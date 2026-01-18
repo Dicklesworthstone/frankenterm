@@ -1,0 +1,41 @@
+[package]
+name = "wa-core"
+description = "Core library for WezTerm Automata - terminal hypervisor for AI agent swarms"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["terminal", "wezterm", "automation", "ai-agents"]
+categories = ["development-tools"]
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+# Pattern matching
+aho-corasick.workspace = true
+memchr.workspace = true
+fancy-regex.workspace = true
+
+# Database
+rusqlite.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
+proptest = "1.5"
+
+[features]
+default = []
+# Optional heavy integrations - feature-gated
+vendored-wezterm = []
+browser-automation = []
+mcp-server = []
