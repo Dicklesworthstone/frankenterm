@@ -465,6 +465,25 @@ impl PolicyDecision {
         }
     }
 
+    /// Returns a stable string representation of the decision type
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny { .. } => "deny",
+            Self::RequireApproval { .. } => "require_approval",
+        }
+    }
+
+    /// Returns the decision reason, if any (for both Deny and RequireApproval)
+    #[must_use]
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Deny { reason, .. } | Self::RequireApproval { reason, .. } => Some(reason),
+            Self::Allow => None,
+        }
+    }
+
     /// Get the allow-once approval payload, if present
     #[must_use]
     pub fn approval_request(&self) -> Option<&ApprovalRequest> {
@@ -1592,6 +1611,111 @@ impl InjectionResult {
             _ => None,
         }
     }
+
+    /// Convert to an audit record for persistence
+    ///
+    /// Creates an `AuditActionRecord` suitable for storing in the audit trail.
+    /// All text fields are already redacted by the PolicyGatedInjector before
+    /// being included in the InjectionResult.
+    ///
+    /// # Arguments
+    /// * `actor` - The actor kind that initiated the action
+    /// * `actor_id` - Optional actor identifier (workflow id, MCP client, etc.)
+    /// * `domain` - Optional domain name of the target pane
+    #[must_use]
+    pub fn to_audit_record(
+        &self,
+        actor: ActorKind,
+        actor_id: Option<String>,
+        domain: Option<String>,
+    ) -> crate::storage::AuditActionRecord {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+
+        match self {
+            Self::Allowed {
+                decision,
+                summary,
+                pane_id,
+                action,
+            } => crate::storage::AuditActionRecord {
+                id: 0, // Assigned by database
+                ts: now_ms,
+                actor_kind: actor.as_str().to_string(),
+                actor_id,
+                pane_id: Some(*pane_id),
+                domain,
+                action_kind: action.as_str().to_string(),
+                policy_decision: decision.as_str().to_string(),
+                decision_reason: None,
+                rule_id: None,
+                input_summary: Some(summary.clone()),
+                verification_summary: None,
+                result: "success".to_string(),
+            },
+            Self::Denied {
+                decision,
+                summary,
+                pane_id,
+                action,
+            } => crate::storage::AuditActionRecord {
+                id: 0,
+                ts: now_ms,
+                actor_kind: actor.as_str().to_string(),
+                actor_id,
+                pane_id: Some(*pane_id),
+                domain,
+                action_kind: action.as_str().to_string(),
+                policy_decision: decision.as_str().to_string(),
+                decision_reason: decision.reason().map(String::from),
+                rule_id: decision.rule_id().map(String::from),
+                input_summary: Some(summary.clone()),
+                verification_summary: None,
+                result: "denied".to_string(),
+            },
+            Self::RequiresApproval {
+                decision,
+                summary,
+                pane_id,
+                action,
+            } => crate::storage::AuditActionRecord {
+                id: 0,
+                ts: now_ms,
+                actor_kind: actor.as_str().to_string(),
+                actor_id,
+                pane_id: Some(*pane_id),
+                domain,
+                action_kind: action.as_str().to_string(),
+                policy_decision: decision.as_str().to_string(),
+                decision_reason: decision.reason().map(String::from),
+                rule_id: decision.rule_id().map(String::from),
+                input_summary: Some(summary.clone()),
+                verification_summary: None,
+                result: "require_approval".to_string(),
+            },
+            Self::Error {
+                error,
+                pane_id,
+                action,
+            } => crate::storage::AuditActionRecord {
+                id: 0,
+                ts: now_ms,
+                actor_kind: actor.as_str().to_string(),
+                actor_id,
+                pane_id: Some(*pane_id),
+                domain,
+                action_kind: action.as_str().to_string(),
+                policy_decision: "allow".to_string(), // Policy allowed, but execution failed
+                decision_reason: None,
+                rule_id: None,
+                input_summary: None,
+                verification_summary: Some(error.clone()),
+                result: "error".to_string(),
+            },
+        }
+    }
 }
 
 /// Policy-gated input injector
@@ -1635,13 +1759,41 @@ impl InjectionResult {
 pub struct PolicyGatedInjector {
     engine: PolicyEngine,
     client: crate::wezterm::WeztermClient,
+    /// Optional storage handle for audit trail emission
+    storage: Option<crate::storage::StorageHandle>,
 }
 
 impl PolicyGatedInjector {
-    /// Create a new policy-gated injector
+    /// Create a new policy-gated injector without audit trail storage
     #[must_use]
     pub fn new(engine: PolicyEngine, client: crate::wezterm::WeztermClient) -> Self {
-        Self { engine, client }
+        Self {
+            engine,
+            client,
+            storage: None,
+        }
+    }
+
+    /// Create a new policy-gated injector with audit trail storage
+    ///
+    /// Every injection (allow, deny, require_approval, error) will be recorded
+    /// to the audit trail via the storage handle.
+    #[must_use]
+    pub fn with_storage(
+        engine: PolicyEngine,
+        client: crate::wezterm::WeztermClient,
+        storage: crate::storage::StorageHandle,
+    ) -> Self {
+        Self {
+            engine,
+            client,
+            storage: Some(storage),
+        }
+    }
+
+    /// Set the storage handle for audit trail emission
+    pub fn set_storage(&mut self, storage: crate::storage::StorageHandle) {
+        self.storage = Some(storage);
     }
 
     /// Create with a permissive policy engine (for testing)
@@ -1766,6 +1918,14 @@ impl PolicyGatedInjector {
     }
 
     /// Internal injection method with policy gating
+    ///
+    /// This method:
+    /// 1. Creates a redacted summary for audit
+    /// 2. Builds policy input with actor, capabilities, and command text
+    /// 3. Authorizes via PolicyEngine
+    /// 4. If allowed, executes the injection
+    /// 5. Emits an audit record (if storage is configured)
+    /// 6. Returns the structured result
     async fn inject(
         &mut self,
         pane_id: u64,
@@ -1797,7 +1957,8 @@ impl PolicyGatedInjector {
         // Authorize
         let decision = self.engine.authorize(&input);
 
-        match &decision {
+        // Build the injection result
+        let result = match &decision {
             PolicyDecision::Allow => {
                 // SAFETY: This is the only place where actual injection happens
                 // after policy approval. The text reference lifetime is handled
@@ -1806,16 +1967,20 @@ impl PolicyGatedInjector {
                 let client = &self.client;
 
                 // We need to call the send function with owned data
-                let result = match action {
+                let send_result = match action {
                     ActionKind::SendText => client.send_text(pane_id, &text_owned).await,
                     ActionKind::SendCtrlC => client.send_ctrl_c(pane_id).await,
                     ActionKind::SendCtrlD => client.send_ctrl_d(pane_id).await,
-                    ActionKind::SendCtrlZ => client.send_control(pane_id, crate::wezterm::control::CTRL_Z).await,
+                    ActionKind::SendCtrlZ => {
+                        client
+                            .send_control(pane_id, crate::wezterm::control::CTRL_Z)
+                            .await
+                    }
                     ActionKind::SendControl => client.send_control(pane_id, &text_owned).await,
                     _ => unreachable!("inject called with non-injection action"),
                 };
 
-                match result {
+                match send_result {
                     Ok(()) => InjectionResult::Allowed {
                         decision,
                         summary,
@@ -1841,7 +2006,28 @@ impl PolicyGatedInjector {
                 pane_id,
                 action,
             },
+        };
+
+        // Emit audit record if storage is configured (wa-4vx.8.7)
+        // Audit is emitted for ALL outcomes: allow, deny, require_approval, and error
+        if let Some(ref storage) = self.storage {
+            let audit_record = result.to_audit_record(
+                actor,
+                workflow_id.map(String::from),
+                None, // domain - could be derived from pane info if available
+            );
+            // Fire-and-forget: don't block on audit persistence
+            // Log on failure but don't propagate the error
+            if let Err(e) = storage.record_audit_action_redacted(audit_record).await {
+                tracing::warn!(
+                    pane_id,
+                    action = action.as_str(),
+                    "Failed to emit audit record: {e}"
+                );
+            }
         }
+
+        result
     }
 
     /// Redact text using the policy engine's redactor
@@ -2084,6 +2270,124 @@ mod tests {
         assert!(!decision.is_allowed());
         assert!(!decision.is_denied());
         assert!(decision.requires_approval());
+    }
+
+    #[test]
+    fn policy_decision_as_str() {
+        assert_eq!(PolicyDecision::allow().as_str(), "allow");
+        assert_eq!(PolicyDecision::deny("reason").as_str(), "deny");
+        assert_eq!(
+            PolicyDecision::require_approval("reason").as_str(),
+            "require_approval"
+        );
+    }
+
+    #[test]
+    fn policy_decision_reason() {
+        assert!(PolicyDecision::allow().reason().is_none());
+        assert_eq!(
+            PolicyDecision::deny("deny reason").reason(),
+            Some("deny reason")
+        );
+        assert_eq!(
+            PolicyDecision::require_approval("approval reason").reason(),
+            Some("approval reason")
+        );
+    }
+
+    // ========================================================================
+    // InjectionResult Audit Record Tests (wa-4vx.8.7)
+    // ========================================================================
+
+    #[test]
+    fn injection_result_allowed_to_audit_record() {
+        let result = InjectionResult::Allowed {
+            decision: PolicyDecision::allow(),
+            summary: "ls -la".to_string(),
+            pane_id: 42,
+            action: ActionKind::SendText,
+        };
+
+        let record = result.to_audit_record(
+            ActorKind::Robot,
+            Some("wf-123".to_string()),
+            Some("local".to_string()),
+        );
+
+        assert_eq!(record.actor_kind, "robot");
+        assert_eq!(record.actor_id, Some("wf-123".to_string()));
+        assert_eq!(record.pane_id, Some(42));
+        assert_eq!(record.domain, Some("local".to_string()));
+        assert_eq!(record.action_kind, "send_text");
+        assert_eq!(record.policy_decision, "allow");
+        assert!(record.decision_reason.is_none());
+        assert!(record.rule_id.is_none());
+        assert_eq!(record.input_summary, Some("ls -la".to_string()));
+        assert_eq!(record.result, "success");
+    }
+
+    #[test]
+    fn injection_result_denied_to_audit_record() {
+        let result = InjectionResult::Denied {
+            decision: PolicyDecision::deny_with_rule("alt screen active", "policy.alt_screen"),
+            summary: "rm -rf /".to_string(),
+            pane_id: 1,
+            action: ActionKind::SendText,
+        };
+
+        let record = result.to_audit_record(ActorKind::Mcp, None, None);
+
+        assert_eq!(record.actor_kind, "mcp");
+        assert!(record.actor_id.is_none());
+        assert_eq!(record.pane_id, Some(1));
+        assert_eq!(record.policy_decision, "deny");
+        assert_eq!(
+            record.decision_reason,
+            Some("alt screen active".to_string())
+        );
+        assert_eq!(record.rule_id, Some("policy.alt_screen".to_string()));
+        assert_eq!(record.result, "denied");
+    }
+
+    #[test]
+    fn injection_result_requires_approval_to_audit_record() {
+        let result = InjectionResult::RequiresApproval {
+            decision: PolicyDecision::require_approval_with_rule("unknown state", "policy.unknown"),
+            summary: "some command".to_string(),
+            pane_id: 5,
+            action: ActionKind::SendCtrlC,
+        };
+
+        let record = result.to_audit_record(ActorKind::Workflow, Some("wf-456".to_string()), None);
+
+        assert_eq!(record.actor_kind, "workflow");
+        assert_eq!(record.actor_id, Some("wf-456".to_string()));
+        assert_eq!(record.action_kind, "send_ctrl_c");
+        assert_eq!(record.policy_decision, "require_approval");
+        assert_eq!(record.decision_reason, Some("unknown state".to_string()));
+        assert_eq!(record.rule_id, Some("policy.unknown".to_string()));
+        assert_eq!(record.result, "require_approval");
+    }
+
+    #[test]
+    fn injection_result_error_to_audit_record() {
+        let result = InjectionResult::Error {
+            error: "WezTerm connection failed".to_string(),
+            pane_id: 99,
+            action: ActionKind::SendText,
+        };
+
+        let record = result.to_audit_record(ActorKind::Human, None, None);
+
+        assert_eq!(record.actor_kind, "human");
+        assert_eq!(record.pane_id, Some(99));
+        assert_eq!(record.policy_decision, "allow"); // Policy allowed, but execution failed
+        assert!(record.input_summary.is_none());
+        assert_eq!(
+            record.verification_summary,
+            Some("WezTerm connection failed".to_string())
+        );
+        assert_eq!(record.result, "error");
     }
 
     // ========================================================================
@@ -2727,7 +3031,10 @@ mod tests {
     #[test]
     fn injection_result_requires_approval_is_correct() {
         let result = InjectionResult::RequiresApproval {
-            decision: PolicyDecision::require_approval_with_rule("needs approval", "policy.approval"),
+            decision: PolicyDecision::require_approval_with_rule(
+                "needs approval",
+                "policy.approval",
+            ),
             summary: "git reset --hard".to_string(),
             pane_id: 1,
             action: ActionKind::SendText,
