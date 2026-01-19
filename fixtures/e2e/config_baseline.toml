@@ -1,0 +1,46 @@
+# Baseline E2E test configuration
+# Permissive settings for basic functionality testing
+
+[ingest]
+poll_interval_ms = 100
+batch_size = 50
+max_segment_bytes = 65536
+
+[storage]
+# Use temp directory (set by WA_DATA_DIR env var)
+retention_days = 1
+vacuum_interval_hours = 24
+
+[search]
+snippet_context_chars = 80
+max_results = 1000
+
+[patterns]
+# Load test patterns
+pack_dirs = ["fixtures/e2e/patterns"]
+
+[workflows]
+max_concurrent = 5
+default_timeout_secs = 60
+
+[safety]
+# Permissive for testing
+block_alt_screen = false
+require_confirmation = false
+audit_all_actions = true
+
+[safety.actors.robot]
+send_text = true
+send_keys = true
+split_pane = true
+close_pane = false
+
+[safety.actors.workflow]
+send_text = true
+send_keys = true
+split_pane = true
+close_pane = false
+
+[logging]
+level = "debug"
+format = "json"
