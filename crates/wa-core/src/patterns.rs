@@ -259,10 +259,7 @@ fn build_engine_index(rules: &[RuleDef]) -> Result<EngineIndex> {
         });
 
         for anchor in &rule.anchors {
-            anchor_to_rules
-                .entry(anchor.clone())
-                .or_default()
-                .push(idx);
+            anchor_to_rules.entry(anchor.clone()).or_default().push(idx);
             if anchor_set.insert(anchor.clone()) {
                 anchor_list.push(anchor.clone());
             }
@@ -602,8 +599,8 @@ impl PatternEngine {
     pub fn new() -> Self {
         let library =
             PatternLibrary::new(builtin_packs()).expect("builtin pattern packs must be valid");
-        let index = build_engine_index(library.rules())
-            .expect("builtin pattern packs must compile");
+        let index =
+            build_engine_index(library.rules()).expect("builtin pattern packs must compile");
         Self {
             library,
             compiled_rules: index.compiled_rules,
@@ -656,7 +653,7 @@ impl PatternEngine {
         let mut matched_anchor_by_rule: HashMap<usize, String> = HashMap::new();
 
         for matched in matcher.find_iter(text) {
-            let anchor = match self.anchor_list.get(matched.pattern()) {
+            let anchor = match self.anchor_list.get(matched.pattern().as_usize()) {
                 Some(anchor) => anchor,
                 None => continue,
             };
@@ -841,7 +838,10 @@ mod tests {
         assert_eq!(detections.len(), 1);
         assert_eq!(detections[0].rule_id, "codex.regex");
         assert_eq!(
-            detections[0].extracted.get("value").and_then(|v| v.as_str()),
+            detections[0]
+                .extracted
+                .get("value")
+                .and_then(|v| v.as_str()),
             Some("42")
         );
     }
