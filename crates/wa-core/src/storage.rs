@@ -3621,6 +3621,9 @@ mod storage_handle_tests {
         let db_path = temp_db_path();
         let handle: StorageHandle = StorageHandle::new(&db_path).await.unwrap();
 
+        // Create pane first (required for foreign key constraint)
+        handle.upsert_pane(test_pane(1)).await.unwrap();
+
         let workflow_id = "wf-test-123";
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3629,14 +3632,17 @@ mod storage_handle_tests {
 
         // Create workflow execution
         let workflow = WorkflowRecord {
-            workflow_id: workflow_id.to_string(),
+            id: workflow_id.to_string(),
+            workflow_name: "test_workflow".to_string(),
             pane_id: 1,
-            event_id: None,
-            started_at: now,
+            trigger_event_id: None,
             current_step: 0,
-            max_steps: 3,
             status: "running".to_string(),
+            wait_condition: None,
+            context: None,
+            result: None,
             error: None,
+            started_at: now,
             updated_at: now,
             completed_at: None,
         };
@@ -3727,17 +3733,24 @@ mod storage_handle_tests {
             .unwrap()
             .as_millis() as i64;
 
+        // Create pane first (foreign key constraint)
+        handle.upsert_pane(test_pane(1)).await.unwrap();
+
         let event = StoredEvent {
             id: 0, // Will be assigned
             pane_id: 1,
             rule_id: "test.rule".to_string(),
-            detected_at: now,
+            agent_type: "codex".to_string(),
+            event_type: "usage".to_string(),
+            severity: "warning".to_string(),
+            confidence: 0.9,
+            extracted: Some(serde_json::json!({"key":"value"})),
+            matched_text: Some("match".to_string()),
             segment_id: None,
-            extracted_data: Some(r#"{"key":"value"}"#.to_string()),
-            handled: false,
+            detected_at: now,
             handled_at: None,
-            handled_by: None,
-            handling_status: None,
+            handled_by_workflow_id: None,
+            handled_status: None,
         };
 
         let event_id: i64 = handle.record_event(event).await.unwrap();
@@ -3809,11 +3822,11 @@ mod storage_handle_tests {
         assert_eq!(pane2_segs.len(), 5);
 
         // Check monotonicity (returned in descending order)
-        let pane1_seqs: Vec<u64> = pane1_segs.iter().map(|s| s.seq).collect();
-        let pane2_seqs: Vec<u64> = pane2_segs.iter().map(|s| s.seq).collect();
+        let pane1_seq_values: Vec<u64> = pane1_segs.iter().map(|s| s.seq).collect();
+        let pane2_seq_values: Vec<u64> = pane2_segs.iter().map(|s| s.seq).collect();
 
-        assert_eq!(pane1_seqs, vec![4, 3, 2, 1, 0]);
-        assert_eq!(pane2_seqs, vec![4, 3, 2, 1, 0]);
+        assert_eq!(pane1_seq_values, vec![4, 3, 2, 1, 0]);
+        assert_eq!(pane2_seq_values, vec![4, 3, 2, 1, 0]);
 
         handle.shutdown().await.unwrap();
         let _ = std::fs::remove_file(&db_path);
@@ -3829,16 +3842,27 @@ mod storage_handle_tests {
             .unwrap()
             .as_millis() as i64;
 
-        let session = AgentSessionRecord {
-            id: 0, // Will be assigned
+        // Create pane first (foreign key constraint)
+        let pane = PaneRecord {
             pane_id: 1,
-            agent_type: "claude".to_string(),
-            started_at: now,
-            ended_at: None,
-            account_id: None,
-            total_tokens: Some(1000),
-            session_data: Some(r#"{"model":"opus"}"#.to_string()),
+            domain: "local".to_string(),
+            window_id: None,
+            tab_id: None,
+            title: None,
+            cwd: None,
+            tty_name: None,
+            first_seen_at: now,
+            last_seen_at: now,
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
         };
+        handle.upsert_pane(pane).await.unwrap();
+
+        let mut session = AgentSessionRecord::new_start(1, "claude_code");
+        session.started_at = now;
+        session.total_tokens = Some(1000);
+        session.model_name = Some("opus".to_string());
 
         let session_id: i64 = handle.upsert_agent_session(session).await.unwrap();
         assert!(session_id > 0);
@@ -3848,7 +3872,7 @@ mod storage_handle_tests {
             handle.get_agent_session(session_id).await.unwrap();
         assert!(retrieved.is_some());
         let retrieved = retrieved.unwrap();
-        assert_eq!(retrieved.agent_type, "claude");
+        assert_eq!(retrieved.agent_type, "claude_code");
         assert_eq!(retrieved.total_tokens, Some(1000));
 
         // Query active sessions

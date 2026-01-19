@@ -71,6 +71,98 @@ pub struct Detection {
     pub matched_text: String,
 }
 
+impl Detection {
+    /// Generate a stable dedup key for this detection.
+    ///
+    /// The key is based on rule_id + significant extracted values, allowing
+    /// the same rule to fire multiple times if the extracted values differ.
+    #[must_use]
+    pub fn dedup_key(&self) -> String {
+        let extracted_hash = if let Some(obj) = self.extracted.as_object() {
+            let mut parts: Vec<String> = obj.iter().map(|(k, v)| format!("{k}:{v}")).collect();
+            parts.sort();
+            parts.join("|")
+        } else {
+            String::new()
+        };
+        format!("{}:{}", self.rule_id, extracted_hash)
+    }
+}
+
+/// Context for detection with agent filtering and deduplication.
+///
+/// Use this to prevent false positives in non-agent panes and avoid
+/// re-emitting the same detection across overlapping tail windows.
+#[derive(Debug, Clone)]
+pub struct DetectionContext {
+    /// Pane ID for tracking
+    pub pane_id: Option<u64>,
+    /// Inferred agent type for this pane (if known)
+    pub agent_type: Option<AgentType>,
+    /// Previously seen dedup keys to avoid re-emitting
+    seen_keys: HashSet<String>,
+}
+
+impl Default for DetectionContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DetectionContext {
+    /// Create a new empty detection context
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            pane_id: None,
+            agent_type: None,
+            seen_keys: HashSet::new(),
+        }
+    }
+
+    /// Create a context with a known agent type
+    #[must_use]
+    pub fn with_agent_type(agent_type: AgentType) -> Self {
+        Self {
+            pane_id: None,
+            agent_type: Some(agent_type),
+            seen_keys: HashSet::new(),
+        }
+    }
+
+    /// Create a context for a specific pane
+    #[must_use]
+    pub fn with_pane(pane_id: u64, agent_type: Option<AgentType>) -> Self {
+        Self {
+            pane_id: Some(pane_id),
+            agent_type,
+            seen_keys: HashSet::new(),
+        }
+    }
+
+    /// Mark a detection as seen, returning true if it was new
+    pub fn mark_seen(&mut self, detection: &Detection) -> bool {
+        self.seen_keys.insert(detection.dedup_key())
+    }
+
+    /// Check if a detection has been seen before
+    #[must_use]
+    pub fn is_seen(&self, detection: &Detection) -> bool {
+        self.seen_keys.contains(&detection.dedup_key())
+    }
+
+    /// Clear the set of seen detections
+    pub fn clear_seen(&mut self) {
+        self.seen_keys.clear();
+    }
+
+    /// Get the number of seen detections
+    #[must_use]
+    pub fn seen_count(&self) -> usize {
+        self.seen_keys.len()
+    }
+}
+
 /// Allowed rule ID prefixes for stable naming
 const ALLOWED_RULE_PREFIXES: [&str; 4] = ["codex.", "claude_code.", "gemini.", "wezterm."];
 
@@ -780,6 +872,72 @@ impl PatternEngine {
         }
 
         detections
+    }
+
+    /// Detect patterns in text with agent filtering and deduplication.
+    ///
+    /// This method filters detections based on the context's agent type:
+    /// - Agent-specific rules only fire if the pane is inferred to be that agent
+    /// - WezTerm rules fire for all agent types (they're infrastructure)
+    /// - Unknown agent type allows all rules (conservative fallback)
+    ///
+    /// Detections are also deduplicated based on rule_id + extracted values.
+    #[must_use]
+    pub fn detect_with_context(
+        &self,
+        text: &str,
+        context: &mut DetectionContext,
+    ) -> Vec<Detection> {
+        if text.is_empty() {
+            return Vec::new();
+        }
+
+        // Get all potential detections first
+        let all_detections = self.detect(text);
+
+        // Filter by agent type and dedup
+        let mut result = Vec::new();
+        for detection in all_detections {
+            // State gating: filter by agent type if specified
+            if let Some(expected_agent) = context.agent_type {
+                if !self.rule_applies_to_agent(&detection, expected_agent) {
+                    continue;
+                }
+            }
+
+            // Deduplication: skip if already seen
+            if context.is_seen(&detection) {
+                continue;
+            }
+
+            // Mark as seen and include in results
+            context.mark_seen(&detection);
+            result.push(detection);
+        }
+
+        result
+    }
+
+    /// Check if a detection's rule applies to the given agent type.
+    ///
+    /// Returns true if:
+    /// - The detection's agent type matches the expected agent
+    /// - The detection is a WezTerm rule (infrastructure rules apply to all)
+    /// - The expected agent is Unknown (conservative fallback)
+    #[must_use]
+    fn rule_applies_to_agent(&self, detection: &Detection, expected_agent: AgentType) -> bool {
+        // WezTerm rules are infrastructure and apply to all agent types
+        if detection.agent_type == AgentType::Wezterm {
+            return true;
+        }
+
+        // Unknown agent type allows all rules (conservative fallback)
+        if expected_agent == AgentType::Unknown {
+            return true;
+        }
+
+        // Otherwise, rule must match the expected agent
+        detection.agent_type == expected_agent
     }
 
     /// Quick reject check - returns false if text definitely has no matches
