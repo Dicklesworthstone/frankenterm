@@ -926,6 +926,245 @@ impl EffectivePaths {
     }
 }
 
+// =============================================================================
+// Hot Reload Support
+// =============================================================================
+
+/// Settings that can be safely hot-reloaded without restarting the watcher.
+///
+/// These settings do not require reinitialization of stateful components
+/// like storage handles or pattern engines.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HotReloadableConfig {
+    // General
+    /// Log level (trace, debug, info, warn, error)
+    pub log_level: String,
+
+    // Ingest
+    /// Base poll interval in milliseconds
+    pub poll_interval_ms: u64,
+    /// Minimum poll interval (adaptive lower bound)
+    pub min_poll_interval_ms: u64,
+
+    // Storage
+    /// Retention period in days
+    pub retention_days: u32,
+    /// Size-based retention in megabytes
+    pub retention_max_mb: u32,
+    /// Checkpoint interval in seconds
+    pub checkpoint_interval_secs: u32,
+
+    // Patterns
+    /// Enabled pattern packs
+    pub pattern_packs: Vec<String>,
+
+    // Workflows
+    /// Enabled workflows
+    pub workflows_enabled: Vec<String>,
+    /// Auto-run allowlist
+    pub auto_run_allowlist: Vec<String>,
+}
+
+impl HotReloadableConfig {
+    /// Extract hot-reloadable settings from a full Config.
+    #[must_use]
+    pub fn from_config(config: &Config) -> Self {
+        Self {
+            log_level: config.general.log_level.clone(),
+            poll_interval_ms: config.ingest.poll_interval_ms,
+            min_poll_interval_ms: config.ingest.min_poll_interval_ms,
+            retention_days: config.storage.retention_days,
+            retention_max_mb: config.storage.retention_max_mb,
+            checkpoint_interval_secs: config.storage.checkpoint_interval_secs,
+            pattern_packs: config.patterns.packs.clone(),
+            workflows_enabled: config.workflows.enabled.clone(),
+            auto_run_allowlist: config.workflows.auto_run_allowlist.clone(),
+        }
+    }
+}
+
+/// Result of comparing two configs for hot reload.
+#[derive(Debug, Clone)]
+pub struct HotReloadResult {
+    /// Whether the reload is allowed (no forbidden changes)
+    pub allowed: bool,
+    /// Settings that changed and can be applied
+    pub changes: Vec<HotReloadChange>,
+    /// Forbidden changes that require a restart
+    pub forbidden: Vec<ForbiddenChange>,
+}
+
+/// A single hot-reloadable setting that changed.
+#[derive(Debug, Clone)]
+pub struct HotReloadChange {
+    /// Setting name (e.g., "poll_interval_ms")
+    pub name: String,
+    /// Previous value (as string for display)
+    pub old_value: String,
+    /// New value (as string for display)
+    pub new_value: String,
+}
+
+/// A change to a setting that cannot be hot-reloaded.
+#[derive(Debug, Clone)]
+pub struct ForbiddenChange {
+    /// Setting name
+    pub name: String,
+    /// Reason why this setting cannot be hot-reloaded
+    pub reason: String,
+}
+
+impl Config {
+    /// Compare two configs and determine what can be hot-reloaded.
+    ///
+    /// Returns `HotReloadResult` indicating whether the reload is allowed
+    /// and what changes would be applied.
+    #[must_use]
+    pub fn diff_for_hot_reload(&self, new_config: &Config) -> HotReloadResult {
+        let mut changes = Vec::new();
+        let mut forbidden = Vec::new();
+
+        // Check forbidden settings first
+        if self.storage.db_path != new_config.storage.db_path {
+            forbidden.push(ForbiddenChange {
+                name: "storage.db_path".to_string(),
+                reason: "Database path cannot be changed at runtime; requires restart".to_string(),
+            });
+        }
+
+        if self.general.data_dir != new_config.general.data_dir {
+            forbidden.push(ForbiddenChange {
+                name: "general.data_dir".to_string(),
+                reason: "Data directory cannot be changed at runtime; requires restart".to_string(),
+            });
+        }
+
+        if self.storage.writer_queue_size != new_config.storage.writer_queue_size {
+            forbidden.push(ForbiddenChange {
+                name: "storage.writer_queue_size".to_string(),
+                reason: "Writer queue size cannot be changed at runtime; requires restart"
+                    .to_string(),
+            });
+        }
+
+        if self.storage.read_pool_size != new_config.storage.read_pool_size {
+            forbidden.push(ForbiddenChange {
+                name: "storage.read_pool_size".to_string(),
+                reason: "Read pool size cannot be changed at runtime; requires restart".to_string(),
+            });
+        }
+
+        // Check hot-reloadable settings
+        if self.general.log_level != new_config.general.log_level {
+            changes.push(HotReloadChange {
+                name: "general.log_level".to_string(),
+                old_value: self.general.log_level.clone(),
+                new_value: new_config.general.log_level.clone(),
+            });
+        }
+
+        if self.ingest.poll_interval_ms != new_config.ingest.poll_interval_ms {
+            changes.push(HotReloadChange {
+                name: "ingest.poll_interval_ms".to_string(),
+                old_value: self.ingest.poll_interval_ms.to_string(),
+                new_value: new_config.ingest.poll_interval_ms.to_string(),
+            });
+        }
+
+        if self.ingest.min_poll_interval_ms != new_config.ingest.min_poll_interval_ms {
+            changes.push(HotReloadChange {
+                name: "ingest.min_poll_interval_ms".to_string(),
+                old_value: self.ingest.min_poll_interval_ms.to_string(),
+                new_value: new_config.ingest.min_poll_interval_ms.to_string(),
+            });
+        }
+
+        if self.storage.retention_days != new_config.storage.retention_days {
+            changes.push(HotReloadChange {
+                name: "storage.retention_days".to_string(),
+                old_value: self.storage.retention_days.to_string(),
+                new_value: new_config.storage.retention_days.to_string(),
+            });
+        }
+
+        if self.storage.retention_max_mb != new_config.storage.retention_max_mb {
+            changes.push(HotReloadChange {
+                name: "storage.retention_max_mb".to_string(),
+                old_value: self.storage.retention_max_mb.to_string(),
+                new_value: new_config.storage.retention_max_mb.to_string(),
+            });
+        }
+
+        if self.storage.checkpoint_interval_secs != new_config.storage.checkpoint_interval_secs {
+            changes.push(HotReloadChange {
+                name: "storage.checkpoint_interval_secs".to_string(),
+                old_value: self.storage.checkpoint_interval_secs.to_string(),
+                new_value: new_config.storage.checkpoint_interval_secs.to_string(),
+            });
+        }
+
+        if self.patterns.packs != new_config.patterns.packs {
+            changes.push(HotReloadChange {
+                name: "patterns.packs".to_string(),
+                old_value: format!("{:?}", self.patterns.packs),
+                new_value: format!("{:?}", new_config.patterns.packs),
+            });
+        }
+
+        if self.workflows.enabled != new_config.workflows.enabled {
+            changes.push(HotReloadChange {
+                name: "workflows.enabled".to_string(),
+                old_value: format!("{:?}", self.workflows.enabled),
+                new_value: format!("{:?}", new_config.workflows.enabled),
+            });
+        }
+
+        if self.workflows.auto_run_allowlist != new_config.workflows.auto_run_allowlist {
+            changes.push(HotReloadChange {
+                name: "workflows.auto_run_allowlist".to_string(),
+                old_value: format!("{:?}", self.workflows.auto_run_allowlist),
+                new_value: format!("{:?}", new_config.workflows.auto_run_allowlist),
+            });
+        }
+
+        HotReloadResult {
+            allowed: forbidden.is_empty(),
+            changes,
+            forbidden,
+        }
+    }
+
+    /// Get the hot-reloadable subset of this config.
+    #[must_use]
+    pub fn hot_reloadable(&self) -> HotReloadableConfig {
+        HotReloadableConfig::from_config(self)
+    }
+}
+
+impl std::fmt::Display for HotReloadResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.forbidden.is_empty() && self.changes.is_empty() {
+            return write!(f, "No configuration changes detected");
+        }
+
+        if !self.forbidden.is_empty() {
+            writeln!(f, "Forbidden changes (require restart):")?;
+            for fc in &self.forbidden {
+                writeln!(f, "  - {}: {}", fc.name, fc.reason)?;
+            }
+        }
+
+        if !self.changes.is_empty() {
+            writeln!(f, "Hot-reloadable changes:")?;
+            for c in &self.changes {
+                writeln!(f, "  - {}: {} -> {}", c.name, c.old_value, c.new_value)?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
 /// Resolve the config path that was loaded (if any).
 #[must_use]
 pub fn resolve_config_path(explicit: Option<&Path>) -> Option<PathBuf> {
@@ -1969,5 +2208,197 @@ title = "vim"
 
         let _ = std::fs::remove_file(&layout.db_path);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ==========================================================================
+    // Hot Reload Tests
+    // ==========================================================================
+
+    #[test]
+    fn hot_reload_allows_poll_interval_change() {
+        let config1 = Config::default();
+        let mut config2 = Config::default();
+        config2.ingest.poll_interval_ms = 500;
+
+        let result = config1.diff_for_hot_reload(&config2);
+
+        assert!(result.allowed);
+        assert_eq!(result.changes.len(), 1);
+        assert_eq!(result.changes[0].name, "ingest.poll_interval_ms");
+        assert_eq!(result.changes[0].old_value, "200");
+        assert_eq!(result.changes[0].new_value, "500");
+        assert!(result.forbidden.is_empty());
+    }
+
+    #[test]
+    fn hot_reload_allows_log_level_change() {
+        let config1 = Config::default();
+        let mut config2 = Config::default();
+        config2.general.log_level = "debug".to_string();
+
+        let result = config1.diff_for_hot_reload(&config2);
+
+        assert!(result.allowed);
+        assert_eq!(result.changes.len(), 1);
+        assert_eq!(result.changes[0].name, "general.log_level");
+        assert_eq!(result.changes[0].old_value, "info");
+        assert_eq!(result.changes[0].new_value, "debug");
+    }
+
+    #[test]
+    fn hot_reload_allows_retention_change() {
+        let config1 = Config::default();
+        let mut config2 = Config::default();
+        config2.storage.retention_days = 60;
+
+        let result = config1.diff_for_hot_reload(&config2);
+
+        assert!(result.allowed);
+        assert_eq!(result.changes.len(), 1);
+        assert_eq!(result.changes[0].name, "storage.retention_days");
+    }
+
+    #[test]
+    fn hot_reload_allows_pattern_packs_change() {
+        let config1 = Config::default();
+        let mut config2 = Config::default();
+        config2.patterns.packs = vec!["builtin:core".to_string()];
+
+        let result = config1.diff_for_hot_reload(&config2);
+
+        assert!(result.allowed);
+        assert!(result.changes.iter().any(|c| c.name == "patterns.packs"));
+    }
+
+    #[test]
+    fn hot_reload_forbids_db_path_change() {
+        let config1 = Config::default();
+        let mut config2 = Config::default();
+        config2.storage.db_path = "/new/path/wa.db".to_string();
+
+        let result = config1.diff_for_hot_reload(&config2);
+
+        assert!(!result.allowed);
+        assert_eq!(result.forbidden.len(), 1);
+        assert_eq!(result.forbidden[0].name, "storage.db_path");
+        assert!(result.forbidden[0]
+            .reason
+            .contains("cannot be changed at runtime"));
+    }
+
+    #[test]
+    fn hot_reload_forbids_data_dir_change() {
+        let config1 = Config::default();
+        let mut config2 = Config::default();
+        config2.general.data_dir = "/new/data/dir".to_string();
+
+        let result = config1.diff_for_hot_reload(&config2);
+
+        assert!(!result.allowed);
+        assert!(result.forbidden.iter().any(|f| f.name == "general.data_dir"));
+    }
+
+    #[test]
+    fn hot_reload_forbids_writer_queue_size_change() {
+        let config1 = Config::default();
+        let mut config2 = Config::default();
+        config2.storage.writer_queue_size = 50000;
+
+        let result = config1.diff_for_hot_reload(&config2);
+
+        assert!(!result.allowed);
+        assert!(result
+            .forbidden
+            .iter()
+            .any(|f| f.name == "storage.writer_queue_size"));
+    }
+
+    #[test]
+    fn hot_reload_no_changes_detected() {
+        let config1 = Config::default();
+        let config2 = Config::default();
+
+        let result = config1.diff_for_hot_reload(&config2);
+
+        assert!(result.allowed);
+        assert!(result.changes.is_empty());
+        assert!(result.forbidden.is_empty());
+    }
+
+    #[test]
+    fn hot_reload_multiple_allowed_changes() {
+        let config1 = Config::default();
+        let mut config2 = Config::default();
+        config2.general.log_level = "debug".to_string();
+        config2.ingest.poll_interval_ms = 500;
+        config2.storage.retention_days = 60;
+
+        let result = config1.diff_for_hot_reload(&config2);
+
+        assert!(result.allowed);
+        assert_eq!(result.changes.len(), 3);
+        assert!(result
+            .changes
+            .iter()
+            .any(|c| c.name == "general.log_level"));
+        assert!(result
+            .changes
+            .iter()
+            .any(|c| c.name == "ingest.poll_interval_ms"));
+        assert!(result
+            .changes
+            .iter()
+            .any(|c| c.name == "storage.retention_days"));
+    }
+
+    #[test]
+    fn hot_reload_mixed_allowed_and_forbidden() {
+        let config1 = Config::default();
+        let mut config2 = Config::default();
+        config2.general.log_level = "debug".to_string(); // Allowed
+        config2.storage.db_path = "/new/path/wa.db".to_string(); // Forbidden
+
+        let result = config1.diff_for_hot_reload(&config2);
+
+        // Should be forbidden overall
+        assert!(!result.allowed);
+        // But should still report what would have been allowed
+        assert!(result
+            .changes
+            .iter()
+            .any(|c| c.name == "general.log_level"));
+        assert!(result.forbidden.iter().any(|f| f.name == "storage.db_path"));
+    }
+
+    #[test]
+    fn hot_reloadable_config_extracts_correctly() {
+        let mut config = Config::default();
+        config.general.log_level = "debug".to_string();
+        config.ingest.poll_interval_ms = 500;
+        config.storage.retention_days = 45;
+        config.patterns.packs = vec!["builtin:core".to_string()];
+
+        let hot = config.hot_reloadable();
+
+        assert_eq!(hot.log_level, "debug");
+        assert_eq!(hot.poll_interval_ms, 500);
+        assert_eq!(hot.retention_days, 45);
+        assert_eq!(hot.pattern_packs, vec!["builtin:core".to_string()]);
+    }
+
+    #[test]
+    fn hot_reload_result_display_format() {
+        let config1 = Config::default();
+        let mut config2 = Config::default();
+        config2.ingest.poll_interval_ms = 500;
+        config2.storage.db_path = "/forbidden/path".to_string();
+
+        let result = config1.diff_for_hot_reload(&config2);
+        let output = format!("{}", result);
+
+        assert!(output.contains("Forbidden changes"));
+        assert!(output.contains("storage.db_path"));
+        assert!(output.contains("Hot-reloadable changes"));
+        assert!(output.contains("ingest.poll_interval_ms"));
     }
 }
