@@ -1,0 +1,49 @@
+version: 2
+updates:
+  # GitHub Actions - keep CI infrastructure current
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/New_York"
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"
+
+  # Rust dependencies
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/New_York"
+    groups:
+      # Group minor/patch updates together
+      rust-deps:
+        patterns: ["*"]
+        exclude-patterns:
+          - "tokio*"
+          - "serde*"
+          - "rusqlite*"
+      # Core async runtime - review separately
+      tokio:
+        patterns: ["tokio*"]
+      # Serialization - review separately
+      serde:
+        patterns: ["serde*"]
+      # Database - review separately (bundled SQLite)
+      database:
+        patterns: ["rusqlite*"]
+    commit-message:
+      prefix: "deps"
+    ignore:
+      # Ignore major version updates for core deps (manual review)
+      - dependency-name: "tokio"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "rusqlite"
+        update-types: ["version-update:semver-major"]
