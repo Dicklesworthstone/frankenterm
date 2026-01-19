@@ -18,7 +18,12 @@
 use crate::policy::PaneCapabilities;
 use crate::storage::StorageHandle;
 use serde::{Deserialize, Serialize};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+
+/// Type alias for a boxed future used in dyn-compatible traits.
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 // ============================================================================
 // Step Results
@@ -290,6 +295,8 @@ pub struct WorkflowContext {
     config: WorkflowConfig,
     /// Workflow execution ID
     execution_id: String,
+    /// Policy-gated injector for terminal actions (optional)
+    injector: Option<Arc<tokio::sync::Mutex<crate::policy::PolicyGatedInjector>>>,
 }
 
 impl WorkflowContext {
@@ -308,7 +315,18 @@ impl WorkflowContext {
             trigger: None,
             config: WorkflowConfig::default(),
             execution_id: execution_id.into(),
+            injector: None,
         }
+    }
+
+    /// Set the policy-gated injector for terminal actions
+    #[must_use]
+    pub fn with_injector(
+        mut self,
+        injector: Arc<tokio::sync::Mutex<crate::policy::PolicyGatedInjector>>,
+    ) -> Self {
+        self.injector = Some(injector);
+        self
     }
 
     /// Set the triggering event/detection
@@ -370,6 +388,79 @@ impl WorkflowContext {
     #[must_use]
     pub fn default_wait_timeout_ms(&self) -> u64 {
         self.config.default_wait_timeout_ms
+    }
+
+    /// Check if an injector is available for actions
+    #[must_use]
+    pub fn has_injector(&self) -> bool {
+        self.injector.is_some()
+    }
+
+    /// Send text to the target pane via policy-gated injection.
+    ///
+    /// Returns `Ok(InjectionResult)` on success, `Err` if no injector is configured.
+    ///
+    /// The injection is performed through the `PolicyGatedInjector` which:
+    /// - Checks policy authorization
+    /// - Emits audit entries
+    /// - Only sends if allowed
+    pub async fn send_text(
+        &mut self,
+        text: &str,
+    ) -> Result<crate::policy::InjectionResult, &'static str> {
+        let injector = self.injector.as_ref().ok_or("No injector configured")?;
+        let mut guard = injector.lock().await;
+        Ok(guard
+            .send_text(
+                self.pane_id,
+                text,
+                crate::policy::ActorKind::Workflow,
+                &self.capabilities,
+                Some(&self.execution_id),
+            )
+            .await)
+    }
+
+    /// Send Ctrl-C (interrupt) to the target pane via policy-gated injection.
+    pub async fn send_ctrl_c(&mut self) -> Result<crate::policy::InjectionResult, &'static str> {
+        let injector = self.injector.as_ref().ok_or("No injector configured")?;
+        let mut guard = injector.lock().await;
+        Ok(guard
+            .send_ctrl_c(
+                self.pane_id,
+                crate::policy::ActorKind::Workflow,
+                &self.capabilities,
+                Some(&self.execution_id),
+            )
+            .await)
+    }
+
+    /// Send Ctrl-D (EOF) to the target pane via policy-gated injection.
+    pub async fn send_ctrl_d(&mut self) -> Result<crate::policy::InjectionResult, &'static str> {
+        let injector = self.injector.as_ref().ok_or("No injector configured")?;
+        let mut guard = injector.lock().await;
+        Ok(guard
+            .send_ctrl_d(
+                self.pane_id,
+                crate::policy::ActorKind::Workflow,
+                &self.capabilities,
+                Some(&self.execution_id),
+            )
+            .await)
+    }
+
+    /// Send Ctrl-Z (suspend) to the target pane via policy-gated injection.
+    pub async fn send_ctrl_z(&mut self) -> Result<crate::policy::InjectionResult, &'static str> {
+        let injector = self.injector.as_ref().ok_or("No injector configured")?;
+        let mut guard = injector.lock().await;
+        Ok(guard
+            .send_ctrl_z(
+                self.pane_id,
+                crate::policy::ActorKind::Workflow,
+                &self.capabilities,
+                Some(&self.execution_id),
+            )
+            .await)
     }
 }
 
@@ -449,13 +540,13 @@ pub trait Workflow: Send + Sync {
         &self,
         ctx: &mut WorkflowContext,
         step_idx: usize,
-    ) -> impl std::future::Future<Output = StepResult> + Send;
+    ) -> BoxFuture<'_, StepResult>;
 
     /// Optional cleanup when workflow is aborted or completes with error.
     ///
     /// Override to release resources, revert partial changes, etc.
-    fn cleanup(&self, _ctx: &mut WorkflowContext) -> impl std::future::Future<Output = ()> + Send {
-        async {}
+    fn cleanup(&self, _ctx: &mut WorkflowContext) -> BoxFuture<'_, ()> {
+        Box::pin(async {})
     }
 
     /// Get the number of steps in this workflow.
@@ -1477,6 +1568,932 @@ fn truncate_for_log(s: &str, max_len: usize) -> String {
     }
 }
 
+// ============================================================================
+// WorkflowRunner - Event-driven workflow execution
+// ============================================================================
+
+/// Result of attempting to start a workflow.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WorkflowStartResult {
+    /// Workflow started successfully
+    Started {
+        /// Unique execution ID
+        execution_id: String,
+        /// Name of the workflow that was started
+        workflow_name: String,
+    },
+    /// No workflow handles this detection
+    NoMatchingWorkflow {
+        /// The rule_id from the detection
+        rule_id: String,
+    },
+    /// The pane is already locked by another workflow
+    PaneLocked {
+        /// The pane that is locked
+        pane_id: u64,
+        /// Workflow name holding the lock
+        held_by_workflow: String,
+        /// Execution ID holding the lock
+        held_by_execution: String,
+    },
+    /// An error occurred
+    Error {
+        /// Error message
+        error: String,
+    },
+}
+
+impl WorkflowStartResult {
+    /// Returns true if a workflow was started.
+    #[must_use]
+    pub fn is_started(&self) -> bool {
+        matches!(self, Self::Started { .. })
+    }
+
+    /// Returns true if the pane was locked by another workflow.
+    #[must_use]
+    pub fn is_locked(&self) -> bool {
+        matches!(self, Self::PaneLocked { .. })
+    }
+
+    /// Returns the execution ID if the workflow was started.
+    #[must_use]
+    pub fn execution_id(&self) -> Option<&str> {
+        match self {
+            Self::Started { execution_id, .. } => Some(execution_id),
+            _ => None,
+        }
+    }
+}
+
+/// Result of workflow execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WorkflowExecutionResult {
+    /// Workflow completed successfully
+    Completed {
+        /// Execution ID
+        execution_id: String,
+        /// Final result value
+        result: serde_json::Value,
+        /// Total elapsed time in milliseconds
+        elapsed_ms: u64,
+        /// Number of steps executed
+        steps_executed: usize,
+    },
+    /// Workflow was aborted
+    Aborted {
+        /// Execution ID
+        execution_id: String,
+        /// Reason for abort
+        reason: String,
+        /// Step index where abort occurred
+        step_index: usize,
+        /// Elapsed time in milliseconds
+        elapsed_ms: u64,
+    },
+    /// Workflow step was denied by policy
+    PolicyDenied {
+        /// Execution ID
+        execution_id: String,
+        /// Step index where denial occurred
+        step_index: usize,
+        /// Reason for denial
+        reason: String,
+    },
+    /// An error occurred during execution
+    Error {
+        /// Execution ID (if available)
+        execution_id: Option<String>,
+        /// Error message
+        error: String,
+    },
+}
+
+impl WorkflowExecutionResult {
+    /// Returns true if the workflow completed successfully.
+    #[must_use]
+    pub fn is_completed(&self) -> bool {
+        matches!(self, Self::Completed { .. })
+    }
+
+    /// Returns true if the workflow was aborted.
+    #[must_use]
+    pub fn is_aborted(&self) -> bool {
+        matches!(self, Self::Aborted { .. })
+    }
+
+    /// Returns the execution ID.
+    #[must_use]
+    pub fn execution_id(&self) -> Option<&str> {
+        match self {
+            Self::Completed { execution_id, .. }
+            | Self::Aborted { execution_id, .. }
+            | Self::PolicyDenied { execution_id, .. } => Some(execution_id),
+            Self::Error { execution_id, .. } => execution_id.as_deref(),
+        }
+    }
+}
+
+/// Configuration for the workflow runner.
+#[derive(Debug, Clone)]
+pub struct WorkflowRunnerConfig {
+    /// Maximum concurrent workflow executions
+    pub max_concurrent: usize,
+    /// Default timeout for step execution (milliseconds)
+    pub step_timeout_ms: u64,
+    /// Retry delay multiplier for exponential backoff
+    pub retry_backoff_multiplier: f64,
+    /// Maximum retries per step
+    pub max_retries_per_step: usize,
+}
+
+impl Default for WorkflowRunnerConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent: 3,
+            step_timeout_ms: 30_000,
+            retry_backoff_multiplier: 2.0,
+            max_retries_per_step: 3,
+        }
+    }
+}
+
+/// Event-driven workflow runner that subscribes to detection events
+/// and executes matching workflows.
+///
+/// # Architecture
+///
+/// ```text
+/// EventBus (detections) -> WorkflowRunner -> find_matching_workflow
+///                                         -> acquire_pane_lock
+///                                         -> WorkflowEngine (persist)
+///                                         -> execute_steps
+///                                         -> release_pane_lock
+/// ```
+///
+/// # Usage
+///
+/// ```ignore
+/// let runner = WorkflowRunner::new(
+///     engine,
+///     lock_manager,
+///     storage,
+///     injector,
+///     config,
+/// );
+///
+/// // Register workflows
+/// runner.register_workflow(Arc::new(MyWorkflow::new()));
+///
+/// // Run the event loop
+/// runner.run(event_bus).await;
+/// ```
+pub struct WorkflowRunner {
+    /// Registered workflows
+    workflows: std::sync::RwLock<Vec<Arc<dyn Workflow>>>,
+    /// Workflow engine for persistence
+    engine: WorkflowEngine,
+    /// Per-pane lock manager
+    lock_manager: Arc<PaneWorkflowLockManager>,
+    /// Storage handle for persistence
+    storage: Arc<crate::storage::StorageHandle>,
+    /// Policy-gated injector for terminal input
+    injector: Arc<tokio::sync::Mutex<crate::policy::PolicyGatedInjector>>,
+    /// Configuration
+    config: WorkflowRunnerConfig,
+}
+
+impl WorkflowRunner {
+    /// Create a new workflow runner.
+    pub fn new(
+        engine: WorkflowEngine,
+        lock_manager: Arc<PaneWorkflowLockManager>,
+        storage: Arc<crate::storage::StorageHandle>,
+        injector: Arc<tokio::sync::Mutex<crate::policy::PolicyGatedInjector>>,
+        config: WorkflowRunnerConfig,
+    ) -> Self {
+        Self {
+            workflows: std::sync::RwLock::new(Vec::new()),
+            engine,
+            lock_manager,
+            storage,
+            injector,
+            config,
+        }
+    }
+
+    /// Get the lock manager.
+    pub fn lock_manager(&self) -> &Arc<PaneWorkflowLockManager> {
+        &self.lock_manager
+    }
+
+    /// Register a workflow.
+    pub fn register_workflow(&self, workflow: Arc<dyn Workflow>) {
+        let mut workflows = self.workflows.write().unwrap();
+        workflows.push(workflow);
+    }
+
+    /// Find a workflow that handles the given detection.
+    pub fn find_matching_workflow(
+        &self,
+        detection: &crate::patterns::Detection,
+    ) -> Option<Arc<dyn Workflow>> {
+        let workflows = self.workflows.read().unwrap();
+        workflows.iter().find(|w| w.handles(detection)).cloned()
+    }
+
+    /// Find a workflow by name.
+    pub fn find_workflow_by_name(&self, name: &str) -> Option<Arc<dyn Workflow>> {
+        let workflows = self.workflows.read().unwrap();
+        workflows.iter().find(|w| w.name() == name).cloned()
+    }
+
+    /// Handle a detection event, potentially starting a workflow.
+    ///
+    /// Returns immediately with `WorkflowStartResult`. The actual workflow
+    /// execution happens asynchronously if started.
+    pub async fn handle_detection(
+        &self,
+        pane_id: u64,
+        detection: &crate::patterns::Detection,
+        event_id: Option<i64>,
+    ) -> WorkflowStartResult {
+        // Find matching workflow
+        let workflow = match self.find_matching_workflow(detection) {
+            Some(w) => w,
+            None => {
+                return WorkflowStartResult::NoMatchingWorkflow {
+                    rule_id: detection.rule_id.clone(),
+                };
+            }
+        };
+
+        let workflow_name = workflow.name().to_string();
+
+        // Try to acquire pane lock
+        let execution_id = generate_workflow_id(&workflow_name);
+        let lock_result = self.lock_manager.try_acquire(pane_id, &workflow_name, &execution_id);
+
+        match lock_result {
+            LockAcquisitionResult::AlreadyLocked {
+                held_by_workflow,
+                held_by_execution,
+                ..
+            } => {
+                return WorkflowStartResult::PaneLocked {
+                    pane_id,
+                    held_by_workflow,
+                    held_by_execution,
+                };
+            }
+            LockAcquisitionResult::Acquired => {
+                // Lock acquired, start execution
+            }
+        }
+
+        // Start workflow execution via engine
+        let context = serde_json::json!({
+            "detection": {
+                "rule_id": detection.rule_id,
+                "matched_text": detection.matched_text,
+                "severity": format!("{:?}", detection.severity),
+            }
+        });
+
+        match self
+            .engine
+            .start(&self.storage, &workflow_name, pane_id, event_id, Some(context))
+            .await
+        {
+            Ok(_execution) => WorkflowStartResult::Started {
+                execution_id,
+                workflow_name,
+            },
+            Err(e) => {
+                // Release lock on error
+                self.lock_manager.release(pane_id, &execution_id);
+                WorkflowStartResult::Error {
+                    error: e.to_string(),
+                }
+            }
+        }
+    }
+
+    /// Run a workflow execution to completion.
+    ///
+    /// This method executes all steps of a workflow, handling retries,
+    /// wait conditions, and policy gates.
+    pub async fn run_workflow(
+        &self,
+        pane_id: u64,
+        workflow: Arc<dyn Workflow>,
+        execution_id: &str,
+        start_step: usize,
+    ) -> WorkflowExecutionResult {
+        let start_time = Instant::now();
+        let workflow_name = workflow.name().to_string();
+        let step_count = workflow.step_count();
+        let mut current_step = start_step;
+        let mut retries = 0;
+
+        // Create workflow context with injector for policy-gated actions
+        let mut ctx = WorkflowContext::new(
+            self.storage.clone(),
+            pane_id,
+            PaneCapabilities::default(),
+            execution_id,
+        )
+        .with_injector(Arc::clone(&self.injector));
+
+        while current_step < step_count {
+            // Execute the step
+            let step_result = workflow.execute_step(&mut ctx, current_step).await;
+
+            // Log step result
+            let result_type = match &step_result {
+                StepResult::Continue => "continue",
+                StepResult::Done { .. } => "done",
+                StepResult::Retry { .. } => "retry",
+                StepResult::Abort { .. } => "abort",
+                StepResult::WaitFor { .. } => "wait_for",
+            };
+
+            let steps = workflow.steps();
+            let step_name = steps
+                .get(current_step)
+                .map(|s| s.name.as_str())
+                .unwrap_or("unknown");
+
+            let result_data = serde_json::to_string(&step_result).ok();
+            let step_started_at = now_ms();
+            let step_completed_at = now_ms();
+
+            // Persist step log
+            if let Err(e) = self
+                .storage
+                .insert_step_log(
+                    execution_id,
+                    current_step,
+                    step_name,
+                    result_type,
+                    result_data,
+                    step_started_at,
+                    step_completed_at,
+                )
+                .await
+            {
+                tracing::warn!(
+                    workflow = %workflow_name,
+                    execution_id,
+                    step = current_step,
+                    error = %e,
+                    "Failed to log step"
+                );
+            }
+
+            // Handle step result
+            match step_result {
+                StepResult::Continue => {
+                    current_step += 1;
+                    retries = 0;
+
+                    // Update execution state
+                    if let Err(e) = self.update_execution_step(execution_id, current_step).await {
+                        tracing::warn!(
+                            execution_id,
+                            error = %e,
+                            "Failed to update execution step"
+                        );
+                    }
+                }
+                StepResult::Done { result } => {
+                    // Workflow completed
+                    let elapsed_ms = elapsed_ms(start_time);
+
+                    // Update execution to completed
+                    if let Err(e) = self
+                        .complete_execution(execution_id, Some(result.clone()))
+                        .await
+                    {
+                        tracing::warn!(
+                            execution_id,
+                            error = %e,
+                            "Failed to complete execution"
+                        );
+                    }
+
+                    // Mark trigger event as handled
+                    if let Err(e) = self
+                        .mark_trigger_event_handled(execution_id, "completed")
+                        .await
+                    {
+                        tracing::warn!(
+                            execution_id,
+                            error = %e,
+                            "Failed to mark trigger event as handled"
+                        );
+                    }
+
+                    // Release lock
+                    self.lock_manager.release(pane_id, execution_id);
+
+                    return WorkflowExecutionResult::Completed {
+                        execution_id: execution_id.to_string(),
+                        result,
+                        elapsed_ms,
+                        steps_executed: current_step + 1,
+                    };
+                }
+                StepResult::Retry { delay_ms } => {
+                    retries += 1;
+                    if retries > self.config.max_retries_per_step {
+                        let elapsed_ms = elapsed_ms(start_time);
+                        let reason = format!(
+                            "Max retries ({}) exceeded at step {}",
+                            self.config.max_retries_per_step, current_step
+                        );
+
+                        // Update execution to failed
+                        if let Err(e) = self.fail_execution(execution_id, &reason).await {
+                            tracing::warn!(
+                                execution_id,
+                                error = %e,
+                                "Failed to fail execution"
+                            );
+                        }
+
+                        // Mark trigger event as handled (with failed status)
+                        if let Err(e) = self
+                            .mark_trigger_event_handled(execution_id, "failed")
+                            .await
+                        {
+                            tracing::warn!(
+                                execution_id,
+                                error = %e,
+                                "Failed to mark trigger event as handled"
+                            );
+                        }
+
+                        // Cleanup and release lock
+                        workflow.cleanup(&mut ctx).await;
+                        self.lock_manager.release(pane_id, execution_id);
+
+                        return WorkflowExecutionResult::Aborted {
+                            execution_id: execution_id.to_string(),
+                            reason,
+                            step_index: current_step,
+                            elapsed_ms,
+                        };
+                    }
+
+                    // Wait before retry
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+                StepResult::Abort { reason } => {
+                    let elapsed_ms = elapsed_ms(start_time);
+
+                    // Update execution to failed
+                    if let Err(e) = self.fail_execution(execution_id, &reason).await {
+                        tracing::warn!(
+                            execution_id,
+                            error = %e,
+                            "Failed to fail execution"
+                        );
+                    }
+
+                    // Mark trigger event as handled (with aborted status)
+                    if let Err(e) = self
+                        .mark_trigger_event_handled(execution_id, "aborted")
+                        .await
+                    {
+                        tracing::warn!(
+                            execution_id,
+                            error = %e,
+                            "Failed to mark trigger event as handled"
+                        );
+                    }
+
+                    // Cleanup and release lock
+                    workflow.cleanup(&mut ctx).await;
+                    self.lock_manager.release(pane_id, execution_id);
+
+                    return WorkflowExecutionResult::Aborted {
+                        execution_id: execution_id.to_string(),
+                        reason,
+                        step_index: current_step,
+                        elapsed_ms,
+                    };
+                }
+                StepResult::WaitFor {
+                    condition,
+                    timeout_ms,
+                } => {
+                    // Update execution to waiting
+                    if let Err(e) = self
+                        .set_execution_waiting(execution_id, current_step, &condition)
+                        .await
+                    {
+                        tracing::warn!(
+                            execution_id,
+                            error = %e,
+                            "Failed to set waiting state"
+                        );
+                    }
+
+                    // Execute wait condition
+                    let timeout = timeout_ms.map_or(
+                        Duration::from_millis(self.config.step_timeout_ms),
+                        Duration::from_millis,
+                    );
+
+                    // Simple wait implementation - in practice would use WaitConditionExecutor
+                    match &condition {
+                        WaitCondition::PaneIdle {
+                            idle_threshold_ms, ..
+                        } => {
+                            tokio::time::sleep(Duration::from_millis(*idle_threshold_ms)).await;
+                        }
+                        WaitCondition::Pattern { .. } => {
+                            // Would use WaitConditionExecutor here
+                            tokio::time::sleep(timeout).await;
+                        }
+                        WaitCondition::External { .. } => {
+                            // Would wait for external signal
+                            tokio::time::sleep(timeout).await;
+                        }
+                    }
+
+                    // Continue to next step after wait
+                    current_step += 1;
+                    retries = 0;
+
+                    // Update execution back to running
+                    if let Err(e) = self.update_execution_step(execution_id, current_step).await {
+                        tracing::warn!(
+                            execution_id,
+                            error = %e,
+                            "Failed to update execution step after wait"
+                        );
+                    }
+                }
+            }
+        }
+
+        // All steps completed without explicit Done
+        let elapsed_ms = elapsed_ms(start_time);
+        let result = serde_json::json!({ "status": "completed" });
+
+        if let Err(e) = self
+            .complete_execution(execution_id, Some(result.clone()))
+            .await
+        {
+            tracing::warn!(
+                execution_id,
+                error = %e,
+                "Failed to complete execution"
+            );
+        }
+
+        // Mark trigger event as handled
+        if let Err(e) = self
+            .mark_trigger_event_handled(execution_id, "completed")
+            .await
+        {
+            tracing::warn!(
+                execution_id,
+                error = %e,
+                "Failed to mark trigger event as handled"
+            );
+        }
+
+        self.lock_manager.release(pane_id, execution_id);
+
+        WorkflowExecutionResult::Completed {
+            execution_id: execution_id.to_string(),
+            result,
+            elapsed_ms,
+            steps_executed: step_count,
+        }
+    }
+
+    /// Run the event loop, subscribing to detection events.
+    ///
+    /// This spawns workflow executions for matching detections. The loop
+    /// runs until the event bus channel is closed.
+    pub async fn run(&self, event_bus: &crate::events::EventBus) {
+        let mut subscriber = event_bus.subscribe_detections();
+
+        loop {
+            match subscriber.recv().await {
+                Ok(event) => {
+                    if let crate::events::Event::PatternDetected {
+                        pane_id,
+                        detection,
+                        event_id,
+                    } = event
+                    {
+                        // Handle detection with event_id for proper event lifecycle
+                        let result = self.handle_detection(pane_id, &detection, event_id).await;
+
+                        match result {
+                            WorkflowStartResult::Started {
+                                execution_id,
+                                workflow_name,
+                            } => {
+                                // Find workflow and spawn execution
+                                if let Some(workflow) = self.find_workflow_by_name(&workflow_name) {
+                                    let execution_id_clone = execution_id.clone();
+                                    let workflow_clone = Arc::clone(&workflow);
+                                    let storage = Arc::clone(&self.storage);
+                                    let lock_manager = Arc::clone(&self.lock_manager);
+                                    let config = self.config.clone();
+                                    let engine = WorkflowEngine::new(config.max_concurrent);
+
+                                    // Create a mini-runner for the spawned task
+                                    let runner = WorkflowRunner {
+                                        workflows: std::sync::RwLock::new(vec![workflow_clone.clone()]),
+                                        engine,
+                                        lock_manager,
+                                        storage,
+                                        injector: Arc::clone(&self.injector),
+                                        config,
+                                    };
+
+                                    tokio::spawn(async move {
+                                        let result = runner
+                                            .run_workflow(pane_id, workflow_clone, &execution_id_clone, 0)
+                                            .await;
+
+                                        match &result {
+                                            WorkflowExecutionResult::Completed { execution_id, steps_executed, elapsed_ms, .. } => {
+                                                tracing::info!(
+                                                    execution_id,
+                                                    steps = steps_executed,
+                                                    elapsed_ms,
+                                                    "Workflow completed"
+                                                );
+                                            }
+                                            WorkflowExecutionResult::Aborted { execution_id, reason, step_index, .. } => {
+                                                tracing::warn!(
+                                                    execution_id,
+                                                    step = step_index,
+                                                    reason,
+                                                    "Workflow aborted"
+                                                );
+                                            }
+                                            WorkflowExecutionResult::PolicyDenied { execution_id, step_index, reason } => {
+                                                tracing::warn!(
+                                                    execution_id,
+                                                    step = step_index,
+                                                    reason,
+                                                    "Workflow denied by policy"
+                                                );
+                                            }
+                                            WorkflowExecutionResult::Error { execution_id, error } => {
+                                                tracing::error!(
+                                                    execution_id = execution_id.as_deref(),
+                                                    error,
+                                                    "Workflow error"
+                                                );
+                                            }
+                                        }
+                                    });
+                                }
+                            }
+                            WorkflowStartResult::NoMatchingWorkflow { rule_id } => {
+                                tracing::debug!(rule_id, "No workflow handles detection");
+                            }
+                            WorkflowStartResult::PaneLocked {
+                                pane_id,
+                                held_by_workflow,
+                                ..
+                            } => {
+                                tracing::debug!(
+                                    pane_id,
+                                    held_by = %held_by_workflow,
+                                    "Pane locked, skipping detection"
+                                );
+                            }
+                            WorkflowStartResult::Error { error } => {
+                                tracing::error!(error, "Failed to start workflow");
+                            }
+                        }
+                    }
+                }
+                Err(crate::events::RecvError::Lagged { missed_count }) => {
+                    tracing::warn!(skipped = missed_count, "Workflow runner lagged, skipped events");
+                }
+                Err(crate::events::RecvError::Closed) => {
+                    tracing::info!("Event bus closed, workflow runner stopping");
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Resume incomplete workflows after restart.
+    ///
+    /// Queries storage for workflows with status 'running' or 'waiting'
+    /// and attempts to resume them.
+    pub async fn resume_incomplete(&self) -> Vec<WorkflowExecutionResult> {
+        let incomplete = match self.storage.find_incomplete_workflows().await {
+            Ok(workflows) => workflows,
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to query incomplete workflows");
+                return vec![];
+            }
+        };
+
+        let mut results = Vec::new();
+
+        for record in incomplete {
+            // Find the workflow definition
+            let workflow = match self.find_workflow_by_name(&record.workflow_name) {
+                Some(w) => w,
+                None => {
+                    tracing::warn!(
+                        workflow_name = %record.workflow_name,
+                        execution_id = %record.id,
+                        "Cannot resume: workflow not registered"
+                    );
+                    continue;
+                }
+            };
+
+            // Compute next step from logs
+            let step_logs = match self.storage.get_step_logs(&record.id).await {
+                Ok(logs) => logs,
+                Err(e) => {
+                    tracing::warn!(
+                        execution_id = %record.id,
+                        error = %e,
+                        "Failed to get step logs for resume"
+                    );
+                    continue;
+                }
+            };
+
+            let next_step = compute_next_step(&step_logs);
+
+            // Try to re-acquire lock
+            let lock_result =
+                self.lock_manager
+                    .try_acquire(record.pane_id, &record.workflow_name, &record.id);
+
+            match lock_result {
+                LockAcquisitionResult::AlreadyLocked { .. } => {
+                    tracing::warn!(
+                        execution_id = %record.id,
+                        pane_id = record.pane_id,
+                        "Cannot resume: pane locked"
+                    );
+                    continue;
+                }
+                LockAcquisitionResult::Acquired => {}
+            }
+
+            tracing::info!(
+                execution_id = %record.id,
+                workflow = %record.workflow_name,
+                pane_id = record.pane_id,
+                resume_step = next_step,
+                "Resuming workflow"
+            );
+
+            let result = self
+                .run_workflow(record.pane_id, workflow, &record.id, next_step)
+                .await;
+
+            results.push(result);
+        }
+
+        results
+    }
+
+    // --- Private helper methods ---
+
+    async fn update_execution_step(&self, execution_id: &str, step: usize) -> crate::Result<()> {
+        let mut record = self
+            .storage
+            .get_workflow(execution_id)
+            .await?
+            .ok_or_else(|| {
+                crate::Error::Workflow(crate::error::WorkflowError::NotFound(
+                    execution_id.to_string(),
+                ))
+            })?;
+
+        record.current_step = step;
+        record.status = "running".to_string();
+        record.wait_condition = None;
+        record.updated_at = now_ms();
+
+        self.storage.upsert_workflow(record).await
+    }
+
+    async fn set_execution_waiting(
+        &self,
+        execution_id: &str,
+        step: usize,
+        condition: &WaitCondition,
+    ) -> crate::Result<()> {
+        let mut record = self
+            .storage
+            .get_workflow(execution_id)
+            .await?
+            .ok_or_else(|| {
+                crate::Error::Workflow(crate::error::WorkflowError::NotFound(
+                    execution_id.to_string(),
+                ))
+            })?;
+
+        record.current_step = step;
+        record.status = "waiting".to_string();
+        record.wait_condition = Some(serde_json::to_value(condition)?);
+        record.updated_at = now_ms();
+
+        self.storage.upsert_workflow(record).await
+    }
+
+    async fn complete_execution(
+        &self,
+        execution_id: &str,
+        result: Option<serde_json::Value>,
+    ) -> crate::Result<()> {
+        let mut record = self
+            .storage
+            .get_workflow(execution_id)
+            .await?
+            .ok_or_else(|| {
+                crate::Error::Workflow(crate::error::WorkflowError::NotFound(
+                    execution_id.to_string(),
+                ))
+            })?;
+
+        record.status = "completed".to_string();
+        record.result = result;
+        record.updated_at = now_ms();
+        record.completed_at = Some(now_ms());
+
+        self.storage.upsert_workflow(record).await
+    }
+
+    async fn fail_execution(&self, execution_id: &str, error: &str) -> crate::Result<()> {
+        let mut record = self
+            .storage
+            .get_workflow(execution_id)
+            .await?
+            .ok_or_else(|| {
+                crate::Error::Workflow(crate::error::WorkflowError::NotFound(
+                    execution_id.to_string(),
+                ))
+            })?;
+
+        record.status = "failed".to_string();
+        record.error = Some(error.to_string());
+        record.updated_at = now_ms();
+        record.completed_at = Some(now_ms());
+
+        self.storage.upsert_workflow(record).await
+    }
+
+    /// Mark the triggering event as handled after workflow completion.
+    ///
+    /// This ensures proper event lifecycle management - events that triggered
+    /// workflows are marked with the outcome so they won't be re-processed.
+    ///
+    /// # Arguments
+    /// * `execution_id` - The workflow execution ID
+    /// * `status` - The handling status ("completed", "failed", "aborted", "denied")
+    async fn mark_trigger_event_handled(
+        &self,
+        execution_id: &str,
+        status: &str,
+    ) -> crate::Result<()> {
+        // Get the workflow record to find trigger_event_id
+        let record = self.storage.get_workflow(execution_id).await?;
+
+        if let Some(record) = record {
+            if let Some(event_id) = record.trigger_event_id {
+                self.storage
+                    .mark_event_handled(event_id, Some(execution_id.to_string()), status)
+                    .await?;
+
+                tracing::debug!(
+                    execution_id,
+                    event_id,
+                    status,
+                    "Marked trigger event as handled"
+                );
+            }
+        }
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1698,17 +2715,25 @@ mod tests {
             ]
         }
 
-        async fn execute_step(&self, _ctx: &mut WorkflowContext, step_idx: usize) -> StepResult {
-            match step_idx {
-                0 => StepResult::cont(),
-                1 => StepResult::wait_for(WaitCondition::pattern("response.ready")),
-                2 => StepResult::done(serde_json::json!({"completed": true})),
-                _ => StepResult::abort("unexpected step index"),
-            }
+        fn execute_step(
+            &self,
+            _ctx: &mut WorkflowContext,
+            step_idx: usize,
+        ) -> BoxFuture<'_, StepResult> {
+            Box::pin(async move {
+                match step_idx {
+                    0 => StepResult::cont(),
+                    1 => StepResult::wait_for(WaitCondition::pattern("response.ready")),
+                    2 => StepResult::done(serde_json::json!({"completed": true})),
+                    _ => StepResult::abort("unexpected step index"),
+                }
+            })
         }
 
-        async fn cleanup(&self, _ctx: &mut WorkflowContext) {
-            // Stub cleanup - no-op
+        fn cleanup(&self, _ctx: &mut WorkflowContext) -> BoxFuture<'_, ()> {
+            Box::pin(async {
+                // Stub cleanup - no-op
+            })
         }
     }
 
@@ -2518,7 +3543,7 @@ mod tests {
                 assert_eq!(held_by_execution, "exec-001");
                 assert!(locked_since_ms > 0);
             }
-            _ => panic!("Expected AlreadyLocked"),
+            LockAcquisitionResult::Acquired => panic!("Expected AlreadyLocked"),
         }
 
         // Release and retry succeeds
@@ -2652,7 +3677,7 @@ mod tests {
         let locked = LockAcquisitionResult::AlreadyLocked {
             held_by_workflow: "test".to_string(),
             held_by_execution: "exec-001".to_string(),
-            locked_since_ms: 1234567890,
+            locked_since_ms: 1_234_567_890,
         };
         assert!(!locked.is_acquired());
         assert!(locked.is_already_locked());
@@ -2705,5 +3730,620 @@ mod tests {
         assert_eq!(parsed.workflow_name, info.workflow_name);
         assert_eq!(parsed.execution_id, info.execution_id);
         assert_eq!(parsed.locked_at_ms, info.locked_at_ms);
+    }
+
+    // ========================================================================
+    // WorkflowRunner Tests
+    // ========================================================================
+
+    #[test]
+    fn workflow_runner_config_default_has_sensible_values() {
+        let config = WorkflowRunnerConfig::default();
+
+        assert!(config.max_concurrent > 0);
+        assert!(config.step_timeout_ms > 0);
+        assert!(config.retry_backoff_multiplier >= 1.0);
+        assert!(config.max_retries_per_step > 0);
+    }
+
+    #[test]
+    fn workflow_start_result_variants_serialize() {
+        let variants = vec![
+            WorkflowStartResult::Started {
+                execution_id: "exec-001".to_string(),
+                workflow_name: "test_workflow".to_string(),
+            },
+            WorkflowStartResult::NoMatchingWorkflow {
+                rule_id: "test.rule".to_string(),
+            },
+            WorkflowStartResult::PaneLocked {
+                pane_id: 42,
+                held_by_workflow: "other_workflow".to_string(),
+                held_by_execution: "exec-002".to_string(),
+            },
+            WorkflowStartResult::Error {
+                error: "Something went wrong".to_string(),
+            },
+        ];
+
+        for variant in variants {
+            let json = serde_json::to_string(&variant).unwrap();
+            let parsed: WorkflowStartResult = serde_json::from_str(&json).unwrap();
+
+            // Verify round-trip
+            let json2 = serde_json::to_string(&parsed).unwrap();
+            assert_eq!(json, json2);
+        }
+    }
+
+    #[test]
+    fn workflow_execution_result_variants_serialize() {
+        let variants = vec![
+            WorkflowExecutionResult::Completed {
+                execution_id: "exec-001".to_string(),
+                result: serde_json::json!({"success": true}),
+                elapsed_ms: 1000,
+                steps_executed: 3,
+            },
+            WorkflowExecutionResult::Aborted {
+                execution_id: "exec-002".to_string(),
+                reason: "Timeout exceeded".to_string(),
+                step_index: 2,
+                elapsed_ms: 5000,
+            },
+            WorkflowExecutionResult::PolicyDenied {
+                execution_id: "exec-003".to_string(),
+                step_index: 1,
+                reason: "Rate limit exceeded".to_string(),
+            },
+            WorkflowExecutionResult::Error {
+                execution_id: Some("exec-004".to_string()),
+                error: "Database connection failed".to_string(),
+            },
+            WorkflowExecutionResult::Error {
+                execution_id: None,
+                error: "Early failure".to_string(),
+            },
+        ];
+
+        for variant in variants {
+            let json = serde_json::to_string(&variant).unwrap();
+            let parsed: WorkflowExecutionResult = serde_json::from_str(&json).unwrap();
+
+            // Verify round-trip
+            let json2 = serde_json::to_string(&parsed).unwrap();
+            assert_eq!(json, json2);
+        }
+    }
+
+    #[test]
+    fn workflow_start_result_accessors_work() {
+        let started = WorkflowStartResult::Started {
+            execution_id: "exec-001".to_string(),
+            workflow_name: "test".to_string(),
+        };
+        assert!(started.is_started());
+        assert!(!started.is_locked());
+        assert!(started.execution_id().is_some());
+
+        let locked = WorkflowStartResult::PaneLocked {
+            pane_id: 1,
+            held_by_workflow: "other".to_string(),
+            held_by_execution: "exec-002".to_string(),
+        };
+        assert!(!locked.is_started());
+        assert!(locked.is_locked());
+        assert!(locked.execution_id().is_none());
+
+        let no_match = WorkflowStartResult::NoMatchingWorkflow {
+            rule_id: "test".to_string(),
+        };
+        assert!(!no_match.is_started());
+        assert!(!no_match.is_locked());
+        assert!(no_match.execution_id().is_none());
+
+        let error = WorkflowStartResult::Error {
+            error: "fail".to_string(),
+        };
+        assert!(!error.is_started());
+        assert!(!error.is_locked());
+        assert!(error.execution_id().is_none());
+    }
+
+    #[test]
+    fn workflow_execution_result_accessors_work() {
+        let completed = WorkflowExecutionResult::Completed {
+            execution_id: "exec-001".to_string(),
+            result: serde_json::Value::Null,
+            elapsed_ms: 100,
+            steps_executed: 2,
+        };
+        assert!(completed.is_completed());
+        assert!(!completed.is_aborted());
+        assert_eq!(completed.execution_id(), Some("exec-001"));
+
+        let aborted = WorkflowExecutionResult::Aborted {
+            execution_id: "exec-002".to_string(),
+            reason: "test".to_string(),
+            step_index: 1,
+            elapsed_ms: 50,
+        };
+        assert!(!aborted.is_completed());
+        assert!(aborted.is_aborted());
+        assert_eq!(aborted.execution_id(), Some("exec-002"));
+
+        let denied = WorkflowExecutionResult::PolicyDenied {
+            execution_id: "exec-003".to_string(),
+            step_index: 0,
+            reason: "rate limit".to_string(),
+        };
+        assert!(!denied.is_completed());
+        assert!(!denied.is_aborted());
+        assert_eq!(denied.execution_id(), Some("exec-003"));
+
+        let error_with_id = WorkflowExecutionResult::Error {
+            execution_id: Some("exec-004".to_string()),
+            error: "fail".to_string(),
+        };
+        assert!(!error_with_id.is_completed());
+        assert!(!error_with_id.is_aborted());
+        assert_eq!(error_with_id.execution_id(), Some("exec-004"));
+
+        let error_no_id = WorkflowExecutionResult::Error {
+            execution_id: None,
+            error: "fail".to_string(),
+        };
+        assert!(error_no_id.execution_id().is_none());
+    }
+
+    // ========================================================================
+    // Workflow Selection Tests
+    // ========================================================================
+
+    /// Test workflow that handles compaction patterns.
+    struct MockCompactionWorkflow;
+
+    impl Workflow for MockCompactionWorkflow {
+        fn name(&self) -> &str {
+            "handle_compaction"
+        }
+
+        fn description(&self) -> &str {
+            "Mock workflow for compaction handling"
+        }
+
+        fn handles(&self, detection: &Detection) -> bool {
+            detection.rule_id.contains("compaction")
+        }
+
+        fn steps(&self) -> Vec<WorkflowStep> {
+            vec![WorkflowStep::new("notify", "Send notification")]
+        }
+
+        fn execute_step(
+            &self,
+            _ctx: &mut WorkflowContext,
+            step_idx: usize,
+        ) -> BoxFuture<'_, StepResult> {
+            Box::pin(async move {
+                match step_idx {
+                    0 => StepResult::done_empty(),
+                    _ => StepResult::abort("Unexpected step"),
+                }
+            })
+        }
+    }
+
+    /// Test workflow that handles usage limit patterns.
+    struct MockUsageLimitWorkflow;
+
+    impl Workflow for MockUsageLimitWorkflow {
+        fn name(&self) -> &str {
+            "handle_usage_limit"
+        }
+
+        fn description(&self) -> &str {
+            "Mock workflow for usage limit handling"
+        }
+
+        fn handles(&self, detection: &Detection) -> bool {
+            detection.rule_id.contains("usage")
+        }
+
+        fn steps(&self) -> Vec<WorkflowStep> {
+            vec![WorkflowStep::new("warn", "Send warning")]
+        }
+
+        fn execute_step(
+            &self,
+            _ctx: &mut WorkflowContext,
+            step_idx: usize,
+        ) -> BoxFuture<'_, StepResult> {
+            Box::pin(async move {
+                match step_idx {
+                    0 => StepResult::done_empty(),
+                    _ => StepResult::abort("Unexpected step"),
+                }
+            })
+        }
+    }
+
+    /// Test that find_matching_workflow returns the correct workflow for a detection.
+    #[test]
+    fn workflow_runner_selects_correct_workflow_for_compaction() {
+        // Create runner with multiple registered workflows
+        let engine = WorkflowEngine::default();
+        let lock_manager = Arc::new(PaneWorkflowLockManager::new());
+
+        // Create mock injector (won't be called in this test)
+        let injector = Arc::new(tokio::sync::Mutex::new(
+            crate::policy::PolicyGatedInjector::new(
+                crate::policy::PolicyEngine::permissive(),
+                crate::wezterm::WeztermClient::new(),
+            ),
+        ));
+
+        // Create a minimal storage handle using temp file
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db").to_string_lossy().to_string();
+        let storage = rt.block_on(async {
+            Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap())
+        });
+
+        let runner = WorkflowRunner::new(
+            engine,
+            lock_manager,
+            storage.clone(),
+            injector,
+            WorkflowRunnerConfig::default(),
+        );
+
+        // Register workflows
+        runner.register_workflow(Arc::new(MockCompactionWorkflow));
+        runner.register_workflow(Arc::new(MockUsageLimitWorkflow));
+
+        // Create compaction detection
+        let compaction_detection = Detection {
+            rule_id: "claude.compaction".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: "compaction".to_string(),
+            severity: Severity::Warning,
+            confidence: 0.9,
+            matched_text: "Auto-compact: compacted".to_string(),
+            extracted: serde_json::json!({}),
+        };
+
+        // Should find compaction workflow
+        let workflow = runner.find_matching_workflow(&compaction_detection);
+        assert!(workflow.is_some());
+        assert_eq!(workflow.unwrap().name(), "handle_compaction");
+
+        // Create usage detection
+        let usage_detection = Detection {
+            rule_id: "codex.usage.warning".to_string(),
+            agent_type: AgentType::Codex,
+            event_type: "usage_warning".to_string(),
+            severity: Severity::Info,
+            confidence: 0.8,
+            matched_text: "less than 25%".to_string(),
+            extracted: serde_json::json!({}),
+        };
+
+        // Should find usage limit workflow
+        let workflow = runner.find_matching_workflow(&usage_detection);
+        assert!(workflow.is_some());
+        assert_eq!(workflow.unwrap().name(), "handle_usage_limit");
+
+        // Create unmatched detection
+        let unmatched_detection = Detection {
+            rule_id: "unknown.pattern".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: "unknown".to_string(),
+            severity: Severity::Info,
+            confidence: 0.5,
+            matched_text: "something".to_string(),
+            extracted: serde_json::json!({}),
+        };
+
+        // Should not find any workflow
+        let workflow = runner.find_matching_workflow(&unmatched_detection);
+        assert!(workflow.is_none());
+
+        // Cleanup
+        rt.block_on(async { storage.shutdown().await.unwrap() });
+    }
+
+    /// Test that pane locks prevent concurrent workflow executions.
+    #[test]
+    fn workflow_runner_lock_prevents_concurrent_runs() {
+        let engine = WorkflowEngine::default();
+        let lock_manager = Arc::new(PaneWorkflowLockManager::new());
+        let injector = Arc::new(tokio::sync::Mutex::new(
+            crate::policy::PolicyGatedInjector::new(
+                crate::policy::PolicyEngine::permissive(),
+                crate::wezterm::WeztermClient::new(),
+            ),
+        ));
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db").to_string_lossy().to_string();
+        let storage = rt.block_on(async {
+            Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap())
+        });
+
+        let runner = WorkflowRunner::new(
+            engine,
+            lock_manager.clone(),
+            storage.clone(),
+            injector,
+            WorkflowRunnerConfig::default(),
+        );
+
+        runner.register_workflow(Arc::new(MockCompactionWorkflow));
+
+        let pane_id = 42u64;
+        let detection = Detection {
+            rule_id: "claude.compaction".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: "compaction".to_string(),
+            severity: Severity::Warning,
+            confidence: 0.9,
+            matched_text: "compacted".to_string(),
+            extracted: serde_json::json!({}),
+        };
+
+        // Create test pane first
+        rt.block_on(async {
+            let pane = crate::storage::PaneRecord {
+                pane_id,
+                domain: "local".to_string(),
+                window_id: Some(1),
+                tab_id: Some(1),
+                title: Some("test".to_string()),
+                cwd: Some("/tmp".to_string()),
+                tty_name: None,
+                first_seen_at: now_ms(),
+                last_seen_at: now_ms(),
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            };
+            storage.upsert_pane(pane).await.unwrap();
+        });
+
+        // First handle_detection should start
+        let result1 = rt.block_on(runner.handle_detection(pane_id, &detection, None));
+        assert!(result1.is_started());
+
+        // Second handle_detection should be blocked by lock
+        let result2 = rt.block_on(runner.handle_detection(pane_id, &detection, None));
+        assert!(result2.is_locked());
+
+        // Verify the lock info
+        if let WorkflowStartResult::PaneLocked {
+            held_by_workflow, ..
+        } = result2
+        {
+            assert_eq!(held_by_workflow, "handle_compaction");
+        }
+
+        // Cleanup
+        rt.block_on(async { storage.shutdown().await.unwrap() });
+    }
+
+    /// Test that find_workflow_by_name works correctly.
+    #[test]
+    fn workflow_runner_find_by_name() {
+        let engine = WorkflowEngine::default();
+        let lock_manager = Arc::new(PaneWorkflowLockManager::new());
+        let injector = Arc::new(tokio::sync::Mutex::new(
+            crate::policy::PolicyGatedInjector::new(
+                crate::policy::PolicyEngine::permissive(),
+                crate::wezterm::WeztermClient::new(),
+            ),
+        ));
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db").to_string_lossy().to_string();
+        let storage = rt.block_on(async {
+            Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap())
+        });
+
+        let runner = WorkflowRunner::new(
+            engine,
+            lock_manager,
+            storage.clone(),
+            injector,
+            WorkflowRunnerConfig::default(),
+        );
+
+        runner.register_workflow(Arc::new(MockCompactionWorkflow));
+        runner.register_workflow(Arc::new(MockUsageLimitWorkflow));
+
+        // Find by name
+        let workflow = runner.find_workflow_by_name("handle_compaction");
+        assert!(workflow.is_some());
+        assert_eq!(workflow.unwrap().name(), "handle_compaction");
+
+        let workflow = runner.find_workflow_by_name("handle_usage_limit");
+        assert!(workflow.is_some());
+        assert_eq!(workflow.unwrap().name(), "handle_usage_limit");
+
+        // Not found
+        let workflow = runner.find_workflow_by_name("nonexistent");
+        assert!(workflow.is_none());
+
+        // Cleanup
+        rt.block_on(async { storage.shutdown().await.unwrap() });
+    }
+
+    // ========================================================================
+    // Policy Denial Tests (wa-nu4.1.1.5)
+    // ========================================================================
+
+    /// Test workflow that attempts to send text and checks policy result.
+    /// Kept for future integration tests that need to test workflow execution with policy gates.
+    #[allow(dead_code)]
+    struct MockTextSendingWorkflow;
+
+    impl Workflow for MockTextSendingWorkflow {
+        fn name(&self) -> &str {
+            "text_sender"
+        }
+
+        fn description(&self) -> &str {
+            "Mock workflow that sends text to test policy gates"
+        }
+
+        fn handles(&self, detection: &Detection) -> bool {
+            detection.rule_id.contains("text_send")
+        }
+
+        fn steps(&self) -> Vec<WorkflowStep> {
+            vec![WorkflowStep::new("send_text", "Send text to terminal")]
+        }
+
+        fn execute_step(
+            &self,
+            ctx: &mut WorkflowContext,
+            step_idx: usize,
+        ) -> BoxFuture<'_, StepResult> {
+            // Need to move ctx reference into the async block properly
+            let pane_id = ctx.pane_id();
+            let has_injector = ctx.has_injector();
+            let execution_id = ctx.execution_id().to_string();
+
+            // Clone capabilities for use in async block
+            let capabilities = ctx.capabilities().clone();
+
+            Box::pin(async move {
+                match step_idx {
+                    0 => {
+                        // Try to send text - policy should deny if command is running
+                        if !has_injector {
+                            return StepResult::abort("No injector configured");
+                        }
+                        // We need access to the context to call send_text
+                        // This is a limitation of the mock - we'll test via the policy directly
+                        StepResult::done(serde_json::json!({
+                            "pane_id": pane_id,
+                            "has_injector": has_injector,
+                            "execution_id": execution_id,
+                            "prompt_active": capabilities.prompt_active,
+                            "command_running": capabilities.command_running,
+                        }))
+                    }
+                    _ => StepResult::abort("Unexpected step"),
+                }
+            })
+        }
+    }
+
+    /// Test that policy denial is properly returned when sending to a running command.
+    #[test]
+    fn policy_denies_send_when_command_running() {
+        use crate::policy::{ActorKind, PolicyEngine, PaneCapabilities, PolicyInput, ActionKind, PolicyDecision};
+
+        // Create a strict policy engine (requires prompt active)
+        let mut engine = PolicyEngine::strict();
+
+        // Create capabilities where command is running (not at prompt)
+        let caps = PaneCapabilities::running();
+
+        // Try to authorize a send - should be denied
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Workflow)
+            .with_pane(42)
+            .with_capabilities(caps)
+            .with_text_summary("test command")
+            .with_workflow("wf-test-001");
+
+        let decision = engine.authorize(&input);
+
+        // Verify it's denied with the expected reason
+        match decision {
+            PolicyDecision::Deny { reason, rule_id } => {
+                assert!(
+                    reason.contains("running command") || reason.contains("wait for prompt"),
+                    "Expected denial reason about running command, got: {reason}"
+                );
+                assert_eq!(rule_id, Some("policy.prompt_required".to_string()));
+            }
+            other => panic!("Expected Deny, got: {other:?}"),
+        }
+    }
+
+    /// Test that InjectionResult::Denied is returned when policy denies.
+    #[tokio::test]
+    async fn policy_gated_injector_returns_denied_for_running_command() {
+        use crate::policy::{ActorKind, PolicyEngine, PolicyGatedInjector, PaneCapabilities, InjectionResult};
+
+        // Create a strict policy engine (requires prompt active)
+        let engine = PolicyEngine::strict();
+        let client = crate::wezterm::WeztermClient::new();
+        let mut injector = PolicyGatedInjector::new(engine, client);
+
+        // Create capabilities where command is running (not at prompt)
+        let caps = PaneCapabilities::running();
+
+        // Try to send text - should be denied by policy
+        let result = injector
+            .send_text(42, "echo test", ActorKind::Workflow, &caps, Some("wf-test-002"))
+            .await;
+
+        // Verify it's denied
+        assert!(result.is_denied(), "Expected denied result, got: {result:?}");
+
+        // Verify the rule ID
+        if let InjectionResult::Denied { decision, .. } = result {
+            assert_eq!(
+                decision.rule_id(),
+                Some("policy.prompt_required"),
+                "Expected policy.prompt_required rule, got: {:?}",
+                decision.rule_id()
+            );
+        }
+    }
+
+    /// Test that WorkflowContext has injector access after with_injector is called.
+    #[test]
+    fn workflow_context_injector_access() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db").to_string_lossy().to_string();
+
+        rt.block_on(async {
+            let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+
+            // Create context without injector
+            let ctx = WorkflowContext::new(
+                storage.clone(),
+                42,
+                PaneCapabilities::default(),
+                "exec-001",
+            );
+            assert!(!ctx.has_injector());
+
+            // Create context with injector
+            let engine = crate::policy::PolicyEngine::permissive();
+            let client = crate::wezterm::WeztermClient::new();
+            let injector = Arc::new(tokio::sync::Mutex::new(
+                crate::policy::PolicyGatedInjector::new(engine, client),
+            ));
+
+            let ctx_with_injector = WorkflowContext::new(
+                storage.clone(),
+                42,
+                PaneCapabilities::default(),
+                "exec-002",
+            )
+            .with_injector(injector);
+
+            assert!(ctx_with_injector.has_injector());
+
+            storage.shutdown().await.unwrap();
+        });
     }
 }
