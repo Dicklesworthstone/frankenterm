@@ -18,6 +18,7 @@ use std::hash::{Hash, Hasher};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::PaneFilterConfig;
+use crate::storage::PaneRecord;
 use crate::wezterm::PaneInfo;
 
 // =============================================================================
@@ -184,6 +185,25 @@ impl PaneEntry {
     #[must_use]
     pub fn should_observe(&self) -> bool {
         self.observation.is_observed()
+    }
+
+    /// Convert to a PaneRecord for storage persistence
+    #[must_use]
+    pub fn to_pane_record(&self) -> PaneRecord {
+        PaneRecord {
+            pane_id: self.info.pane_id,
+            domain: self.info.inferred_domain(),
+            window_id: Some(self.info.window_id),
+            tab_id: Some(self.info.tab_id),
+            title: self.info.title.clone(),
+            cwd: self.info.cwd.clone(),
+            tty_name: self.info.tty_name.clone(),
+            first_seen_at: self.first_seen_at,
+            last_seen_at: self.last_seen_at,
+            observed: self.observation.is_observed(),
+            ignore_reason: self.observation.ignore_reason().map(ToString::to_string),
+            last_decision_at: Some(self.decision_at),
+        }
     }
 }
 
@@ -524,6 +544,38 @@ impl PaneRegistry {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    /// Get all pane records for persistence
+    ///
+    /// Converts all tracked pane entries to PaneRecord format
+    /// suitable for storage in the database.
+    #[must_use]
+    pub fn to_pane_records(&self) -> Vec<PaneRecord> {
+        self.entries
+            .values()
+            .map(PaneEntry::to_pane_record)
+            .collect()
+    }
+
+    /// Get pane records for observed panes only
+    #[must_use]
+    pub fn observed_pane_records(&self) -> Vec<PaneRecord> {
+        self.entries
+            .values()
+            .filter(|e| e.should_observe())
+            .map(PaneEntry::to_pane_record)
+            .collect()
+    }
+
+    /// Get pane records for ignored panes only
+    #[must_use]
+    pub fn ignored_pane_records(&self) -> Vec<PaneRecord> {
+        self.entries
+            .values()
+            .filter(|e| !e.should_observe())
+            .map(PaneEntry::to_pane_record)
+            .collect()
+    }
 }
 
 /// Delta extraction result
@@ -610,6 +662,238 @@ pub fn extract_delta(previous: &str, current: &str, overlap_size: usize) -> Delt
     DeltaResult::Gap {
         reason: "overlap_not_found".to_string(),
         content: current.to_string(),
+    }
+}
+
+// =============================================================================
+// OSC 133 Semantic Markers (Shell Integration)
+// =============================================================================
+
+/// OSC 133 marker types for shell integration.
+///
+/// These markers are emitted by shells with semantic prompt integration enabled.
+/// WezTerm supports these markers through its shell integration scripts.
+///
+/// Reference: <https://gitlab.freedesktop.org/Per_Bothner/specifications/blob/master/proposals/semantic-prompts.md>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Osc133Marker {
+    /// `A` - Fresh line / start of prompt
+    PromptStart,
+    /// `B` - End of prompt, start of user input
+    CommandStart,
+    /// `C` - End of user input, start of command output
+    CommandExecuted,
+    /// `D` - End of command output (optional exit code)
+    CommandFinished { exit_code: Option<i32> },
+}
+
+/// Pane shell state derived from OSC 133 markers.
+///
+/// This tracks the semantic state of a shell session based on OSC 133 markers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShellState {
+    /// No shell integration detected or unknown state
+    #[default]
+    Unknown,
+    /// Prompt is being displayed (after A marker)
+    PromptActive,
+    /// User is typing a command (after B marker)
+    InputActive,
+    /// Command is running (after C marker)
+    CommandRunning,
+    /// Command finished (after D marker), ready for next prompt
+    CommandFinished { exit_code: Option<i32> },
+}
+
+impl ShellState {
+    /// Check if the shell is at a prompt (safe to send commands)
+    #[must_use]
+    pub fn is_at_prompt(&self) -> bool {
+        matches!(
+            self,
+            Self::PromptActive | Self::CommandFinished { .. } | Self::InputActive
+        )
+    }
+
+    /// Check if a command is currently running
+    #[must_use]
+    pub fn is_command_running(&self) -> bool {
+        matches!(self, Self::CommandRunning)
+    }
+}
+
+/// Per-pane state tracker for OSC 133 markers.
+#[derive(Debug, Clone)]
+pub struct Osc133State {
+    /// Current shell state
+    pub state: ShellState,
+    /// Last exit code received (from most recent D marker)
+    pub last_exit_code: Option<i32>,
+    /// Count of markers processed (for diagnostics)
+    pub markers_seen: u64,
+    /// Timestamp of last state change (epoch ms)
+    pub last_change_at: i64,
+}
+
+impl Default for Osc133State {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Osc133State {
+    /// Create a new state tracker
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            state: ShellState::Unknown,
+            last_exit_code: None,
+            markers_seen: 0,
+            last_change_at: 0,
+        }
+    }
+
+    /// Process a marker and update state
+    pub fn process_marker(&mut self, marker: Osc133Marker) {
+        self.markers_seen = self.markers_seen.saturating_add(1);
+        self.last_change_at = epoch_ms();
+
+        match marker {
+            Osc133Marker::PromptStart => {
+                self.state = ShellState::PromptActive;
+            }
+            Osc133Marker::CommandStart => {
+                self.state = ShellState::InputActive;
+            }
+            Osc133Marker::CommandExecuted => {
+                self.state = ShellState::CommandRunning;
+            }
+            Osc133Marker::CommandFinished { exit_code } => {
+                self.last_exit_code = exit_code;
+                self.state = ShellState::CommandFinished { exit_code };
+            }
+        }
+    }
+}
+
+/// Parse OSC 133 markers from terminal output.
+///
+/// This parser is designed to be robust:
+/// - Handles partial/truncated sequences gracefully
+/// - Does not panic on malformed input
+/// - Returns all valid markers found
+///
+/// # Arguments
+/// * `text` - Terminal output that may contain escape sequences
+///
+/// # Returns
+/// Vector of parsed markers in order of occurrence
+#[must_use]
+pub fn parse_osc133_markers(text: &str) -> Vec<Osc133Marker> {
+    let mut markers = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        // Look for ESC ] (OSC start)
+        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b']' {
+            // Found OSC start, look for "133;"
+            if let Some(marker) = try_parse_osc133(&bytes[i..]) {
+                markers.push(marker.0);
+                i += marker.1; // Skip past the parsed sequence
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    markers
+}
+
+/// Try to parse an OSC 133 sequence starting at the given position.
+///
+/// Returns the marker and number of bytes consumed, or None if not a valid OSC 133.
+fn try_parse_osc133(bytes: &[u8]) -> Option<(Osc133Marker, usize)> {
+    // Minimum sequence: ESC ] 1 3 3 ; X ST (where ST is BEL or ESC \)
+    // That's at least 7 bytes: \x1b ] 1 3 3 ; A \x07
+    if bytes.len() < 7 {
+        return None;
+    }
+
+    // Check for ESC ]
+    if bytes[0] != 0x1b || bytes[1] != b']' {
+        return None;
+    }
+
+    // Check for "133;"
+    if bytes.len() < 6 || &bytes[2..6] != b"133;" {
+        return None;
+    }
+
+    // Get the marker type (A, B, C, or D)
+    let marker_type = bytes[6];
+
+    // Find the string terminator (BEL \x07 or ESC \ )
+    let mut end_pos = 7;
+    let mut params_end = 7;
+    let mut found_terminator = false;
+
+    // Scan for terminator, collecting any parameters after the marker type
+    while end_pos < bytes.len() {
+        if bytes[end_pos] == 0x07 {
+            // BEL terminator
+            params_end = end_pos;
+            end_pos += 1;
+            found_terminator = true;
+            break;
+        } else if bytes[end_pos] == 0x1b && end_pos + 1 < bytes.len() && bytes[end_pos + 1] == b'\\'
+        {
+            // ESC \ terminator (ST)
+            params_end = end_pos;
+            end_pos += 2;
+            found_terminator = true;
+            break;
+        } else if end_pos > 50 {
+            // Safety limit - don't scan too far
+            return None;
+        }
+        end_pos += 1;
+    }
+
+    // If we didn't find a terminator, this is incomplete
+    if !found_terminator {
+        return None;
+    }
+
+    // Parse the marker
+    let marker = match marker_type {
+        b'A' => Osc133Marker::PromptStart,
+        b'B' => Osc133Marker::CommandStart,
+        b'C' => Osc133Marker::CommandExecuted,
+        b'D' => {
+            // D marker may have exit code: D;exitcode
+            let exit_code = if params_end > 7 && bytes[7] == b';' {
+                // Try to parse exit code from bytes[8..params_end]
+                std::str::from_utf8(&bytes[8..params_end])
+                    .ok()
+                    .and_then(|s| s.parse::<i32>().ok())
+            } else {
+                None
+            };
+            Osc133Marker::CommandFinished { exit_code }
+        }
+        _ => return None, // Unknown marker type
+    };
+
+    Some((marker, end_pos))
+}
+
+/// Process terminal output and update OSC 133 state.
+///
+/// This is a convenience function that parses markers and updates state in one call.
+pub fn process_osc133_output(state: &mut Osc133State, text: &str) {
+    for marker in parse_osc133_markers(text) {
+        state.process_marker(marker);
     }
 }
 
@@ -952,5 +1236,252 @@ mod tests {
         assert!(registry.get_cursor(1).is_none());
         let entry = registry.entries.get(&1).unwrap();
         assert!(!entry.should_observe());
+    }
+
+    #[test]
+    fn pane_entry_to_pane_record_observed() {
+        let pane = make_pane(1, "bash", Some("/home/user"));
+        let fp = PaneFingerprint::without_content(&pane);
+        let entry = PaneEntry::new(pane, fp, ObservationDecision::Observed);
+
+        let record = entry.to_pane_record();
+
+        assert_eq!(record.pane_id, 1);
+        assert_eq!(record.domain, "local");
+        assert_eq!(record.title, Some("bash".to_string()));
+        assert_eq!(record.cwd, Some("/home/user".to_string()));
+        assert!(record.observed);
+        assert!(record.ignore_reason.is_none());
+        assert!(record.last_decision_at.is_some());
+    }
+
+    #[test]
+    fn pane_entry_to_pane_record_ignored() {
+        let pane = make_pane(2, "vim", Some("/tmp"));
+        let fp = PaneFingerprint::without_content(&pane);
+        let entry = PaneEntry::new(
+            pane,
+            fp,
+            ObservationDecision::Ignored {
+                reason: "exclude-vim".to_string(),
+            },
+        );
+
+        let record = entry.to_pane_record();
+
+        assert_eq!(record.pane_id, 2);
+        assert!(!record.observed);
+        assert_eq!(record.ignore_reason, Some("exclude-vim".to_string()));
+    }
+
+    #[test]
+    fn registry_to_pane_records() {
+        use crate::config::{PaneFilterConfig, PaneFilterRule};
+
+        let mut filter_config = PaneFilterConfig::default();
+        filter_config.exclude.push(PaneFilterRule {
+            id: "skip-vim".to_string(),
+            domain: None,
+            title: Some("vim".to_string()),
+            cwd: None,
+        });
+
+        let mut registry = PaneRegistry::with_filter(filter_config);
+
+        let panes = vec![
+            make_pane(1, "bash", Some("/home")),
+            make_pane(2, "vim", Some("/tmp")),
+            make_pane(3, "zsh", Some("/root")),
+        ];
+
+        registry.discovery_tick(panes);
+
+        // All panes should be tracked
+        let all_records = registry.to_pane_records();
+        assert_eq!(all_records.len(), 3);
+
+        // 2 observed (bash, zsh), 1 ignored (vim)
+        let observed = registry.observed_pane_records();
+        assert_eq!(observed.len(), 2);
+        assert!(observed.iter().all(|r| r.observed));
+        assert!(observed.iter().any(|r| r.pane_id == 1));
+        assert!(observed.iter().any(|r| r.pane_id == 3));
+
+        let ignored = registry.ignored_pane_records();
+        assert_eq!(ignored.len(), 1);
+        assert!(!ignored[0].observed);
+        assert_eq!(ignored[0].pane_id, 2);
+        assert_eq!(ignored[0].ignore_reason, Some("skip-vim".to_string()));
+    }
+
+    // =========================================================================
+    // OSC 133 Parser Tests
+    // =========================================================================
+
+    #[test]
+    fn osc133_parse_prompt_start_bel() {
+        // BEL terminator
+        let markers = parse_osc133_markers("\x1b]133;A\x07");
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0], Osc133Marker::PromptStart);
+    }
+
+    #[test]
+    fn osc133_parse_prompt_start_st() {
+        // ESC \ terminator (ST)
+        let markers = parse_osc133_markers("\x1b]133;A\x1b\\");
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0], Osc133Marker::PromptStart);
+    }
+
+    #[test]
+    fn osc133_parse_command_start() {
+        let markers = parse_osc133_markers("\x1b]133;B\x07");
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0], Osc133Marker::CommandStart);
+    }
+
+    #[test]
+    fn osc133_parse_command_executed() {
+        let markers = parse_osc133_markers("\x1b]133;C\x07");
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0], Osc133Marker::CommandExecuted);
+    }
+
+    #[test]
+    fn osc133_parse_command_finished() {
+        let markers = parse_osc133_markers("\x1b]133;D\x07");
+        assert_eq!(markers.len(), 1);
+        assert_eq!(
+            markers[0],
+            Osc133Marker::CommandFinished { exit_code: None }
+        );
+    }
+
+    #[test]
+    fn osc133_parse_command_finished_with_exit_code() {
+        let markers = parse_osc133_markers("\x1b]133;D;0\x07");
+        assert_eq!(markers.len(), 1);
+        assert_eq!(
+            markers[0],
+            Osc133Marker::CommandFinished { exit_code: Some(0) }
+        );
+
+        let markers = parse_osc133_markers("\x1b]133;D;127\x07");
+        assert_eq!(markers.len(), 1);
+        assert_eq!(
+            markers[0],
+            Osc133Marker::CommandFinished {
+                exit_code: Some(127)
+            }
+        );
+    }
+
+    #[test]
+    fn osc133_parse_multiple_markers() {
+        // Simulate full command cycle
+        let input = "\x1b]133;A\x07$ ls\x1b]133;B\x07\x1b]133;C\x07file1 file2\n\x1b]133;D;0\x07";
+        let markers = parse_osc133_markers(input);
+        assert_eq!(markers.len(), 4);
+        assert_eq!(markers[0], Osc133Marker::PromptStart);
+        assert_eq!(markers[1], Osc133Marker::CommandStart);
+        assert_eq!(markers[2], Osc133Marker::CommandExecuted);
+        assert_eq!(
+            markers[3],
+            Osc133Marker::CommandFinished { exit_code: Some(0) }
+        );
+    }
+
+    #[test]
+    fn osc133_parse_ignores_malformed() {
+        // Unknown marker type
+        let markers = parse_osc133_markers("\x1b]133;X\x07");
+        assert!(markers.is_empty());
+
+        // Missing terminator (text ends before terminator)
+        let markers = parse_osc133_markers("\x1b]133;A");
+        assert!(markers.is_empty());
+
+        // Wrong OSC number
+        let markers = parse_osc133_markers("\x1b]7;A\x07");
+        assert!(markers.is_empty());
+
+        // Not an OSC sequence
+        let markers = parse_osc133_markers("[133;A");
+        assert!(markers.is_empty());
+    }
+
+    #[test]
+    fn osc133_parse_no_panic_on_arbitrary_input() {
+        // Fuzzy test: shouldn't panic on random input
+        let inputs = [
+            "",
+            "hello world",
+            "\x1b]",
+            "\x1b]133",
+            "\x1b]133;",
+            "\x1b]133;A",
+            "\x07\x07\x07",
+            "\x1b\x1b\x1b",
+            "normal\x1b]133;A\x07text\x1b]133;D;1\x07more",
+            "\x00\x01\x02\x7f",
+        ];
+        for input in inputs {
+            let _ = parse_osc133_markers(input);
+        }
+    }
+
+    #[test]
+    fn osc133_state_transitions() {
+        let mut state = Osc133State::new();
+        assert_eq!(state.state, ShellState::Unknown);
+        assert!(state.last_exit_code.is_none());
+
+        state.process_marker(Osc133Marker::PromptStart);
+        assert_eq!(state.state, ShellState::PromptActive);
+        assert!(state.state.is_at_prompt());
+        assert!(!state.state.is_command_running());
+
+        state.process_marker(Osc133Marker::CommandStart);
+        assert_eq!(state.state, ShellState::InputActive);
+        assert!(state.state.is_at_prompt());
+
+        state.process_marker(Osc133Marker::CommandExecuted);
+        assert_eq!(state.state, ShellState::CommandRunning);
+        assert!(!state.state.is_at_prompt());
+        assert!(state.state.is_command_running());
+
+        state.process_marker(Osc133Marker::CommandFinished { exit_code: Some(0) });
+        assert!(matches!(
+            state.state,
+            ShellState::CommandFinished { exit_code: Some(0) }
+        ));
+        assert!(state.state.is_at_prompt());
+        assert!(!state.state.is_command_running());
+        assert_eq!(state.last_exit_code, Some(0));
+    }
+
+    #[test]
+    fn osc133_state_counts_markers() {
+        let mut state = Osc133State::new();
+        assert_eq!(state.markers_seen, 0);
+
+        state.process_marker(Osc133Marker::PromptStart);
+        assert_eq!(state.markers_seen, 1);
+
+        state.process_marker(Osc133Marker::CommandStart);
+        state.process_marker(Osc133Marker::CommandExecuted);
+        assert_eq!(state.markers_seen, 3);
+    }
+
+    #[test]
+    fn osc133_process_output_convenience() {
+        let mut state = Osc133State::new();
+        let text = "\x1b]133;A\x07prompt\x1b]133;B\x07ls\x1b]133;C\x07";
+
+        process_osc133_output(&mut state, text);
+
+        assert_eq!(state.state, ShellState::CommandRunning);
+        assert_eq!(state.markers_seen, 3);
     }
 }
