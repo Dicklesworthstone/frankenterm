@@ -40,11 +40,26 @@ toml.workspace = true
 
 # File locking
 fs2.workspace = true
+base64 = "0.22.1"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
 proptest = "1.5"
 tempfile = "3.10"
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+# Benchmarks
+[[bench]]
+name = "pattern_detection"
+harness = false
+
+[[bench]]
+name = "delta_extraction"
+harness = false
+
+[[bench]]
+name = "fts_query"
+harness = false
 
 [features]
 default = []

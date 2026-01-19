@@ -74,6 +74,9 @@ toml = "0.8"
 # File locking
 fs2 = "0.4"
 
+# Benchmarking
+criterion = { version = "0.5", features = ["async_tokio"] }
+
 # Internal crates
 wa-core = { path = "crates/wa-core" }
 
