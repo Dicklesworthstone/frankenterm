@@ -697,11 +697,18 @@ impl PatternEngine {
         // (e.g., "limit reached" and "Usage limit reached for all Pro models")
         for matched in matcher.find_overlapping_iter(text) {
             #[cfg(test)]
-            eprintln!("detect: matched pattern {} at {:?}", matched.pattern().as_usize(), matched.span());
+            {
+                let pattern = matched.pattern().as_usize();
+                let span = matched.span();
+                eprintln!("detect: matched pattern {pattern} at {span:?}");
+            }
 
             let Some(anchor) = self.anchor_list.get(matched.pattern().as_usize()) else {
                 #[cfg(test)]
-                eprintln!("detect: pattern {} not found in anchor_list", matched.pattern().as_usize());
+                {
+                    let pattern = matched.pattern().as_usize();
+                    eprintln!("detect: pattern {pattern} not found in anchor_list");
+                }
                 continue;
             };
 
@@ -1079,6 +1086,121 @@ mod tests {
         );
     }
 
+    fn assert_rule_extraction(rule_id: &str, text: &str, expected: &[(&str, &str)]) {
+        let engine = PatternEngine::new();
+        let detections = engine.detect(text);
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == rule_id)
+            .unwrap_or_else(|| panic!("Expected detection for rule '{rule_id}'"));
+
+        let map = detection
+            .extracted
+            .as_object()
+            .unwrap_or_else(|| panic!("Expected extracted object for rule '{rule_id}'"));
+
+        assert_eq!(
+            map.len(),
+            expected.len(),
+            "Unexpected extracted keys for rule '{rule_id}'"
+        );
+
+        for (key, value) in expected {
+            let actual = map
+                .get(*key)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            assert_eq!(
+                actual, *value,
+                "Extraction mismatch for rule '{rule_id}' key '{key}'"
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_regex_rules_extract_expected_fields() {
+        let cases = vec![
+            (
+                "codex.usage.warning_25",
+                "Warning: You have less than 25% of your 24h limit remaining.",
+                vec![("remaining", "25"), ("limit_hours", "24")],
+            ),
+            (
+                "codex.usage.warning_10",
+                "Warning: You have less than 10% of your 8h limit remaining.",
+                vec![("remaining", "10"), ("limit_hours", "8")],
+            ),
+            (
+                "codex.usage.warning_5",
+                "Warning: You have less than 5% of your 12h limit remaining.",
+                vec![("remaining", "5"), ("limit_hours", "12")],
+            ),
+            (
+                "codex.usage.reached",
+                "You've hit your usage limit. Please try again at 2026-01-20 12:34 UTC.",
+                vec![("reset_time", "2026-01-20 12:34 UTC")],
+            ),
+            (
+                "codex.session.token_usage",
+                "Token usage: total=1,234 input=567 (+ 89 cached) output=987 (reasoning 12)",
+                vec![
+                    ("total", "1,234"),
+                    ("input", "567"),
+                    ("cached", "89"),
+                    ("output", "987"),
+                    ("reasoning", "12"),
+                ],
+            ),
+            (
+                "codex.session.resume_hint",
+                "To resume later, run: codex resume 123e4567-e89b-12d3-a456-426614174000",
+                vec![("session_id", "123e4567-e89b-12d3-a456-426614174000")],
+            ),
+            (
+                "codex.auth.device_code_prompt",
+                "Enter this one-time code: ABCD-12345",
+                vec![("code", "ABCD-12345")],
+            ),
+            (
+                "claude_code.compaction",
+                "Auto-compact: context compacted 12,345 tokens to 3,210",
+                vec![("tokens_before", "12,345"), ("tokens_after", "3,210")],
+            ),
+            (
+                "claude_code.session.cost_summary",
+                "Session cost: $2.50",
+                vec![("cost", "2.50")],
+            ),
+            (
+                "claude_code.model.selected",
+                "model: claude-3-5-sonnet-20241022",
+                vec![("model", "claude-3-5-sonnet-20241022")],
+            ),
+            (
+                "gemini.session.summary",
+                "Interaction Summary: Session ID: abcdef12-3456-7890-abcd-ef1234567890 Tool Calls: 7",
+                vec![
+                    ("session_id", "abcdef12-3456-7890-abcd-ef1234567890"),
+                    ("tool_calls", "7"),
+                ],
+            ),
+            (
+                "gemini.model.used",
+                "Responding with gemini-1.5-pro",
+                vec![("model", "gemini-1.5-pro")],
+            ),
+            (
+                "wezterm.pane.exited",
+                "pane exited with status 1",
+                vec![("exit_code", "1")],
+            ),
+        ];
+
+        for (rule_id, text, expected) in cases {
+            assert_rule_extraction(rule_id, text, &expected);
+        }
+    }
+
     // ========================================================================
     // AgentType tests
     // ========================================================================
@@ -1152,7 +1274,9 @@ mod tests {
         let text = "You've hit your usage limit for the 3h window. Please try again at 2:30 PM.";
         let detections = engine.detect(text);
         assert!(!detections.is_empty(), "Should detect usage limit");
-        let detection = detections.iter().find(|d| d.rule_id == "codex.usage.reached");
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "codex.usage.reached");
         assert!(detection.is_some(), "Should match codex.usage.reached");
         let d = detection.unwrap();
         assert_eq!(d.severity, Severity::Critical);
@@ -1167,7 +1291,9 @@ mod tests {
         let engine = PatternEngine::new();
         let text = "Warning: You have less than 25% of your 3h limit remaining.";
         let detections = engine.detect(text);
-        let detection = detections.iter().find(|d| d.rule_id == "codex.usage.warning_25");
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "codex.usage.warning_25");
         assert!(detection.is_some(), "Should match codex.usage.warning_25");
     }
 
@@ -1176,7 +1302,9 @@ mod tests {
         let engine = PatternEngine::new();
         let text = "Warning: You have less than 10% of your 3h limit remaining.";
         let detections = engine.detect(text);
-        let detection = detections.iter().find(|d| d.rule_id == "codex.usage.warning_10");
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "codex.usage.warning_10");
         assert!(detection.is_some(), "Should match codex.usage.warning_10");
     }
 
@@ -1185,7 +1313,9 @@ mod tests {
         let engine = PatternEngine::new();
         let text = "Warning: You have less than 5% of your 3h limit remaining.";
         let detections = engine.detect(text);
-        let detection = detections.iter().find(|d| d.rule_id == "codex.usage.warning_5");
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "codex.usage.warning_5");
         assert!(detection.is_some(), "Should match codex.usage.warning_5");
     }
 
@@ -1194,8 +1324,13 @@ mod tests {
         let engine = PatternEngine::new();
         let text = "Token usage: total=125,432 input=50,000 (+ 20,000 cached) output=55,432";
         let detections = engine.detect(text);
-        let detection = detections.iter().find(|d| d.rule_id == "codex.session.token_usage");
-        assert!(detection.is_some(), "Should match codex.session.token_usage");
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "codex.session.token_usage");
+        assert!(
+            detection.is_some(),
+            "Should match codex.session.token_usage"
+        );
         let d = detection.unwrap();
         assert_eq!(
             d.extracted.get("total").and_then(|v| v.as_str()),
@@ -1220,8 +1355,13 @@ mod tests {
         let engine = PatternEngine::new();
         let text = "Token usage: total=200,000 input=80,000 (+ 30,000 cached) output=90,000 (reasoning 10,000)";
         let detections = engine.detect(text);
-        let detection = detections.iter().find(|d| d.rule_id == "codex.session.token_usage");
-        assert!(detection.is_some(), "Should match codex.session.token_usage with reasoning");
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "codex.session.token_usage");
+        assert!(
+            detection.is_some(),
+            "Should match codex.session.token_usage with reasoning"
+        );
         let d = detection.unwrap();
         assert_eq!(
             d.extracted.get("reasoning").and_then(|v| v.as_str()),
@@ -1234,8 +1374,13 @@ mod tests {
         let engine = PatternEngine::new();
         let text = "To resume this session, run: codex resume a1b2c3d4-e5f6-7890-abcd-ef1234567890";
         let detections = engine.detect(text);
-        let detection = detections.iter().find(|d| d.rule_id == "codex.session.resume_hint");
-        assert!(detection.is_some(), "Should match codex.session.resume_hint");
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "codex.session.resume_hint");
+        assert!(
+            detection.is_some(),
+            "Should match codex.session.resume_hint"
+        );
         let d = detection.unwrap();
         assert_eq!(
             d.extracted.get("session_id").and_then(|v| v.as_str()),
@@ -1248,8 +1393,13 @@ mod tests {
         let engine = PatternEngine::new();
         let text = "Enter this one-time code at https://auth.openai.com: ABCD-12345";
         let detections = engine.detect(text);
-        let detection = detections.iter().find(|d| d.rule_id == "codex.auth.device_code_prompt");
-        assert!(detection.is_some(), "Should match codex.auth.device_code_prompt");
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "codex.auth.device_code_prompt");
+        assert!(
+            detection.is_some(),
+            "Should match codex.auth.device_code_prompt"
+        );
         let d = detection.unwrap();
         assert_eq!(
             d.extracted.get("code").and_then(|v| v.as_str()),
@@ -1262,7 +1412,9 @@ mod tests {
         let engine = PatternEngine::new();
         let text = "Conversation compacted 150,000 tokens to 25,000 tokens";
         let detections = engine.detect(text);
-        let detection = detections.iter().find(|d| d.rule_id == "claude_code.compaction");
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "claude_code.compaction");
         assert!(detection.is_some(), "Should match claude_code.compaction");
         let d = detection.unwrap();
         assert_eq!(d.severity, Severity::Warning);
@@ -1281,8 +1433,13 @@ mod tests {
         let engine = PatternEngine::new();
         let text = "context compacted: summarized 100,000 tokens to 15,000 tokens";
         let detections = engine.detect(text);
-        let detection = detections.iter().find(|d| d.rule_id == "claude_code.compaction");
-        assert!(detection.is_some(), "Should match claude_code.compaction with summarized variant");
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "claude_code.compaction");
+        assert!(
+            detection.is_some(),
+            "Should match claude_code.compaction with summarized variant"
+        );
     }
 
     #[test]
@@ -1290,8 +1447,13 @@ mod tests {
         let engine = PatternEngine::new();
         let text = "Session complete. Total cost: $1.25";
         let detections = engine.detect(text);
-        let detection = detections.iter().find(|d| d.rule_id == "claude_code.session.cost_summary");
-        assert!(detection.is_some(), "Should match claude_code.session.cost_summary");
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "claude_code.session.cost_summary");
+        assert!(
+            detection.is_some(),
+            "Should match claude_code.session.cost_summary"
+        );
         let d = detection.unwrap();
         assert_eq!(
             d.extracted.get("cost").and_then(|v| v.as_str()),
@@ -1304,8 +1466,13 @@ mod tests {
         let engine = PatternEngine::new();
         let text = "Error: invalid api key - please check your ANTHROPIC_API_KEY";
         let detections = engine.detect(text);
-        let detection = detections.iter().find(|d| d.rule_id == "claude_code.auth.api_key_error");
-        assert!(detection.is_some(), "Should match claude_code.auth.api_key_error");
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "claude_code.auth.api_key_error");
+        assert!(
+            detection.is_some(),
+            "Should match claude_code.auth.api_key_error"
+        );
         assert_eq!(detection.unwrap().severity, Severity::Critical);
     }
 
@@ -1314,7 +1481,9 @@ mod tests {
         let engine = PatternEngine::new();
         let text = "Claude Code v1.2.3 starting session with model: claude-opus-4-5-20251101";
         let detections = engine.detect(text);
-        let detection = detections.iter().find(|d| d.rule_id == "claude_code.banner");
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "claude_code.banner");
         assert!(detection.is_some(), "Should match claude_code.banner");
         let d = detection.unwrap();
         assert_eq!(
@@ -1328,7 +1497,9 @@ mod tests {
         let engine = PatternEngine::new();
         let text = "Usage limit reached for all Pro models. Please wait before continuing.";
         let detections = engine.detect(text);
-        let detection = detections.iter().find(|d| d.rule_id == "gemini.usage.reached");
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "gemini.usage.reached");
         assert!(detection.is_some(), "Should match gemini.usage.reached");
         assert_eq!(detection.unwrap().severity, Severity::Critical);
     }
@@ -1338,7 +1509,9 @@ mod tests {
         let engine = PatternEngine::new();
         let text = "Interaction Summary\nSession ID: abc12345-def6-7890-abcd-0123456789ab\nTool Calls: 42\nTokens Used: 10000";
         let detections = engine.detect(text);
-        let detection = detections.iter().find(|d| d.rule_id == "gemini.session.summary");
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "gemini.session.summary");
         assert!(detection.is_some(), "Should match gemini.session.summary");
         let d = detection.unwrap();
         assert_eq!(
@@ -1370,8 +1543,13 @@ mod tests {
         let engine = PatternEngine::new();
         let text = "Error: mux server connection lost, attempting reconnect...";
         let detections = engine.detect(text);
-        let detection = detections.iter().find(|d| d.rule_id == "wezterm.mux.connection_lost");
-        assert!(detection.is_some(), "Should match wezterm.mux.connection_lost");
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "wezterm.mux.connection_lost");
+        assert!(
+            detection.is_some(),
+            "Should match wezterm.mux.connection_lost"
+        );
         assert_eq!(detection.unwrap().severity, Severity::Critical);
     }
 
@@ -1380,7 +1558,9 @@ mod tests {
         let engine = PatternEngine::new();
         let text = "shell exited with exit status: 0";
         let detections = engine.detect(text);
-        let detection = detections.iter().find(|d| d.rule_id == "wezterm.pane.exited");
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "wezterm.pane.exited");
         assert!(detection.is_some(), "Should match wezterm.pane.exited");
         let d = detection.unwrap();
         assert_eq!(
@@ -1394,8 +1574,13 @@ mod tests {
         let engine = PatternEngine::new();
         let text = "process exited with status 1";
         let detections = engine.detect(text);
-        let detection = detections.iter().find(|d| d.rule_id == "wezterm.pane.exited");
-        assert!(detection.is_some(), "Should match wezterm.pane.exited with non-zero exit");
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "wezterm.pane.exited");
+        assert!(
+            detection.is_some(),
+            "Should match wezterm.pane.exited with non-zero exit"
+        );
         let d = detection.unwrap();
         assert_eq!(
             d.extracted.get("exit_code").and_then(|v| v.as_str()),
@@ -1408,7 +1593,10 @@ mod tests {
         let engine = PatternEngine::new();
         let text = "This is just some regular text about coding and programming.";
         let detections = engine.detect(text);
-        assert!(detections.is_empty(), "Should not detect patterns in unrelated text");
+        assert!(
+            detections.is_empty(),
+            "Should not detect patterns in unrelated text"
+        );
     }
 
     #[test]
@@ -1418,8 +1606,13 @@ mod tests {
         let text = "The less work we do, the better. Try again later with a 10% discount.";
         let detections = engine.detect(text);
         // Should not match usage warnings because the full anchor isn't present
-        let usage_warning = detections.iter().find(|d| d.rule_id.contains("usage.warning"));
-        assert!(usage_warning.is_none(), "Should not have false positive on partial matches");
+        let usage_warning = detections
+            .iter()
+            .find(|d| d.rule_id.contains("usage.warning"));
+        assert!(
+            usage_warning.is_none(),
+            "Should not have false positive on partial matches"
+        );
     }
 
     // ========================================================================
@@ -1460,8 +1653,7 @@ mod tests {
 
         for fixture in fixtures {
             let detections = engine.detect(&fixture.text);
-            let mut actual: Vec<String> =
-                detections.iter().map(|d| d.rule_id.clone()).collect();
+            let mut actual: Vec<String> = detections.iter().map(|d| d.rule_id.clone()).collect();
             let mut expected = fixture.expected_rule_ids.clone();
             actual.sort();
             expected.sort();

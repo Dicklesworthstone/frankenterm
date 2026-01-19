@@ -598,10 +598,9 @@ impl WeztermClient {
     ///
     /// WezTerm spawn/split-pane returns just the pane ID as a number.
     fn parse_pane_id(output: &str) -> Result<u64> {
-        output
-            .trim()
-            .parse::<u64>()
-            .map_err(|_| WeztermError::ParseError(format!("Invalid pane ID: {}", output.trim())).into())
+        output.trim().parse::<u64>().map_err(|_| {
+            WeztermError::ParseError(format!("Invalid pane ID: {}", output.trim())).into()
+        })
     }
 
     /// Internal implementation for send_text with paste mode option
@@ -943,8 +942,8 @@ fn ms_u64(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn pane_info_deserializes_minimal() {

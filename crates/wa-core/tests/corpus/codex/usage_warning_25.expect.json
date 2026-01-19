@@ -1,0 +1,14 @@
+[
+  {
+    "rule_id": "codex.usage.warning_25",
+    "agent_type": "codex",
+    "event_type": "usage.warning",
+    "severity": "info",
+    "confidence": 0.95,
+    "extracted": {
+      "remaining": "24",
+      "limit_hours": "4"
+    },
+    "matched_text": "24% of your 4h limit remaining"
+  }
+]

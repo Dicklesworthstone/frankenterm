@@ -1034,6 +1034,7 @@ dependencies = [
  "fancy-regex",
  "memchr",
  "proptest",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",

@@ -1,0 +1,1 @@
+pane exited with status 1

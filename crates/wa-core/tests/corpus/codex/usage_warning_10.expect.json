@@ -1,0 +1,14 @@
+[
+  {
+    "rule_id": "codex.usage.warning_10",
+    "agent_type": "codex",
+    "event_type": "usage.warning",
+    "severity": "warning",
+    "confidence": 0.95,
+    "extracted": {
+      "remaining": "9",
+      "limit_hours": "8"
+    },
+    "matched_text": "9% of your 8h limit remaining"
+  }
+]

@@ -142,6 +142,10 @@ enum RobotCommands {
 
         /// Text to send
         text: String,
+
+        /// Preview what would happen without executing
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Wait for a pattern
@@ -226,7 +230,6 @@ struct RobotResponse<T> {
 }
 
 impl<T> RobotResponse<T> {
-    #[allow(dead_code)]
     fn success(data: T, elapsed_ms: u64) -> Self {
         Self {
             ok: true,
@@ -246,6 +249,111 @@ impl<T> RobotResponse<T> {
             elapsed_ms,
         }
     }
+}
+
+fn build_send_dry_run_report(
+    pane_id: u64,
+    text: &str,
+    no_paste: bool,
+    command: &str,
+) -> wa_core::dry_run::DryRunReport {
+    use wa_core::dry_run::{
+        DryRunContext, TargetResolution, build_send_policy_evaluation, create_send_action,
+        create_wait_for_action,
+    };
+
+    let mut ctx = DryRunContext::enabled();
+    ctx.set_command(command);
+
+    // Target resolution (simulated for now)
+    ctx.set_target(
+        TargetResolution::new(pane_id, "local")
+            .with_title("(pane title)")
+            .with_cwd("(current directory)"),
+    );
+
+    // Policy evaluation (simulated values)
+    let eval = build_send_policy_evaluation(
+        (2, 30), // rate limit status
+        true,    // is_prompt_active
+        true,    // require_prompt_active
+        false,   // has_recent_gaps
+    );
+    ctx.set_policy_evaluation(eval);
+
+    // Expected actions
+    ctx.add_action(create_send_action(1, pane_id, text.len()));
+    ctx.add_action(create_wait_for_action(2, "prompt boundary", 30000));
+
+    if no_paste {
+        ctx.add_warning("no_paste mode sends characters individually (slower)");
+    }
+
+    ctx.take_report()
+}
+
+fn build_workflow_dry_run_report(
+    name: &str,
+    pane: u64,
+    command: &str,
+) -> wa_core::dry_run::DryRunReport {
+    use wa_core::dry_run::{
+        ActionType, DryRunContext, PlannedAction, PolicyCheck, PolicyEvaluation, TargetResolution,
+    };
+
+    let mut ctx = DryRunContext::enabled();
+    ctx.set_command(command);
+
+    // Target resolution
+    ctx.set_target(
+        TargetResolution::new(pane, "local")
+            .with_title("(pane title)")
+            .with_agent_type("(detected agent)"),
+    );
+
+    // Policy evaluation for workflow
+    let mut eval = PolicyEvaluation::new();
+    eval.add_check(PolicyCheck::passed(
+        "workflow_enabled",
+        format!("Workflow '{name}' is enabled"),
+    ));
+    eval.add_check(PolicyCheck::passed("pane_state", "Pane is in valid state"));
+    eval.add_check(PolicyCheck::passed("policy", "Workflow execution allowed"));
+    ctx.set_policy_evaluation(eval);
+
+    // Expected workflow steps (example for handle_compaction)
+    ctx.add_action(PlannedAction::new(
+        1,
+        ActionType::AcquireLock,
+        format!("Acquire workflow lock for pane {pane}"),
+    ));
+    ctx.add_action(PlannedAction::new(
+        2,
+        ActionType::WaitFor,
+        "Stabilize: wait for tail stability (no new deltas for N polls; max 2s)".to_string(),
+    ));
+    ctx.add_action(PlannedAction::new(
+        3,
+        ActionType::SendText,
+        "Send re-read instruction to agent".to_string(),
+    ));
+    ctx.add_action(PlannedAction::new(
+        4,
+        ActionType::WaitFor,
+        "Verify: wait for prompt boundary".to_string(),
+    ));
+    ctx.add_action(PlannedAction::new(
+        5,
+        ActionType::MarkEventHandled,
+        "Mark triggering event as handled".to_string(),
+    ));
+    ctx.add_action(PlannedAction::new(
+        6,
+        ActionType::ReleaseLock,
+        "Release workflow lock".to_string(),
+    ));
+
+    ctx.take_report()
 }
 
 /// Helper to convert elapsed time to u64 milliseconds safely
@@ -303,13 +411,28 @@ async fn main() -> anyhow::Result<()> {
                     );
                     println!("{}", serde_json::to_string_pretty(&response)?);
                 }
-                RobotCommands::Send { pane_id, text } => {
-                    let response: RobotResponse<()> = RobotResponse::error(
-                        format!("send to pane {pane_id} not yet implemented (text: {text})"),
-                        None,
-                        elapsed_ms(start),
-                    );
-                    println!("{}", serde_json::to_string_pretty(&response)?);
+                RobotCommands::Send {
+                    pane_id,
+                    text,
+                    dry_run,
+                } => {
+                    if dry_run {
+                        let report = build_send_dry_run_report(
+                            pane_id,
+                            &text,
+                            false,
+                            &format!("wa robot send {pane_id} \"{text}\" --dry-run"),
+                        );
+                        let response = RobotResponse::success(report, elapsed_ms(start));
+                        println!("{}", serde_json::to_string_pretty(&response)?);
+                    } else {
+                        let response: RobotResponse<()> = RobotResponse::error(
+                            format!("send to pane {pane_id} not yet implemented (text: {text})"),
+                            None,
+                            elapsed_ms(start),
+                        );
+                        println!("{}", serde_json::to_string_pretty(&response)?);
+                    }
                 }
                 RobotCommands::WaitFor {
                     pane_id,
@@ -376,40 +499,13 @@ async fn main() -> anyhow::Result<()> {
             dry_run,
         }) => {
             if dry_run {
-                use wa_core::dry_run::{
-                    DryRunContext, TargetResolution, build_send_policy_evaluation,
-                    create_send_action, create_wait_for_action, format_human,
-                };
-
-                let mut ctx = DryRunContext::enabled();
-                ctx.set_command(format!("wa send --pane {} \"{}\"", pane_id, text));
-
-                // Target resolution (simulated for now)
-                ctx.set_target(
-                    TargetResolution::new(pane_id, "local")
-                        .with_title("(pane title)")
-                        .with_cwd("(current directory)"),
+                let report = build_send_dry_run_report(
+                    pane_id,
+                    &text,
+                    no_paste,
+                    &format!("wa send --pane {pane_id} \"{text}\""),
                 );
-
-                // Policy evaluation (simulated values)
-                let eval = build_send_policy_evaluation(
-                    (2, 30), // rate limit status
-                    true,    // is_prompt_active
-                    true,    // require_prompt_active
-                    false,   // has_recent_gaps
-                );
-                ctx.set_policy_evaluation(eval);
-
-                // Expected actions
-                ctx.add_action(create_send_action(1, pane_id, text.len()));
-                ctx.add_action(create_wait_for_action(2, "prompt boundary", 30000));
-
-                if no_paste {
-                    ctx.add_warning("no_paste mode sends characters individually (slower)");
-                }
-
-                let report = ctx.take_report();
-                println!("{}", format_human(&report));
+                println!("{}", wa_core::dry_run::format_human(&report));
             } else {
                 tracing::info!(
                     "Sending to pane {} (no_paste={}): {}",
@@ -441,66 +537,12 @@ async fn main() -> anyhow::Result<()> {
                     dry_run,
                 } => {
                     if dry_run {
-                        use wa_core::dry_run::{
-                            ActionType, DryRunContext, PlannedAction, PolicyCheck,
-                            PolicyEvaluation, TargetResolution, format_human,
-                        };
-
-                        let mut ctx = DryRunContext::enabled();
-                        ctx.set_command(format!("wa workflow run {} --pane {}", name, pane));
-
-                        // Target resolution
-                        ctx.set_target(
-                            TargetResolution::new(pane, "local")
-                                .with_title("(pane title)")
-                                .with_agent_type("(detected agent)"),
+                        let report = build_workflow_dry_run_report(
+                            &name,
+                            pane,
+                            &format!("wa workflow run {name} --pane {pane}"),
                         );
-
-                        // Policy evaluation for workflow
-                        let mut eval = PolicyEvaluation::new();
-                        eval.add_check(PolicyCheck::passed(
-                            "workflow_enabled",
-                            format!("Workflow '{}' is enabled", name),
-                        ));
-                        eval.add_check(PolicyCheck::passed("pane_state", "Pane is in valid state"));
-                        eval.add_check(PolicyCheck::passed("policy", "Workflow execution allowed"));
-                        ctx.set_policy_evaluation(eval);
-
-                        // Expected workflow steps (example for handle_compaction)
-                        ctx.add_action(PlannedAction::new(
-                            1,
-                            ActionType::AcquireLock,
-                            format!("Acquire workflow lock for pane {}", pane),
-                        ));
-                        ctx.add_action(PlannedAction::new(
-                            2,
-                            ActionType::WaitFor,
-                            "Stabilize: wait for tail stability (no new deltas for N polls; max 2s)"
-                                .to_string(),
-                        ));
-                        ctx.add_action(PlannedAction::new(
-                            3,
-                            ActionType::SendText,
-                            "Send re-read instruction to agent".to_string(),
-                        ));
-                        ctx.add_action(PlannedAction::new(
-                            4,
-                            ActionType::WaitFor,
-                            "Verify: wait for prompt boundary".to_string(),
-                        ));
-                        ctx.add_action(PlannedAction::new(
-                            5,
-                            ActionType::MarkEventHandled,
-                            "Mark triggering event as handled".to_string(),
-                        ));
-                        ctx.add_action(PlannedAction::new(
-                            6,
-                            ActionType::ReleaseLock,
-                            "Release workflow lock".to_string(),
-                        ));
-
-                        let report = ctx.take_report();
-                        println!("{}", format_human(&report));
+                        println!("{}", wa_core::dry_run::format_human(&report));
                     } else {
                         tracing::info!("Running workflow '{}' on pane {}", name, pane);
                         // TODO: Implement workflow run

@@ -446,6 +446,29 @@ pub struct WorkflowRecord {
     pub completed_at: Option<i64>,
 }
 
+/// Workflow step log entry
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowStepLogRecord {
+    /// Step log ID
+    pub id: i64,
+    /// Workflow execution ID
+    pub workflow_id: String,
+    /// Step index within workflow
+    pub step_index: usize,
+    /// Step name
+    pub step_name: String,
+    /// Result type (continue, done, retry, abort, wait_for)
+    pub result_type: String,
+    /// Result data (JSON)
+    pub result_data: Option<String>,
+    /// Started timestamp (epoch ms)
+    pub started_at: i64,
+    /// Completed timestamp (epoch ms)
+    pub completed_at: i64,
+    /// Duration in milliseconds
+    pub duration_ms: i64,
+}
+
 // =============================================================================
 // Schema Initialization
 // =============================================================================
@@ -984,6 +1007,24 @@ impl StorageHandle {
         .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
+    /// Get step logs for a workflow
+    ///
+    /// Returns all step logs for the given workflow, ordered by step index.
+    pub async fn get_step_logs(&self, workflow_id: &str) -> Result<Vec<WorkflowStepLogRecord>> {
+        let db_path = Arc::clone(&self.db_path);
+        let workflow_id = workflow_id.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+
+            query_step_logs(&conn, &workflow_id)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+    }
+
     /// Shutdown the storage handle
     ///
     /// Flushes all pending writes and waits for the writer thread to exit.
@@ -1235,13 +1276,7 @@ fn record_gap_sync(conn: &Connection, pane_id: u64, reason: &str) -> Result<Gap>
     conn.execute(
         "INSERT INTO output_gaps (pane_id, seq_before, seq_after, reason, detected_at)
          VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![
-            pane_id_i64,
-            seq_before_i64,
-            seq_after_i64,
-            reason,
-            now
-        ],
+        params![pane_id_i64, seq_before_i64, seq_after_i64, reason, now],
     )
     .map_err(|e| StorageError::Database(format!("Failed to insert gap: {e}")))?;
 
@@ -1315,10 +1350,7 @@ fn upsert_pane_sync(conn: &Connection, pane: &PaneRecord) -> Result<()> {
         .window_id
         .map(|v| u64_to_i64(v, "window_id"))
         .transpose()?;
-    let tab_id_i64 = pane
-        .tab_id
-        .map(|v| u64_to_i64(v, "tab_id"))
-        .transpose()?;
+    let tab_id_i64 = pane.tab_id.map(|v| u64_to_i64(v, "tab_id")).transpose()?;
 
     conn.execute(
         "INSERT INTO panes (pane_id, domain, window_id, tab_id, title, cwd, tty_name,
@@ -1563,18 +1595,8 @@ fn search_fts_with_snippets(
     let limit = options.limit.unwrap_or(100);
     let include_snippets = options.include_snippets.unwrap_or(true);
     let max_tokens = options.snippet_max_tokens.unwrap_or(64);
-    let prefix = escape_sql_literal(
-        options
-            .highlight_prefix
-            .as_deref()
-            .unwrap_or(">>>"),
-    );
-    let suffix = escape_sql_literal(
-        options
-            .highlight_suffix
-            .as_deref()
-            .unwrap_or("<<<"),
-    );
+    let prefix = escape_sql_literal(options.highlight_prefix.as_deref().unwrap_or(">>>"));
+    let suffix = escape_sql_literal(options.highlight_suffix.as_deref().unwrap_or("<<<"));
 
     // Build query with optional filters
     // FTS5 snippet function: snippet(table, column_idx, prefix, suffix, ellipsis, max_tokens)
@@ -1684,7 +1706,10 @@ fn query_agent_session(conn: &Connection, session_id: i64) -> Result<Option<Agen
         |row| {
             Ok(AgentSessionRecord {
                 id: row.get(0)?,
-                pane_id: { let v: i64 = row.get(1)?; v as u64 },
+                pane_id: {
+                    let v: i64 = row.get(1)?;
+                    v as u64
+                },
                 agent_type: row.get(2)?,
                 session_id: row.get(3)?,
                 external_id: row.get(4)?,
@@ -1722,7 +1747,10 @@ fn query_active_sessions(conn: &Connection) -> Result<Vec<AgentSessionRecord>> {
         .query_map([], |row| {
             Ok(AgentSessionRecord {
                 id: row.get(0)?,
-                pane_id: { let v: i64 = row.get(1)?; v as u64 },
+                pane_id: {
+                    let v: i64 = row.get(1)?;
+                    v as u64
+                },
                 agent_type: row.get(2)?,
                 session_id: row.get(3)?,
                 external_id: row.get(4)?,
@@ -1766,7 +1794,10 @@ fn query_sessions_for_pane(conn: &Connection, pane_id: u64) -> Result<Vec<AgentS
         .query_map([pane_id_i64], |row| {
             Ok(AgentSessionRecord {
                 id: row.get(0)?,
-                pane_id: { let v: i64 = row.get(1)?; v as u64 },
+                pane_id: {
+                    let v: i64 = row.get(1)?;
+                    v as u64
+                },
                 agent_type: row.get(2)?,
                 session_id: row.get(3)?,
                 external_id: row.get(4)?,
@@ -2054,6 +2085,45 @@ fn query_workflow(conn: &Connection, workflow_id: &str) -> Result<Option<Workflo
     )
     .optional()
     .map_err(|e| StorageError::Database(format!("Query failed: {e}")).into())
+}
+
+/// Query workflow step logs by workflow ID
+fn query_step_logs(conn: &Connection, workflow_id: &str) -> Result<Vec<WorkflowStepLogRecord>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, workflow_id, step_index, step_name, result_type, result_data,
+             started_at, completed_at, duration_ms
+             FROM workflow_step_logs
+             WHERE workflow_id = ?1
+             ORDER BY step_index ASC",
+        )
+        .map_err(|e| StorageError::Database(format!("Failed to prepare query: {e}")))?;
+
+    let rows = stmt
+        .query_map([workflow_id], |row| {
+            Ok(WorkflowStepLogRecord {
+                id: row.get(0)?,
+                workflow_id: row.get(1)?,
+                step_index: {
+                    let val: i64 = row.get(2)?;
+                    i64_to_usize(val)?
+                },
+                step_name: row.get(3)?,
+                result_type: row.get(4)?,
+                result_data: row.get(5)?,
+                started_at: row.get(6)?,
+                completed_at: row.get(7)?,
+                duration_ms: row.get(8)?,
+            })
+        })
+        .map_err(|e| StorageError::Database(format!("Query failed: {e}")))?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row.map_err(|e| StorageError::Database(format!("Row error: {e}")))?);
+    }
+
+    Ok(results)
 }
 
 #[cfg(test)]
@@ -2559,7 +2629,7 @@ mod tests {
         // Verify gap was recorded
         assert_eq!(gap.pane_id, 1);
         assert_eq!(gap.seq_before, 2); // Last seq was 2
-        assert_eq!(gap.seq_after, 3);  // Next expected would be 3
+        assert_eq!(gap.seq_after, 3); // Next expected would be 3
         assert_eq!(gap.reason, "sequence_jump");
 
         // Query the gap from the database
@@ -2604,7 +2674,9 @@ mod tests {
         }
 
         // Verify all gaps were recorded with stable reasons
-        let mut stmt = conn.prepare("SELECT reason FROM output_gaps WHERE pane_id = ?1 ORDER BY id").unwrap();
+        let mut stmt = conn
+            .prepare("SELECT reason FROM output_gaps WHERE pane_id = ?1 ORDER BY id")
+            .unwrap();
         let recorded_reasons: Vec<String> = stmt
             .query_map([1i64], |row| row.get(0))
             .unwrap()
@@ -2655,7 +2727,10 @@ mod tests {
 
         // Verify strictly descending order
         for window in all_segments.windows(2) {
-            assert!(window[0].seq > window[1].seq, "Segments should be in strictly descending seq order");
+            assert!(
+                window[0].seq > window[1].seq,
+                "Segments should be in strictly descending seq order"
+            );
         }
     }
 
@@ -2791,250 +2866,260 @@ mod tests {
     }
 }
 
-    // =========================================================================
-    // wa-4vx.3.4: FTS Search API Tests
-    // =========================================================================
+// =========================================================================
+// wa-4vx.3.4: FTS Search API Tests
+// =========================================================================
 
-    #[test]
-    fn fts_search_returns_matching_segments() {
-        let conn = Connection::open_in_memory().unwrap();
-        initialize_schema(&conn).unwrap();
+#[test]
+fn fts_search_returns_matching_segments() {
+    let conn = Connection::open_in_memory().unwrap();
+    initialize_schema(&conn).unwrap();
 
-        let now_ms = 1_700_000_000_000i64;
+    let now_ms = 1_700_000_000_000i64;
 
-        // Insert pane
-        conn.execute(
+    // Insert pane
+    conn.execute(
             "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![1i64, "local", now_ms, now_ms, 1],
         ).unwrap();
 
-        // Insert segments with different content
-        conn.execute(
+    // Insert segments with different content
+    conn.execute(
             "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![1i64, 0i64, "error: connection refused", 26, now_ms],
         ).unwrap();
-        conn.execute(
+    conn.execute(
             "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![1i64, 1i64, "successfully connected to server", 32, now_ms + 100],
         ).unwrap();
-        conn.execute(
+    conn.execute(
             "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![1i64, 2i64, "another error occurred here", 27, now_ms + 200],
         ).unwrap();
 
-        // Search for "error"
-        let results = search_fts_with_snippets(&conn, "error", &SearchOptions::default()).unwrap();
+    // Search for "error"
+    let results = search_fts_with_snippets(&conn, "error", &SearchOptions::default()).unwrap();
 
-        assert_eq!(results.len(), 2, "Should find 2 segments with 'error'");
-        assert!(results[0].segment.content.contains("error"));
-        assert!(results[1].segment.content.contains("error"));
-    }
+    assert_eq!(results.len(), 2, "Should find 2 segments with 'error'");
+    assert!(results[0].segment.content.contains("error"));
+    assert!(results[1].segment.content.contains("error"));
+}
 
-    #[test]
-    fn fts_search_returns_snippets_with_highlights() {
-        let conn = Connection::open_in_memory().unwrap();
-        initialize_schema(&conn).unwrap();
+#[test]
+fn fts_search_returns_snippets_with_highlights() {
+    let conn = Connection::open_in_memory().unwrap();
+    initialize_schema(&conn).unwrap();
 
-        let now_ms = 1_700_000_000_000i64;
+    let now_ms = 1_700_000_000_000i64;
 
-        conn.execute(
+    conn.execute(
             "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![1i64, "local", now_ms, now_ms, 1],
         ).unwrap();
 
-        conn.execute(
+    conn.execute(
             "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![1i64, 0i64, "The important error message appears here", 40, now_ms],
         ).unwrap();
 
-        let options = SearchOptions {
-            highlight_prefix: Some("[[".to_string()),
-            highlight_suffix: Some("]]".to_string()),
-            ..Default::default()
-        };
-        let results = search_fts_with_snippets(&conn, "error", &options).unwrap();
+    let options = SearchOptions {
+        highlight_prefix: Some("[[".to_string()),
+        highlight_suffix: Some("]]".to_string()),
+        ..Default::default()
+    };
+    let results = search_fts_with_snippets(&conn, "error", &options).unwrap();
 
-        assert_eq!(results.len(), 1);
-        let snippet = results[0].snippet.as_ref().expect("Should have snippet");
-        assert!(
-            snippet.contains("[[error]]"),
-            "Snippet should contain highlighted term: {snippet}"
-        );
-    }
+    assert_eq!(results.len(), 1);
+    let snippet = results[0].snippet.as_ref().expect("Should have snippet");
+    assert!(
+        snippet.contains("[[error]]"),
+        "Snippet should contain highlighted term: {snippet}"
+    );
+}
 
-    #[test]
-    fn fts_search_respects_pane_filter() {
-        let conn = Connection::open_in_memory().unwrap();
-        initialize_schema(&conn).unwrap();
+#[test]
+fn fts_search_respects_pane_filter() {
+    let conn = Connection::open_in_memory().unwrap();
+    initialize_schema(&conn).unwrap();
 
-        let now_ms = 1_700_000_000_000i64;
+    let now_ms = 1_700_000_000_000i64;
 
-        conn.execute(
+    conn.execute(
             "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![1i64, "local", now_ms, now_ms, 1],
         ).unwrap();
-        conn.execute(
+    conn.execute(
             "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![2i64, "local", now_ms, now_ms, 1],
         ).unwrap();
 
-        conn.execute(
+    conn.execute(
             "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![1i64, 0i64, "pane one test message", 21, now_ms],
         ).unwrap();
-        conn.execute(
+    conn.execute(
             "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![2i64, 0i64, "pane two test message", 21, now_ms],
         ).unwrap();
 
-        let options = SearchOptions {
-            pane_id: Some(1),
-            ..Default::default()
-        };
-        let results = search_fts_with_snippets(&conn, "test", &options).unwrap();
+    let options = SearchOptions {
+        pane_id: Some(1),
+        ..Default::default()
+    };
+    let results = search_fts_with_snippets(&conn, "test", &options).unwrap();
 
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].segment.pane_id, 1);
-    }
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].segment.pane_id, 1);
+}
 
-    #[test]
-    fn fts_search_respects_time_filter() {
-        let conn = Connection::open_in_memory().unwrap();
-        initialize_schema(&conn).unwrap();
+#[test]
+fn fts_search_respects_time_filter() {
+    let conn = Connection::open_in_memory().unwrap();
+    initialize_schema(&conn).unwrap();
 
-        let now_ms = 1_700_000_000_000i64;
+    let now_ms = 1_700_000_000_000i64;
 
-        conn.execute(
+    conn.execute(
             "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![1i64, "local", now_ms, now_ms + 2000, 1],
         ).unwrap();
 
-        conn.execute(
+    conn.execute(
             "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![1i64, 0i64, "early test message", 18, now_ms],
         ).unwrap();
-        conn.execute(
+    conn.execute(
             "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![1i64, 1i64, "middle test message", 19, now_ms + 1000],
         ).unwrap();
-        conn.execute(
+    conn.execute(
             "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![1i64, 2i64, "late test message", 17, now_ms + 2000],
         ).unwrap();
 
-        let options = SearchOptions {
-            since: Some(now_ms + 500),
-            until: Some(now_ms + 1500),
-            ..Default::default()
-        };
-        let results = search_fts_with_snippets(&conn, "test", &options).unwrap();
+    let options = SearchOptions {
+        since: Some(now_ms + 500),
+        until: Some(now_ms + 1500),
+        ..Default::default()
+    };
+    let results = search_fts_with_snippets(&conn, "test", &options).unwrap();
 
-        assert_eq!(results.len(), 1);
-        assert!(results[0].segment.content.contains("middle"));
-    }
+    assert_eq!(results.len(), 1);
+    assert!(results[0].segment.content.contains("middle"));
+}
 
-    #[test]
-    fn fts_search_invalid_query_returns_error() {
-        let conn = Connection::open_in_memory().unwrap();
-        initialize_schema(&conn).unwrap();
+#[test]
+fn fts_search_invalid_query_returns_error() {
+    let conn = Connection::open_in_memory().unwrap();
+    initialize_schema(&conn).unwrap();
 
-        let result = validate_fts_query(&conn, "\"unclosed quote");
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        let err_msg = err.to_string();
-        assert!(
-            err_msg.contains("Invalid FTS5 query syntax"),
-            "Error should mention FTS5 syntax: {err_msg}"
-        );
-    }
+    let result = validate_fts_query(&conn, "\"unclosed quote");
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    let err_msg = err.to_string();
+    assert!(
+        err_msg.contains("Invalid FTS5 query syntax"),
+        "Error should mention FTS5 syntax: {err_msg}"
+    );
+}
 
-    #[test]
-    fn fts_search_respects_limit() {
-        let conn = Connection::open_in_memory().unwrap();
-        initialize_schema(&conn).unwrap();
+#[test]
+fn fts_search_respects_limit() {
+    let conn = Connection::open_in_memory().unwrap();
+    initialize_schema(&conn).unwrap();
 
-        let now_ms = 1_700_000_000_000i64;
+    let now_ms = 1_700_000_000_000i64;
 
-        conn.execute(
-            "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![1i64, "local", now_ms, now_ms, 1],
-        ).unwrap();
+    conn.execute(
+        "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![1i64, "local", now_ms, now_ms, 1],
+    )
+    .unwrap();
 
-        for i in 0i64..10 {
-            conn.execute(
-                "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    1i64,
-                    i,
-                    format!("test message number {i}"),
-                    20,
-                    now_ms + i * 100
-                ],
-            ).unwrap();
-        }
-
-        let options = SearchOptions {
-            limit: Some(3),
-            ..Default::default()
-        };
-        let results = search_fts_with_snippets(&conn, "test", &options).unwrap();
-
-        assert_eq!(results.len(), 3, "Should respect limit of 3");
-    }
-
-    #[test]
-    fn fts_search_bm25_ordering() {
-        let conn = Connection::open_in_memory().unwrap();
-        initialize_schema(&conn).unwrap();
-
-        let now_ms = 1_700_000_000_000i64;
-
-        conn.execute(
-            "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![1i64, "local", now_ms, now_ms, 1],
-        ).unwrap();
-
+    for i in 0i64..10 {
         conn.execute(
             "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![1i64, 0i64, "single error here", 17, now_ms],
-        ).unwrap();
-        conn.execute(
-            "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![1i64, 1i64, "error error error multiple errors", 33, now_ms + 100],
-        ).unwrap();
-
-        let results = search_fts_with_snippets(&conn, "error", &SearchOptions::default()).unwrap();
-
-        assert_eq!(results.len(), 2);
-        assert!(
-            results[0].score <= results[1].score,
-            "First result should have lower (better) BM25 score"
-        );
+            params![
+                1i64,
+                i,
+                format!("test message number {i}"),
+                20,
+                now_ms + i * 100
+            ],
+        )
+        .unwrap();
     }
 
-    #[test]
-    fn fts_search_no_snippets_option() {
-        let conn = Connection::open_in_memory().unwrap();
-        initialize_schema(&conn).unwrap();
+    let options = SearchOptions {
+        limit: Some(3),
+        ..Default::default()
+    };
+    let results = search_fts_with_snippets(&conn, "test", &options).unwrap();
 
-        let now_ms = 1_700_000_000_000i64;
+    assert_eq!(results.len(), 3, "Should respect limit of 3");
+}
 
-        conn.execute(
-            "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![1i64, "local", now_ms, now_ms, 1],
-        ).unwrap();
+#[test]
+fn fts_search_bm25_ordering() {
+    let conn = Connection::open_in_memory().unwrap();
+    initialize_schema(&conn).unwrap();
 
-        conn.execute(
-            "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![1i64, 0i64, "test content here", 17, now_ms],
-        ).unwrap();
+    let now_ms = 1_700_000_000_000i64;
 
-        let options = SearchOptions {
-            include_snippets: Some(false),
-            ..Default::default()
-        };
-        let results = search_fts_with_snippets(&conn, "test", &options).unwrap();
+    conn.execute(
+        "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![1i64, "local", now_ms, now_ms, 1],
+    )
+    .unwrap();
 
-        assert_eq!(results.len(), 1);
-        assert!(results[0].snippet.is_none(), "Snippet should be None when disabled");
-    }
+    conn.execute(
+        "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![1i64, 0i64, "single error here", 17, now_ms],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![1i64, 1i64, "error error error multiple errors", 33, now_ms + 100],
+    )
+    .unwrap();
+
+    let results = search_fts_with_snippets(&conn, "error", &SearchOptions::default()).unwrap();
+
+    assert_eq!(results.len(), 2);
+    assert!(
+        results[0].score <= results[1].score,
+        "First result should have lower (better) BM25 score"
+    );
+}
+
+#[test]
+fn fts_search_no_snippets_option() {
+    let conn = Connection::open_in_memory().unwrap();
+    initialize_schema(&conn).unwrap();
+
+    let now_ms = 1_700_000_000_000i64;
+
+    conn.execute(
+        "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![1i64, "local", now_ms, now_ms, 1],
+    )
+    .unwrap();
+
+    conn.execute(
+        "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![1i64, 0i64, "test content here", 17, now_ms],
+    )
+    .unwrap();
+
+    let options = SearchOptions {
+        include_snippets: Some(false),
+        ..Default::default()
+    };
+    let results = search_fts_with_snippets(&conn, "test", &options).unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert!(
+        results[0].snippet.is_none(),
+        "Snippet should be None when disabled"
+    );
+}

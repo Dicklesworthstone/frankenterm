@@ -545,9 +545,8 @@ pub fn build_send_policy_evaluation(
     // Continuity check
     if has_recent_gaps {
         eval.add_check(
-            PolicyCheck::passed("continuity", "Recent gap detected").with_details(
-                "Output continuity may be affected; consider waiting for stability",
-            ),
+            PolicyCheck::passed("continuity", "Recent gap detected")
+                .with_details("Output continuity may be affected; consider waiting for stability"),
         );
     } else {
         eval.add_check(PolicyCheck::passed("continuity", "No recent gaps (OK)"));
@@ -576,11 +575,7 @@ pub fn create_wait_for_action(
     PlannedAction::new(
         step,
         ActionType::WaitFor,
-        format!(
-            "Wait for: {} (timeout: {}ms)",
-            condition.into(),
-            timeout_ms
-        ),
+        format!("Wait for: {} (timeout: {}ms)", condition.into(), timeout_ms),
     )
 }
 

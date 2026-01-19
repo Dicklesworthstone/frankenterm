@@ -1,0 +1,11 @@
+[
+  {
+    "rule_id": "claude_code.auth.api_key_error",
+    "agent_type": "claude_code",
+    "event_type": "auth.error",
+    "severity": "critical",
+    "confidence": 0.6,
+    "extracted": {},
+    "matched_text": "ANTHROPIC_API_KEY"
+  }
+]

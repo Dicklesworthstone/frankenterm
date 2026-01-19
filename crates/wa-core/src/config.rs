@@ -829,10 +829,19 @@ mod tests {
         let parsed = Config::from_toml(&toml).expect("Failed to parse");
 
         assert_eq!(config.general.log_level, parsed.general.log_level);
-        assert_eq!(config.ingest.poll_interval_ms, parsed.ingest.poll_interval_ms);
+        assert_eq!(
+            config.ingest.poll_interval_ms,
+            parsed.ingest.poll_interval_ms
+        );
         assert_eq!(config.storage.retention_days, parsed.storage.retention_days);
-        assert_eq!(config.workflows.max_concurrent, parsed.workflows.max_concurrent);
-        assert_eq!(config.safety.rate_limit_per_pane, parsed.safety.rate_limit_per_pane);
+        assert_eq!(
+            config.workflows.max_concurrent,
+            parsed.workflows.max_concurrent
+        );
+        assert_eq!(
+            config.safety.rate_limit_per_pane,
+            parsed.safety.rate_limit_per_pane
+        );
         assert_eq!(config.metrics.enabled, parsed.metrics.enabled);
     }
 
@@ -892,7 +901,10 @@ disabled_rules = ["codex.usage_warning"]
         assert_eq!(config.patterns.packs.len(), 2);
         let codex_override = config.patterns.pack_overrides.get("codex");
         assert!(codex_override.is_some());
-        assert_eq!(codex_override.unwrap().disabled_rules, vec!["codex.usage_warning"]);
+        assert_eq!(
+            codex_override.unwrap().disabled_rules,
+            vec!["codex.usage_warning"]
+        );
     }
 
     #[test]
@@ -980,19 +992,21 @@ disabled_rules = ["codex.usage_warning"]
         let mut filter = PaneFilterConfig::default();
 
         // Include all SSH panes
-        filter.include.push(
-            PaneFilterRule::new("include_ssh")
-                .with_domain("SSH:*")
-        );
+        filter
+            .include
+            .push(PaneFilterRule::new("include_ssh").with_domain("SSH:*"));
 
         // But exclude those with private in cwd
-        filter.exclude.push(
-            PaneFilterRule::new("exclude_private")
-                .with_cwd("/home/user/private*")
-        );
+        filter
+            .exclude
+            .push(PaneFilterRule::new("exclude_private").with_cwd("/home/user/private*"));
 
         // SSH pane in normal cwd - allowed
-        assert!(filter.check_pane("SSH:remote", "bash", "/home/user/work").is_none());
+        assert!(
+            filter
+                .check_pane("SSH:remote", "bash", "/home/user/work")
+                .is_none()
+        );
 
         // SSH pane in private cwd - excluded (exclude wins)
         let result = filter.check_pane("SSH:remote", "bash", "/home/user/private/secrets");
@@ -1005,8 +1019,7 @@ disabled_rules = ["codex.usage_warning"]
 
     #[test]
     fn pane_filter_rule_domain_exact_match() {
-        let rule = PaneFilterRule::new("test_domain")
-            .with_domain("local");
+        let rule = PaneFilterRule::new("test_domain").with_domain("local");
 
         assert!(rule.matches("local", "any", "any"));
         assert!(!rule.matches("LOCAL", "any", "any")); // case-sensitive
@@ -1016,8 +1029,7 @@ disabled_rules = ["codex.usage_warning"]
 
     #[test]
     fn pane_filter_rule_domain_glob() {
-        let rule = PaneFilterRule::new("ssh_glob")
-            .with_domain("SSH:*");
+        let rule = PaneFilterRule::new("ssh_glob").with_domain("SSH:*");
 
         assert!(rule.matches("SSH:remote", "any", "any"));
         assert!(rule.matches("SSH:server.example.com", "any", "any"));
@@ -1027,8 +1039,7 @@ disabled_rules = ["codex.usage_warning"]
 
     #[test]
     fn pane_filter_rule_title_substring() {
-        let rule = PaneFilterRule::new("vim_title")
-            .with_title("vim");
+        let rule = PaneFilterRule::new("vim_title").with_title("vim");
 
         assert!(rule.matches("any", "vim", "any"));
         assert!(rule.matches("any", "nvim - file.rs", "any"));
@@ -1039,8 +1050,7 @@ disabled_rules = ["codex.usage_warning"]
 
     #[test]
     fn pane_filter_rule_title_regex() {
-        let rule = PaneFilterRule::new("bash_regex")
-            .with_title("re:^bash.*$");
+        let rule = PaneFilterRule::new("bash_regex").with_title("re:^bash.*$");
 
         assert!(rule.matches("any", "bash", "any"));
         assert!(rule.matches("any", "bash --login", "any"));
@@ -1050,8 +1060,7 @@ disabled_rules = ["codex.usage_warning"]
 
     #[test]
     fn pane_filter_rule_cwd_prefix() {
-        let rule = PaneFilterRule::new("tmp_cwd")
-            .with_cwd("/tmp");
+        let rule = PaneFilterRule::new("tmp_cwd").with_cwd("/tmp");
 
         assert!(rule.matches("any", "any", "/tmp"));
         assert!(rule.matches("any", "any", "/tmp/subdir"));
@@ -1062,8 +1071,7 @@ disabled_rules = ["codex.usage_warning"]
 
     #[test]
     fn pane_filter_rule_cwd_glob() {
-        let rule = PaneFilterRule::new("home_glob")
-            .with_cwd("/home/*/private");
+        let rule = PaneFilterRule::new("home_glob").with_cwd("/home/*/private");
 
         assert!(rule.matches("any", "any", "/home/user/private"));
         assert!(rule.matches("any", "any", "/home/admin/private"));
@@ -1113,8 +1121,7 @@ disabled_rules = ["codex.usage_warning"]
         assert!(no_matchers.validate().is_err());
 
         // Invalid regex
-        let invalid_regex = PaneFilterRule::new("test")
-            .with_title("re:[invalid(regex");
+        let invalid_regex = PaneFilterRule::new("test").with_title("re:[invalid(regex");
         assert!(invalid_regex.validate().is_err());
     }
 
@@ -1159,14 +1166,16 @@ title = "vim"
     #[test]
     fn pane_filter_config_serialization() {
         let mut config = Config::default();
-        config.ingest.panes.include.push(
-            PaneFilterRule::new("test_include")
-                .with_domain("local")
-        );
-        config.ingest.panes.exclude.push(
-            PaneFilterRule::new("test_exclude")
-                .with_cwd("/tmp")
-        );
+        config
+            .ingest
+            .panes
+            .include
+            .push(PaneFilterRule::new("test_include").with_domain("local"));
+        config
+            .ingest
+            .panes
+            .exclude
+            .push(PaneFilterRule::new("test_exclude").with_cwd("/tmp"));
 
         let toml = config.to_toml().expect("Failed to serialize");
         let parsed = Config::from_toml(&toml).expect("Failed to parse");
@@ -1180,8 +1189,7 @@ title = "vim"
     #[test]
     fn pane_filter_glob_special_chars() {
         // Test that special regex characters in domain/cwd are properly escaped
-        let rule = PaneFilterRule::new("special")
-            .with_domain("domain.with.dots");
+        let rule = PaneFilterRule::new("special").with_domain("domain.with.dots");
 
         assert!(rule.matches("domain.with.dots", "any", "any"));
         assert!(!rule.matches("domainXwithXdots", "any", "any"));
@@ -1189,8 +1197,7 @@ title = "vim"
 
     #[test]
     fn pane_filter_question_mark_glob() {
-        let rule = PaneFilterRule::new("single_char")
-            .with_domain("SSH:?");
+        let rule = PaneFilterRule::new("single_char").with_domain("SSH:?");
 
         assert!(rule.matches("SSH:a", "any", "any"));
         assert!(rule.matches("SSH:1", "any", "any"));

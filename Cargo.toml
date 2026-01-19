@@ -62,6 +62,7 @@ rusqlite = { version = "0.32", features = ["bundled", "backup", "functions"] }
 aho-corasick = "1.1"
 memchr = "2.7"
 fancy-regex = "0.14"
+regex = "1.10"
 
 # Config
 toml = "0.8"

@@ -292,7 +292,9 @@ impl EventBus {
     /// Returns the number of subscribers that received the event.
     #[must_use]
     pub fn publish(&self, event: Event) -> usize {
-        self.metrics.events_published.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .events_published
+            .fetch_add(1, Ordering::Relaxed);
         let mut delivered = 0usize;
 
         if let Ok(count) = self.all_sender.send(event.clone()) {
@@ -437,7 +439,9 @@ impl std::fmt::Display for RecvError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Closed => write!(f, "event bus closed"),
-            Self::Lagged { missed_count } => write!(f, "subscriber lagged, missed {missed_count} events"),
+            Self::Lagged { missed_count } => {
+                write!(f, "subscriber lagged, missed {missed_count} events")
+            }
         }
     }
 }
