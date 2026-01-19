@@ -8,7 +8,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::policy::PolicyDecision;
+use crate::policy::{PolicyDecision, Redactor};
 
 // ============================================================================
 // Core Types
@@ -185,6 +185,51 @@ impl DryRunReport {
     #[must_use]
     pub fn action_count(&self) -> usize {
         self.expected_actions.len()
+    }
+
+    /// Return a redacted copy of this report for safe output.
+    #[must_use]
+    pub fn redacted(&self) -> Self {
+        let redactor = Redactor::new();
+        let mut report = self.clone();
+
+        report.command = redactor.redact(&report.command);
+
+        if let Some(target) = &mut report.target_resolution {
+            target.domain = redactor.redact(&target.domain);
+            if let Some(title) = &mut target.title {
+                *title = redactor.redact(title);
+            }
+            if let Some(cwd) = &mut target.cwd {
+                *cwd = redactor.redact(cwd);
+            }
+            if let Some(agent) = &mut target.agent_type {
+                *agent = redactor.redact(agent);
+            }
+        }
+
+        if let Some(policy) = &mut report.policy_evaluation {
+            for check in &mut policy.checks {
+                check.name = redactor.redact(&check.name);
+                check.message = redactor.redact(&check.message);
+                if let Some(details) = &mut check.details {
+                    *details = redactor.redact(details);
+                }
+            }
+        }
+
+        for action in &mut report.expected_actions {
+            action.description = redactor.redact(&action.description);
+            if let Some(metadata) = &mut action.metadata {
+                redact_json_value(metadata, &redactor);
+            }
+        }
+
+        for warning in &mut report.warnings {
+            *warning = redactor.redact(warning);
+        }
+
+        report
     }
 }
 
@@ -449,9 +494,28 @@ impl fmt::Display for ActionType {
 // Output Formatting
 // ============================================================================
 
+fn redact_json_value(value: &mut serde_json::Value, redactor: &Redactor) {
+    match value {
+        serde_json::Value::String(text) => {
+            *text = redactor.redact(text);
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact_json_value(item, redactor);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for value in map.values_mut() {
+                redact_json_value(value, redactor);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
 /// Format a dry-run report as JSON
 pub fn format_json(report: &DryRunReport) -> Result<String, serde_json::Error> {
-    serde_json::to_string_pretty(report)
+    serde_json::to_string_pretty(&report.redacted())
 }
 
 /// Format a dry-run report for human-readable TTY output
@@ -459,6 +523,7 @@ pub fn format_json(report: &DryRunReport) -> Result<String, serde_json::Error> {
 pub fn format_human(report: &DryRunReport) -> String {
     use std::fmt::Write;
 
+    let report = report.redacted();
     let mut output = String::new();
 
     // Header
@@ -669,6 +734,19 @@ mod tests {
         assert!(json.contains("test command"));
         assert!(json.contains("42"));
         assert!(json.contains("warning 1"));
+    }
+
+    #[test]
+    fn format_json_redacts_secrets() {
+        let secret = "sk-abc123456789012345678901234567890123456789012345678901";
+        let mut report = DryRunReport::with_command(format!("wa send {secret}"));
+        report
+            .warnings
+            .push(format!("token: {secret} should be hidden"));
+
+        let json = format_json(&report).expect("serialization should succeed");
+        assert!(json.contains("[REDACTED]"));
+        assert!(!json.contains("sk-abc"));
     }
 
     #[test]

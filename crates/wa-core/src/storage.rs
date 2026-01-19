@@ -16,6 +16,7 @@
 //! - `events`: Pattern detections with lifecycle tracking
 //! - `workflow_executions`: Durable workflow state
 //! - `workflow_step_logs`: Step execution history
+//! - `audit_actions`: Audit trail for policy decisions and outcomes
 //! - `config`: Key-value settings
 //! - `maintenance_log`: System events and metrics
 //!
@@ -25,11 +26,15 @@ use std::path::Path;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
-use rusqlite::{Connection, OptionalExtension, params, types::Type};
+use rusqlite::{
+    Connection, OptionalExtension, params,
+    types::{Type, Value as SqlValue},
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{Result, StorageError};
+use crate::policy::Redactor;
 
 // =============================================================================
 // Schema Definition
@@ -173,6 +178,29 @@ CREATE TABLE IF NOT EXISTS workflow_step_logs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_step_logs_workflow ON workflow_step_logs(workflow_id, step_index);
+
+-- Audit actions: policy decisions and outcomes
+CREATE TABLE IF NOT EXISTS audit_actions (
+    id INTEGER PRIMARY KEY,
+    ts INTEGER NOT NULL,               -- epoch ms
+    actor_kind TEXT NOT NULL,          -- human, robot, mcp, workflow
+    actor_id TEXT,                     -- optional (workflow execution id, MCP client id)
+    pane_id INTEGER REFERENCES panes(pane_id) ON DELETE SET NULL,
+    domain TEXT,
+    action_kind TEXT NOT NULL,         -- send_text, workflow_run, etc.
+    policy_decision TEXT NOT NULL,     -- allow, deny, require_approval
+    decision_reason TEXT,
+    rule_id TEXT,                      -- policy rule id if any
+    input_summary TEXT,                -- redacted summary of input
+    verification_summary TEXT,         -- redacted summary of verification
+    result TEXT NOT NULL               -- success, denied, failed, timeout
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_actions_ts ON audit_actions(ts);
+CREATE INDEX IF NOT EXISTS idx_audit_actions_pane ON audit_actions(pane_id, ts);
+CREATE INDEX IF NOT EXISTS idx_audit_actions_actor ON audit_actions(actor_kind, ts);
+CREATE INDEX IF NOT EXISTS idx_audit_actions_action ON audit_actions(action_kind, ts);
+CREATE INDEX IF NOT EXISTS idx_audit_actions_decision ON audit_actions(policy_decision, ts);
 
 -- Config: key-value settings
 CREATE TABLE IF NOT EXISTS config (
@@ -469,6 +497,55 @@ pub struct WorkflowStepLogRecord {
     pub duration_ms: i64,
 }
 
+/// Audit action record for policy decisions and outcomes
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditActionRecord {
+    /// Audit record ID
+    pub id: i64,
+    /// Timestamp (epoch ms)
+    pub ts: i64,
+    /// Actor kind (human, robot, mcp, workflow)
+    pub actor_kind: String,
+    /// Optional actor identifier (workflow id, MCP client id)
+    pub actor_id: Option<String>,
+    /// Pane ID (if action targeted a pane)
+    pub pane_id: Option<u64>,
+    /// Domain name (if applicable)
+    pub domain: Option<String>,
+    /// Action kind (send_text, workflow_run, etc.)
+    pub action_kind: String,
+    /// Policy decision (allow, deny, require_approval)
+    pub policy_decision: String,
+    /// Policy decision reason (redacted)
+    pub decision_reason: Option<String>,
+    /// Policy rule ID, if any
+    pub rule_id: Option<String>,
+    /// Redacted input summary
+    pub input_summary: Option<String>,
+    /// Redacted verification summary
+    pub verification_summary: Option<String>,
+    /// Result (success, denied, failed, timeout)
+    pub result: String,
+}
+
+impl AuditActionRecord {
+    /// Redact sensitive fields before persistence or export
+    pub fn redact_fields(&mut self, redactor: &Redactor) {
+        self.decision_reason = self
+            .decision_reason
+            .as_ref()
+            .map(|value| redactor.redact(value));
+        self.input_summary = self
+            .input_summary
+            .as_ref()
+            .map(|value| redactor.redact(value));
+        self.verification_summary = self
+            .verification_summary
+            .as_ref()
+            .map(|value| redactor.redact(value));
+    }
+}
+
 // =============================================================================
 // Schema Initialization
 // =============================================================================
@@ -588,6 +665,16 @@ enum WriteCommand {
     UpsertSession {
         session: AgentSessionRecord,
         respond: oneshot::Sender<Result<i64>>,
+    },
+    /// Record an audit action
+    RecordAuditAction {
+        action: AuditActionRecord,
+        respond: oneshot::Sender<Result<i64>>,
+    },
+    /// Purge audit actions older than a cutoff timestamp
+    PurgeAuditActions {
+        before_ts: i64,
+        respond: oneshot::Sender<Result<usize>>,
     },
     /// Shutdown the writer thread (flush pending writes)
     Shutdown { respond: oneshot::Sender<()> },
@@ -745,6 +832,43 @@ impl StorageHandle {
                 event_id,
                 workflow_id,
                 status: status.to_string(),
+                respond: tx,
+            })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    /// Record an audit action
+    pub async fn record_audit_action(&self, action: AuditActionRecord) -> Result<i64> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::RecordAuditAction {
+                action,
+                respond: tx,
+            })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    /// Record an audit action after applying redaction
+    pub async fn record_audit_action_redacted(&self, mut action: AuditActionRecord) -> Result<i64> {
+        let redactor = Redactor::new();
+        action.redact_fields(&redactor);
+        self.record_audit_action(action).await
+    }
+
+    /// Purge audit actions older than a cutoff timestamp
+    pub async fn purge_audit_actions_before(&self, before_ts: i64) -> Result<usize> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::PurgeAuditActions {
+                before_ts,
                 respond: tx,
             })
             .await
@@ -946,6 +1070,21 @@ impl StorageHandle {
         .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
+    /// Query audit actions with filters
+    pub async fn get_audit_actions(&self, query: AuditQuery) -> Result<Vec<AuditActionRecord>> {
+        let db_path = Arc::clone(&self.db_path);
+
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+
+            crate::storage::query_audit_actions(&conn, &query)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+    }
+
     /// Get all panes
     pub async fn get_panes(&self) -> Result<Vec<PaneRecord>> {
         let db_path = Arc::clone(&self.db_path);
@@ -1071,6 +1210,33 @@ pub struct SearchOptions {
     pub highlight_suffix: Option<String>,
 }
 
+/// Query options for audit actions
+#[derive(Debug, Clone, Default)]
+pub struct AuditQuery {
+    /// Maximum number of results (default: 100)
+    pub limit: Option<usize>,
+    /// Filter by pane ID
+    pub pane_id: Option<u64>,
+    /// Filter by domain name
+    pub domain: Option<String>,
+    /// Filter by actor kind
+    pub actor_kind: Option<String>,
+    /// Filter by actor identifier
+    pub actor_id: Option<String>,
+    /// Filter by action kind
+    pub action_kind: Option<String>,
+    /// Filter by policy decision
+    pub policy_decision: Option<String>,
+    /// Filter by rule ID
+    pub rule_id: Option<String>,
+    /// Filter by result
+    pub result: Option<String>,
+    /// Filter by time range start (epoch ms)
+    pub since: Option<i64>,
+    /// Filter by time range end (epoch ms)
+    pub until: Option<i64>,
+}
+
 // =============================================================================
 // Writer Thread Implementation
 // =============================================================================
@@ -1143,6 +1309,14 @@ fn writer_loop(conn: &Connection, rx: &mut mpsc::Receiver<WriteCommand>) {
             }
             WriteCommand::UpsertSession { session, respond } => {
                 let result = upsert_agent_session_sync(conn, &session);
+                let _ = respond.send(result);
+            }
+            WriteCommand::RecordAuditAction { action, respond } => {
+                let result = record_audit_action_sync(conn, &action);
+                let _ = respond.send(result);
+            }
+            WriteCommand::PurgeAuditActions { before_ts, respond } => {
+                let result = purge_audit_actions_sync(conn, before_ts);
                 let _ = respond.send(result);
             }
             WriteCommand::Shutdown { respond } => {
@@ -1542,6 +1716,46 @@ fn upsert_agent_session_sync(conn: &Connection, session: &AgentSessionRecord) ->
     }
 }
 
+/// Record an audit action (synchronous)
+fn record_audit_action_sync(conn: &Connection, action: &AuditActionRecord) -> Result<i64> {
+    let pane_id_i64 = action
+        .pane_id
+        .map(|pane_id| u64_to_i64(pane_id, "pane_id"))
+        .transpose()?;
+    let ts = if action.ts == 0 { now_ms() } else { action.ts };
+
+    conn.execute(
+        "INSERT INTO audit_actions (ts, actor_kind, actor_id, pane_id, domain, action_kind,
+         policy_decision, decision_reason, rule_id, input_summary, verification_summary, result)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            ts,
+            action.actor_kind.as_str(),
+            action.actor_id.as_deref(),
+            pane_id_i64,
+            action.domain.as_deref(),
+            action.action_kind.as_str(),
+            action.policy_decision.as_str(),
+            action.decision_reason.as_deref(),
+            action.rule_id.as_deref(),
+            action.input_summary.as_deref(),
+            action.verification_summary.as_deref(),
+            action.result.as_str(),
+        ],
+    )
+    .map_err(|e| StorageError::Database(format!("Failed to insert audit action: {e}")))?;
+
+    Ok(conn.last_insert_rowid())
+}
+
+/// Purge audit actions before a cutoff timestamp (synchronous)
+fn purge_audit_actions_sync(conn: &Connection, before_ts: i64) -> Result<usize> {
+    let deleted = conn
+        .execute("DELETE FROM audit_actions WHERE ts < ?1", [before_ts])
+        .map_err(|e| StorageError::Database(format!("Failed to purge audit actions: {e}")))?;
+    Ok(deleted)
+}
+
 // =============================================================================
 // Read Operations (called from spawn_blocking)
 // =============================================================================
@@ -1878,6 +2092,97 @@ fn query_unhandled_events(conn: &Connection, limit: usize) -> Result<Vec<StoredE
     Ok(results)
 }
 
+/// Query audit actions with optional filters
+fn query_audit_actions(conn: &Connection, query: &AuditQuery) -> Result<Vec<AuditActionRecord>> {
+    let mut sql = String::from(
+        "SELECT id, ts, actor_kind, actor_id, pane_id, domain, action_kind, policy_decision,
+         decision_reason, rule_id, input_summary, verification_summary, result
+         FROM audit_actions WHERE 1=1",
+    );
+    let mut params: Vec<SqlValue> = Vec::new();
+
+    if let Some(pane_id) = query.pane_id {
+        let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
+        sql.push_str(" AND pane_id = ?");
+        params.push(SqlValue::Integer(pane_id_i64));
+    }
+    if let Some(domain) = &query.domain {
+        sql.push_str(" AND domain = ?");
+        params.push(SqlValue::Text(domain.clone()));
+    }
+    if let Some(actor_kind) = &query.actor_kind {
+        sql.push_str(" AND actor_kind = ?");
+        params.push(SqlValue::Text(actor_kind.clone()));
+    }
+    if let Some(actor_id) = &query.actor_id {
+        sql.push_str(" AND actor_id = ?");
+        params.push(SqlValue::Text(actor_id.clone()));
+    }
+    if let Some(action_kind) = &query.action_kind {
+        sql.push_str(" AND action_kind = ?");
+        params.push(SqlValue::Text(action_kind.clone()));
+    }
+    if let Some(policy_decision) = &query.policy_decision {
+        sql.push_str(" AND policy_decision = ?");
+        params.push(SqlValue::Text(policy_decision.clone()));
+    }
+    if let Some(rule_id) = &query.rule_id {
+        sql.push_str(" AND rule_id = ?");
+        params.push(SqlValue::Text(rule_id.clone()));
+    }
+    if let Some(result) = &query.result {
+        sql.push_str(" AND result = ?");
+        params.push(SqlValue::Text(result.clone()));
+    }
+    if let Some(since) = query.since {
+        sql.push_str(" AND ts >= ?");
+        params.push(SqlValue::Integer(since));
+    }
+    if let Some(until) = query.until {
+        sql.push_str(" AND ts <= ?");
+        params.push(SqlValue::Integer(until));
+    }
+
+    sql.push_str(" ORDER BY ts DESC LIMIT ?");
+    let limit_i64 = usize_to_i64(query.limit.unwrap_or(100), "limit")?;
+    params.push(SqlValue::Integer(limit_i64));
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| StorageError::Database(format!("Failed to prepare audit query: {e}")))?;
+
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(params), |row| {
+            Ok(AuditActionRecord {
+                id: row.get(0)?,
+                ts: row.get(1)?,
+                actor_kind: row.get(2)?,
+                actor_id: row.get(3)?,
+                pane_id: {
+                    let val: Option<i64> = row.get(4)?;
+                    #[allow(clippy::cast_sign_loss)]
+                    val.map(|v| v as u64)
+                },
+                domain: row.get(5)?,
+                action_kind: row.get(6)?,
+                policy_decision: row.get(7)?,
+                decision_reason: row.get(8)?,
+                rule_id: row.get(9)?,
+                input_summary: row.get(10)?,
+                verification_summary: row.get(11)?,
+                result: row.get(12)?,
+            })
+        })
+        .map_err(|e| StorageError::Database(format!("Audit query failed: {e}")))?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row.map_err(|e| StorageError::Database(format!("Row error: {e}")))?);
+    }
+
+    Ok(results)
+}
+
 /// Query all panes
 fn query_panes(conn: &Connection) -> Result<Vec<PaneRecord>> {
     let mut stmt = conn
@@ -2179,6 +2484,7 @@ mod tests {
             "events",
             "workflow_executions",
             "workflow_step_logs",
+            "audit_actions",
             "config",
             "maintenance_log",
         ];
@@ -2596,6 +2902,156 @@ mod tests {
         let json = serde_json::to_string(&workflow).unwrap();
         assert!(json.contains("handle_compaction"));
         assert!(json.contains("wf-001"));
+    }
+
+    // =========================================================================
+    // wa-4vx.3.8: Audit Actions Tests
+    // =========================================================================
+
+    #[test]
+    fn audit_action_record_serializes() {
+        let action = AuditActionRecord {
+            id: 1,
+            ts: 1_700_000_000_000,
+            actor_kind: "human".to_string(),
+            actor_id: Some("user-1".to_string()),
+            pane_id: Some(42),
+            domain: Some("local".to_string()),
+            action_kind: "send_text".to_string(),
+            policy_decision: "allow".to_string(),
+            decision_reason: Some("ok".to_string()),
+            rule_id: Some("policy.allow".to_string()),
+            input_summary: Some("echo hi".to_string()),
+            verification_summary: Some("prompt_active".to_string()),
+            result: "success".to_string(),
+        };
+
+        let json = serde_json::to_string(&action).unwrap();
+        assert!(json.contains("send_text"));
+        assert!(json.contains("policy_decision"));
+    }
+
+    #[test]
+    fn audit_action_redacts_sensitive_fields() {
+        let mut action = AuditActionRecord {
+            id: 0,
+            ts: 1_700_000_000_000,
+            actor_kind: "robot".to_string(),
+            actor_id: None,
+            pane_id: Some(1),
+            domain: Some("local".to_string()),
+            action_kind: "send_text".to_string(),
+            policy_decision: "allow".to_string(),
+            decision_reason: Some(
+                "token sk-abc123456789012345678901234567890123456789012345678901".to_string(),
+            ),
+            rule_id: None,
+            input_summary: Some(
+                "API key sk-abc123456789012345678901234567890123456789012345678901".to_string(),
+            ),
+            verification_summary: Some("checked prompt".to_string()),
+            result: "success".to_string(),
+        };
+
+        let redactor = Redactor::new();
+        action.redact_fields(&redactor);
+
+        let reason = action.decision_reason.unwrap();
+        let input = action.input_summary.unwrap();
+
+        assert!(reason.contains("[REDACTED]"));
+        assert!(input.contains("[REDACTED]"));
+        assert!(!reason.contains("sk-abc"));
+        assert!(!input.contains("sk-abc"));
+    }
+
+    #[test]
+    fn can_insert_and_query_audit_actions() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let now_ms = 1_700_000_000_000i64;
+
+        conn.execute(
+            "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![1i64, "local", now_ms, now_ms, 1],
+        )
+        .unwrap();
+
+        let action = AuditActionRecord {
+            id: 0,
+            ts: now_ms,
+            actor_kind: "human".to_string(),
+            actor_id: Some("cli".to_string()),
+            pane_id: Some(1),
+            domain: Some("local".to_string()),
+            action_kind: "send_text".to_string(),
+            policy_decision: "allow".to_string(),
+            decision_reason: Some("ok".to_string()),
+            rule_id: None,
+            input_summary: Some("echo hi".to_string()),
+            verification_summary: Some("prompt".to_string()),
+            result: "success".to_string(),
+        };
+
+        let id = record_audit_action_sync(&conn, &action).unwrap();
+        assert!(id > 0);
+
+        let query = AuditQuery {
+            pane_id: Some(1),
+            actor_kind: Some("human".to_string()),
+            action_kind: Some("send_text".to_string()),
+            ..Default::default()
+        };
+        let rows = query_audit_actions(&conn, &query).unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].actor_kind, "human");
+        assert_eq!(rows[0].action_kind, "send_text");
+        assert_eq!(rows[0].policy_decision, "allow");
+    }
+
+    #[test]
+    fn purge_audit_actions_removes_old_entries() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![1i64, "local", 1i64, 1i64, 1],
+        )
+        .unwrap();
+
+        let older = AuditActionRecord {
+            id: 0,
+            ts: 1_000,
+            actor_kind: "human".to_string(),
+            actor_id: None,
+            pane_id: Some(1),
+            domain: Some("local".to_string()),
+            action_kind: "send_text".to_string(),
+            policy_decision: "allow".to_string(),
+            decision_reason: None,
+            rule_id: None,
+            input_summary: Some("old".to_string()),
+            verification_summary: None,
+            result: "success".to_string(),
+        };
+        let newer = AuditActionRecord {
+            ts: 2_000,
+            input_summary: Some("new".to_string()),
+            ..older.clone()
+        };
+
+        record_audit_action_sync(&conn, &older).unwrap();
+        record_audit_action_sync(&conn, &newer).unwrap();
+
+        let deleted = purge_audit_actions_sync(&conn, 1_500).unwrap();
+        assert_eq!(deleted, 1);
+
+        let rows = query_audit_actions(&conn, &AuditQuery::default()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].ts, 2_000);
     }
 
     // =========================================================================
@@ -3414,6 +3870,69 @@ async fn storage_handle_insert_step_log_and_query() {
     storage.shutdown().await.unwrap();
 
     // Cleanup
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+    let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+}
+
+#[tokio::test]
+async fn storage_handle_records_audit_action_redacted() {
+    let temp_dir = std::env::temp_dir();
+    let db_path = temp_dir.join(format!("wa_test_audit_{}.db", std::process::id()));
+    let db_path_str = db_path.to_string_lossy().to_string();
+
+    let storage = StorageHandle::new(&db_path_str).await.unwrap();
+
+    let pane = PaneRecord {
+        pane_id: 1,
+        domain: "local".to_string(),
+        window_id: None,
+        tab_id: None,
+        title: Some("test".to_string()),
+        cwd: None,
+        tty_name: None,
+        first_seen_at: 1_700_000_000_000,
+        last_seen_at: 1_700_000_000_000,
+        observed: true,
+        ignore_reason: None,
+        last_decision_at: None,
+    };
+    storage.upsert_pane(pane).await.unwrap();
+
+    let action = AuditActionRecord {
+        id: 0,
+        ts: 1_700_000_000_000,
+        actor_kind: "robot".to_string(),
+        actor_id: None,
+        pane_id: Some(1),
+        domain: Some("local".to_string()),
+        action_kind: "send_text".to_string(),
+        policy_decision: "allow".to_string(),
+        decision_reason: None,
+        rule_id: None,
+        input_summary: Some(
+            "API key sk-abc123456789012345678901234567890123456789012345678901".to_string(),
+        ),
+        verification_summary: None,
+        result: "success".to_string(),
+    };
+
+    storage.record_audit_action_redacted(action).await.unwrap();
+
+    let query = AuditQuery {
+        pane_id: Some(1),
+        limit: Some(10),
+        ..Default::default()
+    };
+    let rows = storage.get_audit_actions(query).await.unwrap();
+    assert_eq!(rows.len(), 1);
+
+    let input = rows[0].input_summary.as_ref().unwrap();
+    assert!(input.contains("[REDACTED]"));
+    assert!(!input.contains("sk-abc"));
+
+    storage.shutdown().await.unwrap();
+
     let _ = std::fs::remove_file(&db_path);
     let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
     let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
