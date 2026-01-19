@@ -17,6 +17,7 @@
 //! - `workflow_executions`: Durable workflow state
 //! - `workflow_step_logs`: Step execution history
 //! - `audit_actions`: Audit trail for policy decisions and outcomes
+//! - `approval_tokens`: Allow-once approvals scoped to actions
 //! - `config`: Key-value settings
 //! - `maintenance_log`: System events and metrics
 //!
@@ -201,6 +202,26 @@ CREATE INDEX IF NOT EXISTS idx_audit_actions_pane ON audit_actions(pane_id, ts);
 CREATE INDEX IF NOT EXISTS idx_audit_actions_actor ON audit_actions(actor_kind, ts);
 CREATE INDEX IF NOT EXISTS idx_audit_actions_action ON audit_actions(action_kind, ts);
 CREATE INDEX IF NOT EXISTS idx_audit_actions_decision ON audit_actions(policy_decision, ts);
+
+-- Approval tokens: allow-once approvals scoped to actions
+CREATE TABLE IF NOT EXISTS approval_tokens (
+    id INTEGER PRIMARY KEY,
+    code_hash TEXT NOT NULL,           -- sha256 hash of allow-once code
+    created_at INTEGER NOT NULL,       -- epoch ms
+    expires_at INTEGER NOT NULL,       -- epoch ms
+    used_at INTEGER,                   -- epoch ms when consumed
+    workspace_id TEXT NOT NULL,        -- workspace scope
+    action_kind TEXT NOT NULL,         -- send_text, workflow_run, etc.
+    pane_id INTEGER REFERENCES panes(pane_id) ON DELETE SET NULL,
+    action_fingerprint TEXT NOT NULL   -- normalized action fingerprint
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_approval_tokens_hash ON approval_tokens(code_hash);
+CREATE INDEX IF NOT EXISTS idx_approval_tokens_workspace ON approval_tokens(workspace_id, action_kind);
+CREATE INDEX IF NOT EXISTS idx_approval_tokens_pane ON approval_tokens(pane_id);
+CREATE INDEX IF NOT EXISTS idx_approval_tokens_expires ON approval_tokens(expires_at);
+CREATE INDEX IF NOT EXISTS idx_approval_tokens_unused ON approval_tokens(used_at) WHERE used_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_approval_tokens_fingerprint ON approval_tokens(action_fingerprint);
 
 -- Config: key-value settings
 CREATE TABLE IF NOT EXISTS config (
@@ -546,6 +567,52 @@ impl AuditActionRecord {
     }
 }
 
+/// Maintenance log record for system events
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaintenanceRecord {
+    /// Maintenance record ID
+    pub id: i64,
+    /// Event type (startup, shutdown, vacuum, retention_cleanup, error)
+    pub event_type: String,
+    /// Optional message
+    pub message: Option<String>,
+    /// Optional JSON metadata
+    pub metadata: Option<String>,
+    /// Timestamp (epoch ms)
+    pub timestamp: i64,
+}
+
+/// Approval token record for allow-once approvals
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalTokenRecord {
+    /// Token record ID
+    pub id: i64,
+    /// Hash of allow-once code (sha256)
+    pub code_hash: String,
+    /// Created timestamp (epoch ms)
+    pub created_at: i64,
+    /// Expiration timestamp (epoch ms)
+    pub expires_at: i64,
+    /// When token was consumed (epoch ms)
+    pub used_at: Option<i64>,
+    /// Workspace identifier
+    pub workspace_id: String,
+    /// Action kind
+    pub action_kind: String,
+    /// Target pane ID (if applicable)
+    pub pane_id: Option<u64>,
+    /// Normalized action fingerprint
+    pub action_fingerprint: String,
+}
+
+impl ApprovalTokenRecord {
+    /// Returns true if the token is unused and unexpired
+    #[must_use]
+    pub fn is_active(&self, now_ms: i64) -> bool {
+        self.used_at.is_none() && self.expires_at >= now_ms
+    }
+}
+
 // =============================================================================
 // Schema Initialization
 // =============================================================================
@@ -676,6 +743,34 @@ enum WriteCommand {
         before_ts: i64,
         respond: oneshot::Sender<Result<usize>>,
     },
+    /// Insert an approval token
+    InsertApprovalToken {
+        token: ApprovalTokenRecord,
+        respond: oneshot::Sender<Result<i64>>,
+    },
+    /// Consume (use) an approval token if it matches scope
+    ConsumeApprovalToken {
+        code_hash: String,
+        workspace_id: String,
+        action_kind: String,
+        pane_id: Option<u64>,
+        action_fingerprint: String,
+        respond: oneshot::Sender<Result<Option<ApprovalTokenRecord>>>,
+    },
+    /// Record a maintenance event
+    RecordMaintenance {
+        record: MaintenanceRecord,
+        respond: oneshot::Sender<Result<i64>>,
+    },
+    /// Prune output segments older than a cutoff
+    PruneSegments {
+        before_ts: i64,
+        respond: oneshot::Sender<Result<usize>>,
+    },
+    /// Vacuum the database (explicit)
+    Vacuum {
+        respond: oneshot::Sender<Result<()>>,
+    },
     /// Shutdown the writer thread (flush pending writes)
     Shutdown { respond: oneshot::Sender<()> },
 }
@@ -751,8 +846,8 @@ impl StorageHandle {
 
         // Spawn writer thread
         let writer_handle = thread::spawn(move || {
-            let conn = init_result;
-            writer_loop(&conn, &mut write_rx);
+            let mut conn = init_result;
+            writer_loop(&mut conn, &mut write_rx);
         });
 
         Ok(Self {
@@ -869,6 +964,106 @@ impl StorageHandle {
         self.write_tx
             .send(WriteCommand::PurgeAuditActions {
                 before_ts,
+                respond: tx,
+            })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    /// Record a maintenance event
+    pub async fn record_maintenance(&self, record: MaintenanceRecord) -> Result<i64> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::RecordMaintenance {
+                record,
+                respond: tx,
+            })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    /// Prune output segments older than a cutoff timestamp
+    pub async fn prune_segments_before(&self, before_ts: i64) -> Result<usize> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::PruneSegments {
+                before_ts,
+                respond: tx,
+            })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    /// Run retention cleanup and log the maintenance event
+    pub async fn retention_cleanup(&self, before_ts: i64) -> Result<usize> {
+        let deleted = self.prune_segments_before(before_ts).await?;
+        let metadata = serde_json::json!({
+            "deleted_segments": deleted,
+            "before_ts": before_ts,
+        })
+        .to_string();
+        let record = MaintenanceRecord {
+            id: 0,
+            event_type: "retention_cleanup".to_string(),
+            message: Some(format!("Deleted {deleted} output segments")),
+            metadata: Some(metadata),
+            timestamp: now_ms(),
+        };
+        let _ = self.record_maintenance(record).await?;
+        Ok(deleted)
+    }
+
+    /// Vacuum the database (explicit)
+    pub async fn vacuum(&self) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::Vacuum { respond: tx })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    /// Insert an approval token
+    pub async fn insert_approval_token(&self, token: ApprovalTokenRecord) -> Result<i64> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::InsertApprovalToken { token, respond: tx })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    /// Consume an approval token if it matches scope and is valid
+    #[allow(clippy::too_many_arguments)]
+    pub async fn consume_approval_token(
+        &self,
+        code_hash: &str,
+        workspace_id: &str,
+        action_kind: &str,
+        pane_id: Option<u64>,
+        action_fingerprint: &str,
+    ) -> Result<Option<ApprovalTokenRecord>> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::ConsumeApprovalToken {
+                code_hash: code_hash.to_string(),
+                workspace_id: workspace_id.to_string(),
+                action_kind: action_kind.to_string(),
+                pane_id,
+                action_fingerprint: action_fingerprint.to_string(),
                 respond: tx,
             })
             .await
@@ -1085,6 +1280,22 @@ impl StorageHandle {
         .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
+    /// Count active (unused + unexpired) approval tokens for a workspace
+    pub async fn count_active_approvals(&self, workspace_id: &str, now_ms: i64) -> Result<u32> {
+        let db_path = Arc::clone(&self.db_path);
+        let workspace_id = workspace_id.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+
+            query_active_approvals_count(&conn, &workspace_id, now_ms)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+    }
+
     /// Get all panes
     pub async fn get_panes(&self) -> Result<Vec<PaneRecord>> {
         let db_path = Arc::clone(&self.db_path);
@@ -1242,7 +1453,7 @@ pub struct AuditQuery {
 // =============================================================================
 
 /// Main loop for the writer thread
-fn writer_loop(conn: &Connection, rx: &mut mpsc::Receiver<WriteCommand>) {
+fn writer_loop(conn: &mut Connection, rx: &mut mpsc::Receiver<WriteCommand>) {
     // Use blocking_recv from sync context
     while let Some(cmd) = rx.blocking_recv() {
         match cmd {
@@ -1317,6 +1528,40 @@ fn writer_loop(conn: &Connection, rx: &mut mpsc::Receiver<WriteCommand>) {
             }
             WriteCommand::PurgeAuditActions { before_ts, respond } => {
                 let result = purge_audit_actions_sync(conn, before_ts);
+                let _ = respond.send(result);
+            }
+            WriteCommand::InsertApprovalToken { token, respond } => {
+                let result = insert_approval_token_sync(conn, &token);
+                let _ = respond.send(result);
+            }
+            WriteCommand::ConsumeApprovalToken {
+                code_hash,
+                workspace_id,
+                action_kind,
+                pane_id,
+                action_fingerprint,
+                respond,
+            } => {
+                let result = consume_approval_token_sync(
+                    conn,
+                    &code_hash,
+                    &workspace_id,
+                    &action_kind,
+                    pane_id,
+                    &action_fingerprint,
+                );
+                let _ = respond.send(result);
+            }
+            WriteCommand::RecordMaintenance { record, respond } => {
+                let result = record_maintenance_sync(conn, &record);
+                let _ = respond.send(result);
+            }
+            WriteCommand::PruneSegments { before_ts, respond } => {
+                let result = prune_segments_sync(conn, before_ts);
+                let _ = respond.send(result);
+            }
+            WriteCommand::Vacuum { respond } => {
+                let result = vacuum_sync(conn);
                 let _ = respond.send(result);
             }
             WriteCommand::Shutdown { respond } => {
@@ -1756,6 +2001,152 @@ fn purge_audit_actions_sync(conn: &Connection, before_ts: i64) -> Result<usize> 
     Ok(deleted)
 }
 
+fn record_maintenance_sync(conn: &Connection, record: &MaintenanceRecord) -> Result<i64> {
+    let ts = if record.timestamp == 0 {
+        now_ms()
+    } else {
+        record.timestamp
+    };
+
+    conn.execute(
+        "INSERT INTO maintenance_log (event_type, message, metadata, timestamp) VALUES (?1, ?2, ?3, ?4)",
+        params![record.event_type, record.message, record.metadata, ts],
+    )
+    .map_err(|e| StorageError::Database(format!("Failed to record maintenance: {e}")))?;
+
+    Ok(conn.last_insert_rowid())
+}
+
+fn prune_segments_sync(conn: &Connection, before_ts: i64) -> Result<usize> {
+    let deleted = conn
+        .execute(
+            "DELETE FROM output_segments WHERE captured_at < ?1",
+            params![before_ts],
+        )
+        .map_err(|e| StorageError::Database(format!("Failed to prune segments: {e}")))?;
+    Ok(deleted)
+}
+
+fn vacuum_sync(conn: &Connection) -> Result<()> {
+    conn.execute_batch("VACUUM")
+        .map_err(|e| StorageError::Database(format!("Failed to vacuum database: {e}")))?;
+    Ok(())
+}
+
+/// Insert an approval token (synchronous)
+fn insert_approval_token_sync(conn: &Connection, token: &ApprovalTokenRecord) -> Result<i64> {
+    let pane_id_i64 = token
+        .pane_id
+        .map(|pane_id| u64_to_i64(pane_id, "pane_id"))
+        .transpose()?;
+
+    conn.execute(
+        "INSERT INTO approval_tokens (code_hash, created_at, expires_at, used_at, workspace_id,
+         action_kind, pane_id, action_fingerprint)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            token.code_hash.as_str(),
+            token.created_at,
+            token.expires_at,
+            token.used_at,
+            token.workspace_id.as_str(),
+            token.action_kind.as_str(),
+            pane_id_i64,
+            token.action_fingerprint.as_str(),
+        ],
+    )
+    .map_err(|e| StorageError::Database(format!("Failed to insert approval token: {e}")))?;
+
+    Ok(conn.last_insert_rowid())
+}
+
+/// Consume an approval token if it matches scope and is valid (synchronous)
+#[allow(clippy::too_many_arguments)]
+fn consume_approval_token_sync(
+    conn: &mut Connection,
+    code_hash: &str,
+    workspace_id: &str,
+    action_kind: &str,
+    pane_id: Option<u64>,
+    action_fingerprint: &str,
+) -> Result<Option<ApprovalTokenRecord>> {
+    let now = now_ms();
+    let tx = conn
+        .transaction()
+        .map_err(|e| StorageError::Database(format!("Failed to start transaction: {e}")))?;
+
+    let mut sql = String::from(
+        "SELECT id, code_hash, created_at, expires_at, used_at, workspace_id, action_kind,
+         pane_id, action_fingerprint
+         FROM approval_tokens
+         WHERE code_hash = ?
+           AND workspace_id = ?
+           AND action_kind = ?
+           AND action_fingerprint = ?
+           AND used_at IS NULL
+           AND expires_at >= ?",
+    );
+    let mut params = vec![
+        SqlValue::Text(code_hash.to_string()),
+        SqlValue::Text(workspace_id.to_string()),
+        SqlValue::Text(action_kind.to_string()),
+        SqlValue::Text(action_fingerprint.to_string()),
+        SqlValue::Integer(now),
+    ];
+
+    if let Some(pane_id) = pane_id {
+        let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
+        sql.push_str(" AND pane_id = ?");
+        params.push(SqlValue::Integer(pane_id_i64));
+    } else {
+        sql.push_str(" AND pane_id IS NULL");
+    }
+
+    sql.push_str(" LIMIT 1");
+
+    let record = {
+        let mut stmt = tx.prepare(&sql).map_err(|e| {
+            StorageError::Database(format!("Failed to prepare approval query: {e}"))
+        })?;
+
+        stmt.query_row(rusqlite::params_from_iter(params), |row| {
+            Ok(ApprovalTokenRecord {
+                id: row.get(0)?,
+                code_hash: row.get(1)?,
+                created_at: row.get(2)?,
+                expires_at: row.get(3)?,
+                used_at: row.get(4)?,
+                workspace_id: row.get(5)?,
+                action_kind: row.get(6)?,
+                pane_id: {
+                    let val: Option<i64> = row.get(7)?;
+                    #[allow(clippy::cast_sign_loss)]
+                    val.map(|v| v as u64)
+                },
+                action_fingerprint: row.get(8)?,
+            })
+        })
+        .optional()
+        .map_err(|e| StorageError::Database(format!("Approval query failed: {e}")))?
+    };
+
+    if let Some(mut record) = record {
+        tx.execute(
+            "UPDATE approval_tokens SET used_at = ?1 WHERE id = ?2",
+            params![now, record.id],
+        )
+        .map_err(|e| StorageError::Database(format!("Failed to consume approval token: {e}")))?;
+        record.used_at = Some(now);
+        tx.commit()
+            .map_err(|e| StorageError::Database(format!("Failed to commit approval token: {e}")))?;
+        return Ok(Some(record));
+    }
+
+    tx.commit()
+        .map_err(|e| StorageError::Database(format!("Failed to commit approval token: {e}")))?;
+    Ok(None)
+}
+
 // =============================================================================
 // Read Operations (called from spawn_blocking)
 // =============================================================================
@@ -2183,6 +2574,22 @@ fn query_audit_actions(conn: &Connection, query: &AuditQuery) -> Result<Vec<Audi
     Ok(results)
 }
 
+/// Count active (unused + unexpired) approval tokens for a workspace
+fn query_active_approvals_count(conn: &Connection, workspace_id: &str, now_ms: i64) -> Result<u32> {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM approval_tokens
+             WHERE workspace_id = ?1 AND used_at IS NULL AND expires_at >= ?2",
+            params![workspace_id, now_ms],
+            |row| row.get(0),
+        )
+        .map_err(|e| StorageError::Database(format!("Approval count query failed: {e}")))?;
+
+    u32::try_from(count).map_err(|_| {
+        StorageError::Database(format!("Active approval count {count} exceeds u32 range")).into()
+    })
+}
+
 /// Query all panes
 fn query_panes(conn: &Connection) -> Result<Vec<PaneRecord>> {
     let mut stmt = conn
@@ -2485,6 +2892,7 @@ mod tests {
             "workflow_executions",
             "workflow_step_logs",
             "audit_actions",
+            "approval_tokens",
             "config",
             "maintenance_log",
         ];
@@ -3052,6 +3460,147 @@ mod tests {
         let rows = query_audit_actions(&conn, &AuditQuery::default()).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].ts, 2_000);
+    }
+
+    #[test]
+    fn approval_token_record_serializes() {
+        let token = ApprovalTokenRecord {
+            id: 1,
+            code_hash: "sha256:abc123".to_string(),
+            created_at: 1_700_000_000_000,
+            expires_at: 1_700_000_010_000,
+            used_at: None,
+            workspace_id: "workspace-a".to_string(),
+            action_kind: "send_text".to_string(),
+            pane_id: Some(42),
+            action_fingerprint: "sha256:fingerprint".to_string(),
+        };
+
+        let json = serde_json::to_string(&token).unwrap();
+        assert!(json.contains("sha256:abc123"));
+        assert!(json.contains("workspace-a"));
+    }
+
+    // =========================================================================
+    // wa-4vx.3.6: Retention & Maintenance Tests
+    // =========================================================================
+
+    #[test]
+    fn retention_prunes_old_segments_and_fts() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let now_ms = 1_700_000_000_000i64;
+
+        conn.execute(
+            "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![1i64, "local", now_ms, now_ms, 1],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![1i64, 0i64, "old content", 11, now_ms - 1000],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![1i64, 1i64, "new content", 11, now_ms + 1000],
+        )
+        .unwrap();
+
+        let deleted = prune_segments_sync(&conn, now_ms).unwrap();
+        assert_eq!(deleted, 1);
+
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM output_segments", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 1);
+
+        let fts_old: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM output_segments_fts WHERE output_segments_fts MATCH 'old'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(fts_old, 0);
+    }
+
+    #[test]
+    fn maintenance_log_records_event() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let record = MaintenanceRecord {
+            id: 0,
+            event_type: "retention_cleanup".to_string(),
+            message: Some("cleanup complete".to_string()),
+            metadata: Some("{\"deleted\": 1}".to_string()),
+            timestamp: 0,
+        };
+
+        let id = record_maintenance_sync(&conn, &record).unwrap();
+        assert!(id > 0);
+
+        let event_type: String = conn
+            .query_row(
+                "SELECT event_type FROM maintenance_log WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(event_type, "retention_cleanup");
+    }
+
+    #[test]
+    fn can_insert_and_consume_approval_token() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![1i64, "local", 1i64, 1i64, 1],
+        )
+        .unwrap();
+
+        let now = now_ms();
+        let token = ApprovalTokenRecord {
+            id: 0,
+            code_hash: "sha256:tokenhash".to_string(),
+            created_at: now,
+            expires_at: now + 5_000,
+            used_at: None,
+            workspace_id: "ws".to_string(),
+            action_kind: "send_text".to_string(),
+            pane_id: Some(1),
+            action_fingerprint: "sha256:fp".to_string(),
+        };
+
+        insert_approval_token_sync(&conn, &token).unwrap();
+
+        let consumed = consume_approval_token_sync(
+            &mut conn,
+            "sha256:tokenhash",
+            "ws",
+            "send_text",
+            Some(1),
+            "sha256:fp",
+        )
+        .unwrap();
+        assert!(consumed.is_some());
+        assert!(consumed.unwrap().used_at.is_some());
+
+        let second = consume_approval_token_sync(
+            &mut conn,
+            "sha256:tokenhash",
+            "ws",
+            "send_text",
+            Some(1),
+            "sha256:fp",
+        )
+        .unwrap();
+        assert!(second.is_none());
     }
 
     // =========================================================================

@@ -21,9 +21,13 @@
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt::Write as _;
+use std::io::Write;
+use std::process::{Command, Stdio};
 use std::sync::LazyLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use crate::config::{CommandGateConfig, DcgDenyPolicy, DcgMode};
 // ============================================================================
 // Action Kinds
 // ============================================================================
@@ -93,6 +97,29 @@ impl ActionKind {
         matches!(
             self,
             Self::Close | Self::DeleteFile | Self::SendCtrlC | Self::SendCtrlD
+        )
+    }
+
+    /// Returns true if this action should be rate limited
+    #[must_use]
+    pub const fn is_rate_limited(&self) -> bool {
+        matches!(
+            self,
+            Self::SendText
+                | Self::SendCtrlC
+                | Self::SendCtrlD
+                | Self::SendCtrlZ
+                | Self::SendControl
+                | Self::Spawn
+                | Self::Split
+                | Self::Close
+                | Self::BrowserAuth
+                | Self::WorkflowRun
+                | Self::ReservePane
+                | Self::ReleasePane
+                | Self::WriteFile
+                | Self::DeleteFile
+                | Self::ExecCommand
         )
     }
 
@@ -214,6 +241,21 @@ impl PaneCapabilities {
 // Policy Decision
 // ============================================================================
 
+/// Allow-once approval payload for RequireApproval decisions
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalRequest {
+    /// Short allow-once code (human-entered)
+    pub allow_once_code: String,
+    /// Full hash of allow-once code (sha256)
+    pub allow_once_full_hash: String,
+    /// Expiration timestamp (epoch ms)
+    pub expires_at: i64,
+    /// Human-readable summary of the approval
+    pub summary: String,
+    /// Command a human can run to approve
+    pub command: String,
+}
+
 /// Result of policy evaluation
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "decision", rename_all = "snake_case")]
@@ -235,6 +277,9 @@ pub enum PolicyDecision {
         /// Optional stable rule ID that triggered approval requirement
         #[serde(skip_serializing_if = "Option::is_none")]
         rule_id: Option<String>,
+        /// Optional allow-once approval payload
+        #[serde(skip_serializing_if = "Option::is_none")]
+        approval: Option<ApprovalRequest>,
     },
 }
 
@@ -269,6 +314,7 @@ impl PolicyDecision {
         Self::RequireApproval {
             reason: reason.into(),
             rule_id: None,
+            approval: None,
         }
     }
 
@@ -281,6 +327,7 @@ impl PolicyDecision {
         Self::RequireApproval {
             reason: reason.into(),
             rule_id: Some(rule_id.into()),
+            approval: None,
         }
     }
 
@@ -321,6 +368,30 @@ impl PolicyDecision {
             Self::Allow => None,
         }
     }
+
+    /// Attach an allow-once approval payload to a RequireApproval decision
+    #[must_use]
+    pub fn with_approval(self, approval: ApprovalRequest) -> Self {
+        match self {
+            Self::RequireApproval {
+                reason, rule_id, ..
+            } => Self::RequireApproval {
+                reason,
+                rule_id,
+                approval: Some(approval),
+            },
+            other => other,
+        }
+    }
+
+    /// Get the allow-once approval payload, if present
+    #[must_use]
+    pub fn approval_request(&self) -> Option<&ApprovalRequest> {
+        match self {
+            Self::RequireApproval { approval, .. } => approval.as_ref(),
+            _ => None,
+        }
+    }
 }
 
 // ============================================================================
@@ -346,6 +417,9 @@ pub struct PolicyInput {
     /// Optional workflow ID (if action is from a workflow)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workflow_id: Option<String>,
+    /// Raw command text for SendText safety gating (not serialized)
+    #[serde(skip)]
+    pub command_text: Option<String>,
 }
 
 impl PolicyInput {
@@ -360,6 +434,7 @@ impl PolicyInput {
             capabilities: PaneCapabilities::default(),
             text_summary: None,
             workflow_id: None,
+            command_text: None,
         }
     }
 
@@ -397,47 +472,498 @@ impl PolicyInput {
         self.workflow_id = Some(workflow_id.into());
         self
     }
+
+    /// Set raw command text for command safety gate
+    #[must_use]
+    pub fn with_command_text(mut self, text: impl Into<String>) -> Self {
+        self.command_text = Some(text.into());
+        self
+    }
 }
 
-/// Rate limiter per pane
+/// Rolling window for rate limiting
+const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+
+/// Scope for a rate limit decision
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateLimitScope {
+    /// Limit is enforced per pane (and action kind)
+    PerPane {
+        /// Pane ID for the limit
+        pane_id: u64,
+    },
+    /// Limit is enforced globally (per action kind)
+    Global,
+}
+
+/// Details about a rate limit violation
+#[derive(Debug, Clone)]
+pub struct RateLimitHit {
+    /// Scope that triggered the limit
+    pub scope: RateLimitScope,
+    /// Action kind being limited
+    pub action: ActionKind,
+    /// Limit in operations per minute
+    pub limit: u32,
+    /// Current count in the window
+    pub current: usize,
+    /// Suggested retry-after delay
+    pub retry_after: Duration,
+}
+
+impl RateLimitHit {
+    /// Format a human-readable reason string
+    #[must_use]
+    pub fn reason(&self) -> String {
+        let retry_secs = self.retry_after.as_millis().div_ceil(1000);
+        let mut reason = match self.scope {
+            RateLimitScope::PerPane { pane_id } => format!(
+                "Rate limit exceeded for action '{}' on pane {}: {}/{} per minute (per-pane)",
+                self.action.as_str(),
+                pane_id,
+                self.current,
+                self.limit
+            ),
+            RateLimitScope::Global => format!(
+                "Global rate limit exceeded for action '{}': {}/{} per minute",
+                self.action.as_str(),
+                self.current,
+                self.limit
+            ),
+        };
+
+        if retry_secs > 0 {
+            let _ = write!(reason, "; retry after {retry_secs}s");
+        }
+
+        reason.push_str(". Remediation: wait before retrying or reduce concurrency.");
+
+        reason
+    }
+}
+
+/// Outcome of a rate limit check
+#[derive(Debug, Clone)]
+pub enum RateLimitOutcome {
+    /// Allowed under current limits
+    Allowed,
+    /// Limited with details about the violation
+    Limited(RateLimitHit),
+}
+
+impl RateLimitOutcome {
+    /// Returns true if the action is allowed
+    #[must_use]
+    pub const fn is_allowed(&self) -> bool {
+        matches!(self, Self::Allowed)
+    }
+}
+
+/// Rate limiter per pane and action kind
 pub struct RateLimiter {
-    /// Maximum operations per minute
-    limit: u32,
-    /// Tracking per pane
-    pane_counts: HashMap<u64, Vec<Instant>>,
+    /// Maximum operations per minute per pane/action
+    limit_per_pane: u32,
+    /// Maximum operations per minute globally per action
+    limit_global: u32,
+    /// Tracking per pane/action
+    pane_counts: HashMap<(u64, ActionKind), Vec<Instant>>,
+    /// Tracking per action globally
+    global_counts: HashMap<ActionKind, Vec<Instant>>,
 }
 
 impl RateLimiter {
     /// Create a new rate limiter
     #[must_use]
-    pub fn new(limit_per_minute: u32) -> Self {
+    pub fn new(limit_per_pane: u32, limit_global: u32) -> Self {
         Self {
-            limit: limit_per_minute,
+            limit_per_pane,
+            limit_global,
             pane_counts: HashMap::new(),
+            global_counts: HashMap::new(),
         }
     }
 
-    /// Check if operation is allowed for pane
+    /// Check if operation is allowed for pane/action
     #[must_use]
-    pub fn check(&mut self, pane_id: u64) -> bool {
+    pub fn check(&mut self, action: ActionKind, pane_id: Option<u64>) -> RateLimitOutcome {
         let now = Instant::now();
-        let minute_ago = now
-            .checked_sub(std::time::Duration::from_secs(60))
-            .unwrap_or(now);
+        let window_start = now.checked_sub(RATE_LIMIT_WINDOW).unwrap_or(now);
 
-        let timestamps = self.pane_counts.entry(pane_id).or_default();
+        if let Some(pane_id) = pane_id {
+            if self.limit_per_pane > 0 {
+                let timestamps = self.pane_counts.entry((pane_id, action)).or_default();
+                prune_old(timestamps, window_start);
+                let current = timestamps.len();
+                if current >= self.limit_per_pane as usize {
+                    let retry_after = retry_after(now, timestamps);
+                    return RateLimitOutcome::Limited(RateLimitHit {
+                        scope: RateLimitScope::PerPane { pane_id },
+                        action,
+                        limit: self.limit_per_pane,
+                        current,
+                        retry_after,
+                    });
+                }
+            }
+        }
 
-        // Remove old timestamps
-        timestamps.retain(|t| *t > minute_ago);
+        if self.limit_global > 0 {
+            let timestamps = self.global_counts.entry(action).or_default();
+            prune_old(timestamps, window_start);
+            let current = timestamps.len();
+            if current >= self.limit_global as usize {
+                let retry_after = retry_after(now, timestamps);
+                return RateLimitOutcome::Limited(RateLimitHit {
+                    scope: RateLimitScope::Global,
+                    action,
+                    limit: self.limit_global,
+                    current,
+                    retry_after,
+                });
+            }
+        }
 
-        // Check if under limit
-        if timestamps.len() < self.limit as usize {
-            timestamps.push(now);
-            true
-        } else {
-            false
+        if let Some(pane_id) = pane_id {
+            if self.limit_per_pane > 0 {
+                self.pane_counts
+                    .entry((pane_id, action))
+                    .or_default()
+                    .push(now);
+            }
+        }
+
+        if self.limit_global > 0 {
+            self.global_counts.entry(action).or_default().push(now);
+        }
+
+        RateLimitOutcome::Allowed
+    }
+}
+
+fn prune_old(timestamps: &mut Vec<Instant>, window_start: Instant) {
+    timestamps.retain(|t| *t > window_start);
+}
+
+fn retry_after(now: Instant, timestamps: &[Instant]) -> Duration {
+    timestamps
+        .first()
+        .and_then(|oldest| oldest.checked_add(RATE_LIMIT_WINDOW))
+        .map_or(Duration::from_secs(0), |deadline| {
+            deadline.saturating_duration_since(now)
+        })
+}
+
+// ============================================================================
+// Command Safety Gate
+// ============================================================================
+
+/// Built-in command gate decision
+#[derive(Debug, Clone)]
+enum CommandGateOutcome {
+    Allow,
+    Deny { reason: String, rule_id: String },
+    RequireApproval { reason: String, rule_id: String },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CommandGateDecision {
+    Deny,
+    RequireApproval,
+}
+
+struct CommandRule {
+    id: &'static str,
+    regex: &'static LazyLock<Regex>,
+    decision: CommandGateDecision,
+    reason: &'static str,
+}
+
+static RM_RF_ROOT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^\s*(?:sudo\s+)?rm\s+-rf\s+(/|~)(\s|$)").expect("rm -rf root regex")
+});
+static RM_RF_GENERIC: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^\s*(?:sudo\s+)?rm\s+-rf\s+").expect("rm -rf regex"));
+static GIT_RESET_HARD: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bgit\s+reset\b.*\s--hard\b").expect("git reset --hard"));
+static GIT_CLEAN_FD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\bgit\s+clean\b.*\s-[-a-z]*f[-a-z]*d").expect("git clean -fd")
+});
+static GIT_PUSH_FORCE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\bgit\s+push\b.*\s(--force|-f)\b").expect("git push --force")
+});
+static GIT_BRANCH_DELETE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bgit\s+branch\b.*\s-D\b").expect("git branch -D"));
+static SQL_DESTRUCTIVE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(drop\s+database|drop\s+table|truncate\s+table)\b").expect("sql destructive")
+});
+
+static COMMAND_RULES: &[CommandRule] = &[
+    CommandRule {
+        id: "command.rm_rf_root",
+        regex: &RM_RF_ROOT,
+        decision: CommandGateDecision::Deny,
+        reason: "Blocking rm -rf on root/home paths",
+    },
+    CommandRule {
+        id: "command.rm_rf",
+        regex: &RM_RF_GENERIC,
+        decision: CommandGateDecision::RequireApproval,
+        reason: "rm -rf is destructive and requires approval",
+    },
+    CommandRule {
+        id: "command.git_reset_hard",
+        regex: &GIT_RESET_HARD,
+        decision: CommandGateDecision::RequireApproval,
+        reason: "git reset --hard discards uncommitted changes",
+    },
+    CommandRule {
+        id: "command.git_clean_fd",
+        regex: &GIT_CLEAN_FD,
+        decision: CommandGateDecision::RequireApproval,
+        reason: "git clean -fd removes untracked files",
+    },
+    CommandRule {
+        id: "command.git_push_force",
+        regex: &GIT_PUSH_FORCE,
+        decision: CommandGateDecision::RequireApproval,
+        reason: "git push --force rewrites remote history",
+    },
+    CommandRule {
+        id: "command.git_branch_delete",
+        regex: &GIT_BRANCH_DELETE,
+        decision: CommandGateDecision::RequireApproval,
+        reason: "git branch -D deletes branches permanently",
+    },
+    CommandRule {
+        id: "command.sql_destructive",
+        regex: &SQL_DESTRUCTIVE,
+        decision: CommandGateDecision::RequireApproval,
+        reason: "Destructive SQL command requires approval",
+    },
+];
+
+const COMMAND_TOKENS: &[&str] = &[
+    "git",
+    "rm",
+    "sudo",
+    "docker",
+    "kubectl",
+    "aws",
+    "psql",
+    "mysql",
+    "sqlite3",
+    "gh",
+    "npm",
+    "yarn",
+    "pnpm",
+    "cargo",
+    "make",
+    "bash",
+    "sh",
+    "zsh",
+    "python",
+    "python3",
+    "node",
+    "go",
+    "rg",
+    "find",
+    "export",
+    "mv",
+    "cp",
+    "chmod",
+    "chown",
+    "dd",
+    "systemctl",
+    "service",
+];
+
+fn first_nonempty_line(text: &str) -> Option<&str> {
+    text.lines().find(|line| !line.trim().is_empty())
+}
+
+/// Determine whether the text looks like a shell command
+#[must_use]
+pub fn is_command_candidate(text: &str) -> bool {
+    let Some(line) = first_nonempty_line(text) else {
+        return false;
+    };
+
+    let mut trimmed = line.trim_start();
+    if trimmed.starts_with('#') {
+        return false;
+    }
+
+    if let Some(stripped) = trimmed.strip_prefix('$') {
+        trimmed = stripped.trim_start();
+    }
+
+    let mut parts = trimmed.split_whitespace();
+    let token = parts.next().unwrap_or("");
+    let token_lower = token.to_ascii_lowercase();
+    if COMMAND_TOKENS.contains(&token_lower.as_str()) {
+        return true;
+    }
+
+    if token_lower == "sudo" {
+        if let Some(next) = parts.next() {
+            let next_lower = next.to_ascii_lowercase();
+            if COMMAND_TOKENS.contains(&next_lower.as_str()) {
+                return true;
+            }
         }
     }
+
+    trimmed.contains("&&")
+        || trimmed.contains("||")
+        || trimmed.contains('|')
+        || trimmed.contains('>')
+        || trimmed.contains(';')
+}
+
+#[derive(Debug)]
+enum DcgDecision {
+    Allow,
+    Deny { rule_id: Option<String> },
+}
+
+#[derive(Debug)]
+enum DcgError {
+    NotAvailable,
+    Failed(String),
+}
+
+#[derive(Deserialize)]
+struct DcgHookOutput {
+    #[serde(rename = "permissionDecision")]
+    permission_decision: String,
+    #[serde(rename = "ruleId")]
+    rule_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DcgResponse {
+    #[serde(rename = "hookSpecificOutput")]
+    hook_specific_output: DcgHookOutput,
+}
+
+fn evaluate_builtin_rules(command: &str) -> Option<CommandGateOutcome> {
+    for rule in COMMAND_RULES {
+        if rule.regex.is_match(command) {
+            let rule_id = rule.id.to_string();
+            let reason = rule.reason.to_string();
+            return Some(match rule.decision {
+                CommandGateDecision::Deny => CommandGateOutcome::Deny { reason, rule_id },
+                CommandGateDecision::RequireApproval => {
+                    CommandGateOutcome::RequireApproval { reason, rule_id }
+                }
+            });
+        }
+    }
+    None
+}
+
+fn evaluate_command_gate_with_runner<F>(
+    text: &str,
+    config: &CommandGateConfig,
+    dcg_runner: F,
+) -> CommandGateOutcome
+where
+    F: Fn(&str) -> Result<DcgDecision, DcgError>,
+{
+    if !config.enabled {
+        return CommandGateOutcome::Allow;
+    }
+
+    if !is_command_candidate(text) {
+        return CommandGateOutcome::Allow;
+    }
+
+    let command_line = first_nonempty_line(text).unwrap_or(text);
+    if let Some(result) = evaluate_builtin_rules(command_line) {
+        return result;
+    }
+
+    match config.dcg_mode {
+        DcgMode::Disabled => CommandGateOutcome::Allow,
+        DcgMode::Opportunistic | DcgMode::Required => match dcg_runner(command_line) {
+            Ok(DcgDecision::Allow) => CommandGateOutcome::Allow,
+            Ok(DcgDecision::Deny { rule_id }) => {
+                let rule = rule_id.unwrap_or_else(|| "unknown".to_string());
+                let rule_id = format!("dcg.{rule}");
+                let reason = format!("Command safety gate blocked by dcg (rule {rule})");
+                match config.dcg_deny_policy {
+                    DcgDenyPolicy::Deny => CommandGateOutcome::Deny { reason, rule_id },
+                    DcgDenyPolicy::RequireApproval => {
+                        CommandGateOutcome::RequireApproval { reason, rule_id }
+                    }
+                }
+            }
+            Err(err) => match config.dcg_mode {
+                DcgMode::Required => {
+                    let detail = match err {
+                        DcgError::NotAvailable => "dcg not available".to_string(),
+                        DcgError::Failed(detail) => format!("dcg error: {detail}"),
+                    };
+                    CommandGateOutcome::RequireApproval {
+                        reason: format!(
+                            "Command safety gate requires dcg but it is unavailable ({detail})"
+                        ),
+                        rule_id: "command_gate.dcg_unavailable".to_string(),
+                    }
+                }
+                _ => CommandGateOutcome::Allow,
+            },
+        },
+    }
+}
+
+fn evaluate_command_gate(text: &str, config: &CommandGateConfig) -> CommandGateOutcome {
+    evaluate_command_gate_with_runner(text, config, run_dcg)
+}
+
+fn run_dcg(command: &str) -> Result<DcgDecision, DcgError> {
+    let payload = serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": { "command": command }
+    });
+    let mut child = Command::new("dcg")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                DcgError::NotAvailable
+            } else {
+                DcgError::Failed(e.to_string())
+            }
+        })?;
+
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin
+            .write_all(payload.to_string().as_bytes())
+            .map_err(|e| DcgError::Failed(e.to_string()))?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| DcgError::Failed(e.to_string()))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout.trim().is_empty() {
+        return Ok(DcgDecision::Allow);
+    }
+
+    let parsed: DcgResponse =
+        serde_json::from_str(stdout.trim()).map_err(|e| DcgError::Failed(e.to_string()))?;
+
+    if parsed.hook_specific_output.permission_decision == "deny" {
+        return Ok(DcgDecision::Deny {
+            rule_id: parsed.hook_specific_output.rule_id,
+        });
+    }
+
+    Ok(DcgDecision::Allow)
 }
 
 // ============================================================================
@@ -713,28 +1239,42 @@ pub struct PolicyEngine {
     rate_limiter: RateLimiter,
     /// Whether to require prompt active before mutating sends
     require_prompt_active: bool,
+    /// Command safety gate configuration
+    command_gate: CommandGateConfig,
 }
 
 impl PolicyEngine {
     /// Create a new policy engine with default settings
     #[must_use]
-    pub fn new(rate_limit: u32, require_prompt_active: bool) -> Self {
+    pub fn new(
+        rate_limit_per_pane: u32,
+        rate_limit_global: u32,
+        require_prompt_active: bool,
+    ) -> Self {
         Self {
-            rate_limiter: RateLimiter::new(rate_limit),
+            rate_limiter: RateLimiter::new(rate_limit_per_pane, rate_limit_global),
             require_prompt_active,
+            command_gate: CommandGateConfig::default(),
         }
     }
 
     /// Create a policy engine with permissive defaults (for testing)
     #[must_use]
     pub fn permissive() -> Self {
-        Self::new(1000, false)
+        Self::new(1000, 5000, false)
     }
 
     /// Create a policy engine with strict defaults
     #[must_use]
     pub fn strict() -> Self {
-        Self::new(30, true)
+        Self::new(30, 100, true)
+    }
+
+    /// Set command safety gate configuration
+    #[must_use]
+    pub fn with_command_gate_config(mut self, command_gate: CommandGateConfig) -> Self {
+        self.command_gate = command_gate;
+        self
     }
 
     /// Authorize an action
@@ -756,12 +1296,13 @@ impl PolicyEngine {
     /// assert!(decision.is_allowed());
     /// ```
     pub fn authorize(&mut self, input: &PolicyInput) -> PolicyDecision {
-        // Check rate limit for mutating actions
-        if input.action.is_mutating() {
-            if let Some(pane_id) = input.pane_id {
-                if !self.rate_limiter.check(pane_id) {
-                    return PolicyDecision::deny_with_rule(
-                        "Rate limit exceeded",
+        // Check rate limit for configured action kinds
+        if input.action.is_rate_limited() {
+            match self.rate_limiter.check(input.action, input.pane_id) {
+                RateLimitOutcome::Allowed => {}
+                RateLimitOutcome::Limited(hit) => {
+                    return PolicyDecision::require_approval_with_rule(
+                        hit.reason(),
                         "policy.rate_limit",
                     );
                 }
@@ -811,6 +1352,21 @@ impl PolicyEngine {
                 ),
                 "policy.pane_reserved",
             );
+        }
+
+        // Command safety gate for SendText
+        if matches!(input.action, ActionKind::SendText) {
+            if let Some(text) = input.command_text.as_deref() {
+                match evaluate_command_gate(text, &self.command_gate) {
+                    CommandGateOutcome::Allow => {}
+                    CommandGateOutcome::Deny { reason, rule_id } => {
+                        return PolicyDecision::deny_with_rule(reason, rule_id);
+                    }
+                    CommandGateOutcome::RequireApproval { reason, rule_id } => {
+                        return PolicyDecision::require_approval_with_rule(reason, rule_id);
+                    }
+                }
+            }
         }
 
         // Destructive actions require approval for non-trusted actors
@@ -875,25 +1431,156 @@ mod tests {
 
     #[test]
     fn rate_limiter_allows_under_limit() {
-        let mut limiter = RateLimiter::new(10);
-        assert!(limiter.check(1));
-        assert!(limiter.check(1));
+        let mut limiter = RateLimiter::new(10, 100);
+        assert!(limiter.check(ActionKind::SendText, Some(1)).is_allowed());
+        assert!(limiter.check(ActionKind::SendText, Some(1)).is_allowed());
     }
 
     #[test]
     fn rate_limiter_denies_over_limit() {
-        let mut limiter = RateLimiter::new(2);
-        assert!(limiter.check(1));
-        assert!(limiter.check(1));
-        assert!(!limiter.check(1)); // Third request denied
+        let mut limiter = RateLimiter::new(2, 100);
+        assert!(limiter.check(ActionKind::SendText, Some(1)).is_allowed());
+        assert!(limiter.check(ActionKind::SendText, Some(1)).is_allowed());
+        assert!(matches!(
+            limiter.check(ActionKind::SendText, Some(1)),
+            RateLimitOutcome::Limited(_)
+        )); // Third request limited
     }
 
     #[test]
     fn rate_limiter_is_per_pane() {
-        let mut limiter = RateLimiter::new(1);
-        assert!(limiter.check(1));
-        assert!(limiter.check(2)); // Different pane, allowed
-        assert!(!limiter.check(1)); // Same pane, denied
+        let mut limiter = RateLimiter::new(1, 100);
+        assert!(limiter.check(ActionKind::SendText, Some(1)).is_allowed());
+        assert!(limiter.check(ActionKind::SendText, Some(2)).is_allowed()); // Different pane, allowed
+        assert!(matches!(
+            limiter.check(ActionKind::SendText, Some(1)),
+            RateLimitOutcome::Limited(_)
+        )); // Same pane, limited
+    }
+
+    #[test]
+    fn rate_limiter_is_per_action_kind() {
+        let mut limiter = RateLimiter::new(1, 100);
+        assert!(limiter.check(ActionKind::SendText, Some(1)).is_allowed());
+        assert!(limiter.check(ActionKind::SendCtrlC, Some(1)).is_allowed()); // Different action, allowed
+        assert!(matches!(
+            limiter.check(ActionKind::SendText, Some(1)),
+            RateLimitOutcome::Limited(_)
+        )); // Same action, limited
+    }
+
+    #[test]
+    fn rate_limiter_enforces_global_limit() {
+        let mut limiter = RateLimiter::new(100, 2);
+        assert!(limiter.check(ActionKind::SendText, Some(1)).is_allowed());
+        assert!(limiter.check(ActionKind::SendText, Some(2)).is_allowed());
+        let hit = match limiter.check(ActionKind::SendText, Some(3)) {
+            RateLimitOutcome::Limited(hit) => hit,
+            RateLimitOutcome::Allowed => panic!("Expected global rate limit"),
+        };
+        assert!(matches!(hit.scope, RateLimitScope::Global));
+    }
+
+    #[test]
+    fn rate_limiter_retry_after_is_nonzero() {
+        let mut limiter = RateLimiter::new(1, 100);
+        assert!(limiter.check(ActionKind::SendText, Some(1)).is_allowed());
+        let hit = match limiter.check(ActionKind::SendText, Some(1)) {
+            RateLimitOutcome::Limited(hit) => hit,
+            RateLimitOutcome::Allowed => panic!("Expected rate limit"),
+        };
+        assert!(hit.retry_after > Duration::from_secs(0));
+    }
+
+    // ========================================================================
+    // Command Safety Gate Tests
+    // ========================================================================
+
+    #[test]
+    fn command_candidate_detects_shell_commands() {
+        assert!(is_command_candidate("git status"));
+        assert!(is_command_candidate("  $ rm -rf /tmp"));
+        assert!(is_command_candidate("sudo git reset --hard"));
+        assert!(!is_command_candidate("Please check the logs"));
+        assert!(!is_command_candidate("# commented command"));
+    }
+
+    #[test]
+    fn command_gate_blocks_rm_rf_root() {
+        let mut engine = PolicyEngine::permissive();
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(PaneCapabilities::prompt())
+            .with_command_text("rm -rf /");
+
+        let decision = engine.authorize(&input);
+        assert!(decision.is_denied());
+        assert_eq!(decision.rule_id(), Some("command.rm_rf_root"));
+    }
+
+    #[test]
+    fn command_gate_requires_approval_for_git_reset() {
+        let mut engine = PolicyEngine::permissive();
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(PaneCapabilities::prompt())
+            .with_command_text("git reset --hard HEAD~1");
+
+        let decision = engine.authorize(&input);
+        assert!(decision.requires_approval());
+        assert_eq!(decision.rule_id(), Some("command.git_reset_hard"));
+    }
+
+    #[test]
+    fn command_gate_ignores_non_command_text() {
+        let mut engine = PolicyEngine::permissive();
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(PaneCapabilities::prompt())
+            .with_command_text("please review the diff and proceed");
+
+        let decision = engine.authorize(&input);
+        assert!(decision.is_allowed());
+    }
+
+    #[test]
+    fn command_gate_uses_dcg_when_enabled() {
+        let config = CommandGateConfig {
+            enabled: true,
+            dcg_mode: DcgMode::Opportunistic,
+            dcg_deny_policy: DcgDenyPolicy::RequireApproval,
+        };
+        let outcome = evaluate_command_gate_with_runner("git status", &config, |_cmd| {
+            Ok(DcgDecision::Deny {
+                rule_id: Some("core.git:reset-hard".to_string()),
+            })
+        });
+
+        match outcome {
+            CommandGateOutcome::RequireApproval { rule_id, .. } => {
+                assert_eq!(rule_id, "dcg.core.git:reset-hard");
+            }
+            _ => panic!("Expected require approval"),
+        }
+    }
+
+    #[test]
+    fn command_gate_requires_approval_when_dcg_required_missing() {
+        let config = CommandGateConfig {
+            enabled: true,
+            dcg_mode: DcgMode::Required,
+            dcg_deny_policy: DcgDenyPolicy::RequireApproval,
+        };
+        let outcome = evaluate_command_gate_with_runner("git status", &config, |_cmd| {
+            Err(DcgError::NotAvailable)
+        });
+
+        match outcome {
+            CommandGateOutcome::RequireApproval { rule_id, .. } => {
+                assert_eq!(rule_id, "command_gate.dcg_unavailable");
+            }
+            _ => panic!("Expected require approval"),
+        }
     }
 
     // ========================================================================
@@ -916,6 +1603,14 @@ mod tests {
         assert!(ActionKind::SendCtrlC.is_destructive());
         assert!(!ActionKind::SendText.is_destructive());
         assert!(!ActionKind::ReadOutput.is_destructive());
+    }
+
+    #[test]
+    fn action_kind_rate_limited() {
+        assert!(ActionKind::SendText.is_rate_limited());
+        assert!(ActionKind::WorkflowRun.is_rate_limited());
+        assert!(!ActionKind::ReadOutput.is_rate_limited());
+        assert!(!ActionKind::SearchOutput.is_rate_limited());
     }
 
     #[test]
@@ -1067,13 +1762,15 @@ mod tests {
 
     #[test]
     fn authorize_enforces_rate_limit() {
-        let mut engine = PolicyEngine::new(1, false);
+        let mut engine = PolicyEngine::new(1, 100, false);
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
             .with_capabilities(PaneCapabilities::prompt());
 
         assert!(engine.authorize(&input).is_allowed());
-        assert!(engine.authorize(&input).is_denied()); // Rate limited
+        let decision = engine.authorize(&input);
+        assert!(decision.requires_approval()); // Rate limited
+        assert_eq!(decision.rule_id(), Some("policy.rate_limit"));
     }
 
     // ========================================================================

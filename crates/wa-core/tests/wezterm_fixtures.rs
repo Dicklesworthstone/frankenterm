@@ -132,6 +132,19 @@ fn parse_future_compat() {
 }
 
 #[test]
+fn parse_unicode_fields() {
+    let panes = load_fixture("unicode_fields.json");
+    assert_eq!(panes.len(), 1);
+
+    let pane = &panes[0];
+    assert_eq!(pane.effective_title(), "\u{7f16}\u{7a0b}\u{7ec8}\u{7aef}");
+
+    let cwd = pane.parsed_cwd();
+    assert!(!cwd.is_remote);
+    assert_eq!(cwd.path, "/home/\u{7528}\u{6237}/\u{9879}\u{76ee}");
+}
+
+#[test]
 fn inferred_domain_from_cwd() {
     // Test domain inference when domain_name is missing but cwd is remote
     let json = r#"[{

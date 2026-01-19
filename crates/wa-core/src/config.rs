@@ -20,6 +20,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 // =============================================================================
 // Main Config
@@ -368,7 +369,7 @@ impl PaneFilterRule {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StorageConfig {
-    /// Database file path (relative to data_dir if not absolute)
+    /// Database file path (relative to workspace .wa dir if not absolute)
     pub db_path: String,
 
     /// Retention period in days (0 = no retention, keep forever)
@@ -500,10 +501,10 @@ impl Default for WorkflowsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SafetyConfig {
-    /// Rate limit: maximum sends per pane per minute
+    /// Rate limit: maximum actions per pane per minute (per action kind)
     pub rate_limit_per_pane: u32,
 
-    /// Rate limit: maximum total sends per minute
+    /// Rate limit: maximum total actions per minute (per action kind)
     pub rate_limit_global: u32,
 
     /// Require prompt to be detected before allowing send
@@ -523,6 +524,9 @@ pub struct SafetyConfig {
 
     /// Pane reservation defaults
     pub reservations: ReservationConfig,
+
+    /// Command safety gate configuration
+    pub command_gate: CommandGateConfig,
 }
 
 impl Default for SafetyConfig {
@@ -536,8 +540,48 @@ impl Default for SafetyConfig {
             approval: ApprovalConfig::default(),
             redaction: RedactionConfig::default(),
             reservations: ReservationConfig::default(),
+            command_gate: CommandGateConfig::default(),
         }
     }
+}
+
+/// Command safety gate configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CommandGateConfig {
+    /// Enable command safety gate for SendText
+    pub enabled: bool,
+    /// dcg integration mode
+    pub dcg_mode: DcgMode,
+    /// Policy when dcg denies a command
+    pub dcg_deny_policy: DcgDenyPolicy,
+}
+
+impl Default for CommandGateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            dcg_mode: DcgMode::Opportunistic,
+            dcg_deny_policy: DcgDenyPolicy::RequireApproval,
+        }
+    }
+}
+
+/// dcg integration mode for command safety gate
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DcgMode {
+    Disabled,
+    Opportunistic,
+    Required,
+}
+
+/// Policy to apply when dcg denies a command
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DcgDenyPolicy {
+    Deny,
+    RequireApproval,
 }
 
 /// Capability gating configuration
@@ -692,6 +736,127 @@ impl Default for MetricsConfig {
 // Config Loading
 // =============================================================================
 
+/// CLI overrides applied after env overrides
+#[derive(Debug, Default, Clone)]
+pub struct ConfigOverrides {
+    /// Override log level
+    pub log_level: Option<String>,
+    /// Override storage database path
+    pub storage_db_path: Option<String>,
+    /// Override metrics enabled flag
+    pub metrics_enabled: Option<bool>,
+    /// Override metrics bind address
+    pub metrics_bind: Option<String>,
+    /// Override metrics prefix
+    pub metrics_prefix: Option<String>,
+}
+
+impl ConfigOverrides {
+    fn apply(&self, config: &mut Config) {
+        if let Some(ref log_level) = self.log_level {
+            config.general.log_level.clone_from(log_level);
+        }
+        if let Some(ref db_path) = self.storage_db_path {
+            config.storage.db_path.clone_from(db_path);
+        }
+        if let Some(enabled) = self.metrics_enabled {
+            config.metrics.enabled = enabled;
+        }
+        if let Some(ref bind) = self.metrics_bind {
+            config.metrics.bind.clone_from(bind);
+        }
+        if let Some(ref prefix) = self.metrics_prefix {
+            config.metrics.prefix.clone_from(prefix);
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct EnvOverrides {
+    log_level: Option<String>,
+    storage_db_path: Option<String>,
+    metrics_enabled: Option<bool>,
+    metrics_bind: Option<String>,
+    metrics_prefix: Option<String>,
+}
+
+impl EnvOverrides {
+    fn from_env() -> crate::Result<Self> {
+        let mut overrides = Self::default();
+
+        if let Ok(value) = std::env::var("WA_LOG_LEVEL") {
+            overrides.log_level = Some(value);
+        }
+        if let Ok(value) = std::env::var("WA_STORAGE_DB_PATH") {
+            overrides.storage_db_path = Some(value);
+        }
+        if let Ok(value) = std::env::var("WA_METRICS_ENABLED") {
+            overrides.metrics_enabled = Some(parse_env_bool(&value)?);
+        }
+        if let Ok(value) = std::env::var("WA_METRICS_BIND") {
+            overrides.metrics_bind = Some(value);
+        }
+        if let Ok(value) = std::env::var("WA_METRICS_PREFIX") {
+            overrides.metrics_prefix = Some(value);
+        }
+
+        Ok(overrides)
+    }
+
+    fn apply(self, config: &mut Config) {
+        if let Some(log_level) = self.log_level {
+            config.general.log_level = log_level;
+        }
+        if let Some(db_path) = self.storage_db_path {
+            config.storage.db_path = db_path;
+        }
+        if let Some(enabled) = self.metrics_enabled {
+            config.metrics.enabled = enabled;
+        }
+        if let Some(bind) = self.metrics_bind {
+            config.metrics.bind = bind;
+        }
+        if let Some(prefix) = self.metrics_prefix {
+            config.metrics.prefix = prefix;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EffectiveConfig {
+    pub config: Config,
+    pub paths: EffectivePaths,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EffectivePaths {
+    pub workspace_root: String,
+    pub wa_dir: String,
+    pub db_path: String,
+    pub lock_path: String,
+    pub ipc_socket_path: String,
+    pub logs_dir: String,
+    pub log_path: String,
+    pub crash_dir: String,
+    pub diag_dir: String,
+}
+
+impl EffectivePaths {
+    fn from_layout(layout: &WorkspaceLayout) -> Self {
+        Self {
+            workspace_root: path_to_string(&layout.root),
+            wa_dir: path_to_string(&layout.wa_dir),
+            db_path: path_to_string(&layout.db_path),
+            lock_path: path_to_string(&layout.lock_path),
+            ipc_socket_path: path_to_string(&layout.ipc_socket_path),
+            logs_dir: path_to_string(&layout.logs_dir),
+            log_path: path_to_string(&layout.log_path),
+            crash_dir: path_to_string(&layout.crash_dir),
+            diag_dir: path_to_string(&layout.diag_dir),
+        }
+    }
+}
+
 impl Config {
     /// Load configuration from default locations
     ///
@@ -740,21 +905,203 @@ impl Config {
             .map_err(|e| crate::error::ConfigError::SerializeFailed(e.to_string()).into())
     }
 
+    /// Load configuration with overrides and validation
+    ///
+    /// Resolution order: defaults -> config file -> env -> CLI overrides.
+    pub fn load_with_overrides(
+        config_path: Option<&Path>,
+        strict: bool,
+        overrides: &ConfigOverrides,
+    ) -> crate::Result<Self> {
+        let mut config = match config_path {
+            Some(path) => {
+                if path.exists() {
+                    Self::load_from(path)?
+                } else if strict {
+                    return Err(crate::error::ConfigError::FileNotFound(
+                        path.display().to_string(),
+                    )
+                    .into());
+                } else {
+                    Self::default()
+                }
+            }
+            None => Self::load()?,
+        };
+
+        let env_overrides = EnvOverrides::from_env()?;
+        env_overrides.apply(&mut config);
+        overrides.apply(&mut config);
+        config.normalize_paths();
+        config.validate()?;
+
+        Ok(config)
+    }
+
+    /// Build a resolved, effective view of the config including workspace paths
+    pub fn effective_config(
+        &self,
+        workspace_root: Option<&Path>,
+    ) -> crate::Result<EffectiveConfig> {
+        let layout = self.workspace_layout(workspace_root)?;
+        Ok(EffectiveConfig {
+            config: self.clone(),
+            paths: EffectivePaths::from_layout(&layout),
+        })
+    }
+
+    /// Normalize path fields by expanding tildes
+    pub fn normalize_paths(&mut self) {
+        let data_dir = expand_tilde(&self.general.data_dir);
+        self.general.data_dir = path_to_string(&data_dir);
+
+        let db_path = expand_tilde(&self.storage.db_path);
+        self.storage.db_path = path_to_string(&db_path);
+    }
+
+    /// Validate semantic constraints
+    pub fn validate(&self) -> crate::Result<()> {
+        if self.ingest.min_poll_interval_ms == 0 {
+            return Err(crate::error::ConfigError::ValidationError(
+                "ingest.min_poll_interval_ms must be >= 1".to_string(),
+            )
+            .into());
+        }
+
+        if self.ingest.poll_interval_ms < self.ingest.min_poll_interval_ms {
+            return Err(crate::error::ConfigError::ValidationError(format!(
+                "ingest.poll_interval_ms ({}) must be >= ingest.min_poll_interval_ms ({})",
+                self.ingest.poll_interval_ms, self.ingest.min_poll_interval_ms
+            ))
+            .into());
+        }
+
+        if self.ingest.max_concurrent_captures == 0 {
+            return Err(crate::error::ConfigError::ValidationError(
+                "ingest.max_concurrent_captures must be >= 1".to_string(),
+            )
+            .into());
+        }
+
+        if self.storage.writer_queue_size == 0 {
+            return Err(crate::error::ConfigError::ValidationError(
+                "storage.writer_queue_size must be >= 1".to_string(),
+            )
+            .into());
+        }
+
+        if self.workflows.max_concurrent == 0 {
+            return Err(crate::error::ConfigError::ValidationError(
+                "workflows.max_concurrent must be >= 1".to_string(),
+            )
+            .into());
+        }
+
+        if self.metrics.bind.trim().is_empty() {
+            return Err(crate::error::ConfigError::ValidationError(
+                "metrics.bind must not be empty".to_string(),
+            )
+            .into());
+        }
+
+        Ok(())
+    }
+
     /// Get the effective data directory (with ~ expansion)
     #[must_use]
     pub fn effective_data_dir(&self) -> std::path::PathBuf {
         expand_tilde(&self.general.data_dir)
     }
 
-    /// Get the effective database path
+    /// Resolve the workspace root (CLI override > WA_WORKSPACE > current dir)
+    pub fn resolve_workspace_root(&self, explicit: Option<&Path>) -> crate::Result<PathBuf> {
+        let env_path = std::env::var("WA_WORKSPACE").ok();
+        resolve_workspace_root_with_env(explicit, env_path.as_deref())
+    }
+
+    /// Resolve workspace layout paths for a given workspace root
+    pub fn workspace_layout(&self, explicit: Option<&Path>) -> crate::Result<WorkspaceLayout> {
+        let root = self.resolve_workspace_root(explicit)?;
+        Ok(WorkspaceLayout::new(root, &self.storage))
+    }
+
+    /// Get the effective database path for a workspace root
     #[must_use]
-    pub fn effective_db_path(&self) -> std::path::PathBuf {
-        let db_path = std::path::Path::new(&self.storage.db_path);
+    pub fn effective_db_path(&self, workspace_root: &Path) -> PathBuf {
+        let db_path = Path::new(&self.storage.db_path);
         if db_path.is_absolute() {
             db_path.to_path_buf()
         } else {
-            self.effective_data_dir().join(db_path)
+            workspace_root.join(".wa").join(db_path)
         }
+    }
+}
+
+// =============================================================================
+// Workspace Layout
+// =============================================================================
+
+/// Resolved filesystem layout for a workspace
+#[derive(Debug, Clone)]
+pub struct WorkspaceLayout {
+    /// Workspace root directory
+    pub root: PathBuf,
+    /// Workspace state directory (.wa)
+    pub wa_dir: PathBuf,
+    /// SQLite database path
+    pub db_path: PathBuf,
+    /// Watcher lock path
+    pub lock_path: PathBuf,
+    /// IPC socket path
+    pub ipc_socket_path: PathBuf,
+    /// Logs directory
+    pub logs_dir: PathBuf,
+    /// Watcher log file path
+    pub log_path: PathBuf,
+    /// Crash reports directory
+    pub crash_dir: PathBuf,
+    /// Diagnostics bundle directory
+    pub diag_dir: PathBuf,
+}
+
+impl WorkspaceLayout {
+    /// Create a new workspace layout for the given root
+    #[must_use]
+    pub fn new(root: PathBuf, storage: &StorageConfig) -> Self {
+        let wa_dir = root.join(".wa");
+        let expanded_db_path = expand_tilde(&storage.db_path);
+        let db_path = if expanded_db_path.is_absolute() {
+            expanded_db_path
+        } else {
+            wa_dir.join(expanded_db_path)
+        };
+        let lock_path = wa_dir.join("watch.lock");
+        let ipc_socket_path = wa_dir.join("ipc.sock");
+        let logs_dir = wa_dir.join("logs");
+        let log_path = logs_dir.join("wa-watch.log");
+        let crash_dir = wa_dir.join("crash");
+        let diag_dir = wa_dir.join("diag");
+
+        Self {
+            root,
+            wa_dir,
+            db_path,
+            lock_path,
+            ipc_socket_path,
+            logs_dir,
+            log_path,
+            crash_dir,
+            diag_dir,
+        }
+    }
+
+    /// Ensure workspace directories exist and are writable
+    pub fn ensure_directories(&self) -> crate::Result<()> {
+        ensure_dir(&self.wa_dir)?;
+        ensure_dir(&self.logs_dir)?;
+        ensure_dir(&self.crash_dir)?;
+        ensure_dir(&self.diag_dir)?;
+        Ok(())
     }
 }
 
@@ -782,6 +1129,69 @@ fn expand_tilde(path: &str) -> std::path::PathBuf {
         }
     }
     std::path::PathBuf::from(path)
+}
+
+fn resolve_path(path: &Path) -> crate::Result<PathBuf> {
+    let expanded = path
+        .to_str()
+        .map_or_else(|| path.to_path_buf(), expand_tilde);
+
+    if expanded.is_absolute() {
+        Ok(expanded)
+    } else {
+        let cwd = std::env::current_dir().map_err(|e| {
+            crate::error::ConfigError::ValidationError(format!(
+                "Failed to resolve current directory: {e}"
+            ))
+        })?;
+        Ok(cwd.join(expanded))
+    }
+}
+
+fn parse_env_bool(value: &str) -> crate::Result<bool> {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(crate::error::ConfigError::ValidationError(format!(
+            "Invalid boolean value '{value}' for environment override"
+        ))
+        .into()),
+    }
+}
+
+fn path_to_string(path: &Path) -> String {
+    path.to_string_lossy().to_string()
+}
+
+fn ensure_dir(path: &Path) -> crate::Result<()> {
+    std::fs::create_dir_all(path).map_err(|e| {
+        crate::error::ConfigError::ValidationError(format!(
+            "Workspace path not writable: {} ({e}). Hint: choose a writable workspace via --workspace or WA_WORKSPACE.",
+            path.display()
+        ))
+        .into()
+    })
+}
+
+fn resolve_workspace_root_with_env(
+    explicit: Option<&Path>,
+    env_path: Option<&str>,
+) -> crate::Result<PathBuf> {
+    if let Some(path) = explicit {
+        return resolve_path(path);
+    }
+
+    if let Some(env_path) = env_path {
+        return resolve_path(Path::new(env_path));
+    }
+
+    std::env::current_dir().map_err(|e| {
+        crate::error::ConfigError::ValidationError(format!(
+            "Failed to resolve current directory: {e}"
+        ))
+        .into()
+    })
 }
 
 // Provide a fallback for dirs crate
@@ -926,9 +1336,9 @@ disabled_rules = ["codex.usage_warning"]
         let mut config = Config::default();
         config.storage.db_path = "test.db".to_string();
 
-        let db_path = config.effective_db_path();
-        assert!(db_path.to_string_lossy().ends_with("test.db"));
-        assert!(db_path.to_string_lossy().contains("wa"));
+        let workspace_root = Path::new("workspace-root");
+        let db_path = config.effective_db_path(workspace_root);
+        assert_eq!(db_path, workspace_root.join(".wa").join("test.db"));
     }
 
     #[test]
@@ -936,8 +1346,110 @@ disabled_rules = ["codex.usage_warning"]
         let mut config = Config::default();
         config.storage.db_path = "/custom/path/wa.db".to_string();
 
-        let db_path = config.effective_db_path();
+        let db_path = config.effective_db_path(Path::new("workspace-root"));
         assert_eq!(db_path.to_string_lossy(), "/custom/path/wa.db");
+    }
+
+    #[test]
+    fn workspace_resolution_prefers_cli_over_env() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let root = resolve_workspace_root_with_env(
+            Some(Path::new("cli-workspace")),
+            Some("env-workspace"),
+        )
+        .expect("resolve");
+        assert_eq!(root, cwd.join("cli-workspace"));
+    }
+
+    #[test]
+    fn workspace_resolution_prefers_env_over_cwd() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let root = resolve_workspace_root_with_env(None, Some("env-workspace")).expect("resolve");
+        assert_eq!(root, cwd.join("env-workspace"));
+    }
+
+    #[test]
+    fn workspace_resolution_defaults_to_cwd() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let root = resolve_workspace_root_with_env(None, None).expect("resolve");
+        assert_eq!(root, cwd);
+    }
+
+    #[test]
+    fn workspace_layout_paths_are_scoped() {
+        let mut config = Config::default();
+        config.storage.db_path = "wa.db".to_string();
+        let root = PathBuf::from("workspace-root");
+        let layout = WorkspaceLayout::new(root.clone(), &config.storage);
+
+        assert_eq!(layout.root, root);
+        assert_eq!(layout.wa_dir, PathBuf::from("workspace-root").join(".wa"));
+        assert_eq!(
+            layout.db_path,
+            PathBuf::from("workspace-root").join(".wa").join("wa.db")
+        );
+        assert!(layout.lock_path.ends_with("watch.lock"));
+        assert!(layout.ipc_socket_path.ends_with("ipc.sock"));
+        assert!(layout.log_path.ends_with("wa-watch.log"));
+    }
+
+    #[test]
+    fn normalize_paths_expands_tilde() {
+        if dirs::home_dir().is_none() {
+            return;
+        }
+        let mut config = Config::default();
+        config.general.data_dir = "~/wa-data".to_string();
+        config.storage.db_path = "~/wa.db".to_string();
+        config.normalize_paths();
+
+        assert!(!config.general.data_dir.contains('~'));
+        assert!(!config.storage.db_path.contains('~'));
+    }
+
+    #[test]
+    fn env_overrides_apply_before_cli_overrides() {
+        let mut config = Config::default();
+        let env_overrides = EnvOverrides {
+            log_level: Some("debug".to_string()),
+            storage_db_path: Some("env.db".to_string()),
+            metrics_enabled: Some(false),
+            metrics_bind: None,
+            metrics_prefix: None,
+        };
+        env_overrides.apply(&mut config);
+
+        let cli_overrides = ConfigOverrides {
+            log_level: Some("info".to_string()),
+            storage_db_path: Some("cli.db".to_string()),
+            metrics_enabled: Some(true),
+            metrics_bind: None,
+            metrics_prefix: None,
+        };
+        cli_overrides.apply(&mut config);
+
+        assert_eq!(config.general.log_level, "info");
+        assert_eq!(config.storage.db_path, "cli.db");
+        assert!(config.metrics.enabled);
+    }
+
+    #[test]
+    fn parse_env_bool_accepts_values() {
+        assert!(parse_env_bool("true").unwrap());
+        assert!(parse_env_bool("1").unwrap());
+        assert!(!parse_env_bool("false").unwrap());
+        assert!(!parse_env_bool("0").unwrap());
+        assert!(parse_env_bool("Yes").unwrap());
+        assert!(!parse_env_bool("off").unwrap());
+    }
+
+    #[test]
+    fn validate_rejects_bad_poll_intervals() {
+        let mut config = Config::default();
+        config.ingest.min_poll_interval_ms = 100;
+        config.ingest.poll_interval_ms = 50;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("poll_interval_ms"));
     }
 
     #[test]

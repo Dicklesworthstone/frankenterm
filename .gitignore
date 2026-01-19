@@ -49,3 +49,4 @@ temp/
 
 # Generated documentation (build on demand)
 doc/
+.ntm/

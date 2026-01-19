@@ -64,6 +64,10 @@ memchr = "2.7"
 fancy-regex = "0.14"
 regex = "1.10"
 
+# Crypto / randomness
+rand = "0.8"
+sha2 = "0.10"
+
 # Config
 toml = "0.8"
 

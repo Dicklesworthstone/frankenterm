@@ -4,7 +4,9 @@
 
 #![forbid(unsafe_code)]
 
+use std::path::Path;
 use std::sync::LazyLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
@@ -21,6 +23,10 @@ struct Cli {
     /// Configuration file path
     #[arg(short, long, global = true)]
     config: Option<String>,
+
+    /// Workspace root (overrides WA_WORKSPACE)
+    #[arg(long, global = true, env = "WA_WORKSPACE")]
+    workspace: Option<String>,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -42,7 +48,7 @@ enum Commands {
     /// Robot mode commands (JSON I/O)
     Robot {
         #[command(subcommand)]
-        command: RobotCommands,
+        command: Option<RobotCommands>,
     },
 
     /// Search captured output
@@ -128,6 +134,9 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum RobotCommands {
+    /// Show robot help as JSON
+    Help,
+
     /// Get all panes as JSON
     State,
 
@@ -218,6 +227,11 @@ enum SetupCommands {
     Config,
 }
 
+const ROBOT_ERR_INVALID_ARGS: &str = "robot.invalid_args";
+const ROBOT_ERR_UNKNOWN_SUBCOMMAND: &str = "robot.unknown_subcommand";
+const ROBOT_ERR_NOT_IMPLEMENTED: &str = "robot.not_implemented";
+const ROBOT_ERR_CONFIG: &str = "robot.config_error";
+
 /// JSON envelope for robot mode responses
 #[derive(serde::Serialize)]
 struct RobotResponse<T> {
@@ -227,8 +241,12 @@ struct RobotResponse<T> {
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     hint: Option<String>,
     elapsed_ms: u64,
+    version: String,
+    now: u64,
 }
 
 impl<T> RobotResponse<T> {
@@ -237,20 +255,43 @@ impl<T> RobotResponse<T> {
             ok: true,
             data: Some(data),
             error: None,
+            error_code: None,
             hint: None,
             elapsed_ms,
+            version: wa_core::VERSION.to_string(),
+            now: now_ms(),
         }
     }
 
-    fn error(msg: impl Into<String>, hint: Option<String>, elapsed_ms: u64) -> Self {
+    fn error_with_code(
+        code: &str,
+        msg: impl Into<String>,
+        hint: Option<String>,
+        elapsed_ms: u64,
+    ) -> Self {
         Self {
             ok: false,
             data: None,
             error: Some(msg.into()),
+            error_code: Some(code.to_string()),
             hint,
             elapsed_ms,
+            version: wa_core::VERSION.to_string(),
+            now: now_ms(),
         }
     }
+}
+
+#[derive(serde::Serialize)]
+struct RobotHelp {
+    commands: Vec<RobotCommandInfo>,
+    global_flags: Vec<&'static str>,
+}
+
+#[derive(serde::Serialize)]
+struct RobotCommandInfo {
+    name: &'static str,
+    description: &'static str,
 }
 
 fn redact_for_output(text: &str) -> String {
@@ -361,9 +402,69 @@ fn build_workflow_dry_run_report(
     ctx.take_report()
 }
 
+#[allow(dead_code)]
+struct RobotContext {
+    effective: wa_core::config::EffectiveConfig,
+}
+
+fn build_robot_context(
+    config_path: Option<&str>,
+    workspace: Option<&str>,
+) -> anyhow::Result<RobotContext> {
+    let overrides = wa_core::config::ConfigOverrides::default();
+    let path = config_path.map(Path::new);
+    let config = wa_core::config::Config::load_with_overrides(path, path.is_some(), &overrides)?;
+    let workspace_path = workspace.map(Path::new);
+    let effective = config.effective_config(workspace_path)?;
+    Ok(RobotContext { effective })
+}
+
+fn build_robot_help() -> RobotHelp {
+    RobotHelp {
+        commands: vec![
+            RobotCommandInfo {
+                name: "help",
+                description: "Show this help as JSON",
+            },
+            RobotCommandInfo {
+                name: "state",
+                description: "List panes with metadata",
+            },
+            RobotCommandInfo {
+                name: "get-text",
+                description: "Fetch recent pane output",
+            },
+            RobotCommandInfo {
+                name: "send",
+                description: "Send text to a pane",
+            },
+            RobotCommandInfo {
+                name: "wait-for",
+                description: "Wait for a pattern on a pane",
+            },
+            RobotCommandInfo {
+                name: "search",
+                description: "Search captured output",
+            },
+            RobotCommandInfo {
+                name: "events",
+                description: "Fetch recent events",
+            },
+        ],
+        global_flags: vec!["--workspace <path>", "--config <path>", "--verbose"],
+    }
+}
+
 /// Helper to convert elapsed time to u64 milliseconds safely
 fn elapsed_ms(start: std::time::Instant) -> u64 {
     u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|dur| u64::try_from(dur.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 fn init_logging(verbose: bool) {
@@ -381,11 +482,56 @@ fn init_logging(verbose: bool) {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    let start = std::time::Instant::now();
+    let args: Vec<String> = std::env::args().collect();
+    let robot_mode = args.get(1).is_some_and(|arg| arg == "robot");
 
-    init_logging(cli.verbose);
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => {
+            if robot_mode {
+                let elapsed = elapsed_ms(start);
+                match err.kind() {
+                    clap::error::ErrorKind::DisplayHelp
+                    | clap::error::ErrorKind::DisplayVersion => {
+                        let response = RobotResponse::success(build_robot_help(), elapsed);
+                        println!("{}", serde_json::to_string_pretty(&response)?);
+                    }
+                    clap::error::ErrorKind::InvalidSubcommand => {
+                        let response = RobotResponse::<()>::error_with_code(
+                            ROBOT_ERR_UNKNOWN_SUBCOMMAND,
+                            "Unknown robot subcommand",
+                            Some("Use `wa robot help` for available commands.".to_string()),
+                            elapsed,
+                        );
+                        println!("{}", serde_json::to_string_pretty(&response)?);
+                    }
+                    _ => {
+                        let response = RobotResponse::<()>::error_with_code(
+                            ROBOT_ERR_INVALID_ARGS,
+                            "Invalid robot arguments",
+                            Some("Use `wa robot help` for usage.".to_string()),
+                            elapsed,
+                        );
+                        println!("{}", serde_json::to_string_pretty(&response)?);
+                    }
+                }
+                return Ok(());
+            }
+            err.exit();
+        }
+    };
 
-    match cli.command {
+    let Cli {
+        verbose,
+        config,
+        workspace,
+        command,
+    } = cli;
+
+    init_logging(verbose);
+
+    match command {
         Some(Commands::Watch {
             auto_handle,
             foreground,
@@ -401,78 +547,117 @@ async fn main() -> anyhow::Result<()> {
 
         Some(Commands::Robot { command }) => {
             let start = std::time::Instant::now();
-            match command {
-                RobotCommands::State => {
-                    // TODO: Implement state command
-                    let response: RobotResponse<Vec<wa_core::wezterm::PaneInfo>> =
-                        RobotResponse::error("Not yet implemented", None, elapsed_ms(start));
-                    println!("{}", serde_json::to_string_pretty(&response)?);
-                }
-                RobotCommands::GetText { pane_id } => {
-                    let response: RobotResponse<String> = RobotResponse::error(
-                        format!("get-text for pane {pane_id} not yet implemented"),
-                        None,
-                        elapsed_ms(start),
-                    );
-                    println!("{}", serde_json::to_string_pretty(&response)?);
-                }
-                RobotCommands::Send {
-                    pane_id,
-                    text,
-                    dry_run,
-                } => {
-                    let redacted_text = redact_for_output(&text);
-                    let command = if dry_run {
-                        format!("wa robot send {pane_id} \"{redacted_text}\" --dry-run")
-                    } else {
-                        format!("wa robot send {pane_id} \"{redacted_text}\"")
-                    };
-                    let command_ctx = wa_core::dry_run::CommandContext::new(command, dry_run);
+            let command = command.unwrap_or(RobotCommands::Help);
 
-                    if command_ctx.is_dry_run() {
-                        let report = build_send_dry_run_report(&command_ctx, pane_id, &text, false);
-                        let response = RobotResponse::success(report, elapsed_ms(start));
-                        println!("{}", serde_json::to_string_pretty(&response)?);
-                    } else {
-                        let response: RobotResponse<()> = RobotResponse::error(
-                            format!(
-                                "send to pane {pane_id} not yet implemented (text: {redacted_text})"
-                            ),
-                            None,
-                            elapsed_ms(start),
-                        );
-                        println!("{}", serde_json::to_string_pretty(&response)?);
+            match command {
+                RobotCommands::Help => {
+                    let response = RobotResponse::success(build_robot_help(), elapsed_ms(start));
+                    println!("{}", serde_json::to_string_pretty(&response)?);
+                }
+                other => {
+                    let _ctx = match build_robot_context(config.as_deref(), workspace.as_deref()) {
+                        Ok(ctx) => ctx,
+                        Err(err) => {
+                            let response = RobotResponse::<()>::error_with_code(
+                                ROBOT_ERR_CONFIG,
+                                format!("Failed to load config: {err}"),
+                                Some("Check --config/--workspace or WA_WORKSPACE.".to_string()),
+                                elapsed_ms(start),
+                            );
+                            println!("{}", serde_json::to_string_pretty(&response)?);
+                            return Ok(());
+                        }
+                    };
+
+                    match other {
+                        RobotCommands::State => {
+                            // TODO: Implement state command
+                            let response: RobotResponse<Vec<wa_core::wezterm::PaneInfo>> =
+                                RobotResponse::error_with_code(
+                                    ROBOT_ERR_NOT_IMPLEMENTED,
+                                    "Not yet implemented",
+                                    None,
+                                    elapsed_ms(start),
+                                );
+                            println!("{}", serde_json::to_string_pretty(&response)?);
+                        }
+                        RobotCommands::GetText { pane_id } => {
+                            let response: RobotResponse<String> = RobotResponse::error_with_code(
+                                ROBOT_ERR_NOT_IMPLEMENTED,
+                                format!("get-text for pane {pane_id} not yet implemented"),
+                                None,
+                                elapsed_ms(start),
+                            );
+                            println!("{}", serde_json::to_string_pretty(&response)?);
+                        }
+                        RobotCommands::Send {
+                            pane_id,
+                            text,
+                            dry_run,
+                        } => {
+                            let redacted_text = redact_for_output(&text);
+                            let command = if dry_run {
+                                format!("wa robot send {pane_id} \"{redacted_text}\" --dry-run")
+                            } else {
+                                format!("wa robot send {pane_id} \"{redacted_text}\"")
+                            };
+                            let command_ctx =
+                                wa_core::dry_run::CommandContext::new(command, dry_run);
+
+                            if command_ctx.is_dry_run() {
+                                let report =
+                                    build_send_dry_run_report(&command_ctx, pane_id, &text, false);
+                                let response = RobotResponse::success(report, elapsed_ms(start));
+                                println!("{}", serde_json::to_string_pretty(&response)?);
+                            } else {
+                                let response: RobotResponse<()> = RobotResponse::error_with_code(
+                                    ROBOT_ERR_NOT_IMPLEMENTED,
+                                    format!(
+                                        "send to pane {pane_id} not yet implemented (text: {redacted_text})"
+                                    ),
+                                    None,
+                                    elapsed_ms(start),
+                                );
+                                println!("{}", serde_json::to_string_pretty(&response)?);
+                            }
+                        }
+                        RobotCommands::WaitFor {
+                            pane_id,
+                            rule_id,
+                            timeout,
+                        } => {
+                            let response: RobotResponse<()> = RobotResponse::error_with_code(
+                                ROBOT_ERR_NOT_IMPLEMENTED,
+                                format!(
+                                    "wait-for on pane {pane_id} for rule {rule_id} (timeout {timeout}ms) not yet implemented"
+                                ),
+                                None,
+                                elapsed_ms(start),
+                            );
+                            println!("{}", serde_json::to_string_pretty(&response)?);
+                        }
+                        RobotCommands::Search { query } => {
+                            let response: RobotResponse<Vec<String>> =
+                                RobotResponse::error_with_code(
+                                    ROBOT_ERR_NOT_IMPLEMENTED,
+                                    format!("search for '{query}' not yet implemented"),
+                                    None,
+                                    elapsed_ms(start),
+                                );
+                            println!("{}", serde_json::to_string_pretty(&response)?);
+                        }
+                        RobotCommands::Events { limit } => {
+                            let response: RobotResponse<Vec<wa_core::events::Event>> =
+                                RobotResponse::error_with_code(
+                                    ROBOT_ERR_NOT_IMPLEMENTED,
+                                    format!("events (limit {limit}) not yet implemented"),
+                                    None,
+                                    elapsed_ms(start),
+                                );
+                            println!("{}", serde_json::to_string_pretty(&response)?);
+                        }
+                        RobotCommands::Help => unreachable!("handled above"),
                     }
-                }
-                RobotCommands::WaitFor {
-                    pane_id,
-                    rule_id,
-                    timeout,
-                } => {
-                    let response: RobotResponse<()> = RobotResponse::error(
-                        format!(
-                            "wait-for on pane {pane_id} for rule {rule_id} (timeout {timeout}ms) not yet implemented"
-                        ),
-                        None,
-                        elapsed_ms(start),
-                    );
-                    println!("{}", serde_json::to_string_pretty(&response)?);
-                }
-                RobotCommands::Search { query } => {
-                    let response: RobotResponse<Vec<String>> = RobotResponse::error(
-                        format!("search for '{query}' not yet implemented"),
-                        None,
-                        elapsed_ms(start),
-                    );
-                    println!("{}", serde_json::to_string_pretty(&response)?);
-                }
-                RobotCommands::Events { limit } => {
-                    let response: RobotResponse<Vec<wa_core::events::Event>> = RobotResponse::error(
-                        format!("events (limit {limit}) not yet implemented"),
-                        None,
-                        elapsed_ms(start),
-                    );
-                    println!("{}", serde_json::to_string_pretty(&response)?);
                 }
             }
         }

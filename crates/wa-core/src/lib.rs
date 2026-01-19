@@ -22,7 +22,9 @@
 //! - `events`: Event bus for detections and signals
 //! - `workflows`: Durable workflow execution
 //! - `config`: Configuration management
+//! - `approval`: Allow-once approvals for RequireApproval decisions
 //! - `policy`: Safety and rate limiting
+//! - `wait`: Wait-for utilities (no fixed sleeps)
 //!
 //! # Safety
 //!
@@ -31,6 +33,7 @@
 #![forbid(unsafe_code)]
 #![feature(stmt_expr_attributes)]
 
+pub mod approval;
 pub mod config;
 pub mod dry_run;
 pub mod error;
@@ -39,6 +42,7 @@ pub mod ingest;
 pub mod patterns;
 pub mod policy;
 pub mod storage;
+pub mod wait;
 pub mod wezterm;
 pub mod workflows;
 

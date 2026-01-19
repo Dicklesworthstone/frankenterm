@@ -309,6 +309,10 @@ pub enum MoveDirection {
 
 /// Default command timeout in seconds
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
+/// Default retry attempts for safe operations
+const DEFAULT_RETRY_ATTEMPTS: u32 = 3;
+/// Default delay between retries (ms)
+const DEFAULT_RETRY_DELAY_MS: u64 = 200;
 
 /// WezTerm CLI client for interacting with WezTerm instances
 ///
@@ -331,6 +335,10 @@ pub struct WeztermClient {
     socket_path: Option<String>,
     /// Command timeout in seconds
     timeout_secs: u64,
+    /// Retry attempts for safe operations
+    retry_attempts: u32,
+    /// Delay between retries in milliseconds
+    retry_delay_ms: u64,
 }
 
 impl Default for WeztermClient {
@@ -346,6 +354,8 @@ impl WeztermClient {
         Self {
             socket_path: None,
             timeout_secs: DEFAULT_TIMEOUT_SECS,
+            retry_attempts: DEFAULT_RETRY_ATTEMPTS,
+            retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
         }
     }
 
@@ -355,6 +365,8 @@ impl WeztermClient {
         Self {
             socket_path: Some(socket_path.into()),
             timeout_secs: DEFAULT_TIMEOUT_SECS,
+            retry_attempts: DEFAULT_RETRY_ATTEMPTS,
+            retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
         }
     }
 
@@ -365,11 +377,27 @@ impl WeztermClient {
         self
     }
 
+    /// Set retry attempts for safe operations
+    #[must_use]
+    pub fn with_retries(mut self, attempts: u32) -> Self {
+        self.retry_attempts = attempts.max(1);
+        self
+    }
+
+    /// Set retry delay in milliseconds
+    #[must_use]
+    pub fn with_retry_delay_ms(mut self, delay_ms: u64) -> Self {
+        self.retry_delay_ms = delay_ms;
+        self
+    }
+
     /// List all panes across all windows and tabs
     ///
     /// Returns a vector of `PaneInfo` structs with full metadata about each pane.
     pub async fn list_panes(&self) -> Result<Vec<PaneInfo>> {
-        let output = self.run_cli(&["cli", "list", "--format", "json"]).await?;
+        let output = self
+            .run_cli_with_retry(&["cli", "list", "--format", "json"])
+            .await?;
         let panes: Vec<PaneInfo> =
             serde_json::from_str(&output).map_err(|e| WeztermError::ParseError(e.to_string()))?;
         Ok(panes)
@@ -397,7 +425,7 @@ impl WeztermClient {
         if escapes {
             args.push("--escapes");
         }
-        self.run_cli_with_pane_check(&args, pane_id).await
+        self.run_cli_with_pane_check_retry(&args, pane_id).await
     }
 
     /// Send text to a pane using paste mode (default, faster for multi-char input)
@@ -637,6 +665,12 @@ impl WeztermClient {
         use tokio::process::Command;
         use tokio::time::{Duration, timeout};
 
+        if let Some(ref socket) = self.socket_path {
+            if !std::path::Path::new(socket).exists() {
+                return Err(WeztermError::SocketNotFound(socket.clone()).into());
+            }
+        }
+
         let mut cmd = Command::new("wezterm");
         cmd.args(args);
 
@@ -679,6 +713,46 @@ impl WeztermClient {
             _ => WeztermError::CommandFailed(e.to_string()),
         }
     }
+
+    async fn run_cli_with_pane_check_retry(&self, args: &[&str], pane_id: u64) -> Result<String> {
+        self.retry_with(|| self.run_cli_with_pane_check(args, pane_id))
+            .await
+    }
+
+    async fn run_cli_with_retry(&self, args: &[&str]) -> Result<String> {
+        self.retry_with(|| self.run_cli(args)).await
+    }
+
+    async fn retry_with<F, Fut>(&self, mut runner: F) -> Result<String>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<String>>,
+    {
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match runner().await {
+                Ok(output) => return Ok(output),
+                Err(err) => {
+                    if attempt >= self.retry_attempts || !is_retryable_error(&err) {
+                        return Err(err);
+                    }
+                    if self.retry_delay_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(self.retry_delay_ms)).await;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn is_retryable_error(err: &crate::Error) -> bool {
+    matches!(
+        err,
+        crate::Error::Wezterm(
+            WeztermError::NotRunning | WeztermError::Timeout(_) | WeztermError::CommandFailed(_)
+        )
+    )
 }
 
 // =============================================================================
@@ -942,6 +1016,7 @@ fn ms_u64(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1097,6 +1172,7 @@ mod tests {
     fn client_can_be_created() {
         let client = WeztermClient::new();
         assert_eq!(client.timeout_secs, DEFAULT_TIMEOUT_SECS);
+        assert_eq!(client.retry_attempts, DEFAULT_RETRY_ATTEMPTS);
     }
 
     #[test]
@@ -1109,6 +1185,54 @@ mod tests {
     fn client_with_timeout() {
         let client = WeztermClient::new().with_timeout(60);
         assert_eq!(client.timeout_secs, 60);
+    }
+
+    #[test]
+    fn client_with_retries() {
+        let client = WeztermClient::new().with_retries(5).with_retry_delay_ms(10);
+        assert_eq!(client.retry_attempts, 5);
+        assert_eq!(client.retry_delay_ms, 10);
+    }
+
+    #[tokio::test]
+    async fn retry_with_retries_transient_errors() {
+        let client = WeztermClient::new().with_retries(3).with_retry_delay_ms(0);
+        let attempts = Cell::new(0);
+
+        let result = client
+            .retry_with(|| {
+                attempts.set(attempts.get() + 1);
+                async {
+                    if attempts.get() < 2 {
+                        Err(WeztermError::NotRunning.into())
+                    } else {
+                        Ok("ok".to_string())
+                    }
+                }
+            })
+            .await;
+
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(result.unwrap(), "ok");
+    }
+
+    #[tokio::test]
+    async fn retry_with_stops_on_non_retryable_error() {
+        let client = WeztermClient::new().with_retries(3).with_retry_delay_ms(0);
+        let attempts = Cell::new(0);
+
+        let result = client
+            .retry_with(|| {
+                attempts.set(attempts.get() + 1);
+                async { Err(WeztermError::PaneNotFound(42).into()) }
+            })
+            .await;
+
+        assert_eq!(attempts.get(), 1);
+        assert!(matches!(
+            result,
+            Err(crate::Error::Wezterm(WeztermError::PaneNotFound(42)))
+        ));
     }
 
     #[test]
