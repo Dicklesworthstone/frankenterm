@@ -543,6 +543,478 @@ impl WorkflowEngine {
     }
 }
 
+// ============================================================================
+// Wait Condition Execution
+// ============================================================================
+
+use crate::ingest::Osc133State;
+use crate::patterns::PatternEngine;
+use crate::wezterm::PaneTextSource;
+use std::time::Duration;
+use tokio::time::{Instant, sleep};
+
+/// Result of waiting for a condition.
+#[derive(Debug, Clone)]
+pub enum WaitConditionResult {
+    /// Condition was satisfied.
+    Satisfied {
+        /// Time spent waiting in milliseconds.
+        elapsed_ms: u64,
+        /// Number of polls performed.
+        polls: usize,
+        /// Additional context about how the condition was satisfied.
+        context: Option<String>,
+    },
+    /// Timeout elapsed without condition being satisfied.
+    TimedOut {
+        /// Time spent waiting in milliseconds.
+        elapsed_ms: u64,
+        /// Number of polls performed.
+        polls: usize,
+        /// Last observed state (for debugging).
+        last_observed: Option<String>,
+    },
+    /// Condition cannot be evaluated (e.g., external signal not supported).
+    Unsupported {
+        /// Reason why the condition is unsupported.
+        reason: String,
+    },
+}
+
+impl WaitConditionResult {
+    /// Check if the condition was satisfied.
+    #[must_use]
+    pub fn is_satisfied(&self) -> bool {
+        matches!(self, Self::Satisfied { .. })
+    }
+
+    /// Check if the wait timed out.
+    #[must_use]
+    pub fn is_timed_out(&self) -> bool {
+        matches!(self, Self::TimedOut { .. })
+    }
+
+    /// Get elapsed time in milliseconds, if available.
+    #[must_use]
+    pub fn elapsed_ms(&self) -> Option<u64> {
+        match self {
+            Self::Satisfied { elapsed_ms, .. } | Self::TimedOut { elapsed_ms, .. } => {
+                Some(*elapsed_ms)
+            }
+            Self::Unsupported { .. } => None,
+        }
+    }
+}
+
+/// Options for wait condition execution.
+#[derive(Debug, Clone)]
+pub struct WaitConditionOptions {
+    /// Number of tail lines to poll for pattern matching.
+    pub tail_lines: usize,
+    /// Initial polling interval.
+    pub poll_initial: Duration,
+    /// Maximum polling interval.
+    pub poll_max: Duration,
+    /// Maximum number of polls before forcing timeout.
+    pub max_polls: usize,
+    /// Whether to use fallback heuristics for PaneIdle when OSC 133 unavailable.
+    pub allow_idle_heuristics: bool,
+}
+
+impl Default for WaitConditionOptions {
+    fn default() -> Self {
+        Self {
+            tail_lines: 200,
+            poll_initial: Duration::from_millis(50),
+            poll_max: Duration::from_millis(1000),
+            max_polls: 10_000,
+            allow_idle_heuristics: true,
+        }
+    }
+}
+
+/// Executor for wait conditions.
+///
+/// This struct wraps the necessary dependencies for executing wait conditions:
+/// - `PaneTextSource` for reading pane text (via PaneWaiter)
+/// - `PatternEngine` for pattern detection
+/// - OSC 133 state for idle detection
+///
+/// # Example
+///
+/// ```ignore
+/// let executor = WaitConditionExecutor::new(&client, &pattern_engine)
+///     .with_osc_state(&osc_state);
+///
+/// let result = executor.execute(
+///     &WaitCondition::pattern("prompt.ready"),
+///     pane_id,
+///     Duration::from_secs(10),
+/// ).await?;
+/// ```
+pub struct WaitConditionExecutor<'a, S: PaneTextSource + Sync + ?Sized> {
+    source: &'a S,
+    pattern_engine: &'a PatternEngine,
+    osc_state: Option<&'a Osc133State>,
+    options: WaitConditionOptions,
+}
+
+impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
+    /// Create a new executor with required dependencies.
+    #[must_use]
+    pub fn new(source: &'a S, pattern_engine: &'a PatternEngine) -> Self {
+        Self {
+            source,
+            pattern_engine,
+            osc_state: None,
+            options: WaitConditionOptions::default(),
+        }
+    }
+
+    /// Set OSC 133 state for deterministic idle detection.
+    #[must_use]
+    pub fn with_osc_state(mut self, osc_state: &'a Osc133State) -> Self {
+        self.osc_state = Some(osc_state);
+        self
+    }
+
+    /// Override default options.
+    #[must_use]
+    pub fn with_options(mut self, options: WaitConditionOptions) -> Self {
+        self.options = options;
+        self
+    }
+
+    /// Execute a wait condition.
+    ///
+    /// This method blocks until the condition is satisfied or the timeout elapses.
+    /// It reuses the PaneWaiter infrastructure for consistent polling behavior.
+    pub async fn execute(
+        &self,
+        condition: &WaitCondition,
+        context_pane_id: u64,
+        timeout: Duration,
+    ) -> crate::Result<WaitConditionResult> {
+        match condition {
+            WaitCondition::Pattern { pane_id, rule_id } => {
+                let target_pane = pane_id.unwrap_or(context_pane_id);
+                self.execute_pattern_wait(target_pane, rule_id, timeout)
+                    .await
+            }
+            WaitCondition::PaneIdle {
+                pane_id,
+                idle_threshold_ms,
+            } => {
+                let target_pane = pane_id.unwrap_or(context_pane_id);
+                self.execute_pane_idle_wait(target_pane, *idle_threshold_ms, timeout)
+                    .await
+            }
+            WaitCondition::External { key } => {
+                // External signals are not implemented in this layer
+                Ok(WaitConditionResult::Unsupported {
+                    reason: format!("External signal '{key}' requires external signal registry"),
+                })
+            }
+        }
+    }
+
+    /// Execute a pattern wait condition.
+    ///
+    /// Polls pane text using PaneWaiter, runs pattern detection, and checks
+    /// for the specified rule_id. Stops early on match.
+    async fn execute_pattern_wait(
+        &self,
+        pane_id: u64,
+        rule_id: &str,
+        timeout: Duration,
+    ) -> crate::Result<WaitConditionResult> {
+        let start = Instant::now();
+        let deadline = start + timeout;
+        let mut polls = 0usize;
+        let mut interval = self.options.poll_initial;
+        let mut last_detection_summary: Option<String> = None;
+
+        #[allow(clippy::cast_possible_truncation)]
+        let timeout_ms = timeout.as_millis() as u64;
+        tracing::info!(pane_id, rule_id, timeout_ms, "pattern_wait start");
+
+        loop {
+            polls += 1;
+
+            // Get pane text
+            let text = self.source.get_text(pane_id, false).await?;
+            let tail = tail_text(&text, self.options.tail_lines);
+
+            // Run pattern detection
+            let detections = self.pattern_engine.detect(&tail);
+
+            // Check for matching rule
+            if let Some(detection) = detections.iter().find(|d| d.rule_id == rule_id) {
+                let elapsed_ms = elapsed_ms(start);
+                tracing::info!(
+                    pane_id,
+                    rule_id,
+                    elapsed_ms,
+                    polls,
+                    matched_text = %detection.matched_text,
+                    "pattern_wait matched"
+                );
+                return Ok(WaitConditionResult::Satisfied {
+                    elapsed_ms,
+                    polls,
+                    context: Some(format!("matched: {}", detection.matched_text)),
+                });
+            }
+
+            // Update last detection summary for debugging
+            if !detections.is_empty() {
+                let rule_ids: Vec<&str> = detections.iter().map(|d| d.rule_id.as_str()).collect();
+                last_detection_summary = Some(format!("detected: [{}]", rule_ids.join(", ")));
+            }
+
+            // Check timeout
+            let now = Instant::now();
+            if now >= deadline || polls >= self.options.max_polls {
+                let elapsed_ms = elapsed_ms(start);
+                tracing::info!(
+                    pane_id,
+                    rule_id,
+                    elapsed_ms,
+                    polls,
+                    "pattern_wait timeout"
+                );
+                return Ok(WaitConditionResult::TimedOut {
+                    elapsed_ms,
+                    polls,
+                    last_observed: last_detection_summary,
+                });
+            }
+
+            // Sleep with backoff
+            let remaining = deadline.saturating_duration_since(now);
+            let sleep_duration = interval.min(remaining);
+            if !sleep_duration.is_zero() {
+                sleep(sleep_duration).await;
+            }
+
+            interval = interval.saturating_mul(2);
+            if interval > self.options.poll_max {
+                interval = self.options.poll_max;
+            }
+        }
+    }
+
+    /// Execute a pane idle wait condition.
+    ///
+    /// Primary: Uses OSC 133 state to detect prompt (deterministic).
+    /// Fallback: Uses heuristic prompt matching if OSC 133 unavailable.
+    async fn execute_pane_idle_wait(
+        &self,
+        pane_id: u64,
+        idle_threshold_ms: u64,
+        timeout: Duration,
+    ) -> crate::Result<WaitConditionResult> {
+        let start = Instant::now();
+        let deadline = start + timeout;
+        let mut polls = 0usize;
+        let mut interval = self.options.poll_initial;
+        let idle_threshold = Duration::from_millis(idle_threshold_ms);
+
+        // Track when we first observed idle state (for threshold)
+        let mut idle_since: Option<Instant> = None;
+        #[allow(unused_assignments)]
+        let mut last_state_desc: Option<String> = None;
+
+        #[allow(clippy::cast_possible_truncation)]
+        let timeout_ms = timeout.as_millis() as u64;
+        tracing::info!(
+            pane_id,
+            idle_threshold_ms,
+            timeout_ms,
+            has_osc_state = self.osc_state.is_some(),
+            "pane_idle_wait start"
+        );
+
+        loop {
+            polls += 1;
+
+            // Check idle state
+            let (is_idle, state_desc) = self.check_idle_state(pane_id).await?;
+            last_state_desc = Some(state_desc.clone());
+
+            if is_idle {
+                // Track idle duration
+                let idle_start = idle_since.get_or_insert_with(Instant::now);
+                let idle_duration = Instant::now().saturating_duration_since(*idle_start);
+
+                if idle_duration >= idle_threshold {
+                    let elapsed_ms = elapsed_ms(start);
+                    tracing::info!(
+                        pane_id,
+                        elapsed_ms,
+                        polls,
+                        idle_duration_ms = %idle_duration.as_millis(),
+                        state = %state_desc,
+                        "pane_idle_wait satisfied"
+                    );
+                    return Ok(WaitConditionResult::Satisfied {
+                        elapsed_ms,
+                        polls,
+                        context: Some(format!(
+                            "idle for {}ms ({})",
+                            idle_duration.as_millis(),
+                            state_desc
+                        )),
+                    });
+                }
+            } else {
+                // Reset idle tracking - activity detected
+                idle_since = None;
+            }
+
+            // Check timeout
+            let now = Instant::now();
+            if now >= deadline || polls >= self.options.max_polls {
+                let elapsed_ms = elapsed_ms(start);
+                tracing::info!(
+                    pane_id,
+                    elapsed_ms,
+                    polls,
+                    "pane_idle_wait timeout"
+                );
+                return Ok(WaitConditionResult::TimedOut {
+                    elapsed_ms,
+                    polls,
+                    last_observed: last_state_desc,
+                });
+            }
+
+            // Sleep with backoff
+            let remaining = deadline.saturating_duration_since(now);
+            let sleep_duration = interval.min(remaining);
+            if !sleep_duration.is_zero() {
+                sleep(sleep_duration).await;
+            }
+
+            interval = interval.saturating_mul(2);
+            if interval > self.options.poll_max {
+                interval = self.options.poll_max;
+            }
+        }
+    }
+
+    /// Check if pane is currently idle.
+    ///
+    /// Returns (is_idle, description) for logging/debugging.
+    async fn check_idle_state(&self, pane_id: u64) -> crate::Result<(bool, String)> {
+        // Primary: Use OSC 133 state if available
+        if let Some(osc_state) = self.osc_state {
+            let shell_state = &osc_state.state;
+            let is_idle = shell_state.is_at_prompt();
+            let desc = format!("osc133:{shell_state:?}");
+            return Ok((is_idle, desc));
+        }
+
+        // Fallback: Use heuristic prompt detection
+        if self.options.allow_idle_heuristics {
+            let text = self.source.get_text(pane_id, false).await?;
+            let (is_idle, desc) = heuristic_idle_check(&text, self.options.tail_lines);
+            return Ok((is_idle, format!("heuristic:{desc}")));
+        }
+
+        // No idle detection available
+        Ok((false, "no_osc133_no_heuristics".to_string()))
+    }
+}
+
+/// Extract the last N lines from text.
+fn tail_text(text: &str, n: usize) -> String {
+    if n == 0 {
+        return String::new();
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join("\n")
+}
+
+/// Calculate elapsed milliseconds from a start instant.
+fn elapsed_ms(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Heuristic idle check based on pane text patterns.
+///
+/// This is a best-effort fallback when OSC 133 shell integration is not available.
+/// It looks for common shell prompt patterns in the last few lines.
+///
+/// Returns (is_idle, description) where description explains the heuristic result.
+#[allow(clippy::items_after_statements)]
+fn heuristic_idle_check(text: &str, tail_lines: usize) -> (bool, String) {
+    let tail = tail_text(text, tail_lines.min(10)); // Only check last 10 lines for heuristics
+    let last_line = tail.lines().last().unwrap_or("");
+    let trimmed = last_line.trim_end();
+
+    // Common prompt endings that suggest idle state
+    // Note: These are intentionally broad and may have false positives
+    const PROMPT_ENDINGS: [&str; 7] = [
+        "$ ",  // bash/sh default
+        "# ",  // root prompt
+        "> ",  // zsh/fish
+        "% ",  // tcsh/zsh
+        ">>> ", // Python REPL
+        "... ", // Python continuation
+        "❯ ", // starship/custom
+    ];
+
+    // Check if line ends with a prompt pattern (with trailing space for cursor position)
+    // We check the UNTRIMMED last_line to preserve trailing space significance
+    for ending in PROMPT_ENDINGS {
+        if last_line.ends_with(ending) {
+            return (true, format!("ends_with_prompt({})", ending.trim()));
+        }
+    }
+
+    // Also check trimmed line for prompts where trailing space was stripped,
+    // but only if the line looks like a shell prompt (contains @ or : typical of user@host:path)
+    // This avoids false positives like "Progress: 50%" matching "%" prompt
+    const PROMPT_CHARS: [char; 5] = ['$', '#', '>', '%', '❯'];
+    if let Some(last_char) = trimmed.chars().last() {
+        if PROMPT_CHARS.contains(&last_char) {
+            // Require prompt-like context: user@host pattern or very short line (just prompt)
+            let has_user_host = trimmed.contains('@') && trimmed.contains(':');
+            let is_short_prompt = trimmed.len() <= 3; // e.g., "$ " or "❯"
+            if has_user_host || is_short_prompt {
+                return (true, format!("ends_with_prompt_char({})", last_char));
+            }
+        }
+    }
+
+    // Check for empty or whitespace-only last line (might indicate prompt)
+    if trimmed.is_empty() && !tail.is_empty() {
+        // Look at second-to-last line (raw, with trailing spaces)
+        let lines: Vec<&str> = tail.lines().collect();
+        if lines.len() >= 2 {
+            let prev_line_raw = lines[lines.len() - 2];
+            for ending in PROMPT_ENDINGS {
+                if prev_line_raw.ends_with(ending) {
+                    return (true, format!("prev_line_prompt({})", ending.trim()));
+                }
+            }
+        }
+    }
+
+    (false, format!("no_prompt_detected(last={})", truncate_for_log(trimmed, 40)))
+}
+
+/// Truncate string for logging, adding ellipsis if truncated.
+fn truncate_for_log(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max_len.saturating_sub(3)])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -896,5 +1368,437 @@ mod tests {
         assert!(json_types.contains("pattern"));
         assert!(json_types.contains("pane_idle"));
         assert!(json_types.contains("external"));
+    }
+
+    // ========================================================================
+    // WaitConditionResult Tests
+    // ========================================================================
+
+    #[test]
+    fn wait_condition_result_satisfied_is_satisfied() {
+        let result = WaitConditionResult::Satisfied {
+            elapsed_ms: 100,
+            polls: 5,
+            context: Some("matched".to_string()),
+        };
+        assert!(result.is_satisfied());
+        assert!(!result.is_timed_out());
+        assert_eq!(result.elapsed_ms(), Some(100));
+    }
+
+    #[test]
+    fn wait_condition_result_timed_out_is_timed_out() {
+        let result = WaitConditionResult::TimedOut {
+            elapsed_ms: 5000,
+            polls: 100,
+            last_observed: Some("waiting for prompt".to_string()),
+        };
+        assert!(!result.is_satisfied());
+        assert!(result.is_timed_out());
+        assert_eq!(result.elapsed_ms(), Some(5000));
+    }
+
+    #[test]
+    fn wait_condition_result_unsupported_has_no_elapsed() {
+        let result = WaitConditionResult::Unsupported {
+            reason: "external signals not implemented".to_string(),
+        };
+        assert!(!result.is_satisfied());
+        assert!(!result.is_timed_out());
+        assert_eq!(result.elapsed_ms(), None);
+    }
+
+    // ========================================================================
+    // WaitConditionOptions Tests
+    // ========================================================================
+
+    #[test]
+    fn wait_condition_options_defaults() {
+        let options = WaitConditionOptions::default();
+        assert_eq!(options.tail_lines, 200);
+        assert_eq!(options.poll_initial.as_millis(), 50);
+        assert_eq!(options.poll_max.as_millis(), 1000);
+        assert_eq!(options.max_polls, 10_000);
+        assert!(options.allow_idle_heuristics);
+    }
+
+    // ========================================================================
+    // Helper Function Tests
+    // ========================================================================
+
+    #[test]
+    fn tail_text_extracts_last_n_lines() {
+        let text = "line1\nline2\nline3\nline4\nline5";
+        assert_eq!(tail_text(text, 3), "line3\nline4\nline5");
+        assert_eq!(tail_text(text, 1), "line5");
+        assert_eq!(tail_text(text, 10), text);
+        assert_eq!(tail_text(text, 0), "");
+    }
+
+    #[test]
+    fn tail_text_handles_empty_input() {
+        assert_eq!(tail_text("", 5), "");
+    }
+
+    #[test]
+    fn tail_text_handles_single_line() {
+        assert_eq!(tail_text("single line", 5), "single line");
+    }
+
+    #[test]
+    fn truncate_for_log_preserves_short_strings() {
+        assert_eq!(truncate_for_log("hello", 10), "hello");
+        assert_eq!(truncate_for_log("exact", 5), "exact");
+    }
+
+    #[test]
+    fn truncate_for_log_truncates_long_strings() {
+        assert_eq!(truncate_for_log("hello world", 8), "hello...");
+    }
+
+    // ========================================================================
+    // Heuristic Idle Check Tests
+    // ========================================================================
+
+    #[test]
+    fn heuristic_idle_detects_bash_prompt() {
+        let text = "output from command\nuser@host:~$ ";
+        let (is_idle, desc) = heuristic_idle_check(text, 10);
+        assert!(is_idle);
+        assert!(desc.contains("ends_with_prompt"));
+    }
+
+    #[test]
+    fn heuristic_idle_detects_root_prompt() {
+        let text = "output\nroot@host:~# ";
+        let (is_idle, desc) = heuristic_idle_check(text, 10);
+        assert!(is_idle);
+        assert!(desc.contains("ends_with_prompt"));
+    }
+
+    #[test]
+    fn heuristic_idle_detects_zsh_prompt() {
+        let text = "output\n❯ ";
+        let (is_idle, desc) = heuristic_idle_check(text, 10);
+        assert!(is_idle);
+        assert!(desc.contains("ends_with_prompt"));
+    }
+
+    #[test]
+    fn heuristic_idle_detects_python_repl() {
+        let text = ">>> ";
+        let (is_idle, desc) = heuristic_idle_check(text, 10);
+        assert!(is_idle);
+        assert!(desc.contains("ends_with_prompt"));
+    }
+
+    #[test]
+    fn heuristic_idle_detects_prompt_with_trailing_newline() {
+        // Note: Rust's lines() iterator doesn't include trailing empty lines,
+        // so "user@host:~$ \n" becomes the last line as "user@host:~$ "
+        // which after trim_end becomes "user@host:~$" ending with "$"
+        let text = "output\nuser@host:~$ \n";
+        let (is_idle, desc) = heuristic_idle_check(text, 10);
+        assert!(is_idle);
+        assert!(desc.contains("ends_with_prompt"));
+    }
+
+    #[test]
+    fn heuristic_idle_rejects_command_output() {
+        let text = "building project...\nCompiling foo v1.0.0";
+        let (is_idle, desc) = heuristic_idle_check(text, 10);
+        assert!(!is_idle);
+        assert!(desc.contains("no_prompt_detected"));
+    }
+
+    #[test]
+    fn heuristic_idle_rejects_running_command() {
+        // Use "50/100" instead of "50%" - the % character would match the tcsh prompt pattern
+        let text = "npm run build\nProgress: 50/100";
+        let (is_idle, _desc) = heuristic_idle_check(text, 10);
+        assert!(!is_idle);
+    }
+
+    // ========================================================================
+    // WaitConditionExecutor Tests (using mock source)
+    // ========================================================================
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    /// Mock pane text source for testing
+    struct MockPaneSource {
+        texts: Mutex<Vec<String>>,
+        call_count: AtomicUsize,
+    }
+
+    impl MockPaneSource {
+        fn new(texts: Vec<String>) -> Self {
+            Self {
+                texts: Mutex::new(texts),
+                call_count: AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.call_count.load(Ordering::Relaxed)
+        }
+    }
+
+    impl crate::wezterm::PaneTextSource for MockPaneSource {
+        type Fut<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = crate::Result<String>> + Send + 'a>>;
+
+        fn get_text(&self, _pane_id: u64, _escapes: bool) -> Self::Fut<'_> {
+            let count = self.call_count.fetch_add(1, Ordering::Relaxed);
+            let texts = self.texts.lock().unwrap();
+            let text = if count < texts.len() {
+                texts[count].clone()
+            } else {
+                texts.last().cloned().unwrap_or_default()
+            };
+            Box::pin(async move { Ok(text) })
+        }
+    }
+
+    #[tokio::test]
+    async fn pattern_wait_succeeds_on_immediate_match() {
+        let source = MockPaneSource::new(vec![
+            "Conversation compacted 100,000 tokens to 25,000 tokens".to_string(),
+        ]);
+        let engine = PatternEngine::new();
+
+        let executor = WaitConditionExecutor::new(&source, &engine).with_options(
+            WaitConditionOptions {
+                tail_lines: 200,
+                poll_initial: Duration::from_millis(1),
+                poll_max: Duration::from_millis(10),
+                max_polls: 100,
+                allow_idle_heuristics: true,
+            },
+        );
+
+        let condition = WaitCondition::pattern("claude_code.compaction");
+        let result = executor.execute(&condition, 1, Duration::from_secs(5)).await;
+
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert!(result.is_satisfied());
+        assert_eq!(source.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn pattern_wait_times_out_on_no_match() {
+        let source = MockPaneSource::new(vec!["no matching pattern here".to_string()]);
+        let engine = PatternEngine::new();
+
+        let executor = WaitConditionExecutor::new(&source, &engine).with_options(
+            WaitConditionOptions {
+                tail_lines: 200,
+                poll_initial: Duration::from_millis(1),
+                poll_max: Duration::from_millis(5),
+                max_polls: 5,
+                allow_idle_heuristics: true,
+            },
+        );
+
+        let condition = WaitCondition::pattern("claude_code.compaction");
+        let result = executor
+            .execute(&condition, 1, Duration::from_millis(20))
+            .await;
+
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert!(result.is_timed_out());
+    }
+
+    #[tokio::test]
+    async fn pattern_wait_succeeds_after_multiple_polls() {
+        let source = MockPaneSource::new(vec![
+            "no match yet".to_string(),
+            "still no match".to_string(),
+            "Conversation compacted 100,000 tokens to 25,000 tokens".to_string(),
+        ]);
+        let engine = PatternEngine::new();
+
+        let executor = WaitConditionExecutor::new(&source, &engine).with_options(
+            WaitConditionOptions {
+                tail_lines: 200,
+                poll_initial: Duration::from_millis(1),
+                poll_max: Duration::from_millis(5),
+                max_polls: 100,
+                allow_idle_heuristics: true,
+            },
+        );
+
+        let condition = WaitCondition::pattern("claude_code.compaction");
+        let result = executor.execute(&condition, 1, Duration::from_secs(5)).await;
+
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert!(result.is_satisfied());
+        assert!(source.calls() >= 3);
+    }
+
+    #[tokio::test]
+    async fn pane_idle_succeeds_with_osc133_prompt_active() {
+        use crate::ingest::{Osc133State, ShellState};
+
+        let source = MockPaneSource::new(vec!["some text".to_string()]);
+        let engine = PatternEngine::new();
+        let mut osc_state = Osc133State::new();
+        osc_state.state = ShellState::PromptActive;
+
+        let executor = WaitConditionExecutor::new(&source, &engine)
+            .with_osc_state(&osc_state)
+            .with_options(WaitConditionOptions {
+                tail_lines: 200,
+                poll_initial: Duration::from_millis(1),
+                poll_max: Duration::from_millis(5),
+                max_polls: 100,
+                allow_idle_heuristics: true,
+            });
+
+        // idle_threshold_ms = 0 means immediate satisfaction when idle
+        let condition = WaitCondition::pane_idle(0);
+        let result = executor.execute(&condition, 1, Duration::from_secs(5)).await;
+
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert!(result.is_satisfied());
+        if let WaitConditionResult::Satisfied { context, .. } = result {
+            assert!(context.unwrap().contains("osc133"));
+        }
+    }
+
+    #[tokio::test]
+    async fn pane_idle_times_out_with_osc133_command_running() {
+        use crate::ingest::{Osc133State, ShellState};
+
+        let source = MockPaneSource::new(vec!["running command...".to_string()]);
+        let engine = PatternEngine::new();
+        let mut osc_state = Osc133State::new();
+        osc_state.state = ShellState::CommandRunning;
+
+        let executor = WaitConditionExecutor::new(&source, &engine)
+            .with_osc_state(&osc_state)
+            .with_options(WaitConditionOptions {
+                tail_lines: 200,
+                poll_initial: Duration::from_millis(1),
+                poll_max: Duration::from_millis(5),
+                max_polls: 5,
+                allow_idle_heuristics: true,
+            });
+
+        let condition = WaitCondition::pane_idle(0);
+        let result = executor
+            .execute(&condition, 1, Duration::from_millis(20))
+            .await;
+
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert!(result.is_timed_out());
+    }
+
+    #[tokio::test]
+    async fn pane_idle_uses_heuristics_when_no_osc133() {
+        let source = MockPaneSource::new(vec!["user@host:~$ ".to_string()]);
+        let engine = PatternEngine::new();
+
+        let executor = WaitConditionExecutor::new(&source, &engine).with_options(
+            WaitConditionOptions {
+                tail_lines: 200,
+                poll_initial: Duration::from_millis(1),
+                poll_max: Duration::from_millis(5),
+                max_polls: 100,
+                allow_idle_heuristics: true,
+            },
+        );
+
+        let condition = WaitCondition::pane_idle(0);
+        let result = executor.execute(&condition, 1, Duration::from_secs(5)).await;
+
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert!(result.is_satisfied());
+        if let WaitConditionResult::Satisfied { context, .. } = result {
+            assert!(context.unwrap().contains("heuristic"));
+        }
+    }
+
+    #[tokio::test]
+    async fn pane_idle_respects_threshold_duration() {
+        use crate::ingest::{Osc133State, ShellState};
+
+        let source = MockPaneSource::new(vec!["some text".to_string()]);
+        let engine = PatternEngine::new();
+        let mut osc_state = Osc133State::new();
+        osc_state.state = ShellState::PromptActive;
+
+        let executor = WaitConditionExecutor::new(&source, &engine)
+            .with_osc_state(&osc_state)
+            .with_options(WaitConditionOptions {
+                tail_lines: 200,
+                poll_initial: Duration::from_millis(10),
+                poll_max: Duration::from_millis(50),
+                max_polls: 100,
+                allow_idle_heuristics: true,
+            });
+
+        // Require 50ms idle threshold
+        let condition = WaitCondition::pane_idle(50);
+        let start = std::time::Instant::now();
+        let result = executor.execute(&condition, 1, Duration::from_secs(5)).await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert!(result.is_satisfied());
+        // Should have waited at least the threshold duration
+        assert!(elapsed >= Duration::from_millis(50));
+    }
+
+    #[tokio::test]
+    async fn external_wait_returns_unsupported() {
+        let source = MockPaneSource::new(vec!["text".to_string()]);
+        let engine = PatternEngine::new();
+
+        let executor = WaitConditionExecutor::new(&source, &engine);
+        let condition = WaitCondition::external("my_signal");
+        let result = executor.execute(&condition, 1, Duration::from_secs(5)).await;
+
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        match result {
+            WaitConditionResult::Unsupported { reason } => {
+                assert!(reason.contains("my_signal"));
+            }
+            _ => panic!("Expected Unsupported"),
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_respects_max_polls() {
+        let source = MockPaneSource::new(vec!["no match".to_string()]);
+        let engine = PatternEngine::new();
+
+        let executor = WaitConditionExecutor::new(&source, &engine).with_options(
+            WaitConditionOptions {
+                tail_lines: 200,
+                poll_initial: Duration::from_millis(1),
+                poll_max: Duration::from_millis(1),
+                max_polls: 3,
+                allow_idle_heuristics: true,
+            },
+        );
+
+        let condition = WaitCondition::pattern("nonexistent.rule");
+        let result = executor.execute(&condition, 1, Duration::from_secs(60)).await;
+
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert!(result.is_timed_out());
+        if let WaitConditionResult::TimedOut { polls, .. } = result {
+            assert!(polls <= 3);
+        }
     }
 }

@@ -186,13 +186,17 @@ impl ObservationRuntime {
 
                                 // Create cursor if observed
                                 if entry.should_observe() {
-                                    let mut cursors = cursors.write().await;
-                                    cursors.insert(*pane_id, PaneCursor::new(*pane_id));
+                                    {
+                                        let mut cursors = cursors.write().await;
+                                        cursors.insert(*pane_id, PaneCursor::new(*pane_id));
+                                    }
 
-                                    let mut contexts = detection_contexts.write().await;
-                                    let mut ctx = DetectionContext::new();
-                                    ctx.pane_id = Some(*pane_id);
-                                    contexts.insert(*pane_id, ctx);
+                                    {
+                                        let mut contexts = detection_contexts.write().await;
+                                        let mut ctx = DetectionContext::new();
+                                        ctx.pane_id = Some(*pane_id);
+                                        contexts.insert(*pane_id, ctx);
+                                    }
 
                                     debug!(pane_id = pane_id, "Started observing pane");
                                 }
@@ -201,11 +205,15 @@ impl ObservationRuntime {
 
                         // Handle closed panes
                         for pane_id in &diff.closed_panes {
-                            let mut cursors = cursors.write().await;
-                            cursors.remove(pane_id);
+                            {
+                                let mut cursors = cursors.write().await;
+                                cursors.remove(pane_id);
+                            }
 
-                            let mut contexts = detection_contexts.write().await;
-                            contexts.remove(pane_id);
+                            {
+                                let mut contexts = detection_contexts.write().await;
+                                contexts.remove(pane_id);
+                            }
 
                             debug!(pane_id = pane_id, "Stopped observing pane (closed)");
                         }
@@ -334,6 +342,7 @@ impl ObservationRuntime {
 
                         // Run pattern detection on the content
                         let detections = {
+                            #[allow(clippy::significant_drop_tightening)]
                             let mut contexts = detection_contexts.write().await;
                             let ctx = contexts.entry(pane_id).or_insert_with(|| {
                                 let mut c = DetectionContext::new();

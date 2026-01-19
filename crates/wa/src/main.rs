@@ -51,6 +51,10 @@ enum Commands {
         /// Disable pattern detection
         #[arg(long)]
         no_patterns: bool,
+
+        /// Disable single-instance lock (DANGEROUS: may corrupt data)
+        #[arg(long)]
+        dangerous_disable_lock: bool,
     },
 
     /// Robot mode commands (JSON I/O)
@@ -580,6 +584,131 @@ fn emit_permission_warnings(warnings: &[wa_core::config::PermissionWarning]) {
     }
 }
 
+
+/// Run the observation watcher daemon.
+async fn run_watcher(
+    layout: &wa_core::config::WorkspaceLayout,
+    config: &wa_core::config::Config,
+    auto_handle: bool,
+    _foreground: bool,
+    poll_interval: u64,
+    no_patterns: bool,
+    disable_lock: bool,
+) -> anyhow::Result<()> {
+    use std::time::Duration;
+    use wa_core::lock::WatcherLock;
+    use wa_core::patterns::PatternEngine;
+    use wa_core::runtime::{ObservationRuntime, RuntimeConfig};
+    use wa_core::storage::StorageHandle;
+
+    // Print resolved paths for diagnostic visibility
+    tracing::info!(
+        workspace = %layout.root.display(),
+        db_path = %layout.db_path.display(),
+        lock_path = %layout.lock_path.display(),
+        ipc_socket = %layout.ipc_socket_path.display(),
+        log_file = %layout.log_path.display(),
+        "Watcher starting with resolved paths"
+    );
+
+    if auto_handle {
+        tracing::info!("Automatic workflow handling: enabled");
+    }
+
+    // Acquire single-instance lock (unless disabled)
+    let _lock_guard = if disable_lock {
+        tracing::warn!("Single-instance lock DISABLED - data corruption may occur if multiple watchers run");
+        None
+    } else {
+        match WatcherLock::acquire(&layout.lock_path) {
+            Ok(lock) => {
+                tracing::info!(
+                    lock_path = %layout.lock_path.display(),
+                    "Acquired single-instance lock"
+                );
+                Some(lock)
+            }
+            Err(wa_core::lock::LockError::AlreadyRunning { pid, started_at }) => {
+                anyhow::bail!(
+                    "Another watcher is already running (pid: {}, started: {}). \
+                     Use --dangerous-disable-lock to override (NOT RECOMMENDED).",
+                    pid,
+                    started_at
+                );
+            }
+            Err(wa_core::lock::LockError::AlreadyRunningNoMeta) => {
+                anyhow::bail!(
+                    "Another watcher is already running (metadata unavailable). \
+                     Use --dangerous-disable-lock to override (NOT RECOMMENDED)."
+                );
+            }
+            Err(e) => {
+                anyhow::bail!("Failed to acquire watcher lock: {}", e);
+            }
+        }
+    };
+
+    // Create storage handle
+    let db_path = layout.db_path.to_string_lossy();
+    let storage_config = wa_core::storage::StorageConfig {
+        write_queue_size: config.storage.writer_queue_size as usize,
+    };
+    let storage = StorageHandle::with_config(&db_path, storage_config).await?;
+    tracing::info!(db_path = %db_path, "Storage initialized");
+
+    // Create pattern engine
+    let pattern_engine = if no_patterns {
+        tracing::info!("Pattern detection: disabled");
+        PatternEngine::default()
+    } else {
+        tracing::info!("Pattern detection: enabled with builtin packs");
+        PatternEngine::new()
+    };
+
+    // Configure the runtime
+    let runtime_config = RuntimeConfig {
+        discovery_interval: Duration::from_millis(poll_interval),
+        capture_interval: Duration::from_millis(config.ingest.poll_interval_ms),
+        overlap_size: 4096, // Default overlap window size
+        pane_filter: config.ingest.panes.clone(),
+        channel_buffer: 1024,
+    };
+
+    // Create and start the observation runtime
+    let mut runtime = ObservationRuntime::new(runtime_config, storage, pattern_engine);
+    let handle = runtime.start().await?;
+    tracing::info!("Observation runtime started");
+
+    // Wait for shutdown signal (SIGINT or SIGTERM)
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigint = signal(SignalKind::interrupt())?;
+        let mut sigterm = signal(SignalKind::terminate())?;
+
+        tokio::select! {
+            _ = sigint.recv() => {
+                tracing::info!("Received SIGINT, initiating graceful shutdown");
+            }
+            _ = sigterm.recv() => {
+                tracing::info!("Received SIGTERM, initiating graceful shutdown");
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await?;
+        tracing::info!("Received Ctrl+C, initiating graceful shutdown");
+    }
+
+    // Graceful shutdown
+    tracing::info!("Shutting down observation runtime...");
+    handle.shutdown().await;
+    tracing::info!("Watcher shutdown complete");
+
+    Ok(())
+}
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let start = std::time::Instant::now();
@@ -681,6 +810,7 @@ async fn main() -> anyhow::Result<()> {
             foreground,
             poll_interval,
             no_patterns,
+            dangerous_disable_lock,
         }) => {
             run_watcher(
                 &layout,
@@ -689,6 +819,7 @@ async fn main() -> anyhow::Result<()> {
                 foreground,
                 poll_interval,
                 no_patterns,
+                dangerous_disable_lock,
             )
             .await?;
         }
@@ -719,15 +850,27 @@ async fn main() -> anyhow::Result<()> {
 
                     match other {
                         RobotCommands::State => {
-                            // TODO: Implement state command
-                            let response: RobotResponse<Vec<wa_core::wezterm::PaneInfo>> =
-                                RobotResponse::error_with_code(
-                                    ROBOT_ERR_NOT_IMPLEMENTED,
-                                    "Not yet implemented",
-                                    None,
-                                    elapsed_ms(start),
-                                );
-                            println!("{}", serde_json::to_string_pretty(&response)?);
+                            let wezterm = wa_core::wezterm::WeztermClient::new();
+                            match wezterm.list_panes().await {
+                                Ok(panes) => {
+                                    let filter = &config.ingest.panes;
+                                    let states: Vec<PaneState> = panes
+                                        .iter()
+                                        .map(|p| PaneState::from_pane_info(p, filter))
+                                        .collect();
+                                    let response = RobotResponse::success(states, elapsed_ms(start));
+                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                }
+                                Err(e) => {
+                                    let response = RobotResponse::<Vec<PaneState>>::error_with_code(
+                                        "robot.wezterm_error",
+                                        format!("Failed to list panes: {e}"),
+                                        Some("Is WezTerm running?".to_string()),
+                                        elapsed_ms(start),
+                                    );
+                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                }
+                            }
                         }
                         RobotCommands::GetText { pane_id } => {
                             let response: RobotResponse<String> = RobotResponse::error_with_code(
@@ -823,10 +966,34 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Some(Commands::List { json }) => {
+            let wezterm = wa_core::wezterm::WeztermClient::new();
+            let panes = match wezterm.list_panes().await {
+                Ok(panes) => panes,
+                Err(e) => {
+                    eprintln!("Failed to list panes: {e}");
+                    return Err(e.into());
+                }
+            };
+
+            let filter = &config.ingest.panes;
+            let states: Vec<PaneState> = panes
+                .iter()
+                .map(|p| PaneState::from_pane_info(p, filter))
+                .collect();
+
             if json {
-                println!("[]");
+                println!("{}", serde_json::to_string_pretty(&states)?);
+            } else if states.is_empty() {
+                println!("No panes found");
             } else {
-                println!("No panes tracked yet");
+                let observed_count = states.iter().filter(|s| s.observed).count();
+                let ignored_count = states.len() - observed_count;
+                println!("Panes ({} observed, {} ignored):", observed_count, ignored_count);
+                println!("  {:>4}  {:>10}  {:<20}  {:<40}  {}", "ID", "STATUS", "TITLE", "CWD", "DOMAIN");
+                println!("  {}", "-".repeat(100));
+                for state in &states {
+                    println!("{}", state.format_human());
+                }
             }
         }
 

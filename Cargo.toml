@@ -71,6 +71,9 @@ sha2 = "0.10"
 # Config
 toml = "0.8"
 
+# File locking
+fs2 = "0.4"
+
 # Internal crates
 wa-core = { path = "crates/wa-core" }
 

@@ -38,6 +38,9 @@ rusqlite.workspace = true
 # Config
 toml.workspace = true
 
+# File locking
+fs2.workspace = true
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
 proptest = "1.5"

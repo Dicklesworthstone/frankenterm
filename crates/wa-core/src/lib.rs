@@ -39,6 +39,7 @@ pub mod dry_run;
 pub mod error;
 pub mod events;
 pub mod ingest;
+pub mod lock;
 pub mod logging;
 pub mod patterns;
 pub mod policy;
