@@ -984,7 +984,7 @@ fn heuristic_idle_check(text: &str, tail_lines: usize) -> (bool, String) {
             let has_user_host = trimmed.contains('@') && trimmed.contains(':');
             let is_short_prompt = trimmed.len() <= 3; // e.g., "$ " or "❯"
             if has_user_host || is_short_prompt {
-                return (true, format!("ends_with_prompt_char({})", last_char));
+                return (true, format!("ends_with_prompt_char({last_char})"));
             }
         }
     }

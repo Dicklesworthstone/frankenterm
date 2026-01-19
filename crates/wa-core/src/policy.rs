@@ -1502,6 +1502,355 @@ impl PolicyEngine {
     }
 }
 
+// ============================================================================
+// Policy Gated Injector (wa-4vx.8.5)
+// ============================================================================
+
+/// Result of a policy-gated injection attempt
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum InjectionResult {
+    /// Injection was allowed and executed
+    Allowed {
+        /// The policy decision (for audit)
+        decision: PolicyDecision,
+        /// Redacted summary of what was sent
+        summary: String,
+        /// Pane ID that received the injection
+        pane_id: u64,
+        /// Action kind that was performed
+        action: ActionKind,
+    },
+    /// Injection was denied by policy
+    Denied {
+        /// The policy decision with reason
+        decision: PolicyDecision,
+        /// Redacted summary of what was attempted
+        summary: String,
+        /// Pane ID that was targeted
+        pane_id: u64,
+        /// Action kind that was attempted
+        action: ActionKind,
+    },
+    /// Injection requires approval before proceeding
+    RequiresApproval {
+        /// The policy decision with approval details
+        decision: PolicyDecision,
+        /// Redacted summary of what was attempted
+        summary: String,
+        /// Pane ID that was targeted
+        pane_id: u64,
+        /// Action kind that was attempted
+        action: ActionKind,
+    },
+    /// Injection failed due to an error (after policy allowed)
+    Error {
+        /// Error message
+        error: String,
+        /// Pane ID that was targeted
+        pane_id: u64,
+        /// Action kind that was attempted
+        action: ActionKind,
+    },
+}
+
+impl InjectionResult {
+    /// Check if the injection succeeded
+    #[must_use]
+    pub fn is_allowed(&self) -> bool {
+        matches!(self, Self::Allowed { .. })
+    }
+
+    /// Check if the injection was denied
+    #[must_use]
+    pub fn is_denied(&self) -> bool {
+        matches!(self, Self::Denied { .. })
+    }
+
+    /// Check if the injection requires approval
+    #[must_use]
+    pub fn requires_approval(&self) -> bool {
+        matches!(self, Self::RequiresApproval { .. })
+    }
+
+    /// Get the error message if this is an error result
+    #[must_use]
+    pub fn error_message(&self) -> Option<&str> {
+        match self {
+            Self::Error { error, .. } => Some(error),
+            _ => None,
+        }
+    }
+
+    /// Get the rule ID that caused denial or approval requirement
+    #[must_use]
+    pub fn rule_id(&self) -> Option<&str> {
+        match self {
+            Self::Denied { decision, .. } | Self::RequiresApproval { decision, .. } => {
+                decision.rule_id()
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Policy-gated input injector
+///
+/// This is the **single implementation** of "send with policy" that all
+/// user-facing send commands and workflow action executors must use.
+///
+/// # Responsibilities
+///
+/// 1. Build a `PolicyInput` (actor kind, pane id, action kind, redacted summary)
+/// 2. Call `PolicyEngine::authorize`
+/// 3. If allowed: perform the injection via the WezTerm client
+/// 4. Return a structured outcome suitable for robot/human/workflow logging
+///
+/// # Safety
+///
+/// Attempting to inject input while pane state is `AltScreen` will be denied.
+/// Unknown alt-screen state also triggers denial (conservative by default).
+///
+/// # Example
+///
+/// ```ignore
+/// use wa_core::policy::{PolicyGatedInjector, PolicyEngine, ActorKind};
+/// use wa_core::wezterm::WeztermClient;
+///
+/// let engine = PolicyEngine::default();
+/// let client = WeztermClient::new();
+/// let injector = PolicyGatedInjector::new(engine, client);
+///
+/// // Capabilities are derived from current pane state
+/// let caps = PaneCapabilities::prompt();
+/// let result = injector.send_text(1, "ls -la", ActorKind::Robot, &caps).await;
+///
+/// match result {
+///     InjectionResult::Allowed { .. } => println!("Sent successfully"),
+///     InjectionResult::Denied { decision, .. } => println!("Denied: {:?}", decision),
+///     InjectionResult::RequiresApproval { decision, .. } => println!("Needs approval"),
+///     InjectionResult::Error { error, .. } => println!("Error: {}", error),
+/// }
+/// ```
+pub struct PolicyGatedInjector {
+    engine: PolicyEngine,
+    client: crate::wezterm::WeztermClient,
+}
+
+impl PolicyGatedInjector {
+    /// Create a new policy-gated injector
+    #[must_use]
+    pub fn new(engine: PolicyEngine, client: crate::wezterm::WeztermClient) -> Self {
+        Self { engine, client }
+    }
+
+    /// Create with a permissive policy engine (for testing)
+    #[must_use]
+    pub fn permissive(client: crate::wezterm::WeztermClient) -> Self {
+        Self::new(PolicyEngine::permissive(), client)
+    }
+
+    /// Get mutable access to the policy engine
+    pub fn engine_mut(&mut self) -> &mut PolicyEngine {
+        &mut self.engine
+    }
+
+    /// Get the policy engine reference
+    #[must_use]
+    pub fn engine(&self) -> &PolicyEngine {
+        &self.engine
+    }
+
+    /// Send text to a pane with policy gating
+    ///
+    /// This is the primary method for sending text. It:
+    /// 1. Builds policy input with the given capabilities
+    /// 2. Checks command safety gate (dangerous command detection)
+    /// 3. Authorizes via PolicyEngine
+    /// 4. If allowed, sends via WeztermClient
+    /// 5. Returns structured result for audit
+    pub async fn send_text(
+        &mut self,
+        pane_id: u64,
+        text: &str,
+        actor: ActorKind,
+        capabilities: &PaneCapabilities,
+        workflow_id: Option<&str>,
+    ) -> InjectionResult {
+        self.inject(
+            pane_id,
+            text,
+            ActionKind::SendText,
+            actor,
+            capabilities,
+            workflow_id,
+        )
+        .await
+    }
+
+    /// Send Ctrl-C (interrupt) to a pane with policy gating
+    pub async fn send_ctrl_c(
+        &mut self,
+        pane_id: u64,
+        actor: ActorKind,
+        capabilities: &PaneCapabilities,
+        workflow_id: Option<&str>,
+    ) -> InjectionResult {
+        self.inject(
+            pane_id,
+            crate::wezterm::control::CTRL_C,
+            ActionKind::SendCtrlC,
+            actor,
+            capabilities,
+            workflow_id,
+        )
+        .await
+    }
+
+    /// Send Ctrl-D (EOF) to a pane with policy gating
+    pub async fn send_ctrl_d(
+        &mut self,
+        pane_id: u64,
+        actor: ActorKind,
+        capabilities: &PaneCapabilities,
+        workflow_id: Option<&str>,
+    ) -> InjectionResult {
+        self.inject(
+            pane_id,
+            crate::wezterm::control::CTRL_D,
+            ActionKind::SendCtrlD,
+            actor,
+            capabilities,
+            workflow_id,
+        )
+        .await
+    }
+
+    /// Send Ctrl-Z (suspend) to a pane with policy gating
+    pub async fn send_ctrl_z(
+        &mut self,
+        pane_id: u64,
+        actor: ActorKind,
+        capabilities: &PaneCapabilities,
+        workflow_id: Option<&str>,
+    ) -> InjectionResult {
+        self.inject(
+            pane_id,
+            crate::wezterm::control::CTRL_Z,
+            ActionKind::SendCtrlZ,
+            actor,
+            capabilities,
+            workflow_id,
+        )
+        .await
+    }
+
+    /// Send any control character to a pane with policy gating
+    pub async fn send_control(
+        &mut self,
+        pane_id: u64,
+        control_char: &str,
+        actor: ActorKind,
+        capabilities: &PaneCapabilities,
+        workflow_id: Option<&str>,
+    ) -> InjectionResult {
+        self.inject(
+            pane_id,
+            control_char,
+            ActionKind::SendControl,
+            actor,
+            capabilities,
+            workflow_id,
+        )
+        .await
+    }
+
+    /// Internal injection method with policy gating
+    async fn inject(
+        &mut self,
+        pane_id: u64,
+        text: &str,
+        action: ActionKind,
+        actor: ActorKind,
+        capabilities: &PaneCapabilities,
+        workflow_id: Option<&str>,
+    ) -> InjectionResult {
+        // Create redacted summary for audit
+        let summary = self.engine.redact_secrets(text);
+
+        // Build policy input
+        let mut input = PolicyInput::new(action, actor)
+            .with_pane(pane_id)
+            .with_capabilities(capabilities.clone())
+            .with_text_summary(&summary);
+
+        // Add workflow context if present
+        if let Some(wf_id) = workflow_id {
+            input = input.with_workflow(wf_id);
+        }
+
+        // For SendText, add command text for safety gate
+        if action == ActionKind::SendText {
+            input = input.with_command_text(text);
+        }
+
+        // Authorize
+        let decision = self.engine.authorize(&input);
+
+        match &decision {
+            PolicyDecision::Allow => {
+                // SAFETY: This is the only place where actual injection happens
+                // after policy approval. The text reference lifetime is handled
+                // by copying to a String for the actual send.
+                let text_owned = text.to_string();
+                let client = &self.client;
+
+                // We need to call the send function with owned data
+                let result = match action {
+                    ActionKind::SendText => client.send_text(pane_id, &text_owned).await,
+                    ActionKind::SendCtrlC => client.send_ctrl_c(pane_id).await,
+                    ActionKind::SendCtrlD => client.send_ctrl_d(pane_id).await,
+                    ActionKind::SendCtrlZ => client.send_control(pane_id, crate::wezterm::control::CTRL_Z).await,
+                    ActionKind::SendControl => client.send_control(pane_id, &text_owned).await,
+                    _ => unreachable!("inject called with non-injection action"),
+                };
+
+                match result {
+                    Ok(()) => InjectionResult::Allowed {
+                        decision,
+                        summary,
+                        pane_id,
+                        action,
+                    },
+                    Err(e) => InjectionResult::Error {
+                        error: e.to_string(),
+                        pane_id,
+                        action,
+                    },
+                }
+            }
+            PolicyDecision::Deny { .. } => InjectionResult::Denied {
+                decision,
+                summary,
+                pane_id,
+                action,
+            },
+            PolicyDecision::RequireApproval { .. } => InjectionResult::RequiresApproval {
+                decision,
+                summary,
+                pane_id,
+                action,
+            },
+        }
+    }
+
+    /// Redact text using the policy engine's redactor
+    #[must_use]
+    pub fn redact(&self, text: &str) -> String {
+        self.engine.redact_secrets(text)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

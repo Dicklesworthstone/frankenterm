@@ -141,11 +141,13 @@ impl WatcherLock {
     }
 
     /// Get the path to the lock file.
+    #[must_use]
     pub fn lock_path(&self) -> &Path {
         &self.lock_path
     }
 
     /// Get the path to the metadata file.
+    #[must_use]
     pub fn meta_path(&self) -> &Path {
         &self.meta_path
     }
@@ -183,6 +185,7 @@ fn metadata_path(lock_path: &Path) -> PathBuf {
 }
 
 /// Read metadata from an existing lock to provide a helpful error message.
+#[allow(clippy::option_if_let_else)]
 fn read_existing_lock_error(lock_path: &Path) -> LockError {
     let meta_path = metadata_path(lock_path);
     match fs::read_to_string(&meta_path) {
@@ -200,6 +203,7 @@ fn read_existing_lock_error(lock_path: &Path) -> LockError {
 /// Check if a watcher is currently running without acquiring the lock.
 ///
 /// Returns `Some(metadata)` if the lock is held, `None` if it's free.
+#[must_use]
 pub fn check_running(lock_path: &Path) -> Option<LockMetadata> {
     let lock_file = OpenOptions::new()
         .read(true)
@@ -212,8 +216,8 @@ pub fn check_running(lock_path: &Path) -> Option<LockMetadata> {
     match lock_file.try_lock_exclusive() {
         Ok(()) => {
             // We got the lock, so nothing was holding it
-            // Release immediately
-            let _ = lock_file.unlock();
+            // Release immediately by dropping the file handle
+            drop(lock_file);
             None
         }
         Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -240,11 +244,12 @@ mod tests {
         // Acquire lock
         let lock = WatcherLock::acquire(&lock_path).unwrap();
         assert!(lock_path.exists());
-        assert!(lock.meta_path().exists());
+        let meta_path = lock.meta_path().to_path_buf();
+        assert!(meta_path.exists());
 
         // Drop releases lock and cleans up metadata
         drop(lock);
-        assert!(!lock.meta_path().exists());
+        assert!(!meta_path.exists());
     }
 
     #[test]

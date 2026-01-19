@@ -341,8 +341,8 @@ impl ObservationRuntime {
                         );
 
                         // Run pattern detection on the content
+                        #[allow(clippy::significant_drop_tightening)]
                         let detections = {
-                            #[allow(clippy::significant_drop_tightening)]
                             let mut contexts = detection_contexts.write().await;
                             let ctx = contexts.entry(pane_id).or_insert_with(|| {
                                 let mut c = DetectionContext::new();
