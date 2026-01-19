@@ -46,7 +46,7 @@ base64 = "0.22.1"
 tokio = { workspace = true, features = ["test-util", "macros"] }
 proptest = "1.5"
 tempfile = "3.10"
-criterion = { version = "0.5", features = ["async_tokio"] }
+criterion = { version = "0.8", features = ["async_tokio"] }
 
 # Benchmarks
 [[bench]]
