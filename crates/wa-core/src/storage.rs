@@ -1461,6 +1461,55 @@ impl StorageHandle {
         .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
+    /// Query events with filters
+    pub async fn get_events(&self, query: EventQuery) -> Result<Vec<StoredEvent>> {
+        let db_path = Arc::clone(&self.db_path);
+
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+
+            query_events(&conn, &query)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+    }
+
+    /// Count unhandled events grouped by pane ID
+    ///
+    /// Returns a map from pane_id to the count of unhandled events for that pane.
+    pub async fn count_unhandled_events_by_pane(&self) -> Result<std::collections::HashMap<u64, u32>> {
+        let db_path = Arc::clone(&self.db_path);
+
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+
+            query_unhandled_event_counts(&conn)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+    }
+
+    /// Get the most recent activity timestamp for each pane
+    ///
+    /// Returns a map from pane_id to the most recent segment captured_at timestamp.
+    pub async fn get_last_activity_by_pane(&self) -> Result<std::collections::HashMap<u64, i64>> {
+        let db_path = Arc::clone(&self.db_path);
+
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+
+            query_last_activity_by_pane(&conn)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+    }
+
     /// Query audit actions with filters
     pub async fn get_audit_actions(&self, query: AuditQuery) -> Result<Vec<AuditActionRecord>> {
         let db_path = Arc::clone(&self.db_path);
@@ -1668,6 +1717,25 @@ pub struct AuditQuery {
     pub rule_id: Option<String>,
     /// Filter by result
     pub result: Option<String>,
+    /// Filter by time range start (epoch ms)
+    pub since: Option<i64>,
+    /// Filter by time range end (epoch ms)
+    pub until: Option<i64>,
+}
+
+/// Query options for events
+#[derive(Debug, Clone, Default)]
+pub struct EventQuery {
+    /// Maximum number of results (default: 20)
+    pub limit: Option<usize>,
+    /// Filter by pane ID
+    pub pane_id: Option<u64>,
+    /// Filter by rule ID (exact match)
+    pub rule_id: Option<String>,
+    /// Filter by event type (e.g., "compaction_warning")
+    pub event_type: Option<String>,
+    /// Only return unhandled events
+    pub unhandled_only: bool,
     /// Filter by time range start (epoch ms)
     pub since: Option<i64>,
     /// Filter by time range end (epoch ms)
@@ -2671,6 +2739,159 @@ fn query_unhandled_events(conn: &Connection, limit: usize) -> Result<Vec<StoredE
 
     let rows = stmt
         .query_map([limit_i64], |row| {
+            let extracted_str: Option<String> = row.get(7)?;
+            let extracted = extracted_str
+                .as_ref()
+                .and_then(|s| serde_json::from_str(s).ok());
+
+            Ok(StoredEvent {
+                id: row.get(0)?,
+                pane_id: {
+                    let val: i64 = row.get(1)?;
+                    #[allow(clippy::cast_sign_loss)]
+                    {
+                        val as u64
+                    }
+                },
+                rule_id: row.get(2)?,
+                agent_type: row.get(3)?,
+                event_type: row.get(4)?,
+                severity: row.get(5)?,
+                confidence: row.get(6)?,
+                extracted,
+                matched_text: row.get(8)?,
+                segment_id: row.get(9)?,
+                detected_at: row.get(10)?,
+                handled_at: row.get(11)?,
+                handled_by_workflow_id: row.get(12)?,
+                handled_status: row.get(13)?,
+            })
+        })
+        .map_err(|e| StorageError::Database(format!("Query failed: {e}")))?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row.map_err(|e| StorageError::Database(format!("Row error: {e}")))?);
+    }
+
+    Ok(results)
+}
+
+/// Count unhandled events per pane
+fn query_unhandled_event_counts(conn: &Connection) -> Result<std::collections::HashMap<u64, u32>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT pane_id, COUNT(*) as cnt
+             FROM events
+             WHERE handled_at IS NULL
+             GROUP BY pane_id",
+        )
+        .map_err(|e| StorageError::Database(format!("Failed to prepare query: {e}")))?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            let pane_id: i64 = row.get(0)?;
+            let count: i64 = row.get(1)?;
+            #[allow(clippy::cast_sign_loss)]
+            Ok((pane_id as u64, count as u32))
+        })
+        .map_err(|e| StorageError::Database(format!("Query failed: {e}")))?;
+
+    let mut result = std::collections::HashMap::new();
+    for row in rows {
+        let (pane_id, count) =
+            row.map_err(|e| StorageError::Database(format!("Row error: {e}")))?;
+        result.insert(pane_id, count);
+    }
+
+    Ok(result)
+}
+
+/// Get most recent activity timestamp per pane (from segments table)
+fn query_last_activity_by_pane(conn: &Connection) -> Result<std::collections::HashMap<u64, i64>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT pane_id, MAX(captured_at) as last_activity
+             FROM output_segments
+             GROUP BY pane_id",
+        )
+        .map_err(|e| StorageError::Database(format!("Failed to prepare query: {e}")))?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            let pane_id: i64 = row.get(0)?;
+            let last_activity: i64 = row.get(1)?;
+            #[allow(clippy::cast_sign_loss)]
+            Ok((pane_id as u64, last_activity))
+        })
+        .map_err(|e| StorageError::Database(format!("Query failed: {e}")))?;
+
+    let mut result = std::collections::HashMap::new();
+    for row in rows {
+        let (pane_id, last_activity) =
+            row.map_err(|e| StorageError::Database(format!("Row error: {e}")))?;
+        result.insert(pane_id, last_activity);
+    }
+
+    Ok(result)
+}
+
+/// Query events with optional filters
+fn query_events(conn: &Connection, query: &EventQuery) -> Result<Vec<StoredEvent>> {
+    let mut sql = String::from(
+        "SELECT id, pane_id, rule_id, agent_type, event_type, severity, confidence,
+         extracted, matched_text, segment_id, detected_at, handled_at,
+         handled_by_workflow_id, handled_status
+         FROM events WHERE 1=1",
+    );
+
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+    if query.unhandled_only {
+        sql.push_str(" AND handled_at IS NULL");
+    }
+
+    if let Some(pane_id) = query.pane_id {
+        sql.push_str(" AND pane_id = ?");
+        #[allow(clippy::cast_possible_wrap)]
+        params.push(Box::new(pane_id as i64));
+    }
+
+    if let Some(ref rule_id) = query.rule_id {
+        sql.push_str(" AND rule_id = ?");
+        params.push(Box::new(rule_id.clone()));
+    }
+
+    if let Some(ref event_type) = query.event_type {
+        sql.push_str(" AND event_type = ?");
+        params.push(Box::new(event_type.clone()));
+    }
+
+    if let Some(since) = query.since {
+        sql.push_str(" AND detected_at >= ?");
+        params.push(Box::new(since));
+    }
+
+    if let Some(until) = query.until {
+        sql.push_str(" AND detected_at <= ?");
+        params.push(Box::new(until));
+    }
+
+    sql.push_str(" ORDER BY detected_at DESC");
+
+    let limit = query.limit.unwrap_or(20);
+    let limit_i64 = usize_to_i64(limit, "limit")?;
+    sql.push_str(" LIMIT ?");
+    params.push(Box::new(limit_i64));
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| StorageError::Database(format!("Failed to prepare query: {e}")))?;
+
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+
+    let rows = stmt
+        .query_map(param_refs.as_slice(), |row| {
             let extracted_str: Option<String> = row.get(7)?;
             let extracted = extracted_str
                 .as_ref()
@@ -5512,5 +5733,233 @@ mod storage_handle_tests {
 
         handle.shutdown().await.unwrap();
         let _ = std::fs::remove_file(&db_path);
+    }
+}
+
+// =============================================================================
+// Property-Based Tests (wa-4vx.10.5)
+// =============================================================================
+
+#[cfg(test)]
+mod proptest_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio::runtime::Runtime;
+
+    // Counter for unique temp DB paths
+    static PROPTEST_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// Generate a unique temp DB path
+    fn temp_db_path() -> String {
+        let counter = PROPTEST_DB_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir();
+        dir.join(format!(
+            "wa_proptest_{counter}_{}.db",
+            std::process::id()
+        ))
+        .to_str()
+        .unwrap()
+        .to_string()
+    }
+
+    /// Helper to create a test pane record
+    fn test_pane(pane_id: u64) -> PaneRecord {
+        let now = now_ms();
+        PaneRecord {
+            pane_id,
+            domain: "local".to_string(),
+            window_id: None,
+            tab_id: None,
+            title: None,
+            cwd: None,
+            tty_name: None,
+            first_seen_at: now,
+            last_seen_at: now,
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        }
+    }
+
+    // Strategy for generating valid segment content (non-empty ASCII strings)
+    fn segment_content_strategy() -> impl Strategy<Value = String> {
+        // Generate strings of 1-100 printable ASCII characters
+        "[a-zA-Z0-9 .,!?]{1,100}".prop_map(|s| s.to_string())
+    }
+
+    // Strategy for generating write operations (pane_id, content)
+    fn write_ops_strategy() -> impl Strategy<Value = Vec<(u64, String)>> {
+        // Generate 1-50 write operations across 1-5 panes
+        let pane_count = 1u64..=5;
+        pane_count.prop_flat_map(|max_panes| {
+            proptest::collection::vec(
+                (1..=max_panes, segment_content_strategy()),
+                1..50,
+            )
+        })
+    }
+
+    proptest! {
+        // Set configuration for deterministic, CI-friendly runs
+        #![proptest_config(ProptestConfig {
+            cases: 50,  // Bounded case count
+            max_shrink_iters: 100,
+            .. ProptestConfig::default()
+        })]
+
+        /// Property: Sequence numbers are monotonically increasing per pane
+        ///
+        /// For any sequence of write operations across multiple panes,
+        /// each pane's segments must have strictly increasing seq numbers.
+        #[test]
+        fn prop_seq_monotonic_per_pane(writes in write_ops_strategy()) {
+            let rt = Runtime::new().expect("create runtime");
+            let db_path = temp_db_path();
+
+            // Collect results from async block for verification
+            let verification_results: Vec<(u64, Vec<u64>)> = rt.block_on(async {
+                let handle = StorageHandle::new(&db_path).await.expect("create storage");
+
+                // Determine which panes we need to create
+                let pane_ids: std::collections::HashSet<u64> = writes.iter().map(|(p, _)| *p).collect();
+
+                // Create all needed panes
+                for &pane_id in &pane_ids {
+                    handle.upsert_pane(test_pane(pane_id)).await.expect("create pane");
+                }
+
+                // Execute all writes
+                for (pane_id, content) in &writes {
+                    handle.append_segment(*pane_id, content, None).await.expect("append segment");
+                }
+
+                // Collect seq values for each pane
+                let mut results = Vec::new();
+                for &pane_id in &pane_ids {
+                    let segments = handle.get_segments(pane_id, 1000).await.expect("get segments");
+                    // Segments are returned in descending seq order, reverse for ascending
+                    let seqs: Vec<u64> = segments.iter().rev().map(|s| s.seq).collect();
+                    results.push((pane_id, seqs));
+                }
+
+                handle.shutdown().await.expect("shutdown");
+                results
+            });
+
+            let _ = std::fs::remove_file(&db_path);
+
+            // Verify monotonicity outside async block
+            for (pane_id, seqs) in verification_results {
+                for (expected, actual) in seqs.iter().enumerate() {
+                    prop_assert_eq!(
+                        *actual, expected as u64,
+                        "Pane {} seq at index {} should be {} but got {}",
+                        pane_id, expected, expected, actual
+                    );
+                }
+            }
+        }
+
+        /// Property: Inserted text becomes searchable via FTS
+        ///
+        /// For any valid search term inserted as segment content,
+        /// FTS search should find it.
+        #[test]
+        fn prop_fts_finds_inserted_text(content in "[a-zA-Z]{3,20}") {
+            let rt = Runtime::new().expect("create runtime");
+            let db_path = temp_db_path();
+
+            // Collect search results from async block
+            let (results_empty, found_content): (bool, bool) = rt.block_on(async {
+                let handle = StorageHandle::new(&db_path).await.expect("create storage");
+                handle.upsert_pane(test_pane(1)).await.expect("create pane");
+
+                // Insert the content as a segment
+                handle.append_segment(1, &content, None).await.expect("append segment");
+
+                // Search for the content
+                let results = handle.search(&content).await.expect("search");
+
+                let is_empty = results.is_empty();
+                let found = results.iter().any(|seg| seg.content.contains(&content));
+
+                handle.shutdown().await.expect("shutdown");
+                (is_empty, found)
+            });
+
+            let _ = std::fs::remove_file(&db_path);
+
+            // Verify outside async block
+            prop_assert!(
+                !results_empty,
+                "FTS search for '{}' should return results",
+                content
+            );
+            prop_assert!(
+                found_content,
+                "At least one result should contain '{}'",
+                content
+            );
+        }
+
+        /// Property: FTS respects pane scoping
+        ///
+        /// Content inserted in one pane should not appear in searches
+        /// scoped to a different pane.
+        #[test]
+        fn prop_fts_respects_pane_scope(
+            (content1, content2) in (
+                "[a-zA-Z]{5,15}".prop_map(|s| s.to_string()),
+                "[a-zA-Z]{5,15}".prop_map(|s| s.to_string())
+            ).prop_filter("contents must differ", |(a, b)| a != b)
+        ) {
+            let rt = Runtime::new().expect("create runtime");
+            let db_path = temp_db_path();
+
+            // Collect search results from async block
+            let (found_in_pane1, found_in_pane2): (bool, bool) = rt.block_on(async {
+                let handle = StorageHandle::new(&db_path).await.expect("create storage");
+
+                // Create two panes
+                handle.upsert_pane(test_pane(1)).await.expect("create pane 1");
+                handle.upsert_pane(test_pane(2)).await.expect("create pane 2");
+
+                // Insert different content in each pane
+                handle.append_segment(1, &content1, None).await.expect("append to pane 1");
+                handle.append_segment(2, &content2, None).await.expect("append to pane 2");
+
+                // Search for content1 scoped to pane 1
+                let opts1 = SearchOptions {
+                    pane_id: Some(1),
+                    ..Default::default()
+                };
+                let results1 = handle.search_with_options(&content1, opts1).await.expect("search pane 1");
+
+                // Search for content1 scoped to pane 2
+                let opts2 = SearchOptions {
+                    pane_id: Some(2),
+                    ..Default::default()
+                };
+                let results2 = handle.search_with_options(&content1, opts2).await.expect("search pane 2");
+
+                handle.shutdown().await.expect("shutdown");
+                (!results1.is_empty(), !results2.is_empty())
+            });
+
+            let _ = std::fs::remove_file(&db_path);
+
+            // Verify outside async block
+            prop_assert!(
+                found_in_pane1,
+                "Should find '{}' in pane 1",
+                content1
+            );
+            prop_assert!(
+                !found_in_pane2,
+                "Should NOT find '{}' in pane 2",
+                content1
+            );
+        }
     }
 }
