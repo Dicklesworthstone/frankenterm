@@ -281,6 +281,32 @@ pub mod control {
     pub const ESCAPE: &str = "\x1b";
 }
 
+/// Direction for splitting a pane
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitDirection {
+    /// Split to the left
+    Left,
+    /// Split to the right
+    Right,
+    /// Split above
+    Top,
+    /// Split below
+    Bottom,
+}
+
+/// Direction for pane navigation
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoveDirection {
+    /// Navigate left
+    Left,
+    /// Navigate right
+    Right,
+    /// Navigate up
+    Up,
+    /// Navigate down
+    Down,
+}
+
 /// Default command timeout in seconds
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
@@ -419,6 +445,163 @@ impl WeztermClient {
     /// Convenience method for `send_control(pane_id, control::CTRL_D)`.
     pub async fn send_ctrl_d(&self, pane_id: u64) -> Result<()> {
         self.send_control(pane_id, control::CTRL_D).await
+    }
+
+    // =========================================================================
+    // Pane lifecycle commands (wa-4vx.2.3)
+    // =========================================================================
+
+    /// Spawn a new pane in the current window
+    ///
+    /// # Arguments
+    /// * `cwd` - Optional working directory for the new pane
+    /// * `domain_name` - Optional domain to spawn in (defaults to local)
+    ///
+    /// # Returns
+    /// The pane ID of the newly spawned pane
+    pub async fn spawn(&self, cwd: Option<&str>, domain_name: Option<&str>) -> Result<u64> {
+        let mut args = vec!["cli", "spawn"];
+
+        // Add domain if specified
+        let domain_arg;
+        if let Some(domain) = domain_name {
+            domain_arg = format!("--domain-name={}", domain);
+            args.push(&domain_arg);
+        }
+
+        // Add cwd if specified
+        let cwd_arg;
+        if let Some(dir) = cwd {
+            cwd_arg = format!("--cwd={}", dir);
+            args.push(&cwd_arg);
+        }
+
+        let output = self.run_cli(&args).await?;
+        Self::parse_pane_id(&output)
+    }
+
+    /// Split an existing pane
+    ///
+    /// # Arguments
+    /// * `pane_id` - The pane to split from
+    /// * `direction` - Direction to split: "left", "right", "top", "bottom"
+    /// * `cwd` - Optional working directory for the new pane
+    /// * `percent` - Optional percentage of the split (10-90)
+    ///
+    /// # Returns
+    /// The pane ID of the newly created pane
+    pub async fn split_pane(
+        &self,
+        pane_id: u64,
+        direction: SplitDirection,
+        cwd: Option<&str>,
+        percent: Option<u8>,
+    ) -> Result<u64> {
+        let pane_id_str = pane_id.to_string();
+        let mut args = vec!["cli", "split-pane", "--pane-id", &pane_id_str];
+
+        // Add direction
+        let dir_flag = match direction {
+            SplitDirection::Left => "--left",
+            SplitDirection::Right => "--right",
+            SplitDirection::Top => "--top",
+            SplitDirection::Bottom => "--bottom",
+        };
+        args.push(dir_flag);
+
+        // Add cwd if specified
+        let cwd_arg;
+        if let Some(dir) = cwd {
+            cwd_arg = format!("--cwd={}", dir);
+            args.push(&cwd_arg);
+        }
+
+        // Add percent if specified
+        let percent_arg;
+        if let Some(pct) = percent {
+            let clamped = pct.clamp(10, 90);
+            percent_arg = format!("--percent={}", clamped);
+            args.push(&percent_arg);
+        }
+
+        let output = self.run_cli_with_pane_check(&args, pane_id).await?;
+        Self::parse_pane_id(&output)
+    }
+
+    /// Activate (focus) a specific pane
+    ///
+    /// # Arguments
+    /// * `pane_id` - The pane to activate
+    pub async fn activate_pane(&self, pane_id: u64) -> Result<()> {
+        let pane_id_str = pane_id.to_string();
+        let args = ["cli", "activate-pane", "--pane-id", &pane_id_str];
+        self.run_cli_with_pane_check(&args, pane_id).await?;
+        Ok(())
+    }
+
+    /// Get the pane ID in a specific direction from the current pane
+    ///
+    /// # Arguments
+    /// * `pane_id` - The reference pane
+    /// * `direction` - Direction to look: "left", "right", "up", "down"
+    ///
+    /// # Returns
+    /// The pane ID in the specified direction, or None if no pane exists there
+    pub async fn get_pane_direction(
+        &self,
+        pane_id: u64,
+        direction: MoveDirection,
+    ) -> Result<Option<u64>> {
+        // WezTerm doesn't have a direct get-pane-direction command.
+        // We use activate-pane-direction to check, but that has side effects.
+        // Instead, we list all panes and use geometry to determine neighbors.
+        // For now, we return None and note this needs enhancement.
+        //
+        // A better implementation would:
+        // 1. List all panes in the same tab
+        // 2. Use cursor_x/cursor_y and size to determine spatial relationships
+        // 3. Return the adjacent pane in the specified direction
+
+        // Placeholder: Always returns None
+        // TODO: Implement geometry-based pane direction lookup
+        let _ = (pane_id, direction);
+        Ok(None)
+    }
+
+    /// Kill (close) a pane
+    ///
+    /// # Arguments
+    /// * `pane_id` - The pane to kill
+    pub async fn kill_pane(&self, pane_id: u64) -> Result<()> {
+        let pane_id_str = pane_id.to_string();
+        let args = ["cli", "kill-pane", "--pane-id", &pane_id_str];
+        self.run_cli_with_pane_check(&args, pane_id).await?;
+        Ok(())
+    }
+
+    /// Zoom or unzoom a pane
+    ///
+    /// # Arguments
+    /// * `pane_id` - The pane to zoom/unzoom
+    /// * `zoom` - Whether to zoom (true) or unzoom (false)
+    pub async fn zoom_pane(&self, pane_id: u64, zoom: bool) -> Result<()> {
+        let pane_id_str = pane_id.to_string();
+        let mut args = vec!["cli", "zoom-pane", "--pane-id", &pane_id_str];
+        if !zoom {
+            args.push("--unzoom");
+        }
+        self.run_cli_with_pane_check(&args, pane_id).await?;
+        Ok(())
+    }
+
+    /// Parse a pane ID from CLI output
+    ///
+    /// WezTerm spawn/split-pane returns just the pane ID as a number.
+    fn parse_pane_id(output: &str) -> Result<u64> {
+        output
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| WeztermError::ParseError(format!("Invalid pane ID: {}", output.trim())).into())
     }
 
     /// Internal implementation for send_text with paste mode option

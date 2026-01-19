@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use aho_corasick::AhoCorasick;
+use aho_corasick::{AhoCorasick, MatchKind};
 use fancy_regex::Regex;
 use memchr::memchr;
 use serde::{Deserialize, Serialize};
@@ -272,10 +272,16 @@ fn build_engine_index(rules: &[RuleDef]) -> Result<EngineIndex> {
     let anchor_matcher = if anchor_list.is_empty() {
         None
     } else {
+        // Use MatchKind::All to report all matches, including overlapping ones.
+        // This ensures that both "limit reached" and "Usage limit reached for all Pro models"
+        // are reported when they both appear in the text.
         Some(
-            AhoCorasick::new(anchor_list.iter().map(String::as_str)).map_err(|e| {
-                PatternError::InvalidRule(format!("failed to build anchor matcher: {e}"))
-            })?,
+            AhoCorasick::builder()
+                .match_kind(MatchKind::All)
+                .build(anchor_list.iter().map(String::as_str))
+                .map_err(|e| {
+                    PatternError::InvalidRule(format!("failed to build anchor matcher: {e}"))
+                })?,
         )
     };
 
@@ -396,7 +402,7 @@ fn builtin_codex_pack() -> PatternPack {
             },
             // Device auth code prompt
             RuleDef {
-                id: "codex.auth.device_code".to_string(),
+                id: "codex.auth.device_code_prompt".to_string(),
                 agent_type: AgentType::Codex,
                 event_type: "auth.device_code".to_string(),
                 severity: Severity::Info,
@@ -416,16 +422,16 @@ fn builtin_claude_code_pack() -> PatternPack {
         "builtin:claude_code",
         "0.1.0",
         vec![
-            // Context compaction
+            // Context compaction (canonical ID: claude_code.compaction)
             RuleDef {
-                id: "claude_code.context.compaction".to_string(),
+                id: "claude_code.compaction".to_string(),
                 agent_type: AgentType::ClaudeCode,
-                event_type: "context.compaction".to_string(),
+                event_type: "session.compaction".to_string(),
                 severity: Severity::Warning,
                 anchors: vec![
+                    "Conversation compacted".to_string(),
                     "Auto-compact".to_string(),
                     "context compacted".to_string(),
-                    "summarizing conversation".to_string(),
                 ],
                 regex: Some(
                     r"(?:compacted|summarized)\s+(?P<tokens_before>[\d,]+)\s+tokens?\s+to\s+(?P<tokens_after>[\d,]+)".to_string()
@@ -433,6 +439,52 @@ fn builtin_claude_code_pack() -> PatternPack {
                 description: "Claude Code context compaction event".to_string(),
                 remediation: Some("Context was reduced - some history may be lost".to_string()),
                 workflow: Some("handle_compaction".to_string()),
+            },
+            // Session banner with version and model info
+            RuleDef {
+                id: "claude_code.banner".to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: "session.start".to_string(),
+                severity: Severity::Info,
+                anchors: vec!["Claude Code v".to_string(), "claude-code/".to_string()],
+                regex: Some(
+                    r"(?:Claude Code v|claude-code/)(?P<version>[\d.]+)(?:.*?model[:\s]+(?P<model>claude-[^\s,]+))?".to_string()
+                ),
+                description: "Claude Code session start banner".to_string(),
+                remediation: None,
+                workflow: None,
+            },
+            // Usage warning (evolving patterns)
+            RuleDef {
+                id: "claude_code.usage.warning".to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: "usage.warning".to_string(),
+                severity: Severity::Warning,
+                anchors: vec![
+                    "usage limit".to_string(),
+                    "approaching limit".to_string(),
+                    "token limit".to_string(),
+                ],
+                regex: Some(r"(?P<remaining>\d+)%?\s*(?:remaining|left|of limit)".to_string()),
+                description: "Claude Code usage warning".to_string(),
+                remediation: Some("Consider saving work soon".to_string()),
+                workflow: None,
+            },
+            // Usage limit reached
+            RuleDef {
+                id: "claude_code.usage.reached".to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: "usage.reached".to_string(),
+                severity: Severity::Critical,
+                anchors: vec![
+                    "rate limit".to_string(),
+                    "limit reached".to_string(),
+                    "quota exceeded".to_string(),
+                ],
+                regex: Some(r"(?:retry|reset|try again).*?(?P<reset_time>[\d:]+\s*(?:AM|PM|UTC)?|\d+\s*(?:seconds?|minutes?|hours?))".to_string()),
+                description: "Claude Code usage limit reached".to_string(),
+                remediation: Some("Wait for limit reset or switch session".to_string()),
+                workflow: Some("handle_usage_limits".to_string()),
             },
             // Session cost summary
             RuleDef {
@@ -460,18 +512,6 @@ fn builtin_claude_code_pack() -> PatternPack {
                 regex: None,
                 description: "Claude Code API key authentication error".to_string(),
                 remediation: Some("Check ANTHROPIC_API_KEY environment variable".to_string()),
-                workflow: None,
-            },
-            // Model selection
-            RuleDef {
-                id: "claude_code.model.selected".to_string(),
-                agent_type: AgentType::ClaudeCode,
-                event_type: "session.model".to_string(),
-                severity: Severity::Info,
-                anchors: vec!["claude-".to_string(), "model:".to_string()],
-                regex: Some(r"(?:model|Model):\s*(?P<model>claude-[^\s,]+)".to_string()),
-                description: "Claude Code model selection".to_string(),
-                remediation: None,
                 workflow: None,
             },
         ],
@@ -504,7 +544,7 @@ fn builtin_gemini_pack() -> PatternPack {
                 severity: Severity::Info,
                 anchors: vec!["Interaction Summary".to_string()],
                 regex: Some(
-                    r"Session ID:\s*(?P<session_id>[0-9a-f-]+).*?Tool Calls:\s*(?P<tool_calls>\d+)"
+                    r"Session ID:\s*(?P<session_id>[0-9a-fA-F-]+)[\s\S]*?Tool Calls:\s*(?P<tool_calls>\d+)"
                         .to_string(),
                 ),
                 description: "Gemini session summary with statistics".to_string(),
@@ -644,18 +684,27 @@ impl PatternEngine {
             return Vec::new();
         }
 
-        let matcher = match self.anchor_matcher.as_ref() {
-            Some(matcher) => matcher,
-            None => return Vec::new(),
+        let Some(matcher) = self.anchor_matcher.as_ref() else {
+            return Vec::new();
         };
 
         let mut candidate_rules: HashSet<usize> = HashSet::new();
         let mut matched_anchor_by_rule: HashMap<usize, String> = HashMap::new();
 
+        #[cfg(test)]
+        {
+            let match_count = matcher.find_iter(text).count();
+            eprintln!("detect: Aho-Corasick found {} matches in text", match_count);
+        }
+
         for matched in matcher.find_iter(text) {
-            let anchor = match self.anchor_list.get(matched.pattern().as_usize()) {
-                Some(anchor) => anchor,
-                None => continue,
+            #[cfg(test)]
+            eprintln!("detect: matched pattern {} at {:?}", matched.pattern().as_usize(), matched.span());
+
+            let Some(anchor) = self.anchor_list.get(matched.pattern().as_usize()) else {
+                #[cfg(test)]
+                eprintln!("detect: pattern {} not found in anchor_list", matched.pattern().as_usize());
+                continue;
             };
 
             if let Some(rule_indices) = self.anchor_to_rules.get(anchor) {
@@ -685,9 +734,8 @@ impl PatternEngine {
                 .unwrap_or_default();
 
             if let Some(regex) = compiled.regex.as_ref() {
-                let captures = match regex.captures(text) {
-                    Ok(Some(captures)) => captures,
-                    _ => continue,
+                let Ok(Some(captures)) = regex.captures(text) else {
+                    continue;
                 };
 
                 let mut extracted = serde_json::Map::new();
@@ -702,8 +750,7 @@ impl PatternEngine {
 
                 let matched_text = captures
                     .get(0)
-                    .map(|m| m.as_str().to_string())
-                    .unwrap_or_else(|| fallback_anchor.clone());
+                    .map_or_else(|| fallback_anchor.clone(), |m| m.as_str().to_string());
 
                 detections.push(Detection {
                     rule_id: rule.id.clone(),
@@ -753,6 +800,10 @@ impl PatternEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Deserialize;
+    use std::collections::{HashMap, HashSet};
+    use std::fs;
+    use std::path::PathBuf;
 
     #[test]
     fn engine_can_be_created() {
@@ -973,18 +1024,32 @@ mod tests {
             ids.contains(&"codex.session.resume_hint"),
             "Missing codex.session.resume_hint"
         );
+        assert!(
+            ids.contains(&"codex.auth.device_code_prompt"),
+            "Missing codex.auth.device_code_prompt"
+        );
     }
 
     #[test]
     fn expected_claude_code_rules_exist() {
         let engine = PatternEngine::new();
+        let ids: Vec<&str> = engine.rules().iter().map(|r| r.id.as_str()).collect();
+
         assert!(
-            engine
-                .rules()
-                .iter()
-                .map(|r| r.id.as_str())
-                .any(|id| id == "claude_code.context.compaction"),
-            "Missing claude_code.context.compaction"
+            ids.contains(&"claude_code.compaction"),
+            "Missing claude_code.compaction"
+        );
+        assert!(
+            ids.contains(&"claude_code.banner"),
+            "Missing claude_code.banner"
+        );
+        assert!(
+            ids.contains(&"claude_code.usage.warning"),
+            "Missing claude_code.usage.warning"
+        );
+        assert!(
+            ids.contains(&"claude_code.usage.reached"),
+            "Missing claude_code.usage.reached"
         );
     }
 
@@ -1077,5 +1142,427 @@ mod tests {
     fn empty_pack_version_is_rejected() {
         let pack = PatternPack::new("pack", "", vec![sample_rule("codex.test")]);
         assert!(PatternLibrary::new(vec![pack]).is_err());
+    }
+
+    // ========================================================================
+    // Real-world detection tests for builtin rules
+    // ========================================================================
+
+    #[test]
+    fn detect_codex_usage_reached() {
+        let engine = PatternEngine::new();
+        let text = "You've hit your usage limit for the 3h window. Please try again at 2:30 PM.";
+        let detections = engine.detect(text);
+        assert!(!detections.is_empty(), "Should detect usage limit");
+        let detection = detections.iter().find(|d| d.rule_id == "codex.usage.reached");
+        assert!(detection.is_some(), "Should match codex.usage.reached");
+        let d = detection.unwrap();
+        assert_eq!(d.severity, Severity::Critical);
+        assert_eq!(
+            d.extracted.get("reset_time").and_then(|v| v.as_str()),
+            Some("2:30 PM")
+        );
+    }
+
+    #[test]
+    fn detect_codex_usage_warning_25() {
+        let engine = PatternEngine::new();
+        let text = "Warning: You have less than 25% of your 3h limit remaining.";
+        let detections = engine.detect(text);
+        let detection = detections.iter().find(|d| d.rule_id == "codex.usage.warning_25");
+        assert!(detection.is_some(), "Should match codex.usage.warning_25");
+    }
+
+    #[test]
+    fn detect_codex_usage_warning_10() {
+        let engine = PatternEngine::new();
+        let text = "Warning: You have less than 10% of your 3h limit remaining.";
+        let detections = engine.detect(text);
+        let detection = detections.iter().find(|d| d.rule_id == "codex.usage.warning_10");
+        assert!(detection.is_some(), "Should match codex.usage.warning_10");
+    }
+
+    #[test]
+    fn detect_codex_usage_warning_5() {
+        let engine = PatternEngine::new();
+        let text = "Warning: You have less than 5% of your 3h limit remaining.";
+        let detections = engine.detect(text);
+        let detection = detections.iter().find(|d| d.rule_id == "codex.usage.warning_5");
+        assert!(detection.is_some(), "Should match codex.usage.warning_5");
+    }
+
+    #[test]
+    fn detect_codex_token_usage() {
+        let engine = PatternEngine::new();
+        let text = "Token usage: total=125,432 input=50,000 (+ 20,000 cached) output=55,432";
+        let detections = engine.detect(text);
+        let detection = detections.iter().find(|d| d.rule_id == "codex.session.token_usage");
+        assert!(detection.is_some(), "Should match codex.session.token_usage");
+        let d = detection.unwrap();
+        assert_eq!(
+            d.extracted.get("total").and_then(|v| v.as_str()),
+            Some("125,432")
+        );
+        assert_eq!(
+            d.extracted.get("input").and_then(|v| v.as_str()),
+            Some("50,000")
+        );
+        assert_eq!(
+            d.extracted.get("cached").and_then(|v| v.as_str()),
+            Some("20,000")
+        );
+        assert_eq!(
+            d.extracted.get("output").and_then(|v| v.as_str()),
+            Some("55,432")
+        );
+    }
+
+    #[test]
+    fn detect_codex_token_usage_with_reasoning() {
+        let engine = PatternEngine::new();
+        let text = "Token usage: total=200,000 input=80,000 (+ 30,000 cached) output=90,000 (reasoning 10,000)";
+        let detections = engine.detect(text);
+        let detection = detections.iter().find(|d| d.rule_id == "codex.session.token_usage");
+        assert!(detection.is_some(), "Should match codex.session.token_usage with reasoning");
+        let d = detection.unwrap();
+        assert_eq!(
+            d.extracted.get("reasoning").and_then(|v| v.as_str()),
+            Some("10,000")
+        );
+    }
+
+    #[test]
+    fn detect_codex_resume_hint() {
+        let engine = PatternEngine::new();
+        let text = "To resume this session, run: codex resume a1b2c3d4-e5f6-7890-abcd-ef1234567890";
+        let detections = engine.detect(text);
+        let detection = detections.iter().find(|d| d.rule_id == "codex.session.resume_hint");
+        assert!(detection.is_some(), "Should match codex.session.resume_hint");
+        let d = detection.unwrap();
+        assert_eq!(
+            d.extracted.get("session_id").and_then(|v| v.as_str()),
+            Some("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
+        );
+    }
+
+    #[test]
+    fn detect_codex_device_auth() {
+        let engine = PatternEngine::new();
+        let text = "Enter this one-time code at https://auth.openai.com: ABCD-12345";
+        let detections = engine.detect(text);
+        let detection = detections.iter().find(|d| d.rule_id == "codex.auth.device_code_prompt");
+        assert!(detection.is_some(), "Should match codex.auth.device_code_prompt");
+        let d = detection.unwrap();
+        assert_eq!(
+            d.extracted.get("code").and_then(|v| v.as_str()),
+            Some("ABCD-12345")
+        );
+    }
+
+    #[test]
+    fn detect_claude_code_compaction() {
+        let engine = PatternEngine::new();
+        let text = "Conversation compacted 150,000 tokens to 25,000 tokens";
+        let detections = engine.detect(text);
+        let detection = detections.iter().find(|d| d.rule_id == "claude_code.compaction");
+        assert!(detection.is_some(), "Should match claude_code.compaction");
+        let d = detection.unwrap();
+        assert_eq!(d.severity, Severity::Warning);
+        assert_eq!(
+            d.extracted.get("tokens_before").and_then(|v| v.as_str()),
+            Some("150,000")
+        );
+        assert_eq!(
+            d.extracted.get("tokens_after").and_then(|v| v.as_str()),
+            Some("25,000")
+        );
+    }
+
+    #[test]
+    fn detect_claude_code_compaction_summarized_variant() {
+        let engine = PatternEngine::new();
+        let text = "context compacted: summarized 100,000 tokens to 15,000 tokens";
+        let detections = engine.detect(text);
+        let detection = detections.iter().find(|d| d.rule_id == "claude_code.compaction");
+        assert!(detection.is_some(), "Should match claude_code.compaction with summarized variant");
+    }
+
+    #[test]
+    fn detect_claude_code_cost_summary() {
+        let engine = PatternEngine::new();
+        let text = "Session complete. Total cost: $1.25";
+        let detections = engine.detect(text);
+        let detection = detections.iter().find(|d| d.rule_id == "claude_code.session.cost_summary");
+        assert!(detection.is_some(), "Should match claude_code.session.cost_summary");
+        let d = detection.unwrap();
+        assert_eq!(
+            d.extracted.get("cost").and_then(|v| v.as_str()),
+            Some("1.25")
+        );
+    }
+
+    #[test]
+    fn detect_claude_code_api_key_error() {
+        let engine = PatternEngine::new();
+        let text = "Error: invalid api key - please check your ANTHROPIC_API_KEY";
+        let detections = engine.detect(text);
+        let detection = detections.iter().find(|d| d.rule_id == "claude_code.auth.api_key_error");
+        assert!(detection.is_some(), "Should match claude_code.auth.api_key_error");
+        assert_eq!(detection.unwrap().severity, Severity::Critical);
+    }
+
+    #[test]
+    fn detect_claude_code_banner() {
+        let engine = PatternEngine::new();
+        let text = "Claude Code v1.2.3 starting session with model: claude-opus-4-5-20251101";
+        let detections = engine.detect(text);
+        let detection = detections.iter().find(|d| d.rule_id == "claude_code.banner");
+        assert!(detection.is_some(), "Should match claude_code.banner");
+        let d = detection.unwrap();
+        assert_eq!(
+            d.extracted.get("version").and_then(|v| v.as_str()),
+            Some("1.2.3")
+        );
+    }
+
+    #[test]
+    fn detect_gemini_usage_reached() {
+        let engine = PatternEngine::new();
+        let text = "Usage limit reached for all Pro models. Please wait before continuing.";
+
+        // Debug: check if the rule exists
+        let gemini_rules: Vec<_> = engine.rules().iter()
+            .filter(|r| r.id.starts_with("gemini."))
+            .collect();
+        eprintln!("Gemini rules: {gemini_rules:?}");
+
+        // Check if the anchor is present
+        let target_anchor = "Usage limit reached for all Pro models";
+        eprintln!("Target anchor present in anchor_list: {}", engine.anchor_list.contains(&target_anchor.to_string()));
+        eprintln!("Target anchor present in anchor_to_rules: {:?}", engine.anchor_to_rules.get(target_anchor));
+
+        // Debug: test the Aho-Corasick matcher directly
+        if let Some(matcher) = engine.anchor_matcher.as_ref() {
+            eprintln!("Matcher patterns count: {}", matcher.patterns_len());
+            let matches: Vec<_> = matcher.find_iter(text).collect();
+            eprintln!("Aho-Corasick matches: {matches:?}");
+            for m in &matches {
+                eprintln!("  Match pattern {} at {}..{}: {:?}",
+                    m.pattern().as_usize(),
+                    m.start(), m.end(),
+                    engine.anchor_list.get(m.pattern().as_usize()));
+            }
+        } else {
+            eprintln!("No anchor matcher!");
+        }
+
+        // Debug: check quick_reject
+        let quick_ok = engine.quick_reject(text);
+        eprintln!("quick_reject result: {quick_ok}");
+
+        let detections = engine.detect(text);
+        eprintln!("Detections: {detections:?}");
+
+        let detection = detections.iter().find(|d| d.rule_id == "gemini.usage.reached");
+        assert!(detection.is_some(), "Should match gemini.usage.reached");
+        assert_eq!(detection.unwrap().severity, Severity::Critical);
+    }
+
+    #[test]
+    fn detect_gemini_session_summary() {
+        let engine = PatternEngine::new();
+        let text = "Interaction Summary\nSession ID: abc12345-def6-7890-abcd-0123456789ab\nTool Calls: 42\nTokens Used: 10000";
+        let detections = engine.detect(text);
+        let detection = detections.iter().find(|d| d.rule_id == "gemini.session.summary");
+        assert!(detection.is_some(), "Should match gemini.session.summary");
+        let d = detection.unwrap();
+        assert_eq!(
+            d.extracted.get("session_id").and_then(|v| v.as_str()),
+            Some("abc12345-def6-7890-abcd-0123456789ab")
+        );
+        assert_eq!(
+            d.extracted.get("tool_calls").and_then(|v| v.as_str()),
+            Some("42")
+        );
+    }
+
+    #[test]
+    fn detect_gemini_model_used() {
+        let engine = PatternEngine::new();
+        let text = "Responding with gemini-2.0-flash-exp model";
+        let detections = engine.detect(text);
+        let detection = detections.iter().find(|d| d.rule_id == "gemini.model.used");
+        assert!(detection.is_some(), "Should match gemini.model.used");
+        let d = detection.unwrap();
+        assert_eq!(
+            d.extracted.get("model").and_then(|v| v.as_str()),
+            Some("gemini-2.0-flash-exp")
+        );
+    }
+
+    #[test]
+    fn detect_wezterm_mux_connection_lost() {
+        let engine = PatternEngine::new();
+        let text = "Error: mux server connection lost, attempting reconnect...";
+        let detections = engine.detect(text);
+        let detection = detections.iter().find(|d| d.rule_id == "wezterm.mux.connection_lost");
+        assert!(detection.is_some(), "Should match wezterm.mux.connection_lost");
+        assert_eq!(detection.unwrap().severity, Severity::Critical);
+    }
+
+    #[test]
+    fn detect_wezterm_pane_exited() {
+        let engine = PatternEngine::new();
+        let text = "shell exited with exit status: 0";
+        let detections = engine.detect(text);
+        let detection = detections.iter().find(|d| d.rule_id == "wezterm.pane.exited");
+        assert!(detection.is_some(), "Should match wezterm.pane.exited");
+        let d = detection.unwrap();
+        assert_eq!(
+            d.extracted.get("exit_code").and_then(|v| v.as_str()),
+            Some("0")
+        );
+    }
+
+    #[test]
+    fn detect_wezterm_pane_exited_nonzero() {
+        let engine = PatternEngine::new();
+        let text = "process exited with status 1";
+        let detections = engine.detect(text);
+        let detection = detections.iter().find(|d| d.rule_id == "wezterm.pane.exited");
+        assert!(detection.is_some(), "Should match wezterm.pane.exited with non-zero exit");
+        let d = detection.unwrap();
+        assert_eq!(
+            d.extracted.get("exit_code").and_then(|v| v.as_str()),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn no_false_positives_on_unrelated_text() {
+        let engine = PatternEngine::new();
+        let text = "This is just some regular text about coding and programming.";
+        let detections = engine.detect(text);
+        assert!(detections.is_empty(), "Should not detect patterns in unrelated text");
+    }
+
+    #[test]
+    fn no_false_positives_on_similar_keywords() {
+        let engine = PatternEngine::new();
+        // Text that contains substrings of anchors but shouldn't match full rules
+        let text = "The less work we do, the better. Try again later with a 10% discount.";
+        let detections = engine.detect(text);
+        // Should not match usage warnings because the full anchor isn't present
+        let usage_warning = detections.iter().find(|d| d.rule_id.contains("usage.warning"));
+        assert!(usage_warning.is_none(), "Should not have false positive on partial matches");
+    }
+
+    // ========================================================================
+    // Fixture corpus regression harness
+    // ========================================================================
+
+    #[derive(Debug, Deserialize)]
+    struct PatternFixture {
+        name: String,
+        text: String,
+        expected_rule_ids: Vec<String>,
+        #[serde(default)]
+        expected_extracted: Option<HashMap<String, String>>,
+        #[serde(default)]
+        negative_for: Option<String>,
+    }
+
+    fn fixtures_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("patterns")
+            .join("builtin.json")
+    }
+
+    fn load_fixtures() -> Vec<PatternFixture> {
+        let path = fixtures_path();
+        let content = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("Failed to read fixture {}: {}", path.display(), e));
+        serde_json::from_str(&content)
+            .unwrap_or_else(|e| panic!("Failed to parse fixture {}: {}", path.display(), e))
+    }
+
+    #[test]
+    fn fixture_corpus_matches_expected() {
+        let engine = PatternEngine::new();
+        let fixtures = load_fixtures();
+
+        for fixture in fixtures {
+            let detections = engine.detect(&fixture.text);
+            let mut actual: Vec<String> =
+                detections.iter().map(|d| d.rule_id.clone()).collect();
+            let mut expected = fixture.expected_rule_ids.clone();
+            actual.sort();
+            expected.sort();
+
+            assert_eq!(
+                actual, expected,
+                "fixture '{}' mismatch (text: {})",
+                fixture.name, fixture.text
+            );
+
+            if let Some(expected_extracted) = fixture.expected_extracted.as_ref() {
+                assert_eq!(
+                    fixture.expected_rule_ids.len(),
+                    1,
+                    "fixture '{}' extraction expects a single rule id",
+                    fixture.name
+                );
+                let rule_id = fixture.expected_rule_ids[0].as_str();
+                let detection = detections
+                    .iter()
+                    .find(|d| d.rule_id == rule_id)
+                    .expect("expected detection missing");
+                for (key, expected_value) in expected_extracted {
+                    let actual_value = detection
+                        .extracted
+                        .get(key)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    assert_eq!(
+                        actual_value, expected_value,
+                        "fixture '{}' extraction mismatch for {}",
+                        fixture.name, key
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fixtures_cover_all_builtin_rules() {
+        let engine = PatternEngine::new();
+        let fixtures = load_fixtures();
+
+        let mut positives = HashSet::new();
+        let mut negatives = HashSet::new();
+
+        for fixture in fixtures {
+            for rule_id in &fixture.expected_rule_ids {
+                positives.insert(rule_id.clone());
+            }
+            if let Some(rule_id) = fixture.negative_for {
+                negatives.insert(rule_id);
+            }
+        }
+
+        for rule in engine.rules() {
+            assert!(
+                positives.contains(&rule.id),
+                "Missing positive fixture for rule {}",
+                rule.id
+            );
+            assert!(
+                negatives.contains(&rule.id),
+                "Missing negative fixture for rule {}",
+                rule.id
+            );
+        }
     }
 }

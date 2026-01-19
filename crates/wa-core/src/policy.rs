@@ -166,6 +166,7 @@ impl ActorKind {
 /// This is a minimal stub. Full implementation in wa-4vx.8.8 will derive
 /// these from OSC 133 markers, alt-screen detection, and heuristics.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct PaneCapabilities {
     /// Whether a shell prompt is currently active
     pub prompt_active: bool,
@@ -509,22 +510,22 @@ impl PolicyEngine {
         if matches!(
             input.action,
             ActionKind::SendText | ActionKind::SendControl
-        ) {
-            if self.require_prompt_active && !input.capabilities.prompt_active {
-                // If command is running, deny
-                if input.capabilities.command_running {
-                    return PolicyDecision::deny_with_rule(
-                        "Refusing to send to running command - wait for prompt",
-                        "policy.prompt_required",
-                    );
-                }
-                // If state is unknown, require approval for non-trusted actors
-                if !input.actor.is_trusted() {
-                    return PolicyDecision::require_approval_with_rule(
-                        "Pane state unknown - approval required before sending",
-                        "policy.prompt_unknown",
-                    );
-                }
+        ) && self.require_prompt_active
+            && !input.capabilities.prompt_active
+        {
+            // If command is running, deny
+            if input.capabilities.command_running {
+                return PolicyDecision::deny_with_rule(
+                    "Refusing to send to running command - wait for prompt",
+                    "policy.prompt_required",
+                );
+            }
+            // If state is unknown, require approval for non-trusted actors
+            if !input.actor.is_trusted() {
+                return PolicyDecision::require_approval_with_rule(
+                    "Pane state unknown - approval required before sending",
+                    "policy.prompt_unknown",
+                );
             }
         }
 

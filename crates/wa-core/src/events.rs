@@ -170,6 +170,31 @@ pub struct MetricsSnapshot {
     pub subscriber_lag_events: u64,
 }
 
+/// Snapshot of queue depth and lag metrics per channel
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventBusStats {
+    /// Queue capacity for each channel
+    pub capacity: usize,
+    /// Buffered delta events
+    pub delta_queued: usize,
+    /// Buffered detection events
+    pub detection_queued: usize,
+    /// Buffered signal events
+    pub signal_queued: usize,
+    /// Delta channel subscribers
+    pub delta_subscribers: usize,
+    /// Detection channel subscribers
+    pub detection_subscribers: usize,
+    /// Signal channel subscribers
+    pub signal_subscribers: usize,
+    /// Age of oldest delta event (ms)
+    pub delta_oldest_lag_ms: Option<u64>,
+    /// Age of oldest detection event (ms)
+    pub detection_oldest_lag_ms: Option<u64>,
+    /// Age of oldest signal event (ms)
+    pub signal_oldest_lag_ms: Option<u64>,
+}
+
 /// Event bus for distributing events to subscribers via broadcast fanout
 ///
 /// Uses tokio broadcast channel for multi-consumer delivery. The bus is
@@ -268,14 +293,35 @@ impl EventBus {
     #[must_use]
     pub fn publish(&self, event: Event) -> usize {
         self.metrics.events_published.fetch_add(1, Ordering::Relaxed);
+        let mut delivered = 0usize;
 
-        self.sender.send(event).unwrap_or_else(|_| {
-            // No active receivers
+        if let Ok(count) = self.all_sender.send(event.clone()) {
+            delivered += count;
+        }
+
+        delivered += match event {
+            Event::SegmentCaptured { .. } | Event::GapDetected { .. } => {
+                self.send_routed(event, &self.delta_sender, &self.delta_times)
+            }
+            Event::PatternDetected { .. } => {
+                self.send_routed(event, &self.detection_sender, &self.detection_times)
+            }
+            Event::PaneDiscovered { .. }
+            | Event::PaneDisappeared { .. }
+            | Event::WorkflowStarted { .. }
+            | Event::WorkflowStep { .. }
+            | Event::WorkflowCompleted { .. } => {
+                self.send_routed(event, &self.signal_sender, &self.signal_times)
+            }
+        };
+
+        if delivered == 0 {
             self.metrics
                 .events_dropped_no_subscribers
                 .fetch_add(1, Ordering::Relaxed);
-            0
-        })
+        }
+
+        delivered
     }
 
     /// Create a new subscriber to receive events
@@ -288,10 +334,97 @@ impl EventBus {
             .active_subscribers
             .fetch_add(1, Ordering::Relaxed);
         EventSubscriber {
-            receiver: self.sender.subscribe(),
+            receiver: self.all_sender.subscribe(),
             metrics: Arc::clone(&self.metrics),
             lagged_count: 0,
         }
+    }
+
+    /// Subscribe to delta events (segments and gaps)
+    #[must_use]
+    pub fn subscribe_deltas(&self) -> EventSubscriber {
+        self.metrics
+            .active_subscribers
+            .fetch_add(1, Ordering::Relaxed);
+        EventSubscriber {
+            receiver: self.delta_sender.subscribe(),
+            metrics: Arc::clone(&self.metrics),
+            lagged_count: 0,
+        }
+    }
+
+    /// Subscribe to detection events
+    #[must_use]
+    pub fn subscribe_detections(&self) -> EventSubscriber {
+        self.metrics
+            .active_subscribers
+            .fetch_add(1, Ordering::Relaxed);
+        EventSubscriber {
+            receiver: self.detection_sender.subscribe(),
+            metrics: Arc::clone(&self.metrics),
+            lagged_count: 0,
+        }
+    }
+
+    /// Subscribe to signal events (pane/workflow lifecycle)
+    #[must_use]
+    pub fn subscribe_signals(&self) -> EventSubscriber {
+        self.metrics
+            .active_subscribers
+            .fetch_add(1, Ordering::Relaxed);
+        EventSubscriber {
+            receiver: self.signal_sender.subscribe(),
+            metrics: Arc::clone(&self.metrics),
+            lagged_count: 0,
+        }
+    }
+
+    /// Snapshot queue depths and oldest message lag per channel
+    #[must_use]
+    pub fn stats(&self) -> EventBusStats {
+        EventBusStats {
+            capacity: self.capacity,
+            delta_queued: self.delta_sender.len(),
+            detection_queued: self.detection_sender.len(),
+            signal_queued: self.signal_sender.len(),
+            delta_subscribers: self.delta_sender.receiver_count(),
+            detection_subscribers: self.detection_sender.receiver_count(),
+            signal_subscribers: self.signal_sender.receiver_count(),
+            delta_oldest_lag_ms: Self::oldest_lag_ms(&self.delta_times),
+            detection_oldest_lag_ms: Self::oldest_lag_ms(&self.detection_times),
+            signal_oldest_lag_ms: Self::oldest_lag_ms(&self.signal_times),
+        }
+    }
+
+    fn send_routed(
+        &self,
+        event: Event,
+        sender: &broadcast::Sender<Event>,
+        times: &Mutex<VecDeque<Instant>>,
+    ) -> usize {
+        match sender.send(event) {
+            Ok(count) => {
+                Self::record_timestamp(times, self.capacity);
+                count
+            }
+            Err(_) => 0,
+        }
+    }
+
+    fn record_timestamp(times: &Mutex<VecDeque<Instant>>, capacity: usize) {
+        if let Ok(mut guard) = times.lock() {
+            guard.push_back(Instant::now());
+            if guard.len() > capacity {
+                guard.pop_front();
+            }
+        }
+    }
+
+    fn oldest_lag_ms(times: &Mutex<VecDeque<Instant>>) -> Option<u64> {
+        let guard = times.lock().ok()?;
+        let oldest = guard.front()?;
+        let elapsed_ms = oldest.elapsed().as_millis();
+        u64::try_from(elapsed_ms).ok()
     }
 }
 

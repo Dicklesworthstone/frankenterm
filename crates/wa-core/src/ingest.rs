@@ -214,7 +214,7 @@ pub fn extract_delta(previous: &str, current: &str, overlap_size: usize) -> Delt
             continue;
         }
 
-        if &previous[prev_start..] == &current[..overlap_len] {
+        if previous[prev_start..] == current[..overlap_len] {
             let delta = &current[overlap_len..];
             if delta.is_empty() {
                 return DeltaResult::Gap {

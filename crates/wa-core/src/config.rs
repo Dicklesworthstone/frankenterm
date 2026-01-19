@@ -125,6 +125,9 @@ pub struct IngestConfig {
 
     /// Maximum segment size in bytes before forced split
     pub max_segment_bytes: u32,
+
+    /// Pane filtering rules (include/exclude)
+    pub panes: PaneFilterConfig,
 }
 
 impl Default for IngestConfig {
@@ -137,7 +140,223 @@ impl Default for IngestConfig {
             gap_detection: true,
             gap_detection_threshold_percent: 50,
             max_segment_bytes: 65536, // 64KB
+            panes: PaneFilterConfig::default(),
         }
+    }
+}
+
+// =============================================================================
+// Pane Filter Config
+// =============================================================================
+
+/// Pane filtering configuration for controlling which panes are observed
+///
+/// Precedence rules:
+/// - Exclude rules are checked first and always win
+/// - If include rules are empty, all panes are included by default
+/// - If include rules are specified, only matching panes are included
+/// - A pane must match at least one include rule (if any) AND not match any exclude rule
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct PaneFilterConfig {
+    /// Include rules: panes matching ANY of these are included (if list is non-empty)
+    /// If empty, all panes are included by default (subject to exclude rules)
+    pub include: Vec<PaneFilterRule>,
+
+    /// Exclude rules: panes matching ANY of these are excluded
+    /// Exclude rules always win over include rules
+    pub exclude: Vec<PaneFilterRule>,
+}
+
+impl PaneFilterConfig {
+    /// Check if a pane should be observed based on the filter rules
+    ///
+    /// Returns `Some(rule_id)` if the pane is excluded (with the matching rule ID),
+    /// or `None` if the pane should be observed.
+    #[must_use]
+    pub fn check_pane(&self, domain: &str, title: &str, cwd: &str) -> Option<String> {
+        // Check exclude rules first (exclude always wins)
+        for rule in &self.exclude {
+            if rule.matches(domain, title, cwd) {
+                return Some(rule.id.clone());
+            }
+        }
+
+        // If include rules are specified, pane must match at least one
+        if !self.include.is_empty() {
+            let matches_include = self.include.iter().any(|r| r.matches(domain, title, cwd));
+            if !matches_include {
+                return Some("no_include_match".to_string());
+            }
+        }
+
+        // Pane should be observed
+        None
+    }
+
+    /// Check if there are any active filter rules
+    #[must_use]
+    pub fn has_rules(&self) -> bool {
+        !self.include.is_empty() || !self.exclude.is_empty()
+    }
+}
+
+/// A single pane filter rule with optional matchers for domain, title, and cwd
+///
+/// All specified matchers must match for the rule to apply (AND logic).
+/// Use separate rules for OR logic (multiple rules in include/exclude lists).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PaneFilterRule {
+    /// Unique identifier for this rule (shown in status output)
+    pub id: String,
+
+    /// Match on domain name (exact match or glob pattern)
+    /// Examples: "local", "SSH:*", "unix:*"
+    pub domain: Option<String>,
+
+    /// Match on pane title (substring or regex pattern)
+    /// If starts with "re:" uses regex matching, otherwise substring match
+    /// Examples: "vim", "re:^bash.*$"
+    pub title: Option<String>,
+
+    /// Match on current working directory (path prefix or glob)
+    /// Examples: "/home/user/private", "/tmp/*"
+    pub cwd: Option<String>,
+}
+
+impl Default for PaneFilterRule {
+    fn default() -> Self {
+        Self {
+            id: "unnamed_rule".to_string(),
+            domain: None,
+            title: None,
+            cwd: None,
+        }
+    }
+}
+
+impl PaneFilterRule {
+    /// Create a new rule with the given ID
+    #[must_use]
+    pub fn new(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            domain: None,
+            title: None,
+            cwd: None,
+        }
+    }
+
+    /// Set the domain matcher
+    #[must_use]
+    pub fn with_domain(mut self, domain: impl Into<String>) -> Self {
+        self.domain = Some(domain.into());
+        self
+    }
+
+    /// Set the title matcher
+    #[must_use]
+    pub fn with_title(mut self, title: impl Into<String>) -> Self {
+        self.title = Some(title.into());
+        self
+    }
+
+    /// Set the cwd matcher
+    #[must_use]
+    pub fn with_cwd(mut self, cwd: impl Into<String>) -> Self {
+        self.cwd = Some(cwd.into());
+        self
+    }
+
+    /// Check if this rule matches the given pane properties
+    ///
+    /// All specified matchers must match (AND logic).
+    /// If no matchers are specified, the rule matches nothing.
+    #[must_use]
+    pub fn matches(&self, domain: &str, title: &str, cwd: &str) -> bool {
+        // Rule must have at least one matcher
+        if self.domain.is_none() && self.title.is_none() && self.cwd.is_none() {
+            return false;
+        }
+
+        // All specified matchers must match (AND logic)
+        let domain_matches = self
+            .domain
+            .as_ref()
+            .is_none_or(|p| Self::match_glob(p, domain));
+        let title_matches = self
+            .title
+            .as_ref()
+            .is_none_or(|p| Self::match_title(p, title));
+        let cwd_matches = self
+            .cwd
+            .as_ref()
+            .is_none_or(|p| Self::match_glob(p, cwd));
+
+        domain_matches && title_matches && cwd_matches
+    }
+
+    /// Match using glob-style patterns (* for any, ? for single char)
+    fn match_glob(pattern: &str, value: &str) -> bool {
+        // Simple glob matching: * matches any sequence, ? matches any single char
+        if !pattern.contains('*') && !pattern.contains('?') {
+            // Exact match or prefix match for paths
+            return value == pattern || value.starts_with(&format!("{pattern}/"));
+        }
+
+        // Convert glob to regex-ish matching
+        let mut regex_pattern = String::from("^");
+        for ch in pattern.chars() {
+            match ch {
+                '*' => regex_pattern.push_str(".*"),
+                '?' => regex_pattern.push('.'),
+                '.' | '+' | '^' | '$' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\' => {
+                    regex_pattern.push('\\');
+                    regex_pattern.push(ch);
+                }
+                _ => regex_pattern.push(ch),
+            }
+        }
+        regex_pattern.push('$');
+
+        fancy_regex::Regex::new(&regex_pattern)
+            .map(|re| re.is_match(value).unwrap_or(false))
+            .unwrap_or(false)
+    }
+
+    /// Match title using substring or regex
+    fn match_title(pattern: &str, title: &str) -> bool {
+        pattern.strip_prefix("re:").map_or_else(
+            || title.to_lowercase().contains(&pattern.to_lowercase()),
+            |regex_pat| {
+                fancy_regex::Regex::new(regex_pat)
+                    .map(|re| re.is_match(title).unwrap_or(false))
+                    .unwrap_or(false)
+            },
+        )
+    }
+
+    /// Validate that this rule has at least one matcher and all patterns are valid
+    pub fn validate(&self) -> Result<(), String> {
+        if self.id.is_empty() {
+            return Err("Rule ID cannot be empty".to_string());
+        }
+
+        if self.domain.is_none() && self.title.is_none() && self.cwd.is_none() {
+            return Err(format!("Rule '{}' has no matchers", self.id));
+        }
+
+        // Validate regex patterns
+        if let Some(ref title) = self.title {
+            if let Some(regex_pat) = title.strip_prefix("re:") {
+                if fancy_regex::Regex::new(regex_pat).is_err() {
+                    return Err(format!("Rule '{}' has invalid title regex: {}", self.id, regex_pat));
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -739,5 +958,244 @@ disabled_rules = ["codex.usage_warning"]
 
         // Redaction should be enabled
         assert!(config.safety.redaction.enabled);
+    }
+
+    // =========================================================================
+    // Pane Filter Tests
+    // =========================================================================
+
+    #[test]
+    fn pane_filter_default_allows_all() {
+        let filter = PaneFilterConfig::default();
+        assert!(filter.include.is_empty());
+        assert!(filter.exclude.is_empty());
+        assert!(!filter.has_rules());
+
+        // With no rules, all panes should be observed
+        assert!(filter.check_pane("local", "bash", "/home/user").is_none());
+        assert!(filter.check_pane("SSH:remote", "vim", "/tmp").is_none());
+    }
+
+    #[test]
+    fn pane_filter_exclude_wins_over_include() {
+        let mut filter = PaneFilterConfig::default();
+
+        // Include all SSH panes
+        filter.include.push(
+            PaneFilterRule::new("include_ssh")
+                .with_domain("SSH:*")
+        );
+
+        // But exclude those with private in cwd
+        filter.exclude.push(
+            PaneFilterRule::new("exclude_private")
+                .with_cwd("/home/user/private*")
+        );
+
+        // SSH pane in normal cwd - allowed
+        assert!(filter.check_pane("SSH:remote", "bash", "/home/user/work").is_none());
+
+        // SSH pane in private cwd - excluded (exclude wins)
+        let result = filter.check_pane("SSH:remote", "bash", "/home/user/private/secrets");
+        assert_eq!(result, Some("exclude_private".to_string()));
+
+        // Local pane - excluded (not in include list)
+        let result = filter.check_pane("local", "bash", "/home/user");
+        assert_eq!(result, Some("no_include_match".to_string()));
+    }
+
+    #[test]
+    fn pane_filter_rule_domain_exact_match() {
+        let rule = PaneFilterRule::new("test_domain")
+            .with_domain("local");
+
+        assert!(rule.matches("local", "any", "any"));
+        assert!(!rule.matches("LOCAL", "any", "any")); // case-sensitive
+        assert!(!rule.matches("local2", "any", "any"));
+        assert!(!rule.matches("SSH:local", "any", "any"));
+    }
+
+    #[test]
+    fn pane_filter_rule_domain_glob() {
+        let rule = PaneFilterRule::new("ssh_glob")
+            .with_domain("SSH:*");
+
+        assert!(rule.matches("SSH:remote", "any", "any"));
+        assert!(rule.matches("SSH:server.example.com", "any", "any"));
+        assert!(!rule.matches("local", "any", "any"));
+        assert!(!rule.matches("ssh:remote", "any", "any")); // case-sensitive
+    }
+
+    #[test]
+    fn pane_filter_rule_title_substring() {
+        let rule = PaneFilterRule::new("vim_title")
+            .with_title("vim");
+
+        assert!(rule.matches("any", "vim", "any"));
+        assert!(rule.matches("any", "nvim - file.rs", "any"));
+        assert!(rule.matches("any", "VIM", "any")); // case-insensitive
+        assert!(rule.matches("any", "using NEOVIM for editing", "any"));
+        assert!(!rule.matches("any", "bash", "any"));
+    }
+
+    #[test]
+    fn pane_filter_rule_title_regex() {
+        let rule = PaneFilterRule::new("bash_regex")
+            .with_title("re:^bash.*$");
+
+        assert!(rule.matches("any", "bash", "any"));
+        assert!(rule.matches("any", "bash --login", "any"));
+        assert!(!rule.matches("any", "using bash here", "any")); // regex anchored to start
+        assert!(!rule.matches("any", "zsh", "any"));
+    }
+
+    #[test]
+    fn pane_filter_rule_cwd_prefix() {
+        let rule = PaneFilterRule::new("tmp_cwd")
+            .with_cwd("/tmp");
+
+        assert!(rule.matches("any", "any", "/tmp"));
+        assert!(rule.matches("any", "any", "/tmp/subdir"));
+        assert!(rule.matches("any", "any", "/tmp/deep/nested/path"));
+        assert!(!rule.matches("any", "any", "/home/tmp"));
+        assert!(!rule.matches("any", "any", "/tmpfile"));
+    }
+
+    #[test]
+    fn pane_filter_rule_cwd_glob() {
+        let rule = PaneFilterRule::new("home_glob")
+            .with_cwd("/home/*/private");
+
+        assert!(rule.matches("any", "any", "/home/user/private"));
+        assert!(rule.matches("any", "any", "/home/admin/private"));
+        assert!(!rule.matches("any", "any", "/home/user/public"));
+        assert!(!rule.matches("any", "any", "/home/user"));
+    }
+
+    #[test]
+    fn pane_filter_rule_and_logic() {
+        // Rule with multiple matchers uses AND logic
+        let rule = PaneFilterRule::new("ssh_vim")
+            .with_domain("SSH:*")
+            .with_title("vim");
+
+        // Both match - true
+        assert!(rule.matches("SSH:remote", "vim editor", "/home"));
+
+        // Only domain matches - false
+        assert!(!rule.matches("SSH:remote", "bash", "/home"));
+
+        // Only title matches - false
+        assert!(!rule.matches("local", "vim editor", "/home"));
+    }
+
+    #[test]
+    fn pane_filter_rule_empty_matches_nothing() {
+        let rule = PaneFilterRule::default();
+
+        // Rule with no matchers should match nothing
+        assert!(!rule.matches("local", "bash", "/home"));
+        assert!(!rule.matches("SSH:remote", "vim", "/tmp"));
+    }
+
+    #[test]
+    fn pane_filter_rule_validation() {
+        // Valid rule
+        let valid = PaneFilterRule::new("test").with_domain("local");
+        assert!(valid.validate().is_ok());
+
+        // Empty ID
+        let mut empty_id = PaneFilterRule::new("test").with_domain("local");
+        empty_id.id = String::new();
+        assert!(empty_id.validate().is_err());
+
+        // No matchers
+        let no_matchers = PaneFilterRule::new("test");
+        assert!(no_matchers.validate().is_err());
+
+        // Invalid regex
+        let invalid_regex = PaneFilterRule::new("test")
+            .with_title("re:[invalid(regex");
+        assert!(invalid_regex.validate().is_err());
+    }
+
+    #[test]
+    fn pane_filter_config_toml_roundtrip() {
+        let toml = r#"
+[ingest]
+poll_interval_ms = 100
+
+[ingest.panes]
+[[ingest.panes.include]]
+id = "observe_ssh"
+domain = "SSH:*"
+
+[[ingest.panes.exclude]]
+id = "skip_private"
+cwd = "/home/*/private"
+
+[[ingest.panes.exclude]]
+id = "skip_vim"
+title = "vim"
+"#;
+        let config = Config::from_toml(toml).expect("Failed to parse");
+
+        assert_eq!(config.ingest.poll_interval_ms, 100);
+        assert_eq!(config.ingest.panes.include.len(), 1);
+        assert_eq!(config.ingest.panes.exclude.len(), 2);
+
+        let include = &config.ingest.panes.include[0];
+        assert_eq!(include.id, "observe_ssh");
+        assert_eq!(include.domain, Some("SSH:*".to_string()));
+
+        let exclude1 = &config.ingest.panes.exclude[0];
+        assert_eq!(exclude1.id, "skip_private");
+        assert_eq!(exclude1.cwd, Some("/home/*/private".to_string()));
+
+        let exclude2 = &config.ingest.panes.exclude[1];
+        assert_eq!(exclude2.id, "skip_vim");
+        assert_eq!(exclude2.title, Some("vim".to_string()));
+    }
+
+    #[test]
+    fn pane_filter_config_serialization() {
+        let mut config = Config::default();
+        config.ingest.panes.include.push(
+            PaneFilterRule::new("test_include")
+                .with_domain("local")
+        );
+        config.ingest.panes.exclude.push(
+            PaneFilterRule::new("test_exclude")
+                .with_cwd("/tmp")
+        );
+
+        let toml = config.to_toml().expect("Failed to serialize");
+        let parsed = Config::from_toml(&toml).expect("Failed to parse");
+
+        assert_eq!(parsed.ingest.panes.include.len(), 1);
+        assert_eq!(parsed.ingest.panes.exclude.len(), 1);
+        assert_eq!(parsed.ingest.panes.include[0].id, "test_include");
+        assert_eq!(parsed.ingest.panes.exclude[0].id, "test_exclude");
+    }
+
+    #[test]
+    fn pane_filter_glob_special_chars() {
+        // Test that special regex characters in domain/cwd are properly escaped
+        let rule = PaneFilterRule::new("special")
+            .with_domain("domain.with.dots");
+
+        assert!(rule.matches("domain.with.dots", "any", "any"));
+        assert!(!rule.matches("domainXwithXdots", "any", "any"));
+    }
+
+    #[test]
+    fn pane_filter_question_mark_glob() {
+        let rule = PaneFilterRule::new("single_char")
+            .with_domain("SSH:?");
+
+        assert!(rule.matches("SSH:a", "any", "any"));
+        assert!(rule.matches("SSH:1", "any", "any"));
+        assert!(!rule.matches("SSH:ab", "any", "any"));
+        assert!(!rule.matches("SSH:", "any", "any"));
     }
 }
