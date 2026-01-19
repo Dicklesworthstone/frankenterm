@@ -25,8 +25,10 @@
 //! - `policy`: Safety and rate limiting
 
 #![forbid(unsafe_code)]
+#![feature(stmt_expr_attributes)]
 
 pub mod config;
+pub mod dry_run;
 pub mod error;
 pub mod events;
 pub mod ingest;
