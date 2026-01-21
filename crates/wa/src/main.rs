@@ -63,18 +63,27 @@ enum Commands {
         command: Option<RobotCommands>,
     },
 
-    /// Search captured output
+    /// Search captured output (FTS query)
+    #[command(alias = "query")]
     Search {
         /// Search query (FTS5 syntax)
         query: String,
+
+        /// Output format: auto, plain, or json
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
 
         /// Limit results
         #[arg(short, long, default_value = "10")]
         limit: usize,
 
         /// Filter by pane ID
-        #[arg(long)]
+        #[arg(long, short = 'p')]
         pane: Option<u64>,
+
+        /// Only return results since this timestamp (epoch ms or ISO8601)
+        #[arg(long, short = 's')]
+        since: Option<i64>,
     },
 
     /// List panes and their status
@@ -127,11 +136,54 @@ enum Commands {
         command: WorkflowCommands,
     },
 
-    /// Show system status
+    /// Show system status and pane overview
     Status {
-        /// Output health check as JSON
+        /// Output health check only (JSON)
         #[arg(long)]
         health: bool,
+
+        /// Output format: auto, plain, or json
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+
+        /// Filter by domain (glob pattern)
+        #[arg(long, short = 'd')]
+        domain: Option<String>,
+
+        /// Filter by agent type
+        #[arg(long, short = 'a')]
+        agent: Option<String>,
+
+        /// Filter by pane ID
+        #[arg(long, short = 'p')]
+        pane_id: Option<u64>,
+    },
+
+    /// Show recent detection events
+    Events {
+        /// Output format: auto, plain, or json
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+
+        /// Maximum number of events to return
+        #[arg(long, short = 'l', default_value = "20")]
+        limit: usize,
+
+        /// Filter by pane ID
+        #[arg(long, short = 'p')]
+        pane_id: Option<u64>,
+
+        /// Filter by rule ID (exact match)
+        #[arg(long, short = 'r')]
+        rule_id: Option<String>,
+
+        /// Filter by event type (e.g., "compaction_warning")
+        #[arg(long, short = 't')]
+        event_type: Option<String>,
+
+        /// Only return unhandled events
+        #[arg(long, short = 'u')]
+        unhandled: bool,
     },
 
     /// Run diagnostics
@@ -1050,6 +1102,35 @@ fn emit_permission_warnings(warnings: &[wa_core::config::PermissionWarning]) {
             "Permissions too open"
         );
     }
+}
+
+/// Simple glob pattern matching for CLI filters.
+///
+/// Supports `*` for any sequence and `?` for single character.
+fn glob_match(pattern: &str, value: &str) -> bool {
+    if !pattern.contains('*') && !pattern.contains('?') {
+        // Exact match
+        return value == pattern;
+    }
+
+    // Convert glob to regex-style matching
+    let mut regex_pattern = String::from("^");
+    for ch in pattern.chars() {
+        match ch {
+            '*' => regex_pattern.push_str(".*"),
+            '?' => regex_pattern.push('.'),
+            '.' | '+' | '^' | '$' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\' => {
+                regex_pattern.push('\\');
+                regex_pattern.push(ch);
+            }
+            _ => regex_pattern.push(ch),
+        }
+    }
+    regex_pattern.push('$');
+
+    fancy_regex::Regex::new(&regex_pattern)
+        .map(|re| re.is_match(value).unwrap_or(false))
+        .unwrap_or(false)
 }
 
 /// Run the observation watcher daemon.
@@ -2051,7 +2132,21 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        Some(Commands::Search { query, limit, pane }) => {
+        Some(Commands::Search {
+            query,
+            format,
+            limit,
+            pane,
+            since,
+        }) => {
+            use wa_core::output::{OutputFormat, SearchResultRenderer, RenderContext, detect_format};
+
+            let output_format = match format.to_lowercase().as_str() {
+                "json" => OutputFormat::Json,
+                "plain" => OutputFormat::Plain,
+                _ => detect_format(),
+            };
+
             let redacted_query = redact_for_output(&query);
             tracing::info!(
                 "Searching for '{}' (limit={}, pane={:?})",
@@ -2059,8 +2154,78 @@ async fn main() -> anyhow::Result<()> {
                 limit,
                 pane
             );
-            // TODO: Implement search
-            println!("Search not yet implemented");
+
+            // Get workspace layout for DB path
+            let layout = match config.workspace_layout(Some(&workspace_root)) {
+                Ok(l) => l,
+                Err(e) => {
+                    if output_format.is_json() {
+                        println!(
+                            r#"{{"ok": false, "error": "Failed to get workspace layout: {}", "version": "{}"}}"#,
+                            e, wa_core::VERSION
+                        );
+                    } else {
+                        eprintln!("Error: Failed to get workspace layout: {e}");
+                        eprintln!("Check --workspace or WA_WORKSPACE");
+                    }
+                    std::process::exit(1);
+                }
+            };
+
+            // Open storage handle
+            let db_path = layout.db_path.to_string_lossy();
+            let storage = match wa_core::storage::StorageHandle::new(&db_path).await {
+                Ok(s) => s,
+                Err(e) => {
+                    if output_format.is_json() {
+                        println!(
+                            r#"{{"ok": false, "error": "Failed to open storage: {}", "version": "{}"}}"#,
+                            e, wa_core::VERSION
+                        );
+                    } else {
+                        eprintln!("Error: Failed to open storage: {e}");
+                        eprintln!("Is the database initialized? Run 'wa watch' first.");
+                    }
+                    std::process::exit(1);
+                }
+            };
+
+            // Build search options
+            let options = wa_core::storage::SearchOptions {
+                limit: Some(limit),
+                pane_id: pane,
+                since,
+                until: None,
+                include_snippets: Some(true),
+                snippet_max_tokens: Some(30),
+                highlight_prefix: Some(">>".to_string()),
+                highlight_suffix: Some("<<".to_string()),
+            };
+
+            // Perform search
+            match storage.search_with_results(&query, options).await {
+                Ok(results) => {
+                    let ctx = RenderContext::new(output_format)
+                        .verbose(cli.verbose)
+                        .limit(limit);
+                    let output = SearchResultRenderer::render(&results, &query, &ctx);
+                    print!("{output}");
+                }
+                Err(e) => {
+                    if output_format.is_json() {
+                        println!(
+                            r#"{{"ok": false, "error": "Search failed: {}", "version": "{}"}}"#,
+                            e, wa_core::VERSION
+                        );
+                    } else {
+                        eprintln!("Error: Search failed: {e}");
+                        if e.to_string().contains("fts5") || e.to_string().contains("syntax") {
+                            eprintln!("Check your FTS query syntax.");
+                        }
+                    }
+                    std::process::exit(1);
+                }
+            }
         }
 
         Some(Commands::List { json }) => {
@@ -2178,12 +2343,187 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        Some(Commands::Status { health }) => {
+        Some(Commands::Status {
+            health,
+            format,
+            domain,
+            agent,
+            pane_id,
+        }) => {
             if health {
+                // Health check mode: simple JSON status
                 println!(r#"{{"status": "ok", "version": "{}"}}"#, wa_core::VERSION);
             } else {
-                println!("wa status: OK");
-                println!("version: {}", wa_core::VERSION);
+                // Rich status mode: pane table + summary
+                use wa_core::output::{OutputFormat, PaneTableRenderer, RenderContext, detect_format};
+
+                let output_format = match format.to_lowercase().as_str() {
+                    "json" => OutputFormat::Json,
+                    "plain" => OutputFormat::Plain,
+                    _ => detect_format(),
+                };
+
+                let wezterm = wa_core::wezterm::WeztermClient::new();
+                match wezterm.list_panes().await {
+                    Ok(panes) => {
+                        let filter = &config.ingest.panes;
+
+                        // Convert to PaneRecord format for rendering
+                        #[allow(clippy::cast_possible_truncation)]
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as i64;
+
+                        let mut records: Vec<wa_core::storage::PaneRecord> = panes
+                            .iter()
+                            .filter_map(|p| {
+                                let pane_domain = p.inferred_domain();
+                                let pane_title = p.title.as_deref().unwrap_or("");
+                                let pane_cwd = p.cwd.as_deref().unwrap_or("");
+
+                                // Apply filters
+                                if let Some(ref filter_pane_id) = pane_id {
+                                    if p.pane_id != *filter_pane_id {
+                                        return None;
+                                    }
+                                }
+
+                                if let Some(ref domain_filter) = domain {
+                                    if !glob_match(domain_filter, &pane_domain) {
+                                        return None;
+                                    }
+                                }
+
+                                // Agent filter would go here when agent inference is implemented
+                                if agent.is_some() {
+                                    // TODO: Filter by inferred agent type once available
+                                }
+
+                                let ignore_reason = filter.check_pane(&pane_domain, pane_title, pane_cwd);
+
+                                Some(wa_core::storage::PaneRecord {
+                                    pane_id: p.pane_id,
+                                    domain: pane_domain,
+                                    window_id: Some(p.window_id),
+                                    tab_id: Some(p.tab_id),
+                                    title: p.title.clone(),
+                                    cwd: p.cwd.clone(),
+                                    tty_name: p.tty_name.clone(),
+                                    first_seen_at: now,
+                                    last_seen_at: now,
+                                    observed: ignore_reason.is_none(),
+                                    ignore_reason,
+                                    last_decision_at: None,
+                                })
+                            })
+                            .collect();
+
+                        // Sort by pane_id for deterministic output
+                        records.sort_by_key(|r| r.pane_id);
+
+                        let ctx = RenderContext::new(output_format).verbose(cli.verbose);
+                        let output = PaneTableRenderer::render(&records, &ctx);
+                        print!("{output}");
+                    }
+                    Err(e) => {
+                        if output_format.is_json() {
+                            println!(
+                                r#"{{"ok": false, "error": "Failed to list panes: {}", "version": "{}"}}"#,
+                                e, wa_core::VERSION
+                            );
+                        } else {
+                            eprintln!("Error: Failed to list panes: {e}");
+                            eprintln!("Is WezTerm running?");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
+        }
+
+        Some(Commands::Events {
+            format,
+            limit,
+            pane_id,
+            rule_id,
+            event_type,
+            unhandled,
+        }) => {
+            use wa_core::output::{OutputFormat, EventListRenderer, RenderContext, detect_format};
+
+            let output_format = match format.to_lowercase().as_str() {
+                "json" => OutputFormat::Json,
+                "plain" => OutputFormat::Plain,
+                _ => detect_format(),
+            };
+
+            // Get workspace layout for DB path
+            let layout = match config.workspace_layout(Some(&workspace_root)) {
+                Ok(l) => l,
+                Err(e) => {
+                    if output_format.is_json() {
+                        println!(
+                            r#"{{"ok": false, "error": "Failed to get workspace layout: {}", "version": "{}"}}"#,
+                            e, wa_core::VERSION
+                        );
+                    } else {
+                        eprintln!("Error: Failed to get workspace layout: {e}");
+                        eprintln!("Check --workspace or WA_WORKSPACE");
+                    }
+                    std::process::exit(1);
+                }
+            };
+
+            // Open storage handle
+            let db_path = layout.db_path.to_string_lossy();
+            let storage = match wa_core::storage::StorageHandle::new(&db_path).await {
+                Ok(s) => s,
+                Err(e) => {
+                    if output_format.is_json() {
+                        println!(
+                            r#"{{"ok": false, "error": "Failed to open storage: {}", "version": "{}"}}"#,
+                            e, wa_core::VERSION
+                        );
+                    } else {
+                        eprintln!("Error: Failed to open storage: {e}");
+                        eprintln!("Is the database initialized? Run 'wa watch' first.");
+                    }
+                    std::process::exit(1);
+                }
+            };
+
+            // Build event query
+            let query = wa_core::storage::EventQuery {
+                limit: Some(limit),
+                pane_id,
+                rule_id: rule_id.clone(),
+                event_type: event_type.clone(),
+                unhandled_only: unhandled,
+                since: None,
+                until: None,
+            };
+
+            // Query events
+            match storage.get_events(query).await {
+                Ok(events) => {
+                    let ctx = RenderContext::new(output_format)
+                        .verbose(cli.verbose)
+                        .limit(limit);
+                    let output = EventListRenderer::render(&events, &ctx);
+                    print!("{output}");
+                }
+                Err(e) => {
+                    if output_format.is_json() {
+                        println!(
+                            r#"{{"ok": false, "error": "Failed to query events: {}", "version": "{}"}}"#,
+                            e, wa_core::VERSION
+                        );
+                    } else {
+                        eprintln!("Error: Failed to query events: {e}");
+                    }
+                    std::process::exit(1);
+                }
             }
         }
 

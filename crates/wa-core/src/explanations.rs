@@ -20,7 +20,7 @@
 //! }
 //! ```
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
@@ -28,7 +28,9 @@ use std::sync::LazyLock;
 ///
 /// Templates provide structured information for user-facing messages,
 /// including context, suggestions, and cross-references.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Note: This type cannot derive Deserialize due to static string references.
+/// Templates are defined statically at compile time.
+#[derive(Debug, Clone, Serialize)]
 pub struct ExplanationTemplate {
     /// Unique identifier (e.g., "deny.alt_screen", "workflow.usage_limit")
     pub id: &'static str,
@@ -53,7 +55,7 @@ pub static DENY_ALT_SCREEN: ExplanationTemplate = ExplanationTemplate {
     id: "deny.alt_screen",
     scenario: "Send denied because alt-screen is active",
     brief: "Pane is in full-screen mode (vim, less, etc.)",
-    detailed: r#"The pane is currently displaying an alternate screen buffer, which typically
+    detailed: r"The pane is currently displaying an alternate screen buffer, which typically
 means a full-screen application like vim, less, htop, or similar is running.
 
 Sending text while alt-screen is active could:
@@ -61,7 +63,7 @@ Sending text while alt-screen is active could:
 - Cause unintended keystrokes
 - Interfere with user interaction
 
-The safety policy blocks sends to alt-screen panes by default."#,
+The safety policy blocks sends to alt-screen panes by default.",
     suggestions: &[
         "Exit the full-screen application first",
         "Use --force if you're certain this is safe",
@@ -75,14 +77,14 @@ pub static DENY_COMMAND_RUNNING: ExplanationTemplate = ExplanationTemplate {
     id: "deny.command_running",
     scenario: "Send denied because a command is running",
     brief: "Another command is currently executing in the pane",
-    detailed: r#"The pane has an active command running (detected via OSC 133 markers or
+    detailed: r"The pane has an active command running (detected via OSC 133 markers or
 heuristics). Sending text while a command runs could:
 
 - Interrupt the running command
 - Queue input for later (confusing)
 - Cause the shell to misinterpret input
 
-wa waits for command completion before sending unless overridden."#,
+wa waits for command completion before sending unless overridden.",
     suggestions: &[
         "Wait for the current command to finish",
         "Use Ctrl-C to cancel the running command first",
@@ -96,12 +98,12 @@ pub static DENY_RECENT_GAP: ExplanationTemplate = ExplanationTemplate {
     id: "deny.recent_gap",
     scenario: "Send denied due to recent output gap",
     brief: "Pane had no output recently, possibly waiting for input",
-    detailed: r#"wa detected a gap in pane output that suggests the pane might be:
+    detailed: r"wa detected a gap in pane output that suggests the pane might be:
 - Waiting for user input at a prompt
 - Displaying a confirmation dialog
 - In an unknown state
 
-The policy requires a prompt marker (OSC 133) or manual confirmation."#,
+The policy requires a prompt marker (OSC 133) or manual confirmation.",
     suggestions: &[
         "Check the pane manually to see its state",
         "Use --force if you've verified the pane is ready",
@@ -115,14 +117,14 @@ pub static DENY_RATE_LIMITED: ExplanationTemplate = ExplanationTemplate {
     id: "deny.rate_limited",
     scenario: "Send denied due to rate limiting",
     brief: "Too many actions in a short period",
-    detailed: r#"The rate limiter has blocked this action to prevent overwhelming the
+    detailed: r"The rate limiter has blocked this action to prevent overwhelming the
 target pane or external services. Rate limits protect against:
 
 - Accidental infinite loops
 - Runaway automation
 - API abuse
 
-Current rate limits are configured in wa.toml under [safety.rate_limits]."#,
+Current rate limits are configured in wa.toml under [safety.rate_limits].",
     suggestions: &[
         "Wait a moment and retry",
         "Check rate limit configuration in wa.toml",
@@ -136,14 +138,14 @@ pub static DENY_UNKNOWN_PANE: ExplanationTemplate = ExplanationTemplate {
     id: "deny.unknown_pane",
     scenario: "Action denied for unknown pane",
     brief: "Pane ID not found in active pane list",
-    detailed: r#"The specified pane ID does not exist in the current WezTerm session.
+    detailed: r"The specified pane ID does not exist in the current WezTerm session.
 This could mean:
 
 - The pane was closed
 - The pane ID was mistyped
 - WezTerm session changed
 
-wa tracks panes discovered via 'wezterm cli list'."#,
+wa tracks panes discovered via 'wezterm cli list'.",
     suggestions: &[
         "Run 'wa robot state' to see active panes",
         "Run 'wezterm cli list' to verify pane exists",
@@ -157,14 +159,14 @@ pub static DENY_PERMISSION: ExplanationTemplate = ExplanationTemplate {
     id: "deny.permission",
     scenario: "Action denied due to insufficient permissions",
     brief: "Required capability not granted",
-    detailed: r#"This action requires a capability that is not enabled in the current
+    detailed: r"This action requires a capability that is not enabled in the current
 policy configuration. Capabilities gate potentially dangerous operations:
 
 - send_text: Sending keystrokes to panes
 - execute: Running shell commands
 - workflow: Triggering automated workflows
 
-Configure capabilities in wa.toml under [safety.capabilities]."#,
+Configure capabilities in wa.toml under [safety.capabilities].",
     suggestions: &[
         "Review required capabilities for this action",
         "Update policy configuration to grant capability",
@@ -182,7 +184,7 @@ pub static WORKFLOW_USAGE_LIMIT: ExplanationTemplate = ExplanationTemplate {
     id: "workflow.usage_limit",
     scenario: "Why handle_usage_limits workflow was triggered",
     brief: "Codex hit its daily token usage limit",
-    detailed: r#"The Codex agent reported it has reached its usage limit. This typically
+    detailed: r"The Codex agent reported it has reached its usage limit. This typically
 happens when:
 
 - Daily token quota exceeded
@@ -193,7 +195,7 @@ The handle_usage_limits workflow will:
 2. Parse the session summary for resume ID
 3. Select an alternate OpenAI account
 4. Complete device auth flow
-5. Resume the session with new credentials"#,
+5. Resume the session with new credentials",
     suggestions: &[
         "Let the workflow complete automatically",
         "Check account status with: caut status",
@@ -231,7 +233,7 @@ pub static WORKFLOW_ERROR_DETECTED: ExplanationTemplate = ExplanationTemplate {
     id: "workflow.error_detected",
     scenario: "Why error recovery workflow was triggered",
     brief: "Agent encountered an error condition",
-    detailed: r#"A pattern matched indicating an error condition in the agent:
+    detailed: r"A pattern matched indicating an error condition in the agent:
 
 - Compilation errors
 - Runtime exceptions
@@ -241,7 +243,7 @@ pub static WORKFLOW_ERROR_DETECTED: ExplanationTemplate = ExplanationTemplate {
 The error recovery workflow can:
 1. Capture error context for debugging
 2. Attempt automatic recovery
-3. Notify operators of persistent failures"#,
+3. Notify operators of persistent failures",
     suggestions: &[
         "Check 'wa robot events' for error details",
         "Review agent output with 'wa get-text <pane>'",
@@ -255,7 +257,7 @@ pub static WORKFLOW_APPROVAL_NEEDED: ExplanationTemplate = ExplanationTemplate {
     id: "workflow.approval_needed",
     scenario: "Why approval workflow was triggered",
     brief: "Agent is waiting for user approval",
-    detailed: r#"The AI agent is requesting approval before proceeding. Common reasons:
+    detailed: r"The AI agent is requesting approval before proceeding. Common reasons:
 
 - Destructive operation (file deletion, force push)
 - External API call with side effects
@@ -265,7 +267,7 @@ pub static WORKFLOW_APPROVAL_NEEDED: ExplanationTemplate = ExplanationTemplate {
 wa's approval system allows:
 1. Interactive approval via prompt
 2. One-time allow tokens
-3. Policy-based auto-approval"#,
+3. Policy-based auto-approval",
     suggestions: &[
         "Review the requested action carefully",
         "Use 'wa approve <token>' to grant one-time approval",
@@ -283,13 +285,13 @@ pub static EVENT_PATTERN_DETECTED: ExplanationTemplate = ExplanationTemplate {
     id: "event.pattern_detected",
     scenario: "Pattern match triggered detection event",
     brief: "Configured pattern matched in pane output",
-    detailed: r#"The pattern detection engine found a match in pane output. Events are
+    detailed: r"The pattern detection engine found a match in pane output. Events are
 generated when patterns from enabled packs match terminal content:
 
 - core pack: Codex, Claude, Gemini state transitions
 - custom pack: User-defined patterns in patterns.toml
 
-Events are stored in the database and can trigger workflows."#,
+Events are stored in the database and can trigger workflows.",
     suggestions: &[
         "Use 'wa robot events' to see recent detections",
         "Configure pattern packs in wa.toml",
@@ -303,14 +305,14 @@ pub static EVENT_GAP_DETECTED: ExplanationTemplate = ExplanationTemplate {
     id: "event.gap_detected",
     scenario: "Output gap detected during capture",
     brief: "Discontinuity in captured terminal output",
-    detailed: r#"wa detected a gap in the capture stream, meaning some output may have
+    detailed: r"wa detected a gap in the capture stream, meaning some output may have
 been missed. Gaps occur when:
 
 - Poll interval too slow for output rate
 - System under heavy load
 - WezTerm scrollback overwritten
 
-Gap markers in storage indicate where discontinuities exist."#,
+Gap markers in storage indicate where discontinuities exist.",
     suggestions: &[
         "Reduce poll_interval_ms in wa.toml for fast-output panes",
         "Check system load during gaps",
@@ -377,7 +379,7 @@ pub fn get_explanation(id: &str) -> Option<&'static ExplanationTemplate> {
 /// Useful for help text and auto-completion.
 pub fn list_template_ids() -> Vec<&'static str> {
     let mut ids: Vec<_> = EXPLANATION_TEMPLATES.keys().copied().collect();
-    ids.sort();
+    ids.sort_unstable();
     ids
 }
 
