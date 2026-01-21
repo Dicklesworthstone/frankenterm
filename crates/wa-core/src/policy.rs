@@ -1614,6 +1614,200 @@ impl Redactor {
 }
 
 // ============================================================================
+// Policy Rule Evaluation
+// ============================================================================
+
+/// Result of evaluating policy rules
+#[derive(Debug, Clone)]
+pub struct RuleEvaluationResult {
+    /// The matching rule, if any
+    pub matching_rule: Option<PolicyRule>,
+    /// The decision from the matching rule
+    pub decision: Option<PolicyRuleDecision>,
+    /// All rules that were evaluated (for audit)
+    pub rules_checked: Vec<String>,
+}
+
+/// Evaluate policy rules against input
+///
+/// Returns the first matching rule with highest priority (lowest priority number wins,
+/// then decision severity: Deny > RequireApproval > Allow, then specificity).
+pub fn evaluate_policy_rules(
+    rules_config: &PolicyRulesConfig,
+    input: &PolicyInput,
+) -> RuleEvaluationResult {
+    if !rules_config.enabled || rules_config.rules.is_empty() {
+        return RuleEvaluationResult {
+            matching_rule: None,
+            decision: None,
+            rules_checked: Vec::new(),
+        };
+    }
+
+    let mut rules_checked = Vec::new();
+    let mut candidates: Vec<&PolicyRule> = Vec::new();
+
+    for rule in &rules_config.rules {
+        rules_checked.push(rule.id.clone());
+
+        if matches_rule(&rule.match_on, input) {
+            candidates.push(rule);
+        }
+    }
+
+    if candidates.is_empty() {
+        return RuleEvaluationResult {
+            matching_rule: None,
+            decision: None,
+            rules_checked,
+        };
+    }
+
+    // Sort candidates by: priority (asc), decision severity (deny > require > allow), specificity (desc)
+    candidates.sort_by(|a, b| {
+        // First: priority (lower is better)
+        let priority_cmp = a.priority.cmp(&b.priority);
+        if priority_cmp != std::cmp::Ordering::Equal {
+            return priority_cmp;
+        }
+
+        // Second: decision severity (deny=0, require_approval=1, allow=2)
+        let decision_cmp = a.decision.priority().cmp(&b.decision.priority());
+        if decision_cmp != std::cmp::Ordering::Equal {
+            return decision_cmp;
+        }
+
+        // Third: specificity (higher is better, so reverse)
+        b.match_on.specificity().cmp(&a.match_on.specificity())
+    });
+
+    let best = candidates.into_iter().next().unwrap();
+    RuleEvaluationResult {
+        matching_rule: Some(best.clone()),
+        decision: Some(best.decision),
+        rules_checked,
+    }
+}
+
+/// Check if a rule matches the given input
+fn matches_rule(match_on: &PolicyRuleMatch, input: &PolicyInput) -> bool {
+    // If all criteria are empty, it's a catch-all rule (matches everything)
+    if match_on.is_catch_all() {
+        return true;
+    }
+
+    // Check action kind
+    if !match_on.actions.is_empty()
+        && !match_on
+            .actions
+            .iter()
+            .any(|a| a == input.action.as_str())
+    {
+        return false;
+    }
+
+    // Check actor kind
+    if !match_on.actors.is_empty()
+        && !match_on.actors.iter().any(|a| a == input.actor.as_str())
+    {
+        return false;
+    }
+
+    // Check pane ID
+    if !match_on.pane_ids.is_empty() {
+        match input.pane_id {
+            Some(id) if match_on.pane_ids.contains(&id) => {}
+            _ => return false,
+        }
+    }
+
+    // Check pane domain
+    if !match_on.pane_domains.is_empty() {
+        match &input.domain {
+            Some(domain) if match_on.pane_domains.iter().any(|d| d == domain) => {}
+            _ => return false,
+        }
+    }
+
+    // Check pane title (glob matching)
+    if !match_on.pane_titles.is_empty() {
+        match &input.pane_title {
+            Some(title) => {
+                let matches_any = match_on.pane_titles.iter().any(|pattern| {
+                    glob_match(pattern, title)
+                });
+                if !matches_any {
+                    return false;
+                }
+            }
+            None => return false,
+        }
+    }
+
+    // Check pane cwd (glob matching)
+    if !match_on.pane_cwds.is_empty() {
+        match &input.pane_cwd {
+            Some(cwd) => {
+                let matches_any = match_on.pane_cwds.iter().any(|pattern| {
+                    glob_match(pattern, cwd)
+                });
+                if !matches_any {
+                    return false;
+                }
+            }
+            None => return false,
+        }
+    }
+
+    // Check command patterns (regex)
+    if !match_on.command_patterns.is_empty() {
+        match &input.command_text {
+            Some(text) => {
+                let matches_any = match_on.command_patterns.iter().any(|pattern| {
+                    Regex::new(pattern).map(|re| re.is_match(text)).unwrap_or(false)
+                });
+                if !matches_any {
+                    return false;
+                }
+            }
+            None => return false,
+        }
+    }
+
+    // Check agent type
+    if !match_on.agent_types.is_empty() {
+        match &input.agent_type {
+            Some(agent) => {
+                let matches_any = match_on
+                    .agent_types
+                    .iter()
+                    .any(|a| a.eq_ignore_ascii_case(agent));
+                if !matches_any {
+                    return false;
+                }
+            }
+            None => return false,
+        }
+    }
+
+    true
+}
+
+/// Simple glob pattern matching
+///
+/// Supports `*` (any characters) and `?` (single character)
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let regex_pattern = pattern
+        .replace('.', r"\.")
+        .replace('*', ".*")
+        .replace('?', ".");
+    let full_pattern = format!("^{regex_pattern}$");
+    Regex::new(&full_pattern)
+        .map(|re| re.is_match(text))
+        .unwrap_or(false)
+}
+
+// ============================================================================
 // Policy Engine
 // ============================================================================
 
@@ -1628,6 +1822,8 @@ pub struct PolicyEngine {
     require_prompt_active: bool,
     /// Command safety gate configuration
     command_gate: CommandGateConfig,
+    /// Custom policy rules configuration
+    policy_rules: PolicyRulesConfig,
 }
 
 impl PolicyEngine {
@@ -1642,6 +1838,7 @@ impl PolicyEngine {
             rate_limiter: RateLimiter::new(rate_limit_per_pane, rate_limit_global),
             require_prompt_active,
             command_gate: CommandGateConfig::default(),
+            policy_rules: PolicyRulesConfig::default(),
         }
     }
 
@@ -1661,6 +1858,13 @@ impl PolicyEngine {
     #[must_use]
     pub fn with_command_gate_config(mut self, command_gate: CommandGateConfig) -> Self {
         self.command_gate = command_gate;
+        self
+    }
+
+    /// Set custom policy rules configuration
+    #[must_use]
+    pub fn with_policy_rules(mut self, rules: PolicyRulesConfig) -> Self {
+        self.policy_rules = rules;
         self
     }
 
@@ -1852,6 +2056,50 @@ impl PolicyEngine {
                 None,
                 Some("non-send action".to_string()),
             );
+        }
+
+        // Evaluate custom policy rules (after builtin safety gates, before defaults)
+        let rule_result = evaluate_policy_rules(&self.policy_rules, input);
+        for rule_id in &rule_result.rules_checked {
+            // Record that we checked this rule (matched rules will be recorded below)
+            context.record_rule(
+                format!("config.rule.{rule_id}"),
+                false,
+                None,
+                Some("rule checked".to_string()),
+            );
+        }
+
+        if let (Some(rule), Some(decision)) = (rule_result.matching_rule, rule_result.decision) {
+            let rule_id = format!("config.rule.{}", rule.id);
+            let reason = rule.message.clone().unwrap_or_else(|| {
+                format!("Rule '{}' matched", rule.id)
+            });
+
+            match decision {
+                PolicyRuleDecision::Deny => {
+                    context.record_rule(&rule_id, true, Some("deny"), Some(reason.clone()));
+                    context.set_determining_rule(&rule_id);
+                    return PolicyDecision::deny_with_rule(reason, rule_id).with_context(context);
+                }
+                PolicyRuleDecision::RequireApproval => {
+                    context.record_rule(
+                        &rule_id,
+                        true,
+                        Some("require_approval"),
+                        Some(reason.clone()),
+                    );
+                    context.set_determining_rule(&rule_id);
+                    return PolicyDecision::require_approval_with_rule(reason, rule_id)
+                        .with_context(context);
+                }
+                PolicyRuleDecision::Allow => {
+                    // Allow rules short-circuit to allow (skipping default checks)
+                    context.record_rule(&rule_id, true, Some("allow"), Some(reason.clone()));
+                    context.set_determining_rule(&rule_id);
+                    return PolicyDecision::allow().with_context(context);
+                }
+            }
         }
 
         // Destructive actions require approval for non-trusted actors

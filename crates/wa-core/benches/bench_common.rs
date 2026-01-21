@@ -22,6 +22,13 @@ struct BenchEnvironment {
 }
 
 #[derive(Serialize)]
+struct BenchTestRun<'a> {
+    test_type: &'static str,
+    name: &'a str,
+    status: &'static str,
+}
+
+#[derive(Serialize)]
 struct BenchMetadata<'a> {
     test_type: &'static str,
     bench: &'a str,
@@ -31,7 +38,56 @@ struct BenchMetadata<'a> {
     environment: BenchEnvironment,
 }
 
-pub fn emit_bench_metadata(bench: &str, budgets: &[BenchBudget]) {
+#[derive(Serialize)]
+struct BenchArtifact<'a> {
+    #[serde(rename = "type")]
+    artifact_type: &'a str,
+    path: String,
+    format: &'a str,
+    description: &'a str,
+    redacted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size_bytes: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct BenchManifest<'a> {
+    version: &'static str,
+    format: &'static str,
+    generated_at_ms: u64,
+    test_run: BenchTestRun<'a>,
+    wa_version: &'static str,
+    wa_commit: Option<&'static str>,
+    budgets: &'a [BenchBudget],
+    environment: BenchEnvironment,
+    artifacts: Vec<BenchArtifact<'a>>,
+}
+
+pub fn emit_bench_artifacts(bench: &str, budgets: &[BenchBudget]) {
+    let environment = build_environment();
+    emit_bench_metadata(bench, budgets, &environment);
+    emit_bench_manifest(bench, budgets, environment);
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
+        .unwrap_or_default()
+}
+
+fn build_environment() -> BenchEnvironment {
+    BenchEnvironment {
+        os: env::consts::OS,
+        arch: env::consts::ARCH,
+        rustc: rustc_version(),
+        cpu: cpu_model(),
+        features: cargo_features(),
+    }
+}
+
+fn emit_bench_metadata(bench: &str, budgets: &[BenchBudget], environment: &BenchEnvironment) {
     let metadata = BenchMetadata {
         test_type: "bench",
         bench,
@@ -39,11 +95,11 @@ pub fn emit_bench_metadata(bench: &str, budgets: &[BenchBudget]) {
         wa_version: env!("CARGO_PKG_VERSION"),
         budgets,
         environment: BenchEnvironment {
-            os: env::consts::OS,
-            arch: env::consts::ARCH,
-            rustc: rustc_version(),
-            cpu: cpu_model(),
-            features: cargo_features(),
+            os: environment.os,
+            arch: environment.arch,
+            rustc: environment.rustc.clone(),
+            cpu: environment.cpu.clone(),
+            features: environment.features.clone(),
         },
     };
 
@@ -53,12 +109,29 @@ pub fn emit_bench_metadata(bench: &str, budgets: &[BenchBudget]) {
     }
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|d| u64::try_from(d.as_millis()).ok())
-        .unwrap_or_default()
+fn emit_bench_manifest(bench: &str, budgets: &[BenchBudget], environment: BenchEnvironment) {
+    let manifest = BenchManifest {
+        version: "1",
+        format: "wa-bench-manifest",
+        generated_at_ms: now_ms(),
+        test_run: BenchTestRun {
+            test_type: "bench",
+            name: bench,
+            status: "passed",
+        },
+        wa_version: env!("CARGO_PKG_VERSION"),
+        wa_commit: option_env!("VERGEN_GIT_SHA"),
+        budgets,
+        environment,
+        artifacts: bench_artifacts(bench),
+    };
+
+    if let Ok(payload) = serde_json::to_string_pretty(&manifest) {
+        let path = format!("target/criterion/wa-bench-manifest-{bench}.json");
+        if write_json(&path, &payload).is_ok() {
+            println!("[BENCH] manifest={path}");
+        }
+    }
 }
 
 fn rustc_version() -> Option<String> {
@@ -109,11 +182,59 @@ fn cargo_features() -> Vec<String> {
     features
 }
 
+fn bench_artifacts(bench: &str) -> Vec<BenchArtifact<'_>> {
+    let criterion_root = "target/criterion".to_string();
+    let bench_path = format!("{}/{}", criterion_root, bench);
+    vec![
+        BenchArtifact {
+            artifact_type: "meta",
+            path: "target/criterion/wa-bench-meta.jsonl".to_string(),
+            format: "jsonl",
+            description: "Bench budgets + environment metadata",
+            redacted: false,
+            size_bytes: file_size("target/criterion/wa-bench-meta.jsonl"),
+        },
+        BenchArtifact {
+            artifact_type: "criterion",
+            path: criterion_root,
+            format: "dir",
+            description: "Criterion output directory",
+            redacted: false,
+            size_bytes: None,
+        },
+        BenchArtifact {
+            artifact_type: "criterion_bench",
+            path: bench_path,
+            format: "dir",
+            description: "Criterion output for bench",
+            redacted: false,
+            size_bytes: None,
+        },
+    ]
+}
+
+fn file_size(path: &str) -> Option<u64> {
+    std::fs::metadata(path).map(|meta| meta.len()).ok()
+}
+
 fn append_jsonl(path: &str, line: &str) -> std::io::Result<()> {
     if let Some(parent) = Path::new(path).parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     writeln!(file, "{line}")?;
+    Ok(())
+}
+
+fn write_json(path: &str, payload: &str) -> std::io::Result<()> {
+    if let Some(parent) = Path::new(path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)?;
+    file.write_all(payload.as_bytes())?;
     Ok(())
 }

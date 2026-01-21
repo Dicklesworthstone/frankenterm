@@ -179,7 +179,7 @@ fn bench_throughput(c: &mut Criterion) {
 }
 
 fn bench_config() -> Criterion {
-    bench_common::emit_bench_metadata("pattern_detection", BUDGETS);
+    bench_common::emit_bench_artifacts("pattern_detection", BUDGETS);
     Criterion::default().configure_from_args()
 }
 
