@@ -497,13 +497,16 @@ mod tests {
     fn all_templates_have_valid_structure() {
         for (id, template) in EXPLANATION_TEMPLATES.iter() {
             assert!(!id.is_empty(), "Template ID should not be empty");
-            assert_eq!(
-                *id, template.id,
-                "Registry key should match template ID"
+            assert_eq!(*id, template.id, "Registry key should match template ID");
+            assert!(
+                !template.scenario.is_empty(),
+                "Scenario should not be empty"
             );
-            assert!(!template.scenario.is_empty(), "Scenario should not be empty");
             assert!(!template.brief.is_empty(), "Brief should not be empty");
-            assert!(!template.detailed.is_empty(), "Detailed should not be empty");
+            assert!(
+                !template.detailed.is_empty(),
+                "Detailed should not be empty"
+            );
         }
     }
 
@@ -607,9 +610,21 @@ mod tests {
                 // Suggestions should start with a verb or "Use"
                 let first_word = suggestion.split_whitespace().next().unwrap_or("");
                 let valid_starts = [
-                    "Exit", "Use", "Wait", "Check", "Run", "Configure", "Review",
-                    "Let", "Consider", "Reduce", "Increase", "Verify", "Add",
-                    "Update", "Enable",
+                    "Exit",
+                    "Use",
+                    "Wait",
+                    "Check",
+                    "Run",
+                    "Configure",
+                    "Review",
+                    "Let",
+                    "Consider",
+                    "Reduce",
+                    "Increase",
+                    "Verify",
+                    "Add",
+                    "Update",
+                    "Enable",
                 ];
                 assert!(
                     valid_starts.iter().any(|s| first_word.starts_with(s)),

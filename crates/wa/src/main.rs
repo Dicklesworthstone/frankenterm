@@ -1323,10 +1323,16 @@ async fn run_watcher(
     Ok(())
 }
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() {
+    let robot_mode = std::env::args().nth(1).is_some_and(|arg| arg == "robot");
+    if let Err(err) = run(robot_mode).await {
+        handle_fatal_error(err, robot_mode);
+        std::process::exit(1);
+    }
+}
+
+async fn run(robot_mode: bool) -> anyhow::Result<()> {
     let start = std::time::Instant::now();
-    let args: Vec<String> = std::env::args().collect();
-    let robot_mode = args.get(1).is_some_and(|arg| arg == "robot");
 
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
@@ -2139,7 +2145,9 @@ async fn main() -> anyhow::Result<()> {
             pane,
             since,
         }) => {
-            use wa_core::output::{OutputFormat, SearchResultRenderer, RenderContext, detect_format};
+            use wa_core::output::{
+                OutputFormat, RenderContext, SearchResultRenderer, detect_format,
+            };
 
             let output_format = match format.to_lowercase().as_str() {
                 "json" => OutputFormat::Json,
@@ -2162,7 +2170,8 @@ async fn main() -> anyhow::Result<()> {
                     if output_format.is_json() {
                         println!(
                             r#"{{"ok": false, "error": "Failed to get workspace layout: {}", "version": "{}"}}"#,
-                            e, wa_core::VERSION
+                            e,
+                            wa_core::VERSION
                         );
                     } else {
                         eprintln!("Error: Failed to get workspace layout: {e}");
@@ -2180,7 +2189,8 @@ async fn main() -> anyhow::Result<()> {
                     if output_format.is_json() {
                         println!(
                             r#"{{"ok": false, "error": "Failed to open storage: {}", "version": "{}"}}"#,
-                            e, wa_core::VERSION
+                            e,
+                            wa_core::VERSION
                         );
                     } else {
                         eprintln!("Error: Failed to open storage: {e}");
@@ -2215,7 +2225,8 @@ async fn main() -> anyhow::Result<()> {
                     if output_format.is_json() {
                         println!(
                             r#"{{"ok": false, "error": "Search failed: {}", "version": "{}"}}"#,
-                            e, wa_core::VERSION
+                            e,
+                            wa_core::VERSION
                         );
                     } else {
                         eprintln!("Error: Search failed: {e}");
@@ -2355,7 +2366,9 @@ async fn main() -> anyhow::Result<()> {
                 println!(r#"{{"status": "ok", "version": "{}"}}"#, wa_core::VERSION);
             } else {
                 // Rich status mode: pane table + summary
-                use wa_core::output::{OutputFormat, PaneTableRenderer, RenderContext, detect_format};
+                use wa_core::output::{
+                    OutputFormat, PaneTableRenderer, RenderContext, detect_format,
+                };
 
                 let output_format = match format.to_lowercase().as_str() {
                     "json" => OutputFormat::Json,
@@ -2400,7 +2413,8 @@ async fn main() -> anyhow::Result<()> {
                                     // TODO: Filter by inferred agent type once available
                                 }
 
-                                let ignore_reason = filter.check_pane(&pane_domain, pane_title, pane_cwd);
+                                let ignore_reason =
+                                    filter.check_pane(&pane_domain, pane_title, pane_cwd);
 
                                 Some(wa_core::storage::PaneRecord {
                                     pane_id: p.pane_id,
@@ -2430,7 +2444,8 @@ async fn main() -> anyhow::Result<()> {
                         if output_format.is_json() {
                             println!(
                                 r#"{{"ok": false, "error": "Failed to list panes: {}", "version": "{}"}}"#,
-                                e, wa_core::VERSION
+                                e,
+                                wa_core::VERSION
                             );
                         } else {
                             eprintln!("Error: Failed to list panes: {e}");
@@ -2450,7 +2465,7 @@ async fn main() -> anyhow::Result<()> {
             event_type,
             unhandled,
         }) => {
-            use wa_core::output::{OutputFormat, EventListRenderer, RenderContext, detect_format};
+            use wa_core::output::{EventListRenderer, OutputFormat, RenderContext, detect_format};
 
             let output_format = match format.to_lowercase().as_str() {
                 "json" => OutputFormat::Json,
@@ -2465,7 +2480,8 @@ async fn main() -> anyhow::Result<()> {
                     if output_format.is_json() {
                         println!(
                             r#"{{"ok": false, "error": "Failed to get workspace layout: {}", "version": "{}"}}"#,
-                            e, wa_core::VERSION
+                            e,
+                            wa_core::VERSION
                         );
                     } else {
                         eprintln!("Error: Failed to get workspace layout: {e}");
@@ -2483,7 +2499,8 @@ async fn main() -> anyhow::Result<()> {
                     if output_format.is_json() {
                         println!(
                             r#"{{"ok": false, "error": "Failed to open storage: {}", "version": "{}"}}"#,
-                            e, wa_core::VERSION
+                            e,
+                            wa_core::VERSION
                         );
                     } else {
                         eprintln!("Error: Failed to open storage: {e}");
@@ -2517,7 +2534,8 @@ async fn main() -> anyhow::Result<()> {
                     if output_format.is_json() {
                         println!(
                             r#"{{"ok": false, "error": "Failed to query events: {}", "version": "{}"}}"#,
-                            e, wa_core::VERSION
+                            e,
+                            wa_core::VERSION
                         );
                     } else {
                         eprintln!("Error: Failed to query events: {e}");
@@ -2572,4 +2590,20 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn handle_fatal_error(err: anyhow::Error, robot_mode: bool) {
+    if robot_mode {
+        eprintln!("Error: {err}");
+        return;
+    }
+
+    if let Some(core_err) = err.downcast_ref::<wa_core::Error>() {
+        eprintln!(
+            "{}",
+            wa_core::error::format_error_with_remediation(core_err)
+        );
+    } else {
+        eprintln!("Error: {err}");
+    }
 }

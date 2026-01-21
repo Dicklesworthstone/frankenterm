@@ -2677,8 +2677,7 @@ impl Workflow for HandleCompaction {
 
     fn handles(&self, detection: &crate::patterns::Detection) -> bool {
         // Handle any compaction-related detection
-        detection.event_type == "session.compaction"
-            || detection.rule_id.contains("compaction")
+        detection.event_type == "session.compaction" || detection.rule_id.contains("compaction")
     }
 
     fn steps(&self) -> Vec<WorkflowStep> {
@@ -2794,10 +2793,7 @@ impl Workflow for HandleCompaction {
 
                     // Check if injector is available
                     if !has_injector {
-                        tracing::error!(
-                            pane_id,
-                            "handle_compaction: no injector configured"
-                        );
+                        tracing::error!(pane_id, "handle_compaction: no injector configured");
                         return StepResult::abort("No injector configured for text injection");
                     }
 
@@ -4729,5 +4725,168 @@ mod tests {
 
             storage.shutdown().await.unwrap();
         });
+    }
+
+    // ========================================================================
+    // HandleCompaction Workflow Tests (wa-nu4.1.2.1)
+    // ========================================================================
+
+    #[test]
+    fn handle_compaction_metadata() {
+        let workflow = HandleCompaction::new();
+
+        assert_eq!(workflow.name(), "handle_compaction");
+        assert_eq!(
+            workflow.description(),
+            "Re-inject critical context (AGENTS.md) after conversation compaction"
+        );
+
+        let steps = workflow.steps();
+        assert_eq!(steps.len(), 4);
+        assert_eq!(steps[0].name, "check_guards");
+        assert_eq!(steps[1].name, "stabilize");
+        assert_eq!(steps[2].name, "send_prompt");
+        assert_eq!(steps[3].name, "verify_send");
+    }
+
+    #[test]
+    fn handle_compaction_handles_compaction_events() {
+        let workflow = HandleCompaction::new();
+
+        // Should handle event_type "session.compaction"
+        let detection_event_type = Detection {
+            rule_id: "something.other".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: "session.compaction".to_string(),
+            severity: Severity::Info,
+            confidence: 1.0,
+            extracted: serde_json::Value::Null,
+            matched_text: "test".to_string(),
+        };
+        assert!(workflow.handles(&detection_event_type));
+
+        // Should handle rule_id containing "compaction"
+        let detection_rule_id = Detection {
+            rule_id: "claude_code.compaction".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: "other".to_string(),
+            severity: Severity::Info,
+            confidence: 1.0,
+            extracted: serde_json::Value::Null,
+            matched_text: "test".to_string(),
+        };
+        assert!(workflow.handles(&detection_rule_id));
+
+        // Should NOT handle unrelated detections
+        let detection_unrelated = Detection {
+            rule_id: "prompt.ready".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: "prompt".to_string(),
+            severity: Severity::Info,
+            confidence: 1.0,
+            extracted: serde_json::Value::Null,
+            matched_text: "test".to_string(),
+        };
+        assert!(!workflow.handles(&detection_unrelated));
+    }
+
+    #[test]
+    fn handle_compaction_guard_checks() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("test_guards.db")
+            .to_string_lossy()
+            .to_string();
+
+        rt.block_on(async {
+            let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+            let workflow = HandleCompaction::new();
+
+            // Normal capabilities - should pass guards
+            let normal_caps = PaneCapabilities {
+                alt_screen: Some(false),
+                command_running: false,
+                has_recent_gap: false,
+                ..Default::default()
+            };
+            let ctx_normal =
+                WorkflowContext::new(storage.clone(), 42, normal_caps, "exec-guard-normal");
+            let result = workflow.check_pane_guards(&ctx_normal);
+            assert!(result.is_ok(), "Normal state should pass guards");
+
+            // Alt-screen active - should fail
+            let alt_caps = PaneCapabilities {
+                alt_screen: Some(true),
+                command_running: false,
+                has_recent_gap: false,
+                ..Default::default()
+            };
+            let ctx_alt = WorkflowContext::new(storage.clone(), 42, alt_caps, "exec-guard-alt");
+            let result = workflow.check_pane_guards(&ctx_alt);
+            assert!(result.is_err());
+            assert!(result.unwrap_err().contains("alt-screen"));
+
+            // Command running - should fail
+            let cmd_caps = PaneCapabilities {
+                alt_screen: Some(false),
+                command_running: true,
+                has_recent_gap: false,
+                ..Default::default()
+            };
+            let ctx_cmd = WorkflowContext::new(storage.clone(), 42, cmd_caps, "exec-guard-cmd");
+            let result = workflow.check_pane_guards(&ctx_cmd);
+            assert!(result.is_err());
+            assert!(result.unwrap_err().contains("running"));
+
+            // Recent gap - should fail
+            let gap_caps = PaneCapabilities {
+                alt_screen: Some(false),
+                command_running: false,
+                has_recent_gap: true,
+                ..Default::default()
+            };
+            let ctx_gap = WorkflowContext::new(storage.clone(), 42, gap_caps, "exec-guard-gap");
+            let result = workflow.check_pane_guards(&ctx_gap);
+            assert!(result.is_err());
+            assert!(result.unwrap_err().contains("gap"));
+
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn handle_compaction_prompts_exist() {
+        // Verify all agent-specific prompts are non-empty
+        assert!(!compaction_prompts::CLAUDE_CODE.is_empty());
+        assert!(!compaction_prompts::CODEX.is_empty());
+        assert!(!compaction_prompts::GEMINI.is_empty());
+        assert!(!compaction_prompts::UNKNOWN.is_empty());
+
+        // Verify they contain AGENTS.md reference (key context file)
+        assert!(compaction_prompts::CLAUDE_CODE.contains("AGENTS.md"));
+        assert!(compaction_prompts::CODEX.contains("AGENTS.md"));
+        assert!(compaction_prompts::GEMINI.contains("AGENTS.md"));
+    }
+
+    #[test]
+    fn handle_compaction_builder_pattern() {
+        let workflow = HandleCompaction::new()
+            .with_stabilization_ms(5000)
+            .with_idle_timeout_ms(60_000);
+
+        assert_eq!(workflow.stabilization_ms, 5000);
+        assert_eq!(workflow.idle_timeout_ms, 60_000);
+    }
+
+    #[test]
+    fn handle_compaction_default_values() {
+        let workflow = HandleCompaction::default();
+
+        // Defaults should be reasonable values
+        assert!(workflow.stabilization_ms > 0);
+        assert!(workflow.idle_timeout_ms > 0);
+        assert!(workflow.idle_timeout_ms > workflow.stabilization_ms);
     }
 }

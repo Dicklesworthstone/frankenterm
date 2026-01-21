@@ -1,6 +1,117 @@
 //! Error types for wa-core
 
+use std::fmt::Write;
 use thiserror::Error;
+
+/// Remediation command for resolving an error
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RemediationCommand {
+    /// Short label describing the command purpose
+    pub label: String,
+    /// Command to run
+    pub command: String,
+    /// Optional platform hint (e.g., "macOS", "Linux")
+    pub platform: Option<String>,
+}
+
+/// Actionable remediation guidance for an error
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Remediation {
+    /// One-line summary of how to fix the issue
+    pub summary: String,
+    /// Suggested commands to resolve or diagnose the issue
+    pub commands: Vec<RemediationCommand>,
+    /// Additional alternative guidance
+    pub alternatives: Vec<String>,
+    /// Optional reference for more details
+    pub learn_more: Option<String>,
+}
+
+impl Remediation {
+    /// Create a new remediation with a summary
+    #[must_use]
+    pub fn new(summary: impl Into<String>) -> Self {
+        Self {
+            summary: summary.into(),
+            commands: Vec::new(),
+            alternatives: Vec::new(),
+            learn_more: None,
+        }
+    }
+
+    /// Add a command without a platform hint
+    #[must_use]
+    pub fn command(mut self, label: impl Into<String>, command: impl Into<String>) -> Self {
+        self.commands.push(RemediationCommand {
+            label: label.into(),
+            command: command.into(),
+            platform: None,
+        });
+        self
+    }
+
+    /// Add a command with a platform hint
+    #[must_use]
+    pub fn platform_command(
+        mut self,
+        label: impl Into<String>,
+        command: impl Into<String>,
+        platform: impl Into<String>,
+    ) -> Self {
+        self.commands.push(RemediationCommand {
+            label: label.into(),
+            command: command.into(),
+            platform: Some(platform.into()),
+        });
+        self
+    }
+
+    /// Add an alternative suggestion
+    #[must_use]
+    pub fn alternative(mut self, alternative: impl Into<String>) -> Self {
+        self.alternatives.push(alternative.into());
+        self
+    }
+
+    /// Add a learn-more reference
+    #[must_use]
+    pub fn learn_more(mut self, link: impl Into<String>) -> Self {
+        self.learn_more = Some(link.into());
+        self
+    }
+
+    /// Render remediation text for human-readable output
+    #[must_use]
+    pub fn render_plain(&self) -> String {
+        let mut output = String::new();
+        let _ = writeln!(output, "To fix:");
+        let _ = writeln!(output, "  {}", self.summary);
+
+        if !self.commands.is_empty() {
+            let _ = writeln!(output, "  Commands:");
+            for cmd in &self.commands {
+                let label = match &cmd.platform {
+                    Some(platform) => format!("{} ({platform})", cmd.label),
+                    None => cmd.label.clone(),
+                };
+                let _ = writeln!(output, "    - {label}: {}", cmd.command);
+            }
+        }
+
+        if !self.alternatives.is_empty() {
+            let _ = writeln!(output, "  Alternatives:");
+            for alt in &self.alternatives {
+                let _ = writeln!(output, "    - {alt}");
+            }
+        }
+
+        if let Some(learn_more) = &self.learn_more {
+            let _ = writeln!(output, "  Learn more: {learn_more}");
+        }
+
+        output
+    }
+}
 
 /// Result type alias using the library's Error type
 pub type Result<T> = std::result::Result<T, Error>;
@@ -45,6 +156,41 @@ pub enum Error {
     Runtime(String),
 }
 
+impl Error {
+    /// Return remediation guidance when available.
+    #[must_use]
+    pub fn remediation(&self) -> Option<Remediation> {
+        match self {
+            Self::Wezterm(err) => Some(err.remediation()),
+            Self::Storage(err) => Some(err.remediation()),
+            Self::Pattern(err) => Some(err.remediation()),
+            Self::Workflow(err) => Some(err.remediation()),
+            Self::Config(err) => Some(err.remediation()),
+            Self::Policy(_) => Some(
+                Remediation::new("Review policy configuration or request approval if needed.")
+                    .command("Status", "wa status")
+                    .command("Diagnostics", "wa doctor")
+                    .alternative("Check wa.toml policy settings for explicit allow rules."),
+            ),
+            Self::Io(_) => Some(
+                Remediation::new("Check filesystem permissions and paths, then retry.")
+                    .command("Diagnostics", "wa doctor")
+                    .alternative("Verify the workspace directory exists and is writable."),
+            ),
+            Self::Json(_) => Some(
+                Remediation::new("Validate the JSON input and retry.")
+                    .command("Validate JSON", "python -m json.tool < input.json")
+                    .alternative("Check for trailing commas or invalid UTF-8."),
+            ),
+            Self::Runtime(_) => Some(
+                Remediation::new("Restart the watcher or retry the command.")
+                    .command("Diagnostics", "wa doctor")
+                    .alternative("If the issue persists, restart wa watch."),
+            ),
+        }
+    }
+}
+
 /// WezTerm-specific errors
 #[derive(Error, Debug)]
 pub enum WeztermError {
@@ -77,6 +223,56 @@ pub enum WeztermError {
     Timeout(u64),
 }
 
+impl WeztermError {
+    #[must_use]
+    pub fn remediation(&self) -> Remediation {
+        match self {
+            Self::CliNotFound => {
+                Remediation::new("Install WezTerm and ensure the `wezterm` binary is on PATH.")
+                    .platform_command("Install", "brew install wezterm", "macOS")
+                    .platform_command(
+                        "Install",
+                        "sudo apt install wezterm",
+                        "Linux (Debian/Ubuntu)",
+                    )
+                    .platform_command("Install", "sudo pacman -S wezterm", "Linux (Arch)")
+                    .command("Verify install", "wezterm --version")
+                    .alternative("If WezTerm is installed elsewhere, add it to PATH.")
+                    .learn_more("https://wezfurlong.org/wezterm/install.html")
+            }
+            Self::NotRunning => Remediation::new("Start WezTerm and retry the command.")
+                .command("Start WezTerm", "wezterm start")
+                .command("Check panes", "wezterm cli list --format json")
+                .alternative("If using a remote socket, set WEZTERM_UNIX_SOCKET."),
+            Self::PaneNotFound(_) => Remediation::new("List panes and use a valid pane id.")
+                .command("List panes", "wa list")
+                .command("List panes (raw)", "wezterm cli list --format json"),
+            Self::SocketNotFound(path) => {
+                Remediation::new(format!("Verify the WezTerm socket path exists: {path}"))
+                    .command("Show socket env", "echo $WEZTERM_UNIX_SOCKET")
+                    .command("List socket", format!("ls \"{path}\""))
+                    .alternative("Unset WEZTERM_UNIX_SOCKET to use the default socket.")
+            }
+            Self::CommandFailed(_) => {
+                Remediation::new("WezTerm CLI command failed. Check WezTerm logs and retry.")
+                    .command("Check panes", "wezterm cli list --format json")
+                    .command("Diagnostics", "wa doctor")
+                    .alternative("Ensure WezTerm is running and responsive.")
+            }
+            Self::ParseError(_) => {
+                Remediation::new("WezTerm returned unexpected output; verify the version.")
+                    .command("Check version", "wezterm --version")
+                    .alternative("Upgrade WezTerm if the output format changed.")
+            }
+            Self::Timeout(timeout) => Remediation::new(format!(
+                "WezTerm CLI timed out after {timeout} seconds. Try again when the system is idle."
+            ))
+            .command("Diagnostics", "wa doctor")
+            .alternative("Reduce load or retry with a longer timeout."),
+        }
+    }
+}
+
 /// Storage-specific errors
 #[derive(Error, Debug)]
 pub enum StorageError {
@@ -91,6 +287,32 @@ pub enum StorageError {
 
     #[error("FTS query error: {0}")]
     FtsQueryError(String),
+}
+
+impl StorageError {
+    #[must_use]
+    pub fn remediation(&self) -> Remediation {
+        match self {
+            Self::Database(_) => Remediation::new(
+                "Database operation failed. Check workspace permissions and retry.",
+            )
+            .command("Diagnostics", "wa doctor")
+            .alternative("Ensure the workspace directory is writable."),
+            Self::SequenceDiscontinuity { expected, actual } => Remediation::new(format!(
+                "Output sequence gap detected (expected {expected}, got {actual})."
+            ))
+            .command("Status", "wa status")
+            .alternative("Restart the watcher: wa watch --foreground"),
+            Self::MigrationFailed(_) => {
+                Remediation::new("Database migration failed. Check logs and retry after backup.")
+                    .command("Diagnostics", "wa doctor")
+                    .alternative("Backup the database file before retrying.")
+            }
+            Self::FtsQueryError(_) => Remediation::new("Invalid FTS query syntax.")
+                .command("Example search", "wa search \"term\"")
+                .alternative("Review FTS5 query syntax and try again."),
+        }
+    }
 }
 
 /// Pattern-specific errors
@@ -109,6 +331,34 @@ pub enum PatternError {
     MatchTimeout,
 }
 
+impl PatternError {
+    #[must_use]
+    pub fn remediation(&self) -> Remediation {
+        match self {
+            Self::InvalidRule(_) => {
+                Remediation::new("Pattern rule invalid. Fix the rule or disable pattern detection.")
+                    .command("Disable patterns", "wa watch --no-patterns")
+                    .alternative("Fix the rule definition in wa.toml.")
+            }
+            Self::InvalidRegex(_) => Remediation::new(
+                "Regex pattern invalid. Fix the regex or disable pattern detection.",
+            )
+            .command("Disable patterns", "wa watch --no-patterns")
+            .alternative("Validate the regex syntax."),
+            Self::PackNotFound(_) => Remediation::new(
+                "Pattern pack not found. Enable the pack or disable pattern detection.",
+            )
+            .command("Disable patterns", "wa watch --no-patterns")
+            .alternative("Enable the pack in wa.toml."),
+            Self::MatchTimeout => Remediation::new(
+                "Pattern evaluation timed out. Simplify patterns or reduce input size.",
+            )
+            .command("Disable patterns", "wa watch --no-patterns")
+            .alternative("Tighten regex or reduce scan scope."),
+        }
+    }
+}
+
 /// Workflow-specific errors
 #[derive(Error, Debug)]
 pub enum WorkflowError {
@@ -123,6 +373,32 @@ pub enum WorkflowError {
 
     #[error("Pane locked by another workflow")]
     PaneLocked,
+}
+
+impl WorkflowError {
+    #[must_use]
+    pub fn remediation(&self) -> Remediation {
+        match self {
+            Self::NotFound(_) => Remediation::new("Workflow not found. Use a valid workflow name.")
+                .command("List workflows", "wa workflow list")
+                .alternative("Use 'wa watch --auto-handle' for event-driven workflows."),
+            Self::Aborted(_) => {
+                Remediation::new("Workflow aborted. Check logs and retry when the pane is stable.")
+                    .command("Status", "wa status")
+                    .alternative("Retry the workflow once the pane is ready.")
+            }
+            Self::GuardFailed(_) => {
+                Remediation::new("Workflow guard failed. Resolve the guard condition and retry.")
+                    .command("Status", "wa status")
+                    .alternative("Verify the pane state and policy settings.")
+            }
+            Self::PaneLocked => {
+                Remediation::new("Pane is locked by another workflow. Wait for it to complete.")
+                    .command("Status", "wa status")
+                    .alternative("Avoid running multiple workflows on the same pane.")
+            }
+        }
+    }
 }
 
 /// Configuration-specific errors
@@ -145,4 +421,108 @@ pub enum ConfigError {
 
     #[error("Validation error: {0}")]
     ValidationError(String),
+}
+
+impl ConfigError {
+    #[must_use]
+    pub fn remediation(&self) -> Remediation {
+        match self {
+            Self::FileNotFound(path) => Remediation::new(format!(
+                "Config file not found: {path}. Verify the path and retry."
+            ))
+            .command("Check path", format!("ls -l \"{path}\""))
+            .alternative("Pass --config with the correct path."),
+            Self::ReadFailed(path, _) => Remediation::new(format!(
+                "Failed to read config file: {path}. Check permissions."
+            ))
+            .command("Check permissions", format!("ls -l \"{path}\""))
+            .alternative("Ensure the file is readable by the current user."),
+            Self::ParseError(_) | Self::ParseFailed(_) => {
+                Remediation::new("Config parse failed. Fix the syntax and retry.")
+                    .command("Diagnostics", "wa doctor")
+                    .alternative("Validate the config file format.")
+            }
+            Self::SerializeFailed(_) => {
+                Remediation::new("Failed to serialize configuration. Check config values.")
+                    .command("Diagnostics", "wa doctor")
+                    .alternative("Recreate the config from known-good defaults.")
+            }
+            Self::ValidationError(_) => {
+                Remediation::new("Config validation failed. Fix the invalid fields and retry.")
+                    .command("Diagnostics", "wa doctor")
+                    .alternative("Review validation errors and adjust wa.toml.")
+            }
+        }
+    }
+}
+
+/// Format an error with remediation guidance for display.
+#[must_use]
+pub fn format_error_with_remediation(error: &Error) -> String {
+    let mut output = format!("Error: {error}");
+    if let Some(remediation) = error.remediation() {
+        output.push('\n');
+        output.push('\n');
+        output.push_str(&remediation.render_plain());
+    }
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remediation_available_for_error_variants() {
+        let json_err = serde_json::from_str::<serde_json::Value>("").unwrap_err();
+        let errors = vec![
+            Error::Wezterm(WeztermError::CliNotFound),
+            Error::Wezterm(WeztermError::NotRunning),
+            Error::Wezterm(WeztermError::PaneNotFound(1)),
+            Error::Wezterm(WeztermError::SocketNotFound("/tmp/wez.sock".to_string())),
+            Error::Wezterm(WeztermError::CommandFailed("boom".to_string())),
+            Error::Wezterm(WeztermError::ParseError("bad json".to_string())),
+            Error::Wezterm(WeztermError::Timeout(5)),
+            Error::Storage(StorageError::Database("db error".to_string())),
+            Error::Storage(StorageError::SequenceDiscontinuity {
+                expected: 1,
+                actual: 2,
+            }),
+            Error::Storage(StorageError::MigrationFailed("migrate".to_string())),
+            Error::Storage(StorageError::FtsQueryError("fts".to_string())),
+            Error::Pattern(PatternError::InvalidRule("rule".to_string())),
+            Error::Pattern(PatternError::InvalidRegex("regex".to_string())),
+            Error::Pattern(PatternError::PackNotFound("pack".to_string())),
+            Error::Pattern(PatternError::MatchTimeout),
+            Error::Workflow(WorkflowError::NotFound("name".to_string())),
+            Error::Workflow(WorkflowError::Aborted("abort".to_string())),
+            Error::Workflow(WorkflowError::GuardFailed("guard".to_string())),
+            Error::Workflow(WorkflowError::PaneLocked),
+            Error::Config(ConfigError::FileNotFound("wa.toml".to_string())),
+            Error::Config(ConfigError::ReadFailed(
+                "wa.toml".to_string(),
+                "io".to_string(),
+            )),
+            Error::Config(ConfigError::ParseError("parse".to_string())),
+            Error::Config(ConfigError::ParseFailed("parse".to_string())),
+            Error::Config(ConfigError::SerializeFailed("serialize".to_string())),
+            Error::Config(ConfigError::ValidationError("invalid".to_string())),
+            Error::Policy("denied".to_string()),
+            Error::Io(std::io::Error::new(std::io::ErrorKind::Other, "io")),
+            Error::Json(json_err),
+            Error::Runtime("runtime".to_string()),
+        ];
+
+        for error in errors {
+            let remediation = error.remediation().expect("missing remediation");
+            assert!(
+                !remediation.summary.is_empty(),
+                "remediation summary empty for {error:?}"
+            );
+            assert!(
+                !remediation.commands.is_empty(),
+                "remediation commands empty for {error:?}"
+            );
+        }
+    }
 }
