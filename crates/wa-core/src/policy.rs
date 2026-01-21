@@ -27,7 +27,10 @@ use std::process::{Command, Stdio};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::config::{CommandGateConfig, DcgDenyPolicy, DcgMode};
+use crate::config::{
+    CommandGateConfig, DcgDenyPolicy, DcgMode, PolicyRule, PolicyRuleDecision, PolicyRuleMatch,
+    PolicyRulesConfig,
+};
 // ============================================================================
 // Action Kinds
 // ============================================================================
@@ -692,6 +695,15 @@ pub struct PolicyInput {
     /// Raw command text for SendText safety gating (not serialized)
     #[serde(skip)]
     pub command_text: Option<String>,
+    /// Pane title for rule matching (if available)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pane_title: Option<String>,
+    /// Pane working directory for rule matching (if available)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pane_cwd: Option<String>,
+    /// Inferred agent type for rule matching (e.g., "claude", "cursor", "shell")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
 }
 
 impl PolicyInput {
@@ -707,6 +719,9 @@ impl PolicyInput {
             text_summary: None,
             workflow_id: None,
             command_text: None,
+            pane_title: None,
+            pane_cwd: None,
+            agent_type: None,
         }
     }
 
@@ -749,6 +764,27 @@ impl PolicyInput {
     #[must_use]
     pub fn with_command_text(mut self, text: impl Into<String>) -> Self {
         self.command_text = Some(text.into());
+        self
+    }
+
+    /// Set pane title for rule matching
+    #[must_use]
+    pub fn with_pane_title(mut self, title: impl Into<String>) -> Self {
+        self.pane_title = Some(title.into());
+        self
+    }
+
+    /// Set pane working directory for rule matching
+    #[must_use]
+    pub fn with_pane_cwd(mut self, cwd: impl Into<String>) -> Self {
+        self.pane_cwd = Some(cwd.into());
+        self
+    }
+
+    /// Set inferred agent type for rule matching
+    #[must_use]
+    pub fn with_agent_type(mut self, agent_type: impl Into<String>) -> Self {
+        self.agent_type = Some(agent_type.into());
         self
     }
 }

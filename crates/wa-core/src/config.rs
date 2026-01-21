@@ -572,6 +572,9 @@ pub struct SafetyConfig {
 
     /// Command safety gate configuration
     pub command_gate: CommandGateConfig,
+
+    /// Custom policy rules (allow/deny/require_approval)
+    pub rules: PolicyRulesConfig,
 }
 
 impl Default for SafetyConfig {
@@ -586,6 +589,7 @@ impl Default for SafetyConfig {
             redaction: RedactionConfig::default(),
             reservations: ReservationConfig::default(),
             command_gate: CommandGateConfig::default(),
+            rules: PolicyRulesConfig::default(),
         }
     }
 }
@@ -627,6 +631,202 @@ pub enum DcgMode {
 pub enum DcgDenyPolicy {
     Deny,
     RequireApproval,
+}
+
+// =============================================================================
+// Policy Rules Config
+// =============================================================================
+
+/// Policy rules configuration
+///
+/// Allows operators to define custom policy rules that match on action context
+/// and specify decisions (allow/deny/require_approval).
+///
+/// # Precedence
+///
+/// Rules are evaluated in order of priority (lower number = higher priority):
+/// 1. Built-in hard denies (capability gates, alt-screen) always win
+/// 2. Explicit deny rules (cannot be overridden by approval)
+/// 3. Explicit require_approval rules
+/// 4. Explicit allow rules
+/// 5. Default behavior (if no rule matches)
+///
+/// Within the same decision type, more specific matches beat general matches.
+/// Specificity is determined by number of non-wildcard match criteria.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PolicyRulesConfig {
+    /// Whether custom policy rules are enabled
+    pub enabled: bool,
+
+    /// Policy rules (evaluated in order after built-in rules)
+    pub rules: Vec<PolicyRule>,
+}
+
+impl Default for PolicyRulesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            rules: Vec::new(),
+        }
+    }
+}
+
+/// A single policy rule
+///
+/// Rules match on action context and produce a decision.
+/// All match criteria are optional; omitted criteria match any value.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyRule {
+    /// Unique identifier for this rule (for audit/debugging)
+    pub id: String,
+
+    /// Human-readable description of why this rule exists
+    #[serde(default)]
+    pub description: Option<String>,
+
+    /// Priority (lower = higher priority, default 100)
+    #[serde(default = "default_priority")]
+    pub priority: u32,
+
+    /// Match criteria
+    #[serde(default)]
+    pub match_on: PolicyRuleMatch,
+
+    /// Decision when this rule matches
+    pub decision: PolicyRuleDecision,
+
+    /// Message to show when this rule triggers (optional)
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+fn default_priority() -> u32 {
+    100
+}
+
+/// Match criteria for a policy rule
+///
+/// All fields are optional. Omitted fields match any value.
+/// Multiple values in a list are OR'd (match any).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PolicyRuleMatch {
+    /// Match specific action kinds (e.g., "send_text", "ctrl_c")
+    #[serde(default)]
+    pub actions: Vec<String>,
+
+    /// Match specific actor kinds (e.g., "robot", "mcp", "workflow")
+    #[serde(default)]
+    pub actors: Vec<String>,
+
+    /// Match pane by ID (exact match)
+    #[serde(default)]
+    pub pane_ids: Vec<u64>,
+
+    /// Match pane by title pattern (glob)
+    #[serde(default)]
+    pub pane_titles: Vec<String>,
+
+    /// Match pane by working directory pattern (glob)
+    #[serde(default)]
+    pub pane_cwds: Vec<String>,
+
+    /// Match pane by domain (exact match)
+    #[serde(default)]
+    pub pane_domains: Vec<String>,
+
+    /// Match command text by regex pattern
+    #[serde(default)]
+    pub command_patterns: Vec<String>,
+
+    /// Match inferred agent type (e.g., "claude", "cursor", "shell")
+    #[serde(default)]
+    pub agent_types: Vec<String>,
+}
+
+impl PolicyRuleMatch {
+    /// Returns the specificity score (number of non-empty match criteria)
+    ///
+    /// Higher specificity = more specific rule = wins ties
+    #[must_use]
+    pub fn specificity(&self) -> u32 {
+        let mut score = 0;
+        if !self.actions.is_empty() {
+            score += 1;
+        }
+        if !self.actors.is_empty() {
+            score += 1;
+        }
+        if !self.pane_ids.is_empty() {
+            score += 2; // ID match is very specific
+        }
+        if !self.pane_titles.is_empty() {
+            score += 1;
+        }
+        if !self.pane_cwds.is_empty() {
+            score += 1;
+        }
+        if !self.pane_domains.is_empty() {
+            score += 1;
+        }
+        if !self.command_patterns.is_empty() {
+            score += 2; // Command pattern is very specific
+        }
+        if !self.agent_types.is_empty() {
+            score += 1;
+        }
+        score
+    }
+
+    /// Returns true if all criteria are empty (matches everything)
+    #[must_use]
+    pub fn is_catch_all(&self) -> bool {
+        self.actions.is_empty()
+            && self.actors.is_empty()
+            && self.pane_ids.is_empty()
+            && self.pane_titles.is_empty()
+            && self.pane_cwds.is_empty()
+            && self.pane_domains.is_empty()
+            && self.command_patterns.is_empty()
+            && self.agent_types.is_empty()
+    }
+}
+
+/// Decision for a policy rule
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyRuleDecision {
+    /// Allow the action
+    Allow,
+    /// Deny the action (cannot be overridden by approval)
+    Deny,
+    /// Require explicit user approval
+    RequireApproval,
+}
+
+impl PolicyRuleDecision {
+    /// Returns the decision priority for rule ordering
+    ///
+    /// Lower number = higher priority (evaluated first)
+    /// Deny > RequireApproval > Allow
+    #[must_use]
+    pub const fn priority(&self) -> u32 {
+        match self {
+            Self::Deny => 0,
+            Self::RequireApproval => 1,
+            Self::Allow => 2,
+        }
+    }
+
+    /// Returns the string representation
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+            Self::RequireApproval => "require_approval",
+        }
+    }
 }
 
 /// Capability gating configuration
