@@ -934,7 +934,7 @@ impl EffectivePaths {
 ///
 /// These settings do not require reinitialization of stateful components
 /// like storage handles or pattern engines.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HotReloadableConfig {
     // General
     /// Log level (trace, debug, info, warn, error)
@@ -1020,7 +1020,7 @@ impl Config {
     /// Returns `HotReloadResult` indicating whether the reload is allowed
     /// and what changes would be applied.
     #[must_use]
-    pub fn diff_for_hot_reload(&self, new_config: &Config) -> HotReloadResult {
+    pub fn diff_for_hot_reload(&self, new_config: &Self) -> HotReloadResult {
         let mut changes = Vec::new();
         let mut forbidden = Vec::new();
 

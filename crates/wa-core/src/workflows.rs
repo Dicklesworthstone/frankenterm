@@ -482,8 +482,8 @@ impl WorkflowContext {
 /// struct PromptInjectionWorkflow;
 ///
 /// impl Workflow for PromptInjectionWorkflow {
-///     fn name(&self) -> &str { "prompt_injection" }
-///     fn description(&self) -> &str { "Sends a prompt and waits for response" }
+///     fn name(&self) -> &'static str { "prompt_injection" }
+///     fn description(&self) -> &'static str { "Sends a prompt and waits for response" }
 ///
 ///     fn handles(&self, detection: &Detection) -> bool {
 ///         detection.rule_id.starts_with("trigger.prompt_injection")
@@ -513,10 +513,10 @@ impl WorkflowContext {
 /// ```
 pub trait Workflow: Send + Sync {
     /// Workflow name (unique identifier)
-    fn name(&self) -> &str;
+    fn name(&self) -> &'static str;
 
     /// Human-readable description
-    fn description(&self) -> &str;
+    fn description(&self) -> &'static str;
 
     /// Check if this workflow handles a given detection.
     ///
@@ -1928,8 +1928,7 @@ impl WorkflowRunner {
             let steps = workflow.steps();
             let step_name = steps
                 .get(current_step)
-                .map(|s| s.name.as_str())
-                .unwrap_or("unknown");
+                .map_or("unknown", |s| s.name.as_str());
 
             let result_data = serde_json::to_string(&step_result).ok();
             let step_started_at = now_ms();
@@ -2108,8 +2107,8 @@ impl WorkflowRunner {
                     }
 
                     // Execute wait condition
-                    let timeout = timeout_ms.map_or(
-                        Duration::from_millis(self.config.step_timeout_ms),
+                    let timeout = timeout_ms.map_or_else(
+                        || Duration::from_millis(self.config.step_timeout_ms),
                         Duration::from_millis,
                     );
 
@@ -2217,7 +2216,7 @@ impl WorkflowRunner {
                                     let engine = WorkflowEngine::new(config.max_concurrent);
 
                                     // Create a mini-runner for the spawned task
-                                    let runner = WorkflowRunner {
+                                    let runner = Self {
                                         workflows: std::sync::RwLock::new(vec![
                                             workflow_clone.clone(),
                                         ]),
@@ -2342,16 +2341,13 @@ impl WorkflowRunner {
 
         for record in incomplete {
             // Find the workflow definition
-            let workflow = match self.find_workflow_by_name(&record.workflow_name) {
-                Some(w) => w,
-                None => {
-                    tracing::warn!(
-                        workflow_name = %record.workflow_name,
-                        execution_id = %record.id,
-                        "Cannot resume: workflow not registered"
-                    );
-                    continue;
-                }
+            let Some(workflow) = self.find_workflow_by_name(&record.workflow_name) else {
+                tracing::warn!(
+                    workflow_name = %record.workflow_name,
+                    execution_id = %record.id,
+                    "Cannot resume: workflow not registered"
+                );
+                continue;
             };
 
             // Compute next step from logs
@@ -2616,19 +2612,18 @@ impl HandleCompaction {
     }
 
     /// Get the agent-specific prompt based on agent type from trigger detection.
-    fn get_prompt_for_agent(&self, ctx: &WorkflowContext) -> &'static str {
+    fn get_prompt_for_agent(ctx: &WorkflowContext) -> &'static str {
         // Extract agent type from trigger detection if available
         let agent_type = ctx
             .trigger()
             .and_then(|t| t.get("agent_type"))
             .and_then(|v| v.as_str())
-            .map(|s| match s {
+            .map_or(crate::patterns::AgentType::Unknown, |s| match s {
                 "claude_code" => crate::patterns::AgentType::ClaudeCode,
                 "codex" => crate::patterns::AgentType::Codex,
                 "gemini" => crate::patterns::AgentType::Gemini,
                 _ => crate::patterns::AgentType::Unknown,
-            })
-            .unwrap_or(crate::patterns::AgentType::Unknown);
+            });
 
         match agent_type {
             crate::patterns::AgentType::ClaudeCode => compaction_prompts::CLAUDE_CODE,
@@ -2644,7 +2639,7 @@ impl HandleCompaction {
     /// - Alt-screen mode (vim, less, etc.)
     /// - Recent output gap (unknown pane state)
     /// - Command currently running
-    fn check_pane_guards(&self, ctx: &WorkflowContext) -> Result<(), String> {
+    fn check_pane_guards(ctx: &WorkflowContext) -> Result<(), String> {
         let caps = ctx.capabilities();
 
         // Guard: alt-screen blocks sends (Some(true) = definitely in alt-screen)
@@ -2667,11 +2662,11 @@ impl HandleCompaction {
 }
 
 impl Workflow for HandleCompaction {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "handle_compaction"
     }
 
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "Re-inject critical context (AGENTS.md) after conversation compaction"
     }
 
@@ -2702,14 +2697,14 @@ impl Workflow for HandleCompaction {
 
         // For step 0: capture guard check result
         let guard_check_result = if step_idx == 0 {
-            Some(self.check_pane_guards(ctx))
+            Some(Self::check_pane_guards(ctx))
         } else {
             None
         };
 
         // For step 2: capture prompt and injector availability
         let prompt = if step_idx == 2 {
-            Some(self.get_prompt_for_agent(ctx))
+            Some(Self::get_prompt_for_agent(ctx))
         } else {
             None
         };
@@ -3036,32 +3031,32 @@ mod tests {
 
     /// A stub workflow for testing that demonstrates all workflow capabilities
     struct StubWorkflow {
-        name: String,
-        description: String,
-        target_rule_prefix: String,
+        name: &'static str,
+        description: &'static str,
+        target_rule_prefix: &'static str,
     }
 
     impl StubWorkflow {
         fn new() -> Self {
             Self {
-                name: "stub_workflow".to_string(),
-                description: "A test workflow for verification".to_string(),
-                target_rule_prefix: "test.".to_string(),
+                name: "stub_workflow",
+                description: "A test workflow for verification",
+                target_rule_prefix: "test.",
             }
         }
     }
 
     impl Workflow for StubWorkflow {
-        fn name(&self) -> &str {
-            &self.name
+        fn name(&self) -> &'static str {
+            self.name
         }
 
-        fn description(&self) -> &str {
-            &self.description
+        fn description(&self) -> &'static str {
+            self.description
         }
 
         fn handles(&self, detection: &Detection) -> bool {
-            detection.rule_id.starts_with(&self.target_rule_prefix)
+            detection.rule_id.starts_with(self.target_rule_prefix)
         }
 
         fn steps(&self) -> Vec<WorkflowStep> {
@@ -4077,7 +4072,7 @@ mod tests {
             pane_id: 42,
             workflow_name: "test_workflow".to_string(),
             execution_id: "exec-001".to_string(),
-            locked_at_ms: 1234567890000,
+            locked_at_ms: 1_234_567_890_000,
         };
 
         let json = serde_json::to_string(&info).unwrap();
@@ -4261,11 +4256,11 @@ mod tests {
     struct MockCompactionWorkflow;
 
     impl Workflow for MockCompactionWorkflow {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "handle_compaction"
         }
 
-        fn description(&self) -> &str {
+        fn description(&self) -> &'static str {
             "Mock workflow for compaction handling"
         }
 
@@ -4295,11 +4290,11 @@ mod tests {
     struct MockUsageLimitWorkflow;
 
     impl Workflow for MockUsageLimitWorkflow {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "handle_usage_limit"
         }
 
-        fn description(&self) -> &str {
+        fn description(&self) -> &'static str {
             "Mock workflow for usage limit handling"
         }
 
@@ -4559,11 +4554,11 @@ mod tests {
     struct MockTextSendingWorkflow;
 
     impl Workflow for MockTextSendingWorkflow {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "text_sender"
         }
 
-        fn description(&self) -> &str {
+        fn description(&self) -> &'static str {
             "Mock workflow that sends text to test policy gates"
         }
 
@@ -4802,7 +4797,6 @@ mod tests {
 
         rt.block_on(async {
             let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
-            let workflow = HandleCompaction::new();
 
             // Normal capabilities - should pass guards
             let normal_caps = PaneCapabilities {
@@ -4813,7 +4807,7 @@ mod tests {
             };
             let ctx_normal =
                 WorkflowContext::new(storage.clone(), 42, normal_caps, "exec-guard-normal");
-            let result = workflow.check_pane_guards(&ctx_normal);
+            let result = HandleCompaction::check_pane_guards(&ctx_normal);
             assert!(result.is_ok(), "Normal state should pass guards");
 
             // Alt-screen active - should fail
@@ -4824,7 +4818,7 @@ mod tests {
                 ..Default::default()
             };
             let ctx_alt = WorkflowContext::new(storage.clone(), 42, alt_caps, "exec-guard-alt");
-            let result = workflow.check_pane_guards(&ctx_alt);
+            let result = HandleCompaction::check_pane_guards(&ctx_alt);
             assert!(result.is_err());
             assert!(result.unwrap_err().contains("alt-screen"));
 
@@ -4836,7 +4830,7 @@ mod tests {
                 ..Default::default()
             };
             let ctx_cmd = WorkflowContext::new(storage.clone(), 42, cmd_caps, "exec-guard-cmd");
-            let result = workflow.check_pane_guards(&ctx_cmd);
+            let result = HandleCompaction::check_pane_guards(&ctx_cmd);
             assert!(result.is_err());
             assert!(result.unwrap_err().contains("running"));
 
@@ -4848,7 +4842,7 @@ mod tests {
                 ..Default::default()
             };
             let ctx_gap = WorkflowContext::new(storage.clone(), 42, gap_caps, "exec-guard-gap");
-            let result = workflow.check_pane_guards(&ctx_gap);
+            let result = HandleCompaction::check_pane_guards(&ctx_gap);
             assert!(result.is_err());
             assert!(result.unwrap_err().contains("gap"));
 

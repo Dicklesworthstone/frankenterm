@@ -41,7 +41,7 @@ pub struct HealthSnapshot {
 
 impl HealthSnapshot {
     /// Update the global health snapshot.
-    pub fn update_global(snapshot: HealthSnapshot) {
+    pub fn update_global(snapshot: Self) {
         let lock = GLOBAL_HEALTH.get_or_init(|| RwLock::new(None));
         if let Ok(mut guard) = lock.write() {
             *guard = Some(snapshot);
@@ -49,7 +49,7 @@ impl HealthSnapshot {
     }
 
     /// Get the current global health snapshot.
-    pub fn get_global() -> Option<HealthSnapshot> {
+    pub fn get_global() -> Option<Self> {
         let lock = GLOBAL_HEALTH.get_or_init(|| RwLock::new(None));
         lock.read().ok().and_then(|guard| guard.clone())
     }
@@ -154,7 +154,7 @@ mod tests {
             db_last_write_at: None,
         };
 
-        HealthSnapshot::update_global(snapshot.clone());
+        HealthSnapshot::update_global(snapshot);
 
         let retrieved = HealthSnapshot::get_global();
         assert!(retrieved.is_some());
