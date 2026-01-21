@@ -3594,7 +3594,7 @@ mod tests {
 
         // Create a minimal v1 schema without the new audit_actions column.
         conn.execute_batch(
-            r#"
+            r"
             CREATE TABLE panes (
                 pane_id INTEGER PRIMARY KEY,
                 domain TEXT NOT NULL DEFAULT 'local',
@@ -3625,7 +3625,7 @@ mod tests {
                 verification_summary TEXT,
                 result TEXT NOT NULL
             );
-            "#,
+            ",
         )
         .unwrap();
         set_user_version(&conn, 0).unwrap();

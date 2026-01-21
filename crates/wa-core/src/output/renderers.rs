@@ -637,8 +637,8 @@ mod tests {
             title: Some("test shell".to_string()),
             cwd: Some("/home/user".to_string()),
             tty_name: Some("/dev/pts/0".to_string()),
-            first_seen_at: 1737446400000,
-            last_seen_at: 1737450000000,
+            first_seen_at: 1_737_446_400_000,
+            last_seen_at: 1_737_450_000_000,
             observed: true,
             ignore_reason: None,
             last_decision_at: None,
@@ -657,7 +657,7 @@ mod tests {
             extracted: Some(serde_json::json!({"usage": 95})),
             matched_text: Some("Usage at 95%".to_string()),
             segment_id: Some(100),
-            detected_at: 1737446400000,
+            detected_at: 1_737_446_400_000,
             handled_at: None,
             handled_by_workflow_id: None,
             handled_status: None,
@@ -708,14 +708,14 @@ mod tests {
     fn test_format_timestamp() {
         // Test that timestamp formatting produces valid format
         // 1737417600000 ms = 2025-01-20 12:00:00 UTC
-        let ts = format_timestamp(1737417600000);
+        let ts = format_timestamp(1_737_417_600_000);
         assert!(ts.starts_with("2025-01-2"));
-        assert!(ts.contains(":"));
+        assert!(ts.contains(':'));
 
         // Also verify the format structure
         let parts: Vec<&str> = ts.split(' ').collect();
         assert_eq!(parts.len(), 2);
-        assert!(parts[0].contains("-")); // date part
-        assert!(parts[1].contains(":")); // time part
+        assert!(parts[0].contains('-')); // date part
+        assert!(parts[1].contains(':')); // time part
     }
 }
