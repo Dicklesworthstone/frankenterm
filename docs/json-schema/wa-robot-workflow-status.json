@@ -26,8 +26,22 @@
     },
     "status": {
       "type": "string",
-      "enum": ["pending", "running", "waiting", "completed", "aborted", "failed"],
+      "enum": ["pending", "running", "waiting", "paused", "completed", "aborted", "failed"],
       "description": "Current execution status"
+    },
+    "step_name": {
+      "type": "string",
+      "description": "Human-readable name of current step (when running/waiting)"
+    },
+    "elapsed_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Time elapsed since workflow started (ms)"
+    },
+    "last_step_result": {
+      "type": "string",
+      "enum": ["continue", "done", "retry", "abort", "wait_for", "send_text"],
+      "description": "Result of the last completed step"
     },
     "current_step": {
       "type": "integer",

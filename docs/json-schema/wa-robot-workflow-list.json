@@ -57,6 +57,18 @@
             "type": "string"
           }
         },
+        "agent_types": {
+          "type": "array",
+          "description": "Agent types this workflow supports (e.g., 'codex', 'claude_code', 'gemini')",
+          "items": {
+            "type": "string"
+          }
+        },
+        "step_count": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Number of steps in the workflow"
+        },
         "parameters": {
           "type": "array",
           "description": "Parameters the workflow accepts",
@@ -68,9 +80,24 @@
           "type": "boolean",
           "description": "Whether this workflow requires a target pane"
         },
+        "requires_approval": {
+          "type": "boolean",
+          "description": "Whether this workflow requires approval before execution"
+        },
+        "can_abort": {
+          "type": "boolean",
+          "description": "Whether this workflow can be safely aborted mid-execution"
+        },
         "destructive": {
           "type": "boolean",
           "description": "Whether this workflow performs destructive actions"
+        },
+        "dependencies": {
+          "type": "array",
+          "description": "External dependencies required by this workflow (e.g., 'caut', 'playwright')",
+          "items": {
+            "type": "string"
+          }
         }
       },
       "additionalProperties": false

@@ -18,14 +18,36 @@
       "type": "string",
       "description": "Name of the workflow that was aborted"
     },
+    "pane_id": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "Pane ID the workflow was targeting (null if not pane-specific)"
+    },
     "previous_status": {
       "type": "string",
-      "enum": ["pending", "running", "waiting", "completed", "aborted", "failed"],
+      "enum": ["pending", "running", "waiting", "paused", "completed", "aborted", "failed"],
       "description": "Status before abort was requested"
+    },
+    "aborted_at_step": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "Step index where abort occurred (null if not started)"
+    },
+    "step_name": {
+      "type": "string",
+      "description": "Human-readable name of step where abort occurred"
     },
     "reason": {
       "type": "string",
-      "description": "Reason provided for the abort"
+      "description": "Reason provided for the abort (from --reason flag)"
+    },
+    "forced": {
+      "type": "boolean",
+      "description": "Whether abort was forced (--force flag, skips cleanup)"
+    },
+    "cleanup_performed": {
+      "type": "boolean",
+      "description": "Whether cleanup steps were executed (false if forced or no cleanup defined)"
     },
     "aborted_at": {
       "type": "integer",
