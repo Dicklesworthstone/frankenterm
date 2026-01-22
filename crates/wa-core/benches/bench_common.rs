@@ -184,7 +184,7 @@ fn cargo_features() -> Vec<String> {
 
 fn bench_artifacts(bench: &str) -> Vec<BenchArtifact<'_>> {
     let criterion_root = "target/criterion".to_string();
-    let bench_path = format!("{}/{}", criterion_root, bench);
+    let bench_path = format!("{criterion_root}/{bench}");
     vec![
         BenchArtifact {
             artifact_type: "meta",

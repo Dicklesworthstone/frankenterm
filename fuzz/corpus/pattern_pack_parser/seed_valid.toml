@@ -1,0 +1,11 @@
+name = "custom:seed"
+version = "0.1.0"
+
+[[rules]]
+id = "codex.seed"
+agent_type = "codex"
+event_type = "seed"
+severity = "info"
+anchors = ["seed"]
+regex = "seed"
+description = "Seed rule"

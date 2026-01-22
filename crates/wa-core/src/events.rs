@@ -192,6 +192,19 @@ pub enum Event {
         name: String,
         payload: UserVarPayload,
     },
+
+    /// Status update received via IPC from WezTerm Lua hook
+    StatusUpdateReceived {
+        pane_id: u64,
+        /// Whether alt-screen state changed
+        alt_screen_changed: bool,
+        /// New alt-screen state (if changed)
+        is_alt_screen: bool,
+        /// Whether title changed
+        title_changed: bool,
+        /// New title (if changed)
+        new_title: Option<String>,
+    },
 }
 
 impl Event {
@@ -208,6 +221,7 @@ impl Event {
             Self::WorkflowStep { .. } => "workflow_step",
             Self::WorkflowCompleted { .. } => "workflow_completed",
             Self::UserVarReceived { .. } => "user_var_received",
+            Self::StatusUpdateReceived { .. } => "status_update_received",
         }
     }
 
@@ -221,7 +235,8 @@ impl Event {
             | Self::PaneDiscovered { pane_id, .. }
             | Self::PaneDisappeared { pane_id }
             | Self::WorkflowStarted { pane_id, .. }
-            | Self::UserVarReceived { pane_id, .. } => Some(*pane_id),
+            | Self::UserVarReceived { pane_id, .. }
+            | Self::StatusUpdateReceived { pane_id, .. } => Some(*pane_id),
             Self::WorkflowStep { .. } | Self::WorkflowCompleted { .. } => None,
         }
     }
@@ -417,7 +432,8 @@ impl EventBus {
             | Event::WorkflowStarted { .. }
             | Event::WorkflowStep { .. }
             | Event::WorkflowCompleted { .. }
-            | Event::UserVarReceived { .. } => {
+            | Event::UserVarReceived { .. }
+            | Event::StatusUpdateReceived { .. } => {
                 self.send_routed(event, &self.signal_sender, &self.signal_times)
             }
         };
@@ -901,5 +917,216 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         let t2 = bus.uptime();
         assert!(t2 > t1);
+    }
+
+    // ========================================================================
+    // User-var payload decoding tests (wa-4vx.4.10)
+    // ========================================================================
+
+    #[test]
+    fn user_var_decode_valid_base64_json() {
+        use base64::Engine;
+
+        // Encode {"type":"command_start","cmd":"ls -la"}
+        let json = r#"{"type":"command_start","cmd":"ls -la"}"#;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(json);
+
+        let payload = UserVarPayload::decode(&encoded, false).unwrap();
+
+        assert_eq!(payload.event_type, Some("command_start".to_string()));
+        assert!(payload.event_data.is_some());
+        let data = payload.event_data.unwrap();
+        assert_eq!(data.get("cmd").and_then(|v| v.as_str()), Some("ls -la"));
+    }
+
+    #[test]
+    fn user_var_decode_invalid_base64_strict() {
+        // Not valid base64
+        let invalid = "!!!not-base64!!!";
+        let result = UserVarPayload::decode(invalid, false);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, UserVarError::ParseFailed(_)));
+        assert!(err.to_string().contains("invalid base64"));
+    }
+
+    #[test]
+    fn user_var_decode_invalid_base64_lenient() {
+        // Not valid base64, but lenient mode should return raw value
+        let invalid = "!!!not-base64!!!";
+        let payload = UserVarPayload::decode(invalid, true).unwrap();
+
+        assert_eq!(payload.value, invalid);
+        assert!(payload.event_type.is_none());
+        assert!(payload.event_data.is_none());
+    }
+
+    #[test]
+    fn user_var_decode_valid_base64_invalid_json_strict() {
+        use base64::Engine;
+
+        // Valid base64, but not valid JSON
+        let not_json = "this is not json";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(not_json);
+
+        let result = UserVarPayload::decode(&encoded, false);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, UserVarError::ParseFailed(_)));
+        assert!(err.to_string().contains("invalid JSON"));
+    }
+
+    #[test]
+    fn user_var_decode_valid_base64_invalid_json_lenient() {
+        use base64::Engine;
+
+        // Valid base64, but not valid JSON - lenient mode returns raw value
+        let not_json = "this is not json";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(not_json);
+
+        let payload = UserVarPayload::decode(&encoded, true).unwrap();
+
+        assert_eq!(payload.value, encoded);
+        assert!(payload.event_type.is_none());
+        assert!(payload.event_data.is_none());
+    }
+
+    #[test]
+    fn user_var_decode_unknown_event_type() {
+        use base64::Engine;
+
+        // Unknown event type - should decode fine but event_type comes through
+        let json = r#"{"type":"completely_unknown_event","data":"whatever"}"#;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(json);
+
+        let payload = UserVarPayload::decode(&encoded, false).unwrap();
+
+        // Should not panic, should capture the type
+        assert_eq!(
+            payload.event_type,
+            Some("completely_unknown_event".to_string())
+        );
+        assert!(payload.event_data.is_some());
+    }
+
+    #[test]
+    fn user_var_decode_missing_type_field() {
+        use base64::Engine;
+
+        // Valid JSON but missing "type" field
+        let json = r#"{"data":"some data","other":"field"}"#;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(json);
+
+        let payload = UserVarPayload::decode(&encoded, false).unwrap();
+
+        // Should decode fine, just no event_type
+        assert!(payload.event_type.is_none());
+        assert!(payload.event_data.is_some());
+    }
+
+    #[test]
+    fn user_var_decode_empty_json_object() {
+        use base64::Engine;
+
+        let json = "{}";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(json);
+
+        let payload = UserVarPayload::decode(&encoded, false).unwrap();
+
+        assert!(payload.event_type.is_none());
+        assert!(payload.event_data.is_some());
+    }
+
+    #[test]
+    fn user_var_decode_invalid_utf8_strict() {
+        use base64::Engine;
+
+        // Valid base64 but contains invalid UTF-8 bytes
+        let invalid_utf8: &[u8] = &[0xff, 0xfe, 0x00, 0x01];
+        let encoded = base64::engine::general_purpose::STANDARD.encode(invalid_utf8);
+
+        let result = UserVarPayload::decode(&encoded, false);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, UserVarError::ParseFailed(_)));
+        assert!(err.to_string().contains("invalid UTF-8"));
+    }
+
+    #[test]
+    fn user_var_decode_invalid_utf8_lenient() {
+        use base64::Engine;
+
+        // Valid base64 but contains invalid UTF-8 bytes - lenient mode
+        let invalid_utf8: &[u8] = &[0xff, 0xfe, 0x00, 0x01];
+        let encoded = base64::engine::general_purpose::STANDARD.encode(invalid_utf8);
+
+        let payload = UserVarPayload::decode(&encoded, true).unwrap();
+
+        // Should not panic, retains raw value
+        assert_eq!(payload.value, encoded);
+        assert!(payload.event_type.is_none());
+        assert!(payload.event_data.is_none());
+    }
+
+    #[test]
+    fn user_var_error_messages_are_actionable() {
+        // Test error message clarity
+
+        let err = UserVarError::WatcherNotRunning {
+            socket_path: "/tmp/test.sock".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("not running"));
+        assert!(msg.contains("/tmp/test.sock"));
+
+        let err = UserVarError::IpcSendFailed {
+            message: "connection refused".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("IPC"));
+        assert!(msg.contains("connection refused"));
+
+        let err = UserVarError::ParseFailed("invalid base64".to_string());
+        let msg = err.to_string();
+        assert!(msg.contains("parse"));
+        assert!(msg.contains("invalid base64"));
+    }
+
+    #[test]
+    fn user_var_payload_preserves_raw_value() {
+        use base64::Engine;
+
+        let json = r#"{"type":"test"}"#;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(json);
+
+        let payload = UserVarPayload::decode(&encoded, false).unwrap();
+
+        // Raw value should be preserved
+        assert_eq!(payload.value, encoded);
+    }
+
+    #[test]
+    fn user_var_received_event_routing() {
+        // UserVarReceived should be routed to signal channel
+        let bus = EventBus::new(10);
+        let mut signal_sub = bus.subscribe_signals();
+        let mut delta_sub = bus.subscribe_deltas();
+
+        let payload = UserVarPayload {
+            value: "test".to_string(),
+            event_type: Some("test".to_string()),
+            event_data: None,
+        };
+
+        let _ = bus.publish(Event::UserVarReceived {
+            pane_id: 1,
+            name: "WA_EVENT".to_string(),
+            payload,
+        });
+
+        // Should be in signal channel
+        assert!(signal_sub.try_recv().is_some());
+        // Should NOT be in delta channel
+        assert!(delta_sub.try_recv().is_none());
     }
 }

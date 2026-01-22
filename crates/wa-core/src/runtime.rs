@@ -335,6 +335,12 @@ impl ObservationRuntime {
                                     }
 
                                     debug!(pane_id = pane_id, "Started observing pane");
+                                } else if let Some(reason) = entry.observation.ignore_reason() {
+                                    info!(
+                                        pane_id = pane_id,
+                                        reason = reason,
+                                        "Pane ignored by observation filter"
+                                    );
                                 }
                             }
                         }
@@ -418,43 +424,50 @@ impl ObservationRuntime {
         };
 
         tokio::spawn(async move {
+            let poll_interval = tailer_config.min_interval;
+            let source = Arc::new(WeztermClient::new());
             // Create tailer supervisor
             let mut supervisor = TailerSupervisor::new(
                 tailer_config,
                 capture_tx,
                 cursors,
                 Arc::clone(&shutdown_flag),
+                source,
             );
 
             // Sync tailers periodically with discovery interval
-            let mut ticker = tokio::time::interval(discovery_interval);
+            let mut sync_tick = tokio::time::interval(discovery_interval);
+            let mut poll_tick = tokio::time::interval(poll_interval);
 
             loop {
-                ticker.tick().await;
+                tokio::select! {
+                    _ = sync_tick.tick() => {
+                        if shutdown_flag.load(Ordering::SeqCst) {
+                            debug!("Capture task: shutdown signal received");
+                            break;
+                        }
 
-                // Check shutdown flag
-                if shutdown_flag.load(Ordering::SeqCst) {
-                    debug!("Capture task: shutdown signal received");
-                    break;
+                        // Get current observed panes from registry
+                        let observed_panes: HashMap<u64, PaneInfo> = {
+                            let reg = registry.read().await;
+                            reg.observed_pane_ids()
+                                .into_iter()
+                                .filter_map(|id| reg.get_entry(id).map(|e| (id, e.info.clone())))
+                                .collect()
+                        };
+
+                        supervisor.sync_tailers(&observed_panes);
+
+                        debug!(
+                            active_tailers = supervisor.active_count(),
+                            observed_panes = observed_panes.len(),
+                            "Tailer sync tick"
+                        );
+                    }
+                    _ = poll_tick.tick() => {
+                        supervisor.poll_once().await;
+                    }
                 }
-
-                // Get current observed panes from registry
-                let observed_panes: HashMap<u64, PaneInfo> = {
-                    let reg = registry.read().await;
-                    reg.observed_pane_ids()
-                        .into_iter()
-                        .filter_map(|id| reg.get_entry(id).map(|e| (id, e.info.clone())))
-                        .collect()
-                };
-
-                // Sync tailers with observed panes
-                supervisor.sync_tailers(&observed_panes);
-
-                debug!(
-                    active_tailers = supervisor.active_count(),
-                    observed_panes = observed_panes.len(),
-                    "Tailer sync tick"
-                );
             }
 
             // Graceful shutdown of all tailers

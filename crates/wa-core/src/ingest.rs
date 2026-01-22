@@ -17,6 +17,9 @@ use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::hash::{Hash, Hasher};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rand::Rng;
+use sha2::{Digest, Sha256};
+
 use crate::config::PaneFilterConfig;
 use crate::error::Result;
 use crate::storage::{Gap, PaneRecord, Segment, StorageHandle};
@@ -33,6 +36,51 @@ fn epoch_ms() -> i64 {
         .ok()
         .and_then(|d| i64::try_from(d.as_millis()).ok())
         .unwrap_or(0)
+}
+
+// =============================================================================
+// Pane UUID
+// =============================================================================
+
+/// Generate a stable pane UUID.
+///
+/// The UUID is a hex-encoded hash combining:
+/// - domain name
+/// - pane_id (session-local, but helps distinguish within session)
+/// - creation timestamp (epoch ms)
+/// - random entropy (ensures uniqueness even with identical metadata)
+///
+/// Format: 32-character lowercase hex string (16 bytes / 128 bits)
+///
+/// This approach:
+/// - Is idempotent: calling with same inputs produces same output
+/// - Is bounded: computed once at pane discovery, never updated
+/// - Is safe: purely read-based, no writes to WezTerm
+/// - Is auditable: deterministic from inputs
+#[must_use]
+pub fn generate_pane_uuid(domain: &str, pane_id: u64, created_at: i64) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(domain.as_bytes());
+    hasher.update(pane_id.to_le_bytes());
+    hasher.update(created_at.to_le_bytes());
+
+    // Add random entropy to ensure uniqueness even if same pane_id reappears
+    let entropy: [u8; 8] = rand::thread_rng().r#gen();
+    hasher.update(entropy);
+
+    let hash = hasher.finalize();
+
+    // Take first 16 bytes and encode as lowercase hex (32 chars)
+    hex_encode(&hash[..16])
+}
+
+/// Encode bytes as lowercase hex string
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02x}");
+        s
+    })
 }
 
 // =============================================================================
@@ -146,6 +194,11 @@ pub struct PaneEntry {
     pub fingerprint: PaneFingerprint,
     /// Observation decision (observe vs ignore)
     pub observation: ObservationDecision,
+    /// Stable pane UUID (persists across renames/moves within a session)
+    ///
+    /// Assigned once at discovery, never changes for this pane's lifetime.
+    /// Format: 32-character lowercase hex string.
+    pub pane_uuid: String,
     /// First seen timestamp (epoch ms)
     pub first_seen_at: i64,
     /// Last seen timestamp (epoch ms)
@@ -154,10 +207,17 @@ pub struct PaneEntry {
     pub decision_at: i64,
     /// Generation number (increments when fingerprint changes)
     pub generation: u32,
+    /// Whether pane is in alternate screen buffer (from Lua status updates)
+    pub is_alt_screen: bool,
+    /// Timestamp of last status update (epoch ms)
+    pub last_status_at: Option<i64>,
 }
 
 impl PaneEntry {
     /// Create a new pane entry
+    ///
+    /// Generates a stable `pane_uuid` based on domain, pane_id, and creation time.
+    /// The UUID is assigned once and never changes for this pane's lifetime.
     #[must_use]
     pub fn new(
         info: PaneInfo,
@@ -165,14 +225,43 @@ impl PaneEntry {
         observation: ObservationDecision,
     ) -> Self {
         let now = epoch_ms();
+        let domain = info.inferred_domain();
+        let pane_uuid = generate_pane_uuid(&domain, info.pane_id, now);
+
         Self {
             info,
             fingerprint,
             observation,
+            pane_uuid,
             first_seen_at: now,
             last_seen_at: now,
             decision_at: now,
             generation: 0,
+            is_alt_screen: false,
+            last_status_at: None,
+        }
+    }
+
+    /// Create a pane entry with a specific UUID (for recovery/testing)
+    #[must_use]
+    pub fn with_uuid(
+        info: PaneInfo,
+        fingerprint: PaneFingerprint,
+        observation: ObservationDecision,
+        pane_uuid: String,
+    ) -> Self {
+        let now = epoch_ms();
+        Self {
+            info,
+            fingerprint,
+            observation,
+            pane_uuid,
+            first_seen_at: now,
+            last_seen_at: now,
+            decision_at: now,
+            generation: 0,
+            is_alt_screen: false,
+            last_status_at: None,
         }
     }
 
@@ -180,6 +269,44 @@ impl PaneEntry {
     pub fn update_info(&mut self, info: PaneInfo) {
         self.info = info;
         self.last_seen_at = epoch_ms();
+    }
+
+    /// Update from a status update (from Lua hooks)
+    ///
+    /// Updates title, dimensions, cursor, and alt-screen state from the IPC payload.
+    /// Returns whether the alt-screen state changed.
+    pub fn update_from_status(
+        &mut self,
+        title: Option<String>,
+        dimensions: Option<(u32, u32)>,
+        cursor: Option<(u32, u32)>,
+        is_alt_screen: bool,
+        ts: i64,
+    ) -> bool {
+        let alt_changed = self.is_alt_screen != is_alt_screen;
+
+        // Update title if provided
+        if let Some(new_title) = title {
+            self.info.title = Some(new_title);
+        }
+
+        // Update dimensions if provided
+        if let Some((cols, rows)) = dimensions {
+            self.info.cols = Some(cols);
+            self.info.rows = Some(rows);
+        }
+
+        // Update cursor if provided
+        if let Some((col, row)) = cursor {
+            self.info.cursor_x = Some(col);
+            self.info.cursor_y = Some(row);
+        }
+
+        self.is_alt_screen = is_alt_screen;
+        self.last_status_at = Some(ts);
+        self.last_seen_at = epoch_ms();
+
+        alt_changed
     }
 
     /// Check if this pane should be observed
@@ -193,6 +320,7 @@ impl PaneEntry {
     pub fn to_pane_record(&self) -> PaneRecord {
         PaneRecord {
             pane_id: self.info.pane_id,
+            pane_uuid: Some(self.pane_uuid.clone()),
             domain: self.info.inferred_domain(),
             window_id: Some(self.info.window_id),
             tab_id: Some(self.info.tab_id),
@@ -205,6 +333,12 @@ impl PaneEntry {
             ignore_reason: self.observation.ignore_reason().map(ToString::to_string),
             last_decision_at: Some(self.decision_at),
         }
+    }
+
+    /// Get the pane UUID
+    #[must_use]
+    pub fn uuid(&self) -> &str {
+        &self.pane_uuid
     }
 }
 
@@ -411,6 +545,8 @@ impl PaneCursor {
 pub struct PaneRegistry {
     /// Extended pane entries with fingerprints and observation state
     entries: HashMap<u64, PaneEntry>,
+    /// Reverse index: pane_uuid -> pane_id
+    uuid_index: HashMap<String, u64>,
     /// Cursors for each pane (delta extraction state)
     cursors: HashMap<u64, PaneCursor>,
     /// Pane filter configuration (cached)
@@ -429,6 +565,7 @@ impl PaneRegistry {
     pub fn new() -> Self {
         Self {
             entries: HashMap::new(),
+            uuid_index: HashMap::new(),
             cursors: HashMap::new(),
             filter_config: PaneFilterConfig::default(),
         }
@@ -439,6 +576,7 @@ impl PaneRegistry {
     pub fn with_filter(filter_config: PaneFilterConfig) -> Self {
         Self {
             entries: HashMap::new(),
+            uuid_index: HashMap::new(),
             cursors: HashMap::new(),
             filter_config,
         }
@@ -487,6 +625,7 @@ impl PaneRegistry {
                 let observation = self.decide_observation(&pane);
 
                 let entry = PaneEntry::new(pane, fingerprint, observation);
+                self.uuid_index.insert(entry.pane_uuid.clone(), pane_id);
                 self.entries.insert(pane_id, entry);
 
                 // Only create cursor if observed
@@ -510,6 +649,10 @@ impl PaneRegistry {
 
         for pane_id in &closed {
             diff.closed_panes.push(*pane_id);
+            // Remove UUID from index before removing entry
+            if let Some(entry) = self.entries.get(pane_id) {
+                self.uuid_index.remove(&entry.pane_uuid);
+            }
             self.entries.remove(pane_id);
             self.cursors.remove(pane_id);
         }
@@ -574,6 +717,26 @@ impl PaneRegistry {
     #[must_use]
     pub fn get_pane(&self, pane_id: u64) -> Option<&PaneInfo> {
         self.entries.get(&pane_id).map(|e| &e.info)
+    }
+
+    /// Get pane_id by UUID
+    #[must_use]
+    pub fn get_pane_id_by_uuid(&self, uuid: &str) -> Option<u64> {
+        self.uuid_index.get(uuid).copied()
+    }
+
+    /// Get pane entry by UUID
+    #[must_use]
+    pub fn get_entry_by_uuid(&self, uuid: &str) -> Option<&PaneEntry> {
+        self.uuid_index
+            .get(uuid)
+            .and_then(|pane_id| self.entries.get(pane_id))
+    }
+
+    /// Get pane info by UUID (convenience method)
+    #[must_use]
+    pub fn get_pane_by_uuid(&self, uuid: &str) -> Option<&PaneInfo> {
+        self.get_entry_by_uuid(uuid).map(|e| &e.info)
     }
 
     /// Get cursor for a pane
@@ -662,6 +825,47 @@ impl PaneRegistry {
             .filter(|e| !e.should_observe())
             .map(PaneEntry::to_pane_record)
             .collect()
+    }
+
+    /// Update pane state from a status update (from Lua IPC hooks).
+    ///
+    /// This updates the in-memory pane entry with title, dimensions, cursor,
+    /// and alt-screen state from the status update payload.
+    ///
+    /// Returns `Some(alt_changed)` if the pane was updated, or `None` if:
+    /// - The pane is unknown (not tracked)
+    /// - The pane is ignored (not observed)
+    ///
+    /// # Arguments
+    /// * `pane_id` - The pane ID to update
+    /// * `title` - New title (if provided)
+    /// * `dimensions` - New (cols, rows) (if provided)
+    /// * `cursor` - New (col, row) cursor position (if provided)
+    /// * `is_alt_screen` - Whether pane is in alt-screen mode
+    /// * `ts` - Timestamp of the status update (epoch ms)
+    pub fn update_from_status(
+        &mut self,
+        pane_id: u64,
+        title: Option<String>,
+        dimensions: Option<(u32, u32)>,
+        cursor: Option<(u32, u32)>,
+        is_alt_screen: bool,
+        ts: i64,
+    ) -> Option<bool> {
+        let entry = self.entries.get_mut(&pane_id)?;
+
+        // Don't update ignored panes
+        if !entry.should_observe() {
+            return None;
+        }
+
+        Some(entry.update_from_status(title, dimensions, cursor, is_alt_screen, ts))
+    }
+
+    /// Get the alt-screen state for a pane
+    #[must_use]
+    pub fn is_alt_screen(&self, pane_id: u64) -> Option<bool> {
+        self.entries.get(&pane_id).map(|e| e.is_alt_screen)
     }
 }
 

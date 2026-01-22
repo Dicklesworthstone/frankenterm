@@ -4455,6 +4455,7 @@ mod tests {
         rt.block_on(async {
             let pane = crate::storage::PaneRecord {
                 pane_id,
+                pane_uuid: None,
                 domain: "local".to_string(),
                 window_id: Some(1),
                 tab_id: Some(1),

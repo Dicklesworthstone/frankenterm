@@ -8,11 +8,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use tokio::sync::{RwLock, mpsc};
-use tracing::{debug, trace};
+use tokio::sync::{RwLock, Semaphore, mpsc};
+use tokio::task::JoinSet;
+use tokio::time::timeout;
+use tracing::{debug, trace, warn};
 
 use crate::ingest::{CapturedSegment, PaneCursor};
-use crate::wezterm::PaneInfo;
+use crate::wezterm::{PaneInfo, PaneTextSource};
 
 /// Configuration for the tailer supervisor.
 #[derive(Debug, Clone)]
@@ -117,7 +119,10 @@ impl PaneTailer {
 }
 
 /// Supervisor for managing multiple pane tailers.
-pub struct TailerSupervisor {
+pub struct TailerSupervisor<S>
+where
+    S: PaneTextSource + Send + Sync + 'static,
+{
     /// Configuration
     config: TailerConfig,
     /// Channel for sending capture events (will be used when actual polling is implemented)
@@ -127,6 +132,10 @@ pub struct TailerSupervisor {
     cursors: Arc<RwLock<HashMap<u64, PaneCursor>>>,
     /// Shutdown flag
     shutdown_flag: Arc<AtomicBool>,
+    /// Pane text source (WezTerm client or test double)
+    source: Arc<S>,
+    /// Concurrency limiter for in-flight polls
+    semaphore: Arc<Semaphore>,
     /// Per-pane tailer state
     tailers: HashMap<u64, PaneTailer>,
     /// Metrics
@@ -135,19 +144,26 @@ pub struct TailerSupervisor {
     supervisor_metrics: SupervisorMetrics,
 }
 
-impl TailerSupervisor {
+impl<S> TailerSupervisor<S>
+where
+    S: PaneTextSource + Send + Sync + 'static,
+{
     /// Create a new tailer supervisor.
     pub fn new(
         config: TailerConfig,
         tx: mpsc::Sender<CaptureEvent>,
         cursors: Arc<RwLock<HashMap<u64, PaneCursor>>>,
         shutdown_flag: Arc<AtomicBool>,
+        source: Arc<S>,
     ) -> Self {
+        let max_concurrent = config.max_concurrent.max(1);
         Self {
             config,
             tx,
             cursors,
             shutdown_flag,
+            source,
+            semaphore: Arc::new(Semaphore::new(max_concurrent)),
             tailers: HashMap::new(),
             metrics: TailerMetrics::default(),
             supervisor_metrics: SupervisorMetrics::default(),
@@ -203,32 +219,105 @@ impl TailerSupervisor {
             .iter()
             .filter(|(_, t)| t.should_poll())
             .map(|(id, _)| *id)
-            .take(self.config.max_concurrent)
             .collect();
 
         if ready_panes.is_empty() {
             return;
         }
 
+        let mut join_set = JoinSet::new();
+
         for pane_id in ready_panes {
-            let has_cursor = {
-                let mut cursors = self.cursors.write().await;
-                cursors.get_mut(&pane_id).is_some()
+            let tx = self.tx.clone();
+            let cursors = Arc::clone(&self.cursors);
+            let source = Arc::clone(&self.source);
+            let semaphore = Arc::clone(&self.semaphore);
+            let overlap_size = self.config.overlap_size;
+            let send_timeout = self.config.send_timeout;
+
+            join_set.spawn(async move {
+                let Ok(_permit) = semaphore.acquire_owned().await else {
+                    return (pane_id, PollOutcome::Backpressure);
+                };
+
+                let has_cursor = {
+                    let cursors = cursors.read().await;
+                    cursors.contains_key(&pane_id)
+                };
+
+                if !has_cursor {
+                    return (pane_id, PollOutcome::NoCursor);
+                }
+
+                let permit = match timeout(send_timeout, tx.reserve()).await {
+                    Ok(Ok(permit)) => permit,
+                    Ok(Err(_)) => return (pane_id, PollOutcome::ChannelClosed),
+                    Err(_) => return (pane_id, PollOutcome::Backpressure),
+                };
+
+                let text = match source.get_text(pane_id, false).await {
+                    Ok(text) => text,
+                    Err(err) => {
+                        drop(permit);
+                        return (pane_id, PollOutcome::Error(err.to_string()));
+                    }
+                };
+
+                let captured = {
+                    let mut cursors = cursors.write().await;
+                    cursors
+                        .get_mut(&pane_id)
+                        .and_then(|cursor| cursor.capture_snapshot(&text, overlap_size))
+                };
+
+                if let Some(segment) = captured {
+                    permit.send(CaptureEvent { segment });
+                    (pane_id, PollOutcome::Changed)
+                } else {
+                    drop(permit);
+                    (pane_id, PollOutcome::NoChange)
+                }
+            });
+        }
+
+        while let Some(result) = join_set.join_next().await {
+            let (pane_id, outcome) = match result {
+                Ok(value) => value,
+                Err(e) => {
+                    warn!(error = %e, "Tailer poll task failed");
+                    continue;
+                }
             };
 
-            if !has_cursor {
-                continue;
-            }
-
-            // In a real implementation, we would fetch current pane content here
-            // and call _cursor.capture_snapshot() with the content.
-            // For now, this is a placeholder - actual implementation would call wezterm CLI
-
             if let Some(tailer) = self.tailers.get_mut(&pane_id) {
-                // Placeholder: mark as no change since we're not actually polling
-                tailer.record_poll(false, &self.config);
-                self.metrics.no_change_captures += 1;
-                trace!(pane_id, "Tailer poll (placeholder - no actual capture)");
+                match outcome {
+                    PollOutcome::Changed => {
+                        tailer.record_poll(true, &self.config);
+                        self.metrics.events_sent += 1;
+                    }
+                    PollOutcome::NoChange => {
+                        tailer.record_poll(false, &self.config);
+                        self.metrics.no_change_captures += 1;
+                        trace!(pane_id, "Tailer poll no change");
+                    }
+                    PollOutcome::Backpressure => {
+                        tailer.record_poll(false, &self.config);
+                        self.metrics.send_timeouts += 1;
+                        warn!(pane_id, "Tailer backpressure: capture queue full");
+                    }
+                    PollOutcome::NoCursor => {
+                        tailer.record_poll(false, &self.config);
+                        trace!(pane_id, "Tailer poll skipped (no cursor)");
+                    }
+                    PollOutcome::ChannelClosed => {
+                        tailer.record_poll(false, &self.config);
+                        warn!(pane_id, "Tailer channel closed");
+                    }
+                    PollOutcome::Error(error) => {
+                        tailer.record_poll(false, &self.config);
+                        warn!(pane_id, error = %error, "Tailer poll failed");
+                    }
+                }
             }
         }
     }
@@ -255,9 +344,110 @@ impl TailerSupervisor {
     }
 }
 
+#[derive(Debug)]
+enum PollOutcome {
+    Changed,
+    NoChange,
+    Backpressure,
+    NoCursor,
+    ChannelClosed,
+    Error(String),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn make_pane(id: u64) -> PaneInfo {
+        PaneInfo {
+            pane_id: id,
+            tab_id: 0,
+            window_id: 0,
+            domain_id: None,
+            domain_name: None,
+            workspace: None,
+            size: None,
+            rows: Some(24),
+            cols: Some(80),
+            cwd: None,
+            title: None,
+            tty_name: None,
+            cursor_x: Some(0),
+            cursor_y: Some(0),
+            cursor_visibility: None,
+            left_col: None,
+            top_row: None,
+            is_active: id == 1,
+            is_zoomed: false,
+            extra: std::collections::HashMap::new(),
+        }
+    }
+
+    #[derive(Default)]
+    struct StaticSource;
+
+    impl PaneTextSource for StaticSource {
+        type Fut<'a> = Pin<Box<dyn Future<Output = crate::Result<String>> + Send + 'a>>;
+
+        fn get_text(&self, _pane_id: u64, _escapes: bool) -> Self::Fut<'_> {
+            Box::pin(async { Ok(String::new()) })
+        }
+    }
+
+    #[derive(Default)]
+    struct FixedSource;
+
+    impl PaneTextSource for FixedSource {
+        type Fut<'a> = Pin<Box<dyn Future<Output = crate::Result<String>> + Send + 'a>>;
+
+        fn get_text(&self, pane_id: u64, _escapes: bool) -> Self::Fut<'_> {
+            Box::pin(async move { Ok(format!("pane-{pane_id}")) })
+        }
+    }
+
+    struct CountingSource {
+        active: Arc<AtomicUsize>,
+        max: Arc<AtomicUsize>,
+        delay: Duration,
+    }
+
+    impl CountingSource {
+        fn new(active: Arc<AtomicUsize>, max: Arc<AtomicUsize>, delay: Duration) -> Self {
+            Self { active, max, delay }
+        }
+    }
+
+    impl PaneTextSource for CountingSource {
+        type Fut<'a> = Pin<Box<dyn Future<Output = crate::Result<String>> + Send + 'a>>;
+
+        fn get_text(&self, pane_id: u64, _escapes: bool) -> Self::Fut<'_> {
+            let active = Arc::clone(&self.active);
+            let max = Arc::clone(&self.max);
+            let delay = self.delay;
+            Box::pin(async move {
+                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                loop {
+                    let observed = max.load(Ordering::SeqCst);
+                    if current <= observed {
+                        break;
+                    }
+                    if max
+                        .compare_exchange(observed, current, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                    {
+                        break;
+                    }
+                }
+
+                tokio::time::sleep(delay).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                Ok(format!("pane-{pane_id}-tick"))
+            })
+        }
+    }
 
     #[test]
     fn tailer_config_default() {
@@ -313,63 +503,16 @@ mod tests {
         let (tx, _rx) = mpsc::channel(10);
         let cursors = Arc::new(RwLock::new(HashMap::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
 
-        let mut supervisor = TailerSupervisor::new(config, tx, cursors, shutdown);
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, shutdown, source);
 
         assert_eq!(supervisor.active_count(), 0);
 
         // Add some panes
         let mut panes = HashMap::new();
-        panes.insert(
-            1,
-            PaneInfo {
-                pane_id: 1,
-                tab_id: 0,
-                window_id: 0,
-                domain_id: None,
-                domain_name: None,
-                workspace: None,
-                size: None,
-                rows: Some(24),
-                cols: Some(80),
-                cwd: None,
-                title: None,
-                tty_name: None,
-                cursor_x: Some(0),
-                cursor_y: Some(0),
-                cursor_visibility: None,
-                left_col: None,
-                top_row: None,
-                is_active: true,
-                is_zoomed: false,
-                extra: std::collections::HashMap::new(),
-            },
-        );
-        panes.insert(
-            2,
-            PaneInfo {
-                pane_id: 2,
-                tab_id: 0,
-                window_id: 0,
-                domain_id: None,
-                domain_name: None,
-                workspace: None,
-                size: None,
-                rows: Some(24),
-                cols: Some(80),
-                cwd: None,
-                title: None,
-                tty_name: None,
-                cursor_x: Some(0),
-                cursor_y: Some(0),
-                cursor_visibility: None,
-                left_col: None,
-                top_row: None,
-                is_active: false,
-                is_zoomed: false,
-                extra: std::collections::HashMap::new(),
-            },
-        );
+        panes.insert(1, make_pane(1));
+        panes.insert(2, make_pane(2));
 
         supervisor.sync_tailers(&panes);
         assert_eq!(supervisor.active_count(), 2);
@@ -378,6 +521,84 @@ mod tests {
         panes.remove(&1);
         supervisor.sync_tailers(&panes);
         assert_eq!(supervisor.active_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn supervisor_respects_concurrency_limit() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let max = Arc::new(AtomicUsize::new(0));
+        let source = Arc::new(CountingSource::new(
+            Arc::clone(&active),
+            Arc::clone(&max),
+            Duration::from_millis(20),
+        ));
+
+        let config = TailerConfig {
+            min_interval: Duration::from_millis(1),
+            max_interval: Duration::from_millis(50),
+            max_concurrent: 2,
+            send_timeout: Duration::from_millis(50),
+            ..Default::default()
+        };
+
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        {
+            let mut cursor_guard = cursors.write().await;
+            for pane_id in 1..=4 {
+                cursor_guard.insert(pane_id, PaneCursor::new(pane_id));
+            }
+        }
+
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, shutdown, source);
+
+        let mut panes = HashMap::new();
+        for pane_id in 1..=4 {
+            panes.insert(pane_id, make_pane(pane_id));
+        }
+        supervisor.sync_tailers(&panes);
+
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        supervisor.poll_once().await;
+
+        let max_seen = max.load(Ordering::SeqCst);
+        assert!(max_seen <= 2, "max concurrency observed: {max_seen}");
+    }
+
+    #[tokio::test]
+    async fn supervisor_backpressure_records_timeout() {
+        let source = Arc::new(FixedSource);
+        let config = TailerConfig {
+            min_interval: Duration::from_millis(1),
+            max_interval: Duration::from_millis(50),
+            max_concurrent: 2,
+            send_timeout: Duration::from_millis(10),
+            ..Default::default()
+        };
+
+        let (tx, _rx) = mpsc::channel(1);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        {
+            let mut cursor_guard = cursors.write().await;
+            cursor_guard.insert(1, PaneCursor::new(1));
+            cursor_guard.insert(2, PaneCursor::new(2));
+        }
+
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, shutdown, source);
+
+        let mut panes = HashMap::new();
+        panes.insert(1, make_pane(1));
+        panes.insert(2, make_pane(2));
+        supervisor.sync_tailers(&panes);
+
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        supervisor.poll_once().await;
+
+        assert!(supervisor.metrics().send_timeouts >= 1);
     }
 
     #[test]

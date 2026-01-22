@@ -36,6 +36,7 @@ fn test_pane(pane_id: u64) -> PaneRecord {
     let now = now_ms();
     PaneRecord {
         pane_id,
+        pane_uuid: None,
         domain: "local".to_string(),
         window_id: Some(1),
         tab_id: Some(1),

@@ -53,3 +53,6 @@ doc/
 
 # E2E test artifacts (runtime)
 e2e-artifacts/
+
+# Fuzzing artifacts
+fuzz/artifacts/

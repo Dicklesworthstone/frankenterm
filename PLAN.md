@@ -4244,6 +4244,27 @@ Selective vendoring gives us the best of both worlds when needed.
 - **CLI**: Essential for shell scripts, human debugging, composability
 - Both share the same core logic
 
+### 21.5 Schema Source of Truth + Client Generation Strategy
+
+**Decision:** Rust structs are the single source of truth. JSON Schema files are generated
+from Rust and committed under `docs/json-schema/` for downstream consumers.
+
+**Rationale:**
+- Rust types already drive behavior and validation; duplicating schema logic invites drift.
+- Generated schemas keep machine contracts in sync with code.
+- Committed artifacts are easy to consume without Rust tooling.
+
+**Client targets (v0.1):**
+- **TypeScript**: Primary external consumer (tooling and agent integrations).
+- **Rust**: Native use via the same structs (no extra generation needed).
+- **Python**: Defer to Phase 2 unless a concrete integration requires it.
+
+**Versioning policy:**
+- Embed `schema_version` in the robot/MCP envelope.
+- **Additive-only changes** keep the same `schema_version`.
+- **Breaking changes** require a `schema_version` bump and a `wa` major version bump.
+- CI will regenerate schemas and fail if committed artifacts drift.
+
 ---
 
 ## 22. Open Questions

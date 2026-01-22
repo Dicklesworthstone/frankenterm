@@ -396,6 +396,8 @@ pub struct Gap {
 pub struct PaneRecord {
     /// Pane ID (from WezTerm)
     pub pane_id: u64,
+    /// Stable pane UUID (persists across renames/moves)
+    pub pane_uuid: Option<String>,
     /// Domain name
     pub domain: String,
     /// Window ID
@@ -1030,6 +1032,12 @@ impl StorageHandle {
     /// Returns an error if the database cannot be opened or schema fails.
     pub async fn new(db_path: &str) -> Result<Self> {
         Self::with_config(db_path, StorageConfig::default()).await
+    }
+
+    /// Return the database path backing this storage handle.
+    #[must_use]
+    pub fn db_path(&self) -> &str {
+        self.db_path.as_str()
     }
 
     /// Create a storage handle with custom configuration
@@ -3080,6 +3088,7 @@ fn query_panes(conn: &Connection) -> Result<Vec<PaneRecord>> {
                         val as u64
                     }
                 },
+                pane_uuid: None, // Not yet in schema
                 domain: row.get(1)?,
                 window_id: {
                     let val: Option<i64> = row.get(2)?;
@@ -3129,6 +3138,7 @@ fn query_pane(conn: &Connection, pane_id: u64) -> Result<Option<PaneRecord>> {
                         val as u64
                     }
                 },
+                pane_uuid: None, // Not yet in schema
                 domain: row.get(1)?,
                 window_id: {
                     let val: Option<i64> = row.get(2)?;
@@ -5397,6 +5407,7 @@ mod storage_handle_tests {
         let now = now_ms();
         PaneRecord {
             pane_id,
+            pane_uuid: None,
             domain: "local".to_string(),
             window_id: None,
             tab_id: None,
@@ -5766,6 +5777,7 @@ mod storage_handle_tests {
         // Create pane first (foreign key constraint)
         let pane = PaneRecord {
             pane_id: 1,
+            pane_uuid: None,
             domain: "local".to_string(),
             window_id: None,
             tab_id: None,
@@ -5834,6 +5846,7 @@ mod proptest_tests {
         let now = now_ms();
         PaneRecord {
             pane_id,
+            pane_uuid: None,
             domain: "local".to_string(),
             window_id: None,
             tab_id: None,

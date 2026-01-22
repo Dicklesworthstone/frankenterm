@@ -96,10 +96,22 @@
     "negative_for": "claude_code.compaction"
   },
   {
+    "name": "claude_compaction_complete_positive",
+    "text": "Compaction complete, saved 50,000 tokens",
+    "expected_rule_ids": ["claude_code.compaction.complete"],
+    "expected_extracted": {"tokens_saved": "50,000"}
+  },
+  {
+    "name": "claude_compaction_complete_negative",
+    "text": "The conversation has not been compacted",
+    "expected_rule_ids": [],
+    "negative_for": "claude_code.compaction.complete"
+  },
+  {
     "name": "claude_banner_positive",
-    "text": "Claude Code v1.2.3 starting session with model: claude-opus-4-5-20251101",
+    "text": "Claude Code v1.2.3 starting session",
     "expected_rule_ids": ["claude_code.banner"],
-    "expected_extracted": {"version": "1.2.3", "model": "claude-opus-4-5-20251101"}
+    "expected_extracted": {"version": "1.2.3"}
   },
   {
     "name": "claude_banner_negative",
@@ -132,6 +144,18 @@
     "negative_for": "claude_code.usage.reached"
   },
   {
+    "name": "claude_approval_needed_positive",
+    "text": "Do you want to allow this command?",
+    "expected_rule_ids": ["claude_code.approval_needed"],
+    "expected_extracted": {"action": "allow"}
+  },
+  {
+    "name": "claude_approval_needed_negative",
+    "text": "The operation completed successfully",
+    "expected_rule_ids": [],
+    "negative_for": "claude_code.approval_needed"
+  },
+  {
     "name": "claude_cost_summary_positive",
     "text": "Session complete. Total cost: $1.25",
     "expected_rule_ids": ["claude_code.session.cost_summary"],
@@ -153,6 +177,100 @@
     "text": "Error: invalid key - please check your API_TOKEN",
     "expected_rule_ids": [],
     "negative_for": "claude_code.auth.api_key_error"
+  },
+  {
+    "name": "claude_context_warning_positive",
+    "text": "Warning: context window 85% context used",
+    "expected_rule_ids": ["claude_code.context.warning"],
+    "expected_extracted": {"percent": "85"}
+  },
+  {
+    "name": "claude_context_warning_negative",
+    "text": "Memory usage at 85%",
+    "expected_rule_ids": [],
+    "negative_for": "claude_code.context.warning"
+  },
+  {
+    "name": "claude_error_network_positive",
+    "text": "Error: connection failed to API server",
+    "expected_rule_ids": ["claude_code.error.network"]
+  },
+  {
+    "name": "claude_error_network_negative",
+    "text": "Error: failed to parse response",
+    "expected_rule_ids": [],
+    "negative_for": "claude_code.error.network"
+  },
+  {
+    "name": "claude_error_overloaded_positive",
+    "text": "Server overloaded, please retry in 30 seconds",
+    "expected_rule_ids": ["claude_code.error.overloaded"],
+    "expected_extracted": {"retry_after": "30"}
+  },
+  {
+    "name": "claude_error_overloaded_negative",
+    "text": "Server error, please try again later",
+    "expected_rule_ids": [],
+    "negative_for": "claude_code.error.overloaded"
+  },
+  {
+    "name": "claude_error_timeout_positive",
+    "text": "Request timed out after 30 seconds",
+    "expected_rule_ids": ["claude_code.error.timeout"],
+    "expected_extracted": {"duration": "30"}
+  },
+  {
+    "name": "claude_error_timeout_negative",
+    "text": "Request failed with error code 500",
+    "expected_rule_ids": [],
+    "negative_for": "claude_code.error.timeout"
+  },
+  {
+    "name": "claude_model_selected_positive",
+    "text": "Using model: claude-opus-4-20250101",
+    "expected_rule_ids": ["claude_code.model.selected"],
+    "expected_extracted": {"model": "claude-opus-4-20250101"}
+  },
+  {
+    "name": "claude_model_selected_negative",
+    "text": "Using model: gpt-4o",
+    "expected_rule_ids": [],
+    "negative_for": "claude_code.model.selected"
+  },
+  {
+    "name": "claude_session_end_positive",
+    "text": "Session ended. Thank you for using Claude Code.",
+    "expected_rule_ids": ["claude_code.session.end"]
+  },
+  {
+    "name": "claude_session_end_negative",
+    "text": "Session started. Welcome to Claude Code.",
+    "expected_rule_ids": [],
+    "negative_for": "claude_code.session.end"
+  },
+  {
+    "name": "claude_thinking_positive",
+    "text": "Thinking for 15 seconds on complex problem",
+    "expected_rule_ids": ["claude_code.thinking"],
+    "expected_extracted": {"duration": "15"}
+  },
+  {
+    "name": "claude_thinking_negative",
+    "text": "Processing request...",
+    "expected_rule_ids": [],
+    "negative_for": "claude_code.thinking"
+  },
+  {
+    "name": "claude_tool_use_positive",
+    "text": "Using tool: Bash",
+    "expected_rule_ids": ["claude_code.tool_use"],
+    "expected_extracted": {"tool_name": "Bash"}
+  },
+  {
+    "name": "claude_tool_use_negative",
+    "text": "Running command: npm install",
+    "expected_rule_ids": [],
+    "negative_for": "claude_code.tool_use"
   },
   {
     "name": "gemini_usage_reached_positive",

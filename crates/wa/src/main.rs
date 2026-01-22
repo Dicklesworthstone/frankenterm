@@ -231,6 +231,12 @@ enum Commands {
         #[command(subcommand)]
         command: SetupCommands,
     },
+
+    /// Configuration management commands
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -409,9 +415,61 @@ enum SetupCommands {
     Config,
 }
 
+#[derive(Subcommand)]
+enum ConfigCommands {
+    /// Initialize configuration (creates default config if absent)
+    Init {
+        /// Overwrite existing config (dangerous)
+        #[arg(long)]
+        force: bool,
+
+        /// Custom config path (default: ./wa.toml or ~/.config/wa/wa.toml)
+        #[arg(long)]
+        path: Option<String>,
+    },
+
+    /// Validate configuration file (schema + semantic checks)
+    Validate {
+        /// Custom config path to validate
+        #[arg(long)]
+        path: Option<String>,
+
+        /// Strict validation (fail on warnings)
+        #[arg(long)]
+        strict: bool,
+    },
+
+    /// Show current configuration
+    Show {
+        /// Show effective config including resolved paths
+        #[arg(long)]
+        effective: bool,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Custom config path
+        #[arg(long)]
+        path: Option<String>,
+    },
+
+    /// Set a configuration value
+    Set {
+        /// Configuration key (dot notation, e.g., "general.log_level")
+        key: String,
+
+        /// Value to set
+        value: String,
+
+        /// Custom config path
+        #[arg(long)]
+        path: Option<String>,
+    },
+}
+
 const ROBOT_ERR_INVALID_ARGS: &str = "robot.invalid_args";
 const ROBOT_ERR_UNKNOWN_SUBCOMMAND: &str = "robot.unknown_subcommand";
-const ROBOT_ERR_NOT_IMPLEMENTED: &str = "robot.not_implemented";
 const ROBOT_ERR_CONFIG: &str = "robot.config_error";
 const ROBOT_ERR_FTS_QUERY: &str = "robot.fts_query_error";
 const ROBOT_ERR_STORAGE: &str = "robot.storage_error";
@@ -1472,7 +1530,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
     let Cli {
         verbose,
-        config,
+        config: cli_config_arg,
         workspace,
         command,
     } = cli;
@@ -1482,7 +1540,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
         overrides.log_level = Some("debug".to_string());
     }
 
-    let config_path = config.as_deref().map(Path::new);
+    let config_path = cli_config_arg.as_deref().map(Path::new);
     let config = match wa_core::config::Config::load_with_overrides(
         config_path,
         config_path.is_some(),
@@ -1643,6 +1701,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             timeout_secs,
                             wait_for_regex,
                         } => {
+                            use std::fmt::Write as _;
+
                             let redacted_text = redact_for_output(&text);
                             let mut command = if dry_run {
                                 format!("wa robot send {pane_id} \"{redacted_text}\" --dry-run")
@@ -1651,11 +1711,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             };
                             if let Some(pattern) = &wait_for {
                                 let redacted_pattern = redact_for_output(pattern);
-                                command.push_str(&format!(" --wait-for \"{redacted_pattern}\""));
+                                let _ = write!(command, " --wait-for \"{redacted_pattern}\"");
                                 if wait_for_regex {
                                     command.push_str(" --wait-for-regex");
                                 }
-                                command.push_str(&format!(" --timeout-secs {timeout_secs}"));
+                                let _ = write!(command, " --timeout-secs {timeout_secs}");
                             }
                             let command_ctx =
                                 wa_core::dry_run::CommandContext::new(command, dry_run);
@@ -1681,11 +1741,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 use wa_core::wezterm::{PaneWaiter, WaitMatcher, WaitOptions};
 
                                 let db_path = &ctx.effective.paths.db_path;
-                                let storage =
-                                    match wa_core::storage::StorageHandle::new(db_path).await {
-                                        Ok(s) => s,
-                                        Err(e) => {
-                                            let response =
+                                let storage = match wa_core::storage::StorageHandle::new(db_path)
+                                    .await
+                                {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        let response =
                                                 RobotResponse::<RobotSendData>::error_with_code(
                                                     ROBOT_ERR_STORAGE,
                                                     format!("Failed to open storage: {e}"),
@@ -1695,13 +1756,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                     ),
                                                     elapsed_ms(start),
                                                 );
-                                            println!(
-                                                "{}",
-                                                serde_json::to_string_pretty(&response)?
-                                            );
-                                            return Ok(());
-                                        }
-                                    };
+                                        println!("{}", serde_json::to_string_pretty(&response)?);
+                                        return Ok(());
+                                    }
+                                };
 
                                 let wezterm = wa_core::wezterm::WeztermClient::new();
                                 let pane_info = match wezterm.get_pane(pane_id).await {
@@ -1715,10 +1773,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 hint,
                                                 elapsed_ms(start),
                                             );
-                                        println!(
-                                            "{}",
-                                            serde_json::to_string_pretty(&response)?
-                                        );
+                                        println!("{}", serde_json::to_string_pretty(&response)?);
                                         return Ok(());
                                     }
                                 };
@@ -1736,12 +1791,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 let capabilities = PaneCapabilities::prompt();
 
                                 let summary = engine.redact_secrets(&text);
-                                let mut input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
-                                    .with_pane(pane_id)
-                                    .with_domain(domain.clone())
-                                    .with_capabilities(capabilities)
-                                    .with_text_summary(&summary)
-                                    .with_command_text(&text);
+                                let input =
+                                    PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+                                        .with_pane(pane_id)
+                                        .with_domain(domain.clone())
+                                        .with_capabilities(capabilities)
+                                        .with_text_summary(&summary)
+                                        .with_command_text(&text);
 
                                 let mut decision = engine.authorize(&input);
                                 if decision.requires_approval() {
@@ -1756,12 +1812,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     {
                                         Ok(updated) => updated,
                                         Err(e) => {
-                                            let response = RobotResponse::<RobotSendData>::error_with_code(
-                                                "robot.approval_error",
-                                                format!("Failed to issue approval token: {e}"),
-                                                None,
-                                                elapsed_ms(start),
-                                            );
+                                            let response =
+                                                RobotResponse::<RobotSendData>::error_with_code(
+                                                    "robot.approval_error",
+                                                    format!("Failed to issue approval token: {e}"),
+                                                    None,
+                                                    elapsed_ms(start),
+                                                );
                                             println!(
                                                 "{}",
                                                 serde_json::to_string_pretty(&response)?
@@ -1773,8 +1830,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                                 let injection = match decision {
                                     PolicyDecision::Allow { .. } => {
-                                        let send_result =
-                                            wezterm.send_text(pane_id, &text).await;
+                                        let send_result = wezterm.send_text(pane_id, &text).await;
                                         match send_result {
                                             Ok(()) => InjectionResult::Allowed {
                                                 decision,
@@ -1822,7 +1878,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     if let Some(pattern) = &wait_for {
                                         let matcher = if wait_for_regex {
                                             match fancy_regex::Regex::new(pattern) {
-                                                Ok(compiled) => WaitMatcher::regex(compiled),
+                                                Ok(compiled) => Some(WaitMatcher::regex(compiled)),
                                                 Err(e) => {
                                                     verification_error = Some(format!(
                                                         "Invalid wait-for regex: {e}"
@@ -1840,10 +1896,16 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 escapes: false,
                                                 ..WaitOptions::default()
                                             };
-                                            let waiter = PaneWaiter::new(&wezterm).with_options(options);
-                                            let timeout = std::time::Duration::from_secs(timeout_secs);
-                                            match waiter.wait_for(pane_id, &matcher, timeout).await {
-                                                Ok(wa_core::wezterm::WaitResult::Matched { elapsed_ms, polls }) => {
+                                            let waiter =
+                                                PaneWaiter::new(&wezterm).with_options(options);
+                                            let timeout =
+                                                std::time::Duration::from_secs(timeout_secs);
+                                            match waiter.wait_for(pane_id, &matcher, timeout).await
+                                            {
+                                                Ok(wa_core::wezterm::WaitResult::Matched {
+                                                    elapsed_ms,
+                                                    polls,
+                                                }) => {
                                                     wait_for_data = Some(RobotWaitForData {
                                                         pane_id,
                                                         pattern: pattern.clone(),
@@ -1853,7 +1915,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                         is_regex: wait_for_regex,
                                                     });
                                                 }
-                                                Ok(wa_core::wezterm::WaitResult::TimedOut { elapsed_ms, polls, .. }) => {
+                                                Ok(wa_core::wezterm::WaitResult::TimedOut {
+                                                    elapsed_ms,
+                                                    polls,
+                                                    ..
+                                                }) => {
                                                     wait_for_data = Some(RobotWaitForData {
                                                         pane_id,
                                                         pattern: pattern.clone(),
@@ -1867,9 +1933,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                     ));
                                                 }
                                                 Err(e) => {
-                                                    verification_error = Some(format!(
-                                                        "wait-for failed: {e}"
-                                                    ));
+                                                    verification_error =
+                                                        Some(format!("wait-for failed: {e}"));
                                                 }
                                             }
                                         }
@@ -2721,6 +2786,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                                 Some(wa_core::storage::PaneRecord {
                                     pane_id: p.pane_id,
+                                    pane_uuid: None,
                                     domain: pane_domain,
                                     window_id: Some(p.window_id),
                                     tab_id: Some(p.tab_id),
@@ -2868,19 +2934,22 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             let should_list = list || template_id.is_none();
 
             if should_list {
-                let mut ids: Vec<String> = if let Some(prefix) = category.as_deref() {
-                    let mut items: Vec<String> = list_templates_by_category(prefix)
-                        .into_iter()
-                        .map(|t| t.id.to_string())
-                        .collect();
-                    items.sort();
-                    items
-                } else {
-                    list_template_ids()
-                        .into_iter()
-                        .map(|id| id.to_string())
-                        .collect()
-                };
+                let mut ids: Vec<String> = category.as_deref().map_or_else(
+                    || {
+                        list_template_ids()
+                            .into_iter()
+                            .map(ToString::to_string)
+                            .collect()
+                    },
+                    |prefix| {
+                        let mut items: Vec<String> = list_templates_by_category(prefix)
+                            .into_iter()
+                            .map(|t| t.id.to_string())
+                            .collect();
+                        items.sort();
+                        items
+                    },
+                );
 
                 if output_format.is_json() {
                     #[derive(serde::Serialize)]
@@ -2920,40 +2989,37 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             }
 
             let id = template_id.unwrap_or_default();
-            match get_explanation(&id) {
-                Some(template) => {
-                    if output_format.is_json() {
-                        #[derive(serde::Serialize)]
-                        struct WhyTemplateResponse<'a> {
-                            ok: bool,
-                            template: &'a wa_core::explanations::ExplanationTemplate,
-                            version: &'static str,
-                        }
+            if let Some(template) = get_explanation(&id) {
+                if output_format.is_json() {
+                    #[derive(serde::Serialize)]
+                    struct WhyTemplateResponse<'a> {
+                        ok: bool,
+                        template: &'a wa_core::explanations::ExplanationTemplate,
+                        version: &'static str,
+                    }
 
-                        let response = WhyTemplateResponse {
-                            ok: true,
-                            template,
-                            version: wa_core::VERSION,
-                        };
-                        println!("{}", serde_json::to_string_pretty(&response)?);
-                    } else {
-                        let formatted = format_explanation(template, None);
-                        println!("{formatted}");
-                    }
+                    let response = WhyTemplateResponse {
+                        ok: true,
+                        template,
+                        version: wa_core::VERSION,
+                    };
+                    println!("{}", serde_json::to_string_pretty(&response)?);
+                } else {
+                    let formatted = format_explanation(template, None);
+                    println!("{formatted}");
                 }
-                None => {
-                    if output_format.is_json() {
-                        println!(
-                            r#"{{"ok": false, "error": "Unknown explanation id: {}", "hint": "Use 'wa why --list' to see available templates.", "version": "{}"}}"#,
-                            id,
-                            wa_core::VERSION
-                        );
-                    } else {
-                        eprintln!("Error: Unknown explanation id: {id}");
-                        eprintln!("Use 'wa why --list' to see available templates.");
-                    }
-                    std::process::exit(1);
+            } else {
+                if output_format.is_json() {
+                    println!(
+                        r#"{{"ok": false, "error": "Unknown explanation id: {}", "hint": "Use 'wa why --list' to see available templates.", "version": "{}"}}"#,
+                        id,
+                        wa_core::VERSION
+                    );
+                } else {
+                    eprintln!("Error: Unknown explanation id: {id}");
+                    eprintln!("Use 'wa why --list' to see available templates.");
                 }
+                std::process::exit(1);
             }
         }
 
@@ -3054,6 +3120,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             }
         },
 
+        Some(Commands::Config { command }) => {
+            handle_config_command(command, cli_config_arg.as_deref(), workspace.as_deref()).await?;
+        }
+
         None => {
             println!("wa - WezTerm Automata");
             println!();
@@ -3080,6 +3150,378 @@ fn handle_fatal_error(err: &anyhow::Error, robot_mode: bool) {
     } else {
         eprintln!("Error: {err}");
     }
+}
+
+/// Handle `wa config` subcommands
+async fn handle_config_command(
+    command: ConfigCommands,
+    cli_config: Option<&str>,
+    cli_workspace: Option<&str>,
+) -> anyhow::Result<()> {
+    use wa_core::config::{Config, ConfigOverrides};
+
+    match command {
+        ConfigCommands::Init { force, path } => {
+            // Determine config path
+            let config_path = if let Some(p) = path {
+                std::path::PathBuf::from(p)
+            } else if let Some(p) = cli_config {
+                std::path::PathBuf::from(p)
+            } else {
+                // Default: ./wa.toml, fallback to ~/.config/wa/wa.toml
+                let cwd_config = std::path::PathBuf::from("wa.toml");
+                if cwd_config.exists() && !force {
+                    anyhow::bail!(
+                        "Config file already exists at {}. Use --force to overwrite.",
+                        cwd_config.display()
+                    );
+                }
+                if cwd_config.exists() || std::env::current_dir().is_ok() {
+                    cwd_config
+                } else {
+                    dirs::config_dir()
+                        .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
+                        .join("wa")
+                        .join("wa.toml")
+                }
+            };
+
+            // Check if exists
+            if config_path.exists() && !force {
+                anyhow::bail!(
+                    "Config file already exists at {}. Use --force to overwrite.",
+                    config_path.display()
+                );
+            }
+
+            // Create parent directories
+            if let Some(parent) = config_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+
+            // Write default config
+            let _default_config = Config::default();
+            let toml_content = generate_default_config_toml();
+            std::fs::write(&config_path, toml_content)?;
+
+            println!("Created config at: {}", config_path.display());
+            println!();
+            println!("Edit this file to customize wa behavior.");
+            println!("Run `wa config validate` to check for errors.");
+        }
+
+        ConfigCommands::Validate { path, strict } => {
+            // Find config
+            let config_path = if let Some(p) = path {
+                Some(std::path::PathBuf::from(p))
+            } else if let Some(p) = cli_config {
+                Some(std::path::PathBuf::from(p))
+            } else {
+                None
+            };
+
+            let config = Config::load_with_overrides(
+                config_path.as_deref(),
+                strict,
+                &ConfigOverrides::default(),
+            )?;
+
+            // Run validation
+            config.validate()?;
+
+            let path_display = config_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "(default)".to_string());
+
+            println!("✓ Config is valid: {path_display}");
+
+            // Show any warnings (non-fatal)
+            let warnings = validate_config_warnings(&config);
+            if !warnings.is_empty() {
+                println!();
+                println!("Warnings:");
+                for warning in &warnings {
+                    println!("  ⚠ {warning}");
+                }
+                if strict {
+                    anyhow::bail!("{} warning(s) found in strict mode", warnings.len());
+                }
+            }
+        }
+
+        ConfigCommands::Show {
+            effective,
+            json,
+            path,
+        } => {
+            // Find config
+            let config_path = if let Some(p) = path {
+                Some(std::path::PathBuf::from(p))
+            } else if let Some(p) = cli_config {
+                Some(std::path::PathBuf::from(p))
+            } else {
+                None
+            };
+
+            let config = Config::load_with_overrides(
+                config_path.as_deref(),
+                false,
+                &ConfigOverrides::default(),
+            )?;
+
+            if effective {
+                // Show effective config with resolved paths
+                let workspace_root = cli_workspace.map(std::path::PathBuf::from);
+                let effective_config = config.effective_config(workspace_root.as_deref())?;
+
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&effective_config)?);
+                } else {
+                    println!("Effective Configuration");
+                    println!("=======================");
+                    println!();
+                    println!("Paths:");
+                    println!(
+                        "  workspace_root: {}",
+                        effective_config.paths.workspace_root
+                    );
+                    println!("  wa_dir:         {}", effective_config.paths.wa_dir);
+                    println!("  db_path:        {}", effective_config.paths.db_path);
+                    println!("  lock_path:      {}", effective_config.paths.lock_path);
+                    println!(
+                        "  ipc_socket:     {}",
+                        effective_config.paths.ipc_socket_path
+                    );
+                    println!("  logs_dir:       {}", effective_config.paths.logs_dir);
+                    println!("  log_path:       {}", effective_config.paths.log_path);
+                    println!();
+                    println!("Settings:");
+                    println!(
+                        "  log_level:      {}",
+                        effective_config.config.general.log_level
+                    );
+                    println!(
+                        "  log_format:     {}",
+                        effective_config.config.general.log_format
+                    );
+                    println!(
+                        "  poll_interval:  {}ms",
+                        effective_config.config.ingest.poll_interval_ms
+                    );
+                    println!(
+                        "  retention_days: {}",
+                        effective_config.config.storage.retention_days
+                    );
+                }
+            } else {
+                // Show raw config
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&config)?);
+                } else {
+                    // Re-serialize to TOML for display
+                    let toml_str =
+                        toml::to_string_pretty(&config).unwrap_or_else(|_| format!("{config:?}"));
+                    println!("{toml_str}");
+                }
+            }
+        }
+
+        ConfigCommands::Set { key, value, path } => {
+            // Find config path
+            let config_path = if let Some(p) = path {
+                std::path::PathBuf::from(p)
+            } else if let Some(p) = cli_config {
+                std::path::PathBuf::from(p)
+            } else {
+                // Default to ./wa.toml or user config
+                let cwd_config = std::path::PathBuf::from("wa.toml");
+                if cwd_config.exists() {
+                    cwd_config
+                } else {
+                    dirs::config_dir()
+                        .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
+                        .join("wa")
+                        .join("wa.toml")
+                }
+            };
+
+            // Read existing config
+            let content = if config_path.exists() {
+                std::fs::read_to_string(&config_path)?
+            } else {
+                generate_default_config_toml()
+            };
+
+            // Parse as TOML value for modification
+            let mut doc = content.parse::<toml_edit::DocumentMut>().map_err(|e| {
+                anyhow::anyhow!("Failed to parse config: {e}")
+            })?;
+
+            // Split key by dots
+            let parts: Vec<&str> = key.split('.').collect();
+            if parts.is_empty() {
+                anyhow::bail!("Invalid key: empty");
+            }
+
+            // Navigate to the target and set value
+            set_toml_value(&mut doc, &parts, &value)?;
+
+            // Create parent directory if needed
+            if let Some(parent) = config_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+
+            // Write back
+            std::fs::write(&config_path, doc.to_string())?;
+
+            println!("Set {key} = {value}");
+            println!("Config file: {}", config_path.display());
+        }
+    }
+
+    Ok(())
+}
+
+/// Generate default config TOML with comments
+fn generate_default_config_toml() -> String {
+    r#"# wa configuration file
+# See: https://github.com/your-org/wezterm-automata for documentation
+
+[general]
+# Log level: trace, debug, info, warn, error
+log_level = "info"
+# Log format: pretty (human) or json (machine)
+log_format = "pretty"
+# Optional log file path
+# log_file = "~/.wa/wa.log"
+
+[ingest]
+# Base poll interval in milliseconds
+poll_interval_ms = 200
+# Minimum poll interval (adaptive polling lower bound)
+min_poll_interval_ms = 50
+# Maximum concurrent pane captures
+max_concurrent_captures = 10
+# Enable gap detection
+gap_detection = true
+
+[storage]
+# Database file name (relative to workspace .wa/ directory)
+db_path = "wa.db"
+# Retention period in days (0 = unlimited)
+retention_days = 30
+# Maximum database size in MB (0 = unlimited)
+retention_max_mb = 1000
+
+[patterns]
+# Enabled pattern packs
+enabled_packs = ["builtin:core"]
+
+[workflows]
+# Enable workflow execution
+enabled = true
+# Maximum concurrent workflows
+max_concurrent = 3
+
+[safety]
+# Require prompt to be active for send operations
+require_prompt_active = true
+# Block sends during alt-screen
+block_alt_screen = true
+# Block sends when there's a recent capture gap
+block_recent_gap = true
+"#
+    .to_string()
+}
+
+/// Validate config and return warnings (non-fatal issues)
+fn validate_config_warnings(config: &wa_core::config::Config) -> Vec<String> {
+    let mut warnings = Vec::new();
+
+    if config.ingest.poll_interval_ms < 50 {
+        warnings.push(format!(
+            "poll_interval_ms ({}) is very low; may cause high CPU usage",
+            config.ingest.poll_interval_ms
+        ));
+    }
+
+    if config.storage.retention_days == 0 && config.storage.retention_max_mb == 0 {
+        warnings.push(
+            "Both retention_days and retention_max_mb are 0; database may grow unbounded"
+                .to_string(),
+        );
+    }
+
+    if config.ingest.max_concurrent_captures > 50 {
+        warnings.push(format!(
+            "max_concurrent_captures ({}) is very high; may cause system instability",
+            config.ingest.max_concurrent_captures
+        ));
+    }
+
+    warnings
+}
+
+/// Set a value in a TOML document using dot-notation path
+fn set_toml_value(
+    doc: &mut toml_edit::DocumentMut,
+    path: &[&str],
+    value: &str,
+) -> anyhow::Result<()> {
+    if path.is_empty() {
+        anyhow::bail!("Empty path");
+    }
+
+    // Navigate to the parent table
+    let mut current: &mut toml_edit::Item = doc.as_item_mut();
+    for (i, part) in path.iter().enumerate() {
+        if i == path.len() - 1 {
+            // Last element - set the value
+            if let Some(table) = current.as_table_mut() {
+                // Try to parse the value as appropriate type
+                let toml_value = parse_toml_value(value);
+                table[*part] = toml_value;
+            } else {
+                anyhow::bail!("Cannot set value: parent is not a table");
+            }
+        } else {
+            // Intermediate element - navigate or create table
+            if let Some(table) = current.as_table_mut() {
+                if !table.contains_key(*part) {
+                    table[*part] = toml_edit::Item::Table(toml_edit::Table::new());
+                }
+                current = &mut table[*part];
+            } else {
+                anyhow::bail!("Cannot navigate: {} is not a table", path[..=i].join("."));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Parse a string value into appropriate TOML type
+fn parse_toml_value(value: &str) -> toml_edit::Item {
+    // Try integer
+    if let Ok(n) = value.parse::<i64>() {
+        return toml_edit::value(n);
+    }
+
+    // Try float
+    if let Ok(f) = value.parse::<f64>() {
+        return toml_edit::value(f);
+    }
+
+    // Try boolean
+    match value.to_lowercase().as_str() {
+        "true" => return toml_edit::value(true),
+        "false" => return toml_edit::value(false),
+        _ => {}
+    }
+
+    // Default to string
+    toml_edit::value(value)
 }
 
 #[cfg(test)]

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/wa",
     "crates/wa-core",
+    "fuzz",
 ]
 
 # Crate boundary rules:
@@ -70,6 +71,7 @@ sha2 = "0.10"
 
 # Config
 toml = "0.8"
+toml_edit = "0.22"
 
 # File locking
 fs2 = "0.4"

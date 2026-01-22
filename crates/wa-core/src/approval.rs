@@ -305,6 +305,7 @@ mod tests {
         let storage = StorageHandle::new(&db_path_str).await.unwrap();
         let pane = PaneRecord {
             pane_id: 1,
+            pane_uuid: None,
             domain: "local".to_string(),
             window_id: None,
             tab_id: None,
@@ -356,6 +357,7 @@ mod tests {
         let storage = StorageHandle::new(&db_path_str).await.unwrap();
         let pane = PaneRecord {
             pane_id: 1,
+            pane_uuid: None,
             domain: "local".to_string(),
             window_id: None,
             tab_id: None,
@@ -399,6 +401,7 @@ mod tests {
         let storage = StorageHandle::new(&db_path_str).await.unwrap();
         let pane = PaneRecord {
             pane_id: 1,
+            pane_uuid: None,
             domain: "local".to_string(),
             window_id: None,
             tab_id: None,
@@ -439,6 +442,7 @@ mod tests {
         let storage = StorageHandle::new(&db_path_str).await.unwrap();
         let pane = PaneRecord {
             pane_id: 1,
+            pane_uuid: None,
             domain: "local".to_string(),
             window_id: None,
             tab_id: None,
@@ -492,6 +496,7 @@ mod tests {
         let storage = StorageHandle::new(&db_path_str).await.unwrap();
         let pane = PaneRecord {
             pane_id: 1,
+            pane_uuid: None,
             domain: "local".to_string(),
             window_id: None,
             tab_id: None,
