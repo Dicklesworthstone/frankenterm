@@ -1,0 +1,11 @@
+[
+  {
+    "rule_id": "claude_code.error.network",
+    "agent_type": "claude_code",
+    "event_type": "error.network",
+    "severity": "critical",
+    "confidence": 0.95,
+    "extracted": {},
+    "matched_text": "connection failed"
+  }
+]

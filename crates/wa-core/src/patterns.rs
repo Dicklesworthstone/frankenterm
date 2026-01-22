@@ -600,6 +600,188 @@ fn builtin_claude_code_pack() -> PatternPack {
                 remediation: Some("Check ANTHROPIC_API_KEY environment variable".to_string()),
                 workflow: None,
             },
+            // Tool use indicator
+            RuleDef {
+                id: "claude_code.tool_use".to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: "session.tool_use".to_string(),
+                severity: Severity::Info,
+                anchors: vec![
+                    "Using tool".to_string(),
+                    "Tool call:".to_string(),
+                    "Executing:".to_string(),
+                ],
+                regex: Some(
+                    r"(?:Using tool|Tool call|Executing)[:\s]+(?P<tool_name>Bash|Read|Write|Edit|Glob|Grep|Task|WebFetch|WebSearch|TodoWrite|NotebookEdit)".to_string()
+                ),
+                description: "Claude Code tool invocation".to_string(),
+                remediation: None,
+                workflow: None,
+            },
+            // Approval/permission needed
+            RuleDef {
+                id: "claude_code.approval_needed".to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: "session.approval_needed".to_string(),
+                severity: Severity::Warning,
+                anchors: vec![
+                    "Approve?".to_string(),
+                    "Allow?".to_string(),
+                    "Permission".to_string(),
+                    "Do you want".to_string(),
+                ],
+                regex: Some(
+                    r"(?P<action>run|execute|write|delete|send|allow|proceed).*?\?".to_string()
+                ),
+                description: "Claude Code approval/permission prompt".to_string(),
+                remediation: Some("User input required for approval".to_string()),
+                workflow: None,
+            },
+            // Context window warning
+            RuleDef {
+                id: "claude_code.context.warning".to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: "context.warning".to_string(),
+                severity: Severity::Warning,
+                anchors: vec![
+                    "context window".to_string(),
+                    "context limit".to_string(),
+                    "running low on context".to_string(),
+                ],
+                regex: Some(
+                    r"(?P<percent>\d+)%?\s*(?:of context|context (?:used|remaining))".to_string()
+                ),
+                description: "Claude Code context window warning".to_string(),
+                remediation: Some("Consider compacting or starting new session".to_string()),
+                workflow: None,
+            },
+            // Extended thinking indicator
+            RuleDef {
+                id: "claude_code.thinking".to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: "session.thinking".to_string(),
+                severity: Severity::Info,
+                anchors: vec![
+                    "Thinking".to_string(),
+                    "Extended thinking".to_string(),
+                    "ultrathink".to_string(),
+                ],
+                regex: Some(
+                    r"(?:Thinking|Extended thinking)(?:\.{3}|\s+for\s+(?P<duration>\d+)\s*(?:seconds?|s))".to_string()
+                ),
+                description: "Claude Code extended thinking mode".to_string(),
+                remediation: None,
+                workflow: None,
+            },
+            // Network/connection error
+            RuleDef {
+                id: "claude_code.error.network".to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: "error.network".to_string(),
+                severity: Severity::Critical,
+                anchors: vec![
+                    "connection".to_string(),
+                    "network error".to_string(),
+                    "failed to connect".to_string(),
+                    "ECONNREFUSED".to_string(),
+                ],
+                regex: Some(
+                    r"(?:connection|network)\s+(?:error|failed|refused|timeout|closed)".to_string()
+                ),
+                description: "Claude Code network/connection error".to_string(),
+                remediation: Some("Check network connectivity and retry".to_string()),
+                workflow: None,
+            },
+            // Timeout error
+            RuleDef {
+                id: "claude_code.error.timeout".to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: "error.timeout".to_string(),
+                severity: Severity::Warning,
+                anchors: vec![
+                    "timed out".to_string(),
+                    "timeout".to_string(),
+                    "request timeout".to_string(),
+                ],
+                regex: Some(
+                    r"(?:timed? out|timeout)\s*(?:after\s+(?P<duration>\d+)\s*(?:seconds?|ms|s))?".to_string()
+                ),
+                description: "Claude Code timeout error".to_string(),
+                remediation: Some("Operation timed out - consider retrying".to_string()),
+                workflow: None,
+            },
+            // Session/conversation end
+            RuleDef {
+                id: "claude_code.session.end".to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: "session.end".to_string(),
+                severity: Severity::Info,
+                anchors: vec![
+                    "Session ended".to_string(),
+                    "Goodbye".to_string(),
+                    "session complete".to_string(),
+                ],
+                regex: Some(
+                    r"(?:Session|Conversation)\s+(?:ended|complete|finished)".to_string()
+                ),
+                description: "Claude Code session ended".to_string(),
+                remediation: None,
+                workflow: None,
+            },
+            // Model selection/change
+            RuleDef {
+                id: "claude_code.model.selected".to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: "session.model".to_string(),
+                severity: Severity::Info,
+                anchors: vec![
+                    "model:".to_string(),
+                    "Using model".to_string(),
+                    "claude-".to_string(),
+                ],
+                regex: Some(
+                    r"(?:model[:\s]+|Using model[:\s]+)(?P<model>claude-(?:opus|sonnet|haiku)-?[^\s,\]]+)".to_string()
+                ),
+                description: "Claude Code model selection".to_string(),
+                remediation: None,
+                workflow: None,
+            },
+            // Auto-compaction completed
+            RuleDef {
+                id: "claude_code.compaction.complete".to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: "session.compaction_complete".to_string(),
+                severity: Severity::Info,
+                anchors: vec![
+                    "Compaction complete".to_string(),
+                    "Summary created".to_string(),
+                    "compacted successfully".to_string(),
+                ],
+                regex: Some(
+                    r"(?:Compaction complete|compacted successfully|Summary created)(?:.*?saved\s+(?P<tokens_saved>[\d,]+))?".to_string()
+                ),
+                description: "Claude Code compaction completed".to_string(),
+                remediation: None,
+                workflow: None,
+            },
+            // Overloaded error (API busy)
+            RuleDef {
+                id: "claude_code.error.overloaded".to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: "error.overloaded".to_string(),
+                severity: Severity::Warning,
+                anchors: vec![
+                    "overloaded".to_string(),
+                    "too many requests".to_string(),
+                    "server busy".to_string(),
+                ],
+                regex: Some(
+                    r"(?:overloaded|too many requests|server busy)(?:.*?retry\s+(?:in\s+)?(?P<retry_after>\d+)\s*(?:seconds?|s))?".to_string()
+                ),
+                description: "Claude API is overloaded".to_string(),
+                remediation: Some("API is busy - wait and retry".to_string()),
+                workflow: None,
+            },
         ],
     )
 }

@@ -472,10 +472,7 @@ mod tests {
             .consume(&request.allow_once_code, &input)
             .await
             .unwrap();
-        assert!(
-            consumed.is_none(),
-            "Expired token should not be consumable"
-        );
+        assert!(consumed.is_none(), "Expired token should not be consumable");
 
         storage.shutdown().await.unwrap();
         let _ = std::fs::remove_file(&db_path);

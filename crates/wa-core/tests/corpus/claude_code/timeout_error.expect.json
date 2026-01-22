@@ -1,0 +1,13 @@
+[
+  {
+    "rule_id": "claude_code.error.timeout",
+    "agent_type": "claude_code",
+    "event_type": "error.timeout",
+    "severity": "warning",
+    "confidence": 0.95,
+    "extracted": {
+      "duration": "30"
+    },
+    "matched_text": "timed out after 30 seconds"
+  }
+]

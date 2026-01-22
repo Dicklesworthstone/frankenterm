@@ -239,6 +239,13 @@ wa search "<query>" --pane 0 # Scope to specific pane
 wa search "<query>" --limit 50
 ```
 
+### Explainability
+
+```bash
+wa why --list                # List available explanation templates
+wa why deny.alt_screen       # Explain a common policy denial
+```
+
 ### Robot Mode (JSON API)
 
 ```bash

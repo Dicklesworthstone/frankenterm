@@ -1647,6 +1647,7 @@ pub struct RuleEvaluationResult {
 ///
 /// Returns the first matching rule with highest priority (lowest priority number wins,
 /// then decision severity: Deny > RequireApproval > Allow, then specificity).
+#[must_use]
 pub fn evaluate_policy_rules(
     rules_config: &PolicyRulesConfig,
     input: &PolicyInput,
@@ -2176,7 +2177,7 @@ impl PolicyEngine {
                 }
                 PolicyRuleDecision::Allow => {
                     // Allow rules short-circuit to allow (skipping default checks)
-                    context.record_rule(&rule_id, true, Some("allow"), Some(reason.clone()));
+                    context.record_rule(&rule_id, true, Some("allow"), Some(reason));
                     context.set_determining_rule(&rule_id);
                     return PolicyDecision::allow_with_rule(rule_id).with_context(context);
                 }
@@ -3230,7 +3231,8 @@ mod tests {
             .with_capabilities(PaneCapabilities::unknown());
         let decision = engine.authorize(&input);
         assert!(decision.requires_approval());
-        assert_eq!(decision.rule_id(), Some("policy.prompt_unknown"));
+        // When fully unknown, alt_screen check fires first (before prompt check)
+        assert_eq!(decision.rule_id(), Some("policy.alt_screen_unknown"));
     }
 
     #[test]
@@ -4126,14 +4128,15 @@ mod tests {
         };
 
         // Should match vim title
-        let input =
-            PolicyInput::new(ActionKind::SendText, ActorKind::Robot).with_pane_title("nvim file.rs");
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane_title("nvim file.rs");
         let result = evaluate_policy_rules(&config, &input);
         assert!(result.matching_rule.is_some());
         assert_eq!(result.decision, Some(PolicyRuleDecision::Deny));
 
         // Should not match bash title
-        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot).with_pane_title("bash");
+        let input =
+            PolicyInput::new(ActionKind::SendText, ActorKind::Robot).with_pane_title("bash");
         let result = evaluate_policy_rules(&config, &input);
         assert!(result.matching_rule.is_none());
     }
@@ -4156,8 +4159,8 @@ mod tests {
         };
 
         // Should match home directory
-        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
-            .with_pane_cwd("/home/user");
+        let input =
+            PolicyInput::new(ActionKind::SendText, ActorKind::Robot).with_pane_cwd("/home/user");
         let result = evaluate_policy_rules(&config, &input);
         assert!(result.matching_rule.is_some());
 
@@ -4255,7 +4258,10 @@ mod tests {
 
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
         let result = evaluate_policy_rules(&config, &input);
-        assert_eq!(result.matching_rule.as_ref().unwrap().id, "high-priority-deny");
+        assert_eq!(
+            result.matching_rule.as_ref().unwrap().id,
+            "high-priority-deny"
+        );
         assert_eq!(result.decision, Some(PolicyRuleDecision::Deny));
     }
 

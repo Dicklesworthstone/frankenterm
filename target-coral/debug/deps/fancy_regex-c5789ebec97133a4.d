@@ -1,0 +1,12 @@
+/data/projects/wezterm_automata/target-coral/debug/deps/fancy_regex-c5789ebec97133a4.d: /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fancy-regex-0.14.0/src/lib.rs /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fancy-regex-0.14.0/src/analyze.rs /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fancy-regex-0.14.0/src/compile.rs /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fancy-regex-0.14.0/src/error.rs /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fancy-regex-0.14.0/src/expand.rs /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fancy-regex-0.14.0/src/parse.rs /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fancy-regex-0.14.0/src/replacer.rs /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fancy-regex-0.14.0/src/vm.rs
+
+/data/projects/wezterm_automata/target-coral/debug/deps/libfancy_regex-c5789ebec97133a4.rmeta: /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fancy-regex-0.14.0/src/lib.rs /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fancy-regex-0.14.0/src/analyze.rs /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fancy-regex-0.14.0/src/compile.rs /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fancy-regex-0.14.0/src/error.rs /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fancy-regex-0.14.0/src/expand.rs /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fancy-regex-0.14.0/src/parse.rs /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fancy-regex-0.14.0/src/replacer.rs /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fancy-regex-0.14.0/src/vm.rs
+
+/home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fancy-regex-0.14.0/src/lib.rs:
+/home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fancy-regex-0.14.0/src/analyze.rs:
+/home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fancy-regex-0.14.0/src/compile.rs:
+/home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fancy-regex-0.14.0/src/error.rs:
+/home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fancy-regex-0.14.0/src/expand.rs:
+/home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fancy-regex-0.14.0/src/parse.rs:
+/home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fancy-regex-0.14.0/src/replacer.rs:
+/home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fancy-regex-0.14.0/src/vm.rs:

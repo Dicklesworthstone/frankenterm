@@ -186,6 +186,43 @@ enum Commands {
         unhandled: bool,
     },
 
+    /// Ingest external events (e.g., WezTerm user-var signals)
+    Event {
+        /// Event source is a WezTerm user-var change
+        #[arg(long)]
+        from_uservar: bool,
+
+        /// Pane ID that emitted the user-var
+        #[arg(long)]
+        pane: u64,
+
+        /// User-var name (e.g., "wa_event")
+        #[arg(long)]
+        name: String,
+
+        /// Raw user-var value (typically base64-encoded JSON)
+        #[arg(long)]
+        value: String,
+    },
+
+    /// Explain decisions and workflows using built-in templates
+    Why {
+        /// Template ID to explain (e.g., "deny.alt_screen")
+        template_id: Option<String>,
+
+        /// Filter templates by category prefix (deny/workflow/event)
+        #[arg(long)]
+        category: Option<String>,
+
+        /// Output format: auto, plain, or json
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+
+        /// List available templates
+        #[arg(long)]
+        list: bool,
+    },
+
     /// Run diagnostics
     Doctor,
 
@@ -233,6 +270,18 @@ enum RobotCommands {
         /// Preview what would happen without executing
         #[arg(long)]
         dry_run: bool,
+
+        /// Verify by waiting for a pattern after sending
+        #[arg(long)]
+        wait_for: Option<String>,
+
+        /// Timeout for wait-for verification (seconds)
+        #[arg(long, default_value = "30")]
+        timeout_secs: u64,
+
+        /// Treat wait-for pattern as regex
+        #[arg(long)]
+        wait_for_regex: bool,
     },
 
     /// Wait for a pattern in pane output
@@ -562,6 +611,17 @@ struct RobotWaitForData {
     is_regex: bool,
 }
 
+/// Robot send response data
+#[derive(serde::Serialize)]
+struct RobotSendData {
+    pane_id: u64,
+    injection: wa_core::policy::InjectionResult,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wait_for: Option<RobotWaitForData>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verification_error: Option<String>,
+}
+
 /// Search result data for robot mode
 #[derive(serde::Serialize)]
 struct RobotSearchData {
@@ -656,6 +716,8 @@ fn build_send_dry_run_report(
     pane_id: u64,
     text: &str,
     no_paste: bool,
+    wait_for: Option<&str>,
+    timeout_secs: u64,
 ) -> wa_core::dry_run::DryRunReport {
     use wa_core::dry_run::{
         TargetResolution, build_send_policy_evaluation, create_send_action, create_wait_for_action,
@@ -681,7 +743,10 @@ fn build_send_dry_run_report(
 
     // Expected actions
     ctx.add_action(create_send_action(1, pane_id, text.len()));
-    ctx.add_action(create_wait_for_action(2, "prompt boundary", 30000));
+    if let Some(pattern) = wait_for {
+        let timeout_ms = timeout_secs.saturating_mul(1000);
+        ctx.add_action(create_wait_for_action(2, pattern, timeout_ms));
+    }
 
     if no_paste {
         ctx.add_warning("no_paste mode sends characters individually (slower)");
@@ -1133,6 +1198,42 @@ fn glob_match(pattern: &str, value: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn is_structured_uservar_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.starts_with("wa-") || lower.starts_with("wa_") || lower == "wa_event"
+}
+
+fn validate_uservar_request(pane_id: u64, name: &str, value: &str) -> Result<(), String> {
+    if name.trim().is_empty() {
+        return Err("user-var name cannot be empty".to_string());
+    }
+    if value.is_empty() {
+        return Err("user-var value cannot be empty".to_string());
+    }
+
+    let request = wa_core::ipc::IpcRequest::UserVar {
+        pane_id,
+        name: name.to_string(),
+        value: value.to_string(),
+    };
+    let request_json = serde_json::to_string(&request)
+        .map_err(|e| format!("failed to serialize IPC request for validation: {e}"))?;
+    let request_size = request_json.len();
+    if request_size > wa_core::ipc::MAX_MESSAGE_SIZE {
+        return Err(format!(
+            "user-var payload too large: {request_size} bytes (max {})",
+            wa_core::ipc::MAX_MESSAGE_SIZE
+        ));
+    }
+
+    if is_structured_uservar_name(name) {
+        wa_core::events::UserVarPayload::decode(value, false)
+            .map_err(|e| format!("invalid structured user-var payload for '{name}': {e}"))?;
+    }
+
+    Ok(())
+}
+
 /// Run the observation watcher daemon.
 #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 async fn run_watcher(
@@ -1538,30 +1639,250 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             pane_id,
                             text,
                             dry_run,
+                            wait_for,
+                            timeout_secs,
+                            wait_for_regex,
                         } => {
                             let redacted_text = redact_for_output(&text);
-                            let command = if dry_run {
+                            let mut command = if dry_run {
                                 format!("wa robot send {pane_id} \"{redacted_text}\" --dry-run")
                             } else {
                                 format!("wa robot send {pane_id} \"{redacted_text}\"")
                             };
+                            if let Some(pattern) = &wait_for {
+                                let redacted_pattern = redact_for_output(pattern);
+                                command.push_str(&format!(" --wait-for \"{redacted_pattern}\""));
+                                if wait_for_regex {
+                                    command.push_str(" --wait-for-regex");
+                                }
+                                command.push_str(&format!(" --timeout-secs {timeout_secs}"));
+                            }
                             let command_ctx =
                                 wa_core::dry_run::CommandContext::new(command, dry_run);
 
                             if command_ctx.is_dry_run() {
-                                let report =
-                                    build_send_dry_run_report(&command_ctx, pane_id, &text, false);
-                                let response = RobotResponse::success(report, elapsed_ms(start));
+                                let report = build_send_dry_run_report(
+                                    &command_ctx,
+                                    pane_id,
+                                    &text,
+                                    false,
+                                    wait_for.as_deref(),
+                                    timeout_secs,
+                                );
+                                let response =
+                                    RobotResponse::success(report.redacted(), elapsed_ms(start));
                                 println!("{}", serde_json::to_string_pretty(&response)?);
                             } else {
-                                let response: RobotResponse<()> = RobotResponse::error_with_code(
-                                    ROBOT_ERR_NOT_IMPLEMENTED,
-                                    format!(
-                                        "send to pane {pane_id} not yet implemented (text: {redacted_text})"
-                                    ),
-                                    None,
-                                    elapsed_ms(start),
-                                );
+                                use wa_core::approval::ApprovalStore;
+                                use wa_core::policy::{
+                                    ActionKind, ActorKind, InjectionResult, PaneCapabilities,
+                                    PolicyDecision, PolicyEngine, PolicyInput,
+                                };
+                                use wa_core::wezterm::{PaneWaiter, WaitMatcher, WaitOptions};
+
+                                let db_path = &ctx.effective.paths.db_path;
+                                let storage =
+                                    match wa_core::storage::StorageHandle::new(db_path).await {
+                                        Ok(s) => s,
+                                        Err(e) => {
+                                            let response =
+                                                RobotResponse::<RobotSendData>::error_with_code(
+                                                    ROBOT_ERR_STORAGE,
+                                                    format!("Failed to open storage: {e}"),
+                                                    Some(
+                                                        "Is the database initialized? Run 'wa watch' first."
+                                                            .to_string(),
+                                                    ),
+                                                    elapsed_ms(start),
+                                                );
+                                            println!(
+                                                "{}",
+                                                serde_json::to_string_pretty(&response)?
+                                            );
+                                            return Ok(());
+                                        }
+                                    };
+
+                                let wezterm = wa_core::wezterm::WeztermClient::new();
+                                let pane_info = match wezterm.get_pane(pane_id).await {
+                                    Ok(info) => info,
+                                    Err(e) => {
+                                        let (code, hint) = map_wezterm_error_to_robot(&e);
+                                        let response =
+                                            RobotResponse::<RobotSendData>::error_with_code(
+                                                code,
+                                                format!("{e}"),
+                                                hint,
+                                                elapsed_ms(start),
+                                            );
+                                        println!(
+                                            "{}",
+                                            serde_json::to_string_pretty(&response)?
+                                        );
+                                        return Ok(());
+                                    }
+                                };
+                                let domain = pane_info.inferred_domain();
+
+                                let mut engine = PolicyEngine::new(
+                                    config.safety.rate_limit_per_pane,
+                                    config.safety.rate_limit_global,
+                                    config.safety.require_prompt_active,
+                                )
+                                .with_command_gate_config(config.safety.command_gate.clone())
+                                .with_policy_rules(config.safety.rules.clone());
+
+                                // NOTE: Until ingest state is wired into CLI, assume prompt state.
+                                let capabilities = PaneCapabilities::prompt();
+
+                                let summary = engine.redact_secrets(&text);
+                                let mut input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+                                    .with_pane(pane_id)
+                                    .with_domain(domain.clone())
+                                    .with_capabilities(capabilities)
+                                    .with_text_summary(&summary)
+                                    .with_command_text(&text);
+
+                                let mut decision = engine.authorize(&input);
+                                if decision.requires_approval() {
+                                    let store = ApprovalStore::new(
+                                        &storage,
+                                        config.safety.approval.clone(),
+                                        ctx.effective.paths.workspace_root.clone(),
+                                    );
+                                    decision = match store
+                                        .attach_to_decision(decision, &input, Some(summary.clone()))
+                                        .await
+                                    {
+                                        Ok(updated) => updated,
+                                        Err(e) => {
+                                            let response = RobotResponse::<RobotSendData>::error_with_code(
+                                                "robot.approval_error",
+                                                format!("Failed to issue approval token: {e}"),
+                                                None,
+                                                elapsed_ms(start),
+                                            );
+                                            println!(
+                                                "{}",
+                                                serde_json::to_string_pretty(&response)?
+                                            );
+                                            return Ok(());
+                                        }
+                                    };
+                                }
+
+                                let injection = match decision {
+                                    PolicyDecision::Allow { .. } => {
+                                        let send_result =
+                                            wezterm.send_text(pane_id, &text).await;
+                                        match send_result {
+                                            Ok(()) => InjectionResult::Allowed {
+                                                decision,
+                                                summary: summary.clone(),
+                                                pane_id,
+                                                action: ActionKind::SendText,
+                                            },
+                                            Err(e) => InjectionResult::Error {
+                                                error: e.to_string(),
+                                                pane_id,
+                                                action: ActionKind::SendText,
+                                            },
+                                        }
+                                    }
+                                    PolicyDecision::Deny { .. } => InjectionResult::Denied {
+                                        decision,
+                                        summary: summary.clone(),
+                                        pane_id,
+                                        action: ActionKind::SendText,
+                                    },
+                                    PolicyDecision::RequireApproval { .. } => {
+                                        InjectionResult::RequiresApproval {
+                                            decision,
+                                            summary: summary.clone(),
+                                            pane_id,
+                                            action: ActionKind::SendText,
+                                        }
+                                    }
+                                };
+
+                                if let Err(e) = storage
+                                    .record_audit_action_redacted(injection.to_audit_record(
+                                        ActorKind::Robot,
+                                        None,
+                                        Some(domain.clone()),
+                                    ))
+                                    .await
+                                {
+                                    tracing::warn!(pane_id, "Failed to record audit: {e}");
+                                }
+
+                                let mut wait_for_data = None;
+                                let mut verification_error = None;
+                                if injection.is_allowed() {
+                                    if let Some(pattern) = &wait_for {
+                                        let matcher = if wait_for_regex {
+                                            match fancy_regex::Regex::new(pattern) {
+                                                Ok(compiled) => WaitMatcher::regex(compiled),
+                                                Err(e) => {
+                                                    verification_error = Some(format!(
+                                                        "Invalid wait-for regex: {e}"
+                                                    ));
+                                                    None
+                                                }
+                                            }
+                                        } else {
+                                            Some(WaitMatcher::substring(pattern))
+                                        };
+
+                                        if let Some(matcher) = matcher {
+                                            let options = WaitOptions {
+                                                tail_lines: 200,
+                                                escapes: false,
+                                                ..WaitOptions::default()
+                                            };
+                                            let waiter = PaneWaiter::new(&wezterm).with_options(options);
+                                            let timeout = std::time::Duration::from_secs(timeout_secs);
+                                            match waiter.wait_for(pane_id, &matcher, timeout).await {
+                                                Ok(wa_core::wezterm::WaitResult::Matched { elapsed_ms, polls }) => {
+                                                    wait_for_data = Some(RobotWaitForData {
+                                                        pane_id,
+                                                        pattern: pattern.clone(),
+                                                        matched: true,
+                                                        elapsed_ms,
+                                                        polls,
+                                                        is_regex: wait_for_regex,
+                                                    });
+                                                }
+                                                Ok(wa_core::wezterm::WaitResult::TimedOut { elapsed_ms, polls, .. }) => {
+                                                    wait_for_data = Some(RobotWaitForData {
+                                                        pane_id,
+                                                        pattern: pattern.clone(),
+                                                        matched: false,
+                                                        elapsed_ms,
+                                                        polls,
+                                                        is_regex: wait_for_regex,
+                                                    });
+                                                    verification_error = Some(format!(
+                                                        "Timeout waiting for pattern '{pattern}'"
+                                                    ));
+                                                }
+                                                Err(e) => {
+                                                    verification_error = Some(format!(
+                                                        "wait-for failed: {e}"
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                let data = RobotSendData {
+                                    pane_id,
+                                    injection,
+                                    wait_for: wait_for_data,
+                                    verification_error,
+                                };
+                                let response = RobotResponse::success(data, elapsed_ms(start));
                                 println!("{}", serde_json::to_string_pretty(&response)?);
                             }
                         }
@@ -2279,7 +2600,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             let command_ctx = wa_core::dry_run::CommandContext::new(command, dry_run);
 
             if command_ctx.is_dry_run() {
-                let report = build_send_dry_run_report(&command_ctx, pane_id, &text, no_paste);
+                let report =
+                    build_send_dry_run_report(&command_ctx, pane_id, &text, no_paste, None, 30);
                 println!("{}", wa_core::dry_run::format_human(&report));
             } else {
                 tracing::info!(
@@ -2526,6 +2848,177 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             }
         }
 
+        Some(Commands::Why {
+            template_id,
+            category,
+            format,
+            list,
+        }) => {
+            use wa_core::explanations::{
+                format_explanation, get_explanation, list_template_ids, list_templates_by_category,
+            };
+            use wa_core::output::{OutputFormat, detect_format};
+
+            let output_format = match format.to_lowercase().as_str() {
+                "json" => OutputFormat::Json,
+                "plain" => OutputFormat::Plain,
+                _ => detect_format(),
+            };
+
+            let should_list = list || template_id.is_none();
+
+            if should_list {
+                let mut ids: Vec<String> = if let Some(prefix) = category.as_deref() {
+                    let mut items: Vec<String> = list_templates_by_category(prefix)
+                        .into_iter()
+                        .map(|t| t.id.to_string())
+                        .collect();
+                    items.sort();
+                    items
+                } else {
+                    list_template_ids()
+                        .into_iter()
+                        .map(|id| id.to_string())
+                        .collect()
+                };
+
+                if output_format.is_json() {
+                    #[derive(serde::Serialize)]
+                    struct WhyListResponse {
+                        ok: bool,
+                        templates: Vec<String>,
+                        count: usize,
+                        category: Option<String>,
+                        version: &'static str,
+                    }
+
+                    let response = WhyListResponse {
+                        ok: true,
+                        count: ids.len(),
+                        templates: std::mem::take(&mut ids),
+                        category,
+                        version: wa_core::VERSION,
+                    };
+                    println!("{}", serde_json::to_string_pretty(&response)?);
+                } else {
+                    if let Some(prefix) = category.as_deref() {
+                        println!("Templates (category={prefix}):");
+                    } else {
+                        println!("Available explanations:");
+                    }
+                    if ids.is_empty() {
+                        println!("  (none)");
+                    } else {
+                        for id in ids {
+                            println!("  - {id}");
+                        }
+                    }
+                    println!();
+                    println!("Usage: wa why <template_id>");
+                }
+                return Ok(());
+            }
+
+            let id = template_id.unwrap_or_default();
+            match get_explanation(&id) {
+                Some(template) => {
+                    if output_format.is_json() {
+                        #[derive(serde::Serialize)]
+                        struct WhyTemplateResponse<'a> {
+                            ok: bool,
+                            template: &'a wa_core::explanations::ExplanationTemplate,
+                            version: &'static str,
+                        }
+
+                        let response = WhyTemplateResponse {
+                            ok: true,
+                            template,
+                            version: wa_core::VERSION,
+                        };
+                        println!("{}", serde_json::to_string_pretty(&response)?);
+                    } else {
+                        let formatted = format_explanation(template, None);
+                        println!("{formatted}");
+                    }
+                }
+                None => {
+                    if output_format.is_json() {
+                        println!(
+                            r#"{{"ok": false, "error": "Unknown explanation id: {}", "hint": "Use 'wa why --list' to see available templates.", "version": "{}"}}"#,
+                            id,
+                            wa_core::VERSION
+                        );
+                    } else {
+                        eprintln!("Error: Unknown explanation id: {id}");
+                        eprintln!("Use 'wa why --list' to see available templates.");
+                    }
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        Some(Commands::Event {
+            from_uservar,
+            pane,
+            name,
+            value,
+        }) => {
+            if !from_uservar {
+                eprintln!("Error: only --from-uservar is supported for now.");
+                eprintln!(
+                    "Hint: use `wa event --from-uservar --pane <id> --name <name> --value <value>`"
+                );
+                std::process::exit(1);
+            }
+
+            let name_for_log = name.clone();
+            let value_len = value.len();
+
+            if let Err(message) = validate_uservar_request(pane, &name, &value) {
+                eprintln!("Error: {message}");
+                eprintln!("Context: pane_id={pane} name=\"{name_for_log}\" value_len={value_len}");
+                std::process::exit(1);
+            }
+
+            tracing::debug!(
+                pane_id = pane,
+                name = %name_for_log,
+                value_len,
+                "Forwarding user-var event to watcher"
+            );
+
+            let client = wa_core::ipc::IpcClient::new(&layout.ipc_socket_path);
+            match client.send_user_var(pane, name, value).await {
+                Ok(response) => {
+                    if !response.ok {
+                        let detail = response
+                            .error
+                            .unwrap_or_else(|| "unknown error".to_string());
+                        eprintln!("Error: watcher rejected user-var event: {detail}");
+                        eprintln!(
+                            "Context: pane_id={pane} name=\"{name_for_log}\" value_len={value_len}"
+                        );
+                        std::process::exit(1);
+                    }
+                }
+                Err(err) => {
+                    match err {
+                        wa_core::events::UserVarError::WatcherNotRunning { .. } => {
+                            eprintln!("Error: {err}");
+                            eprintln!("Hint: start the watcher with `wa watch` in this workspace.");
+                        }
+                        _ => {
+                            eprintln!("Error: failed to forward user-var event: {err}");
+                        }
+                    }
+                    eprintln!(
+                        "Context: pane_id={pane} name=\"{name_for_log}\" value_len={value_len}"
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+
         Some(Commands::Doctor) => {
             println!("Running diagnostics...");
             println!("  [OK] wa-core loaded");
@@ -2586,5 +3079,39 @@ fn handle_fatal_error(err: &anyhow::Error, robot_mode: bool) {
         );
     } else {
         eprintln!("Error: {err}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn structured_uservar_name_detection() {
+        assert!(is_structured_uservar_name("wa_event"));
+        assert!(is_structured_uservar_name("wa-foo"));
+        assert!(is_structured_uservar_name("WA_FOO"));
+        assert!(!is_structured_uservar_name("other_event"));
+    }
+
+    #[test]
+    fn validate_uservar_rejects_empty_fields() {
+        assert!(validate_uservar_request(1, "", "x").is_err());
+        assert!(validate_uservar_request(1, "wa_event", "").is_err());
+    }
+
+    #[test]
+    fn validate_uservar_rejects_oversize_payload() {
+        let name = "wa_event";
+        let value = "a".repeat(wa_core::ipc::MAX_MESSAGE_SIZE);
+        let err = validate_uservar_request(1, name, &value).unwrap_err();
+        assert!(err.contains("too large"));
+    }
+
+    #[test]
+    fn validate_uservar_accepts_base64_json() {
+        let name = "wa_event";
+        let value = "eyJraW5kIjoicHJvbXB0In0="; // {"kind":"prompt"}
+        assert!(validate_uservar_request(1, name, value).is_ok());
     }
 }
