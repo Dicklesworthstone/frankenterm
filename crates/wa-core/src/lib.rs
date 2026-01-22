@@ -21,6 +21,7 @@
 //! - `patterns`: Pattern detection engine
 //! - `events`: Event bus for detections and signals
 //! - `explanations`: Reusable explanation templates for wa why and errors
+//! - `suggestions`: Context-aware suggestion system for actionable errors
 //! - `workflows`: Durable workflow execution
 //! - `config`: Configuration management
 //! - `approval`: Allow-once approvals for RequireApproval decisions
@@ -50,6 +51,7 @@ pub mod patterns;
 pub mod policy;
 pub mod runtime;
 pub mod storage;
+pub mod suggestions;
 pub mod tailer;
 pub mod wait;
 pub mod wezterm;
