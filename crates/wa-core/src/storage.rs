@@ -48,7 +48,7 @@ use crate::policy::Redactor;
 /// This is the target version that new databases will be initialized to,
 /// and existing databases will be migrated to.
 /// Uses SQLite's PRAGMA user_version for atomic version tracking.
-pub const SCHEMA_VERSION: i32 = 2;
+pub const SCHEMA_VERSION: i32 = 3;
 
 /// Schema initialization SQL
 ///
@@ -73,6 +73,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 -- Supports: wa status, wa robot state, privacy/perf filtering
 CREATE TABLE IF NOT EXISTS panes (
     pane_id INTEGER PRIMARY KEY,
+    pane_uuid TEXT,                    -- stable UUID (persists across renames/moves)
     domain TEXT NOT NULL DEFAULT 'local',
     window_id INTEGER,
     tab_id INTEGER,
@@ -335,6 +336,11 @@ static MIGRATIONS: &[Migration] = &[
         version: 2,
         description: "Add decision_context to audit_actions",
         up_sql: "ALTER TABLE audit_actions ADD COLUMN decision_context TEXT;",
+    },
+    Migration {
+        version: 3,
+        description: "Add pane_uuid to panes for stable identity",
+        up_sql: "ALTER TABLE panes ADD COLUMN pane_uuid TEXT;",
     },
 ];
 
@@ -2092,10 +2098,11 @@ fn upsert_pane_sync(conn: &Connection, pane: &PaneRecord) -> Result<()> {
     let tab_id_i64 = pane.tab_id.map(|v| u64_to_i64(v, "tab_id")).transpose()?;
 
     conn.execute(
-        "INSERT INTO panes (pane_id, domain, window_id, tab_id, title, cwd, tty_name,
+        "INSERT INTO panes (pane_id, pane_uuid, domain, window_id, tab_id, title, cwd, tty_name,
          first_seen_at, last_seen_at, observed, ignore_reason, last_decision_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
          ON CONFLICT(pane_id) DO UPDATE SET
+            pane_uuid = COALESCE(excluded.pane_uuid, panes.pane_uuid),
             domain = excluded.domain,
             window_id = excluded.window_id,
             tab_id = excluded.tab_id,
@@ -2108,6 +2115,7 @@ fn upsert_pane_sync(conn: &Connection, pane: &PaneRecord) -> Result<()> {
             last_decision_at = excluded.last_decision_at",
         params![
             pane_id_i64,
+            pane.pane_uuid,
             pane.domain,
             window_id_i64,
             tab_id_i64,
@@ -3071,7 +3079,7 @@ fn query_active_approvals_count(conn: &Connection, workspace_id: &str, now_ms: i
 fn query_panes(conn: &Connection) -> Result<Vec<PaneRecord>> {
     let mut stmt = conn
         .prepare(
-            "SELECT pane_id, domain, window_id, tab_id, title, cwd, tty_name,
+            "SELECT pane_id, pane_uuid, domain, window_id, tab_id, title, cwd, tty_name,
              first_seen_at, last_seen_at, observed, ignore_reason, last_decision_at
              FROM panes
              ORDER BY last_seen_at DESC",
@@ -3088,26 +3096,26 @@ fn query_panes(conn: &Connection) -> Result<Vec<PaneRecord>> {
                         val as u64
                     }
                 },
-                pane_uuid: None, // Not yet in schema
-                domain: row.get(1)?,
+                pane_uuid: row.get(1)?,
+                domain: row.get(2)?,
                 window_id: {
-                    let val: Option<i64> = row.get(2)?;
-                    #[allow(clippy::cast_sign_loss)]
-                    val.map(|v| v as u64)
-                },
-                tab_id: {
                     let val: Option<i64> = row.get(3)?;
                     #[allow(clippy::cast_sign_loss)]
                     val.map(|v| v as u64)
                 },
-                title: row.get(4)?,
-                cwd: row.get(5)?,
-                tty_name: row.get(6)?,
-                first_seen_at: row.get(7)?,
-                last_seen_at: row.get(8)?,
-                observed: row.get::<_, i64>(9)? != 0,
-                ignore_reason: row.get(10)?,
-                last_decision_at: row.get(11)?,
+                tab_id: {
+                    let val: Option<i64> = row.get(4)?;
+                    #[allow(clippy::cast_sign_loss)]
+                    val.map(|v| v as u64)
+                },
+                title: row.get(5)?,
+                cwd: row.get(6)?,
+                tty_name: row.get(7)?,
+                first_seen_at: row.get(8)?,
+                last_seen_at: row.get(9)?,
+                observed: row.get::<_, i64>(10)? != 0,
+                ignore_reason: row.get(11)?,
+                last_decision_at: row.get(12)?,
             })
         })
         .map_err(|e| StorageError::Database(format!("Query failed: {e}")))?;
@@ -3125,7 +3133,7 @@ fn query_pane(conn: &Connection, pane_id: u64) -> Result<Option<PaneRecord>> {
     let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
 
     conn.query_row(
-        "SELECT pane_id, domain, window_id, tab_id, title, cwd, tty_name,
+        "SELECT pane_id, pane_uuid, domain, window_id, tab_id, title, cwd, tty_name,
          first_seen_at, last_seen_at, observed, ignore_reason, last_decision_at
          FROM panes WHERE pane_id = ?1",
         [pane_id_i64],
@@ -3138,26 +3146,26 @@ fn query_pane(conn: &Connection, pane_id: u64) -> Result<Option<PaneRecord>> {
                         val as u64
                     }
                 },
-                pane_uuid: None, // Not yet in schema
-                domain: row.get(1)?,
+                pane_uuid: row.get(1)?,
+                domain: row.get(2)?,
                 window_id: {
-                    let val: Option<i64> = row.get(2)?;
-                    #[allow(clippy::cast_sign_loss)]
-                    val.map(|v| v as u64)
-                },
-                tab_id: {
                     let val: Option<i64> = row.get(3)?;
                     #[allow(clippy::cast_sign_loss)]
                     val.map(|v| v as u64)
                 },
-                title: row.get(4)?,
-                cwd: row.get(5)?,
-                tty_name: row.get(6)?,
-                first_seen_at: row.get(7)?,
-                last_seen_at: row.get(8)?,
-                observed: row.get::<_, i64>(9)? != 0,
-                ignore_reason: row.get(10)?,
-                last_decision_at: row.get(11)?,
+                tab_id: {
+                    let val: Option<i64> = row.get(4)?;
+                    #[allow(clippy::cast_sign_loss)]
+                    val.map(|v| v as u64)
+                },
+                title: row.get(5)?,
+                cwd: row.get(6)?,
+                tty_name: row.get(7)?,
+                first_seen_at: row.get(8)?,
+                last_seen_at: row.get(9)?,
+                observed: row.get::<_, i64>(10)? != 0,
+                ignore_reason: row.get(11)?,
+                last_decision_at: row.get(12)?,
             })
         },
     )

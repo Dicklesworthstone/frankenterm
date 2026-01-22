@@ -700,11 +700,10 @@ fn builtin_claude_code_pack() -> PatternPack {
                 severity: Severity::Warning,
                 anchors: vec![
                     "timed out".to_string(),
-                    "timeout".to_string(),
-                    "request timeout".to_string(),
+                    "time out".to_string(),
                 ],
                 regex: Some(
-                    r"(?:timed? out|timeout)\s*(?:after\s+(?P<duration>\d+)\s*(?:seconds?|ms|s))?".to_string()
+                    r"timed? out(?:\s+after\s+(?P<duration>\d+)\s*(?:seconds?|ms|s))?".to_string()
                 ),
                 description: "Claude Code timeout error".to_string(),
                 remediation: Some("Operation timed out - consider retrying".to_string()),
