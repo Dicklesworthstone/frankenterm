@@ -185,6 +185,15 @@ pub struct RuleDef {
     pub remediation: Option<String>,
     /// Suggested workflow name (optional)
     pub workflow: Option<String>,
+    /// Manual fix instructions for when workflow is not available or user prefers manual action
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual_fix: Option<String>,
+    /// Preview command template supporting {pane}, {event_id}, {agent} interpolation
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_command: Option<String>,
+    /// URL for more information about this rule
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub learn_more_url: Option<String>,
 }
 
 impl RuleDef {
@@ -220,6 +229,52 @@ impl RuleDef {
         }
 
         Ok(())
+    }
+
+    /// Interpolate template variables in a string.
+    ///
+    /// Supported variables:
+    /// - `{pane}`: Pane ID where event was detected
+    /// - `{event_id}`: Event ID for reference
+    /// - `{agent}`: Detected agent type
+    /// - `{rule_id}`: The rule ID that matched
+    #[must_use]
+    pub fn interpolate_template(
+        template: &str,
+        pane_id: u64,
+        event_id: Option<i64>,
+        agent_type: &AgentType,
+        rule_id: &str,
+    ) -> String {
+        template
+            .replace("{pane}", &pane_id.to_string())
+            .replace("{event_id}", &event_id.map_or_else(|| "unknown".to_string(), |id| id.to_string()))
+            .replace("{agent}", &agent_type.to_string())
+            .replace("{rule_id}", rule_id)
+    }
+
+    /// Get the interpolated preview command for this rule.
+    #[must_use]
+    pub fn get_preview_command(
+        &self,
+        pane_id: u64,
+        event_id: Option<i64>,
+    ) -> Option<String> {
+        self.preview_command.as_ref().map(|cmd| {
+            Self::interpolate_template(cmd, pane_id, event_id, &self.agent_type, &self.id)
+        })
+    }
+
+    /// Get the interpolated manual fix instructions for this rule.
+    #[must_use]
+    pub fn get_manual_fix(
+        &self,
+        pane_id: u64,
+        event_id: Option<i64>,
+    ) -> Option<String> {
+        self.manual_fix.as_ref().map(|fix| {
+            Self::interpolate_template(fix, pane_id, event_id, &self.agent_type, &self.id)
+        })
     }
 }
 
@@ -423,6 +478,9 @@ fn builtin_codex_pack() -> PatternPack {
                 description: "Codex usage below 25% remaining".to_string(),
                 remediation: None,
                 workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
             },
             RuleDef {
                 id: "codex.usage.warning_10".to_string(),
@@ -434,6 +492,9 @@ fn builtin_codex_pack() -> PatternPack {
                 description: "Codex usage below 10% remaining".to_string(),
                 remediation: Some("Consider pausing work soon".to_string()),
                 workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
             },
             RuleDef {
                 id: "codex.usage.warning_5".to_string(),
@@ -445,6 +506,9 @@ fn builtin_codex_pack() -> PatternPack {
                 description: "Codex usage below 5% remaining - critical threshold".to_string(),
                 remediation: Some("Save work and prepare for limit".to_string()),
                 workflow: Some("handle_usage_warning".to_string()),
+                manual_fix: Some("Finish current task quickly and prepare to switch accounts or wait for reset".to_string()),
+                preview_command: Some("wa workflow run handle_usage_warning --pane {pane} --dry-run".to_string()),
+                learn_more_url: None,
             },
             // Usage limit reached
             RuleDef {
@@ -457,6 +521,9 @@ fn builtin_codex_pack() -> PatternPack {
                 description: "Codex usage limit reached".to_string(),
                 remediation: Some("Wait for reset or switch account".to_string()),
                 workflow: Some("handle_usage_limits".to_string()),
+                manual_fix: Some("Exit Codex with Ctrl-C, log out, then log in with a different OpenAI account".to_string()),
+                preview_command: Some("wa workflow run handle_usage_limits --pane {pane} --dry-run".to_string()),
+                learn_more_url: None,
             },
             // Session token usage summary
             RuleDef {
@@ -471,6 +538,9 @@ fn builtin_codex_pack() -> PatternPack {
                 description: "Codex session token usage summary".to_string(),
                 remediation: None,
                 workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
             },
             // Resume session hint
             RuleDef {
@@ -485,6 +555,9 @@ fn builtin_codex_pack() -> PatternPack {
                 description: "Codex session resume hint with session ID".to_string(),
                 remediation: None,
                 workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
             },
             // Device auth code prompt
             RuleDef {
@@ -497,6 +570,9 @@ fn builtin_codex_pack() -> PatternPack {
                 description: "Codex device authentication code prompt".to_string(),
                 remediation: Some("User needs to enter the code in browser".to_string()),
                 workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
             },
         ],
     )
@@ -525,6 +601,9 @@ fn builtin_claude_code_pack() -> PatternPack {
                 description: "Claude Code context compaction event".to_string(),
                 remediation: Some("Context was reduced - some history may be lost".to_string()),
                 workflow: Some("handle_compaction".to_string()),
+                manual_fix: Some("Ask the agent to re-read AGENTS.md and key project context files".to_string()),
+                preview_command: Some("wa workflow run handle_compaction --pane {pane} --dry-run".to_string()),
+                learn_more_url: None,
             },
             // Session banner with version and model info
             RuleDef {
@@ -539,6 +618,9 @@ fn builtin_claude_code_pack() -> PatternPack {
                 description: "Claude Code session start banner".to_string(),
                 remediation: None,
                 workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
             },
             // Usage warning (evolving patterns)
             RuleDef {
@@ -555,6 +637,9 @@ fn builtin_claude_code_pack() -> PatternPack {
                 description: "Claude Code usage warning".to_string(),
                 remediation: Some("Consider saving work soon".to_string()),
                 workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
             },
             // Usage limit reached
             RuleDef {
@@ -571,6 +656,9 @@ fn builtin_claude_code_pack() -> PatternPack {
                 description: "Claude Code usage limit reached".to_string(),
                 remediation: Some("Wait for limit reset or switch session".to_string()),
                 workflow: Some("handle_usage_limits".to_string()),
+                manual_fix: Some("Exit Claude Code with Ctrl-C, then switch to a different Anthropic account or wait for limit reset".to_string()),
+                preview_command: Some("wa workflow run handle_usage_limits --pane {pane} --dry-run".to_string()),
+                learn_more_url: None,
             },
             // Session cost summary
             RuleDef {
@@ -583,6 +671,9 @@ fn builtin_claude_code_pack() -> PatternPack {
                 description: "Claude Code session cost summary".to_string(),
                 remediation: None,
                 workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
             },
             // API key error
             RuleDef {
@@ -599,6 +690,9 @@ fn builtin_claude_code_pack() -> PatternPack {
                 description: "Claude Code API key authentication error".to_string(),
                 remediation: Some("Check ANTHROPIC_API_KEY environment variable".to_string()),
                 workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
             },
             // Tool use indicator
             RuleDef {
@@ -617,6 +711,9 @@ fn builtin_claude_code_pack() -> PatternPack {
                 description: "Claude Code tool invocation".to_string(),
                 remediation: None,
                 workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
             },
             // Approval/permission needed
             RuleDef {
@@ -636,6 +733,9 @@ fn builtin_claude_code_pack() -> PatternPack {
                 description: "Claude Code approval/permission prompt".to_string(),
                 remediation: Some("User input required for approval".to_string()),
                 workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
             },
             // Context window warning
             RuleDef {
@@ -654,6 +754,9 @@ fn builtin_claude_code_pack() -> PatternPack {
                 description: "Claude Code context window warning".to_string(),
                 remediation: Some("Consider compacting or starting new session".to_string()),
                 workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
             },
             // Extended thinking indicator
             RuleDef {
@@ -672,6 +775,9 @@ fn builtin_claude_code_pack() -> PatternPack {
                 description: "Claude Code extended thinking mode".to_string(),
                 remediation: None,
                 workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
             },
             // Network/connection error
             RuleDef {
@@ -691,6 +797,9 @@ fn builtin_claude_code_pack() -> PatternPack {
                 description: "Claude Code network/connection error".to_string(),
                 remediation: Some("Check network connectivity and retry".to_string()),
                 workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
             },
             // Timeout error
             RuleDef {
@@ -708,6 +817,9 @@ fn builtin_claude_code_pack() -> PatternPack {
                 description: "Claude Code timeout error".to_string(),
                 remediation: Some("Operation timed out - consider retrying".to_string()),
                 workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
             },
             // Session/conversation end
             RuleDef {
@@ -726,6 +838,9 @@ fn builtin_claude_code_pack() -> PatternPack {
                 description: "Claude Code session ended".to_string(),
                 remediation: None,
                 workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
             },
             // Model selection/change
             RuleDef {
@@ -744,6 +859,9 @@ fn builtin_claude_code_pack() -> PatternPack {
                 description: "Claude Code model selection".to_string(),
                 remediation: None,
                 workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
             },
             // Auto-compaction completed
             RuleDef {
@@ -762,6 +880,9 @@ fn builtin_claude_code_pack() -> PatternPack {
                 description: "Claude Code compaction completed".to_string(),
                 remediation: None,
                 workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
             },
             // Overloaded error (API busy)
             RuleDef {
@@ -780,6 +901,9 @@ fn builtin_claude_code_pack() -> PatternPack {
                 description: "Claude API is overloaded".to_string(),
                 remediation: Some("API is busy - wait and retry".to_string()),
                 workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
             },
         ],
     )
@@ -802,6 +926,9 @@ fn builtin_gemini_pack() -> PatternPack {
                 description: "Gemini usage limit reached".to_string(),
                 remediation: Some("Wait for limit reset or switch model".to_string()),
                 workflow: Some("handle_usage_limits".to_string()),
+                manual_fix: Some("Exit Gemini CLI with Ctrl-C, then switch to a different Google account or use a non-Pro model".to_string()),
+                preview_command: Some("wa workflow run handle_usage_limits --pane {pane} --dry-run".to_string()),
+                learn_more_url: None,
             },
             // Session summary
             RuleDef {
@@ -817,6 +944,9 @@ fn builtin_gemini_pack() -> PatternPack {
                 description: "Gemini session summary with statistics".to_string(),
                 remediation: None,
                 workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
             },
             // Model indicator
             RuleDef {
@@ -829,6 +959,9 @@ fn builtin_gemini_pack() -> PatternPack {
                 description: "Gemini model being used".to_string(),
                 remediation: None,
                 workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
             },
         ],
     )
@@ -855,6 +988,9 @@ fn builtin_wezterm_pack() -> PatternPack {
                 description: "WezTerm mux server connection lost".to_string(),
                 remediation: Some("Check WezTerm mux server status".to_string()),
                 workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
             },
             // Pane exited
             RuleDef {
@@ -871,6 +1007,9 @@ fn builtin_wezterm_pack() -> PatternPack {
                 description: "WezTerm pane process exited".to_string(),
                 remediation: None,
                 workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
             },
         ],
     )
@@ -1171,6 +1310,9 @@ mod tests {
             description: "test rule".to_string(),
             remediation: None,
             workflow: None,
+            manual_fix: None,
+            preview_command: None,
+            learn_more_url: None,
         }
     }
 
@@ -1185,6 +1327,9 @@ mod tests {
             description: "test rule".to_string(),
             remediation: None,
             workflow: None,
+            manual_fix: None,
+            preview_command: None,
+            learn_more_url: None,
         }
     }
 

@@ -2212,11 +2212,7 @@ impl WorkflowRunner {
 
                     match send_result {
                         crate::policy::InjectionResult::Allowed { .. } => {
-                            tracing::info!(
-                                pane_id,
-                                execution_id,
-                                "Text injection succeeded"
-                            );
+                            tracing::info!(pane_id, execution_id, "Text injection succeeded");
 
                             // If there's a wait condition, handle it
                             if let Some(condition) = wait_for {
@@ -2261,11 +2257,12 @@ impl WorkflowRunner {
                         crate::policy::InjectionResult::Denied { decision, .. } => {
                             let elapsed_ms = elapsed_ms(start_time);
                             let reason = match &decision {
-                                crate::policy::PolicyDecision::Deny { reason, .. } => reason.clone(),
+                                crate::policy::PolicyDecision::Deny { reason, .. } => {
+                                    reason.clone()
+                                }
                                 _ => "Unknown denial reason".to_string(),
                             };
-                            let abort_reason =
-                                format!("Policy denied text injection: {reason}");
+                            let abort_reason = format!("Policy denied text injection: {reason}");
 
                             tracing::warn!(
                                 pane_id,
@@ -2275,9 +2272,7 @@ impl WorkflowRunner {
                             );
 
                             // Update execution to failed
-                            if let Err(e) =
-                                self.fail_execution(execution_id, &abort_reason).await
-                            {
+                            if let Err(e) = self.fail_execution(execution_id, &abort_reason).await {
                                 tracing::warn!(
                                     execution_id,
                                     error = %e,
@@ -2311,17 +2306,16 @@ impl WorkflowRunner {
                         crate::policy::InjectionResult::RequiresApproval { decision, .. } => {
                             let elapsed_ms = elapsed_ms(start_time);
                             let code = match &decision {
-                                crate::policy::PolicyDecision::RequireApproval { approval, .. } => {
-                                    approval.as_ref().map_or_else(
-                                        || "unknown".to_string(),
-                                        |a| a.allow_once_code.clone(),
-                                    )
-                                }
+                                crate::policy::PolicyDecision::RequireApproval {
+                                    approval, ..
+                                } => approval.as_ref().map_or_else(
+                                    || "unknown".to_string(),
+                                    |a| a.allow_once_code.clone(),
+                                ),
                                 _ => "unknown".to_string(),
                             };
-                            let abort_reason = format!(
-                                "Text injection requires approval (code: {code})"
-                            );
+                            let abort_reason =
+                                format!("Text injection requires approval (code: {code})");
 
                             tracing::warn!(
                                 pane_id,
@@ -2331,13 +2325,54 @@ impl WorkflowRunner {
                             );
 
                             // Update execution to failed (approval not auto-granted for workflows)
-                            if let Err(e) =
-                                self.fail_execution(execution_id, &abort_reason).await
-                            {
+                            if let Err(e) = self.fail_execution(execution_id, &abort_reason).await {
                                 tracing::warn!(
                                     execution_id,
                                     error = %e,
                                     "Failed to fail execution"
+                                );
+                            }
+
+                            // Cleanup and release lock
+                            workflow.cleanup(&mut ctx).await;
+                            self.lock_manager.release(pane_id, execution_id);
+
+                            return WorkflowExecutionResult::Aborted {
+                                execution_id: execution_id.to_string(),
+                                reason: abort_reason,
+                                step_index: current_step,
+                                elapsed_ms,
+                            };
+                        }
+                        crate::policy::InjectionResult::Error { error, .. } => {
+                            let elapsed_ms = elapsed_ms(start_time);
+                            let abort_reason =
+                                format!("Text injection failed after policy allowed: {error}");
+
+                            tracing::error!(
+                                pane_id,
+                                execution_id,
+                                error = %error,
+                                "Text injection failed after policy allowed"
+                            );
+
+                            // Update execution to failed
+                            if let Err(e) = self.fail_execution(execution_id, &abort_reason).await {
+                                tracing::warn!(
+                                    execution_id,
+                                    error = %e,
+                                    "Failed to fail execution"
+                                );
+                            }
+
+                            // Mark trigger event as handled (with error status)
+                            if let Err(e) =
+                                self.mark_trigger_event_handled(execution_id, "error").await
+                            {
+                                tracing::warn!(
+                                    execution_id,
+                                    error = %e,
+                                    "Failed to mark trigger event as handled"
                                 );
                             }
 
