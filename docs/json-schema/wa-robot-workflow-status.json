@@ -1,0 +1,159 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wezterm-automata.dev/schemas/wa-robot-workflow-status.json",
+  "title": "WA Robot Workflow Status Response",
+  "description": "Schema for the data field when calling 'wa robot workflow status <execution_id>'. Returns workflow execution status.",
+  "type": "object",
+  "required": ["execution_id", "workflow_name", "status"],
+  "properties": {
+    "execution_id": {
+      "type": "string",
+      "description": "Unique execution identifier"
+    },
+    "workflow_name": {
+      "type": "string",
+      "description": "Name of the workflow being executed"
+    },
+    "pane_id": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "Target pane ID (null if not pane-specific)"
+    },
+    "trigger_event_id": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "Event ID that triggered this execution (null if manually triggered)"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["pending", "running", "waiting", "completed", "aborted", "failed"],
+      "description": "Current execution status"
+    },
+    "current_step": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Current step index (0-based)"
+    },
+    "total_steps": {
+      "type": ["integer", "null"],
+      "minimum": 1,
+      "description": "Total number of steps (null if unknown)"
+    },
+    "wait_condition": {
+      "$ref": "#/$defs/wait_condition",
+      "description": "Current wait condition (present when status='waiting')"
+    },
+    "context": {
+      "type": "object",
+      "description": "Workflow context/state (workflow-specific data)"
+    },
+    "result": {
+      "type": "object",
+      "description": "Workflow result (present when status='completed')"
+    },
+    "error": {
+      "type": "string",
+      "description": "Error message (present when status='failed' or 'aborted')"
+    },
+    "started_at": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Unix timestamp (ms) when execution started"
+    },
+    "updated_at": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Unix timestamp (ms) of last status update"
+    },
+    "completed_at": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "Unix timestamp (ms) when execution completed (null if still running)"
+    },
+    "step_logs": {
+      "type": "array",
+      "description": "Log of executed steps",
+      "items": {
+        "$ref": "#/$defs/step_log"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "wait_condition": {
+      "type": "object",
+      "description": "Condition the workflow is waiting for",
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["pattern_matched", "pane_idle", "external_signal", "time"],
+          "description": "Type of wait condition"
+        },
+        "pattern": {
+          "type": "string",
+          "description": "Pattern to match (for pattern_matched)"
+        },
+        "idle_ms": {
+          "type": "integer",
+          "description": "Idle duration in ms (for pane_idle)"
+        },
+        "signal_name": {
+          "type": "string",
+          "description": "Signal name to wait for (for external_signal)"
+        },
+        "delay_ms": {
+          "type": "integer",
+          "description": "Delay in ms (for time)"
+        },
+        "timeout_at": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Unix timestamp (ms) when wait times out"
+        }
+      },
+      "additionalProperties": false
+    },
+    "step_log": {
+      "type": "object",
+      "description": "Log entry for a workflow step execution",
+      "required": ["step_index", "step_name", "result_type"],
+      "properties": {
+        "step_index": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Step index (0-based)"
+        },
+        "step_name": {
+          "type": "string",
+          "description": "Human-readable step name"
+        },
+        "result_type": {
+          "type": "string",
+          "enum": ["continue", "done", "retry", "abort", "wait_for", "send_text"],
+          "description": "Step result type"
+        },
+        "result_data": {
+          "type": "object",
+          "description": "Step-specific result data"
+        },
+        "started_at": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Unix timestamp (ms) when step started"
+        },
+        "completed_at": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Unix timestamp (ms) when step completed"
+        },
+        "duration_ms": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Step duration in milliseconds"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

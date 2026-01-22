@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wezterm-automata.dev/schemas/wa-robot-approve.json",
+  "title": "WA Robot Approve Response",
+  "description": "Schema for the data field when calling 'wa robot approve <code>'. Validates and consumes approval tokens.",
+  "type": "object",
+  "required": ["code", "valid"],
+  "properties": {
+    "code": {
+      "type": "string",
+      "description": "The approval code that was submitted"
+    },
+    "valid": {
+      "type": "boolean",
+      "description": "Whether the approval code was valid and consumed"
+    },
+    "action_kind": {
+      "type": "string",
+      "description": "The action type this approval was for (e.g., 'send_text', 'workflow_run')"
+    },
+    "pane_id": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "The pane ID the approval was scoped to (null if not pane-specific)"
+    },
+    "expires_at": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Unix timestamp (ms) when the approval would have expired"
+    },
+    "consumed_at": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Unix timestamp (ms) when the approval was consumed (present when valid=true)"
+    },
+    "error_reason": {
+      "type": "string",
+      "description": "Why the approval failed (present when valid=false)",
+      "enum": ["invalid_code", "expired", "already_used", "wrong_action", "wrong_pane"]
+    },
+    "action_fingerprint": {
+      "type": "string",
+      "description": "Hash of the action this approval was issued for"
+    }
+  },
+  "additionalProperties": false
+}

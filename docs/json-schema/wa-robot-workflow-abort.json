@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wezterm-automata.dev/schemas/wa-robot-workflow-abort.json",
+  "title": "WA Robot Workflow Abort Response",
+  "description": "Schema for the data field when calling 'wa robot workflow abort <execution_id>'. Aborts a running workflow.",
+  "type": "object",
+  "required": ["execution_id", "aborted"],
+  "properties": {
+    "execution_id": {
+      "type": "string",
+      "description": "The execution ID that was targeted"
+    },
+    "aborted": {
+      "type": "boolean",
+      "description": "Whether the workflow was successfully aborted"
+    },
+    "workflow_name": {
+      "type": "string",
+      "description": "Name of the workflow that was aborted"
+    },
+    "previous_status": {
+      "type": "string",
+      "enum": ["pending", "running", "waiting", "completed", "aborted", "failed"],
+      "description": "Status before abort was requested"
+    },
+    "reason": {
+      "type": "string",
+      "description": "Reason provided for the abort"
+    },
+    "aborted_at": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Unix timestamp (ms) when abort was recorded"
+    },
+    "error_reason": {
+      "type": "string",
+      "description": "Why the abort failed (present when aborted=false)",
+      "enum": ["not_found", "already_completed", "already_aborted", "already_failed"]
+    }
+  },
+  "additionalProperties": false
+}
