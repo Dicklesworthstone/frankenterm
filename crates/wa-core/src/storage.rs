@@ -708,7 +708,10 @@ impl ActionUndoRecord {
     /// Redact sensitive fields before persistence or export
     pub fn redact_fields(&mut self, redactor: &Redactor) {
         self.undo_hint = self.undo_hint.as_ref().map(|value| redactor.redact(value));
-        self.undo_payload = self.undo_payload.as_ref().map(|value| redactor.redact(value));
+        self.undo_payload = self
+            .undo_payload
+            .as_ref()
+            .map(|value| redactor.redact(value));
     }
 }
 
@@ -1348,10 +1351,7 @@ impl StorageHandle {
     }
 
     /// Upsert undo metadata after applying redaction
-    pub async fn upsert_action_undo_redacted(
-        &self,
-        mut record: ActionUndoRecord,
-    ) -> Result<()> {
+    pub async fn upsert_action_undo_redacted(&self, mut record: ActionUndoRecord) -> Result<()> {
         let redactor = Redactor::new();
         record.redact_fields(&redactor);
         self.upsert_action_undo(record).await
@@ -3560,9 +3560,9 @@ fn query_action_history(
     let limit_i64 = usize_to_i64(query.limit.unwrap_or(100), "limit")?;
     params.push(SqlValue::Integer(limit_i64));
 
-    let mut stmt = conn
-        .prepare(&sql)
-        .map_err(|e| StorageError::Database(format!("Failed to prepare action history query: {e}")))?;
+    let mut stmt = conn.prepare(&sql).map_err(|e| {
+        StorageError::Database(format!("Failed to prepare action history query: {e}"))
+    })?;
 
     let rows = stmt
         .query_map(rusqlite::params_from_iter(params), |row| {

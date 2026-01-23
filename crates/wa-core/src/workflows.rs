@@ -6411,11 +6411,29 @@ mod tests {
         // Manually insert step logs to simulate partial execution
         // Steps 0 and 1 completed, step 2 was in progress
         storage
-            .insert_step_log(&execution.id, None, 0, "step_0", "continue", None, 1000, 1100)
+            .insert_step_log(
+                &execution.id,
+                None,
+                0,
+                "step_0",
+                "continue",
+                None,
+                1000,
+                1100,
+            )
             .await
             .unwrap();
         storage
-            .insert_step_log(&execution.id, None, 1, "step_1", "continue", None, 1100, 1200)
+            .insert_step_log(
+                &execution.id,
+                None,
+                1,
+                "step_1",
+                "continue",
+                None,
+                1100,
+                1200,
+            )
             .await
             .unwrap();
 
@@ -6527,11 +6545,29 @@ mod tests {
 
         // Insert step logs for steps 0 and 1 (completed)
         storage
-            .insert_step_log(&execution_id, None, 0, "step_0", "continue", None, 1000, 1100)
+            .insert_step_log(
+                &execution_id,
+                None,
+                0,
+                "step_0",
+                "continue",
+                None,
+                1000,
+                1100,
+            )
             .await
             .unwrap();
         storage
-            .insert_step_log(&execution_id, None, 1, "step_1", "continue", None, 1100, 1200)
+            .insert_step_log(
+                &execution_id,
+                None,
+                1,
+                "step_1",
+                "continue",
+                None,
+                1100,
+                1200,
+            )
             .await
             .unwrap();
 
