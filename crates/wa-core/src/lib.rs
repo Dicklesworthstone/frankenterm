@@ -57,6 +57,9 @@ pub mod wait;
 pub mod wezterm;
 pub mod workflows;
 
+#[cfg(feature = "tui")]
+pub mod tui;
+
 pub use error::{Error, Result, StorageError};
 
 /// Library version

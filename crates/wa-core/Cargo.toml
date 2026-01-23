@@ -42,6 +42,10 @@ toml.workspace = true
 fs2.workspace = true
 base64 = "0.22.1"
 
+# TUI (optional, behind feature)
+ratatui = { workspace = true, optional = true }
+crossterm = { workspace = true, optional = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
 proptest = "1.5"
@@ -76,7 +80,7 @@ vendored = ["vendored-wezterm"]
 browser = ["browser-automation"]
 mcp = ["mcp-server"]
 web = []
-tui = []
+tui = ["dep:ratatui", "dep:crossterm"]
 metrics = []
 distributed = []
 

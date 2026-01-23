@@ -237,6 +237,18 @@ enum Commands {
         #[command(subcommand)]
         command: ConfigCommands,
     },
+
+    /// Launch the interactive TUI (requires --features tui)
+    #[cfg(feature = "tui")]
+    Tui {
+        /// Enable debug mode
+        #[arg(long)]
+        debug: bool,
+
+        /// Refresh interval in seconds
+        #[arg(long, default_value = "5")]
+        refresh: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -3773,42 +3785,118 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
         }
 
         Some(Commands::Doctor) => {
-            println!("Running diagnostics...");
-            println!("  [OK] wa-core loaded");
-            if permission_warnings.is_empty() {
-                println!("  [OK] filesystem permissions");
-                println!("All checks passed!");
+            println!("wa doctor - Running diagnostics...\n");
+
+            let checks = run_diagnostics(&permission_warnings);
+
+            for check in &checks {
+                check.print();
+            }
+
+            let has_errors = checks.iter().any(|c| c.status == DiagnosticStatus::Error);
+            let has_warnings = checks.iter().any(|c| c.status == DiagnosticStatus::Warning);
+
+            println!();
+            if has_errors {
+                println!("Diagnostics completed with errors. Fix issues above before using wa.");
+                std::process::exit(1);
+            } else if has_warnings {
+                println!("Diagnostics completed with warnings. wa should work but performance may be affected.");
             } else {
-                for warning in &permission_warnings {
-                    println!(
-                        "WARNING: {} permissions too open ({:o})",
-                        warning.label, warning.actual_mode
-                    );
-                    println!("  Path: {}", warning.path.display());
-                    println!(
-                        "  Recommended: chmod {:o} {}",
-                        warning.expected_mode,
-                        warning.path.display()
-                    );
-                }
-                println!("Diagnostics completed with warnings.");
+                println!("All checks passed! wa is ready to use.");
             }
         }
 
         Some(Commands::Setup { command }) => match command {
             SetupCommands::Local => {
-                println!("Local setup not yet implemented");
+                println!("wa setup local - WezTerm Configuration Guide\n");
+                println!("wa requires WezTerm to be configured with adequate scrollback.");
+                println!("Without sufficient scrollback, wa may miss terminal output.\n");
+
+                // Check current state
+                match check_wezterm_scrollback() {
+                    Ok((lines, path)) => {
+                        if lines >= RECOMMENDED_SCROLLBACK_LINES {
+                            println!("✓ Your WezTerm scrollback is already configured!");
+                            println!("  Current: {} lines in {}", lines, path.display());
+                            println!("  Recommended minimum: {} lines", RECOMMENDED_SCROLLBACK_LINES);
+                            println!("\nNo changes needed.");
+                        } else {
+                            println!("⚠ Your WezTerm scrollback is below recommended minimum.");
+                            println!("  Current: {} lines in {}", lines, path.display());
+                            println!("  Recommended: {} lines\n", RECOMMENDED_SCROLLBACK_LINES);
+                            println!("Add this line to your wezterm.lua:");
+                            println!("  config.scrollback_lines = {}", RECOMMENDED_SCROLLBACK_LINES);
+                        }
+                    }
+                    Err(_) => {
+                        println!("Could not find or parse WezTerm config.\n");
+                        println!("Add the following to your ~/.config/wezterm/wezterm.lua:\n");
+                        println!("  config.scrollback_lines = {}\n", RECOMMENDED_SCROLLBACK_LINES);
+                        println!("This ensures wa can capture all terminal output without gaps.");
+                    }
+                }
+
+                println!("\n--- Why {} lines? ---", RECOMMENDED_SCROLLBACK_LINES);
+                println!("• AI coding agents can produce substantial output");
+                println!("• wa uses delta extraction to capture only new content");
+                println!("• Insufficient scrollback causes capture gaps (EVENT_GAP_DETECTED)");
+                println!("• 50k lines ≈ 2-5 MB memory per pane (negligible on modern systems)");
+                println!("\nRun 'wa doctor' to verify your configuration.");
             }
             SetupCommands::Remote { host } => {
-                println!("Remote setup for '{host}' not yet implemented");
+                println!("wa setup remote - Remote Host Setup for '{host}'\n");
+                println!("Remote setup is not yet implemented.\n");
+                println!("For now, ensure the remote host has:");
+                println!("  1. WezTerm SSH domain configured in your wezterm.lua");
+                println!("  2. Adequate scrollback_lines setting");
+                println!("\nExample SSH domain configuration:");
+                println!("  config.ssh_domains = {{");
+                println!("    {{");
+                println!("      name = '{}',", host);
+                println!("      remote_address = '{}.example.com',", host);
+                println!("      username = 'your_user',");
+                println!("    }},");
+                println!("  }}");
             }
             SetupCommands::Config => {
-                println!("Config generation not yet implemented");
+                println!("wa setup config - Generate WezTerm Config Additions\n");
+                println!("Add the following to your ~/.config/wezterm/wezterm.lua:\n");
+                println!("-- wa (WezTerm Automata) recommended settings");
+                println!("-- Ensure adequate scrollback for terminal capture");
+                println!("config.scrollback_lines = {}", RECOMMENDED_SCROLLBACK_LINES);
+                println!();
+                println!("-- Optional: Enable hyperlinks for file navigation");
+                println!("config.hyperlink_rules = wezterm.default_hyperlink_rules()");
+                println!();
+                println!("-- Optional: Quick-access key for wa status");
+                println!("-- config.keys = {{");
+                println!("--   {{ key = 'w', mods = 'CTRL|SHIFT', action = wezterm.action.SpawnCommandInNewTab {{");
+                println!("--     args = {{ 'wa', 'status' }},");
+                println!("--   }} }},");
+                println!("-- }}");
             }
         },
 
         Some(Commands::Config { command }) => {
             handle_config_command(command, cli_config_arg.as_deref(), workspace.as_deref()).await?;
+        }
+
+        #[cfg(feature = "tui")]
+        Some(Commands::Tui { debug, refresh }) => {
+            use wa_core::tui::{run_tui, AppConfig, ProductionQueryClient};
+            use std::time::Duration;
+
+            let query_client = ProductionQueryClient::new(layout.clone());
+            let tui_config = AppConfig {
+                refresh_interval: Duration::from_secs(refresh),
+                debug,
+            };
+
+            if let Err(e) = run_tui(query_client, tui_config) {
+                eprintln!("TUI error: {e}");
+                return Err(e.into());
+            }
         }
 
         None => {
@@ -4186,6 +4274,266 @@ fn set_toml_value(
     }
 
     Ok(())
+}
+
+/// Recommended minimum scrollback lines for wa to function reliably
+const RECOMMENDED_SCROLLBACK_LINES: u64 = 50_000;
+
+/// Check WezTerm scrollback configuration
+///
+/// Returns (scrollback_lines, config_path) if found, or an error message.
+fn check_wezterm_scrollback() -> Result<(u64, std::path::PathBuf), String> {
+    // Check common WezTerm config locations
+    let config_paths: Vec<std::path::PathBuf> = vec![
+        dirs::config_dir()
+            .map(|p| p.join("wezterm/wezterm.lua"))
+            .unwrap_or_default(),
+        dirs::home_dir()
+            .map(|p| p.join(".wezterm.lua"))
+            .unwrap_or_default(),
+        dirs::home_dir()
+            .map(|p| p.join(".config/wezterm/wezterm.lua"))
+            .unwrap_or_default(),
+    ];
+
+    for config_path in config_paths {
+        if config_path.exists() {
+            match std::fs::read_to_string(&config_path) {
+                Ok(content) => {
+                    // Parse scrollback_lines from Lua config
+                    // Patterns: config.scrollback_lines = N or scrollback_lines = N
+                    for line in content.lines() {
+                        let line = line.trim();
+                        // Skip comments
+                        if line.starts_with("--") {
+                            continue;
+                        }
+                        // Match: config.scrollback_lines = 50000 or scrollback_lines = 50000
+                        if line.contains("scrollback_lines") && line.contains('=') {
+                            // Extract the number after '='
+                            if let Some(value_part) = line.split('=').nth(1) {
+                                let value_str = value_part.trim().trim_end_matches(',');
+                                if let Ok(lines) = value_str.parse::<u64>() {
+                                    return Ok((lines, config_path));
+                                }
+                            }
+                        }
+                    }
+                    return Err(format!(
+                        "scrollback_lines not set in {}",
+                        config_path.display()
+                    ));
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "Failed to read {}: {}",
+                        config_path.display(),
+                        e
+                    ));
+                }
+            }
+        }
+    }
+
+    Err("No WezTerm config file found (~/.config/wezterm/wezterm.lua or ~/.wezterm.lua)".to_string())
+}
+
+/// Diagnostic result for a single check
+struct DiagnosticCheck {
+    name: &'static str,
+    status: DiagnosticStatus,
+    detail: Option<String>,
+    recommendation: Option<String>,
+}
+
+#[derive(PartialEq)]
+enum DiagnosticStatus {
+    Ok,
+    Warning,
+    Error,
+}
+
+impl DiagnosticCheck {
+    fn ok(name: &'static str) -> Self {
+        Self {
+            name,
+            status: DiagnosticStatus::Ok,
+            detail: None,
+            recommendation: None,
+        }
+    }
+
+    fn ok_with_detail(name: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            name,
+            status: DiagnosticStatus::Ok,
+            detail: Some(detail.into()),
+            recommendation: None,
+        }
+    }
+
+    fn warning(name: &'static str, detail: impl Into<String>, recommendation: impl Into<String>) -> Self {
+        Self {
+            name,
+            status: DiagnosticStatus::Warning,
+            detail: Some(detail.into()),
+            recommendation: Some(recommendation.into()),
+        }
+    }
+
+    fn error(name: &'static str, detail: impl Into<String>, recommendation: impl Into<String>) -> Self {
+        Self {
+            name,
+            status: DiagnosticStatus::Error,
+            detail: Some(detail.into()),
+            recommendation: Some(recommendation.into()),
+        }
+    }
+
+    fn print(&self) {
+        let status_icon = match self.status {
+            DiagnosticStatus::Ok => "[OK]",
+            DiagnosticStatus::Warning => "[WARN]",
+            DiagnosticStatus::Error => "[ERR]",
+        };
+
+        if let Some(detail) = &self.detail {
+            println!("  {} {} - {}", status_icon, self.name, detail);
+        } else {
+            println!("  {} {}", status_icon, self.name);
+        }
+
+        if let Some(rec) = &self.recommendation {
+            println!("       → {}", rec);
+        }
+    }
+}
+
+/// Run all diagnostic checks and return results
+fn run_diagnostics(permission_warnings: &[wa_core::config::PermissionWarning]) -> Vec<DiagnosticCheck> {
+    let mut checks = Vec::new();
+
+    // Check 1: wa-core loaded
+    checks.push(DiagnosticCheck::ok("wa-core loaded"));
+
+    // Check 2: WezTerm CLI available
+    match std::process::Command::new("wezterm")
+        .arg("--version")
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            let version = String::from_utf8_lossy(&output.stdout);
+            let version = version.trim();
+            checks.push(DiagnosticCheck::ok_with_detail("WezTerm CLI", version));
+        }
+        Ok(_) => {
+            checks.push(DiagnosticCheck::error(
+                "WezTerm CLI",
+                "wezterm command failed",
+                "Ensure WezTerm is installed and in PATH",
+            ));
+        }
+        Err(_) => {
+            checks.push(DiagnosticCheck::error(
+                "WezTerm CLI",
+                "wezterm not found",
+                "Install WezTerm from https://wezfurlong.org/wezterm/",
+            ));
+        }
+    }
+
+    // Check 3: WezTerm scrollback configuration
+    match check_wezterm_scrollback() {
+        Ok((lines, path)) => {
+            if lines >= RECOMMENDED_SCROLLBACK_LINES {
+                checks.push(DiagnosticCheck::ok_with_detail(
+                    "WezTerm scrollback",
+                    format!("{} lines ({})", lines, path.display()),
+                ));
+            } else {
+                checks.push(DiagnosticCheck::warning(
+                    "WezTerm scrollback",
+                    format!("{} lines (below {} recommended)", lines, RECOMMENDED_SCROLLBACK_LINES),
+                    format!(
+                        "Add to wezterm.lua: config.scrollback_lines = {}",
+                        RECOMMENDED_SCROLLBACK_LINES
+                    ),
+                ));
+            }
+        }
+        Err(msg) => {
+            checks.push(DiagnosticCheck::warning(
+                "WezTerm scrollback",
+                msg,
+                format!(
+                    "Add to wezterm.lua: config.scrollback_lines = {}",
+                    RECOMMENDED_SCROLLBACK_LINES
+                ),
+            ));
+        }
+    }
+
+    // Check 4: Filesystem permissions
+    if permission_warnings.is_empty() {
+        checks.push(DiagnosticCheck::ok("filesystem permissions"));
+    } else {
+        for warning in permission_warnings {
+            checks.push(DiagnosticCheck::warning(
+                "filesystem permissions",
+                format!(
+                    "{} permissions too open ({:o})",
+                    warning.label, warning.actual_mode
+                ),
+                format!(
+                    "chmod {:o} {}",
+                    warning.expected_mode,
+                    warning.path.display()
+                ),
+            ));
+        }
+    }
+
+    // Check 5: WezTerm running and responding
+    match std::process::Command::new("wezterm")
+        .args(["cli", "list", "--format", "json"])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            match serde_json::from_str::<Vec<serde_json::Value>>(&stdout) {
+                Ok(panes) => {
+                    checks.push(DiagnosticCheck::ok_with_detail(
+                        "WezTerm connection",
+                        format!("{} pane(s) detected", panes.len()),
+                    ));
+                }
+                Err(_) => {
+                    checks.push(DiagnosticCheck::warning(
+                        "WezTerm connection",
+                        "Could not parse pane list",
+                        "Check WezTerm version compatibility",
+                    ));
+                }
+            }
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            checks.push(DiagnosticCheck::error(
+                "WezTerm connection",
+                format!("CLI failed: {}", stderr.trim()),
+                "Ensure WezTerm GUI is running",
+            ));
+        }
+        Err(e) => {
+            checks.push(DiagnosticCheck::error(
+                "WezTerm connection",
+                format!("CLI error: {}", e),
+                "Ensure WezTerm is installed and running",
+            ));
+        }
+    }
+
+    checks
 }
 
 /// Parse a string value into appropriate TOML type

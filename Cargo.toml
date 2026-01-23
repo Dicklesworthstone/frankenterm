@@ -76,6 +76,10 @@ toml_edit = "0.22"
 # File locking
 fs2 = "0.4"
 
+# TUI (optional)
+ratatui = "0.29"
+crossterm = "0.28"
+
 # Benchmarking
 criterion = { version = "0.5", features = ["async_tokio"] }
 
