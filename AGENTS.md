@@ -121,8 +121,8 @@ wa robot --format toon --stats state
 # Get recent output from pane
 wa robot get-text 0
 
-# Get last N lines
-wa robot get-text 0 --lines 50
+# Get last N lines (tail)
+wa robot get-text 0 --tail 50
 
 # Include escape sequences
 wa robot get-text 0 --escapes
@@ -137,18 +137,18 @@ wa robot send 1 "/compact"
 # Preview without executing
 wa robot send 1 "dangerous command" --dry-run
 
-# Character-by-character (no paste)
-wa robot send 1 "slow" --no-paste
+# Send and wait for confirmation pattern
+wa robot send 1 "y" --wait-for "confirmed"
 ```
 
 #### Pattern Waiting
 
 ```bash
-# Wait for pattern with timeout
-wa robot wait-for 0 "core.codex:usage_reached" --timeout 3600
+# Wait for pattern with timeout (seconds)
+wa robot wait-for 0 "core.codex:usage_reached" --timeout-secs 3600
 
 # Wait for completion marker
-wa robot wait-for 0 "✓ Done" --timeout 60
+wa robot wait-for 0 "✓ Done" --timeout-secs 60
 ```
 
 #### Search
@@ -171,7 +171,7 @@ wa robot search "warning" --limit 5
 wa robot events --limit 10
 
 # Filter by pane
-wa robot events --pane-id 0
+wa robot events --pane 0
 
 # Filter by rule
 wa robot events --rule-id "usage_limit"
