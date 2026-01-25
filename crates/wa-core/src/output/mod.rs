@@ -27,10 +27,12 @@
 //! println!("{}", renderer.render(&panes));
 //! ```
 
+mod error_renderer;
 mod format;
 mod renderers;
 mod table;
 
+pub use error_renderer::{ErrorRenderer, get_code_for_error, render_error};
 pub use format::{OutputFormat, detect_format};
 pub use renderers::{
     EventListRenderer, PaneTableRenderer, Render, RenderContext, SearchResultRenderer,
