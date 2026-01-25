@@ -307,7 +307,7 @@ Robot mode returns structured errors:
 {
   "ok": false,
   "error": {
-    "code": "PANE_NOT_FOUND",
+    "code": "robot.pane_not_found",
     "message": "Pane 99 not found",
     "hint": "Use 'wa robot state' to list available panes"
   }
