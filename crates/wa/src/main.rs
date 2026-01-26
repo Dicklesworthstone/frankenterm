@@ -246,6 +246,12 @@ enum Commands {
         command: ConfigCommands,
     },
 
+    /// Database maintenance commands
+    Db {
+        #[command(subcommand)]
+        command: DbCommands,
+    },
+
     /// Launch the interactive TUI (requires --features tui)
     #[cfg(feature = "tui")]
     Tui {
@@ -562,6 +568,32 @@ enum ConfigCommands {
         /// Custom config path
         #[arg(long)]
         path: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum DbCommands {
+    /// Migrate or inspect the database schema
+    Migrate {
+        /// Show migration status without applying changes
+        #[arg(long)]
+        status: bool,
+
+        /// Target schema version (default: current SCHEMA_VERSION)
+        #[arg(long)]
+        to: Option<i32>,
+
+        /// Apply without prompting for confirmation
+        #[arg(long)]
+        yes: bool,
+
+        /// Allow downgrades (dangerous)
+        #[arg(long)]
+        allow_downgrade: bool,
+
+        /// Show the plan without applying migrations
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -4806,6 +4838,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
         Some(Commands::Config { command }) => {
             handle_config_command(command, cli_config_arg.as_deref(), workspace.as_deref()).await?;
+        }
+
+        Some(Commands::Db { command }) => {
+            handle_db_command(command, &layout).await?;
         }
 
         #[cfg(feature = "tui")]

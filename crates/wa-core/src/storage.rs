@@ -360,6 +360,81 @@ pub struct Migration {
     pub description: &'static str,
     /// SQL to execute for the upgrade
     pub up_sql: &'static str,
+    /// SQL to execute for rollback (None means rollback unsupported)
+    pub down_sql: Option<&'static str>,
+}
+
+/// Direction for a migration plan or execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationDirection {
+    /// Upgrade schema to a newer version
+    Up,
+    /// Roll back schema to an older version
+    Down,
+}
+
+impl MigrationDirection {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Up => "up",
+            Self::Down => "down",
+        }
+    }
+}
+
+/// A single migration step in a plan or report.
+#[derive(Debug, Clone)]
+pub struct MigrationStep {
+    /// Migration version being applied or rolled back
+    pub migration_version: i32,
+    /// Resulting schema version after this step
+    pub resulting_version: i32,
+    /// Human-readable description
+    pub description: &'static str,
+    /// Direction of this step
+    pub direction: MigrationDirection,
+}
+
+/// Migration plan or execution report.
+#[derive(Debug, Clone)]
+pub struct MigrationPlan {
+    /// Starting version
+    pub from_version: i32,
+    /// Target version
+    pub to_version: i32,
+    /// Direction (up/down)
+    pub direction: MigrationDirection,
+    /// Steps to apply
+    pub steps: Vec<MigrationStep>,
+}
+
+/// Status entry for a migration.
+#[derive(Debug, Clone)]
+pub struct MigrationStatusEntry {
+    /// Schema version after the migration is applied
+    pub version: i32,
+    /// Human-readable description
+    pub description: &'static str,
+    /// Whether this migration is applied
+    pub applied: bool,
+    /// Whether rollback is available
+    pub rollback_supported: bool,
+}
+
+/// Status report for schema migrations.
+#[derive(Debug, Clone)]
+pub struct MigrationStatusReport {
+    /// Whether the database file exists
+    pub db_exists: bool,
+    /// Whether schema initialization is required
+    pub needs_initialization: bool,
+    /// Current schema version (PRAGMA user_version)
+    pub current_version: i32,
+    /// Target schema version (SCHEMA_VERSION)
+    pub target_version: i32,
+    /// All migration entries with applied/pending status
+    pub entries: Vec<MigrationStatusEntry>,
 }
 
 /// Registry of all migrations.
@@ -380,16 +455,19 @@ static MIGRATIONS: &[Migration] = &[
         version: 1,
         description: "Initial schema",
         up_sql: "", // Empty - baseline schema is created via SCHEMA_SQL
+        down_sql: None,
     },
     Migration {
         version: 2,
         description: "Add decision_context to audit_actions",
         up_sql: "ALTER TABLE audit_actions ADD COLUMN decision_context TEXT;",
+        down_sql: Some("ALTER TABLE audit_actions DROP COLUMN decision_context;"),
     },
     Migration {
         version: 3,
         description: "Add pane_uuid to panes for stable identity",
         up_sql: "ALTER TABLE panes ADD COLUMN pane_uuid TEXT;",
+        down_sql: Some("ALTER TABLE panes DROP COLUMN pane_uuid;"),
     },
     Migration {
         version: 4,
@@ -417,6 +495,15 @@ static MIGRATIONS: &[Migration] = &[
             LEFT JOIN action_undo u ON u.audit_action_id = a.id
             LEFT JOIN workflow_step_logs w ON w.audit_action_id = a.id;
         ",
+        down_sql: Some(
+            r"
+            DROP VIEW IF EXISTS action_history;
+            DROP INDEX IF EXISTS idx_action_undo_undoable;
+            DROP TABLE IF EXISTS action_undo;
+            DROP INDEX IF EXISTS idx_step_logs_audit_action;
+            ALTER TABLE workflow_step_logs DROP COLUMN audit_action_id;
+        ",
+        ),
     },
     Migration {
         version: 5,
@@ -442,6 +529,15 @@ static MIGRATIONS: &[Migration] = &[
             CREATE INDEX IF NOT EXISTS idx_accounts_percent ON accounts(service, percent_remaining DESC);
             CREATE INDEX IF NOT EXISTS idx_accounts_last_used ON accounts(service, last_used_at);
         ",
+        down_sql: Some(
+            r"
+            DROP INDEX IF EXISTS idx_accounts_last_used;
+            DROP INDEX IF EXISTS idx_accounts_percent;
+            DROP INDEX IF EXISTS idx_accounts_service;
+            DROP INDEX IF EXISTS idx_accounts_service_account;
+            DROP TABLE IF EXISTS accounts;
+        ",
+        ),
     },
 ];
 
@@ -1080,6 +1176,186 @@ fn ensure_workflow_step_logs_audit_action_id(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migration_for_version(version: i32) -> Option<&'static Migration> {
+    MIGRATIONS.iter().find(|m| m.version == version)
+}
+
+fn previous_migration_version(version: i32) -> i32 {
+    let mut prev = 0;
+    for migration in MIGRATIONS {
+        if migration.version < version {
+            prev = migration.version;
+        } else {
+            break;
+        }
+    }
+    prev
+}
+
+fn build_migration_plan(from_version: i32, to_version: i32) -> Result<MigrationPlan> {
+    if to_version > SCHEMA_VERSION {
+        return Err(StorageError::MigrationFailed(format!(
+            "Target schema version ({to_version}) is newer than supported ({SCHEMA_VERSION}). \
+             Please upgrade wa to a newer version."
+        ))
+        .into());
+    }
+
+    if to_version < 1 {
+        return Err(StorageError::MigrationFailed(format!(
+            "Target schema version ({to_version}) is not supported. \
+             The minimum supported schema version is 1."
+        ))
+        .into());
+    }
+
+    if from_version == to_version {
+        return Ok(MigrationPlan {
+            from_version,
+            to_version,
+            direction: MigrationDirection::Up,
+            steps: Vec::new(),
+        });
+    }
+
+    if to_version > from_version {
+        let steps = MIGRATIONS
+            .iter()
+            .filter(|m| m.version > from_version && m.version <= to_version)
+            .map(|m| MigrationStep {
+                migration_version: m.version,
+                resulting_version: m.version,
+                description: m.description,
+                direction: MigrationDirection::Up,
+            })
+            .collect();
+
+        return Ok(MigrationPlan {
+            from_version,
+            to_version,
+            direction: MigrationDirection::Up,
+            steps,
+        });
+    }
+
+    let mut steps = Vec::new();
+    for migration in MIGRATIONS.iter().rev() {
+        if migration.version <= to_version || migration.version > from_version {
+            continue;
+        }
+        if migration.down_sql.is_none() {
+            return Err(StorageError::MigrationFailed(format!(
+                "Rollback not supported for migration v{} ({})",
+                migration.version, migration.description
+            ))
+            .into());
+        }
+        let resulting_version = previous_migration_version(migration.version);
+        steps.push(MigrationStep {
+            migration_version: migration.version,
+            resulting_version,
+            description: migration.description,
+            direction: MigrationDirection::Down,
+        });
+    }
+
+    Ok(MigrationPlan {
+        from_version,
+        to_version,
+        direction: MigrationDirection::Down,
+        steps,
+    })
+}
+
+fn apply_migration_step(conn: &Connection, step: &MigrationStep) -> Result<()> {
+    let Some(migration) = migration_for_version(step.migration_version) else {
+        return Err(StorageError::MigrationFailed(format!(
+            "Unknown migration version {}",
+            step.migration_version
+        ))
+        .into());
+    };
+
+    conn.execute_batch("BEGIN IMMEDIATE").map_err(|e| {
+        StorageError::MigrationFailed(format!(
+            "Failed to start migration transaction for v{}: {e}",
+            migration.version
+        ))
+    })?;
+
+    let result = match step.direction {
+        MigrationDirection::Up => {
+            if migration.version == 4 {
+                ensure_workflow_step_logs_audit_action_id(conn)?;
+            }
+            if !migration.up_sql.is_empty() {
+                conn.execute_batch(migration.up_sql).map_err(|e| {
+                    StorageError::MigrationFailed(format!(
+                        "Migration to v{} ({}) failed: {e}",
+                        migration.version, migration.description
+                    ))
+                })?;
+            }
+            set_user_version(conn, migration.version)?;
+            record_migration(conn, migration.version, migration.description)?;
+            Ok(())
+        }
+        MigrationDirection::Down => {
+            let down_sql = migration.down_sql.ok_or_else(|| {
+                StorageError::MigrationFailed(format!(
+                    "Rollback not supported for migration v{} ({})",
+                    migration.version, migration.description
+                ))
+            })?;
+            if !down_sql.is_empty() {
+                conn.execute_batch(down_sql).map_err(|e| {
+                    StorageError::MigrationFailed(format!(
+                        "Rollback of v{} ({}) failed: {e}",
+                        migration.version, migration.description
+                    ))
+                })?;
+            }
+            set_user_version(conn, step.resulting_version)?;
+            record_migration(
+                conn,
+                step.resulting_version,
+                &format!("Rollback: {}", migration.description),
+            )?;
+            Ok(())
+        }
+    };
+
+    match result {
+        Ok(()) => {
+            conn.execute_batch("COMMIT").map_err(|e| {
+                StorageError::MigrationFailed(format!(
+                    "Failed to commit migration transaction for v{}: {e}",
+                    migration.version
+                ))
+            })?;
+            Ok(())
+        }
+        Err(err) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(err)
+        }
+    }
+}
+
+fn apply_migration_plan(conn: &Connection, plan: &MigrationPlan) -> Result<()> {
+    for step in &plan.steps {
+        apply_migration_step(conn, step)?;
+        tracing::info!(
+            direction = step.direction.as_str(),
+            version = step.migration_version,
+            resulting_version = step.resulting_version,
+            description = step.description,
+            "Applied schema migration step"
+        );
+    }
+    Ok(())
+}
+
 /// Apply all pending migrations from the current version to SCHEMA_VERSION.
 ///
 /// Each migration is applied in order, and the user_version is updated after
@@ -1087,40 +1363,8 @@ fn ensure_workflow_step_logs_audit_action_id(conn: &Connection) -> Result<()> {
 /// through, the database version correctly reflects which migrations have
 /// been applied.
 fn run_migrations(conn: &Connection, from_version: i32) -> Result<()> {
-    for migration in MIGRATIONS {
-        if migration.version <= from_version {
-            // Already applied
-            continue;
-        }
-
-        if migration.version == 4 {
-            ensure_workflow_step_logs_audit_action_id(conn)?;
-        }
-
-        // Apply migration SQL if non-empty
-        if !migration.up_sql.is_empty() {
-            conn.execute_batch(migration.up_sql).map_err(|e| {
-                StorageError::MigrationFailed(format!(
-                    "Migration to v{} ({}) failed: {e}",
-                    migration.version, migration.description
-                ))
-            })?;
-        }
-
-        // Update version atomically
-        set_user_version(conn, migration.version)?;
-
-        // Record for audit trail
-        record_migration(conn, migration.version, migration.description)?;
-
-        tracing::info!(
-            version = migration.version,
-            description = migration.description,
-            "Applied schema migration"
-        );
-    }
-
-    Ok(())
+    let plan = build_migration_plan(from_version, SCHEMA_VERSION)?;
+    apply_migration_plan(conn, &plan)
 }
 
 /// Get the current schema version from the schema_version audit table.
@@ -1129,7 +1373,7 @@ fn run_migrations(conn: &Connection, from_version: i32) -> Result<()> {
 /// PRAGMA user_version but provides history of when migrations were applied.
 pub fn get_schema_version(conn: &Connection) -> Result<Option<i32>> {
     conn.query_row(
-        "SELECT version FROM schema_version ORDER BY version DESC LIMIT 1",
+        "SELECT version FROM schema_version ORDER BY applied_at DESC, rowid DESC LIMIT 1",
         [],
         |row| row.get(0),
     )
@@ -1159,6 +1403,112 @@ pub fn pending_migrations(current_version: i32) -> Vec<&'static Migration> {
         .iter()
         .filter(|m| m.version > current_version)
         .collect()
+}
+
+/// Build a migration plan for a database path without executing it.
+pub fn migration_plan_for_path(db_path: &Path, target_version: i32) -> Result<MigrationPlan> {
+    if !db_path.exists() {
+        return Err(StorageError::MigrationFailed(format!(
+            "Database not found at {}",
+            db_path.display()
+        ))
+        .into());
+    }
+
+    let conn = Connection::open(db_path)
+        .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
+    let needs_init = needs_initialization(&conn)?;
+    if needs_init {
+        return Err(StorageError::MigrationFailed(
+            "Database is uninitialized; run migration without --status to initialize".to_string(),
+        )
+        .into());
+    }
+
+    let current = get_user_version(&conn)?;
+    build_migration_plan(current, target_version)
+}
+
+/// Return a migration status report for a database path.
+pub fn migration_status_for_path(db_path: &Path) -> Result<MigrationStatusReport> {
+    let db_exists = db_path.exists();
+    if !db_exists {
+        return Ok(MigrationStatusReport {
+            db_exists,
+            needs_initialization: true,
+            current_version: 0,
+            target_version: SCHEMA_VERSION,
+            entries: MIGRATIONS
+                .iter()
+                .map(|m| MigrationStatusEntry {
+                    version: m.version,
+                    description: m.description,
+                    applied: false,
+                    rollback_supported: m.down_sql.is_some(),
+                })
+                .collect(),
+        });
+    }
+
+    let conn = Connection::open(db_path)
+        .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
+    let needs_init = needs_initialization(&conn)?;
+    let current = get_user_version(&conn)?;
+    let entries = MIGRATIONS
+        .iter()
+        .map(|m| MigrationStatusEntry {
+            version: m.version,
+            description: m.description,
+            applied: !needs_init && m.version <= current,
+            rollback_supported: m.down_sql.is_some(),
+        })
+        .collect();
+
+    Ok(MigrationStatusReport {
+        db_exists,
+        needs_initialization: needs_init,
+        current_version: current,
+        target_version: SCHEMA_VERSION,
+        entries,
+    })
+}
+
+/// Migrate a database at the given path to a target schema version.
+///
+/// If the database is uninitialized, it will be initialized to the current
+/// schema version (SCHEMA_VERSION). Initializing to older versions is not supported.
+pub fn migrate_database_to_version(db_path: &Path, target_version: i32) -> Result<MigrationPlan> {
+    ensure_parent_dir(db_path)?;
+
+    let conn = Connection::open(db_path)
+        .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
+    let needs_init = needs_initialization(&conn)?;
+    let current = get_user_version(&conn)?;
+
+    if needs_init {
+        if target_version != SCHEMA_VERSION {
+            return Err(StorageError::MigrationFailed(format!(
+                "Database is uninitialized; can only initialize to current schema version ({SCHEMA_VERSION})."
+            ))
+            .into());
+        }
+        initialize_schema(&conn)?;
+        return Ok(MigrationPlan {
+            from_version: 0,
+            to_version: SCHEMA_VERSION,
+            direction: MigrationDirection::Up,
+            steps: vec![MigrationStep {
+                migration_version: SCHEMA_VERSION,
+                resulting_version: SCHEMA_VERSION,
+                description: "Initial schema",
+                direction: MigrationDirection::Up,
+            }],
+        });
+    }
+
+    let plan = build_migration_plan(current, target_version)?;
+    apply_migration_plan(&conn, &plan)?;
+    Ok(plan)
 }
 
 // =============================================================================
@@ -2135,6 +2485,115 @@ impl StorageHandle {
         // We can't easily send a ping without adding a new WriteCommand variant,
         // so we check if the channel has capacity (indicates writer is processing)
         !self.write_tx.is_closed()
+    }
+
+    // =========================================================================
+    // Account Operations
+    // =========================================================================
+
+    /// Upsert an account record (insert or update by service+account_id)
+    ///
+    /// Returns the row ID of the upserted account.
+    pub async fn upsert_account(&self, account: crate::accounts::AccountRecord) -> Result<i64> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::UpsertAccount { account, respond: tx })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    /// Update an account's last_used_at timestamp
+    ///
+    /// Call this when an account is selected for use to maintain LRU ordering.
+    pub async fn update_account_last_used(
+        &self,
+        service: &str,
+        account_id: &str,
+        last_used_at: i64,
+    ) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::UpdateAccountLastUsed {
+                service: service.to_string(),
+                account_id: account_id.to_string(),
+                last_used_at,
+                respond: tx,
+            })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    /// Delete an account by service and account_id
+    ///
+    /// Returns true if an account was deleted, false if not found.
+    pub async fn delete_account(&self, service: &str, account_id: &str) -> Result<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::DeleteAccount {
+                service: service.to_string(),
+                account_id: account_id.to_string(),
+                respond: tx,
+            })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    /// Get all accounts for a service
+    ///
+    /// Returns accounts sorted by percent_remaining DESC, last_used_at ASC.
+    pub async fn get_accounts_by_service(
+        &self,
+        service: &str,
+    ) -> Result<Vec<crate::accounts::AccountRecord>> {
+        let db_path = self.db_path.clone();
+        let service = service.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str())
+                .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
+            get_accounts_by_service_sync(&conn, &service)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+    }
+
+    /// Get a single account by service and account_id
+    pub async fn get_account(
+        &self,
+        service: &str,
+        account_id: &str,
+    ) -> Result<Option<crate::accounts::AccountRecord>> {
+        let db_path = self.db_path.clone();
+        let service = service.to_string();
+        let account_id = account_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str())
+                .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
+            get_account_sync(&conn, &service, &account_id)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+    }
+
+    /// Select the best account for a service according to selection policy
+    ///
+    /// This combines fetching accounts with the selection algorithm from the
+    /// accounts module.
+    pub async fn select_account(
+        &self,
+        service: &str,
+        config: &crate::accounts::AccountSelectionConfig,
+    ) -> Result<crate::accounts::AccountSelectionResult> {
+        let accounts = self.get_accounts_by_service(service).await?;
+        Ok(crate::accounts::select_account(&accounts, config))
     }
 
     /// Shutdown the storage handle
