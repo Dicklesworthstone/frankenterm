@@ -1138,7 +1138,10 @@ impl SuggestionRule for FirstTimeUserRule {
                 self.id(),
             )
             .with_priority(Priority::Low)
-            .with_action(SuggestedAction::new("Start watching", "wa watch --foreground"))
+            .with_action(SuggestedAction::new(
+                "Start watching",
+                "wa watch --foreground",
+            ))
             .with_dismissable(true),
         )
     }
@@ -1656,11 +1659,12 @@ mod tests {
 
     #[test]
     fn test_suggestion_builder() {
-        let suggestion = Suggestion::new("test_id", SuggestionType::Tip, "Test message", "test.rule")
-            .with_priority(Priority::High)
-            .with_action(SuggestedAction::new("Do it", "wa do-it"))
-            .with_learn_more("https://example.com")
-            .with_dismissable(false);
+        let suggestion =
+            Suggestion::new("test_id", SuggestionType::Tip, "Test message", "test.rule")
+                .with_priority(Priority::High)
+                .with_action(SuggestedAction::new("Do it", "wa do-it"))
+                .with_learn_more("https://example.com")
+                .with_dismissable(false);
 
         assert_eq!(suggestion.id.as_str(), "test_id");
         assert_eq!(suggestion.suggestion_type, SuggestionType::Tip);

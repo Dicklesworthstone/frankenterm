@@ -897,12 +897,7 @@ pub fn check_and_recover_wal(conn: &Connection, db_path: &str) -> Result<()> {
         .map_err(|e| StorageError::Database(format!("WAL checkpoint failed: {e}")))?;
 
     if wal_frames > 0 {
-        tracing::info!(
-            busy,
-            wal_frames,
-            checkpointed,
-            "WAL checkpoint completed"
-        );
+        tracing::info!(busy, wal_frames, checkpointed, "WAL checkpoint completed");
     }
 
     // If WAL is huge, do a full checkpoint to truncate it

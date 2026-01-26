@@ -4668,35 +4668,47 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 "Forwarding user-var event to watcher"
             );
 
-            let client = wa_core::ipc::IpcClient::new(&layout.ipc_socket_path);
-            match client.send_user_var(pane, name, value).await {
-                Ok(response) => {
-                    if !response.ok {
-                        let detail = response
-                            .error
-                            .unwrap_or_else(|| "unknown error".to_string());
-                        eprintln!("Error: watcher rejected user-var event: {detail}");
+            #[cfg(unix)]
+            {
+                let client = wa_core::ipc::IpcClient::new(&layout.ipc_socket_path);
+                match client.send_user_var(pane, name, value).await {
+                    Ok(response) => {
+                        if !response.ok {
+                            let detail = response
+                                .error
+                                .unwrap_or_else(|| "unknown error".to_string());
+                            eprintln!("Error: watcher rejected user-var event: {detail}");
+                            eprintln!(
+                                "Context: pane_id={pane} name=\"{name_for_log}\" value_len={value_len}"
+                            );
+                            std::process::exit(1);
+                        }
+                    }
+                    Err(err) => {
+                        match err {
+                            wa_core::events::UserVarError::WatcherNotRunning { .. } => {
+                                eprintln!("Error: {err}");
+                                eprintln!(
+                                    "Hint: start the watcher with `wa watch` in this workspace."
+                                );
+                            }
+                            _ => {
+                                eprintln!("Error: failed to forward user-var event: {err}");
+                            }
+                        }
                         eprintln!(
                             "Context: pane_id={pane} name=\"{name_for_log}\" value_len={value_len}"
                         );
                         std::process::exit(1);
                     }
                 }
-                Err(err) => {
-                    match err {
-                        wa_core::events::UserVarError::WatcherNotRunning { .. } => {
-                            eprintln!("Error: {err}");
-                            eprintln!("Hint: start the watcher with `wa watch` in this workspace.");
-                        }
-                        _ => {
-                            eprintln!("Error: failed to forward user-var event: {err}");
-                        }
-                    }
-                    eprintln!(
-                        "Context: pane_id={pane} name=\"{name_for_log}\" value_len={value_len}"
-                    );
-                    std::process::exit(1);
-                }
+            }
+
+            #[cfg(not(unix))]
+            {
+                eprintln!("Error: IPC event forwarding is only supported on Unix platforms.");
+                eprintln!("Context: pane_id={pane} name=\"{name_for_log}\" value_len={value_len}");
+                std::process::exit(1);
             }
         }
 

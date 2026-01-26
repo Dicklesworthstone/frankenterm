@@ -47,6 +47,7 @@ pub mod event_templates;
 pub mod events;
 pub mod explanations;
 pub mod ingest;
+#[cfg(unix)]
 pub mod ipc;
 pub mod lock;
 pub mod logging;
