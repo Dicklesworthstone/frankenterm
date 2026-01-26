@@ -418,6 +418,31 @@ static MIGRATIONS: &[Migration] = &[
             LEFT JOIN workflow_step_logs w ON w.audit_action_id = a.id;
         ",
     },
+    Migration {
+        version: 5,
+        description: "Add accounts table for usage tracking and failover selection",
+        up_sql: r"
+            CREATE TABLE IF NOT EXISTS accounts (
+                id INTEGER PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                service TEXT NOT NULL,
+                name TEXT,
+                percent_remaining REAL NOT NULL,
+                reset_at TEXT,
+                tokens_used INTEGER,
+                tokens_remaining INTEGER,
+                tokens_limit INTEGER,
+                last_refreshed_at INTEGER NOT NULL,
+                last_used_at INTEGER,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_service_account ON accounts(service, account_id);
+            CREATE INDEX IF NOT EXISTS idx_accounts_service ON accounts(service);
+            CREATE INDEX IF NOT EXISTS idx_accounts_percent ON accounts(service, percent_remaining DESC);
+            CREATE INDEX IF NOT EXISTS idx_accounts_last_used ON accounts(service, last_used_at);
+        ",
+    },
 ];
 
 // =============================================================================
@@ -1248,6 +1273,24 @@ enum WriteCommand {
     /// Vacuum the database (explicit)
     Vacuum {
         respond: oneshot::Sender<Result<()>>,
+    },
+    /// Upsert an account record (insert or update by service+account_id)
+    UpsertAccount {
+        account: crate::accounts::AccountRecord,
+        respond: oneshot::Sender<Result<i64>>,
+    },
+    /// Update an account's last_used_at timestamp
+    UpdateAccountLastUsed {
+        service: String,
+        account_id: String,
+        last_used_at: i64,
+        respond: oneshot::Sender<Result<()>>,
+    },
+    /// Delete an account by service and account_id
+    DeleteAccount {
+        service: String,
+        account_id: String,
+        respond: oneshot::Sender<Result<bool>>,
     },
     /// Shutdown the writer thread (flush pending writes)
     Shutdown { respond: oneshot::Sender<()> },
@@ -2355,6 +2398,27 @@ fn writer_loop(conn: &mut Connection, rx: &mut mpsc::Receiver<WriteCommand>) {
                 let result = vacuum_sync(conn);
                 let _ = respond.send(result);
             }
+            WriteCommand::UpsertAccount { account, respond } => {
+                let result = upsert_account_sync(conn, &account);
+                let _ = respond.send(result);
+            }
+            WriteCommand::UpdateAccountLastUsed {
+                service,
+                account_id,
+                last_used_at,
+                respond,
+            } => {
+                let result = update_account_last_used_sync(conn, &service, &account_id, last_used_at);
+                let _ = respond.send(result);
+            }
+            WriteCommand::DeleteAccount {
+                service,
+                account_id,
+                respond,
+            } => {
+                let result = delete_account_sync(conn, &service, &account_id);
+                let _ = respond.send(result);
+            }
             WriteCommand::Shutdown { respond } => {
                 // Acknowledge shutdown
                 let _ = respond.send(());
@@ -2857,6 +2921,167 @@ fn vacuum_sync(conn: &Connection) -> Result<()> {
     conn.execute_batch("VACUUM")
         .map_err(|e| StorageError::Database(format!("Failed to vacuum database: {e}")))?;
     Ok(())
+}
+
+// =============================================================================
+// Account Operations (Synchronous)
+// =============================================================================
+
+/// Upsert an account record (insert or update by service+account_id)
+fn upsert_account_sync(conn: &Connection, account: &crate::accounts::AccountRecord) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO accounts (
+            account_id, service, name, percent_remaining, reset_at,
+            tokens_used, tokens_remaining, tokens_limit,
+            last_refreshed_at, last_used_at, created_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        ON CONFLICT(service, account_id) DO UPDATE SET
+            name = excluded.name,
+            percent_remaining = excluded.percent_remaining,
+            reset_at = excluded.reset_at,
+            tokens_used = excluded.tokens_used,
+            tokens_remaining = excluded.tokens_remaining,
+            tokens_limit = excluded.tokens_limit,
+            last_refreshed_at = excluded.last_refreshed_at,
+            updated_at = excluded.updated_at",
+        params![
+            account.account_id,
+            account.service,
+            account.name,
+            account.percent_remaining,
+            account.reset_at,
+            account.tokens_used,
+            account.tokens_remaining,
+            account.tokens_limit,
+            account.last_refreshed_at,
+            account.last_used_at,
+            account.created_at,
+            account.updated_at,
+        ],
+    )
+    .map_err(|e| StorageError::Database(format!("Failed to upsert account: {e}")))?;
+
+    Ok(conn.last_insert_rowid())
+}
+
+/// Update an account's last_used_at timestamp
+fn update_account_last_used_sync(
+    conn: &Connection,
+    service: &str,
+    account_id: &str,
+    last_used_at: i64,
+) -> Result<()> {
+    let updated = conn
+        .execute(
+            "UPDATE accounts SET last_used_at = ?1, updated_at = ?2
+             WHERE service = ?3 AND account_id = ?4",
+            params![last_used_at, now_ms(), service, account_id],
+        )
+        .map_err(|e| StorageError::Database(format!("Failed to update account last_used: {e}")))?;
+
+    if updated == 0 {
+        return Err(StorageError::NotFound(format!(
+            "Account not found: {service}/{account_id}"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+/// Delete an account by service and account_id
+fn delete_account_sync(conn: &Connection, service: &str, account_id: &str) -> Result<bool> {
+    let deleted = conn
+        .execute(
+            "DELETE FROM accounts WHERE service = ?1 AND account_id = ?2",
+            params![service, account_id],
+        )
+        .map_err(|e| StorageError::Database(format!("Failed to delete account: {e}")))?;
+
+    Ok(deleted > 0)
+}
+
+/// Get all accounts for a service (synchronous, read-only)
+fn get_accounts_by_service_sync(
+    conn: &Connection,
+    service: &str,
+) -> Result<Vec<crate::accounts::AccountRecord>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, account_id, service, name, percent_remaining, reset_at,
+                    tokens_used, tokens_remaining, tokens_limit,
+                    last_refreshed_at, last_used_at, created_at, updated_at
+             FROM accounts
+             WHERE service = ?1
+             ORDER BY percent_remaining DESC, last_used_at ASC NULLS FIRST",
+        )
+        .map_err(|e| StorageError::Database(format!("Failed to prepare accounts query: {e}")))?;
+
+    let rows = stmt
+        .query_map([service], |row| {
+            Ok(crate::accounts::AccountRecord {
+                id: row.get(0)?,
+                account_id: row.get(1)?,
+                service: row.get(2)?,
+                name: row.get(3)?,
+                percent_remaining: row.get(4)?,
+                reset_at: row.get(5)?,
+                tokens_used: row.get(6)?,
+                tokens_remaining: row.get(7)?,
+                tokens_limit: row.get(8)?,
+                last_refreshed_at: row.get(9)?,
+                last_used_at: row.get(10)?,
+                created_at: row.get(11)?,
+                updated_at: row.get(12)?,
+            })
+        })
+        .map_err(|e| StorageError::Database(format!("Failed to query accounts: {e}")))?;
+
+    let mut accounts = Vec::new();
+    for row in rows {
+        accounts.push(
+            row.map_err(|e| StorageError::Database(format!("Failed to read account row: {e}")))?,
+        );
+    }
+    Ok(accounts)
+}
+
+/// Get a single account by service and account_id (synchronous, read-only)
+fn get_account_sync(
+    conn: &Connection,
+    service: &str,
+    account_id: &str,
+) -> Result<Option<crate::accounts::AccountRecord>> {
+    let result = conn.query_row(
+        "SELECT id, account_id, service, name, percent_remaining, reset_at,
+                tokens_used, tokens_remaining, tokens_limit,
+                last_refreshed_at, last_used_at, created_at, updated_at
+         FROM accounts
+         WHERE service = ?1 AND account_id = ?2",
+        params![service, account_id],
+        |row| {
+            Ok(crate::accounts::AccountRecord {
+                id: row.get(0)?,
+                account_id: row.get(1)?,
+                service: row.get(2)?,
+                name: row.get(3)?,
+                percent_remaining: row.get(4)?,
+                reset_at: row.get(5)?,
+                tokens_used: row.get(6)?,
+                tokens_remaining: row.get(7)?,
+                tokens_limit: row.get(8)?,
+                last_refreshed_at: row.get(9)?,
+                last_used_at: row.get(10)?,
+                created_at: row.get(11)?,
+                updated_at: row.get(12)?,
+            })
+        },
+    );
+
+    match result {
+        Ok(account) => Ok(Some(account)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(StorageError::Database(format!("Failed to get account: {e}")).into()),
+    }
 }
 
 /// Insert an approval token (synchronous)
