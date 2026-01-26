@@ -5129,6 +5129,156 @@ async fn handle_config_command(
     Ok(())
 }
 
+/// Handle `wa db` subcommands
+async fn handle_db_command(
+    command: DbCommands,
+    layout: &wa_core::config::WorkspaceLayout,
+) -> anyhow::Result<()> {
+    use wa_core::storage::{
+        MigrationDirection, MigrationPlan, MigrationStatusReport, SCHEMA_VERSION,
+        migrate_database_to_version, migration_plan_for_path, migration_status_for_path,
+    };
+
+    let db_path = &layout.db_path;
+
+    match command {
+        DbCommands::Migrate {
+            status,
+            to,
+            yes,
+            allow_downgrade,
+            dry_run,
+        } => {
+            let target_version = to.unwrap_or(SCHEMA_VERSION);
+
+            if status {
+                let report = migration_status_for_path(db_path)?;
+                print_migration_status(&report, db_path);
+                return Ok(());
+            }
+
+            if dry_run {
+                let report = migration_status_for_path(db_path)?;
+                if report.needs_initialization {
+                    println!("Database is uninitialized at {}.", db_path.display());
+                    println!("Would initialize to schema v{}.", SCHEMA_VERSION);
+                    return Ok(());
+                }
+                let plan = migration_plan_for_path(db_path, target_version)?;
+                print_migration_plan(&plan);
+                return Ok(());
+            }
+
+            let report = migration_status_for_path(db_path)?;
+            if report.needs_initialization {
+                if target_version != SCHEMA_VERSION {
+                    anyhow::bail!(
+                        "Database is uninitialized; can only initialize to schema v{}.",
+                        SCHEMA_VERSION
+                    );
+                }
+                println!(
+                    "Database is uninitialized; will initialize to schema v{}.",
+                    SCHEMA_VERSION
+                );
+                if !yes && !prompt_confirm("Proceed? [y/N]: ")? {
+                    println!("Aborted.");
+                    return Ok(());
+                }
+                let plan = migrate_database_to_version(db_path, target_version)?;
+                println!("Migration complete.");
+                print_migration_plan(&plan);
+                return Ok(());
+            }
+
+            let plan = migration_plan_for_path(db_path, target_version)?;
+            if plan.steps.is_empty() {
+                println!("Database already at schema v{}.", plan.to_version);
+                return Ok(());
+            }
+
+            if plan.direction == MigrationDirection::Down && !allow_downgrade {
+                anyhow::bail!(
+                    "Refusing to downgrade from v{} to v{} without --allow-downgrade.",
+                    plan.from_version,
+                    plan.to_version
+                );
+            }
+
+            print_migration_plan(&plan);
+            if !yes && !prompt_confirm("Apply migrations? [y/N]: ")? {
+                println!("Aborted.");
+                return Ok(());
+            }
+
+            let applied_plan = migrate_database_to_version(db_path, target_version)?;
+            println!("Migration complete.");
+            print_migration_plan(&applied_plan);
+        }
+    }
+
+    Ok(())
+}
+
+fn print_migration_status(report: &MigrationStatusReport, db_path: &Path) {
+    println!("Database: {}", db_path.display());
+    println!("Exists: {}", report.db_exists);
+    println!("Needs initialization: {}", report.needs_initialization);
+    println!("Current schema version: {}", report.current_version);
+    println!("Target schema version: {}", report.target_version);
+    println!();
+    println!("Migrations:");
+    for entry in &report.entries {
+        let applied = if entry.applied { "[x]" } else { "[ ]" };
+        let rollback = if entry.rollback_supported {
+            "rollback: yes"
+        } else {
+            "rollback: no"
+        };
+        println!(
+            "  {applied} v{version:02} {desc} ({rollback})",
+            version = entry.version,
+            desc = entry.description
+        );
+    }
+}
+
+fn print_migration_plan(plan: &MigrationPlan) {
+    println!(
+        "Migration plan ({direction}): v{from} -> v{to}",
+        direction = plan.direction.as_str(),
+        from = plan.from_version,
+        to = plan.to_version
+    );
+
+    if plan.steps.is_empty() {
+        println!("  (no steps)");
+        return;
+    }
+
+    for step in &plan.steps {
+        println!(
+            "  - {dir} v{from} -> v{to}: {desc}",
+            dir = step.direction.as_str(),
+            from = step.migration_version,
+            to = step.resulting_version,
+            desc = step.description
+        );
+    }
+}
+
+fn prompt_confirm(prompt: &str) -> anyhow::Result<bool> {
+    use std::io::{self, Write};
+
+    print!("{prompt}");
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let value = input.trim().to_ascii_lowercase();
+    Ok(matches!(value.as_str(), "y" | "yes"))
+}
+
 /// Generate default config TOML with comments
 fn generate_default_config_toml() -> String {
     r#"# wa configuration file

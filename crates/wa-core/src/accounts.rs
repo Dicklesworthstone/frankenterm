@@ -332,18 +332,20 @@ mod tests {
 
         assert!(result.selected.is_some());
         assert_eq!(result.selected.unwrap().account_id, "beta");
-        assert!(result
-            .explanation
-            .selection_reason
-            .contains("Highest percent_remaining"));
+        assert!(
+            result
+                .explanation
+                .selection_reason
+                .contains("Highest percent_remaining")
+        );
     }
 
     #[test]
     fn filter_below_threshold() {
         let accounts = vec![
-            make_account("alpha", 3.0, None),  // below 5%
-            make_account("beta", 50.0, None),  // above
-            make_account("gamma", 4.5, None),  // below 5%
+            make_account("alpha", 3.0, None), // below 5%
+            make_account("beta", 50.0, None), // above
+            make_account("gamma", 4.5, None), // below 5%
         ];
         let config = AccountSelectionConfig {
             threshold_percent: 5.0,
@@ -370,10 +372,12 @@ mod tests {
         let result = select_account(&accounts, &config);
 
         assert!(result.selected.is_none());
-        assert!(result
-            .explanation
-            .selection_reason
-            .contains("below threshold"));
+        assert!(
+            result
+                .explanation
+                .selection_reason
+                .contains("below threshold")
+        );
     }
 
     #[test]
