@@ -50,7 +50,7 @@ use crate::policy::Redactor;
 /// This is the target version that new databases will be initialized to,
 /// and existing databases will be migrated to.
 /// Uses SQLite's PRAGMA user_version for atomic version tracking.
-pub const SCHEMA_VERSION: i32 = 4;
+pub const SCHEMA_VERSION: i32 = 5;
 
 /// Schema initialization SQL
 ///
@@ -295,6 +295,29 @@ CREATE INDEX IF NOT EXISTS idx_approval_tokens_pane ON approval_tokens(pane_id);
 CREATE INDEX IF NOT EXISTS idx_approval_tokens_expires ON approval_tokens(expires_at);
 CREATE INDEX IF NOT EXISTS idx_approval_tokens_unused ON approval_tokens(used_at) WHERE used_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_approval_tokens_fingerprint ON approval_tokens(action_fingerprint);
+
+-- Accounts: mirrors caut usage data for failover selection
+-- Supports: account selection policy, usage tracking
+CREATE TABLE IF NOT EXISTS accounts (
+    id INTEGER PRIMARY KEY,
+    account_id TEXT NOT NULL,          -- stable identifier (from caut or hash)
+    service TEXT NOT NULL,             -- openai, anthropic, google, etc.
+    name TEXT,                         -- display name
+    percent_remaining REAL NOT NULL,   -- 0.0-100.0
+    reset_at TEXT,                     -- ISO8601 or epoch string
+    tokens_used INTEGER,
+    tokens_remaining INTEGER,
+    tokens_limit INTEGER,
+    last_refreshed_at INTEGER NOT NULL, -- epoch ms
+    last_used_at INTEGER,              -- epoch ms when used for failover
+    created_at INTEGER NOT NULL,       -- epoch ms
+    updated_at INTEGER NOT NULL        -- epoch ms
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_service_account ON accounts(service, account_id);
+CREATE INDEX IF NOT EXISTS idx_accounts_service ON accounts(service);
+CREATE INDEX IF NOT EXISTS idx_accounts_percent ON accounts(service, percent_remaining DESC);
+CREATE INDEX IF NOT EXISTS idx_accounts_last_used ON accounts(service, last_used_at);
 
 -- Config: key-value settings
 CREATE TABLE IF NOT EXISTS config (

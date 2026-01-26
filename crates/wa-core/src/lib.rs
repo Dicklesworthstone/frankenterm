@@ -28,6 +28,7 @@
 //! - `approval`: Allow-once approvals for RequireApproval decisions
 //! - `policy`: Safety and rate limiting
 //! - `wait`: Wait-for utilities (no fixed sleeps)
+//! - `accounts`: Account management and selection policy
 //!
 //! # Safety
 //!
@@ -36,6 +37,7 @@
 #![forbid(unsafe_code)]
 #![feature(stmt_expr_attributes)]
 
+pub mod accounts;
 pub mod approval;
 pub mod caut;
 pub mod config;
