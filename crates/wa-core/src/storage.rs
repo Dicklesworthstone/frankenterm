@@ -2497,7 +2497,10 @@ impl StorageHandle {
     pub async fn upsert_account(&self, account: crate::accounts::AccountRecord) -> Result<i64> {
         let (tx, rx) = oneshot::channel();
         self.write_tx
-            .send(WriteCommand::UpsertAccount { account, respond: tx })
+            .send(WriteCommand::UpsertAccount {
+                account,
+                respond: tx,
+            })
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
@@ -2867,7 +2870,8 @@ fn writer_loop(conn: &mut Connection, rx: &mut mpsc::Receiver<WriteCommand>) {
                 last_used_at,
                 respond,
             } => {
-                let result = update_account_last_used_sync(conn, &service, &account_id, last_used_at);
+                let result =
+                    update_account_last_used_sync(conn, &service, &account_id, last_used_at);
                 let _ = respond.send(result);
             }
             WriteCommand::DeleteAccount {
@@ -3439,10 +3443,9 @@ fn update_account_last_used_sync(
         .map_err(|e| StorageError::Database(format!("Failed to update account last_used: {e}")))?;
 
     if updated == 0 {
-        return Err(StorageError::NotFound(format!(
-            "Account not found: {service}/{account_id}"
-        ))
-        .into());
+        return Err(
+            StorageError::NotFound(format!("Account not found: {service}/{account_id}")).into(),
+        );
     }
     Ok(())
 }
@@ -4889,6 +4892,33 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 1, "Table {table} should exist");
         }
+    }
+
+    // =========================================================================
+    // Migration Plan Tests
+    // =========================================================================
+
+    #[test]
+    fn migration_plan_empty_when_at_target() {
+        let plan = build_migration_plan(SCHEMA_VERSION, SCHEMA_VERSION).unwrap();
+        assert!(plan.steps.is_empty());
+        assert_eq!(plan.from_version, SCHEMA_VERSION);
+        assert_eq!(plan.to_version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn migration_roundtrip_down_then_up() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let downgrade_target = 3;
+        let down_plan = build_migration_plan(SCHEMA_VERSION, downgrade_target).unwrap();
+        apply_migration_plan(&conn, &down_plan).unwrap();
+        assert_eq!(get_user_version(&conn).unwrap(), downgrade_target);
+
+        let up_plan = build_migration_plan(downgrade_target, SCHEMA_VERSION).unwrap();
+        apply_migration_plan(&conn, &up_plan).unwrap();
+        assert_eq!(get_user_version(&conn).unwrap(), SCHEMA_VERSION);
     }
 
     #[test]
