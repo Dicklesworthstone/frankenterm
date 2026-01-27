@@ -6267,8 +6267,8 @@ mod tests {
 
     #[test]
     fn validate_uservar_rejects_oversize_payload() {
-        // MAX_MESSAGE_SIZE is 65536 (64KB)
-        const MAX_MESSAGE_SIZE: usize = 65536;
+        // MAX_MESSAGE_SIZE is 131072 (128KB) - must match validate_uservar_request
+        const MAX_MESSAGE_SIZE: usize = 131072;
         let name = "wa_event";
         let value = "a".repeat(MAX_MESSAGE_SIZE);
         let err = validate_uservar_request(1, name, &value).unwrap_err();

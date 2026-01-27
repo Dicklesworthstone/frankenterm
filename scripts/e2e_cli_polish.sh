@@ -104,10 +104,10 @@ check_prerequisites() {
         exit 2
     fi
 
-    WA_BIN="$PROJECT_ROOT/target/debug/wa"
+    # Try cargo target directory first (used by cargo run), then project target
+    WA_BIN="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}/debug/wa"
     if [[ ! -x "$WA_BIN" ]]; then
-        # Try cargo target directory
-        WA_BIN="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}/debug/wa"
+        WA_BIN="$PROJECT_ROOT/target/debug/wa"
     fi
 
     if [[ ! -x "$WA_BIN" ]]; then
@@ -155,7 +155,10 @@ test_help_output() {
         local cmd_help
         cmd_help=$(run_wa "$cmd" --help 2>&1) || true
 
-        if [[ -n "$cmd_help" && "$cmd_help" != *"error"* ]]; then
+        # Robot mode outputs JSON help, which is valid
+        if [[ "$cmd" == "robot" && "$cmd_help" =~ "\"ok\":" ]]; then
+            log_pass "Subcommand has help: $cmd (JSON format)"
+        elif [[ -n "$cmd_help" && "$cmd_help" != *"error"* ]]; then
             log_pass "Subcommand has help: $cmd"
         else
             log_fail "Subcommand help broken: $cmd"
