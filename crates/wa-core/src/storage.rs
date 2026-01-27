@@ -3116,16 +3116,7 @@ fn usize_to_i64(value: usize, label: &str) -> Result<i64> {
 }
 
 fn i64_to_usize(value: i64) -> rusqlite::Result<usize> {
-    usize::try_from(value).map_err(|_| {
-        rusqlite::Error::FromSqlConversionFailure(
-            0, // Column index - we don't have the actual column in this context
-            Type::Integer,
-            Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("value {value} out of usize range"),
-            )),
-        )
-    })
+    usize::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, value))
 }
 
 /// Append a segment (synchronous, called from writer thread)
@@ -3806,14 +3797,12 @@ fn consume_approval_token_sync(
         SqlValue::Integer(now),
     ];
 
-    if let Some(pane_id) = pane_id {
-        let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
+    // Add pane_id constraint if specified
+    if let Some(pid) = pane_id {
         sql.push_str(" AND pane_id = ?");
-        params.push(SqlValue::Integer(pane_id_i64));
-    } else {
-        sql.push_str(" AND pane_id IS NULL");
+        #[allow(clippy::cast_possible_wrap)]
+        params.push(SqlValue::Integer(pid as i64));
     }
-
     sql.push_str(" LIMIT 1");
 
     let record = {
@@ -3843,11 +3832,18 @@ fn consume_approval_token_sync(
     };
 
     if let Some(mut record) = record {
-        tx.execute(
-            "UPDATE approval_tokens SET used_at = ?1 WHERE id = ?2",
+        let updated = tx.execute(
+            "UPDATE approval_tokens SET used_at = ?1 WHERE id = ?2 AND used_at IS NULL",
             params![now, record.id],
         )
         .map_err(|e| StorageError::Database(format!("Failed to consume approval token: {e}")))?;
+
+        if updated == 0 {
+            tx.commit()
+                .map_err(|e| StorageError::Database(format!("Failed to commit approval token: {e}")))?;
+            return Ok(None);
+        }
+
         record.used_at = Some(now);
         tx.commit()
             .map_err(|e| StorageError::Database(format!("Failed to commit approval token: {e}")))?;
@@ -3944,11 +3940,18 @@ fn consume_approval_token_by_code_sync(
     };
 
     if let Some(mut record) = record {
-        tx.execute(
-            "UPDATE approval_tokens SET used_at = ?1 WHERE id = ?2",
+        let updated = tx.execute(
+            "UPDATE approval_tokens SET used_at = ?1 WHERE id = ?2 AND used_at IS NULL",
             params![now, record.id],
         )
         .map_err(|e| StorageError::Database(format!("Failed to consume approval token: {e}")))?;
+
+        if updated == 0 {
+            tx.commit()
+                .map_err(|e| StorageError::Database(format!("Failed to commit approval token: {e}")))?;
+            return Ok(None);
+        }
+
         record.used_at = Some(now);
         tx.commit()
             .map_err(|e| StorageError::Database(format!("Failed to commit approval token: {e}")))?;
