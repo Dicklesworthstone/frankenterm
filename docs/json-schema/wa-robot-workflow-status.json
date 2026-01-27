@@ -90,6 +90,31 @@
       "items": {
         "$ref": "#/$defs/step_log"
       }
+    },
+    "action_plan": {
+      "type": "object",
+      "description": "Persisted action plan for this workflow execution",
+      "required": ["plan_id", "plan_hash"],
+      "properties": {
+        "plan_id": {
+          "type": "string",
+          "description": "Content-addressed plan identifier"
+        },
+        "plan_hash": {
+          "type": "string",
+          "description": "Plan hash (sha256 prefix)"
+        },
+        "plan": {
+          "type": ["object", "null"],
+          "description": "Canonical ActionPlan JSON"
+        },
+        "created_at": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Unix timestamp (ms) when plan was created"
+        }
+      },
+      "additionalProperties": false
     }
   },
   "additionalProperties": false,
@@ -142,6 +167,14 @@
           "type": "string",
           "description": "Human-readable step name"
         },
+        "step_id": {
+          "type": ["string", "null"],
+          "description": "Content-addressed step identifier"
+        },
+        "step_kind": {
+          "type": ["string", "null"],
+          "description": "Action kind for the step"
+        },
         "result_type": {
           "type": "string",
           "enum": ["continue", "done", "retry", "abort", "wait_for", "send_text"],
@@ -150,6 +183,21 @@
         "result_data": {
           "type": "object",
           "description": "Step-specific result data"
+        },
+        "policy_summary": {
+          "type": ["object", "null"],
+          "description": "Policy decision summary (if step was policy-gated)"
+        },
+        "verification_refs": {
+          "type": ["array", "null"],
+          "description": "Verification evidence references for the step",
+          "items": {
+            "type": "object"
+          }
+        },
+        "error_code": {
+          "type": ["string", "null"],
+          "description": "Stable error code for the step"
         },
         "started_at": {
           "type": "integer",
