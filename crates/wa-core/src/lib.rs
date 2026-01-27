@@ -29,6 +29,7 @@
 //! - `policy`: Safety and rate limiting
 //! - `wait`: Wait-for utilities (no fixed sleeps)
 //! - `accounts`: Account management and selection policy
+//! - `plan`: Action plan types for unified workflow representation
 //!
 //! # Safety
 //!
@@ -55,6 +56,7 @@ pub mod lock;
 pub mod logging;
 pub mod output;
 pub mod patterns;
+pub mod plan;
 pub mod policy;
 pub mod runtime;
 pub mod storage;
