@@ -370,7 +370,7 @@ pub(crate) async fn persist_codex_session_summary(
 // ============================================================================
 
 /// Result of the account selection workflow step.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct AccountSelectionStepResult {
     /// The selected account (if any eligible accounts exist)
     pub selected: Option<crate::accounts::AccountRecord>,

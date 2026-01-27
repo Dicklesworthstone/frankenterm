@@ -1744,6 +1744,9 @@ fn dirs_config_path() -> Option<std::path::PathBuf> {
 
 /// Expand ~ to home directory
 fn expand_tilde(path: &str) -> std::path::PathBuf {
+    if path == "~" {
+        return dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from(path));
+    }
     if let Some(suffix) = path.strip_prefix("~/") {
         if let Some(home) = dirs::home_dir() {
             return home.join(suffix);

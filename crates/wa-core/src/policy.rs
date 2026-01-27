@@ -1199,6 +1199,11 @@ pub fn is_command_candidate(text: &str) -> bool {
         trimmed = stripped.trim_start();
     }
 
+    // Also strip leading parens (subshells)
+    while let Some(stripped) = trimmed.strip_prefix('(') {
+        trimmed = stripped.trim_start();
+    }
+
     let mut parts = trimmed.split_whitespace();
     let token = parts.next().unwrap_or("");
     let token_lower = token.to_ascii_lowercase();

@@ -1010,6 +1010,12 @@ pub fn extract_delta(previous: &str, current: &str, overlap_size: usize) -> Delt
         return DeltaResult::Content(current.to_string());
     }
 
+    // Fast path: pure append (current starts with previous)
+    // This handles the common case efficiently (O(N)) and avoids the overlap limit
+    if current.len() > previous.len() && current.starts_with(previous) {
+        return DeltaResult::Content(current[previous.len()..].to_string());
+    }
+
     if overlap_size == 0 || current.is_empty() {
         return DeltaResult::Gap {
             reason: "overlap_size_zero_or_current_empty".to_string(),

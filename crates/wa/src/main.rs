@@ -2372,11 +2372,14 @@ async fn run_watcher(
     let runtime_config = RuntimeConfig {
         discovery_interval: Duration::from_millis(poll_interval),
         capture_interval: Duration::from_millis(config.ingest.poll_interval_ms),
-        min_capture_interval: Duration::from_millis(50),
+        min_capture_interval: Duration::from_millis(config.ingest.min_poll_interval_ms),
         overlap_size: 4096, // Default overlap window size
         pane_filter: config.ingest.panes.clone(),
         channel_buffer: 1024,
-        max_concurrent_captures: 10,
+        max_concurrent_captures: config.ingest.max_concurrent_captures as usize,
+        retention_days: config.storage.retention_days,
+        retention_max_mb: config.storage.retention_max_mb,
+        checkpoint_interval_secs: config.storage.checkpoint_interval_secs,
     };
 
     // Create and start the observation runtime (with event bus for workflow integration)
