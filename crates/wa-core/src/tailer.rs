@@ -667,13 +667,19 @@ mod tests {
         let mut join_set = JoinSet::new();
         supervisor.spawn_ready(&mut join_set);
 
+        let mut outcomes = Vec::new();
         while let Some(result) = join_set.join_next().await {
             if let Ok((pane_id, outcome)) = result {
+                outcomes.push((pane_id, format!("{outcome:?}")));
                 supervisor.handle_poll_result(pane_id, outcome);
             }
         }
 
-        assert!(supervisor.metrics().send_timeouts >= 1);
+        let metrics = supervisor.metrics();
+        assert!(
+            metrics.send_timeouts >= 1,
+            "Expected at least 1 backpressure timeout, got 0. Outcomes: {outcomes:?}, metrics: {metrics:?}"
+        );
     }
 
     #[test]
