@@ -184,28 +184,88 @@ impl QueryClient for ProductionQueryClient {
     }
 
     fn list_events(&self, filters: &EventFilters) -> Result<Vec<EventView>, QueryError> {
-        if !self.db_exists() {
+        let Some(storage) = &self.storage else {
             return Err(QueryError::DatabaseNotInitialized(
-                "Database file not found. Run `wa watch` first.".to_string(),
+                "Database connection not available".to_string(),
             ));
-        }
+        };
 
-        // For now, return empty list - full implementation requires storage access
-        // This is scaffolding; the actual query will be wired up later
-        let _ = filters;
-        Ok(Vec::new())
+        // Get a handle to the current tokio runtime
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|e| QueryError::QueryFailed(format!("No tokio runtime: {e}")))?;
+
+        let query = crate::storage::EventQuery {
+            limit: Some(filters.limit),
+            pane_id: filters.pane_id,
+            rule_id: filters.rule_id.clone(),
+            event_type: filters.event_type.clone(),
+            unhandled_only: filters.unhandled_only,
+            since: None,
+            until: None,
+        };
+
+        let events = tokio::task::block_in_place(|| {
+            handle.block_on(async {
+                storage
+                    .get_events(query)
+                    .await
+                    .map_err(|e| QueryError::StorageError(e.to_string()))
+            })
+        })?;
+
+        Ok(events
+            .into_iter()
+            .map(|e| EventView {
+                id: e.id,
+                rule_id: e.rule_id,
+                pane_id: e.pane_id,
+                severity: e.severity,
+                message: e.matched_text.unwrap_or_else(|| "Pattern matched".to_string()),
+                timestamp: e.detected_at,
+                handled: e.handled_at.is_some(),
+            })
+            .collect())
     }
 
     fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResultView>, QueryError> {
-        if !self.db_exists() {
+        let Some(storage) = &self.storage else {
             return Err(QueryError::DatabaseNotInitialized(
-                "Database file not found. Run `wa watch` first.".to_string(),
+                "Database connection not available".to_string(),
             ));
-        }
+        };
 
-        // For now, return empty list - full implementation requires storage access
-        let _ = (query, limit);
-        Ok(Vec::new())
+        // Get a handle to the current tokio runtime
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|e| QueryError::QueryFailed(format!("No tokio runtime: {e}")))?;
+
+        let options = crate::storage::SearchOptions {
+            limit: Some(limit),
+            include_snippets: Some(true),
+            snippet_max_tokens: Some(30),
+            highlight_prefix: Some(">>".to_string()),
+            highlight_suffix: Some("<<".to_string()),
+            ..Default::default()
+        };
+
+        let query = query.to_string();
+        let results = tokio::task::block_in_place(|| {
+            handle.block_on(async {
+                storage
+                    .search_with_results(&query, options)
+                    .await
+                    .map_err(|e| QueryError::StorageError(e.to_string()))
+            })
+        })?;
+
+        Ok(results
+            .into_iter()
+            .map(|r| SearchResultView {
+                pane_id: r.segment.pane_id,
+                timestamp: r.segment.captured_at,
+                snippet: r.snippet.unwrap_or_else(|| r.segment.content),
+                rank: r.score,
+            })
+            .collect())
     }
 
     fn health(&self) -> Result<HealthStatus, QueryError> {

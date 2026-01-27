@@ -2380,7 +2380,8 @@ async fn run_watcher(
 
         // Register built-in workflows
         workflow_runner.register_workflow(Arc::new(HandleCompaction::default()));
-        tracing::info!("Registered workflow: handle_compaction");
+        workflow_runner.register_workflow(Arc::new(wa_core::workflows::HandleUsageLimits::default()));
+        tracing::info!("Registered workflows: handle_compaction, handle_usage_limits");
 
         // Spawn workflow runner event loop
         let event_bus_clone = Arc::clone(&event_bus);
@@ -3623,7 +3624,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             requires_pane: Some(true),
                                         },
                                         RobotWorkflowInfo {
-                                            name: "handle_usage_limit".to_string(),
+                                            name: "handle_usage_limits".to_string(),
                                             description: Some(
                                                 "Handle API usage limit reached events".to_string(),
                                             ),
@@ -5027,7 +5028,16 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             use std::time::Duration;
             use wa_core::tui::{AppConfig, ProductionQueryClient, run_tui};
 
-            let query_client = ProductionQueryClient::new(layout.clone());
+            let db_path = layout.db_path.to_string_lossy();
+            let storage = match wa_core::storage::StorageHandle::new(&db_path).await {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Failed to open storage: {e}");
+                    return Err(e.into());
+                }
+            };
+
+            let query_client = ProductionQueryClient::with_storage(layout.clone(), storage);
             let tui_config = AppConfig {
                 refresh_interval: Duration::from_secs(refresh),
                 debug,

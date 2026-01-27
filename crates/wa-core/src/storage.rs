@@ -7462,8 +7462,13 @@ async fn storage_handle_insert_step_log_and_query() {
             None,
             0,
             "async_step",
+            None, // step_id
+            None, // step_kind
             "continue",
             Some(r#"{"async": true}"#.to_string()),
+            None, // policy_summary
+            None, // verification_refs
+            None, // error_code
             1_700_000_000_000,
             1_700_000_000_050,
         )
@@ -7901,8 +7906,13 @@ mod storage_handle_tests {
                 None,
                 0,
                 "init",
+                None, // step_id
+                None, // step_kind
                 "success",
                 Some(r#"{"message":"started"}"#.to_string()),
+                None, // policy_summary
+                None, // verification_refs
+                None, // error_code
                 now,
                 now + 100,
             )
@@ -7915,8 +7925,13 @@ mod storage_handle_tests {
                 None,
                 1,
                 "send_text",
+                None, // step_id
+                None, // step_kind
                 "success",
                 Some(r#"{"chars":42}"#.to_string()),
+                None, // policy_summary
+                None, // verification_refs
+                None, // error_code
                 now + 100,
                 now + 200,
             )
@@ -7929,8 +7944,13 @@ mod storage_handle_tests {
                 None,
                 2,
                 "wait_for",
+                None, // step_id
+                None, // step_kind
                 "success",
                 Some(r#"{"matched":true}"#.to_string()),
+                None, // policy_summary
+                None, // verification_refs
+                None, // error_code
                 now + 200,
                 now + 500,
             )
@@ -7959,7 +7979,11 @@ mod storage_handle_tests {
         let _seg: Segment = handle.append_segment(1, "Before gap", None).await.unwrap();
 
         // Record a gap
-        let gap: Gap = handle.record_gap(1, "connection_lost").await.unwrap();
+        let gap: Gap = handle
+            .record_gap(1, "connection_lost")
+            .await
+            .unwrap()
+            .expect("should return gap");
 
         assert_eq!(gap.pane_id, 1);
         assert_eq!(gap.reason, "connection_lost");
