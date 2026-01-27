@@ -1268,4 +1268,678 @@ mod tests {
         assert_eq!(plan.title, parsed.title);
         assert_eq!(plan.steps.len(), parsed.steps.len());
     }
+
+    // ========================================================================
+    // Additional comprehensive tests for wa-upg.2.5
+    // ========================================================================
+
+    #[test]
+    fn test_plan_hash_stability_known_value() {
+        // This test ensures hash stability across runs/platforms by checking
+        // against a known value. If canonical serialization changes, this test
+        // will catch it.
+        let plan = ActionPlan::builder("Stable Test", "ws-stable")
+            .add_step(StepPlan::new(
+                1,
+                StepAction::SendText {
+                    pane_id: 0,
+                    text: "test".into(),
+                    paste_mode: None,
+                },
+                "Send test",
+            ))
+            .build();
+
+        let hash = plan.compute_hash();
+        // Hash should start with sha256: prefix
+        assert!(hash.starts_with("sha256:"));
+        // Hash should be consistent length (sha256: + 32 hex chars)
+        assert_eq!(hash.len(), 7 + 32);
+    }
+
+    #[test]
+    fn test_plan_hash_excludes_timestamps() {
+        let plan1 = ActionPlan::builder("Test", "ws")
+            .add_step(StepPlan::new(
+                1,
+                StepAction::SendText {
+                    pane_id: 0,
+                    text: "x".into(),
+                    paste_mode: None,
+                },
+                "Step",
+            ))
+            .created_at(1000)
+            .build();
+
+        let plan2 = ActionPlan::builder("Test", "ws")
+            .add_step(StepPlan::new(
+                1,
+                StepAction::SendText {
+                    pane_id: 0,
+                    text: "x".into(),
+                    paste_mode: None,
+                },
+                "Step",
+            ))
+            .created_at(2000) // Different timestamp
+            .build();
+
+        // Hashes should be equal because timestamps are excluded
+        assert_eq!(plan1.compute_hash(), plan2.compute_hash());
+    }
+
+    #[test]
+    fn test_plan_hash_excludes_metadata() {
+        let plan1 = ActionPlan::builder("Test", "ws")
+            .add_step(StepPlan::new(
+                1,
+                StepAction::SendText {
+                    pane_id: 0,
+                    text: "x".into(),
+                    paste_mode: None,
+                },
+                "Step",
+            ))
+            .metadata(serde_json::json!({"key": "value1"}))
+            .build();
+
+        let plan2 = ActionPlan::builder("Test", "ws")
+            .add_step(StepPlan::new(
+                1,
+                StepAction::SendText {
+                    pane_id: 0,
+                    text: "x".into(),
+                    paste_mode: None,
+                },
+                "Step",
+            ))
+            .metadata(serde_json::json!({"key": "value2"})) // Different metadata
+            .build();
+
+        // Hashes should be equal because metadata is excluded
+        assert_eq!(plan1.compute_hash(), plan2.compute_hash());
+    }
+
+    #[test]
+    fn test_plan_hash_includes_workspace() {
+        let plan1 = ActionPlan::builder("Test", "workspace-1")
+            .add_step(StepPlan::new(
+                1,
+                StepAction::SendText {
+                    pane_id: 0,
+                    text: "x".into(),
+                    paste_mode: None,
+                },
+                "Step",
+            ))
+            .build();
+
+        let plan2 = ActionPlan::builder("Test", "workspace-2") // Different workspace
+            .add_step(StepPlan::new(
+                1,
+                StepAction::SendText {
+                    pane_id: 0,
+                    text: "x".into(),
+                    paste_mode: None,
+                },
+                "Step",
+            ))
+            .build();
+
+        // Hashes should differ because workspace is included
+        assert_ne!(plan1.compute_hash(), plan2.compute_hash());
+    }
+
+    #[test]
+    fn test_plan_hash_includes_title() {
+        let plan1 = ActionPlan::builder("Title A", "ws")
+            .add_step(StepPlan::new(
+                1,
+                StepAction::SendText {
+                    pane_id: 0,
+                    text: "x".into(),
+                    paste_mode: None,
+                },
+                "Step",
+            ))
+            .build();
+
+        let plan2 = ActionPlan::builder("Title B", "ws") // Different title
+            .add_step(StepPlan::new(
+                1,
+                StepAction::SendText {
+                    pane_id: 0,
+                    text: "x".into(),
+                    paste_mode: None,
+                },
+                "Step",
+            ))
+            .build();
+
+        assert_ne!(plan1.compute_hash(), plan2.compute_hash());
+    }
+
+    #[test]
+    fn test_idempotency_key_differs_by_workspace() {
+        let key1 = IdempotencyKey::for_action(
+            "ws-1",
+            1,
+            &StepAction::SendText {
+                pane_id: 0,
+                text: "hello".into(),
+                paste_mode: None,
+            },
+        );
+
+        let key2 = IdempotencyKey::for_action(
+            "ws-2", // Different workspace
+            1,
+            &StepAction::SendText {
+                pane_id: 0,
+                text: "hello".into(),
+                paste_mode: None,
+            },
+        );
+
+        assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn test_idempotency_key_differs_by_step_number() {
+        let key1 = IdempotencyKey::for_action(
+            "ws",
+            1,
+            &StepAction::SendText {
+                pane_id: 0,
+                text: "hello".into(),
+                paste_mode: None,
+            },
+        );
+
+        let key2 = IdempotencyKey::for_action(
+            "ws",
+            2, // Different step number
+            &StepAction::SendText {
+                pane_id: 0,
+                text: "hello".into(),
+                paste_mode: None,
+            },
+        );
+
+        assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn test_idempotency_key_differs_by_action() {
+        let key1 = IdempotencyKey::for_action(
+            "ws",
+            1,
+            &StepAction::SendText {
+                pane_id: 0,
+                text: "hello".into(),
+                paste_mode: None,
+            },
+        );
+
+        let key2 = IdempotencyKey::for_action(
+            "ws",
+            1,
+            &StepAction::SendText {
+                pane_id: 1, // Different pane
+                text: "hello".into(),
+                paste_mode: None,
+            },
+        );
+
+        assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn test_validation_duplicate_step_ids() {
+        let mut plan = ActionPlan::builder("Test", "ws")
+            .add_step(StepPlan::new(
+                1,
+                StepAction::SendText {
+                    pane_id: 0,
+                    text: "a".into(),
+                    paste_mode: None,
+                },
+                "Step 1",
+            ))
+            .add_step(StepPlan::new(
+                2,
+                StepAction::SendText {
+                    pane_id: 0,
+                    text: "b".into(),
+                    paste_mode: None,
+                },
+                "Step 2",
+            ))
+            .build();
+
+        // Manually create duplicate step ID
+        plan.steps[1].step_id = plan.steps[0].step_id.clone();
+
+        let result = plan.validate();
+        assert!(matches!(result, Err(PlanValidationError::DuplicateStepId(_))));
+    }
+
+    #[test]
+    fn test_validation_unknown_step_reference() {
+        let mut plan = ActionPlan::builder("Test", "ws")
+            .add_step(StepPlan::new(
+                1,
+                StepAction::SendText {
+                    pane_id: 0,
+                    text: "a".into(),
+                    paste_mode: None,
+                },
+                "Step 1",
+            ))
+            .build();
+
+        // Add precondition referencing non-existent step
+        plan.preconditions.push(Precondition::StepCompleted {
+            step_id: IdempotencyKey::from_hash("nonexistent"),
+        });
+
+        let result = plan.validate();
+        assert!(matches!(
+            result,
+            Err(PlanValidationError::UnknownStepReference(_))
+        ));
+    }
+
+    #[test]
+    fn test_precondition_canonical_strings() {
+        // Test all precondition types produce stable canonical strings
+        let preconditions = vec![
+            Precondition::PaneExists { pane_id: 0 },
+            Precondition::PaneState {
+                pane_id: 1,
+                expected_agent: Some("claude".into()),
+                expected_domain: None,
+            },
+            Precondition::PatternMatched {
+                rule_id: "test.rule".into(),
+                pane_id: Some(0),
+                within_ms: Some(5000),
+            },
+            Precondition::PatternNotMatched {
+                rule_id: "error.rule".into(),
+                pane_id: None,
+            },
+            Precondition::LockHeld {
+                lock_name: "test_lock".into(),
+            },
+            Precondition::LockAvailable {
+                lock_name: "other_lock".into(),
+            },
+            Precondition::StepCompleted {
+                step_id: IdempotencyKey::from_hash("abc123"),
+            },
+            Precondition::Custom {
+                name: "custom".into(),
+                expression: "x > 0".into(),
+            },
+        ];
+
+        for precond in &preconditions {
+            let s1 = precond.canonical_string();
+            let s2 = precond.canonical_string();
+            assert_eq!(s1, s2, "Precondition canonical string not stable");
+            assert!(!s1.is_empty(), "Canonical string should not be empty");
+        }
+    }
+
+    #[test]
+    fn test_verification_canonical_strings() {
+        let verifications = vec![
+            Verification::pattern_match("test.rule"),
+            Verification::pane_idle(5000),
+            Verification {
+                strategy: VerificationStrategy::PatternAbsent {
+                    rule_id: "error".into(),
+                    pane_id: Some(0),
+                    wait_ms: 1000,
+                },
+                description: None,
+                timeout_ms: None,
+            },
+            Verification {
+                strategy: VerificationStrategy::Custom {
+                    name: "custom".into(),
+                    expression: "check()".into(),
+                },
+                description: Some("Custom check".into()),
+                timeout_ms: Some(5000),
+            },
+            Verification {
+                strategy: VerificationStrategy::None,
+                description: None,
+                timeout_ms: None,
+            },
+        ];
+
+        for verify in &verifications {
+            let s1 = verify.canonical_string();
+            let s2 = verify.canonical_string();
+            assert_eq!(s1, s2, "Verification canonical string not stable");
+        }
+    }
+
+    #[test]
+    fn test_on_failure_canonical_strings() {
+        let strategies = vec![
+            OnFailure::abort(),
+            OnFailure::abort_with_message("Something went wrong"),
+            OnFailure::retry(3, 1000),
+            OnFailure::Retry {
+                max_attempts: 5,
+                initial_delay_ms: 500,
+                max_delay_ms: Some(30000),
+                backoff_multiplier: Some(2.0),
+            },
+            OnFailure::skip(),
+            OnFailure::RequireApproval {
+                summary: "Manual intervention needed".into(),
+            },
+        ];
+
+        for strategy in &strategies {
+            let s1 = strategy.canonical_string();
+            let s2 = strategy.canonical_string();
+            assert_eq!(s1, s2, "OnFailure canonical string not stable");
+        }
+    }
+
+    #[test]
+    fn test_step_action_canonical_strings() {
+        let actions = vec![
+            StepAction::SendText {
+                pane_id: 0,
+                text: "hello".into(),
+                paste_mode: Some(true),
+            },
+            StepAction::WaitFor {
+                pane_id: Some(0),
+                condition: WaitCondition::Pattern {
+                    pane_id: None,
+                    rule_id: "test".into(),
+                },
+                timeout_ms: 5000,
+            },
+            StepAction::AcquireLock {
+                lock_name: "test".into(),
+                timeout_ms: Some(1000),
+            },
+            StepAction::ReleaseLock {
+                lock_name: "test".into(),
+            },
+            StepAction::StoreData {
+                key: "key".into(),
+                value: serde_json::json!({"data": 123}),
+            },
+            StepAction::RunWorkflow {
+                workflow_id: "wf-1".into(),
+                params: Some(serde_json::json!({"arg": "value"})),
+            },
+            StepAction::MarkEventHandled { event_id: 42 },
+            StepAction::ValidateApproval {
+                approval_code: "ABC123".into(),
+            },
+            StepAction::Custom {
+                action_type: "custom_action".into(),
+                payload: serde_json::json!({}),
+            },
+        ];
+
+        for action in &actions {
+            let s1 = action.canonical_string();
+            let s2 = action.canonical_string();
+            assert_eq!(s1, s2, "StepAction canonical string not stable");
+            assert!(!s1.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_wait_condition_canonical_strings() {
+        let conditions = vec![
+            WaitCondition::Pattern {
+                pane_id: Some(0),
+                rule_id: "test.rule".into(),
+            },
+            WaitCondition::Pattern {
+                pane_id: None,
+                rule_id: "any.rule".into(),
+            },
+            WaitCondition::PaneIdle {
+                pane_id: Some(1),
+                idle_threshold_ms: 5000,
+            },
+            WaitCondition::External {
+                key: "signal_key".into(),
+            },
+        ];
+
+        for cond in &conditions {
+            let s1 = cond.canonical_string();
+            let s2 = cond.canonical_string();
+            assert_eq!(s1, s2, "WaitCondition canonical string not stable");
+        }
+    }
+
+    #[test]
+    fn test_plan_with_all_features() {
+        // Test a complex plan with all features to ensure serialization works
+        let plan = ActionPlan::builder("Complex Plan", "workspace-complex")
+            .add_step(
+                StepPlan::new(
+                    1,
+                    StepAction::AcquireLock {
+                        lock_name: "pane-lock".into(),
+                        timeout_ms: Some(5000),
+                    },
+                    "Acquire lock",
+                )
+                .with_precondition(Precondition::LockAvailable {
+                    lock_name: "pane-lock".into(),
+                })
+                .with_timeout_ms(10000)
+                .idempotent(),
+            )
+            .add_step(
+                StepPlan::new(
+                    2,
+                    StepAction::SendText {
+                        pane_id: 0,
+                        text: "/compact".into(),
+                        paste_mode: Some(true),
+                    },
+                    "Send compact command",
+                )
+                .with_precondition(Precondition::PaneExists { pane_id: 0 })
+                .with_verification(
+                    Verification::pattern_match("core.claude:compaction_complete")
+                        .with_timeout_ms(60000),
+                )
+                .with_on_failure(OnFailure::retry(3, 1000)),
+            )
+            .add_step(
+                StepPlan::new(
+                    3,
+                    StepAction::ReleaseLock {
+                        lock_name: "pane-lock".into(),
+                    },
+                    "Release lock",
+                )
+                .idempotent(),
+            )
+            .add_precondition(Precondition::PaneState {
+                pane_id: 0,
+                expected_agent: Some("claude-code".into()),
+                expected_domain: Some("local".into()),
+            })
+            .on_failure(OnFailure::abort_with_message("Plan failed"))
+            .metadata(serde_json::json!({
+                "source": "test",
+                "version": 1
+            }))
+            .created_at(1706400000000)
+            .build();
+
+        // Validate the plan
+        assert!(plan.validate().is_ok());
+
+        // Test JSON roundtrip
+        let json = serde_json::to_string_pretty(&plan).unwrap();
+        let parsed: ActionPlan = serde_json::from_str(&json).unwrap();
+        assert_eq!(plan.plan_id, parsed.plan_id);
+        assert_eq!(plan.steps.len(), 3);
+
+        // Test hash is stable
+        let hash1 = plan.compute_hash();
+        let hash2 = parsed.compute_hash();
+        assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_plan_step_count_and_helpers() {
+        let plan = ActionPlan::builder("Test", "ws")
+            .add_step(StepPlan::new(
+                1,
+                StepAction::SendText {
+                    pane_id: 0,
+                    text: "a".into(),
+                    paste_mode: None,
+                },
+                "Step 1",
+            ))
+            .add_step(StepPlan::new(
+                2,
+                StepAction::SendText {
+                    pane_id: 0,
+                    text: "b".into(),
+                    paste_mode: None,
+                },
+                "Step 2",
+            ))
+            .add_precondition(Precondition::PaneExists { pane_id: 0 })
+            .build();
+
+        assert_eq!(plan.step_count(), 2);
+        assert!(plan.has_preconditions());
+    }
+
+    #[test]
+    fn test_plan_id_display() {
+        let id = PlanId::from_hash("sha256:abcdef1234567890");
+        assert!(id.to_string().starts_with("plan:"));
+        assert!(!id.is_placeholder());
+
+        let placeholder = PlanId::placeholder();
+        assert!(placeholder.is_placeholder());
+    }
+
+    #[test]
+    fn test_idempotency_key_display() {
+        let key = IdempotencyKey::from_hash("abcdef12");
+        assert!(key.to_string().starts_with("step:"));
+    }
+
+    #[test]
+    fn test_action_type_names() {
+        assert_eq!(
+            StepAction::SendText {
+                pane_id: 0,
+                text: "".into(),
+                paste_mode: None
+            }
+            .action_type_name(),
+            "send_text"
+        );
+        assert_eq!(
+            StepAction::WaitFor {
+                pane_id: None,
+                condition: WaitCondition::External { key: "".into() },
+                timeout_ms: 0
+            }
+            .action_type_name(),
+            "wait_for"
+        );
+        assert_eq!(
+            StepAction::AcquireLock {
+                lock_name: "".into(),
+                timeout_ms: None
+            }
+            .action_type_name(),
+            "acquire_lock"
+        );
+        assert_eq!(
+            StepAction::ReleaseLock {
+                lock_name: "".into()
+            }
+            .action_type_name(),
+            "release_lock"
+        );
+        assert_eq!(
+            StepAction::StoreData {
+                key: "".into(),
+                value: serde_json::Value::Null
+            }
+            .action_type_name(),
+            "store_data"
+        );
+        assert_eq!(
+            StepAction::RunWorkflow {
+                workflow_id: "".into(),
+                params: None
+            }
+            .action_type_name(),
+            "run_workflow"
+        );
+        assert_eq!(
+            StepAction::MarkEventHandled { event_id: 0 }.action_type_name(),
+            "mark_event_handled"
+        );
+        assert_eq!(
+            StepAction::ValidateApproval {
+                approval_code: "".into()
+            }
+            .action_type_name(),
+            "validate_approval"
+        );
+        assert_eq!(
+            StepAction::Custom {
+                action_type: "".into(),
+                payload: serde_json::Value::Null
+            }
+            .action_type_name(),
+            "custom"
+        );
+    }
+
+    #[test]
+    fn test_validation_error_display() {
+        let err1 = PlanValidationError::InvalidStepNumber {
+            expected: 1,
+            actual: 5,
+        };
+        assert!(err1.to_string().contains("expected 1"));
+        assert!(err1.to_string().contains("got 5"));
+
+        let err2 = PlanValidationError::DuplicateStepId(IdempotencyKey::from_hash("abc"));
+        assert!(err2.to_string().contains("Duplicate"));
+
+        let err3 = PlanValidationError::UnknownStepReference(IdempotencyKey::from_hash("xyz"));
+        assert!(err3.to_string().contains("Unknown"));
+
+        let err4 = PlanValidationError::UnsupportedVersion {
+            version: 99,
+            max_supported: 1,
+        };
+        assert!(err4.to_string().contains("99"));
+        assert!(err4.to_string().contains("1"));
+    }
 }

@@ -4751,7 +4751,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
         Some(Commands::Doctor) => {
             println!("wa doctor - Running diagnostics...\n");
 
-            let checks = run_diagnostics(&permission_warnings);
+            let checks = run_diagnostics(&permission_warnings, &config, &layout);
 
             for check in &checks {
                 check.print();
@@ -5547,11 +5547,200 @@ impl DiagnosticCheck {
 /// Run all diagnostic checks and return results
 fn run_diagnostics(
     permission_warnings: &[wa_core::config::PermissionWarning],
+    config: &wa_core::config::Config,
+    layout: &wa_core::config::WorkspaceLayout,
 ) -> Vec<DiagnosticCheck> {
     let mut checks = Vec::new();
 
-    // Check 1: wa-core loaded
-    checks.push(DiagnosticCheck::ok("wa-core loaded"));
+    // Check 1: wa-core loaded with version
+    checks.push(DiagnosticCheck::ok_with_detail(
+        "wa-core loaded",
+        format!("v{}", env!("CARGO_PKG_VERSION")),
+    ));
+
+    // Check 2: Workspace resolution
+    checks.push(DiagnosticCheck::ok_with_detail(
+        "workspace root",
+        layout.root.display().to_string(),
+    ));
+
+    // Check 3: .wa directory
+    if layout.wa_dir.exists() {
+        checks.push(DiagnosticCheck::ok_with_detail(
+            ".wa directory",
+            layout.wa_dir.display().to_string(),
+        ));
+    } else {
+        checks.push(DiagnosticCheck::warning(
+            ".wa directory",
+            format!("{} does not exist", layout.wa_dir.display()),
+            "Will be created on first daemon start",
+        ));
+    }
+
+    // Check 4: Database path and status
+    if layout.db_path.exists() {
+        // Try to open and check DB
+        match rusqlite::Connection::open_with_flags(
+            &layout.db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ) {
+            Ok(conn) => {
+                // Check schema version
+                match conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0)) {
+                    Ok(version) => {
+                        let target = wa_core::storage::SCHEMA_VERSION;
+                        if version == target {
+                            // Check WAL mode
+                            let wal_mode: String = conn
+                                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                                .unwrap_or_else(|_| "unknown".to_string());
+                            checks.push(DiagnosticCheck::ok_with_detail(
+                                "database",
+                                format!(
+                                    "schema v{}, journal={} ({})",
+                                    version,
+                                    wal_mode,
+                                    layout.db_path.display()
+                                ),
+                            ));
+                        } else if version < target {
+                            checks.push(DiagnosticCheck::warning(
+                                "database",
+                                format!("schema v{} (needs migration to v{})", version, target),
+                                "Run 'wa daemon start' to auto-migrate",
+                            ));
+                        } else {
+                            checks.push(DiagnosticCheck::error(
+                                "database",
+                                format!("schema v{} is newer than wa supports (v{})", version, target),
+                                "Update wa to a newer version",
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        checks.push(DiagnosticCheck::warning(
+                            "database",
+                            format!("could not read schema version: {}", e),
+                            "Database may be corrupt or locked",
+                        ));
+                    }
+                }
+            }
+            Err(e) => {
+                checks.push(DiagnosticCheck::error(
+                    "database",
+                    format!("could not open: {}", e),
+                    "Check file permissions or if another process has locked it",
+                ));
+            }
+        }
+    } else {
+        checks.push(DiagnosticCheck::warning(
+            "database",
+            format!("{} does not exist", layout.db_path.display()),
+            "Will be created on first daemon start",
+        ));
+    }
+
+    // Check 5: Lock file (watcher status)
+    if layout.lock_path.exists() {
+        // Try to read lock file to see if daemon is running
+        match std::fs::read_to_string(&layout.lock_path) {
+            Ok(content) => {
+                let pid = content.trim();
+                // Check if process is actually running
+                let is_running = std::process::Command::new("kill")
+                    .args(["-0", pid])
+                    .output()
+                    .map(|o| o.status.success())
+                    .unwrap_or(false);
+
+                if is_running {
+                    checks.push(DiagnosticCheck::ok_with_detail(
+                        "daemon status",
+                        format!("running (PID {})", pid),
+                    ));
+                } else {
+                    checks.push(DiagnosticCheck::warning(
+                        "daemon status",
+                        format!("stale lock (PID {} not running)", pid),
+                        format!("Remove lock: rm {}", layout.lock_path.display()),
+                    ));
+                }
+            }
+            Err(_) => {
+                checks.push(DiagnosticCheck::warning(
+                    "daemon status",
+                    "lock file exists but unreadable",
+                    format!("Check permissions: {}", layout.lock_path.display()),
+                ));
+            }
+        }
+    } else {
+        checks.push(DiagnosticCheck::ok_with_detail("daemon status", "not running"));
+    }
+
+    // Check 6: Logs directory writability
+    if layout.logs_dir.exists() {
+        let test_file = layout.logs_dir.join(".wa_doctor_test");
+        match std::fs::write(&test_file, "test") {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&test_file);
+                checks.push(DiagnosticCheck::ok_with_detail(
+                    "logs directory",
+                    layout.logs_dir.display().to_string(),
+                ));
+            }
+            Err(e) => {
+                checks.push(DiagnosticCheck::error(
+                    "logs directory",
+                    format!("not writable: {}", e),
+                    format!("Check permissions: chmod 755 {}", layout.logs_dir.display()),
+                ));
+            }
+        }
+    } else {
+        checks.push(DiagnosticCheck::warning(
+            "logs directory",
+            format!("{} does not exist", layout.logs_dir.display()),
+            "Will be created on first daemon start",
+        ));
+    }
+
+    // Check 7: Feature flags
+    #[allow(unused_mut)]
+    let mut features: Vec<&str> = Vec::new();
+    #[cfg(feature = "tui")]
+    features.push("tui");
+    #[cfg(feature = "browser")]
+    features.push("browser");
+    #[cfg(feature = "mcp")]
+    features.push("mcp");
+    #[cfg(feature = "web")]
+    features.push("web");
+    #[cfg(feature = "metrics")]
+    features.push("metrics");
+
+    if features.is_empty() {
+        checks.push(DiagnosticCheck::ok_with_detail(
+            "features",
+            "default (no optional features)",
+        ));
+    } else {
+        checks.push(DiagnosticCheck::ok_with_detail(
+            "features",
+            features.join(", "),
+        ));
+    }
+
+    // Check 8: Config source (without exposing secrets)
+    let config_source = if config.general.log_level.is_empty() {
+        "defaults".to_string()
+    } else {
+        format!("log_level={}", config.general.log_level)
+    };
+    checks.push(DiagnosticCheck::ok_with_detail("config", config_source));
 
     // Check 2: WezTerm CLI available
     match std::process::Command::new("wezterm")

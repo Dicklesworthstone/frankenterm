@@ -898,6 +898,8 @@ pub struct WorkflowContext {
     execution_id: String,
     /// Policy-gated injector for terminal actions (optional)
     injector: Option<Arc<tokio::sync::Mutex<crate::policy::PolicyGatedInjector>>>,
+    /// The action plan for this workflow execution (plan-first mode)
+    action_plan: Option<crate::plan::ActionPlan>,
 }
 
 impl WorkflowContext {
@@ -917,6 +919,7 @@ impl WorkflowContext {
             config: WorkflowConfig::default(),
             execution_id: execution_id.into(),
             injector: None,
+            action_plan: None,
         }
     }
 
@@ -1063,6 +1066,47 @@ impl WorkflowContext {
             )
             .await)
     }
+
+    // ========================================================================
+    // Plan-first execution support (wa-upg.2.3)
+    // ========================================================================
+
+    /// Set the action plan for this workflow execution.
+    pub fn set_action_plan(&mut self, plan: crate::plan::ActionPlan) {
+        self.action_plan = Some(plan);
+    }
+
+    /// Get the action plan for this workflow execution, if any.
+    #[must_use]
+    pub fn action_plan(&self) -> Option<&crate::plan::ActionPlan> {
+        self.action_plan.as_ref()
+    }
+
+    /// Check if this context is executing in plan-first mode.
+    #[must_use]
+    pub fn has_action_plan(&self) -> bool {
+        self.action_plan.is_some()
+    }
+
+    /// Get the step plan for a given step index, if executing in plan-first mode.
+    #[must_use]
+    pub fn get_step_plan(&self, step_idx: usize) -> Option<&crate::plan::StepPlan> {
+        self.action_plan
+            .as_ref()
+            .and_then(|plan| plan.steps.get(step_idx))
+    }
+
+    /// Get the idempotency key for a step, if executing in plan-first mode.
+    #[must_use]
+    pub fn get_step_idempotency_key(&self, step_idx: usize) -> Option<&crate::plan::IdempotencyKey> {
+        self.get_step_plan(step_idx).map(|step| &step.step_id)
+    }
+
+    /// Get the workspace ID from the action plan.
+    #[must_use]
+    pub fn workspace_id(&self) -> Option<&str> {
+        self.action_plan.as_ref().map(|p| p.workspace_id.as_str())
+    }
 }
 
 // ============================================================================
@@ -1202,6 +1246,61 @@ pub trait Workflow: Send + Sync {
     /// Whether this workflow is currently enabled.
     fn is_enabled(&self) -> bool {
         true
+    }
+
+    // ========================================================================
+    // Plan-first execution support (wa-upg.2.3)
+    // ========================================================================
+
+    /// Generate an ActionPlan representing this workflow's execution.
+    ///
+    /// This enables plan-first execution where the plan is persisted before
+    /// any side effects are performed. The plan provides:
+    /// - Deterministic step descriptions for audit trails
+    /// - Idempotency keys for safe replay
+    /// - Structured verification and failure handling
+    ///
+    /// # Arguments
+    /// * `ctx` - Workflow context with pane state and trigger info
+    /// * `execution_id` - The workflow execution ID (used in plan metadata)
+    ///
+    /// # Default Implementation
+    /// Returns `None`, meaning the workflow uses legacy step-by-step execution.
+    /// Workflows can override this to provide plan-first execution.
+    fn to_action_plan(
+        &self,
+        _ctx: &WorkflowContext,
+        _execution_id: &str,
+    ) -> Option<crate::plan::ActionPlan> {
+        None
+    }
+
+    /// Convert workflow steps to StepPlan entries for plan generation.
+    ///
+    /// Helper method that creates basic StepPlans from WorkflowStep metadata.
+    /// Workflows can use this as a starting point and enrich the plans with
+    /// preconditions, verification, and failure handling.
+    fn steps_to_plans(&self, pane_id: u64) -> Vec<crate::plan::StepPlan> {
+        self.steps()
+            .iter()
+            .enumerate()
+            .map(|(idx, step)| {
+                let step_number = (idx + 1) as u32;
+                crate::plan::StepPlan::new(
+                    step_number,
+                    crate::plan::StepAction::Custom {
+                        action_type: format!("workflow_step:{}", step.name),
+                        payload: serde_json::json!({
+                            "workflow": self.name(),
+                            "step_name": step.name,
+                            "description": step.description,
+                            "pane_id": pane_id,
+                        }),
+                    },
+                    &step.description,
+                )
+            })
+            .collect()
     }
 }
 
@@ -1572,6 +1671,103 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
         .unwrap_or(0)
+}
+
+// ============================================================================
+// Plan-first Execution Helpers (wa-upg.2.3)
+// ============================================================================
+
+/// Generate an ActionPlan from a workflow definition.
+///
+/// This helper creates a complete ActionPlan using the workflow's step metadata.
+/// Workflows can use this as a base and then customize the plan.
+///
+/// # Arguments
+/// * `workflow` - The workflow to generate a plan for
+/// * `workspace_id` - The workspace scope for the plan
+/// * `pane_id` - Target pane ID
+/// * `execution_id` - The workflow execution ID (used in metadata)
+pub fn workflow_to_action_plan(
+    workflow: &dyn Workflow,
+    workspace_id: &str,
+    pane_id: u64,
+    execution_id: &str,
+) -> crate::plan::ActionPlan {
+    let steps = workflow.steps_to_plans(pane_id);
+
+    crate::plan::ActionPlan::builder(workflow.description(), workspace_id)
+        .add_steps(steps)
+        .metadata(serde_json::json!({
+            "workflow_name": workflow.name(),
+            "execution_id": execution_id,
+            "pane_id": pane_id,
+            "generated_by": "workflow_to_action_plan",
+        }))
+        .created_at(now_ms())
+        .build()
+}
+
+/// Result of checking a step's idempotency.
+#[derive(Debug, Clone)]
+pub enum IdempotencyCheckResult {
+    /// Step has not been executed before - proceed with execution
+    NotExecuted,
+    /// Step was already executed successfully - skip
+    AlreadyCompleted {
+        /// When the step was completed
+        completed_at: i64,
+        /// Result from the previous execution
+        previous_result: Option<String>,
+    },
+    /// Step was started but not completed - may need recovery
+    PartiallyExecuted {
+        /// When the step was started
+        started_at: i64,
+    },
+}
+
+/// Check if a step has already been executed based on its idempotency key.
+///
+/// This enables safe replay by checking the step log for previous executions.
+pub async fn check_step_idempotency(
+    storage: &StorageHandle,
+    execution_id: &str,
+    idempotency_key: &crate::plan::IdempotencyKey,
+    step_index: usize,
+) -> IdempotencyCheckResult {
+    // Query step logs for this execution
+    let logs = match storage.get_step_logs(execution_id).await {
+        Ok(logs) => logs,
+        Err(_) => return IdempotencyCheckResult::NotExecuted,
+    };
+
+    // Find the log for this step by index
+    for log in logs {
+        if log.step_index == step_index {
+            // Check if the result data contains this idempotency key
+            if let Some(ref result_data) = log.result_data {
+                if let Ok(data) = serde_json::from_str::<serde_json::Value>(result_data) {
+                    if let Some(key) = data.get("idempotency_key").and_then(|v| v.as_str()) {
+                        if key == idempotency_key.0 {
+                            // Check if step completed successfully
+                            if log.result_type == "continue" || log.result_type == "done" {
+                                return IdempotencyCheckResult::AlreadyCompleted {
+                                    completed_at: log.completed_at,
+                                    previous_result: log.result_data.clone(),
+                                };
+                            } else {
+                                return IdempotencyCheckResult::PartiallyExecuted {
+                                    started_at: log.started_at,
+                                };
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    IdempotencyCheckResult::NotExecuted
 }
 
 // ============================================================================
@@ -2625,6 +2821,14 @@ impl WorkflowRunner {
     ///
     /// This method executes all steps of a workflow, handling retries,
     /// wait conditions, and policy gates.
+    ///
+    /// # Plan-first execution (wa-upg.2.3)
+    ///
+    /// If the workflow implements `to_action_plan`, the plan is generated and
+    /// attached to the context before execution begins. This enables:
+    /// - Deterministic step descriptions for audit trails
+    /// - Idempotency keys for safe replay
+    /// - Structured verification and failure handling
     pub async fn run_workflow(
         &self,
         pane_id: u64,
@@ -2647,6 +2851,32 @@ impl WorkflowRunner {
         )
         .with_injector(Arc::clone(&self.injector));
 
+        // Plan-first execution: generate ActionPlan if workflow supports it (wa-upg.2.3)
+        if let Some(plan) = workflow.to_action_plan(&ctx, execution_id) {
+            tracing::info!(
+                execution_id,
+                workflow_name = %workflow_name,
+                plan_id = %plan.plan_id,
+                step_count = plan.step_count(),
+                "Generated action plan for workflow"
+            );
+
+            // Validate the plan before execution
+            if let Err(validation_error) = plan.validate() {
+                tracing::error!(
+                    execution_id,
+                    error = %validation_error,
+                    "Action plan validation failed"
+                );
+                return WorkflowExecutionResult::Error {
+                    execution_id: Some(execution_id.to_string()),
+                    error: format!("Plan validation failed: {validation_error}"),
+                };
+            }
+
+            ctx.set_action_plan(plan);
+        }
+
         while current_step < step_count {
             // Execute the step
             let step_result = workflow.execute_step(&mut ctx, current_step).await;
@@ -2666,7 +2896,25 @@ impl WorkflowRunner {
                 .get(current_step)
                 .map_or("unknown", |s| s.name.as_str());
 
-            let result_data = serde_json::to_string(&step_result).ok();
+            // Build result data, enriching with plan information if available (wa-upg.2.3)
+            let result_data = {
+                let mut data = serde_json::json!({
+                    "step_result": &step_result,
+                });
+
+                // Include idempotency key from plan if executing in plan-first mode
+                if let Some(idempotency_key) = ctx.get_step_idempotency_key(current_step) {
+                    data["idempotency_key"] = serde_json::json!(idempotency_key.0);
+                }
+
+                // Include step action type from plan if available
+                if let Some(step_plan) = ctx.get_step_plan(current_step) {
+                    data["action_type"] = serde_json::json!(step_plan.action.action_type_name());
+                    data["step_description"] = serde_json::json!(step_plan.description);
+                }
+
+                serde_json::to_string(&data).ok()
+            };
             let step_started_at = now_ms();
             let step_completed_at = now_ms();
 
