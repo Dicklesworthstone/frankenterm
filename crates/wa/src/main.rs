@@ -1495,6 +1495,9 @@ fn resolve_workflow(name: &str) -> Option<std::sync::Arc<dyn wa_core::workflows:
         "handle_compaction" => Some(std::sync::Arc::new(
             wa_core::workflows::HandleCompaction::default(),
         )),
+        "handle_usage_limits" => Some(std::sync::Arc::new(
+            wa_core::workflows::HandleUsageLimits::default(),
+        )),
         _ => None,
     }
 }

@@ -641,7 +641,7 @@ fn builtin_codex_pack() -> PatternPack {
                 severity: Severity::Info,
                 anchors: vec!["Token usage:".to_string()],
                 regex: Some(
-                    r"total=(?P<total>[\d,]+)\s+input=(?P<input>[\d,]+)\s+\(\+\s*(?P<cached>[\d,]+)\s+cached\)\s+output=(?P<output>[\d,]+)(?:\s+\(reasoning\s+(?P<reasoning>[\d,]+)\))?".to_string()
+                    r"total=(?P<total>[\d,]+)\s+input=(?P<input>[\d,]+)(?:\s+\(\+\s*(?P<cached>[\d,]+)\s+cached\))?\s+output=(?P<output>[\d,]+)(?:\s+\(reasoning\s+(?P<reasoning>[\d,]+)\))?".to_string()
                 ),
                 description: "Codex session token usage summary".to_string(),
                 remediation: None,

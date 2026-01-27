@@ -18,7 +18,8 @@
 use crate::policy::{InjectionResult, PaneCapabilities};
 use crate::storage::StorageHandle;
 use crate::wezterm::{
-    CodexSummaryWaitResult, PaneTextSource, WaitOptions, wait_for_codex_session_summary,
+    CodexSummaryWaitResult, PaneTextSource, WaitOptions, elapsed_ms, stable_hash, tail_text,
+    wait_for_codex_session_summary,
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -240,15 +241,7 @@ static CODEX_CACHED_RE: LazyLock<Regex> =
 static CODEX_REASONING_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\(reasoning\s+([\d,]+)\)").expect("reasoning regex"));
 
-#[allow(dead_code)]
-fn stable_hash(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64; // FNV-1a offset basis
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0100_0000_01b3);
-    }
-    hash
-}
+
 
 #[allow(dead_code)]
 fn parse_number(raw: &str) -> Option<i64> {
@@ -494,6 +487,101 @@ pub(crate) async fn mark_account_used(
 
     Ok(())
 }
+
+// ============================================================================
+// Device Auth Step (wa-nu4.1.3.5)
+// ============================================================================
+
+/// Device code extracted from Codex device-auth login prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceCode {
+    /// The device code (e.g., "ABCD-1234" or "ABCD-12345")
+    pub code: String,
+    /// The URL to visit for authentication (if present)
+    pub url: Option<String>,
+}
+
+/// Structured error for device code parsing.
+#[derive(Debug, Clone)]
+pub struct DeviceCodeParseError {
+    /// What was expected
+    pub expected: &'static str,
+    /// Hash of the tail (for safe diagnostics)
+    pub tail_hash: u64,
+    /// Length of the tail
+    pub tail_len: usize,
+}
+
+impl std::fmt::Display for DeviceCodeParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Device code not found (expected: {}, tail_hash={:016x}, tail_len={})",
+            self.expected, self.tail_hash, self.tail_len
+        )
+    }
+}
+
+impl std::error::Error for DeviceCodeParseError {}
+
+/// Regex for device codes: 4+ alphanumeric, dash, 4+ alphanumeric
+#[allow(dead_code)]
+static DEVICE_CODE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(?:code|enter)[\s:]+([A-Z0-9]{4,}-[A-Z0-9]{4,})").expect("device code regex")
+});
+
+/// Regex for authentication URL
+#[allow(dead_code)]
+static DEVICE_URL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(?:https?://[^\s]+(?:device|auth|activate)[^\s]*)").expect("device url regex")
+});
+
+/// Parse device code from pane tail text.
+///
+/// Looks for patterns like:
+/// - "Enter code: ABCD-1234"
+/// - "Your code is ABCD-12345"
+/// - "code: WXYZ-5678"
+#[allow(dead_code)]
+pub(crate) fn parse_device_code(tail: &str) -> Result<DeviceCode, DeviceCodeParseError> {
+    let tail_hash = stable_hash(tail.as_bytes());
+    let tail_len = tail.len();
+
+    // Try to find the device code
+    let code = DEVICE_CODE_RE
+        .captures(tail)
+        .and_then(|caps| caps.get(1))
+        .map(|m| m.as_str().to_uppercase());
+
+    // Try to find the URL (optional)
+    let url = DEVICE_URL_RE.find(tail).map(|m| m.as_str().to_string());
+
+    match code {
+        Some(code) => Ok(DeviceCode { code, url }),
+        None => Err(DeviceCodeParseError {
+            expected: "device code pattern like 'code: XXXX-YYYY'",
+            tail_hash,
+            tail_len,
+        }),
+    }
+}
+
+/// Validate a device code format.
+///
+/// Returns true if the code matches the expected pattern (4+ chars, dash, 4+ chars).
+#[allow(dead_code)]
+pub(crate) fn validate_device_code(code: &str) -> bool {
+    let parts: Vec<&str> = code.split('-').collect();
+    if parts.len() != 2 {
+        return false;
+    }
+    let first_valid = parts[0].len() >= 4 && parts[0].chars().all(|c| c.is_ascii_alphanumeric());
+    let second_valid = parts[1].len() >= 4 && parts[1].chars().all(|c| c.is_ascii_alphanumeric());
+    first_valid && second_valid
+}
+
+/// The command to send to initiate device auth login.
+pub const DEVICE_AUTH_LOGIN_COMMAND: &str = "cod login --device-auth\n";
 
 // ============================================================================
 // Step Results
@@ -2134,20 +2222,9 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
     }
 }
 
-/// Extract the last N lines from text.
-fn tail_text(text: &str, n: usize) -> String {
-    if n == 0 {
-        return String::new();
-    }
-    let lines: Vec<&str> = text.lines().collect();
-    let start = lines.len().saturating_sub(n);
-    lines[start..].join("\n")
-}
 
-/// Calculate elapsed milliseconds from a start instant.
-fn elapsed_ms(start: Instant) -> u64 {
-    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
-}
+
+
 
 /// Heuristic idle check based on pane text patterns.
 ///
@@ -2633,6 +2710,15 @@ impl WorkflowRunner {
                             error = %e,
                             "Failed to update execution step"
                         );
+                        if let crate::Error::Workflow(crate::error::WorkflowError::Aborted(reason)) = e {
+                            self.lock_manager.release(pane_id, execution_id);
+                            return WorkflowExecutionResult::Aborted {
+                                execution_id: execution_id.to_string(),
+                                reason,
+                                step_index: current_step,
+                                elapsed_ms: elapsed_ms(start_time),
+                            };
+                        }
                     }
                 }
                 StepResult::Done { result } => {
@@ -2767,6 +2853,15 @@ impl WorkflowRunner {
                             error = %e,
                             "Failed to set waiting state"
                         );
+                        if let crate::Error::Workflow(crate::error::WorkflowError::Aborted(reason)) = e {
+                            self.lock_manager.release(pane_id, execution_id);
+                            return WorkflowExecutionResult::Aborted {
+                                execution_id: execution_id.to_string(),
+                                reason,
+                                step_index: current_step,
+                                elapsed_ms: elapsed_ms(start_time),
+                            };
+                        }
                     }
 
                     // Execute wait condition
@@ -2803,6 +2898,15 @@ impl WorkflowRunner {
                             error = %e,
                             "Failed to update execution step after wait"
                         );
+                        if let crate::Error::Workflow(crate::error::WorkflowError::Aborted(reason)) = e {
+                            self.lock_manager.release(pane_id, execution_id);
+                            return WorkflowExecutionResult::Aborted {
+                                execution_id: execution_id.to_string(),
+                                reason,
+                                step_index: current_step,
+                                elapsed_ms: elapsed_ms(start_time),
+                            };
+                        }
                     }
                 }
                 StepResult::SendText {
@@ -2899,6 +3003,15 @@ impl WorkflowRunner {
                                     error = %e,
                                     "Failed to update execution step after send"
                                 );
+                                if let crate::Error::Workflow(crate::error::WorkflowError::Aborted(reason)) = e {
+                                    self.lock_manager.release(pane_id, execution_id);
+                                    return WorkflowExecutionResult::Aborted {
+                                        execution_id: execution_id.to_string(),
+                                        reason,
+                                        step_index: current_step,
+                                        elapsed_ms: elapsed_ms(start_time),
+                                    };
+                                }
                             }
                         }
                         crate::policy::InjectionResult::Denied { decision, .. } => {
@@ -3333,6 +3446,13 @@ impl WorkflowRunner {
                 ))
             })?;
 
+        // Check if workflow was externally aborted/completed
+        if record.status == "aborted" || record.status == "failed" || record.status == "completed" {
+            return Err(crate::Error::Workflow(crate::error::WorkflowError::Aborted(
+                format!("Workflow externally modified to status: {}", record.status),
+            )));
+        }
+
         record.current_step = step;
         record.status = "running".to_string();
         record.wait_condition = None;
@@ -3356,6 +3476,13 @@ impl WorkflowRunner {
                     execution_id.to_string(),
                 ))
             })?;
+
+        // Check if workflow was externally aborted/completed
+        if record.status == "aborted" || record.status == "failed" || record.status == "completed" {
+            return Err(crate::Error::Workflow(crate::error::WorkflowError::Aborted(
+                format!("Workflow externally modified to status: {}", record.status),
+            )));
+        }
 
         record.current_step = step;
         record.status = "waiting".to_string();
@@ -3906,6 +4033,122 @@ impl Workflow for HandleCompaction {
         // we just log that cleanup was called.
         Box::pin(async move {
             tracing::debug!("handle_compaction: cleanup completed");
+        })
+    }
+}
+
+/// Handle usage limits workflow: exit agent, persist session, and select new account.
+pub struct HandleUsageLimits;
+
+impl HandleUsageLimits {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for HandleUsageLimits {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Workflow for HandleUsageLimits {
+    fn name(&self) -> &'static str {
+        "handle_usage_limits"
+    }
+
+    fn description(&self) -> &'static str {
+        "Exit agent, persist session summary, and select new account for failover"
+    }
+
+    fn handles(&self, detection: &crate::patterns::Detection) -> bool {
+        detection.rule_id.contains("usage") && detection.agent_type == crate::patterns::AgentType::Codex
+    }
+
+    fn steps(&self) -> Vec<WorkflowStep> {
+        vec![
+            WorkflowStep::new("check_guards", "Validate pane state allows interaction"),
+            WorkflowStep::new("exit_and_persist", "Exit Codex and persist session summary"),
+            WorkflowStep::new("select_account", "Select best available account"),
+        ]
+    }
+
+    fn execute_step(
+        &self,
+        ctx: &mut WorkflowContext,
+        step_idx: usize,
+    ) -> BoxFuture<'_, StepResult> {
+        let pane_id = ctx.pane_id();
+        let storage = ctx.storage().clone();
+        let mut ctx_clone = ctx.clone();
+
+        Box::pin(async move {
+            match step_idx {
+                0 => {
+                    let caps = ctx_clone.capabilities();
+                    if caps.alt_screen == Some(true) {
+                        return StepResult::abort("Pane is in alt-screen mode");
+                    }
+                    if caps.command_running {
+                        return StepResult::abort("Command is running");
+                    }
+                    StepResult::cont()
+                }
+                1 => {
+                    let client = crate::wezterm::WeztermClient::new();
+                    let options = CodexExitOptions::default();
+
+                    let outcome = codex_exit_and_wait_for_summary(
+                        pane_id,
+                        &client,
+                        || {
+                            let mut c = ctx_clone.clone();
+                            async move {
+                                c.send_ctrl_c().await.map_err(|e| e.to_string())
+                            }
+                        },
+                        &options
+                    ).await;
+
+                    match outcome {
+                        Ok(_) => {
+                            let text = match client.get_text(pane_id, false).await {
+                                Ok(t) => t,
+                                Err(e) => return StepResult::abort(format!("Failed to get text: {e}")),
+                            };
+                            let tail = crate::wezterm::tail_text(&text, 200);
+                            
+                            match parse_codex_session_summary(&tail) {
+                                Ok(parsed) => {
+                                    if let Err(e) = persist_codex_session_summary(&storage, pane_id, &parsed).await {
+                                        tracing::warn!("Failed to persist session summary: {e}");
+                                    }
+                                    StepResult::cont()
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Failed to parse session summary: {e}");
+                                    StepResult::cont()
+                                }
+                            }
+                        }
+                        Err(e) => StepResult::abort(format!("Failed to exit Codex: {e}")),
+                    }
+                }
+                2 => {
+                    let caut_client = crate::caut::CautClient::new();
+                    let config = crate::accounts::AccountSelectionConfig::default();
+                    let result = refresh_and_select_account(&caut_client, &storage, &config).await;
+
+                    match result {
+                        Ok(selection) => {
+                            let json = serde_json::to_value(selection).unwrap_or_default();
+                            StepResult::done(json)
+                        }
+                        Err(e) => StepResult::abort(e.to_string()),
+                    }
+                }
+                _ => StepResult::abort("Unexpected step"),
+            }
         })
     }
 }
@@ -7512,7 +7755,7 @@ Try again at 3:00 PM UTC.
 
     #[test]
     fn account_selection_step_result_can_be_constructed() {
-        use crate::accounts::{AccountRecord, AccountSelectionConfig, SelectionExplanation};
+        use crate::accounts::SelectionExplanation;
 
         // Verify the step result structure is correct
         let explanation = SelectionExplanation {

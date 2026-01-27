@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 use crate::config::PaneFilterConfig;
 use crate::error::Result;
 use crate::storage::{Gap, PaneRecord, Segment, StorageHandle};
-use crate::wezterm::PaneInfo;
+use crate::wezterm::{PaneInfo, stable_hash};
 
 // =============================================================================
 // Time Utilities
@@ -993,9 +993,7 @@ pub async fn persist_captured_segment(
 }
 
 fn hash_text(text: &str) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    text.hash(&mut hasher);
-    hasher.finish()
+    stable_hash(text.as_bytes())
 }
 
 /// Extract delta from current vs previous content.

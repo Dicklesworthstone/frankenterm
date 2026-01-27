@@ -1071,11 +1071,11 @@ pub async fn wait_for_codex_session_summary<S: PaneTextSource + Sync + ?Sized>(
     }
 }
 
-fn elapsed_ms(start: Instant) -> u64 {
+pub(crate) fn elapsed_ms(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-fn stable_hash(bytes: &[u8]) -> u64 {
+pub(crate) fn stable_hash(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64; // FNV-1a offset basis
     for byte in bytes {
         hash ^= u64::from(*byte);
@@ -1084,7 +1084,7 @@ fn stable_hash(bytes: &[u8]) -> u64 {
     hash
 }
 
-fn tail_text(text: &str, tail_lines: usize) -> String {
+pub(crate) fn tail_text(text: &str, tail_lines: usize) -> String {
     if tail_lines == 0 {
         return String::new();
     }
