@@ -207,6 +207,26 @@ pub fn fingerprint_for_input(input: &PolicyInput) -> String {
     if let Some(workflow_id) = &input.workflow_id {
         canonical.push_str(workflow_id);
     }
+    canonical.push('|');
+    canonical.push_str("command_text=");
+    if let Some(cmd) = &input.command_text {
+        canonical.push_str(cmd);
+    }
+    canonical.push('|');
+    canonical.push_str("agent_type=");
+    if let Some(agent) = &input.agent_type {
+        canonical.push_str(agent);
+    }
+    canonical.push('|');
+    canonical.push_str("pane_title=");
+    if let Some(title) = &input.pane_title {
+        canonical.push_str(title);
+    }
+    canonical.push('|');
+    canonical.push_str("pane_cwd=");
+    if let Some(cwd) = &input.pane_cwd {
+        canonical.push_str(cwd);
+    }
 
     format!("sha256:{}", sha256_hex(&canonical))
 }
@@ -293,6 +313,17 @@ mod tests {
             .with_domain("local")
             .with_text_summary("echo bye");
         assert_ne!(first, fingerprint_for_input(&different));
+    }
+
+    #[test]
+    fn command_text_changes_fingerprint() {
+        let input1 = base_input().with_command_text("echo A");
+        let input2 = base_input().with_command_text("echo B");
+
+        let fp1 = fingerprint_for_input(&input1);
+        let fp2 = fingerprint_for_input(&input2);
+
+        assert_ne!(fp1, fp2, "Fingerprint should differ when command_text changes");
     }
 
     #[tokio::test]

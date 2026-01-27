@@ -50,7 +50,7 @@ use crate::policy::Redactor;
 /// This is the target version that new databases will be initialized to,
 /// and existing databases will be migrated to.
 /// Uses SQLite's PRAGMA user_version for atomic version tracking.
-pub const SCHEMA_VERSION: i32 = 5;
+pub const SCHEMA_VERSION: i32 = 6;
 
 /// Schema initialization SQL
 ///
@@ -69,6 +69,15 @@ CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER NOT NULL,
     applied_at INTEGER NOT NULL,  -- epoch ms
     description TEXT
+);
+
+-- wa metadata: version compatibility + provenance
+CREATE TABLE IF NOT EXISTS wa_meta (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    schema_version INTEGER NOT NULL,
+    min_compatible_wa TEXT NOT NULL,
+    created_by_wa TEXT NOT NULL,
+    created_at INTEGER NOT NULL  -- epoch ms
 );
 
 -- Panes: metadata and observation decisions
@@ -538,6 +547,20 @@ static MIGRATIONS: &[Migration] = &[
             DROP TABLE IF EXISTS accounts;
         ",
         ),
+    },
+    Migration {
+        version: 6,
+        description: "Add wa_meta for version compatibility tracking",
+        up_sql: r"
+            CREATE TABLE IF NOT EXISTS wa_meta (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                schema_version INTEGER NOT NULL,
+                min_compatible_wa TEXT NOT NULL,
+                created_by_wa TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+        ",
+        down_sql: Some("DROP TABLE IF EXISTS wa_meta;"),
     },
 ];
 
@@ -1094,15 +1117,20 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
     let needs_init = needs_initialization(conn)?;
 
     if current > SCHEMA_VERSION {
-        return Err(StorageError::MigrationFailed(format!(
-            "Database schema version ({current}) is newer than supported ({SCHEMA_VERSION}). \
-             Please upgrade wa to a newer version."
-        ))
+        return Err(StorageError::SchemaTooNew {
+            current,
+            supported: SCHEMA_VERSION,
+        }
         .into());
+    }
+
+    if current != 0 {
+        check_wa_version_compatibility(conn)?;
     }
 
     if current == SCHEMA_VERSION {
         // Already up to date
+        ensure_wa_meta(conn, SCHEMA_VERSION)?;
         return Ok(());
     }
 
@@ -1112,6 +1140,7 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
             .map_err(|e| StorageError::MigrationFailed(format!("Schema init failed: {e}")))?;
         set_user_version(conn, SCHEMA_VERSION)?;
         record_migration(conn, SCHEMA_VERSION, "Initial schema")?;
+        ensure_wa_meta(conn, SCHEMA_VERSION)?;
         return Ok(());
     }
 
@@ -1123,6 +1152,8 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
 
     // Apply pending migrations for existing databases
     run_migrations(conn, current)?;
+
+    ensure_wa_meta(conn, SCHEMA_VERSION)?;
 
     Ok(())
 }
@@ -1379,6 +1410,174 @@ pub fn get_schema_version(conn: &Connection) -> Result<Option<i32>> {
     )
     .optional()
     .map_err(|e| StorageError::Database(e.to_string()).into())
+}
+
+#[derive(Debug, Clone)]
+struct WaMeta {
+    schema_version: i32,
+    min_compatible_wa: String,
+    created_by_wa: String,
+    created_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct WaVersion {
+    major: u64,
+    minor: u64,
+    patch: u64,
+}
+
+impl WaVersion {
+    fn parse(input: &str) -> Option<Self> {
+        let core = input
+            .split(|c| c == '-' || c == '+')
+            .next()
+            .unwrap_or_default();
+        let mut parts = core.split('.');
+        let major: u64 = parts.next()?.parse().ok()?;
+        let minor: u64 = parts.next().unwrap_or("0").parse().ok()?;
+        let patch: u64 = parts.next().unwrap_or("0").parse().ok()?;
+        Some(Self {
+            major,
+            minor,
+            patch,
+        })
+    }
+}
+
+fn now_epoch_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_millis()).ok())
+        .unwrap_or(0)
+}
+
+fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    let exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+            params![table],
+            |row| row.get(0),
+        )
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+    Ok(exists > 0)
+}
+
+fn load_wa_meta(conn: &Connection) -> Result<Option<WaMeta>> {
+    if !table_exists(conn, "wa_meta")? {
+        return Ok(None);
+    }
+
+    conn.query_row(
+        "SELECT schema_version, min_compatible_wa, created_by_wa, created_at \
+         FROM wa_meta WHERE id = 1",
+        [],
+        |row| {
+            Ok(WaMeta {
+                schema_version: row.get(0)?,
+                min_compatible_wa: row.get(1)?,
+                created_by_wa: row.get(2)?,
+                created_at: row.get(3)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|e| StorageError::Database(e.to_string()).into())
+}
+
+fn ensure_wa_meta(conn: &Connection, schema_version: i32) -> Result<()> {
+    if !table_exists(conn, "wa_meta")? {
+        return Ok(());
+    }
+
+    let now_ms = now_epoch_ms();
+    let current_wa = crate::VERSION.to_string();
+
+    let existing = load_wa_meta(conn)?;
+    match existing {
+        None => {
+            conn.execute(
+                "INSERT INTO wa_meta \
+                 (id, schema_version, min_compatible_wa, created_by_wa, created_at) \
+                 VALUES (1, ?1, ?2, ?3, ?4)",
+                params![schema_version, current_wa, current_wa, now_ms],
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        }
+        Some(meta) => {
+            let mut min_compatible = meta.min_compatible_wa.clone();
+            if let (Some(current), Some(existing_min)) = (
+                WaVersion::parse(&current_wa),
+                WaVersion::parse(&meta.min_compatible_wa),
+            ) {
+                if current > existing_min {
+                    min_compatible = current_wa.clone();
+                }
+            } else if meta.min_compatible_wa != current_wa {
+                min_compatible = current_wa.clone();
+            }
+
+            let created_by = if meta.created_by_wa.is_empty() {
+                current_wa.clone()
+            } else {
+                meta.created_by_wa.clone()
+            };
+            let created_at = if meta.created_at <= 0 {
+                now_ms
+            } else {
+                meta.created_at
+            };
+
+            if meta.schema_version != schema_version
+                || meta.min_compatible_wa != min_compatible
+                || meta.created_by_wa != created_by
+                || meta.created_at != created_at
+            {
+                conn.execute(
+                    "UPDATE wa_meta \
+                     SET schema_version=?1, min_compatible_wa=?2, created_by_wa=?3, created_at=?4 \
+                     WHERE id = 1",
+                    params![schema_version, min_compatible, created_by, created_at],
+                )
+                .map_err(|e| StorageError::Database(e.to_string()))?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn check_wa_version_compatibility(conn: &Connection) -> Result<()> {
+    let Some(meta) = load_wa_meta(conn)? else {
+        return Ok(());
+    };
+
+    let Some(current) = WaVersion::parse(crate::VERSION) else {
+        return Err(StorageError::MigrationFailed(format!(
+            "Invalid wa version string: {}",
+            crate::VERSION
+        ))
+        .into());
+    };
+
+    let Some(min) = WaVersion::parse(&meta.min_compatible_wa) else {
+        return Err(StorageError::MigrationFailed(format!(
+            "Invalid min_compatible_wa value in database: {}",
+            meta.min_compatible_wa
+        ))
+        .into());
+    };
+
+    if current < min {
+        return Err(StorageError::WaTooOld {
+            current: crate::VERSION.to_string(),
+            min_compatible: meta.min_compatible_wa,
+        }
+        .into());
+    }
+
+    Ok(())
 }
 
 /// Check if schema needs initialization (fresh database).
@@ -5072,6 +5271,46 @@ mod tests {
         assert_eq!(version, SCHEMA_VERSION);
         assert!(applied_at > 0, "applied_at should be set");
         assert_eq!(description, "Initial schema");
+    }
+
+    #[test]
+    fn wa_meta_initialized_on_fresh_db() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let (schema_version, min_compatible, created_by, created_at): (i32, String, String, i64) =
+            conn.query_row(
+                "SELECT schema_version, min_compatible_wa, created_by_wa, created_at \
+                 FROM wa_meta WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+
+        assert_eq!(schema_version, SCHEMA_VERSION);
+        assert_eq!(min_compatible, crate::VERSION);
+        assert_eq!(created_by, crate::VERSION);
+        assert!(created_at > 0, "created_at should be set");
+    }
+
+    #[test]
+    fn wa_too_old_rejected_by_meta() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        conn.execute(
+            "UPDATE wa_meta SET min_compatible_wa = '99.0.0' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+
+        let result = initialize_schema(&conn);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("requires wa"),
+            "Error should mention required wa version: {err}"
+        );
     }
 
     #[test]

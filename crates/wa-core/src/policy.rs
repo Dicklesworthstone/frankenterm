@@ -1081,10 +1081,10 @@ struct CommandRule {
 }
 
 static RM_RF_ROOT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)^\s*(?:sudo\s+)?rm\s+-rf\s+(/|~)(\s|$)").expect("rm -rf root regex")
+    Regex::new(r"(?i)\brm\s+-rf\s+(/|~)(\s|$)").expect("rm -rf root regex")
 });
 static RM_RF_GENERIC: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)^\s*(?:sudo\s+)?rm\s+-rf\s+").expect("rm -rf regex"));
+    LazyLock::new(|| Regex::new(r"(?i)\brm\s+-rf\s+").expect("rm -rf regex"));
 static GIT_RESET_HARD: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\bgit\s+reset\b.*\s--hard\b").expect("git reset --hard"));
 static GIT_CLEAN_FD: LazyLock<Regex> = LazyLock::new(|| {
