@@ -46,63 +46,10 @@ wezterm.on('user-var-changed', function(window, pane, name, value)
   end
 end)";
 
-/// The Lua snippet for status update signals
-///
-/// This snippet hooks WezTerm's update-status event and sends pane metadata
-/// to the wa daemon. Rate-limited to 1 update per 2 seconds per pane.
-/// See PLAN §2.7 for the specification.
-const STATUS_UPDATE_LUA: &str = r#"-- Forward pane status updates to wa daemon (rate-limited)
-local wa_last_status_update = {}
-local WA_STATUS_UPDATE_INTERVAL_MS = 2000
-
-wezterm.on('update-status', function(window, pane)
-  local pane_id = pane:pane_id()
-  local now_ms = os.time() * 1000
-
-  -- Rate limit: only send if enough time has passed
-  local last = wa_last_status_update[pane_id] or 0
-  if now_ms - last < WA_STATUS_UPDATE_INTERVAL_MS then
-    return
-  end
-  wa_last_status_update[pane_id] = now_ms
-
-  -- Gather pane metadata
-  local dims = pane:get_dimensions()
-  local cursor = pane:get_cursor_position()
-  local domain = pane:get_domain_name()
-  local title = pane:get_title()
-  local is_alt = pane:is_alt_screen_active()
-
-  -- JSON-escape a string (handles \, ", and control chars)
-  local function json_escape(s)
-    if not s then return '' end
-    return s:gsub('\\', '\\\\')
-            :gsub('"', '\\"')
-            :gsub('\n', '\\n')
-            :gsub('\r', '\\r')
-            :gsub('\t', '\\t')
-  end
-
-  -- Build JSON payload (inline to avoid dependencies)
-  local payload = string.format(
-    '{"schema_version":0,"pane_id":%d,"domain":"%s","title":"%s",' ..
-    '"cursor":{"row":%d,"col":%d},"dimensions":{"rows":%d,"cols":%d},' ..
-    '"is_alt_screen":%s,"ts":%d}',
-    pane_id,
-    json_escape(domain),
-    json_escape(title):sub(1, 256),
-    cursor.y, cursor.x,
-    dims.viewport_rows, dims.viewport_cols,
-    is_alt and 'true' or 'false',
-    now_ms
-  )
-
-  wezterm.background_child_process {
-    'wa', 'event', '--from-status',
-    '--pane', tostring(pane_id),
-    '--payload', payload
-  }
-end)"#;
+// NOTE: STATUS_UPDATE_LUA was removed in v0.2.0 to eliminate Lua performance bottleneck.
+// The update-status event fires at ~60Hz, causing significant WezTerm slowdown.
+// Alt-screen detection is now handled via escape sequence parsing (see screen_state.rs).
+// Pane metadata (title, dimensions, cursor) is obtained via `wezterm cli list`.
 
 // =============================================================================
 // Shell Integration: OSC 133 Prompt Markers
@@ -706,9 +653,6 @@ pub fn generate_ssh_domains_lua(hosts: &[SshHost], scrollback_lines: u64) -> Str
     }
     output.push('\n');
     output.push_str(USERVAR_FORWARDING_LUA);
-    output.push('\n');
-    output.push('\n');
-    output.push_str(STATUS_UPDATE_LUA);
     output.push('\n');
     output.push_str(WA_END_MARKER);
     output.push('\n');
