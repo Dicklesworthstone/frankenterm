@@ -259,6 +259,11 @@ pub enum IpcRequest {
     Ping,
     /// Request current watcher status
     Status,
+    /// Request pane state from watcher registry
+    PaneState {
+        /// Pane ID to inspect
+        pane_id: u64,
+    },
 }
 
 /// Response message from server to client.
@@ -532,7 +537,39 @@ async fn handle_request_with_context(request: IpcRequest, ctx: &IpcHandlerContex
                 "subscriber_count": total_subscribers,
             }))
         }
+        IpcRequest::PaneState { pane_id } => handle_pane_state(pane_id, ctx).await,
     }
+}
+
+async fn handle_pane_state(pane_id: u64, ctx: &IpcHandlerContext) -> IpcResponse {
+    let Some(ref registry_lock) = ctx.registry else {
+        return IpcResponse::ok_with_data(serde_json::json!({
+            "pane_id": pane_id,
+            "known": false,
+            "reason": "no_registry",
+        }));
+    };
+
+    let registry = registry_lock.read().await;
+    let Some(entry) = registry.get_entry(pane_id) else {
+        return IpcResponse::ok_with_data(serde_json::json!({
+            "pane_id": pane_id,
+            "known": false,
+            "reason": "unknown_pane",
+        }));
+    };
+
+    let cursor = registry.get_cursor(pane_id);
+
+    IpcResponse::ok_with_data(serde_json::json!({
+        "pane_id": pane_id,
+        "known": true,
+        "observed": entry.should_observe(),
+        "alt_screen": entry.is_alt_screen,
+        "last_status_at": entry.last_status_at,
+        "in_gap": cursor.map(|c| c.in_gap),
+        "cursor_alt_screen": cursor.map(|c| c.in_alt_screen),
+    }))
 }
 
 /// Handle a status update request.
@@ -721,6 +758,14 @@ impl IpcClient {
     /// Returns error if connection fails.
     pub async fn status(&self) -> Result<IpcResponse, UserVarError> {
         self.send_request(IpcRequest::Status).await
+    }
+
+    /// Request pane state from watcher registry.
+    ///
+    /// # Errors
+    /// Returns error if connection fails.
+    pub async fn pane_state(&self, pane_id: u64) -> Result<IpcResponse, UserVarError> {
+        self.send_request(IpcRequest::PaneState { pane_id }).await
     }
 
     /// Send a request and receive a response.
