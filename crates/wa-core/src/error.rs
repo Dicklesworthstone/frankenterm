@@ -291,6 +291,19 @@ impl WeztermError {
             .alternative("Ensure WezTerm is running and responsive."),
         }
     }
+
+    /// Returns true if this error should contribute to circuit breaker failure counts.
+    #[must_use]
+    pub fn is_circuit_breaker_trigger(&self) -> bool {
+        matches!(
+            self,
+            Self::CliNotFound
+                | Self::NotRunning
+                | Self::SocketNotFound(_)
+                | Self::Timeout(_)
+                | Self::CommandFailed(_)
+        )
+    }
 }
 
 /// Storage-specific errors

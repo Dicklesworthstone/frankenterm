@@ -5745,7 +5745,16 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
         }) => {
             if health {
                 // Health check mode: simple JSON status
-                println!(r#"{{"status": "ok", "version": "{}"}}"#, wa_core::VERSION);
+                let wezterm = wa_core::wezterm::WeztermClient::new();
+                let payload = serde_json::json!({
+                    "status": "ok",
+                    "version": wa_core::VERSION,
+                    "wezterm_circuit": wezterm.circuit_status(),
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string())
+                );
             } else {
                 // Rich status mode: pane table + summary
                 use wa_core::output::{
@@ -5824,6 +5833,32 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         print!("{output}");
                     }
                     Err(e) => {
+                        if let wa_core::Error::Wezterm(wa_core::error::WeztermError::CircuitOpen {
+                            retry_after_ms,
+                        }) = &e
+                        {
+                            if output_format.is_json() {
+                                let payload = serde_json::json!({
+                                    "ok": false,
+                                    "error": format!(
+                                        "WezTerm circuit breaker open; retry in {retry_after_ms} ms"
+                                    ),
+                                    "circuit": wezterm.circuit_status(),
+                                    "version": wa_core::VERSION,
+                                });
+                                println!(
+                                    "{}",
+                                    serde_json::to_string(&payload)
+                                        .unwrap_or_else(|_| "{}".to_string())
+                                );
+                            } else {
+                                eprintln!(
+                                    "Error: WezTerm circuit breaker open; retry in {retry_after_ms} ms."
+                                );
+                                eprintln!("Is WezTerm running and responsive?");
+                            }
+                            std::process::exit(1);
+                        }
                         if output_format.is_json() {
                             println!(
                                 r#"{{"ok": false, "error": "Failed to list panes: {}", "version": "{}"}}"#,

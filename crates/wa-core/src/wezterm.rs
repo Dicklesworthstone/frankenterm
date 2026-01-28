@@ -13,9 +13,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::Result;
+use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitBreakerStatus};
 use crate::error::WeztermError;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::{Instant, sleep};
 
@@ -340,6 +342,8 @@ pub struct WeztermClient {
     retry_attempts: u32,
     /// Delay between retries in milliseconds
     retry_delay_ms: u64,
+    /// Circuit breaker for CLI reliability
+    circuit_breaker: Arc<Mutex<CircuitBreaker>>,
 }
 
 impl Default for WeztermClient {
@@ -357,6 +361,9 @@ impl WeztermClient {
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             retry_attempts: DEFAULT_RETRY_ATTEMPTS,
             retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
+            circuit_breaker: Arc::new(Mutex::new(CircuitBreaker::new(
+                CircuitBreakerConfig::default(),
+            ))),
         }
     }
 
@@ -368,6 +375,9 @@ impl WeztermClient {
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             retry_attempts: DEFAULT_RETRY_ATTEMPTS,
             retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
+            circuit_breaker: Arc::new(Mutex::new(CircuitBreaker::new(
+                CircuitBreakerConfig::default(),
+            ))),
         }
     }
 
@@ -390,6 +400,23 @@ impl WeztermClient {
     pub fn with_retry_delay_ms(mut self, delay_ms: u64) -> Self {
         self.retry_delay_ms = delay_ms;
         self
+    }
+
+    /// Configure circuit breaker settings.
+    #[must_use]
+    pub fn with_circuit_breaker_config(mut self, config: CircuitBreakerConfig) -> Self {
+        self.circuit_breaker = Arc::new(Mutex::new(CircuitBreaker::new(config)));
+        self
+    }
+
+    /// Get current circuit breaker status.
+    #[must_use]
+    pub fn circuit_status(&self) -> CircuitBreakerStatus {
+        let guard = match self.circuit_breaker.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.status()
     }
 
     /// List all panes across all windows and tabs
@@ -833,13 +860,51 @@ impl WeztermClient {
         }
     }
 
+    fn circuit_guard(&self) -> Result<()> {
+        let mut guard = match self.circuit_breaker.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        if guard.allow() {
+            Ok(())
+        } else {
+            let status = guard.status();
+            let retry_after_ms = status.cooldown_remaining_ms.unwrap_or(0);
+            Err(WeztermError::CircuitOpen { retry_after_ms }.into())
+        }
+    }
+
+    fn circuit_record_result(&self, outcome: &Result<String>) {
+        let mut guard = match self.circuit_breaker.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        match outcome {
+            Ok(_) => guard.record_success(),
+            Err(err) => {
+                if let crate::Error::Wezterm(wez) = err {
+                    if wez.is_circuit_breaker_trigger() {
+                        guard.record_failure();
+                    }
+                }
+            }
+        }
+    }
+
     async fn run_cli_with_pane_check_retry(&self, args: &[&str], pane_id: u64) -> Result<String> {
-        self.retry_with(|| self.run_cli_with_pane_check(args, pane_id))
-            .await
+        self.circuit_guard()?;
+        let result = self.retry_with(|| self.run_cli_with_pane_check(args, pane_id)).await;
+        self.circuit_record_result(&result);
+        result
     }
 
     async fn run_cli_with_retry(&self, args: &[&str]) -> Result<String> {
-        self.retry_with(|| self.run_cli(args)).await
+        self.circuit_guard()?;
+        let result = self.retry_with(|| self.run_cli(args)).await;
+        self.circuit_record_result(&result);
+        result
     }
 
     async fn retry_with<F, Fut>(&self, mut runner: F) -> Result<String>
