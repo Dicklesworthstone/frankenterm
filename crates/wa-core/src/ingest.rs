@@ -1043,14 +1043,28 @@ pub fn extract_delta(previous: &str, current: &str, overlap_size: usize) -> Delt
 
     // Limit overlap search to a bounded suffix/prefix window.
     let max_overlap = overlap_size.min(previous.len()).min(current.len());
+    let search_start = previous.len() - max_overlap;
+    let search_window = &previous[search_start..];
 
-    for overlap_len in (1..=max_overlap).rev() {
-        let prev_start = previous.len() - overlap_len;
-        if !previous.is_char_boundary(prev_start) || !current.is_char_boundary(overlap_len) {
+    // Safety: current is known not to be empty from check above
+    let first_char = current.as_bytes()[0];
+
+    // Find all occurrences of first_char in search_window using memchr (SIMD-optimized)
+    // We iterate from left to right (smallest pos -> largest overlap)
+    for pos in memchr::memchr_iter(first_char, search_window.as_bytes()) {
+        // search_window[pos] == first_char
+        // Candidate overlap starts at pos relative to search_window
+        // Note: search_window.len() == max_overlap (since search_start = previous.len() - max_overlap)
+        let overlap_len = search_window.len() - pos;
+
+        if !current.is_char_boundary(overlap_len) {
             continue;
         }
 
-        if previous[prev_start..] == current[..overlap_len] {
+        // Check full match
+        // search_window[pos..] has length overlap_len
+        // current[..overlap_len] has length overlap_len
+        if search_window[pos..] == current[..overlap_len] {
             let delta = &current[overlap_len..];
             if delta.is_empty() {
                 return DeltaResult::Gap {

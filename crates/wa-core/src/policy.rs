@@ -1386,6 +1386,17 @@ const COMMAND_TOKENS: &[&str] = &[
     "dd",
     "systemctl",
     "service",
+    // Interpreters and dangerous builtins
+    "perl",
+    "ruby",
+    "php",
+    "lua",
+    "eval",
+    "exec",
+    "env",
+    "xargs",
+    "busybox",
+    "openssl",
 ];
 
 fn first_nonempty_line(text: &str) -> Option<&str> {
@@ -1408,9 +1419,17 @@ pub fn is_command_candidate(text: &str) -> bool {
         trimmed = stripped.trim_start();
     }
 
-    // Also strip leading parens (subshells)
-    while let Some(stripped) = trimmed.strip_prefix('(') {
-        trimmed = stripped.trim_start();
+    // Also strip leading parens (subshells) and braces (blocks)
+    loop {
+        if let Some(stripped) = trimmed.strip_prefix('(') {
+            trimmed = stripped.trim_start();
+            continue;
+        }
+        if let Some(stripped) = trimmed.strip_prefix('{') {
+            trimmed = stripped.trim_start();
+            continue;
+        }
+        break;
     }
 
     let mut parts = trimmed.split_whitespace();

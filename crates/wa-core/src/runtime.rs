@@ -204,12 +204,12 @@ impl ObservationRuntime {
     /// # Arguments
     /// * `config` - Runtime configuration
     /// * `storage` - Storage handle for persistence
-    /// * `pattern_engine` - Pattern detection engine
+    /// * `pattern_engine` - Pattern detection engine (shared)
     #[must_use]
     pub fn new(
         config: RuntimeConfig,
         storage: StorageHandle,
-        pattern_engine: PatternEngine,
+        pattern_engine: Arc<PatternEngine>,
     ) -> Self {
         let registry = PaneRegistry::with_filter(config.pane_filter.clone());
         let metrics = Arc::new(RuntimeMetrics::default());
@@ -233,7 +233,7 @@ impl ObservationRuntime {
         Self {
             config,
             storage: Arc::new(tokio::sync::Mutex::new(storage)),
-            pattern_engine: Arc::new(pattern_engine),
+            pattern_engine,
             registry: Arc::new(RwLock::new(registry)),
             cursors: Arc::new(RwLock::new(HashMap::new())),
             detection_contexts: Arc::new(RwLock::new(HashMap::new())),
@@ -1093,7 +1093,7 @@ mod tests {
         let engine = PatternEngine::new();
 
         let config = RuntimeConfig::default();
-        let _runtime = ObservationRuntime::new(config, storage, engine);
+        let _runtime = ObservationRuntime::new(config, storage, engine.into());
     }
 
     #[test]

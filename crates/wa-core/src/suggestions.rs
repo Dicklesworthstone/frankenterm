@@ -1391,7 +1391,11 @@ impl SuggestionRule for ErrorRecoveryRule {
     }
 
     fn generate(&self, ctx: &SuggestionContext) -> Option<Suggestion> {
-        let event = ctx.recent_events.iter().find(|e| is_error_event(e))?;
+        let event = ctx
+            .recent_events
+            .iter()
+            .filter(|e| is_error_event(e))
+            .max_by_key(|e| e.detected_at)?;
         let code = error_code_from_event(event);
         Some(
             Suggestion::new(
