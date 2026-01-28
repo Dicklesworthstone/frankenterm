@@ -1869,6 +1869,204 @@ fn policy_error_code_from_injection(result: &crate::policy::InjectionResult) -> 
     }
 }
 
+async fn record_workflow_action(
+    storage: &crate::storage::StorageHandle,
+    action_kind: &str,
+    execution_id: &str,
+    pane_id: u64,
+    _workflow_name: &str,
+    input_summary: Option<String>,
+    result: &str,
+    decision_reason: Option<String>,
+) -> Option<i64> {
+    let action = crate::storage::AuditActionRecord {
+        id: 0,
+        ts: now_ms(),
+        actor_kind: "workflow".to_string(),
+        actor_id: Some(execution_id.to_string()),
+        pane_id: Some(pane_id),
+        domain: None,
+        action_kind: action_kind.to_string(),
+        policy_decision: "allow".to_string(),
+        decision_reason,
+        rule_id: None,
+        input_summary,
+        verification_summary: None,
+        decision_context: None,
+        result: result.to_string(),
+    };
+
+    match storage.record_audit_action_redacted(action).await {
+        Ok(id) => Some(id),
+        Err(e) => {
+            tracing::warn!(
+                execution_id,
+                action_kind,
+                error = %e,
+                "Failed to record workflow audit action"
+            );
+            None
+        }
+    }
+}
+
+async fn record_workflow_start_action(
+    storage: &crate::storage::StorageHandle,
+    workflow_name: &str,
+    execution_id: &str,
+    pane_id: u64,
+    step_count: usize,
+    start_step: usize,
+) -> Option<i64> {
+    let summary = serde_json::json!({
+        "workflow_name": workflow_name,
+        "execution_id": execution_id,
+        "step_count": step_count,
+        "start_step": start_step,
+    });
+    let summary = serde_json::to_string(&summary).ok();
+    let action_id = record_workflow_action(
+        storage,
+        "workflow_start",
+        execution_id,
+        pane_id,
+        workflow_name,
+        summary,
+        "started",
+        None,
+    )
+    .await?;
+
+    let undo_payload = serde_json::json!({
+        "execution_id": execution_id,
+        "workflow_name": workflow_name,
+    });
+    let undo = crate::storage::ActionUndoRecord {
+        audit_action_id: action_id,
+        undoable: true,
+        undo_strategy: "workflow_abort".to_string(),
+        undo_hint: Some(format!("wa robot workflow abort {execution_id}")),
+        undo_payload: serde_json::to_string(&undo_payload).ok(),
+        undone_at: None,
+        undone_by: None,
+    };
+    if let Err(e) = storage.upsert_action_undo_redacted(undo).await {
+        tracing::warn!(
+            execution_id,
+            error = %e,
+            "Failed to record workflow undo metadata"
+        );
+    }
+
+    Some(action_id)
+}
+
+async fn fetch_workflow_start_action_id(
+    storage: &crate::storage::StorageHandle,
+    execution_id: &str,
+) -> Option<i64> {
+    let query = crate::storage::AuditQuery {
+        limit: Some(1),
+        actor_id: Some(execution_id.to_string()),
+        action_kind: Some("workflow_start".to_string()),
+        ..Default::default()
+    };
+    storage
+        .get_audit_actions(query)
+        .await
+        .ok()
+        .and_then(|mut rows| rows.pop().map(|row| row.id))
+}
+
+async fn record_workflow_step_action(
+    storage: &crate::storage::StorageHandle,
+    workflow_name: &str,
+    execution_id: &str,
+    pane_id: u64,
+    step_index: usize,
+    step_name: &str,
+    step_id: Option<String>,
+    step_kind: Option<String>,
+    result_type: &str,
+    parent_action_id: Option<i64>,
+) -> Option<i64> {
+    let summary = serde_json::json!({
+        "workflow_name": workflow_name,
+        "execution_id": execution_id,
+        "step_index": step_index,
+        "step_name": step_name,
+        "step_id": step_id,
+        "step_kind": step_kind,
+        "result_type": result_type,
+        "parent_action_id": parent_action_id,
+    });
+    let summary = serde_json::to_string(&summary).ok();
+    record_workflow_action(
+        storage,
+        "workflow_step",
+        execution_id,
+        pane_id,
+        workflow_name,
+        summary,
+        result_type,
+        None,
+    )
+    .await
+}
+
+async fn record_workflow_terminal_action(
+    storage: &crate::storage::StorageHandle,
+    workflow_name: &str,
+    execution_id: &str,
+    pane_id: u64,
+    action_kind: &str,
+    result: &str,
+    reason: Option<&str>,
+    step_index: Option<usize>,
+    steps_executed: Option<usize>,
+    start_action_id: Option<i64>,
+) {
+    let summary = serde_json::json!({
+        "workflow_name": workflow_name,
+        "execution_id": execution_id,
+        "reason": reason,
+        "step_index": step_index,
+        "steps_executed": steps_executed,
+        "parent_action_id": start_action_id,
+    });
+    let summary = serde_json::to_string(&summary).ok();
+    let _ = record_workflow_action(
+        storage,
+        action_kind,
+        execution_id,
+        pane_id,
+        workflow_name,
+        summary,
+        result,
+        reason.map(str::to_string),
+    )
+    .await;
+
+    if let Some(start_action_id) = start_action_id {
+        let undo = crate::storage::ActionUndoRecord {
+            audit_action_id: start_action_id,
+            undoable: false,
+            undo_strategy: "workflow_abort".to_string(),
+            undo_hint: Some("workflow no longer running".to_string()),
+            undo_payload: None,
+            undone_at: None,
+            undone_by: None,
+        };
+        if let Err(e) = storage.upsert_action_undo_redacted(undo).await {
+            tracing::warn!(
+                execution_id,
+                error = %e,
+                "Failed to update workflow undo metadata"
+            );
+        }
+    }
+}
+
 // ============================================================================
 // Plan-first Execution Helpers (wa-upg.2.3)
 // ============================================================================
@@ -3136,6 +3334,19 @@ impl WorkflowRunner {
         let step_count = workflow.step_count();
         let mut current_step = start_step;
         let mut retries = 0;
+        let start_action_id = if start_step == 0 {
+            record_workflow_start_action(
+                &self.storage,
+                &workflow_name,
+                execution_id,
+                pane_id,
+                step_count,
+                start_step,
+            )
+            .await
+        } else {
+            fetch_workflow_start_action_id(&self.storage, execution_id).await
+        };
 
         // Create workflow context with injector for policy-gated actions
         let mut ctx = WorkflowContext::new(
@@ -3163,9 +3374,23 @@ impl WorkflowRunner {
                     error = %validation_error,
                     "Action plan validation failed"
                 );
+                let reason = format!("Plan validation failed: {validation_error}");
+                record_workflow_terminal_action(
+                    &self.storage,
+                    &workflow_name,
+                    execution_id,
+                    pane_id,
+                    "workflow_error",
+                    "error",
+                    Some(&reason),
+                    Some(start_step),
+                    None,
+                    start_action_id,
+                )
+                .await;
                 return WorkflowExecutionResult::Error {
                     execution_id: Some(execution_id.to_string()),
-                    error: format!("Plan validation failed: {validation_error}"),
+                    error: reason,
                 };
             }
 
@@ -3230,11 +3455,25 @@ impl WorkflowRunner {
             // Persist step log for non-SendText steps
             // SendText steps are logged after injection to capture the audit_action_id (wa-nu4.1.1.11)
             if !matches!(&step_result, StepResult::SendText { .. }) {
+                let step_audit_action_id = record_workflow_step_action(
+                    &self.storage,
+                    &workflow_name,
+                    execution_id,
+                    pane_id,
+                    current_step,
+                    step_name,
+                    step_id.clone(),
+                    step_kind.clone(),
+                    result_type,
+                    start_action_id,
+                )
+                .await;
+
                 if let Err(e) = self
                     .storage
                     .insert_step_log(
                         execution_id,
-                        None,
+                        step_audit_action_id,
                         current_step,
                         step_name,
                         step_id.clone(),
@@ -3277,6 +3516,19 @@ impl WorkflowRunner {
                         )) = e
                         {
                             self.lock_manager.release(pane_id, execution_id);
+                            record_workflow_terminal_action(
+                                &self.storage,
+                                &workflow_name,
+                                execution_id,
+                                pane_id,
+                                "workflow_aborted",
+                                "aborted",
+                                Some(&reason),
+                                Some(current_step),
+                                None,
+                                start_action_id,
+                            )
+                            .await;
                             return WorkflowExecutionResult::Aborted {
                                 execution_id: execution_id.to_string(),
                                 reason,
@@ -3316,6 +3568,20 @@ impl WorkflowRunner {
 
                     // Release lock
                     self.lock_manager.release(pane_id, execution_id);
+
+                    record_workflow_terminal_action(
+                        &self.storage,
+                        &workflow_name,
+                        execution_id,
+                        pane_id,
+                        "workflow_completed",
+                        "completed",
+                        None,
+                        Some(current_step),
+                        Some(current_step + 1),
+                        start_action_id,
+                    )
+                    .await;
 
                     return WorkflowExecutionResult::Completed {
                         execution_id: execution_id.to_string(),
@@ -3358,6 +3624,20 @@ impl WorkflowRunner {
                         workflow.cleanup(&mut ctx).await;
                         self.lock_manager.release(pane_id, execution_id);
 
+                        record_workflow_terminal_action(
+                            &self.storage,
+                            &workflow_name,
+                            execution_id,
+                            pane_id,
+                            "workflow_aborted",
+                            "aborted",
+                            Some(&reason),
+                            Some(current_step),
+                            Some(current_step + 1),
+                            start_action_id,
+                        )
+                        .await;
+
                         return WorkflowExecutionResult::Aborted {
                             execution_id: execution_id.to_string(),
                             reason,
@@ -3397,6 +3677,20 @@ impl WorkflowRunner {
                     workflow.cleanup(&mut ctx).await;
                     self.lock_manager.release(pane_id, execution_id);
 
+                    record_workflow_terminal_action(
+                        &self.storage,
+                        &workflow_name,
+                        execution_id,
+                        pane_id,
+                        "workflow_aborted",
+                        "aborted",
+                        Some(&reason),
+                        Some(current_step),
+                        Some(current_step + 1),
+                        start_action_id,
+                    )
+                    .await;
+
                     return WorkflowExecutionResult::Aborted {
                         execution_id: execution_id.to_string(),
                         reason,
@@ -3423,6 +3717,19 @@ impl WorkflowRunner {
                         )) = e
                         {
                             self.lock_manager.release(pane_id, execution_id);
+                            record_workflow_terminal_action(
+                                &self.storage,
+                                &workflow_name,
+                                execution_id,
+                                pane_id,
+                                "workflow_aborted",
+                                "aborted",
+                                Some(&reason),
+                                Some(current_step),
+                                None,
+                                start_action_id,
+                            )
+                            .await;
                             return WorkflowExecutionResult::Aborted {
                                 execution_id: execution_id.to_string(),
                                 reason,
@@ -3475,6 +3782,19 @@ impl WorkflowRunner {
                         )) = e
                         {
                             self.lock_manager.release(pane_id, execution_id);
+                            record_workflow_terminal_action(
+                                &self.storage,
+                                &workflow_name,
+                                execution_id,
+                                pane_id,
+                                "workflow_aborted",
+                                "aborted",
+                                Some(&reason),
+                                Some(current_step),
+                                None,
+                                start_action_id,
+                            )
+                            .await;
                             return WorkflowExecutionResult::Aborted {
                                 execution_id: execution_id.to_string(),
                                 reason,
@@ -3594,6 +3914,19 @@ impl WorkflowRunner {
                                 ) = e
                                 {
                                     self.lock_manager.release(pane_id, execution_id);
+                                    record_workflow_terminal_action(
+                                        &self.storage,
+                                        &workflow_name,
+                                        execution_id,
+                                        pane_id,
+                                        "workflow_aborted",
+                                        "aborted",
+                                        Some(&reason),
+                                        Some(current_step),
+                                        None,
+                                        start_action_id,
+                                    )
+                                    .await;
                                     return WorkflowExecutionResult::Aborted {
                                         execution_id: execution_id.to_string(),
                                         reason,
@@ -3645,6 +3978,20 @@ impl WorkflowRunner {
                             workflow.cleanup(&mut ctx).await;
                             self.lock_manager.release(pane_id, execution_id);
 
+                            record_workflow_terminal_action(
+                                &self.storage,
+                                &workflow_name,
+                                execution_id,
+                                pane_id,
+                                "workflow_policy_denied",
+                                "policy_denied",
+                                Some(&abort_reason),
+                                Some(current_step),
+                                Some(current_step + 1),
+                                start_action_id,
+                            )
+                            .await;
+
                             return WorkflowExecutionResult::Aborted {
                                 execution_id: execution_id.to_string(),
                                 reason: abort_reason,
@@ -3685,6 +4032,20 @@ impl WorkflowRunner {
                             // Cleanup and release lock
                             workflow.cleanup(&mut ctx).await;
                             self.lock_manager.release(pane_id, execution_id);
+
+                            record_workflow_terminal_action(
+                                &self.storage,
+                                &workflow_name,
+                                execution_id,
+                                pane_id,
+                                "workflow_requires_approval",
+                                "requires_approval",
+                                Some(&abort_reason),
+                                Some(current_step),
+                                Some(current_step + 1),
+                                start_action_id,
+                            )
+                            .await;
 
                             return WorkflowExecutionResult::Aborted {
                                 execution_id: execution_id.to_string(),
@@ -3729,6 +4090,20 @@ impl WorkflowRunner {
                             workflow.cleanup(&mut ctx).await;
                             self.lock_manager.release(pane_id, execution_id);
 
+                            record_workflow_terminal_action(
+                                &self.storage,
+                                &workflow_name,
+                                execution_id,
+                                pane_id,
+                                "workflow_error",
+                                "error",
+                                Some(&abort_reason),
+                                Some(current_step),
+                                Some(current_step + 1),
+                                start_action_id,
+                            )
+                            .await;
+
                             return WorkflowExecutionResult::Aborted {
                                 execution_id: execution_id.to_string(),
                                 reason: abort_reason,
@@ -3769,6 +4144,20 @@ impl WorkflowRunner {
         }
 
         self.lock_manager.release(pane_id, execution_id);
+
+        record_workflow_terminal_action(
+            &self.storage,
+            &workflow_name,
+            execution_id,
+            pane_id,
+            "workflow_completed",
+            "completed",
+            None,
+            Some(step_count.saturating_sub(1)),
+            Some(step_count),
+            start_action_id,
+        )
+        .await;
 
         WorkflowExecutionResult::Completed {
             execution_id: execution_id.to_string(),

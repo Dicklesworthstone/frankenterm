@@ -4,6 +4,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::io::IsTerminal;
 use std::path::Path;
 use std::sync::{Arc, LazyLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -124,9 +125,25 @@ enum Commands {
         #[arg(long)]
         no_paste: bool,
 
+        /// Do not append a trailing newline
+        #[arg(long)]
+        no_newline: bool,
+
         /// Preview what would happen without executing
         #[arg(long)]
         dry_run: bool,
+
+        /// Verify by waiting for a pattern after sending
+        #[arg(long)]
+        wait_for: Option<String>,
+
+        /// Timeout for wait-for verification (seconds)
+        #[arg(long, default_value = "30")]
+        timeout_secs: u64,
+
+        /// Treat wait-for pattern as regex
+        #[arg(long)]
+        wait_for_regex: bool,
     },
 
     /// Get text from a pane
@@ -1060,6 +1077,19 @@ struct RobotSendData {
     verification_error: Option<String>,
 }
 
+/// Human send response data (stable JSON when non-TTY)
+#[derive(serde::Serialize)]
+struct HumanSendData {
+    pane_id: u64,
+    injection: wa_core::policy::InjectionResult,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wait_for: Option<RobotWaitForData>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verification_error: Option<String>,
+    no_paste: bool,
+    no_newline: bool,
+}
+
 /// Search result data for robot mode
 #[derive(serde::Serialize)]
 struct RobotSearchData {
@@ -1686,6 +1716,94 @@ fn build_send_dry_run_report(
     }
 
     ctx.take_report()
+}
+
+fn format_send_result_human(
+    data: &HumanSendData,
+    redacted_text: &str,
+    redacted_wait_for: Option<&str>,
+) -> String {
+    use std::fmt::Write as _;
+    use wa_core::policy::{InjectionResult, PolicyDecision};
+
+    let mut output = String::new();
+    let status = match data.injection {
+        InjectionResult::Allowed { .. } => "allowed",
+        InjectionResult::Denied { .. } => "denied",
+        InjectionResult::RequiresApproval { .. } => "approval_required",
+        InjectionResult::Error { .. } => "error",
+    };
+
+    let mut reason = None;
+    let mut approval = None;
+    if let InjectionResult::Denied { decision, .. }
+    | InjectionResult::RequiresApproval { decision, .. } = &data.injection
+    {
+        match decision {
+            PolicyDecision::Deny { reason: r, .. } => reason = Some(r.as_str()),
+            PolicyDecision::RequireApproval {
+                reason: r,
+                approval: a,
+                ..
+            } => {
+                reason = Some(r.as_str());
+                approval = a.as_ref();
+            }
+            PolicyDecision::Allow { .. } => {}
+        }
+    }
+
+    if let InjectionResult::Error { error, .. } = &data.injection {
+        reason = Some(error.as_str());
+    }
+
+    let _ = writeln!(output, "Send result");
+    let _ = writeln!(output, "  Pane: {}", data.pane_id);
+    let _ = writeln!(output, "  Status: {status}");
+    let _ = writeln!(output, "  Text: {redacted_text}");
+
+    if data.no_paste {
+        let _ = writeln!(output, "  Mode: no-paste");
+    }
+    if data.no_newline {
+        let _ = writeln!(output, "  Newline: suppressed");
+    }
+
+    if let Some(rule_id) = data.injection.rule_id() {
+        let _ = writeln!(output, "  Rule: {rule_id}");
+    }
+    if let Some(reason) = reason {
+        let _ = writeln!(output, "  Reason: {reason}");
+    }
+    if let Some(approval) = approval {
+        let _ = writeln!(output, "  Approval: {}", approval.summary);
+        let _ = writeln!(output, "  Command: {}", approval.command);
+    }
+    if let Some(audit_id) = data.injection.audit_action_id() {
+        let _ = writeln!(output, "  Audit ID: {audit_id}");
+    }
+
+    if let Some(wait_for) = &data.wait_for {
+        let status = if wait_for.matched {
+            "matched"
+        } else {
+            "timed out"
+        };
+        let regex = if wait_for.is_regex { " (regex)" } else { "" };
+        let _ = writeln!(
+            output,
+            "  Wait-for{regex}: {} ({status}, {} ms, {} polls)",
+            wait_for.pattern, wait_for.elapsed_ms, wait_for.polls
+        );
+    } else if redacted_wait_for.is_some() && !data.injection.is_allowed() {
+        let _ = writeln!(output, "  Wait-for: skipped (send not executed)");
+    }
+
+    if let Some(err) = data.verification_error.as_deref() {
+        let _ = writeln!(output, "  Verification: {err}");
+    }
+
+    output
 }
 
 fn resolve_workflow(name: &str) -> Option<std::sync::Arc<dyn wa_core::workflows::Workflow>> {
@@ -2526,9 +2644,10 @@ async fn run_watcher(
         // Create policy engine (permissive defaults for auto-handling)
         let policy_engine = PolicyEngine::permissive();
         let wezterm_client = wa_core::wezterm::WeztermClient::new();
-        let injector = Arc::new(tokio::sync::Mutex::new(PolicyGatedInjector::new(
+        let injector = Arc::new(tokio::sync::Mutex::new(PolicyGatedInjector::with_storage(
             policy_engine,
             wezterm_client,
+            storage_for_workflows.as_ref().clone(),
         )));
 
         // Create workflow engine and lock manager
@@ -3078,13 +3197,17 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     }
                                 };
 
-                                if let Err(e) = storage
-                                    .record_audit_action_redacted(injection.to_audit_record(
-                                        ActorKind::Robot,
-                                        None,
-                                        Some(domain.clone()),
-                                    ))
-                                    .await
+                                let mut audit_record = injection.to_audit_record(
+                                    ActorKind::Robot,
+                                    None,
+                                    Some(domain.clone()),
+                                );
+                                audit_record.input_summary =
+                                    Some(wa_core::policy::build_send_text_audit_summary(
+                                        &text, None, None,
+                                    ));
+                                if let Err(e) =
+                                    storage.record_audit_action_redacted(audit_record).await
                                 {
                                     tracing::warn!(pane_id, "Failed to record audit: {e}");
                                 }
@@ -3638,7 +3761,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     // Create policy-gated injector with WezTerm client
                                     let wezterm_client = wa_core::wezterm::WeztermClient::new();
                                     let injector = Arc::new(tokio::sync::Mutex::new(
-                                        PolicyGatedInjector::new(policy_engine, wezterm_client),
+                                        PolicyGatedInjector::with_storage(
+                                            policy_engine,
+                                            wezterm_client,
+                                            storage.as_ref().clone(),
+                                        ),
                                     ));
                                     let runner_config = WorkflowRunnerConfig::default();
                                     let runner = WorkflowRunner::new(
@@ -4173,7 +4300,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     );
                                     let wezterm_client = wa_core::wezterm::WeztermClient::new();
                                     let injector = Arc::new(tokio::sync::Mutex::new(
-                                        PolicyGatedInjector::new(policy_engine, wezterm_client),
+                                        PolicyGatedInjector::with_storage(
+                                            policy_engine,
+                                            wezterm_client,
+                                            storage.as_ref().clone(),
+                                        ),
                                     ));
                                     let runner_config = WorkflowRunnerConfig::default();
                                     let runner = WorkflowRunner::new(
@@ -4877,14 +5008,41 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             pane_id,
             text,
             no_paste,
+            no_newline,
             dry_run,
+            wait_for,
+            timeout_secs,
+            wait_for_regex,
         }) => {
+            use wa_core::output::{OutputFormat, detect_format};
+
+            let output_format = detect_format();
+            let emit_json = matches!(output_format, OutputFormat::Json)
+                || (matches!(output_format, OutputFormat::Auto)
+                    && !std::io::stdout().is_terminal());
             let redacted_text = redact_for_output(&text);
-            let command = if dry_run {
+            let redacted_wait_for = wait_for.as_ref().map(|p| redact_for_output(p));
+
+            let mut command = if dry_run {
                 format!("wa send --pane {pane_id} \"{redacted_text}\" --dry-run")
             } else {
                 format!("wa send --pane {pane_id} \"{redacted_text}\"")
             };
+            if no_paste {
+                command.push_str(" --no-paste");
+            }
+            if no_newline {
+                command.push_str(" --no-newline");
+            }
+            if let Some(pattern) = &redacted_wait_for {
+                command.push_str(" --wait-for \"");
+                command.push_str(pattern);
+                command.push('"');
+                if wait_for_regex {
+                    command.push_str(" --wait-for-regex");
+                }
+                command.push_str(&format!(" --timeout-secs {timeout_secs}"));
+            }
             let command_ctx = wa_core::dry_run::CommandContext::new(command, dry_run);
 
             if command_ctx.is_dry_run() {
@@ -4896,11 +5054,15 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     pane_info.as_ref(),
                     &text,
                     no_paste,
-                    None,
-                    30,
+                    wait_for.as_deref(),
+                    timeout_secs,
                     &config,
                 );
-                println!("{}", wa_core::dry_run::format_human(&report));
+                if emit_json {
+                    println!("{}", serde_json::to_string_pretty(&report.redacted())?);
+                } else {
+                    println!("{}", wa_core::dry_run::format_human(&report));
+                }
             } else {
                 tracing::info!(
                     "Sending to pane {} (no_paste={}): {}",
@@ -4908,8 +5070,237 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     no_paste,
                     redacted_text
                 );
-                // TODO: Implement send
-                println!("Send not yet implemented");
+                let emit_error = |message: &str, hint: Option<&str>| {
+                    if emit_json {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "ok": false,
+                                "error": message,
+                                "hint": hint,
+                                "version": wa_core::VERSION,
+                            })
+                        );
+                    } else {
+                        eprintln!("Error: {message}");
+                        if let Some(hint) = hint {
+                            eprintln!("{hint}");
+                        }
+                    }
+                };
+
+                let db_path = layout.db_path.to_string_lossy();
+                let storage = match wa_core::storage::StorageHandle::new(&db_path).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        emit_error(
+                            &format!("Failed to open storage: {e}"),
+                            Some("Is the database initialized? Run 'wa watch' first."),
+                        );
+                        return Ok(());
+                    }
+                };
+
+                let wezterm = wa_core::wezterm::WeztermClient::new();
+                let pane_info = match wezterm.get_pane(pane_id).await {
+                    Ok(info) => info,
+                    Err(e) => {
+                        let (_code, hint) = map_wezterm_error_to_robot(&e);
+                        emit_error(&format!("{e}"), hint.as_deref());
+                        return Ok(());
+                    }
+                };
+                let domain = pane_info.inferred_domain();
+
+                let mut engine = wa_core::policy::PolicyEngine::new(
+                    config.safety.rate_limit_per_pane,
+                    config.safety.rate_limit_global,
+                    config.safety.require_prompt_active,
+                )
+                .with_command_gate_config(config.safety.command_gate.clone())
+                .with_policy_rules(config.safety.rules.clone());
+
+                // NOTE: Until ingest state is wired into CLI, assume prompt state.
+                let capabilities = wa_core::policy::PaneCapabilities::prompt();
+
+                let summary = engine.redact_secrets(&text);
+                let input = wa_core::policy::PolicyInput::new(
+                    wa_core::policy::ActionKind::SendText,
+                    wa_core::policy::ActorKind::Human,
+                )
+                .with_pane(pane_id)
+                .with_domain(domain.clone())
+                .with_capabilities(capabilities)
+                .with_text_summary(&summary)
+                .with_command_text(&text);
+
+                let mut decision = engine.authorize(&input);
+                if decision.requires_approval() {
+                    let store = wa_core::approval::ApprovalStore::new(
+                        &storage,
+                        config.safety.approval.clone(),
+                        workspace_root.to_string_lossy().to_string(),
+                    );
+                    decision = match store
+                        .attach_to_decision(decision, &input, Some(summary.clone()))
+                        .await
+                    {
+                        Ok(updated) => updated,
+                        Err(e) => {
+                            emit_error(&format!("Failed to issue approval token: {e}"), None);
+                            return Ok(());
+                        }
+                    };
+                }
+
+                let mut injection = match decision {
+                    wa_core::policy::PolicyDecision::Allow { .. } => {
+                        let send_result = wezterm
+                            .send_text_with_options(pane_id, &text, no_paste, no_newline)
+                            .await;
+                        match send_result {
+                            Ok(()) => wa_core::policy::InjectionResult::Allowed {
+                                decision,
+                                summary: summary.clone(),
+                                pane_id,
+                                action: wa_core::policy::ActionKind::SendText,
+                                audit_action_id: None,
+                            },
+                            Err(e) => wa_core::policy::InjectionResult::Error {
+                                error: e.to_string(),
+                                pane_id,
+                                action: wa_core::policy::ActionKind::SendText,
+                                audit_action_id: None,
+                            },
+                        }
+                    }
+                    wa_core::policy::PolicyDecision::Deny { .. } => {
+                        wa_core::policy::InjectionResult::Denied {
+                            decision,
+                            summary: summary.clone(),
+                            pane_id,
+                            action: wa_core::policy::ActionKind::SendText,
+                            audit_action_id: None,
+                        }
+                    }
+                    wa_core::policy::PolicyDecision::RequireApproval { .. } => {
+                        wa_core::policy::InjectionResult::RequiresApproval {
+                            decision,
+                            summary: summary.clone(),
+                            pane_id,
+                            action: wa_core::policy::ActionKind::SendText,
+                            audit_action_id: None,
+                        }
+                    }
+                };
+
+                let mut audit_record = injection.to_audit_record(
+                    wa_core::policy::ActorKind::Human,
+                    None,
+                    Some(domain.clone()),
+                );
+                audit_record.input_summary = Some(wa_core::policy::build_send_text_audit_summary(
+                    &text, None, None,
+                ));
+                match storage.record_audit_action_redacted(audit_record).await {
+                    Ok(audit_id) => {
+                        injection.set_audit_action_id(audit_id);
+                    }
+                    Err(e) => {
+                        tracing::warn!(pane_id, "Failed to record audit: {e}");
+                    }
+                }
+
+                let mut wait_for_data = None;
+                let mut verification_error = None;
+                if injection.is_allowed() {
+                    if let Some(pattern) = &wait_for {
+                        let matcher = if wait_for_regex {
+                            match fancy_regex::Regex::new(pattern) {
+                                Ok(compiled) => {
+                                    Some(wa_core::wezterm::WaitMatcher::regex(compiled))
+                                }
+                                Err(e) => {
+                                    verification_error =
+                                        Some(format!("Invalid wait-for regex: {e}"));
+                                    None
+                                }
+                            }
+                        } else {
+                            Some(wa_core::wezterm::WaitMatcher::substring(pattern))
+                        };
+
+                        if let Some(matcher) = matcher {
+                            let options = wa_core::wezterm::WaitOptions {
+                                tail_lines: 200,
+                                escapes: false,
+                                ..wa_core::wezterm::WaitOptions::default()
+                            };
+                            let waiter =
+                                wa_core::wezterm::PaneWaiter::new(&wezterm).with_options(options);
+                            let timeout = std::time::Duration::from_secs(timeout_secs);
+                            match waiter.wait_for(pane_id, &matcher, timeout).await {
+                                Ok(wa_core::wezterm::WaitResult::Matched { elapsed_ms, polls }) => {
+                                    let pattern_out = redacted_wait_for
+                                        .clone()
+                                        .unwrap_or_else(|| pattern.clone());
+                                    wait_for_data = Some(RobotWaitForData {
+                                        pane_id,
+                                        pattern: pattern_out,
+                                        matched: true,
+                                        elapsed_ms,
+                                        polls,
+                                        is_regex: wait_for_regex,
+                                    });
+                                }
+                                Ok(wa_core::wezterm::WaitResult::TimedOut {
+                                    elapsed_ms,
+                                    polls,
+                                    ..
+                                }) => {
+                                    let pattern_out = redacted_wait_for
+                                        .clone()
+                                        .unwrap_or_else(|| pattern.clone());
+                                    wait_for_data = Some(RobotWaitForData {
+                                        pane_id,
+                                        pattern: pattern_out,
+                                        matched: false,
+                                        elapsed_ms,
+                                        polls,
+                                        is_regex: wait_for_regex,
+                                    });
+                                    verification_error =
+                                        Some(format!("Timeout waiting for pattern '{pattern}'"));
+                                }
+                                Err(e) => {
+                                    verification_error = Some(format!("wait-for failed: {e}"));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let data = HumanSendData {
+                    pane_id,
+                    injection,
+                    wait_for: wait_for_data,
+                    verification_error,
+                    no_paste,
+                    no_newline,
+                };
+
+                if emit_json {
+                    println!("{}", serde_json::to_string_pretty(&data)?);
+                } else {
+                    println!(
+                        "{}",
+                        format_send_result_human(
+                            &data,
+                            &redacted_text,
+                            redacted_wait_for.as_deref()
+                        )
+                    );
+                }
             }
         }
 
@@ -6789,6 +7180,173 @@ mod tests {
         let expected_value: serde_json::Value = serde_json::to_value(&resp).unwrap();
 
         assert_eq!(decoded_value, expected_value);
+    }
+
+    #[test]
+    fn send_dry_run_report_includes_wait_for_and_no_paste_warning() {
+        let config = wa_core::config::Config::default();
+        let command_ctx = wa_core::dry_run::CommandContext::new("wa send", true);
+        let report = build_send_dry_run_report(
+            &command_ctx,
+            1,
+            None,
+            "echo hi",
+            true,
+            Some("READY"),
+            5,
+            &config,
+        );
+
+        assert!(
+            report
+                .expected_actions
+                .iter()
+                .any(|action| action.action_type == wa_core::dry_run::ActionType::SendText)
+        );
+        assert!(
+            report
+                .expected_actions
+                .iter()
+                .any(|action| action.action_type == wa_core::dry_run::ActionType::WaitFor)
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("no_paste"))
+        );
+    }
+
+    #[test]
+    fn format_send_result_human_includes_approval_and_wait_for_skip() {
+        let approval = wa_core::policy::ApprovalRequest {
+            allow_once_code: "ABC123".to_string(),
+            allow_once_full_hash: "sha256:deadbeef".to_string(),
+            expires_at: 0,
+            summary: "Needs approval".to_string(),
+            command: "wa approve ABC123".to_string(),
+        };
+        let decision = wa_core::policy::PolicyDecision::RequireApproval {
+            reason: "Alt-screen unknown".to_string(),
+            rule_id: Some("policy.alt_screen_unknown".to_string()),
+            approval: Some(approval),
+            context: None,
+        };
+        let injection = wa_core::policy::InjectionResult::RequiresApproval {
+            decision,
+            summary: "[redacted]".to_string(),
+            pane_id: 7,
+            action: wa_core::policy::ActionKind::SendText,
+            audit_action_id: Some(42),
+        };
+        let data = HumanSendData {
+            pane_id: 7,
+            injection,
+            wait_for: None,
+            verification_error: None,
+            no_paste: false,
+            no_newline: false,
+        };
+
+        let output = format_send_result_human(&data, "[redacted]", Some("READY"));
+
+        assert!(output.contains("approval_required"));
+        assert!(output.contains("wa approve ABC123"));
+        assert!(output.contains("Audit ID: 42"));
+        assert!(output.contains("Wait-for: skipped"));
+    }
+
+    #[test]
+    fn format_send_result_human_includes_wait_for_match() {
+        let decision = wa_core::policy::PolicyDecision::Allow {
+            rule_id: Some("policy.allow".to_string()),
+            context: None,
+        };
+        let injection = wa_core::policy::InjectionResult::Allowed {
+            decision,
+            summary: "[redacted]".to_string(),
+            pane_id: 1,
+            action: wa_core::policy::ActionKind::SendText,
+            audit_action_id: Some(7),
+        };
+        let wait_for = RobotWaitForData {
+            pane_id: 1,
+            pattern: "READY".to_string(),
+            matched: true,
+            elapsed_ms: 10,
+            polls: 2,
+            is_regex: false,
+        };
+        let data = HumanSendData {
+            pane_id: 1,
+            injection,
+            wait_for: Some(wait_for),
+            verification_error: None,
+            no_paste: false,
+            no_newline: false,
+        };
+
+        let output = format_send_result_human(&data, "[redacted]", None);
+
+        assert!(output.contains("matched"));
+        assert!(output.contains("Wait-for"));
+        assert!(output.contains("Audit ID: 7"));
+    }
+
+    #[test]
+    fn format_send_result_human_includes_denial_and_verification_error() {
+        let decision = wa_core::policy::PolicyDecision::Deny {
+            reason: "Alt-screen active".to_string(),
+            rule_id: Some("policy.alt_screen".to_string()),
+            context: None,
+        };
+        let injection = wa_core::policy::InjectionResult::Denied {
+            decision,
+            summary: "[redacted]".to_string(),
+            pane_id: 9,
+            action: wa_core::policy::ActionKind::SendText,
+            audit_action_id: Some(99),
+        };
+        let data = HumanSendData {
+            pane_id: 9,
+            injection,
+            wait_for: None,
+            verification_error: Some("Timeout waiting for pattern 'READY'".to_string()),
+            no_paste: false,
+            no_newline: false,
+        };
+
+        let output = format_send_result_human(&data, "[redacted]", Some("READY"));
+
+        assert!(output.contains("Status: denied"));
+        assert!(output.contains("policy.alt_screen"));
+        assert!(output.contains("Alt-screen active"));
+        assert!(output.contains("Wait-for: skipped"));
+        assert!(output.contains("Verification"));
+        assert!(output.contains("Audit ID: 99"));
+    }
+
+    #[test]
+    fn send_dry_run_report_redacts_command() {
+        let config = wa_core::config::Config::default();
+        let command_ctx = wa_core::dry_run::CommandContext::new(
+            "wa send 1 \"sk-abc123456789012345678901234567890123456789012345678901\"",
+            true,
+        );
+        let report = build_send_dry_run_report(
+            &command_ctx,
+            1,
+            None,
+            "sk-abc123456789012345678901234567890123456789012345678901",
+            false,
+            None,
+            10,
+            &config,
+        );
+
+        let redacted = report.redacted();
+        assert!(redacted.command.contains("[REDACTED]"));
+        assert!(!redacted.command.contains("sk-abc"));
     }
 
     #[test]
