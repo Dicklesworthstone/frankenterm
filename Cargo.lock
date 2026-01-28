@@ -3636,8 +3636,10 @@ version = "0.1.0"
 dependencies = [
  "aho-corasick",
  "base64",
+ "chrono",
  "criterion",
  "crossterm",
+ "dirs",
  "fancy-regex 0.14.0",
  "fs2",
  "hex",
