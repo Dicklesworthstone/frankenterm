@@ -1293,9 +1293,11 @@ alias ll='ls -la'
 
         let aliases: Vec<_> = hosts.iter().map(|host| host.alias.as_str()).collect();
         assert_eq!(aliases, vec!["prod", "staging", "dev"]);
-        assert!(hosts
-            .iter()
-            .all(|host| !host.alias.contains('*') && !host.alias.contains('?')));
+        assert!(
+            hosts
+                .iter()
+                .all(|host| !host.alias.contains('*') && !host.alias.contains('?'))
+        );
 
         let prod = &hosts[0];
         assert_eq!(prod.hostname.as_deref(), Some("prod.example.com"));

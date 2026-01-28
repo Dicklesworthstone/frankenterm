@@ -255,8 +255,12 @@ enum Commands {
 
     /// Setup helpers
     Setup {
+        /// List SSH hosts from ~/.ssh/config
+        #[arg(long = "list-hosts")]
+        list_hosts: bool,
+
         #[command(subcommand)]
-        command: SetupCommands,
+        command: Option<SetupCommands>,
     },
 
     /// Configuration management commands
@@ -6100,181 +6104,251 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             }
         }
 
-        Some(Commands::Setup { command }) => match command {
-            SetupCommands::Local => {
-                println!("wa setup local - WezTerm Configuration Guide\n");
-                println!("wa requires WezTerm to be configured with adequate scrollback.");
-                println!("Without sufficient scrollback, wa may miss terminal output.\n");
-
-                // Check current state
-                if let Ok((lines, path)) = check_wezterm_scrollback() {
-                    if lines >= RECOMMENDED_SCROLLBACK_LINES {
-                        println!("✓ Your WezTerm scrollback is already configured!");
-                        println!("  Current: {} lines in {}", lines, path.display());
-                        println!("  Recommended minimum: {RECOMMENDED_SCROLLBACK_LINES} lines");
-                        println!("\nNo changes needed.");
-                    } else {
-                        println!("⚠ Your WezTerm scrollback is below recommended minimum.");
-                        println!("  Current: {} lines in {}", lines, path.display());
-                        println!("  Recommended: {RECOMMENDED_SCROLLBACK_LINES} lines\n");
-                        println!("Add this line to your wezterm.lua:");
-                        println!("  config.scrollback_lines = {RECOMMENDED_SCROLLBACK_LINES}");
-                    }
-                } else {
-                    println!("Could not find or parse WezTerm config.\n");
-                    println!("Add the following to your ~/.config/wezterm/wezterm.lua:\n");
-                    println!("  config.scrollback_lines = {RECOMMENDED_SCROLLBACK_LINES}\n");
-                    println!("This ensures wa can capture all terminal output without gaps.");
-                }
-
-                println!("\n--- Why {RECOMMENDED_SCROLLBACK_LINES} lines? ---");
-                println!("• AI coding agents can produce substantial output");
-                println!("• wa uses delta extraction to capture only new content");
-                println!("• Insufficient scrollback causes capture gaps (EVENT_GAP_DETECTED)");
-                println!("• 50k lines ≈ 2-5 MB memory per pane (negligible on modern systems)");
-                println!("\nRun 'wa doctor' to verify your configuration.");
-            }
-            SetupCommands::Remote { host } => {
-                println!("wa setup remote - Remote Host Setup for '{host}'\n");
-                println!("Remote setup is not yet implemented.\n");
-                println!("For now, ensure the remote host has:");
-                println!("  1. WezTerm SSH domain configured in your wezterm.lua");
-                println!("  2. Adequate scrollback_lines setting");
-                println!("\nExample SSH domain configuration:");
-                println!("  config.ssh_domains = {{");
-                println!("    {{");
-                println!("      name = '{host}',");
-                println!("      remote_address = '{host}.example.com',");
-                println!("      username = 'your_user',");
-                println!("    }},");
-                println!("  }}");
-            }
-            SetupCommands::Config => {
-                println!("wa setup config - Generate WezTerm Config Additions\n");
-                println!("Add the following to your ~/.config/wezterm/wezterm.lua:\n");
-                println!("-- wa (WezTerm Automata) recommended settings");
-                println!("-- Ensure adequate scrollback for terminal capture");
-                println!("config.scrollback_lines = {RECOMMENDED_SCROLLBACK_LINES}");
-                println!();
-                println!("-- Optional: Enable hyperlinks for file navigation");
-                println!("config.hyperlink_rules = wezterm.default_hyperlink_rules()");
-                println!();
-                println!("-- Optional: Quick-access key for wa status");
-                println!("-- config.keys = {{");
-                println!(
-                    "--   {{ key = 'w', mods = 'CTRL|SHIFT', action = wezterm.action.SpawnCommandInNewTab {{"
-                );
-                println!("--     args = {{ 'wa', 'status' }},");
-                println!("--   }} }},");
-                println!("-- }}");
-            }
-            SetupCommands::Patch {
-                remove,
-                config_path,
-            } => {
+        Some(Commands::Setup {
+            list_hosts,
+            command,
+        }) => {
+            if list_hosts {
                 use wa_core::setup;
 
-                println!("wa setup patch - WezTerm User-Var Forwarding\n");
+                println!("wa setup --list-hosts\n");
 
-                let result = if remove {
-                    if let Some(path) = config_path {
-                        setup::unpatch_wezterm_config_at(&path)
-                    } else {
-                        let path = setup::locate_wezterm_config()?;
-                        setup::unpatch_wezterm_config_at(&path)
-                    }
-                } else if let Some(path) = config_path {
-                    setup::patch_wezterm_config_at(&path)
-                } else {
-                    setup::patch_wezterm_config()
-                };
-
-                match result {
-                    Ok(patch_result) => {
-                        if patch_result.modified {
-                            println!("✓ {}", patch_result.message);
-                            if let Some(backup) = patch_result.backup_path {
-                                println!("  Backup: {}", backup.display());
+                match setup::locate_ssh_config() {
+                    Ok(path) => match setup::load_ssh_hosts(&path) {
+                        Ok(hosts) => {
+                            if hosts.is_empty() {
+                                println!("No SSH hosts found in {}.", path.display());
+                            } else {
+                                println!(
+                                    "Found {} SSH host(s) in {}:\n",
+                                    hosts.len(),
+                                    path.display()
+                                );
+                                for host in hosts {
+                                    println!("• {}", host.alias);
+                                    if let Some(hostname) = host.hostname.as_deref() {
+                                        println!("  HostName: {hostname}");
+                                    }
+                                    if let Some(user) = host.user.as_deref() {
+                                        println!("  User: {user}");
+                                    }
+                                    if let Some(port) = host.port {
+                                        println!("  Port: {port}");
+                                    }
+                                    let identities = host.redacted_identity_files();
+                                    if !identities.is_empty() {
+                                        println!("  IdentityFile(s): {}", identities.join(", "));
+                                    }
+                                    println!();
+                                }
                             }
-                            println!("\nRestart WezTerm to apply the changes.");
-                        } else {
-                            println!("✓ {}", patch_result.message);
                         }
-                    }
-                    Err(e) => {
-                        eprintln!("Error: {e}");
-                        std::process::exit(1);
-                    }
-                }
-            }
-            SetupCommands::Shell {
-                remove,
-                shell,
-                rc_path,
-            } => {
-                use wa_core::setup::{self, ShellType};
-
-                // Determine shell type
-                let shell_type = match shell.as_deref() {
-                    Some("bash") => ShellType::Bash,
-                    Some("zsh") => ShellType::Zsh,
-                    Some("fish") => ShellType::Fish,
-                    Some(other) => {
-                        eprintln!("Error: Unsupported shell: {other}");
-                        eprintln!("Supported shells: bash, zsh, fish");
-                        std::process::exit(1);
-                    }
-                    None => {
-                        // Auto-detect from $SHELL
-                        if let Some(st) = ShellType::detect() {
-                            println!("Detected shell: {}\n", st.name());
-                            st
-                        } else {
-                            eprintln!("Error: Could not detect shell from $SHELL");
-                            eprintln!("Please specify --shell bash|zsh|fish");
+                        Err(err) => {
+                            eprintln!("Error: {err}");
                             std::process::exit(1);
                         }
-                    }
-                };
-
-                println!(
-                    "wa setup shell - OSC 133 Prompt Markers ({})\n",
-                    shell_type.name()
-                );
-
-                let result = if remove {
-                    if let Some(path) = rc_path {
-                        setup::unpatch_shell_rc_at(&path)
-                    } else {
-                        let path = setup::locate_shell_rc(shell_type)?;
-                        setup::unpatch_shell_rc_at(&path)
-                    }
-                } else if let Some(path) = rc_path {
-                    setup::patch_shell_rc_at(&path, shell_type)
-                } else {
-                    setup::patch_shell_rc(shell_type)
-                };
-
-                match result {
-                    Ok(patch_result) => {
-                        if patch_result.modified {
-                            println!("✓ {}", patch_result.message);
-                            if let Some(backup) = patch_result.backup_path {
-                                println!("  Backup: {}", backup.display());
-                            }
-                            println!("\nSource your shell config or restart your shell to apply:");
-                            println!("  source {}", patch_result.config_path.display());
-                        } else {
-                            println!("✓ {}", patch_result.message);
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("Error: {e}");
+                    },
+                    Err(err) => {
+                        eprintln!("Error: {err}");
                         std::process::exit(1);
                     }
                 }
+            } else if let Some(command) = command {
+                match command {
+                    SetupCommands::Local => {
+                        println!("wa setup local - WezTerm Configuration Guide\n");
+                        println!("wa requires WezTerm to be configured with adequate scrollback.");
+                        println!("Without sufficient scrollback, wa may miss terminal output.\n");
+
+                        // Check current state
+                        if let Ok((lines, path)) = check_wezterm_scrollback() {
+                            if lines >= RECOMMENDED_SCROLLBACK_LINES {
+                                println!("✓ Your WezTerm scrollback is already configured!");
+                                println!("  Current: {} lines in {}", lines, path.display());
+                                println!(
+                                    "  Recommended minimum: {RECOMMENDED_SCROLLBACK_LINES} lines"
+                                );
+                                println!("\nNo changes needed.");
+                            } else {
+                                println!("⚠ Your WezTerm scrollback is below recommended minimum.");
+                                println!("  Current: {} lines in {}", lines, path.display());
+                                println!("  Recommended: {RECOMMENDED_SCROLLBACK_LINES} lines\n");
+                                println!("Add this line to your wezterm.lua:");
+                                println!(
+                                    "  config.scrollback_lines = {RECOMMENDED_SCROLLBACK_LINES}"
+                                );
+                            }
+                        } else {
+                            println!("Could not find or parse WezTerm config.\n");
+                            println!("Add the following to your ~/.config/wezterm/wezterm.lua:\n");
+                            println!(
+                                "  config.scrollback_lines = {RECOMMENDED_SCROLLBACK_LINES}\n"
+                            );
+                            println!(
+                                "This ensures wa can capture all terminal output without gaps."
+                            );
+                        }
+
+                        println!("\n--- Why {RECOMMENDED_SCROLLBACK_LINES} lines? ---");
+                        println!("• AI coding agents can produce substantial output");
+                        println!("• wa uses delta extraction to capture only new content");
+                        println!(
+                            "• Insufficient scrollback causes capture gaps (EVENT_GAP_DETECTED)"
+                        );
+                        println!(
+                            "• 50k lines ≈ 2-5 MB memory per pane (negligible on modern systems)"
+                        );
+                        println!("\nRun 'wa doctor' to verify your configuration.");
+                    }
+                    SetupCommands::Remote { host } => {
+                        println!("wa setup remote - Remote Host Setup for '{host}'\n");
+                        println!("Remote setup is not yet implemented.\n");
+                        println!("For now, ensure the remote host has:");
+                        println!("  1. WezTerm SSH domain configured in your wezterm.lua");
+                        println!("  2. Adequate scrollback_lines setting");
+                        println!("\nExample SSH domain configuration:");
+                        println!("  config.ssh_domains = {{");
+                        println!("    {{");
+                        println!("      name = '{host}',");
+                        println!("      remote_address = '{host}.example.com',");
+                        println!("      username = 'your_user',");
+                        println!("    }},");
+                        println!("  }}");
+                    }
+                    SetupCommands::Config => {
+                        println!("wa setup config - Generate WezTerm Config Additions\n");
+                        println!("Add the following to your ~/.config/wezterm/wezterm.lua:\n");
+                        println!("-- wa (WezTerm Automata) recommended settings");
+                        println!("-- Ensure adequate scrollback for terminal capture");
+                        println!("config.scrollback_lines = {RECOMMENDED_SCROLLBACK_LINES}");
+                        println!();
+                        println!("-- Optional: Enable hyperlinks for file navigation");
+                        println!("config.hyperlink_rules = wezterm.default_hyperlink_rules()");
+                        println!();
+                        println!("-- Optional: Quick-access key for wa status");
+                        println!("-- config.keys = {{");
+                        println!(
+                            "--   {{ key = 'w', mods = 'CTRL|SHIFT', action = wezterm.action.SpawnCommandInNewTab {{"
+                        );
+                        println!("--     args = {{ 'wa', 'status' }},");
+                        println!("--   }} }},");
+                        println!("-- }}");
+                    }
+                    SetupCommands::Patch {
+                        remove,
+                        config_path,
+                    } => {
+                        use wa_core::setup;
+
+                        println!("wa setup patch - WezTerm User-Var Forwarding\n");
+
+                        let result = if remove {
+                            if let Some(path) = config_path {
+                                setup::unpatch_wezterm_config_at(&path)
+                            } else {
+                                let path = setup::locate_wezterm_config()?;
+                                setup::unpatch_wezterm_config_at(&path)
+                            }
+                        } else if let Some(path) = config_path {
+                            setup::patch_wezterm_config_at(&path)
+                        } else {
+                            setup::patch_wezterm_config()
+                        };
+
+                        match result {
+                            Ok(patch_result) => {
+                                if patch_result.modified {
+                                    println!("✓ {}", patch_result.message);
+                                    if let Some(backup) = patch_result.backup_path {
+                                        println!("  Backup: {}", backup.display());
+                                    }
+                                    println!("\nRestart WezTerm to apply the changes.");
+                                } else {
+                                    println!("✓ {}", patch_result.message);
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("Error: {e}");
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                    SetupCommands::Shell {
+                        remove,
+                        shell,
+                        rc_path,
+                    } => {
+                        use wa_core::setup::{self, ShellType};
+
+                        // Determine shell type
+                        let shell_type = match shell.as_deref() {
+                            Some("bash") => ShellType::Bash,
+                            Some("zsh") => ShellType::Zsh,
+                            Some("fish") => ShellType::Fish,
+                            Some(other) => {
+                                eprintln!("Error: Unsupported shell: {other}");
+                                eprintln!("Supported shells: bash, zsh, fish");
+                                std::process::exit(1);
+                            }
+                            None => {
+                                // Auto-detect from $SHELL
+                                if let Some(st) = ShellType::detect() {
+                                    println!("Detected shell: {}\n", st.name());
+                                    st
+                                } else {
+                                    eprintln!("Error: Could not detect shell from $SHELL");
+                                    eprintln!("Please specify --shell bash|zsh|fish");
+                                    std::process::exit(1);
+                                }
+                            }
+                        };
+
+                        println!(
+                            "wa setup shell - OSC 133 Prompt Markers ({})\n",
+                            shell_type.name()
+                        );
+
+                        let result = if remove {
+                            if let Some(path) = rc_path {
+                                setup::unpatch_shell_rc_at(&path)
+                            } else {
+                                let path = setup::locate_shell_rc(shell_type)?;
+                                setup::unpatch_shell_rc_at(&path)
+                            }
+                        } else if let Some(path) = rc_path {
+                            setup::patch_shell_rc_at(&path, shell_type)
+                        } else {
+                            setup::patch_shell_rc(shell_type)
+                        };
+
+                        match result {
+                            Ok(patch_result) => {
+                                if patch_result.modified {
+                                    println!("✓ {}", patch_result.message);
+                                    if let Some(backup) = patch_result.backup_path {
+                                        println!("  Backup: {}", backup.display());
+                                    }
+                                    println!(
+                                        "\nSource your shell config or restart your shell to apply:"
+                                    );
+                                    println!("  source {}", patch_result.config_path.display());
+                                } else {
+                                    println!("✓ {}", patch_result.message);
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("Error: {e}");
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                }
+            } else {
+                eprintln!("Error: Missing setup subcommand.");
+                eprintln!("Run `wa setup --help` for usage.");
+                std::process::exit(1);
             }
-        },
+        }
 
         Some(Commands::Config { command }) => {
             handle_config_command(command, cli_config_arg.as_deref(), workspace.as_deref()).await?;
