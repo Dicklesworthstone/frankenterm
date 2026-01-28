@@ -241,8 +241,6 @@ static CODEX_CACHED_RE: LazyLock<Regex> =
 static CODEX_REASONING_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\(reasoning\s+([\d,]+)\)").expect("reasoning regex"));
 
-
-
 #[allow(dead_code)]
 fn parse_number(raw: &str) -> Option<i64> {
     let cleaned = raw.replace(',', "");
@@ -435,8 +433,11 @@ pub(crate) async fn refresh_and_select_account(
     let accounts_refreshed = refresh_result.accounts.len();
 
     for usage in &refresh_result.accounts {
-        let record =
-            crate::accounts::AccountRecord::from_caut(usage, crate::caut::CautService::OpenAI, now_ms);
+        let record = crate::accounts::AccountRecord::from_caut(
+            usage,
+            crate::caut::CautService::OpenAI,
+            now_ms,
+        );
         storage
             .upsert_account(record)
             .await
@@ -1126,7 +1127,10 @@ impl WorkflowContext {
 
     /// Get the idempotency key for a step, if executing in plan-first mode.
     #[must_use]
-    pub fn get_step_idempotency_key(&self, step_idx: usize) -> Option<&crate::plan::IdempotencyKey> {
+    pub fn get_step_idempotency_key(
+        &self,
+        step_idx: usize,
+    ) -> Option<&crate::plan::IdempotencyKey> {
         self.get_step_plan(step_idx).map(|step| &step.step_id)
     }
 
@@ -2640,12 +2644,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
 
         #[allow(clippy::cast_possible_truncation)]
         let timeout_ms = timeout.as_millis() as u64;
-        tracing::info!(
-            pane_id,
-            stable_for_ms,
-            timeout_ms,
-            "stable_tail_wait start"
-        );
+        tracing::info!(pane_id, stable_for_ms, timeout_ms, "stable_tail_wait start");
 
         loop {
             polls += 1;
@@ -2687,16 +2686,19 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
             }
 
             last_hash = Some(tail_hash);
-            last_tail_len = tail_len;
+            if tail_len != last_tail_len {
+                last_tail_len = tail_len;
+            }
 
             let now = Instant::now();
             if now >= deadline || polls >= self.options.max_polls {
                 let elapsed_ms = elapsed_ms(start);
                 tracing::info!(pane_id, elapsed_ms, polls, "stable_tail_wait timeout");
                 let last_observed = last_hash.map(|hash| {
+                    let tail_len = last_tail_len;
                     format!(
                         "last_hash={:016x} tail_len={} stable_for_ms={}",
-                        hash, last_tail_len, stable_for_ms
+                        hash, tail_len, stable_for_ms
                     )
                 });
                 return Ok(WaitConditionResult::TimedOut {
@@ -2719,10 +2721,6 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
         }
     }
 }
-
-
-
-
 
 /// Heuristic idle check based on pane text patterns.
 ///
@@ -3176,11 +3174,7 @@ impl WorkflowRunner {
                 };
             }
 
-            if let Err(e) = self
-                .storage
-                .upsert_action_plan(execution_id, &plan)
-                .await
-            {
+            if let Err(e) = self.storage.upsert_action_plan(execution_id, &plan).await {
                 tracing::warn!(
                     execution_id,
                     error = %e,
@@ -3283,7 +3277,10 @@ impl WorkflowRunner {
                             error = %e,
                             "Failed to update execution step"
                         );
-                        if let crate::Error::Workflow(crate::error::WorkflowError::Aborted(reason)) = e {
+                        if let crate::Error::Workflow(crate::error::WorkflowError::Aborted(
+                            reason,
+                        )) = e
+                        {
                             self.lock_manager.release(pane_id, execution_id);
                             return WorkflowExecutionResult::Aborted {
                                 execution_id: execution_id.to_string(),
@@ -3426,7 +3423,10 @@ impl WorkflowRunner {
                             error = %e,
                             "Failed to set waiting state"
                         );
-                        if let crate::Error::Workflow(crate::error::WorkflowError::Aborted(reason)) = e {
+                        if let crate::Error::Workflow(crate::error::WorkflowError::Aborted(
+                            reason,
+                        )) = e
+                        {
                             self.lock_manager.release(pane_id, execution_id);
                             return WorkflowExecutionResult::Aborted {
                                 execution_id: execution_id.to_string(),
@@ -3475,7 +3475,10 @@ impl WorkflowRunner {
                             error = %e,
                             "Failed to update execution step after wait"
                         );
-                        if let crate::Error::Workflow(crate::error::WorkflowError::Aborted(reason)) = e {
+                        if let crate::Error::Workflow(crate::error::WorkflowError::Aborted(
+                            reason,
+                        )) = e
+                        {
                             self.lock_manager.release(pane_id, execution_id);
                             return WorkflowExecutionResult::Aborted {
                                 execution_id: execution_id.to_string(),
@@ -3570,10 +3573,8 @@ impl WorkflowRunner {
                                         tokio::time::sleep(timeout).await;
                                     }
                                     WaitCondition::StableTail { stable_for_ms, .. } => {
-                                        tokio::time::sleep(Duration::from_millis(
-                                            *stable_for_ms,
-                                        ))
-                                        .await;
+                                        tokio::time::sleep(Duration::from_millis(*stable_for_ms))
+                                            .await;
                                     }
                                     WaitCondition::External { .. } => {
                                         tokio::time::sleep(timeout).await;
@@ -3593,7 +3594,10 @@ impl WorkflowRunner {
                                     error = %e,
                                     "Failed to update execution step after send"
                                 );
-                                if let crate::Error::Workflow(crate::error::WorkflowError::Aborted(reason)) = e {
+                                if let crate::Error::Workflow(
+                                    crate::error::WorkflowError::Aborted(reason),
+                                ) = e
+                                {
                                     self.lock_manager.release(pane_id, execution_id);
                                     return WorkflowExecutionResult::Aborted {
                                         execution_id: execution_id.to_string(),
@@ -4038,9 +4042,12 @@ impl WorkflowRunner {
 
         // Check if workflow was externally aborted/completed
         if record.status == "aborted" || record.status == "failed" || record.status == "completed" {
-            return Err(crate::Error::Workflow(crate::error::WorkflowError::Aborted(
-                format!("Workflow externally modified to status: {}", record.status),
-            )));
+            return Err(crate::Error::Workflow(
+                crate::error::WorkflowError::Aborted(format!(
+                    "Workflow externally modified to status: {}",
+                    record.status
+                )),
+            ));
         }
 
         record.current_step = step;
@@ -4069,9 +4076,12 @@ impl WorkflowRunner {
 
         // Check if workflow was externally aborted/completed
         if record.status == "aborted" || record.status == "failed" || record.status == "completed" {
-            return Err(crate::Error::Workflow(crate::error::WorkflowError::Aborted(
-                format!("Workflow externally modified to status: {}", record.status),
-            )));
+            return Err(crate::Error::Workflow(
+                crate::error::WorkflowError::Aborted(format!(
+                    "Workflow externally modified to status: {}",
+                    record.status
+                )),
+            ));
         }
 
         record.current_step = step;
@@ -4337,6 +4347,13 @@ pub mod compaction_prompts {
     pub const UNKNOWN: &str = "Please review the project context files (AGENTS.md, README.md).\n";
 }
 
+#[derive(Debug)]
+struct StabilizationOutcome {
+    waited_ms: u64,
+    polls: usize,
+    last_activity_ms: Option<i64>,
+}
+
 /// Handle compaction workflow: re-inject critical context after conversation compaction.
 ///
 /// This workflow is triggered when an AI agent compacts or summarizes its context window.
@@ -4404,17 +4421,7 @@ impl HandleCompaction {
 
     /// Get the agent-specific prompt based on agent type from trigger detection.
     fn get_prompt_for_agent(ctx: &WorkflowContext) -> &'static str {
-        // Extract agent type from trigger detection if available
-        let agent_type = ctx
-            .trigger()
-            .and_then(|t| t.get("agent_type"))
-            .and_then(|v| v.as_str())
-            .map_or(crate::patterns::AgentType::Unknown, |s| match s {
-                "claude_code" => crate::patterns::AgentType::ClaudeCode,
-                "codex" => crate::patterns::AgentType::Codex,
-                "gemini" => crate::patterns::AgentType::Gemini,
-                _ => crate::patterns::AgentType::Unknown,
-            });
+        let agent_type = Self::agent_type_from_trigger(ctx);
 
         match agent_type {
             crate::patterns::AgentType::ClaudeCode => compaction_prompts::CLAUDE_CODE,
@@ -4422,6 +4429,19 @@ impl HandleCompaction {
             crate::patterns::AgentType::Gemini => compaction_prompts::GEMINI,
             _ => compaction_prompts::UNKNOWN,
         }
+    }
+
+    /// Extract agent type from trigger context, if available.
+    fn agent_type_from_trigger(ctx: &WorkflowContext) -> crate::patterns::AgentType {
+        ctx.trigger()
+            .and_then(|t| t.get("agent_type"))
+            .and_then(|v| v.as_str())
+            .map_or(crate::patterns::AgentType::Unknown, |s| match s {
+                "claude_code" => crate::patterns::AgentType::ClaudeCode,
+                "codex" => crate::patterns::AgentType::Codex,
+                "gemini" => crate::patterns::AgentType::Gemini,
+                _ => crate::patterns::AgentType::Unknown,
+            })
     }
 
     /// Check if pane state allows workflow execution.
@@ -4450,6 +4470,78 @@ impl HandleCompaction {
 
         Ok(())
     }
+
+    /// Wait until output has been stable for the requested window.
+    ///
+    /// Uses captured output activity timestamps from storage to avoid
+    /// reading from the pane directly. This is a best-effort stabilization
+    /// strategy until deterministic compaction-complete markers are wired in.
+    async fn wait_for_stable_output(
+        storage: Arc<StorageHandle>,
+        pane_id: u64,
+        stable_for_ms: u64,
+        timeout_ms: u64,
+    ) -> Result<StabilizationOutcome, String> {
+        if stable_for_ms == 0 {
+            return Ok(StabilizationOutcome {
+                waited_ms: 0,
+                polls: 0,
+                last_activity_ms: None,
+            });
+        }
+
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(timeout_ms);
+        let mut interval = Duration::from_millis(50);
+        let mut polls = 0usize;
+
+        let stable_for_ms_i64 = i64::try_from(stable_for_ms).unwrap_or(i64::MAX);
+
+        loop {
+            polls += 1;
+
+            let activity_map = storage
+                .get_last_activity_by_pane()
+                .await
+                .map_err(|e| format!("Failed to read pane activity: {e}"))?;
+
+            let last_activity_ms = activity_map.get(&pane_id).copied();
+
+            // If we have no activity recorded, treat as stable enough to proceed.
+            if last_activity_ms.is_none() {
+                return Ok(StabilizationOutcome {
+                    waited_ms: elapsed_ms(start),
+                    polls,
+                    last_activity_ms,
+                });
+            }
+
+            let now = now_ms();
+            let since_ms = now.saturating_sub(last_activity_ms.unwrap_or(now));
+            if since_ms >= stable_for_ms_i64 {
+                return Ok(StabilizationOutcome {
+                    waited_ms: elapsed_ms(start),
+                    polls,
+                    last_activity_ms,
+                });
+            }
+
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "Stabilization timeout after {}ms (last_activity_ms={:?}, stable_for_ms={})",
+                    elapsed_ms(start),
+                    last_activity_ms,
+                    stable_for_ms
+                ));
+            }
+
+            tokio::time::sleep(interval).await;
+            interval = interval.saturating_mul(2);
+            if interval > Duration::from_millis(1000) {
+                interval = Duration::from_millis(1000);
+            }
+        }
+    }
 }
 
 impl Workflow for HandleCompaction {
@@ -4469,7 +4561,7 @@ impl Workflow for HandleCompaction {
     fn steps(&self) -> Vec<WorkflowStep> {
         vec![
             WorkflowStep::new("check_guards", "Validate pane state allows injection"),
-            WorkflowStep::new("stabilize", "Wait for pane to become idle"),
+            WorkflowStep::new("stabilize", "Wait for compaction output to stabilize"),
             WorkflowStep::new("send_prompt", "Send agent-specific context refresh prompt"),
             WorkflowStep::new("verify_send", "Verify the prompt was processed"),
         ]
@@ -4483,8 +4575,10 @@ impl Workflow for HandleCompaction {
         // Capture all values needed in the async block BEFORE entering it.
         // This avoids lifetime issues since we own the captured values.
         let stabilization_ms = self.stabilization_ms;
+        let idle_timeout_ms = self.idle_timeout_ms;
         let pane_id = ctx.pane_id();
         let execution_id = ctx.execution_id().to_string();
+        let storage = Arc::clone(ctx.storage());
 
         // For step 0: capture guard check result
         let guard_check_result = if step_idx == 0 {
@@ -4553,14 +4647,33 @@ impl Workflow for HandleCompaction {
                     tracing::info!(
                         pane_id,
                         stabilization_ms,
-                        "handle_compaction: waiting for pane to stabilize"
+                        idle_timeout_ms,
+                        "handle_compaction: waiting for output to stabilize"
                     );
 
-                    // Wait for pane idle using wait condition
-                    StepResult::wait_for_with_timeout(
-                        WaitCondition::pane_idle(stabilization_ms),
-                        stabilization_ms * 5, // 5x stabilization as timeout
+                    match Self::wait_for_stable_output(
+                        storage.clone(),
+                        pane_id,
+                        stabilization_ms,
+                        idle_timeout_ms,
                     )
+                    .await
+                    {
+                        Ok(outcome) => {
+                            tracing::info!(
+                                pane_id,
+                                waited_ms = outcome.waited_ms,
+                                polls = outcome.polls,
+                                last_activity_ms = ?outcome.last_activity_ms,
+                                "handle_compaction: output stabilized"
+                            );
+                            StepResult::cont()
+                        }
+                        Err(reason) => {
+                            tracing::warn!(pane_id, reason = %reason, "handle_compaction: stabilization failed");
+                            StepResult::abort(reason)
+                        }
+                    }
                 }
 
                 // Step 2: Send agent-specific prompt
@@ -4652,7 +4765,8 @@ impl Workflow for HandleUsageLimits {
     }
 
     fn handles(&self, detection: &crate::patterns::Detection) -> bool {
-        detection.rule_id.contains("usage") && detection.agent_type == crate::patterns::AgentType::Codex
+        detection.rule_id.contains("usage")
+            && detection.agent_type == crate::patterns::AgentType::Codex
     }
 
     fn steps(&self) -> Vec<WorkflowStep> {
@@ -4693,24 +4807,28 @@ impl Workflow for HandleUsageLimits {
                         &client,
                         || {
                             let mut c = ctx_clone.clone();
-                            async move {
-                                c.send_ctrl_c().await.map_err(|e| e.to_string())
-                            }
+                            async move { c.send_ctrl_c().await.map_err(|e| e.to_string()) }
                         },
-                        &options
-                    ).await;
+                        &options,
+                    )
+                    .await;
 
                     match outcome {
                         Ok(_) => {
                             let text = match client.get_text(pane_id, false).await {
                                 Ok(t) => t,
-                                Err(e) => return StepResult::abort(format!("Failed to get text: {e}")),
+                                Err(e) => {
+                                    return StepResult::abort(format!("Failed to get text: {e}"));
+                                }
                             };
                             let tail = crate::wezterm::tail_text(&text, 200);
-                            
+
                             match parse_codex_session_summary(&tail) {
                                 Ok(parsed) => {
-                                    if let Err(e) = persist_codex_session_summary(&storage, pane_id, &parsed).await {
+                                    if let Err(e) =
+                                        persist_codex_session_summary(&storage, pane_id, &parsed)
+                                            .await
+                                    {
                                         tracing::warn!("Failed to persist session summary: {e}");
                                     }
                                     StepResult::cont()
@@ -5498,6 +5616,63 @@ mod tests {
         assert!(result.is_satisfied());
         // Should have waited at least the threshold duration
         assert!(elapsed >= Duration::from_millis(50));
+    }
+
+    #[tokio::test]
+    async fn stable_tail_succeeds_after_stability_window() {
+        let source = MockPaneSource::new(vec![
+            "compaction in progress".to_string(),
+            "compaction in progress".to_string(),
+            "compaction in progress".to_string(),
+        ]);
+        let engine = PatternEngine::new();
+
+        let executor =
+            WaitConditionExecutor::new(&source, &engine).with_options(WaitConditionOptions {
+                tail_lines: 200,
+                poll_initial: Duration::from_millis(1),
+                poll_max: Duration::from_millis(5),
+                max_polls: 100,
+                allow_idle_heuristics: true,
+            });
+
+        let condition = WaitCondition::stable_tail(1);
+        let result = executor
+            .execute(&condition, 1, Duration::from_millis(50))
+            .await;
+
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert!(result.is_satisfied());
+    }
+
+    #[tokio::test]
+    async fn stable_tail_times_out_when_changing() {
+        let source = MockPaneSource::new(vec![
+            "line 1".to_string(),
+            "line 2".to_string(),
+            "line 3".to_string(),
+            "line 4".to_string(),
+        ]);
+        let engine = PatternEngine::new();
+
+        let executor =
+            WaitConditionExecutor::new(&source, &engine).with_options(WaitConditionOptions {
+                tail_lines: 200,
+                poll_initial: Duration::from_millis(1),
+                poll_max: Duration::from_millis(5),
+                max_polls: 5,
+                allow_idle_heuristics: true,
+            });
+
+        let condition = WaitCondition::stable_tail(100);
+        let result = executor
+            .execute(&condition, 1, Duration::from_millis(10))
+            .await;
+
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert!(result.is_timed_out());
     }
 
     #[tokio::test]
@@ -7209,10 +7384,10 @@ mod tests {
         storage.shutdown().await.unwrap();
     }
 
-    /// Test: Workflow execution step 1 (stabilize) returns WaitFor condition
-    /// Expected: Step returns WaitFor with PaneIdle condition
+    /// Test: Workflow execution step 1 (stabilize) returns Continue after stabilization
+    /// Expected: Step returns Continue (no wait-for result)
     #[tokio::test]
-    async fn handle_compaction_execute_step1_returns_wait_for() {
+    async fn handle_compaction_execute_step1_returns_continue() {
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir
             .path()
@@ -7231,25 +7406,18 @@ mod tests {
 
         let mut ctx = WorkflowContext::new(storage.clone(), 42, prompt_caps, "test-step1-001");
 
-        let workflow = HandleCompaction::new();
+        let workflow = HandleCompaction::new()
+            .with_stabilization_ms(0)
+            .with_idle_timeout_ms(50);
         let result = workflow.execute_step(&mut ctx, 1).await;
 
-        // Step 1 should return WaitFor with PaneIdle condition
+        // Step 1 should return Continue once stabilized
         match result {
-            StepResult::WaitFor { condition, .. } => {
-                // Verify it's waiting for pane idle
-                if let WaitCondition::PaneIdle {
-                    idle_threshold_ms, ..
-                } = condition
-                {
-                    assert!(idle_threshold_ms > 0, "Idle threshold should be positive");
-                } else {
-                    panic!("Step 1 should wait for PaneIdle, got: {:?}", condition);
-                }
+            StepResult::Continue => {}
+            StepResult::Abort { reason } => {
+                panic!("Step 1 should not abort when stabilization is zero: {reason}");
             }
-            other => {
-                panic!("Step 1 should return WaitFor, got: {:?}", other);
-            }
+            other => panic!("Step 1 should return Continue, got: {:?}", other),
         }
 
         storage.shutdown().await.unwrap();
@@ -8351,14 +8519,24 @@ Try again at 3:00 PM UTC.
     fn parse_codex_session_summary_extracts_reset_time_variations() {
         // Various reset time formats
         let cases = [
-            ("Token usage: total=1\ncodex resume abcd1234\ntry again at 2:30 PM", Some("2:30 PM")),
-            ("Token usage: total=1\ncodex resume abcd1234\nTry again at tomorrow 9am.", Some("tomorrow 9am")),
+            (
+                "Token usage: total=1\ncodex resume abcd1234\ntry again at 2:30 PM",
+                Some("2:30 PM"),
+            ),
+            (
+                "Token usage: total=1\ncodex resume abcd1234\nTry again at tomorrow 9am.",
+                Some("tomorrow 9am"),
+            ),
             ("Token usage: total=1\ncodex resume abcd1234", None),
         ];
 
         for (tail, expected_reset) in cases {
             let result = parse_codex_session_summary(tail).expect("should parse");
-            assert_eq!(result.reset_time.as_deref(), expected_reset, "Failed for: {tail}");
+            assert_eq!(
+                result.reset_time.as_deref(),
+                expected_reset,
+                "Failed for: {tail}"
+            );
         }
     }
 

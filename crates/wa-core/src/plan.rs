@@ -579,7 +579,7 @@ impl StepAction {
                 condition,
                 timeout_ms,
             } => {
-                let pane = pane_id.map_or("any".to_string(), |p| p.to_string());
+                let pane = pane_id.map_or_else(|| "any".to_string(), |p| p.to_string());
                 format!(
                     "wait_for:pane={},cond={},timeout={}",
                     pane,
@@ -600,7 +600,10 @@ impl StepAction {
                 let value_str = serde_json::to_string(value).unwrap_or_default();
                 format!("store_data:key={key},value={value_str}")
             }
-            Self::RunWorkflow { workflow_id, params } => {
+            Self::RunWorkflow {
+                workflow_id,
+                params,
+            } => {
                 let params_str = params
                     .as_ref()
                     .and_then(|p| serde_json::to_string(p).ok())
@@ -662,6 +665,13 @@ pub enum WaitCondition {
         idle_threshold_ms: u64,
     },
 
+    /// Wait for pane output tail to be stable
+    StableTail {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pane_id: Option<u64>,
+        stable_for_ms: u64,
+    },
+
     /// Wait for external signal
     External { key: String },
 }
@@ -672,15 +682,22 @@ impl WaitCondition {
     pub fn canonical_string(&self) -> String {
         match self {
             Self::Pattern { pane_id, rule_id } => {
-                let pane = pane_id.map_or("any".to_string(), |p| p.to_string());
+                let pane = pane_id.map_or_else(|| "any".to_string(), |p| p.to_string());
                 format!("pattern:pane={pane},rule={rule_id}")
             }
             Self::PaneIdle {
                 pane_id,
                 idle_threshold_ms,
             } => {
-                let pane = pane_id.map_or("any".to_string(), |p| p.to_string());
+                let pane = pane_id.map_or_else(|| "any".to_string(), |p| p.to_string());
                 format!("pane_idle:pane={pane},threshold={idle_threshold_ms}")
+            }
+            Self::StableTail {
+                pane_id,
+                stable_for_ms,
+            } => {
+                let pane = pane_id.map_or_else(|| "any".to_string(), |p| p.to_string());
+                format!("stable_tail:pane={pane},stable_for_ms={stable_for_ms}")
             }
             Self::External { key } => format!("external:key={key}"),
         }
@@ -759,12 +776,12 @@ impl Precondition {
                 pane_id,
                 within_ms,
             } => {
-                let pane = pane_id.map_or("any".to_string(), |p| p.to_string());
-                let within = within_ms.map_or("any".to_string(), |w| w.to_string());
+                let pane = pane_id.map_or_else(|| "any".to_string(), |p| p.to_string());
+                let within = within_ms.map_or_else(|| "any".to_string(), |w| w.to_string());
                 format!("pattern_matched:{rule_id},pane={pane},within={within}")
             }
             Self::PatternNotMatched { rule_id, pane_id } => {
-                let pane = pane_id.map_or("any".to_string(), |p| p.to_string());
+                let pane = pane_id.map_or_else(|| "any".to_string(), |p| p.to_string());
                 format!("pattern_not_matched:{rule_id},pane={pane}")
             }
             Self::LockHeld { lock_name } => format!("lock_held:{lock_name}"),
@@ -774,7 +791,9 @@ impl Precondition {
                     "approval_valid:ws={},action={},pane={}",
                     scope.workspace_id,
                     scope.action_kind,
-                    scope.pane_id.map_or("any".to_string(), |p| p.to_string())
+                    scope
+                        .pane_id
+                        .map_or_else(|| "any".to_string(), |p| p.to_string())
                 )
             }
             Self::StepCompleted { step_id } => format!("step_completed:{}", step_id.0),
@@ -902,14 +921,14 @@ impl VerificationStrategy {
     pub fn canonical_string(&self) -> String {
         match self {
             Self::PatternMatch { rule_id, pane_id } => {
-                let pane = pane_id.map_or("any".to_string(), |p| p.to_string());
+                let pane = pane_id.map_or_else(|| "any".to_string(), |p| p.to_string());
                 format!("pattern_match:{rule_id},pane={pane}")
             }
             Self::PaneIdle {
                 pane_id,
                 idle_threshold_ms,
             } => {
-                let pane = pane_id.map_or("any".to_string(), |p| p.to_string());
+                let pane = pane_id.map_or_else(|| "any".to_string(), |p| p.to_string());
                 format!("pane_idle:pane={pane},threshold={idle_threshold_ms}")
             }
             Self::PatternAbsent {
@@ -917,7 +936,7 @@ impl VerificationStrategy {
                 pane_id,
                 wait_ms,
             } => {
-                let pane = pane_id.map_or("any".to_string(), |p| p.to_string());
+                let pane = pane_id.map_or_else(|| "any".to_string(), |p| p.to_string());
                 format!("pattern_absent:{rule_id},pane={pane},wait={wait_ms}")
             }
             Self::Custom { name, expression } => format!("custom:{name}={expression}"),
@@ -1522,7 +1541,10 @@ mod tests {
         plan.steps[1].step_id = plan.steps[0].step_id.clone();
 
         let result = plan.validate();
-        assert!(matches!(result, Err(PlanValidationError::DuplicateStepId(_))));
+        assert!(matches!(
+            result,
+            Err(PlanValidationError::DuplicateStepId(_))
+        ));
     }
 
     #[test]
@@ -1717,6 +1739,10 @@ mod tests {
             WaitCondition::PaneIdle {
                 pane_id: Some(1),
                 idle_threshold_ms: 5000,
+            },
+            WaitCondition::StableTail {
+                pane_id: Some(2),
+                stable_for_ms: 1500,
             },
             WaitCondition::External {
                 key: "signal_key".into(),

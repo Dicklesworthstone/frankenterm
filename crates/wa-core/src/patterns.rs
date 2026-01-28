@@ -303,7 +303,7 @@ impl DetectionContext {
     pub fn is_seen(&self, detection: &Detection) -> bool {
         let key = detection.dedup_key();
         if let Some(timestamp) = self.seen_keys.get(&key) {
-             Instant::now().duration_since(*timestamp) < self.ttl
+            Instant::now().duration_since(*timestamp) < self.ttl
         } else {
             false
         }
