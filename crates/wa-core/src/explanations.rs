@@ -322,6 +322,119 @@ Gap markers in storage indicate where discontinuities exist.",
 };
 
 // ============================================================================
+// Risk Explanation Templates (wa-upg.6.3)
+// ============================================================================
+
+/// Explanation for elevated risk score.
+pub static RISK_ELEVATED: ExplanationTemplate = ExplanationTemplate {
+    id: "risk.elevated",
+    scenario: "Action has elevated risk score requiring approval",
+    brief: "Risk factors combined to exceed the automatic allow threshold",
+    detailed: r"wa's risk scoring model evaluated multiple factors and determined this action
+has elevated risk (score 51-70). Risk factors can include:
+
+- State factors: alt-screen mode, running commands, capture gaps
+- Action factors: mutating operations, control characters, destructive actions
+- Context factors: untrusted actor, broadcast targets
+- Content factors: destructive tokens (rm -rf, DROP, etc.), sudo elevation
+
+The combined score exceeds the configured threshold for automatic allow.",
+    suggestions: &[
+        "Review the contributing factors in the risk breakdown",
+        "Use 'wa approve <token>' to grant one-time approval",
+        "Configure risk thresholds in wa.toml under [policy.risk]",
+        "Add weight overrides for trusted operations",
+    ],
+    see_also: &["wa policy", "wa config show"],
+};
+
+/// Explanation for high risk score denial.
+pub static RISK_HIGH: ExplanationTemplate = ExplanationTemplate {
+    id: "risk.high",
+    scenario: "Action denied due to high risk score",
+    brief: "Risk factors combined to exceed the denial threshold",
+    detailed: r"wa's risk scoring model evaluated multiple factors and determined this action
+has high risk (score 71-100), triggering automatic denial.
+
+High-risk scenarios typically involve multiple concerning factors:
+- Sending to alternate screen + destructive command content
+- Unknown pane state + sudo elevation
+- Reserved pane + untrusted actor
+
+These combinations represent genuinely dangerous operations that require
+explicit override or configuration changes.",
+    suggestions: &[
+        "Review the contributing factors carefully",
+        "Wait for pane to reach a safer state",
+        "Configure hard overrides in wa.toml if this is a false positive",
+        "Consider using a workflow with explicit approval gates",
+    ],
+    see_also: &["wa policy", "wa config show"],
+};
+
+/// Explanation for alt-screen risk factor.
+pub static RISK_FACTOR_ALT_SCREEN: ExplanationTemplate = ExplanationTemplate {
+    id: "risk.factor.alt_screen",
+    scenario: "Alt-screen state contributes to risk",
+    brief: "Pane is in alternate screen mode (vim, less, etc.)",
+    detailed: r"The target pane is running a full-screen application that uses the alternate
+screen buffer. Sending text input to such applications can cause unpredictable
+behavior or data corruption.
+
+This factor adds significant weight (default: 60) to the risk score because:
+- Applications like vim interpret text as commands
+- Screen-based apps don't have a shell prompt
+- Text could trigger unintended operations",
+    suggestions: &[
+        "Wait for the application to exit",
+        "Use the application's native input method",
+        "Check 'wa status --pane <id>' for alt-screen state",
+    ],
+    see_also: &["wa status", "wa policy"],
+};
+
+/// Explanation for destructive content risk factor.
+pub static RISK_FACTOR_DESTRUCTIVE: ExplanationTemplate = ExplanationTemplate {
+    id: "risk.factor.destructive_tokens",
+    scenario: "Destructive patterns detected in command",
+    brief: "Command contains patterns commonly associated with destructive operations",
+    detailed: r"The command text contains patterns that are commonly destructive:
+- 'rm -rf' or 'rm -r' (recursive file deletion)
+- 'DROP TABLE' or 'DROP DATABASE' (SQL destruction)
+- 'git reset --hard' or 'git clean -fd' (git history/file loss)
+- 'mkfs' or 'dd if=' (disk operations)
+
+This factor adds weight (default: 40) to encourage human review of
+potentially irreversible operations.",
+    suggestions: &[
+        "Review the command carefully before approving",
+        "Consider using --dry-run if available",
+        "Use explicit file paths instead of wildcards",
+    ],
+    see_also: &["wa policy"],
+};
+
+/// Explanation for sudo elevation risk factor.
+pub static RISK_FACTOR_SUDO: ExplanationTemplate = ExplanationTemplate {
+    id: "risk.factor.sudo_elevation",
+    scenario: "Sudo/doas elevation detected in command",
+    brief: "Command uses privilege elevation",
+    detailed: r"The command includes sudo, doas, or similar privilege elevation. Elevated
+commands have broader system access and can cause more damage if misused.
+
+This factor adds moderate weight (default: 30) because:
+- Root access bypasses normal permission checks
+- Mistakes with elevated privileges are harder to undo
+- Automation should be cautious about privileged operations",
+    suggestions: &[
+        "Verify the command needs elevated privileges",
+        "Consider reducing weight in trusted environments",
+        "Review sudo configuration for the target pane",
+    ],
+    see_also: &["wa policy"],
+};
+
+// ============================================================================
 // Template Registry
 // ============================================================================
 
@@ -347,6 +460,13 @@ pub static EXPLANATION_TEMPLATES: LazyLock<HashMap<&'static str, &'static Explan
         // Events
         m.insert(EVENT_PATTERN_DETECTED.id, &EVENT_PATTERN_DETECTED);
         m.insert(EVENT_GAP_DETECTED.id, &EVENT_GAP_DETECTED);
+
+        // Risk (wa-upg.6.3)
+        m.insert(RISK_ELEVATED.id, &RISK_ELEVATED);
+        m.insert(RISK_HIGH.id, &RISK_HIGH);
+        m.insert(RISK_FACTOR_ALT_SCREEN.id, &RISK_FACTOR_ALT_SCREEN);
+        m.insert(RISK_FACTOR_DESTRUCTIVE.id, &RISK_FACTOR_DESTRUCTIVE);
+        m.insert(RISK_FACTOR_SUDO.id, &RISK_FACTOR_SUDO);
 
         m
     });
@@ -387,7 +507,7 @@ pub fn list_template_ids() -> Vec<&'static str> {
 ///
 /// # Arguments
 ///
-/// * `prefix` - Category prefix (e.g., "deny", "workflow", "event")
+/// * `prefix` - Category prefix (e.g., "deny", "workflow", "event", "risk")
 ///
 /// # Returns
 ///
@@ -591,13 +711,12 @@ mod tests {
                 "Template ID '{id}' should have category.name format"
             );
             let parts: Vec<_> = id.split('.').collect();
-            assert_eq!(
-                parts.len(),
-                2,
-                "Template ID '{id}' should have exactly one dot"
+            assert!(
+                parts.len() >= 2,
+                "Template ID '{id}' should have at least one dot"
             );
             assert!(
-                ["deny", "workflow", "event"].contains(&parts[0]),
+                ["deny", "workflow", "event", "risk"].contains(&parts[0]),
                 "Template ID '{}' has unknown category '{}'",
                 id,
                 parts[0]
