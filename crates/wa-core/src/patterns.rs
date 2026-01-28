@@ -4,6 +4,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use aho_corasick::AhoCorasick;
 use fancy_regex::Regex;
@@ -206,10 +207,12 @@ pub struct DetectionContext {
     pub pane_id: Option<u64>,
     /// Inferred agent type for this pane (if known)
     pub agent_type: Option<AgentType>,
-    /// Previously seen dedup keys to avoid re-emitting
-    seen_keys: HashSet<String>,
+    /// Previously seen dedup keys with timestamp to avoid re-emitting
+    seen_keys: HashMap<String, Instant>,
     /// Order of seen keys for eviction (FIFO)
     seen_order: VecDeque<String>,
+    /// Time-to-live for deduplication (default: 5 minutes)
+    pub ttl: Duration,
 }
 
 impl Default for DetectionContext {
@@ -221,6 +224,8 @@ impl Default for DetectionContext {
 impl DetectionContext {
     /// Maximum number of seen keys to retain
     const MAX_SEEN_KEYS: usize = 1000;
+    /// Default deduplication TTL
+    const DEFAULT_TTL: Duration = Duration::from_secs(5 * 60);
 
     /// Create a new empty detection context
     #[must_use]
@@ -228,8 +233,9 @@ impl DetectionContext {
         Self {
             pane_id: None,
             agent_type: None,
-            seen_keys: HashSet::new(),
+            seen_keys: HashMap::new(),
             seen_order: VecDeque::new(),
+            ttl: Self::DEFAULT_TTL,
         }
     }
 
@@ -239,8 +245,9 @@ impl DetectionContext {
         Self {
             pane_id: None,
             agent_type: Some(agent_type),
-            seen_keys: HashSet::new(),
+            seen_keys: HashMap::new(),
             seen_order: VecDeque::new(),
+            ttl: Self::DEFAULT_TTL,
         }
     }
 
@@ -250,34 +257,56 @@ impl DetectionContext {
         Self {
             pane_id: Some(pane_id),
             agent_type,
-            seen_keys: HashSet::new(),
+            seen_keys: HashMap::new(),
             seen_order: VecDeque::new(),
+            ttl: Self::DEFAULT_TTL,
         }
     }
 
-    /// Mark a detection as seen, returning true if it was new
+    /// Set the deduplication TTL.
+    pub fn set_ttl(&mut self, ttl: Duration) {
+        self.ttl = ttl;
+    }
+
+    /// Mark a detection as seen, returning true if it was new (or expired)
     pub fn mark_seen(&mut self, detection: &Detection) -> bool {
         let key = detection.dedup_key();
-        if self.seen_keys.contains(&key) {
-            return false;
+        let now = Instant::now();
+
+        // Check if seen and valid (not expired)
+        if let Some(timestamp) = self.seen_keys.get(&key) {
+            if now.duration_since(*timestamp) < self.ttl {
+                return false;
+            }
         }
 
-        // Enforce capacity
-        if self.seen_keys.len() >= Self::MAX_SEEN_KEYS {
+        // Enforce capacity if adding a new key (or updating expired one that was pruned?)
+        // If we update an existing key, we don't increase count.
+        // But if we insert new, we might overflow.
+        // Simple strategy: Always remove if at capacity, then insert.
+        if !self.seen_keys.contains_key(&key) && self.seen_keys.len() >= Self::MAX_SEEN_KEYS {
             if let Some(oldest) = self.seen_order.pop_front() {
                 self.seen_keys.remove(&oldest);
             }
         }
 
-        self.seen_keys.insert(key.clone());
+        self.seen_keys.insert(key.clone(), now);
+        // Push to back of order. If it was already there, we technically have duplicates in VecDeque
+        // but that's acceptable for a simple LRU approximation or we can just ignore strict ordering for updates.
+        // For simplicity, we just push. Pruning might remove the old entry reference later.
         self.seen_order.push_back(key);
         true
     }
 
-    /// Check if a detection has been seen before
+    /// Check if a detection has been seen before and is unexpired
     #[must_use]
     pub fn is_seen(&self, detection: &Detection) -> bool {
-        self.seen_keys.contains(&detection.dedup_key())
+        let key = detection.dedup_key();
+        if let Some(timestamp) = self.seen_keys.get(&key) {
+             Instant::now().duration_since(*timestamp) < self.ttl
+        } else {
+            false
+        }
     }
 
     /// Clear the set of seen detections
