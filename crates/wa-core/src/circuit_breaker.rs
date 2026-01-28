@@ -261,23 +261,13 @@ pub fn get_or_register_circuit(
 
     write_guard
         .entry(name.clone())
-        .or_insert_with(|| {
-            Arc::new(Mutex::new(CircuitBreaker::with_name(
-                name.clone(),
-                config,
-            )))
-        })
+        .or_insert_with(|| Arc::new(Mutex::new(CircuitBreaker::with_name(name.clone(), config))))
         .clone()
 }
 
 /// Ensure default circuits exist for status reporting.
 pub fn ensure_default_circuits() {
-    let defaults = [
-        "wezterm_cli",
-        "caut_cli",
-        "browser_auth",
-        "webhook",
-    ];
+    let defaults = ["wezterm_cli", "caut_cli", "browser_auth", "webhook"];
     for name in defaults {
         let _ = get_or_register_circuit(name, CircuitBreakerConfig::default());
     }

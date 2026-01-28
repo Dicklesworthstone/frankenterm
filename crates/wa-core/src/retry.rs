@@ -311,10 +311,10 @@ pub fn is_retryable(error: &Error) -> bool {
             StorageError::SequenceDiscontinuity { .. } => false, // Logic error
             StorageError::MigrationFailed(_) => false, // Persistent issue
             StorageError::SchemaTooNew { .. } => false, // Version mismatch
-            StorageError::WaTooOld { .. } => false,    // Version mismatch
-            StorageError::FtsQueryError(_) => false,   // Query syntax issue
-            StorageError::Corruption { .. } => false,  // Serious issue
-            StorageError::NotFound(_) => false,        // Item doesn't exist
+            StorageError::WaTooOld { .. } => false, // Version mismatch
+            StorageError::FtsQueryError(_) => false, // Query syntax issue
+            StorageError::Corruption { .. } => false, // Serious issue
+            StorageError::NotFound(_) => false, // Item doesn't exist
         },
         // Pattern errors are not retryable (invalid regex, etc.)
         Error::Pattern(_) => false,

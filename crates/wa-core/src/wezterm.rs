@@ -363,7 +363,10 @@ impl WeztermClient {
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             retry_attempts: DEFAULT_RETRY_ATTEMPTS,
             retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
-            circuit_breaker: get_or_register_circuit("wezterm_cli", CircuitBreakerConfig::default()),
+            circuit_breaker: get_or_register_circuit(
+                "wezterm_cli",
+                CircuitBreakerConfig::default(),
+            ),
         }
     }
 
@@ -375,7 +378,10 @@ impl WeztermClient {
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             retry_attempts: DEFAULT_RETRY_ATTEMPTS,
             retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
-            circuit_breaker: get_or_register_circuit("wezterm_cli", CircuitBreakerConfig::default()),
+            circuit_breaker: get_or_register_circuit(
+                "wezterm_cli",
+                CircuitBreakerConfig::default(),
+            ),
         }
     }
 
@@ -403,10 +409,8 @@ impl WeztermClient {
     /// Configure circuit breaker settings.
     #[must_use]
     pub fn with_circuit_breaker_config(mut self, config: CircuitBreakerConfig) -> Self {
-        self.circuit_breaker = Arc::new(Mutex::new(CircuitBreaker::with_name(
-            "wezterm_cli",
-            config,
-        )));
+        self.circuit_breaker =
+            Arc::new(Mutex::new(CircuitBreaker::with_name("wezterm_cli", config)));
         self
     }
 

@@ -6177,7 +6177,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             let has_warnings = checks.iter().any(|c| c.status == DiagnosticStatus::Warning);
 
             if circuits {
-                use wa_core::circuit_breaker::{circuit_snapshots, ensure_default_circuits, CircuitStateKind};
+                use wa_core::circuit_breaker::{
+                    CircuitStateKind, circuit_snapshots, ensure_default_circuits,
+                };
 
                 ensure_default_circuits();
                 let snapshots = circuit_snapshots();
@@ -6192,8 +6194,16 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                     let format_retry = |ms: Option<u64>| -> String {
                         match ms {
-                            Some(value) if value >= 60_000 => format!("{:.1}m", value as f64 / 60_000.0),
-                            Some(value) if value >= 1_000 => format!("{:.1}s", value as f64 / 1_000.0),
+                            Some(value) if value >= 60_000 => {
+                                let minutes = value / 60_000;
+                                let seconds = (value % 60_000) / 1_000;
+                                format!("{minutes}m{seconds:02}s")
+                            }
+                            Some(value) if value >= 1_000 => {
+                                let seconds = value / 1_000;
+                                let millis = value % 1_000;
+                                format!("{seconds}.{millis:03}s")
+                            }
                             Some(value) => format!("{value}ms"),
                             None => "n/a".to_string(),
                         }
