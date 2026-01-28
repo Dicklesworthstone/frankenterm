@@ -1708,8 +1708,7 @@ fn generate_workflow_id(workflow_name: &str) -> String {
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 fn build_verification_refs(
@@ -1741,17 +1740,15 @@ fn build_verification_refs(
             }));
         }
         StepResult::SendText {
-            wait_for,
+            wait_for: Some(condition),
             wait_timeout_ms,
             ..
         } => {
-            if let Some(condition) = wait_for {
-                refs.push(serde_json::json!({
-                    "source": "post_send_wait",
-                    "condition": condition,
-                    "timeout_ms": wait_timeout_ms,
-                }));
-            }
+            refs.push(serde_json::json!({
+                "source": "post_send_wait",
+                "condition": condition,
+                "timeout_ms": wait_timeout_ms,
+            }));
         }
         _ => {}
     }
@@ -1935,9 +1932,8 @@ pub async fn check_step_idempotency(
     step_index: usize,
 ) -> IdempotencyCheckResult {
     // Query step logs for this execution
-    let logs = match storage.get_step_logs(execution_id).await {
-        Ok(logs) => logs,
-        Err(_) => return IdempotencyCheckResult::NotExecuted,
+    let Ok(logs) = storage.get_step_logs(execution_id).await else {
+        return IdempotencyCheckResult::NotExecuted;
     };
 
     // Find the log for this step by index
@@ -2098,8 +2094,7 @@ impl PaneWorkflowLockManager {
 
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-            .unwrap_or(0);
+            .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
 
         locks.insert(
             pane_id,
@@ -2326,7 +2321,7 @@ impl Default for WaitConditionOptions {
         Self {
             tail_lines: 200,
             poll_initial: Duration::from_millis(50),
-            poll_max: Duration::from_millis(1000),
+            poll_max: Duration::from_secs(1),
             max_polls: 10_000,
             allow_idle_heuristics: true,
         }
@@ -4537,8 +4532,8 @@ impl HandleCompaction {
 
             tokio::time::sleep(interval).await;
             interval = interval.saturating_mul(2);
-            if interval > Duration::from_millis(1000) {
-                interval = Duration::from_millis(1000);
+            if interval > Duration::from_secs(1) {
+                interval = Duration::from_secs(1);
             }
         }
     }
@@ -4744,6 +4739,7 @@ impl Workflow for HandleCompaction {
 pub struct HandleUsageLimits;
 
 impl HandleUsageLimits {
+    #[must_use]
     pub fn new() -> Self {
         Self
     }
@@ -4807,7 +4803,7 @@ impl Workflow for HandleUsageLimits {
                         &client,
                         || {
                             let mut c = ctx_clone.clone();
-                            async move { c.send_ctrl_c().await.map_err(|e| e.to_string()) }
+                            async move { c.send_ctrl_c().await.map_err(ToString::to_string) }
                         },
                         &options,
                     )

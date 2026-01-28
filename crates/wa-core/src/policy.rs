@@ -1779,9 +1779,10 @@ fn matches_rule(match_on: &PolicyRuleMatch, input: &PolicyInput) -> bool {
     if !match_on.command_patterns.is_empty() {
         match &input.command_text {
             Some(text) => {
-                let matches_any = match_on.command_patterns.iter().any(|pattern| {
-                    Regex::new(pattern).is_ok_and(|re| re.is_match(text))
-                });
+                let matches_any = match_on
+                    .command_patterns
+                    .iter()
+                    .any(|pattern| Regex::new(pattern).is_ok_and(|re| re.is_match(text)));
                 if !matches_any {
                     return false;
                 }

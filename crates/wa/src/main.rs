@@ -4397,7 +4397,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     let mut warnings: Vec<RobotLintIssue> = Vec::new();
 
                                     // 1. Validate rule ID naming conventions
-                                    for rule in rules.iter() {
+                                    for rule in rules {
                                         let has_valid_prefix =
                                             ALLOWED_PREFIXES.iter().any(|p| rule.id.starts_with(p));
                                         if !has_valid_prefix {
@@ -4411,7 +4411,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 suggestion: Some(format!(
                                                     "Rename to '{}.{}'",
                                                     rule.agent_type,
-                                                    rule.id.split('.').skip(1).collect::<Vec<_>>().join(".")
+                                                    rule.id
+                                                        .split('.')
+                                                        .skip(1)
+                                                        .collect::<Vec<_>>()
+                                                        .join(".")
                                                 )),
                                             });
                                         }
@@ -4474,14 +4478,16 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         use std::collections::HashSet;
                                         use std::fs;
 
-                                        let corpus_base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                                            .parent()
-                                            .unwrap_or(std::path::Path::new("."))
-                                            .join("wa-core")
-                                            .join("tests")
-                                            .join("corpus");
+                                        let corpus_base =
+                                            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                                                .parent()
+                                                .unwrap_or_else(|| std::path::Path::new("."))
+                                                .join("wa-core")
+                                                .join("tests")
+                                                .join("corpus");
 
-                                        let mut rules_with_fixtures: HashSet<String> = HashSet::new();
+                                        let mut rules_with_fixtures: HashSet<String> =
+                                            HashSet::new();
                                         let mut total_fixtures = 0;
 
                                         // Collect all expect.json files and extract rule IDs
@@ -4496,7 +4502,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             for entry in entries.flatten() {
                                                 let path = entry.path();
                                                 if path.is_dir() {
-                                                    collect_fixtures(&path, rules_with_fixtures, total_fixtures);
+                                                    collect_fixtures(
+                                                        &path,
+                                                        rules_with_fixtures,
+                                                        total_fixtures,
+                                                    );
                                                 } else if path
                                                     .extension()
                                                     .is_some_and(|ext| ext == "json")
@@ -4504,16 +4514,20 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 {
                                                     *total_fixtures += 1;
                                                     if let Ok(content) = fs::read_to_string(&path) {
-                                                        if let Ok(val) =
-                                                            serde_json::from_str::<serde_json::Value>(&content)
-                                                        {
+                                                        if let Ok(val) = serde_json::from_str::<
+                                                            serde_json::Value,
+                                                        >(
+                                                            &content
+                                                        ) {
                                                             if let Some(arr) = val.as_array() {
                                                                 for item in arr {
-                                                                    if let Some(rule_id) =
-                                                                        item.get("rule_id").and_then(|v| v.as_str())
+                                                                    if let Some(rule_id) = item
+                                                                        .get("rule_id")
+                                                                        .and_then(|v| v.as_str())
                                                                     {
-                                                                        rules_with_fixtures
-                                                                            .insert(rule_id.to_string());
+                                                                        rules_with_fixtures.insert(
+                                                                            rule_id.to_string(),
+                                                                        );
                                                                     }
                                                                 }
                                                             }
@@ -4523,7 +4537,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             }
                                         }
 
-                                        collect_fixtures(&corpus_base, &mut rules_with_fixtures, &mut total_fixtures);
+                                        collect_fixtures(
+                                            &corpus_base,
+                                            &mut rules_with_fixtures,
+                                            &mut total_fixtures,
+                                        );
 
                                         // Find rules without any fixture coverage
                                         let rules_without: Vec<String> = rules
@@ -4540,7 +4558,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 message: "No corpus fixture found for this rule".to_string(),
                                                 suggestion: Some(format!(
                                                     "Add tests/corpus/<agent>/{}.txt and .expect.json",
-                                                    rule_id.split('.').last().unwrap_or("unknown")
+                                                    rule_id.split('.').next_back().unwrap_or("unknown")
                                                 )),
                                             });
                                         }
