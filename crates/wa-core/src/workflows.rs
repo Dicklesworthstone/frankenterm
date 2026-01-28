@@ -745,6 +745,7 @@ impl StepResult {
 /// Wait conditions pause workflow execution until satisfied:
 /// - `Pattern`: Wait for a pattern rule to match on a pane
 /// - `PaneIdle`: Wait for a pane to become idle (no output)
+/// - `StableTail`: Wait for pane output to stop changing for a duration
 /// - `External`: Wait for an external signal by key
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -762,6 +763,13 @@ pub enum WaitCondition {
         pane_id: Option<u64>,
         /// Idle duration threshold in milliseconds
         idle_threshold_ms: u64,
+    },
+    /// Wait for pane output tail to be stable for a duration
+    StableTail {
+        /// Pane to monitor (None = workflow's target pane)
+        pane_id: Option<u64>,
+        /// Required stability duration in milliseconds
+        stable_for_ms: u64,
     },
     /// Wait for an external signal
     External {
@@ -807,6 +815,24 @@ impl WaitCondition {
         }
     }
 
+    /// Create a StableTail wait condition for the workflow's target pane
+    #[must_use]
+    pub fn stable_tail(stable_for_ms: u64) -> Self {
+        Self::StableTail {
+            pane_id: None,
+            stable_for_ms,
+        }
+    }
+
+    /// Create a StableTail wait condition for a specific pane
+    #[must_use]
+    pub fn stable_tail_on(pane_id: u64, stable_for_ms: u64) -> Self {
+        Self::StableTail {
+            pane_id: Some(pane_id),
+            stable_for_ms,
+        }
+    }
+
     /// Create an External wait condition
     #[must_use]
     pub fn external(key: impl Into<String>) -> Self {
@@ -817,7 +843,9 @@ impl WaitCondition {
     #[must_use]
     pub fn pane_id(&self) -> Option<u64> {
         match self {
-            Self::Pattern { pane_id, .. } | Self::PaneIdle { pane_id, .. } => *pane_id,
+            Self::Pattern { pane_id, .. }
+            | Self::PaneIdle { pane_id, .. }
+            | Self::StableTail { pane_id, .. } => *pane_id,
             Self::External { .. } => None,
         }
     }
@@ -2377,6 +2405,14 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
                 self.execute_pane_idle_wait(target_pane, *idle_threshold_ms, timeout)
                     .await
             }
+            WaitCondition::StableTail {
+                pane_id,
+                stable_for_ms,
+            } => {
+                let target_pane = pane_id.unwrap_or(context_pane_id);
+                self.execute_stable_tail_wait(target_pane, *stable_for_ms, timeout)
+                    .await
+            }
             WaitCondition::External { key } => {
                 // External signals are not implemented in this layer
                 Ok(WaitConditionResult::Unsupported {
@@ -2581,6 +2617,106 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
 
         // No idle detection available
         Ok((false, "no_osc133_no_heuristics".to_string()))
+    }
+
+    /// Execute a stable tail wait condition.
+    ///
+    /// Waits until the tail content remains unchanged for `stable_for_ms`.
+    async fn execute_stable_tail_wait(
+        &self,
+        pane_id: u64,
+        stable_for_ms: u64,
+        timeout: Duration,
+    ) -> crate::Result<WaitConditionResult> {
+        let start = Instant::now();
+        let deadline = start + timeout;
+        let mut polls = 0usize;
+        let mut interval = self.options.poll_initial;
+        let stable_for = Duration::from_millis(stable_for_ms);
+
+        let mut last_hash: Option<u64> = None;
+        let mut last_change_at = Instant::now();
+        let mut last_tail_len: usize = 0;
+
+        #[allow(clippy::cast_possible_truncation)]
+        let timeout_ms = timeout.as_millis() as u64;
+        tracing::info!(
+            pane_id,
+            stable_for_ms,
+            timeout_ms,
+            "stable_tail_wait start"
+        );
+
+        loop {
+            polls += 1;
+
+            let text = self.source.get_text(pane_id, false).await?;
+            let tail = tail_text(&text, self.options.tail_lines);
+            let tail_hash = stable_hash(tail.as_bytes());
+            let tail_len = tail.len();
+
+            if let Some(prev_hash) = last_hash {
+                if prev_hash == tail_hash {
+                    let stable_duration = Instant::now().saturating_duration_since(last_change_at);
+                    if stable_duration >= stable_for {
+                        let elapsed_ms = elapsed_ms(start);
+                        tracing::info!(
+                            pane_id,
+                            elapsed_ms,
+                            polls,
+                            stable_duration_ms = %stable_duration.as_millis(),
+                            tail_len,
+                            "stable_tail_wait satisfied"
+                        );
+                        return Ok(WaitConditionResult::Satisfied {
+                            elapsed_ms,
+                            polls,
+                            context: Some(format!(
+                                "stable for {}ms (tail_len={}, hash={:016x})",
+                                stable_duration.as_millis(),
+                                tail_len,
+                                tail_hash
+                            )),
+                        });
+                    }
+                } else {
+                    last_change_at = Instant::now();
+                }
+            } else {
+                last_change_at = Instant::now();
+            }
+
+            last_hash = Some(tail_hash);
+            last_tail_len = tail_len;
+
+            let now = Instant::now();
+            if now >= deadline || polls >= self.options.max_polls {
+                let elapsed_ms = elapsed_ms(start);
+                tracing::info!(pane_id, elapsed_ms, polls, "stable_tail_wait timeout");
+                let last_observed = last_hash.map(|hash| {
+                    format!(
+                        "last_hash={:016x} tail_len={} stable_for_ms={}",
+                        hash, last_tail_len, stable_for_ms
+                    )
+                });
+                return Ok(WaitConditionResult::TimedOut {
+                    elapsed_ms,
+                    polls,
+                    last_observed,
+                });
+            }
+
+            let remaining = deadline.saturating_duration_since(now);
+            let sleep_duration = interval.min(remaining);
+            if !sleep_duration.is_zero() {
+                sleep(sleep_duration).await;
+            }
+
+            interval = interval.saturating_mul(2);
+            if interval > self.options.poll_max {
+                interval = self.options.poll_max;
+            }
+        }
     }
 }
 
@@ -3318,6 +3454,10 @@ impl WorkflowRunner {
                             // Would use WaitConditionExecutor here
                             tokio::time::sleep(timeout).await;
                         }
+                        WaitCondition::StableTail { stable_for_ms, .. } => {
+                            // Would use WaitConditionExecutor here
+                            tokio::time::sleep(Duration::from_millis(*stable_for_ms)).await;
+                        }
                         WaitCondition::External { .. } => {
                             // Would wait for external signal
                             tokio::time::sleep(timeout).await;
@@ -3428,6 +3568,12 @@ impl WorkflowRunner {
                                     }
                                     WaitCondition::Pattern { .. } => {
                                         tokio::time::sleep(timeout).await;
+                                    }
+                                    WaitCondition::StableTail { stable_for_ms, .. } => {
+                                        tokio::time::sleep(Duration::from_millis(
+                                            *stable_for_ms,
+                                        ))
+                                        .await;
                                     }
                                     WaitCondition::External { .. } => {
                                         tokio::time::sleep(timeout).await;
