@@ -2347,7 +2347,7 @@ impl PolicyEngine {
 
     /// Map a risk score to a policy decision
     #[must_use]
-    pub fn risk_to_decision(&self, risk: &RiskScore, input: &PolicyInput) -> PolicyDecision {
+    pub fn risk_to_decision(&self, risk: &RiskScore, _input: &PolicyInput) -> PolicyDecision {
         if risk.score <= self.risk_config.allow_max {
             PolicyDecision::allow_with_rule("risk.score_allow")
         } else if risk.score <= self.risk_config.require_approval_max {
