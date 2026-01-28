@@ -319,10 +319,15 @@ impl DetectionContext {
         }
     }
 
-    /// Clear the set of seen detections
+    /// Clear the set of seen detections and the tail buffer.
+    ///
+    /// This allows detecting patterns fresh in subsequent calls, as if
+    /// starting from a new context. Both the dedup state and the cross-segment
+    /// matching buffer are reset.
     pub fn clear_seen(&mut self) {
         self.seen_keys.clear();
         self.seen_order.clear();
+        self.tail_buffer.clear();
     }
 
     /// Get the number of seen detections
@@ -1418,10 +1423,11 @@ impl PatternEngine {
         // Filter by agent type, span (overlap), and dedup
         let mut result = Vec::new();
         for detection in all_detections {
-            // Overlap filtering: skip if match STARTS within the overlap region.
-            // If a detection starts in the overlap, its pattern beginning was already
-            // visible in the previous segment (even if the match extends into new text).
-            if overlap_len > 0 && detection.span.0 < overlap_len {
+            // Overlap filtering: skip if match is ENTIRELY within the overlap region.
+            // If a detection ends within the overlap, it was fully visible in the
+            // previous segment and should not be re-emitted. Detections that span
+            // the boundary (start in overlap, end in new text) are kept.
+            if overlap_len > 0 && detection.span.1 <= overlap_len {
                 continue;
             }
 
