@@ -2441,169 +2441,337 @@ run_scenario_workflow_resume() {
 
 run_scenario_status_update() {
     # Validates the Lua status_update lane:
-    # 1. Start wa watch with a pane in the registry
-    # 2. Send a status update via `wa event --from-status`
-    # 3. Verify pane state changed (alt_screen toggle, title change)
-    # 4. Verify invalid payloads are rejected safely
+    # 1. Start a dedicated WezTerm instance with status_update hook
+    # 2. Start wa watch pointed at that instance
+    # 3. Spawn a pane that toggles alt-screen + title
+    # 4. Verify pane state updates via IPC pane_state
+    # 5. Verify invalid payloads are rejected safely
     #
     # Task: wa-4vx.2.7.3
 
     local scenario_dir="$1"
+    local scenario_name="status_update"
     local temp_workspace
     temp_workspace=$(mktemp -d /tmp/wa-e2e-status-XXXXXX)
     local wa_pid=""
+    local wezterm_pid=""
     local pane_id=""
     local result=0
-    local wait_timeout=${TIMEOUT:-30}
+    local wait_timeout=${TIMEOUT:-60}
     local now_ms
     now_ms=$(date +%s%3N 2>/dev/null || python3 -c 'import time; print(int(time.time() * 1000))')
+    local wezterm_socket="$temp_workspace/wezterm.sock"
+    local config_file="$temp_workspace/wezterm.lua"
+    local emit_script="$temp_workspace/emit_status.sh"
 
-    log_info "Workspace: $temp_workspace"
+    declare -A step_start_ms=()
+
+    scenario_prefix() {
+        echo "[$scenario_name pane_id=${pane_id:-unknown}]"
+    }
+
+    step_start() {
+        local step="$1"
+        local ts
+        ts=$(date +%s%3N 2>/dev/null || python3 -c 'import time; print(int(time.time() * 1000))')
+        step_start_ms["$step"]="$ts"
+        log_info "$(scenario_prefix) STEP_START step=$step ts_ms=$ts"
+        echo "step_start: $step ts_ms=$ts pane_id=${pane_id:-unknown}" >> "$scenario_dir/scenario.log"
+    }
+
+    step_end() {
+        local step="$1"
+        local end_ts
+        end_ts=$(date +%s%3N 2>/dev/null || python3 -c 'import time; print(int(time.time() * 1000))')
+        local start_ts="${step_start_ms[$step]:-}"
+        local duration_ms=""
+        if [[ -n "$start_ts" ]]; then
+            duration_ms=$(( end_ts - start_ts ))
+        fi
+        log_info "$(scenario_prefix) STEP_END step=$step ts_ms=$end_ts duration_ms=${duration_ms:-unknown}"
+        echo "step_end: $step ts_ms=$end_ts duration_ms=${duration_ms:-unknown} pane_id=${pane_id:-unknown}" >> "$scenario_dir/scenario.log"
+    }
+
+    ipc_pane_state() {
+        local target_pane="$1"
+        local socket_path="$WA_DATA_DIR/ipc.sock"
+        python3 - "$socket_path" "$target_pane" <<'PY'
+import json
+import socket
+import sys
+
+sock_path = sys.argv[1]
+pane_id = int(sys.argv[2])
+req = {"type": "pane_state", "pane_id": pane_id}
+
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(2.0)
+s.connect(sock_path)
+s.sendall((json.dumps(req) + "\n").encode("utf-8"))
+data = b""
+while not data.endswith(b"\n"):
+    chunk = s.recv(4096)
+    if not chunk:
+        break
+    data += chunk
+s.close()
+sys.stdout.write(data.decode("utf-8").strip())
+PY
+    }
+
+    log_info "$(scenario_prefix) Workspace: $temp_workspace"
+    log_info "$(scenario_prefix) WezTerm socket: $wezterm_socket"
 
     # Setup environment for isolated wa instance
     export WA_DATA_DIR="$temp_workspace/.wa"
     export WA_WORKSPACE="$temp_workspace"
     mkdir -p "$WA_DATA_DIR"
 
+    echo "scenario: $scenario_name" >> "$scenario_dir/scenario.log"
     echo "workspace: $temp_workspace" >> "$scenario_dir/scenario.log"
+    echo "wezterm_socket: $wezterm_socket" >> "$scenario_dir/scenario.log"
     echo "test_timestamp_ms: $now_ms" >> "$scenario_dir/scenario.log"
 
     cleanup_status_update() {
-        log_verbose "Cleaning up status_update scenario"
+        log_verbose "$(scenario_prefix) Cleaning up status_update scenario"
         if [[ -n "$wa_pid" ]] && kill -0 "$wa_pid" 2>/dev/null; then
-            log_verbose "Stopping wa watch (pid $wa_pid)"
+            log_verbose "$(scenario_prefix) Stopping wa watch (pid $wa_pid)"
             kill "$wa_pid" 2>/dev/null || true
             wait "$wa_pid" 2>/dev/null || true
         fi
         if [[ -n "$pane_id" ]]; then
-            log_verbose "Closing dummy pane $pane_id"
-            wezterm cli kill-pane --pane-id "$pane_id" 2>/dev/null || true
+            log_verbose "$(scenario_prefix) Closing dummy pane $pane_id"
+            WEZTERM_UNIX_SOCKET="$wezterm_socket" wezterm cli --no-auto-start \
+                kill-pane --pane-id "$pane_id" 2>/dev/null || true
+        fi
+        if [[ -n "$wezterm_pid" ]] && kill -0 "$wezterm_pid" 2>/dev/null; then
+            log_verbose "$(scenario_prefix) Stopping wezterm (pid $wezterm_pid)"
+            kill "$wezterm_pid" 2>/dev/null || true
+            wait "$wezterm_pid" 2>/dev/null || true
         fi
         if [[ -d "$temp_workspace" ]]; then
             cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp "$config_file" "$scenario_dir/wezterm.lua" 2>/dev/null || true
+            cp "$emit_script" "$scenario_dir/emit_status.sh" 2>/dev/null || true
         fi
         rm -rf "$temp_workspace"
     }
     trap cleanup_status_update EXIT
 
-    # Step 1: Spawn a dummy pane first (so it exists in the registry)
-    log_info "Step 1: Spawning dummy pane..."
+    # Step 1: Write a minimal wezterm.lua with status_update hook
+    step_start "write_config"
+    cat > "$config_file" <<'EOF'
+local wezterm = require 'wezterm'
+local wa_bin = os.getenv("WA_E2E_WA_BINARY") or "wa"
+local wa_last_status_update = {}
+local WA_STATUS_UPDATE_INTERVAL_MS = 2000
+
+wezterm.on('update-status', function(window, pane)
+  local pane_id = pane:pane_id()
+  local now_ms = os.time() * 1000
+  local last = wa_last_status_update[pane_id] or 0
+  if now_ms - last < WA_STATUS_UPDATE_INTERVAL_MS then
+    return
+  end
+  wa_last_status_update[pane_id] = now_ms
+
+  local dims = pane:get_dimensions()
+  local cursor = pane:get_cursor_position()
+  local domain = pane:get_domain_name()
+  local title = pane:get_title()
+  local is_alt = pane:is_alt_screen_active()
+
+  local function json_escape(s)
+    if not s then return '' end
+    return s:gsub('\\', '\\\\')
+            :gsub('"', '\\"')
+            :gsub('\n', '\\n')
+            :gsub('\r', '\\r')
+            :gsub('\t', '\\t')
+  end
+
+  local payload = string.format(
+    '{"schema_version":0,"pane_id":%d,"domain":"%s","title":"%s",' ..
+    '"cursor":{"row":%d,"col":%d},"dimensions":{"rows":%d,"cols":%d},' ..
+    '"is_alt_screen":%s,"ts":%d}',
+    pane_id,
+    json_escape(domain),
+    json_escape(title):sub(1, 256),
+    cursor.y, cursor.x,
+    dims.viewport_rows, dims.viewport_cols,
+    is_alt and 'true' or 'false',
+    now_ms
+  )
+
+  wezterm.background_child_process {
+    wa_bin, 'event', '--from-status',
+    '--pane', tostring(pane_id),
+    '--payload', payload
+  }
+end)
+
+return {}
+EOF
+    step_end "write_config"
+
+    # Step 2: Start a dedicated wezterm instance with the config
+    step_start "start_wezterm"
+    WA_E2E_WA_BINARY="$WA_BINARY" WEZTERM_UNIX_SOCKET="$wezterm_socket" \
+        wezterm start --always-new-process --config-file "$config_file" \
+        --workspace "wa-e2e-status" > "$scenario_dir/wezterm.log" 2>&1 &
+    wezterm_pid=$!
+    echo "wezterm_pid: $wezterm_pid" >> "$scenario_dir/scenario.log"
+
+    local check_mux_cmd="WEZTERM_UNIX_SOCKET=\"$wezterm_socket\" wezterm cli --no-auto-start list >/dev/null 2>&1"
+    if ! wait_for_condition "wezterm mux ready" "$check_mux_cmd" "$wait_timeout"; then
+        log_fail "$(scenario_prefix) Timeout waiting for wezterm mux"
+        result=1
+        return $result
+    fi
+    log_pass "$(scenario_prefix) WezTerm mux ready"
+    step_end "start_wezterm"
+
+    # Step 3: Start wa watch against the test mux
+    step_start "start_watch"
+    WA_WORKSPACE="$temp_workspace" WA_DATA_DIR="$temp_workspace/.wa" \
+        WEZTERM_UNIX_SOCKET="$wezterm_socket" WA_LOG_LEVEL=debug \
+        "$WA_BINARY" watch --foreground > "$scenario_dir/wa_watch.log" 2>&1 &
+    wa_pid=$!
+    echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
+
+    local check_watch_cmd="kill -0 $wa_pid 2>/dev/null"
+    if ! wait_for_condition "wa watch running" "$check_watch_cmd" 10; then
+        log_fail "$(scenario_prefix) wa watch exited immediately"
+        result=1
+        return $result
+    fi
+    log_pass "$(scenario_prefix) wa watch running"
+    step_end "start_watch"
+
+    # Step 4: Prepare a pane script that toggles alt screen + title
+    step_start "prepare_pane_script"
+    cat > "$emit_script" <<'EOS'
+#!/bin/bash
+set -euo pipefail
+printf '\033]0;wa-e2e-status\007'
+printf '\033[?1049h'
+sleep 5
+printf '\033[?1049l'
+sleep "${1:-600}"
+EOS
+    chmod +x "$emit_script"
+    step_end "prepare_pane_script"
+
+    # Step 5: Spawn a pane in the test mux
+    step_start "spawn_pane"
     local spawn_output
-    spawn_output=$(wezterm cli spawn --cwd "$temp_workspace" -- sleep 600 2>&1)
+    spawn_output=$(WEZTERM_UNIX_SOCKET="$wezterm_socket" wezterm cli --no-auto-start spawn \
+        --cwd "$temp_workspace" -- "$emit_script" 600 2>&1)
     pane_id=$(echo "$spawn_output" | grep -oE '^[0-9]+$' | head -1)
 
     if [[ -z "$pane_id" ]]; then
-        log_fail "Failed to spawn dummy pane"
-        echo "Spawn output: $spawn_output" >> "$scenario_dir/scenario.log"
-        return 1
+        log_fail "$(scenario_prefix) Failed to spawn status_update pane"
+        echo "spawn_output: $spawn_output" >> "$scenario_dir/scenario.log"
+        result=1
+        return $result
     fi
-    log_info "Spawned pane: $pane_id"
+    log_info "$(scenario_prefix) Spawned pane: $pane_id"
     echo "pane_id: $pane_id" >> "$scenario_dir/scenario.log"
+    step_end "spawn_pane"
 
-    # Step 2: Start wa watch
-    log_info "Step 2: Starting wa watch..."
-    WA_LOG_LEVEL=debug "$WA_BINARY" watch --foreground \
-        > "$scenario_dir/wa_watch.log" 2>&1 &
-    wa_pid=$!
-    log_verbose "wa watch started with PID $wa_pid"
-    echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
-
-    sleep 2
-
-    if ! kill -0 "$wa_pid" 2>/dev/null; then
-        log_fail "wa watch exited immediately"
-        return 1
-    fi
-
-    # Step 3: Wait for pane to be observed
-    log_info "Step 3: Waiting for pane to be observed..."
-    local check_cmd="\"$WA_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane_id)' >/dev/null 2>&1"
-
+    # Step 6: Wait for pane to be observed by wa
+    step_start "wait_pane_observed"
+    local check_cmd="WEZTERM_UNIX_SOCKET=\"$wezterm_socket\" \"$WA_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane_id)' >/dev/null 2>&1"
     if ! wait_for_condition "pane $pane_id observed" "$check_cmd" "$wait_timeout"; then
-        log_fail "Timeout waiting for pane to be observed"
-        "$WA_BINARY" robot state > "$scenario_dir/robot_state_initial.json" 2>&1 || true
-        return 1
+        log_fail "$(scenario_prefix) Timeout waiting for pane to be observed"
+        WEZTERM_UNIX_SOCKET="$wezterm_socket" "$WA_BINARY" robot state > "$scenario_dir/robot_state_initial.json" 2>&1 || true
+        result=1
+        return $result
     fi
-    log_pass "Pane observed"
+    log_pass "$(scenario_prefix) Pane observed"
+    WEZTERM_UNIX_SOCKET="$wezterm_socket" "$WA_BINARY" robot state > "$scenario_dir/robot_state_initial.json" 2>&1 || true
+    step_end "wait_pane_observed"
 
-    # Capture initial state
-    "$WA_BINARY" robot state > "$scenario_dir/robot_state_initial.json" 2>&1 || true
+    # Step 7: Wait for status_update to land in pane_state
+    step_start "wait_status_update"
+    local check_status_cmd="ipc_pane_state \"$pane_id\" | jq -e '.ok == true and (.data.last_status_at // 0) > 0' >/dev/null 2>&1"
+    if ! wait_for_condition "pane_state last_status_at set" "$check_status_cmd" "$wait_timeout"; then
+        log_fail "$(scenario_prefix) Timeout waiting for status_update"
+        ipc_pane_state "$pane_id" > "$scenario_dir/pane_state_timeout.json" 2>&1 || true
+        result=1
+        return $result
+    fi
+    log_pass "$(scenario_prefix) status_update observed via IPC"
+    ipc_pane_state "$pane_id" > "$scenario_dir/pane_state_after_update.json" 2>&1 || true
+    step_end "wait_status_update"
 
-    # Step 4: Send a status update with alt_screen=true
-    log_info "Step 4: Sending status update (alt_screen=true)..."
-    local status_payload
-    status_payload=$(printf '{"pane_id":%s,"is_alt_screen":true,"title":"vim AGENTS.md","ts":%s,"schema_version":0}' "$pane_id" "$now_ms")
-    echo "status_payload: $status_payload" >> "$scenario_dir/scenario.log"
-
-    local event_output
-    event_output=$("$WA_BINARY" event --from-status --pane "$pane_id" --payload "$status_payload" 2>&1) || {
-        log_fail "wa event --from-status failed"
-        echo "event_output: $event_output" >> "$scenario_dir/scenario.log"
-        return 1
-    }
-    log_pass "Status update sent successfully"
-    echo "event_output: $event_output" >> "$scenario_dir/scenario.log"
-
-    # Small delay for watcher to process
-    sleep 1
-
-    # Step 5: Verify pane state changed (check alt_screen via robot state or IPC)
-    log_info "Step 5: Verifying pane state changed..."
-    local robot_state
-    robot_state=$("$WA_BINARY" robot state 2>&1)
-    echo "$robot_state" > "$scenario_dir/robot_state_after_update.json"
-
-    # Check if pane shows alt_screen = true
-    local alt_screen_state
-    alt_screen_state=$(echo "$robot_state" | jq -r ".data[]? | select(.pane_id == $pane_id) | .is_alt_screen // false" 2>/dev/null || echo "unknown")
-
-    if [[ "$alt_screen_state" == "true" ]]; then
-        log_pass "Pane alt_screen updated to true"
+    # Step 8: Verify alt-screen toggled to true at least once
+    step_start "verify_alt_screen_true"
+    local check_alt_cmd="ipc_pane_state \"$pane_id\" | jq -e '.ok == true and ((.data.alt_screen // false) == true or (.data.cursor_alt_screen // false) == true)' >/dev/null 2>&1"
+    if ! wait_for_condition "alt_screen true" "$check_alt_cmd" 15; then
+        log_fail "$(scenario_prefix) Alt-screen true not observed"
+        ipc_pane_state "$pane_id" > "$scenario_dir/pane_state_alt_screen_missing.json" 2>&1 || true
+        result=1
     else
-        log_warn "Pane alt_screen not updated (got: $alt_screen_state) - may be expected if robot state doesn't reflect status updates"
-        # Don't fail - the unit tests cover this; here we mainly verify the CLI works
+        log_pass "$(scenario_prefix) Alt-screen true observed"
     fi
+    step_end "verify_alt_screen_true"
 
-    # Step 6: Test invalid payload rejection
-    log_info "Step 6: Testing invalid payload rejection..."
-    local invalid_payload='{"pane_id":999,"schema_version":99,"ts":0}'
-    local invalid_output
-    if invalid_output=$("$WA_BINARY" event --from-status --pane 999 --payload "$invalid_payload" 2>&1); then
-        # Command succeeded - check if watcher rejected it
-        if echo "$invalid_output" | grep -qi "unsupported schema_version\|validation failed\|error" 2>/dev/null; then
-            log_pass "Invalid payload rejected with error message"
-        else
-            log_warn "Invalid payload may have been accepted (check wa_watch.log)"
-        fi
+    # Step 9: Verify alt-screen eventually returns to false
+    step_start "verify_alt_screen_false"
+    local check_alt_false_cmd="ipc_pane_state \"$pane_id\" | jq -e '.ok == true and ((.data.alt_screen // false) == false)' >/dev/null 2>&1"
+    if ! wait_for_condition "alt_screen false" "$check_alt_false_cmd" 20; then
+        log_fail "$(scenario_prefix) Alt-screen false not observed"
+        ipc_pane_state "$pane_id" > "$scenario_dir/pane_state_alt_screen_stuck.json" 2>&1 || true
+        result=1
     else
-        log_pass "Invalid payload rejected (non-zero exit code)"
+        log_pass "$(scenario_prefix) Alt-screen returned to false"
     fi
-    echo "invalid_payload_output: $invalid_output" >> "$scenario_dir/scenario.log"
+    step_end "verify_alt_screen_false"
 
-    # Step 7: Verify no raw payloads in logs (security check)
-    log_info "Step 7: Checking logs for raw payload leakage..."
-    if grep -q '"pane_id":999' "$scenario_dir/wa_watch.log" 2>/dev/null; then
-        log_warn "Found raw JSON in logs (may want to add redaction)"
+    # Step 10: Test invalid payload rejection
+    step_start "invalid_payload"
+    local invalid_payload
+    invalid_payload=$(printf '{"pane_id":%s,"schema_version":99,"ts":%s}' "$pane_id" "$now_ms")
+    local invalid_output=""
+    local invalid_exit=0
+    set +e
+    invalid_output=$(WA_WORKSPACE="$temp_workspace" WA_DATA_DIR="$temp_workspace/.wa" \
+        WEZTERM_UNIX_SOCKET="$wezterm_socket" "$WA_BINARY" event --from-status \
+        --pane "$pane_id" --payload "$invalid_payload" 2>&1)
+    invalid_exit=$?
+    set -e
+    echo "invalid_exit: $invalid_exit" >> "$scenario_dir/scenario.log"
+    echo "invalid_payload_len: ${#invalid_payload}" >> "$scenario_dir/scenario.log"
+    echo "$invalid_output" > "$scenario_dir/wa_event_invalid.log"
+
+    if [[ "$invalid_exit" -ne 0 ]]; then
+        log_pass "$(scenario_prefix) Invalid payload rejected"
     else
-        log_pass "No raw JSON payloads found in logs"
+        log_fail "$(scenario_prefix) Invalid payload unexpectedly accepted"
+        result=1
     fi
+    step_end "invalid_payload"
 
-    # Step 8: Test rate limiting by sending rapid updates
-    log_info "Step 8: Testing rate limiting (rapid updates)..."
-    local rapid_count=0
-    for i in 1 2 3 4 5; do
-        local rapid_ts
-        rapid_ts=$(date +%s%3N 2>/dev/null || python3 -c 'import time; print(int(time.time() * 1000))')
-        local rapid_payload
-        rapid_payload=$(printf '{"pane_id":%s,"cursor":{"row":%d,"col":0},"ts":%s,"schema_version":0}' "$pane_id" "$i" "$rapid_ts")
-        if "$WA_BINARY" event --from-status --pane "$pane_id" --payload "$rapid_payload" >/dev/null 2>&1; then
-            ((rapid_count++))
-        fi
-    done
-    echo "rapid_updates_sent: $rapid_count" >> "$scenario_dir/scenario.log"
-    log_pass "Sent $rapid_count rapid updates (rate limiting tested in unit tests)"
+    # Step 11: Verify no raw invalid payloads in logs (redaction check)
+    step_start "redaction_check"
+    if grep -q '"schema_version":99' "$scenario_dir/wa_watch.log" 2>/dev/null; then
+        log_warn "$(scenario_prefix) Found raw invalid payload in logs (redaction may be needed)"
+    else
+        log_pass "$(scenario_prefix) No raw invalid payloads found in logs"
+    fi
+    step_end "redaction_check"
 
-    log_info "Scenario complete"
+    # Step 12: Capture DB snapshot and pane_state for artifacts
+    step_start "artifacts_snapshot"
+    local db_path="$WA_DATA_DIR/wa.db"
+    if [[ -f "$db_path" ]]; then
+        cp "$db_path" "$scenario_dir/wa.db" 2>/dev/null || true
+    fi
+    ipc_pane_state "$pane_id" > "$scenario_dir/pane_state_final.json" 2>&1 || true
+    step_end "artifacts_snapshot"
+
+    log_info "$(scenario_prefix) Scenario complete"
 
     # Cleanup trap will handle the rest
     trap - EXIT
