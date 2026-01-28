@@ -1063,6 +1063,7 @@ mod tests {
             confidence: 0.95,
             extracted: serde_json::json!({"key": "value"}),
             matched_text: "matched text".to_string(),
+            span: (0, 0),
         };
 
         let event = detection_to_stored_event(42, &detection, Some(123));

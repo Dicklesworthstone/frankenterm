@@ -6905,6 +6905,7 @@ mod tests {
             confidence: 0.5,
             matched_text: "something".to_string(),
             extracted: serde_json::json!({}),
+            span: (0, 0),
         };
 
         // Should not find any workflow
@@ -6957,6 +6958,7 @@ mod tests {
             confidence: 0.9,
             matched_text: "compacted".to_string(),
             extracted: serde_json::json!({}),
+            span: (0, 0),
         };
 
         // Create test pane first

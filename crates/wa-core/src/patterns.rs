@@ -2565,6 +2565,7 @@ mod tests {
             confidence: 0.9,
             extracted: serde_json::json!({"tokens": "1000"}),
             matched_text: "test".into(),
+            span: (0, 0),
         };
 
         let d2 = Detection {
@@ -2575,6 +2576,7 @@ mod tests {
             confidence: 0.9,
             extracted: serde_json::json!({"tokens": "2000"}),
             matched_text: "test".into(),
+            span: (0, 0),
         };
 
         assert_ne!(
@@ -2592,6 +2594,7 @@ mod tests {
             confidence: 0.9,
             extracted: serde_json::json!({"tokens": "1000"}),
             matched_text: "different text".into(),
+            span: (0, 0),
         };
 
         assert_eq!(
@@ -2620,6 +2623,7 @@ mod tests {
             confidence: 0.9,
             extracted: serde_json::Value::Null,
             matched_text: "test".into(),
+            span: (0, 0),
         };
 
         // Codex rule should apply to Codex agent
@@ -2649,6 +2653,7 @@ mod tests {
             confidence: 0.9,
             extracted: serde_json::Value::Null,
             matched_text: "test".into(),
+            span: (0, 0),
         };
 
         assert!(PatternEngine::rule_applies_to_agent(
