@@ -352,6 +352,9 @@ pub struct DecisionContext {
     pub evidence: Vec<DecisionEvidence>,
     /// Rate limit snapshot, if applicable
     pub rate_limit: Option<RateLimitSnapshot>,
+    /// Risk score, if calculated
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub risk: Option<RiskScore>,
 }
 
 impl DecisionContext {
@@ -371,7 +374,13 @@ impl DecisionContext {
             determining_rule: None,
             evidence: Vec::new(),
             rate_limit: None,
+            risk: None,
         }
+    }
+
+    /// Set the risk score on this context
+    pub fn set_risk(&mut self, risk: RiskScore) {
+        self.risk = Some(risk);
     }
 
     /// Record a rule evaluation in order.
@@ -439,6 +448,207 @@ pub struct RateLimitSnapshot {
     pub current: usize,
     /// Suggested retry-after in seconds
     pub retry_after_secs: u64,
+}
+
+// ============================================================================
+// Risk Scoring
+// ============================================================================
+
+/// Risk factor categories
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RiskCategory {
+    /// Pane/session state factors
+    State,
+    /// Action type factors
+    Action,
+    /// Request context factors
+    Context,
+    /// Command content factors
+    Content,
+}
+
+impl RiskCategory {
+    /// Returns a stable string identifier
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::State => "state",
+            Self::Action => "action",
+            Self::Context => "context",
+            Self::Content => "content",
+        }
+    }
+}
+
+/// A risk factor definition with its metadata
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RiskFactor {
+    /// Stable factor ID (e.g., "state.alt_screen")
+    pub id: String,
+    /// Factor category
+    pub category: RiskCategory,
+    /// Base weight (0-100)
+    pub base_weight: u8,
+    /// Human-readable short description
+    pub description: String,
+}
+
+impl RiskFactor {
+    /// Create a new risk factor
+    #[must_use]
+    pub fn new(
+        id: impl Into<String>,
+        category: RiskCategory,
+        base_weight: u8,
+        description: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            category,
+            base_weight: base_weight.min(100),
+            description: description.into(),
+        }
+    }
+}
+
+/// A factor that was applied to the risk calculation
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppliedRiskFactor {
+    /// Factor ID
+    pub id: String,
+    /// Weight that was applied
+    pub weight: u8,
+    /// Human-readable explanation
+    pub explanation: String,
+}
+
+/// Calculated risk score with contributing factors
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RiskScore {
+    /// Total risk score (0-100)
+    pub score: u8,
+    /// Factors that contributed to the score
+    pub factors: Vec<AppliedRiskFactor>,
+    /// Human-readable summary
+    pub summary: String,
+}
+
+impl RiskScore {
+    /// Create a zero-risk score
+    #[must_use]
+    pub fn zero() -> Self {
+        Self {
+            score: 0,
+            factors: Vec::new(),
+            summary: "Low risk".to_string(),
+        }
+    }
+
+    /// Create a risk score from applied factors
+    #[must_use]
+    pub fn from_factors(factors: Vec<AppliedRiskFactor>) -> Self {
+        let total: u32 = factors.iter().map(|f| u32::from(f.weight)).sum();
+        let score = total.min(100) as u8;
+        let summary = Self::summary_for_score(score);
+        Self {
+            score,
+            factors,
+            summary,
+        }
+    }
+
+    /// Get human-readable summary for a score
+    #[must_use]
+    pub fn summary_for_score(score: u8) -> String {
+        match score {
+            0..=20 => "Low risk".to_string(),
+            21..=50 => "Medium risk".to_string(),
+            51..=70 => "Elevated risk".to_string(),
+            71..=100 => "High risk".to_string(),
+            _ => "Unknown risk".to_string(),
+        }
+    }
+
+    /// Returns true if this is low risk (score <= 20)
+    #[must_use]
+    pub const fn is_low(&self) -> bool {
+        self.score <= 20
+    }
+
+    /// Returns true if this is medium risk (21-50)
+    #[must_use]
+    pub const fn is_medium(&self) -> bool {
+        self.score > 20 && self.score <= 50
+    }
+
+    /// Returns true if this is elevated risk (51-70)
+    #[must_use]
+    pub const fn is_elevated(&self) -> bool {
+        self.score > 50 && self.score <= 70
+    }
+
+    /// Returns true if this is high risk (> 70)
+    #[must_use]
+    pub const fn is_high(&self) -> bool {
+        self.score > 70
+    }
+}
+
+impl Default for RiskScore {
+    fn default() -> Self {
+        Self::zero()
+    }
+}
+
+/// Risk scoring configuration
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RiskConfig {
+    /// Enable risk scoring
+    pub enabled: bool,
+    /// Maximum score for automatic allow (default: 50)
+    pub allow_max: u8,
+    /// Maximum score for require-approval; above this = deny (default: 70)
+    pub require_approval_max: u8,
+    /// Weight overrides by factor ID
+    #[serde(default)]
+    pub weights: std::collections::HashMap<String, u8>,
+    /// Disabled factor IDs
+    #[serde(default)]
+    pub disabled: std::collections::HashSet<String>,
+}
+
+impl Default for RiskConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            allow_max: 50,
+            require_approval_max: 70,
+            weights: std::collections::HashMap::new(),
+            disabled: std::collections::HashSet::new(),
+        }
+    }
+}
+
+impl RiskConfig {
+    /// Get the effective weight for a factor
+    #[must_use]
+    pub fn get_weight(&self, factor_id: &str, base_weight: u8) -> u8 {
+        if self.disabled.contains(factor_id) {
+            return 0;
+        }
+        self.weights
+            .get(factor_id)
+            .copied()
+            .unwrap_or(base_weight)
+            .min(100)
+    }
+
+    /// Check if a factor is disabled
+    #[must_use]
+    pub fn is_disabled(&self, factor_id: &str) -> bool {
+        self.disabled.contains(factor_id)
+    }
 }
 
 /// Allow-once approval payload for RequireApproval decisions
@@ -827,6 +1037,7 @@ impl DecisionContext {
             determining_rule: None,
             evidence: Vec::new(),
             rate_limit: None,
+            risk: None,
         };
 
         ctx.add_evidence(
@@ -1839,6 +2050,8 @@ pub struct PolicyEngine {
     command_gate: CommandGateConfig,
     /// Custom policy rules configuration
     policy_rules: PolicyRulesConfig,
+    /// Risk scoring configuration
+    risk_config: RiskConfig,
 }
 
 impl PolicyEngine {
@@ -1854,6 +2067,7 @@ impl PolicyEngine {
             require_prompt_active,
             command_gate: CommandGateConfig::default(),
             policy_rules: PolicyRulesConfig::default(),
+            risk_config: RiskConfig::default(),
         }
     }
 
@@ -1881,6 +2095,278 @@ impl PolicyEngine {
     pub fn with_policy_rules(mut self, rules: PolicyRulesConfig) -> Self {
         self.policy_rules = rules;
         self
+    }
+
+    /// Set risk scoring configuration
+    #[must_use]
+    pub fn with_risk_config(mut self, config: RiskConfig) -> Self {
+        self.risk_config = config;
+        self
+    }
+
+    /// Get the current risk configuration
+    #[must_use]
+    pub fn risk_config(&self) -> &RiskConfig {
+        &self.risk_config
+    }
+
+    /// Calculate risk score for the given input
+    ///
+    /// This evaluates all applicable risk factors and returns a composite score.
+    #[must_use]
+    pub fn calculate_risk(&self, input: &PolicyInput) -> RiskScore {
+        if !self.risk_config.enabled {
+            return RiskScore::zero();
+        }
+
+        let mut factors = Vec::new();
+
+        // State factors
+        let caps = &input.capabilities;
+        {
+            // Alt-screen detection
+            match caps.alt_screen {
+                Some(true) => {
+                    self.add_factor(
+                        &mut factors,
+                        "state.alt_screen",
+                        RiskCategory::State,
+                        60,
+                        "Pane is in alternate screen mode (vim, less, etc.)",
+                    );
+                }
+                None => {
+                    self.add_factor(
+                        &mut factors,
+                        "state.alt_screen_unknown",
+                        RiskCategory::State,
+                        40,
+                        "Cannot determine if pane is in alternate screen mode",
+                    );
+                }
+                Some(false) => {}
+            }
+
+            // Command running
+            if caps.command_running {
+                self.add_factor(
+                    &mut factors,
+                    "state.command_running",
+                    RiskCategory::State,
+                    25,
+                    "A command is currently executing",
+                );
+            }
+
+            // No prompt
+            if !caps.prompt_active && input.action.is_mutating() {
+                self.add_factor(
+                    &mut factors,
+                    "state.no_prompt",
+                    RiskCategory::State,
+                    20,
+                    "No active prompt detected",
+                );
+            }
+
+            // Recent gap
+            if caps.has_recent_gap {
+                self.add_factor(
+                    &mut factors,
+                    "state.recent_gap",
+                    RiskCategory::State,
+                    35,
+                    "Recent capture gap (state uncertainty)",
+                );
+            }
+
+            // Pane reserved
+            if caps.is_reserved {
+                self.add_factor(
+                    &mut factors,
+                    "state.is_reserved",
+                    RiskCategory::State,
+                    50,
+                    "Pane is reserved by another workflow",
+                );
+            }
+        }
+
+        // Action factors
+        if input.action.is_mutating() {
+            self.add_factor(
+                &mut factors,
+                "action.is_mutating",
+                RiskCategory::Action,
+                10,
+                "Action modifies pane state",
+            );
+        }
+
+        if input.action.is_destructive() {
+            self.add_factor(
+                &mut factors,
+                "action.is_destructive",
+                RiskCategory::Action,
+                25,
+                "Action could be destructive (close, Ctrl-C/D)",
+            );
+        }
+
+        if matches!(input.action, ActionKind::BrowserAuth) {
+            self.add_factor(
+                &mut factors,
+                "action.browser_auth",
+                RiskCategory::Action,
+                30,
+                "Browser-based authentication flow",
+            );
+        }
+
+        if matches!(input.action, ActionKind::Spawn | ActionKind::Split) {
+            self.add_factor(
+                &mut factors,
+                "action.spawn_split",
+                RiskCategory::Action,
+                20,
+                "Creating new pane (resource allocation)",
+            );
+        }
+
+        // Context factors
+        if !input.actor.is_trusted() {
+            self.add_factor(
+                &mut factors,
+                "context.actor_untrusted",
+                RiskCategory::Context,
+                15,
+                "Actor is not human (robot/mcp/workflow)",
+            );
+        }
+
+        // Content factors (for SendText)
+        if input.action == ActionKind::SendText {
+            if let Some(text) = &input.command_text {
+                self.analyze_content_risk(text, &mut factors);
+            }
+        }
+
+        RiskScore::from_factors(factors)
+    }
+
+    /// Helper to add a risk factor if not disabled
+    fn add_factor(
+        &self,
+        factors: &mut Vec<AppliedRiskFactor>,
+        id: &str,
+        _category: RiskCategory,
+        base_weight: u8,
+        explanation: &str,
+    ) {
+        let weight = self.risk_config.get_weight(id, base_weight);
+        if weight > 0 {
+            factors.push(AppliedRiskFactor {
+                id: id.to_string(),
+                weight,
+                explanation: explanation.to_string(),
+            });
+        }
+    }
+
+    /// Analyze command text for content-based risk factors
+    fn analyze_content_risk(&self, text: &str, factors: &mut Vec<AppliedRiskFactor>) {
+        let text_lower = text.to_lowercase();
+
+        // Destructive tokens
+        const DESTRUCTIVE_PATTERNS: &[&str] = &[
+            "rm -rf",
+            "rm -fr",
+            "rmdir",
+            "drop table",
+            "drop database",
+            "truncate",
+            "delete from",
+            "git reset --hard",
+            "git clean -f",
+            "format c:",
+            "mkfs",
+            "> /dev/",
+            "dd if=",
+        ];
+
+        if DESTRUCTIVE_PATTERNS
+            .iter()
+            .any(|p| text_lower.contains(p))
+        {
+            self.add_factor(
+                factors,
+                "content.destructive_tokens",
+                RiskCategory::Content,
+                40,
+                "Command contains destructive patterns (rm -rf, DROP, etc.)",
+            );
+        }
+
+        // Sudo/elevation
+        if text_lower.starts_with("sudo ")
+            || text_lower.contains(" sudo ")
+            || text_lower.starts_with("doas ")
+            || text_lower.starts_with("run0 ")
+        {
+            self.add_factor(
+                factors,
+                "content.sudo_elevation",
+                RiskCategory::Content,
+                30,
+                "Command uses privilege elevation (sudo/doas)",
+            );
+        }
+
+        // Multi-line/complex
+        if text.contains('\n') && text.lines().count() > 2 {
+            self.add_factor(
+                factors,
+                "content.multiline_complex",
+                RiskCategory::Content,
+                15,
+                "Multi-line command (heredoc, compound)",
+            );
+        }
+
+        // Pipe chain
+        if text.contains(" | ") && text.matches(" | ").count() >= 2 {
+            self.add_factor(
+                factors,
+                "content.pipe_chain",
+                RiskCategory::Content,
+                10,
+                "Complex piped command chain",
+            );
+        }
+    }
+
+    /// Map a risk score to a policy decision
+    #[must_use]
+    pub fn risk_to_decision(&self, risk: &RiskScore, input: &PolicyInput) -> PolicyDecision {
+        if risk.score <= self.risk_config.allow_max {
+            PolicyDecision::allow_with_rule("risk.score_allow")
+        } else if risk.score <= self.risk_config.require_approval_max {
+            PolicyDecision::require_approval_with_rule(
+                format!(
+                    "Action has elevated risk score of {} (threshold: {}). {}",
+                    risk.score, self.risk_config.allow_max, risk.summary
+                ),
+                "risk.score_approval",
+            )
+        } else {
+            PolicyDecision::deny_with_rule(
+                format!(
+                    "Action has high risk score of {} (threshold: {}). {}",
+                    risk.score, self.risk_config.require_approval_max, risk.summary
+                ),
+                "risk.score_deny",
+            )
+        }
     }
 
     /// Authorize an action
