@@ -777,9 +777,10 @@ fn insert_wa_block(content: &str, wa_block: &str) -> String {
 
 /// Create the full wa-managed block with markers
 ///
-/// Includes both user-var forwarding and status update snippets.
+/// Includes user-var forwarding for SSH domain support.
+/// Note: Status update Lua was removed in v0.2.0 to eliminate performance bottleneck.
 fn create_wa_block() -> String {
-    format!("{WA_BEGIN_MARKER}\n{USERVAR_FORWARDING_LUA}\n\n{STATUS_UPDATE_LUA}\n{WA_END_MARKER}")
+    format!("{WA_BEGIN_MARKER}\n{USERVAR_FORWARDING_LUA}\n{WA_END_MARKER}")
 }
 
 /// Create a backup of the config file
@@ -1168,7 +1169,7 @@ return config
         assert!(block.contains("port = 2222"));
         assert!(block.contains("multiplexing = 'WezTerm'"));
         assert!(block.contains(USERVAR_FORWARDING_LUA));
-        assert!(block.contains(STATUS_UPDATE_LUA));
+        // Note: STATUS_UPDATE_LUA was removed in v0.2.0 (alt-screen now via escape sequences)
         assert!(block.contains(WA_END_MARKER));
     }
 
@@ -1348,13 +1349,9 @@ after";
         // User-var forwarding snippet
         assert!(block.contains("user-var-changed"));
         assert!(block.contains("wa%-"));
-        // Status update snippet
-        assert!(block.contains("update-status"));
-        assert!(block.contains("wa_last_status_update"));
-        assert!(block.contains("WA_STATUS_UPDATE_INTERVAL_MS"));
-        assert!(block.contains("--from-status"));
-        // JSON escaping helper
-        assert!(block.contains("json_escape"));
+        // Status update snippet should be removed
+        assert!(!block.contains("update-status"));
+        assert!(!block.contains("--from-status"));
     }
 
     // =========================================================================
