@@ -222,7 +222,6 @@ enum Commands {
 
         // NOTE: --from-status was removed in v0.2.0 (Lua performance optimization)
         // Alt-screen detection is now handled via escape sequence parsing (see screen_state.rs).
-
         /// Pane ID that emitted the event
         #[arg(long)]
         pane: u64,
