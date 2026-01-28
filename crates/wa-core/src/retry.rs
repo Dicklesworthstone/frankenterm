@@ -127,14 +127,15 @@ impl RetryPolicy {
 
     /// Calculate the delay for a given attempt number (0-indexed).
     #[must_use]
-    #[allow(clippy::cast_precision_loss)] // u64 ms values are well within f64 precision
+    #[allow(clippy::cast_precision_loss)] // ms values are well within f64 precision for delays
+    #[allow(clippy::cast_possible_wrap)] // attempt is capped at 31, safe for i32
     pub fn delay_for_attempt(&self, attempt: u32) -> Duration {
-        // Use u64 instead of u128 - millisecond delays won't exceed u64 range
-        let initial_ms = self.initial_delay.as_millis().min(u64::MAX as u128) as u64;
-        let max_ms = self.max_delay.as_millis().min(u64::MAX as u128) as u64;
+        // Clamp to sane values - delays beyond u64::MAX ms are not practical
+        let initial_ms = u64::try_from(self.initial_delay.as_millis()).unwrap_or(u64::MAX);
+        let max_ms = u64::try_from(self.max_delay.as_millis()).unwrap_or(u64::MAX);
 
-        // Safe conversion: attempt is u32, which fits in i32's positive range for reasonable values
-        let exp = attempt.min(31) as i32; // Cap exponent to prevent overflow
+        // Cap exponent to prevent overflow in powi; 31 iterations of 2x is already huge
+        let exp = attempt.min(31) as i32;
         let base_ms = (initial_ms as f64) * self.backoff_factor.powi(exp);
         let base_ms = base_ms.min(max_ms as f64);
 
@@ -421,6 +422,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_precision_loss)] // Test values are small enough for f64
     fn jitter_within_range() {
         let policy = RetryPolicy {
             initial_delay: Duration::from_secs(1),
