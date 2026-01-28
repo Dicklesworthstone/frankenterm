@@ -5498,6 +5498,7 @@ mod tests {
             confidence: 1.0,
             extracted: serde_json::Value::Null,
             matched_text: "test".to_string(),
+            span: (0, 0),
         }
     }
 
