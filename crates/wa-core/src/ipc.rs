@@ -1007,7 +1007,8 @@ mod tests {
             Some(true)
         );
         assert_eq!(
-            data.get("cursor_alt_screen").and_then(|v| v.as_bool()),
+            data.get("cursor_alt_screen")
+                .and_then(serde_json::Value::as_bool),
             Some(true)
         );
         assert_eq!(

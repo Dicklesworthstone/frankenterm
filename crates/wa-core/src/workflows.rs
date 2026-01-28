@@ -9026,7 +9026,7 @@ Try again at 3:00 PM UTC.
         };
 
         let result = AccountSelectionStepResult {
-            selected: Some(account.clone()),
+            selected: Some(account),
             explanation,
             accounts_refreshed: 1,
         };

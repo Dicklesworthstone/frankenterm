@@ -5224,9 +5224,11 @@ mod tests {
         let engine = PolicyEngine::permissive();
 
         // Multiple risk factors: untrusted actor + mutating action + command running
-        let mut caps = PaneCapabilities::default();
-        caps.command_running = true;
-        caps.alt_screen = Some(false);
+        let caps = PaneCapabilities {
+            command_running: true,
+            alt_screen: Some(false),
+            ..Default::default()
+        };
 
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
@@ -5331,10 +5333,12 @@ mod tests {
         // Create a scenario with many risk factors that would exceed 100
         let engine = PolicyEngine::permissive();
 
-        let mut caps = PaneCapabilities::default();
-        caps.alt_screen = Some(true); // 60
-        caps.has_recent_gap = true; // 35
-        caps.is_reserved = true; // 50
+        let caps = PaneCapabilities {
+            alt_screen: Some(true), // 60
+            has_recent_gap: true,   // 35
+            is_reserved: true,      // 50
+            ..Default::default()
+        };
 
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot) // +10 mutating +15 untrusted
             .with_pane(1)
@@ -5351,9 +5355,11 @@ mod tests {
         let mut engine = PolicyEngine::permissive();
 
         // Create input with some risk factors
-        let mut caps = PaneCapabilities::default();
-        caps.prompt_active = true;
-        caps.command_running = true; // Adds risk: command_running (25)
+        let caps = PaneCapabilities {
+            prompt_active: true,
+            command_running: true, // Adds risk: command_running (25)
+            ..Default::default()
+        };
 
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot) // +10 mutating +15 untrusted
             .with_pane(1)
@@ -5380,9 +5386,11 @@ mod tests {
     fn authorize_risk_included_in_serialized_output() {
         let mut engine = PolicyEngine::permissive();
 
-        let mut caps = PaneCapabilities::default();
-        caps.prompt_active = true;
-        caps.command_running = true;
+        let caps = PaneCapabilities {
+            prompt_active: true,
+            command_running: true,
+            ..Default::default()
+        };
 
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
@@ -5419,8 +5427,10 @@ mod tests {
         // ReadOutput action doesn't add action-specific risk factors
         let engine = PolicyEngine::permissive();
 
-        let mut caps = PaneCapabilities::default();
-        caps.prompt_active = true; // Safe state
+        let caps = PaneCapabilities {
+            prompt_active: true, // Safe state
+            ..Default::default()
+        };
 
         let input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot)
             .with_pane(1)
@@ -5443,8 +5453,10 @@ mod tests {
         // Human actors don't get the "untrusted actor" penalty
         let engine = PolicyEngine::permissive();
 
-        let mut caps = PaneCapabilities::default();
-        caps.prompt_active = true;
+        let caps = PaneCapabilities {
+            prompt_active: true,
+            ..Default::default()
+        };
 
         let robot_input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
@@ -5484,10 +5496,12 @@ mod tests {
         let engine = PolicyEngine::permissive();
 
         // Combine: alt_screen (60) + command_running (25) + has_recent_gap (35)
-        let mut caps = PaneCapabilities::default();
-        caps.alt_screen = Some(true);
-        caps.command_running = true;
-        caps.has_recent_gap = true;
+        let caps = PaneCapabilities {
+            alt_screen: Some(true),
+            command_running: true,
+            has_recent_gap: true,
+            ..Default::default()
+        };
 
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
@@ -5508,8 +5522,10 @@ mod tests {
         // Test content analysis factors
         let engine = PolicyEngine::permissive();
 
-        let mut caps = PaneCapabilities::default();
-        caps.prompt_active = true;
+        let caps = PaneCapabilities {
+            prompt_active: true,
+            ..Default::default()
+        };
 
         // Test various dangerous commands
         let test_cases = vec![
@@ -5541,10 +5557,12 @@ mod tests {
         // Test reserved pane scenarios
         let engine = PolicyEngine::permissive();
 
-        let mut caps = PaneCapabilities::default();
-        caps.prompt_active = true;
-        caps.is_reserved = true;
-        caps.reserved_by = Some("other-workflow".to_string());
+        let caps = PaneCapabilities {
+            prompt_active: true,
+            is_reserved: true,
+            reserved_by: Some("other-workflow".to_string()),
+            ..Default::default()
+        };
 
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
@@ -5566,9 +5584,11 @@ mod tests {
         // Factors should be in deterministic order across multiple calls
         let engine = PolicyEngine::permissive();
 
-        let mut caps = PaneCapabilities::default();
-        caps.alt_screen = Some(true);
-        caps.command_running = true;
+        let caps = PaneCapabilities {
+            alt_screen: Some(true),
+            command_running: true,
+            ..Default::default()
+        };
 
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
@@ -5594,8 +5614,10 @@ mod tests {
         // Each factor should have the same weight across calls
         let engine = PolicyEngine::permissive();
 
-        let mut caps = PaneCapabilities::default();
-        caps.alt_screen = Some(true);
+        let caps = PaneCapabilities {
+            alt_screen: Some(true),
+            ..Default::default()
+        };
 
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
@@ -5622,8 +5644,10 @@ mod tests {
     fn risk_score_json_schema_has_required_fields() {
         let engine = PolicyEngine::permissive();
 
-        let mut caps = PaneCapabilities::default();
-        caps.command_running = true;
+        let caps = PaneCapabilities {
+            command_running: true,
+            ..Default::default()
+        };
 
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
@@ -5674,8 +5698,10 @@ mod tests {
     fn risk_factor_json_schema_has_required_fields() {
         let engine = PolicyEngine::permissive();
 
-        let mut caps = PaneCapabilities::default();
-        caps.alt_screen = Some(true);
+        let caps = PaneCapabilities {
+            alt_screen: Some(true),
+            ..Default::default()
+        };
 
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
@@ -5720,9 +5746,11 @@ mod tests {
     fn decision_context_risk_json_is_valid() {
         let mut engine = PolicyEngine::permissive();
 
-        let mut caps = PaneCapabilities::default();
-        caps.prompt_active = true;
-        caps.command_running = true;
+        let caps = PaneCapabilities {
+            prompt_active: true,
+            command_running: true,
+            ..Default::default()
+        };
 
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)

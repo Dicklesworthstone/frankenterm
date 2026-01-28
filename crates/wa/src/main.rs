@@ -4,6 +4,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
@@ -1372,10 +1373,46 @@ struct RobotLintIssue {
 
 /// Fixture coverage statistics
 #[derive(Debug, serde::Serialize)]
+#[allow(clippy::struct_field_names)]
 struct RobotFixtureCoverage {
     rules_with_fixtures: usize,
     rules_without_fixtures: Vec<String>,
     total_fixtures: usize,
+}
+
+const RULE_ID_PREFIXES: &[&str] = &["codex.", "claude_code.", "gemini.", "wezterm."];
+
+fn collect_fixture_rule_ids(
+    dir: &Path,
+    rules_with_fixtures: &mut HashSet<String>,
+    total_fixtures: &mut usize,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_fixture_rule_ids(&path, rules_with_fixtures, total_fixtures);
+        } else if path.extension().is_some_and(|ext| ext == "json")
+            && path.to_string_lossy().contains(".expect.")
+        {
+            *total_fixtures += 1;
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if let Some(arr) = val.as_array() {
+                        for item in arr {
+                            if let Some(rule_id) =
+                                item.get("rule_id").and_then(serde_json::Value::as_str)
+                            {
+                                rules_with_fixtures.insert(rule_id.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1572,8 +1609,7 @@ async fn evaluate_robot_approve(
 
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_millis() as i64);
 
     if token.used_at.is_some() {
         return Err(RobotApproveError::new(
@@ -1814,11 +1850,7 @@ async fn resolve_pane_capabilities(
                     ));
                 }
                 if !state.known {
-                    let reason = state
-                        .reason
-                        .as_ref()
-                        .map(String::as_str)
-                        .unwrap_or("unknown");
+                    let reason = state.reason.as_deref().unwrap_or("unknown");
                     warnings.push(format!("Watcher has no state for this pane ({reason})."));
                 } else if state.observed == Some(false) {
                     warnings.push(
@@ -2041,7 +2073,7 @@ fn resolve_workflow(name: &str) -> Option<std::sync::Arc<dyn wa_core::workflows:
             wa_core::workflows::HandleCompaction::default(),
         )),
         "handle_usage_limits" => Some(std::sync::Arc::new(
-            wa_core::workflows::HandleUsageLimits::default(),
+            wa_core::workflows::HandleUsageLimits::new(),
         )),
         _ => None,
     }
@@ -2575,8 +2607,7 @@ fn elapsed_ms(start: std::time::Instant) -> u64 {
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|dur| u64::try_from(dur.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0)
+        .map_or(0, |dur| u64::try_from(dur.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// Apply tail truncation to text, returning the truncated text and truncation info
@@ -2731,9 +2762,7 @@ fn glob_match(pattern: &str, value: &str) -> bool {
     }
     regex_pattern.push('$');
 
-    fancy_regex::Regex::new(&regex_pattern)
-        .map(|re| re.is_match(value).unwrap_or(false))
-        .unwrap_or(false)
+    fancy_regex::Regex::new(&regex_pattern).is_ok_and(|re| re.is_match(value).unwrap_or(false))
 }
 
 fn is_structured_uservar_name(name: &str) -> bool {
@@ -2899,8 +2928,7 @@ async fn run_watcher(
 
         // Register built-in workflows
         workflow_runner.register_workflow(Arc::new(HandleCompaction::default()));
-        workflow_runner
-            .register_workflow(Arc::new(wa_core::workflows::HandleUsageLimits::default()));
+        workflow_runner.register_workflow(Arc::new(wa_core::workflows::HandleUsageLimits::new()));
         tracing::info!("Registered workflows: handle_compaction, handle_usage_limits");
 
         // Spawn workflow runner event loop
@@ -3028,7 +3056,7 @@ async fn run_watcher(
 #[tokio::main]
 async fn main() {
     let robot_mode = sniff_robot_mode_from_args();
-    if let Err(err) = run(robot_mode).await {
+    if let Err(err) = Box::pin(run(robot_mode)).await {
         handle_fatal_error(&err, robot_mode);
         std::process::exit(1);
     }
@@ -4701,7 +4729,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             extracted: if d.extracted.is_null()
                                                 || d.extracted
                                                     .as_object()
-                                                    .is_some_and(|o| o.is_empty())
+                                                    .is_some_and(serde_json::Map::is_empty)
                                             {
                                                 None
                                             } else {
@@ -4768,10 +4796,6 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 } => {
                                     let _ = pack; // Pack filtering not yet implemented
 
-                                    // Valid rule ID prefixes (agent_type prefix)
-                                    const ALLOWED_PREFIXES: &[&str] =
-                                        &["codex.", "claude_code.", "gemini.", "wezterm."];
-
                                     let rules = engine.rules();
                                     let mut errors: Vec<RobotLintIssue> = Vec::new();
                                     let mut warnings: Vec<RobotLintIssue> = Vec::new();
@@ -4779,14 +4803,14 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     // 1. Validate rule ID naming conventions
                                     for rule in rules {
                                         let has_valid_prefix =
-                                            ALLOWED_PREFIXES.iter().any(|p| rule.id.starts_with(p));
+                                            RULE_ID_PREFIXES.iter().any(|p| rule.id.starts_with(p));
                                         if !has_valid_prefix {
                                             errors.push(RobotLintIssue {
                                                 rule_id: rule.id.clone(),
                                                 category: "naming".to_string(),
                                                 message: format!(
                                                     "Rule ID must start with one of: {}",
-                                                    ALLOWED_PREFIXES.join(", ")
+                                                    RULE_ID_PREFIXES.join(", ")
                                                 ),
                                                 suggestion: Some(format!(
                                                     "Rename to '{}.{}'",
@@ -4855,9 +4879,6 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                                     // 3. Check fixture coverage if requested
                                     let fixture_coverage = if fixtures {
-                                        use std::collections::HashSet;
-                                        use std::fs;
-
                                         let corpus_base =
                                             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                                                 .parent()
@@ -4870,54 +4891,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             HashSet::new();
                                         let mut total_fixtures = 0;
 
-                                        // Collect all expect.json files and extract rule IDs
-                                        fn collect_fixtures(
-                                            dir: &std::path::Path,
-                                            rules_with_fixtures: &mut HashSet<String>,
-                                            total_fixtures: &mut usize,
-                                        ) {
-                                            let Ok(entries) = fs::read_dir(dir) else {
-                                                return;
-                                            };
-                                            for entry in entries.flatten() {
-                                                let path = entry.path();
-                                                if path.is_dir() {
-                                                    collect_fixtures(
-                                                        &path,
-                                                        rules_with_fixtures,
-                                                        total_fixtures,
-                                                    );
-                                                } else if path
-                                                    .extension()
-                                                    .is_some_and(|ext| ext == "json")
-                                                    && path.to_string_lossy().contains(".expect.")
-                                                {
-                                                    *total_fixtures += 1;
-                                                    if let Ok(content) = fs::read_to_string(&path) {
-                                                        if let Ok(val) = serde_json::from_str::<
-                                                            serde_json::Value,
-                                                        >(
-                                                            &content
-                                                        ) {
-                                                            if let Some(arr) = val.as_array() {
-                                                                for item in arr {
-                                                                    if let Some(rule_id) = item
-                                                                        .get("rule_id")
-                                                                        .and_then(|v| v.as_str())
-                                                                    {
-                                                                        rules_with_fixtures.insert(
-                                                                            rule_id.to_string(),
-                                                                        );
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-
-                                        collect_fixtures(
+                                        collect_fixture_rule_ids(
                                             &corpus_base,
                                             &mut rules_with_fixtures,
                                             &mut total_fixtures,
@@ -6203,18 +6177,16 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 println!("wa setup patch - WezTerm User-Var Forwarding\n");
 
                 let result = if remove {
-                    match config_path {
-                        Some(path) => setup::unpatch_wezterm_config_at(&path),
-                        None => {
-                            let path = setup::locate_wezterm_config()?;
-                            setup::unpatch_wezterm_config_at(&path)
-                        }
+                    if let Some(path) = config_path {
+                        setup::unpatch_wezterm_config_at(&path)
+                    } else {
+                        let path = setup::locate_wezterm_config()?;
+                        setup::unpatch_wezterm_config_at(&path)
                     }
+                } else if let Some(path) = config_path {
+                    setup::patch_wezterm_config_at(&path)
                 } else {
-                    match config_path {
-                        Some(path) => setup::patch_wezterm_config_at(&path),
-                        None => setup::patch_wezterm_config(),
-                    }
+                    setup::patch_wezterm_config()
                 };
 
                 match result {
@@ -6254,16 +6226,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     }
                     None => {
                         // Auto-detect from $SHELL
-                        match ShellType::detect() {
-                            Some(st) => {
-                                println!("Detected shell: {}\n", st.name());
-                                st
-                            }
-                            None => {
-                                eprintln!("Error: Could not detect shell from $SHELL");
-                                eprintln!("Please specify --shell bash|zsh|fish");
-                                std::process::exit(1);
-                            }
+                        if let Some(st) = ShellType::detect() {
+                            println!("Detected shell: {}\n", st.name());
+                            st
+                        } else {
+                            eprintln!("Error: Could not detect shell from $SHELL");
+                            eprintln!("Please specify --shell bash|zsh|fish");
+                            std::process::exit(1);
                         }
                     }
                 };
@@ -6274,18 +6243,16 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 );
 
                 let result = if remove {
-                    match rc_path {
-                        Some(path) => setup::unpatch_shell_rc_at(&path),
-                        None => {
-                            let path = setup::locate_shell_rc(shell_type)?;
-                            setup::unpatch_shell_rc_at(&path)
-                        }
+                    if let Some(path) = rc_path {
+                        setup::unpatch_shell_rc_at(&path)
+                    } else {
+                        let path = setup::locate_shell_rc(shell_type)?;
+                        setup::unpatch_shell_rc_at(&path)
                     }
+                } else if let Some(path) = rc_path {
+                    setup::patch_shell_rc_at(&path, shell_type)
                 } else {
-                    match rc_path {
-                        Some(path) => setup::patch_shell_rc_at(&path, shell_type),
-                        None => setup::patch_shell_rc(shell_type),
-                    }
+                    setup::patch_shell_rc(shell_type)
                 };
 
                 match result {
@@ -7065,35 +7032,39 @@ fn run_diagnostics(
                 match conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0)) {
                     Ok(version) => {
                         let target = wa_core::storage::SCHEMA_VERSION;
-                        if version == target {
-                            // Check WAL mode
-                            let wal_mode: String = conn
-                                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
-                                .unwrap_or_else(|_| "unknown".to_string());
-                            checks.push(DiagnosticCheck::ok_with_detail(
-                                "database",
-                                format!(
-                                    "schema v{}, journal={} ({})",
-                                    version,
-                                    wal_mode,
-                                    layout.db_path.display()
-                                ),
-                            ));
-                        } else if version < target {
-                            checks.push(DiagnosticCheck::warning(
-                                "database",
-                                format!("schema v{} (needs migration to v{})", version, target),
-                                "Run 'wa daemon start' to auto-migrate",
-                            ));
-                        } else {
-                            checks.push(DiagnosticCheck::error(
-                                "database",
-                                format!(
-                                    "schema v{} is newer than wa supports (v{})",
-                                    version, target
-                                ),
-                                "Update wa to a newer version",
-                            ));
+                        match version.cmp(&target) {
+                            std::cmp::Ordering::Equal => {
+                                // Check WAL mode
+                                let wal_mode: String = conn
+                                    .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                                    .unwrap_or_else(|_| "unknown".to_string());
+                                checks.push(DiagnosticCheck::ok_with_detail(
+                                    "database",
+                                    format!(
+                                        "schema v{}, journal={} ({})",
+                                        version,
+                                        wal_mode,
+                                        layout.db_path.display()
+                                    ),
+                                ));
+                            }
+                            std::cmp::Ordering::Less => {
+                                checks.push(DiagnosticCheck::warning(
+                                    "database",
+                                    format!("schema v{} (needs migration to v{})", version, target),
+                                    "Run 'wa daemon start' to auto-migrate",
+                                ));
+                            }
+                            std::cmp::Ordering::Greater => {
+                                checks.push(DiagnosticCheck::error(
+                                    "database",
+                                    format!(
+                                        "schema v{} is newer than wa supports (v{})",
+                                        version, target
+                                    ),
+                                    "Update wa to a newer version",
+                                ));
+                            }
                         }
                     }
                     Err(e) => {
@@ -7131,8 +7102,7 @@ fn run_diagnostics(
                 let is_running = std::process::Command::new("kill")
                     .args(["-0", pid])
                     .output()
-                    .map(|o| o.status.success())
-                    .unwrap_or(false);
+                    .is_ok_and(|o| o.status.success());
 
                 if is_running {
                     checks.push(DiagnosticCheck::ok_with_detail(
@@ -7375,8 +7345,7 @@ mod tests {
     fn now_ms() -> i64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0)
+            .map_or(0, |d| d.as_millis() as i64)
     }
 
     async fn setup_storage(label: &str) -> (StorageHandle, String) {

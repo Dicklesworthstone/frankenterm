@@ -298,7 +298,7 @@ mod tests {
         let args = CautClient::build_args("usage", CautService::OpenAI);
         assert_eq!(
             args,
-            vec!["usage", "--service", "openai", "--format", "json"]
+            ["usage", "--service", "openai", "--format", "json"]
                 .iter()
                 .map(std::string::ToString::to_string)
                 .collect::<Vec<_>>()

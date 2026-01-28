@@ -1879,7 +1879,7 @@ mod tests {
         assert_eq!(
             StepAction::SendText {
                 pane_id: 0,
-                text: "".into(),
+                text: String::new(),
                 paste_mode: None
             }
             .action_type_name(),
@@ -1888,7 +1888,7 @@ mod tests {
         assert_eq!(
             StepAction::WaitFor {
                 pane_id: None,
-                condition: WaitCondition::External { key: "".into() },
+                condition: WaitCondition::External { key: String::new() },
                 timeout_ms: 0
             }
             .action_type_name(),
@@ -1896,7 +1896,7 @@ mod tests {
         );
         assert_eq!(
             StepAction::AcquireLock {
-                lock_name: "".into(),
+                lock_name: String::new(),
                 timeout_ms: None
             }
             .action_type_name(),
@@ -1904,14 +1904,14 @@ mod tests {
         );
         assert_eq!(
             StepAction::ReleaseLock {
-                lock_name: "".into()
+                lock_name: String::new()
             }
             .action_type_name(),
             "release_lock"
         );
         assert_eq!(
             StepAction::StoreData {
-                key: "".into(),
+                key: String::new(),
                 value: serde_json::Value::Null
             }
             .action_type_name(),
@@ -1919,7 +1919,7 @@ mod tests {
         );
         assert_eq!(
             StepAction::RunWorkflow {
-                workflow_id: "".into(),
+                workflow_id: String::new(),
                 params: None
             }
             .action_type_name(),
@@ -1931,14 +1931,14 @@ mod tests {
         );
         assert_eq!(
             StepAction::ValidateApproval {
-                approval_code: "".into()
+                approval_code: String::new()
             }
             .action_type_name(),
             "validate_approval"
         );
         assert_eq!(
             StepAction::Custom {
-                action_type: "".into(),
+                action_type: String::new(),
                 payload: serde_json::Value::Null
             }
             .action_type_name(),
@@ -1966,6 +1966,6 @@ mod tests {
             max_supported: 1,
         };
         assert!(err4.to_string().contains("99"));
-        assert!(err4.to_string().contains("1"));
+        assert!(err4.to_string().contains('1'));
     }
 }
