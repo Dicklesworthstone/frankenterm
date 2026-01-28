@@ -72,14 +72,24 @@ wezterm.on('update-status', function(window, pane)
   local title = pane:get_title()
   local is_alt = pane:is_alt_screen_active()
 
+  -- JSON-escape a string (handles \, ", and control chars)
+  local function json_escape(s)
+    if not s then return '' end
+    return s:gsub('\\', '\\\\')
+            :gsub('"', '\\"')
+            :gsub('\n', '\\n')
+            :gsub('\r', '\\r')
+            :gsub('\t', '\\t')
+  end
+
   -- Build JSON payload (inline to avoid dependencies)
   local payload = string.format(
     '{"schema_version":1,"pane_id":%d,"domain":"%s","title":"%s",' ..
     '"cursor":{"row":%d,"col":%d},"dimensions":{"rows":%d,"cols":%d},' ..
     '"is_alt_screen":%s,"ts":%d}',
     pane_id,
-    (domain or ''):gsub('"', '\\"'),
-    (title or ''):gsub('"', '\\"'):sub(1, 256),
+    json_escape(domain),
+    json_escape(title):sub(1, 256),
     cursor.y, cursor.x,
     dims.viewport_rows, dims.viewport_cols,
     is_alt and 'true' or 'false',
@@ -165,7 +175,6 @@ __wa_prompt_start() { printf '\e]133;A\e\\'; }
 __wa_command_start() { printf '\e]133;C\e\\'; }
 __wa_command_end() { printf '\e]133;D;%s\e\\' "$__wa_last_exit"; }
 __wa_preexec() {
-    __wa_last_exit=$?
     __wa_command_start
 }
 __wa_precmd() {
