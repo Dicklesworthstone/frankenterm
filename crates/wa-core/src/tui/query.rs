@@ -266,18 +266,18 @@ impl QueryClient for ProductionQueryClient {
             .map(|r| SearchResultView {
                 pane_id: r.segment.pane_id,
                 timestamp: r.segment.captured_at,
-                snippet: r.snippet.unwrap_or_else(|| r.segment.content),
+                snippet: r.snippet.unwrap_or(r.segment.content),
                 rank: r.score,
             })
             .collect())
     }
 
     fn health(&self) -> Result<HealthStatus, QueryError> {
-        let wezterm_accessible = self.list_panes().map(|p| !p.is_empty()).unwrap_or(false);
+        let wezterm_accessible = self.list_panes().is_ok_and(|p| !p.is_empty());
 
         let db_accessible = self.db_exists();
         let watcher_running = self.is_watcher_running();
-        let pane_count = self.list_panes().map(|p| p.len()).unwrap_or(0);
+        let pane_count = self.list_panes().map_or(0, |p| p.len());
 
         Ok(HealthStatus {
             watcher_running,
