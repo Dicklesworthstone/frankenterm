@@ -5471,29 +5471,29 @@ impl HandleSessionEnd {
             record.session_id = ext
                 .get("session_id")
                 .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
+                .map(ToString::to_string);
 
             // Token fields (Codex session.summary)
             record.total_tokens = ext
                 .get("total")
                 .and_then(|v| v.as_str())
-                .and_then(|s| parse_number(s));
+                .and_then(parse_number);
             record.input_tokens = ext
                 .get("input")
                 .and_then(|v| v.as_str())
-                .and_then(|s| parse_number(s));
+                .and_then(parse_number);
             record.output_tokens = ext
                 .get("output")
                 .and_then(|v| v.as_str())
-                .and_then(|s| parse_number(s));
+                .and_then(parse_number);
             record.cached_tokens = ext
                 .get("cached")
                 .and_then(|v| v.as_str())
-                .and_then(|s| parse_number(s));
+                .and_then(parse_number);
             record.reasoning_tokens = ext
                 .get("reasoning")
                 .and_then(|v| v.as_str())
-                .and_then(|s| parse_number(s));
+                .and_then(parse_number);
 
             // Cost field (Claude Code session.cost_summary)
             record.estimated_cost_usd = ext
@@ -5505,7 +5505,7 @@ impl HandleSessionEnd {
             record.model_name = ext
                 .get("model")
                 .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
+                .map(ToString::to_string);
         }
 
         record
@@ -5691,17 +5691,17 @@ impl AuthRecoveryStrategy {
             let code = extracted
                 .and_then(|e| e.get("code"))
                 .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
+                .map(ToString::to_string);
             let url = extracted
                 .and_then(|e| e.get("url"))
                 .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
+                .map(ToString::to_string);
             AuthRecoveryStrategy::DeviceCode { code, url }
         } else if event_type == "auth.error" || rule_id.contains("api_key") {
             let key_hint = extracted
                 .and_then(|e| e.get("key_name"))
                 .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
+                .map(ToString::to_string);
             AuthRecoveryStrategy::ApiKeyError { key_hint }
         } else {
             AuthRecoveryStrategy::ManualIntervention {
@@ -5882,7 +5882,7 @@ impl Workflow for HandleAuthRequired {
                     let rule_id = trigger
                         .get("rule_id")
                         .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
+                        .map(ToString::to_string);
 
                     // Record the auth event in the audit log
                     let audit = crate::storage::AuditActionRecord {
