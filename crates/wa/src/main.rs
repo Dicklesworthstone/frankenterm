@@ -468,6 +468,7 @@ SEE ALSO:
     /// Run diagnostics
     #[command(after_help = r#"EXAMPLES:
     wa doctor                         Run all environment checks
+    wa doctor --json                  Output as JSON (for automation)
     wa doctor --circuits              Show circuit breaker status
 
 SEE ALSO:
@@ -477,6 +478,9 @@ SEE ALSO:
         /// Show circuit breaker status
         #[arg(long)]
         circuits: bool,
+        /// Output as JSON (for automation)
+        #[arg(long)]
+        json: bool,
     },
 
     /// Export an incident bundle for sharing or analysis
@@ -6996,58 +7000,38 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             }
         }
 
-        Some(Commands::Doctor { circuits }) => {
-            println!("wa doctor - Running diagnostics...\n");
-
+        Some(Commands::Doctor { circuits, json }) => {
             let checks = run_diagnostics(&permission_warnings, &config, &layout);
-
-            for check in &checks {
-                check.print();
-            }
-
-            let mut has_errors = checks.iter().any(|c| c.status == DiagnosticStatus::Error);
-            let mut has_warnings = checks.iter().any(|c| c.status == DiagnosticStatus::Warning);
+            let mut all_checks: Vec<DiagnosticCheck> = checks;
 
             // Runtime health snapshot (only available when daemon is running in-process)
+            let mut runtime_checks: Vec<DiagnosticCheck> = Vec::new();
             if let Some(snapshot) = wa_core::crash::HealthSnapshot::get_global() {
                 use wa_core::output::{HealthDiagnosticStatus, HealthSnapshotRenderer};
 
-                println!();
-                println!("Runtime Health:");
                 let health_checks = HealthSnapshotRenderer::diagnostic_checks(&snapshot);
                 for hc in &health_checks {
                     let diag = match hc.status {
-                        HealthDiagnosticStatus::Ok => {
+                        HealthDiagnosticStatus::Ok | HealthDiagnosticStatus::Info => {
                             DiagnosticCheck::ok_with_detail(hc.name, &hc.detail)
                         }
-                        HealthDiagnosticStatus::Info => {
-                            DiagnosticCheck::ok_with_detail(hc.name, &hc.detail)
-                        }
-                        HealthDiagnosticStatus::Warning => {
-                            has_warnings = true;
-                            DiagnosticCheck::warning(
-                                hc.name,
-                                &hc.detail,
-                                "Check wa status for details",
-                            )
-                        }
-                        HealthDiagnosticStatus::Error => {
-                            has_errors = true;
-                            DiagnosticCheck::error(
-                                hc.name,
-                                &hc.detail,
-                                "Investigate immediately: database may be unresponsive",
-                            )
-                        }
+                        HealthDiagnosticStatus::Warning => DiagnosticCheck::warning(
+                            hc.name,
+                            &hc.detail,
+                            "Check wa status for details",
+                        ),
+                        HealthDiagnosticStatus::Error => DiagnosticCheck::error(
+                            hc.name,
+                            &hc.detail,
+                            "Investigate immediately: database may be unresponsive",
+                        ),
                     };
-                    diag.print();
+                    runtime_checks.push(diag);
                 }
             }
 
             // Recent crash bundles
-            {
-                println!();
-                println!("Crash History:");
+            let crash_check =
                 if let Some(bundle) = wa_core::crash::latest_crash_bundle(&layout.crash_dir) {
                     let detail = if let Some(ref report) = bundle.report {
                         let msg = if report.message.len() > 80 {
@@ -7055,30 +7039,24 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         } else {
                             report.message.clone()
                         };
-                        let loc = report
-                            .location
-                            .as_deref()
-                            .unwrap_or("unknown location");
+                        let loc = report.location.as_deref().unwrap_or("unknown location");
                         format!("{msg} (at {loc})")
                     } else if let Some(ref manifest) = bundle.manifest {
                         format!("crash at {}", manifest.created_at)
                     } else {
                         "crash bundle found".to_string()
                     };
-
-                    has_warnings = true;
-                    let check = DiagnosticCheck::warning(
+                    DiagnosticCheck::warning(
                         "Recent crash",
                         &detail,
                         format!("Inspect bundle: {}", bundle.path.display()),
-                    );
-                    check.print();
+                    )
                 } else {
                     DiagnosticCheck::ok_with_detail("Crash history", "No crash bundles found")
-                        .print();
-                }
-            }
+                };
 
+            // Circuit breaker status
+            let mut circuit_checks: Vec<serde_json::Value> = Vec::new();
             if circuits {
                 use wa_core::circuit_breaker::{
                     CircuitStateKind, circuit_snapshots, ensure_default_circuits,
@@ -7086,59 +7064,152 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                 ensure_default_circuits();
                 let snapshots = circuit_snapshots();
-
-                if !snapshots.is_empty() {
-                    let name_width = snapshots
-                        .iter()
-                        .map(|s| s.name.len())
-                        .max()
-                        .unwrap_or(0)
-                        .max(8);
-
-                    let format_retry = |ms: Option<u64>| -> String {
-                        match ms {
-                            Some(value) if value >= 60_000 => {
-                                let minutes = value / 60_000;
-                                let seconds = (value % 60_000) / 1_000;
-                                format!("{minutes}m{seconds:02}s")
-                            }
-                            Some(value) if value >= 1_000 => {
-                                let seconds = value / 1_000;
-                                let millis = value % 1_000;
-                                format!("{seconds}.{millis:03}s")
-                            }
-                            Some(value) => format!("{value}ms"),
-                            None => "n/a".to_string(),
-                        }
+                for snapshot in &snapshots {
+                    let state_str = match snapshot.status.state {
+                        CircuitStateKind::Closed => "closed",
+                        CircuitStateKind::HalfOpen => "half_open",
+                        CircuitStateKind::Open => "open",
                     };
-
-                    println!("Circuit Breaker Status:");
-                    for snapshot in snapshots {
-                        let status = match snapshot.status.state {
-                            CircuitStateKind::Closed => "CLOSED (healthy)".to_string(),
-                            CircuitStateKind::HalfOpen => "HALF-OPEN (testing)".to_string(),
-                            CircuitStateKind::Open => format!(
-                                "OPEN ({} failures, retry in {})",
-                                snapshot.status.consecutive_failures,
-                                format_retry(snapshot.status.cooldown_remaining_ms)
-                            ),
-                        };
-                        println!("  {:width$}: {status}", snapshot.name, width = name_width);
-                    }
-                    println!();
+                    circuit_checks.push(serde_json::json!({
+                        "name": snapshot.name,
+                        "state": state_str,
+                        "consecutive_failures": snapshot.status.consecutive_failures,
+                        "cooldown_remaining_ms": snapshot.status.cooldown_remaining_ms,
+                    }));
                 }
             }
 
-            println!();
-            if has_errors {
-                println!("Diagnostics completed with errors. Fix issues above before using wa.");
-                std::process::exit(1);
-            } else if has_warnings {
+            // Determine overall status
+            let has_errors = all_checks
+                .iter()
+                .chain(runtime_checks.iter())
+                .chain(std::iter::once(&crash_check))
+                .any(|c| c.status == DiagnosticStatus::Error);
+            let has_warnings = all_checks
+                .iter()
+                .chain(runtime_checks.iter())
+                .chain(std::iter::once(&crash_check))
+                .any(|c| c.status == DiagnosticStatus::Warning);
+
+            if json {
+                // JSON output for automation
+                let overall = if has_errors {
+                    "error"
+                } else if has_warnings {
+                    "warning"
+                } else {
+                    "ok"
+                };
+
+                all_checks.extend(runtime_checks);
+                all_checks.push(crash_check);
+
+                let mut result = serde_json::json!({
+                    "ok": !has_errors,
+                    "status": overall,
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "checks": all_checks.iter().map(|c| c.to_json_value()).collect::<Vec<_>>(),
+                });
+
+                if !circuit_checks.is_empty() {
+                    result["circuits"] = serde_json::json!(circuit_checks);
+                }
+
                 println!(
-                    "Diagnostics completed with warnings. wa should work but performance may be affected."
+                    "{}",
+                    serde_json::to_string_pretty(&result)
+                        .unwrap_or_else(|_| "{}".to_string())
                 );
             } else {
-                println!("All checks passed! wa is ready to use.");
+                // Plain text output
+                println!("wa doctor - Running diagnostics...\n");
+
+                for check in &all_checks {
+                    check.print();
+                }
+
+                if !runtime_checks.is_empty() {
+                    println!();
+                    println!("Runtime Health:");
+                    for check in &runtime_checks {
+                        check.print();
+                    }
+                }
+
+                println!();
+                println!("Crash History:");
+                crash_check.print();
+
+                if circuits {
+                    use wa_core::circuit_breaker::{
+                        CircuitStateKind, circuit_snapshots, ensure_default_circuits,
+                    };
+
+                    ensure_default_circuits();
+                    let snapshots = circuit_snapshots();
+
+                    if !snapshots.is_empty() {
+                        let name_width = snapshots
+                            .iter()
+                            .map(|s| s.name.len())
+                            .max()
+                            .unwrap_or(0)
+                            .max(8);
+
+                        let format_retry = |ms: Option<u64>| -> String {
+                            match ms {
+                                Some(value) if value >= 60_000 => {
+                                    let minutes = value / 60_000;
+                                    let seconds = (value % 60_000) / 1_000;
+                                    format!("{minutes}m{seconds:02}s")
+                                }
+                                Some(value) if value >= 1_000 => {
+                                    let seconds = value / 1_000;
+                                    let millis = value % 1_000;
+                                    format!("{seconds}.{millis:03}s")
+                                }
+                                Some(value) => format!("{value}ms"),
+                                None => "n/a".to_string(),
+                            }
+                        };
+
+                        println!("Circuit Breaker Status:");
+                        for snapshot in snapshots {
+                            let status = match snapshot.status.state {
+                                CircuitStateKind::Closed => "CLOSED (healthy)".to_string(),
+                                CircuitStateKind::HalfOpen => "HALF-OPEN (testing)".to_string(),
+                                CircuitStateKind::Open => format!(
+                                    "OPEN ({} failures, retry in {})",
+                                    snapshot.status.consecutive_failures,
+                                    format_retry(snapshot.status.cooldown_remaining_ms)
+                                ),
+                            };
+                            println!(
+                                "  {:width$}: {status}",
+                                snapshot.name,
+                                width = name_width
+                            );
+                        }
+                        println!();
+                    }
+                }
+
+                println!();
+                if has_errors {
+                    println!(
+                        "Diagnostics completed with errors. Fix issues above before using wa."
+                    );
+                } else if has_warnings {
+                    println!(
+                        "Diagnostics completed with warnings. wa should work but performance may be affected."
+                    );
+                } else {
+                    println!("All checks passed! wa is ready to use.");
+                }
+            }
+
+            if has_errors {
+                std::process::exit(1);
             }
         }
 
@@ -10182,6 +10253,30 @@ impl DiagnosticCheck {
             println!("       → {rec}");
         }
     }
+
+    fn to_json_value(&self) -> serde_json::Value {
+        let mut obj = serde_json::json!({
+            "name": self.name,
+            "status": self.status.as_str(),
+        });
+        if let Some(detail) = &self.detail {
+            obj["detail"] = serde_json::json!(detail);
+        }
+        if let Some(rec) = &self.recommendation {
+            obj["recommendation"] = serde_json::json!(rec);
+        }
+        obj
+    }
+}
+
+impl DiagnosticStatus {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Warning => "warning",
+            Self::Error => "error",
+        }
+    }
 }
 
 /// Run all diagnostic checks and return results
@@ -10709,7 +10804,7 @@ mod tests {
             wa_path: None,
             wa_version: Some("git"),
             timeout_secs: 5,
-            verbose: false,
+            verbose: 0,
         };
 
         run_remote_setup_with_runner("example", &options, &runner).unwrap();
