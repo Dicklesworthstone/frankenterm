@@ -640,6 +640,20 @@ SEE ALSO:
         json: bool,
     },
 
+    /// Browser authentication testing and profile management
+    #[command(subcommand, after_help = r#"EXAMPLES:
+    wa auth test openai --account work      Test OpenAI device auth
+    wa auth test openai --headful           Debug mode (visible browser)
+    wa auth status openai                   Check profile health
+
+SEE ALSO:
+    wa doctor     System diagnostics
+    wa status     Pane overview"#)]
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommands,
+    },
+
     /// Show prioritized issues needing attention
     #[command(after_help = r#"EXAMPLES:
     wa triage                         Prioritized triage overview
@@ -1352,6 +1366,143 @@ enum BackupCommands {
         #[arg(long, short = 'f', default_value = "auto")]
         format: String,
     },
+}
+
+// =============================================================================
+// Auth subcommands
+// =============================================================================
+
+#[derive(Subcommand)]
+enum AuthCommands {
+    /// Test browser authentication flow for a service
+    #[command(after_help = r#"EXAMPLES:
+    wa auth test openai --account work     Test OpenAI auth with 'work' profile
+    wa auth test openai --headful          Debug mode (visible browser)
+    wa auth test openai --timeout-secs 120 Custom timeout
+
+OUTCOMES:
+    Success     Profile authenticated, automated auth works
+    NeedsHuman  Interactive bootstrap required (MFA/password)
+    Fail        Automation error (selector change, network, etc.)"#)]
+    Test {
+        /// Service to test (e.g., "openai")
+        service: String,
+
+        /// Account name for profile selection (default: "default")
+        #[arg(long, default_value = "default")]
+        account: String,
+
+        /// Run browser in visible (non-headless) mode for debugging
+        #[arg(long)]
+        headful: bool,
+
+        /// Flow timeout in seconds (default: 60)
+        #[arg(long, default_value = "60")]
+        timeout_secs: u64,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Check browser profile health and authentication status
+    #[command(after_help = r#"EXAMPLES:
+    wa auth status openai                  Check OpenAI profile
+    wa auth status openai --account work   Check specific account
+    wa auth status --all                   Check all profiles"#)]
+    Status {
+        /// Service to check (omit with --all for all services)
+        service: Option<String>,
+
+        /// Account name (default: "default")
+        #[arg(long, default_value = "default")]
+        account: String,
+
+        /// Check all profiles
+        #[arg(long)]
+        all: bool,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Interactively bootstrap a browser profile (one-time login)
+    #[command(after_help = r#"EXAMPLES:
+    wa auth bootstrap openai               Bootstrap OpenAI profile
+    wa auth bootstrap openai --account work Bootstrap specific account
+
+NOTE: Opens a visible browser window. You must complete login manually."#)]
+    Bootstrap {
+        /// Service to bootstrap (e.g., "openai")
+        service: String,
+
+        /// Account name (default: "default")
+        #[arg(long, default_value = "default")]
+        account: String,
+
+        /// Login URL override
+        #[arg(long)]
+        login_url: Option<String>,
+
+        /// Bootstrap timeout in seconds (default: 300)
+        #[arg(long, default_value = "300")]
+        timeout_secs: u64,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Outcome of a browser auth test, matching the auth realities matrix.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "outcome")]
+enum AuthTestOutcome {
+    /// Profile is authenticated; automated auth flow succeeds.
+    #[serde(rename = "success")]
+    Success {
+        service: String,
+        account: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        elapsed_ms: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        last_bootstrapped: Option<String>,
+    },
+    /// Interactive login required (MFA/password).
+    #[serde(rename = "needs_human")]
+    NeedsHuman {
+        service: String,
+        account: String,
+        reason: String,
+        next_step: String,
+    },
+    /// Auth test failed with an error.
+    #[serde(rename = "fail")]
+    Fail {
+        service: String,
+        account: String,
+        error: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        next_step: Option<String>,
+    },
+}
+
+/// Profile status for `wa auth status`.
+#[derive(Debug, Clone, serde::Serialize)]
+struct AuthProfileStatus {
+    service: String,
+    account: String,
+    profile_exists: bool,
+    has_storage_state: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bootstrapped_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bootstrap_method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_used_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    automated_use_count: Option<u64>,
 }
 
 const ROBOT_ERR_INVALID_ARGS: &str = "robot.invalid_args";
@@ -8505,6 +8656,114 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             }
 
             storage.shutdown().await?;
+        }
+
+        Some(Commands::Export {
+            kind,
+            pane_id,
+            since,
+            until,
+            limit,
+            no_redact,
+            pretty,
+            output,
+        }) => {
+            use wa_core::export::{ExportKind, ExportOptions, export_jsonl};
+            use wa_core::storage::ExportQuery;
+
+            let export_kind = match ExportKind::from_str_loose(&kind) {
+                Some(k) => k,
+                None => {
+                    eprintln!(
+                        "Error: Unknown export kind '{kind}'. Valid kinds: {}",
+                        ExportKind::all_names().join(", ")
+                    );
+                    std::process::exit(1);
+                }
+            };
+
+            // Warn about --no-redact
+            if no_redact {
+                eprintln!(
+                    "WARNING: Redaction is disabled. Exported data may contain secrets \
+                     (API keys, tokens, passwords). Handle output with care."
+                );
+            }
+
+            // Get workspace layout for DB path
+            let layout = match config.workspace_layout(Some(&workspace_root)) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("Error: Failed to get workspace layout: {e}");
+                    eprintln!("Check --workspace or WA_WORKSPACE");
+                    std::process::exit(1);
+                }
+            };
+
+            // Open storage handle
+            let db_path = layout.db_path.to_string_lossy();
+            let storage = match wa_core::storage::StorageHandle::new(&db_path).await {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error: Failed to open storage: {e}");
+                    eprintln!("Is the database initialized? Run 'wa watch' first.");
+                    std::process::exit(1);
+                }
+            };
+
+            let opts = ExportOptions {
+                kind: export_kind,
+                query: ExportQuery {
+                    pane_id,
+                    since,
+                    until,
+                    limit,
+                },
+                redact: !no_redact,
+                pretty,
+            };
+
+            // Determine output target
+            let result = if let Some(ref path) = output {
+                let mut file = match std::fs::File::create(path) {
+                    Ok(f) => std::io::BufWriter::new(f),
+                    Err(e) => {
+                        eprintln!("Error: Failed to create output file '{path}': {e}");
+                        std::process::exit(1);
+                    }
+                };
+                export_jsonl(&storage, &opts, &mut file).await
+            } else {
+                let stdout = std::io::stdout();
+                let mut handle = std::io::BufWriter::new(stdout.lock());
+                export_jsonl(&storage, &opts, &mut handle).await
+            };
+
+            match result {
+                Ok(count) => {
+                    if let Some(ref path) = output {
+                        eprintln!(
+                            "Exported {count} {kind} record(s) to {path}{}",
+                            if !no_redact { " (redacted)" } else { "" }
+                        );
+                    } else {
+                        eprintln!(
+                            "Exported {count} {kind} record(s){}",
+                            if !no_redact { " (redacted)" } else { "" }
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: Export failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+
+            storage.shutdown().await?;
+        }
+
+        Some(Commands::Auth { command }) => {
+            handle_auth_command(command, &layout, cli.verbose > 0).await?;
         }
 
         Some(Commands::Triage {
