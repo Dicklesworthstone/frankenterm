@@ -884,4 +884,240 @@ url = "http://localhost:8080/hook"
         assert!(json.contains("core.codex:usage_reached"));
         assert!(json.contains("\"pane_id\":1"));
     }
+
+    // ========================================================================
+    // Pipeline integration tests (wa-psm.4)
+    //
+    // These test the full notification pipeline:
+    //   Detection → NotificationGate → WebhookDispatcher
+    // ========================================================================
+
+    #[tokio::test]
+    async fn pipeline_gate_filters_before_dispatch() {
+        use crate::events::{EventFilter, NotificationGate, NotifyDecision};
+
+        let filter = EventFilter::from_config(
+            &[],
+            &["*:usage_*".to_string()], // exclude usage events
+            None,
+            &[],
+        );
+        let mut gate = NotificationGate::from_config(
+            filter,
+            std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(30),
+        );
+
+        let d = test_detection(); // core.codex:usage_reached — should be excluded
+        let decision = gate.should_notify(&d, 3);
+        assert_eq!(decision, NotifyDecision::Filtered);
+
+        // Since it's filtered, dispatcher should not be called
+        let transport = MockTransport::success();
+        let endpoints = vec![
+            test_endpoint("slack", "http://slack.test", WebhookTemplate::Slack),
+        ];
+        let dispatcher = WebhookDispatcher::new(endpoints, Box::new(transport.clone()));
+
+        // Only dispatch if gate says Send
+        if matches!(decision, NotifyDecision::Send { .. }) {
+            dispatcher.dispatch(&d, 3, &test_rendered(), 0).await;
+        }
+        // Verify no requests were made
+        assert!(transport.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pipeline_gate_allows_and_dispatches() {
+        use crate::events::{EventFilter, NotificationGate, NotifyDecision};
+
+        let filter = EventFilter::from_config(
+            &["*:usage_*".to_string()], // include usage events
+            &[],
+            None,
+            &[],
+        );
+        let mut gate = NotificationGate::from_config(
+            filter,
+            std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(30),
+        );
+
+        let d = test_detection();
+        let decision = gate.should_notify(&d, 3);
+
+        let suppressed = match decision {
+            NotifyDecision::Send { suppressed_since_last } => suppressed_since_last,
+            other => panic!("Expected Send, got {other:?}"),
+        };
+
+        let transport = MockTransport::success();
+        let endpoints = vec![
+            test_endpoint("slack", "http://slack.test", WebhookTemplate::Slack),
+            test_endpoint("discord", "http://discord.test", WebhookTemplate::Discord),
+        ];
+        let dispatcher = WebhookDispatcher::new(endpoints, Box::new(transport.clone()));
+
+        let records = dispatcher
+            .dispatch(&d, 3, &test_rendered(), suppressed)
+            .await;
+
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|r| r.accepted));
+
+        let reqs = transport.requests();
+        assert_eq!(reqs.len(), 2);
+        // First request: Slack (has blocks)
+        assert!(reqs[0].body["blocks"].is_array());
+        // Second request: Discord (has embeds)
+        assert!(reqs[1].body["embeds"].is_array());
+    }
+
+    #[tokio::test]
+    async fn pipeline_dedup_prevents_second_dispatch() {
+        use crate::events::{EventFilter, NotificationGate, NotifyDecision};
+
+        let mut gate = NotificationGate::from_config(
+            EventFilter::allow_all(),
+            std::time::Duration::from_secs(300), // 5min dedup window
+            std::time::Duration::from_secs(30),
+        );
+
+        let d = test_detection();
+        let transport = MockTransport::success();
+        let endpoints = vec![
+            test_endpoint("hook", "http://test.hook", WebhookTemplate::Generic),
+        ];
+        let dispatcher = WebhookDispatcher::new(endpoints, Box::new(transport.clone()));
+
+        // First event — should pass through
+        let d1 = gate.should_notify(&d, 3);
+        assert!(matches!(d1, NotifyDecision::Send { .. }));
+        if let NotifyDecision::Send { suppressed_since_last } = d1 {
+            dispatcher.dispatch(&d, 3, &test_rendered(), suppressed_since_last).await;
+        }
+        assert_eq!(transport.requests().len(), 1);
+
+        // Second identical event — should be deduplicated
+        let d2 = gate.should_notify(&d, 3);
+        assert!(matches!(d2, NotifyDecision::Deduplicated { .. }));
+        // No dispatch for deduplicated events
+    }
+
+    #[tokio::test]
+    async fn pipeline_severity_filter_blocks_info_events() {
+        use crate::events::{EventFilter, NotificationGate, NotifyDecision};
+
+        let filter = EventFilter::from_config(
+            &[],
+            &[],
+            Some("warning"), // only warning+
+            &[],
+        );
+        let mut gate = NotificationGate::from_config(
+            filter,
+            std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(30),
+        );
+
+        let mut info_event = test_detection();
+        info_event.severity = Severity::Info;
+        assert_eq!(gate.should_notify(&info_event, 1), NotifyDecision::Filtered);
+
+        // Warning should pass
+        let warning_event = test_detection(); // already Warning
+        assert!(matches!(
+            gate.should_notify(&warning_event, 1),
+            NotifyDecision::Send { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn pipeline_per_endpoint_event_filter() {
+        let transport = MockTransport::success();
+        let mut codex_only = test_endpoint("codex-hook", "http://codex.test", WebhookTemplate::Generic);
+        codex_only.events = vec!["core.codex:*".to_string()];
+
+        let mut gemini_only = test_endpoint("gemini-hook", "http://gemini.test", WebhookTemplate::Generic);
+        gemini_only.events = vec!["core.gemini:*".to_string()];
+
+        let dispatcher = WebhookDispatcher::new(
+            vec![codex_only, gemini_only],
+            Box::new(transport.clone()),
+        );
+
+        // Codex event → only codex-hook receives it
+        let records = dispatcher
+            .dispatch(&test_detection(), 1, &test_rendered(), 0)
+            .await;
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].endpoint, "codex-hook");
+        assert_eq!(transport.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pipeline_mixed_success_and_failure() {
+        // Two transports with different responses — simulate via
+        // a single dispatcher with the same transport returning failure
+        let transport = MockTransport::failure(500, "Internal Server Error");
+        let endpoints = vec![
+            test_endpoint("failing1", "http://fail1.test", WebhookTemplate::Generic),
+            test_endpoint("failing2", "http://fail2.test", WebhookTemplate::Slack),
+        ];
+        let dispatcher = WebhookDispatcher::new(endpoints, Box::new(transport));
+
+        let records = dispatcher
+            .dispatch(&test_detection(), 1, &test_rendered(), 0)
+            .await;
+
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|r| !r.accepted));
+        assert!(records.iter().all(|r| r.status_code == 500));
+        assert!(records.iter().all(|r| r.error.is_some()));
+    }
+
+    #[test]
+    fn pipeline_config_to_dispatcher() {
+        // Verify that NotificationConfig can produce working components
+        let nc = crate::config::NotificationConfig {
+            enabled: true,
+            cooldown_ms: 1000,
+            dedup_window_ms: 5000,
+            include: vec!["codex.*".to_string()],
+            exclude: Vec::new(),
+            min_severity: Some("warning".to_string()),
+            agent_types: Vec::new(),
+            webhooks: vec![WebhookEndpointConfig {
+                name: "test".to_string(),
+                url: "http://test.hook".to_string(),
+                template: WebhookTemplate::Slack,
+                events: Vec::new(),
+                headers: HashMap::new(),
+                enabled: true,
+            }],
+            desktop: crate::desktop_notify::DesktopNotifyConfig::default(),
+        };
+
+        // Build gate from config
+        let mut gate = nc.to_notification_gate();
+        let filter = nc.to_event_filter();
+        assert!(!filter.is_permissive());
+
+        // Build dispatcher from config endpoints
+        let dispatcher = WebhookDispatcher::new(
+            nc.webhooks.clone(),
+            Box::new(MockTransport::success()),
+        );
+        assert_eq!(dispatcher.endpoint_count(), 1);
+        assert_eq!(dispatcher.active_endpoint_count(), 1);
+
+        // Gate should filter info events
+        let mut info = test_detection();
+        info.severity = Severity::Info;
+        assert_eq!(
+            gate.should_notify(&info, 1),
+            crate::events::NotifyDecision::Filtered,
+        );
+    }
 }
