@@ -789,6 +789,12 @@ enum RobotCommands {
         code: String,
     },
 
+    /// Account management commands (list, refresh, pick preview)
+    Accounts {
+        #[command(subcommand)]
+        command: RobotAccountsCommands,
+    },
+
     /// Submit an approval code for a pending action
     Approve {
         /// The approval code (8-character alphanumeric)
@@ -915,6 +921,28 @@ enum RobotRulesCommands {
         /// Fail on warnings (exit non-zero)
         #[arg(long)]
         strict: bool,
+    },
+}
+
+/// Robot accounts subcommands
+#[derive(Subcommand)]
+enum RobotAccountsCommands {
+    /// List accounts with usage data and pick preview
+    List {
+        /// Service filter (default: "openai")
+        #[arg(long, default_value = "openai")]
+        service: String,
+
+        /// Include pick preview (which account would be selected next)
+        #[arg(long)]
+        pick: bool,
+    },
+
+    /// Refresh account usage data from caut
+    Refresh {
+        /// Service to refresh (default: "openai")
+        #[arg(long, default_value = "openai")]
+        service: String,
     },
 }
 
@@ -2083,6 +2111,60 @@ struct RobotWorkflowAbortData {
     aborted_at: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error_reason: Option<String>,
+}
+
+/// Account info for robot accounts list
+#[derive(serde::Serialize)]
+struct RobotAccountInfo {
+    account_id: String,
+    service: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    percent_remaining: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reset_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tokens_used: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tokens_remaining: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tokens_limit: Option<i64>,
+    last_refreshed_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_used_at: Option<i64>,
+}
+
+/// Robot accounts list response data
+#[derive(serde::Serialize)]
+struct RobotAccountsListData {
+    accounts: Vec<RobotAccountInfo>,
+    total: usize,
+    service: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pick_preview: Option<RobotAccountPickPreview>,
+}
+
+/// Pick preview shows which account would be selected next
+#[derive(serde::Serialize)]
+struct RobotAccountPickPreview {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selected_account_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selected_name: Option<String>,
+    selection_reason: String,
+    threshold_percent: f64,
+    candidates_count: usize,
+    filtered_count: usize,
+}
+
+/// Robot accounts refresh response data
+#[derive(serde::Serialize)]
+struct RobotAccountsRefreshData {
+    service: String,
+    refreshed_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refreshed_at: Option<String>,
+    accounts: Vec<RobotAccountInfo>,
 }
 
 fn redact_for_output(text: &str) -> String {
@@ -5636,6 +5718,266 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             elapsed_ms(start),
                                         );
                                     print_robot_response(&response, format, stats)?;
+                                }
+                            }
+                        }
+                        RobotCommands::Accounts { command } => {
+                            // Get workspace layout for db path
+                            let layout = match config.workspace_layout(Some(&workspace_root)) {
+                                Ok(l) => l,
+                                Err(e) => {
+                                    let response =
+                                        RobotResponse::<RobotAccountsListData>::error_with_code(
+                                            ROBOT_ERR_CONFIG,
+                                            format!("Failed to get workspace layout: {e}"),
+                                            Some(
+                                                "Check --workspace or WA_WORKSPACE".to_string(),
+                                            ),
+                                            elapsed_ms(start),
+                                        );
+                                    print_robot_response(&response, format, stats)?;
+                                    return Ok(());
+                                }
+                            };
+
+                            match command {
+                                RobotAccountsCommands::List { service, pick } => {
+                                    // Open storage handle
+                                    let db_path = layout.db_path.to_string_lossy();
+                                    let storage =
+                                        match wa_core::storage::StorageHandle::new(&db_path)
+                                            .await
+                                        {
+                                            Ok(s) => s,
+                                            Err(e) => {
+                                                let response =
+                                                    RobotResponse::<RobotAccountsListData>::error_with_code(
+                                                        ROBOT_ERR_STORAGE,
+                                                        format!("Failed to open storage: {e}"),
+                                                        Some(
+                                                            "Is the database initialized? Run 'wa watch' first."
+                                                                .to_string(),
+                                                        ),
+                                                        elapsed_ms(start),
+                                                    );
+                                                print_robot_response(
+                                                    &response, format, stats,
+                                                )?;
+                                                return Ok(());
+                                            }
+                                        };
+
+                                    // Fetch accounts
+                                    let accounts = match storage
+                                        .get_accounts_by_service(&service)
+                                        .await
+                                    {
+                                        Ok(a) => a,
+                                        Err(e) => {
+                                            let response =
+                                                RobotResponse::<RobotAccountsListData>::error_with_code(
+                                                    ROBOT_ERR_STORAGE,
+                                                    format!("Failed to fetch accounts: {e}"),
+                                                    None,
+                                                    elapsed_ms(start),
+                                                );
+                                            print_robot_response(
+                                                &response, format, stats,
+                                            )?;
+                                            return Ok(());
+                                        }
+                                    };
+
+                                    // Build pick preview if requested
+                                    let pick_preview = if pick {
+                                        let sel_config =
+                                            wa_core::accounts::AccountSelectionConfig::default();
+                                        let result = wa_core::accounts::select_account(
+                                            &accounts, &sel_config,
+                                        );
+                                        Some(RobotAccountPickPreview {
+                                            selected_account_id: result
+                                                .selected
+                                                .as_ref()
+                                                .map(|a| a.account_id.clone()),
+                                            selected_name: result
+                                                .selected
+                                                .as_ref()
+                                                .and_then(|a| a.name.clone()),
+                                            selection_reason: result
+                                                .explanation
+                                                .selection_reason,
+                                            threshold_percent: sel_config.threshold_percent,
+                                            candidates_count: result
+                                                .explanation
+                                                .candidates
+                                                .len(),
+                                            filtered_count: result
+                                                .explanation
+                                                .filtered_out
+                                                .len(),
+                                        })
+                                    } else {
+                                        None
+                                    };
+
+                                    let total = accounts.len();
+                                    let account_infos: Vec<RobotAccountInfo> = accounts
+                                        .into_iter()
+                                        .map(|a| RobotAccountInfo {
+                                            account_id: a.account_id,
+                                            service: a.service,
+                                            name: a.name,
+                                            percent_remaining: a.percent_remaining,
+                                            reset_at: a.reset_at,
+                                            tokens_used: a.tokens_used,
+                                            tokens_remaining: a.tokens_remaining,
+                                            tokens_limit: a.tokens_limit,
+                                            last_refreshed_at: a.last_refreshed_at,
+                                            last_used_at: a.last_used_at,
+                                        })
+                                        .collect();
+
+                                    let data = RobotAccountsListData {
+                                        accounts: account_infos,
+                                        total,
+                                        service,
+                                        pick_preview,
+                                    };
+                                    let response =
+                                        RobotResponse::success(data, elapsed_ms(start));
+                                    print_robot_response(&response, format, stats)?;
+
+                                    // Clean shutdown
+                                    if let Err(e) = storage.shutdown().await {
+                                        tracing::warn!(
+                                            "Failed to shutdown storage cleanly: {e}"
+                                        );
+                                    }
+                                }
+                                RobotAccountsCommands::Refresh { service } => {
+                                    // Parse CautService
+                                    let caut_service = match service.as_str() {
+                                        "openai" => wa_core::caut::CautService::OpenAI,
+                                        other => {
+                                            let response =
+                                                RobotResponse::<RobotAccountsRefreshData>::error_with_code(
+                                                    "robot.invalid_service",
+                                                    format!("Unknown service: {other}"),
+                                                    Some(
+                                                        "Supported services: openai".to_string(),
+                                                    ),
+                                                    elapsed_ms(start),
+                                                );
+                                            print_robot_response(
+                                                &response, format, stats,
+                                            )?;
+                                            return Ok(());
+                                        }
+                                    };
+
+                                    // Call caut refresh
+                                    let caut = wa_core::caut::CautClient::new();
+                                    let refresh_result = match caut
+                                        .refresh(caut_service)
+                                        .await
+                                    {
+                                        Ok(r) => r,
+                                        Err(e) => {
+                                            let response =
+                                                RobotResponse::<RobotAccountsRefreshData>::error_with_code(
+                                                    "robot.caut_error",
+                                                    format!("caut refresh failed: {e}"),
+                                                    Some(
+                                                        e.remediation().summary.to_string(),
+                                                    ),
+                                                    elapsed_ms(start),
+                                                );
+                                            print_robot_response(
+                                                &response, format, stats,
+                                            )?;
+                                            return Ok(());
+                                        }
+                                    };
+
+                                    // Open storage to persist refreshed data
+                                    let db_path = layout.db_path.to_string_lossy();
+                                    let storage =
+                                        match wa_core::storage::StorageHandle::new(&db_path)
+                                            .await
+                                        {
+                                            Ok(s) => s,
+                                            Err(e) => {
+                                                let response =
+                                                    RobotResponse::<RobotAccountsRefreshData>::error_with_code(
+                                                        ROBOT_ERR_STORAGE,
+                                                        format!("Failed to open storage: {e}"),
+                                                        Some(
+                                                            "Is the database initialized? Run 'wa watch' first."
+                                                                .to_string(),
+                                                        ),
+                                                        elapsed_ms(start),
+                                                    );
+                                                print_robot_response(
+                                                    &response, format, stats,
+                                                )?;
+                                                return Ok(());
+                                            }
+                                        };
+
+                                    // Convert and upsert each account
+                                    let now_ms = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_millis()
+                                        as i64;
+
+                                    let mut account_infos = Vec::new();
+                                    for usage in &refresh_result.accounts {
+                                        let record =
+                                            wa_core::accounts::AccountRecord::from_caut(
+                                                usage,
+                                                caut_service,
+                                                now_ms,
+                                            );
+                                        if let Err(e) =
+                                            storage.upsert_account(record.clone()).await
+                                        {
+                                            tracing::warn!(
+                                                "Failed to upsert account {}: {e}",
+                                                record.account_id
+                                            );
+                                        }
+                                        account_infos.push(RobotAccountInfo {
+                                            account_id: record.account_id,
+                                            service: record.service,
+                                            name: record.name,
+                                            percent_remaining: record.percent_remaining,
+                                            reset_at: record.reset_at,
+                                            tokens_used: record.tokens_used,
+                                            tokens_remaining: record.tokens_remaining,
+                                            tokens_limit: record.tokens_limit,
+                                            last_refreshed_at: record.last_refreshed_at,
+                                            last_used_at: record.last_used_at,
+                                        });
+                                    }
+
+                                    let data = RobotAccountsRefreshData {
+                                        service,
+                                        refreshed_count: account_infos.len(),
+                                        refreshed_at: refresh_result.refreshed_at,
+                                        accounts: account_infos,
+                                    };
+                                    let response =
+                                        RobotResponse::success(data, elapsed_ms(start));
+                                    print_robot_response(&response, format, stats)?;
+
+                                    // Clean shutdown
+                                    if let Err(e) = storage.shutdown().await {
+                                        tracing::warn!(
+                                            "Failed to shutdown storage cleanly: {e}"
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -12137,5 +12479,401 @@ mod tests {
             primary.contains("reproduce"),
             "Crash primary action should reference reproduce: {primary}"
         );
+    }
+
+    // =========================================================================
+    // Robot accounts tests (wa-nu4.1.5.4)
+    // =========================================================================
+
+    fn make_robot_account_info(id: &str, pct: f64, last_used: Option<i64>) -> RobotAccountInfo {
+        RobotAccountInfo {
+            account_id: id.to_string(),
+            service: "openai".to_string(),
+            name: Some(format!("{id}-name")),
+            percent_remaining: pct,
+            reset_at: None,
+            tokens_used: Some(1000),
+            tokens_remaining: Some(9000),
+            tokens_limit: Some(10000),
+            last_refreshed_at: 1000,
+            last_used_at: last_used,
+        }
+    }
+
+    #[test]
+    fn robot_accounts_list_json_schema() {
+        let data = RobotAccountsListData {
+            accounts: vec![
+                make_robot_account_info("acc-1", 80.0, None),
+                make_robot_account_info("acc-2", 20.0, Some(5000)),
+            ],
+            total: 2,
+            service: "openai".to_string(),
+            pick_preview: None,
+        };
+
+        let json = serde_json::to_value(&data).unwrap();
+
+        // Verify required fields
+        assert_eq!(json["total"].as_u64().unwrap(), 2);
+        assert_eq!(json["service"].as_str().unwrap(), "openai");
+        assert!(json["accounts"].is_array());
+        assert_eq!(json["accounts"].as_array().unwrap().len(), 2);
+
+        // pick_preview should be absent (skip_serializing_if)
+        assert!(json.get("pick_preview").is_none());
+    }
+
+    #[test]
+    fn robot_account_info_json_schema() {
+        let info = make_robot_account_info("acc-1", 75.5, Some(3000));
+        let json = serde_json::to_value(&info).unwrap();
+
+        // Required fields
+        assert_eq!(json["account_id"].as_str().unwrap(), "acc-1");
+        assert_eq!(json["service"].as_str().unwrap(), "openai");
+        assert!((json["percent_remaining"].as_f64().unwrap() - 75.5).abs() < 0.001);
+        assert_eq!(json["last_refreshed_at"].as_i64().unwrap(), 1000);
+        assert_eq!(json["last_used_at"].as_i64().unwrap(), 3000);
+
+        // Optional fields present
+        assert_eq!(json["name"].as_str().unwrap(), "acc-1-name");
+        assert_eq!(json["tokens_used"].as_i64().unwrap(), 1000);
+        assert_eq!(json["tokens_remaining"].as_i64().unwrap(), 9000);
+        assert_eq!(json["tokens_limit"].as_i64().unwrap(), 10000);
+    }
+
+    #[test]
+    fn robot_account_info_skips_none_fields() {
+        let info = RobotAccountInfo {
+            account_id: "acc-1".to_string(),
+            service: "openai".to_string(),
+            name: None,
+            percent_remaining: 50.0,
+            reset_at: None,
+            tokens_used: None,
+            tokens_remaining: None,
+            tokens_limit: None,
+            last_refreshed_at: 1000,
+            last_used_at: None,
+        };
+        let json = serde_json::to_value(&info).unwrap();
+
+        // None fields should not appear
+        assert!(json.get("name").is_none());
+        assert!(json.get("reset_at").is_none());
+        assert!(json.get("tokens_used").is_none());
+        assert!(json.get("tokens_remaining").is_none());
+        assert!(json.get("tokens_limit").is_none());
+        assert!(json.get("last_used_at").is_none());
+
+        // Required fields always present
+        assert!(json.get("account_id").is_some());
+        assert!(json.get("service").is_some());
+        assert!(json.get("percent_remaining").is_some());
+        assert!(json.get("last_refreshed_at").is_some());
+    }
+
+    #[test]
+    fn robot_accounts_pick_preview_json_schema() {
+        let preview = RobotAccountPickPreview {
+            selected_account_id: Some("acc-best".to_string()),
+            selected_name: Some("Best Account".to_string()),
+            selection_reason: "Highest percent_remaining (90.0% vs 50.0%)".to_string(),
+            threshold_percent: 5.0,
+            candidates_count: 2,
+            filtered_count: 1,
+        };
+        let json = serde_json::to_value(&preview).unwrap();
+
+        assert_eq!(json["selected_account_id"].as_str().unwrap(), "acc-best");
+        assert_eq!(json["selected_name"].as_str().unwrap(), "Best Account");
+        assert!(json["selection_reason"].as_str().unwrap().contains("Highest"));
+        assert!((json["threshold_percent"].as_f64().unwrap() - 5.0).abs() < 0.001);
+        assert_eq!(json["candidates_count"].as_u64().unwrap(), 2);
+        assert_eq!(json["filtered_count"].as_u64().unwrap(), 1);
+    }
+
+    #[test]
+    fn robot_accounts_pick_preview_none_selected() {
+        let preview = RobotAccountPickPreview {
+            selected_account_id: None,
+            selected_name: None,
+            selection_reason: "All 3 accounts below threshold (5.0%)".to_string(),
+            threshold_percent: 5.0,
+            candidates_count: 0,
+            filtered_count: 3,
+        };
+        let json = serde_json::to_value(&preview).unwrap();
+
+        assert!(json.get("selected_account_id").is_none());
+        assert!(json.get("selected_name").is_none());
+        assert_eq!(json["candidates_count"].as_u64().unwrap(), 0);
+        assert_eq!(json["filtered_count"].as_u64().unwrap(), 3);
+    }
+
+    #[test]
+    fn robot_accounts_list_with_pick_preview() {
+        let data = RobotAccountsListData {
+            accounts: vec![
+                make_robot_account_info("best", 90.0, None),
+                make_robot_account_info("ok", 50.0, Some(2000)),
+                make_robot_account_info("low", 3.0, None),
+            ],
+            total: 3,
+            service: "openai".to_string(),
+            pick_preview: Some(RobotAccountPickPreview {
+                selected_account_id: Some("best".to_string()),
+                selected_name: Some("best-name".to_string()),
+                selection_reason: "Highest percent_remaining (90.0% vs 50.0%)".to_string(),
+                threshold_percent: 5.0,
+                candidates_count: 2,
+                filtered_count: 1,
+            }),
+        };
+        let json = serde_json::to_value(&data).unwrap();
+
+        // pick_preview should now be present
+        assert!(json.get("pick_preview").is_some());
+        let pp = &json["pick_preview"];
+        assert_eq!(pp["selected_account_id"].as_str().unwrap(), "best");
+        assert_eq!(pp["candidates_count"].as_u64().unwrap(), 2);
+    }
+
+    #[test]
+    fn robot_accounts_mapping_from_account_record() {
+        // Verify that AccountRecord maps correctly to RobotAccountInfo
+        let record = wa_core::accounts::AccountRecord {
+            id: 42,
+            account_id: "acc-test".to_string(),
+            service: "openai".to_string(),
+            name: Some("Test Account".to_string()),
+            percent_remaining: 65.5,
+            reset_at: Some("2026-02-01T00:00:00Z".to_string()),
+            tokens_used: Some(3450),
+            tokens_remaining: Some(6550),
+            tokens_limit: Some(10000),
+            last_refreshed_at: 1234567890,
+            last_used_at: Some(1234567800),
+            created_at: 1234560000,
+            updated_at: 1234567890,
+        };
+
+        // This mimics the mapping in the handler
+        let info = RobotAccountInfo {
+            account_id: record.account_id.clone(),
+            service: record.service.clone(),
+            name: record.name.clone(),
+            percent_remaining: record.percent_remaining,
+            reset_at: record.reset_at.clone(),
+            tokens_used: record.tokens_used,
+            tokens_remaining: record.tokens_remaining,
+            tokens_limit: record.tokens_limit,
+            last_refreshed_at: record.last_refreshed_at,
+            last_used_at: record.last_used_at,
+        };
+
+        assert_eq!(info.account_id, "acc-test");
+        assert_eq!(info.service, "openai");
+        assert_eq!(info.name.as_deref(), Some("Test Account"));
+        assert!((info.percent_remaining - 65.5).abs() < 0.001);
+        assert_eq!(info.reset_at.as_deref(), Some("2026-02-01T00:00:00Z"));
+        assert_eq!(info.tokens_used, Some(3450));
+
+        // Verify id and created_at/updated_at are NOT in the output (internal fields)
+        let json = serde_json::to_value(&info).unwrap();
+        assert!(json.get("id").is_none());
+        assert!(json.get("created_at").is_none());
+        assert!(json.get("updated_at").is_none());
+    }
+
+    #[test]
+    fn robot_accounts_pick_matches_select_account() {
+        // The pick preview must use the same selection logic as workflows
+        use wa_core::accounts::{AccountRecord, AccountSelectionConfig, select_account};
+
+        let accounts = vec![
+            AccountRecord {
+                id: 0,
+                account_id: "depleted".to_string(),
+                service: "openai".to_string(),
+                name: Some("Depleted".to_string()),
+                percent_remaining: 2.0,
+                reset_at: None,
+                tokens_used: None,
+                tokens_remaining: None,
+                tokens_limit: None,
+                last_refreshed_at: 1000,
+                last_used_at: None,
+                created_at: 1000,
+                updated_at: 1000,
+            },
+            AccountRecord {
+                id: 0,
+                account_id: "best".to_string(),
+                service: "openai".to_string(),
+                name: Some("Best".to_string()),
+                percent_remaining: 90.0,
+                reset_at: None,
+                tokens_used: None,
+                tokens_remaining: None,
+                tokens_limit: None,
+                last_refreshed_at: 1000,
+                last_used_at: Some(5000),
+                created_at: 1000,
+                updated_at: 1000,
+            },
+            AccountRecord {
+                id: 0,
+                account_id: "mid".to_string(),
+                service: "openai".to_string(),
+                name: Some("Mid".to_string()),
+                percent_remaining: 50.0,
+                reset_at: None,
+                tokens_used: None,
+                tokens_remaining: None,
+                tokens_limit: None,
+                last_refreshed_at: 1000,
+                last_used_at: None,
+                created_at: 1000,
+                updated_at: 1000,
+            },
+        ];
+
+        let config = AccountSelectionConfig::default();
+        let result = select_account(&accounts, &config);
+
+        // Build pick preview the same way the handler does
+        let preview = RobotAccountPickPreview {
+            selected_account_id: result.selected.as_ref().map(|a| a.account_id.clone()),
+            selected_name: result.selected.as_ref().and_then(|a| a.name.clone()),
+            selection_reason: result.explanation.selection_reason.clone(),
+            threshold_percent: config.threshold_percent,
+            candidates_count: result.explanation.candidates.len(),
+            filtered_count: result.explanation.filtered_out.len(),
+        };
+
+        // Verify pick matches expected behavior
+        assert_eq!(preview.selected_account_id.as_deref(), Some("best"));
+        assert_eq!(preview.selected_name.as_deref(), Some("Best"));
+        assert_eq!(preview.candidates_count, 2); // best + mid
+        assert_eq!(preview.filtered_count, 1); // depleted below 5%
+        assert!(preview.selection_reason.contains("Highest percent_remaining"));
+    }
+
+    #[test]
+    fn robot_accounts_list_ordering_deterministic() {
+        // Same input data produces same JSON output every time
+        let build_data = || {
+            RobotAccountsListData {
+                accounts: vec![
+                    make_robot_account_info("c", 30.0, Some(100)),
+                    make_robot_account_info("a", 90.0, None),
+                    make_robot_account_info("b", 50.0, Some(200)),
+                ],
+                total: 3,
+                service: "openai".to_string(),
+                pick_preview: None,
+            }
+        };
+
+        let json1 = serde_json::to_string(&build_data()).unwrap();
+        let json2 = serde_json::to_string(&build_data()).unwrap();
+        let json3 = serde_json::to_string(&build_data()).unwrap();
+
+        assert_eq!(json1, json2);
+        assert_eq!(json2, json3);
+    }
+
+    #[test]
+    fn robot_accounts_refresh_json_schema() {
+        let data = RobotAccountsRefreshData {
+            service: "openai".to_string(),
+            refreshed_count: 2,
+            refreshed_at: Some("2026-01-28T12:00:00Z".to_string()),
+            accounts: vec![
+                make_robot_account_info("acc-1", 80.0, None),
+                make_robot_account_info("acc-2", 40.0, None),
+            ],
+        };
+        let json = serde_json::to_value(&data).unwrap();
+
+        assert_eq!(json["service"].as_str().unwrap(), "openai");
+        assert_eq!(json["refreshed_count"].as_u64().unwrap(), 2);
+        assert_eq!(json["refreshed_at"].as_str().unwrap(), "2026-01-28T12:00:00Z");
+        assert_eq!(json["accounts"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn robot_accounts_empty_list() {
+        let data = RobotAccountsListData {
+            accounts: vec![],
+            total: 0,
+            service: "openai".to_string(),
+            pick_preview: None,
+        };
+        let json = serde_json::to_value(&data).unwrap();
+
+        assert_eq!(json["total"].as_u64().unwrap(), 0);
+        assert!(json["accounts"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn robot_accounts_db_round_trip() {
+        // End-to-end: insert accounts into DB, fetch, build robot response
+        let (storage, db_path) = setup_storage("robot_accounts").await;
+
+        let record = wa_core::accounts::AccountRecord {
+            id: 0,
+            account_id: "test-acc".to_string(),
+            service: "openai".to_string(),
+            name: Some("Test".to_string()),
+            percent_remaining: 75.0,
+            reset_at: None,
+            tokens_used: Some(2500),
+            tokens_remaining: Some(7500),
+            tokens_limit: Some(10000),
+            last_refreshed_at: 1000,
+            last_used_at: None,
+            created_at: 1000,
+            updated_at: 1000,
+        };
+        storage.upsert_account(record).await.unwrap();
+
+        let accounts = storage.get_accounts_by_service("openai").await.unwrap();
+        assert_eq!(accounts.len(), 1);
+
+        // Build the same robot response the handler would
+        let total = accounts.len();
+        let account_infos: Vec<RobotAccountInfo> = accounts
+            .into_iter()
+            .map(|a| RobotAccountInfo {
+                account_id: a.account_id,
+                service: a.service,
+                name: a.name,
+                percent_remaining: a.percent_remaining,
+                reset_at: a.reset_at,
+                tokens_used: a.tokens_used,
+                tokens_remaining: a.tokens_remaining,
+                tokens_limit: a.tokens_limit,
+                last_refreshed_at: a.last_refreshed_at,
+                last_used_at: a.last_used_at,
+            })
+            .collect();
+
+        let data = RobotAccountsListData {
+            accounts: account_infos,
+            total,
+            service: "openai".to_string(),
+            pick_preview: None,
+        };
+        let json = serde_json::to_value(&data).unwrap();
+
+        assert_eq!(json["total"].as_u64().unwrap(), 1);
+        let acc = &json["accounts"][0];
+        assert_eq!(acc["account_id"].as_str().unwrap(), "test-acc");
+        assert!((acc["percent_remaining"].as_f64().unwrap() - 75.0).abs() < 0.001);
+
+        cleanup_storage(storage, &db_path).await;
     }
 }
