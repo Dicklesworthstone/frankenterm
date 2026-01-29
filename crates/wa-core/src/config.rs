@@ -1250,6 +1250,13 @@ pub struct NotificationConfig {
     /// types are forwarded.
     /// Accepts: `"codex"`, `"claude_code"`, `"gemini"`, `"wezterm"`, `"unknown"`.
     pub agent_types: Vec<String>,
+
+    /// Webhook endpoints for HTTP POST delivery.
+    ///
+    /// Each endpoint can subscribe to specific event patterns and use
+    /// a different payload template (generic, slack, discord).
+    #[serde(default)]
+    pub webhooks: Vec<crate::webhook::WebhookEndpointConfig>,
 }
 
 impl Default for NotificationConfig {
@@ -1262,6 +1269,7 @@ impl Default for NotificationConfig {
             exclude: Vec::new(),
             min_severity: None,
             agent_types: Vec::new(),
+            webhooks: Vec::new(),
         }
     }
 }
@@ -3010,6 +3018,7 @@ agent_types = ["codex", "claude_code"]
             exclude: vec!["*.debug".to_string()],
             min_severity: Some("warning".to_string()),
             agent_types: vec!["codex".to_string()],
+            webhooks: Vec::new(),
         };
         let filter = nc.to_event_filter();
         assert!(!filter.is_permissive());

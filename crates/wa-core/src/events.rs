@@ -952,7 +952,7 @@ fn parse_agent_type(s: &str) -> Option<crate::patterns::AgentType> {
 ///
 /// Supports `*` (any sequence) and `?` (any single char).
 /// Without wildcards, performs exact equality.
-fn match_rule_glob(pattern: &str, value: &str) -> bool {
+pub fn match_rule_glob(pattern: &str, value: &str) -> bool {
     if !pattern.contains('*') && !pattern.contains('?') {
         return value == pattern;
     }

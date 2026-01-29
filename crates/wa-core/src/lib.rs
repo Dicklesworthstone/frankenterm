@@ -70,14 +70,18 @@ pub mod policy;
 pub mod retry;
 pub mod runtime;
 pub mod screen_state;
+pub mod session_correlation;
 pub mod setup;
 pub mod storage;
 pub mod suggestions;
 pub mod tailer;
 pub mod wait;
 pub mod watchdog;
+pub mod webhook;
 pub mod wezterm;
 pub mod workflows;
+
+pub mod vendored;
 
 #[cfg(feature = "browser")]
 pub mod browser;
