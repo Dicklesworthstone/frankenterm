@@ -41,6 +41,8 @@
 pub mod accounts;
 pub mod approval;
 pub mod caut;
+#[cfg(test)]
+pub mod chaos;
 pub mod circuit_breaker;
 pub mod config;
 pub mod crash;
