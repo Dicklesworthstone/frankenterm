@@ -668,11 +668,7 @@ impl RulesListRenderer {
             } else {
                 style.gray("-")
             };
-            let workflow = rule
-                .workflow
-                .as_deref()
-                .unwrap_or("-")
-                .to_string();
+            let workflow = rule.workflow.as_deref().unwrap_or("-").to_string();
 
             table.add_row(vec![
                 rule.id.clone(),
@@ -770,14 +766,18 @@ impl RulesTestRenderer {
                 severity,
                 m.confidence,
             ));
-            output.push_str(&format!("     Agent: {}  Event: {}\n", m.agent_type, m.event_type));
-            output.push_str(&format!("     Matched: \"{}\"\n", truncate(&m.matched_text, 80)));
+            output.push_str(&format!(
+                "     Agent: {}  Event: {}\n",
+                m.agent_type, m.event_type
+            ));
+            output.push_str(&format!(
+                "     Matched: \"{}\"\n",
+                truncate(&m.matched_text, 80)
+            ));
 
             if let Some(ref extracted) = m.extracted {
                 if !extracted.is_null()
-                    && !extracted
-                        .as_object()
-                        .is_some_and(serde_json::Map::is_empty)
+                    && !extracted.as_object().is_some_and(serde_json::Map::is_empty)
                 {
                     let json =
                         serde_json::to_string(extracted).unwrap_or_else(|_| "{}".to_string());
@@ -814,10 +814,7 @@ impl RuleDetailRenderer {
         output.push_str(&format!("  Severity:   {severity}\n"));
         output.push_str(&format!("  Description: {}\n", detail.description));
 
-        output.push_str(&format!(
-            "\n  Anchors ({}):\n",
-            detail.anchors.len()
-        ));
+        output.push_str(&format!("\n  Anchors ({}):\n", detail.anchors.len()));
         for anchor in &detail.anchors {
             output.push_str(&format!("    - \"{anchor}\"\n"));
         }
@@ -1777,5 +1774,192 @@ mod tests {
         // caller (storage layer) is responsible for redaction before display.
         // The assertion here is just structural: we confirm the renderer runs.
         assert!(output.contains("Search results"));
+    }
+
+    // =========================================================================
+    // Rules renderer tests (wa-nu4.3.2.6)
+    // =========================================================================
+
+    fn sample_rule_list_item() -> RuleListItem {
+        RuleListItem {
+            id: "codex.usage_reached".to_string(),
+            agent_type: "codex".to_string(),
+            event_type: "usage_alert".to_string(),
+            severity: "warning".to_string(),
+            description: "Codex usage limit reached".to_string(),
+            workflow: Some("handle_usage".to_string()),
+            anchor_count: 2,
+            has_regex: true,
+        }
+    }
+
+    fn sample_rule_test_match() -> RuleTestMatch {
+        RuleTestMatch {
+            rule_id: "codex.usage_reached".to_string(),
+            agent_type: "codex".to_string(),
+            event_type: "usage_alert".to_string(),
+            severity: "warning".to_string(),
+            confidence: 0.95,
+            matched_text: "Usage at 95%".to_string(),
+            extracted: Some(serde_json::json!({"usage": 95})),
+        }
+    }
+
+    fn sample_rule_detail() -> RuleDetail {
+        RuleDetail {
+            id: "codex.usage_reached".to_string(),
+            agent_type: "codex".to_string(),
+            event_type: "usage_alert".to_string(),
+            severity: "warning".to_string(),
+            description: "Codex usage limit reached".to_string(),
+            anchors: vec!["Usage".to_string(), "limit".to_string()],
+            regex: Some(r"Usage at (\d+)%".to_string()),
+            workflow: Some("handle_usage".to_string()),
+            remediation: Some("Restart agent session".to_string()),
+            manual_fix: None,
+            learn_more_url: Some("https://example.com/docs".to_string()),
+        }
+    }
+
+    #[test]
+    fn rules_list_render_plain() {
+        let rules = vec![sample_rule_list_item()];
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = RulesListRenderer::render(&rules, &ctx);
+
+        assert!(output.contains("Rules (1)"));
+        assert!(output.contains("codex.usage_reached"));
+        assert!(output.contains("codex"));
+        assert!(output.contains("warning"));
+        assert!(output.contains("handle_usage"));
+    }
+
+    #[test]
+    fn rules_list_render_plain_no_ansi() {
+        let rules = vec![sample_rule_list_item()];
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = RulesListRenderer::render(&rules, &ctx);
+
+        assert_no_ansi(&output, "RulesListRenderer");
+    }
+
+    #[test]
+    fn rules_list_render_json() {
+        let rules = vec![sample_rule_list_item()];
+        let ctx = RenderContext::new(OutputFormat::Json);
+        let output = RulesListRenderer::render(&rules, &ctx);
+
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert!(parsed.is_array());
+        assert_eq!(parsed[0]["id"], "codex.usage_reached");
+        assert_eq!(parsed[0]["agent_type"], "codex");
+        assert_eq!(parsed[0]["severity"], "warning");
+        assert!(parsed[0]["has_regex"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn rules_list_render_empty() {
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = RulesListRenderer::render(&[], &ctx);
+
+        assert!(output.contains("No rules found"));
+    }
+
+    #[test]
+    fn rules_list_render_verbose() {
+        let rules = vec![sample_rule_list_item()];
+        let ctx = RenderContext::new(OutputFormat::Plain).verbose(true);
+        let output = RulesListRenderer::render_verbose(&rules, &ctx);
+
+        assert!(output.contains("codex.usage_reached"));
+        assert!(output.contains("Codex usage limit reached"));
+        assert!(output.contains("Workflow: handle_usage"));
+    }
+
+    #[test]
+    fn rules_test_render_plain() {
+        let matches = vec![sample_rule_test_match()];
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = RulesTestRenderer::render(&matches, 128, &ctx);
+
+        assert!(output.contains("Matches (1 hit"));
+        assert!(output.contains("128 bytes tested"));
+        assert!(output.contains("codex.usage_reached"));
+        assert!(output.contains("confidence=0.95"));
+        assert!(output.contains("Usage at 95%"));
+    }
+
+    #[test]
+    fn rules_test_render_plain_no_ansi() {
+        let matches = vec![sample_rule_test_match()];
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = RulesTestRenderer::render(&matches, 128, &ctx);
+
+        assert_no_ansi(&output, "RulesTestRenderer");
+    }
+
+    #[test]
+    fn rules_test_render_json() {
+        let matches = vec![sample_rule_test_match()];
+        let ctx = RenderContext::new(OutputFormat::Json);
+        let output = RulesTestRenderer::render(&matches, 128, &ctx);
+
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["text_length"], 128);
+        assert_eq!(parsed["match_count"], 1);
+        assert_eq!(parsed["matches"][0]["rule_id"], "codex.usage_reached");
+        assert_eq!(parsed["matches"][0]["confidence"], 0.95);
+    }
+
+    #[test]
+    fn rules_test_render_no_matches() {
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = RulesTestRenderer::render(&[], 64, &ctx);
+
+        assert!(output.contains("No matches"));
+        assert!(output.contains("64 bytes tested"));
+    }
+
+    #[test]
+    fn rule_detail_render_plain() {
+        let detail = sample_rule_detail();
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = RuleDetailRenderer::render(&detail, &ctx);
+
+        assert!(output.contains("Rule: codex.usage_reached"));
+        assert!(output.contains("Agent:      codex"));
+        assert!(output.contains("Event:      usage_alert"));
+        assert!(output.contains("Severity:   warning"));
+        assert!(output.contains("Codex usage limit reached"));
+        assert!(output.contains("Anchors (2)"));
+        assert!(output.contains("\"Usage\""));
+        assert!(output.contains("\"limit\""));
+        assert!(output.contains("Regex:"));
+        assert!(output.contains("Workflow: handle_usage"));
+        assert!(output.contains("Remediation: Restart agent session"));
+        assert!(output.contains("Learn more: https://example.com/docs"));
+    }
+
+    #[test]
+    fn rule_detail_render_plain_no_ansi() {
+        let detail = sample_rule_detail();
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = RuleDetailRenderer::render(&detail, &ctx);
+
+        assert_no_ansi(&output, "RuleDetailRenderer");
+    }
+
+    #[test]
+    fn rule_detail_render_json() {
+        let detail = sample_rule_detail();
+        let ctx = RenderContext::new(OutputFormat::Json);
+        let output = RuleDetailRenderer::render(&detail, &ctx);
+
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["id"], "codex.usage_reached");
+        assert_eq!(parsed["agent_type"], "codex");
+        assert_eq!(parsed["anchors"].as_array().unwrap().len(), 2);
+        assert!(parsed["regex"].is_string());
+        assert_eq!(parsed["workflow"], "handle_usage");
     }
 }
