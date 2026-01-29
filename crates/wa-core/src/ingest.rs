@@ -2742,4 +2742,331 @@ mod tests {
             assert!(!cache.is_new(1, content), "content {i} should be cached");
         }
     }
+
+    // =========================================================================
+    // pane_uuid stability tests (wa-upg.4.5)
+    // =========================================================================
+
+    /// Helper: build a minimal PaneInfo for testing.
+    fn make_pane_info(pane_id: u64, window_id: u64, tab_id: u64) -> PaneInfo {
+        PaneInfo {
+            pane_id,
+            tab_id,
+            window_id,
+            domain_id: None,
+            domain_name: Some("local".to_string()),
+            workspace: None,
+            size: None,
+            rows: None,
+            cols: None,
+            title: Some("bash".to_string()),
+            cwd: Some("/home/user".to_string()),
+            tty_name: Some(format!("/dev/pts/{pane_id}")),
+            cursor_x: None,
+            cursor_y: None,
+            cursor_visibility: None,
+            left_col: None,
+            top_row: None,
+            is_active: false,
+            is_zoomed: false,
+            extra: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn pane_uuid_format_is_32_hex_chars() {
+        let uuid = generate_pane_uuid("local", 1, 1_700_000_000_000);
+        assert_eq!(uuid.len(), 32, "uuid should be 32 chars: {uuid}");
+        assert!(
+            uuid.chars().all(|c| c.is_ascii_hexdigit()),
+            "uuid should be hex: {uuid}"
+        );
+        // Must be lowercase hex
+        assert_eq!(uuid, uuid.to_ascii_lowercase());
+    }
+
+    #[test]
+    fn pane_uuid_includes_random_entropy() {
+        // Two calls with identical inputs should produce different UUIDs
+        // because generate_pane_uuid adds random entropy.
+        let a = generate_pane_uuid("local", 1, 1_000);
+        let b = generate_pane_uuid("local", 1, 1_000);
+        assert_ne!(a, b, "UUIDs should differ due to random entropy");
+    }
+
+    #[test]
+    fn registry_assigns_uuid_on_discovery() {
+        let mut reg = PaneRegistry::new();
+        let pane = make_pane_info(1, 100, 10);
+        let diff = reg.discovery_tick(vec![pane]);
+
+        assert_eq!(diff.new_panes, vec![1]);
+        let entry = reg.get_entry(1).expect("pane should be registered");
+        assert_eq!(entry.pane_uuid.len(), 32);
+        assert_eq!(entry.generation, 0);
+    }
+
+    #[test]
+    fn registry_uuid_stable_across_title_change() {
+        let mut reg = PaneRegistry::new();
+        let pane = make_pane_info(1, 100, 10);
+        reg.discovery_tick(vec![pane]);
+
+        let uuid_before = reg.get_entry(1).unwrap().pane_uuid.clone();
+
+        // Change the title (triggers new generation, but UUID stays)
+        let mut changed = make_pane_info(1, 100, 10);
+        changed.title = Some("vim".to_string());
+        let diff = reg.discovery_tick(vec![changed]);
+
+        assert!(diff.new_generations.contains(&1), "should be new generation");
+        assert!(diff.new_panes.is_empty(), "should not be new pane");
+        let uuid_after = reg.get_entry(1).unwrap().pane_uuid.clone();
+        assert_eq!(uuid_before, uuid_after, "UUID must be stable across title change");
+    }
+
+    #[test]
+    fn registry_uuid_stable_across_cwd_change() {
+        let mut reg = PaneRegistry::new();
+        let pane = make_pane_info(1, 100, 10);
+        reg.discovery_tick(vec![pane]);
+
+        let uuid_before = reg.get_entry(1).unwrap().pane_uuid.clone();
+
+        // Change the cwd (triggers new generation, but UUID stays)
+        let mut changed = make_pane_info(1, 100, 10);
+        changed.cwd = Some("/tmp".to_string());
+        let diff = reg.discovery_tick(vec![changed]);
+
+        assert!(diff.new_generations.contains(&1));
+        let uuid_after = reg.get_entry(1).unwrap().pane_uuid.clone();
+        assert_eq!(uuid_before, uuid_after, "UUID must be stable across cwd change");
+    }
+
+    #[test]
+    fn registry_uuid_stable_across_tab_move() {
+        let mut reg = PaneRegistry::new();
+        let pane = make_pane_info(1, 100, 10);
+        reg.discovery_tick(vec![pane]);
+
+        let uuid_before = reg.get_entry(1).unwrap().pane_uuid.clone();
+
+        // Move pane to different tab and window (metadata change, not generation)
+        let mut moved = make_pane_info(1, 200, 20);
+        moved.title = Some("bash".to_string());
+        moved.cwd = Some("/home/user".to_string());
+        let diff = reg.discovery_tick(vec![moved]);
+
+        // Should be changed_panes (metadata), not new_generations (same fingerprint)
+        assert!(diff.changed_panes.contains(&1), "should detect metadata change");
+        assert!(diff.new_generations.is_empty(), "same fingerprint = no new generation");
+        let uuid_after = reg.get_entry(1).unwrap().pane_uuid.clone();
+        assert_eq!(uuid_before, uuid_after, "UUID must be stable across tab/window move");
+    }
+
+    #[test]
+    fn registry_uuid_removed_on_close() {
+        let mut reg = PaneRegistry::new();
+        let pane = make_pane_info(1, 100, 10);
+        reg.discovery_tick(vec![pane]);
+
+        let uuid = reg.get_entry(1).unwrap().pane_uuid.clone();
+        assert!(reg.get_pane_id_by_uuid(&uuid).is_some());
+
+        // Pane disappears (not in next tick)
+        let diff = reg.discovery_tick(vec![]);
+        assert_eq!(diff.closed_panes, vec![1]);
+
+        // UUID should be removed from reverse index
+        assert!(reg.get_entry(1).is_none());
+        assert!(reg.get_pane_id_by_uuid(&uuid).is_none());
+    }
+
+    #[test]
+    fn registry_new_uuid_on_reappearance() {
+        let mut reg = PaneRegistry::new();
+        let pane = make_pane_info(1, 100, 10);
+        reg.discovery_tick(vec![pane]);
+
+        let uuid_first = reg.get_entry(1).unwrap().pane_uuid.clone();
+
+        // Pane disappears
+        reg.discovery_tick(vec![]);
+        assert!(reg.get_entry(1).is_none());
+
+        // Same pane_id reappears (new shell session)
+        let reappear = make_pane_info(1, 100, 10);
+        let diff = reg.discovery_tick(vec![reappear]);
+        assert_eq!(diff.new_panes, vec![1]);
+
+        let uuid_second = reg.get_entry(1).unwrap().pane_uuid.clone();
+        assert_ne!(
+            uuid_first, uuid_second,
+            "reappeared pane should get a new UUID"
+        );
+    }
+
+    #[test]
+    fn registry_uuid_reverse_index_consistent() {
+        let mut reg = PaneRegistry::new();
+        let panes = vec![
+            make_pane_info(1, 100, 10),
+            make_pane_info(2, 100, 10),
+            make_pane_info(3, 200, 20),
+        ];
+        reg.discovery_tick(panes);
+
+        // All 3 panes should have distinct UUIDs accessible via reverse index
+        for pane_id in [1, 2, 3] {
+            let entry = reg.get_entry(pane_id).unwrap();
+            let looked_up = reg.get_pane_id_by_uuid(&entry.pane_uuid);
+            assert_eq!(looked_up, Some(pane_id), "reverse index should map UUID back to pane_id");
+        }
+
+        // UUIDs should be distinct
+        let uuids: Vec<_> = [1, 2, 3]
+            .iter()
+            .map(|id| reg.get_entry(*id).unwrap().pane_uuid.clone())
+            .collect();
+        let unique: std::collections::HashSet<_> = uuids.iter().collect();
+        assert_eq!(unique.len(), 3, "all UUIDs should be distinct");
+    }
+
+    #[test]
+    fn registry_generation_increments_on_fingerprint_change() {
+        let mut reg = PaneRegistry::new();
+        let pane = make_pane_info(1, 100, 10);
+        reg.discovery_tick(vec![pane]);
+        assert_eq!(reg.get_entry(1).unwrap().generation, 0);
+
+        // Change title → new fingerprint → generation++
+        let mut v2 = make_pane_info(1, 100, 10);
+        v2.title = Some("vim".to_string());
+        reg.discovery_tick(vec![v2]);
+        assert_eq!(reg.get_entry(1).unwrap().generation, 1);
+
+        // Change cwd → new fingerprint → generation++
+        let mut v3 = make_pane_info(1, 100, 10);
+        v3.title = Some("vim".to_string());
+        v3.cwd = Some("/tmp".to_string());
+        reg.discovery_tick(vec![v3]);
+        assert_eq!(reg.get_entry(1).unwrap().generation, 2);
+    }
+
+    #[test]
+    fn registry_lookup_by_uuid_returns_correct_info() {
+        let mut reg = PaneRegistry::new();
+        let pane = make_pane_info(42, 100, 10);
+        reg.discovery_tick(vec![pane]);
+
+        let uuid = reg.get_entry(42).unwrap().pane_uuid.clone();
+        let info = reg.get_pane_by_uuid(&uuid).expect("should find pane by UUID");
+        assert_eq!(info.pane_id, 42);
+        assert_eq!(info.title.as_deref(), Some("bash"));
+    }
+
+    #[test]
+    fn fingerprint_same_generation_when_unchanged() {
+        let pane = make_pane_info(1, 100, 10);
+        let fp1 = PaneFingerprint::without_content(&pane);
+        let fp2 = PaneFingerprint::without_content(&pane);
+        assert!(fp1.is_same_generation(&fp2));
+    }
+
+    #[test]
+    fn fingerprint_new_generation_on_title_change() {
+        let pane = make_pane_info(1, 100, 10);
+        let fp1 = PaneFingerprint::without_content(&pane);
+
+        let mut changed = make_pane_info(1, 100, 10);
+        changed.title = Some("ssh session".to_string());
+        let fp2 = PaneFingerprint::without_content(&changed);
+
+        assert!(!fp1.is_same_generation(&fp2));
+    }
+
+    #[test]
+    fn fingerprint_new_generation_on_cwd_change() {
+        let pane = make_pane_info(1, 100, 10);
+        let fp1 = PaneFingerprint::without_content(&pane);
+
+        let mut changed = make_pane_info(1, 100, 10);
+        changed.cwd = Some("/var/log".to_string());
+        let fp2 = PaneFingerprint::without_content(&changed);
+
+        assert!(!fp1.is_same_generation(&fp2));
+    }
+
+    #[test]
+    fn fingerprint_new_generation_on_domain_change() {
+        let pane = make_pane_info(1, 100, 10);
+        let fp1 = PaneFingerprint::without_content(&pane);
+
+        let mut changed = make_pane_info(1, 100, 10);
+        changed.domain_name = Some("SSH:remote.example.com".to_string());
+        let fp2 = PaneFingerprint::without_content(&changed);
+
+        assert!(!fp1.is_same_generation(&fp2));
+    }
+
+    #[test]
+    fn fingerprint_ignores_tab_window_change() {
+        // Tab/window moves don't affect fingerprint (only metadata)
+        let pane = make_pane_info(1, 100, 10);
+        let fp1 = PaneFingerprint::without_content(&pane);
+
+        let moved = make_pane_info(1, 200, 20);
+        let fp2 = PaneFingerprint::without_content(&moved);
+
+        assert!(
+            fp1.is_same_generation(&fp2),
+            "tab/window changes should not create new generation"
+        );
+    }
+
+    #[test]
+    fn registry_multi_pane_churn_stability() {
+        // Simulate a realistic session: 3 panes, various changes
+        let mut reg = PaneRegistry::new();
+
+        // T0: 3 panes discovered
+        let panes = vec![
+            make_pane_info(1, 100, 10),
+            make_pane_info(2, 100, 10),
+            make_pane_info(3, 100, 11),
+        ];
+        reg.discovery_tick(panes);
+
+        let uuid1 = reg.get_entry(1).unwrap().pane_uuid.clone();
+        let uuid2 = reg.get_entry(2).unwrap().pane_uuid.clone();
+        let uuid3 = reg.get_entry(3).unwrap().pane_uuid.clone();
+
+        // T1: Pane 1 changes title, Pane 2 moves tab, Pane 3 unchanged
+        let mut p1 = make_pane_info(1, 100, 10);
+        p1.title = Some("vim".to_string());
+        let p2 = make_pane_info(2, 100, 12); // tab changed
+        let p3 = make_pane_info(3, 100, 11);
+        reg.discovery_tick(vec![p1, p2, p3]);
+
+        assert_eq!(reg.get_entry(1).unwrap().pane_uuid, uuid1, "UUID1 stable after title change");
+        assert_eq!(reg.get_entry(2).unwrap().pane_uuid, uuid2, "UUID2 stable after tab move");
+        assert_eq!(reg.get_entry(3).unwrap().pane_uuid, uuid3, "UUID3 stable when unchanged");
+
+        // T2: Pane 2 closes, pane 4 appears
+        let mut p1_v2 = make_pane_info(1, 100, 10);
+        p1_v2.title = Some("vim".to_string());
+        let p3_v2 = make_pane_info(3, 100, 11);
+        let p4 = make_pane_info(4, 100, 13);
+        let diff = reg.discovery_tick(vec![p1_v2, p3_v2, p4]);
+
+        assert!(diff.closed_panes.contains(&2), "pane 2 should close");
+        assert!(diff.new_panes.contains(&4), "pane 4 should be new");
+        assert_eq!(reg.get_entry(1).unwrap().pane_uuid, uuid1, "UUID1 still stable");
+        assert_eq!(reg.get_entry(3).unwrap().pane_uuid, uuid3, "UUID3 still stable");
+        assert!(reg.get_pane_id_by_uuid(&uuid2).is_none(), "UUID2 removed after close");
+        assert!(reg.get_entry(4).is_some(), "pane 4 should exist");
+        let uuid4 = reg.get_entry(4).unwrap().pane_uuid.clone();
+        assert_ne!(uuid4, uuid1, "new pane gets distinct UUID");
+        assert_ne!(uuid4, uuid3, "new pane gets distinct UUID");
+    }
 }
