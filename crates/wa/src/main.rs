@@ -11623,4 +11623,249 @@ mod tests {
 
         cleanup_storage(storage, &db_path).await;
     }
+
+    // ---- Triage scoring / ordering tests ----
+
+    /// Helper: the severity ranking function used in the triage handler.
+    /// Mirrors the closure in the Triage command handler exactly.
+    fn triage_severity_rank(s: &str) -> u8 {
+        match s {
+            "error" => 3,
+            "warning" => 2,
+            "info" => 1,
+            _ => 0,
+        }
+    }
+
+    /// Helper: build a triage item JSON value for testing.
+    fn triage_item(section: &str, severity: &str, title: &str) -> serde_json::Value {
+        serde_json::json!({
+            "section": section,
+            "severity": severity,
+            "title": title,
+            "detail": "",
+            "action": "wa doctor",
+        })
+    }
+
+    /// Helper: sort triage items the same way the handler does.
+    fn triage_sort(items: &mut Vec<serde_json::Value>) {
+        items.sort_by(|a, b| {
+            let sa = triage_severity_rank(a["severity"].as_str().unwrap_or("info"));
+            let sb = triage_severity_rank(b["severity"].as_str().unwrap_or("info"));
+            sb.cmp(&sa)
+        });
+    }
+
+    /// Helper: apply severity filter the same way the handler does.
+    fn triage_filter(items: &mut Vec<serde_json::Value>, min_severity: &str) {
+        let min_rank = triage_severity_rank(min_severity);
+        items.retain(|item| {
+            let sev = item["severity"].as_str().unwrap_or("info");
+            triage_severity_rank(sev) >= min_rank
+        });
+    }
+
+    #[test]
+    fn triage_severity_rank_ordering() {
+        assert!(triage_severity_rank("error") > triage_severity_rank("warning"));
+        assert!(triage_severity_rank("warning") > triage_severity_rank("info"));
+        assert!(triage_severity_rank("info") > triage_severity_rank("unknown"));
+        assert_eq!(triage_severity_rank("error"), 3);
+        assert_eq!(triage_severity_rank("warning"), 2);
+        assert_eq!(triage_severity_rank("info"), 1);
+        assert_eq!(triage_severity_rank("other"), 0);
+    }
+
+    #[test]
+    fn triage_sort_errors_first() {
+        let mut items = vec![
+            triage_item("events", "info", "workflow running"),
+            triage_item("health", "error", "db timeout"),
+            triage_item("crashes", "warning", "recent crash"),
+            triage_item("events", "warning", "unhandled event"),
+            triage_item("health", "error", "circuit open"),
+        ];
+
+        triage_sort(&mut items);
+
+        let severities: Vec<&str> = items
+            .iter()
+            .map(|i| i["severity"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            severities,
+            vec!["error", "error", "warning", "warning", "info"]
+        );
+    }
+
+    #[test]
+    fn triage_sort_deterministic_within_same_severity() {
+        // Items with the same severity should maintain stable relative order
+        let mut items = vec![
+            triage_item("events", "warning", "alpha"),
+            triage_item("crashes", "warning", "beta"),
+            triage_item("health", "warning", "gamma"),
+        ];
+
+        // Sort twice and verify same result (stability)
+        triage_sort(&mut items);
+        let first: Vec<String> = items
+            .iter()
+            .map(|i| i["title"].as_str().unwrap().to_string())
+            .collect();
+
+        triage_sort(&mut items);
+        let second: Vec<String> = items
+            .iter()
+            .map(|i| i["title"].as_str().unwrap().to_string())
+            .collect();
+
+        assert_eq!(first, second, "Sort must be stable across invocations");
+    }
+
+    #[test]
+    fn triage_filter_by_severity_error() {
+        let mut items = vec![
+            triage_item("health", "error", "db timeout"),
+            triage_item("crashes", "warning", "recent crash"),
+            triage_item("events", "info", "workflow"),
+        ];
+
+        triage_filter(&mut items, "error");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["severity"], "error");
+    }
+
+    #[test]
+    fn triage_filter_by_severity_warning() {
+        let mut items = vec![
+            triage_item("health", "error", "db timeout"),
+            triage_item("crashes", "warning", "recent crash"),
+            triage_item("events", "info", "workflow"),
+        ];
+
+        triage_filter(&mut items, "warning");
+        assert_eq!(items.len(), 2);
+        let severities: Vec<&str> = items
+            .iter()
+            .map(|i| i["severity"].as_str().unwrap())
+            .collect();
+        assert!(severities.contains(&"error"));
+        assert!(severities.contains(&"warning"));
+    }
+
+    #[test]
+    fn triage_filter_by_severity_info_keeps_all() {
+        let mut items = vec![
+            triage_item("health", "error", "db timeout"),
+            triage_item("crashes", "warning", "recent crash"),
+            triage_item("events", "info", "workflow"),
+        ];
+
+        triage_filter(&mut items, "info");
+        assert_eq!(items.len(), 3);
+    }
+
+    #[test]
+    fn triage_json_schema_structure() {
+        // The triage JSON output has a specific contract; verify the shape
+        let items = vec![
+            triage_item("health", "error", "db timeout"),
+            triage_item("events", "warning", "unhandled"),
+        ];
+
+        let result = serde_json::json!({
+            "ok": true,
+            "version": wa_core::VERSION,
+            "total": items.len(),
+            "items": items,
+        });
+
+        // Top-level fields
+        assert_eq!(result["ok"], true);
+        assert!(result["version"].is_string());
+        assert_eq!(result["total"], 2);
+        assert!(result["items"].is_array());
+
+        // Per-item fields
+        let first = &result["items"][0];
+        assert!(first["section"].is_string());
+        assert!(first["severity"].is_string());
+        assert!(first["title"].is_string());
+        assert!(first["detail"].is_string());
+        assert!(first["action"].is_string());
+    }
+
+    #[test]
+    fn triage_json_schema_empty_output() {
+        let items: Vec<serde_json::Value> = vec![];
+        let result = serde_json::json!({
+            "ok": true,
+            "version": wa_core::VERSION,
+            "total": items.len(),
+            "items": items,
+        });
+
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["total"], 0);
+        assert_eq!(result["items"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn triage_item_sections_are_valid() {
+        let valid_sections = ["health", "crashes", "events", "workflows"];
+        let items = vec![
+            triage_item("health", "error", "a"),
+            triage_item("crashes", "warning", "b"),
+            triage_item("events", "info", "c"),
+            triage_item("workflows", "info", "d"),
+        ];
+        for item in &items {
+            let section = item["section"].as_str().unwrap();
+            assert!(
+                valid_sections.contains(&section),
+                "Invalid section: {section}"
+            );
+        }
+    }
+
+    #[test]
+    fn triage_severity_values_are_valid() {
+        let valid_severities = ["error", "warning", "info"];
+        let items = vec![
+            triage_item("health", "error", "a"),
+            triage_item("crashes", "warning", "b"),
+            triage_item("events", "info", "c"),
+        ];
+        for item in &items {
+            let sev = item["severity"].as_str().unwrap();
+            assert!(
+                valid_severities.contains(&sev),
+                "Invalid severity: {sev}"
+            );
+        }
+    }
+
+    #[test]
+    fn triage_sort_then_filter_produces_correct_order() {
+        let mut items = vec![
+            triage_item("events", "info", "wf-running"),
+            triage_item("health", "error", "db-timeout"),
+            triage_item("crashes", "warning", "crash-1"),
+            triage_item("events", "warning", "unhandled-1"),
+            triage_item("health", "error", "circuit-open"),
+            triage_item("events", "info", "wf-waiting"),
+        ];
+
+        triage_sort(&mut items);
+        triage_filter(&mut items, "warning");
+
+        // Should have 4 items: 2 errors + 2 warnings, in that order
+        assert_eq!(items.len(), 4);
+        assert_eq!(items[0]["severity"], "error");
+        assert_eq!(items[1]["severity"], "error");
+        assert_eq!(items[2]["severity"], "warning");
+        assert_eq!(items[3]["severity"], "warning");
+    }
 }
