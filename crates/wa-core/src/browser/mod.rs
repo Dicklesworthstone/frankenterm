@@ -39,6 +39,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, StorageError};
 
+pub mod openai_device;
+
 // =============================================================================
 // Configuration
 // =============================================================================
