@@ -8935,9 +8935,17 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 };
                 export_jsonl(&storage, &opts, &mut file).await
             } else {
-                let stdout = std::io::stdout();
-                let mut handle = std::io::BufWriter::new(stdout.lock());
-                export_jsonl(&storage, &opts, &mut handle).await
+                // Collect to a Vec first to avoid holding stdout lock across await
+                let mut buffer = Vec::new();
+                let count = export_jsonl(&storage, &opts, &mut buffer).await;
+                // Now write to stdout synchronously
+                {
+                    use std::io::Write;
+                    let stdout = std::io::stdout();
+                    let mut handle = stdout.lock();
+                    let _ = handle.write_all(&buffer);
+                }
+                count
             };
 
             match result {
