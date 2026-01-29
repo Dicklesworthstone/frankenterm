@@ -2134,29 +2134,79 @@ pub async fn check_step_idempotency(
         return IdempotencyCheckResult::NotExecuted;
     };
 
-    // Find the log for this step by index
+    let mut latest_completed: Option<(i64, Option<String>)> = None;
+    let mut latest_started: Option<i64> = None;
+
+    // Find logs for this step by index and idempotency key
     for log in logs {
-        if log.step_index == step_index {
-            // Check if the result data contains this idempotency key
-            if let Some(ref result_data) = log.result_data {
-                if let Ok(data) = serde_json::from_str::<serde_json::Value>(result_data) {
-                    if let Some(key) = data.get("idempotency_key").and_then(|v| v.as_str()) {
-                        if key == idempotency_key.0 {
-                            // Check if step completed successfully
-                            if log.result_type == "continue" || log.result_type == "done" {
-                                return IdempotencyCheckResult::AlreadyCompleted {
-                                    completed_at: log.completed_at,
-                                    previous_result: log.result_data.clone(),
-                                };
-                            }
-                            return IdempotencyCheckResult::PartiallyExecuted {
-                                started_at: log.started_at,
-                            };
-                        }
-                    }
+        if log.step_index != step_index {
+            continue;
+        }
+
+        let key_matches = if let Some(step_id) = log.step_id.as_deref() {
+            step_id == idempotency_key.0.as_str()
+        } else if let Some(ref result_data) = log.result_data {
+            serde_json::from_str::<serde_json::Value>(result_data)
+                .ok()
+                .and_then(|data| {
+                    data.get("idempotency_key")
+                        .and_then(|v| v.as_str())
+                        .map(|key| key == idempotency_key.0.as_str())
+                })
+                .unwrap_or(false)
+        } else {
+            false
+        };
+
+        if !key_matches {
+            continue;
+        }
+
+        let is_completed = match log.result_type.as_str() {
+            "continue" | "done" => true,
+            "send_text" => {
+                if let Some(ref summary) = log.policy_summary {
+                    serde_json::from_str::<serde_json::Value>(summary)
+                        .ok()
+                        .and_then(|data| {
+                            data.get("decision")
+                                .and_then(|v| v.as_str())
+                                .map(|decision| decision == "allow")
+                        })
+                        .unwrap_or(true)
+                } else {
+                    true
                 }
             }
+            _ => false,
+        };
+
+        if is_completed {
+            let should_replace = latest_completed
+                .as_ref()
+                .is_none_or(|(ts, _)| log.completed_at > *ts);
+            if should_replace {
+                latest_completed = Some((log.completed_at, log.result_data.clone()));
+            }
+        } else {
+            let should_replace = latest_started
+                .as_ref()
+                .is_none_or(|ts| log.started_at > *ts);
+            if should_replace {
+                latest_started = Some(log.started_at);
+            }
         }
+    }
+
+    if let Some((completed_at, previous_result)) = latest_completed {
+        return IdempotencyCheckResult::AlreadyCompleted {
+            completed_at,
+            previous_result,
+        };
+    }
+
+    if let Some(started_at) = latest_started {
+        return IdempotencyCheckResult::PartiallyExecuted { started_at };
     }
 
     IdempotencyCheckResult::NotExecuted
@@ -5027,8 +5077,7 @@ impl Workflow for HandleCompaction {
                 }),
             },
             "Validate pane state allows injection",
-        )
-        .idempotent();
+        );
 
         let stabilize = crate::plan::StepPlan::new(
             2,
@@ -5041,8 +5090,7 @@ impl Workflow for HandleCompaction {
                 }),
             },
             "Wait for compaction output to stabilize",
-        )
-        .idempotent();
+        );
 
         let send_prompt = crate::plan::StepPlan::new(
             3,
@@ -5064,8 +5112,7 @@ impl Workflow for HandleCompaction {
                 }),
             },
             "Verify the prompt was processed",
-        )
-        .idempotent();
+        );
 
         Some(
             crate::plan::ActionPlan::builder(self.description(), workspace_id)

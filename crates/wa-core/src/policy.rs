@@ -1391,6 +1391,7 @@ const COMMAND_TOKENS: &[&str] = &[
     "ruby",
     "php",
     "lua",
+    "tclsh",
     "eval",
     "exec",
     "env",
