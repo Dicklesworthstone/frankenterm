@@ -1257,6 +1257,10 @@ pub struct NotificationConfig {
     /// a different payload template (generic, slack, discord).
     #[serde(default)]
     pub webhooks: Vec<crate::webhook::WebhookEndpointConfig>,
+
+    /// Desktop notification settings (native OS alerts).
+    #[serde(default)]
+    pub desktop: crate::desktop_notify::DesktopNotifyConfig,
 }
 
 impl Default for NotificationConfig {
@@ -1270,6 +1274,7 @@ impl Default for NotificationConfig {
             min_severity: None,
             agent_types: Vec::new(),
             webhooks: Vec::new(),
+            desktop: crate::desktop_notify::DesktopNotifyConfig::default(),
         }
     }
 }
@@ -3019,6 +3024,7 @@ agent_types = ["codex", "claude_code"]
             min_severity: Some("warning".to_string()),
             agent_types: vec!["codex".to_string()],
             webhooks: Vec::new(),
+            desktop: crate::desktop_notify::DesktopNotifyConfig::default(),
         };
         let filter = nc.to_event_filter();
         assert!(!filter.is_permissive());

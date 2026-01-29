@@ -49,6 +49,7 @@ pub mod chaos;
 pub mod circuit_breaker;
 pub mod config;
 pub mod crash;
+pub mod desktop_notify;
 pub mod degradation;
 pub mod diagnostic;
 pub mod dry_run;
