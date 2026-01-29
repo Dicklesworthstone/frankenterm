@@ -178,10 +178,10 @@ fn gather_db_health(db_path: &Path) -> crate::Result<DbHealthStats> {
         .unwrap_or(-1)
     };
 
-    let db_file_size = fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
+    let db_file_size = fs::metadata(db_path).map_or(0, |m| m.len());
 
     let wal_path = db_path.with_extension("db-wal");
-    let wal_file_size = fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+    let wal_file_size = fs::metadata(&wal_path).map_or(0, |m| m.len());
 
     Ok(DbHealthStats {
         schema_version: pragma_i64("user_version") as i32,
@@ -608,13 +608,12 @@ fn write_json_file<T: Serialize>(dir: &Path, name: &str, value: &T) -> crate::Re
 
 fn dir_size(path: &Path) -> u64 {
     fs::read_dir(path)
-        .map(|entries| {
+        .map_or(0, |entries| {
             entries
-                .filter_map(|e| e.ok())
-                .map(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
+                .filter_map(Result::ok)
+                .map(|e| e.metadata().map_or(0, |m| m.len()))
                 .sum()
         })
-        .unwrap_or(0)
 }
 
 // =============================================================================
@@ -1029,7 +1028,13 @@ mod tests {
 
         // Create an active reservation
         let res = storage
-            .create_reservation(1, "workflow", "wf-test-123", Some("testing bundle"), 3600000)
+            .create_reservation(
+                1,
+                "workflow",
+                "wf-test-123",
+                Some("testing bundle"),
+                3_600_000,
+            )
             .await
             .unwrap();
         assert!(res.id > 0);

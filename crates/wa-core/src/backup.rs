@@ -431,7 +431,7 @@ fn dump_database_sql(db_path: &Path, sql_path: &Path) -> Result<()> {
                 "Failed to query tables: {e}"
             )))
         })?
-        .filter_map(|r| r.ok())
+        .filter_map(std::result::Result::ok)
         .collect();
 
     for (name, create_sql) in &tables {
@@ -494,7 +494,7 @@ fn dump_database_sql(db_path: &Path, sql_path: &Path) -> Result<()> {
                 "Failed to query indexes: {e}"
             )))
         })?
-        .filter_map(|r| r.ok())
+        .filter_map(std::result::Result::ok)
         .collect();
 
     if !indexes.is_empty() {
@@ -558,11 +558,10 @@ fn default_backup_path(workspace_root: &Path) -> PathBuf {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default();
     let ts = format_timestamp_compact(now.as_secs());
-    let backup_dir = workspace_root
+    workspace_root
         .join(".wa")
         .join("backups")
-        .join(format!("wa_backup_{ts}"));
-    backup_dir
+        .join(format!("wa_backup_{ts}"))
 }
 
 /// Format epoch seconds as compact timestamp: YYYYMMDD_HHMMSS
@@ -620,7 +619,7 @@ fn dir_size(path: &Path) -> u64 {
     fs::read_dir(path)
         .map_or(0, |entries| {
             entries
-                .filter_map(|r| r.ok())
+                .filter_map(std::result::Result::ok)
                 .map(|e| e.metadata().map_or(0, |m| m.len()))
                 .sum()
         })

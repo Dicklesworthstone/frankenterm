@@ -5696,15 +5696,15 @@ impl AuthRecoveryStrategy {
                 .and_then(|e| e.get("url"))
                 .and_then(|v| v.as_str())
                 .map(ToString::to_string);
-            AuthRecoveryStrategy::DeviceCode { code, url }
+            Self::DeviceCode { code, url }
         } else if event_type == "auth.error" || rule_id.contains("api_key") {
             let key_hint = extracted
                 .and_then(|e| e.get("key_name"))
                 .and_then(|v| v.as_str())
                 .map(ToString::to_string);
-            AuthRecoveryStrategy::ApiKeyError { key_hint }
+            Self::ApiKeyError { key_hint }
         } else {
-            AuthRecoveryStrategy::ManualIntervention {
+            Self::ManualIntervention {
                 agent_type: agent_type.to_string(),
                 hint: format!("Auth required for {agent_type}; manual login may be needed"),
             }
@@ -5712,6 +5712,7 @@ impl AuthRecoveryStrategy {
     }
 
     /// Human-readable label for the strategy.
+    #[must_use]
     pub fn label(&self) -> &'static str {
         match self {
             Self::DeviceCode { .. } => "device_code",
@@ -5737,6 +5738,7 @@ impl HandleAuthRequired {
 
     /// Create with a custom cooldown (useful for testing or configuration).
     #[allow(dead_code)]
+    #[must_use]
     pub fn with_cooldown_ms(cooldown_ms: i64) -> Self {
         Self { cooldown_ms }
     }
@@ -6214,11 +6216,14 @@ pub enum ResumeSessionOutcome {
 /// # Panics
 ///
 /// None — if `{session_id}` is not in the template, the template is returned as-is.
+#[allow(clippy::literal_string_with_formatting_args)]
+const SESSION_ID_TOKEN: &str = "{session_id}";
+
 #[must_use]
 pub fn format_resume_command(session_id: &str, config: &ResumeSessionConfig) -> String {
     config
         .resume_command_template
-        .replace("{session_id}", session_id)
+        .replace(SESSION_ID_TOKEN, session_id)
 }
 
 /// Validate a session ID for resume.
@@ -6273,6 +6278,7 @@ pub fn build_proceed_step_result(config: &ResumeSessionConfig) -> StepResult {
 /// - `Ready` → `StepResult::Done` (workflow complete)
 /// - `VerifyTimeout` → `StepResult::Done` with timeout info (non-fatal)
 /// - `Failed` → `StepResult::Abort`
+#[must_use]
 pub fn resume_outcome_to_step_result(outcome: &ResumeSessionOutcome) -> StepResult {
     match outcome {
         ResumeSessionOutcome::Ready { .. } => {
