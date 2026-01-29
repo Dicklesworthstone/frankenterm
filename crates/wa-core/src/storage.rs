@@ -48,7 +48,7 @@ use crate::policy::Redactor;
 /// This is the target version that new databases will be initialized to,
 /// and existing databases will be migrated to.
 /// Uses SQLite's PRAGMA user_version for atomic version tracking.
-pub const SCHEMA_VERSION: i32 = 7;
+pub const SCHEMA_VERSION: i32 = 8;
 
 /// Schema initialization SQL
 ///
@@ -342,6 +342,24 @@ CREATE INDEX IF NOT EXISTS idx_accounts_service ON accounts(service);
 CREATE INDEX IF NOT EXISTS idx_accounts_percent ON accounts(service, percent_remaining DESC);
 CREATE INDEX IF NOT EXISTS idx_accounts_last_used ON accounts(service, last_used_at);
 
+-- Pane reservations: exclusive workflow locks on panes
+-- Only one active reservation per pane; auto-expire on TTL
+CREATE TABLE IF NOT EXISTS pane_reservations (
+    id INTEGER PRIMARY KEY,
+    pane_id INTEGER NOT NULL REFERENCES panes(pane_id),
+    owner_kind TEXT NOT NULL,          -- workflow, agent, manual
+    owner_id TEXT NOT NULL,            -- workflow ID or agent name
+    reason TEXT,                       -- human-readable reason
+    created_at INTEGER NOT NULL,       -- epoch ms
+    expires_at INTEGER NOT NULL,       -- epoch ms (created_at + TTL)
+    released_at INTEGER,              -- epoch ms when released (NULL if active)
+    status TEXT NOT NULL DEFAULT 'active'  -- active | released
+);
+
+CREATE INDEX IF NOT EXISTS idx_reservations_pane_status ON pane_reservations(pane_id, status);
+CREATE INDEX IF NOT EXISTS idx_reservations_status ON pane_reservations(status);
+CREATE INDEX IF NOT EXISTS idx_reservations_expires ON pane_reservations(expires_at) WHERE status = 'active';
+
 -- Config: key-value settings
 CREATE TABLE IF NOT EXISTS config (
     key TEXT PRIMARY KEY,
@@ -594,6 +612,38 @@ static MIGRATIONS: &[Migration] = &[
             r"
             DROP INDEX IF EXISTS idx_action_plans_hash;
             DROP TABLE IF EXISTS workflow_action_plans;
+        ",
+        ),
+    },
+    Migration {
+        version: 8,
+        description: "Add pane_reservations for per-pane workflow lock/reservation",
+        up_sql: r"
+            CREATE TABLE IF NOT EXISTS pane_reservations (
+                id INTEGER PRIMARY KEY,
+                pane_id INTEGER NOT NULL REFERENCES panes(pane_id),
+                owner_kind TEXT NOT NULL,
+                owner_id TEXT NOT NULL,
+                reason TEXT,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                released_at INTEGER,
+                status TEXT NOT NULL DEFAULT 'active'
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_reservations_pane_status
+                ON pane_reservations(pane_id, status);
+            CREATE INDEX IF NOT EXISTS idx_reservations_status
+                ON pane_reservations(status);
+            CREATE INDEX IF NOT EXISTS idx_reservations_expires
+                ON pane_reservations(expires_at) WHERE status = 'active';
+        ",
+        down_sql: Some(
+            r"
+            DROP INDEX IF EXISTS idx_reservations_expires;
+            DROP INDEX IF EXISTS idx_reservations_status;
+            DROP INDEX IF EXISTS idx_reservations_pane_status;
+            DROP TABLE IF EXISTS pane_reservations;
         ",
         ),
     },
@@ -1080,6 +1130,68 @@ impl ApprovalTokenRecord {
     #[must_use]
     pub fn is_active(&self, now_ms: i64) -> bool {
         self.used_at.is_none() && self.expires_at >= now_ms
+    }
+}
+
+/// A pane reservation representing an exclusive workflow lock on a pane.
+///
+/// Only one active reservation per pane is allowed. Reservations expire
+/// automatically after their TTL.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaneReservation {
+    /// Unique reservation ID
+    pub id: i64,
+    /// Pane this reservation applies to
+    pub pane_id: u64,
+    /// Kind of owner (e.g. "workflow", "agent", "manual")
+    pub owner_kind: String,
+    /// Owner identifier (e.g. workflow ID or agent name)
+    pub owner_id: String,
+    /// Human-readable reason for the reservation
+    pub reason: Option<String>,
+    /// When the reservation was created (epoch ms)
+    pub created_at: i64,
+    /// When the reservation expires (epoch ms)
+    pub expires_at: i64,
+    /// When the reservation was released (epoch ms), None if still active
+    pub released_at: Option<i64>,
+    /// Current status: "active" or "released"
+    pub status: String,
+}
+
+impl PaneReservation {
+    /// Returns true if the reservation is still active and unexpired.
+    #[must_use]
+    pub fn is_active(&self, now_ms: i64) -> bool {
+        self.status == "active" && self.released_at.is_none() && self.expires_at > now_ms
+    }
+}
+
+/// Configuration for pane reservation behavior.
+#[derive(Debug, Clone)]
+pub struct PaneReservationConfig {
+    /// Default TTL in milliseconds (30 minutes)
+    pub default_ttl_ms: i64,
+    /// Maximum allowed TTL in milliseconds (4 hours)
+    pub max_ttl_ms: i64,
+}
+
+impl Default for PaneReservationConfig {
+    fn default() -> Self {
+        Self {
+            default_ttl_ms: 30 * 60 * 1000,   // 30 minutes
+            max_ttl_ms: 4 * 60 * 60 * 1000,    // 4 hours
+        }
+    }
+}
+
+impl PaneReservationConfig {
+    /// Clamp a requested TTL to the allowed range.
+    ///
+    /// Returns the clamped TTL in milliseconds. The minimum is 1000ms (1 second).
+    #[must_use]
+    pub fn clamp_ttl(&self, requested_ttl_ms: i64) -> i64 {
+        requested_ttl_ms.clamp(1000, self.max_ttl_ms)
     }
 }
 
@@ -2504,6 +2616,24 @@ enum WriteCommand {
         account_id: String,
         respond: oneshot::Sender<Result<bool>>,
     },
+    /// Create a pane reservation (exclusive lock)
+    CreateReservation {
+        pane_id: u64,
+        owner_kind: String,
+        owner_id: String,
+        reason: Option<String>,
+        ttl_ms: i64,
+        respond: oneshot::Sender<Result<PaneReservation>>,
+    },
+    /// Release a pane reservation by ID
+    ReleaseReservation {
+        reservation_id: i64,
+        respond: oneshot::Sender<Result<bool>>,
+    },
+    /// Expire all stale reservations (past their TTL)
+    ExpireStaleReservations {
+        respond: oneshot::Sender<Result<usize>>,
+    },
     /// Checkpoint WAL (incremental, non-blocking)
     Checkpoint { respond: oneshot::Sender<Result<CheckpointResult>> },
     /// Shutdown the writer thread (flush pending writes)
@@ -3584,6 +3714,94 @@ impl StorageHandle {
         Ok(crate::accounts::select_account(&accounts, config))
     }
 
+    // =========================================================================
+    // Pane Reservation Operations
+    // =========================================================================
+
+    /// Create an exclusive pane reservation.
+    ///
+    /// Returns a conflict error if the pane already has an active reservation.
+    /// TTL is clamped to `[1s, max_ttl]` via `PaneReservationConfig`.
+    pub async fn create_reservation(
+        &self,
+        pane_id: u64,
+        owner_kind: &str,
+        owner_id: &str,
+        reason: Option<&str>,
+        ttl_ms: i64,
+    ) -> Result<PaneReservation> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::CreateReservation {
+                pane_id,
+                owner_kind: owner_kind.to_string(),
+                owner_id: owner_id.to_string(),
+                reason: reason.map(String::from),
+                ttl_ms,
+                respond: tx,
+            })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    /// Release a pane reservation by ID.
+    ///
+    /// Returns true if released, false if not found or already released.
+    pub async fn release_reservation(&self, reservation_id: i64) -> Result<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::ReleaseReservation {
+                reservation_id,
+                respond: tx,
+            })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    /// Get the active reservation for a pane (read-only).
+    pub async fn get_active_reservation(&self, pane_id: u64) -> Result<Option<PaneReservation>> {
+        let db_path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str())
+                .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
+            get_active_reservation_sync(&conn, pane_id)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+    }
+
+    /// List all active (unexpired) pane reservations (read-only).
+    pub async fn list_active_reservations(&self) -> Result<Vec<PaneReservation>> {
+        let db_path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str())
+                .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
+            list_active_reservations_sync(&conn)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+    }
+
+    /// Expire all stale reservations (past their TTL).
+    ///
+    /// Returns the number of reservations expired.
+    pub async fn expire_stale_reservations(&self) -> Result<usize> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::ExpireStaleReservations { respond: tx })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
     /// Shutdown the storage handle
     ///
     /// Flushes all pending writes and waits for the writer thread to exit.
@@ -3943,6 +4161,29 @@ fn dispatch_write_command(conn: &mut Connection, cmd: WriteCommand, should_break
             respond,
         } => {
             let result = delete_account_sync(conn, &service, &account_id);
+            let _ = respond.send(result);
+        }
+        WriteCommand::CreateReservation {
+            pane_id,
+            owner_kind,
+            owner_id,
+            reason,
+            ttl_ms,
+            respond,
+        } => {
+            let result =
+                create_reservation_sync(conn, pane_id, &owner_kind, &owner_id, reason.as_deref(), ttl_ms);
+            let _ = respond.send(result);
+        }
+        WriteCommand::ReleaseReservation {
+            reservation_id,
+            respond,
+        } => {
+            let result = release_reservation_sync(conn, reservation_id);
+            let _ = respond.send(result);
+        }
+        WriteCommand::ExpireStaleReservations { respond } => {
+            let result = expire_stale_reservations_sync(conn);
             let _ = respond.send(result);
         }
         WriteCommand::Shutdown { respond } => {
@@ -4649,6 +4890,178 @@ fn get_account_sync(
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(e) => Err(StorageError::Database(format!("Failed to get account: {e}")).into()),
     }
+}
+
+// =============================================================================
+// Pane Reservation Sync Operations
+// =============================================================================
+
+/// Create a pane reservation, enforcing one-active-per-pane.
+///
+/// If an active, unexpired reservation already exists for the pane, returns
+/// a conflict error. Expired reservations are treated as released.
+fn create_reservation_sync(
+    conn: &Connection,
+    pane_id: u64,
+    owner_kind: &str,
+    owner_id: &str,
+    reason: Option<&str>,
+    ttl_ms: i64,
+) -> Result<PaneReservation> {
+    let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
+    let now = now_ms();
+
+    // Check for existing active reservation (not expired)
+    let existing: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM pane_reservations
+             WHERE pane_id = ?1 AND status = 'active' AND expires_at > ?2",
+            params![pane_id_i64, now],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| StorageError::Database(format!("Failed to check reservation: {e}")))?;
+
+    if let Some(existing_id) = existing {
+        return Err(StorageError::Database(format!(
+            "Pane {pane_id} already has active reservation (id={existing_id})"
+        ))
+        .into());
+    }
+
+    let expires_at = now + ttl_ms;
+
+    conn.execute(
+        "INSERT INTO pane_reservations (pane_id, owner_kind, owner_id, reason, created_at, expires_at, status)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active')",
+        params![pane_id_i64, owner_kind, owner_id, reason, now, expires_at],
+    )
+    .map_err(|e| StorageError::Database(format!("Failed to create reservation: {e}")))?;
+
+    let id = conn.last_insert_rowid();
+
+    Ok(PaneReservation {
+        id,
+        pane_id,
+        owner_kind: owner_kind.to_string(),
+        owner_id: owner_id.to_string(),
+        reason: reason.map(String::from),
+        created_at: now,
+        expires_at,
+        released_at: None,
+        status: "active".to_string(),
+    })
+}
+
+/// Release a pane reservation by setting status to "released".
+///
+/// Returns true if a reservation was released, false if not found or already released.
+fn release_reservation_sync(conn: &Connection, reservation_id: i64) -> Result<bool> {
+    let now = now_ms();
+    let updated = conn
+        .execute(
+            "UPDATE pane_reservations SET status = 'released', released_at = ?1
+             WHERE id = ?2 AND status = 'active'",
+            params![now, reservation_id],
+        )
+        .map_err(|e| StorageError::Database(format!("Failed to release reservation: {e}")))?;
+
+    Ok(updated > 0)
+}
+
+/// Get the active reservation for a pane (if any).
+///
+/// Only returns a reservation that is both status='active' and not expired.
+fn get_active_reservation_sync(
+    conn: &Connection,
+    pane_id: u64,
+) -> Result<Option<PaneReservation>> {
+    let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
+    let now = now_ms();
+
+    let result = conn.query_row(
+        "SELECT id, pane_id, owner_kind, owner_id, reason, created_at, expires_at, released_at, status
+         FROM pane_reservations
+         WHERE pane_id = ?1 AND status = 'active' AND expires_at > ?2",
+        params![pane_id_i64, now],
+        |row| {
+            let pane_id_val: i64 = row.get(1)?;
+            #[allow(clippy::cast_sign_loss)]
+            Ok(PaneReservation {
+                id: row.get(0)?,
+                pane_id: pane_id_val as u64,
+                owner_kind: row.get(2)?,
+                owner_id: row.get(3)?,
+                reason: row.get(4)?,
+                created_at: row.get(5)?,
+                expires_at: row.get(6)?,
+                released_at: row.get(7)?,
+                status: row.get(8)?,
+            })
+        },
+    );
+
+    match result {
+        Ok(reservation) => Ok(Some(reservation)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(StorageError::Database(format!("Failed to get reservation: {e}")).into()),
+    }
+}
+
+/// List all active (unexpired) reservations.
+fn list_active_reservations_sync(conn: &Connection) -> Result<Vec<PaneReservation>> {
+    let now = now_ms();
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, pane_id, owner_kind, owner_id, reason, created_at, expires_at, released_at, status
+             FROM pane_reservations
+             WHERE status = 'active' AND expires_at > ?1
+             ORDER BY created_at ASC",
+        )
+        .map_err(|e| StorageError::Database(format!("Failed to prepare reservations query: {e}")))?;
+
+    let rows = stmt
+        .query_map([now], |row| {
+            let pane_id_val: i64 = row.get(1)?;
+            #[allow(clippy::cast_sign_loss)]
+            Ok(PaneReservation {
+                id: row.get(0)?,
+                pane_id: pane_id_val as u64,
+                owner_kind: row.get(2)?,
+                owner_id: row.get(3)?,
+                reason: row.get(4)?,
+                created_at: row.get(5)?,
+                expires_at: row.get(6)?,
+                released_at: row.get(7)?,
+                status: row.get(8)?,
+            })
+        })
+        .map_err(|e| StorageError::Database(format!("Failed to query reservations: {e}")))?;
+
+    let mut reservations = Vec::new();
+    for row in rows {
+        reservations.push(
+            row.map_err(|e| StorageError::Database(format!("Failed to read reservation row: {e}")))?,
+        );
+    }
+    Ok(reservations)
+}
+
+/// Expire all stale reservations (past their TTL).
+///
+/// Sets status to "released" and released_at to now for all active reservations
+/// whose expires_at is in the past. Returns the number of reservations expired.
+fn expire_stale_reservations_sync(conn: &Connection) -> Result<usize> {
+    let now = now_ms();
+    let expired = conn
+        .execute(
+            "UPDATE pane_reservations SET status = 'released', released_at = ?1
+             WHERE status = 'active' AND expires_at <= ?1",
+            params![now],
+        )
+        .map_err(|e| StorageError::Database(format!("Failed to expire reservations: {e}")))?;
+
+    Ok(expired)
 }
 
 /// Insert an approval token (synchronous)
@@ -10639,5 +11052,433 @@ mod accounts_db_tests {
         assert_eq!(fetched.name.as_deref(), Some("Updated Name"));
         assert!((fetched.percent_remaining - 50.0).abs() < 0.001);
         assert_eq!(fetched.reset_at.as_deref(), Some("2026-02-01T00:00:00Z"));
+    }
+}
+
+#[cfg(test)]
+mod reservation_tests {
+    use super::*;
+
+    fn setup_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        // Ensure a pane exists for FK constraint
+        conn.execute(
+            "INSERT INTO panes (pane_id, title, cwd, observed, first_seen_at, last_seen_at)
+             VALUES (1, 'test', '/tmp', 1, 1000, 1000)",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    fn setup_db_with_panes(pane_ids: &[u64]) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        for &pid in pane_ids {
+            conn.execute(
+                "INSERT INTO panes (pane_id, title, cwd, observed, first_seen_at, last_seen_at)
+                 VALUES (?1, 'test', '/tmp', 1, 1000, 1000)",
+                params![pid as i64],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    // =========================================================================
+    // PaneReservation struct tests
+    // =========================================================================
+
+    #[test]
+    fn reservation_is_active_when_valid() {
+        let r = PaneReservation {
+            id: 1,
+            pane_id: 1,
+            owner_kind: "workflow".to_string(),
+            owner_id: "wf-123".to_string(),
+            reason: Some("test".to_string()),
+            created_at: 1000,
+            expires_at: 5000,
+            released_at: None,
+            status: "active".to_string(),
+        };
+        assert!(r.is_active(2000));
+        assert!(r.is_active(4999));
+    }
+
+    #[test]
+    fn reservation_not_active_when_expired() {
+        let r = PaneReservation {
+            id: 1,
+            pane_id: 1,
+            owner_kind: "workflow".to_string(),
+            owner_id: "wf-123".to_string(),
+            reason: None,
+            created_at: 1000,
+            expires_at: 5000,
+            released_at: None,
+            status: "active".to_string(),
+        };
+        // At exactly expires_at, is_active returns false (> not >=)
+        assert!(!r.is_active(5000));
+        assert!(!r.is_active(6000));
+    }
+
+    #[test]
+    fn reservation_not_active_when_released() {
+        let r = PaneReservation {
+            id: 1,
+            pane_id: 1,
+            owner_kind: "workflow".to_string(),
+            owner_id: "wf-123".to_string(),
+            reason: None,
+            created_at: 1000,
+            expires_at: 5000,
+            released_at: Some(3000),
+            status: "released".to_string(),
+        };
+        assert!(!r.is_active(2000));
+    }
+
+    // =========================================================================
+    // PaneReservationConfig tests
+    // =========================================================================
+
+    #[test]
+    fn config_default_values() {
+        let cfg = PaneReservationConfig::default();
+        assert_eq!(cfg.default_ttl_ms, 30 * 60 * 1000);
+        assert_eq!(cfg.max_ttl_ms, 4 * 60 * 60 * 1000);
+    }
+
+    #[test]
+    fn config_clamp_ttl_within_range() {
+        let cfg = PaneReservationConfig::default();
+        assert_eq!(cfg.clamp_ttl(60_000), 60_000);
+    }
+
+    #[test]
+    fn config_clamp_ttl_below_minimum() {
+        let cfg = PaneReservationConfig::default();
+        assert_eq!(cfg.clamp_ttl(500), 1000);
+        assert_eq!(cfg.clamp_ttl(0), 1000);
+        assert_eq!(cfg.clamp_ttl(-100), 1000);
+    }
+
+    #[test]
+    fn config_clamp_ttl_above_maximum() {
+        let cfg = PaneReservationConfig::default();
+        let five_hours = 5 * 60 * 60 * 1000;
+        assert_eq!(cfg.clamp_ttl(five_hours), cfg.max_ttl_ms);
+    }
+
+    // =========================================================================
+    // create_reservation_sync tests
+    // =========================================================================
+
+    #[test]
+    fn create_reservation_basic() {
+        let conn = setup_db();
+        let r = create_reservation_sync(&conn, 1, "workflow", "wf-1", Some("testing"), 60_000)
+            .unwrap();
+
+        assert_eq!(r.pane_id, 1);
+        assert_eq!(r.owner_kind, "workflow");
+        assert_eq!(r.owner_id, "wf-1");
+        assert_eq!(r.reason.as_deref(), Some("testing"));
+        assert_eq!(r.status, "active");
+        assert!(r.released_at.is_none());
+        assert!(r.expires_at > r.created_at);
+    }
+
+    #[test]
+    fn create_reservation_no_reason() {
+        let conn = setup_db();
+        let r = create_reservation_sync(&conn, 1, "agent", "agent-x", None, 30_000).unwrap();
+
+        assert!(r.reason.is_none());
+        assert_eq!(r.owner_kind, "agent");
+    }
+
+    #[test]
+    fn create_reservation_conflict_with_active() {
+        let conn = setup_db();
+
+        // First reservation succeeds
+        let _r1 = create_reservation_sync(&conn, 1, "workflow", "wf-1", None, 600_000).unwrap();
+
+        // Second reservation on same pane should fail
+        let r2 = create_reservation_sync(&conn, 1, "workflow", "wf-2", None, 60_000);
+        assert!(r2.is_err());
+        let err_msg = format!("{}", r2.unwrap_err());
+        assert!(err_msg.contains("already has active reservation"));
+    }
+
+    #[test]
+    fn create_reservation_allowed_after_release() {
+        let conn = setup_db();
+
+        let r1 = create_reservation_sync(&conn, 1, "workflow", "wf-1", None, 600_000).unwrap();
+        release_reservation_sync(&conn, r1.id).unwrap();
+
+        // Now a new reservation should succeed
+        let r2 = create_reservation_sync(&conn, 1, "workflow", "wf-2", None, 60_000);
+        assert!(r2.is_ok());
+    }
+
+    #[test]
+    fn create_reservation_allowed_on_different_panes() {
+        let conn = setup_db_with_panes(&[1, 2]);
+
+        let r1 = create_reservation_sync(&conn, 1, "workflow", "wf-1", None, 600_000);
+        let r2 = create_reservation_sync(&conn, 2, "workflow", "wf-2", None, 600_000);
+
+        assert!(r1.is_ok());
+        assert!(r2.is_ok());
+    }
+
+    // =========================================================================
+    // release_reservation_sync tests
+    // =========================================================================
+
+    #[test]
+    fn release_reservation_sets_released() {
+        let conn = setup_db();
+        let r = create_reservation_sync(&conn, 1, "workflow", "wf-1", None, 600_000).unwrap();
+
+        let released = release_reservation_sync(&conn, r.id).unwrap();
+        assert!(released);
+
+        // Verify status changed in DB
+        let active = get_active_reservation_sync(&conn, 1).unwrap();
+        assert!(active.is_none());
+    }
+
+    #[test]
+    fn release_nonexistent_returns_false() {
+        let conn = setup_db();
+        let released = release_reservation_sync(&conn, 9999).unwrap();
+        assert!(!released);
+    }
+
+    #[test]
+    fn release_already_released_returns_false() {
+        let conn = setup_db();
+        let r = create_reservation_sync(&conn, 1, "workflow", "wf-1", None, 600_000).unwrap();
+
+        assert!(release_reservation_sync(&conn, r.id).unwrap());
+        // Second release is a no-op
+        assert!(!release_reservation_sync(&conn, r.id).unwrap());
+    }
+
+    // =========================================================================
+    // get_active_reservation_sync tests
+    // =========================================================================
+
+    #[test]
+    fn get_active_reservation_returns_some() {
+        let conn = setup_db();
+        let created = create_reservation_sync(&conn, 1, "workflow", "wf-1", Some("reason"), 600_000)
+            .unwrap();
+
+        let fetched = get_active_reservation_sync(&conn, 1).unwrap();
+        assert!(fetched.is_some());
+        let f = fetched.unwrap();
+        assert_eq!(f.id, created.id);
+        assert_eq!(f.owner_id, "wf-1");
+        assert_eq!(f.reason.as_deref(), Some("reason"));
+    }
+
+    #[test]
+    fn get_active_reservation_returns_none_for_unreserved_pane() {
+        let conn = setup_db();
+        let fetched = get_active_reservation_sync(&conn, 1).unwrap();
+        assert!(fetched.is_none());
+    }
+
+    #[test]
+    fn get_active_reservation_returns_none_after_release() {
+        let conn = setup_db();
+        let r = create_reservation_sync(&conn, 1, "workflow", "wf-1", None, 600_000).unwrap();
+        release_reservation_sync(&conn, r.id).unwrap();
+
+        let fetched = get_active_reservation_sync(&conn, 1).unwrap();
+        assert!(fetched.is_none());
+    }
+
+    // =========================================================================
+    // list_active_reservations_sync tests
+    // =========================================================================
+
+    #[test]
+    fn list_active_empty() {
+        let conn = setup_db();
+        let list = list_active_reservations_sync(&conn).unwrap();
+        assert!(list.is_empty());
+    }
+
+    #[test]
+    fn list_active_multiple_panes() {
+        let conn = setup_db_with_panes(&[1, 2, 3]);
+
+        create_reservation_sync(&conn, 1, "workflow", "wf-1", None, 600_000).unwrap();
+        create_reservation_sync(&conn, 2, "agent", "agent-a", None, 600_000).unwrap();
+        create_reservation_sync(&conn, 3, "manual", "user-1", None, 600_000).unwrap();
+
+        let list = list_active_reservations_sync(&conn).unwrap();
+        assert_eq!(list.len(), 3);
+    }
+
+    #[test]
+    fn list_active_excludes_released() {
+        let conn = setup_db_with_panes(&[1, 2]);
+
+        let r1 = create_reservation_sync(&conn, 1, "workflow", "wf-1", None, 600_000).unwrap();
+        create_reservation_sync(&conn, 2, "workflow", "wf-2", None, 600_000).unwrap();
+
+        release_reservation_sync(&conn, r1.id).unwrap();
+
+        let list = list_active_reservations_sync(&conn).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].pane_id, 2);
+    }
+
+    // =========================================================================
+    // expire_stale_reservations_sync tests
+    // =========================================================================
+
+    #[test]
+    fn expire_stale_none_to_expire() {
+        let conn = setup_db();
+        create_reservation_sync(&conn, 1, "workflow", "wf-1", None, 600_000).unwrap();
+
+        let expired = expire_stale_reservations_sync(&conn).unwrap();
+        assert_eq!(expired, 0);
+    }
+
+    #[test]
+    fn expire_stale_expires_past_ttl() {
+        let conn = setup_db();
+
+        // Manually insert a reservation with expires_at in the past
+        let past = now_ms() - 10_000;
+        conn.execute(
+            "INSERT INTO pane_reservations (pane_id, owner_kind, owner_id, reason, created_at, expires_at, status)
+             VALUES (1, 'workflow', 'wf-old', NULL, ?1, ?2, 'active')",
+            params![past - 60_000, past],
+        )
+        .unwrap();
+
+        let expired = expire_stale_reservations_sync(&conn).unwrap();
+        assert_eq!(expired, 1);
+
+        // Should no longer appear as active
+        let active = get_active_reservation_sync(&conn, 1).unwrap();
+        assert!(active.is_none());
+    }
+
+    #[test]
+    fn expire_stale_does_not_touch_valid() {
+        let conn = setup_db_with_panes(&[1, 2]);
+
+        // One valid, one expired
+        create_reservation_sync(&conn, 1, "workflow", "wf-valid", None, 600_000).unwrap();
+
+        let past = now_ms() - 5_000;
+        conn.execute(
+            "INSERT INTO pane_reservations (pane_id, owner_kind, owner_id, reason, created_at, expires_at, status)
+             VALUES (2, 'workflow', 'wf-old', NULL, ?1, ?2, 'active')",
+            params![past - 60_000, past],
+        )
+        .unwrap();
+
+        let expired = expire_stale_reservations_sync(&conn).unwrap();
+        assert_eq!(expired, 1);
+
+        // Valid one should still be active
+        let active = list_active_reservations_sync(&conn).unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].owner_id, "wf-valid");
+    }
+
+    // =========================================================================
+    // Round-trip / integration tests
+    // =========================================================================
+
+    #[test]
+    fn reserve_release_reserve_round_trip() {
+        let conn = setup_db();
+
+        // Create first reservation
+        let r1 = create_reservation_sync(&conn, 1, "workflow", "wf-1", Some("first"), 600_000)
+            .unwrap();
+        assert!(get_active_reservation_sync(&conn, 1).unwrap().is_some());
+
+        // Release it
+        assert!(release_reservation_sync(&conn, r1.id).unwrap());
+        assert!(get_active_reservation_sync(&conn, 1).unwrap().is_none());
+
+        // Create second reservation on same pane
+        let r2 = create_reservation_sync(&conn, 1, "agent", "agent-b", Some("second"), 300_000)
+            .unwrap();
+        let active = get_active_reservation_sync(&conn, 1).unwrap().unwrap();
+        assert_eq!(active.id, r2.id);
+        assert_eq!(active.owner_kind, "agent");
+        assert_eq!(active.owner_id, "agent-b");
+    }
+
+    #[test]
+    fn expired_reservation_allows_new_creation() {
+        let conn = setup_db();
+
+        // Insert an already-expired reservation directly
+        let past = now_ms() - 10_000;
+        conn.execute(
+            "INSERT INTO pane_reservations (pane_id, owner_kind, owner_id, reason, created_at, expires_at, status)
+             VALUES (1, 'workflow', 'wf-expired', NULL, ?1, ?2, 'active')",
+            params![past - 60_000, past],
+        )
+        .unwrap();
+
+        // New reservation should succeed because the existing one is expired
+        let r = create_reservation_sync(&conn, 1, "workflow", "wf-new", None, 60_000);
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn ttl_determines_expiry() {
+        let conn = setup_db();
+        let ttl = 120_000i64; // 2 minutes
+        let r = create_reservation_sync(&conn, 1, "workflow", "wf-1", None, ttl).unwrap();
+
+        // expires_at should be approximately created_at + ttl
+        let diff = r.expires_at - r.created_at;
+        assert_eq!(diff, ttl);
+    }
+
+    #[test]
+    fn serialization_round_trip() {
+        let r = PaneReservation {
+            id: 42,
+            pane_id: 7,
+            owner_kind: "workflow".to_string(),
+            owner_id: "wf-abc".to_string(),
+            reason: Some("testing serialization".to_string()),
+            created_at: 1000,
+            expires_at: 2000,
+            released_at: None,
+            status: "active".to_string(),
+        };
+
+        let json = serde_json::to_string(&r).unwrap();
+        let deserialized: PaneReservation = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.id, r.id);
+        assert_eq!(deserialized.pane_id, r.pane_id);
+        assert_eq!(deserialized.owner_kind, r.owner_kind);
+        assert_eq!(deserialized.owner_id, r.owner_id);
+        assert_eq!(deserialized.reason, r.reason);
+        assert_eq!(deserialized.status, r.status);
     }
 }
