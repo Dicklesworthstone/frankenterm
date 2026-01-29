@@ -15,8 +15,8 @@ use crate::storage::{AuditActionRecord, PaneRecord, SearchResult, StoredEvent};
 pub struct RenderContext {
     /// Output format
     pub format: OutputFormat,
-    /// Whether to show verbose details
-    pub verbose: bool,
+    /// Verbosity level: 0=default, 1=verbose (-v), 2=debug (-vv)
+    pub verbose: u8,
     /// Maximum items to display (0 = unlimited)
     pub limit: usize,
 }
@@ -25,7 +25,7 @@ impl Default for RenderContext {
     fn default() -> Self {
         Self {
             format: OutputFormat::Auto,
-            verbose: false,
+            verbose: 0,
             limit: 0,
         }
     }
@@ -41,11 +41,23 @@ impl RenderContext {
         }
     }
 
-    /// Set verbose mode
+    /// Set verbosity level (0=default, 1=verbose, 2+=debug)
     #[must_use]
-    pub fn verbose(mut self, verbose: bool) -> Self {
+    pub fn verbose(mut self, verbose: u8) -> Self {
         self.verbose = verbose;
         self
+    }
+
+    /// Whether verbose level is at least 1 (-v)
+    #[must_use]
+    pub fn is_verbose(&self) -> bool {
+        self.verbose >= 1
+    }
+
+    /// Whether verbose level is at least 2 (-vv)
+    #[must_use]
+    pub fn is_debug(&self) -> bool {
+        self.verbose >= 2
     }
 
     /// Set display limit
@@ -166,7 +178,7 @@ impl PaneTableRenderer {
             output.push_str(&format!("  TTY:     {tty}\n"));
         }
 
-        if ctx.verbose {
+        if ctx.is_verbose() {
             output.push_str(&format!(
                 "  First seen: {}\n",
                 format_timestamp(pane.first_seen_at)
@@ -500,7 +512,7 @@ impl WorkflowResultRenderer {
         }
 
         // Result data (verbose only)
-        if ctx.verbose {
+        if ctx.is_verbose() {
             if let Some(data) = &result.result {
                 output.push_str("\n  Result data:\n");
                 let json = serde_json::to_string_pretty(data).unwrap_or_else(|_| "{}".to_string());
@@ -682,7 +694,7 @@ impl RulesListRenderer {
 
         output.push_str(&table.render());
 
-        if ctx.verbose {
+        if ctx.is_verbose() {
             output.push_str(&style.dim("\n(use 'wa rules show <ID>' for full details)\n"));
         }
 
@@ -1074,6 +1086,238 @@ pub fn truncate(s: &str, max_len: usize) -> String {
     } else {
         s[..max_len].to_string()
     }
+}
+
+// =============================================================================
+// Health Snapshot Renderer (wa-upg.12.4)
+// =============================================================================
+
+use crate::crash::HealthSnapshot;
+
+/// Renderer for runtime health snapshot (queue depths, ingest lag, warnings).
+///
+/// Used by `wa status` and `wa doctor` to surface backpressure and health data
+/// when the daemon is running.
+pub struct HealthSnapshotRenderer;
+
+impl HealthSnapshotRenderer {
+    /// Render a full health snapshot.
+    #[must_use]
+    pub fn render(snapshot: &HealthSnapshot, ctx: &RenderContext) -> String {
+        if ctx.format.is_json() {
+            return serde_json::to_string_pretty(snapshot)
+                .unwrap_or_else(|_| "{}".to_string());
+        }
+
+        let style = Style::from_format(ctx.format);
+        let mut output = String::new();
+
+        output.push_str(&style.bold("Health\n"));
+
+        // Queue depths
+        let capture_status = Self::queue_status_label(
+            snapshot.capture_queue_depth,
+            &style,
+        );
+        let write_status = Self::queue_status_label(
+            snapshot.write_queue_depth,
+            &style,
+        );
+
+        output.push_str(&format!(
+            "  Capture queue: {} pending{}\n",
+            snapshot.capture_queue_depth, capture_status
+        ));
+        output.push_str(&format!(
+            "  Write queue:   {} pending{}\n",
+            snapshot.write_queue_depth, write_status
+        ));
+
+        // Ingest lag
+        output.push_str(&format!(
+            "  Ingest lag:    avg {:.1}ms, max {}ms\n",
+            snapshot.ingest_lag_avg_ms, snapshot.ingest_lag_max_ms
+        ));
+
+        // DB status
+        let db_label = if snapshot.db_writable {
+            style.green("writable")
+        } else {
+            style.red("NOT writable")
+        };
+        output.push_str(&format!("  Database:      {db_label}\n"));
+
+        // Observed panes
+        output.push_str(&format!(
+            "  Observed:      {} pane(s)\n",
+            snapshot.observed_panes
+        ));
+
+        // Verbose: per-pane sequence numbers
+        if ctx.is_verbose() && !snapshot.last_seq_by_pane.is_empty() {
+            output.push_str("  Sequences:     ");
+            let pairs: Vec<String> = snapshot
+                .last_seq_by_pane
+                .iter()
+                .map(|(pane, seq)| format!("pane {pane}=seq {seq}"))
+                .collect();
+            output.push_str(&pairs.join(", "));
+            output.push('\n');
+        }
+
+        // Warnings
+        if !snapshot.warnings.is_empty() {
+            output.push('\n');
+            for w in &snapshot.warnings {
+                output.push_str(&format!("  {} {w}\n", style.yellow("WARNING:")));
+            }
+        }
+
+        output
+    }
+
+    /// Render a compact one-line summary suitable for appending to status output.
+    #[must_use]
+    pub fn render_compact(snapshot: &HealthSnapshot, ctx: &RenderContext) -> String {
+        if ctx.format.is_json() {
+            return String::new(); // JSON mode renders the full snapshot elsewhere
+        }
+
+        let style = Style::from_format(ctx.format);
+        let mut output = String::new();
+
+        let queue_total = snapshot.capture_queue_depth + snapshot.write_queue_depth;
+        let lag_label = if snapshot.ingest_lag_max_ms > 0 {
+            format!("lag {}ms", snapshot.ingest_lag_max_ms)
+        } else {
+            "lag 0ms".to_string()
+        };
+
+        let db_label = if snapshot.db_writable { "db ok" } else { "db ERR" };
+
+        output.push_str(&format!(
+            "  Health: {} queued, {}, {}\n",
+            queue_total, lag_label, db_label
+        ));
+
+        // Surface warnings inline
+        for w in &snapshot.warnings {
+            output.push_str(&format!("  {} {w}\n", style.yellow("WARNING:")));
+        }
+
+        output
+    }
+
+    /// Produce diagnostic checks from a health snapshot (for `wa doctor`).
+    #[must_use]
+    pub fn diagnostic_checks(snapshot: &HealthSnapshot) -> Vec<HealthDiagnostic> {
+        let mut checks = Vec::new();
+
+        // Queue depths
+        let capture_pct = if snapshot.capture_queue_depth > 0 {
+            format!("{} pending", snapshot.capture_queue_depth)
+        } else {
+            "idle".to_string()
+        };
+        checks.push(HealthDiagnostic {
+            name: "capture queue",
+            status: if snapshot.capture_queue_depth > 0 {
+                HealthDiagnosticStatus::Info
+            } else {
+                HealthDiagnosticStatus::Ok
+            },
+            detail: capture_pct,
+        });
+
+        let write_pct = if snapshot.write_queue_depth > 0 {
+            format!("{} pending", snapshot.write_queue_depth)
+        } else {
+            "idle".to_string()
+        };
+        checks.push(HealthDiagnostic {
+            name: "write queue",
+            status: if snapshot.write_queue_depth > 0 {
+                HealthDiagnosticStatus::Info
+            } else {
+                HealthDiagnosticStatus::Ok
+            },
+            detail: write_pct,
+        });
+
+        // Ingest lag
+        let lag_status = if snapshot.ingest_lag_max_ms > 5000 {
+            HealthDiagnosticStatus::Warning
+        } else {
+            HealthDiagnosticStatus::Ok
+        };
+        checks.push(HealthDiagnostic {
+            name: "ingest lag",
+            status: lag_status,
+            detail: format!(
+                "avg {:.1}ms, max {}ms",
+                snapshot.ingest_lag_avg_ms, snapshot.ingest_lag_max_ms
+            ),
+        });
+
+        // DB writability
+        if !snapshot.db_writable {
+            checks.push(HealthDiagnostic {
+                name: "database health",
+                status: HealthDiagnosticStatus::Error,
+                detail: "database is NOT writable".to_string(),
+            });
+        } else {
+            checks.push(HealthDiagnostic {
+                name: "database health",
+                status: HealthDiagnosticStatus::Ok,
+                detail: "writable".to_string(),
+            });
+        }
+
+        // Surface warnings as individual diagnostics
+        for w in &snapshot.warnings {
+            checks.push(HealthDiagnostic {
+                name: "runtime warning",
+                status: HealthDiagnosticStatus::Warning,
+                detail: w.clone(),
+            });
+        }
+
+        checks
+    }
+
+    /// Label suffix for queue status (empty when queue is idle).
+    fn queue_status_label(depth: usize, style: &Style) -> String {
+        if depth == 0 {
+            format!(" ({})", style.green("idle"))
+        } else {
+            String::new()
+        }
+    }
+}
+
+/// Diagnostic status levels for health checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealthDiagnosticStatus {
+    /// No issues
+    Ok,
+    /// Informational (non-zero but not concerning)
+    Info,
+    /// Possible issue
+    Warning,
+    /// Definite issue
+    Error,
+}
+
+/// A single diagnostic result from health snapshot analysis.
+#[derive(Debug, Clone)]
+pub struct HealthDiagnostic {
+    /// Check name (e.g., "capture queue")
+    pub name: &'static str,
+    /// Status level
+    pub status: HealthDiagnosticStatus,
+    /// Detail message
+    pub detail: String,
 }
 
 #[cfg(test)]
@@ -1868,7 +2112,7 @@ mod tests {
     #[test]
     fn rules_list_render_verbose() {
         let rules = vec![sample_rule_list_item()];
-        let ctx = RenderContext::new(OutputFormat::Plain).verbose(true);
+        let ctx = RenderContext::new(OutputFormat::Plain).verbose(1);
         let output = RulesListRenderer::render_verbose(&rules, &ctx);
 
         assert!(output.contains("codex.usage_reached"));
@@ -1961,5 +2205,275 @@ mod tests {
         assert_eq!(parsed["anchors"].as_array().unwrap().len(), 2);
         assert!(parsed["regex"].is_string());
         assert_eq!(parsed["workflow"], "handle_usage");
+    }
+
+    // =========================================================================
+    // Verbosity level tests (wa-rnf.3)
+    // =========================================================================
+
+    #[test]
+    fn render_context_default_verbosity_is_zero() {
+        let ctx = RenderContext::default();
+        assert_eq!(ctx.verbose, 0);
+        assert!(!ctx.is_verbose());
+        assert!(!ctx.is_debug());
+    }
+
+    #[test]
+    fn render_context_verbose_level_one() {
+        let ctx = RenderContext::new(OutputFormat::Plain).verbose(1);
+        assert_eq!(ctx.verbose, 1);
+        assert!(ctx.is_verbose());
+        assert!(!ctx.is_debug());
+    }
+
+    #[test]
+    fn render_context_verbose_level_two() {
+        let ctx = RenderContext::new(OutputFormat::Plain).verbose(2);
+        assert_eq!(ctx.verbose, 2);
+        assert!(ctx.is_verbose());
+        assert!(ctx.is_debug());
+    }
+
+    #[test]
+    fn render_context_verbose_level_three_is_debug() {
+        let ctx = RenderContext::new(OutputFormat::Plain).verbose(3);
+        assert!(ctx.is_verbose());
+        assert!(ctx.is_debug());
+    }
+
+    #[test]
+    fn pane_detail_default_hides_timestamps() {
+        let pane = sample_pane();
+        let ctx = RenderContext::new(OutputFormat::Plain).verbose(0);
+        let output = PaneTableRenderer::render_detail(&pane, &ctx);
+        assert!(!output.contains("First seen:"));
+    }
+
+    #[test]
+    fn pane_detail_verbose_shows_timestamps() {
+        let pane = sample_pane();
+        let ctx = RenderContext::new(OutputFormat::Plain).verbose(1);
+        let output = PaneTableRenderer::render_detail(&pane, &ctx);
+        assert!(output.contains("First seen:"));
+    }
+
+    #[test]
+    fn render_context_builder_chain() {
+        let ctx = RenderContext::new(OutputFormat::Json).verbose(2).limit(10);
+        assert_eq!(ctx.verbose, 2);
+        assert_eq!(ctx.limit, 10);
+        assert!(ctx.format.is_json());
+        assert!(ctx.is_debug());
+    }
+
+    // =========================================================================
+    // Health Snapshot Renderer Tests (wa-upg.12.4)
+    // =========================================================================
+
+    fn sample_health_snapshot() -> HealthSnapshot {
+        HealthSnapshot {
+            timestamp: 1_700_000_000_000,
+            observed_panes: 3,
+            capture_queue_depth: 12,
+            write_queue_depth: 5,
+            last_seq_by_pane: vec![(1, 100), (2, 50)],
+            warnings: vec![],
+            ingest_lag_avg_ms: 15.5,
+            ingest_lag_max_ms: 42,
+            db_writable: true,
+            db_last_write_at: Some(1_700_000_000_000),
+        }
+    }
+
+    #[test]
+    fn health_snapshot_plain_shows_queue_depths() {
+        let snapshot = sample_health_snapshot();
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = HealthSnapshotRenderer::render(&snapshot, &ctx);
+
+        assert!(output.contains("Capture queue: 12 pending"));
+        assert!(output.contains("Write queue:   5 pending"));
+    }
+
+    #[test]
+    fn health_snapshot_plain_shows_ingest_lag() {
+        let snapshot = sample_health_snapshot();
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = HealthSnapshotRenderer::render(&snapshot, &ctx);
+
+        assert!(output.contains("Ingest lag:    avg 15.5ms, max 42ms"));
+    }
+
+    #[test]
+    fn health_snapshot_plain_shows_db_status() {
+        let snapshot = sample_health_snapshot();
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = HealthSnapshotRenderer::render(&snapshot, &ctx);
+
+        assert!(output.contains("Database:      writable"));
+    }
+
+    #[test]
+    fn health_snapshot_plain_shows_observed_panes() {
+        let snapshot = sample_health_snapshot();
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = HealthSnapshotRenderer::render(&snapshot, &ctx);
+
+        assert!(output.contains("Observed:      3 pane(s)"));
+    }
+
+    #[test]
+    fn health_snapshot_json_is_valid() {
+        let snapshot = sample_health_snapshot();
+        let ctx = RenderContext::new(OutputFormat::Json);
+        let output = HealthSnapshotRenderer::render(&snapshot, &ctx);
+
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["capture_queue_depth"], 12);
+        assert_eq!(parsed["write_queue_depth"], 5);
+        assert_eq!(parsed["observed_panes"], 3);
+        assert_eq!(parsed["db_writable"], true);
+    }
+
+    #[test]
+    fn health_snapshot_verbose_shows_sequences() {
+        let snapshot = sample_health_snapshot();
+        let ctx = RenderContext::new(OutputFormat::Plain).verbose(1);
+        let output = HealthSnapshotRenderer::render(&snapshot, &ctx);
+
+        assert!(output.contains("Sequences:"));
+        assert!(output.contains("pane 1=seq 100"));
+        assert!(output.contains("pane 2=seq 50"));
+    }
+
+    #[test]
+    fn health_snapshot_non_verbose_hides_sequences() {
+        let snapshot = sample_health_snapshot();
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = HealthSnapshotRenderer::render(&snapshot, &ctx);
+
+        assert!(!output.contains("Sequences:"));
+    }
+
+    #[test]
+    fn health_snapshot_warnings_displayed() {
+        let mut snapshot = sample_health_snapshot();
+        snapshot.warnings = vec![
+            "Capture queue backpressure: 800/1024 (78%)".to_string(),
+        ];
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = HealthSnapshotRenderer::render(&snapshot, &ctx);
+
+        assert!(output.contains("WARNING:"));
+        assert!(output.contains("Capture queue backpressure"));
+    }
+
+    #[test]
+    fn health_snapshot_db_not_writable() {
+        let mut snapshot = sample_health_snapshot();
+        snapshot.db_writable = false;
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = HealthSnapshotRenderer::render(&snapshot, &ctx);
+
+        assert!(output.contains("NOT writable"));
+    }
+
+    #[test]
+    fn health_compact_shows_totals() {
+        let snapshot = sample_health_snapshot();
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = HealthSnapshotRenderer::render_compact(&snapshot, &ctx);
+
+        assert!(output.contains("17 queued")); // 12 + 5
+        assert!(output.contains("lag 42ms"));
+        assert!(output.contains("db ok"));
+    }
+
+    #[test]
+    fn health_compact_db_error() {
+        let mut snapshot = sample_health_snapshot();
+        snapshot.db_writable = false;
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = HealthSnapshotRenderer::render_compact(&snapshot, &ctx);
+
+        assert!(output.contains("db ERR"));
+    }
+
+    #[test]
+    fn health_compact_json_returns_empty() {
+        let snapshot = sample_health_snapshot();
+        let ctx = RenderContext::new(OutputFormat::Json);
+        let output = HealthSnapshotRenderer::render_compact(&snapshot, &ctx);
+
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn health_diagnostics_idle_all_ok() {
+        let mut snapshot = sample_health_snapshot();
+        snapshot.capture_queue_depth = 0;
+        snapshot.write_queue_depth = 0;
+        let checks = HealthSnapshotRenderer::diagnostic_checks(&snapshot);
+
+        // Should have: capture queue, write queue, ingest lag, db health
+        assert!(checks.len() >= 4);
+        assert!(checks.iter().all(|c| c.status == HealthDiagnosticStatus::Ok));
+    }
+
+    #[test]
+    fn health_diagnostics_queue_active() {
+        let snapshot = sample_health_snapshot(); // depth 12 and 5
+        let checks = HealthSnapshotRenderer::diagnostic_checks(&snapshot);
+
+        let capture = checks.iter().find(|c| c.name == "capture queue").unwrap();
+        assert_eq!(capture.status, HealthDiagnosticStatus::Info);
+        assert!(capture.detail.contains("12 pending"));
+    }
+
+    #[test]
+    fn health_diagnostics_high_lag_warns() {
+        let mut snapshot = sample_health_snapshot();
+        snapshot.ingest_lag_max_ms = 6000; // > 5000 threshold
+        let checks = HealthSnapshotRenderer::diagnostic_checks(&snapshot);
+
+        let lag = checks.iter().find(|c| c.name == "ingest lag").unwrap();
+        assert_eq!(lag.status, HealthDiagnosticStatus::Warning);
+    }
+
+    #[test]
+    fn health_diagnostics_db_not_writable_errors() {
+        let mut snapshot = sample_health_snapshot();
+        snapshot.db_writable = false;
+        let checks = HealthSnapshotRenderer::diagnostic_checks(&snapshot);
+
+        let db = checks.iter().find(|c| c.name == "database health").unwrap();
+        assert_eq!(db.status, HealthDiagnosticStatus::Error);
+    }
+
+    #[test]
+    fn health_diagnostics_warnings_surfaced() {
+        let mut snapshot = sample_health_snapshot();
+        snapshot.warnings = vec!["Write queue backpressure: 50/64 (78%)".to_string()];
+        let checks = HealthSnapshotRenderer::diagnostic_checks(&snapshot);
+
+        let warns: Vec<_> = checks
+            .iter()
+            .filter(|c| c.name == "runtime warning")
+            .collect();
+        assert_eq!(warns.len(), 1);
+        assert_eq!(warns[0].status, HealthDiagnosticStatus::Warning);
+        assert!(warns[0].detail.contains("backpressure"));
+    }
+
+    #[test]
+    fn health_idle_queue_shows_idle_label() {
+        let mut snapshot = sample_health_snapshot();
+        snapshot.capture_queue_depth = 0;
+        snapshot.write_queue_depth = 0;
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = HealthSnapshotRenderer::render(&snapshot, &ctx);
+
+        assert!(output.contains("0 pending (idle)"));
     }
 }
