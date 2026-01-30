@@ -48,7 +48,7 @@ use crate::policy::Redactor;
 /// This is the target version that new databases will be initialized to,
 /// and existing databases will be migrated to.
 /// Uses SQLite's PRAGMA user_version for atomic version tracking.
-pub const SCHEMA_VERSION: i32 = 10;
+pub const SCHEMA_VERSION: i32 = 11;
 
 /// Schema initialization SQL
 ///
@@ -262,6 +262,27 @@ CREATE TABLE IF NOT EXISTS workflow_action_plans (
 );
 
 CREATE INDEX IF NOT EXISTS idx_action_plans_hash ON workflow_action_plans(plan_hash);
+
+-- Prepared plans: plan previews awaiting commit
+CREATE TABLE IF NOT EXISTS prepared_plans (
+    plan_id TEXT PRIMARY KEY,
+    plan_hash TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
+    action_kind TEXT NOT NULL,
+    pane_id INTEGER,
+    pane_uuid TEXT,
+    params_json TEXT,
+    plan_json TEXT NOT NULL,          -- redacted plan JSON for preview
+    requires_approval INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,      -- epoch ms
+    expires_at INTEGER NOT NULL,      -- epoch ms
+    consumed_at INTEGER               -- epoch ms when commit was attempted
+);
+
+CREATE INDEX IF NOT EXISTS idx_prepared_plans_hash ON prepared_plans(plan_hash);
+CREATE INDEX IF NOT EXISTS idx_prepared_plans_workspace ON prepared_plans(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_prepared_plans_expires ON prepared_plans(expires_at)
+    WHERE consumed_at IS NULL;
 
 -- Audit actions: policy decisions and outcomes
 CREATE TABLE IF NOT EXISTS audit_actions (
@@ -699,6 +720,39 @@ static MIGRATIONS: &[Migration] = &[
             r"
             DROP TABLE IF EXISTS fts_pane_progress;
             DROP TABLE IF EXISTS fts_index_state;
+        ",
+        ),
+    },
+    Migration {
+        version: 11,
+        description: "Add prepared_plans for prepare/commit plan previews",
+        up_sql: r"
+            CREATE TABLE IF NOT EXISTS prepared_plans (
+                plan_id TEXT PRIMARY KEY,
+                plan_hash TEXT NOT NULL,
+                workspace_id TEXT NOT NULL,
+                action_kind TEXT NOT NULL,
+                pane_id INTEGER,
+                pane_uuid TEXT,
+                params_json TEXT,
+                plan_json TEXT NOT NULL,
+                requires_approval INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                consumed_at INTEGER
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_prepared_plans_hash ON prepared_plans(plan_hash);
+            CREATE INDEX IF NOT EXISTS idx_prepared_plans_workspace ON prepared_plans(workspace_id);
+            CREATE INDEX IF NOT EXISTS idx_prepared_plans_expires ON prepared_plans(expires_at)
+                WHERE consumed_at IS NULL;
+        ",
+        down_sql: Some(
+            r"
+            DROP INDEX IF EXISTS idx_prepared_plans_expires;
+            DROP INDEX IF EXISTS idx_prepared_plans_workspace;
+            DROP INDEX IF EXISTS idx_prepared_plans_hash;
+            DROP TABLE IF EXISTS prepared_plans;
         ",
         ),
     },
@@ -1237,6 +1291,35 @@ pub struct WorkflowActionPlanRecord {
     pub plan_json: String,
     /// Creation timestamp (epoch ms)
     pub created_at: i64,
+}
+
+/// Prepared action plan record (plan preview awaiting commit)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreparedPlanRecord {
+    /// Content-addressed plan ID
+    pub plan_id: String,
+    /// Plan hash (sha256 prefix)
+    pub plan_hash: String,
+    /// Workspace scope for the plan
+    pub workspace_id: String,
+    /// Action kind this plan represents (send_text, workflow_run, etc.)
+    pub action_kind: String,
+    /// Target pane ID (if applicable)
+    pub pane_id: Option<u64>,
+    /// Stable pane UUID (if known)
+    pub pane_uuid: Option<String>,
+    /// Action parameters (JSON, redacted as needed)
+    pub params_json: Option<String>,
+    /// Redacted plan JSON for preview
+    pub plan_json: String,
+    /// Whether approval is required before commit
+    pub requires_approval: bool,
+    /// Creation timestamp (epoch ms)
+    pub created_at: i64,
+    /// Expiration timestamp (epoch ms)
+    pub expires_at: i64,
+    /// When the plan was consumed (commit attempted)
+    pub consumed_at: Option<i64>,
 }
 
 /// Workflow step log entry
@@ -2845,6 +2928,17 @@ enum WriteCommand {
         record: WorkflowActionPlanRecord,
         respond: oneshot::Sender<Result<()>>,
     },
+    /// Insert a prepared plan preview
+    InsertPreparedPlan {
+        record: PreparedPlanRecord,
+        respond: oneshot::Sender<Result<()>>,
+    },
+    /// Consume a prepared plan (mark as used)
+    ConsumePreparedPlan {
+        plan_id: String,
+        now_ms: i64,
+        respond: oneshot::Sender<Result<Option<PreparedPlanRecord>>>,
+    },
     /// Insert a workflow step log
     InsertStepLog {
         workflow_id: String,
@@ -3540,6 +3634,38 @@ impl StorageHandle {
             .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
     }
 
+    /// Insert a prepared plan preview for later commit
+    pub async fn insert_prepared_plan(&self, record: PreparedPlanRecord) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::InsertPreparedPlan { record, respond: tx })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    /// Consume a prepared plan by plan_id (marks as used if valid)
+    pub async fn consume_prepared_plan(
+        &self,
+        plan_id: &str,
+        now_ms: i64,
+    ) -> Result<Option<PreparedPlanRecord>> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::ConsumePreparedPlan {
+                plan_id: plan_id.to_string(),
+                now_ms,
+                respond: tx,
+            })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
     /// Insert a workflow step log entry
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_step_log(
@@ -3981,6 +4107,25 @@ impl StorageHandle {
             })?;
 
             query_action_plan(&conn, &workflow_id)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+    }
+
+    /// Get a prepared plan preview by plan_id
+    pub async fn get_prepared_plan(
+        &self,
+        plan_id: &str,
+    ) -> Result<Option<PreparedPlanRecord>> {
+        let db_path = Arc::clone(&self.db_path);
+        let plan_id = plan_id.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+
+            query_prepared_plan(&conn, &plan_id)
         })
         .await
         .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
@@ -4528,6 +4673,18 @@ fn dispatch_write_command(conn: &mut Connection, cmd: WriteCommand, should_break
         }
         WriteCommand::UpsertActionPlan { record, respond } => {
             let result = upsert_action_plan_sync(conn, &record);
+            let _ = respond.send(result);
+        }
+        WriteCommand::InsertPreparedPlan { record, respond } => {
+            let result = insert_prepared_plan_sync(conn, &record);
+            let _ = respond.send(result);
+        }
+        WriteCommand::ConsumePreparedPlan {
+            plan_id,
+            now_ms,
+            respond,
+        } => {
+            let result = consume_prepared_plan_sync(conn, &plan_id, now_ms);
             let _ = respond.send(result);
         }
         WriteCommand::InsertStepLog {
@@ -5592,6 +5749,114 @@ fn insert_approval_token_sync(conn: &Connection, token: &ApprovalTokenRecord) ->
     .map_err(|e| StorageError::Database(format!("Failed to insert approval token: {e}")))?;
 
     Ok(conn.last_insert_rowid())
+}
+
+/// Insert a prepared plan preview (synchronous)
+fn insert_prepared_plan_sync(conn: &Connection, record: &PreparedPlanRecord) -> Result<()> {
+    let pane_id_i64 = record
+        .pane_id
+        .map(|pane_id| u64_to_i64(pane_id, "pane_id"))
+        .transpose()?;
+    let requires = if record.requires_approval { 1 } else { 0 };
+
+    conn.execute(
+        "INSERT OR REPLACE INTO prepared_plans
+         (plan_id, plan_hash, workspace_id, action_kind, pane_id, pane_uuid, params_json,
+          plan_json, requires_approval, created_at, expires_at, consumed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            record.plan_id.as_str(),
+            record.plan_hash.as_str(),
+            record.workspace_id.as_str(),
+            record.action_kind.as_str(),
+            pane_id_i64,
+            record.pane_uuid.as_deref(),
+            record.params_json.as_deref(),
+            record.plan_json.as_str(),
+            requires,
+            record.created_at,
+            record.expires_at,
+            record.consumed_at,
+        ],
+    )
+    .map_err(|e| StorageError::Database(format!("Failed to insert prepared plan: {e}")))?;
+
+    Ok(())
+}
+
+/// Consume a prepared plan by plan_id (synchronous)
+fn consume_prepared_plan_sync(
+    conn: &mut Connection,
+    plan_id: &str,
+    now_ms: i64,
+) -> Result<Option<PreparedPlanRecord>> {
+    let tx = conn
+        .transaction()
+        .map_err(|e| StorageError::Database(format!("Failed to start transaction: {e}")))?;
+
+    let record = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT plan_id, plan_hash, workspace_id, action_kind, pane_id, pane_uuid, params_json,
+                        plan_json, requires_approval, created_at, expires_at, consumed_at
+                 FROM prepared_plans
+                 WHERE plan_id = ?1
+                   AND consumed_at IS NULL
+                   AND expires_at >= ?2
+                 LIMIT 1",
+            )
+            .map_err(|e| {
+                StorageError::Database(format!("Failed to prepare prepared plan query: {e}"))
+            })?;
+
+        stmt.query_row(params![plan_id, now_ms], |row| {
+            let pane_id: Option<i64> = row.get(4)?;
+            let requires: i64 = row.get(8)?;
+            Ok(PreparedPlanRecord {
+                plan_id: row.get(0)?,
+                plan_hash: row.get(1)?,
+                workspace_id: row.get(2)?,
+                action_kind: row.get(3)?,
+                pane_id: pane_id.map(|v| v as u64),
+                pane_uuid: row.get(5)?,
+                params_json: row.get(6)?,
+                plan_json: row.get(7)?,
+                requires_approval: requires != 0,
+                created_at: row.get(9)?,
+                expires_at: row.get(10)?,
+                consumed_at: row.get(11)?,
+            })
+        })
+        .optional()
+        .map_err(|e| StorageError::Database(format!("Prepared plan query failed: {e}")))?;
+    };
+
+    if let Some(mut record) = record {
+        let updated = tx
+            .execute(
+                "UPDATE prepared_plans SET consumed_at = ?1 WHERE plan_id = ?2 AND consumed_at IS NULL",
+                params![now_ms, plan_id],
+            )
+            .map_err(|e| {
+                StorageError::Database(format!("Failed to consume prepared plan: {e}"))
+            })?;
+
+        if updated == 0 {
+            tx.commit().map_err(|e| {
+                StorageError::Database(format!("Failed to commit prepared plan: {e}"))
+            })?;
+            return Ok(None);
+        }
+
+        record.consumed_at = Some(now_ms);
+        tx.commit()
+            .map_err(|e| StorageError::Database(format!("Failed to commit prepared plan: {e}")))?;
+        return Ok(Some(record));
+    }
+
+    tx.commit()
+        .map_err(|e| StorageError::Database(format!("Failed to commit prepared plan: {e}")))?;
+    Ok(None)
 }
 
 /// Consume an approval token if it matches scope and is valid (synchronous)
@@ -7717,6 +7982,39 @@ fn query_action_plan(
                 plan_hash: row.get(2)?,
                 plan_json: row.get(3)?,
                 created_at: row.get(4)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|e| StorageError::Database(format!("Query failed: {e}")).into())
+}
+
+fn query_prepared_plan(
+    conn: &Connection,
+    plan_id: &str,
+) -> Result<Option<PreparedPlanRecord>> {
+    conn.query_row(
+        "SELECT plan_id, plan_hash, workspace_id, action_kind, pane_id, pane_uuid, params_json,
+                plan_json, requires_approval, created_at, expires_at, consumed_at
+         FROM prepared_plans
+         WHERE plan_id = ?1",
+        [plan_id],
+        |row| {
+            let pane_id: Option<i64> = row.get(4)?;
+            let requires: i64 = row.get(8)?;
+            Ok(PreparedPlanRecord {
+                plan_id: row.get(0)?,
+                plan_hash: row.get(1)?,
+                workspace_id: row.get(2)?,
+                action_kind: row.get(3)?,
+                pane_id: pane_id.map(|v| v as u64),
+                pane_uuid: row.get(5)?,
+                params_json: row.get(6)?,
+                plan_json: row.get(7)?,
+                requires_approval: requires != 0,
+                created_at: row.get(9)?,
+                expires_at: row.get(10)?,
+                consumed_at: row.get(11)?,
             })
         },
     )

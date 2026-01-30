@@ -448,6 +448,44 @@ SEE ALSO:
         timeout: u64,
     },
 
+    /// Prepare an action plan preview for commit
+    #[command(after_help = r#"EXAMPLES:
+    wa prepare send --pane-id 3 "ls"
+    wa prepare workflow run handle_compaction --pane-id 3
+
+SEE ALSO:
+    wa commit     Execute a prepared plan
+    wa approve    Approve denied actions"#)]
+    Prepare {
+        #[command(subcommand)]
+        command: PrepareCommands,
+    },
+
+    /// Commit a previously prepared plan
+    #[command(after_help = r#"EXAMPLES:
+    wa commit plan:abcd1234 --text "ls"
+    wa commit plan:abcd1234 --approval-code ABC12345 --text "rm -rf /tmp/test"
+
+SEE ALSO:
+    wa prepare    Prepare plan preview
+    wa approve    Approve denied actions"#)]
+    Commit {
+        /// Plan ID (from wa prepare)
+        plan_id: String,
+
+        /// Action text (required for send_text plans)
+        #[arg(long)]
+        text: Option<String>,
+
+        /// Read action text from a file (required for send_text plans)
+        #[arg(long)]
+        text_file: Option<PathBuf>,
+
+        /// Approval code to consume during commit (if required)
+        #[arg(long)]
+        approval_code: Option<String>,
+    },
+
     /// Submit an approval code for a pending action
     #[command(after_help = r#"EXAMPLES:
     wa approve AB12CD34              Submit an approval code
@@ -1280,6 +1318,58 @@ enum WorkflowCommands {
         /// Include action plan and step logs (-v verbose, -vv debug)
         #[arg(long, short, action = clap::ArgAction::Count)]
         verbose: u8,
+    },
+}
+
+#[derive(Subcommand)]
+enum PrepareCommands {
+    /// Prepare a send_text plan preview
+    Send {
+        /// Target pane ID
+        #[arg(long, alias = "pane")]
+        pane_id: u64,
+
+        /// Text to send
+        text: String,
+
+        /// Send character by character (no paste mode)
+        #[arg(long)]
+        no_paste: bool,
+
+        /// Do not append a trailing newline
+        #[arg(long)]
+        no_newline: bool,
+
+        /// Verify by waiting for a pattern after sending
+        #[arg(long)]
+        wait_for: Option<String>,
+
+        /// Timeout for wait-for verification (seconds)
+        #[arg(long, default_value = "30")]
+        timeout_secs: u64,
+
+        /// Treat wait-for pattern as regex
+        #[arg(long)]
+        wait_for_regex: bool,
+    },
+
+    /// Prepare a workflow action plan preview
+    Workflow {
+        #[command(subcommand)]
+        command: PrepareWorkflowCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum PrepareWorkflowCommands {
+    /// Prepare a workflow run plan
+    Run {
+        /// Workflow name
+        name: String,
+
+        /// Target pane ID
+        #[arg(long, alias = "pane")]
+        pane_id: u64,
     },
 }
 
@@ -2145,6 +2235,23 @@ struct HumanSendData {
     verification_error: Option<String>,
     no_paste: bool,
     no_newline: bool,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum PreparedPlanParams {
+    SendText {
+        pane_id: u64,
+        no_paste: bool,
+        no_newline: bool,
+        wait_for: Option<String>,
+        wait_for_regex: bool,
+        timeout_secs: u64,
+    },
+    WorkflowRun {
+        workflow_name: String,
+        pane_id: u64,
+    },
 }
 
 #[derive(Debug, serde::Deserialize)]
