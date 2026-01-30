@@ -3063,18 +3063,23 @@ fn build_send_dry_run_report(
     wait_for: Option<&str>,
     timeout_secs: u64,
     config: &wa_core::config::Config,
+    actor_kind: wa_core::policy::ActorKind,
 ) -> wa_core::dry_run::DryRunReport {
     use wa_core::dry_run::{
-        TargetResolution, build_send_policy_evaluation, create_send_action, create_wait_for_action,
+        PolicyCheck, TargetResolution, build_send_policy_evaluation, create_send_action,
+        create_wait_for_action,
     };
-    use wa_core::policy::PaneCapabilities;
+    use wa_core::policy::{ActionKind, PaneCapabilities, PolicyEngine, PolicyInput};
 
     let mut ctx = command_ctx.dry_run_context();
 
     // Target resolution (best-effort)
+    let domain = pane_info
+        .map(|info| info.inferred_domain())
+        .unwrap_or_else(|| "unknown".to_string());
     if let Some(info) = pane_info {
         let mut target =
-            TargetResolution::new(pane_id, info.inferred_domain()).with_is_active(info.is_active);
+            TargetResolution::new(pane_id, domain.clone()).with_is_active(info.is_active);
         if let Some(title) = &info.title {
             target = target.with_title(title.clone());
         }
@@ -3092,12 +3097,90 @@ fn build_send_dry_run_report(
     let capabilities = capabilities_opt
         .cloned()
         .unwrap_or_else(PaneCapabilities::prompt);
-    let eval = build_send_policy_evaluation(
+    let mut eval = build_send_policy_evaluation(
         (0, config.safety.rate_limit_per_pane),
         capabilities.prompt_active,
         config.safety.require_prompt_active,
         capabilities.has_recent_gap,
     );
+
+    let mut engine = PolicyEngine::new(
+        config.safety.rate_limit_per_pane,
+        config.safety.rate_limit_global,
+        config.safety.require_prompt_active,
+    )
+    .with_command_gate_config(config.safety.command_gate.clone())
+    .with_policy_rules(config.safety.rules.clone());
+
+    let summary = engine.redact_secrets(text);
+    let mut input = PolicyInput::new(ActionKind::SendText, actor_kind)
+        .with_pane(pane_id)
+        .with_domain(domain.clone())
+        .with_capabilities(capabilities.clone())
+        .with_text_summary(summary)
+        .with_command_text(text);
+    if let Some(info) = pane_info {
+        if let Some(title) = &info.title {
+            input = input.with_pane_title(title.clone());
+        }
+        if let Some(cwd) = &info.cwd {
+            input = input.with_pane_cwd(cwd.clone());
+        }
+    }
+
+    let decision = engine.authorize(&input);
+    let mut decision_check = PolicyCheck::from(&decision);
+    if let Some(rule_id) = decision.rule_id() {
+        decision_check = decision_check.with_details(format!("rule: {rule_id}"));
+    }
+    eval.add_check(decision_check);
+    if let Some(context) = decision.context() {
+        if let Some(rule) = context
+            .rules_evaluated
+            .iter()
+            .find(|rule| rule.rule_id.starts_with("command."))
+        {
+            let reason = rule
+                .reason
+                .as_deref()
+                .unwrap_or("Command safety gate triggered");
+            let message = match rule.decision.as_deref() {
+                Some("require_approval") => format!("Approval required: {reason}"),
+                Some("deny") => reason.to_string(),
+                Some("allow") => reason.to_string(),
+                _ => reason.to_string(),
+            };
+            let mut check = if matches!(rule.decision.as_deref(), Some("allow")) {
+                PolicyCheck::passed("command_safety", message)
+            } else {
+                PolicyCheck::failed("command_safety", message)
+            };
+            check = check.with_details(format!("rule: {}", rule.rule_id));
+            eval.add_check(check);
+        } else if let Some(rule) = context
+            .rules_evaluated
+            .iter()
+            .find(|rule| rule.rule_id == "policy.command_gate")
+        {
+            let message = rule
+                .reason
+                .clone()
+                .unwrap_or_else(|| "Command gate evaluated".to_string());
+            let check = PolicyCheck::passed("command_safety", message)
+                .with_details(format!("rule: {}", rule.rule_id));
+            eval.add_check(check);
+        } else {
+            eval.add_check(PolicyCheck::passed(
+                "command_safety",
+                "Command gate not evaluated (blocked earlier)",
+            ));
+        }
+    } else {
+        eval.add_check(PolicyCheck::passed(
+            "command_safety",
+            "Command gate context unavailable",
+        ));
+    }
     ctx.set_policy_evaluation(eval);
 
     if let Some(provided_caps) = capabilities_opt {
@@ -4810,6 +4893,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     wait_for.as_deref(),
                                     timeout_secs,
                                     &config,
+                                    wa_core::policy::ActorKind::Robot,
                                 );
                                 report.warnings.extend(resolution.warnings);
                                 let response =
@@ -7368,6 +7452,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     wait_for.as_deref(),
                     timeout_secs,
                     &config,
+                    wa_core::policy::ActorKind::Human,
                 );
                 report.warnings.extend(resolution.warnings);
                 if emit_json {
@@ -14020,6 +14105,7 @@ mod tests {
             Some("READY"),
             5,
             &config,
+            wa_core::policy::ActorKind::Human,
         );
 
         assert!(
@@ -14168,6 +14254,7 @@ mod tests {
             None,
             10,
             &config,
+            wa_core::policy::ActorKind::Human,
         );
 
         let redacted = report.redacted();

@@ -1146,6 +1146,7 @@ pub struct TimelineQuery {
 
 impl TimelineQuery {
     /// Create a new query with default settings
+    #[must_use]
     pub fn new() -> Self {
         Self {
             limit: 100,
@@ -1155,6 +1156,7 @@ impl TimelineQuery {
     }
 
     /// Set time range
+    #[must_use]
     pub fn with_range(mut self, start: i64, end: i64) -> Self {
         self.start = Some(start);
         self.end = Some(end);
@@ -1162,24 +1164,28 @@ impl TimelineQuery {
     }
 
     /// Filter by panes
+    #[must_use]
     pub fn with_panes(mut self, pane_ids: Vec<u64>) -> Self {
         self.pane_ids = Some(pane_ids);
         self
     }
 
     /// Filter by severities
+    #[must_use]
     pub fn with_severities(mut self, severities: Vec<String>) -> Self {
         self.severities = Some(severities);
         self
     }
 
     /// Only show unhandled events
+    #[must_use]
     pub fn unhandled_only(mut self) -> Self {
         self.unhandled_only = true;
         self
     }
 
     /// Set pagination
+    #[must_use]
     pub fn with_pagination(mut self, limit: usize, offset: usize) -> Self {
         self.limit = limit;
         self.offset = offset;
@@ -6325,9 +6331,9 @@ fn full_fts_rebuild_sync(conn: &Connection, config: &FtsSyncConfig) -> Result<Ft
     let mut warnings = Vec::new();
 
     // Drop all FTS content
-    if let Err(e) = conn.execute_batch(
-        "INSERT INTO output_segments_fts(output_segments_fts) VALUES('delete-all')",
-    ) {
+    if let Err(e) = conn
+        .execute_batch("INSERT INTO output_segments_fts(output_segments_fts) VALUES('delete-all')")
+    {
         warnings.push(format!("FTS delete-all failed (may be empty): {e}"));
     }
 
@@ -6877,7 +6883,10 @@ fn query_timeline(conn: &Connection, query: &TimelineQuery) -> Result<Timeline> 
     if let Some(ref event_types) = query.event_types {
         if !event_types.is_empty() {
             let placeholders: Vec<&str> = event_types.iter().map(|_| "?").collect();
-            sql.push_str(&format!(" AND e.event_type IN ({})", placeholders.join(",")));
+            sql.push_str(&format!(
+                " AND e.event_type IN ({})",
+                placeholders.join(",")
+            ));
             for et in event_types {
                 params.push(Box::new(et.clone()));
             }
@@ -6888,7 +6897,10 @@ fn query_timeline(conn: &Connection, query: &TimelineQuery) -> Result<Timeline> 
     if let Some(ref agent_types) = query.agent_types {
         if !agent_types.is_empty() {
             let placeholders: Vec<&str> = agent_types.iter().map(|_| "?").collect();
-            sql.push_str(&format!(" AND e.agent_type IN ({})", placeholders.join(",")));
+            sql.push_str(&format!(
+                " AND e.agent_type IN ({})",
+                placeholders.join(",")
+            ));
             for at in agent_types {
                 params.push(Box::new(at.clone()));
             }
@@ -6955,7 +6967,10 @@ fn query_timeline(conn: &Connection, query: &TimelineQuery) -> Result<Timeline> 
                     handled_at.map(|ts| HandledInfo {
                         handled_at: ts,
                         workflow_id: row.get(9).ok().flatten(),
-                        status: row.get::<_, Option<String>>(10).ok().flatten()
+                        status: row
+                            .get::<_, Option<String>>(10)
+                            .ok()
+                            .flatten()
                             .unwrap_or_else(|| "unknown".to_string()),
                     })
                 },
@@ -10882,7 +10897,13 @@ mod fts_sync_tests {
         conn.execute(
             "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![pane_id as i64, seq as i64, content, content.len() as i64, now],
+            params![
+                pane_id as i64,
+                seq as i64,
+                content,
+                content.len() as i64,
+                now
+            ],
         )
         .unwrap();
     }
@@ -11247,8 +11268,22 @@ mod timeline_tests {
 
         // Create events
         let now = now_ms();
-        insert_test_event(&conn, 1, "codex.usage_limit", "usage_limit", "warning", now - 2000);
-        insert_test_event(&conn, 2, "codex.compaction", "compaction", "info", now - 1000);
+        insert_test_event(
+            &conn,
+            1,
+            "codex.usage_limit",
+            "usage_limit",
+            "warning",
+            now - 2000,
+        );
+        insert_test_event(
+            &conn,
+            2,
+            "codex.compaction",
+            "compaction",
+            "info",
+            now - 1000,
+        );
         insert_test_event(&conn, 1, "codex.error", "error", "critical", now);
 
         let query = TimelineQuery::new();
@@ -11315,7 +11350,14 @@ mod timeline_tests {
 
         let now = now_ms();
         for i in 0..10 {
-            insert_test_event(&conn, 1, &format!("rule{i}"), "event", "info", now + i * 1000);
+            insert_test_event(
+                &conn,
+                1,
+                &format!("rule{i}"),
+                "event",
+                "info",
+                now + i * 1000,
+            );
         }
 
         // First page
@@ -11359,7 +11401,9 @@ mod timeline_tests {
 
         // Should detect temporal correlation
         assert!(!timeline.correlations.is_empty());
-        let temporal = timeline.correlations.iter()
+        let temporal = timeline
+            .correlations
+            .iter()
             .find(|c| c.correlation_type == CorrelationType::Temporal);
         assert!(temporal.is_some());
     }

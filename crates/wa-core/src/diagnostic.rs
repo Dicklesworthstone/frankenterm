@@ -922,8 +922,12 @@ mod tests {
             event_type: "auth".to_string(),
             severity: "critical".to_string(),
             confidence: 1.0,
-            extracted: Some(serde_json::json!({"key": "sk-abc123def456ghi789jkl012mno345pqr678stu901v"})),
-            matched_text: Some("Error: Invalid API key sk-abc123def456ghi789jkl012mno345pqr678stu901v".to_string()),
+            extracted: Some(
+                serde_json::json!({"key": "sk-abc123def456ghi789jkl012mno345pqr678stu901v"}),
+            ),
+            matched_text: Some(
+                "Error: Invalid API key sk-abc123def456ghi789jkl012mno345pqr678stu901v".to_string(),
+            ),
             segment_id: None,
             detected_at: 1000,
             handled_at: None,
@@ -935,8 +939,20 @@ mod tests {
 
         assert_eq!(traces.len(), 1);
         // Matched text should be redacted
-        assert!(traces[0].matched_text.as_ref().unwrap().contains("[REDACTED]"));
-        assert!(!traces[0].matched_text.as_ref().unwrap().contains("sk-abc123"));
+        assert!(
+            traces[0]
+                .matched_text
+                .as_ref()
+                .unwrap()
+                .contains("[REDACTED]")
+        );
+        assert!(
+            !traces[0]
+                .matched_text
+                .as_ref()
+                .unwrap()
+                .contains("sk-abc123")
+        );
         // Extracted fields should also be redacted
         assert!(!traces[0].extracted_fields.is_empty());
         let key_field = &traces[0].extracted_fields[0];
