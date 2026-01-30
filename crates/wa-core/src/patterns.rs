@@ -1129,9 +1129,9 @@ fn builtin_gemini_pack() -> PatternPack {
                 regex: None,
                 description: "Gemini usage limit reached".to_string(),
                 remediation: Some("Wait for limit reset or switch model".to_string()),
-                workflow: Some("handle_usage_limits".to_string()),
-                manual_fix: Some("Exit Gemini CLI with Ctrl-C, then switch to a different Google account or use a non-Pro model".to_string()),
-                preview_command: Some("wa workflow run handle_usage_limits --pane {pane} --dry-run".to_string()),
+                workflow: Some("handle_gemini_quota".to_string()),
+                manual_fix: Some("Switch to a non-Pro model or wait for quota reset".to_string()),
+                preview_command: Some("wa workflow run handle_gemini_quota --pane {pane} --dry-run".to_string()),
                 learn_more_url: None,
             },
             // Session summary

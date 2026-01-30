@@ -5840,6 +5840,7 @@ dependencies = [
  "clap",
  "dirs",
  "fancy-regex 0.14.0",
+ "fastmcp",
  "predicates",
  "rusqlite",
  "serde",

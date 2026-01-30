@@ -3190,6 +3190,9 @@ fn resolve_workflow(
         "handle_claude_code_limits" => Some(std::sync::Arc::new(
             wa_core::workflows::HandleClaudeCodeLimits::new(),
         )),
+        "handle_gemini_quota" => Some(std::sync::Arc::new(
+            wa_core::workflows::HandleGeminiQuota::new(),
+        )),
         _ => None,
     }
 }
@@ -4077,8 +4080,9 @@ async fn run_watcher(
         workflow_runner.register_workflow(Arc::new(wa_core::workflows::HandleAuthRequired::new()));
         workflow_runner
             .register_workflow(Arc::new(wa_core::workflows::HandleClaudeCodeLimits::new()));
+        workflow_runner.register_workflow(Arc::new(wa_core::workflows::HandleGeminiQuota::new()));
         tracing::info!(
-            "Registered workflows: handle_compaction, handle_usage_limits, handle_session_end, handle_auth_required, handle_claude_code_limits"
+            "Registered workflows: handle_compaction, handle_usage_limits, handle_session_end, handle_auth_required, handle_claude_code_limits, handle_gemini_quota"
         );
 
         // Spawn workflow runner event loop
@@ -5400,6 +5404,20 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             name: "handle_claude_code_limits".to_string(),
                                             description: Some(
                                                 "Safe-pause on Claude Code usage/rate limits \
+                                                 with recovery plan"
+                                                    .to_string(),
+                                            ),
+                                            enabled: true,
+                                            trigger_event_types: Some(vec![
+                                                "usage.warning".to_string(),
+                                                "usage.reached".to_string(),
+                                            ]),
+                                            requires_pane: Some(true),
+                                        },
+                                        RobotWorkflowInfo {
+                                            name: "handle_gemini_quota".to_string(),
+                                            description: Some(
+                                                "Safe-pause on Gemini quota/usage limits \
                                                  with recovery plan"
                                                     .to_string(),
                                             ),
@@ -9055,10 +9073,6 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
         Some(Commands::Auth { command }) => {
             handle_auth_command(command, &layout, cli.verbose > 0).await?;
-        }
-
-        Some(Commands::Mcp { command }) => {
-            handle_mcp_command(command, &config).await?;
         }
 
         Some(Commands::Triage {
@@ -15261,13 +15275,14 @@ mod tests {
             },
         ];
 
-        assert_eq!(workflows.len(), 5, "must list exactly 5 workflows");
+        assert_eq!(workflows.len(), 6, "must list exactly 6 workflows");
         let names: Vec<&str> = workflows.iter().map(|w| w.name.as_str()).collect();
         assert!(names.contains(&"handle_compaction"));
         assert!(names.contains(&"handle_usage_limits"));
         assert!(names.contains(&"handle_session_end"));
         assert!(names.contains(&"handle_auth_required"));
         assert!(names.contains(&"handle_claude_code_limits"));
+        assert!(names.contains(&"handle_gemini_quota"));
         assert!(
             workflows.iter().all(|w| w.enabled),
             "all workflows must be enabled"

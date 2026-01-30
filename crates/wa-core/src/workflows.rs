@@ -6799,7 +6799,7 @@ impl HandleClaudeCodeLimits {
     /// Build a recovery plan JSON object for the operator.
     fn build_recovery_plan(
         limit_type: &str,
-        reset_time: &Option<String>,
+        reset_time: Option<&str>,
         pane_id: u64,
     ) -> serde_json::Value {
         let next_steps = match limit_type {
@@ -6969,7 +6969,8 @@ impl Workflow for HandleClaudeCodeLimits {
                         .and_then(|v| v.as_str())
                         .map(ToString::to_string);
 
-                    let plan = Self::build_recovery_plan(limit_type, &reset_time, pane_id);
+                    let plan =
+                        Self::build_recovery_plan(limit_type, reset_time.as_deref(), pane_id);
 
                     // Record the limit event in the audit log
                     let audit = crate::storage::AuditActionRecord {
@@ -7016,6 +7017,281 @@ impl Workflow for HandleClaudeCodeLimits {
                                 "handle_claude_code_limits: failed to record limit event"
                             );
                             StepResult::abort(format!("Failed to record usage limit event: {e}"))
+                        }
+                    }
+                }
+
+                _ => StepResult::abort("Unexpected step"),
+            }
+        })
+    }
+}
+
+// ============================================================================
+// HandleGeminiQuota — safe-pause on Gemini usage/quota limits (wa-smm)
+// ============================================================================
+
+/// Default cooldown window in milliseconds (10 minutes).
+const GEMINI_QUOTA_COOLDOWN_MS: i64 = 10 * 60 * 1000;
+
+/// Handle Gemini usage-limit and quota events.
+///
+/// Similar to [`HandleClaudeCodeLimits`], this workflow does not attempt
+/// automated account rotation. It:
+///   1. Guards against unsafe pane states.
+///   2. Applies a cooldown to avoid spamming on repeated events.
+///   3. Classifies the quota type (warning vs reached).
+///   4. Persists an audit record and produces a recovery plan.
+pub struct HandleGeminiQuota {
+    cooldown_ms: i64,
+}
+
+impl HandleGeminiQuota {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            cooldown_ms: GEMINI_QUOTA_COOLDOWN_MS,
+        }
+    }
+
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn with_cooldown_ms(cooldown_ms: i64) -> Self {
+        Self { cooldown_ms }
+    }
+
+    fn classify_quota(trigger: &serde_json::Value) -> (&'static str, Option<String>) {
+        let event_type = trigger
+            .get("event_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let extracted = trigger.get("extracted");
+
+        let remaining = extracted
+            .and_then(|e| e.get("remaining"))
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string);
+
+        let quota_type = match event_type {
+            "usage.warning" => "quota_warning",
+            "usage.reached" => "quota_reached",
+            _ => "unknown_quota",
+        };
+
+        (quota_type, remaining)
+    }
+
+    fn build_recovery_plan(
+        quota_type: &str,
+        remaining_pct: Option<&str>,
+        pane_id: u64,
+    ) -> serde_json::Value {
+        let next_steps = match quota_type {
+            "quota_warning" => vec![
+                "Save current work and commit progress",
+                "Consider switching to a non-Pro model if available",
+                "Check quota reset time in Google AI Studio",
+            ],
+            "quota_reached" => vec![
+                "Gemini Pro models quota is exhausted",
+                "Do not send further input to avoid wasted requests",
+                "Switch to a non-Pro model or wait for quota reset",
+                "Or start a new session with a different Google account",
+            ],
+            _ => vec!["Unknown quota type; check pane output for details"],
+        };
+
+        serde_json::json!({
+            "quota_type": quota_type,
+            "pane_id": pane_id,
+            "remaining_pct": remaining_pct,
+            "next_steps": next_steps,
+            "safe_to_send": quota_type == "quota_warning",
+        })
+    }
+}
+
+impl Default for HandleGeminiQuota {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Workflow for HandleGeminiQuota {
+    fn name(&self) -> &'static str {
+        "handle_gemini_quota"
+    }
+
+    fn description(&self) -> &'static str {
+        "Safe-pause on Gemini quota/usage limits with recovery plan"
+    }
+
+    fn handles(&self, detection: &crate::patterns::Detection) -> bool {
+        detection.agent_type == crate::patterns::AgentType::Gemini
+            && matches!(
+                detection.event_type.as_str(),
+                "usage.warning" | "usage.reached"
+            )
+    }
+
+    fn trigger_event_types(&self) -> &'static [&'static str] {
+        &["usage.warning", "usage.reached"]
+    }
+
+    fn supported_agent_types(&self) -> &'static [&'static str] {
+        &["gemini"]
+    }
+
+    fn requires_pane(&self) -> bool {
+        true
+    }
+
+    fn requires_approval(&self) -> bool {
+        false
+    }
+
+    fn is_destructive(&self) -> bool {
+        false
+    }
+
+    fn steps(&self) -> Vec<WorkflowStep> {
+        vec![
+            WorkflowStep::new("check_guards", "Validate pane state allows interaction"),
+            WorkflowStep::new(
+                "check_cooldown",
+                "Skip if quota event was recently handled for this pane",
+            ),
+            WorkflowStep::new(
+                "classify_and_record",
+                "Classify quota type, record audit event, and build recovery plan",
+            ),
+        ]
+    }
+
+    fn execute_step(
+        &self,
+        ctx: &mut WorkflowContext,
+        step_idx: usize,
+    ) -> BoxFuture<'_, StepResult> {
+        let pane_id = ctx.pane_id();
+        let storage = ctx.storage().clone();
+        let trigger = ctx.trigger().cloned().unwrap_or(serde_json::Value::Null);
+        let execution_id = ctx.execution_id().to_string();
+        let cooldown_ms = self.cooldown_ms;
+        let caps = ctx.capabilities().clone();
+
+        Box::pin(async move {
+            match step_idx {
+                0 => {
+                    if caps.alt_screen == Some(true) {
+                        return StepResult::abort("Pane is in alt-screen mode");
+                    }
+                    if caps.command_running {
+                        return StepResult::abort("Command is running in pane");
+                    }
+                    tracing::debug!(pane_id, "handle_gemini_quota: guard checks passed");
+                    StepResult::cont()
+                }
+
+                1 => {
+                    let since = now_ms() - cooldown_ms;
+                    let query = crate::storage::AuditQuery {
+                        pane_id: Some(pane_id),
+                        action_kind: Some("gemini_quota_limit".to_string()),
+                        since: Some(since),
+                        limit: Some(1),
+                        ..Default::default()
+                    };
+
+                    match storage.get_audit_actions(query).await {
+                        Ok(recent) if !recent.is_empty() => {
+                            tracing::info!(
+                                pane_id,
+                                last_quota_ts = recent[0].ts,
+                                "handle_gemini_quota: within cooldown, skipping"
+                            );
+                            StepResult::done(serde_json::json!({
+                                "status": "cooldown_skipped",
+                                "pane_id": pane_id,
+                                "last_quota_ts": recent[0].ts,
+                            }))
+                        }
+                        Ok(_) => {
+                            tracing::debug!(
+                                pane_id,
+                                "handle_gemini_quota: no recent quota events, proceeding"
+                            );
+                            StepResult::cont()
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                pane_id,
+                                error = %e,
+                                "handle_gemini_quota: cooldown check failed, proceeding"
+                            );
+                            StepResult::cont()
+                        }
+                    }
+                }
+
+                2 => {
+                    let (quota_type, remaining_pct) = Self::classify_quota(&trigger);
+                    let agent_type = trigger
+                        .get("agent_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("gemini");
+                    let rule_id = trigger
+                        .get("rule_id")
+                        .and_then(|v| v.as_str())
+                        .map(ToString::to_string);
+
+                    let plan =
+                        Self::build_recovery_plan(quota_type, remaining_pct.as_deref(), pane_id);
+
+                    let audit = crate::storage::AuditActionRecord {
+                        id: 0,
+                        ts: now_ms(),
+                        actor_kind: "workflow".to_string(),
+                        actor_id: Some(execution_id.clone()),
+                        pane_id: Some(pane_id),
+                        domain: None,
+                        action_kind: "gemini_quota_limit".to_string(),
+                        policy_decision: "allow".to_string(),
+                        decision_reason: None,
+                        rule_id,
+                        input_summary: Some(format!("Gemini {quota_type} on pane {pane_id}")),
+                        verification_summary: None,
+                        decision_context: Some(serde_json::to_string(&plan).unwrap_or_default()),
+                        result: "recorded".to_string(),
+                    };
+
+                    match storage.record_audit_action(audit).await {
+                        Ok(audit_id) => {
+                            tracing::info!(
+                                pane_id,
+                                audit_id,
+                                quota_type,
+                                remaining_pct = ?remaining_pct,
+                                "handle_gemini_quota: recorded quota event"
+                            );
+
+                            StepResult::done(serde_json::json!({
+                                "status": "recorded",
+                                "pane_id": pane_id,
+                                "agent_type": agent_type,
+                                "quota_type": quota_type,
+                                "remaining_pct": remaining_pct,
+                                "recovery_plan": plan,
+                                "audit_id": audit_id,
+                            }))
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                pane_id,
+                                error = %e,
+                                "handle_gemini_quota: failed to record quota event"
+                            );
+                            StepResult::abort(format!("Failed to record quota event: {e}"))
                         }
                     }
                 }
@@ -7691,6 +7967,19 @@ pub fn is_fallback_result(result: &StepResult) -> bool {
 mod tests {
     use super::*;
     use crate::patterns::{AgentType, Detection, Severity};
+
+    fn make_detection(rule_id: &str, agent_type: AgentType, event_type: &str) -> Detection {
+        Detection {
+            rule_id: rule_id.to_string(),
+            agent_type,
+            event_type: event_type.to_string(),
+            severity: Severity::Info,
+            confidence: 1.0,
+            extracted: serde_json::json!({}),
+            matched_text: String::new(),
+            span: (0, 0),
+        }
+    }
 
     // ========================================================================
     // StepResult Tests
@@ -12796,7 +13085,7 @@ Try again at 3:00 PM UTC.
 
     #[test]
     fn handle_claude_code_limits_recovery_plan_warning() {
-        let plan = HandleClaudeCodeLimits::build_recovery_plan("usage_warning", &None, 42);
+        let plan = HandleClaudeCodeLimits::build_recovery_plan("usage_warning", None, 42);
         assert_eq!(plan["limit_type"], "usage_warning");
         assert_eq!(plan["pane_id"], 42);
         assert_eq!(plan["safe_to_send"], true);
@@ -12806,7 +13095,8 @@ Try again at 3:00 PM UTC.
     #[test]
     fn handle_claude_code_limits_recovery_plan_reached() {
         let reset = Some("2 hours".to_string());
-        let plan = HandleClaudeCodeLimits::build_recovery_plan("usage_reached", &reset, 7);
+        let plan =
+            HandleClaudeCodeLimits::build_recovery_plan("usage_reached", reset.as_deref(), 7);
         assert_eq!(plan["limit_type"], "usage_reached");
         assert_eq!(plan["safe_to_send"], false);
         assert_eq!(plan["reset_time"], "2 hours");
@@ -12816,6 +13106,175 @@ Try again at 3:00 PM UTC.
     fn handle_claude_code_limits_custom_cooldown() {
         let wf = HandleClaudeCodeLimits::with_cooldown_ms(30_000);
         assert_eq!(wf.cooldown_ms, 30_000);
+    }
+
+    // ========================================================================
+    // HandleGeminiQuota Unit Tests (wa-smm)
+    // ========================================================================
+
+    #[test]
+    fn handle_gemini_quota_metadata() {
+        let wf = HandleGeminiQuota::default();
+        assert_eq!(wf.name(), "handle_gemini_quota");
+        assert!(!wf.description().is_empty());
+        assert_eq!(wf.steps().len(), 3);
+        assert_eq!(wf.steps()[0].name, "check_guards");
+        assert_eq!(wf.steps()[1].name, "check_cooldown");
+        assert_eq!(wf.steps()[2].name, "classify_and_record");
+    }
+
+    #[test]
+    fn handle_gemini_quota_handles_usage_warning() {
+        let wf = HandleGeminiQuota::default();
+        let detection = Detection {
+            rule_id: "gemini.usage.reached".to_string(),
+            agent_type: AgentType::Gemini,
+            event_type: "usage.warning".to_string(),
+            severity: Severity::Warning,
+            confidence: 0.95,
+            extracted: serde_json::json!({"remaining": "15"}),
+            matched_text: "usage warning".to_string(),
+            span: (0, 13),
+        };
+        assert!(wf.handles(&detection));
+    }
+
+    #[test]
+    fn handle_gemini_quota_handles_usage_reached() {
+        let wf = HandleGeminiQuota::default();
+        let detection = Detection {
+            rule_id: "gemini.usage.reached".to_string(),
+            agent_type: AgentType::Gemini,
+            event_type: "usage.reached".to_string(),
+            severity: Severity::Critical,
+            confidence: 0.95,
+            extracted: serde_json::json!({"remaining": "0"}),
+            matched_text: "usage reached".to_string(),
+            span: (0, 13),
+        };
+        assert!(wf.handles(&detection));
+    }
+
+    #[test]
+    fn handle_gemini_quota_ignores_codex_usage() {
+        let wf = HandleGeminiQuota::default();
+        let detection = Detection {
+            rule_id: "codex.usage.reached".to_string(),
+            agent_type: AgentType::Codex,
+            event_type: "usage.reached".to_string(),
+            severity: Severity::Critical,
+            confidence: 0.95,
+            extracted: serde_json::json!({}),
+            matched_text: "usage reached".to_string(),
+            span: (0, 13),
+        };
+        assert!(!wf.handles(&detection));
+    }
+
+    #[test]
+    fn handle_gemini_quota_ignores_claude_code_usage() {
+        let wf = HandleGeminiQuota::default();
+        let detection = Detection {
+            rule_id: "claude_code.usage.reached".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: "usage.reached".to_string(),
+            severity: Severity::Critical,
+            confidence: 0.95,
+            extracted: serde_json::json!({}),
+            matched_text: "usage reached".to_string(),
+            span: (0, 13),
+        };
+        assert!(!wf.handles(&detection));
+    }
+
+    #[test]
+    fn handle_gemini_quota_ignores_session_events() {
+        let wf = HandleGeminiQuota::default();
+        let detection = Detection {
+            rule_id: "gemini.session.end".to_string(),
+            agent_type: AgentType::Gemini,
+            event_type: "session.end".to_string(),
+            severity: Severity::Info,
+            confidence: 0.95,
+            extracted: serde_json::json!({}),
+            matched_text: "session end".to_string(),
+            span: (0, 11),
+        };
+        assert!(!wf.handles(&detection));
+    }
+
+    #[test]
+    fn handle_gemini_quota_trigger_event_types() {
+        let wf = HandleGeminiQuota::default();
+        let types = wf.trigger_event_types();
+        assert_eq!(types, &["usage.warning", "usage.reached"]);
+    }
+
+    #[test]
+    fn handle_gemini_quota_supported_agents() {
+        let wf = HandleGeminiQuota::default();
+        assert_eq!(wf.supported_agent_types(), &["gemini"]);
+    }
+
+    #[test]
+    fn handle_gemini_quota_not_destructive() {
+        let wf = HandleGeminiQuota::default();
+        assert!(!wf.is_destructive());
+        assert!(!wf.requires_approval());
+        assert!(wf.requires_pane());
+    }
+
+    #[test]
+    fn handle_gemini_quota_classify_usage_warning() {
+        let trigger = serde_json::json!({
+            "event_type": "usage.warning",
+            "extracted": { "remaining": "15" }
+        });
+        let (quota_type, remaining) = HandleGeminiQuota::classify_quota(&trigger);
+        assert_eq!(quota_type, "quota_warning");
+        assert_eq!(remaining, Some("15".to_string()));
+    }
+
+    #[test]
+    fn handle_gemini_quota_classify_usage_reached() {
+        let trigger = serde_json::json!({
+            "event_type": "usage.reached",
+            "extracted": { "remaining": "0" }
+        });
+        let (quota_type, remaining) = HandleGeminiQuota::classify_quota(&trigger);
+        assert_eq!(quota_type, "quota_reached");
+        assert_eq!(remaining, Some("0".to_string()));
+    }
+
+    #[test]
+    fn handle_gemini_quota_recovery_plan_warning() {
+        let plan = HandleGeminiQuota::build_recovery_plan(
+            "quota_warning",
+            Some("15"),
+            42,
+        );
+        assert_eq!(plan["quota_type"], "quota_warning");
+        assert_eq!(plan["pane_id"], 42);
+        assert_eq!(plan["safe_to_send"], true);
+        assert!(plan["next_steps"].is_array());
+    }
+
+    #[test]
+    fn handle_gemini_quota_recovery_plan_reached() {
+        let plan = HandleGeminiQuota::build_recovery_plan(
+            "quota_reached",
+            Some("0"),
+            42,
+        );
+        assert_eq!(plan["quota_type"], "quota_reached");
+        assert_eq!(plan["safe_to_send"], false);
+        assert!(plan["next_steps"].is_array());
+    }
+
+    #[test]
+    fn handle_gemini_quota_custom_cooldown() {
+        let wf = HandleGeminiQuota::with_cooldown_ms(60_000);
+        assert_eq!(wf.cooldown_ms, 60_000);
     }
 
     // ========================================================================
