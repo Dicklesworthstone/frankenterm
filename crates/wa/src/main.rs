@@ -4155,6 +4155,29 @@ async fn run_watcher(
     let handle = runtime.start().await?;
     tracing::info!("Observation runtime started");
 
+    // Start scheduled backups if enabled
+    let scheduled_backup_handle = if config.backup.scheduled.enabled {
+        let backup_config = config.backup.scheduled.clone();
+        let workspace_root = layout.root.clone();
+        let db_path = layout.db_path.clone();
+        let storage = Arc::clone(&handle.storage);
+        let shutdown_flag = Arc::clone(&handle.shutdown_flag);
+        let notify_config = config.notifications.desktop.clone();
+        Some(tokio::spawn(async move {
+            run_scheduled_backups(
+                backup_config,
+                workspace_root,
+                db_path,
+                storage,
+                shutdown_flag,
+                notify_config,
+            )
+            .await;
+        }))
+    } else {
+        None
+    };
+
     // Track current config for hot reload
     let mut current_config = config.clone();
 
@@ -4242,8 +4265,241 @@ async fn run_watcher(
     handle.shutdown().await;
     tracing::info!("Watcher shutdown complete");
 
+    if let Some(backup_handle) = scheduled_backup_handle {
+        let _ = backup_handle.await;
+    }
+
     Ok(())
 }
+
+async fn run_scheduled_backups(
+    config: wa_core::config::ScheduledBackupConfig,
+    workspace_root: PathBuf,
+    db_path: PathBuf,
+    storage: Arc<tokio::sync::Mutex<wa_core::storage::StorageHandle>>,
+    shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
+    notify_config: wa_core::desktop_notify::DesktopNotifyConfig,
+) {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    let schedule = match wa_core::backup::BackupSchedule::parse(&config.schedule) {
+        Ok(schedule) => schedule,
+        Err(err) => {
+            tracing::error!(error = %err, "Invalid scheduled backup configuration");
+            return;
+        }
+    };
+
+    if config.compress {
+        tracing::warn!(
+            "Scheduled backup compression is not implemented; storing directory backups"
+        );
+    }
+    if config.metadata_only {
+        tracing::info!("Scheduled backup metadata_only: verification disabled");
+    }
+
+    let notifier = wa_core::desktop_notify::DesktopNotifier::new(notify_config);
+
+    loop {
+        if shutdown_flag.load(Ordering::SeqCst) {
+            break;
+        }
+
+        let now = chrono::Local::now();
+        let next_run = match schedule.next_after(now) {
+            Ok(next_run) => next_run,
+            Err(err) => {
+                tracing::warn!(error = %err, "Failed to compute next backup schedule; retrying");
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(60)) => {}
+                    _ = wait_for_shutdown(shutdown_flag.clone()) => break,
+                }
+                continue;
+            }
+        };
+
+        let sleep_duration = match (next_run - now).to_std() {
+            Ok(duration) => duration,
+            Err(_) => Duration::from_secs(1),
+        };
+
+        tracing::info!(
+            schedule = %schedule.display_label(),
+            next_run_at = %format_local_datetime(next_run),
+            "Scheduled backup queued"
+        );
+
+        tokio::select! {
+            _ = tokio::time::sleep(sleep_duration) => {}
+            _ = wait_for_shutdown(shutdown_flag.clone()) => break,
+        }
+
+        if shutdown_flag.load(Ordering::SeqCst) {
+            break;
+        }
+
+        let mut attempt = 0;
+        let mut last_error: Option<String> = None;
+        let mut success = false;
+
+        while attempt < 3 {
+            attempt += 1;
+            if shutdown_flag.load(Ordering::SeqCst) {
+                break;
+            }
+
+            match run_single_scheduled_backup(&config, &workspace_root, &db_path, &storage).await {
+                Ok(result) => {
+                    success = true;
+                    tracing::info!(
+                        output = %result.output_path,
+                        size_bytes = result.total_size_bytes,
+                        "Scheduled backup completed"
+                    );
+
+                    if config.notify_on_success {
+                        let message = format!(
+                            "Backup saved to {} ({})",
+                            result.output_path,
+                            format_bytes_compact(result.total_size_bytes)
+                        );
+                        send_backup_notification(&notifier, "wa backup success", &message);
+                    }
+
+                    break;
+                }
+                Err(err) => {
+                    last_error = Some(err.to_string());
+                    tracing::warn!(attempt, error = %err, "Scheduled backup attempt failed");
+                    if attempt < 3 {
+                        let backoff = Duration::from_secs(2_u64.pow(attempt - 1));
+                        tokio::select! {
+                            _ = tokio::time::sleep(backoff) => {}
+                            _ = wait_for_shutdown(shutdown_flag.clone()) => break,
+                        }
+                    }
+                }
+            }
+        }
+
+        if !success {
+            if let Some(ref err) = last_error {
+                tracing::error!(error = %err, "Scheduled backup failed");
+            }
+            if config.notify_on_failure {
+                let body = last_error
+                    .as_deref()
+                    .unwrap_or("Backup failed (unknown error)");
+                send_backup_notification(&notifier, "wa backup failed", body);
+            }
+        }
+    }
+}
+
+async fn run_single_scheduled_backup(
+    config: &wa_core::config::ScheduledBackupConfig,
+    workspace_root: &Path,
+    db_path: &Path,
+    storage: &Arc<tokio::sync::Mutex<wa_core::storage::StorageHandle>>,
+) -> anyhow::Result<wa_core::backup::ExportResult> {
+    if !db_path.exists() {
+        anyhow::bail!("Database not found at {}", db_path.display());
+    }
+
+    if let Err(err) = storage.lock().await.checkpoint().await {
+        tracing::warn!(error = %err, "Backup checkpoint failed");
+    }
+
+    let now = chrono::Local::now();
+    let output_dir = wa_core::backup::scheduled_backup_output_path(
+        workspace_root,
+        config.destination.as_deref(),
+        now,
+    );
+
+    let opts = wa_core::backup::ExportOptions {
+        output: Some(output_dir),
+        include_sql_dump: false,
+        verify: !config.metadata_only,
+    };
+
+    let db_path = db_path.to_path_buf();
+    let workspace_root = workspace_root.to_path_buf();
+    let workspace_root_for_closure = workspace_root.clone();
+    let export_result = tokio::task::spawn_blocking(move || {
+        wa_core::backup::export_backup(&db_path, &workspace_root_for_closure, &opts)
+    })
+    .await??;
+
+    let retention_days = config.retention_days;
+    let max_backups = config.max_backups;
+    let destination_root =
+        wa_core::backup::backup_destination_root(&workspace_root, config.destination.as_deref());
+
+    if retention_days > 0 || max_backups > 0 {
+        let now = chrono::Local::now();
+        let destination_root = destination_root.clone();
+        tokio::task::spawn_blocking(move || {
+            wa_core::backup::prune_backups(&destination_root, retention_days, max_backups, now)
+        })
+        .await??;
+    }
+
+    Ok(export_result)
+}
+
+async fn wait_for_shutdown(flag: Arc<std::sync::atomic::AtomicBool>) {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    while !flag.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+fn format_local_datetime(value: chrono::DateTime<chrono::Local>) -> String {
+    use chrono::{Datelike, Timelike};
+
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+        value.year(),
+        value.month(),
+        value.day(),
+        value.hour(),
+        value.minute(),
+        value.second()
+    )
+}
+
+fn format_bytes_compact(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let value = bytes as f64;
+    if value >= GB {
+        format!("{:.1} GB", value / GB)
+    } else if value >= MB {
+        format!("{:.1} MB", value / MB)
+    } else if value >= KB {
+        format!("{:.1} KB", value / KB)
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
+fn send_backup_notification(
+    notifier: &wa_core::desktop_notify::DesktopNotifier,
+    title: &str,
+    body: &str,
+) {
+    if !notifier.is_available() {
+        return;
+    }
+    let _ = notifier.notify_message(title, body, wa_core::desktop_notify::Urgency::Normal);
+}
+
 #[tokio::main]
 async fn main() {
     let robot_mode = sniff_robot_mode_from_args();
@@ -7354,9 +7610,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             match command {
                 WorkflowCommands::List => {
                     use std::sync::Arc;
-                    use wa_core::workflows::{
-                        HandleCompaction, Workflow,
-                    };
+                    use wa_core::workflows::{HandleCompaction, Workflow};
 
                     let workflows: Vec<Arc<dyn Workflow>> = vec![
                         Arc::new(
@@ -7414,9 +7668,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         use wa_core::policy::{PolicyEngine, PolicyGatedInjector};
                         use wa_core::storage::StorageHandle;
                         use wa_core::workflows::{
-                            PaneWorkflowLockManager, WorkflowEngine,
-                            WorkflowExecutionResult, WorkflowRunner,
-                            WorkflowRunnerConfig,
+                            PaneWorkflowLockManager, WorkflowEngine, WorkflowExecutionResult,
+                            WorkflowRunner, WorkflowRunnerConfig,
                         };
 
                         tracing::info!("Running workflow '{}' on pane {}", name, pane);
@@ -7462,13 +7715,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         );
 
                         let wezterm_client = wa_core::wezterm::WeztermClient::new();
-                        let injector = Arc::new(tokio::sync::Mutex::new(
-                            PolicyGatedInjector::with_storage(
+                        let injector =
+                            Arc::new(tokio::sync::Mutex::new(PolicyGatedInjector::with_storage(
                                 policy_engine,
                                 wezterm_client,
                                 storage.as_ref().clone(),
-                            ),
-                        ));
+                            )));
                         let runner_config = WorkflowRunnerConfig::default();
                         let runner = WorkflowRunner::new(
                             engine,
@@ -7503,10 +7755,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         let workflow = runner.find_workflow_by_name(&name);
 
                         if let Some(wf) = workflow {
-                            println!(
-                                "Workflow: {} ({})",
-                                wf.name(), wf.description()
-                            );
+                            println!("Workflow: {} ({})", wf.name(), wf.description());
                             println!("Target pane: {pane}");
                             println!("Steps: {}", wf.step_count());
                             println!();
@@ -7520,16 +7769,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                             // Run the workflow
                             let run_start = std::time::Instant::now();
-                            let result = runner
-                                .run_workflow(pane, wf, &execution_id, 0)
-                                .await;
+                            let result = runner.run_workflow(pane, wf, &execution_id, 0).await;
                             let elapsed = run_start.elapsed();
 
                             match result {
-                                WorkflowExecutionResult::Completed {
-                                    steps_executed,
-                                    ..
-                                } => {
+                                WorkflowExecutionResult::Completed { steps_executed, .. } => {
                                     println!(
                                         "Result: completed ({} step(s) in {:.1}s)",
                                         steps_executed,
@@ -7538,13 +7782,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     println!("Execution ID: {execution_id}");
                                 }
                                 WorkflowExecutionResult::Aborted {
-                                    reason,
-                                    step_index,
-                                    ..
+                                    reason, step_index, ..
                                 } => {
-                                    eprintln!(
-                                        "Result: aborted at step {step_index}"
-                                    );
+                                    eprintln!("Result: aborted at step {step_index}");
                                     eprintln!("Reason: {reason}");
                                     eprintln!("Execution ID: {execution_id}");
                                     eprintln!(
@@ -7556,9 +7796,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     step_index,
                                     ..
                                 } => {
-                                    eprintln!(
-                                        "Result: denied by policy at step {step_index}"
-                                    );
+                                    eprintln!("Result: denied by policy at step {step_index}");
                                     eprintln!("Reason: {reason}");
                                     eprintln!("Execution ID: {execution_id}");
                                     eprintln!(
@@ -7573,9 +7811,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             }
                         } else {
                             eprintln!("Error: Workflow '{name}' not found.");
-                            eprintln!(
-                                "Hint: Use 'wa workflow list' to see available workflows."
-                            );
+                            eprintln!("Hint: Use 'wa workflow list' to see available workflows.");
                             std::process::exit(1);
                         }
 
@@ -7856,6 +8092,56 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 let path = crash.path.display();
                                 println!("Last crash: {msg}");
                                 println!("  Bundle: {path}");
+                            }
+                        }
+
+                        match wa_core::backup::scheduled_backup_status(
+                            &config.backup.scheduled,
+                            &workspace_root,
+                            chrono::Local::now(),
+                        ) {
+                            Ok(status) => {
+                                if output_format.is_json() {
+                                    let payload = serde_json::json!({ "scheduled_backup": status });
+                                    println!(
+                                        "{}",
+                                        serde_json::to_string(&payload)
+                                            .unwrap_or_else(|_| "{}".to_string())
+                                    );
+                                } else {
+                                    println!();
+                                    if status.enabled {
+                                        println!("Scheduled backup: enabled ({})", status.schedule);
+                                        if let Some(last) = status.last_backup_at.as_ref() {
+                                            let size = status
+                                                .last_backup_size_bytes
+                                                .map(format_bytes_compact)
+                                                .unwrap_or_else(|| "<unknown>".to_string());
+                                            println!("  Last backup: {last} ({size})");
+                                        } else {
+                                            println!("  Last backup: <none>");
+                                        }
+                                        if let Some(next) = status.next_backup_at.as_ref() {
+                                            println!("  Next backup: {next}");
+                                        }
+                                        match status.max_backups {
+                                            Some(max) => println!(
+                                                "  Backups kept: {}/{}",
+                                                status.backups_kept, max
+                                            ),
+                                            None => {
+                                                println!("  Backups kept: {}", status.backups_kept);
+                                            }
+                                        }
+                                        println!("  Destination: {}", status.destination);
+                                    } else {
+                                        println!("Scheduled backup: disabled");
+                                        println!("  Destination: {}", status.destination);
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                tracing::warn!(error = %err, "Failed to load scheduled backup status");
                             }
                         }
                     }
@@ -10973,7 +11259,10 @@ fn handle_learn_command(
             println!("{}", serde_json::to_string_pretty(&status)?);
         } else {
             println!("wa learn --status\n");
-            println!("Overall Progress: {}/{} exercises", status.completed_exercises, status.total_exercises);
+            println!(
+                "Overall Progress: {}/{} exercises",
+                status.completed_exercises, status.total_exercises
+            );
             println!("Achievements: {}", status.achievements_earned);
             println!("Time spent: {} minutes\n", status.total_time_minutes);
 
@@ -11055,9 +11344,15 @@ fn handle_learn_command(
             } else {
                 let (completed, total) = engine.track_progress(&track_id);
                 println!("wa learn {}\n", track_id);
-                println!("Track: {} ({}/{})",
-                    engine.get_track(&track_id).map(|t| t.name.as_str()).unwrap_or(&track_id),
-                    completed, total);
+                println!(
+                    "Track: {} ({}/{})",
+                    engine
+                        .get_track(&track_id)
+                        .map(|t| t.name.as_str())
+                        .unwrap_or(&track_id),
+                    completed,
+                    total
+                );
                 println!("\n--- Exercise: {} ---\n", exercise.title);
                 println!("{}\n", exercise.description);
                 println!("Instructions:");
@@ -11100,8 +11395,10 @@ fn handle_learn_command(
                 } else {
                     " "
                 };
-                println!("  [{status_marker}] {} - {} (~{} min)",
-                    track.id, track.description, track.estimated_minutes);
+                println!(
+                    "  [{status_marker}] {} - {} (~{} min)",
+                    track.id, track.description, track.estimated_minutes
+                );
                 println!("      Progress: {}/{}", completed, total);
             }
 
@@ -16326,18 +16623,17 @@ mod tests {
 
     #[test]
     fn human_workflow_run_parses_name_and_pane() {
-        let cli = Cli::try_parse_from([
-            "wa",
-            "workflow",
-            "run",
-            "handle_compaction",
-            "--pane",
-            "5",
-        ])
-        .expect("workflow run should parse");
+        let cli =
+            Cli::try_parse_from(["wa", "workflow", "run", "handle_compaction", "--pane", "5"])
+                .expect("workflow run should parse");
         match cli.command {
             Some(Commands::Workflow {
-                command: WorkflowCommands::Run { name, pane, dry_run },
+                command:
+                    WorkflowCommands::Run {
+                        name,
+                        pane,
+                        dry_run,
+                    },
             }) => {
                 assert_eq!(name, "handle_compaction");
                 assert_eq!(pane, 5);
@@ -16371,23 +16667,15 @@ mod tests {
 
     #[test]
     fn human_workflow_run_rejects_missing_pane() {
-        let result =
-            Cli::try_parse_from(["wa", "workflow", "run", "handle_compaction"]);
-        assert!(
-            result.is_err(),
-            "workflow run without --pane should fail"
-        );
+        let result = Cli::try_parse_from(["wa", "workflow", "run", "handle_compaction"]);
+        assert!(result.is_err(), "workflow run without --pane should fail");
     }
 
     #[test]
     fn human_workflow_status_parses_execution_id() {
-        let cli = Cli::try_parse_from([
-            "wa",
-            "workflow",
-            "status",
-            "human-handle_compaction-123456",
-        ])
-        .expect("workflow status should parse");
+        let cli =
+            Cli::try_parse_from(["wa", "workflow", "status", "human-handle_compaction-123456"])
+                .expect("workflow status should parse");
         match cli.command {
             Some(Commands::Workflow {
                 command:
@@ -16405,14 +16693,8 @@ mod tests {
 
     #[test]
     fn human_workflow_status_verbose_flag() {
-        let cli = Cli::try_parse_from([
-            "wa",
-            "workflow",
-            "status",
-            "wf-abc",
-            "-v",
-        ])
-        .expect("workflow status -v should parse");
+        let cli = Cli::try_parse_from(["wa", "workflow", "status", "wf-abc", "-v"])
+            .expect("workflow status -v should parse");
         match cli.command {
             Some(Commands::Workflow {
                 command: WorkflowCommands::Status { verbose, .. },
@@ -16425,14 +16707,8 @@ mod tests {
 
     #[test]
     fn human_workflow_status_double_verbose() {
-        let cli = Cli::try_parse_from([
-            "wa",
-            "workflow",
-            "status",
-            "wf-abc",
-            "-vv",
-        ])
-        .expect("workflow status -vv should parse");
+        let cli = Cli::try_parse_from(["wa", "workflow", "status", "wf-abc", "-vv"])
+            .expect("workflow status -vv should parse");
         match cli.command {
             Some(Commands::Workflow {
                 command: WorkflowCommands::Status { verbose, .. },

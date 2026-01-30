@@ -304,6 +304,23 @@ writer_queue_size = 100
 # How long to retain captured output
 retention_days = 30
 
+[backup.scheduled]
+# Enable scheduled backups
+enabled = false
+# Schedule: hourly, daily, weekly, or 5-field cron
+schedule = "daily"
+# Retention policy
+retention_days = 30
+max_backups = 10
+# Optional destination root
+destination = "~/.local/share/wa/backups"
+# Optional tweaks
+compress = false
+metadata_only = false
+# Notifications
+notify_on_failure = true
+notify_on_success = false
+
 [patterns]
 # Which detection packs to enable
 packs = ["core"]
