@@ -18,6 +18,11 @@
       "type": "string",
       "description": "The action type this approval was for (e.g., 'SendText', 'WorkflowRun')"
     },
+    "created_at": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Unix timestamp (ms) when the approval token was created"
+    },
     "pane_id": {
       "type": ["integer", "null"],
       "minimum": 0,

@@ -2289,6 +2289,8 @@ struct RobotApproveData {
     code: String,
     valid: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    created_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     action_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pane_id: Option<u64>,
@@ -2804,6 +2806,7 @@ async fn evaluate_approve(
         return Ok(RobotApproveData {
             code: code.to_string(),
             valid: true,
+            created_at: Some(token.created_at as u64),
             action_kind: Some(token.action_kind),
             pane_id: token.pane_id,
             expires_at: Some(token.expires_at as u64),
@@ -2877,6 +2880,7 @@ async fn evaluate_approve(
     Ok(RobotApproveData {
         code: code.to_string(),
         valid: true,
+        created_at: Some(consumed_token.created_at as u64),
         action_kind: Some(consumed_token.action_kind),
         pane_id: consumed_token.pane_id,
         expires_at: Some(consumed_token.expires_at as u64),
@@ -8531,6 +8535,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 }
             };
             let workspace_id = layout.root.to_string_lossy().to_string();
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as i64);
 
             match evaluate_approve(
                 &storage,
@@ -8545,17 +8552,45 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             {
                 Ok(data) => {
                     if data.dry_run == Some(true) {
-                        println!("Approval code: {}", data.code);
-                        println!("Status: valid (not consumed — dry run)");
-                        if let Some(action) = &data.action_kind {
-                            println!("Action: {action}");
-                        }
-                        if let Some(pane_id) = data.pane_id {
-                            println!("Pane: {pane_id}");
+                        println!("DRY RUN - No changes will be made");
+                        println!();
+                        println!("Approval Token:");
+                        println!("  Code: {}", data.code);
+                        println!("  Status: valid (not consumed)");
+                        if let Some(created) = data.created_at {
+                            println!(
+                                "  Created: {} ({created} ms)",
+                                format_epoch_ms(created as i64)
+                            );
                         }
                         if let Some(expires) = data.expires_at {
-                            println!("Expires at: {expires} (epoch ms)");
+                            println!(
+                                "  Expires: {} ({expires} ms)",
+                                format_epoch_ms(expires as i64)
+                            );
+                            let remaining = expires as i64 - now_ms;
+                            if remaining <= 60_000 && remaining > 0 {
+                                println!("  Warning: expires in ~{}s", remaining / 1000);
+                            }
                         }
+                        println!();
+                        println!("Associated Action:");
+                        if let Some(action) = &data.action_kind {
+                            println!("  Kind: {action}");
+                        }
+                        if let Some(pane_id) = data.pane_id {
+                            println!("  Pane: {pane_id}");
+                        }
+                        if let Some(fingerprint) = &data.action_fingerprint {
+                            println!("  Fingerprint: {fingerprint}");
+                        }
+                        println!();
+                        println!("Would grant:");
+                        println!("  - Allow-once permission for this action");
+                        println!("  - Audit log entry would be created");
+                        println!();
+                        println!("To approve for real:");
+                        println!("  wa approve {}", data.code);
                     } else {
                         println!("Approval granted.");
                         if let Some(action) = &data.action_kind {

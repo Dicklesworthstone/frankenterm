@@ -956,6 +956,7 @@ run_scenario_unhandled_event_lifecycle() {
     local pane_id=""
     local result=0
     local wait_timeout=${TIMEOUT:-45}
+    local db_path=""
 
     log_info "Workspace: $temp_workspace"
 
@@ -995,9 +996,9 @@ run_scenario_unhandled_event_lifecycle() {
     }
     trap cleanup_unhandled_event_lifecycle EXIT
 
-    # Step 1: Start wa watch with auto-handle
-    log_info "Step 1: Starting wa watch with --auto-handle..."
-    "$WA_BINARY" watch --foreground --auto-handle \
+    # Step 1: Start wa watch (manual workflow trigger)
+    log_info "Step 1: Starting wa watch..."
+    "$WA_BINARY" watch --foreground \
         > "$scenario_dir/wa_watch.log" 2>&1 &
     wa_pid=$!
     log_verbose "wa watch started with PID $wa_pid"
@@ -1083,8 +1084,29 @@ run_scenario_unhandled_event_lifecycle() {
         log_warn "No recommended workflow found in preview"
     fi
 
-    # Step 7: Wait for event to be handled (unhandled list empty)
-    log_info "Step 7: Waiting for event to be handled..."
+    db_path="$temp_workspace/.wa/wa.db"
+    if [[ -f "$db_path" ]]; then
+        sqlite3 "$db_path" -json \
+            "SELECT action_kind, actor_kind, result FROM audit_actions ORDER BY id DESC LIMIT 50;" \
+            > "$scenario_dir/audit_actions_pre.json" 2>/dev/null || true
+    fi
+
+    # Step 7: Run recommended workflow to handle the event
+    local workflow_to_run="${recommended_workflow:-handle_compaction}"
+    if [[ -z "$workflow_to_run" ]]; then
+        workflow_to_run="handle_compaction"
+    fi
+    log_info "Step 7: Running workflow ($workflow_to_run) on pane $pane_id..."
+    if "$WA_BINARY" workflow run "$workflow_to_run" --pane "$pane_id" \
+        > "$scenario_dir/workflow_run_output.txt" 2>&1; then
+        log_pass "Workflow run completed"
+    else
+        log_fail "Workflow run failed"
+        result=1
+    fi
+
+    # Step 8: Wait for event to be handled (unhandled list empty)
+    log_info "Step 8: Waiting for event to be handled..."
     local handled_cmd="\"$WA_BINARY\" events -f json --unhandled --rule-id \"codex:compaction\" --limit 20 2>/dev/null | jq -e 'length == 0' >/dev/null 2>&1"
     if ! wait_for_condition "compaction event handled" "$handled_cmd" "$wait_timeout"; then
         log_fail "Timeout waiting for event to be handled"
@@ -1093,8 +1115,8 @@ run_scenario_unhandled_event_lifecycle() {
         log_pass "Unhandled list cleared"
     fi
 
-    # Step 8: Capture handled events and audit trail slice
-    log_info "Step 8: Capturing handled events and audit trail..."
+    # Step 9: Capture handled events and audit trail slice
+    log_info "Step 9: Capturing handled events and audit trail..."
     "$WA_BINARY" events -f json --rule-id "codex:compaction" --limit 20 \
         > "$scenario_dir/events_post.json" 2>&1 || true
 
@@ -1110,22 +1132,40 @@ run_scenario_unhandled_event_lifecycle() {
         result=1
     fi
 
-    local db_path="$temp_workspace/.wa/wa.db"
     if [[ -f "$db_path" ]]; then
-        sqlite3 "$db_path" -header -csv \
+        sqlite3 "$db_path" -json \
             "SELECT action_kind, actor_kind, result FROM audit_actions ORDER BY id DESC LIMIT 50;" \
-            > "$scenario_dir/audit_actions.csv" 2>/dev/null || true
-        if grep -q "workflow_start" "$scenario_dir/audit_actions.csv" 2>/dev/null; then
-            log_pass "Audit trail shows workflow activity"
+            > "$scenario_dir/audit_actions_post.json" 2>/dev/null || true
+        if jq -e '.[] | select(.action_kind == "workflow_run" or .action_kind == "workflow_start")' \
+            "$scenario_dir/audit_actions_post.json" >/dev/null 2>&1; then
+            log_pass "Audit trail shows workflow run"
         else
-            log_warn "Workflow audit action not found in recent audit slice"
+            log_fail "Workflow audit action not found in recent audit slice"
+            result=1
+        fi
+        if jq -e '.[] | select(.action_kind == "send_text")' \
+            "$scenario_dir/audit_actions_post.json" >/dev/null 2>&1; then
+            log_pass "Audit trail shows send_text action"
+        else
+            log_fail "Audit trail missing send_text action"
+            result=1
+        fi
+
+        sqlite3 "$db_path" -json \
+            "SELECT workflow_name FROM workflow_executions ORDER BY started_at DESC LIMIT 1;" \
+            > "$scenario_dir/workflow_execution.json" 2>/dev/null || true
+        local actual_workflow
+        actual_workflow=$(jq -r '.[0].workflow_name // empty' "$scenario_dir/workflow_execution.json" 2>/dev/null || echo "")
+        if [[ -n "$recommended_workflow" && -n "$actual_workflow" && "$recommended_workflow" != "$actual_workflow" ]]; then
+            log_fail "Recommended workflow ($recommended_workflow) does not match executed ($actual_workflow)"
+            result=1
         fi
     else
         log_warn "Database file not found at $db_path"
     fi
 
-    # Step 9: Check wa watch logs for workflow activity
-    log_info "Step 9: Checking wa watch logs for workflow activity..."
+    # Step 10: Check wa watch logs for workflow activity
+    log_info "Step 10: Checking wa watch logs for workflow activity..."
     if [[ -n "$recommended_workflow" ]]; then
         if grep -qi "$recommended_workflow" "$scenario_dir/wa_watch.log" 2>/dev/null; then
             log_pass "Workflow activity found in logs"
@@ -1140,8 +1180,8 @@ run_scenario_unhandled_event_lifecycle() {
         fi
     fi
 
-    # Step 10: Stop wa watch gracefully
-    log_info "Step 10: Stopping wa watch..."
+    # Step 11: Stop wa watch gracefully
+    log_info "Step 11: Stopping wa watch..."
     kill -TERM "$wa_pid" 2>/dev/null || true
     wait "$wa_pid" 2>/dev/null || true
     wa_pid=""
@@ -1421,6 +1461,10 @@ EOF
         sqlite3 "$db_path" -json \
             "SELECT id, workflow_name, status, result FROM workflow_executions WHERE workflow_name = 'handle_usage_limits' ORDER BY started_at DESC LIMIT 1;" \
             > "$scenario_dir/workflow_execution.json" 2>/dev/null || true
+
+        sqlite3 "$db_path" -json \
+            "SELECT id, action_kind, actor_kind, result FROM audit_actions ORDER BY id DESC LIMIT 50;" \
+            > "$scenario_dir/audit_actions.json" 2>/dev/null || true
 
         if jq -e '.[0].result | fromjson? | .fallback == true' "$scenario_dir/workflow_execution.json" >/dev/null 2>&1; then
             log_pass "Workflow result contains fallback plan"
@@ -2609,6 +2653,7 @@ run_scenario_stress_scale() {
     # Env overrides:
     #   STRESS_PANES, STRESS_LINES_PER_PANE, STRESS_LARGE_LINES, STRESS_DELAY_SECS
     #   STRESS_INGEST_LAG_MAX_MS, STRESS_RSS_KB_MAX, STRESS_CPU_PCT_MAX, STRESS_FTS_MS_MAX
+    #   STRESS_LONG_RUN_SECS, STRESS_MEM_GROWTH_PCT_MAX
     local scenario_dir="$1"
     local temp_workspace
     temp_workspace=$(mktemp -d /tmp/wa-e2e-stress-XXXXXX)
@@ -2623,10 +2668,15 @@ run_scenario_stress_scale() {
     local rss_budget_kb="${STRESS_RSS_KB_MAX:-800000}"
     local cpu_budget_pct="${STRESS_CPU_PCT_MAX:-80}"
     local fts_budget_ms="${STRESS_FTS_MS_MAX:-800}"
+    local long_run_secs="${STRESS_LONG_RUN_SECS:-0}"
+    local mem_growth_budget_pct="${STRESS_MEM_GROWTH_PCT_MAX:-15}"
     local marker="E2E_STRESS_$(date +%s%N)"
     local burst_script="$PROJECT_ROOT/fixtures/e2e/dummy_burst.sh"
     local chatter_script="$temp_workspace/emit_chatter.sh"
     local pane_ids=()
+    local rss_kb_start="null"
+    local rss_kb_end="null"
+    local mem_growth_pct="null"
 
     log_info "Workspace: $temp_workspace"
     log_info "Stress marker: $marker"
@@ -2783,6 +2833,7 @@ EOS
     if [[ -n "$ps_stats" ]]; then
         cpu_pct=$(echo "$ps_stats" | awk '{print $1}')
         rss_kb=$(echo "$ps_stats" | awk '{print $2}')
+        rss_kb_start="$rss_kb"
         echo "cpu_pct: $cpu_pct" >> "$scenario_dir/scenario.log"
         echo "rss_kb: $rss_kb" >> "$scenario_dir/scenario.log"
         if awk -v v="$cpu_pct" -v max="$cpu_budget_pct" 'BEGIN { exit !(v <= max) }'; then
@@ -2799,6 +2850,32 @@ EOS
         fi
     else
         log_warn "Failed to read CPU/RSS from ps"
+    fi
+
+    if [[ "$long_run_secs" -gt 0 ]]; then
+        log_info "Step 4b: Long-run memory check (${long_run_secs}s)..."
+        if [[ "$rss_kb_start" != "null" && "$rss_kb_start" -gt 0 ]]; then
+            sleep "$long_run_secs"
+            local rss_after
+            rss_after=$(ps -o rss= -p "$wa_pid" 2>/dev/null | awk '{print $1}')
+            if [[ -n "$rss_after" ]]; then
+                rss_kb_end="$rss_after"
+                mem_growth_pct=$(awk -v start="$rss_kb_start" -v end="$rss_kb_end" 'BEGIN { if (start <= 0) {print "null"; exit}; printf "%.2f", ((end - start) / start) * 100 }')
+                echo "rss_kb_start: $rss_kb_start" >> "$scenario_dir/scenario.log"
+                echo "rss_kb_end: $rss_kb_end" >> "$scenario_dir/scenario.log"
+                echo "mem_growth_pct: $mem_growth_pct" >> "$scenario_dir/scenario.log"
+                if [[ "$mem_growth_pct" != "null" ]] && awk -v v="$mem_growth_pct" -v max="$mem_growth_budget_pct" 'BEGIN { exit !(v <= max) }'; then
+                    log_pass "Memory growth ${mem_growth_pct}% within budget (${mem_growth_budget_pct}%)"
+                else
+                    log_fail "Memory growth ${mem_growth_pct}% exceeds budget (${mem_growth_budget_pct}%)"
+                    result=1
+                fi
+            else
+                log_warn "Failed to read RSS after long-run sleep"
+            fi
+        else
+            log_warn "Skipping long-run memory check (RSS start unavailable)"
+        fi
     fi
 
     # Step 5: Measure FTS query latency
@@ -2859,13 +2936,18 @@ PY
   "ingest_lag_max_ms": $ingest_lag_max,
   "cpu_pct": "$cpu_pct",
   "rss_kb": $rss_kb,
+  "rss_kb_start": $rss_kb_start,
+  "rss_kb_end": $rss_kb_end,
+  "mem_growth_pct": $mem_growth_pct,
   "fts_elapsed_ms": $fts_elapsed,
   "fts_hits": $fts_hits,
   "budgets": {
     "ingest_lag_max_ms": $ingest_lag_budget_ms,
     "cpu_pct": $cpu_budget_pct,
     "rss_kb": $rss_budget_kb,
-    "fts_elapsed_ms": $fts_budget_ms
+    "fts_elapsed_ms": $fts_budget_ms,
+    "mem_growth_pct": $mem_growth_budget_pct,
+    "long_run_secs": $long_run_secs
   }
 }
 EOF
