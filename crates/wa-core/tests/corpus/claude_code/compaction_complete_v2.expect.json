@@ -1,0 +1,11 @@
+[
+  {
+    "rule_id": "claude_code.compaction.complete",
+    "agent_type": "claude_code",
+    "event_type": "session.compaction_complete",
+    "severity": "info",
+    "confidence": 0.95,
+    "extracted": {},
+    "matched_text": "Summary created"
+  }
+]

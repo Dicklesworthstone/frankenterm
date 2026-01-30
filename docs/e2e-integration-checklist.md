@@ -26,12 +26,17 @@ Registry lives in `scripts/e2e_test.sh` (SCENARIO_REGISTRY). Current entries:
 - natural_language
 - compaction_workflow
 - unhandled_event_lifecycle
+- usage_limit_safe_pause
 - policy_denial
 - graceful_shutdown
 - pane_exclude_filter
 - workspace_isolation
+- setup_idempotency
 - uservar_forwarding
+- alt_screen_detection
+- no_lua_status_hook
 - workflow_resume
+- accounts_refresh
 
 ## Checklist by Feature Area
 
@@ -76,9 +81,9 @@ Registry lives in `scripts/e2e_test.sh` (SCENARIO_REGISTRY). Current entries:
 - [ ] Artifacts: workflow execution logs + step log export. Scenario(s): none
 
 #### Usage limits (wa-nu4.1.3)
-- [ ] E2E: end-to-end usage-limit workflow fixture-first (no real auth). Scenario(s): none
-- [ ] E2E: key failure modes are safe/actionable (MFA required, cannot pick account). Scenario(s): none
-- [ ] Artifacts: parsed resume/session info (redacted), next-step plan output. Scenario(s): none
+- [x] E2E: end-to-end usage-limit workflow fixture-first (no real auth). Scenario(s): usage_limit_safe_pause
+- [ ] E2E: key failure modes are safe/actionable (MFA required, cannot pick account). Scenario(s): usage_limit_safe_pause (partial: cannot pick account)
+- [ ] Artifacts: parsed resume/session info (redacted), next-step plan output. Scenario(s): usage_limit_safe_pause (partial)
 
 #### Compaction (wa-nu4.1.2)
 - [x] E2E: compaction detected and handled exactly once per event (dedupe/cooldown). Scenario(s): unhandled_event_lifecycle

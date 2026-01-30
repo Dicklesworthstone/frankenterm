@@ -1,0 +1,1 @@
+rate limit details: check your API dashboard for more information

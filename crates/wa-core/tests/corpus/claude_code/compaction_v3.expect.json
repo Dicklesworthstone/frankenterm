@@ -1,0 +1,14 @@
+[
+  {
+    "rule_id": "claude_code.compaction",
+    "agent_type": "claude_code",
+    "event_type": "session.compaction",
+    "severity": "warning",
+    "confidence": 0.95,
+    "extracted": {
+      "tokens_before": "8,000",
+      "tokens_after": "2,100"
+    },
+    "matched_text": "summarized 8,000 token to 2,100"
+  }
+]

@@ -1,0 +1,13 @@
+[
+  {
+    "rule_id": "claude_code.usage.reached",
+    "agent_type": "claude_code",
+    "event_type": "usage.reached",
+    "severity": "critical",
+    "confidence": 0.95,
+    "extracted": {
+      "reset_time": "30 seconds"
+    },
+    "matched_text": "retry after 30 seconds"
+  }
+]

@@ -1,0 +1,1 @@
+Auto-compact: summarized 8,000 token to 2,100

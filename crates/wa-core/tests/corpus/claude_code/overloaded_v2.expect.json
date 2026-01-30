@@ -1,0 +1,13 @@
+[
+  {
+    "rule_id": "claude_code.error.overloaded",
+    "agent_type": "claude_code",
+    "event_type": "error.overloaded",
+    "severity": "warning",
+    "confidence": 0.95,
+    "extracted": {
+      "retry_after": "60"
+    },
+    "matched_text": "too many requests to API. Will retry in 60 seconds"
+  }
+]

@@ -339,6 +339,7 @@ SCENARIO_REGISTRY=(
     "natural_language:Validate event summaries and wa why output"
     "compaction_workflow:Validate pattern detection and workflow execution"
     "unhandled_event_lifecycle:Validate unhandled event lifecycle and dedupe handling"
+    "usage_limit_safe_pause:Validate usage-limit safe pause workflow (fallback plan persisted)"
     "policy_denial:Validate safety gates block sends to protected panes"
     "graceful_shutdown:Validate wa watch graceful shutdown (SIGINT flush, lock release, restart clean)"
     "pane_exclude_filter:Validate pane selection filters protect privacy (ignored pane absent from search)"
@@ -348,6 +349,7 @@ SCENARIO_REGISTRY=(
     "alt_screen_detection:Validate alt-screen detection via escape sequences (no Lua status hook)"
     "no_lua_status_hook:Validate wa setup does not inject update-status Lua"
     "workflow_resume:Validate workflow resumes after watcher restart (no duplicate steps)"
+    "accounts_refresh:Validate accounts refresh via fake caut + pick preview + redaction"
 )
 
 list_scenarios() {
@@ -1141,6 +1143,370 @@ run_scenario_unhandled_event_lifecycle() {
 
     trap - EXIT
     cleanup_unhandled_event_lifecycle
+
+    return $result
+}
+
+run_scenario_usage_limit_safe_pause() {
+    local scenario_dir="$1"
+    local temp_workspace
+    temp_workspace=$(mktemp -d /tmp/wa-e2e-usage-limit-XXXXXX)
+    local temp_bin="$temp_workspace/bin"
+    local fake_caut="$temp_bin/caut"
+    local wa_pid=""
+    local wa_pid_restart=""
+    local pane_id=""
+    local result=0
+    local wait_timeout=${TIMEOUT:-90}
+    local old_path="$PATH"
+    local old_wa_data_dir="${WA_DATA_DIR:-}"
+    local old_wa_workspace="${WA_WORKSPACE:-}"
+    local old_wa_config="${WA_CONFIG:-}"
+    local old_caut_mode="${CAUT_FAKE_MODE:-}"
+    local old_caut_log="${CAUT_FAKE_LOG:-}"
+
+    log_info "Workspace: $temp_workspace"
+
+    cleanup_usage_limit_safe_pause() {
+        log_verbose "Cleaning up usage_limit_safe_pause scenario"
+        if [[ -n "${wa_pid:-}" ]] && kill -0 "$wa_pid" 2>/dev/null; then
+            log_verbose "Stopping wa watch (pid $wa_pid)"
+            kill "$wa_pid" 2>/dev/null || true
+            wait "$wa_pid" 2>/dev/null || true
+        fi
+        if [[ -n "${wa_pid_restart:-}" ]] && kill -0 "$wa_pid_restart" 2>/dev/null; then
+            log_verbose "Stopping wa watch restart (pid $wa_pid_restart)"
+            kill "$wa_pid_restart" 2>/dev/null || true
+            wait "$wa_pid_restart" 2>/dev/null || true
+        fi
+        if [[ -n "${pane_id:-}" ]]; then
+            log_verbose "Closing dummy agent pane $pane_id"
+            wezterm cli kill-pane --pane-id "$pane_id" 2>/dev/null || true
+        fi
+        export PATH="$old_path"
+        if [[ -n "$old_wa_data_dir" ]]; then
+            export WA_DATA_DIR="$old_wa_data_dir"
+        else
+            unset WA_DATA_DIR
+        fi
+        if [[ -n "$old_wa_workspace" ]]; then
+            export WA_WORKSPACE="$old_wa_workspace"
+        else
+            unset WA_WORKSPACE
+        fi
+        if [[ -n "$old_wa_config" ]]; then
+            export WA_CONFIG="$old_wa_config"
+        else
+            unset WA_CONFIG
+        fi
+        if [[ -n "$old_caut_mode" ]]; then
+            export CAUT_FAKE_MODE="$old_caut_mode"
+        else
+            unset CAUT_FAKE_MODE
+        fi
+        if [[ -n "$old_caut_log" ]]; then
+            export CAUT_FAKE_LOG="$old_caut_log"
+        else
+            unset CAUT_FAKE_LOG
+        fi
+        if [[ -d "${temp_workspace:-}" ]]; then
+            cp -r "${temp_workspace}/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp "${temp_workspace}/wa.toml" "$scenario_dir/" 2>/dev/null || true
+            cp "${temp_workspace}/caut_invocations.log" "$scenario_dir/" 2>/dev/null || true
+        fi
+        rm -rf "${temp_workspace:-}"
+    }
+    trap cleanup_usage_limit_safe_pause EXIT
+
+    # Step 0: Create fake caut binary (accounts exhausted)
+    log_info "Step 0: Creating fake caut binary (accounts exhausted)..."
+    mkdir -p "$temp_bin"
+    cat > "$fake_caut" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+mode="${CAUT_FAKE_MODE:-exhausted}"
+log_path="${CAUT_FAKE_LOG:-}"
+
+if [[ -n "$log_path" ]]; then
+    echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") $*" >> "$log_path"
+fi
+
+subcommand="${1:-}"
+shift || true
+
+service=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --service)
+            service="$2"
+            shift 2
+            ;;
+        --format)
+            shift 2
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+
+if [[ "$service" != "openai" ]]; then
+    echo "{\"error\":\"unsupported service\"}" >&2
+    exit 2
+fi
+
+if [[ "$mode" == "fail" ]]; then
+    echo "caut failed: sk-test-should-redact-usage-limit" >&2
+    exit 42
+fi
+
+if [[ "$subcommand" == "refresh" ]]; then
+    cat <<JSON
+{
+  "service": "openai",
+  "refreshed_at": "2026-01-30T00:00:00Z",
+  "accounts": [
+    {
+      "id": "acc-low",
+      "name": "low",
+      "percentRemaining": 1,
+      "resetAt": "2026-02-01T00:00:00Z"
+    },
+    {
+      "id": "acc-zero",
+      "name": "zero",
+      "percentRemaining": 0,
+      "resetAt": "2026-02-01T00:00:00Z"
+    }
+  ]
+}
+JSON
+else
+    cat <<JSON
+{
+  "service": "openai",
+  "generated_at": "2026-01-30T00:00:00Z",
+  "accounts": [
+    { "id": "acc-low", "name": "low", "percentRemaining": 1 },
+    { "id": "acc-zero", "name": "zero", "percentRemaining": 0 }
+  ]
+}
+JSON
+fi
+EOF
+    chmod +x "$fake_caut"
+
+    export PATH="$temp_bin:$PATH"
+    export CAUT_FAKE_LOG="$temp_workspace/caut_invocations.log"
+    unset CAUT_FAKE_MODE
+
+    # Step 1: Configure isolated workspace
+    log_info "Step 1: Preparing isolated workspace..."
+    export WA_DATA_DIR="$temp_workspace/.wa"
+    export WA_WORKSPACE="$temp_workspace"
+    mkdir -p "$WA_DATA_DIR"
+
+    local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
+    if [[ -f "$baseline_config" ]]; then
+        cp "$baseline_config" "$temp_workspace/wa.toml"
+        export WA_CONFIG="$temp_workspace/wa.toml"
+        log_verbose "Using baseline config: $baseline_config"
+    else
+        log_fail "Baseline config not found: $baseline_config"
+        return 1
+    fi
+
+    # Step 2: Start wa watch with auto-handle
+    log_info "Step 2: Starting wa watch with --auto-handle..."
+    "$WA_BINARY" watch --foreground --auto-handle --config "$temp_workspace/wa.toml" \
+        > "$scenario_dir/wa_watch_1.log" 2>&1 &
+    wa_pid=$!
+    log_verbose "wa watch started with PID $wa_pid"
+    echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
+
+    sleep 2
+    if ! kill -0 "$wa_pid" 2>/dev/null; then
+        log_fail "wa watch exited immediately"
+        return 1
+    fi
+
+    # Step 3: Spawn dummy usage-limit pane
+    log_info "Step 3: Spawning dummy usage-limit pane..."
+    local agent_script="$PROJECT_ROOT/fixtures/e2e/dummy_usage_limit.sh"
+    if [[ ! -x "$agent_script" ]]; then
+        log_fail "Dummy usage-limit script not found or not executable: $agent_script"
+        return 1
+    fi
+
+    local spawn_output
+    spawn_output=$(wezterm cli spawn --cwd "$temp_workspace" -- bash "$agent_script" 1 "2026-02-01 00:00 UTC" 2>&1)
+    pane_id=$(echo "$spawn_output" | grep -oE '^[0-9]+$' | head -1)
+
+    if [[ -z "$pane_id" ]]; then
+        log_fail "Failed to spawn dummy usage-limit pane"
+        echo "Spawn output: $spawn_output" >> "$scenario_dir/scenario.log"
+        return 1
+    fi
+    log_info "Spawned usage-limit pane: $pane_id"
+    echo "agent_pane_id: $pane_id" >> "$scenario_dir/scenario.log"
+
+    # Step 4: Wait for pane to be observed
+    log_info "Step 4: Waiting for pane to be observed..."
+    local check_cmd="\"$WA_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane_id)' >/dev/null 2>&1"
+    if ! wait_for_condition "pane $pane_id observed" "$check_cmd" "$wait_timeout"; then
+        log_fail "Timeout waiting for pane to be observed"
+        "$WA_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
+        return 1
+    fi
+    log_pass "Pane observed"
+
+    # Step 5: Wait for unhandled usage-limit event
+    log_info "Step 5: Waiting for unhandled usage-limit event..."
+    local unhandled_cmd="\"$WA_BINARY\" events -f json --unhandled --rule-id \"codex.usage.reached\" --limit 20 2>/dev/null | jq -e 'length >= 1' >/dev/null 2>&1"
+    if ! wait_for_condition "unhandled usage-limit event detected" "$unhandled_cmd" "$wait_timeout"; then
+        log_fail "Timeout waiting for unhandled usage-limit event"
+        "$WA_BINARY" events -f json --limit 20 > "$scenario_dir/events_debug.json" 2>&1 || true
+        result=1
+    else
+        log_pass "Unhandled usage-limit event detected"
+    fi
+
+    # Step 6: Capture unhandled events + recommended workflow preview
+    log_info "Step 6: Capturing unhandled events and workflow preview..."
+    "$WA_BINARY" events -f json --unhandled --rule-id "codex.usage.reached" --limit 20 \
+        > "$scenario_dir/events_unhandled_pre.json" 2>&1 || true
+
+    "$WA_BINARY" robot events --unhandled --rule-id "codex.usage.reached" --limit 5 --would-handle --dry-run \
+        > "$scenario_dir/robot_events_preview.json" 2>&1 || true
+
+    local recommended_workflow
+    recommended_workflow=$(jq -r '.data.events[0].would_handle_with.workflow // empty' \
+        "$scenario_dir/robot_events_preview.json" 2>/dev/null || echo "")
+
+    if [[ -n "$recommended_workflow" ]]; then
+        log_pass "Recommended workflow: $recommended_workflow"
+        echo "recommended_workflow: $recommended_workflow" >> "$scenario_dir/scenario.log"
+    else
+        log_warn "No recommended workflow found in preview"
+    fi
+
+    # Step 7: Wait for event to be handled (unhandled list empty)
+    log_info "Step 7: Waiting for event to be handled..."
+    local handled_cmd="\"$WA_BINARY\" events -f json --unhandled --rule-id \"codex.usage.reached\" --limit 20 2>/dev/null | jq -e 'length == 0' >/dev/null 2>&1"
+    if ! wait_for_condition "usage-limit event handled" "$handled_cmd" "$wait_timeout"; then
+        log_fail "Timeout waiting for usage-limit event to be handled"
+        result=1
+    else
+        log_pass "Unhandled list cleared"
+    fi
+
+    # Step 8: Capture handled event + workflow result
+    log_info "Step 8: Capturing handled events and workflow result..."
+    "$WA_BINARY" events -f json --rule-id "codex.usage.reached" --limit 20 \
+        > "$scenario_dir/events_post.json" 2>&1 || true
+
+    local db_path="$temp_workspace/.wa/wa.db"
+    if [[ -f "$db_path" ]]; then
+        sqlite3 "$db_path" -header -csv \
+            "SELECT id, rule_id, handled_at, handled_status FROM events WHERE rule_id = 'codex.usage.reached' ORDER BY detected_at DESC LIMIT 1;" \
+            > "$scenario_dir/events_db.csv" 2>/dev/null || true
+
+        sqlite3 "$db_path" -json \
+            "SELECT id, workflow_name, status, result FROM workflow_executions WHERE workflow_name = 'handle_usage_limits' ORDER BY started_at DESC LIMIT 1;" \
+            > "$scenario_dir/workflow_execution.json" 2>/dev/null || true
+
+        if jq -e '.[0].result | fromjson? | .fallback == true' "$scenario_dir/workflow_execution.json" >/dev/null 2>&1; then
+            log_pass "Workflow result contains fallback plan"
+        else
+            log_fail "Workflow result missing fallback plan"
+            result=1
+        fi
+    else
+        log_warn "Database file not found at $db_path"
+        result=1
+    fi
+
+    # Step 8b: Verify fake caut refresh was invoked
+    log_info "Step 8b: Verifying fake caut invocation..."
+    if [[ -f "$temp_workspace/caut_invocations.log" ]] && grep -q "refresh" "$temp_workspace/caut_invocations.log"; then
+        log_pass "Fake caut invoked for refresh"
+    else
+        log_fail "Fake caut invocation not recorded"
+        result=1
+    fi
+
+    # Step 9: Spam guard (no send_text; ctrl-c should be <= 1)
+    log_info "Step 9: Validating spam guard (no send_text)..."
+    if [[ -f "$db_path" ]]; then
+        local send_text_count
+        local send_ctrl_c_count
+        send_text_count=$(sqlite3 "$db_path" "SELECT COUNT(*) FROM audit_actions WHERE action_kind = 'send_text';" 2>/dev/null || echo "0")
+        send_ctrl_c_count=$(sqlite3 "$db_path" "SELECT COUNT(*) FROM audit_actions WHERE action_kind = 'send_ctrl_c';" 2>/dev/null || echo "0")
+        echo "send_text_count: $send_text_count" >> "$scenario_dir/scenario.log"
+        echo "send_ctrl_c_count: $send_ctrl_c_count" >> "$scenario_dir/scenario.log"
+
+        if [[ "$send_text_count" -eq 0 ]]; then
+            log_pass "No send_text actions recorded"
+        else
+            log_fail "send_text actions recorded: $send_text_count"
+            result=1
+        fi
+
+        if [[ "$send_ctrl_c_count" -le 1 ]]; then
+            log_pass "Ctrl-C injections within expected bounds ($send_ctrl_c_count)"
+        else
+            log_fail "Excess Ctrl-C injections recorded: $send_ctrl_c_count"
+            result=1
+        fi
+    else
+        log_warn "Database file not found for spam guard checks"
+        result=1
+    fi
+
+    # Step 10: Stop wa watch and restart to verify persistence
+    log_info "Step 10: Restarting wa watch to verify plan persistence..."
+    kill -TERM "$wa_pid" 2>/dev/null || true
+    wait "$wa_pid" 2>/dev/null || true
+    wa_pid=""
+
+    "$WA_BINARY" watch --foreground --auto-handle --config "$temp_workspace/wa.toml" \
+        > "$scenario_dir/wa_watch_2.log" 2>&1 &
+    wa_pid_restart=$!
+    log_verbose "wa watch restart PID $wa_pid_restart"
+    echo "wa_pid_restart: $wa_pid_restart" >> "$scenario_dir/scenario.log"
+
+    sleep 2
+    if ! kill -0 "$wa_pid_restart" 2>/dev/null; then
+        log_fail "wa watch restart exited immediately"
+        result=1
+    fi
+
+    if [[ -f "$db_path" ]]; then
+        sqlite3 "$db_path" -json \
+            "SELECT id, workflow_name, status, result FROM workflow_executions WHERE workflow_name = 'handle_usage_limits' ORDER BY started_at DESC LIMIT 1;" \
+            > "$scenario_dir/workflow_execution_after_restart.json" 2>/dev/null || true
+
+        if jq -e '.[0].result | fromjson? | .fallback == true' "$scenario_dir/workflow_execution_after_restart.json" >/dev/null 2>&1; then
+            log_pass "Fallback plan still present after restart"
+        else
+            log_fail "Fallback plan missing after restart"
+            result=1
+        fi
+    else
+        log_warn "Database file not found after restart"
+        result=1
+    fi
+
+    # Step 11: Stop wa watch restart
+    log_info "Step 11: Stopping wa watch restart..."
+    kill -TERM "$wa_pid_restart" 2>/dev/null || true
+    wait "$wa_pid_restart" 2>/dev/null || true
+    wa_pid_restart=""
+    log_verbose "wa watch restart stopped"
+
+    trap - EXIT
+    cleanup_usage_limit_safe_pause
 
     return $result
 }
@@ -2652,6 +3018,284 @@ run_scenario_workflow_resume() {
     return $result
 }
 
+# ==============================================================================
+# Scenario: Accounts Refresh (fake caut + pick preview + redaction)
+# ==============================================================================
+# Validates that:
+# 1) `wa robot accounts refresh` pulls from caut and persists to DB
+# 2) `wa robot accounts list --pick` returns deterministic ordering + pick preview
+# 3) caut failures are surfaced with redacted error output
+# 4) invalid JSON from caut is handled safely with redaction
+# ==============================================================================
+
+run_scenario_accounts_refresh() {
+    local scenario_dir="$1"
+    local temp_workspace
+    temp_workspace=$(mktemp -d /tmp/wa-e2e-accounts-XXXXXX)
+    local temp_workspace_fail
+    temp_workspace_fail=$(mktemp -d /tmp/wa-e2e-accounts-fail-XXXXXX)
+    local temp_workspace_invalid
+    temp_workspace_invalid=$(mktemp -d /tmp/wa-e2e-accounts-invalid-XXXXXX)
+    local temp_bin="$temp_workspace/bin"
+    local fake_caut="$temp_bin/caut"
+    local result=0
+    local old_path="$PATH"
+    local old_wa_data_dir="${WA_DATA_DIR:-}"
+    local old_wa_workspace="${WA_WORKSPACE:-}"
+    local old_wa_config="${WA_CONFIG:-}"
+    local old_caut_mode="${CAUT_FAKE_MODE:-}"
+    local old_caut_log="${CAUT_FAKE_LOG:-}"
+
+    log_info "Workspace: $temp_workspace"
+    log_info "Workspace (fail): $temp_workspace_fail"
+    log_info "Workspace (invalid): $temp_workspace_invalid"
+
+    cleanup_accounts_refresh() {
+        log_verbose "Cleaning up accounts_refresh scenario"
+        export PATH="$old_path"
+        if [[ -n "$old_wa_data_dir" ]]; then
+            export WA_DATA_DIR="$old_wa_data_dir"
+        else
+            unset WA_DATA_DIR
+        fi
+        if [[ -n "$old_wa_workspace" ]]; then
+            export WA_WORKSPACE="$old_wa_workspace"
+        else
+            unset WA_WORKSPACE
+        fi
+        if [[ -n "$old_wa_config" ]]; then
+            export WA_CONFIG="$old_wa_config"
+        else
+            unset WA_CONFIG
+        fi
+        if [[ -n "$old_caut_mode" ]]; then
+            export CAUT_FAKE_MODE="$old_caut_mode"
+        else
+            unset CAUT_FAKE_MODE
+        fi
+        if [[ -n "$old_caut_log" ]]; then
+            export CAUT_FAKE_LOG="$old_caut_log"
+        else
+            unset CAUT_FAKE_LOG
+        fi
+        if [[ -d "$temp_workspace" ]]; then
+            cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp "$temp_workspace/caut_invocations.log" "$scenario_dir/" 2>/dev/null || true
+        fi
+        if [[ -d "$temp_workspace_fail" ]]; then
+            cp -r "$temp_workspace_fail/.wa"/* "$scenario_dir/" 2>/dev/null || true
+        fi
+        if [[ -d "$temp_workspace_invalid" ]]; then
+            cp -r "$temp_workspace_invalid/.wa"/* "$scenario_dir/" 2>/dev/null || true
+        fi
+        rm -rf "$temp_workspace" "$temp_workspace_fail" "$temp_workspace_invalid"
+    }
+    trap cleanup_accounts_refresh EXIT
+
+    # Step 0: Create fake caut
+    log_info "Step 0: Creating fake caut binary..."
+    mkdir -p "$temp_bin"
+    cat > "$fake_caut" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+mode="${CAUT_FAKE_MODE:-ok}"
+log_path="${CAUT_FAKE_LOG:-}"
+
+if [[ -n "$log_path" ]]; then
+    echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") $*" >> "$log_path"
+fi
+
+subcommand="${1:-}"
+shift || true
+
+service=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --service)
+            service="$2"
+            shift 2
+            ;;
+        --format)
+            shift 2
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+
+if [[ "$service" != "openai" ]]; then
+    echo "{\"error\":\"unsupported service\"}" >&2
+    exit 2
+fi
+
+if [[ "$mode" == "fail" ]]; then
+    echo "caut failed: sk-test-should-redact-1234567890" >&2
+    exit 42
+fi
+
+if [[ "$mode" == "invalid_json" ]]; then
+    # malformed JSON with secret-like token (should be redacted)
+    echo "{\"service\":\"openai\",\"accounts\":[{\"id\":\"acc-1\",\"name\":\"alpha\",\"percentRemaining\":85,\"resetAt\":\"2026-02-01T00:00:00Z\",\"tokensUsed\":1000,\"tokensRemaining\":9000,\"tokensLimit\":10000},{\"id\":\"acc-2\",\"name\":\"beta\",\"percentRemaining\":20,\"resetAt\":\"2026-02-01T00:00:00Z\"}],\"note\":\"sk-test-should-redact-abcdef\""
+    exit 0
+fi
+
+if [[ "$subcommand" == "refresh" ]]; then
+    cat <<JSON
+{
+  "service": "openai",
+  "refreshed_at": "2026-01-30T00:00:00Z",
+  "accounts": [
+    {
+      "id": "acc-1",
+      "name": "alpha",
+      "percentRemaining": 85,
+      "resetAt": "2026-02-01T00:00:00Z",
+      "tokensUsed": 1000,
+      "tokensRemaining": 9000,
+      "tokensLimit": 10000
+    },
+    {
+      "id": "acc-2",
+      "name": "beta",
+      "percentRemaining": 20,
+      "resetAt": "2026-02-01T00:00:00Z",
+      "tokensUsed": 8000,
+      "tokensRemaining": 2000,
+      "tokensLimit": 10000
+    }
+  ]
+}
+JSON
+else
+    cat <<JSON
+{
+  "service": "openai",
+  "generated_at": "2026-01-30T00:00:00Z",
+  "accounts": [
+    {
+      "id": "acc-1",
+      "name": "alpha",
+      "percentRemaining": 85
+    },
+    {
+      "id": "acc-2",
+      "name": "beta",
+      "percentRemaining": 20
+    }
+  ]
+}
+JSON
+fi
+EOF
+    chmod +x "$fake_caut"
+
+    export PATH="$temp_bin:$PATH"
+    export CAUT_FAKE_LOG="$temp_workspace/caut_invocations.log"
+    unset CAUT_FAKE_MODE
+
+    # Step 1: Refresh accounts (success path)
+    log_info "Step 1: Running accounts refresh (success)..."
+    export WA_DATA_DIR="$temp_workspace/.wa"
+    export WA_WORKSPACE="$temp_workspace"
+    unset WA_CONFIG
+    mkdir -p "$WA_DATA_DIR"
+
+    local refresh_output
+    refresh_output=$("$WA_BINARY" robot --format json accounts refresh --service openai 2>&1 || true)
+    echo "$refresh_output" > "$scenario_dir/refresh_output.json"
+
+    if echo "$refresh_output" | jq -e '.ok == true and .data.service == "openai" and (.data.accounts | length == 2)' >/dev/null 2>&1; then
+        log_pass "Accounts refresh returned 2 accounts"
+    else
+        log_fail "Accounts refresh did not return expected JSON"
+        result=1
+    fi
+
+    if [[ -f "$CAUT_FAKE_LOG" ]] && grep -q "refresh" "$CAUT_FAKE_LOG"; then
+        log_pass "Fake caut invoked for refresh"
+    else
+        log_fail "Fake caut invocation not recorded"
+        result=1
+    fi
+
+    # Step 2: List accounts with pick preview
+    log_info "Step 2: Listing accounts with pick preview..."
+    local list_output
+    list_output=$("$WA_BINARY" robot --format json accounts list --service openai --pick 2>&1 || true)
+    echo "$list_output" > "$scenario_dir/accounts_list.json"
+
+    if echo "$list_output" | jq -e '.ok == true and .data.pick_preview.selected_account_id == "acc-1"' >/dev/null 2>&1; then
+        log_pass "Pick preview selects acc-1"
+    else
+        log_fail "Pick preview did not select expected account"
+        result=1
+    fi
+
+    if echo "$list_output" | jq -e '.data.accounts | length == 2 and .[0].percent_remaining >= .[1].percent_remaining' >/dev/null 2>&1; then
+        log_pass "Account ordering is deterministic (percent_remaining desc)"
+    else
+        log_fail "Account ordering did not match expectation"
+        result=1
+    fi
+
+    # Step 3: Refresh failure path (redaction)
+    log_info "Step 3: Refresh failure path (redaction)..."
+    export WA_DATA_DIR="$temp_workspace_fail/.wa"
+    export WA_WORKSPACE="$temp_workspace_fail"
+    mkdir -p "$WA_DATA_DIR"
+    export CAUT_FAKE_MODE="fail"
+
+    local fail_output
+    fail_output=$("$WA_BINARY" robot --format json accounts refresh --service openai 2>&1 || true)
+    echo "$fail_output" > "$scenario_dir/refresh_fail_output.json"
+
+    if echo "$fail_output" | jq -e '.ok == false and .error.code == "robot.caut_error"' >/dev/null 2>&1; then
+        log_pass "Refresh failure surfaced as robot.caut_error"
+    else
+        log_fail "Refresh failure did not return expected error code"
+        result=1
+    fi
+
+    if echo "$fail_output" | grep -q "sk-test-should-redact"; then
+        log_fail "Secret token leaked in failure output"
+        result=1
+    else
+        log_pass "Failure output redacted secret token"
+    fi
+
+    # Step 4: Invalid JSON path (redaction)
+    log_info "Step 4: Refresh invalid JSON (redaction)..."
+    export WA_DATA_DIR="$temp_workspace_invalid/.wa"
+    export WA_WORKSPACE="$temp_workspace_invalid"
+    mkdir -p "$WA_DATA_DIR"
+    export CAUT_FAKE_MODE="invalid_json"
+
+    local invalid_output
+    invalid_output=$("$WA_BINARY" robot --format json accounts refresh --service openai 2>&1 || true)
+    echo "$invalid_output" > "$scenario_dir/refresh_invalid_output.json"
+
+    if echo "$invalid_output" | jq -e '.ok == false and .error.code == "robot.caut_error"' >/dev/null 2>&1; then
+        log_pass "Invalid JSON surfaced as robot.caut_error"
+    else
+        log_fail "Invalid JSON did not return expected error code"
+        result=1
+    fi
+
+    if echo "$invalid_output" | grep -q "sk-test-should-redact"; then
+        log_fail "Secret token leaked in invalid JSON output"
+        result=1
+    else
+        log_pass "Invalid JSON output redacted secret token"
+    fi
+
+    trap - EXIT
+    cleanup_accounts_refresh
+
+    return $result
+}
+
 run_scenario_alt_screen_detection() {
     local scenario_dir="$1"
     local temp_workspace
@@ -2976,6 +3620,12 @@ run_scenario() {
             ;;
         workflow_resume)
             run_scenario_workflow_resume "$scenario_dir" || result=$?
+            ;;
+        accounts_refresh)
+            run_scenario_accounts_refresh "$scenario_dir" || result=$?
+            ;;
+        usage_limit_safe_pause)
+            run_scenario_usage_limit_safe_pause "$scenario_dir" || result=$?
             ;;
         *)
             log_fail "Unknown scenario: $name"

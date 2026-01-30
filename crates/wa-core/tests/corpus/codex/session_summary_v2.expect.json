@@ -1,0 +1,27 @@
+[
+  {
+    "rule_id": "codex.session.resume_hint",
+    "agent_type": "codex",
+    "event_type": "session.resume_hint",
+    "severity": "info",
+    "confidence": 0.95,
+    "extracted": {
+      "session_id": "fedcba98-7654-3210-fedc-ba9876543210"
+    },
+    "matched_text": "codex resume fedcba98-7654-3210-fedc-ba9876543210"
+  },
+  {
+    "rule_id": "codex.session.token_usage",
+    "agent_type": "codex",
+    "event_type": "session.summary",
+    "severity": "info",
+    "confidence": 0.95,
+    "extracted": {
+      "total": "42,000",
+      "input": "20,000",
+      "cached": "5,000",
+      "output": "17,000"
+    },
+    "matched_text": "total=42,000 input=20,000 (+ 5,000 cached) output=17,000"
+  }
+]
