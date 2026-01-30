@@ -531,11 +531,11 @@ impl OpenAiDeviceAuthFlow {
 
         if !output.status.success() {
             // Parse structured error from stdout if possible
-            return Err(self.parse_playwright_error(&stdout, &stderr, output.status));
+            return Err(Self::parse_playwright_error(&stdout, &stderr, output.status));
         }
 
         // Parse the JSON result from stdout
-        self.parse_playwright_result(&stdout)
+        Self::parse_playwright_result(&stdout)
     }
 
     /// Build the Node.js/Playwright script for the device auth flow.
@@ -700,10 +700,7 @@ const {{ chromium }} = require('playwright');
     }
 
     /// Parse a successful Playwright script result from stdout JSON.
-    fn parse_playwright_result(
-        &self,
-        stdout: &str,
-    ) -> Result<PlaywrightOutcome, PlaywrightFlowError> {
+    fn parse_playwright_result(stdout: &str) -> Result<PlaywrightOutcome, PlaywrightFlowError> {
         let trimmed = stdout.trim();
         if trimmed.is_empty() {
             return Err(PlaywrightFlowError {
@@ -766,7 +763,6 @@ const {{ chromium }} = require('playwright');
 
     /// Parse error information from a failed Playwright subprocess.
     fn parse_playwright_error(
-        &self,
         stdout: &str,
         stderr: &str,
         status: std::process::ExitStatus,
@@ -1126,15 +1122,13 @@ mod tests {
 
     #[test]
     fn parse_success_result() {
-        let flow = OpenAiDeviceAuthFlow::with_defaults();
-        let result = flow.parse_playwright_result(r#"{"status":"success"}"#);
+        let result = OpenAiDeviceAuthFlow::parse_playwright_result(r#"{"status":"success"}"#);
         assert!(matches!(result, Ok(PlaywrightOutcome::Success)));
     }
 
     #[test]
     fn parse_interactive_required_result() {
-        let flow = OpenAiDeviceAuthFlow::with_defaults();
-        let result = flow.parse_playwright_result(
+        let result = OpenAiDeviceAuthFlow::parse_playwright_result(
             r#"{"status":"interactive_required","reason":"password needed"}"#,
         );
         match result {
@@ -1147,8 +1141,7 @@ mod tests {
 
     #[test]
     fn parse_error_result() {
-        let flow = OpenAiDeviceAuthFlow::with_defaults();
-        let result = flow.parse_playwright_result(
+        let result = OpenAiDeviceAuthFlow::parse_playwright_result(
             r#"{"status":"error","kind":"VerificationFailed","message":"no marker"}"#,
         );
         match result {
@@ -1162,30 +1155,26 @@ mod tests {
 
     #[test]
     fn parse_empty_output() {
-        let flow = OpenAiDeviceAuthFlow::with_defaults();
-        let result = flow.parse_playwright_result("");
+        let result = OpenAiDeviceAuthFlow::parse_playwright_result("");
         assert!(result.is_err());
     }
 
     #[test]
     fn parse_output_with_preceding_lines() {
-        let flow = OpenAiDeviceAuthFlow::with_defaults();
         let output = "Debugger attached.\nSome warning\n{\"status\":\"success\"}";
-        let result = flow.parse_playwright_result(output);
+        let result = OpenAiDeviceAuthFlow::parse_playwright_result(output);
         assert!(matches!(result, Ok(PlaywrightOutcome::Success)));
     }
 
     #[test]
     fn parse_malformed_json() {
-        let flow = OpenAiDeviceAuthFlow::with_defaults();
-        let result = flow.parse_playwright_result("not json at all");
+        let result = OpenAiDeviceAuthFlow::parse_playwright_result("not json at all");
         assert!(result.is_err());
     }
 
     #[test]
     fn parse_unknown_status() {
-        let flow = OpenAiDeviceAuthFlow::with_defaults();
-        let result = flow.parse_playwright_result(r#"{"status":"unexpected"}"#);
+        let result = OpenAiDeviceAuthFlow::parse_playwright_result(r#"{"status":"unexpected"}"#);
         assert!(result.is_err());
     }
 
@@ -1278,24 +1267,22 @@ mod tests {
 
     #[test]
     fn parse_playwright_error_with_json() {
-        let flow = OpenAiDeviceAuthFlow::with_defaults();
         let stdout = r#"{"status":"error","kind":"NavigationFailed","message":"timeout"}"#;
         let status = std::process::Command::new("false")
             .status()
             .unwrap_or_else(|_| std::process::ExitStatus::default());
-        let err = flow.parse_playwright_error(stdout, "", status);
+        let err = OpenAiDeviceAuthFlow::parse_playwright_error(stdout, "", status);
         assert_eq!(err.kind, AuthFlowFailureKind::NavigationFailed);
         assert_eq!(err.error, "timeout");
     }
 
     #[test]
     fn parse_playwright_error_fallback_to_stderr() {
-        let flow = OpenAiDeviceAuthFlow::with_defaults();
         let stderr = "Error: browser not found\nsome detail";
         let status = std::process::Command::new("false")
             .status()
             .unwrap_or_else(|_| std::process::ExitStatus::default());
-        let err = flow.parse_playwright_error("", stderr, status);
+        let err = OpenAiDeviceAuthFlow::parse_playwright_error("", stderr, status);
         assert_eq!(err.kind, AuthFlowFailureKind::PlaywrightError);
         assert!(err.error.contains("browser not found"));
     }

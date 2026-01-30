@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -38,6 +37,7 @@ impl DirectMuxClientConfig {
         cfg
     }
 
+    #[must_use]
     pub fn with_socket_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.socket_path = Some(path.into());
         self
@@ -274,6 +274,7 @@ fn resolve_socket_path(config: &DirectMuxClientConfig) -> Result<PathBuf, Direct
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn decode_from_buffer_roundtrip() {

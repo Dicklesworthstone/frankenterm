@@ -11380,7 +11380,7 @@ async fn handle_auth_command(
 
             let mut bootstrap_config = BootstrapConfig::default();
             if let Some(url) = &login_url {
-                bootstrap_config.login_url = url.clone();
+                bootstrap_config.login_url.clone_from(url);
             }
             bootstrap_config.timeout_ms = timeout_secs * 1000;
 

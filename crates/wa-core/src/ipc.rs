@@ -13,7 +13,9 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{RwLock, mpsc};
 
@@ -134,11 +136,13 @@ impl IpcHandlerContext {
 }
 
 /// IPC server that runs in the watcher daemon.
+#[cfg(unix)]
 pub struct IpcServer {
     socket_path: PathBuf,
     listener: UnixListener,
 }
 
+#[cfg(unix)]
 impl IpcServer {
     /// Create and bind a new IPC server.
     ///
@@ -241,7 +245,54 @@ impl IpcServer {
     }
 }
 
+#[cfg(not(unix))]
+pub struct IpcServer {
+    socket_path: PathBuf,
+}
+
+#[cfg(not(unix))]
+impl IpcServer {
+    /// Create and bind a new IPC server.
+    ///
+    /// # Errors
+    /// Returns error on non-unix platforms (IPC sockets are unix-only).
+    pub async fn bind(socket_path: impl AsRef<Path>) -> std::io::Result<Self> {
+        let socket_path = socket_path.as_ref().to_path_buf();
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!(
+                "IPC sockets are only supported on unix platforms (socket: {})",
+                socket_path.display()
+            ),
+        ))
+    }
+
+    /// Get the socket path.
+    #[must_use]
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
+    }
+
+    /// Run the IPC server (no-op on non-unix platforms).
+    pub async fn run(self, _event_bus: Arc<EventBus>, mut shutdown_rx: mpsc::Receiver<()>) {
+        tracing::warn!("IPC server not supported on this platform");
+        let _ = shutdown_rx.recv().await;
+    }
+
+    /// Run the IPC server with registry (no-op on non-unix platforms).
+    pub async fn run_with_registry(
+        self,
+        _event_bus: Arc<EventBus>,
+        _registry: Arc<RwLock<PaneRegistry>>,
+        mut shutdown_rx: mpsc::Receiver<()>,
+    ) {
+        tracing::warn!("IPC server not supported on this platform");
+        let _ = shutdown_rx.recv().await;
+    }
+}
+
 /// Handle a single client connection with full context.
+#[cfg(unix)]
 async fn handle_client_with_context(
     stream: UnixStream,
     ctx: Arc<IpcHandlerContext>,
@@ -385,6 +436,10 @@ impl IpcClient {
         self.socket_path.exists()
     }
 
+}
+
+#[cfg(unix)]
+impl IpcClient {
     /// Send a user-var event to the watcher daemon.
     ///
     /// # Arguments
@@ -497,7 +552,38 @@ impl IpcClient {
     }
 }
 
-#[cfg(test)]
+#[cfg(not(unix))]
+impl IpcClient {
+    /// IPC is unix-only; return a clear error on other platforms.
+    fn unsupported() -> UserVarError {
+        UserVarError::IpcSendFailed {
+            message: "IPC sockets are only supported on unix platforms".to_string(),
+        }
+    }
+
+    pub async fn send_user_var(
+        &self,
+        _pane_id: u64,
+        _name: String,
+        _value: String,
+    ) -> Result<IpcResponse, UserVarError> {
+        Err(Self::unsupported())
+    }
+
+    pub async fn ping(&self) -> Result<IpcResponse, UserVarError> {
+        Err(Self::unsupported())
+    }
+
+    pub async fn status(&self) -> Result<IpcResponse, UserVarError> {
+        Err(Self::unsupported())
+    }
+
+    pub async fn pane_state(&self, _pane_id: u64) -> Result<IpcResponse, UserVarError> {
+        Err(Self::unsupported())
+    }
+}
+
+#[cfg(all(test, unix))]
 #[allow(clippy::items_after_statements, clippy::significant_drop_tightening)]
 mod tests {
     use super::*;

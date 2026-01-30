@@ -294,7 +294,7 @@ impl InteractiveBootstrap {
             ));
         }
 
-        self.parse_bootstrap_result(&stdout)
+        Self::parse_bootstrap_result(&stdout)
     }
 
     /// Build the Node.js/Playwright script for interactive bootstrap.
@@ -311,7 +311,7 @@ impl InteractiveBootstrap {
         let login_url_escaped = login_url.replace('\'', "\\'");
 
         format!(
-            r#"
+            r"
 const {{ chromium }} = require('playwright');
 
 (async () => {{
@@ -394,12 +394,12 @@ const {{ chromium }} = require('playwright');
     }}
   }}
 }})();
-"#
+"
         )
     }
 
     /// Parse the result from the bootstrap Playwright script.
-    fn parse_bootstrap_result(&self, stdout: &str) -> Result<ScriptOutcome, String> {
+    fn parse_bootstrap_result(stdout: &str) -> Result<ScriptOutcome, String> {
         let trimmed = stdout.trim();
         if trimmed.is_empty() {
             return Err("Bootstrap script produced no output".to_string());
@@ -628,9 +628,8 @@ mod tests {
 
     #[test]
     fn parse_success_with_state() {
-        let bootstrap = InteractiveBootstrap::with_defaults();
         let stdout = r#"{"status":"success","storage_state":"{\"cookies\":[]}"}"#;
-        let result = bootstrap.parse_bootstrap_result(stdout);
+        let result = InteractiveBootstrap::parse_bootstrap_result(stdout);
         match result {
             Ok(ScriptOutcome::Success { storage_state }) => {
                 let state_str = String::from_utf8(storage_state).unwrap();
@@ -642,38 +641,33 @@ mod tests {
 
     #[test]
     fn parse_timeout() {
-        let bootstrap = InteractiveBootstrap::with_defaults();
-        let result = bootstrap.parse_bootstrap_result(r#"{"status":"timeout"}"#);
+        let result = InteractiveBootstrap::parse_bootstrap_result(r#"{"status":"timeout"}"#);
         assert!(matches!(result, Ok(ScriptOutcome::Timeout)));
     }
 
     #[test]
     fn parse_browser_closed() {
-        let bootstrap = InteractiveBootstrap::with_defaults();
-        let result = bootstrap.parse_bootstrap_result(r#"{"status":"browser_closed"}"#);
+        let result = InteractiveBootstrap::parse_bootstrap_result(r#"{"status":"browser_closed"}"#);
         assert!(matches!(result, Ok(ScriptOutcome::BrowserClosed)));
     }
 
     #[test]
     fn parse_error() {
-        let bootstrap = InteractiveBootstrap::with_defaults();
-        let result = bootstrap.parse_bootstrap_result(r#"{"status":"error","message":"crash"}"#);
+        let result = InteractiveBootstrap::parse_bootstrap_result(r#"{"status":"error","message":"crash"}"#);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("crash"));
     }
 
     #[test]
     fn parse_empty_output() {
-        let bootstrap = InteractiveBootstrap::with_defaults();
-        let result = bootstrap.parse_bootstrap_result("");
+        let result = InteractiveBootstrap::parse_bootstrap_result("");
         assert!(result.is_err());
     }
 
     #[test]
     fn parse_with_preceding_output() {
-        let bootstrap = InteractiveBootstrap::with_defaults();
         let stdout = "Debugger attached.\n{\"status\":\"timeout\"}";
-        let result = bootstrap.parse_bootstrap_result(stdout);
+        let result = InteractiveBootstrap::parse_bootstrap_result(stdout);
         assert!(matches!(result, Ok(ScriptOutcome::Timeout)));
     }
 }
