@@ -102,11 +102,17 @@ Instead of repeatedly capturing entire scrollback buffers, `wa` uses 4KB overlap
 
 ### 4. Single-Writer Integrity
 
-A watcher lock ensures only one daemon can write to the database. No corruption from concurrent mutations. Graceful fallback for read-only introspection.
+A watcher lock ensures only one watcher can write to the database. No corruption from concurrent mutations. Graceful fallback for read-only introspection.
 
 ### 5. Agent-First Interface
 
 Robot Mode returns structured JSON with consistent schemas. Every response includes `ok`, `data`, `error`, `elapsed_ms`, and `version`. Designed for machines to parse, not humans to read.
+
+## Safety Guarantees
+
+- **Observe vs act split**: `wa watch` is read-only; mutating actions must pass the Policy Engine.
+- **No silent gaps**: capture gaps are recorded explicitly and surfaced in events/diagnostics.
+- **Policy-gated sending**: `wa send` and workflows enforce prompt/alt-screen checks, rate limits, and approvals.
 
 ---
 
@@ -162,14 +168,21 @@ cargo install --git https://github.com/Dicklesworthstone/wezterm_automata.git wa
 
 ## Quick Start
 
-### 1. Verify WezTerm CLI
+### 1. Run Setup (recommended)
+
+```bash
+# Guided setup (generates config snippets and shell hooks)
+wa setup
+```
+
+### 2. Verify WezTerm CLI
 
 ```bash
 # Should list your current panes
 wezterm cli list
 ```
 
-### 2. Start the Watcher
+### 3. Start the Watcher
 
 ```bash
 # Start observing all panes
@@ -179,7 +192,7 @@ wa watch
 wa -v watch --foreground
 ```
 
-### 3. Check Status
+### 4. Check Status
 
 ```bash
 # See what wa is observing
@@ -189,17 +202,21 @@ wa status
 wa robot state
 ```
 
-### 4. Search Captured Output
+### 5. Search Captured Output
 
 ```bash
-# Full-text search across all panes
+# Full-text search across all panes (alias: `wa query`)
 wa search "error"
+wa query "error"
+
+# Events feed (recent detections)
+wa events
 
 # Robot mode with structured results
 wa robot search "compilation failed" --limit 20
 ```
 
-### 5. React to Events
+### 6. React to Events
 
 ```bash
 # Wait for an agent to hit its rate limit
@@ -254,11 +271,46 @@ wa why --list                # List available explanation templates
 wa why deny.alt_screen       # Explain a common policy denial
 ```
 
+### Workflows
+
+```bash
+wa workflow list                         # List available workflows
+wa workflow run handle_usage_limits --pane 0
+wa workflow run handle_usage_limits --pane 0 --dry-run
+wa workflow status <execution_id> -v
+```
+
+### Rules
+
+```bash
+wa rules list                            # List detection rules
+wa rules test "Usage limit reached"      # Test text against rules
+wa rules show codex.usage_reached        # Show rule details
+```
+
+### Audit & Approvals
+
+```bash
+wa approve AB12CD34 --dry-run            # Check approval status
+wa audit --limit 50 --pane 3             # Filter audit history
+wa audit --decision deny                 # Only denied decisions
+```
+
+### Diagnostics
+
+```bash
+wa triage                               # Summarize issues (health/crashes/events)
+wa diag bundle --output /tmp/wa-diag    # Collect diagnostic bundle
+wa reproduce --kind crash               # Export latest crash bundle
+```
+
 ### Robot Mode (JSON API)
+
+Use `--format toon` for token-efficient output and `wa robot help` for the full command list.
 
 ```bash
 wa robot state               # All panes as JSON
-wa robot get-text <id>      # Pane output as JSON
+wa robot get-text <id> --tail 50      # Pane output as JSON
 wa robot send <id> "<text>" # Send input (with policy)
 wa robot send <id> "<text>" --dry-run  # Preview without executing
 wa robot wait-for <id> <rule_id>       # Wait for pattern
@@ -267,6 +319,18 @@ wa robot events             # Recent detection events
 wa robot help               # List all robot commands
 ```
 
+### MCP (Model Context Protocol)
+
+```bash
+# Build with MCP feature enabled
+cargo build --release --features mcp
+
+# Start MCP server over stdio
+wa mcp serve
+```
+
+MCP mirrors robot mode. See `docs/mcp-api-spec.md` for the tool list and `docs/json-schema/` for response schemas.
+
 ### Configuration
 
 ```bash
@@ -274,6 +338,8 @@ wa config show               # Display current config
 wa config validate           # Check config syntax
 wa config reload             # Hot-reload config (SIGHUP)
 ```
+
+For the full command matrix (human + robot + MCP), see `docs/cli-reference.md`.
 
 ---
 
@@ -382,10 +448,13 @@ send_text = { max_per_second = 2 }
                                    │
                                    ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                         Robot Mode API                                   │
+│                 Robot Mode API + MCP (stdio)                             │
 │   wa robot state │ get-text │ send │ wait-for │ search │ events        │
+│   wa mcp serve (feature-gated, stdio transport)                          │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
+
+For a deeper architecture writeup (OSC 133 prompt markers, gap semantics, library map), see `docs/architecture.md`.
 
 ### Data Flow
 
@@ -432,14 +501,14 @@ wezterm start --always-new-process
 
 ### Daemon won't start: "watcher lock held"
 
-Another `wa` daemon is already running.
+Another `wa` watcher is already running.
 
 ```bash
-# Check for existing daemon
-wa daemon status
+# Check for existing watcher
+wa status
 
 # Force stop if stuck
-wa daemon stop --force
+wa stop --force
 
 # Or remove stale lock
 rm ~/.local/share/wa/watcher.lock
@@ -451,7 +520,7 @@ Delta extraction is failing; falling back to full captures.
 
 ```bash
 # Check for gaps in capture
-wa robot events --type gap
+wa robot events --event-type gap
 
 # Reduce poll interval
 # In wa.toml:
@@ -463,10 +532,10 @@ poll_interval_ms = 500  # Slower polling
 
 ```bash
 # Enable debug logging
-wa daemon run --log-level trace
+wa -vv watch --foreground
 
 # Test pattern manually
-echo "your terminal output" | wa pattern test "core.codex:usage_reached"
+wa rules test "Usage limit reached. Try again later."
 ```
 
 ### Robot mode returns errors
@@ -498,7 +567,7 @@ wa robot send 0 "test" --dry-run
 | Capability | Current State | Planned |
 |------------|---------------|---------|
 | Browser automation (OAuth) | Feature-gated, partial | v0.2 |
-| MCP server integration | Planned | v0.2 |
+| MCP server integration | Feature-gated (stdio) | v0.2 |
 | Web dashboard | Not started | v0.3 |
 | Multi-host federation | Not started | v2.0 |
 
@@ -536,7 +605,7 @@ severity = "critical"
 ### What's the performance overhead?
 
 - **CPU**: <1% during idle; brief spikes during pattern detection
-- **Memory**: ~50MB for daemon with 100 panes
+- **Memory**: ~50MB for watcher with 100 panes
 - **Disk**: ~10MB/day for typical multi-agent usage (compressed deltas)
 - **Latency**: <50ms average capture lag
 

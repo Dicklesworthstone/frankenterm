@@ -8,6 +8,15 @@ mirrors `wa robot` for parity, stability, and token-efficient responses.
 - Token-efficient responses that match robot schemas.
 - Minimal, complete tool set required to operate wa.
 
+## Running the MCP Server
+
+The MCP server is feature-gated. Build with MCP enabled and run over stdio:
+
+```bash
+cargo build --release --features mcp
+wa mcp serve
+```
+
 ## Versioning
 - `mcp_version`: MCP surface version (currently `v1`).
 - `version`: wa semver (e.g., `0.1.0`).

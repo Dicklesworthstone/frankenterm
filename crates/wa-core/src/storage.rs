@@ -7033,8 +7033,45 @@ fn detect_correlations(events: &[TimelineEvent]) -> Vec<Correlation> {
     let mut correlations = Vec::new();
     let mut correlation_counter = 0u64;
 
-    // Temporal correlation: events within 5 seconds of each other
-    const TEMPORAL_WINDOW_MS: i64 = 5000;
+    // Temporal correlation: events within 10 seconds of each other
+    const TEMPORAL_WINDOW_MS: i64 = 10_000;
+    // Cascade correlation window: 30 seconds
+    const CASCADE_WINDOW_MS: i64 = 30_000;
+    // Failover correlation window: 5 minutes
+    const FAILOVER_WINDOW_MS: i64 = 300_000;
+
+    fn rule_prefix(rule_id: &str) -> Option<&str> {
+        let prefix = rule_id.split('.').next()?;
+        match prefix {
+            "codex" | "claude_code" | "gemini" | "wezterm" => Some(prefix),
+            _ => None,
+        }
+    }
+
+    fn event_agent_type(event: &TimelineEvent) -> Option<&str> {
+        if let Some(prefix) = rule_prefix(&event.rule_id) {
+            Some(prefix)
+        } else {
+            event.pane_info.agent_type.as_deref()
+        }
+    }
+
+    fn is_usage_limit_event(event: &TimelineEvent) -> bool {
+        event.event_type == "usage.reached"
+            || event.event_type == "usage_limit"
+            || event.rule_id.contains("usage.reached")
+            || event.rule_id.contains("usage_limit")
+    }
+
+    fn is_session_start_event(event: &TimelineEvent) -> bool {
+        event.event_type == "session.start" || event.rule_id.contains("session.start")
+    }
+
+    fn is_recovery_event(event: &TimelineEvent) -> bool {
+        event.event_type.starts_with("session.")
+            || event.rule_id.contains("session.resume")
+            || event.rule_id.contains("session.start")
+    }
 
     // Find temporal clusters
     let mut i = 0;
@@ -7100,30 +7137,77 @@ fn detect_correlations(events: &[TimelineEvent]) -> Vec<Correlation> {
         }
     }
 
-    // Failover correlation: usage_limit followed by new session in different pane
+    // Cascade correlation: error/critical in one pane followed by recovery event elsewhere
     for (i, event) in events.iter().enumerate() {
-        if event.event_type == "usage_limit" || event.rule_id.contains("usage_limit") {
-            // Look for session start in another pane within 60 seconds
-            for later_event in events.iter().skip(i + 1) {
-                if later_event.timestamp - event.timestamp > 60000 {
-                    break;
-                }
-                if later_event.pane_info.pane_id != event.pane_info.pane_id
-                    && (later_event.event_type == "session_start"
-                        || later_event.rule_id.contains("session_start"))
-                {
-                    correlation_counter += 1;
-                    correlations.push(Correlation {
-                        id: format!("corr-failover-{correlation_counter}"),
-                        event_ids: vec![event.id, later_event.id],
-                        correlation_type: CorrelationType::Failover,
-                        confidence: 0.8,
-                        description: "Usage limit followed by new session (potential failover)"
-                            .to_string(),
-                    });
-                    break;
-                }
+        let severity = event.severity.to_lowercase();
+        if severity != "error" && severity != "critical" {
+            continue;
+        }
+
+        let agent = event_agent_type(event);
+
+        for later_event in events.iter().skip(i + 1) {
+            if later_event.timestamp - event.timestamp > CASCADE_WINDOW_MS {
+                break;
             }
+            if later_event.pane_info.pane_id == event.pane_info.pane_id {
+                continue;
+            }
+            if !is_recovery_event(later_event) {
+                continue;
+            }
+
+            let later_agent = event_agent_type(later_event);
+            if agent.is_some() && later_agent.is_some() && agent != later_agent {
+                continue;
+            }
+
+            correlation_counter += 1;
+            correlations.push(Correlation {
+                id: format!("corr-cascade-{correlation_counter}"),
+                event_ids: vec![event.id, later_event.id],
+                correlation_type: CorrelationType::Cascade,
+                confidence: 0.75,
+                description: "Error followed by recovery event in another pane".to_string(),
+            });
+            break;
+        }
+    }
+
+    // Failover correlation: usage limit followed by new session in different pane
+    for (i, event) in events.iter().enumerate() {
+        if !is_usage_limit_event(event) {
+            continue;
+        }
+
+        let agent = event_agent_type(event);
+
+        // Look for session start in another pane within 5 minutes
+        for later_event in events.iter().skip(i + 1) {
+            if later_event.timestamp - event.timestamp > FAILOVER_WINDOW_MS {
+                break;
+            }
+            if later_event.pane_info.pane_id == event.pane_info.pane_id {
+                continue;
+            }
+            if !is_session_start_event(later_event) {
+                continue;
+            }
+
+            let later_agent = event_agent_type(later_event);
+            if agent.is_some() && later_agent.is_some() && agent != later_agent {
+                continue;
+            }
+
+            correlation_counter += 1;
+            correlations.push(Correlation {
+                id: format!("corr-failover-{correlation_counter}"),
+                event_ids: vec![event.id, later_event.id],
+                correlation_type: CorrelationType::Failover,
+                confidence: 0.85,
+                description: "Usage limit followed by new session (potential failover)".to_string(),
+            });
+            break;
         }
     }
 
@@ -11392,7 +11476,7 @@ mod timeline_tests {
         insert_test_pane(&conn, 2, "ssh");
 
         let now = now_ms();
-        // Events within 5 second window across different panes
+        // Events within temporal window across different panes
         insert_test_event(&conn, 1, "rule1", "event1", "info", now);
         insert_test_event(&conn, 2, "rule2", "event2", "info", now + 2000); // 2s later
 
@@ -11406,6 +11490,74 @@ mod timeline_tests {
             .iter()
             .find(|c| c.correlation_type == CorrelationType::Temporal);
         assert!(temporal.is_some());
+    }
+
+    #[test]
+    fn detect_failover_correlations() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        insert_test_pane(&conn, 1, "local");
+        insert_test_pane(&conn, 2, "ssh");
+
+        let now = now_ms();
+        insert_test_event(
+            &conn,
+            1,
+            "codex.usage.reached",
+            "usage.reached",
+            "critical",
+            now,
+        );
+        insert_test_event(
+            &conn,
+            2,
+            "codex.session.start",
+            "session.start",
+            "info",
+            now + 10_000,
+        );
+
+        let timeline = query_timeline(&conn, &TimelineQuery::new()).unwrap();
+        let failover = timeline
+            .correlations
+            .iter()
+            .find(|c| c.correlation_type == CorrelationType::Failover);
+        assert!(failover.is_some());
+    }
+
+    #[test]
+    fn detect_cascade_correlations() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        insert_test_pane(&conn, 1, "local");
+        insert_test_pane(&conn, 2, "ssh");
+
+        let now = now_ms();
+        insert_test_event(
+            &conn,
+            1,
+            "codex.error.timeout",
+            "error.timeout",
+            "critical",
+            now,
+        );
+        insert_test_event(
+            &conn,
+            2,
+            "codex.session.resume_hint",
+            "session.resume_hint",
+            "info",
+            now + 5_000,
+        );
+
+        let timeline = query_timeline(&conn, &TimelineQuery::new()).unwrap();
+        let cascade = timeline
+            .correlations
+            .iter()
+            .find(|c| c.correlation_type == CorrelationType::Cascade);
+        assert!(cascade.is_some());
     }
 
     #[test]
