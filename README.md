@@ -47,8 +47,8 @@ cargo install --git https://github.com/Dicklesworthstone/wezterm_automata.git wa
 ## Quick Example
 
 ```bash
-# Start the wa daemon (observes all WezTerm panes)
-$ wa daemon start
+# Start the wa watcher (observes all WezTerm panes)
+$ wa watch
 
 # See all active panes as JSON
 $ wa robot state
@@ -69,10 +69,10 @@ $ wa robot --format toon state
 $ wa robot --format toon --stats state
 
 # Get recent output from a specific pane
-$ wa robot get-text 0 --lines 50
+$ wa robot get-text 0 --tail 50
 
 # Wait for a specific pattern (e.g., agent hitting rate limit)
-$ wa robot wait-for 0 "core.codex:usage_reached" --timeout 3600
+$ wa robot wait-for 0 "core.codex:usage_reached" --timeout-secs 3600
 
 # Search all captured output
 $ wa robot search "error: compilation failed"
@@ -169,14 +169,14 @@ cargo install --git https://github.com/Dicklesworthstone/wezterm_automata.git wa
 wezterm cli list
 ```
 
-### 2. Start the Daemon
+### 2. Start the Watcher
 
 ```bash
 # Start observing all panes
-wa daemon start
+wa watch
 
 # Or run in foreground for debugging
-wa daemon run --log-level debug
+wa -v watch --foreground
 ```
 
 ### 3. Check Status
@@ -213,13 +213,13 @@ wa robot send 0 "/compact"
 
 ## Commands
 
-### Daemon Management
+### Watcher Management
 
 ```bash
-wa daemon start              # Start daemon in background
-wa daemon stop               # Stop running daemon
-wa daemon run                # Run in foreground
-wa daemon status             # Check if running
+wa watch                     # Start watcher in background
+wa watch --foreground        # Run in foreground
+wa watch --auto-handle       # Enable auto workflows
+wa stop                      # Stop running watcher
 ```
 
 ### Pane Inspection
@@ -472,8 +472,8 @@ echo "your terminal output" | wa pattern test "core.codex:usage_reached"
 ### Robot mode returns errors
 
 ```bash
-# Check daemon is running
-wa daemon status
+# Check watcher is running
+wa status
 
 # Verify pane exists
 wezterm cli list
