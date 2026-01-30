@@ -203,7 +203,7 @@ fn next_hourly(now: DateTime<Local>, minute: u32) -> Result<DateTime<Local>> {
         .ok_or_else(|| Error::Runtime("Failed to compute hourly schedule time".to_string()))?;
 
     if candidate <= now {
-        candidate = candidate + ChronoDuration::hours(1);
+        candidate += ChronoDuration::hours(1);
     }
     Ok(candidate)
 }
@@ -222,7 +222,7 @@ fn next_daily(now: DateTime<Local>, hour: u32, minute: u32) -> Result<DateTime<L
         .ok_or_else(|| Error::Runtime("Failed to compute daily schedule time".to_string()))?;
 
     if candidate <= now {
-        candidate = candidate + ChronoDuration::days(1);
+        candidate += ChronoDuration::days(1);
     }
     Ok(candidate)
 }
@@ -293,8 +293,8 @@ fn cron_matches(candidate: DateTime<Local>, cron: &CronSchedule) -> bool {
         }
     }
 
-    let day_of_month_matches = cron.day_of_month.map_or(true, |dom| candidate.day() == dom);
-    let day_of_week_matches = cron.day_of_week.map_or(true, |dow| {
+    let day_of_month_matches = cron.day_of_month.is_none_or(|dom| candidate.day() == dom);
+    let day_of_week_matches = cron.day_of_week.is_none_or(|dow| {
         let normalized = if dow == 7 { 0 } else { dow };
         let candidate_dow = candidate.weekday().num_days_from_sunday();
         candidate_dow == normalized
@@ -592,7 +592,7 @@ pub fn prune_backups(
     }
 
     if max_backups > 0 && entries.len() > max_backups as usize {
-        entries.sort_by(|a, b| compare_backup_entries(a, b));
+        entries.sort_by(compare_backup_entries);
         let keep_count = max_backups as usize;
         for entry in entries.drain(0..entries.len().saturating_sub(keep_count)) {
             if let Err(e) = fs::remove_dir_all(&entry.path) {
