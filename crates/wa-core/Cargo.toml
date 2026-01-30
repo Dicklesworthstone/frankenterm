@@ -38,6 +38,7 @@ rusqlite.workspace = true
 
 # Config
 toml.workspace = true
+serde_yaml.workspace = true
 
 # Directory paths
 dirs = "6.0.0"

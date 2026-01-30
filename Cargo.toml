@@ -176,6 +176,7 @@ sha2 = "0.10.9"
 # Config
 toml = "0.8.23"
 toml_edit = "0.24.0"
+serde_yaml = "0.9.34"
 
 # Serialization
 toon_rust = { git = "https://github.com/Dicklesworthstone/toon_rust", branch = "master" }
