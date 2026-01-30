@@ -345,6 +345,7 @@ SCENARIO_REGISTRY=(
     "notification_webhook:Validate webhook notifications (delivery, retry, throttle, recovery)"
     "policy_denial:Validate safety gates block sends to protected panes"
     "quickfix_suggestions:Validate quick-fix suggestions for events and errors"
+    "rules_explain_trace:Validate rules test trace + lint artifacts (explain-match)"
     "stress_scale:Validate scaled stress test (panes + large transcript)"
     "graceful_shutdown:Validate wa watch graceful shutdown (SIGINT flush, lock release, restart clean)"
     "pane_exclude_filter:Validate pane selection filters protect privacy (ignored pane absent from search)"
@@ -2645,6 +2646,97 @@ EOS
   "policy_denial_suggestions_present": $policy_suggestions_ok
 }
 EOF
+
+    return $result
+}
+
+run_scenario_rules_explain_trace() {
+    local scenario_dir="$1"
+    local result=0
+    local filler
+    filler=$(printf 'x%.0s' $(seq 1 120))
+    local test_text="Usage limit warning: ${filler} 42% of your Pro models quota remaining"
+
+    # Step 1: Capture rules list (human JSON)
+    log_info "Step 1: Capturing rules list (JSON)..."
+    local list_output
+    list_output=$("$WA_BINARY" rules list --format json 2>&1 || true)
+    echo "$list_output" > "$scenario_dir/rules_list.json"
+    if echo "$list_output" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
+        log_pass "Rules list JSON captured"
+    else
+        log_fail "Rules list JSON invalid or empty"
+        result=1
+    fi
+
+    # Step 2: Run robot rules test with trace
+    log_info "Step 2: Running robot rules test with trace..."
+    local robot_output
+    robot_output=$("$WA_BINARY" robot --format json rules test "$test_text" --trace 2>&1 || true)
+    echo "$robot_output" > "$scenario_dir/robot_rules_test_trace.json"
+
+    if echo "$robot_output" | jq -e '.ok == true and (.data.match_count // 0) >= 1' >/dev/null 2>&1; then
+        log_pass "Robot rules test returned matches"
+    else
+        log_fail "Robot rules test missing matches"
+        result=1
+    fi
+
+    if echo "$robot_output" | jq -e '.data.matches | map(select(.rule_id == "gemini.usage.warning")) | length >= 1' >/dev/null 2>&1; then
+        log_pass "Expected rule match found (gemini.usage.warning)"
+    else
+        log_warn "Expected rule match not found (gemini.usage.warning)"
+    fi
+
+    if echo "$robot_output" | jq -e '.data.matches[0].trace.anchors_checked == true and .data.matches[0].trace.regex_matched == true' >/dev/null 2>&1; then
+        log_pass "Trace fields present (anchors_checked, regex_matched)"
+    else
+        log_fail "Trace fields missing or invalid"
+        result=1
+    fi
+
+    local matched_len
+    matched_len=$(echo "$robot_output" | jq -r '[.data.matches[] | select(.rule_id == "gemini.usage.warning") | (.matched_text | length)] | if length > 0 then .[0] else 0 end' 2>/dev/null || echo "0")
+
+    # Step 3: Run human rules test (plain output)
+    log_info "Step 3: Running human rules test (plain)..."
+    local human_output
+    human_output=$("$WA_BINARY" rules test "$test_text" --format plain 2>&1 || true)
+    echo "$human_output" > "$scenario_dir/rules_test_output.txt"
+
+    if echo "$human_output" | grep -q "Matches ("; then
+        log_pass "Human rules test output rendered"
+    else
+        log_fail "Human rules test output missing matches header"
+        result=1
+    fi
+
+    if [[ "$matched_len" -gt 80 ]]; then
+        if echo "$human_output" | grep -q "Matched: .*\\.\\.\\."; then
+            log_pass "Matched text truncated with ellipsis"
+        else
+            log_fail "Matched text not truncated when expected"
+            result=1
+        fi
+    fi
+
+    # Step 4: Run robot rules lint (fixtures)
+    log_info "Step 4: Running robot rules lint (fixtures)..."
+    local lint_output
+    lint_output=$("$WA_BINARY" robot --format json rules lint --fixtures 2>&1 || true)
+    echo "$lint_output" > "$scenario_dir/robot_rules_lint.json"
+    if echo "$lint_output" | jq -e '.ok == true and (.data.rules_checked // 0) > 0' >/dev/null 2>&1; then
+        log_pass "Robot rules lint output captured"
+    else
+        log_fail "Robot rules lint output invalid"
+        result=1
+    fi
+
+    if echo "$lint_output" | jq -e '.data.fixture_coverage.total_fixtures >= 0' >/dev/null 2>&1; then
+        log_pass "Fixture coverage stats present"
+    else
+        log_warn "Fixture coverage stats missing"
+    fi
 
     return $result
 }
@@ -5033,6 +5125,9 @@ run_scenario() {
             ;;
         quickfix_suggestions)
             run_scenario_quickfix_suggestions "$scenario_dir" || result=$?
+            ;;
+        rules_explain_trace)
+            run_scenario_rules_explain_trace "$scenario_dir" || result=$?
             ;;
         stress_scale)
             run_scenario_stress_scale "$scenario_dir" || result=$?

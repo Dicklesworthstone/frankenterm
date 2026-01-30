@@ -31,6 +31,9 @@ Registry lives in `scripts/e2e_test.sh` (SCENARIO_REGISTRY). Current entries:
 - usage_limit_safe_pause
 - notification_webhook
 - policy_denial
+- quickfix_suggestions
+- rules_explain_trace
+- stress_scale
 - graceful_shutdown
 - pane_exclude_filter
 - workspace_isolation
@@ -56,6 +59,7 @@ Registry lives in `scripts/e2e_test.sh` (SCENARIO_REGISTRY). Current entries:
 - [ ] E2E: false positives are rejected (near-miss negative fixture). Scenario(s): none
 - [ ] E2E: extraction captures expected structured facts. Scenario(s): none
 - [ ] Artifacts: rule_id matched, extracted facts JSON, match timing. Scenario(s): none
+- [x] E2E: explain-match trace surfaces (rules list/test + lint artifacts). Scenario(s): rules_explain_trace
 
 #### Daemon/runtime (wa-4vx.6)
 - [x] E2E: `wa watch` starts, runs, and exits cleanly. Scenario(s): graceful_shutdown
