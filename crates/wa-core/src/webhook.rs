@@ -21,11 +21,11 @@
 //! wa-core stays free of HTTP client dependencies. The CLI crate (or
 //! feature-gated code) provides the real implementation.
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use serde::{Deserialize, Serialize};
 
 use crate::event_templates::RenderedEvent;
 use crate::patterns::Detection;
@@ -148,10 +148,7 @@ impl WebhookPayload {
         rendered: &RenderedEvent,
         suppressed_since_last: u64,
     ) -> Self {
-        let quick_fix = rendered
-            .suggestions
-            .first()
-            .and_then(|s| s.command.clone());
+        let quick_fix = rendered.suggestions.first().and_then(|s| s.command.clone());
 
         Self {
             event_type: detection.rule_id.clone(),
@@ -170,10 +167,7 @@ impl WebhookPayload {
 
 /// Render a payload into the format expected by the target platform.
 #[must_use]
-pub fn render_template(
-    template: WebhookTemplate,
-    payload: &WebhookPayload,
-) -> serde_json::Value {
+pub fn render_template(template: WebhookTemplate, payload: &WebhookPayload) -> serde_json::Value {
     match template {
         WebhookTemplate::Generic => render_generic(payload),
         WebhookTemplate::Slack => render_slack(payload),
@@ -194,10 +188,7 @@ fn render_slack(p: &WebhookPayload) -> serde_json::Value {
 
     let mut text = format!("{severity_emoji} *wa: {}*", p.summary);
     if p.suppressed_since_last > 0 {
-        text.push_str(&format!(
-            " (+{} suppressed)",
-            p.suppressed_since_last
-        ));
+        text.push_str(&format!(" (+{} suppressed)", p.suppressed_since_last));
     }
 
     let mut fields = vec![
@@ -251,9 +242,9 @@ fn render_slack(p: &WebhookPayload) -> serde_json::Value {
 
 fn render_discord(p: &WebhookPayload) -> serde_json::Value {
     let color = match p.severity.as_str() {
-        "critical" => 0xFF0000,  // red
-        "warning" => 0xFFAA00,   // amber
-        _ => 0x3498DB,           // blue
+        "critical" => 0xFF0000, // red
+        "warning" => 0xFFAA00,  // amber
+        _ => 0x3498DB,          // blue
     };
 
     let mut fields = vec![
@@ -389,12 +380,8 @@ impl WebhookDispatcher {
         rendered: &RenderedEvent,
         suppressed_since_last: u64,
     ) -> Vec<DeliveryRecord> {
-        let payload = WebhookPayload::from_detection(
-            detection,
-            pane_id,
-            rendered,
-            suppressed_since_last,
-        );
+        let payload =
+            WebhookPayload::from_detection(detection, pane_id, rendered, suppressed_since_last);
 
         let mut records = Vec::new();
 
@@ -559,12 +546,10 @@ mod tests {
         RenderedEvent {
             summary: "Codex hit usage limit on Pane 3".to_string(),
             description: "The Codex CLI reported a usage limit.".to_string(),
-            suggestions: vec![
-                crate::event_templates::Suggestion::with_command(
-                    "Run wa workflow",
-                    "wa workflow run handle_usage_limits --pane 3",
-                ),
-            ],
+            suggestions: vec![crate::event_templates::Suggestion::with_command(
+                "Run wa workflow",
+                "wa workflow run handle_usage_limits --pane 3",
+            )],
             severity: Severity::Warning,
         }
     }
@@ -592,7 +577,7 @@ mod tests {
         assert_eq!(p.pane_id, 3);
         assert_eq!(p.severity, "warning");
         assert_eq!(p.agent_type, "codex");
-        assert_eq!(p.confidence, 0.95);
+        assert!((p.confidence - 0.95_f64).abs() < f64::EPSILON);
         assert_eq!(p.suppressed_since_last, 5);
         assert!(p.quick_fix.is_some());
         assert!(p.quick_fix.unwrap().contains("handle_usage_limits"));
@@ -708,8 +693,16 @@ mod tests {
     async fn dispatcher_sends_to_matching_endpoints() {
         let transport = MockTransport::success();
         let endpoints = vec![
-            test_endpoint("slack", "https://hooks.slack.com/test", WebhookTemplate::Slack),
-            test_endpoint("discord", "https://discord.com/api/webhooks/test", WebhookTemplate::Discord),
+            test_endpoint(
+                "slack",
+                "https://hooks.slack.com/test",
+                WebhookTemplate::Slack,
+            ),
+            test_endpoint(
+                "discord",
+                "https://discord.com/api/webhooks/test",
+                WebhookTemplate::Discord,
+            ),
         ];
         let dispatcher = WebhookDispatcher::new(endpoints, Box::new(transport.clone()));
 
@@ -755,7 +748,11 @@ mod tests {
     #[tokio::test]
     async fn dispatcher_records_failures() {
         let transport = MockTransport::failure(500, "Internal Server Error");
-        let endpoints = vec![test_endpoint("broken", "http://localhost", WebhookTemplate::Generic)];
+        let endpoints = vec![test_endpoint(
+            "broken",
+            "http://localhost",
+            WebhookTemplate::Generic,
+        )];
         let dispatcher = WebhookDispatcher::new(endpoints, Box::new(transport));
 
         let records = dispatcher
@@ -804,7 +801,10 @@ mod tests {
             .await;
 
         let reqs = transport.requests();
-        assert_eq!(reqs[0].headers.get("Authorization").unwrap(), "Bearer tok123");
+        assert_eq!(
+            reqs[0].headers.get("Authorization").unwrap(),
+            "Bearer tok123"
+        );
     }
 
     #[test]
@@ -812,10 +812,7 @@ mod tests {
         let mut ep1 = test_endpoint("a", "http://a.com", WebhookTemplate::Generic);
         let ep2 = test_endpoint("b", "http://b.com", WebhookTemplate::Generic);
         ep1.enabled = false;
-        let dispatcher = WebhookDispatcher::new(
-            vec![ep1, ep2],
-            Box::new(MockTransport::success()),
-        );
+        let dispatcher = WebhookDispatcher::new(vec![ep1, ep2], Box::new(MockTransport::success()));
         assert_eq!(dispatcher.endpoint_count(), 2);
         assert_eq!(dispatcher.active_endpoint_count(), 1);
     }
@@ -914,9 +911,11 @@ url = "http://localhost:8080/hook"
 
         // Since it's filtered, dispatcher should not be called
         let transport = MockTransport::success();
-        let endpoints = vec![
-            test_endpoint("slack", "http://slack.test", WebhookTemplate::Slack),
-        ];
+        let endpoints = vec![test_endpoint(
+            "slack",
+            "http://slack.test",
+            WebhookTemplate::Slack,
+        )];
         let dispatcher = WebhookDispatcher::new(endpoints, Box::new(transport.clone()));
 
         // Only dispatch if gate says Send
@@ -947,7 +946,9 @@ url = "http://localhost:8080/hook"
         let decision = gate.should_notify(&d, 3);
 
         let suppressed = match decision {
-            NotifyDecision::Send { suppressed_since_last } => suppressed_since_last,
+            NotifyDecision::Send {
+                suppressed_since_last,
+            } => suppressed_since_last,
             other => panic!("Expected Send, got {other:?}"),
         };
 
@@ -985,16 +986,23 @@ url = "http://localhost:8080/hook"
 
         let d = test_detection();
         let transport = MockTransport::success();
-        let endpoints = vec![
-            test_endpoint("hook", "http://test.hook", WebhookTemplate::Generic),
-        ];
+        let endpoints = vec![test_endpoint(
+            "hook",
+            "http://test.hook",
+            WebhookTemplate::Generic,
+        )];
         let dispatcher = WebhookDispatcher::new(endpoints, Box::new(transport.clone()));
 
         // First event — should pass through
         let d1 = gate.should_notify(&d, 3);
         assert!(matches!(d1, NotifyDecision::Send { .. }));
-        if let NotifyDecision::Send { suppressed_since_last } = d1 {
-            dispatcher.dispatch(&d, 3, &test_rendered(), suppressed_since_last).await;
+        if let NotifyDecision::Send {
+            suppressed_since_last,
+        } = d1
+        {
+            dispatcher
+                .dispatch(&d, 3, &test_rendered(), suppressed_since_last)
+                .await;
         }
         assert_eq!(transport.requests().len(), 1);
 
@@ -1035,16 +1043,19 @@ url = "http://localhost:8080/hook"
     #[tokio::test]
     async fn pipeline_per_endpoint_event_filter() {
         let transport = MockTransport::success();
-        let mut codex_only = test_endpoint("codex-hook", "http://codex.test", WebhookTemplate::Generic);
+        let mut codex_only =
+            test_endpoint("codex-hook", "http://codex.test", WebhookTemplate::Generic);
         codex_only.events = vec!["core.codex:*".to_string()];
 
-        let mut gemini_only = test_endpoint("gemini-hook", "http://gemini.test", WebhookTemplate::Generic);
+        let mut gemini_only = test_endpoint(
+            "gemini-hook",
+            "http://gemini.test",
+            WebhookTemplate::Generic,
+        );
         gemini_only.events = vec!["core.gemini:*".to_string()];
 
-        let dispatcher = WebhookDispatcher::new(
-            vec![codex_only, gemini_only],
-            Box::new(transport.clone()),
-        );
+        let dispatcher =
+            WebhookDispatcher::new(vec![codex_only, gemini_only], Box::new(transport.clone()));
 
         // Codex event → only codex-hook receives it
         let records = dispatcher
@@ -1105,10 +1116,8 @@ url = "http://localhost:8080/hook"
         assert!(!filter.is_permissive());
 
         // Build dispatcher from config endpoints
-        let dispatcher = WebhookDispatcher::new(
-            nc.webhooks.clone(),
-            Box::new(MockTransport::success()),
-        );
+        let dispatcher =
+            WebhookDispatcher::new(nc.webhooks.clone(), Box::new(MockTransport::success()));
         assert_eq!(dispatcher.endpoint_count(), 1);
         assert_eq!(dispatcher.active_endpoint_count(), 1);
 

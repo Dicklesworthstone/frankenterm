@@ -158,11 +158,7 @@ pub fn build_command(
 
 fn build_macos_command(title: &str, body: &str, sound: bool) -> NotifyCommand {
     // osascript -e 'display notification "body" with title "title" [sound name "default"]'
-    let sound_clause = if sound {
-        " sound name \"default\""
-    } else {
-        ""
-    };
+    let sound_clause = if sound { " sound name \"default\"" } else { "" };
     let script = format!(
         "display notification \"{}\" with title \"{}\"{}",
         escape_applescript(body),
@@ -436,7 +432,10 @@ mod tests {
     fn backend_display() {
         assert_eq!(format!("{}", NotifyBackend::MacOs), "macos (osascript)");
         assert_eq!(format!("{}", NotifyBackend::Linux), "linux (notify-send)");
-        assert_eq!(format!("{}", NotifyBackend::Windows), "windows (powershell)");
+        assert_eq!(
+            format!("{}", NotifyBackend::Windows),
+            "windows (powershell)"
+        );
         assert_eq!(format!("{}", NotifyBackend::None), "none");
     }
 
@@ -553,10 +552,10 @@ mod tests {
 
     #[test]
     fn config_toml_roundtrip() {
-        let toml_str = r#"
+        let toml_str = r"
 enabled = true
 sound = true
-"#;
+";
         let c: DesktopNotifyConfig = toml::from_str(toml_str).expect("parse");
         assert!(c.enabled);
         assert!(c.sound);
@@ -621,10 +620,7 @@ sound = true
 
     #[test]
     fn notifier_backend_accessor() {
-        let n = DesktopNotifier::with_backend(
-            NotifyBackend::Linux,
-            DesktopNotifyConfig::default(),
-        );
+        let n = DesktopNotifier::with_backend(NotifyBackend::Linux, DesktopNotifyConfig::default());
         assert_eq!(n.backend(), NotifyBackend::Linux);
     }
 

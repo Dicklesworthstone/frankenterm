@@ -6,11 +6,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
 use crate::config as wa_config;
-use config as wezterm_config;
 use codec::{
-    DecodedPdu, GetCodecVersion, GetCodecVersionResponse, ListPanes, ListPanesResponse, Pdu,
-    SetClientId, UnitResponse, CODEC_VERSION,
+    CODEC_VERSION, DecodedPdu, GetCodecVersion, GetCodecVersionResponse, ListPanes,
+    ListPanesResponse, Pdu, SetClientId, UnitResponse,
 };
+use config as wezterm_config;
 use mux::client::ClientId;
 
 const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 5_000;
@@ -80,9 +80,7 @@ pub enum DirectMuxError {
     RemoteError(String),
     #[error("unexpected response: expected {expected}, got {got}")]
     UnexpectedResponse { expected: String, got: String },
-    #[error(
-        "codec version mismatch: local {local} != remote {remote} (version {remote_version})"
-    )]
+    #[error("codec version mismatch: local {local} != remote {remote} (version {remote_version})")]
     IncompatibleCodec {
         local: usize,
         remote: usize,
@@ -107,12 +105,10 @@ impl DirectMuxClient {
             return Err(DirectMuxError::SocketNotFound(socket_path));
         }
 
-        let stream = tokio::time::timeout(
-            config.connect_timeout,
-            UnixStream::connect(&socket_path),
-        )
-        .await
-        .map_err(|_| DirectMuxError::ConnectTimeout(socket_path.clone()))??;
+        let stream =
+            tokio::time::timeout(config.connect_timeout, UnixStream::connect(&socket_path))
+                .await
+                .map_err(|_| DirectMuxError::ConnectTimeout(socket_path.clone()))??;
 
         let mut client = Self {
             stream,
@@ -133,9 +129,7 @@ impl DirectMuxClient {
     }
 
     pub async fn list_panes(&mut self) -> Result<ListPanesResponse, DirectMuxError> {
-        let response = self
-            .send_request(Pdu::ListPanes(ListPanes {}))
-            .await?;
+        let response = self.send_request(Pdu::ListPanes(ListPanes {})).await?;
         match response {
             Pdu::ListPanesResponse(payload) => Ok(payload),
             other => Err(DirectMuxError::UnexpectedResponse {
@@ -214,7 +208,9 @@ impl DirectMuxClient {
 
     async fn read_next_pdu(&mut self) -> Result<DecodedPdu, DirectMuxError> {
         loop {
-            if let Some(decoded) = decode_from_buffer(&mut self.read_buf, self.config.max_frame_bytes)? {
+            if let Some(decoded) =
+                decode_from_buffer(&mut self.read_buf, self.config.max_frame_bytes)?
+            {
                 return Ok(decoded);
             }
 
@@ -283,8 +279,7 @@ mod tests {
     fn decode_from_buffer_roundtrip() {
         let mut buf = Vec::new();
         let pdu = Pdu::Ping(codec::Ping {});
-        pdu.encode(&mut buf, 42)
-            .expect("encode should succeed");
+        pdu.encode(&mut buf, 42).expect("encode should succeed");
 
         let mut partial = buf[..buf.len() / 2].to_vec();
         let result = decode_from_buffer(&mut partial, 1024).expect("decode should not error");
@@ -303,7 +298,7 @@ mod tests {
         let err = decode_from_buffer(&mut buf, 4).expect_err("should reject oversize buffer");
         match err {
             DirectMuxError::FrameTooLarge { .. } => {}
-            other => panic!("unexpected error: {other}")
+            other => panic!("unexpected error: {other}"),
         }
     }
 
@@ -311,8 +306,7 @@ mod tests {
     async fn list_panes_roundtrip() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let socket_path = temp_dir.path().join("mux.sock");
-        let listener = tokio::net::UnixListener::bind(&socket_path)
-            .expect("bind listener");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind listener");
 
         tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
@@ -360,9 +354,7 @@ mod tests {
 
         let mut config = DirectMuxClientConfig::default();
         config.socket_path = Some(socket_path);
-        let mut client = DirectMuxClient::connect(config)
-            .await
-            .expect("connect");
+        let mut client = DirectMuxClient::connect(config).await.expect("connect");
         let panes = client.list_panes().await.expect("list panes");
         assert!(panes.tabs.is_empty());
     }
