@@ -5828,7 +5828,7 @@ fn consume_prepared_plan_sync(
             })
         })
         .optional()
-        .map_err(|e| StorageError::Database(format!("Prepared plan query failed: {e}")))?;
+        .map_err(|e| StorageError::Database(format!("Prepared plan query failed: {e}")))?
     };
 
     if let Some(mut record) = record {
