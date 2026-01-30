@@ -851,4 +851,239 @@ mod tests {
         assert_eq!(target.is_active, Some(true));
         assert_eq!(target.agent_type, Some("claude_code".to_string()));
     }
+
+    // ========================================================================
+    // wa-1pe.5: Additional dry-run tests for error paths and edge cases
+    // ========================================================================
+
+    #[test]
+    fn report_policy_passed_helper() {
+        // Empty report (no policy evaluation) should pass
+        let empty_report = DryRunReport::new();
+        assert!(empty_report.policy_passed());
+
+        // Report with all passing checks should pass
+        let mut report = DryRunReport::new();
+        let mut eval = PolicyEvaluation::new();
+        eval.add_check(PolicyCheck::passed("check1", "ok"));
+        eval.add_check(PolicyCheck::passed("check2", "ok"));
+        report.policy_evaluation = Some(eval);
+        assert!(report.policy_passed());
+
+        // Report with failing check should not pass
+        let mut report_fail = DryRunReport::new();
+        let mut eval_fail = PolicyEvaluation::new();
+        eval_fail.add_check(PolicyCheck::passed("check1", "ok"));
+        eval_fail.add_check(PolicyCheck::failed("check2", "denied"));
+        report_fail.policy_evaluation = Some(eval_fail);
+        assert!(!report_fail.policy_passed());
+    }
+
+    #[test]
+    fn report_action_count_helper() {
+        let mut report = DryRunReport::new();
+        assert_eq!(report.action_count(), 0);
+
+        report
+            .expected_actions
+            .push(PlannedAction::new(1, ActionType::SendText, "send"));
+        assert_eq!(report.action_count(), 1);
+
+        report
+            .expected_actions
+            .push(PlannedAction::new(2, ActionType::WaitFor, "wait"));
+        assert_eq!(report.action_count(), 2);
+    }
+
+    #[test]
+    fn report_has_warnings_helper() {
+        let mut report = DryRunReport::new();
+        assert!(!report.has_warnings());
+
+        report.warnings.push("warning 1".to_string());
+        assert!(report.has_warnings());
+    }
+
+    #[test]
+    fn policy_denial_shows_clear_reason() {
+        use crate::policy::PolicyDecision;
+
+        // Deny with detailed reason
+        let denied = PolicyDecision::deny("Pane 42 is in alt-screen mode");
+        let check: PolicyCheck = (&denied).into();
+
+        assert!(!check.passed);
+        assert!(check.message.contains("alt-screen"));
+
+        // Require approval with reason
+        let approval = PolicyDecision::require_approval("Command requires human review");
+        let check: PolicyCheck = (&approval).into();
+
+        assert!(!check.passed);
+        assert!(check.message.contains("human review"));
+    }
+
+    #[test]
+    fn human_format_shows_policy_failure_clearly() {
+        let mut report = DryRunReport::with_command("wa send 42 \"rm -rf /\"");
+
+        let mut eval = PolicyEvaluation::new();
+        eval.add_check(PolicyCheck::passed("rate_limit", "within budget"));
+        eval.add_check(PolicyCheck::failed(
+            "command_safety",
+            "Command appears destructive",
+        ));
+        report.policy_evaluation = Some(eval);
+
+        let output = format_human(&report);
+
+        // Should contain failure indicator
+        assert!(output.contains("✗"));
+        assert!(output.contains("destructive"));
+        assert!(output.contains("command_safety"));
+    }
+
+    #[test]
+    fn prompt_inactive_policy_shows_warning() {
+        let eval = build_send_policy_evaluation((0, 30), false, true, false);
+
+        assert!(!eval.all_passed());
+        let failed = eval.failed_checks();
+        assert_eq!(failed.len(), 1);
+        assert!(failed[0].message.contains("Prompt not active"));
+    }
+
+    #[test]
+    fn rate_limit_disabled_shows_disabled() {
+        let eval = build_send_policy_evaluation((0, 0), true, true, false);
+
+        assert!(eval.all_passed());
+        assert!(eval.checks.iter().any(|c| c.message.contains("disabled")));
+    }
+
+    #[test]
+    fn recent_gaps_shows_details() {
+        let eval = build_send_policy_evaluation((0, 30), true, false, true);
+
+        assert!(eval.all_passed());
+        let gap_check = eval.checks.iter().find(|c| c.name == "continuity").unwrap();
+        assert!(gap_check.details.is_some());
+        assert!(gap_check.details.as_ref().unwrap().contains("stability"));
+    }
+
+    #[test]
+    fn wait_for_action_includes_timeout() {
+        let action = create_wait_for_action(2, "prompt boundary", 30000);
+
+        assert_eq!(action.step, 2);
+        assert_eq!(action.action_type, ActionType::WaitFor);
+        assert!(action.description.contains("prompt boundary"));
+        assert!(action.description.contains("30000"));
+    }
+
+    #[test]
+    fn planned_action_with_metadata() {
+        let metadata = serde_json::json!({
+            "target_pane": 42,
+            "text_length": 100
+        });
+        let action = PlannedAction::new(1, ActionType::SendText, "send text").with_metadata(metadata);
+
+        assert!(action.metadata.is_some());
+        let meta = action.metadata.unwrap();
+        assert_eq!(meta["target_pane"], 42);
+    }
+
+    #[test]
+    fn redaction_covers_all_report_fields() {
+        let secret = "sk-secret123456789012345678901234567890123456789012345678";
+
+        let mut report = DryRunReport::with_command(format!("wa send {secret}"));
+        report.target_resolution = Some(
+            TargetResolution::new(1, format!("ssh:{secret}@host"))
+                .with_title(format!("session-{secret}"))
+                .with_cwd(format!("/home/{secret}"))
+                .with_agent_type(format!("agent-{secret}")),
+        );
+
+        let mut eval = PolicyEvaluation::new();
+        eval.add_check(
+            PolicyCheck::passed("check", format!("token: {secret}"))
+                .with_details(format!("details: {secret}")),
+        );
+        report.policy_evaluation = Some(eval);
+
+        report.expected_actions.push(
+            PlannedAction::new(1, ActionType::SendText, format!("send {secret}"))
+                .with_metadata(serde_json::json!({"secret": secret})),
+        );
+
+        report.warnings.push(format!("warning: {secret}"));
+
+        let redacted = report.redacted();
+
+        // Verify all fields are redacted
+        assert!(!redacted.command.contains("sk-secret"));
+        let target = redacted.target_resolution.as_ref().unwrap();
+        assert!(!target.domain.contains("sk-secret"));
+        assert!(!target.title.as_ref().unwrap().contains("sk-secret"));
+        assert!(!target.cwd.as_ref().unwrap().contains("sk-secret"));
+        assert!(!target.agent_type.as_ref().unwrap().contains("sk-secret"));
+
+        let policy = redacted.policy_evaluation.as_ref().unwrap();
+        assert!(!policy.checks[0].message.contains("sk-secret"));
+        assert!(!policy.checks[0].details.as_ref().unwrap().contains("sk-secret"));
+
+        assert!(!redacted.expected_actions[0].description.contains("sk-secret"));
+        assert!(!redacted.warnings[0].contains("sk-secret"));
+    }
+
+    #[test]
+    fn json_format_produces_valid_json() {
+        let mut report = DryRunReport::with_command("wa send 1 \"test\"");
+        report.target_resolution = Some(TargetResolution::new(1, "local"));
+
+        let mut eval = PolicyEvaluation::new();
+        eval.add_check(PolicyCheck::passed("test", "ok"));
+        report.policy_evaluation = Some(eval);
+
+        report
+            .expected_actions
+            .push(PlannedAction::new(1, ActionType::SendText, "send"));
+
+        let json = format_json(&report).expect("should serialize");
+
+        // Verify it's valid JSON by parsing
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("should parse");
+
+        assert!(parsed.get("command").is_some());
+        assert!(parsed.get("target_resolution").is_some());
+        assert!(parsed.get("policy_evaluation").is_some());
+        assert!(parsed.get("expected_actions").is_some());
+    }
+
+    #[test]
+    fn action_type_all_variants_display() {
+        // Ensure all action types have display implementations
+        assert_eq!(format!("{}", ActionType::SendText), "send-text");
+        assert_eq!(format!("{}", ActionType::WaitFor), "wait-for");
+        assert_eq!(format!("{}", ActionType::AcquireLock), "acquire-lock");
+        assert_eq!(format!("{}", ActionType::ReleaseLock), "release-lock");
+        assert_eq!(format!("{}", ActionType::StoreData), "store-data");
+        assert_eq!(format!("{}", ActionType::WorkflowStep), "workflow-step");
+        assert_eq!(format!("{}", ActionType::MarkEventHandled), "mark-event-handled");
+        assert_eq!(format!("{}", ActionType::ValidateApproval), "validate-approval");
+        assert_eq!(format!("{}", ActionType::Other), "other");
+    }
+
+    #[test]
+    fn policy_check_with_details() {
+        let check = PolicyCheck::passed("rate_limit", "5/30 sends")
+            .with_details("Last send was 30 seconds ago");
+
+        assert!(check.passed);
+        assert_eq!(check.name, "rate_limit");
+        assert!(check.details.is_some());
+        assert!(check.details.unwrap().contains("30 seconds"));
+    }
 }
