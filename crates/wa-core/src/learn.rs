@@ -220,10 +220,7 @@ impl TutorialEngine {
                         id: "basics.3".into(),
                         title: "View pane status".into(),
                         description: "See what panes wa is observing".into(),
-                        instructions: vec![
-                            "Run: wa list".into(),
-                            "Run: wa status".into(),
-                        ],
+                        instructions: vec!["Run: wa list".into(), "Run: wa status".into()],
                         verification_command: None,
                         verification_pattern: None,
                     },
@@ -269,9 +266,7 @@ impl TutorialEngine {
                         id: "workflows.1".into(),
                         title: "List workflows".into(),
                         description: "See available workflow definitions".into(),
-                        instructions: vec![
-                            "Run: wa workflow list".into(),
-                        ],
+                        instructions: vec!["Run: wa workflow list".into()],
                         verification_command: None,
                         verification_pattern: None,
                     },
@@ -322,15 +317,10 @@ impl TutorialEngine {
                 // Advance to next exercise if possible
                 if let Some(track_id) = &self.state.current_track {
                     if let Some(track) = self.tracks.iter().find(|t| &t.id == track_id) {
-                        let current_idx = track
-                            .exercises
-                            .iter()
-                            .position(|e| e.id == exercise_id);
+                        let current_idx = track.exercises.iter().position(|e| e.id == exercise_id);
                         if let Some(idx) = current_idx {
-                            self.state.current_exercise = track
-                                .exercises
-                                .get(idx + 1)
-                                .map(|e| e.id.clone());
+                            self.state.current_exercise =
+                                track.exercises.get(idx + 1).map(|e| e.id.clone());
                         }
                     }
                 }
@@ -345,15 +335,10 @@ impl TutorialEngine {
                 // Advance to next without marking complete
                 if let Some(track_id) = &self.state.current_track {
                     if let Some(track) = self.tracks.iter().find(|t| &t.id == track_id) {
-                        let current_idx = track
-                            .exercises
-                            .iter()
-                            .position(|e| e.id == exercise_id);
+                        let current_idx = track.exercises.iter().position(|e| e.id == exercise_id);
                         if let Some(idx) = current_idx {
-                            self.state.current_exercise = track
-                                .exercises
-                                .get(idx + 1)
-                                .map(|e| e.id.clone());
+                            self.state.current_exercise =
+                                track.exercises.get(idx + 1).map(|e| e.id.clone());
                         }
                     }
                 }
@@ -387,7 +372,8 @@ impl TutorialEngine {
                     // Only count if positive and less than an hour gap
                     // Cap at 5 minutes per heartbeat, use saturating_add to prevent overflow
                     let to_add = (elapsed_minutes as u32).min(5);
-                    self.state.total_time_minutes = self.state.total_time_minutes.saturating_add(to_add);
+                    self.state.total_time_minutes =
+                        self.state.total_time_minutes.saturating_add(to_add);
                 }
                 self.state.last_active = now;
             }
@@ -403,7 +389,11 @@ impl TutorialEngine {
 
         // First watch achievement
         if self.state.completed_exercises.contains("basics.2")
-            && !self.state.achievements.iter().any(|a| a.id == "first_watch")
+            && !self
+                .state
+                .achievements
+                .iter()
+                .any(|a| a.id == "first_watch")
         {
             to_add.push((
                 "first_watch".into(),
@@ -414,7 +404,11 @@ impl TutorialEngine {
 
         // First event achievement
         if self.state.completed_exercises.contains("events.1")
-            && !self.state.achievements.iter().any(|a| a.id == "first_event")
+            && !self
+                .state
+                .achievements
+                .iter()
+                .any(|a| a.id == "first_event")
         {
             to_add.push((
                 "first_event".into(),
@@ -431,7 +425,13 @@ impl TutorialEngine {
                 .all(|e| self.state.completed_exercises.contains(&e.id));
             let achievement_id = format!("track_{}_complete", track.id);
 
-            if all_complete && !self.state.achievements.iter().any(|a| a.id == achievement_id) {
+            if all_complete
+                && !self
+                    .state
+                    .achievements
+                    .iter()
+                    .any(|a| a.id == achievement_id)
+            {
                 to_add.push((
                     achievement_id,
                     format!("{} Master", track.name),
@@ -683,7 +683,13 @@ mod tests {
             .unwrap();
 
         // Should have unlocked "first_watch" achievement
-        assert!(engine.state().achievements.iter().any(|a| a.id == "first_watch"));
+        assert!(
+            engine
+                .state()
+                .achievements
+                .iter()
+                .any(|a| a.id == "first_watch")
+        );
     }
 
     #[test]

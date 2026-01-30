@@ -531,7 +531,11 @@ impl OpenAiDeviceAuthFlow {
 
         if !output.status.success() {
             // Parse structured error from stdout if possible
-            return Err(Self::parse_playwright_error(&stdout, &stderr, output.status));
+            return Err(Self::parse_playwright_error(
+                &stdout,
+                &stderr,
+                output.status,
+            ));
         }
 
         // Parse the JSON result from stdout

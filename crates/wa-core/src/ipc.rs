@@ -435,7 +435,6 @@ impl IpcClient {
     pub fn socket_exists(&self) -> bool {
         self.socket_path.exists()
     }
-
 }
 
 #[cfg(unix)]

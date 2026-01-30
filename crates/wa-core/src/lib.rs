@@ -62,6 +62,7 @@ pub mod export;
 pub mod ingest;
 #[cfg(unix)]
 pub mod ipc;
+pub mod learn;
 pub mod lock;
 pub mod logging;
 #[cfg(feature = "mcp")]
@@ -77,7 +78,6 @@ pub mod session_correlation;
 pub mod setup;
 pub mod storage;
 pub mod suggestions;
-pub mod learn;
 pub mod tailer;
 pub mod wait;
 pub mod watchdog;

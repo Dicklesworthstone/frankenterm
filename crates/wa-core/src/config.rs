@@ -1960,9 +1960,7 @@ impl Config {
             .into());
         }
 
-        if self.backup.scheduled.enabled {
-            crate::backup::BackupSchedule::parse(&self.backup.scheduled.schedule)?;
-        }
+        crate::backup::BackupSchedule::parse(&self.backup.scheduled.schedule)?;
 
         if self.storage.writer_queue_size == 0 {
             return Err(crate::error::ConfigError::ValidationError(
@@ -2490,10 +2488,19 @@ disabled_rules = ["codex.usage_warning"]
         let mut config = Config::default();
         config.general.data_dir = "~/wa-data".to_string();
         config.storage.db_path = "~/wa.db".to_string();
+        config.backup.scheduled.destination = Some("~/wa-backups".to_string());
         config.normalize_paths();
 
         assert!(!config.general.data_dir.contains('~'));
         assert!(!config.storage.db_path.contains('~'));
+        assert!(
+            config
+                .backup
+                .scheduled
+                .destination
+                .as_ref()
+                .is_some_and(|path| !path.contains('~'))
+        );
     }
 
     #[test]

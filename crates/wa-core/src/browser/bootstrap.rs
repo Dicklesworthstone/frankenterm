@@ -653,7 +653,8 @@ mod tests {
 
     #[test]
     fn parse_error() {
-        let result = InteractiveBootstrap::parse_bootstrap_result(r#"{"status":"error","message":"crash"}"#);
+        let result =
+            InteractiveBootstrap::parse_bootstrap_result(r#"{"status":"error","message":"crash"}"#);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("crash"));
     }
