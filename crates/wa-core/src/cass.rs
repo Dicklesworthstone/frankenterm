@@ -132,6 +132,89 @@ pub struct CassMessage {
     pub extra: HashMap<String, Value>,
 }
 
+/// Aggregated summary for a cass session.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CassSessionSummary {
+    #[serde(default)]
+    pub total_tokens: Option<i64>,
+    #[serde(default)]
+    pub input_tokens: Option<i64>,
+    #[serde(default)]
+    pub output_tokens: Option<i64>,
+    #[serde(default)]
+    pub message_count: usize,
+    #[serde(default)]
+    pub session_started_at_ms: Option<i64>,
+    #[serde(default)]
+    pub session_ended_at_ms: Option<i64>,
+    #[serde(default)]
+    pub first_message_at_ms: Option<i64>,
+    #[serde(default)]
+    pub last_message_at_ms: Option<i64>,
+}
+
+impl CassSessionSummary {
+    /// Build a summary from a cass session payload.
+    #[must_use]
+    pub fn from_session(session: &CassSession) -> Self {
+        let mut total_tokens: i64 = 0;
+        let mut input_tokens: i64 = 0;
+        let mut output_tokens: i64 = 0;
+        let mut has_tokens = false;
+
+        let mut first_message_at_ms: Option<i64> = None;
+        let mut last_message_at_ms: Option<i64> = None;
+
+        for message in &session.messages {
+            if let Some(timestamp) = message.timestamp.as_deref() {
+                if let Some(parsed) = parse_cass_timestamp_ms(timestamp) {
+                    first_message_at_ms =
+                        Some(first_message_at_ms.map_or(parsed, |prev| prev.min(parsed)));
+                    last_message_at_ms =
+                        Some(last_message_at_ms.map_or(parsed, |prev| prev.max(parsed)));
+                }
+            }
+
+            if let Some(tokens) = message.token_count {
+                has_tokens = true;
+                let tokens_i64 = i64::try_from(tokens).unwrap_or(i64::MAX);
+                total_tokens = total_tokens.saturating_add(tokens_i64);
+                if let Some(role) = message.role.as_deref() {
+                    match classify_role(role) {
+                        RoleClass::Input => {
+                            input_tokens = input_tokens.saturating_add(tokens_i64);
+                        }
+                        RoleClass::Output => {
+                            output_tokens = output_tokens.saturating_add(tokens_i64);
+                        }
+                        RoleClass::Unknown => {}
+                    }
+                }
+            }
+        }
+
+        let session_started_at_ms = session
+            .started_at
+            .as_deref()
+            .and_then(parse_cass_timestamp_ms);
+        let session_ended_at_ms = session
+            .ended_at
+            .as_deref()
+            .and_then(parse_cass_timestamp_ms);
+
+        Self {
+            total_tokens: has_tokens.then_some(total_tokens),
+            input_tokens: has_tokens.then_some(input_tokens),
+            output_tokens: has_tokens.then_some(output_tokens),
+            message_count: session.messages.len(),
+            session_started_at_ms,
+            session_ended_at_ms,
+            first_message_at_ms,
+            last_message_at_ms,
+        }
+    }
+}
+
 /// Parsed output for `cass view` (session query).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CassViewResult {
@@ -484,6 +567,57 @@ impl CassClient {
 
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoleClass {
+    Input,
+    Output,
+    Unknown,
+}
+
+fn classify_role(role: &str) -> RoleClass {
+    match role.trim().to_lowercase().as_str() {
+        "user" | "human" | "system" => RoleClass::Input,
+        "assistant" | "model" | "ai" => RoleClass::Output,
+        _ => RoleClass::Unknown,
+    }
+}
+
+/// Parse a cass timestamp into epoch milliseconds.
+///
+/// Accepts epoch seconds, epoch milliseconds, RFC3339, and common
+/// `%Y-%m-%d %H:%M:%S` formats.
+pub fn parse_cass_timestamp_ms(raw: &str) -> Option<i64> {
+    use chrono::{DateTime, NaiveDateTime, Utc};
+
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    if let Ok(value) = raw.parse::<i64>() {
+        // Heuristic: treat large values as ms, smaller as seconds.
+        return Some(if value > 10_000_000_000 {
+            value
+        } else {
+            value.saturating_mul(1_000)
+        });
+    }
+
+    if let Ok(parsed) = DateTime::parse_from_rfc3339(raw) {
+        return Some(parsed.timestamp_millis());
+    }
+
+    if let Ok(naive) = NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S") {
+        return Some(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc).timestamp_millis());
+    }
+
+    if let Ok(naive) = NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%SZ") {
+        return Some(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc).timestamp_millis());
+    }
+
+    None
 }
 
 fn categorize_io_error(err: &std::io::Error) -> CassError {
@@ -845,5 +979,69 @@ mod tests {
     fn view_options_default() {
         let opts = ViewOptions::default();
         assert!(opts.context_lines.is_none());
+    }
+
+    #[test]
+    fn summarize_session_with_roles() {
+        let session = CassSession {
+            started_at: Some("2026-01-29T09:58:00Z".to_string()),
+            ended_at: Some("2026-01-29T10:02:00Z".to_string()),
+            messages: vec![
+                CassMessage {
+                    role: Some("user".to_string()),
+                    token_count: Some(10),
+                    timestamp: Some("2026-01-29T10:00:00Z".to_string()),
+                    ..CassMessage::default()
+                },
+                CassMessage {
+                    role: Some("assistant".to_string()),
+                    token_count: Some(20),
+                    timestamp: Some("2026-01-29T10:01:00Z".to_string()),
+                    ..CassMessage::default()
+                },
+                CassMessage {
+                    role: Some("system".to_string()),
+                    token_count: Some(5),
+                    timestamp: Some("2026-01-29T09:59:00Z".to_string()),
+                    ..CassMessage::default()
+                },
+            ],
+            ..CassSession::default()
+        };
+
+        let summary = CassSessionSummary::from_session(&session);
+        assert_eq!(summary.total_tokens, Some(35));
+        assert_eq!(summary.input_tokens, Some(15));
+        assert_eq!(summary.output_tokens, Some(20));
+        assert_eq!(summary.message_count, 3);
+        assert!(summary.session_started_at_ms.is_some());
+        assert!(summary.session_ended_at_ms.is_some());
+        assert!(summary.first_message_at_ms.is_some());
+        assert!(summary.last_message_at_ms.is_some());
+    }
+
+    #[test]
+    fn summarize_session_without_token_counts() {
+        let session = CassSession {
+            messages: vec![
+                CassMessage {
+                    role: Some("user".to_string()),
+                    timestamp: Some("2026-01-29T10:00:00Z".to_string()),
+                    ..CassMessage::default()
+                },
+                CassMessage {
+                    role: Some("assistant".to_string()),
+                    timestamp: Some("2026-01-29T10:01:00Z".to_string()),
+                    ..CassMessage::default()
+                },
+            ],
+            ..CassSession::default()
+        };
+
+        let summary = CassSessionSummary::from_session(&session);
+        assert_eq!(summary.total_tokens, None);
+        assert_eq!(summary.input_tokens, None);
+        assert_eq!(summary.output_tokens, None);
+        assert_eq!(summary.message_count, 2);
     }
 }
