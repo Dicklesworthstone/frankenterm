@@ -3,11 +3,13 @@
 //! Provides portable backup archives containing the SQLite database,
 //! manifest metadata, and integrity checksums.
 
+use std::cmp::Ordering;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local, Timelike, Weekday};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -74,6 +76,258 @@ impl Default for ExportOptions {
             verify: true,
         }
     }
+}
+
+/// Parsed schedule for automatic backups.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackupSchedule {
+    /// Run every hour at the given minute (default: minute 0).
+    Hourly { minute: u32 },
+    /// Run daily at the given hour/minute (default: 03:00).
+    Daily { hour: u32, minute: u32 },
+    /// Run weekly on the given weekday at hour/minute (default: Sunday 03:00).
+    Weekly {
+        weekday: Weekday,
+        hour: u32,
+        minute: u32,
+    },
+    /// Simple 5-field cron (supports "*" or a single numeric value per field).
+    Cron(CronSchedule),
+}
+
+/// Simple cron schedule representation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CronSchedule {
+    minute: Option<u32>,
+    hour: Option<u32>,
+    day_of_month: Option<u32>,
+    month: Option<u32>,
+    day_of_week: Option<u32>,
+    raw: String,
+}
+
+impl BackupSchedule {
+    /// Parse a schedule string ("hourly", "daily", "weekly", or "m h dom mon dow").
+    pub fn parse(raw: &str) -> Result<Self> {
+        let trimmed = raw.trim();
+        if trimmed.eq_ignore_ascii_case("hourly") {
+            return Ok(Self::Hourly { minute: 0 });
+        }
+        if trimmed.eq_ignore_ascii_case("daily") {
+            return Ok(Self::Daily { hour: 3, minute: 0 });
+        }
+        if trimmed.eq_ignore_ascii_case("weekly") {
+            return Ok(Self::Weekly {
+                weekday: Weekday::Sun,
+                hour: 3,
+                minute: 0,
+            });
+        }
+
+        let parts: Vec<&str> = trimmed.split_whitespace().collect();
+        if parts.len() != 5 {
+            return Err(Error::Config(crate::error::ConfigError::ParseError(
+                "backup schedule must be 'hourly', 'daily', 'weekly', or 5-field cron".to_string(),
+            )));
+        }
+
+        let minute = parse_cron_field(parts[0], 0, 59)?;
+        let hour = parse_cron_field(parts[1], 0, 23)?;
+        let day_of_month = parse_cron_field(parts[2], 1, 31)?;
+        let month = parse_cron_field(parts[3], 1, 12)?;
+        let day_of_week = parse_cron_field(parts[4], 0, 7)?;
+
+        Ok(Self::Cron(CronSchedule {
+            minute,
+            hour,
+            day_of_month,
+            month,
+            day_of_week,
+            raw: trimmed.to_string(),
+        }))
+    }
+
+    /// Return a human-friendly schedule label for status output.
+    #[must_use]
+    pub fn display_label(&self) -> String {
+        match self {
+            Self::Hourly { .. } => "hourly".to_string(),
+            Self::Daily { .. } => "daily".to_string(),
+            Self::Weekly { .. } => "weekly".to_string(),
+            Self::Cron(cron) => format!("cron: {}", cron.raw),
+        }
+    }
+
+    /// Compute the next run time after `now` (local time).
+    pub fn next_after(&self, now: DateTime<Local>) -> Result<DateTime<Local>> {
+        match self {
+            Self::Hourly { minute } => next_hourly(now, *minute),
+            Self::Daily { hour, minute } => next_daily(now, *hour, *minute),
+            Self::Weekly {
+                weekday,
+                hour,
+                minute,
+            } => next_weekly(now, *weekday, *hour, *minute),
+            Self::Cron(cron) => next_cron(now, cron),
+        }
+    }
+}
+
+fn parse_cron_field(raw: &str, min: u32, max: u32) -> Result<Option<u32>> {
+    if raw == "*" {
+        return Ok(None);
+    }
+    let value: u32 = raw.parse().map_err(|_| {
+        Error::Config(crate::error::ConfigError::ParseError(format!(
+            "invalid cron field '{raw}'"
+        )))
+    })?;
+    if value < min || value > max {
+        return Err(Error::Config(crate::error::ConfigError::ParseError(
+            format!("cron field '{raw}' out of range ({min}-{max})"),
+        )));
+    }
+    Ok(Some(value))
+}
+
+fn next_hourly(now: DateTime<Local>, minute: u32) -> Result<DateTime<Local>> {
+    if minute > 59 {
+        return Err(Error::Config(crate::error::ConfigError::ParseError(
+            "hourly minute must be 0-59".to_string(),
+        )));
+    }
+    let mut candidate = now
+        .with_minute(minute)
+        .and_then(|t| t.with_second(0))
+        .and_then(|t| t.with_nanosecond(0))
+        .ok_or_else(|| Error::Runtime("Failed to compute hourly schedule time".to_string()))?;
+
+    if candidate <= now {
+        candidate = candidate + ChronoDuration::hours(1);
+    }
+    Ok(candidate)
+}
+
+fn next_daily(now: DateTime<Local>, hour: u32, minute: u32) -> Result<DateTime<Local>> {
+    if hour > 23 || minute > 59 {
+        return Err(Error::Config(crate::error::ConfigError::ParseError(
+            "daily schedule time must be in 24h range".to_string(),
+        )));
+    }
+    let mut candidate = now
+        .with_hour(hour)
+        .and_then(|t| t.with_minute(minute))
+        .and_then(|t| t.with_second(0))
+        .and_then(|t| t.with_nanosecond(0))
+        .ok_or_else(|| Error::Runtime("Failed to compute daily schedule time".to_string()))?;
+
+    if candidate <= now {
+        candidate = candidate + ChronoDuration::days(1);
+    }
+    Ok(candidate)
+}
+
+fn next_weekly(
+    now: DateTime<Local>,
+    weekday: Weekday,
+    hour: u32,
+    minute: u32,
+) -> Result<DateTime<Local>> {
+    if hour > 23 || minute > 59 {
+        return Err(Error::Config(crate::error::ConfigError::ParseError(
+            "weekly schedule time must be in 24h range".to_string(),
+        )));
+    }
+
+    let now_weekday = now.weekday().number_from_monday() as i64;
+    let target_weekday = weekday.number_from_monday() as i64;
+    let mut days_ahead = target_weekday - now_weekday;
+    if days_ahead < 0 {
+        days_ahead += 7;
+    }
+
+    let mut candidate = now
+        .date_naive()
+        .and_hms_opt(hour, minute, 0)
+        .ok_or_else(|| Error::Runtime("Failed to compute weekly schedule time".to_string()))?;
+    candidate += ChronoDuration::days(days_ahead);
+    let candidate = Local
+        .from_local_datetime(&candidate)
+        .single()
+        .ok_or_else(|| Error::Runtime("Failed to localize weekly schedule time".to_string()))?;
+
+    if candidate <= now {
+        return Ok(candidate + ChronoDuration::days(7));
+    }
+    Ok(candidate)
+}
+
+fn next_cron(now: DateTime<Local>, cron: &CronSchedule) -> Result<DateTime<Local>> {
+    // Scan forward minute-by-minute up to 366 days.
+    let max_minutes = 366_u32.saturating_mul(24).saturating_mul(60);
+    for offset in 1..=max_minutes {
+        let candidate = now + ChronoDuration::minutes(offset as i64);
+        if cron_matches(candidate, cron) {
+            return Ok(candidate);
+        }
+    }
+    Err(Error::Runtime(
+        "Failed to find next cron run within 366 days".to_string(),
+    ))
+}
+
+fn cron_matches(candidate: DateTime<Local>, cron: &CronSchedule) -> bool {
+    if let Some(minute) = cron.minute {
+        if candidate.minute() != minute {
+            return false;
+        }
+    }
+    if let Some(hour) = cron.hour {
+        if candidate.hour() != hour {
+            return false;
+        }
+    }
+    if let Some(month) = cron.month {
+        if candidate.month() != month {
+            return false;
+        }
+    }
+
+    let dom_match = cron
+        .day_of_month
+        .map_or(true, |dom| candidate.day() == dom);
+    let dow_match = cron.day_of_week.map_or(true, |dow| {
+        let normalized = if dow == 7 { 0 } else { dow };
+        let candidate_dow = candidate.weekday().num_days_from_sunday();
+        candidate_dow == normalized
+    });
+
+    match (cron.day_of_month.is_some(), cron.day_of_week.is_some()) {
+        (true, true) => dom_match || dow_match,
+        _ => dom_match && dow_match,
+    }
+}
+
+/// Information about a backup directory on disk.
+#[derive(Debug, Clone)]
+pub struct BackupEntry {
+    pub path: PathBuf,
+    pub created_at: Option<String>,
+    pub created_ts: Option<i64>,
+    pub total_size_bytes: u64,
+}
+
+/// Status summary for scheduled backups.
+#[derive(Debug, Clone, Serialize)]
+pub struct ScheduledBackupStatus {
+    pub enabled: bool,
+    pub schedule: String,
+    pub next_backup_at: Option<String>,
+    pub last_backup_at: Option<String>,
+    pub last_backup_size_bytes: Option<u64>,
+    pub backups_kept: usize,
+    pub max_backups: Option<u32>,
+    pub destination: String,
 }
 
 /// Export a backup of the wa database to a directory archive.
@@ -184,6 +438,175 @@ pub fn export_backup(
         manifest,
         total_size_bytes: total_size,
     })
+}
+
+/// Compute scheduled backup status for `wa status`.
+pub fn scheduled_backup_status(
+    config: &crate::config::ScheduledBackupConfig,
+    workspace_root: &Path,
+    now: DateTime<Local>,
+) -> Result<ScheduledBackupStatus> {
+    let schedule = BackupSchedule::parse(&config.schedule)?;
+    let destination_root = resolve_destination_root(workspace_root, config.destination.as_deref());
+    let entries = list_backup_entries(&destination_root)?;
+    let latest = entries
+        .iter()
+        .max_by(|a, b| compare_backup_entries(a, b));
+
+    let next_backup_at = if config.enabled {
+        Some(format_local_datetime(schedule.next_after(now)?))
+    } else {
+        None
+    };
+
+    Ok(ScheduledBackupStatus {
+        enabled: config.enabled,
+        schedule: schedule.display_label(),
+        next_backup_at,
+        last_backup_at: latest.and_then(|entry| entry.created_at.clone()),
+        last_backup_size_bytes: latest.map(|entry| entry.total_size_bytes),
+        backups_kept: entries.len(),
+        max_backups: if config.max_backups == 0 {
+            None
+        } else {
+            Some(config.max_backups)
+        },
+        destination: destination_root.display().to_string(),
+    })
+}
+
+/// Resolve a backup destination root directory.
+#[must_use]
+pub fn backup_destination_root(
+    workspace_root: &Path,
+    destination: Option<&str>,
+) -> PathBuf {
+    resolve_destination_root(workspace_root, destination)
+}
+
+/// Build a unique output directory for a scheduled backup.
+#[must_use]
+pub fn scheduled_backup_output_path(
+    workspace_root: &Path,
+    destination: Option<&str>,
+    now: DateTime<Local>,
+) -> PathBuf {
+    let base_dir = resolve_destination_root(workspace_root, destination);
+    let ts = format_timestamp_compact(now.timestamp() as u64);
+    unique_backup_path(&base_dir, &format!("wa_backup_{ts}"))
+}
+
+/// List backup directories under the destination root.
+pub fn list_backup_entries(base_dir: &Path) -> Result<Vec<BackupEntry>> {
+    if !base_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(base_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let manifest_path = path.join("manifest.json");
+        let (created_at, created_ts) = if manifest_path.exists() {
+            match fs::read_to_string(&manifest_path)
+                .ok()
+                .and_then(|data| serde_json::from_str::<BackupManifest>(&data).ok())
+            {
+                Some(manifest) => {
+                    let ts = parse_manifest_timestamp(&manifest.created_at);
+                    (Some(manifest.created_at), ts)
+                }
+                None => (None, None),
+            }
+        } else {
+            (None, None)
+        };
+
+        let created_ts = created_ts.or_else(|| {
+            entry
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|m| m.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+        });
+
+        let total_size_bytes = dir_size(&path);
+        entries.push(BackupEntry {
+            path,
+            created_at,
+            created_ts,
+            total_size_bytes,
+        });
+    }
+
+    Ok(entries)
+}
+
+/// Summary of retention/rotation pruning.
+#[derive(Debug, Clone)]
+pub struct PruneSummary {
+    pub removed: usize,
+    pub kept: usize,
+}
+
+/// Prune backups by retention and max count.
+pub fn prune_backups(
+    base_dir: &Path,
+    retention_days: u32,
+    max_backups: u32,
+    now: DateTime<Local>,
+) -> Result<PruneSummary> {
+    let mut entries = list_backup_entries(base_dir)?;
+    if entries.is_empty() {
+        return Ok(PruneSummary { removed: 0, kept: 0 });
+    }
+
+    let mut removed = 0_usize;
+    if retention_days > 0 {
+        let cutoff = now - ChronoDuration::days(retention_days as i64);
+        entries.retain(|entry| {
+            let keep = entry
+                .created_ts
+                .map(|ts| ts >= cutoff.timestamp())
+                .unwrap_or(true);
+            if !keep {
+                if let Err(e) = fs::remove_dir_all(&entry.path) {
+                    tracing::warn!(
+                        path = %entry.path.display(),
+                        error = %e,
+                        "Failed to remove expired backup"
+                    );
+                } else {
+                    removed += 1;
+                }
+            }
+            keep
+        });
+    }
+
+    if max_backups > 0 && entries.len() > max_backups as usize {
+        entries.sort_by(|a, b| compare_backup_entries(a, b));
+        let keep_count = max_backups as usize;
+        for entry in entries.drain(0..entries.len().saturating_sub(keep_count)) {
+            if let Err(e) = fs::remove_dir_all(&entry.path) {
+                tracing::warn!(
+                    path = %entry.path.display(),
+                    error = %e,
+                    "Failed to remove rotated backup"
+                );
+            } else {
+                removed += 1;
+            }
+        }
+    }
+
+    let kept = list_backup_entries(base_dir)?.len();
+    Ok(PruneSummary { removed, kept })
 }
 
 /// Verify a backup directory's integrity.
@@ -546,6 +969,74 @@ fn sha256_bytes(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
     format!("{:x}", hasher.finalize())
+}
+
+fn resolve_destination_root(workspace_root: &Path, destination: Option<&str>) -> PathBuf {
+    match destination {
+        Some(raw) => {
+            let expanded = expand_tilde(raw);
+            if expanded.is_absolute() {
+                expanded
+            } else {
+                workspace_root.join(expanded)
+            }
+        }
+        None => workspace_root.join(".wa").join("backups"),
+    }
+}
+
+fn unique_backup_path(base_dir: &Path, base_name: &str) -> PathBuf {
+    let mut candidate = base_dir.join(base_name);
+    if !candidate.exists() {
+        return candidate;
+    }
+    for idx in 1..=1000 {
+        let name = format!("{base_name}_{idx:02}");
+        candidate = base_dir.join(name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    candidate
+}
+
+fn parse_manifest_timestamp(created_at: &str) -> Option<i64> {
+    DateTime::parse_from_rfc3339(created_at)
+        .ok()
+        .map(|dt| dt.timestamp())
+}
+
+fn compare_backup_entries(a: &BackupEntry, b: &BackupEntry) -> Ordering {
+    match (a.created_ts, b.created_ts) {
+        (Some(ts_a), Some(ts_b)) => ts_a.cmp(&ts_b),
+        (Some(_), None) => Ordering::Greater,
+        (None, Some(_)) => Ordering::Less,
+        (None, None) => a.path.cmp(&b.path),
+    }
+}
+
+fn format_local_datetime(value: DateTime<Local>) -> String {
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+        value.year(),
+        value.month(),
+        value.day(),
+        value.hour(),
+        value.minute(),
+        value.second()
+    )
+}
+
+fn expand_tilde(path: &str) -> PathBuf {
+    if path == "~" {
+        return dirs::home_dir().unwrap_or_else(|| PathBuf::from(path));
+    }
+    if let Some(suffix) = path.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(suffix);
+        }
+    }
+    PathBuf::from(path)
 }
 
 /// Generate default backup path based on timestamp.

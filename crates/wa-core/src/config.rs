@@ -8,6 +8,7 @@
 //! - `general`: Log level, workspace/data directory
 //! - `ingest`: Poll interval, concurrency, gap detection
 //! - `storage`: DB path, retention, flush intervals
+//! - `backup`: Scheduled backup configuration
 //! - `patterns`: Enabled packs, per-pack overrides
 //! - `workflows`: Enable/disable, allowlist/denylist, concurrency
 //! - `safety`: Capability gates, rate limits, approval, redaction, reservations
@@ -44,6 +45,9 @@ pub struct Config {
 
     /// Storage settings (database, retention)
     pub storage: StorageConfig,
+
+    /// Backup settings (scheduled backups)
+    pub backup: BackupConfig,
 
     /// Pattern detection settings
     pub patterns: PatternsConfig,
@@ -446,6 +450,66 @@ impl Default for StorageConfig {
             checkpoint_interval_secs: 60,
             writer_queue_size: 10000,
             read_pool_size: 4,
+        }
+    }
+}
+
+// =============================================================================
+// Backup Config
+// =============================================================================
+
+/// Backup configuration
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BackupConfig {
+    /// Scheduled backups configuration
+    pub scheduled: ScheduledBackupConfig,
+}
+
+impl Default for BackupConfig {
+    fn default() -> Self {
+        Self {
+            scheduled: ScheduledBackupConfig::default(),
+        }
+    }
+}
+
+/// Scheduled backup configuration
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ScheduledBackupConfig {
+    /// Enable scheduled backups
+    pub enabled: bool,
+    /// Schedule string (hourly, daily, weekly, or 5-field cron)
+    pub schedule: String,
+    /// Retention period in days (0 = keep forever)
+    pub retention_days: u32,
+    /// Maximum backups to retain (0 = unlimited)
+    pub max_backups: u32,
+    /// Destination root directory for backups (optional)
+    pub destination: Option<String>,
+    /// Enable compression (if supported)
+    pub compress: bool,
+    /// Metadata-only mode (skip expensive verification)
+    pub metadata_only: bool,
+    /// Notify on failures
+    pub notify_on_failure: bool,
+    /// Notify on successes
+    pub notify_on_success: bool,
+}
+
+impl Default for ScheduledBackupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            schedule: "daily".to_string(),
+            retention_days: 30,
+            max_backups: 10,
+            destination: None,
+            compress: false,
+            metadata_only: false,
+            notify_on_failure: true,
+            notify_on_success: false,
         }
     }
 }
@@ -1605,6 +1669,14 @@ impl Config {
             });
         }
 
+        if self.backup.scheduled != new_config.backup.scheduled {
+            forbidden.push(ForbiddenChange {
+                name: "backup.scheduled".to_string(),
+                reason: "Scheduled backup settings cannot be changed at runtime; requires restart"
+                    .to_string(),
+            });
+        }
+
         // Check hot-reloadable settings
         if self.general.log_level != new_config.general.log_level {
             changes.push(HotReloadChange {
@@ -1857,6 +1929,11 @@ impl Config {
             let mux_path = expand_tilde(&path);
             self.vendored.mux_socket_path = Some(path_to_string(&mux_path));
         }
+
+        if let Some(dest) = self.backup.scheduled.destination.take() {
+            let dest_path = expand_tilde(&dest);
+            self.backup.scheduled.destination = Some(path_to_string(&dest_path));
+        }
     }
 
     /// Validate semantic constraints
@@ -1881,6 +1958,10 @@ impl Config {
                 "ingest.max_concurrent_captures must be >= 1".to_string(),
             )
             .into());
+        }
+
+        if self.backup.scheduled.enabled {
+            crate::backup::BackupSchedule::parse(&self.backup.scheduled.schedule)?;
         }
 
         if self.storage.writer_queue_size == 0 {
