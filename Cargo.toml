@@ -197,6 +197,10 @@ crossterm = "0.29.0"
 # Benchmarking
 criterion = { version = "0.7.0", features = ["async_tokio"] }
 
+# MCP (optional, local workspace)
+fastmcp = { path = "../fastmcp_rust/crates/fastmcp" }
+fastmcp-transport = { path = "../fastmcp_rust/crates/fastmcp-transport" }
+
 # Internal crates
 wa-core = { path = "crates/wa-core" }
 

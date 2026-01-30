@@ -33,12 +33,14 @@ toml_edit.workspace = true
 toon_rust.workspace = true
 rusqlite.workspace = true
 dirs = "6.0.0"
+fastmcp = { workspace = true, optional = true }
+fastmcp-transport = { workspace = true, optional = true }
 
 [features]
 default = []
 vendored = ["wa-core/vendored"]
 browser = ["wa-core/browser"]
-mcp = ["wa-core/mcp"]
+mcp = ["wa-core/mcp", "dep:fastmcp", "dep:fastmcp-transport"]
 web = ["wa-core/web"]
 tui = ["wa-core/tui"]
 metrics = ["wa-core/metrics"]
