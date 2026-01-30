@@ -47,6 +47,12 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 fs2.workspace = true
 base64 = "0.22.1"
 
+# Vendored WezTerm crates (optional)
+codec = { workspace = true, optional = true }
+config = { workspace = true, optional = true }
+mux = { workspace = true, optional = true }
+wezterm-term = { workspace = true, optional = true }
+
 # TUI (optional, behind feature)
 ratatui = { workspace = true, optional = true }
 crossterm = { workspace = true, optional = true }
@@ -90,6 +96,6 @@ metrics = []
 distributed = []
 
 # Optional heavy integrations - feature-gated (internal)
-vendored-wezterm = []
+vendored-wezterm = ["dep:codec", "dep:config", "dep:mux", "dep:wezterm-term"]
 browser-automation = []
 mcp-server = []

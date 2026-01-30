@@ -180,6 +180,12 @@ toml_edit = "0.24.0"
 # Serialization
 toon_rust = { git = "https://github.com/Dicklesworthstone/toon_rust", branch = "master" }
 
+# WezTerm (vendored, optional)
+codec = { git = "https://github.com/wez/wezterm" }
+config = { git = "https://github.com/wez/wezterm" }
+mux = { git = "https://github.com/wez/wezterm" }
+wezterm-term = { git = "https://github.com/wez/wezterm" }
+
 # File locking
 fs2 = "0.4.3"
 
