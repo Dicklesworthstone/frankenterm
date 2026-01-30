@@ -4,7 +4,7 @@
   "title": "WA Robot Workflow Abort Response",
   "description": "Schema for the data field when calling 'wa robot workflow abort <execution_id>'. Aborts a running workflow.",
   "type": "object",
-  "required": ["execution_id", "aborted"],
+  "required": ["execution_id", "aborted", "forced"],
   "properties": {
     "execution_id": {
       "type": "string",

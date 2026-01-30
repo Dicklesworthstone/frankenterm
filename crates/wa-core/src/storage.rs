@@ -1839,13 +1839,18 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
         return Ok(());
     }
 
-    // Existing database at version 0: ensure base schema exists, then migrate.
+    // Existing database at version 0: apply full schema (idempotent via IF NOT EXISTS).
+    // SCHEMA_SQL creates the complete current schema, so no incremental migrations needed.
     if current == 0 {
         conn.execute_batch(SCHEMA_SQL)
             .map_err(|e| StorageError::MigrationFailed(format!("Schema init failed: {e}")))?;
+        set_user_version(conn, SCHEMA_VERSION)?;
+        record_migration(conn, SCHEMA_VERSION, "Schema init from v0")?;
+        ensure_wa_meta(conn, SCHEMA_VERSION)?;
+        return Ok(());
     }
 
-    // Apply pending migrations for existing databases
+    // Apply pending migrations for existing databases (version > 0)
     run_migrations(conn, current)?;
 
     ensure_wa_meta(conn, SCHEMA_VERSION)?;

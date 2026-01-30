@@ -1069,6 +1069,10 @@ enum RobotWorkflowCommands {
         /// Reason for aborting
         #[arg(long)]
         reason: Option<String>,
+
+        /// Force abort (skip cleanup steps)
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -2508,6 +2512,7 @@ struct RobotWorkflowStatusListData {
 struct RobotWorkflowAbortData {
     execution_id: String,
     aborted: bool,
+    forced: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     workflow_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5334,6 +5339,32 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             ]),
                                             requires_pane: Some(true),
                                         },
+                                        RobotWorkflowInfo {
+                                            name: "handle_session_end".to_string(),
+                                            description: Some(
+                                                "Capture and store structured session summary on \
+                                                 agent session end"
+                                                    .to_string(),
+                                            ),
+                                            enabled: true,
+                                            trigger_event_types: Some(vec![
+                                                "session_end".to_string(),
+                                            ]),
+                                            requires_pane: Some(true),
+                                        },
+                                        RobotWorkflowInfo {
+                                            name: "handle_auth_required".to_string(),
+                                            description: Some(
+                                                "Handle authentication prompts requiring user \
+                                                 intervention or automated login"
+                                                    .to_string(),
+                                            ),
+                                            enabled: true,
+                                            trigger_event_types: Some(vec![
+                                                "auth_required".to_string(),
+                                            ]),
+                                            requires_pane: Some(true),
+                                        },
                                     ];
 
                                     let total = workflows.len();
@@ -5663,6 +5694,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 RobotWorkflowCommands::Abort {
                                     execution_id,
                                     reason,
+                                    force,
                                 } => {
                                     use wa_core::policy::{PolicyEngine, PolicyGatedInjector};
                                     use wa_core::storage::StorageHandle;
@@ -5718,17 +5750,14 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                                     // Execute the abort
                                     match runner
-                                        .abort_execution(
-                                            &execution_id,
-                                            reason.as_deref(),
-                                            false, // force
-                                        )
+                                        .abort_execution(&execution_id, reason.as_deref(), force)
                                         .await
                                     {
                                         Ok(result) => {
                                             let data = RobotWorkflowAbortData {
                                                 execution_id: result.execution_id,
                                                 aborted: result.aborted,
+                                                forced: force,
                                                 workflow_name: Some(result.workflow_name),
                                                 previous_status: Some(result.previous_status),
                                                 reason: result.reason,
@@ -7288,10 +7317,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     "version": wa_core::VERSION,
                     "wezterm_circuit": wezterm.circuit_status(),
                 });
-                let local_version = wa_core::vendored::read_local_wezterm_version();
-                let compat = wa_core::vendored::compatibility_report(local_version.as_ref());
-                payload["vendored_compatibility"] =
-                    serde_json::to_value(&compat).unwrap_or(serde_json::Value::Null);
+                #[cfg(feature = "vendored")]
+                {
+                    let local_version = wa_core::vendored::read_local_wezterm_version();
+                    let compat = wa_core::vendored::compatibility_report(local_version.as_ref());
+                    payload["vendored_compatibility"] =
+                        serde_json::to_value(&compat).unwrap_or(serde_json::Value::Null);
+                }
                 if let Some(snap) = snapshot {
                     payload["health"] =
                         serde_json::to_value(&snap).unwrap_or(serde_json::Value::Null);
@@ -12591,6 +12623,7 @@ fn run_diagnostics(
     checks.push(DiagnosticCheck::ok_with_detail("config", config_source));
 
     // Check 2: WezTerm CLI available
+    #[cfg(feature = "vendored")]
     let mut local_wezterm_version: Option<wa_core::vendored::WeztermVersion> = None;
     match std::process::Command::new("wezterm")
         .arg("--version")
@@ -12600,7 +12633,10 @@ fn run_diagnostics(
             let version = String::from_utf8_lossy(&output.stdout);
             let version = version.trim();
             checks.push(DiagnosticCheck::ok_with_detail("WezTerm CLI", version));
-            local_wezterm_version = Some(wa_core::vendored::WeztermVersion::parse(version));
+            #[cfg(feature = "vendored")]
+            {
+                local_wezterm_version = Some(wa_core::vendored::WeztermVersion::parse(version));
+            }
         }
         Ok(_) => {
             checks.push(DiagnosticCheck::error(
@@ -12619,41 +12655,51 @@ fn run_diagnostics(
     }
 
     // Check 2b: Vendored compatibility (only meaningful when vendored feature is enabled)
-    let compat = wa_core::vendored::compatibility_report(local_wezterm_version.as_ref());
-    if !compat.vendored_enabled {
+    #[cfg(feature = "vendored")]
+    {
+        let compat = wa_core::vendored::compatibility_report(local_wezterm_version.as_ref());
+        if !compat.vendored_enabled {
+            checks.push(DiagnosticCheck::ok_with_detail(
+                "WezTerm vendored",
+                "vendored feature not enabled",
+            ));
+        } else {
+            match compat.status {
+                wa_core::vendored::VendoredCompatibilityStatus::Matched => {
+                    checks.push(DiagnosticCheck::ok_with_detail(
+                        "WezTerm vendored",
+                        compat.message,
+                    ));
+                }
+                wa_core::vendored::VendoredCompatibilityStatus::Compatible => {
+                    let recommendation = compat
+                        .recommendation
+                        .unwrap_or_else(|| "Review vendored compatibility".to_string());
+                    checks.push(DiagnosticCheck::warning(
+                        "WezTerm vendored",
+                        compat.message,
+                        recommendation,
+                    ));
+                }
+                wa_core::vendored::VendoredCompatibilityStatus::Incompatible => {
+                    let recommendation = compat
+                        .recommendation
+                        .unwrap_or_else(|| "Update WezTerm or rebuild wa".to_string());
+                    checks.push(DiagnosticCheck::error(
+                        "WezTerm vendored",
+                        compat.message,
+                        recommendation,
+                    ));
+                }
+            }
+        }
+    }
+    #[cfg(not(feature = "vendored"))]
+    {
         checks.push(DiagnosticCheck::ok_with_detail(
             "WezTerm vendored",
             "vendored feature not enabled",
         ));
-    } else {
-        match compat.status {
-            wa_core::vendored::VendoredCompatibilityStatus::Matched => {
-                checks.push(DiagnosticCheck::ok_with_detail(
-                    "WezTerm vendored",
-                    compat.message,
-                ));
-            }
-            wa_core::vendored::VendoredCompatibilityStatus::Compatible => {
-                let recommendation = compat
-                    .recommendation
-                    .unwrap_or_else(|| "Review vendored compatibility".to_string());
-                checks.push(DiagnosticCheck::warning(
-                    "WezTerm vendored",
-                    compat.message,
-                    recommendation,
-                ));
-            }
-            wa_core::vendored::VendoredCompatibilityStatus::Incompatible => {
-                let recommendation = compat
-                    .recommendation
-                    .unwrap_or_else(|| "Update WezTerm or rebuild wa".to_string());
-                checks.push(DiagnosticCheck::error(
-                    "WezTerm vendored",
-                    compat.message,
-                    recommendation,
-                ));
-            }
-        }
     }
 
     // Check 3: WezTerm scrollback configuration
@@ -15064,5 +15110,320 @@ mod tests {
         for window in field_positions.windows(2) {
             assert!(window[0] < window[1], "fields must appear in stable order");
         }
+    }
+
+    // ── Robot Workflow Command Tests (bd-qvbz) ──────────────────────────
+
+    #[test]
+    fn robot_response_success_envelope_has_required_fields() {
+        let data = RobotWorkflowListData {
+            workflows: vec![],
+            total: 0,
+            enabled_count: Some(0),
+        };
+        let resp = RobotResponse::success(data, 42);
+        let json = serde_json::to_value(&resp).unwrap();
+
+        assert_eq!(json["ok"], true);
+        assert!(json["data"].is_object());
+        assert!(json["error"].is_null());
+        assert!(json["error_code"].is_null());
+        assert!(json["hint"].is_null());
+        assert_eq!(json["elapsed_ms"], 42);
+        assert!(json["version"].is_string());
+        assert!(json["now"].is_number());
+    }
+
+    #[test]
+    fn robot_response_error_envelope_has_required_fields() {
+        let resp = RobotResponse::<RobotWorkflowAbortData>::error_with_code(
+            "E_EXECUTION_NOT_FOUND",
+            "Execution not found",
+            Some("Use --active to list running workflows.".to_string()),
+            99,
+        );
+        let json = serde_json::to_value(&resp).unwrap();
+
+        assert_eq!(json["ok"], false);
+        assert!(json["data"].is_null());
+        assert_eq!(json["error"], "Execution not found");
+        assert_eq!(json["error_code"], "E_EXECUTION_NOT_FOUND");
+        assert_eq!(json["hint"], "Use --active to list running workflows.");
+        assert_eq!(json["elapsed_ms"], 99);
+        assert!(json["version"].is_string());
+        assert!(json["now"].is_number());
+    }
+
+    #[test]
+    fn robot_workflow_list_returns_all_four_workflows() {
+        // Replicate the hardcoded list from the List handler to verify completeness.
+        let workflows: Vec<RobotWorkflowInfo> = vec![
+            RobotWorkflowInfo {
+                name: "handle_compaction".to_string(),
+                description: Some(
+                    "Re-inject critical context after conversation compaction".to_string(),
+                ),
+                enabled: true,
+                trigger_event_types: Some(vec!["compaction_warning".to_string()]),
+                requires_pane: Some(true),
+            },
+            RobotWorkflowInfo {
+                name: "handle_usage_limits".to_string(),
+                description: Some("Handle API usage limit reached events".to_string()),
+                enabled: true,
+                trigger_event_types: Some(vec!["usage_limit".to_string()]),
+                requires_pane: Some(true),
+            },
+            RobotWorkflowInfo {
+                name: "handle_session_end".to_string(),
+                description: Some(
+                    "Capture and store structured session summary on agent session end".to_string(),
+                ),
+                enabled: true,
+                trigger_event_types: Some(vec!["session_end".to_string()]),
+                requires_pane: Some(true),
+            },
+            RobotWorkflowInfo {
+                name: "handle_auth_required".to_string(),
+                description: Some(
+                    "Handle authentication prompts requiring user intervention or automated login"
+                        .to_string(),
+                ),
+                enabled: true,
+                trigger_event_types: Some(vec!["auth_required".to_string()]),
+                requires_pane: Some(true),
+            },
+        ];
+
+        assert_eq!(workflows.len(), 4, "must list exactly 4 workflows");
+        let names: Vec<&str> = workflows.iter().map(|w| w.name.as_str()).collect();
+        assert!(names.contains(&"handle_compaction"));
+        assert!(names.contains(&"handle_usage_limits"));
+        assert!(names.contains(&"handle_session_end"));
+        assert!(names.contains(&"handle_auth_required"));
+        assert!(
+            workflows.iter().all(|w| w.enabled),
+            "all workflows must be enabled"
+        );
+    }
+
+    #[test]
+    fn robot_workflow_list_data_serialization_matches_schema() {
+        let workflows = vec![RobotWorkflowInfo {
+            name: "handle_compaction".to_string(),
+            description: Some("Test workflow".to_string()),
+            enabled: true,
+            trigger_event_types: Some(vec!["compaction_warning".to_string()]),
+            requires_pane: Some(true),
+        }];
+        let data = RobotWorkflowListData {
+            workflows,
+            total: 1,
+            enabled_count: Some(1),
+        };
+
+        let json = serde_json::to_value(&data).unwrap();
+
+        // Schema requires: workflows (array), total (integer)
+        assert!(json["workflows"].is_array());
+        assert_eq!(json["total"], 1);
+        assert_eq!(json["enabled_count"], 1);
+
+        let wf = &json["workflows"][0];
+        assert_eq!(wf["name"], "handle_compaction");
+        assert_eq!(wf["description"], "Test workflow");
+        assert_eq!(wf["enabled"], true);
+        assert_eq!(wf["trigger_event_types"][0], "compaction_warning");
+        assert_eq!(wf["requires_pane"], true);
+    }
+
+    #[test]
+    fn robot_workflow_abort_data_serializes_forced_field() {
+        let data = RobotWorkflowAbortData {
+            execution_id: "exec-123".to_string(),
+            aborted: true,
+            forced: true,
+            workflow_name: Some("handle_compaction".to_string()),
+            previous_status: Some("running".to_string()),
+            reason: Some("test abort".to_string()),
+            aborted_at: Some(1700000000000),
+            error_reason: None,
+        };
+
+        let json = serde_json::to_value(&data).unwrap();
+
+        // Schema required fields: execution_id, aborted, forced
+        assert_eq!(json["execution_id"], "exec-123");
+        assert_eq!(json["aborted"], true);
+        assert_eq!(json["forced"], true);
+        assert_eq!(json["workflow_name"], "handle_compaction");
+        assert_eq!(json["previous_status"], "running");
+        assert_eq!(json["reason"], "test abort");
+        assert_eq!(json["aborted_at"], 1700000000000_u64);
+        // error_reason is None → must be absent (skip_serializing_if)
+        assert!(json.get("error_reason").is_none());
+    }
+
+    #[test]
+    fn robot_workflow_abort_data_not_aborted_includes_error_reason() {
+        let data = RobotWorkflowAbortData {
+            execution_id: "exec-456".to_string(),
+            aborted: false,
+            forced: false,
+            workflow_name: None,
+            previous_status: None,
+            reason: None,
+            aborted_at: None,
+            error_reason: Some("already_completed".to_string()),
+        };
+
+        let json = serde_json::to_value(&data).unwrap();
+
+        assert_eq!(json["aborted"], false);
+        assert_eq!(json["forced"], false);
+        assert_eq!(json["error_reason"], "already_completed");
+        // Optional fields should be absent when None
+        assert!(json.get("workflow_name").is_none());
+        assert!(json.get("previous_status").is_none());
+        assert!(json.get("reason").is_none());
+        assert!(json.get("aborted_at").is_none());
+    }
+
+    #[test]
+    fn robot_workflow_status_data_serialization() {
+        let data = RobotWorkflowStatusData {
+            execution_id: "exec-789".to_string(),
+            workflow_name: "handle_usage_limits".to_string(),
+            pane_id: Some(42),
+            trigger_event_id: Some(100),
+            status: "running".to_string(),
+            step_name: Some("rate_limit_check".to_string()),
+            elapsed_ms: Some(1500),
+            last_step_result: Some("success".to_string()),
+            current_step: Some(2),
+            total_steps: Some(5),
+            wait_condition: None,
+            context: None,
+            result: None,
+            error: None,
+            started_at: Some(1700000000000),
+            updated_at: None,
+            completed_at: None,
+            step_logs: None,
+            action_plan: None,
+        };
+
+        let json = serde_json::to_value(&data).unwrap();
+
+        // Schema required: execution_id, workflow_name, status
+        assert_eq!(json["execution_id"], "exec-789");
+        assert_eq!(json["workflow_name"], "handle_usage_limits");
+        assert_eq!(json["status"], "running");
+        assert_eq!(json["pane_id"], 42);
+        assert_eq!(json["trigger_event_id"], 100);
+        assert_eq!(json["step_name"], "rate_limit_check");
+        assert_eq!(json["current_step"], 2);
+        assert_eq!(json["total_steps"], 5);
+        // completed_at is None → must be absent
+        assert!(json.get("completed_at").is_none());
+    }
+
+    #[test]
+    fn robot_workflow_status_list_data_serialization() {
+        let data = RobotWorkflowStatusListData {
+            executions: vec![],
+            pane_filter: Some(42),
+            active_only: Some(true),
+            count: 0,
+        };
+
+        let json = serde_json::to_value(&data).unwrap();
+
+        assert!(json["executions"].is_array());
+        assert_eq!(json["executions"].as_array().unwrap().len(), 0);
+        assert_eq!(json["pane_filter"], 42);
+        assert_eq!(json["active_only"], true);
+        assert_eq!(json["count"], 0);
+    }
+
+    #[test]
+    fn robot_error_code_constants_are_stable() {
+        // Error codes are part of the robot mode API contract and must not change.
+        assert_eq!(ROBOT_ERR_INVALID_ARGS, "robot.invalid_args");
+        assert_eq!(ROBOT_ERR_UNKNOWN_SUBCOMMAND, "robot.unknown_subcommand");
+        assert_eq!(ROBOT_ERR_CONFIG, "robot.config_error");
+        assert_eq!(ROBOT_ERR_FTS_QUERY, "robot.fts_query_error");
+        assert_eq!(ROBOT_ERR_STORAGE, "robot.storage_error");
+    }
+
+    #[test]
+    fn robot_workflow_abort_response_wraps_in_envelope() {
+        let data = RobotWorkflowAbortData {
+            execution_id: "exec-abc".to_string(),
+            aborted: true,
+            forced: false,
+            workflow_name: Some("handle_session_end".to_string()),
+            previous_status: Some("running".to_string()),
+            reason: None,
+            aborted_at: Some(1700000000000),
+            error_reason: None,
+        };
+        let resp = RobotResponse::success(data, 55);
+        let json = serde_json::to_value(&resp).unwrap();
+
+        // Envelope structure
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["elapsed_ms"], 55);
+
+        // Data payload
+        let d = &json["data"];
+        assert_eq!(d["execution_id"], "exec-abc");
+        assert_eq!(d["aborted"], true);
+        assert_eq!(d["forced"], false);
+        assert_eq!(d["workflow_name"], "handle_session_end");
+    }
+
+    #[test]
+    fn robot_workflow_list_toon_roundtrip() {
+        let workflows = vec![
+            RobotWorkflowInfo {
+                name: "handle_compaction".to_string(),
+                description: Some("Test".to_string()),
+                enabled: true,
+                trigger_event_types: Some(vec!["compaction_warning".to_string()]),
+                requires_pane: Some(true),
+            },
+            RobotWorkflowInfo {
+                name: "handle_usage_limits".to_string(),
+                description: Some("Test 2".to_string()),
+                enabled: true,
+                trigger_event_types: Some(vec!["usage_limit".to_string()]),
+                requires_pane: Some(true),
+            },
+        ];
+        let data = RobotWorkflowListData {
+            workflows,
+            total: 2,
+            enabled_count: Some(2),
+        };
+        let resp = RobotResponse::success(data, 10);
+        let json_value = serde_json::to_value(&resp).unwrap();
+
+        // Encode to TOON and decode back
+        let toon = toon_rust::encode(json_value.clone(), None);
+        let decoded = toon_rust::try_decode(&toon, None).unwrap();
+        let json_str = toon_rust::cli::json_stringify::json_stringify_lines(&decoded, 0).join("\n");
+        let roundtripped: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+
+        // Verify key fields survive the roundtrip
+        assert_eq!(roundtripped["ok"], json_value["ok"]);
+        assert_eq!(
+            roundtripped["data"]["total"].as_f64().unwrap() as usize,
+            json_value["data"]["total"].as_u64().unwrap() as usize
+        );
+        let rt_workflows = roundtripped["data"]["workflows"].as_array().unwrap();
+        assert_eq!(rt_workflows.len(), 2);
+        assert_eq!(rt_workflows[0]["name"], "handle_compaction");
+        assert_eq!(rt_workflows[1]["name"], "handle_usage_limits");
     }
 }

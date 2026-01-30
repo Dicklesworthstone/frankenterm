@@ -1290,8 +1290,8 @@ impl Default for NotificationConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            cooldown_ms: 30_000,        // 30 seconds
-            dedup_window_ms: 300_000,    // 5 minutes
+            cooldown_ms: 30_000,      // 30 seconds
+            dedup_window_ms: 300_000, // 5 minutes
             include: Vec::new(),
             exclude: Vec::new(),
             min_severity: None,
@@ -3037,8 +3037,14 @@ agent_types = ["codex", "claude_code"]
         assert_eq!(config.notifications.dedup_window_ms, 60000);
         assert_eq!(config.notifications.include, vec!["*.error", "codex.*"]);
         assert_eq!(config.notifications.exclude, vec!["test.*"]);
-        assert_eq!(config.notifications.min_severity, Some("warning".to_string()));
-        assert_eq!(config.notifications.agent_types, vec!["codex", "claude_code"]);
+        assert_eq!(
+            config.notifications.min_severity,
+            Some("warning".to_string())
+        );
+        assert_eq!(
+            config.notifications.agent_types,
+            vec!["codex", "claude_code"]
+        );
     }
 
     #[test]
