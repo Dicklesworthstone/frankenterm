@@ -43,6 +43,17 @@ Rules:
   allowlisted).
 - No secrets in logs or artifacts.
 
+## Rotation Workflow (Operator)
+Recommended rotation steps (safe-by-default):
+1. Generate new token / certs offline.
+2. Update `distributed.token` and/or `distributed.tls.*` paths in `wa.toml`.
+3. Restart `wa` (distributed settings require restart today).
+4. Run `wa doctor` to confirm the effective distributed security status.
+
+Notes:
+- Do not log or paste secret material into logs or diagnostics.
+- Prefer path-based certs/keys; avoid inline PEM in config.
+
 ## Replay Protection & Session Semantics
 Define a session per connection:
 - **session_id** per connection

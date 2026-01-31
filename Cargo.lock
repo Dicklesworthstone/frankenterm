@@ -172,6 +172,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "asn1-rs"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "56624a96882bb8c26d61312ae18cb45868e5a9992ea73c58e45c3101e56a1e60"
+dependencies = [
+ "asn1-rs-derive",
+ "asn1-rs-impl",
+ "displaydoc",
+ "nom 7.1.3",
+ "num-traits",
+ "rusticata-macros",
+ "thiserror 2.0.18",
+ "time",
+]
+
+[[package]]
+name = "asn1-rs-derive"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3109e49b1e4909e9db6515a30c633684d68cdeaa252f215214cb4fa1a5bfee2c"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.114",
+ "synstructure",
+]
+
+[[package]]
+name = "asn1-rs-impl"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b18050c2cd6fe86c3a76584ef5e0baf286d038cda203eb6223df2cc413565f7"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.114",
+]
+
+[[package]]
 name = "assert_cmd"
 version = "2.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -189,6 +228,27 @@ dependencies = [
 [[package]]
 name = "asupersync"
 version = "0.1.0"
+dependencies = [
+ "bincode",
+ "crossbeam-queue",
+ "getrandom 0.2.17",
+ "libc",
+ "nix",
+ "parking_lot",
+ "pin-project",
+ "polling 2.8.0",
+ "rmp-serde",
+ "serde",
+ "serde_json",
+ "slab",
+ "socket2 0.6.1",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "asupersync"
+version = "0.1.0"
+source = "git+https://github.com/Dicklesworthstone/asupersync.git#cf434ce8777a37fefcdbd19e47bc31c102925f5f"
 dependencies = [
  "bincode",
  "crossbeam-queue",
@@ -1012,6 +1072,22 @@ checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 
 [[package]]
 name = "crossterm"
+version = "0.28.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "829d955a0bb380ef178a640b91779e3987da38c9aea133b20614cfed8cdea9c6"
+dependencies = [
+ "bitflags 2.10.0",
+ "crossterm_winapi",
+ "mio 1.1.1",
+ "parking_lot",
+ "rustix 0.38.44",
+ "signal-hook 0.3.18",
+ "signal-hook-mio",
+ "winapi",
+]
+
+[[package]]
+name = "crossterm"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8b9f2e4c67f833b660cdb0a3523065869fb35570177239812ed4c905aeff87b"
@@ -1147,10 +1223,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "data-encoding"
+version = "2.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7a1e2f27636f116493b8b860f5546edb47c8d8f8ea73e1d2a20be88e28d1fea"
+
+[[package]]
 name = "deltae"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5729f5117e208430e437df2f4843f5e5952997175992d1414f94c57d61e270b4"
+
+[[package]]
+name = "der-parser"
+version = "10.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07da5016415d5a3c4dd39b11ed26f915f52fc4e0dc197d87908bc916e51bc1a6"
+dependencies = [
+ "asn1-rs",
+ "displaydoc",
+ "nom 7.1.3",
+ "num-bigint",
+ "num-traits",
+ "rusticata-macros",
+]
 
 [[package]]
 name = "deranged"
@@ -1462,6 +1558,80 @@ dependencies = [
 ]
 
 [[package]]
+name = "fastapi"
+version = "0.1.0"
+dependencies = [
+ "fastapi-core",
+ "fastapi-http",
+ "fastapi-macros",
+ "fastapi-openapi",
+ "fastapi-output",
+ "fastapi-router",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "fastapi-core"
+version = "0.1.0"
+dependencies = [
+ "asupersync 0.1.0 (git+https://github.com/Dicklesworthstone/asupersync.git)",
+ "futures-executor",
+ "memchr",
+ "parking_lot",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "fastapi-http"
+version = "0.1.0"
+dependencies = [
+ "asupersync 0.1.0 (git+https://github.com/Dicklesworthstone/asupersync.git)",
+ "fastapi-core",
+]
+
+[[package]]
+name = "fastapi-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "regex",
+ "serde_json",
+ "syn 2.0.114",
+]
+
+[[package]]
+name = "fastapi-openapi"
+version = "0.1.0"
+dependencies = [
+ "fastapi-core",
+ "fastapi-router",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "fastapi-output"
+version = "0.1.0"
+dependencies = [
+ "crossterm 0.28.1",
+ "parking_lot",
+ "regex",
+ "rich_rust 0.1.1 (git+https://github.com/Dicklesworthstone/rich_rust.git)",
+ "unicode-width",
+]
+
+[[package]]
+name = "fastapi-router"
+version = "0.1.0"
+dependencies = [
+ "fastapi-core",
+ "serde_json",
+]
+
+[[package]]
 name = "faster-hex"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1475,7 +1645,7 @@ dependencies = [
 name = "fastmcp"
 version = "0.1.0"
 dependencies = [
- "asupersync",
+ "asupersync 0.1.0",
  "fastmcp-client",
  "fastmcp-core",
  "fastmcp-macros",
@@ -1490,7 +1660,7 @@ dependencies = [
 name = "fastmcp-client"
 version = "0.1.0"
 dependencies = [
- "asupersync",
+ "asupersync 0.1.0",
  "dirs",
  "fastmcp-core",
  "fastmcp-protocol",
@@ -1509,7 +1679,7 @@ dependencies = [
  "fastmcp-protocol",
  "log",
  "regex",
- "rich_rust",
+ "rich_rust 0.1.1",
  "serde",
  "serde_json",
  "strip-ansi-escapes",
@@ -1522,7 +1692,7 @@ dependencies = [
 name = "fastmcp-core"
 version = "0.1.0"
 dependencies = [
- "asupersync",
+ "asupersync 0.1.0",
  "log",
  "serde",
  "serde_json",
@@ -1550,7 +1720,7 @@ dependencies = [
 name = "fastmcp-server"
 version = "0.1.0"
 dependencies = [
- "asupersync",
+ "asupersync 0.1.0",
  "chrono",
  "fastmcp-client",
  "fastmcp-console",
@@ -1566,7 +1736,7 @@ dependencies = [
 name = "fastmcp-transport"
 version = "0.1.0"
 dependencies = [
- "asupersync",
+ "asupersync 0.1.0",
  "fastmcp-core",
  "fastmcp-protocol",
  "getrandom 0.3.4",
@@ -1779,6 +1949,17 @@ name = "futures-core"
 version = "0.3.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05f29059c0c2090612e8d742178b0580d2dc940c837851ad723096f87af6663e"
+
+[[package]]
+name = "futures-executor"
+version = "0.3.31"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e28d1d997f585e54aebc3f97d39e72338912123a67330d723fdbb564d646c9f"
+dependencies = [
+ "futures-core",
+ "futures-task",
+ "futures-util",
+]
 
 [[package]]
 name = "futures-io"
@@ -3734,6 +3915,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "oid-registry"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12f40cff3dde1b6087cc5d5f5d4d65712f34016a03ed60e9c08dcc392736b5b7"
+dependencies = [
+ "asn1-rs",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4439,7 +4629,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "577c9b9f652b4c121fb25c6a391dd06406d3b092ba68827e6d2f09550edc54b3"
 dependencies = [
  "cfg-if",
- "crossterm",
+ "crossterm 0.29.0",
  "instability",
  "ratatui-core",
 ]
@@ -4633,7 +4823,24 @@ name = "rich_rust"
 version = "0.1.1"
 dependencies = [
  "bitflags 2.10.0",
- "crossterm",
+ "crossterm 0.29.0",
+ "log",
+ "lru",
+ "num-rational",
+ "once_cell",
+ "regex",
+ "smallvec",
+ "time",
+ "unicode-width",
+]
+
+[[package]]
+name = "rich_rust"
+version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/rich_rust.git#232a35595682328d0c5d110d64fc5e93771d431e"
+dependencies = [
+ "bitflags 2.10.0",
+ "crossterm 0.29.0",
  "log",
  "lru",
  "num-rational",
@@ -4715,6 +4922,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
 dependencies = [
  "semver",
+]
+
+[[package]]
+name = "rusticata-macros"
+version = "4.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "faf0c4a6ece9950b9abdb62b1cfcf2a68b3b67a10ba445b3bb85be2a293d0632"
+dependencies = [
+ "nom 7.1.3",
 ]
 
 [[package]]
@@ -5995,16 +6211,18 @@ name = "wa-core"
 version = "0.1.0"
 dependencies = [
  "aho-corasick",
- "asupersync",
+ "asupersync 0.1.0",
  "base64",
  "bloomfilter",
  "chrono",
  "codec",
  "config",
  "criterion",
- "crossterm",
+ "crossterm 0.29.0",
  "dirs",
  "fancy-regex 0.14.0",
+ "fastapi",
+ "fastapi-core",
  "fastmcp",
  "fs2",
  "hex",
@@ -6029,6 +6247,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wezterm-term",
+ "x509-parser",
 ]
 
 [[package]]
@@ -6866,6 +7085,23 @@ name = "writeable"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9edde0db4769d2dc68579893f2306b26c6ecfbe0ef499b013d731b7b9247e0b9"
+
+[[package]]
+name = "x509-parser"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eb3e137310115a65136898d2079f003ce33331a6c4b0d51f1531d1be082b6425"
+dependencies = [
+ "asn1-rs",
+ "data-encoding",
+ "der-parser",
+ "lazy_static",
+ "nom 7.1.3",
+ "oid-registry",
+ "rusticata-macros",
+ "thiserror 2.0.18",
+ "time",
+]
 
 [[package]]
 name = "y4m"

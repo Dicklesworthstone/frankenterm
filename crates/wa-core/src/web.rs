@@ -4,8 +4,9 @@
 //! management for graceful shutdown.
 
 use crate::{Error, Result, VERSION};
-use fastapi::{ServerConfig, ServerError, TcpServer, get, prelude::*};
-use fastapi::core::{ControlFlow, Cx, Handler, Middleware, RequestContext, StartupOutcome};
+use fastapi::core::{ControlFlow, Cx, Handler, Middleware, StartupOutcome};
+use fastapi::prelude::{App, Method, Request, RequestContext, Response};
+use fastapi::{ServerConfig, ServerError, TcpServer};
 use serde::Serialize;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -129,27 +130,31 @@ impl Middleware for RequestSpanLogger {
     }
 }
 
+fn build_app() -> App {
+    App::builder()
+        .title("wa web")
+        .version(VERSION)
+        .middleware(RequestSpanLogger::default())
+        .route(
+            "/health",
+            Method::Get,
+            |_ctx: &RequestContext, _req: &mut Request| async { health_response() },
+        )
+        .build()
+}
+
 #[derive(Serialize)]
 struct HealthResponse {
     ok: bool,
     version: &'static str,
 }
 
-#[get("/health")]
-async fn health(_cx: &Cx) -> Json<HealthResponse> {
-    Json(HealthResponse {
+fn health_response() -> Response {
+    let payload = HealthResponse {
         ok: true,
         version: VERSION,
-    })
-}
-
-fn build_app() -> App {
-    App::builder()
-        .title("wa web")
-        .version(VERSION)
-        .middleware(RequestSpanLogger::default())
-        .route(health)
-        .build()
+    };
+    Response::json(&payload).unwrap_or_else(|_| Response::internal_error())
 }
 
 /// Start the web server and return a handle for shutdown.

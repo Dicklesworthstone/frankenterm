@@ -44,6 +44,18 @@ jobs:
       - name: Clippy (all features)
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+  generated-artifacts:
+    name: Generated Artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Regenerate docs/types and check drift
+        run: scripts/check_generated_artifacts.sh
+
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

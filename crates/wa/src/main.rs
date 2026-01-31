@@ -15314,7 +15314,7 @@ struct DiagnosticCheck {
     recommendation: Option<String>,
 }
 
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq)]
 enum DiagnosticStatus {
     Ok,
     Warning,
@@ -15406,6 +15406,86 @@ impl DiagnosticStatus {
             Self::Warning => "warning",
             Self::Error => "error",
         }
+    }
+}
+
+fn is_loopback_bind_addr(bind_addr: &str) -> bool {
+    if let Ok(addr) = bind_addr.parse::<std::net::SocketAddr>() {
+        return addr.ip().is_loopback();
+    }
+
+    let host = bind_addr.split(':').next().unwrap_or(bind_addr).trim();
+    host.eq_ignore_ascii_case("localhost") || host.starts_with("127.")
+}
+
+fn distributed_security_check(config: &wa_core::config::Config) -> DiagnosticCheck {
+    let dist = &config.distributed;
+    if !dist.enabled {
+        return DiagnosticCheck::ok_with_detail("distributed security", "disabled");
+    }
+
+    let auth_label = match dist.auth_mode {
+        wa_core::config::DistributedAuthMode::Token => "token",
+        wa_core::config::DistributedAuthMode::Mtls => "mtls",
+        wa_core::config::DistributedAuthMode::TokenAndMtls => "token+mtls",
+    };
+
+    let token_label = if dist.token.as_deref().unwrap_or("").trim().is_empty() {
+        "missing"
+    } else {
+        "set"
+    };
+    let tls_label = if dist.tls.enabled {
+        format!("on (min {})", dist.tls.min_tls_version)
+    } else {
+        "off".to_string()
+    };
+    let detail = format!(
+        "bind={}, auth={}, tls={}, token={}, allowlist={}",
+        dist.bind_addr,
+        auth_label,
+        tls_label,
+        token_label,
+        dist.allow_agent_ids.len()
+    );
+
+    let mut status = DiagnosticStatus::Ok;
+    let mut recommendation = if dist.auth_mode.requires_token() && token_label == "missing" {
+        status = DiagnosticStatus::Error;
+        Some("Set distributed.token".to_string())
+    } else {
+        None
+    };
+
+    if dist.allow_insecure {
+        if status != DiagnosticStatus::Error {
+            status = DiagnosticStatus::Warning;
+        }
+        recommendation
+            .get_or_insert_with(|| "Disable distributed.allow_insecure or enable TLS".to_string());
+    }
+
+    if dist.require_tls_for_non_loopback
+        && !is_loopback_bind_addr(&dist.bind_addr)
+        && !dist.tls.enabled
+        && !dist.allow_insecure
+    {
+        status = DiagnosticStatus::Error;
+        recommendation = Some("Enable distributed.tls or bind to loopback".to_string());
+    }
+
+    match status {
+        DiagnosticStatus::Ok => DiagnosticCheck::ok_with_detail("distributed security", detail),
+        DiagnosticStatus::Warning => DiagnosticCheck::warning(
+            "distributed security",
+            detail,
+            recommendation.unwrap_or_else(|| "Review distributed config".to_string()),
+        ),
+        DiagnosticStatus::Error => DiagnosticCheck::error(
+            "distributed security",
+            detail,
+            recommendation.unwrap_or_else(|| "Fix distributed configuration".to_string()),
+        ),
     }
 }
 
@@ -15613,6 +15693,7 @@ fn run_diagnostics(
         format!("log_level={}", config.general.log_level)
     };
     checks.push(DiagnosticCheck::ok_with_detail("config", config_source));
+    checks.push(distributed_security_check(config));
 
     // Check 2: WezTerm CLI available
     #[cfg(feature = "vendored")]
@@ -18978,5 +19059,35 @@ mod tests {
             commit_validation_message(CommitValidationError::Expired, "plan:deadbeef");
         assert!(message.contains("E_PLAN_EXPIRED"));
         assert!(hint.unwrap().contains("Re-run `wa prepare"));
+    }
+
+    #[test]
+    fn distributed_security_check_disabled_is_ok() {
+        let config = wa_core::config::Config::default();
+        let check = distributed_security_check(&config);
+        assert_eq!(check.name, "distributed security");
+        assert_eq!(check.status, DiagnosticStatus::Ok);
+    }
+
+    #[test]
+    fn distributed_security_check_warns_on_allow_insecure() {
+        let mut config = wa_core::config::Config::default();
+        config.distributed.enabled = true;
+        config.distributed.bind_addr = "0.0.0.0:4141".to_string();
+        config.distributed.allow_insecure = true;
+        config.distributed.token = Some("token".to_string());
+        let check = distributed_security_check(&config);
+        assert_eq!(check.status, DiagnosticStatus::Warning);
+    }
+
+    #[test]
+    fn distributed_security_check_errors_on_missing_token() {
+        let mut config = wa_core::config::Config::default();
+        config.distributed.enabled = true;
+        config.distributed.bind_addr = "127.0.0.1:4141".to_string();
+        config.distributed.auth_mode = wa_core::config::DistributedAuthMode::Token;
+        config.distributed.token = None;
+        let check = distributed_security_check(&config);
+        assert_eq!(check.status, DiagnosticStatus::Error);
     }
 }

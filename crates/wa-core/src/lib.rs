@@ -100,7 +100,6 @@ pub mod browser;
 pub mod tui;
 
 #[cfg(feature = "web")]
-#[path = "web/mod.rs"]
 pub mod web;
 
 #[cfg(feature = "distributed")]
