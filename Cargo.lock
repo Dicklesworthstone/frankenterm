@@ -246,27 +246,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "asupersync"
-version = "0.1.0"
-source = "git+https://github.com/Dicklesworthstone/asupersync.git#cf434ce8777a37fefcdbd19e47bc31c102925f5f"
-dependencies = [
- "bincode",
- "crossbeam-queue",
- "getrandom 0.2.17",
- "libc",
- "nix",
- "parking_lot",
- "pin-project",
- "polling 2.8.0",
- "rmp-serde",
- "serde",
- "serde_json",
- "slab",
- "socket2 0.6.1",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "async-channel"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1575,7 +1554,7 @@ dependencies = [
 name = "fastapi-core"
 version = "0.1.0"
 dependencies = [
- "asupersync 0.1.0 (git+https://github.com/Dicklesworthstone/asupersync.git)",
+ "asupersync",
  "futures-executor",
  "memchr",
  "parking_lot",
@@ -1587,7 +1566,7 @@ dependencies = [
 name = "fastapi-http"
 version = "0.1.0"
 dependencies = [
- "asupersync 0.1.0 (git+https://github.com/Dicklesworthstone/asupersync.git)",
+ "asupersync",
  "fastapi-core",
 ]
 
@@ -1645,7 +1624,7 @@ dependencies = [
 name = "fastmcp"
 version = "0.1.0"
 dependencies = [
- "asupersync 0.1.0",
+ "asupersync",
  "fastmcp-client",
  "fastmcp-core",
  "fastmcp-macros",
@@ -1660,7 +1639,7 @@ dependencies = [
 name = "fastmcp-client"
 version = "0.1.0"
 dependencies = [
- "asupersync 0.1.0",
+ "asupersync",
  "dirs",
  "fastmcp-core",
  "fastmcp-protocol",
@@ -1692,7 +1671,7 @@ dependencies = [
 name = "fastmcp-core"
 version = "0.1.0"
 dependencies = [
- "asupersync 0.1.0",
+ "asupersync",
  "log",
  "serde",
  "serde_json",
@@ -1720,7 +1699,7 @@ dependencies = [
 name = "fastmcp-server"
 version = "0.1.0"
 dependencies = [
- "asupersync 0.1.0",
+ "asupersync",
  "chrono",
  "fastmcp-client",
  "fastmcp-console",
@@ -1736,7 +1715,7 @@ dependencies = [
 name = "fastmcp-transport"
 version = "0.1.0"
 dependencies = [
- "asupersync 0.1.0",
+ "asupersync",
  "fastmcp-core",
  "fastmcp-protocol",
  "getrandom 0.3.4",
@@ -6211,7 +6190,7 @@ name = "wa-core"
 version = "0.1.0"
 dependencies = [
  "aho-corasick",
- "asupersync 0.1.0",
+ "asupersync",
  "base64",
  "bloomfilter",
  "chrono",

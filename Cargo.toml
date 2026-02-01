@@ -237,3 +237,6 @@ lto = true          # Link-time optimization
 codegen-units = 1   # Single codegen unit for better optimization
 panic = "abort"     # Smaller binary, no unwinding overhead
 strip = true        # Remove debug symbols
+
+[patch."https://github.com/Dicklesworthstone/asupersync.git"]
+asupersync = { path = "../asupersync" }

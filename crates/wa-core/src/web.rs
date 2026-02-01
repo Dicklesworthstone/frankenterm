@@ -9,9 +9,9 @@ use fastapi::core::{ControlFlow, Cx, Handler, Middleware, StartupOutcome};
 use fastapi::prelude::{App, Method, Request, RequestContext, Response};
 use fastapi::{ServerConfig, ServerError, TcpServer};
 use serde::Serialize;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 const DEFAULT_HOST: &str = "127.0.0.1";
@@ -78,6 +78,7 @@ impl WebServerHandle {
     /// Trigger graceful shutdown and wait for completion.
     pub async fn shutdown(self) -> Result<()> {
         self.server.shutdown();
+        poke_listener(self.bound_addr);
         handle_server_exit(self.join.await, &self.server, &self.app).await
     }
 }
@@ -174,7 +175,9 @@ pub async fn start_web_server(config: WebServerConfig) -> Result<WebServerHandle
 
     let app = Arc::new(app);
     let bind_addr = config.bind_addr();
-    let listener = TcpListener::bind(&bind_addr).await.map_err(Error::Io)?;
+    let listener = TcpListener::bind(bind_addr.clone())
+        .await
+        .map_err(Error::Io)?;
     let local_addr = listener.local_addr().map_err(Error::Io)?;
 
     let server = Arc::new(TcpServer::new(ServerConfig::new(bind_addr)));
@@ -220,6 +223,7 @@ pub async fn run_web_server(config: WebServerConfig) -> Result<()> {
         shutdown = wait_for_shutdown_signal() => {
             shutdown?;
             server.shutdown();
+            poke_listener(bound_addr);
             handle_server_exit(join.await, &server, &app).await?;
         }
     }
@@ -272,4 +276,8 @@ async fn handle_server_exit(
     }
     app.run_shutdown_hooks().await;
     Ok(())
+}
+
+fn poke_listener(addr: SocketAddr) {
+    let _ = TcpStream::connect_timeout(&addr, Duration::from_millis(200));
 }
