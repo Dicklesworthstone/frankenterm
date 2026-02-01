@@ -1095,9 +1095,13 @@ fn detection_to_stored_event(
         id: 0, // Will be assigned by storage
         pane_id,
         rule_id: detection.rule_id.clone(),
-        agent_type: format!("{:?}", detection.agent_type),
+        agent_type: detection.agent_type.to_string(),
         event_type: detection.event_type.clone(),
-        severity: format!("{:?}", detection.severity),
+        severity: match detection.severity {
+            crate::patterns::Severity::Info => "info".to_string(),
+            crate::patterns::Severity::Warning => "warning".to_string(),
+            crate::patterns::Severity::Critical => "critical".to_string(),
+        },
         confidence: detection.confidence,
         extracted: Some(detection.extracted.clone()),
         matched_text: Some(detection.matched_text.clone()),

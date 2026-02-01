@@ -33,6 +33,7 @@ toml.workspace = true
 toml_edit.workspace = true
 toon_rust.workspace = true
 rusqlite.workspace = true
+reqwest.workspace = true
 dirs = "6.0.0"
 fastmcp = { workspace = true, optional = true }
 

@@ -9,9 +9,11 @@ use std::pin::Pin;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use crate::event_templates::RenderedEvent;
+use crate::event_templates::{RenderedEvent, render_event};
+use crate::events::{NotificationGate, NotifyDecision};
 use crate::patterns::Detection;
 use crate::policy::Redactor;
+use crate::storage::StoredEvent;
 
 /// Unified notification payload for all senders.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,10 +209,110 @@ where
     }
 }
 
+/// Outcome of attempting to notify about a detection.
+#[derive(Debug, Clone)]
+pub struct NotificationOutcome {
+    /// Gate decision (send / filtered / deduped / throttled).
+    pub decision: NotifyDecision,
+    /// Delivery results per sender (empty if not sent).
+    pub deliveries: Vec<NotificationDelivery>,
+}
+
+/// Notification pipeline that gates and fans out deliveries.
+pub struct NotificationPipeline {
+    gate: NotificationGate,
+    senders: Vec<Box<dyn NotificationSender>>,
+}
+
+impl NotificationPipeline {
+    /// Create a pipeline with a gate and sender list.
+    #[must_use]
+    pub fn new(gate: NotificationGate, senders: Vec<Box<dyn NotificationSender>>) -> Self {
+        Self { gate, senders }
+    }
+
+    /// Number of active senders in this pipeline.
+    #[must_use]
+    pub fn sender_count(&self) -> usize {
+        self.senders.len()
+    }
+
+    /// Gate and dispatch a detection event.
+    pub async fn handle_detection(
+        &mut self,
+        detection: &Detection,
+        pane_id: u64,
+        event_id: Option<i64>,
+    ) -> NotificationOutcome {
+        let decision = self.gate.should_notify(detection, pane_id);
+        match decision {
+            NotifyDecision::Send {
+                suppressed_since_last,
+            } => {
+                let rendered = render_detection(detection, pane_id, event_id);
+                let payload = NotificationPayload::from_detection(
+                    detection,
+                    pane_id,
+                    &rendered,
+                    suppressed_since_last,
+                );
+                let deliveries = self.dispatch_payload(&payload).await;
+                NotificationOutcome {
+                    decision,
+                    deliveries,
+                }
+            }
+            _ => NotificationOutcome {
+                decision,
+                deliveries: Vec::new(),
+            },
+        }
+    }
+
+    async fn dispatch_payload(&self, payload: &NotificationPayload) -> Vec<NotificationDelivery> {
+        let mut deliveries = Vec::with_capacity(self.senders.len());
+        for sender in &self.senders {
+            deliveries.push(sender.send(payload).await);
+        }
+        deliveries
+    }
+}
+
+fn render_detection(detection: &Detection, pane_id: u64, event_id: Option<i64>) -> RenderedEvent {
+    let event = StoredEvent {
+        id: event_id.unwrap_or(0),
+        pane_id,
+        rule_id: detection.rule_id.clone(),
+        agent_type: detection.agent_type.to_string(),
+        event_type: detection.event_type.clone(),
+        severity: severity_str(detection),
+        confidence: detection.confidence,
+        extracted: Some(detection.extracted.clone()),
+        matched_text: Some(detection.matched_text.clone()),
+        segment_id: None,
+        detected_at: now_epoch_ms(),
+        handled_at: None,
+        handled_by_workflow_id: None,
+        handled_status: None,
+    };
+
+    render_event(&event)
+}
+
+fn now_epoch_ms() -> i64 {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    i64::try_from(ts.as_millis()).unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::{EventFilter, NotificationGate};
     use crate::patterns::{AgentType, Severity};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     fn test_detection() -> Detection {
         Detection {
@@ -250,5 +352,98 @@ mod tests {
         assert!(!payload.description.contains("sk-abc"));
         assert!(payload.quick_fix.is_some());
         assert!(!payload.quick_fix.unwrap().contains("sk-abc"));
+    }
+
+    #[derive(Clone)]
+    struct MockSender {
+        name: &'static str,
+        sent: Arc<Mutex<Vec<NotificationPayload>>>,
+    }
+
+    impl MockSender {
+        fn new(name: &'static str, sent: Arc<Mutex<Vec<NotificationPayload>>>) -> Self {
+            Self { name, sent }
+        }
+    }
+
+    impl NotificationSender for MockSender {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn send<'a>(&'a self, payload: &'a NotificationPayload) -> NotificationFuture<'a> {
+            let sent = Arc::clone(&self.sent);
+            let payload = payload.clone();
+            Box::pin(async move {
+                let mut guard = sent.lock().unwrap_or_else(|e| e.into_inner());
+                guard.push(payload);
+                NotificationDelivery {
+                    sender: "mock".to_string(),
+                    success: true,
+                    rate_limited: false,
+                    error: None,
+                    records: Vec::new(),
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn pipeline_sends_when_gate_allows() {
+        let filter = EventFilter::allow_all();
+        let gate =
+            NotificationGate::from_config(filter, Duration::from_secs(60), Duration::from_secs(60));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sender = MockSender::new("mock", Arc::clone(&sent));
+        let mut pipeline = NotificationPipeline::new(gate, vec![Box::new(sender)]);
+
+        let outcome = pipeline
+            .handle_detection(&test_detection(), 7, Some(42))
+            .await;
+
+        assert!(matches!(outcome.decision, NotifyDecision::Send { .. }));
+        assert_eq!(outcome.deliveries.len(), 1);
+        assert_eq!(sent.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pipeline_filters_events() {
+        let include: Vec<String> = Vec::new();
+        let exclude = vec!["core.*".to_string()];
+        let agent_types: Vec<String> = Vec::new();
+        let filter = EventFilter::from_config(&include, &exclude, None, &agent_types);
+        let gate =
+            NotificationGate::from_config(filter, Duration::from_secs(60), Duration::from_secs(60));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sender = MockSender::new("mock", Arc::clone(&sent));
+        let mut pipeline = NotificationPipeline::new(gate, vec![Box::new(sender)]);
+
+        let outcome = pipeline.handle_detection(&test_detection(), 7, None).await;
+
+        assert!(matches!(outcome.decision, NotifyDecision::Filtered));
+        assert!(outcome.deliveries.is_empty());
+        assert!(sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pipeline_deduplicates_repeated_events() {
+        let filter = EventFilter::allow_all();
+        let gate = NotificationGate::from_config(
+            filter,
+            Duration::from_secs(300),
+            Duration::from_secs(60),
+        );
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sender = MockSender::new("mock", Arc::clone(&sent));
+        let mut pipeline = NotificationPipeline::new(gate, vec![Box::new(sender)]);
+
+        let _ = pipeline.handle_detection(&test_detection(), 7, None).await;
+        let outcome = pipeline.handle_detection(&test_detection(), 7, None).await;
+
+        assert!(matches!(
+            outcome.decision,
+            NotifyDecision::Deduplicated { .. }
+        ));
+        assert_eq!(sent.lock().unwrap().len(), 1);
     }
 }

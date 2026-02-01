@@ -4685,6 +4685,56 @@ fn validate_uservar_request(pane_id: u64, name: &str, value: &str) -> Result<(),
     Ok(())
 }
 
+struct ReqwestWebhookTransport {
+    client: reqwest::Client,
+}
+
+impl ReqwestWebhookTransport {
+    fn new() -> Self {
+        Self {
+            client: reqwest::Client::new(),
+        }
+    }
+}
+
+impl wa_core::webhook::WebhookTransport for ReqwestWebhookTransport {
+    fn send<'a>(
+        &'a self,
+        url: &'a str,
+        headers: &'a std::collections::HashMap<String, String>,
+        body: &'a serde_json::Value,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = wa_core::webhook::DeliveryResult> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let mut req = self.client.post(url).json(body);
+            for (key, value) in headers {
+                req = req.header(key, value);
+            }
+
+            match req.send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        wa_core::webhook::DeliveryResult::ok(status.as_u16())
+                    } else {
+                        let body = resp.text().await.unwrap_or_default();
+                        let message = if body.trim().is_empty() {
+                            format!("http {}", status.as_u16())
+                        } else {
+                            format!("http {}: {}", status.as_u16(), body.trim())
+                        };
+                        wa_core::webhook::DeliveryResult::err(status.as_u16(), message)
+                    }
+                }
+                Err(err) => {
+                    wa_core::webhook::DeliveryResult::err(0, format!("request_failed: {err}"))
+                }
+            }
+        })
+    }
+}
+
 /// Run the observation watcher daemon.
 #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 async fn run_watcher(
@@ -4699,12 +4749,14 @@ async fn run_watcher(
 ) -> anyhow::Result<()> {
     use std::time::Duration;
     use wa_core::config::{Config, ConfigOverrides, HotReloadableConfig};
-    use wa_core::events::EventBus;
+    use wa_core::events::{Event, EventBus, NotifyDecision};
     use wa_core::lock::WatcherLock;
+    use wa_core::notifications::NotificationPipeline;
     use wa_core::patterns::PatternEngine;
     use wa_core::policy::{PolicyEngine, PolicyGatedInjector};
     use wa_core::runtime::{ObservationRuntime, RuntimeConfig};
     use wa_core::storage::StorageHandle;
+    use wa_core::webhook::WebhookDispatcher;
     use wa_core::workflows::{
         HandleCompaction, PaneWorkflowLockManager, WorkflowEngine, WorkflowRunner,
         WorkflowRunnerConfig,
@@ -4776,6 +4828,136 @@ async fn run_watcher(
 
     // Create event bus for publishing detections to workflow runners
     let event_bus = Arc::new(EventBus::new(1000));
+
+    let _notification_handle = if config.notifications.enabled {
+        let mut senders: Vec<Box<dyn wa_core::notifications::NotificationSender>> = Vec::new();
+
+        if !config.notifications.webhooks.is_empty() {
+            let dispatcher = WebhookDispatcher::new(
+                config.notifications.webhooks.clone(),
+                Box::new(ReqwestWebhookTransport::new()),
+            );
+            if dispatcher.active_endpoint_count() > 0 {
+                tracing::info!(
+                    count = dispatcher.active_endpoint_count(),
+                    "Webhook notifications enabled"
+                );
+                senders.push(Box::new(dispatcher));
+            } else {
+                tracing::info!("Webhook notifications configured but no endpoints are enabled");
+            }
+        }
+
+        let desktop_notifier =
+            wa_core::desktop_notify::DesktopNotifier::new(config.notifications.desktop.clone());
+        if desktop_notifier.is_available() {
+            tracing::info!("Desktop notifications enabled");
+            senders.push(Box::new(desktop_notifier));
+        } else if config.notifications.desktop.enabled {
+            tracing::info!("Desktop notifications enabled but no backend is available");
+        }
+
+        if senders.is_empty() {
+            tracing::info!("Notification pipeline disabled (no active senders)");
+            None
+        } else {
+            let mut pipeline =
+                NotificationPipeline::new(config.notifications.to_notification_gate(), senders);
+            let mut subscriber = event_bus.subscribe_detections();
+            let handle = tokio::spawn(async move {
+                tracing::info!("Notification pipeline started, listening for detection events");
+                loop {
+                    match subscriber.recv().await {
+                        Ok(Event::PatternDetected {
+                            pane_id,
+                            detection,
+                            event_id,
+                        }) => {
+                            let outcome = pipeline
+                                .handle_detection(&detection, pane_id, event_id)
+                                .await;
+                            match &outcome.decision {
+                                NotifyDecision::Send {
+                                    suppressed_since_last,
+                                } => {
+                                    if outcome.deliveries.is_empty() {
+                                        tracing::warn!(
+                                            pane_id,
+                                            rule_id = %detection.rule_id,
+                                            "Notification send requested but no deliveries occurred"
+                                        );
+                                    } else {
+                                        for delivery in &outcome.deliveries {
+                                            if delivery.success {
+                                                tracing::info!(
+                                                    pane_id,
+                                                    rule_id = %detection.rule_id,
+                                                    sender = %delivery.sender,
+                                                    suppressed_since_last,
+                                                    "Notification delivered"
+                                                );
+                                            } else if delivery.rate_limited {
+                                                tracing::debug!(
+                                                    pane_id,
+                                                    rule_id = %detection.rule_id,
+                                                    sender = %delivery.sender,
+                                                    "Notification rate limited"
+                                                );
+                                            } else {
+                                                tracing::warn!(
+                                                    pane_id,
+                                                    rule_id = %detection.rule_id,
+                                                    sender = %delivery.sender,
+                                                    error = ?delivery.error,
+                                                    "Notification delivery failed"
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                NotifyDecision::Filtered => {
+                                    tracing::debug!(
+                                        pane_id,
+                                        rule_id = %detection.rule_id,
+                                        "Notification filtered"
+                                    );
+                                }
+                                NotifyDecision::Deduplicated { suppressed_count } => {
+                                    tracing::debug!(
+                                        pane_id,
+                                        rule_id = %detection.rule_id,
+                                        suppressed = suppressed_count,
+                                        "Notification deduplicated"
+                                    );
+                                }
+                                NotifyDecision::Throttled { total_suppressed } => {
+                                    tracing::debug!(
+                                        pane_id,
+                                        rule_id = %detection.rule_id,
+                                        suppressed = total_suppressed,
+                                        "Notification throttled"
+                                    );
+                                }
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(wa_core::events::RecvError::Lagged { missed_count }) => {
+                            tracing::warn!(missed = missed_count, "Notification subscriber lagged");
+                        }
+                        Err(wa_core::events::RecvError::Closed) => {
+                            break;
+                        }
+                    }
+                }
+                tracing::info!("Notification pipeline stopped");
+            });
+
+            Some(handle)
+        }
+    } else {
+        tracing::info!("Notification pipeline disabled by config");
+        None
+    };
 
     // Set up workflow runner if auto_handle is enabled
     let _workflow_runner_handle = if auto_handle {
