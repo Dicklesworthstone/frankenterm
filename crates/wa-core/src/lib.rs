@@ -69,6 +69,7 @@ pub mod lock;
 pub mod logging;
 #[cfg(feature = "mcp")]
 pub mod mcp;
+pub mod notifications;
 pub mod output;
 pub mod patterns;
 pub mod plan;

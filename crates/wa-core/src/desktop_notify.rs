@@ -14,6 +14,9 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 
 use crate::event_templates::RenderedEvent;
+use crate::notifications::{
+    NotificationDelivery, NotificationFuture, NotificationPayload, NotificationSender,
+};
 use crate::patterns::Detection;
 
 // ============================================================================
@@ -46,6 +49,14 @@ pub fn severity_to_urgency(severity: crate::patterns::Severity) -> Urgency {
         crate::patterns::Severity::Info => Urgency::Low,
         crate::patterns::Severity::Warning => Urgency::Normal,
         crate::patterns::Severity::Critical => Urgency::Critical,
+    }
+}
+
+fn urgency_from_str(severity: &str) -> Urgency {
+    match severity {
+        "critical" => Urgency::Critical,
+        "warning" => Urgency::Normal,
+        _ => Urgency::Low,
     }
 }
 
@@ -287,17 +298,21 @@ impl DesktopNotifier {
             };
         }
 
+        let payload = NotificationPayload::from_detection(
+            detection,
+            pane_id,
+            rendered,
+            suppressed_since_last,
+        );
         let urgency = severity_to_urgency(detection.severity);
 
-        let title = format!("wa: {}", rendered.summary);
+        let title = format!("wa: {}", payload.summary);
         let mut body = format!(
             "[{}] {} (pane {})",
-            detection.severity_str(),
-            detection.rule_id,
-            pane_id
+            payload.severity, payload.event_type, payload.pane_id
         );
-        if suppressed_since_last > 0 {
-            body.push_str(&format!(" (+{suppressed_since_last} suppressed)"));
+        if payload.suppressed_since_last > 0 {
+            body.push_str(&format!(" (+{} suppressed)", payload.suppressed_since_last));
         }
 
         let Some(cmd) = build_command(self.backend, &title, &body, urgency, self.config.sound)
@@ -419,18 +434,89 @@ impl DesktopNotifier {
     }
 }
 
-/// Helper: severity as a display string.
-trait SeverityStr {
-    fn severity_str(&self) -> &str;
-}
+impl NotificationSender for DesktopNotifier {
+    fn name(&self) -> &'static str {
+        "desktop"
+    }
 
-impl SeverityStr for Detection {
-    fn severity_str(&self) -> &str {
-        match self.severity {
-            crate::patterns::Severity::Info => "info",
-            crate::patterns::Severity::Warning => "warning",
-            crate::patterns::Severity::Critical => "critical",
-        }
+    fn send<'a>(&'a self, payload: &'a NotificationPayload) -> NotificationFuture<'a> {
+        Box::pin(async move {
+            if !self.config.enabled {
+                return NotificationDelivery {
+                    sender: self.name().to_string(),
+                    success: false,
+                    rate_limited: false,
+                    error: Some("desktop notifications disabled".to_string()),
+                    records: Vec::new(),
+                };
+            }
+
+            let urgency = urgency_from_str(&payload.severity);
+            let title = format!("wa: {}", payload.summary);
+            let mut body = format!(
+                "[{}] {} (pane {})",
+                payload.severity, payload.event_type, payload.pane_id
+            );
+            if payload.suppressed_since_last > 0 {
+                body.push_str(&format!(" (+{} suppressed)", payload.suppressed_since_last));
+            }
+
+            let Some(cmd) = build_command(self.backend, &title, &body, urgency, self.config.sound)
+            else {
+                return NotificationDelivery {
+                    sender: self.name().to_string(),
+                    success: false,
+                    rate_limited: false,
+                    error: Some("no notification backend available".to_string()),
+                    records: Vec::new(),
+                };
+            };
+
+            tracing::debug!(
+                backend = %self.backend,
+                program = %cmd.program,
+                "sending desktop notification"
+            );
+
+            let result = match Command::new(&cmd.program).args(&cmd.args).output() {
+                Ok(output) if output.status.success() => NotificationDelivery {
+                    sender: self.name().to_string(),
+                    success: true,
+                    rate_limited: false,
+                    error: None,
+                    records: Vec::new(),
+                },
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    NotificationDelivery {
+                        sender: self.name().to_string(),
+                        success: false,
+                        rate_limited: false,
+                        error: Some(format!(
+                            "exit {}: {}",
+                            output.status.code().unwrap_or(-1),
+                            stderr.trim()
+                        )),
+                        records: Vec::new(),
+                    }
+                }
+                Err(e) => NotificationDelivery {
+                    sender: self.name().to_string(),
+                    success: false,
+                    rate_limited: false,
+                    error: Some(format!("command not found: {e}")),
+                    records: Vec::new(),
+                },
+            };
+
+            if result.success {
+                tracing::info!(backend = %self.backend, "desktop notification sent");
+            } else if let Some(ref err) = result.error {
+                tracing::warn!(backend = %self.backend, error = %err, "desktop notification failed");
+            }
+
+            result
+        })
     }
 }
 

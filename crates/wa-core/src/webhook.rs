@@ -28,6 +28,10 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::event_templates::RenderedEvent;
+use crate::notifications::{
+    NotificationDelivery, NotificationDeliveryRecord, NotificationFuture, NotificationPayload,
+    NotificationSender,
+};
 use crate::patterns::Detection;
 
 // ============================================================================
@@ -107,63 +111,25 @@ impl WebhookEndpointConfig {
             .iter()
             .any(|pat| crate::events::match_rule_glob(pat, &detection.rule_id))
     }
+
+    /// Check if this endpoint is interested in an event type (rule_id).
+    #[must_use]
+    pub fn matches_event_type(&self, event_type: &str) -> bool {
+        if self.events.is_empty() {
+            return true;
+        }
+        self.events
+            .iter()
+            .any(|pat| crate::events::match_rule_glob(pat, event_type))
+    }
 }
 
 // ============================================================================
 // Webhook payloads
 // ============================================================================
 
-/// Generic webhook payload sent via HTTP POST.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WebhookPayload {
-    /// Event type (rule_id).
-    pub event_type: String,
-    /// Pane where the event was detected.
-    pub pane_id: u64,
-    /// ISO 8601 timestamp.
-    pub timestamp: String,
-    /// Human-readable summary.
-    pub summary: String,
-    /// Longer description with context.
-    pub description: String,
-    /// Severity level.
-    pub severity: String,
-    /// Agent type.
-    pub agent_type: String,
-    /// Confidence score (0.0-1.0).
-    pub confidence: f64,
-    /// Suggested quick-fix command (if any).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub quick_fix: Option<String>,
-    /// Number of similar events suppressed since the last notification.
-    pub suppressed_since_last: u64,
-}
-
-impl WebhookPayload {
-    /// Build a generic payload from a detection and rendered event.
-    #[must_use]
-    pub fn from_detection(
-        detection: &Detection,
-        pane_id: u64,
-        rendered: &RenderedEvent,
-        suppressed_since_last: u64,
-    ) -> Self {
-        let quick_fix = rendered.suggestions.first().and_then(|s| s.command.clone());
-
-        Self {
-            event_type: detection.rule_id.clone(),
-            pane_id,
-            timestamp: now_iso8601(),
-            summary: rendered.summary.clone(),
-            description: rendered.description.clone(),
-            severity: format!("{:?}", detection.severity).to_lowercase(),
-            agent_type: detection.agent_type.to_string(),
-            confidence: detection.confidence,
-            quick_fix,
-            suppressed_since_last,
-        }
-    }
-}
+/// Webhook payload type (shared with other notification senders).
+pub type WebhookPayload = NotificationPayload;
 
 /// Render a payload into the format expected by the target platform.
 #[must_use]
@@ -345,17 +311,7 @@ pub struct WebhookDispatcher {
 }
 
 /// Record of a single delivery attempt for observability.
-#[derive(Debug, Clone, Serialize)]
-pub struct DeliveryRecord {
-    /// Endpoint name.
-    pub endpoint: String,
-    /// Whether the delivery was accepted.
-    pub accepted: bool,
-    /// HTTP status code.
-    pub status_code: u16,
-    /// Error message (if any).
-    pub error: Option<String>,
-}
+pub type DeliveryRecord = NotificationDeliveryRecord;
 
 impl WebhookDispatcher {
     /// Create a new dispatcher with the given endpoints and transport.
@@ -382,7 +338,11 @@ impl WebhookDispatcher {
     ) -> Vec<DeliveryRecord> {
         let payload =
             WebhookPayload::from_detection(detection, pane_id, rendered, suppressed_since_last);
+        self.dispatch_payload(&payload).await
+    }
 
+    /// Dispatch a pre-built payload to all matching endpoints.
+    pub async fn dispatch_payload(&self, payload: &NotificationPayload) -> Vec<DeliveryRecord> {
         let mut records = Vec::new();
 
         for endpoint in &self.endpoints {
@@ -390,17 +350,17 @@ impl WebhookDispatcher {
                 continue;
             }
 
-            if !endpoint.matches_detection(detection) {
+            if !endpoint.matches_event_type(&payload.event_type) {
                 continue;
             }
 
-            let body = render_template(endpoint.template, &payload);
+            let body = render_template(endpoint.template, payload);
 
             tracing::debug!(
                 endpoint = %endpoint.name,
                 url = %endpoint.url,
                 template = %endpoint.template,
-                rule_id = %detection.rule_id,
+                rule_id = %payload.event_type,
                 "dispatching webhook"
             );
 
@@ -425,7 +385,7 @@ impl WebhookDispatcher {
             }
 
             records.push(DeliveryRecord {
-                endpoint: endpoint.name.clone(),
+                target: endpoint.name.clone(),
                 accepted: result.accepted,
                 status_code: result.status_code,
                 error: result.error,
@@ -448,20 +408,33 @@ impl WebhookDispatcher {
     }
 }
 
+impl NotificationSender for WebhookDispatcher {
+    fn name(&self) -> &'static str {
+        "webhook"
+    }
+
+    fn send<'a>(&'a self, payload: &'a NotificationPayload) -> NotificationFuture<'a> {
+        Box::pin(async move {
+            let records = self.dispatch_payload(payload).await;
+            let success = records.iter().all(|r| r.accepted);
+            NotificationDelivery {
+                sender: self.name().to_string(),
+                success,
+                rate_limited: false,
+                error: if success {
+                    None
+                } else {
+                    Some("one_or_more_deliveries_failed".to_string())
+                },
+                records,
+            }
+        })
+    }
+}
+
 // ============================================================================
 // Helpers
 // ============================================================================
-
-fn now_iso8601() -> String {
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    // Simple ISO 8601 without chrono dependency
-    chrono::DateTime::from_timestamp(ts as i64, 0)
-        .map(|dt| dt.to_rfc3339())
-        .unwrap_or_else(|| format!("{ts}"))
-}
 
 // ============================================================================
 // Tests
@@ -1063,7 +1036,7 @@ url = "http://localhost:8080/hook"
             .await;
 
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].endpoint, "codex-hook");
+        assert_eq!(records[0].target, "codex-hook");
         assert_eq!(transport.requests().len(), 1);
     }
 
