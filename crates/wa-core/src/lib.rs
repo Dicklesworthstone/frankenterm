@@ -94,6 +94,9 @@ pub mod vendored;
 #[cfg(feature = "vendored")]
 pub mod wezterm_native;
 
+#[cfg(feature = "native-wezterm")]
+pub mod native_events;
+
 #[cfg(feature = "browser")]
 pub mod browser;
 

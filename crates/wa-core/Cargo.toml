@@ -108,6 +108,7 @@ mcp = ["mcp-server"]
 web = ["dep:fastapi", "dep:fastapi-core", "dep:asupersync"]
 tui = ["dep:ratatui", "dep:crossterm"]
 metrics = []
+native-wezterm = []
 distributed = [
     "dep:rustls",
     "dep:tokio-rustls",
