@@ -171,6 +171,16 @@ impl RuntimeMetrics {
         }
     }
 
+    /// Get total ingest lag sample count.
+    pub fn ingest_lag_count(&self) -> u64 {
+        self.ingest_lag_count.load(Ordering::SeqCst)
+    }
+
+    /// Get total ingest lag sum in milliseconds.
+    pub fn ingest_lag_sum_ms(&self) -> u64 {
+        self.ingest_lag_sum_ms.load(Ordering::SeqCst)
+    }
+
     /// Get maximum ingest lag in milliseconds.
     pub fn max_ingest_lag_ms(&self) -> u64 {
         self.ingest_lag_max_ms.load(Ordering::SeqCst)
@@ -180,6 +190,16 @@ impl RuntimeMetrics {
     pub fn last_db_write(&self) -> Option<u64> {
         let ts = self.last_db_write_at.load(Ordering::SeqCst);
         if ts == 0 { None } else { Some(ts) }
+    }
+
+    /// Get total segments persisted.
+    pub fn segments_persisted(&self) -> u64 {
+        self.segments_persisted.load(Ordering::SeqCst)
+    }
+
+    /// Get total events recorded.
+    pub fn events_recorded(&self) -> u64 {
+        self.events_recorded.load(Ordering::SeqCst)
     }
 }
 

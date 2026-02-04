@@ -106,6 +106,18 @@ SEE ALSO:
         #[arg(long)]
         no_patterns: bool,
 
+        /// Enable Prometheus metrics endpoint
+        #[arg(long)]
+        metrics: bool,
+
+        /// Metrics bind address (overrides config)
+        #[arg(long)]
+        metrics_bind: Option<String>,
+
+        /// Metrics prefix for exported metrics
+        #[arg(long)]
+        metrics_prefix: Option<String>,
+
         /// Disable single-instance lock (DANGEROUS: may corrupt data)
         #[arg(long)]
         dangerous_disable_lock: bool,
@@ -5534,6 +5546,43 @@ async fn run_watcher(
     let handle = runtime.start().await?;
     tracing::info!("Observation runtime started");
 
+    let metrics_handle = if config.metrics.enabled {
+        #[cfg(feature = "metrics")]
+        {
+            let collector =
+                wa_core::metrics::RuntimeMetricsCollector::new(Arc::clone(&handle));
+            let server = wa_core::metrics::MetricsServer::new(
+                config.metrics.bind.clone(),
+                config.metrics.prefix.clone(),
+                Arc::new(collector),
+                Arc::clone(&handle.shutdown_flag),
+            );
+            match server.start().await {
+                Ok(handle) => {
+                    tracing::info!(
+                        bind = %handle.local_addr(),
+                        prefix = %config.metrics.prefix,
+                        "Metrics endpoint enabled"
+                    );
+                    Some(handle)
+                }
+                Err(err) => {
+                    tracing::error!(error = %err, "Failed to start metrics endpoint");
+                    None
+                }
+            }
+        }
+        #[cfg(not(feature = "metrics"))]
+        {
+            tracing::warn!(
+                "Metrics enabled in config, but wa was built without the metrics feature"
+            );
+            None
+        }
+    } else {
+        None
+    };
+
     let config_path_buf = config_path.map(Path::to_path_buf);
     let ipc_handle = if config.ipc.enabled {
         #[cfg(unix)]
@@ -5705,6 +5754,10 @@ async fn run_watcher(
     tracing::info!("Shutting down observation runtime...");
     handle.shutdown().await;
     tracing::info!("Watcher shutdown complete");
+
+    if let Some(metrics_handle) = metrics_handle {
+        metrics_handle.wait().await;
+    }
 
     if let Some(backup_handle) = scheduled_backup_handle {
         let _ = backup_handle.await;
@@ -6018,6 +6071,25 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
     if verbose > 0 {
         overrides.log_level = Some("debug".to_string());
     }
+    if let Some(Commands::Watch {
+        metrics,
+        metrics_bind,
+        metrics_prefix,
+        ..
+    }) = &command
+    {
+        if *metrics {
+            overrides.metrics_enabled = Some(true);
+        }
+        if let Some(bind) = metrics_bind {
+            overrides.metrics_enabled.get_or_insert(true);
+            overrides.metrics_bind = Some(bind.clone());
+        }
+        if let Some(prefix) = metrics_prefix {
+            overrides.metrics_enabled.get_or_insert(true);
+            overrides.metrics_prefix = Some(prefix.clone());
+        }
+    }
 
     let config_path = cli_config_arg.as_deref().map(Path::new);
     let config = match wa_core::config::Config::load_with_overrides(
@@ -6085,6 +6157,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             foreground,
             poll_interval,
             no_patterns,
+            metrics: _metrics,
+            metrics_bind: _metrics_bind,
+            metrics_prefix: _metrics_prefix,
             dangerous_disable_lock,
         }) => {
             run_watcher_with_backoff(
