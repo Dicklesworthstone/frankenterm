@@ -68,10 +68,10 @@ pub mod ipc;
 pub mod learn;
 pub mod lock;
 pub mod logging;
-#[cfg(feature = "metrics")]
-pub mod metrics;
 #[cfg(feature = "mcp")]
 pub mod mcp;
+#[cfg(feature = "metrics")]
+pub mod metrics;
 pub mod notifications;
 pub mod output;
 pub mod patterns;

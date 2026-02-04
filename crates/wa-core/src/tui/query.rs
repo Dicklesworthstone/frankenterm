@@ -8,11 +8,12 @@
 //! - Decoupling: UI doesn't know about SQLite or storage internals
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::circuit_breaker::CircuitBreakerStatus;
 use crate::config::WorkspaceLayout;
 use crate::storage::StorageHandle;
-use crate::wezterm::{PaneInfo, WeztermClient};
+use crate::wezterm::{PaneInfo, WeztermClient, WeztermInterface};
 
 /// Errors that can occur during query operations
 #[derive(Debug, thiserror::Error)]
@@ -155,7 +156,7 @@ pub trait QueryClient: Send + Sync {
 /// runs in a separate thread from the main async context.
 pub struct ProductionQueryClient {
     workspace_layout: WorkspaceLayout,
-    wezterm: WeztermClient,
+    wezterm: Arc<dyn WeztermInterface>,
     #[allow(dead_code)]
     storage: Option<StorageHandle>,
     /// Dedicated runtime for async operations - avoids nested runtime panics
@@ -178,7 +179,7 @@ impl ProductionQueryClient {
 
         Self {
             workspace_layout,
-            wezterm: WeztermClient::new(),
+            wezterm: Arc::new(WeztermClient::new()),
             storage: None,
             runtime,
         }
@@ -199,7 +200,50 @@ impl ProductionQueryClient {
 
         Self {
             workspace_layout,
-            wezterm: WeztermClient::new(),
+            wezterm: Arc::new(WeztermClient::new()),
+            storage: Some(storage),
+            runtime,
+        }
+    }
+
+    /// Create with a custom WezTerm interface (useful for tests/mocks).
+    #[must_use]
+    pub fn with_wezterm(
+        workspace_layout: WorkspaceLayout,
+        wezterm: Arc<dyn WeztermInterface>,
+    ) -> Self {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .thread_name("tui-query-runtime")
+            .build()
+            .expect("Failed to create TUI query runtime");
+
+        Self {
+            workspace_layout,
+            wezterm,
+            storage: None,
+            runtime,
+        }
+    }
+
+    /// Create with storage and a custom WezTerm interface.
+    #[must_use]
+    pub fn with_storage_and_wezterm(
+        workspace_layout: WorkspaceLayout,
+        storage: StorageHandle,
+        wezterm: Arc<dyn WeztermInterface>,
+    ) -> Self {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .thread_name("tui-query-runtime")
+            .build()
+            .expect("Failed to create TUI query runtime");
+
+        Self {
+            workspace_layout,
+            wezterm,
             storage: Some(storage),
             runtime,
         }
