@@ -352,14 +352,15 @@ impl RecordingManager {
             return Ok(());
         }
 
-        let mut payload = segment.content.as_bytes().to_vec();
-        if self.options.redact_output {
+        let payload = if self.options.redact_output {
             let redacted = self.redactor.redact(&segment.content);
-            payload = redacted.into_bytes();
-        }
+            redacted.into_bytes()
+        } else {
+            segment.content.as_bytes().to_vec()
+        };
 
         let is_gap = matches!(segment.kind, CapturedSegmentKind::Gap { .. });
-        recorder.bytes_raw += segment.content.as_bytes().len() as u64;
+        recorder.bytes_raw += segment.content.len() as u64;
         recorder.record_output(segment.captured_at, is_gap, &payload)
     }
 
@@ -429,28 +430,30 @@ mod tests {
 
     #[test]
     fn redact_detection_scrubs_secrets() {
+        let secret = "sk-abc123456789012345678901234567890123456789012345678901";
         let detection = Detection {
             rule_id: "test.rule".to_string(),
             agent_type: AgentType::Codex,
             event_type: "usage.warning".to_string(),
             severity: Severity::Warning,
             confidence: 0.9,
-            extracted: json!({ "token": "sk-secret-value" }),
-            matched_text: "sk-secret-value".to_string(),
+            extracted: json!({ "token": secret }),
+            matched_text: secret.to_string(),
             span: (0, 5),
         };
 
         let redactor = Redactor::new();
         let redacted = super::redact_detection(&detection, &redactor);
-        assert!(!redacted.matched_text.contains("sk-secret-value"));
+        assert!(!redacted.matched_text.contains(secret));
         let serialized = serde_json::to_string(&redacted.extracted).unwrap();
-        assert!(!serialized.contains("sk-secret-value"));
+        assert!(!serialized.contains(secret));
     }
 
     #[tokio::test]
     async fn recording_manager_redacts_output() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.war");
+        let secret = "sk-abc123456789012345678901234567890123456789012345678901";
 
         let manager = RecordingManager::new(RecordingOptions {
             flush_threshold: 1,
@@ -462,7 +465,7 @@ mod tests {
         let segment = CapturedSegment {
             pane_id: 1,
             seq: 0,
-            content: "token sk-secret-value".to_string(),
+            content: format!("token {secret}"),
             kind: CapturedSegmentKind::Delta,
             captured_at: 10,
         };
@@ -471,7 +474,7 @@ mod tests {
 
         let bytes = std::fs::read(&path).unwrap();
         let text = String::from_utf8_lossy(&bytes);
-        assert!(!text.contains("sk-secret-value"));
+        assert!(!text.contains(secret));
         assert!(text.contains("[REDACTED]"));
     }
 }

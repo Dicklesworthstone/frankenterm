@@ -1081,6 +1081,7 @@ url = "http://localhost:8080/hook"
                 enabled: true,
             }],
             desktop: crate::desktop_notify::DesktopNotifyConfig::default(),
+            email: crate::email_notify::EmailNotifyConfig::default(),
         };
 
         // Build gate from config

@@ -4128,6 +4128,7 @@ agent_types = ["codex", "claude_code"]
             agent_types: vec!["codex".to_string()],
             webhooks: Vec::new(),
             desktop: crate::desktop_notify::DesktopNotifyConfig::default(),
+            email: crate::email_notify::EmailNotifyConfig::default(),
         };
         let filter = nc.to_event_filter();
         assert!(!filter.is_permissive());

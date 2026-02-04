@@ -891,10 +891,20 @@ impl PaneRegistry {
     // Alt-screen detection is now handled via escape sequence parsing (see screen_state.rs).
     // Pane metadata (title, dimensions, cursor) is obtained via `wezterm cli list`.
 
-    /// Get the alt-screen state for a pane
+    /// Get the alt-screen state for a pane (authoritative only).
+    ///
+    /// Returns `None` when we don't have an authoritative status update.
+    /// This avoids forcing a false value that would override text-based
+    /// alt-screen detection in the capture pipeline.
     #[must_use]
     pub fn is_alt_screen(&self, pane_id: u64) -> Option<bool> {
-        self.entries.get(&pane_id).map(|e| e.is_alt_screen)
+        self.entries.get(&pane_id).and_then(|e| {
+            if e.last_status_at.is_some() {
+                Some(e.is_alt_screen)
+            } else {
+                None
+            }
+        })
     }
 }
 
