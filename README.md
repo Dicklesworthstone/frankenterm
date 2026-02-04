@@ -364,6 +364,25 @@ poll_interval_ms = 200
 include = []  # Empty = all panes
 exclude = ["*htop*", "*vim*"]  # Glob patterns
 
+# Pane priority overrides (lower number = higher priority)
+[ingest.priorities]
+default_priority = 100
+
+[[ingest.priorities.rules]]
+id = "critical_codex"
+priority = 10
+title = "codex"
+
+[[ingest.priorities.rules]]
+id = "deprioritize_ssh"
+priority = 200
+domain = "SSH:*"
+
+# Capture budgets (0 = unlimited)
+[ingest.budgets]
+max_captures_per_sec = 0
+max_bytes_per_sec = 0
+
 [storage]
 # Write queue size for batched inserts
 writer_queue_size = 100

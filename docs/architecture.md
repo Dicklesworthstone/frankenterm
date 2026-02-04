@@ -31,6 +31,50 @@ WezTerm panes
 - Gap events are treated as uncertainty: policy checks can require approval
   when recent gaps are present.
 
+## Backpressure Signals and Degradation Policy
+
+Backpressure is treated as a first-class signal. The system should remain
+deterministic under load and make data loss explicit rather than silent.
+
+### Signals (authoritative)
+
+- Capture queue depth (runtime capture channel).
+- Storage writer queue depth (bounded write queue).
+- Event bus queue depth + oldest message lag (delta/detection/signal).
+- Ingest lag (avg/max from runtime metrics).
+- Per-pane consecutive backpressure (tailer send timeouts).
+- Indexing lag (FTS insert latency), when available.
+
+### Thresholds
+
+- Warning: queue depth >= 75% of capacity (matches current `BACKPRESSURE_WARN_RATIO`).
+- Critical: queue depth >= 90% of capacity or sustained lag > 5s.
+- Overflow: per-pane consecutive backpressure >= `OVERFLOW_BACKPRESSURE_THRESHOLD`
+  (currently 5) triggers an explicit gap.
+
+### Responses (deterministic)
+
+- Warning:
+  - Surface warning in `HealthSnapshot` and `wa status/doctor`.
+  - Continue observing, but prioritize draining queues.
+- Critical:
+  - Slow down polling (adaptive backoff).
+  - Reduce capture concurrency if configured to do so.
+  - Emit explicit GAPs if continuity becomes uncertain.
+- Overflow:
+  - Insert `backpressure_overflow` GAP on next successful capture for the pane.
+  - Reset per-pane backpressure counters.
+- Persistent DB backpressure:
+  - Enter `DbWrite` degradation (queue bounded writes, keep observing).
+  - If queue saturates, degrade further and record explicit gaps.
+- Persistent detection lag:
+  - Enter `PatternEngine` degradation (skip or disable rules).
+  - Continue ingesting and storing segments.
+
+These rules are designed to be implementable with existing metrics and to keep
+failure modes explicit: if wa cannot keep up, it must record a gap rather than
+pretend the stream is continuous.
+
 ## Interfaces
 
 - Human CLI is optimized for operator use and safety.
