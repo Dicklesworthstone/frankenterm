@@ -19,6 +19,7 @@
 //! send/act APIs - it is purely passive.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -33,8 +34,14 @@ use crate::config::{
 use crate::crash::{HealthSnapshot, ShutdownSummary};
 use crate::error::Result;
 use crate::events::EventBus;
+#[cfg(feature = "native-wezterm")]
+use crate::events::{Event, UserVarPayload};
 use crate::ingest::{PaneCursor, PaneRegistry, persist_captured_segment};
+#[cfg(feature = "native-wezterm")]
+use crate::native_events::{NativeEvent, NativeEventListener};
 use crate::patterns::{Detection, DetectionContext, PatternEngine};
+#[cfg(feature = "native-wezterm")]
+use crate::storage::PaneRecord;
 use crate::storage::{StorageHandle, StoredEvent};
 use crate::tailer::{CaptureEvent, TailerConfig, TailerSupervisor};
 use crate::watchdog::HeartbeatRegistry;
@@ -67,6 +74,8 @@ pub struct RuntimeConfig {
     pub retention_max_mb: u32,
     /// Database checkpoint interval in seconds
     pub checkpoint_interval_secs: u32,
+    /// Optional Unix socket path for native WezTerm events
+    pub native_event_socket: Option<PathBuf>,
 }
 
 impl Default for RuntimeConfig {
@@ -84,6 +93,7 @@ impl Default for RuntimeConfig {
             retention_days: 30,
             retention_max_mb: 0,
             checkpoint_interval_secs: 60,
+            native_event_socket: None,
         }
     }
 }
@@ -285,8 +295,33 @@ impl ObservationRuntime {
         // Spawn discovery task
         let discovery_handle = self.spawn_discovery_task();
 
-        // Spawn capture tasks (will be dynamically managed based on discovered panes)
-        let capture_handle = self.spawn_capture_task(capture_tx);
+        let native_socket = self.config.native_event_socket.clone();
+
+        #[cfg(feature = "native-wezterm")]
+        let native_enabled = native_socket.is_some();
+        #[cfg(not(feature = "native-wezterm"))]
+        let native_enabled = false;
+
+        // Spawn capture tasks (polling) unless native events are enabled.
+        let capture_handle = if native_enabled {
+            self.spawn_idle_capture_task()
+        } else {
+            self.spawn_capture_task(capture_tx.clone())
+        };
+
+        // Spawn native event listener if configured and supported.
+        #[cfg(feature = "native-wezterm")]
+        let native_handle =
+            native_socket.map(|socket| self.spawn_native_event_task(socket, capture_tx.clone()));
+        #[cfg(not(feature = "native-wezterm"))]
+        let native_handle = {
+            if native_socket.is_some() {
+                warn!(
+                    "Native event socket configured but wa-core built without native-wezterm feature"
+                );
+            }
+            None
+        };
 
         // Spawn persistence and detection task
         let persistence_handle = self.spawn_persistence_task(capture_rx, Arc::clone(&self.cursors));
@@ -311,6 +346,7 @@ impl ObservationRuntime {
             event_bus: self.event_bus.clone(),
             heartbeats: Arc::clone(&self.heartbeats),
             capture_tx: capture_tx_probe,
+            native_events: native_handle,
         })
     }
 
@@ -752,6 +788,65 @@ impl ObservationRuntime {
         })
     }
 
+    /// Spawn a no-op capture task when native events are used for output capture.
+    fn spawn_idle_capture_task(&self) -> JoinHandle<()> {
+        let shutdown_flag = Arc::clone(&self.shutdown_flag);
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(500));
+            loop {
+                interval.tick().await;
+                if shutdown_flag.load(Ordering::SeqCst) {
+                    break;
+                }
+            }
+        })
+    }
+
+    /// Spawn the native event listener task (vendored WezTerm integration).
+    #[cfg(feature = "native-wezterm")]
+    fn spawn_native_event_task(
+        &self,
+        socket_path: PathBuf,
+        capture_tx: mpsc::Sender<CaptureEvent>,
+    ) -> JoinHandle<()> {
+        let shutdown_flag = Arc::clone(&self.shutdown_flag);
+        let cursors = Arc::clone(&self.cursors);
+        let detection_contexts = Arc::clone(&self.detection_contexts);
+        let storage = Arc::clone(&self.storage);
+        let event_bus = self.event_bus.clone();
+        let pane_filter = self.config.pane_filter.clone();
+
+        tokio::spawn(async move {
+            let listener = match NativeEventListener::bind(socket_path.clone()).await {
+                Ok(listener) => listener,
+                Err(err) => {
+                    warn!(error = %err, path = %socket_path.display(), "Failed to bind native event socket");
+                    return;
+                }
+            };
+
+            let (event_tx, mut event_rx) = mpsc::channel::<NativeEvent>(1024);
+
+            let accept_handle = tokio::spawn(listener.run(event_tx, Arc::clone(&shutdown_flag)));
+
+            while let Some(event) = event_rx.recv().await {
+                handle_native_event(
+                    event,
+                    &capture_tx,
+                    &cursors,
+                    &detection_contexts,
+                    &storage,
+                    event_bus.as_ref(),
+                    &pane_filter,
+                )
+                .await;
+            }
+
+            let _ = accept_handle.await;
+        })
+    }
+
     /// Spawn the persistence and detection task.
     fn spawn_persistence_task(
         &self,
@@ -906,12 +1001,163 @@ impl ObservationRuntime {
     }
 }
 
+#[cfg(feature = "native-wezterm")]
+async fn handle_native_event(
+    event: NativeEvent,
+    capture_tx: &mpsc::Sender<CaptureEvent>,
+    cursors: &Arc<RwLock<HashMap<u64, PaneCursor>>>,
+    detection_contexts: &Arc<RwLock<HashMap<u64, DetectionContext>>>,
+    storage: &Arc<tokio::sync::Mutex<StorageHandle>>,
+    event_bus: Option<&Arc<EventBus>>,
+    pane_filter: &PaneFilterConfig,
+) {
+    match event {
+        NativeEvent::PaneOutput {
+            pane_id,
+            data,
+            timestamp_ms,
+        } => {
+            if data.is_empty() {
+                return;
+            }
+
+            let content = String::from_utf8_lossy(&data).to_string();
+            let segment = {
+                let mut cursors_guard = cursors.write().await;
+                cursors_guard
+                    .get_mut(&pane_id)
+                    .map(|cursor| cursor.capture_delta(content, timestamp_ms))
+            };
+
+            if let Some(segment) = segment {
+                if capture_tx.try_send(CaptureEvent { segment }).is_err() {
+                    debug!(pane_id, "Native event queue full; dropping output");
+                }
+            } else {
+                debug!(
+                    pane_id,
+                    "Native output received before cursor initialized; dropping"
+                );
+            }
+        }
+        NativeEvent::StateChange { pane_id, state, .. } => {
+            let mut gap_segment = None;
+            {
+                let mut cursors_guard = cursors.write().await;
+                if let Some(cursor) = cursors_guard.get_mut(&pane_id) {
+                    if cursor.in_alt_screen != state.is_alt_screen {
+                        let reason = if state.is_alt_screen {
+                            "alt_screen_entered"
+                        } else {
+                            "alt_screen_exited"
+                        };
+                        cursor.in_alt_screen = state.is_alt_screen;
+                        gap_segment = Some(cursor.emit_gap(reason));
+                    } else {
+                        cursor.in_alt_screen = state.is_alt_screen;
+                    }
+                }
+            }
+
+            if let Some(segment) = gap_segment {
+                if capture_tx.try_send(CaptureEvent { segment }).is_err() {
+                    debug!(pane_id, "Native event queue full; dropping gap");
+                }
+            }
+        }
+        NativeEvent::UserVarChanged {
+            pane_id,
+            name,
+            value,
+            ..
+        } => {
+            if let Some(bus) = event_bus {
+                match UserVarPayload::decode(&value, true) {
+                    Ok(payload) => {
+                        let event = Event::UserVarReceived {
+                            pane_id,
+                            name,
+                            payload,
+                        };
+                        bus.publish(event);
+                    }
+                    Err(err) => {
+                        debug!(pane_id, error = %err, "Failed to decode native user-var payload");
+                    }
+                }
+            }
+        }
+        NativeEvent::PaneCreated {
+            pane_id,
+            domain,
+            cwd,
+            timestamp_ms,
+        } => {
+            let ignore_reason = pane_filter.check_pane(&domain, "", cwd.as_deref().unwrap_or(""));
+            let observed = ignore_reason.is_none();
+
+            let record = PaneRecord {
+                pane_id,
+                pane_uuid: None,
+                domain,
+                window_id: None,
+                tab_id: None,
+                title: None,
+                cwd,
+                tty_name: None,
+                first_seen_at: timestamp_ms,
+                last_seen_at: timestamp_ms,
+                observed,
+                ignore_reason,
+                last_decision_at: Some(timestamp_ms),
+            };
+
+            let storage_guard = storage.lock().await;
+            if let Err(err) = storage_guard.upsert_pane(record).await {
+                warn!(pane_id, error = %err, "Failed to upsert pane from native event");
+            }
+            let max_seq = storage_guard.get_max_seq(pane_id).await.unwrap_or(None);
+            drop(storage_guard);
+
+            if observed {
+                let next_seq = max_seq.map_or(0, |seq| seq + 1);
+
+                {
+                    let mut cursors_guard = cursors.write().await;
+                    cursors_guard
+                        .entry(pane_id)
+                        .or_insert_with(|| PaneCursor::from_seq(pane_id, next_seq));
+                }
+
+                {
+                    let mut contexts = detection_contexts.write().await;
+                    contexts.entry(pane_id).or_insert_with(|| {
+                        let mut ctx = DetectionContext::new();
+                        ctx.pane_id = Some(pane_id);
+                        ctx
+                    });
+                }
+            }
+        }
+        NativeEvent::PaneDestroyed { pane_id, .. } => {
+            let mut cursors_guard = cursors.write().await;
+            cursors_guard.remove(&pane_id);
+            drop(cursors_guard);
+
+            let mut contexts = detection_contexts.write().await;
+            contexts.remove(&pane_id);
+        }
+    }
+}
+
 /// Handle to the running observation runtime.
 pub struct RuntimeHandle {
     /// Discovery task handle
     pub discovery: JoinHandle<()>,
     /// Capture task handle
     pub capture: JoinHandle<()>,
+    /// Native events listener task handle (optional)
+    pub native_events: Option<JoinHandle<()>>,
     /// Persistence task handle
     pub persistence: JoinHandle<()>,
     /// Maintenance task handle (retention, checkpointing)
@@ -967,6 +1213,9 @@ impl RuntimeHandle {
     pub async fn join(self) {
         let _ = self.discovery.await;
         let _ = self.capture.await;
+        if let Some(native) = self.native_events {
+            let _ = native.await;
+        }
         let _ = self.persistence.await;
         if let Some(maintenance) = self.maintenance {
             let _ = maintenance.await;
@@ -993,6 +1242,9 @@ impl RuntimeHandle {
         let join_result = tokio::time::timeout(timeout, async {
             let _ = self.discovery.await;
             let _ = self.capture.await;
+            if let Some(native) = self.native_events {
+                let _ = native.await;
+            }
             let _ = self.persistence.await;
         })
         .await;

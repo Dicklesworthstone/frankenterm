@@ -548,13 +548,26 @@ impl PaneCursor {
         self.in_gap = true;
     }
 
-    /// Emit a synthetic gap due to backpressure overflow.
+    /// Create a captured delta segment from raw content (native event path).
     ///
-    /// Called by the tailer when consecutive backpressure events exceed the
-    /// overflow threshold, indicating that capture data was likely lost.
-    /// The gap has empty content because no snapshot was captured during the
-    /// overflow period.
-    pub fn emit_overflow_gap(&mut self, reason: &str) -> CapturedSegment {
+    /// This bypasses snapshot-based delta extraction and simply appends the
+    /// provided content as a new segment with a monotonically increasing seq.
+    pub fn capture_delta(&mut self, content: String, captured_at: i64) -> CapturedSegment {
+        self.in_gap = false;
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.saturating_add(1);
+
+        CapturedSegment {
+            pane_id: self.pane_id,
+            seq,
+            content,
+            kind: CapturedSegmentKind::Delta,
+            captured_at,
+        }
+    }
+
+    /// Emit a gap segment with the provided reason.
+    pub fn emit_gap(&mut self, reason: &str) -> CapturedSegment {
         self.in_gap = true;
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
@@ -567,6 +580,16 @@ impl PaneCursor {
             },
             captured_at: epoch_ms(),
         }
+    }
+
+    /// Emit a synthetic gap due to backpressure overflow.
+    ///
+    /// Called by the tailer when consecutive backpressure events exceed the
+    /// overflow threshold, indicating that capture data was likely lost.
+    /// The gap has empty content because no snapshot was captured during the
+    /// overflow period.
+    pub fn emit_overflow_gap(&mut self, reason: &str) -> CapturedSegment {
+        self.emit_gap(reason)
     }
 
     /// Alias for `capture_snapshot` for backward compatibility.

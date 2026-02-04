@@ -68,6 +68,9 @@ pub struct Config {
     /// Vendored WezTerm settings
     pub vendored: VendoredConfig,
 
+    /// Native WezTerm event listener settings
+    pub native: NativeEventsConfig,
+
     /// Metrics/telemetry settings
     pub metrics: MetricsConfig,
 
@@ -1657,6 +1660,30 @@ impl Default for ReservationConfig {
 }
 
 // =============================================================================
+// Native Events Config
+// =============================================================================
+
+/// Native WezTerm event listener configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct NativeEventsConfig {
+    /// Enable the native WezTerm event listener.
+    pub enabled: bool,
+
+    /// Unix socket path to bind for native events.
+    pub socket_path: String,
+}
+
+impl Default for NativeEventsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            socket_path: "/tmp/wa/events.sock".to_string(),
+        }
+    }
+}
+
+// =============================================================================
 // Vendored Config
 // =============================================================================
 
@@ -2124,6 +2151,14 @@ impl Config {
             });
         }
 
+        if self.native != new_config.native {
+            forbidden.push(ForbiddenChange {
+                name: "native".to_string(),
+                reason: "Native event listener settings cannot be hot-reloaded; requires restart"
+                    .to_string(),
+            });
+        }
+
         // Check hot-reloadable settings
         if self.general.log_level != new_config.general.log_level {
             changes.push(HotReloadChange {
@@ -2393,6 +2428,9 @@ impl Config {
             self.vendored.mux_socket_path = Some(path_to_string(&mux_path));
         }
 
+        let native_path = expand_tilde(&self.native.socket_path);
+        self.native.socket_path = path_to_string(&native_path);
+
         if let Some(dest) = self.backup.scheduled.destination.take() {
             let dest_path = expand_tilde(&dest);
             self.backup.scheduled.destination = Some(path_to_string(&dest_path));
@@ -2477,6 +2515,13 @@ impl Config {
         if self.metrics.bind.trim().is_empty() {
             return Err(crate::error::ConfigError::ValidationError(
                 "metrics.bind must not be empty".to_string(),
+            )
+            .into());
+        }
+
+        if self.native.enabled && self.native.socket_path.trim().is_empty() {
+            return Err(crate::error::ConfigError::ValidationError(
+                "native.socket_path must not be empty when native.enabled=true".to_string(),
             )
             .into());
         }

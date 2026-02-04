@@ -5023,6 +5023,14 @@ async fn run_watcher(
     };
 
     // Configure the runtime
+    let native_event_socket = if config.native.enabled {
+        let env_socket = std::env::var("WEZTERM_WA_SOCKET").ok();
+        let socket = env_socket.unwrap_or_else(|| config.native.socket_path.clone());
+        Some(PathBuf::from(socket))
+    } else {
+        None
+    };
+
     let runtime_config = RuntimeConfig {
         discovery_interval: Duration::from_millis(poll_interval),
         capture_interval: Duration::from_millis(config.ingest.poll_interval_ms),
@@ -5036,6 +5044,7 @@ async fn run_watcher(
         retention_days: config.storage.retention_days,
         retention_max_mb: config.storage.retention_max_mb,
         checkpoint_interval_secs: config.storage.checkpoint_interval_secs,
+        native_event_socket,
     };
 
     // Create and start the observation runtime (with event bus for workflow integration)

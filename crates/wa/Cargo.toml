@@ -45,6 +45,7 @@ mcp = ["wa-core/mcp", "dep:fastmcp"]
 web = ["wa-core/web"]
 tui = ["wa-core/tui"]
 metrics = ["wa-core/metrics"]
+native-wezterm = ["wa-core/native-wezterm"]
 distributed = ["wa-core/distributed"]
 sync = ["wa-core/sync"]
 
