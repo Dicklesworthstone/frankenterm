@@ -3107,17 +3107,20 @@ impl InjectionResult {
 ///     InjectionResult::Error { error, .. } => println!("Error: {}", error),
 /// }
 /// ```
-pub struct PolicyGatedInjector {
+pub struct PolicyGatedInjector<C = crate::wezterm::WeztermClient> {
     engine: PolicyEngine,
-    client: crate::wezterm::WeztermClient,
+    client: C,
     /// Optional storage handle for audit trail emission
     storage: Option<crate::storage::StorageHandle>,
 }
 
-impl PolicyGatedInjector {
+impl<C> PolicyGatedInjector<C>
+where
+    C: crate::wezterm::WeztermInterface,
+{
     /// Create a new policy-gated injector without audit trail storage
     #[must_use]
-    pub fn new(engine: PolicyEngine, client: crate::wezterm::WeztermClient) -> Self {
+    pub fn new(engine: PolicyEngine, client: C) -> Self {
         Self {
             engine,
             client,
@@ -3132,7 +3135,7 @@ impl PolicyGatedInjector {
     #[must_use]
     pub fn with_storage(
         engine: PolicyEngine,
-        client: crate::wezterm::WeztermClient,
+        client: C,
         storage: crate::storage::StorageHandle,
     ) -> Self {
         Self {
@@ -3149,7 +3152,7 @@ impl PolicyGatedInjector {
 
     /// Create with a permissive policy engine (for testing)
     #[must_use]
-    pub fn permissive(client: crate::wezterm::WeztermClient) -> Self {
+    pub fn permissive(client: C) -> Self {
         Self::new(PolicyEngine::permissive(), client)
     }
 

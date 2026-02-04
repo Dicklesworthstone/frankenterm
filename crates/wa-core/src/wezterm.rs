@@ -23,6 +23,62 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::{Instant, sleep};
 
+/// Boxed future for WezTerm interface operations.
+pub type WeztermFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+
+/// Abstraction layer over WezTerm interactions.
+///
+/// This allows swapping real CLI clients with mock implementations for
+/// simulation/testing without changing call sites.
+pub trait WeztermInterface: Send + Sync {
+    /// List all panes across all windows and tabs.
+    fn list_panes(&self) -> WeztermFuture<'_, Vec<PaneInfo>>;
+    /// Get a specific pane by ID.
+    fn get_pane(&self, pane_id: u64) -> WeztermFuture<'_, PaneInfo>;
+    /// Get text content from a pane.
+    fn get_text(&self, pane_id: u64, escapes: bool) -> WeztermFuture<'_, String>;
+    /// Send text using paste mode.
+    fn send_text(&self, pane_id: u64, text: &str) -> WeztermFuture<'_, ()>;
+    /// Send text without paste mode.
+    fn send_text_no_paste(&self, pane_id: u64, text: &str) -> WeztermFuture<'_, ()>;
+    /// Send text with explicit options (paste/newline).
+    fn send_text_with_options(
+        &self,
+        pane_id: u64,
+        text: &str,
+        no_paste: bool,
+        no_newline: bool,
+    ) -> WeztermFuture<'_, ()>;
+    /// Send a control character (no-paste).
+    fn send_control(&self, pane_id: u64, control_char: &str) -> WeztermFuture<'_, ()>;
+    /// Send Ctrl+C.
+    fn send_ctrl_c(&self, pane_id: u64) -> WeztermFuture<'_, ()>;
+    /// Send Ctrl+D.
+    fn send_ctrl_d(&self, pane_id: u64) -> WeztermFuture<'_, ()>;
+    /// Spawn a new pane.
+    fn spawn(&self, cwd: Option<&str>, domain_name: Option<&str>) -> WeztermFuture<'_, u64>;
+    /// Split an existing pane.
+    fn split_pane(
+        &self,
+        pane_id: u64,
+        direction: SplitDirection,
+        cwd: Option<&str>,
+        percent: Option<u8>,
+    ) -> WeztermFuture<'_, u64>;
+    /// Activate a pane.
+    fn activate_pane(&self, pane_id: u64) -> WeztermFuture<'_, ()>;
+    /// Get a pane in a direction relative to another.
+    fn get_pane_direction(
+        &self,
+        pane_id: u64,
+        direction: MoveDirection,
+    ) -> WeztermFuture<'_, Option<u64>>;
+    /// Kill (close) a pane.
+    fn kill_pane(&self, pane_id: u64) -> WeztermFuture<'_, ()>;
+    /// Zoom or unzoom a pane.
+    fn zoom_pane(&self, pane_id: u64, zoom: bool) -> WeztermFuture<'_, ()>;
+}
+
 /// Pane size information
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PaneSize {
@@ -945,6 +1001,95 @@ fn is_retryable_error(err: &crate::Error) -> bool {
             WeztermError::NotRunning | WeztermError::Timeout(_) | WeztermError::CommandFailed(_)
         )
     )
+}
+
+impl WeztermInterface for WeztermClient {
+    fn list_panes(&self) -> WeztermFuture<'_, Vec<PaneInfo>> {
+        Box::pin(async move { WeztermClient::list_panes(self).await })
+    }
+
+    fn get_pane(&self, pane_id: u64) -> WeztermFuture<'_, PaneInfo> {
+        Box::pin(async move { WeztermClient::get_pane(self, pane_id).await })
+    }
+
+    fn get_text(&self, pane_id: u64, escapes: bool) -> WeztermFuture<'_, String> {
+        Box::pin(async move { WeztermClient::get_text(self, pane_id, escapes).await })
+    }
+
+    fn send_text(&self, pane_id: u64, text: &str) -> WeztermFuture<'_, ()> {
+        let text = text.to_string();
+        Box::pin(async move { WeztermClient::send_text(self, pane_id, &text).await })
+    }
+
+    fn send_text_no_paste(&self, pane_id: u64, text: &str) -> WeztermFuture<'_, ()> {
+        let text = text.to_string();
+        Box::pin(async move { WeztermClient::send_text_no_paste(self, pane_id, &text).await })
+    }
+
+    fn send_text_with_options(
+        &self,
+        pane_id: u64,
+        text: &str,
+        no_paste: bool,
+        no_newline: bool,
+    ) -> WeztermFuture<'_, ()> {
+        let text = text.to_string();
+        Box::pin(async move {
+            WeztermClient::send_text_with_options(self, pane_id, &text, no_paste, no_newline).await
+        })
+    }
+
+    fn send_control(&self, pane_id: u64, control_char: &str) -> WeztermFuture<'_, ()> {
+        let control_char = control_char.to_string();
+        Box::pin(async move { WeztermClient::send_control(self, pane_id, &control_char).await })
+    }
+
+    fn send_ctrl_c(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
+        Box::pin(async move { WeztermClient::send_ctrl_c(self, pane_id).await })
+    }
+
+    fn send_ctrl_d(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
+        Box::pin(async move { WeztermClient::send_ctrl_d(self, pane_id).await })
+    }
+
+    fn spawn(&self, cwd: Option<&str>, domain_name: Option<&str>) -> WeztermFuture<'_, u64> {
+        let cwd = cwd.map(str::to_string);
+        let domain = domain_name.map(str::to_string);
+        Box::pin(async move { WeztermClient::spawn(self, cwd.as_deref(), domain.as_deref()).await })
+    }
+
+    fn split_pane(
+        &self,
+        pane_id: u64,
+        direction: SplitDirection,
+        cwd: Option<&str>,
+        percent: Option<u8>,
+    ) -> WeztermFuture<'_, u64> {
+        let cwd = cwd.map(str::to_string);
+        Box::pin(async move {
+            WeztermClient::split_pane(self, pane_id, direction, cwd.as_deref(), percent).await
+        })
+    }
+
+    fn activate_pane(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
+        Box::pin(async move { WeztermClient::activate_pane(self, pane_id).await })
+    }
+
+    fn get_pane_direction(
+        &self,
+        pane_id: u64,
+        direction: MoveDirection,
+    ) -> WeztermFuture<'_, Option<u64>> {
+        Box::pin(async move { WeztermClient::get_pane_direction(self, pane_id, direction).await })
+    }
+
+    fn kill_pane(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
+        Box::pin(async move { WeztermClient::kill_pane(self, pane_id).await })
+    }
+
+    fn zoom_pane(&self, pane_id: u64, zoom: bool) -> WeztermFuture<'_, ()> {
+        Box::pin(async move { WeztermClient::zoom_pane(self, pane_id, zoom).await })
+    }
 }
 
 // =============================================================================
