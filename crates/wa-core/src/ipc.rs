@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 #[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 #[cfg(unix)]
@@ -39,6 +39,10 @@ fn now_ms() -> u64 {
         .ok()
         .and_then(|d| u64::try_from(d.as_millis()).ok())
         .unwrap_or(0)
+}
+
+fn elapsed_ms(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 // NOTE: StatusUpdate types (CursorPosition, PaneDimensions, StatusUpdate, StatusUpdateRateLimiter)
@@ -69,6 +73,11 @@ pub enum IpcRequest {
         /// Pane ID to inspect
         pane_id: u64,
     },
+    /// RPC request forwarded to robot handlers.
+    Rpc {
+        /// Robot command arguments (e.g., ["state"] or ["send", "1", "ls"]).
+        args: Vec<String>,
+    },
 }
 
 impl IpcRequest {
@@ -77,7 +86,31 @@ impl IpcRequest {
         match self {
             Self::UserVar { .. } => IpcScope::Write,
             Self::Ping | Self::Status | Self::PaneState { .. } => IpcScope::Read,
+            Self::Rpc { args } => rpc_required_scope(args),
         }
+    }
+}
+
+fn rpc_required_scope(args: &[String]) -> IpcScope {
+    let Some(cmd) = args.first().map(String::as_str) else {
+        return IpcScope::Write;
+    };
+
+    match cmd {
+        "send" | "approve" => IpcScope::Write,
+        "workflow" => match args.get(1).map(String::as_str) {
+            Some("run" | "abort") => IpcScope::Write,
+            _ => IpcScope::Read,
+        },
+        "accounts" => match args.get(1).map(String::as_str) {
+            Some("refresh") => IpcScope::Write,
+            _ => IpcScope::Read,
+        },
+        "reservations" => match args.get(1).map(String::as_str) {
+            Some("reserve" | "release") => IpcScope::Write,
+            _ => IpcScope::Read,
+        },
+        _ => IpcScope::Read,
     }
 }
 
@@ -89,9 +122,21 @@ pub struct IpcResponse {
     /// Error message if failed
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Stable error code for machine parsing
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    /// Optional hint for recovery
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
     /// Additional data (for status requests)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<serde_json::Value>,
+    /// Elapsed time to handle the request (ms)
+    pub elapsed_ms: u64,
+    /// wa version
+    pub version: String,
+    /// Server timestamp (epoch ms)
+    pub now: u64,
 }
 
 impl IpcResponse {
@@ -101,7 +146,12 @@ impl IpcResponse {
         Self {
             ok: true,
             error: None,
+            error_code: None,
+            hint: None,
             data: None,
+            elapsed_ms: 0,
+            version: crate::VERSION.to_string(),
+            now: now_ms(),
         }
     }
 
@@ -111,7 +161,12 @@ impl IpcResponse {
         Self {
             ok: true,
             error: None,
+            error_code: None,
+            hint: None,
             data: Some(data),
+            elapsed_ms: 0,
+            version: crate::VERSION.to_string(),
+            now: now_ms(),
         }
     }
 
@@ -121,19 +176,65 @@ impl IpcResponse {
         Self {
             ok: false,
             error: Some(message.into()),
+            error_code: None,
+            hint: None,
             data: None,
+            elapsed_ms: 0,
+            version: crate::VERSION.to_string(),
+            now: now_ms(),
         }
+    }
+
+    /// Create an error response with a stable error code.
+    #[must_use]
+    pub fn error_with_code(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        hint: Option<String>,
+    ) -> Self {
+        Self {
+            ok: false,
+            error: Some(message.into()),
+            error_code: Some(code.into()),
+            hint,
+            data: None,
+            elapsed_ms: 0,
+            version: crate::VERSION.to_string(),
+            now: now_ms(),
+        }
+    }
+
+    fn with_timing(mut self, start: Instant) -> Self {
+        self.elapsed_ms = elapsed_ms(start);
+        self.now = now_ms();
+        self
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct IpcEnvelope {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     token: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
     #[serde(flatten)]
     request: IpcRequest,
 }
+
+pub struct IpcRpcRequest {
+    pub args: Vec<String>,
+    pub request_id: Option<String>,
+}
+
+pub type IpcRpcHandler = Arc<
+    dyn Fn(
+            IpcRpcRequest,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = IpcResponse> + Send>>
+        + Send
+        + Sync,
+>;
 
 #[derive(Debug, Clone)]
 pub struct IpcAuth {
@@ -146,11 +247,7 @@ impl IpcAuth {
         Self { tokens }
     }
 
-    fn authorize(
-        &self,
-        token: Option<&str>,
-        required: IpcScope,
-    ) -> Result<(), IpcAuthError> {
+    fn authorize(&self, token: Option<&str>, required: IpcScope) -> Result<(), IpcAuthError> {
         if self.tokens.is_empty() {
             return Ok(());
         }
@@ -184,6 +281,8 @@ impl IpcAuth {
 }
 
 #[derive(Debug)]
+// NOTE: Reserved for IPC auth enforcement (bd-3p06).
+#[allow(dead_code)]
 enum IpcAuthError {
     MissingToken,
     InvalidToken,
@@ -191,6 +290,7 @@ enum IpcAuthError {
     InsufficientScope { required: IpcScope },
 }
 
+#[allow(dead_code)] // Reserved for IPC auth enforcement (bd-3p06).
 impl IpcAuthError {
     fn message(&self) -> String {
         match self {
@@ -215,6 +315,8 @@ pub struct IpcHandlerContext {
     pub registry: Option<Arc<RwLock<PaneRegistry>>>,
     /// Optional IPC auth configuration
     pub auth: Option<IpcAuth>,
+    /// Optional RPC handler (robot/MCP parity).
+    pub rpc_handler: Option<IpcRpcHandler>,
     // NOTE: rate_limiter field was removed in v0.2.0 (StatusUpdate removed)
 }
 
@@ -226,6 +328,7 @@ impl IpcHandlerContext {
             event_bus,
             registry: None,
             auth: None,
+            rpc_handler: None,
         }
     }
 
@@ -236,6 +339,7 @@ impl IpcHandlerContext {
             event_bus,
             registry: Some(registry),
             auth: None,
+            rpc_handler: None,
         }
     }
 
@@ -250,6 +354,23 @@ impl IpcHandlerContext {
             event_bus,
             registry,
             auth,
+            rpc_handler: None,
+        }
+    }
+
+    /// Create a new handler context with optional auth and RPC handler.
+    #[must_use]
+    pub fn with_auth_and_rpc(
+        event_bus: Arc<EventBus>,
+        registry: Option<Arc<RwLock<PaneRegistry>>>,
+        auth: Option<IpcAuth>,
+        rpc_handler: Option<IpcRpcHandler>,
+    ) -> Self {
+        Self {
+            event_bus,
+            registry,
+            auth,
+            rpc_handler,
         }
     }
 }
@@ -325,7 +446,7 @@ impl IpcServer {
     /// # Arguments
     /// * `event_bus` - Event bus to publish received events
     /// * `shutdown_rx` - Channel to receive shutdown signal
-    pub async fn run(self, event_bus: Arc<EventBus>, mut shutdown_rx: mpsc::Receiver<()>) {
+    pub async fn run(self, event_bus: Arc<EventBus>, shutdown_rx: mpsc::Receiver<()>) {
         self.run_with_auth(event_bus, None, shutdown_rx).await;
     }
 
@@ -341,7 +462,7 @@ impl IpcServer {
         self,
         event_bus: Arc<EventBus>,
         registry: Arc<RwLock<PaneRegistry>>,
-        mut shutdown_rx: mpsc::Receiver<()>,
+        shutdown_rx: mpsc::Receiver<()>,
     ) {
         self.run_with_registry_and_auth(event_bus, registry, None, shutdown_rx)
             .await;
@@ -370,6 +491,24 @@ impl IpcServer {
             event_bus,
             Some(registry),
             auth,
+        ));
+        self.run_with_context(ctx, &mut shutdown_rx).await;
+    }
+
+    /// Run the IPC server with registry, auth, and RPC handler.
+    pub async fn run_with_registry_auth_and_rpc(
+        self,
+        event_bus: Arc<EventBus>,
+        registry: Arc<RwLock<PaneRegistry>>,
+        auth: Option<IpcAuth>,
+        rpc_handler: Option<IpcRpcHandler>,
+        mut shutdown_rx: mpsc::Receiver<()>,
+    ) {
+        let ctx = Arc::new(IpcHandlerContext::with_auth_and_rpc(
+            event_bus,
+            Some(registry),
+            auth,
+            rpc_handler,
         ));
         self.run_with_context(ctx, &mut shutdown_rx).await;
     }
@@ -453,6 +592,42 @@ impl IpcServer {
         tracing::warn!("IPC server not supported on this platform");
         let _ = shutdown_rx.recv().await;
     }
+
+    /// Run the IPC server with optional auth configuration (no-op on non-unix platforms).
+    pub async fn run_with_auth(
+        self,
+        _event_bus: Arc<EventBus>,
+        _auth: Option<IpcAuth>,
+        mut shutdown_rx: mpsc::Receiver<()>,
+    ) {
+        tracing::warn!("IPC server not supported on this platform");
+        let _ = shutdown_rx.recv().await;
+    }
+
+    /// Run the IPC server with registry and auth (no-op on non-unix platforms).
+    pub async fn run_with_registry_and_auth(
+        self,
+        _event_bus: Arc<EventBus>,
+        _registry: Arc<RwLock<PaneRegistry>>,
+        _auth: Option<IpcAuth>,
+        mut shutdown_rx: mpsc::Receiver<()>,
+    ) {
+        tracing::warn!("IPC server not supported on this platform");
+        let _ = shutdown_rx.recv().await;
+    }
+
+    /// Run the IPC server with registry, auth, and RPC handler (no-op on non-unix platforms).
+    pub async fn run_with_registry_auth_and_rpc(
+        self,
+        _event_bus: Arc<EventBus>,
+        _registry: Arc<RwLock<PaneRegistry>>,
+        _auth: Option<IpcAuth>,
+        _rpc_handler: Option<IpcRpcHandler>,
+        mut shutdown_rx: mpsc::Receiver<()>,
+    ) {
+        tracing::warn!("IPC server not supported on this platform");
+        let _ = shutdown_rx.recv().await;
+    }
 }
 
 /// Handle a single client connection with full context.
@@ -461,6 +636,7 @@ async fn handle_client_with_context(
     stream: UnixStream,
     ctx: Arc<IpcHandlerContext>,
 ) -> std::io::Result<()> {
+    let start = Instant::now();
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
@@ -481,10 +657,24 @@ async fn handle_client_with_context(
     }
 
     // Parse and handle request
-    let response = match serde_json::from_str::<IpcRequest>(&line) {
-        Ok(request) => handle_request_with_context(request, &ctx).await,
+    let response = match serde_json::from_str::<IpcEnvelope>(&line) {
+        Ok(envelope) => {
+            if let Some(auth) = ctx.auth.as_ref() {
+                if let Err(err) =
+                    auth.authorize(envelope.token.as_deref(), envelope.request.required_scope())
+                {
+                    IpcResponse::error(err.message())
+                } else {
+                    handle_request_with_context(envelope, &ctx).await
+                }
+            } else {
+                handle_request_with_context(envelope, &ctx).await
+            }
+        }
         Err(e) => IpcResponse::error(format!("invalid request: {e}")),
     };
+
+    let response = response.with_timing(start);
 
     // Send response
     let response_json = serde_json::to_string(&response).unwrap_or_default();
@@ -496,8 +686,11 @@ async fn handle_client_with_context(
 }
 
 /// Handle a parsed IPC request with full context.
-async fn handle_request_with_context(request: IpcRequest, ctx: &IpcHandlerContext) -> IpcResponse {
-    match request {
+async fn handle_request_with_context(
+    envelope: IpcEnvelope,
+    ctx: &IpcHandlerContext,
+) -> IpcResponse {
+    match envelope.request {
         IpcRequest::UserVar {
             pane_id,
             name,
@@ -545,6 +738,16 @@ async fn handle_request_with_context(request: IpcRequest, ctx: &IpcHandlerContex
             IpcResponse::ok_with_data(payload)
         }
         IpcRequest::PaneState { pane_id } => handle_pane_state(pane_id, ctx).await,
+        IpcRequest::Rpc { args } => {
+            let Some(handler) = ctx.rpc_handler.as_ref() else {
+                return IpcResponse::error("rpc handler not configured");
+            };
+            handler(IpcRpcRequest {
+                args,
+                request_id: envelope.request_id,
+            })
+            .await
+        }
     }
 }
 
@@ -588,6 +791,7 @@ async fn handle_pane_state(pane_id: u64, ctx: &IpcHandlerContext) -> IpcResponse
 /// IPC client for sending requests to the watcher daemon.
 pub struct IpcClient {
     socket_path: PathBuf,
+    auth_token: Option<String>,
 }
 
 impl IpcClient {
@@ -596,7 +800,22 @@ impl IpcClient {
     pub fn new(socket_path: impl AsRef<Path>) -> Self {
         Self {
             socket_path: socket_path.as_ref().to_path_buf(),
+            auth_token: std::env::var("WA_IPC_TOKEN").ok(),
         }
+    }
+
+    /// Create a new IPC client with an explicit auth token.
+    #[must_use]
+    pub fn with_token(socket_path: impl AsRef<Path>, token: impl Into<String>) -> Self {
+        Self {
+            socket_path: socket_path.as_ref().to_path_buf(),
+            auth_token: Some(token.into()),
+        }
+    }
+
+    /// Update the auth token (use `None` to clear).
+    pub fn set_token(&mut self, token: Option<String>) {
+        self.auth_token = token;
     }
 
     /// Check if the watcher socket exists.
@@ -655,10 +874,31 @@ impl IpcClient {
         self.send_request(IpcRequest::PaneState { pane_id }).await
     }
 
+    /// Call a robot RPC command over IPC.
+    ///
+    /// # Errors
+    /// Returns error if connection fails.
+    pub async fn call_rpc(
+        &self,
+        args: Vec<String>,
+        request_id: Option<String>,
+    ) -> Result<IpcResponse, UserVarError> {
+        self.send_request_with_id(IpcRequest::Rpc { args }, request_id)
+            .await
+    }
+
     // NOTE: send_status_update method was removed in v0.2.0 (Lua performance optimization)
 
     /// Send a request and receive a response.
     async fn send_request(&self, request: IpcRequest) -> Result<IpcResponse, UserVarError> {
+        self.send_request_with_id(request, None).await
+    }
+
+    async fn send_request_with_id(
+        &self,
+        request: IpcRequest,
+        request_id: Option<String>,
+    ) -> Result<IpcResponse, UserVarError> {
         // Check if socket exists
         if !self.socket_path.exists() {
             return Err(UserVarError::WatcherNotRunning {
@@ -676,8 +916,13 @@ impl IpcClient {
         let (reader, mut writer) = stream.into_split();
 
         // Send request
+        let envelope = IpcEnvelope {
+            token: self.auth_token.clone(),
+            request_id,
+            request,
+        };
         let request_json =
-            serde_json::to_string(&request).map_err(|e| UserVarError::IpcSendFailed {
+            serde_json::to_string(&envelope).map_err(|e| UserVarError::IpcSendFailed {
                 message: format!("failed to serialize request: {e}"),
             })?;
 
@@ -749,6 +994,14 @@ impl IpcClient {
     pub async fn pane_state(&self, _pane_id: u64) -> Result<IpcResponse, UserVarError> {
         Err(Self::unsupported())
     }
+
+    pub async fn call_rpc(
+        &self,
+        _args: Vec<String>,
+        _request_id: Option<String>,
+    ) -> Result<IpcResponse, UserVarError> {
+        Err(Self::unsupported())
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -766,6 +1019,9 @@ mod tests {
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"ok\":true"));
         assert!(!json.contains("error"));
+        assert!(json.contains("\"elapsed_ms\""));
+        assert!(json.contains("\"version\""));
+        assert!(json.contains("\"now\""));
     }
 
     #[test]
@@ -774,6 +1030,19 @@ mod tests {
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"ok\":false"));
         assert!(json.contains("test error"));
+    }
+
+    #[test]
+    fn ipc_response_error_with_code_serializes() {
+        let response = IpcResponse::error_with_code(
+            "ipc.test_error",
+            "test error",
+            Some("try again".to_string()),
+        );
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"ok\":false"));
+        assert!(json.contains("\"error_code\":\"ipc.test_error\""));
+        assert!(json.contains("\"hint\":\"try again\""));
     }
 
     #[test]
@@ -804,9 +1073,141 @@ mod tests {
     }
 
     #[test]
+    fn ipc_request_rpc_serializes() {
+        let request = IpcRequest::Rpc {
+            args: vec!["state".to_string()],
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"type\":\"rpc\""));
+        assert!(json.contains("\"state\""));
+    }
+
+    #[test]
     fn ipc_client_detects_missing_socket() {
         let client = IpcClient::new("/nonexistent/path/ipc.sock");
         assert!(!client.socket_exists());
+    }
+
+    fn build_auth(token: &str, scopes: Vec<IpcScope>, expires_at_ms: Option<u64>) -> IpcAuth {
+        IpcAuth::new(vec![IpcAuthToken {
+            token: token.to_string(),
+            scopes,
+            expires_at_ms,
+        }])
+    }
+
+    async fn start_auth_server(
+        socket_path: &Path,
+        auth: IpcAuth,
+    ) -> (mpsc::Sender<()>, tokio::task::JoinHandle<()>) {
+        let server = IpcServer::bind(socket_path).await.unwrap();
+        let event_bus = Arc::new(EventBus::new(100));
+        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+        let handle = tokio::spawn(async move {
+            server
+                .run_with_auth(event_bus, Some(auth), shutdown_rx)
+                .await;
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        (shutdown_tx, handle)
+    }
+
+    #[tokio::test]
+    async fn ipc_auth_rejects_missing_token() {
+        let temp_dir = TempDir::new().unwrap();
+        let socket_path = temp_dir.path().join("test.sock");
+
+        let auth = build_auth("secret", vec![IpcScope::Read], None);
+        let (shutdown_tx, server_handle) = start_auth_server(&socket_path, auth).await;
+
+        let mut client = IpcClient::new(&socket_path);
+        client.set_token(None);
+        let response = client.ping().await.unwrap();
+        assert!(!response.ok);
+        assert!(
+            response
+                .error
+                .unwrap_or_default()
+                .contains("missing auth token")
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        let _ = server_handle.await;
+    }
+
+    #[tokio::test]
+    async fn ipc_auth_rejects_invalid_token() {
+        let temp_dir = TempDir::new().unwrap();
+        let socket_path = temp_dir.path().join("test.sock");
+
+        let auth = build_auth("secret", vec![IpcScope::Read], None);
+        let (shutdown_tx, server_handle) = start_auth_server(&socket_path, auth).await;
+
+        let client = IpcClient::with_token(&socket_path, "bad-token");
+        let response = client.ping().await.unwrap();
+        assert!(!response.ok);
+        assert!(
+            response
+                .error
+                .unwrap_or_default()
+                .contains("invalid auth token")
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        let _ = server_handle.await;
+    }
+
+    #[tokio::test]
+    async fn ipc_auth_rejects_expired_token() {
+        let temp_dir = TempDir::new().unwrap();
+        let socket_path = temp_dir.path().join("test.sock");
+
+        let expired_at = now_ms().saturating_sub(1);
+        let auth = build_auth("secret", vec![IpcScope::Read], Some(expired_at));
+        let (shutdown_tx, server_handle) = start_auth_server(&socket_path, auth).await;
+
+        let client = IpcClient::with_token(&socket_path, "secret");
+        let response = client.ping().await.unwrap();
+        assert!(!response.ok);
+        assert!(
+            response
+                .error
+                .unwrap_or_default()
+                .contains("auth token expired")
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        let _ = server_handle.await;
+    }
+
+    #[tokio::test]
+    async fn ipc_auth_enforces_scopes() {
+        let temp_dir = TempDir::new().unwrap();
+        let socket_path = temp_dir.path().join("test.sock");
+
+        let auth = build_auth("reader", vec![IpcScope::Read], None);
+        let (shutdown_tx, server_handle) = start_auth_server(&socket_path, auth).await;
+
+        let client = IpcClient::with_token(&socket_path, "reader");
+        let response = client
+            .send_user_var(
+                1,
+                "WA_EVENT".to_string(),
+                "eyJraW5kIjoidGVzdCJ9".to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(!response.ok);
+        assert!(
+            response
+                .error
+                .unwrap_or_default()
+                .contains("insufficient scope")
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        let _ = server_handle.await;
     }
 
     #[tokio::test]
@@ -847,6 +1248,27 @@ mod tests {
         // Shutdown
         let _ = shutdown_tx.send(()).await;
         let _ = server_handle.await;
+    }
+
+    #[tokio::test]
+    async fn ipc_server_removes_socket_on_shutdown() {
+        let temp_dir = TempDir::new().unwrap();
+        let socket_path = temp_dir.path().join("test.sock");
+
+        let server = IpcServer::bind(&socket_path).await.unwrap();
+        let event_bus = Arc::new(EventBus::new(100));
+        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+
+        let server_handle = tokio::spawn(async move {
+            server.run(event_bus, shutdown_rx).await;
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(socket_path.exists());
+
+        let _ = shutdown_tx.send(()).await;
+        let _ = server_handle.await;
+        assert!(!socket_path.exists());
     }
 
     fn make_pane_info(pane_id: u64) -> crate::wezterm::PaneInfo {

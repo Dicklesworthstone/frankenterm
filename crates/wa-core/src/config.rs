@@ -1914,6 +1914,10 @@ pub struct NotificationConfig {
     /// Desktop notification settings (native OS alerts).
     #[serde(default)]
     pub desktop: crate::desktop_notify::DesktopNotifyConfig,
+
+    /// Email notification settings (SMTP).
+    #[serde(default)]
+    pub email: crate::email_notify::EmailNotifyConfig,
 }
 
 impl Default for NotificationConfig {
@@ -1928,11 +1932,96 @@ impl Default for NotificationConfig {
             agent_types: Vec::new(),
             webhooks: Vec::new(),
             desktop: crate::desktop_notify::DesktopNotifyConfig::default(),
+            email: crate::email_notify::EmailNotifyConfig::default(),
         }
     }
 }
 
 impl NotificationConfig {
+    /// Validate semantic constraints for notification configuration.
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(min_severity) = &self.min_severity {
+            if parse_notification_severity(min_severity).is_none() {
+                return Err(format!(
+                    "notifications.min_severity must be one of info, warning, critical (got {min_severity})"
+                ));
+            }
+        }
+
+        for (idx, pattern) in self.include.iter().enumerate() {
+            if pattern.trim().is_empty() {
+                return Err(format!("notifications.include[{idx}] must not be empty"));
+            }
+        }
+
+        for (idx, pattern) in self.exclude.iter().enumerate() {
+            if pattern.trim().is_empty() {
+                return Err(format!("notifications.exclude[{idx}] must not be empty"));
+            }
+        }
+
+        for (idx, agent_type) in self.agent_types.iter().enumerate() {
+            if agent_type.trim().is_empty() {
+                return Err(format!(
+                    "notifications.agent_types[{idx}] must not be empty"
+                ));
+            }
+            if parse_notification_agent_type(agent_type).is_none() {
+                return Err(format!(
+                    "notifications.agent_types[{idx}] must be one of codex, claude_code, gemini, wezterm, unknown (got {agent_type})"
+                ));
+            }
+        }
+
+        let mut webhook_names = std::collections::HashSet::new();
+        for (idx, webhook) in self.webhooks.iter().enumerate() {
+            let name = webhook.name.trim();
+            if name.is_empty() {
+                return Err(format!(
+                    "notifications.webhooks[{idx}].name must not be empty"
+                ));
+            }
+            if name.eq_ignore_ascii_case("desktop") {
+                return Err(format!(
+                    "notifications.webhooks[{idx}].name must not be 'desktop' (reserved)"
+                ));
+            }
+            if !webhook_names.insert(name.to_lowercase()) {
+                return Err(format!(
+                    "notifications.webhooks has duplicate name: {}",
+                    webhook.name
+                ));
+            }
+
+            let url = webhook.url.trim();
+            if url.is_empty() {
+                return Err(format!(
+                    "notifications.webhooks[{idx}].url must not be empty"
+                ));
+            }
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                return Err(format!(
+                    "notifications.webhooks[{idx}].url must start with http:// or https://"
+                ));
+            }
+            if url.len() <= "http://".len() {
+                return Err(format!(
+                    "notifications.webhooks[{idx}].url must include a host"
+                ));
+            }
+
+            for (event_idx, pattern) in webhook.events.iter().enumerate() {
+                if pattern.trim().is_empty() {
+                    return Err(format!(
+                        "notifications.webhooks[{idx}].events[{event_idx}] must not be empty"
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Build an [`EventFilter`](crate::events::EventFilter) from this config.
     #[must_use]
     pub fn to_event_filter(&self) -> crate::events::EventFilter {
@@ -1952,6 +2041,26 @@ impl NotificationConfig {
             Duration::from_millis(self.dedup_window_ms),
             Duration::from_millis(self.cooldown_ms),
         )
+    }
+}
+
+fn parse_notification_severity(value: &str) -> Option<crate::patterns::Severity> {
+    match value.to_lowercase().as_str() {
+        "info" => Some(crate::patterns::Severity::Info),
+        "warning" => Some(crate::patterns::Severity::Warning),
+        "critical" => Some(crate::patterns::Severity::Critical),
+        _ => None,
+    }
+}
+
+fn parse_notification_agent_type(value: &str) -> Option<crate::patterns::AgentType> {
+    match value.to_lowercase().as_str() {
+        "codex" => Some(crate::patterns::AgentType::Codex),
+        "claude_code" => Some(crate::patterns::AgentType::ClaudeCode),
+        "gemini" => Some(crate::patterns::AgentType::Gemini),
+        "wezterm" => Some(crate::patterns::AgentType::Wezterm),
+        "unknown" => Some(crate::patterns::AgentType::Unknown),
+        _ => None,
     }
 }
 
@@ -2675,6 +2784,10 @@ impl Config {
             .map_err(crate::error::ConfigError::ValidationError)?;
 
         self.sync
+            .validate()
+            .map_err(crate::error::ConfigError::ValidationError)?;
+
+        self.notifications
             .validate()
             .map_err(crate::error::ConfigError::ValidationError)?;
 
@@ -4037,6 +4150,50 @@ log_level = "debug"
         let config: Config = toml::from_str(toml_str).expect("parse");
         assert!(config.notifications.enabled);
         assert_eq!(config.notifications.cooldown_ms, 30_000);
+    }
+
+    #[test]
+    fn notification_config_validation_rejects_bad_min_severity() {
+        let mut config = Config::default();
+        config.notifications.min_severity = Some("loud".to_string());
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("notifications.min_severity"));
+    }
+
+    #[test]
+    fn notification_config_validation_rejects_bad_agent_type() {
+        let mut config = Config::default();
+        config.notifications.agent_types = vec!["codex".to_string(), "nonsense".to_string()];
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("notifications.agent_types[1]"));
+    }
+
+    #[test]
+    fn notification_config_validation_rejects_duplicate_webhook_names() {
+        use std::collections::HashMap;
+
+        let mut config = Config::default();
+        config.notifications.webhooks = vec![
+            crate::webhook::WebhookEndpointConfig {
+                name: "alerts".to_string(),
+                url: "https://example.com/one".to_string(),
+                template: crate::webhook::WebhookTemplate::Generic,
+                events: Vec::new(),
+                headers: HashMap::new(),
+                enabled: true,
+            },
+            crate::webhook::WebhookEndpointConfig {
+                name: "alerts".to_string(),
+                url: "https://example.com/two".to_string(),
+                template: crate::webhook::WebhookTemplate::Generic,
+                events: Vec::new(),
+                headers: HashMap::new(),
+                enabled: true,
+            },
+        ];
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("duplicate name"));
     }
 
     #[test]
