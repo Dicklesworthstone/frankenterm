@@ -1011,6 +1011,7 @@ mod tests {
         let layout = WorkspaceLayout::new(
             std::env::temp_dir().join(format!("wa_test_diag_ws_{}", std::process::id())),
             &config.storage,
+            &config.ipc,
         );
 
         let output_dir =
@@ -1117,6 +1118,7 @@ mod tests {
         let layout = WorkspaceLayout::new(
             std::env::temp_dir().join(format!("wa_test_diag_secrets_ws_{}", std::process::id())),
             &config.storage,
+            &config.ipc,
         );
 
         let output_dir = std::env::temp_dir().join(format!(
@@ -1164,6 +1166,7 @@ mod tests {
         let layout = WorkspaceLayout::new(
             std::env::temp_dir().join(format!("wa_test_diag_meta_ws_{}", std::process::id())),
             &config.storage,
+            &config.ipc,
         );
 
         let output_dir =
@@ -1254,6 +1257,7 @@ mod tests {
         let layout = WorkspaceLayout::new(
             std::env::temp_dir().join(format!("wa_test_diag_res_ws_{}", std::process::id())),
             &config.storage,
+            &config.ipc,
         );
 
         let output_dir =
@@ -1307,6 +1311,7 @@ mod tests {
         let layout = WorkspaceLayout::new(
             std::env::temp_dir().join(format!("wa_test_diag_reuse_ws_{}", std::process::id())),
             &config.storage,
+            &config.ipc,
         );
 
         let output_dir =

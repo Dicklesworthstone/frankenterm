@@ -11,6 +11,8 @@
 //! - Server responds: `{"ok":true}\n` or `{"ok":false,"error":"..."}\n`
 
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(unix)]
@@ -145,7 +147,7 @@ pub struct IpcServer {
 
 #[cfg(unix)]
 impl IpcServer {
-    /// Create and bind a new IPC server.
+    /// Create and bind a new IPC server with default permissions (0o600).
     ///
     /// # Arguments
     /// * `socket_path` - Path to the Unix socket file
@@ -153,6 +155,21 @@ impl IpcServer {
     /// # Errors
     /// Returns error if socket binding fails.
     pub async fn bind(socket_path: impl AsRef<Path>) -> std::io::Result<Self> {
+        Self::bind_with_permissions(socket_path, Some(0o600)).await
+    }
+
+    /// Create and bind a new IPC server with explicit permissions.
+    ///
+    /// # Arguments
+    /// * `socket_path` - Path to the Unix socket file
+    /// * `permissions` - Optional permissions to set on the socket path
+    ///
+    /// # Errors
+    /// Returns error if socket binding or permission setting fails.
+    pub async fn bind_with_permissions(
+        socket_path: impl AsRef<Path>,
+        permissions: Option<u32>,
+    ) -> std::io::Result<Self> {
         let socket_path = socket_path.as_ref().to_path_buf();
 
         // Remove stale socket file if it exists
@@ -166,6 +183,10 @@ impl IpcServer {
         }
 
         let listener = UnixListener::bind(&socket_path)?;
+        if let Some(mode) = permissions {
+            let perms = std::fs::Permissions::from_mode(mode);
+            std::fs::set_permissions(&socket_path, perms)?;
+        }
         tracing::info!(path = %socket_path.display(), "IPC server listening");
 
         Ok(Self {

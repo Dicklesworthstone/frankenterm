@@ -5523,6 +5523,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
         &layout,
         resolved_config_path.as_deref(),
         log_file_path.as_deref(),
+        &config.ipc,
     );
     emit_permission_warnings(&permission_warnings);
 

@@ -68,6 +68,9 @@ pub struct Config {
     /// Vendored WezTerm settings
     pub vendored: VendoredConfig,
 
+    /// IPC (local RPC socket) settings
+    pub ipc: IpcConfig,
+
     /// Native WezTerm event listener settings
     pub native: NativeEventsConfig,
 
@@ -1660,6 +1663,34 @@ impl Default for ReservationConfig {
 }
 
 // =============================================================================
+// IPC Config
+// =============================================================================
+
+/// IPC (local RPC socket) configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct IpcConfig {
+    /// Enable the IPC server.
+    pub enabled: bool,
+
+    /// Socket path for the IPC server (absolute or relative to workspace .wa).
+    pub socket_path: String,
+
+    /// File permissions for the socket (octal), e.g. 0o600.
+    pub permissions: u32,
+}
+
+impl Default for IpcConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            socket_path: "ipc.sock".to_string(),
+            permissions: 0o600,
+        }
+    }
+}
+
+// =============================================================================
 // Native Events Config
 // =============================================================================
 
@@ -2120,6 +2151,29 @@ impl Config {
             });
         }
 
+        if self.ipc.enabled != new_config.ipc.enabled {
+            forbidden.push(ForbiddenChange {
+                name: "ipc.enabled".to_string(),
+                reason: "IPC enablement cannot be changed at runtime; requires restart".to_string(),
+            });
+        }
+
+        if self.ipc.socket_path != new_config.ipc.socket_path {
+            forbidden.push(ForbiddenChange {
+                name: "ipc.socket_path".to_string(),
+                reason: "IPC socket path cannot be changed at runtime; requires restart"
+                    .to_string(),
+            });
+        }
+
+        if self.ipc.permissions != new_config.ipc.permissions {
+            forbidden.push(ForbiddenChange {
+                name: "ipc.permissions".to_string(),
+                reason: "IPC socket permissions cannot be changed at runtime; requires restart"
+                    .to_string(),
+            });
+        }
+
         if self.storage.writer_queue_size != new_config.storage.writer_queue_size {
             forbidden.push(ForbiddenChange {
                 name: "storage.writer_queue_size".to_string(),
@@ -2428,6 +2482,9 @@ impl Config {
             self.vendored.mux_socket_path = Some(path_to_string(&mux_path));
         }
 
+        let ipc_path = expand_tilde(&self.ipc.socket_path);
+        self.ipc.socket_path = path_to_string(&ipc_path);
+
         let native_path = expand_tilde(&self.native.socket_path);
         self.native.socket_path = path_to_string(&native_path);
 
@@ -2519,6 +2576,13 @@ impl Config {
             .into());
         }
 
+        if self.ipc.enabled && self.ipc.socket_path.trim().is_empty() {
+            return Err(crate::error::ConfigError::ValidationError(
+                "ipc.socket_path must not be empty when ipc.enabled=true".to_string(),
+            )
+            .into());
+        }
+
         if self.native.enabled && self.native.socket_path.trim().is_empty() {
             return Err(crate::error::ConfigError::ValidationError(
                 "native.socket_path must not be empty when native.enabled=true".to_string(),
@@ -2557,7 +2621,7 @@ impl Config {
     /// Resolve workspace layout paths for a given workspace root
     pub fn workspace_layout(&self, explicit: Option<&Path>) -> crate::Result<WorkspaceLayout> {
         let root = self.resolve_workspace_root(explicit)?;
-        Ok(WorkspaceLayout::new(root, &self.storage))
+        Ok(WorkspaceLayout::new(root, &self.storage, &self.ipc))
     }
 
     /// Get the effective database path for a workspace root
@@ -2602,7 +2666,7 @@ pub struct WorkspaceLayout {
 impl WorkspaceLayout {
     /// Create a new workspace layout for the given root
     #[must_use]
-    pub fn new(root: PathBuf, storage: &StorageConfig) -> Self {
+    pub fn new(root: PathBuf, storage: &StorageConfig, ipc: &IpcConfig) -> Self {
         let wa_dir = root.join(".wa");
         let expanded_db_path = expand_tilde(&storage.db_path);
         let db_path = if expanded_db_path.is_absolute() {
@@ -2611,7 +2675,7 @@ impl WorkspaceLayout {
             wa_dir.join(expanded_db_path)
         };
         let lock_path = wa_dir.join("watch.lock");
-        let ipc_socket_path = wa_dir.join("ipc.sock");
+        let ipc_socket_path = resolve_ipc_socket_path(&wa_dir, ipc);
         let logs_dir = wa_dir.join("logs");
         let log_path = logs_dir.join("wa-watch.log");
         let crash_dir = wa_dir.join("crash");
@@ -2640,6 +2704,20 @@ impl WorkspaceLayout {
     }
 }
 
+fn resolve_ipc_socket_path(wa_dir: &Path, ipc: &IpcConfig) -> PathBuf {
+    let raw = if ipc.socket_path.trim().is_empty() {
+        "ipc.sock"
+    } else {
+        ipc.socket_path.as_str()
+    };
+    let candidate = Path::new(raw);
+    if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        wa_dir.join(candidate)
+    }
+}
+
 /// Warning for paths that are more permissive than expected.
 #[derive(Debug, Clone)]
 pub struct PermissionWarning {
@@ -2655,6 +2733,7 @@ pub fn collect_permission_warnings(
     layout: &WorkspaceLayout,
     config_path: Option<&Path>,
     log_file_override: Option<&Path>,
+    ipc: &IpcConfig,
 ) -> Vec<PermissionWarning> {
     let mut warnings = Vec::new();
 
@@ -2679,8 +2758,12 @@ pub fn collect_permission_warnings(
     if let Some(warning) = check_permission(&layout.lock_path, 0o644, "lock file") {
         warnings.push(warning);
     }
-    if let Some(warning) = check_permission(&layout.ipc_socket_path, 0o600, "ipc socket") {
-        warnings.push(warning);
+    if ipc.enabled {
+        if let Some(warning) =
+            check_permission(&layout.ipc_socket_path, ipc.permissions, "ipc socket")
+        {
+            warnings.push(warning);
+        }
     }
     if let Some(path) = config_path {
         if let Some(warning) = check_permission(path, 0o600, "config file") {
@@ -3034,7 +3117,7 @@ disabled_rules = ["codex.usage_warning"]
         let mut config = Config::default();
         config.storage.db_path = "wa.db".to_string();
         let root = PathBuf::from("workspace-root");
-        let layout = WorkspaceLayout::new(root.clone(), &config.storage);
+        let layout = WorkspaceLayout::new(root.clone(), &config.storage, &config.ipc);
 
         assert_eq!(layout.root, root);
         assert_eq!(layout.wa_dir, PathBuf::from("workspace-root").join(".wa"));
@@ -3055,6 +3138,7 @@ disabled_rules = ["codex.usage_warning"]
         let mut config = Config::default();
         config.general.data_dir = "~/wa-data".to_string();
         config.storage.db_path = "~/wa.db".to_string();
+        config.ipc.socket_path = "~/wa-ipc.sock".to_string();
         config.backup.scheduled.destination = Some("~/wa-backups".to_string());
         config.sync.allow_paths = vec!["~/wa-allow".to_string()];
         config.sync.deny_paths = vec!["~/wa-deny".to_string()];
@@ -3069,6 +3153,7 @@ disabled_rules = ["codex.usage_warning"]
 
         assert!(!config.general.data_dir.contains('~'));
         assert!(!config.storage.db_path.contains('~'));
+        assert!(!config.ipc.socket_path.contains('~'));
         assert!(
             config
                 .backup
@@ -3566,7 +3651,7 @@ max_bytes_per_sec = 1048576
         let _ = std::fs::remove_dir_all(&root);
 
         let config = Config::default();
-        let layout = WorkspaceLayout::new(root.clone(), &config.storage);
+        let layout = WorkspaceLayout::new(root.clone(), &config.storage, &config.ipc);
 
         std::fs::create_dir_all(&layout.wa_dir).expect("create wa_dir");
         std::fs::set_permissions(&layout.wa_dir, std::fs::Permissions::from_mode(0o755))
@@ -3578,7 +3663,7 @@ max_bytes_per_sec = 1048576
         std::fs::set_permissions(&layout.db_path, std::fs::Permissions::from_mode(0o644))
             .expect("set db perms");
 
-        let warnings = collect_permission_warnings(&layout, None, None);
+        let warnings = collect_permission_warnings(&layout, None, None, &config.ipc);
         assert!(warnings.iter().any(|w| w.label == "workspace dir"));
         assert!(warnings.iter().any(|w| w.label == "database"));
 
