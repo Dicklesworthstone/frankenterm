@@ -5543,14 +5543,13 @@ async fn run_watcher(
     // Create and start the observation runtime (with event bus for workflow integration)
     let mut runtime = ObservationRuntime::new(runtime_config, storage, pattern_engine)
         .with_event_bus(Arc::clone(&event_bus));
-    let handle = runtime.start().await?;
+    let handle = Arc::new(runtime.start().await?);
     tracing::info!("Observation runtime started");
 
     let metrics_handle = if config.metrics.enabled {
         #[cfg(feature = "metrics")]
         {
-            let collector =
-                wa_core::metrics::RuntimeMetricsCollector::new(Arc::clone(&handle));
+            let collector = wa_core::metrics::RuntimeMetricsCollector::new(Arc::clone(&handle));
             let server = wa_core::metrics::MetricsServer::new(
                 config.metrics.bind.clone(),
                 config.metrics.prefix.clone(),
