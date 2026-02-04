@@ -6,7 +6,7 @@
 //!
 //! The configuration is structured into sections:
 //! - `general`: Log level, workspace/data directory
-//! - `ingest`: Poll interval, concurrency, gap detection
+//! - `ingest`: Poll interval, concurrency, gap detection, pane filters/priorities, budgets
 //! - `storage`: DB path, retention, flush intervals
 //! - `backup`: Scheduled backup configuration
 //! - `sync`: Asupersync targets, allow/deny rules, safety defaults
@@ -192,6 +192,12 @@ pub struct IngestConfig {
 
     /// Pane filtering rules (include/exclude)
     pub panes: PaneFilterConfig,
+
+    /// Pane priority rules (default + overrides)
+    pub priorities: PanePriorityConfig,
+
+    /// Capture budget settings (rate limits for ingest)
+    pub budgets: CaptureBudgetConfig,
 }
 
 impl Default for IngestConfig {
@@ -205,6 +211,8 @@ impl Default for IngestConfig {
             gap_detection_threshold_percent: 50,
             max_segment_bytes: 65536, // 64KB
             panes: PaneFilterConfig::default(),
+            priorities: PanePriorityConfig::default(),
+            budgets: CaptureBudgetConfig::default(),
         }
     }
 }
@@ -269,7 +277,7 @@ impl PaneFilterConfig {
 ///
 /// All specified matchers must match for the rule to apply (AND logic).
 /// Use separate rules for OR logic (multiple rules in include/exclude lists).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct PaneFilterRule {
     /// Unique identifier for this rule (shown in status output)
@@ -418,6 +426,127 @@ impl PaneFilterRule {
         }
 
         Ok(())
+    }
+}
+
+// =============================================================================
+// Pane Priority Config
+// =============================================================================
+
+/// Pane priority configuration for capture scheduling.
+///
+/// Precedence rules:
+/// - Rules are evaluated in order; first match wins.
+/// - Lower numbers indicate higher priority.
+/// - If no rule matches, `default_priority` applies.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct PanePriorityConfig {
+    /// Default priority for panes without an override
+    pub default_priority: u32,
+
+    /// Per-pane priority overrides
+    pub rules: Vec<PanePriorityRule>,
+}
+
+impl Default for PanePriorityConfig {
+    fn default() -> Self {
+        Self {
+            default_priority: default_pane_priority_value(),
+            rules: Vec::new(),
+        }
+    }
+}
+
+impl PanePriorityConfig {
+    /// Compute the priority for a pane based on configured rules.
+    #[must_use]
+    pub fn priority_for_pane(&self, domain: &str, title: &str, cwd: &str) -> u32 {
+        for rule in &self.rules {
+            if rule.matches(domain, title, cwd) {
+                return rule.priority;
+            }
+        }
+        self.default_priority
+    }
+
+    /// Validate rules and ensure unique IDs.
+    pub fn validate(&self) -> Result<(), String> {
+        let mut seen = HashSet::new();
+        for rule in &self.rules {
+            rule.validate()?;
+            if !seen.insert(rule.matcher.id.clone()) {
+                return Err(format!(
+                    "Duplicate pane priority rule id: {}",
+                    rule.matcher.id
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Per-pane priority override rule.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct PanePriorityRule {
+    /// Matchers for domain/title/cwd
+    #[serde(flatten)]
+    pub matcher: PaneFilterRule,
+
+    /// Priority value (lower = higher priority)
+    #[serde(default = "default_pane_priority_value")]
+    pub priority: u32,
+}
+
+impl Default for PanePriorityRule {
+    fn default() -> Self {
+        Self {
+            matcher: PaneFilterRule::default(),
+            priority: default_pane_priority_value(),
+        }
+    }
+}
+
+impl PanePriorityRule {
+    /// Check if this rule matches a pane.
+    #[must_use]
+    pub fn matches(&self, domain: &str, title: &str, cwd: &str) -> bool {
+        self.matcher.matches(domain, title, cwd)
+    }
+
+    /// Validate that this rule has a matcher and a non-empty id.
+    pub fn validate(&self) -> Result<(), String> {
+        self.matcher.validate()
+    }
+}
+
+fn default_pane_priority_value() -> u32 {
+    100
+}
+
+// =============================================================================
+// Capture Budget Config
+// =============================================================================
+
+/// Capture budget configuration for ingest throttling.
+///
+/// A value of 0 disables the budget (unlimited).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct CaptureBudgetConfig {
+    /// Maximum capture operations per second across all panes (0 = unlimited)
+    pub max_captures_per_sec: u32,
+    /// Maximum captured bytes per second across all panes (0 = unlimited)
+    pub max_bytes_per_sec: u64,
+}
+
+impl Default for CaptureBudgetConfig {
+    fn default() -> Self {
+        Self {
+            max_captures_per_sec: 0,
+            max_bytes_per_sec: 0,
+        }
     }
 }
 
@@ -1863,6 +1992,10 @@ pub struct HotReloadableConfig {
     pub min_poll_interval_ms: u64,
     /// Maximum concurrent captures
     pub max_concurrent_captures: u32,
+    /// Pane priority overrides
+    pub pane_priorities: PanePriorityConfig,
+    /// Capture budgets
+    pub capture_budgets: CaptureBudgetConfig,
 
     // Storage
     /// Retention period in days
@@ -1892,6 +2025,8 @@ impl HotReloadableConfig {
             poll_interval_ms: config.ingest.poll_interval_ms,
             min_poll_interval_ms: config.ingest.min_poll_interval_ms,
             max_concurrent_captures: config.ingest.max_concurrent_captures,
+            pane_priorities: config.ingest.priorities.clone(),
+            capture_budgets: config.ingest.budgets.clone(),
             retention_days: config.storage.retention_days,
             retention_max_mb: config.storage.retention_max_mb,
             checkpoint_interval_secs: config.storage.checkpoint_interval_secs,
@@ -2019,6 +2154,22 @@ impl Config {
                 name: "ingest.max_concurrent_captures".to_string(),
                 old_value: self.ingest.max_concurrent_captures.to_string(),
                 new_value: new_config.ingest.max_concurrent_captures.to_string(),
+            });
+        }
+
+        if self.ingest.priorities != new_config.ingest.priorities {
+            changes.push(HotReloadChange {
+                name: "ingest.priorities".to_string(),
+                old_value: format!("{:?}", self.ingest.priorities),
+                new_value: format!("{:?}", new_config.ingest.priorities),
+            });
+        }
+
+        if self.ingest.budgets != new_config.ingest.budgets {
+            changes.push(HotReloadChange {
+                name: "ingest.budgets".to_string(),
+                old_value: format!("{:?}", self.ingest.budgets),
+                new_value: format!("{:?}", new_config.ingest.budgets),
             });
         }
 
@@ -2301,6 +2452,11 @@ impl Config {
             )
             .into());
         }
+
+        self.ingest
+            .priorities
+            .validate()
+            .map_err(crate::error::ConfigError::ValidationError)?;
 
         crate::backup::BackupSchedule::parse(&self.backup.scheduled.schedule)?;
 
@@ -3264,6 +3420,56 @@ title = "vim"
     }
 
     #[test]
+    fn pane_priority_and_budget_toml_roundtrip() {
+        let toml = r#"
+[ingest.priorities]
+default_priority = 120
+
+[[ingest.priorities.rules]]
+id = "high_codex"
+priority = 10
+title = "codex"
+
+[ingest.budgets]
+max_captures_per_sec = 50
+max_bytes_per_sec = 1048576
+"#;
+
+        let config = Config::from_toml(toml).expect("Failed to parse");
+
+        assert_eq!(config.ingest.priorities.default_priority, 120);
+        assert_eq!(config.ingest.priorities.rules.len(), 1);
+        assert_eq!(config.ingest.priorities.rules[0].priority, 10);
+        assert_eq!(
+            config.ingest.priorities.rules[0].matcher.title,
+            Some("codex".to_string())
+        );
+        assert_eq!(config.ingest.budgets.max_captures_per_sec, 50);
+        assert_eq!(config.ingest.budgets.max_bytes_per_sec, 1_048_576);
+    }
+
+    #[test]
+    fn pane_priority_validation_duplicate_ids() {
+        let mut config = Config::default();
+        config.ingest.priorities.rules = vec![
+            PanePriorityRule {
+                matcher: PaneFilterRule::new("dup").with_title("codex"),
+                priority: 10,
+            },
+            PanePriorityRule {
+                matcher: PaneFilterRule::new("dup").with_title("claude"),
+                priority: 20,
+            },
+        ];
+
+        let err = config.validate().expect_err("Expected validation failure");
+        assert!(
+            err.to_string().contains("Duplicate pane priority rule id"),
+            "Unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn pane_filter_glob_special_chars() {
         // Test that special regex characters in domain/cwd are properly escaped
         let rule = PaneFilterRule::new("special").with_domain("domain.with.dots");
@@ -3507,6 +3713,8 @@ title = "vim"
         let mut config = Config::default();
         config.general.log_level = "debug".to_string();
         config.ingest.poll_interval_ms = 500;
+        config.ingest.priorities.default_priority = 42;
+        config.ingest.budgets.max_captures_per_sec = 25;
         config.storage.retention_days = 45;
         config.patterns.packs = vec!["builtin:core".to_string()];
 
@@ -3514,6 +3722,8 @@ title = "vim"
 
         assert_eq!(hot.log_level, "debug");
         assert_eq!(hot.poll_interval_ms, 500);
+        assert_eq!(hot.pane_priorities.default_priority, 42);
+        assert_eq!(hot.capture_budgets.max_captures_per_sec, 25);
         assert_eq!(hot.retention_days, 45);
         assert_eq!(hot.pattern_packs, vec!["builtin:core".to_string()]);
     }
