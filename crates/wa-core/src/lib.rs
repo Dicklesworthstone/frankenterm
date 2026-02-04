@@ -53,6 +53,7 @@ pub mod config;
 pub mod crash;
 pub mod degradation;
 pub mod desktop_notify;
+pub mod email_notify;
 pub mod diagnostic;
 pub mod dry_run;
 pub mod error;
