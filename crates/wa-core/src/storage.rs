@@ -4158,6 +4158,21 @@ impl StorageHandle {
         .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
+    /// Scan segments in ascending id order with incremental paging.
+    pub async fn scan_segments(&self, query: SegmentScanQuery) -> Result<Vec<Segment>> {
+        let db_path = Arc::clone(&self.db_path);
+
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+
+            query_scan_segments(&conn, &query)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+    }
+
     /// Get workflow by ID
     pub async fn get_workflow(&self, workflow_id: &str) -> Result<Option<WorkflowRecord>> {
         let db_path = Arc::clone(&self.db_path);
@@ -5066,6 +5081,33 @@ pub struct ExportQuery {
     pub until: Option<i64>,
     /// Maximum number of results
     pub limit: Option<usize>,
+}
+
+/// Query options for incremental segment scans.
+#[derive(Debug, Clone)]
+pub struct SegmentScanQuery {
+    /// Return segments with id strictly greater than this value.
+    pub after_id: Option<i64>,
+    /// Filter by pane ID.
+    pub pane_id: Option<u64>,
+    /// Filter by time range start (epoch ms).
+    pub since: Option<i64>,
+    /// Filter by time range end (epoch ms).
+    pub until: Option<i64>,
+    /// Maximum number of results to return.
+    pub limit: usize,
+}
+
+impl Default for SegmentScanQuery {
+    fn default() -> Self {
+        Self {
+            after_id: None,
+            pane_id: None,
+            since: None,
+            until: None,
+            limit: 1_000,
+        }
+    }
 }
 
 // =============================================================================
@@ -8792,6 +8834,105 @@ fn query_incomplete_workflows(conn: &Connection) -> Result<Vec<WorkflowRecord>> 
                 started_at: row.get(10)?,
                 updated_at: row.get(11)?,
                 completed_at: row.get(12)?,
+            })
+        })
+        .map_err(|e| StorageError::Database(format!("Query failed: {e}")))?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row.map_err(|e| StorageError::Database(format!("Row error: {e}")))?);
+    }
+
+    Ok(results)
+}
+
+// =============================================================================
+// Segment Scan Query Functions
+// =============================================================================
+
+/// Build a dynamic WHERE clause and params from a SegmentScanQuery.
+/// `time_column` is the column name used for since/until filtering.
+fn build_segment_scan_where(
+    query: &SegmentScanQuery,
+    time_column: &str,
+) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+    let mut clauses: Vec<String> = Vec::new();
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+    if let Some(after_id) = query.after_id {
+        clauses.push(format!("id > ?{}", params.len() + 1));
+        params.push(Box::new(after_id));
+    }
+    if let Some(pane_id) = query.pane_id {
+        clauses.push(format!("pane_id = ?{}", params.len() + 1));
+        params.push(Box::new(u64_to_i64_unchecked(pane_id)));
+    }
+    if let Some(since) = query.since {
+        clauses.push(format!("{time_column} >= ?{}", params.len() + 1));
+        params.push(Box::new(since));
+    }
+    if let Some(until) = query.until {
+        clauses.push(format!("{time_column} <= ?{}", params.len() + 1));
+        params.push(Box::new(until));
+    }
+
+    let where_clause = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", clauses.join(" AND "))
+    };
+
+    (where_clause, params)
+}
+
+fn query_scan_segments(conn: &Connection, query: &SegmentScanQuery) -> Result<Vec<Segment>> {
+    let (where_clause, params) = build_segment_scan_where(query, "captured_at");
+    let limit = if query.limit == 0 { 1_000 } else { query.limit };
+    let sql = format!(
+        "SELECT id, pane_id, seq, content, content_len, content_hash, captured_at
+         FROM output_segments{where_clause}
+         ORDER BY id ASC
+         LIMIT ?{}",
+        params.len() + 1
+    );
+
+    let mut all_params = params;
+    all_params.push(Box::new(limit as i64));
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+        all_params.iter().map(|p| p.as_ref()).collect();
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| StorageError::Database(format!("Failed to prepare query: {e}")))?;
+
+    let rows = stmt
+        .query_map(param_refs.as_slice(), |row| {
+            Ok(Segment {
+                id: row.get(0)?,
+                pane_id: {
+                    let val: i64 = row.get(1)?;
+                    #[allow(clippy::cast_sign_loss)]
+                    {
+                        val as u64
+                    }
+                },
+                seq: {
+                    let val: i64 = row.get(2)?;
+                    #[allow(clippy::cast_sign_loss)]
+                    {
+                        val as u64
+                    }
+                },
+                content: row.get(3)?,
+                content_len: {
+                    let val: i64 = row.get(4)?;
+                    #[allow(clippy::cast_sign_loss)]
+                    {
+                        val as usize
+                    }
+                },
+                content_hash: row.get(5)?,
+                captured_at: row.get(6)?,
             })
         })
         .map_err(|e| StorageError::Database(format!("Query failed: {e}")))?;
