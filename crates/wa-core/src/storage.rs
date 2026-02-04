@@ -1430,6 +1430,68 @@ impl AuditActionRecord {
     }
 }
 
+/// Redacted audit record for JSONL streaming.
+///
+/// This schema is stable and safe for external consumers. The `id` field is
+/// monotonically increasing and can be used as a cursor for pagination.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditStreamRecord {
+    /// Monotonic record ID (cursor)
+    pub id: i64,
+    /// Timestamp (epoch ms)
+    pub ts: i64,
+    /// Actor kind (human/robot/mcp/workflow)
+    pub actor_kind: String,
+    /// Actor identifier, if any
+    pub actor_id: Option<String>,
+    /// Correlation identifier, if any
+    pub correlation_id: Option<String>,
+    /// Pane ID, if applicable
+    pub pane_id: Option<u64>,
+    /// Domain name, if applicable
+    pub domain: Option<String>,
+    /// Action kind (send_text, workflow_run, etc.)
+    pub action_kind: String,
+    /// Policy decision (allow/deny/require_approval)
+    pub policy_decision: String,
+    /// Redacted decision reason, if any
+    pub decision_reason: Option<String>,
+    /// Policy rule ID, if any
+    pub rule_id: Option<String>,
+    /// Redacted input summary, if any
+    pub input_summary: Option<String>,
+    /// Redacted verification summary, if any
+    pub verification_summary: Option<String>,
+    /// Redacted decision context (JSON), if any
+    pub decision_context: Option<String>,
+    /// Result (success/denied/failed/timeout)
+    pub result: String,
+}
+
+impl AuditStreamRecord {
+    /// Build a redacted stream record from an audit action.
+    pub fn from_action(mut action: AuditActionRecord, redactor: &Redactor) -> Self {
+        action.redact_fields(redactor);
+        Self {
+            id: action.id,
+            ts: action.ts,
+            actor_kind: action.actor_kind,
+            actor_id: action.actor_id,
+            correlation_id: action.correlation_id,
+            pane_id: action.pane_id,
+            domain: action.domain,
+            action_kind: action.action_kind,
+            policy_decision: action.policy_decision,
+            decision_reason: action.decision_reason,
+            rule_id: action.rule_id,
+            input_summary: action.input_summary,
+            verification_summary: action.verification_summary,
+            decision_context: action.decision_context,
+            result: action.result,
+        }
+    }
+}
+
 /// Undo metadata for an audit action
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionUndoRecord {
@@ -3963,6 +4025,26 @@ impl StorageHandle {
         .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
+    /// Stream audit actions using a cursor and stable ordering.
+    ///
+    /// Records are ordered by monotonically increasing ID for deterministic paging.
+    pub async fn get_audit_actions_stream(
+        &self,
+        query: AuditStreamQuery,
+    ) -> Result<AuditStreamPage> {
+        let db_path = Arc::clone(&self.db_path);
+
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+
+            crate::storage::query_audit_actions_stream(&conn, &query)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+    }
+
     /// Query action history view with filters
     pub async fn get_action_history(
         &self,
@@ -4536,6 +4618,48 @@ pub struct AuditQuery {
     pub since: Option<i64>,
     /// Filter by time range end (epoch ms)
     pub until: Option<i64>,
+}
+
+/// Query options for cursor-based audit streaming
+#[derive(Debug, Clone, Default)]
+pub struct AuditStreamQuery {
+    /// Resume after this audit action ID (exclusive)
+    pub cursor: Option<i64>,
+    /// Maximum number of results (default: 100)
+    pub limit: Option<usize>,
+    /// Optional offset (applied after cursor filtering)
+    pub offset: Option<usize>,
+    /// Filter by pane ID
+    pub pane_id: Option<u64>,
+    /// Filter by domain name
+    pub domain: Option<String>,
+    /// Filter by actor kind
+    pub actor_kind: Option<String>,
+    /// Filter by actor identifier
+    pub actor_id: Option<String>,
+    /// Filter by correlation identifier
+    pub correlation_id: Option<String>,
+    /// Filter by action kind
+    pub action_kind: Option<String>,
+    /// Filter by policy decision
+    pub policy_decision: Option<String>,
+    /// Filter by rule ID
+    pub rule_id: Option<String>,
+    /// Filter by result
+    pub result: Option<String>,
+    /// Filter by time range start (epoch ms)
+    pub since: Option<i64>,
+    /// Filter by time range end (epoch ms)
+    pub until: Option<i64>,
+}
+
+/// Cursor-based audit stream page
+#[derive(Debug, Clone, Default)]
+pub struct AuditStreamPage {
+    /// Ordered audit records for this page
+    pub records: Vec<AuditActionRecord>,
+    /// Cursor to resume from (last record ID), if any
+    pub next_cursor: Option<i64>,
 }
 
 /// Query options for action history view
@@ -7621,6 +7745,121 @@ fn query_audit_actions(conn: &Connection, query: &AuditQuery) -> Result<Vec<Audi
     Ok(results)
 }
 
+/// Query audit actions using a cursor for stable streaming.
+fn query_audit_actions_stream(
+    conn: &Connection,
+    query: &AuditStreamQuery,
+) -> Result<AuditStreamPage> {
+    let mut sql = String::from(
+        "SELECT id, ts, actor_kind, actor_id, correlation_id, pane_id, domain, action_kind,
+         policy_decision, decision_reason, rule_id, input_summary, verification_summary,
+         decision_context, result
+         FROM audit_actions WHERE 1=1",
+    );
+    let mut params: Vec<SqlValue> = Vec::new();
+
+    if let Some(cursor) = query.cursor {
+        sql.push_str(" AND id > ?");
+        params.push(SqlValue::Integer(cursor));
+    }
+    if let Some(pane_id) = query.pane_id {
+        let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
+        sql.push_str(" AND pane_id = ?");
+        params.push(SqlValue::Integer(pane_id_i64));
+    }
+    if let Some(domain) = &query.domain {
+        sql.push_str(" AND domain = ?");
+        params.push(SqlValue::Text(domain.clone()));
+    }
+    if let Some(actor_kind) = &query.actor_kind {
+        sql.push_str(" AND actor_kind = ?");
+        params.push(SqlValue::Text(actor_kind.clone()));
+    }
+    if let Some(actor_id) = &query.actor_id {
+        sql.push_str(" AND actor_id = ?");
+        params.push(SqlValue::Text(actor_id.clone()));
+    }
+    if let Some(correlation_id) = &query.correlation_id {
+        sql.push_str(" AND correlation_id = ?");
+        params.push(SqlValue::Text(correlation_id.clone()));
+    }
+    if let Some(action_kind) = &query.action_kind {
+        sql.push_str(" AND action_kind = ?");
+        params.push(SqlValue::Text(action_kind.clone()));
+    }
+    if let Some(policy_decision) = &query.policy_decision {
+        sql.push_str(" AND policy_decision = ?");
+        params.push(SqlValue::Text(policy_decision.clone()));
+    }
+    if let Some(rule_id) = &query.rule_id {
+        sql.push_str(" AND rule_id = ?");
+        params.push(SqlValue::Text(rule_id.clone()));
+    }
+    if let Some(result) = &query.result {
+        sql.push_str(" AND result = ?");
+        params.push(SqlValue::Text(result.clone()));
+    }
+    if let Some(since) = query.since {
+        sql.push_str(" AND ts >= ?");
+        params.push(SqlValue::Integer(since));
+    }
+    if let Some(until) = query.until {
+        sql.push_str(" AND ts <= ?");
+        params.push(SqlValue::Integer(until));
+    }
+
+    sql.push_str(" ORDER BY id ASC LIMIT ?");
+    let limit_i64 = usize_to_i64(query.limit.unwrap_or(100), "limit")?;
+    params.push(SqlValue::Integer(limit_i64));
+
+    if let Some(offset) = query.offset {
+        sql.push_str(" OFFSET ?");
+        let offset_i64 = usize_to_i64(offset, "offset")?;
+        params.push(SqlValue::Integer(offset_i64));
+    }
+
+    let mut stmt = conn.prepare(&sql).map_err(|e| {
+        StorageError::Database(format!("Failed to prepare audit stream query: {e}"))
+    })?;
+
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(params), |row| {
+            Ok(AuditActionRecord {
+                id: row.get(0)?,
+                ts: row.get(1)?,
+                actor_kind: row.get(2)?,
+                actor_id: row.get(3)?,
+                correlation_id: row.get(4)?,
+                pane_id: {
+                    let val: Option<i64> = row.get(5)?;
+                    #[allow(clippy::cast_sign_loss)]
+                    val.map(|v| v as u64)
+                },
+                domain: row.get(6)?,
+                action_kind: row.get(7)?,
+                policy_decision: row.get(8)?,
+                decision_reason: row.get(9)?,
+                rule_id: row.get(10)?,
+                input_summary: row.get(11)?,
+                verification_summary: row.get(12)?,
+                decision_context: row.get(13)?,
+                result: row.get(14)?,
+            })
+        })
+        .map_err(|e| StorageError::Database(format!("Audit stream query failed: {e}")))?;
+
+    let mut records = Vec::new();
+    for row in rows {
+        records.push(row.map_err(|e| StorageError::Database(format!("Row error: {e}")))?);
+    }
+
+    let next_cursor = records.last().map(|record| record.id);
+    Ok(AuditStreamPage {
+        records,
+        next_cursor,
+    })
+}
+
 /// Query action history view with optional filters
 fn query_action_history(
     conn: &Connection,
@@ -9443,6 +9682,43 @@ mod tests {
     }
 
     #[test]
+    fn audit_stream_record_redacts_sensitive_fields() {
+        let action = AuditActionRecord {
+            id: 42,
+            ts: 1_700_000_000_123,
+            actor_kind: "robot".to_string(),
+            actor_id: Some("cli".to_string()),
+            correlation_id: None,
+            pane_id: Some(2),
+            domain: Some("local".to_string()),
+            action_kind: "send_text".to_string(),
+            policy_decision: "allow".to_string(),
+            decision_reason: Some("token sk-abc123456789012345678901234567890".to_string()),
+            rule_id: None,
+            input_summary: Some("API key sk-abc123456789012345678901234567890".to_string()),
+            verification_summary: Some("prompt ok".to_string()),
+            decision_context: Some(
+                "{\"token\":\"sk-abc123456789012345678901234567890\"}".to_string(),
+            ),
+            result: "success".to_string(),
+        };
+
+        let redactor = Redactor::new();
+        let record = AuditStreamRecord::from_action(action, &redactor);
+
+        let reason = record.decision_reason.unwrap();
+        let input = record.input_summary.unwrap();
+        let context = record.decision_context.unwrap();
+
+        assert!(reason.contains("[REDACTED]"));
+        assert!(input.contains("[REDACTED]"));
+        assert!(context.contains("[REDACTED]"));
+        assert!(!reason.contains("sk-abc"));
+        assert!(!input.contains("sk-abc"));
+        assert!(!context.contains("sk-abc"));
+    }
+
+    #[test]
     fn can_insert_and_query_audit_actions() {
         let conn = Connection::open_in_memory().unwrap();
         initialize_schema(&conn).unwrap();
@@ -9676,6 +9952,177 @@ mod tests {
         .unwrap();
         assert_eq!(denied.len(), 1);
         assert_eq!(denied[0].policy_decision, "deny");
+    }
+
+    #[test]
+    fn audit_stream_query_pages_with_cursor() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![1i64, "local", 1i64, 1i64, 1],
+        )
+        .unwrap();
+
+        let base = AuditActionRecord {
+            id: 0,
+            ts: 1_000,
+            actor_kind: "human".to_string(),
+            actor_id: None,
+            correlation_id: None,
+            pane_id: Some(1),
+            domain: Some("local".to_string()),
+            action_kind: "send_text".to_string(),
+            policy_decision: "allow".to_string(),
+            decision_reason: None,
+            rule_id: None,
+            input_summary: Some("first".to_string()),
+            verification_summary: None,
+            decision_context: None,
+            result: "success".to_string(),
+        };
+
+        let id1 = record_audit_action_sync(&conn, &base).unwrap();
+        let id2 = record_audit_action_sync(
+            &conn,
+            &AuditActionRecord {
+                ts: 2_000,
+                input_summary: Some("second".to_string()),
+                ..base.clone()
+            },
+        )
+        .unwrap();
+        let id3 = record_audit_action_sync(
+            &conn,
+            &AuditActionRecord {
+                ts: 3_000,
+                input_summary: Some("third".to_string()),
+                ..base.clone()
+            },
+        )
+        .unwrap();
+
+        let page1 = query_audit_actions_stream(
+            &conn,
+            &AuditStreamQuery {
+                limit: Some(2),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(page1.records.len(), 2);
+        assert!(page1.records[0].id < page1.records[1].id);
+        assert_eq!(page1.records[0].id, id1);
+        assert_eq!(page1.records[1].id, id2);
+        assert_eq!(page1.next_cursor, Some(id2));
+
+        let page2 = query_audit_actions_stream(
+            &conn,
+            &AuditStreamQuery {
+                cursor: page1.next_cursor,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(page2.records.len(), 1);
+        assert_eq!(page2.records[0].id, id3);
+        assert_eq!(page2.next_cursor, Some(id3));
+    }
+
+    #[test]
+    fn audit_stream_query_empty_returns_none_cursor() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let page = query_audit_actions_stream(&conn, &AuditStreamQuery::default()).unwrap();
+        assert!(page.records.is_empty());
+        assert!(page.next_cursor.is_none());
+    }
+
+    #[test]
+    fn audit_stream_query_respects_limit() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![1i64, "local", 1i64, 1i64, 1],
+        )
+        .unwrap();
+
+        let action = AuditActionRecord {
+            id: 0,
+            ts: 1_000,
+            actor_kind: "human".to_string(),
+            actor_id: None,
+            correlation_id: None,
+            pane_id: Some(1),
+            domain: Some("local".to_string()),
+            action_kind: "send_text".to_string(),
+            policy_decision: "allow".to_string(),
+            decision_reason: None,
+            rule_id: None,
+            input_summary: Some("hi".to_string()),
+            verification_summary: None,
+            decision_context: None,
+            result: "success".to_string(),
+        };
+
+        record_audit_action_sync(&conn, &action).unwrap();
+        record_audit_action_sync(
+            &conn,
+            &AuditActionRecord {
+                ts: 2_000,
+                input_summary: Some("second".to_string()),
+                ..action.clone()
+            },
+        )
+        .unwrap();
+
+        let page = query_audit_actions_stream(
+            &conn,
+            &AuditStreamQuery {
+                limit: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(page.records.len(), 1);
+        assert_eq!(page.next_cursor, Some(page.records[0].id));
+    }
+
+    #[test]
+    fn audit_stream_record_serializes_json_schema() {
+        let action = AuditActionRecord {
+            id: 7,
+            ts: 1_700_000_000_999,
+            actor_kind: "workflow".to_string(),
+            actor_id: Some("wf-123".to_string()),
+            correlation_id: Some("corr-1".to_string()),
+            pane_id: Some(3),
+            domain: Some("local".to_string()),
+            action_kind: "workflow_run".to_string(),
+            policy_decision: "allow".to_string(),
+            decision_reason: Some("ok".to_string()),
+            rule_id: Some("rule-1".to_string()),
+            input_summary: Some("input".to_string()),
+            verification_summary: Some("verify".to_string()),
+            decision_context: Some("{\"ctx\":true}".to_string()),
+            result: "success".to_string(),
+        };
+
+        let redactor = Redactor::new();
+        let record = AuditStreamRecord::from_action(action, &redactor);
+        let value = serde_json::to_value(&record).unwrap();
+
+        assert!(value.get("id").is_some());
+        assert!(value.get("ts").is_some());
+        assert!(value.get("actor_kind").is_some());
+        assert!(value.get("action_kind").is_some());
+        assert!(value.get("policy_decision").is_some());
+        assert!(value.get("result").is_some());
     }
 
     #[test]

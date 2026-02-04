@@ -6,10 +6,10 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use wa_core::logging::{LogConfig, LogError, init_logging};
@@ -520,46 +520,50 @@ SEE ALSO:
     wa audit -d deny                  Only denied decisions
     wa audit -k send_text             Only send_text actions
     wa audit -f json                  Machine-readable output
+    wa audit tail --follow            Stream audit records as JSONL
 
 SEE ALSO:
     wa why        Explain specific decisions
     wa events     Detection events
     wa approve    Approve denied actions"#)]
     Audit {
+        #[command(subcommand)]
+        command: Option<AuditCommands>,
+
         /// Output format: auto, plain, or json
         #[arg(long, short = 'f', default_value = "auto")]
         format: String,
 
         /// Maximum number of records to return
-        #[arg(long, short = 'l', default_value = "20")]
+        #[arg(long, short = 'l', default_value = "20", global = true)]
         limit: usize,
 
         /// Filter by pane ID
-        #[arg(long, short = 'p')]
+        #[arg(long, short = 'p', global = true)]
         pane_id: Option<u64>,
 
         /// Filter by actor kind (human, robot, mcp, workflow)
-        #[arg(long, short = 'a')]
+        #[arg(long, short = 'a', global = true)]
         actor: Option<String>,
 
         /// Filter by correlation id (plan hash for prepare/commit chains)
-        #[arg(long, visible_alias = "plan-hash")]
+        #[arg(long, visible_alias = "plan-hash", global = true)]
         correlation_id: Option<String>,
 
         /// Filter by action kind (send_text, workflow_run, approve_allow_once, etc.)
-        #[arg(long, short = 'k')]
+        #[arg(long, short = 'k', global = true)]
         action: Option<String>,
 
         /// Filter by policy decision (allow, deny, require_approval)
-        #[arg(long, short = 'd')]
+        #[arg(long, short = 'd', global = true)]
         decision: Option<String>,
 
         /// Filter by result (success, denied, failed, timeout)
-        #[arg(long, short = 'r')]
+        #[arg(long, short = 'r', global = true)]
         result: Option<String>,
 
         /// Only show records since this timestamp (epoch ms)
-        #[arg(long, short = 's')]
+        #[arg(long, short = 's', global = true)]
         since: Option<i64>,
     },
 
@@ -963,6 +967,24 @@ SEE ALSO:
     Mcp {
         #[command(subcommand)]
         command: McpCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuditCommands {
+    /// Stream audit log as JSONL
+    #[command(after_help = r#"EXAMPLES:
+    wa audit tail --follow            Stream audit records as JSONL
+    wa audit tail --follow -l 100     Stream with larger batches
+    wa audit -s 1706000000 tail       Stream records since timestamp"#)]
+    Tail {
+        /// Continue streaming and poll for new records
+        #[arg(long)]
+        follow: bool,
+
+        /// Poll interval while following (milliseconds)
+        #[arg(long, default_value = "1000")]
+        poll_interval_ms: u64,
     },
 }
 
@@ -10683,6 +10705,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
         }
 
         Some(Commands::Audit {
+            command,
             format,
             limit,
             pane_id,
@@ -10693,111 +10716,213 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             result,
             since,
         }) => {
-            use wa_core::output::{AuditListRenderer, OutputFormat, RenderContext, detect_format};
-
-            let output_format = match format.to_lowercase().as_str() {
-                "json" => OutputFormat::Json,
-                "plain" => OutputFormat::Plain,
-                _ => detect_format(),
-            };
-
-            // Get workspace layout for DB path
-            let layout = match config.workspace_layout(Some(&workspace_root)) {
-                Ok(l) => l,
-                Err(e) => {
-                    if output_format.is_json() {
-                        println!(
-                            r#"{{"ok": false, "error": "Failed to get workspace layout: {}", "version": "{}"}}"#,
-                            e,
-                            wa_core::VERSION
-                        );
-                    } else {
+            if let Some(AuditCommands::Tail {
+                follow,
+                poll_interval_ms,
+            }) = command
+            {
+                let layout = match config.workspace_layout(Some(&workspace_root)) {
+                    Ok(l) => l,
+                    Err(e) => {
                         eprintln!("Error: Failed to get workspace layout: {e}");
                         eprintln!("Check --workspace or WA_WORKSPACE");
+                        std::process::exit(1);
                     }
-                    std::process::exit(1);
-                }
-            };
+                };
 
-            // Open storage handle
-            let db_path = layout.db_path.to_string_lossy();
-            let storage = match wa_core::storage::StorageHandle::new(&db_path).await {
-                Ok(s) => s,
-                Err(e) => {
-                    if output_format.is_json() {
-                        println!(
-                            r#"{{"ok": false, "error": "Failed to open storage: {}", "version": "{}"}}"#,
-                            e,
-                            wa_core::VERSION
-                        );
-                    } else {
+                let db_path = layout.db_path.to_string_lossy();
+                let storage = match wa_core::storage::StorageHandle::new(&db_path).await {
+                    Ok(s) => s,
+                    Err(e) => {
                         eprintln!("Error: Failed to open storage: {e}");
                         eprintln!("Is the database initialized? Run 'wa watch' first.");
+                        std::process::exit(1);
                     }
-                    std::process::exit(1);
-                }
-            };
+                };
 
-            // Build audit query
-            let query = wa_core::storage::AuditQuery {
-                limit: Some(limit),
-                pane_id,
-                actor_kind: actor.clone(),
-                correlation_id: correlation_id.clone(),
-                action_kind: action.clone(),
-                policy_decision: decision.clone(),
-                result: result.clone(),
-                since,
-                ..Default::default()
-            };
-
-            if cli.verbose > 0 {
-                eprintln!("Workspace: {}", layout.root.display());
-                eprintln!("Database:  {}", layout.db_path.display());
-                if let Some(pane_id) = pane_id {
-                    eprintln!("Filter:    pane_id={pane_id}");
-                }
-                if let Some(actor) = &actor {
-                    eprintln!("Filter:    actor={actor}");
-                }
-                if let Some(correlation_id) = &correlation_id {
-                    eprintln!("Filter:    correlation_id={correlation_id}");
-                }
-                if let Some(action) = &action {
-                    eprintln!("Filter:    action={action}");
-                }
-                if let Some(decision) = &decision {
-                    eprintln!("Filter:    decision={decision}");
-                }
-                if let Some(result) = &result {
-                    eprintln!("Filter:    result={result}");
-                }
-                if let Some(since) = since {
-                    eprintln!("Filter:    since={since}");
-                }
-                eprintln!("Limit:     {limit}");
-            }
-
-            // Query audit actions
-            match storage.get_audit_actions(query).await {
-                Ok(actions) => {
-                    let ctx = RenderContext::new(output_format)
-                        .verbose(cli.verbose)
-                        .limit(limit);
-                    let output = AuditListRenderer::render(&actions, &ctx);
-                    print!("{output}");
-                }
-                Err(e) => {
-                    if output_format.is_json() {
-                        println!(
-                            r#"{{"ok": false, "error": "Failed to query audit trail: {}", "version": "{}"}}"#,
-                            e,
-                            wa_core::VERSION
-                        );
-                    } else {
-                        eprintln!("Error: Failed to query audit trail: {e}");
+                if cli.verbose > 0 {
+                    eprintln!("Workspace: {}", layout.root.display());
+                    eprintln!("Database:  {}", layout.db_path.display());
+                    if let Some(pane_id) = pane_id {
+                        eprintln!("Filter:    pane_id={pane_id}");
                     }
-                    std::process::exit(1);
+                    if let Some(actor) = &actor {
+                        eprintln!("Filter:    actor={actor}");
+                    }
+                    if let Some(correlation_id) = &correlation_id {
+                        eprintln!("Filter:    correlation_id={correlation_id}");
+                    }
+                    if let Some(action) = &action {
+                        eprintln!("Filter:    action={action}");
+                    }
+                    if let Some(decision) = &decision {
+                        eprintln!("Filter:    decision={decision}");
+                    }
+                    if let Some(result) = &result {
+                        eprintln!("Filter:    result={result}");
+                    }
+                    if let Some(since) = since {
+                        eprintln!("Filter:    since={since}");
+                    }
+                    eprintln!("Limit:     {limit}");
+                }
+
+                let mut cursor: Option<i64> = None;
+                let redactor = wa_core::policy::Redactor::new();
+                let page_limit = if limit == 0 { 1 } else { limit };
+                let mut stdout = std::io::stdout();
+
+                loop {
+                    let query = wa_core::storage::AuditStreamQuery {
+                        cursor,
+                        limit: Some(page_limit),
+                        pane_id,
+                        actor_kind: actor.clone(),
+                        correlation_id: correlation_id.clone(),
+                        action_kind: action.clone(),
+                        policy_decision: decision.clone(),
+                        result: result.clone(),
+                        since,
+                        ..Default::default()
+                    };
+
+                    let page = match storage.get_audit_actions_stream(query).await {
+                        Ok(page) => page,
+                        Err(e) => {
+                            eprintln!("Error: Failed to stream audit trail: {e}");
+                            std::process::exit(1);
+                        }
+                    };
+
+                    let record_count = page.records.len();
+                    for action in page.records {
+                        let record =
+                            wa_core::storage::AuditStreamRecord::from_action(action, &redactor);
+                        if let Ok(line) = serde_json::to_string(&record) {
+                            let _ = writeln!(stdout, "{line}");
+                        }
+                    }
+
+                    let _ = stdout.flush();
+                    cursor = page.next_cursor.or(cursor);
+
+                    if !follow {
+                        break;
+                    }
+
+                    if record_count < page_limit {
+                        tokio::time::sleep(Duration::from_millis(poll_interval_ms)).await;
+                    }
+                }
+            } else {
+                use wa_core::output::{
+                    AuditListRenderer, OutputFormat, RenderContext, detect_format,
+                };
+
+                let output_format = match format.to_lowercase().as_str() {
+                    "json" => OutputFormat::Json,
+                    "plain" => OutputFormat::Plain,
+                    _ => detect_format(),
+                };
+
+                // Get workspace layout for DB path
+                let layout = match config.workspace_layout(Some(&workspace_root)) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        if output_format.is_json() {
+                            println!(
+                                r#"{{"ok": false, "error": "Failed to get workspace layout: {}", "version": "{}"}}"#,
+                                e,
+                                wa_core::VERSION
+                            );
+                        } else {
+                            eprintln!("Error: Failed to get workspace layout: {e}");
+                            eprintln!("Check --workspace or WA_WORKSPACE");
+                        }
+                        std::process::exit(1);
+                    }
+                };
+
+                // Open storage handle
+                let db_path = layout.db_path.to_string_lossy();
+                let storage = match wa_core::storage::StorageHandle::new(&db_path).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        if output_format.is_json() {
+                            println!(
+                                r#"{{"ok": false, "error": "Failed to open storage: {}", "version": "{}"}}"#,
+                                e,
+                                wa_core::VERSION
+                            );
+                        } else {
+                            eprintln!("Error: Failed to open storage: {e}");
+                            eprintln!("Is the database initialized? Run 'wa watch' first.");
+                        }
+                        std::process::exit(1);
+                    }
+                };
+
+                // Build audit query
+                let query = wa_core::storage::AuditQuery {
+                    limit: Some(limit),
+                    pane_id,
+                    actor_kind: actor.clone(),
+                    correlation_id: correlation_id.clone(),
+                    action_kind: action.clone(),
+                    policy_decision: decision.clone(),
+                    result: result.clone(),
+                    since,
+                    ..Default::default()
+                };
+
+                if cli.verbose > 0 {
+                    eprintln!("Workspace: {}", layout.root.display());
+                    eprintln!("Database:  {}", layout.db_path.display());
+                    if let Some(pane_id) = pane_id {
+                        eprintln!("Filter:    pane_id={pane_id}");
+                    }
+                    if let Some(actor) = &actor {
+                        eprintln!("Filter:    actor={actor}");
+                    }
+                    if let Some(correlation_id) = &correlation_id {
+                        eprintln!("Filter:    correlation_id={correlation_id}");
+                    }
+                    if let Some(action) = &action {
+                        eprintln!("Filter:    action={action}");
+                    }
+                    if let Some(decision) = &decision {
+                        eprintln!("Filter:    decision={decision}");
+                    }
+                    if let Some(result) = &result {
+                        eprintln!("Filter:    result={result}");
+                    }
+                    if let Some(since) = since {
+                        eprintln!("Filter:    since={since}");
+                    }
+                    eprintln!("Limit:     {limit}");
+                }
+
+                // Query audit actions
+                match storage.get_audit_actions(query).await {
+                    Ok(actions) => {
+                        let ctx = RenderContext::new(output_format)
+                            .verbose(cli.verbose)
+                            .limit(limit);
+                        let output = AuditListRenderer::render(&actions, &ctx);
+                        print!("{output}");
+                    }
+                    Err(e) => {
+                        if output_format.is_json() {
+                            println!(
+                                r#"{{"ok": false, "error": "Failed to query audit trail: {}", "version": "{}"}}"#,
+                                e,
+                                wa_core::VERSION
+                            );
+                        } else {
+                            eprintln!("Error: Failed to query audit trail: {e}");
+                        }
+                        std::process::exit(1);
+                    }
                 }
             }
         }

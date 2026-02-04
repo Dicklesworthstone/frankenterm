@@ -291,6 +291,12 @@ impl DetectionContext {
             }
         }
 
+        // Keep the order queue unique to avoid unbounded growth when a key
+        // reappears after TTL expiry.
+        if let Some(pos) = self.seen_order.iter().position(|item| item == &key) {
+            self.seen_order.remove(pos);
+        }
+
         // Enforce capacity if adding a new key (or updating expired one that was pruned?)
         // If we update an existing key, we don't increase count.
         // But if we insert new, we might overflow.
@@ -302,9 +308,7 @@ impl DetectionContext {
         }
 
         self.seen_keys.insert(key.clone(), now);
-        // Push to back of order. If it was already there, we technically have duplicates in VecDeque
-        // but that's acceptable for a simple LRU approximation or we can just ignore strict ordering for updates.
-        // For simplicity, we just push. Pruning might remove the old entry reference later.
+        // Push to back of order for LRU-style eviction.
         self.seen_order.push_back(key);
         true
     }

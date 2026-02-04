@@ -344,6 +344,7 @@ SCENARIO_REGISTRY=(
     "usage_limit_safe_pause:Validate usage-limit safe pause workflow (fallback plan persisted)"
     "notification_webhook:Validate webhook notifications (delivery, retry, throttle, recovery)"
     "policy_denial:Validate safety gates block sends to protected panes"
+    "audit_tail_streaming:Validate audit tail JSONL streaming with redaction"
     "prepare_commit_approvals:Validate prepare/commit approvals with hash mismatch guard"
     "quickfix_suggestions:Validate quick-fix suggestions for events and errors"
     "triage_multi_issue:Validate triage ordering and suggested actions with multiple issues"
@@ -2281,6 +2282,165 @@ run_scenario_policy_denial() {
     # Cleanup trap will handle the rest
     trap - EXIT
     cleanup_policy_denial
+
+    return $result
+}
+
+# ==============================================================================
+# Scenario: Audit Tail Streaming
+# ==============================================================================
+# Validates `wa audit tail --follow` JSONL output, redaction, and ordering.
+# ==============================================================================
+
+run_scenario_audit_tail_streaming() {
+    local scenario_dir="$1"
+    local temp_workspace
+    temp_workspace=$(mktemp -d /tmp/wa-e2e-audit-tail-XXXXXX)
+    local wa_pid=""
+    local pane_id=""
+    local tail_pid=""
+    local result=0
+    local secret_token="sk-test-$(date +%s)1234567890"
+
+    log_info "Workspace: $temp_workspace"
+
+    # Setup environment for isolated wa instance
+    export WA_DATA_DIR="$temp_workspace/.wa"
+    export WA_WORKSPACE="$temp_workspace"
+    mkdir -p "$WA_DATA_DIR"
+
+    local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
+    if [[ -f "$baseline_config" ]]; then
+        cp "$baseline_config" "$temp_workspace/wa.toml"
+        export WA_CONFIG="$temp_workspace/wa.toml"
+        log_verbose "Using baseline config: $baseline_config"
+    fi
+
+    cleanup_audit_tail() {
+        log_verbose "Cleaning up audit_tail_streaming scenario"
+        if [[ -n "$tail_pid" ]] && kill -0 "$tail_pid" 2>/dev/null; then
+            log_verbose "Stopping audit tail (pid $tail_pid)"
+            kill "$tail_pid" 2>/dev/null || true
+            wait "$tail_pid" 2>/dev/null || true
+        fi
+        if [[ -n "$wa_pid" ]] && kill -0 "$wa_pid" 2>/dev/null; then
+            log_verbose "Stopping wa watch (pid $wa_pid)"
+            kill "$wa_pid" 2>/dev/null || true
+            wait "$wa_pid" 2>/dev/null || true
+        fi
+        if [[ -n "$pane_id" ]]; then
+            log_verbose "Closing pane $pane_id"
+            wezterm cli kill-pane --pane-id "$pane_id" 2>/dev/null || true
+        fi
+        if [[ -d "$temp_workspace" ]]; then
+            cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp "$temp_workspace/wa.toml" "$scenario_dir/" 2>/dev/null || true
+        fi
+        rm -rf "$temp_workspace"
+    }
+    trap cleanup_audit_tail EXIT
+
+    # Step 1: Spawn an alt-screen pane for deterministic denial
+    log_info "Step 1: Spawning alt-screen pane..."
+    local alt_script="$PROJECT_ROOT/fixtures/e2e/dummy_alt_screen.sh"
+    if [[ ! -x "$alt_script" ]]; then
+        log_fail "Alt-screen script not found or not executable: $alt_script"
+        return 1
+    fi
+
+    local spawn_output
+    spawn_output=$(wezterm cli spawn --cwd "$temp_workspace" -- bash "$alt_script" 60 2>&1)
+    pane_id=$(echo "$spawn_output" | grep -oE '^[0-9]+$' | head -1)
+
+    if [[ -z "$pane_id" ]]; then
+        log_fail "Failed to spawn alt-screen pane"
+        echo "Spawn output: $spawn_output" >> "$scenario_dir/scenario.log"
+        return 1
+    fi
+    log_info "Spawned alt-screen pane: $pane_id"
+    echo "alt_screen_pane_id: $pane_id" >> "$scenario_dir/scenario.log"
+
+    sleep 2
+
+    # Step 2: Start wa watch in background
+    log_info "Step 2: Starting wa watch..."
+    "$WA_BINARY" watch --foreground \
+        > "$scenario_dir/wa_watch.log" 2>&1 &
+    wa_pid=$!
+    log_verbose "wa watch started with PID $wa_pid"
+    echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
+
+    sleep 2
+
+    # Step 3: Wait for pane to be observed
+    log_info "Step 3: Waiting for pane to be observed..."
+    local wait_timeout=${TIMEOUT:-30}
+    local check_cmd="\"$WA_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane_id)' >/dev/null 2>&1"
+
+    if ! wait_for_condition "pane $pane_id observed" "$check_cmd" "$wait_timeout"; then
+        log_fail "Timeout waiting for pane to be observed"
+        "$WA_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
+        return 1
+    fi
+    log_pass "Pane observed"
+    "$WA_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
+
+    # Step 4: Start audit tail in follow mode
+    log_info "Step 4: Starting audit tail stream..."
+    local since_ms
+    since_ms=$(( $(date +%s) * 1000 ))
+    timeout 8 "$WA_BINARY" audit tail --follow --since "$since_ms" --limit 50 \
+        > "$scenario_dir/audit_tail.jsonl" 2> "$scenario_dir/audit_tail.stderr" &
+    tail_pid=$!
+    echo "audit_tail_pid: $tail_pid" >> "$scenario_dir/scenario.log"
+    echo "audit_tail_since_ms: $since_ms" >> "$scenario_dir/scenario.log"
+
+    sleep 1
+
+    # Step 5: Generate an audit action (intentional denial) with redaction
+    log_info "Step 5: Triggering audit action..."
+    local send_output
+    send_output=$("$WA_BINARY" robot send "$pane_id" "echo $secret_token" 2>&1 || true)
+    echo "$send_output" > "$scenario_dir/send_output.json"
+
+    # Step 6: Wait for audit tail output
+    log_info "Step 6: Waiting for audit tail output..."
+    local tail_check_cmd="test -s \"$scenario_dir/audit_tail.jsonl\""
+    if ! wait_for_condition "audit tail output" "$tail_check_cmd" "$wait_timeout"; then
+        log_fail "Timeout waiting for audit tail output"
+        return 1
+    fi
+
+    wait "$tail_pid" 2>/dev/null || true
+
+    # Step 7: Validate JSONL output and redaction
+    log_info "Step 7: Validating audit tail output..."
+    if ! jq -s 'length > 0' "$scenario_dir/audit_tail.jsonl" >/dev/null 2>&1; then
+        log_fail "Audit tail output is not valid JSONL"
+        result=1
+    fi
+
+    if grep -q "$secret_token" "$scenario_dir/audit_tail.jsonl" 2>/dev/null; then
+        log_fail "Audit tail output leaked secret token"
+        result=1
+    fi
+
+    if ! grep -q "\\[REDACTED\\]" "$scenario_dir/audit_tail.jsonl" 2>/dev/null; then
+        log_fail "Audit tail output missing redaction marker"
+        result=1
+    fi
+
+    local ids
+    ids=$(jq -r '.id' "$scenario_dir/audit_tail.jsonl" 2>/dev/null || true)
+    echo "audit_ids: $ids" >> "$scenario_dir/scenario.log"
+    local last_id
+    last_id=$(echo "$ids" | tail -n1)
+    echo "audit_cursor_last_id: $last_id" >> "$scenario_dir/scenario.log"
+
+    if ! echo "$ids" | awk 'NR==1 {prev=$1; next} { if ($1 < prev) { exit 1 } prev=$1 }'; then
+        log_fail "Audit IDs are not in deterministic order"
+        result=1
+    fi
 
     return $result
 }
@@ -5561,6 +5721,9 @@ run_scenario() {
                 ;;
         policy_denial)
             run_scenario_policy_denial "$scenario_dir" || result=$?
+            ;;
+        audit_tail_streaming)
+            run_scenario_audit_tail_streaming "$scenario_dir" || result=$?
             ;;
         prepare_commit_approvals)
             run_scenario_prepare_commit_approvals "$scenario_dir" || result=$?
