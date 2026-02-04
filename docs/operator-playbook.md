@@ -14,6 +14,22 @@ If something needs attention, follow the relevant flow below.
 
 ---
 
+**Crash-Only Behavior + Crash Bundles**
+wa treats a crash as an observable event with artifacts, not a silent failure.
+On panic, the watcher writes a bounded, redacted crash bundle and then exits.
+
+Crash bundle facts:
+- Default location: `<workspace>/.wa/crash/wa_crash_YYYYMMDD_HHMMSS/`
+- Files included: `manifest.json`, `crash_report.json`, and `health_snapshot.json` (if available)
+- Redaction: all text is passed through the policy redactor before writing
+- Size bounds: backtrace truncated to 64 KiB, total bundle capped at 1 MiB
+
+Where to find the crash directory:
+- It lives under the workspace root. Use `wa config show` or `wa status` to confirm the workspace path.
+- You can change the workspace via `--workspace` or `WA_WORKSPACE` if you need bundles elsewhere.
+
+---
+
 ## Flow 1: triage → why → fix
 
 Use this for unhandled events or workflows that need intervention.
@@ -51,11 +67,14 @@ Tip: If you are unsure, run workflows with `--dry-run` first.
 
 Use this for crashes or persistent failures you can’t fix locally.
 
-1) Export the latest crash bundle:
+1) Export the latest crash bundle as an incident bundle:
 
 ```bash
 wa reproduce --kind crash
 ```
+
+The incident bundle is a self-contained directory with crash report + manifest,
+health snapshot (if present), and a redacted config summary when available.
 
 2) Collect a diagnostics bundle (optional but recommended):
 
@@ -65,6 +84,7 @@ wa diag bundle --output /tmp/wa-diag
 
 3) File an issue with:
 - crash bundle path
+- incident bundle path (from `wa reproduce --kind crash`)
 - triage output (plain or JSON)
 - any recent wa logs
 
@@ -117,4 +137,3 @@ wa workflow status <execution_id>
 wa reproduce --kind crash
 wa diag bundle --output /tmp/wa-diag
 ```
-
