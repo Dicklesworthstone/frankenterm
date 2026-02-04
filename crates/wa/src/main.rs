@@ -151,19 +151,26 @@ SEE ALSO:
     /// Search captured output (FTS query)
     #[command(
         alias = "query",
+        subcommand_precedence_over_arg = true,
         after_help = r#"EXAMPLES:
     wa search "error"                 Find lines containing "error"
     wa search "error" --pane 3        Search in specific pane
     wa search "error OR warning"      FTS5 boolean query
     wa search "error" -f json         Machine-readable output
+    wa search fts verify              Verify FTS index health
+    wa search fts rebuild             Rebuild FTS index
 
 SEE ALSO:
     wa list       List available panes
     wa events     View detected events"#
     )]
     Search {
+        #[command(subcommand)]
+        command: Option<SearchCommands>,
+
         /// Search query (FTS5 syntax)
-        query: String,
+        #[arg(required = false)]
+        query: Option<String>,
 
         /// Output format: auto, plain, or json
         #[arg(long, short = 'f', default_value = "auto")]
@@ -565,6 +572,19 @@ SEE ALSO:
         /// Only show records since this timestamp (epoch ms)
         #[arg(long, short = 's', global = true)]
         since: Option<i64>,
+    },
+
+    /// Notification utilities (test channels)
+    #[command(after_help = r#"EXAMPLES:
+    wa notify test --channel desktop
+    wa notify test --channel ops --format json
+
+SEE ALSO:
+    wa events     Detection events
+    wa config     Configuration management"#)]
+    Notify {
+        #[command(subcommand)]
+        command: NotifyCommands,
     },
 
     /// Run diagnostics
@@ -986,6 +1006,51 @@ enum AuditCommands {
         #[arg(long, default_value = "1000")]
         poll_interval_ms: u64,
     },
+}
+
+#[derive(Subcommand)]
+enum NotifyCommands {
+    /// Send a test notification to a configured channel
+    #[command(after_help = r#"EXAMPLES:
+    wa notify test --channel desktop
+    wa notify test --channel ops --format json
+
+NOTES:
+    Channel names match [notifications.webhooks].name or "desktop"."#)]
+    Test {
+        /// Channel name (webhook name or "desktop")
+        #[arg(long)]
+        channel: String,
+
+        /// Output format: auto, plain, or json
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum SearchCommands {
+    /// FTS maintenance commands
+    #[command(after_help = r#"EXAMPLES:
+    wa search fts verify              Verify FTS index health
+    wa search fts rebuild             Rebuild FTS index
+
+SEE ALSO:
+    wa search \"error\"               Run a normal search
+    wa doctor                         System diagnostics"#)]
+    Fts {
+        #[command(subcommand)]
+        command: FtsCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum FtsCommands {
+    /// Verify FTS index integrity and consistency
+    Verify,
+
+    /// Rebuild the FTS index from stored segments
+    Rebuild,
 }
 
 #[derive(Subcommand)]
@@ -2439,6 +2504,37 @@ struct PrepareOutput {
     plan: wa_core::plan::ActionPlan,
 }
 
+#[derive(serde::Serialize)]
+struct NotifyTestOutput {
+    channel: String,
+    channel_type: String,
+    event_type: String,
+    severity: String,
+    agent_type: String,
+    decision: String,
+    redaction_ok: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    redaction_issues: Vec<String>,
+    payload: wa_core::notifications::NotificationPayload,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delivery: Option<wa_core::notifications::NotificationDelivery>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct NotifyTestResponse {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<NotifyTestOutput>,
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct IpcPaneState {
     pane_id: u64,
@@ -2972,6 +3068,44 @@ fn redact_for_output(text: &str) -> String {
     static REDACTOR: LazyLock<wa_core::policy::Redactor> =
         LazyLock::new(wa_core::policy::Redactor::new);
     REDACTOR.redact(text)
+}
+
+fn search_lints_have_errors(lints: &[wa_core::storage::SearchLint]) -> bool {
+    lints
+        .iter()
+        .any(|lint| lint.severity == wa_core::storage::SearchLintSeverity::Error)
+}
+
+fn format_search_lints_plain(lints: &[wa_core::storage::SearchLint]) -> String {
+    let mut output = String::new();
+    output.push_str("Query lint findings:\n");
+    for lint in lints {
+        let severity = match lint.severity {
+            wa_core::storage::SearchLintSeverity::Error => "error",
+            wa_core::storage::SearchLintSeverity::Warning => "warning",
+        };
+        output.push_str(&format!("  - [{severity}] {}\n", lint.message));
+        if let Some(suggestion) = &lint.suggestion {
+            output.push_str(&format!("    Suggestion: {suggestion}\n"));
+        }
+    }
+    output
+}
+
+fn format_search_lint_hint(lints: &[wa_core::storage::SearchLint]) -> Option<String> {
+    let mut hint_lines = Vec::new();
+    for lint in lints.iter().take(3) {
+        let mut line = lint.message.clone();
+        if let Some(suggestion) = &lint.suggestion {
+            line.push_str(&format!(" (suggestion: {suggestion})"));
+        }
+        hint_lines.push(line);
+    }
+    if hint_lines.is_empty() {
+        None
+    } else {
+        Some(hint_lines.join(" | "))
+    }
 }
 
 async fn evaluate_robot_approve(
@@ -4707,6 +4841,193 @@ fn validate_uservar_request(pane_id: u64, name: &str, value: &str) -> Result<(),
     Ok(())
 }
 
+struct IpcRpcArgError {
+    message: String,
+    hint: Option<String>,
+}
+
+fn sanitize_ipc_rpc_args(args: &[String]) -> Result<Vec<String>, IpcRpcArgError> {
+    let mut sanitized = Vec::with_capacity(args.len());
+    let mut skip_next = false;
+
+    for arg in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+
+        if arg == "--help" || arg == "-h" {
+            return Err(IpcRpcArgError {
+                message: "help flags are not supported over IPC".to_string(),
+                hint: Some("Use `wa robot help` or the `help` command instead.".to_string()),
+            });
+        }
+
+        if arg == "--format" || arg == "-f" {
+            skip_next = true;
+            continue;
+        }
+
+        if arg.starts_with("--format=") || arg == "--stats" {
+            continue;
+        }
+
+        sanitized.push(arg.clone());
+    }
+
+    Ok(sanitized)
+}
+
+fn build_ipc_rpc_summary(args: &[String]) -> String {
+    if args.is_empty() {
+        return "wa robot".to_string();
+    }
+
+    let redacted: Vec<String> = args.iter().map(|arg| redact_for_output(arg)).collect();
+    format!("wa robot {}", redacted.join(" "))
+}
+
+async fn run_robot_rpc_via_cli(
+    args: &[String],
+    config_path: Option<&Path>,
+    workspace_root: &Path,
+) -> Result<wa_core::ipc::IpcResponse, String> {
+    use std::process::Stdio;
+    use tokio::process::Command;
+
+    let exe =
+        std::env::current_exe().map_err(|e| format!("failed to resolve wa executable: {e}"))?;
+    let mut cmd = Command::new(exe);
+
+    if let Some(path) = config_path {
+        cmd.arg("--config").arg(path);
+    }
+
+    cmd.arg("--workspace").arg(workspace_root);
+    cmd.arg("robot").arg("--format").arg("json");
+    cmd.args(args);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let output = cmd
+        .output()
+        .await
+        .map_err(|e| format!("failed to run wa robot: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
+        };
+        if detail.is_empty() {
+            return Err(format!("wa robot exited with status {}", output.status));
+        }
+        return Err(format!("wa robot failed: {detail}"));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let payload = stdout.trim();
+    if payload.is_empty() {
+        return Err("wa robot returned empty output".to_string());
+    }
+
+    serde_json::from_str::<wa_core::ipc::IpcResponse>(payload)
+        .map_err(|e| format!("invalid wa robot response: {e}"))
+}
+
+async fn record_ipc_rpc_audit(
+    storage: &Arc<tokio::sync::Mutex<wa_core::storage::StorageHandle>>,
+    request_id: Option<String>,
+    summary: String,
+    result: &str,
+) {
+    let audit = wa_core::storage::AuditActionRecord {
+        id: 0,
+        ts: now_ms_i64(),
+        actor_kind: "robot".to_string(),
+        actor_id: None,
+        correlation_id: request_id,
+        pane_id: None,
+        domain: None,
+        action_kind: "ipc.rpc".to_string(),
+        policy_decision: "allow".to_string(),
+        decision_reason: None,
+        rule_id: None,
+        input_summary: Some(summary),
+        verification_summary: None,
+        decision_context: None,
+        result: result.to_string(),
+    };
+
+    if let Err(e) = storage
+        .lock()
+        .await
+        .record_audit_action_redacted(audit)
+        .await
+    {
+        tracing::warn!("Failed to record IPC RPC audit: {e}");
+    }
+}
+
+async fn handle_ipc_rpc_request(
+    request: wa_core::ipc::IpcRpcRequest,
+    workspace_root: PathBuf,
+    config_path: Option<PathBuf>,
+    storage: Arc<tokio::sync::Mutex<wa_core::storage::StorageHandle>>,
+) -> wa_core::ipc::IpcResponse {
+    let summary = build_ipc_rpc_summary(&request.args);
+    tracing::debug!(
+        request_id = request.request_id.as_deref(),
+        command = %summary,
+        "IPC RPC request (redacted)"
+    );
+
+    let sanitized = match sanitize_ipc_rpc_args(&request.args) {
+        Ok(args) => args,
+        Err(err) => {
+            let response = wa_core::ipc::IpcResponse::error_with_code(
+                "ipc.rpc_invalid_args",
+                err.message,
+                err.hint,
+            );
+            record_ipc_rpc_audit(&storage, request.request_id, summary, "error").await;
+            return response;
+        }
+    };
+
+    let response =
+        match run_robot_rpc_via_cli(&sanitized, config_path.as_deref(), &workspace_root).await {
+            Ok(resp) => resp,
+            Err(err) => wa_core::ipc::IpcResponse::error_with_code(
+                "ipc.rpc_failed",
+                err,
+                Some("Ensure 'wa robot' can run and outputs JSON.".to_string()),
+            ),
+        };
+
+    let result = if response.ok { "success" } else { "error" };
+    record_ipc_rpc_audit(&storage, request.request_id, summary, result).await;
+
+    response
+}
+
+fn build_ipc_rpc_handler(
+    workspace_root: PathBuf,
+    config_path: Option<PathBuf>,
+    storage: Arc<tokio::sync::Mutex<wa_core::storage::StorageHandle>>,
+) -> wa_core::ipc::IpcRpcHandler {
+    Arc::new(move |request: wa_core::ipc::IpcRpcRequest| {
+        let workspace_root = workspace_root.clone();
+        let config_path = config_path.clone();
+        let storage = Arc::clone(&storage);
+        Box::pin(async move {
+            handle_ipc_rpc_request(request, workspace_root, config_path, storage).await
+        })
+    })
+}
+
 struct ReqwestWebhookTransport {
     client: reqwest::Client,
 }
@@ -4770,6 +5091,7 @@ async fn run_watcher(
     disable_lock: bool,
 ) -> anyhow::Result<()> {
     use std::time::Duration;
+    use tokio::sync::mpsc;
     use wa_core::config::{Config, ConfigOverrides, HotReloadableConfig};
     use wa_core::events::{Event, EventBus, NotifyDecision};
     use wa_core::lock::WatcherLock;
@@ -5070,10 +5392,67 @@ async fn run_watcher(
     };
 
     // Create and start the observation runtime (with event bus for workflow integration)
-    let mut runtime =
-        ObservationRuntime::new(runtime_config, storage, pattern_engine).with_event_bus(event_bus);
+    let mut runtime = ObservationRuntime::new(runtime_config, storage, pattern_engine)
+        .with_event_bus(Arc::clone(&event_bus));
     let handle = runtime.start().await?;
     tracing::info!("Observation runtime started");
+
+    let config_path_buf = config_path.map(Path::to_path_buf);
+    let ipc_handle = if config.ipc.enabled {
+        #[cfg(unix)]
+        {
+            let ipc_auth = if config.ipc.tokens.is_empty() {
+                None
+            } else {
+                Some(wa_core::ipc::IpcAuth::new(config.ipc.tokens.clone()))
+            };
+            let rpc_handler = Some(build_ipc_rpc_handler(
+                layout.root.clone(),
+                config_path_buf.clone(),
+                Arc::clone(&handle.storage),
+            ));
+            match wa_core::ipc::IpcServer::bind_with_permissions(
+                &layout.ipc_socket_path,
+                Some(config.ipc.permissions),
+            )
+            .await
+            {
+                Ok(server) => {
+                    let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+                    let event_bus = Arc::clone(&event_bus);
+                    let registry = Arc::clone(&handle.registry);
+                    let ipc_task = tokio::spawn(async move {
+                        server
+                            .run_with_registry_auth_and_rpc(
+                                event_bus,
+                                registry,
+                                ipc_auth,
+                                rpc_handler,
+                                shutdown_rx,
+                            )
+                            .await;
+                    });
+                    Some((shutdown_tx, ipc_task))
+                }
+                Err(err) => {
+                    tracing::error!(
+                        error = %err,
+                        socket = %layout.ipc_socket_path.display(),
+                        "Failed to start IPC server"
+                    );
+                    None
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            tracing::warn!("IPC server not supported on this platform");
+            None
+        }
+    } else {
+        tracing::info!("IPC server disabled by config");
+        None
+    };
 
     // Start scheduled backups if enabled
     let scheduled_backup_handle = if config.backup.scheduled.enabled {
@@ -5181,6 +5560,11 @@ async fn run_watcher(
     }
 
     // Graceful shutdown
+    if let Some((shutdown_tx, ipc_task)) = ipc_handle {
+        let _ = shutdown_tx.send(()).await;
+        let _ = ipc_task.await;
+    }
+
     tracing::info!("Shutting down observation runtime...");
     handle.shutdown().await;
     tracing::info!("Watcher shutdown complete");
@@ -6113,6 +6497,18 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     return Ok(());
                                 }
                             };
+
+                            let lints = wa_core::storage::lint_fts_query(&query);
+                            if search_lints_have_errors(&lints) {
+                                let response = RobotResponse::<RobotSearchData>::error_with_code(
+                                    ROBOT_ERR_FTS_QUERY,
+                                    "Invalid search query.".to_string(),
+                                    format_search_lint_hint(&lints),
+                                    elapsed_ms(start),
+                                );
+                                print_robot_response(&response, format, stats)?;
+                                return Ok(());
+                            }
 
                             // Open storage handle
                             let db_path = layout.db_path.to_string_lossy();
@@ -8083,6 +8479,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
         }
 
         Some(Commands::Search {
+            command,
             query,
             format,
             limit,
@@ -8098,14 +8495,6 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 "plain" => OutputFormat::Plain,
                 _ => detect_format(),
             };
-
-            let redacted_query = redact_for_output(&query);
-            tracing::info!(
-                "Searching for '{}' (limit={}, pane={:?})",
-                redacted_query,
-                limit,
-                pane
-            );
 
             // Get workspace layout for DB path
             let layout = match config.workspace_layout(Some(&workspace_root)) {
@@ -8144,41 +8533,192 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 }
             };
 
-            // Build search options
-            let options = wa_core::storage::SearchOptions {
-                limit: Some(limit),
-                pane_id: pane,
-                since,
-                until: None,
-                include_snippets: Some(true),
-                snippet_max_tokens: Some(30),
-                highlight_prefix: Some(">>".to_string()),
-                highlight_suffix: Some("<<".to_string()),
-            };
-
-            // Perform search
-            match storage.search_with_results(&query, options).await {
-                Ok(results) => {
-                    let ctx = RenderContext::new(output_format)
-                        .verbose(cli.verbose)
-                        .limit(limit);
-                    let output = SearchResultRenderer::render(&results, &query, &ctx);
-                    print!("{output}");
-                }
-                Err(e) => {
-                    if output_format.is_json() {
-                        println!(
-                            r#"{{"ok": false, "error": "Search failed: {}", "version": "{}"}}"#,
-                            e,
-                            wa_core::VERSION
-                        );
-                    } else {
-                        eprintln!("Error: Search failed: {e}");
-                        if e.to_string().contains("fts5") || e.to_string().contains("syntax") {
-                            eprintln!("Check your FTS query syntax.");
+            match command {
+                Some(SearchCommands::Fts { command }) => match command {
+                    FtsCommands::Verify => match storage.get_indexing_health().await {
+                        Ok(report) => {
+                            if output_format.is_json() {
+                                let payload = serde_json::json!({
+                                    "ok": true,
+                                    "report": report,
+                                    "version": wa_core::VERSION,
+                                });
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&payload).unwrap_or_default()
+                                );
+                            } else {
+                                let status = if report.healthy {
+                                    "healthy"
+                                } else {
+                                    "unhealthy"
+                                };
+                                println!("FTS index health: {status}");
+                                println!("  Total segments: {}", report.total_segments);
+                                println!("  Total FTS rows: {}", report.total_fts_rows);
+                                println!("  Inconsistent panes: {}", report.inconsistent_panes);
+                                if !report.healthy || cli.verbose > 0 {
+                                    for pane in &report.panes {
+                                        if !pane.fts_consistent || cli.verbose > 0 {
+                                            println!(
+                                                "  Pane {}: segments={} fts_rows={} consistent={}",
+                                                pane.pane_id,
+                                                pane.segment_count,
+                                                pane.fts_row_count,
+                                                pane.fts_consistent
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            if output_format.is_json() {
+                                println!(
+                                    r#"{{"ok": false, "error": "FTS verify failed: {}", "version": "{}"}}"#,
+                                    e,
+                                    wa_core::VERSION
+                                );
+                            } else {
+                                eprintln!("Error: FTS verify failed: {e}");
+                            }
+                            std::process::exit(1);
+                        }
+                    },
+                    FtsCommands::Rebuild => {
+                        if !output_format.is_json() {
+                            println!("Rebuilding FTS index...");
+                        }
+                        let config = wa_core::storage::FtsSyncConfig::default();
+                        match storage.rebuild_fts(config).await {
+                            Ok(result) => {
+                                if output_format.is_json() {
+                                    let payload = serde_json::json!({
+                                        "ok": true,
+                                        "result": result,
+                                        "version": wa_core::VERSION,
+                                    });
+                                    println!(
+                                        "{}",
+                                        serde_json::to_string_pretty(&payload).unwrap_or_default()
+                                    );
+                                } else {
+                                    println!(
+                                        "FTS rebuild complete: panes_processed={} segments_indexed={} duration_ms={}",
+                                        result.panes_processed,
+                                        result.segments_indexed,
+                                        result.duration_ms
+                                    );
+                                    if !result.warnings.is_empty() {
+                                        println!("Warnings:");
+                                        for warning in &result.warnings {
+                                            println!("  - {warning}");
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                if output_format.is_json() {
+                                    println!(
+                                        r#"{{"ok": false, "error": "FTS rebuild failed: {}", "version": "{}"}}"#,
+                                        e,
+                                        wa_core::VERSION
+                                    );
+                                } else {
+                                    eprintln!("Error: FTS rebuild failed: {e}");
+                                }
+                                std::process::exit(1);
+                            }
                         }
                     }
-                    std::process::exit(1);
+                },
+                None => {
+                    let query = match query {
+                        Some(q) => q,
+                        None => {
+                            if output_format.is_json() {
+                                println!(
+                                    r#"{{"ok": false, "error": "Missing search query.", "version": "{}"}}"#,
+                                    wa_core::VERSION
+                                );
+                            } else {
+                                eprintln!("Error: Missing search query.");
+                                eprintln!("Try: wa search \"error\"");
+                            }
+                            std::process::exit(1);
+                        }
+                    };
+
+                    let redacted_query = redact_for_output(&query);
+                    tracing::info!(
+                        "Searching for '{}' (limit={}, pane={:?})",
+                        redacted_query,
+                        limit,
+                        pane
+                    );
+
+                    let lints = wa_core::storage::lint_fts_query(&query);
+                    if search_lints_have_errors(&lints) {
+                        if output_format.is_json() {
+                            let payload = serde_json::json!({
+                                "ok": false,
+                                "error": "Invalid search query.",
+                                "lint": lints,
+                                "version": wa_core::VERSION,
+                            });
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&payload).unwrap_or_default()
+                            );
+                        } else {
+                            eprintln!("Error: Invalid search query.");
+                            eprint!("{}", format_search_lints_plain(&lints));
+                        }
+                        std::process::exit(1);
+                    }
+                    if !lints.is_empty() && !output_format.is_json() {
+                        eprint!("{}", format_search_lints_plain(&lints));
+                    }
+
+                    // Build search options
+                    let options = wa_core::storage::SearchOptions {
+                        limit: Some(limit),
+                        pane_id: pane,
+                        since,
+                        until: None,
+                        include_snippets: Some(true),
+                        snippet_max_tokens: Some(30),
+                        highlight_prefix: Some(">>".to_string()),
+                        highlight_suffix: Some("<<".to_string()),
+                    };
+
+                    // Perform search
+                    match storage.search_with_results(&query, options).await {
+                        Ok(results) => {
+                            let ctx = RenderContext::new(output_format)
+                                .verbose(cli.verbose)
+                                .limit(limit);
+                            let output = SearchResultRenderer::render(&results, &query, &ctx);
+                            print!("{output}");
+                        }
+                        Err(e) => {
+                            if output_format.is_json() {
+                                println!(
+                                    r#"{{"ok": false, "error": "Search failed: {}", "version": "{}"}}"#,
+                                    e,
+                                    wa_core::VERSION
+                                );
+                            } else {
+                                eprintln!("Error: Search failed: {e}");
+                                if e.to_string().contains("fts5")
+                                    || e.to_string().contains("syntax")
+                                {
+                                    eprintln!("Check your FTS query syntax.");
+                                }
+                            }
+                            std::process::exit(1);
+                        }
+                    }
                 }
             }
         }
@@ -10925,6 +11465,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     }
                 }
             }
+        }
+
+        Some(Commands::Notify { command }) => {
+            handle_notify_command(command, &config).await?;
         }
 
         Some(Commands::Doctor { circuits, json }) => {
@@ -14056,6 +14600,499 @@ async fn handle_db_command(
     }
 
     Ok(())
+}
+
+fn resolve_notify_output_format(format: &str) -> wa_core::output::OutputFormat {
+    use wa_core::output::{OutputFormat, detect_format};
+
+    match format.to_lowercase().as_str() {
+        "json" => OutputFormat::Json,
+        "plain" => OutputFormat::Plain,
+        "auto" => detect_format(),
+        _ => {
+            eprintln!("Error: Unknown output format '{format}'. Use auto, plain, or json.");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn parse_notify_severity(value: &str) -> Option<wa_core::patterns::Severity> {
+    match value.to_lowercase().as_str() {
+        "info" => Some(wa_core::patterns::Severity::Info),
+        "warning" => Some(wa_core::patterns::Severity::Warning),
+        "critical" => Some(wa_core::patterns::Severity::Critical),
+        _ => None,
+    }
+}
+
+fn parse_notify_agent_type(value: &str) -> Option<wa_core::patterns::AgentType> {
+    match value.to_lowercase().as_str() {
+        "codex" => Some(wa_core::patterns::AgentType::Codex),
+        "claude_code" => Some(wa_core::patterns::AgentType::ClaudeCode),
+        "gemini" => Some(wa_core::patterns::AgentType::Gemini),
+        "wezterm" => Some(wa_core::patterns::AgentType::Wezterm),
+        "unknown" => Some(wa_core::patterns::AgentType::Unknown),
+        _ => None,
+    }
+}
+
+fn notify_decision_label(decision: &wa_core::events::NotifyDecision) -> &'static str {
+    use wa_core::events::NotifyDecision;
+
+    match decision {
+        NotifyDecision::Send { .. } => "send",
+        NotifyDecision::Filtered => "filtered",
+        NotifyDecision::Deduplicated { .. } => "deduplicated",
+        NotifyDecision::Throttled { .. } => "throttled",
+    }
+}
+
+fn glob_example(pattern: &str) -> String {
+    let mut out = String::new();
+    for ch in pattern.chars() {
+        match ch {
+            '*' => out.push_str("test"),
+            '?' => out.push('x'),
+            other => out.push(other),
+        }
+    }
+
+    if out.trim().is_empty() {
+        "wa.notify_test".to_string()
+    } else {
+        out
+    }
+}
+
+fn notify_test_candidates(
+    config: &wa_core::config::NotificationConfig,
+    endpoint: Option<&wa_core::webhook::WebhookEndpointConfig>,
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::new();
+    let mut push_candidate = |value: String| {
+        if seen.insert(value.clone()) {
+            candidates.push(value);
+        }
+    };
+
+    if let Some(endpoint) = endpoint {
+        for pattern in &endpoint.events {
+            push_candidate(glob_example(pattern));
+        }
+    }
+
+    for pattern in &config.include {
+        push_candidate(glob_example(pattern));
+    }
+
+    push_candidate("wa.notify_test".to_string());
+    candidates
+}
+
+fn build_notify_test_detection(
+    rule_id: &str,
+    agent_type: wa_core::patterns::AgentType,
+    severity: wa_core::patterns::Severity,
+) -> wa_core::patterns::Detection {
+    wa_core::patterns::Detection {
+        rule_id: rule_id.to_string(),
+        agent_type,
+        event_type: rule_id.to_string(),
+        severity,
+        confidence: 0.95,
+        extracted: serde_json::json!({ "test": true }),
+        matched_text: "wa notify test".to_string(),
+        span: (0, 0),
+    }
+}
+
+fn build_notify_test_rendered(
+    secret: &str,
+    severity: wa_core::patterns::Severity,
+) -> wa_core::event_templates::RenderedEvent {
+    wa_core::event_templates::RenderedEvent {
+        summary: format!("wa notify test: secret {secret}"),
+        description: format!("Testing redaction for {secret}"),
+        suggestions: vec![wa_core::event_templates::Suggestion::with_command(
+            "Rotate credentials",
+            format!("export WA_NOTIFY_TOKEN={secret}"),
+        )],
+        severity,
+    }
+}
+
+async fn handle_notify_command(
+    command: NotifyCommands,
+    config: &wa_core::config::Config,
+) -> anyhow::Result<()> {
+    match command {
+        NotifyCommands::Test { channel, format } => {
+            use wa_core::events::NotifyDecision;
+            use wa_core::notifications::{NotificationPayload, NotificationSender};
+
+            let output_format = resolve_notify_output_format(&format);
+            let channel = channel.trim().to_string();
+
+            if channel.is_empty() {
+                let response = NotifyTestResponse {
+                    ok: false,
+                    error: Some("Channel name must not be empty".to_string()),
+                    error_code: Some("E_CHANNEL_REQUIRED".to_string()),
+                    hint: Some("Use `wa notify test --channel <name>`.".to_string()),
+                    data: None,
+                };
+                emit_notify_test_response(&response, output_format);
+                std::process::exit(1);
+            }
+
+            let warning = if !config.notifications.enabled {
+                Some("notifications.enabled=false (test still attempted)".to_string())
+            } else {
+                None
+            };
+
+            let (channel_type, endpoint) = if channel.eq_ignore_ascii_case("desktop") {
+                ("desktop".to_string(), None)
+            } else {
+                let endpoint = config
+                    .notifications
+                    .webhooks
+                    .iter()
+                    .find(|ep| ep.name.eq_ignore_ascii_case(&channel));
+                match endpoint {
+                    Some(ep) => ("webhook".to_string(), Some(ep)),
+                    None => {
+                        let mut available = vec!["desktop".to_string()];
+                        available.extend(
+                            config
+                                .notifications
+                                .webhooks
+                                .iter()
+                                .map(|ep| ep.name.clone()),
+                        );
+                        let response = NotifyTestResponse {
+                            ok: false,
+                            error: Some(format!("Unknown channel: {channel}")),
+                            error_code: Some("E_CHANNEL_NOT_FOUND".to_string()),
+                            hint: Some(format!("Available channels: {}", available.join(", "))),
+                            data: None,
+                        };
+                        emit_notify_test_response(&response, output_format);
+                        std::process::exit(1);
+                    }
+                }
+            };
+
+            if channel_type == "webhook" {
+                if let Some(ep) = endpoint {
+                    if !ep.enabled {
+                        let response = NotifyTestResponse {
+                            ok: false,
+                            error: Some(format!("Channel '{channel}' is disabled")),
+                            error_code: Some("E_CHANNEL_DISABLED".to_string()),
+                            hint: Some(
+                                "Enable the webhook endpoint in [notifications.webhooks]."
+                                    .to_string(),
+                            ),
+                            data: None,
+                        };
+                        emit_notify_test_response(&response, output_format);
+                        std::process::exit(1);
+                    }
+                }
+            } else if !config.notifications.desktop.enabled {
+                let response = NotifyTestResponse {
+                    ok: false,
+                    error: Some("Desktop notifications are disabled".to_string()),
+                    error_code: Some("E_CHANNEL_DISABLED".to_string()),
+                    hint: Some("Set [notifications.desktop].enabled = true to test.".to_string()),
+                    data: None,
+                };
+                emit_notify_test_response(&response, output_format);
+                std::process::exit(1);
+            }
+
+            let severity = match config
+                .notifications
+                .min_severity
+                .as_deref()
+                .and_then(parse_notify_severity)
+            {
+                Some(sev) => sev,
+                None => wa_core::patterns::Severity::Warning,
+            };
+
+            let agent_type = if config.notifications.agent_types.is_empty() {
+                wa_core::patterns::AgentType::Unknown
+            } else {
+                match parse_notify_agent_type(&config.notifications.agent_types[0]) {
+                    Some(agent) => agent,
+                    None => {
+                        let response = NotifyTestResponse {
+                            ok: false,
+                            error: Some(
+                                "Invalid notifications.agent_types configuration".to_string(),
+                            ),
+                            error_code: Some("E_NOTIFY_CONFIG".to_string()),
+                            hint: Some(
+                                "Use codex, claude_code, gemini, wezterm, or unknown.".to_string(),
+                            ),
+                            data: None,
+                        };
+                        emit_notify_test_response(&response, output_format);
+                        std::process::exit(1);
+                    }
+                }
+            };
+
+            let mut gate = config.notifications.to_notification_gate();
+            let event_type = {
+                let filter = gate.filter();
+                notify_test_candidates(&config.notifications, endpoint)
+                    .into_iter()
+                    .find(|candidate| {
+                        let detection =
+                            build_notify_test_detection(candidate, agent_type, severity);
+                        if !filter.matches(&detection) {
+                            return false;
+                        }
+                        if let Some(ep) = endpoint {
+                            return ep.matches_event_type(candidate);
+                        }
+                        true
+                    })
+            };
+
+            let Some(event_type) = event_type else {
+                let response = NotifyTestResponse {
+                    ok: false,
+                    error: Some("Notification filters exclude test events".to_string()),
+                    error_code: Some("E_NOTIFICATION_FILTERED".to_string()),
+                    hint: Some(
+                        "Adjust notifications.include/exclude/min_severity/agent_types or channel events."
+                            .to_string(),
+                    ),
+                    data: None,
+                };
+                emit_notify_test_response(&response, output_format);
+                std::process::exit(1);
+            };
+
+            let detection = build_notify_test_detection(&event_type, agent_type, severity);
+            let pane_id = 0;
+            let decision = gate.should_notify(&detection, pane_id);
+            let suppressed_since_last = match decision {
+                NotifyDecision::Send {
+                    suppressed_since_last,
+                } => suppressed_since_last,
+                _ => 0,
+            };
+
+            let secret = "sk-abc123456789012345678901234567890123456789012345678901";
+            let rendered = build_notify_test_rendered(secret, severity);
+            let redactor = wa_core::policy::Redactor::new();
+            let payload = NotificationPayload::from_detection_with_redactor(
+                &detection,
+                pane_id,
+                &rendered,
+                suppressed_since_last,
+                &redactor,
+            );
+
+            let mut redaction_issues = Vec::new();
+            if !payload.summary.contains("[REDACTED]") {
+                redaction_issues.push("summary_not_redacted".to_string());
+            }
+            if redactor.contains_secrets(&payload.summary) {
+                redaction_issues.push("summary_contains_secret".to_string());
+            }
+            if !payload.description.contains("[REDACTED]") {
+                redaction_issues.push("description_not_redacted".to_string());
+            }
+            if redactor.contains_secrets(&payload.description) {
+                redaction_issues.push("description_contains_secret".to_string());
+            }
+            if let Some(quick_fix) = payload.quick_fix.as_deref() {
+                if !quick_fix.contains("[REDACTED]") {
+                    redaction_issues.push("quick_fix_not_redacted".to_string());
+                }
+                if redactor.contains_secrets(quick_fix) {
+                    redaction_issues.push("quick_fix_contains_secret".to_string());
+                }
+            } else {
+                redaction_issues.push("quick_fix_missing".to_string());
+            }
+
+            let redaction_ok = redaction_issues.is_empty();
+            let decision_label = notify_decision_label(&decision).to_string();
+
+            let mut output = NotifyTestOutput {
+                channel: channel.clone(),
+                channel_type: channel_type.clone(),
+                event_type: event_type.clone(),
+                severity: payload.severity.clone(),
+                agent_type: payload.agent_type.clone(),
+                decision: decision_label.clone(),
+                redaction_ok,
+                redaction_issues,
+                payload,
+                delivery: None,
+                warning,
+            };
+
+            if !redaction_ok {
+                let response = NotifyTestResponse {
+                    ok: false,
+                    error: Some("Redaction failed for test payload".to_string()),
+                    error_code: Some("E_REDACTION_FAILED".to_string()),
+                    hint: Some("Check secret patterns in wa_core::policy::Redactor.".to_string()),
+                    data: Some(output),
+                };
+                emit_notify_test_response(&response, output_format);
+                std::process::exit(1);
+            }
+
+            if !matches!(decision, NotifyDecision::Send { .. }) {
+                let response = NotifyTestResponse {
+                    ok: false,
+                    error: Some(format!(
+                        "Notification gate returned decision: {decision_label}"
+                    )),
+                    error_code: Some("E_NOTIFICATION_BLOCKED".to_string()),
+                    hint: Some("Review notification filters or cooldown settings.".to_string()),
+                    data: Some(output),
+                };
+                emit_notify_test_response(&response, output_format);
+                std::process::exit(1);
+            }
+
+            let delivery = if channel_type == "desktop" {
+                let notifier = wa_core::desktop_notify::DesktopNotifier::new(
+                    config.notifications.desktop.clone(),
+                );
+                notifier.send(&output.payload).await
+            } else {
+                let endpoint = endpoint.expect("endpoint exists for webhook channel");
+                let dispatcher = wa_core::webhook::WebhookDispatcher::new(
+                    vec![endpoint.clone()],
+                    Box::new(ReqwestWebhookTransport::new()),
+                );
+                dispatcher.send(&output.payload).await
+            };
+
+            output.delivery = Some(delivery.clone());
+
+            if !delivery.success {
+                let response = NotifyTestResponse {
+                    ok: false,
+                    error: Some(
+                        delivery
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| "Notification delivery failed".to_string()),
+                    ),
+                    error_code: Some("E_DELIVERY_FAILED".to_string()),
+                    hint: Some(
+                        "Check endpoint reachability, auth headers, or desktop backend."
+                            .to_string(),
+                    ),
+                    data: Some(output),
+                };
+                emit_notify_test_response(&response, output_format);
+                std::process::exit(1);
+            }
+
+            let response = NotifyTestResponse {
+                ok: true,
+                error: None,
+                error_code: None,
+                hint: None,
+                data: Some(output),
+            };
+            emit_notify_test_response(&response, output_format);
+        }
+    }
+
+    Ok(())
+}
+
+fn emit_notify_test_response(response: &NotifyTestResponse, format: wa_core::output::OutputFormat) {
+    if format.is_json() {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(response).unwrap_or_else(|_| "{}".to_string())
+        );
+        return;
+    }
+
+    if let Some(data) = &response.data {
+        println!("wa notify test\n");
+        println!("Channel: {} ({})", data.channel, data.channel_type);
+        println!("Event: {}", data.event_type);
+        println!("Severity: {}", data.severity);
+        println!("Agent type: {}", data.agent_type);
+        println!("Decision: {}", data.decision);
+        if data.redaction_ok {
+            println!("Redaction: OK");
+        } else {
+            println!("Redaction: FAILED");
+            if !data.redaction_issues.is_empty() {
+                println!("Redaction issues: {}", data.redaction_issues.join(", "));
+            }
+        }
+
+        if let Some(delivery) = &data.delivery {
+            let status = if delivery.success {
+                "success"
+            } else {
+                "failed"
+            };
+            println!("Delivery: {}", status);
+            if let Some(err) = &delivery.error {
+                println!("Delivery error: {err}");
+            }
+            if !delivery.records.is_empty() {
+                println!("Delivery records:");
+                for (idx, record) in delivery.records.iter().enumerate() {
+                    let accepted = if record.accepted {
+                        "accepted"
+                    } else {
+                        "rejected"
+                    };
+                    if let Some(err) = &record.error {
+                        println!(
+                            "  {}. {} ({accepted}, status {}, error: {})",
+                            idx + 1,
+                            record.target,
+                            record.status_code,
+                            err
+                        );
+                    } else {
+                        println!(
+                            "  {}. {} ({accepted}, status {})",
+                            idx + 1,
+                            record.target,
+                            record.status_code
+                        );
+                    }
+                }
+            }
+        }
+
+        if let Some(warning) = &data.warning {
+            println!("Warning: {warning}");
+        }
+    }
+
+    if !response.ok {
+        if let Some(error) = &response.error {
+            eprintln!("Error: {error}");
+        }
+        if let Some(hint) = &response.hint {
+            eprintln!("Hint: {hint}");
+        }
+    }
 }
 
 async fn handle_backup_command(
@@ -19094,6 +20131,21 @@ mod tests {
                 _ => panic!("expected Events"),
             },
             _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn cli_notify_test_parses() {
+        let cli = Cli::try_parse_from(["wa", "notify", "test", "--channel", "desktop"])
+            .expect("notify test should parse");
+        match cli.command {
+            Some(Commands::Notify { command }) => match command {
+                NotifyCommands::Test { channel, format } => {
+                    assert_eq!(channel, "desktop");
+                    assert_eq!(format, "auto");
+                }
+            },
+            _ => panic!("expected Notify command"),
         }
     }
 

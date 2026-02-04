@@ -4591,6 +4591,222 @@ pub struct SearchOptions {
     pub highlight_suffix: Option<String>,
 }
 
+/// Severity level for query lint findings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchLintSeverity {
+    /// Query is invalid and should not be executed.
+    Error,
+    /// Query is valid but likely unintended.
+    Warning,
+}
+
+/// Lint finding for a search query.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchLint {
+    /// Stable lint identifier.
+    pub code: String,
+    /// Severity of the lint finding.
+    pub severity: SearchLintSeverity,
+    /// Human-readable description.
+    pub message: String,
+    /// Suggested fix or example query.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggestion: Option<String>,
+}
+
+/// Lint an FTS query for common mistakes.
+#[must_use]
+pub fn lint_fts_query(query: &str) -> Vec<SearchLint> {
+    let trimmed = query.trim();
+    let mut lints = Vec::new();
+
+    if trimmed.is_empty() {
+        lints.push(SearchLint {
+            code: "empty_query".to_string(),
+            severity: SearchLintSeverity::Error,
+            message: "Query is empty.".to_string(),
+            suggestion: Some("Try: wa search \"error\"".to_string()),
+        });
+        return lints;
+    }
+
+    let (tokens, unbalanced_quotes, paren_imbalance, paren_underflow) = tokenize_fts_query(trimmed);
+
+    if unbalanced_quotes {
+        lints.push(SearchLint {
+            code: "unbalanced_quotes".to_string(),
+            severity: SearchLintSeverity::Error,
+            message: "Unbalanced double quotes in query.".to_string(),
+            suggestion: Some("Close the quote or remove it.".to_string()),
+        });
+    }
+
+    if paren_underflow {
+        lints.push(SearchLint {
+            code: "unmatched_paren_close".to_string(),
+            severity: SearchLintSeverity::Error,
+            message: "Unmatched closing parenthesis in query.".to_string(),
+            suggestion: Some("Remove the extra ')' or add a matching '('.".to_string()),
+        });
+    } else if paren_imbalance {
+        lints.push(SearchLint {
+            code: "unbalanced_parentheses".to_string(),
+            severity: SearchLintSeverity::Warning,
+            message: "Unbalanced parentheses in query.".to_string(),
+            suggestion: Some("Check grouping parentheses for a match.".to_string()),
+        });
+    }
+
+    if tokens.is_empty() {
+        lints.push(SearchLint {
+            code: "empty_tokens".to_string(),
+            severity: SearchLintSeverity::Error,
+            message: "Query contains no searchable tokens.".to_string(),
+            suggestion: Some("Add at least one term, e.g. \"error\".".to_string()),
+        });
+        return lints;
+    }
+
+    let mut prev_operator = false;
+    for (idx, token) in tokens.iter().enumerate() {
+        let token_trim = token.trim();
+        if token_trim.is_empty() {
+            continue;
+        }
+
+        if is_operator_token(token_trim) {
+            if idx == 0 {
+                lints.push(SearchLint {
+                    code: "leading_operator".to_string(),
+                    severity: SearchLintSeverity::Error,
+                    message: format!("Query starts with operator '{token_trim}'."),
+                    suggestion: Some("Start with a term or a quoted phrase.".to_string()),
+                });
+            }
+            if idx + 1 == tokens.len() {
+                lints.push(SearchLint {
+                    code: "trailing_operator".to_string(),
+                    severity: SearchLintSeverity::Error,
+                    message: format!("Query ends with operator '{token_trim}'."),
+                    suggestion: Some("Add a term after the operator.".to_string()),
+                });
+            }
+            if prev_operator {
+                lints.push(SearchLint {
+                    code: "double_operator".to_string(),
+                    severity: SearchLintSeverity::Error,
+                    message: "Consecutive boolean operators detected.".to_string(),
+                    suggestion: Some("Remove the extra operator.".to_string()),
+                });
+            }
+            prev_operator = true;
+            continue;
+        }
+
+        prev_operator = false;
+
+        if is_quoted_token(token_trim) {
+            continue;
+        }
+
+        if token_trim == "*" {
+            lints.push(SearchLint {
+                code: "wildcard_only".to_string(),
+                severity: SearchLintSeverity::Error,
+                message: "Wildcard '*' cannot be used alone.".to_string(),
+                suggestion: Some("Use a term with prefix wildcard, e.g. \"err*\".".to_string()),
+            });
+        } else if token_trim.contains('*') {
+            if !token_trim.ends_with('*') {
+                lints.push(SearchLint {
+                    code: "wildcard_position".to_string(),
+                    severity: SearchLintSeverity::Warning,
+                    message: format!("Wildcard in '{token_trim}' is not in suffix position."),
+                    suggestion: Some("Use prefix search syntax like \"term*\".".to_string()),
+                });
+            } else if token_trim.starts_with('*') {
+                lints.push(SearchLint {
+                    code: "wildcard_prefix".to_string(),
+                    severity: SearchLintSeverity::Warning,
+                    message: format!("Leading wildcard in '{token_trim}' is not supported."),
+                    suggestion: Some("Use a suffix wildcard like \"term*\".".to_string()),
+                });
+            }
+        }
+    }
+
+    lints
+}
+
+fn tokenize_fts_query(query: &str) -> (Vec<String>, bool, bool, bool) {
+    let mut tokens = Vec::new();
+    let mut buf = String::new();
+    let mut in_quotes = false;
+    let mut escaped = false;
+    let mut paren_balance: i32 = 0;
+    let mut paren_underflow = false;
+
+    for ch in query.chars() {
+        if escaped {
+            buf.push(ch);
+            escaped = false;
+            continue;
+        }
+
+        if ch == '\\' {
+            buf.push(ch);
+            escaped = true;
+            continue;
+        }
+
+        if ch == '"' {
+            in_quotes = !in_quotes;
+            buf.push(ch);
+            continue;
+        }
+
+        if !in_quotes {
+            match ch {
+                '(' => paren_balance += 1,
+                ')' => {
+                    paren_balance -= 1;
+                    if paren_balance < 0 {
+                        paren_underflow = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if ch.is_whitespace() && !in_quotes {
+            if !buf.is_empty() {
+                tokens.push(std::mem::take(&mut buf));
+            }
+        } else {
+            buf.push(ch);
+        }
+    }
+
+    if !buf.is_empty() {
+        tokens.push(buf);
+    }
+
+    let unbalanced_quotes = in_quotes;
+    let paren_imbalance = paren_balance != 0;
+
+    (tokens, unbalanced_quotes, paren_imbalance, paren_underflow)
+}
+
+fn is_operator_token(token: &str) -> bool {
+    let upper = token.to_ascii_uppercase();
+    matches!(upper.as_str(), "AND" | "OR" | "NOT")
+}
+
+fn is_quoted_token(token: &str) -> bool {
+    token.len() >= 2 && token.starts_with('"') && token.ends_with('"')
+}
+
 /// Query options for audit actions
 #[derive(Debug, Clone, Default)]
 pub struct AuditQuery {
@@ -9406,6 +9622,74 @@ mod tests {
     }
 
     #[test]
+    fn fts_lint_detects_empty_query() {
+        let lints = lint_fts_query("   ");
+        assert!(
+            lints.iter().any(|lint| lint.code == "empty_query"),
+            "expected empty_query lint"
+        );
+        assert!(
+            lints
+                .iter()
+                .any(|lint| lint.severity == SearchLintSeverity::Error),
+            "expected error severity for empty query"
+        );
+    }
+
+    #[test]
+    fn fts_lint_detects_unbalanced_quotes() {
+        let lints = lint_fts_query("\"unterminated");
+        assert!(
+            lints.iter().any(|lint| lint.code == "unbalanced_quotes"),
+            "expected unbalanced_quotes lint"
+        );
+    }
+
+    #[test]
+    fn fts_lint_detects_operator_misuse() {
+        let lints = lint_fts_query("AND error OR");
+        assert!(
+            lints.iter().any(|lint| lint.code == "leading_operator"),
+            "expected leading_operator lint"
+        );
+        assert!(
+            lints.iter().any(|lint| lint.code == "trailing_operator"),
+            "expected trailing_operator lint"
+        );
+    }
+
+    #[test]
+    fn fts_lint_warns_on_bad_wildcard_position() {
+        let lints = lint_fts_query("err*or");
+        assert!(
+            lints.iter().any(|lint| lint.code == "wildcard_position"),
+            "expected wildcard_position lint"
+        );
+    }
+
+    #[test]
+    fn fts_lint_allows_quoted_phrase() {
+        let lints = lint_fts_query("\"error code\"");
+        assert!(
+            lints
+                .iter()
+                .all(|lint| lint.severity != SearchLintSeverity::Error),
+            "expected no error lints for quoted phrase"
+        );
+    }
+
+    #[test]
+    fn fts_lint_allows_operator_query() {
+        let lints = lint_fts_query("error OR warning");
+        assert!(
+            lints
+                .iter()
+                .all(|lint| lint.severity != SearchLintSeverity::Error),
+            "expected no error lints for operator query"
+        );
+    }
+
+    #[test]
     fn fts_search_order_is_deterministic_on_ties() {
         let conn = Connection::open_in_memory().unwrap();
         initialize_schema(&conn).unwrap();
@@ -12038,6 +12322,40 @@ mod fts_sync_tests {
         let progress = get_fts_pane_progress_sync(&conn, 1).unwrap().unwrap();
         assert_eq!(progress.last_indexed_seq, 2);
         assert_eq!(progress.indexed_count, 2);
+    }
+
+    #[test]
+    fn full_rebuild_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        insert_test_pane(&conn, 1);
+        insert_test_segment(&conn, 1, 1, "Alpha");
+        insert_test_segment(&conn, 1, 2, "Beta");
+        insert_test_segment(&conn, 1, 3, "Gamma");
+
+        let config = FtsSyncConfig::default();
+        let first = full_fts_rebuild_sync(&conn, &config).unwrap();
+        assert!(first.full_rebuild);
+        assert_eq!(first.segments_indexed, 3);
+
+        let fts_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM output_segments_fts", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(fts_rows, 3);
+
+        let second = full_fts_rebuild_sync(&conn, &config).unwrap();
+        assert!(second.full_rebuild);
+        assert_eq!(second.segments_indexed, 3);
+
+        let fts_rows_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM output_segments_fts", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(fts_rows_after, 3);
     }
 
     #[test]

@@ -345,6 +345,7 @@ SCENARIO_REGISTRY=(
     "notification_webhook:Validate webhook notifications (delivery, retry, throttle, recovery)"
     "policy_denial:Validate safety gates block sends to protected panes"
     "audit_tail_streaming:Validate audit tail JSONL streaming with redaction"
+    "ipc_rpc_roundtrip:Validate IPC RPC round-trip with auth + audit"
     "prepare_commit_approvals:Validate prepare/commit approvals with hash mismatch guard"
     "quickfix_suggestions:Validate quick-fix suggestions for events and errors"
     "triage_multi_issue:Validate triage ordering and suggested actions with multiple issues"
@@ -354,6 +355,7 @@ SCENARIO_REGISTRY=(
     "pane_exclude_filter:Validate pane selection filters protect privacy (ignored pane absent from search)"
     "workspace_isolation:Validate workspace isolation (no cross-project DB leakage)"
     "setup_idempotency:Validate wa setup idempotent patching (temp home, no leaks)"
+    "search_linting_rebuild:Validate search linting + FTS verify/rebuild commands"
     "uservar_forwarding:Validate user-var forwarding lane (wezterm.lua -> wa event -> watcher)"
     "alt_screen_detection:Validate alt-screen detection via escape sequences (no Lua status hook)"
     "no_lua_status_hook:Validate wa setup does not inject update-status Lua"
@@ -656,6 +658,70 @@ run_scenario_capture_search() {
     # Cleanup trap will handle the rest
     trap - EXIT
     cleanup_capture_search
+
+    return $result
+}
+
+run_scenario_search_linting_rebuild() {
+    local scenario_dir="$1"
+    local temp_workspace
+    temp_workspace=$(mktemp -d /tmp/wa-e2e-search-XXXXXX)
+    local result=0
+
+    log_info "Workspace: $temp_workspace"
+    echo "workspace: $temp_workspace" >> "$scenario_dir/scenario.log"
+
+    export WA_DATA_DIR="$temp_workspace/.wa"
+    export WA_WORKSPACE="$temp_workspace"
+    mkdir -p "$WA_DATA_DIR"
+
+    cleanup_search_linting_rebuild() {
+        if [[ -d "$temp_workspace" ]]; then
+            cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            rm -rf "$temp_workspace"
+        fi
+    }
+    trap cleanup_search_linting_rebuild EXIT
+
+    log_info "Step 1: Verify FTS index health..."
+    "$WA_BINARY" search fts verify -f json > "$scenario_dir/fts_verify.json" 2>&1 || result=1
+    if jq -e '.ok == true' "$scenario_dir/fts_verify.json" >/dev/null 2>&1; then
+        log_pass "FTS verify succeeded"
+    else
+        log_fail "FTS verify failed"
+        result=1
+    fi
+
+    log_info "Step 2: Validate linting on invalid query..."
+    local lint_exit=0
+    set +e
+    "$WA_BINARY" search "\"unterminated" -f json > "$scenario_dir/search_lint.json" 2>&1
+    lint_exit=$?
+    set -e
+    if [[ "$lint_exit" -eq 0 ]]; then
+        log_fail "Expected search lint to fail but it exited 0"
+        result=1
+    fi
+    if jq -e '.ok == false and (.lint[]? | select(.code == "unbalanced_quotes"))' \
+        "$scenario_dir/search_lint.json" >/dev/null 2>&1; then
+        log_pass "Lint output contains unbalanced_quotes"
+    else
+        log_fail "Lint output missing expected lint codes"
+        result=1
+    fi
+
+    log_info "Step 3: Rebuild FTS index..."
+    "$WA_BINARY" search fts rebuild -f json > "$scenario_dir/fts_rebuild.json" 2>&1 || result=1
+    if jq -e '.ok == true and .result.full_rebuild == true' \
+        "$scenario_dir/fts_rebuild.json" >/dev/null 2>&1; then
+        log_pass "FTS rebuild succeeded"
+    else
+        log_fail "FTS rebuild failed"
+        result=1
+    fi
+
+    trap - EXIT
+    cleanup_search_linting_rebuild
 
     return $result
 }
@@ -2441,6 +2507,198 @@ run_scenario_audit_tail_streaming() {
         log_fail "Audit IDs are not in deterministic order"
         result=1
     fi
+
+    return $result
+}
+
+# ==============================================================================
+# Scenario: IPC RPC Round-Trip
+# ==============================================================================
+# Validates IPC RPC auth enforcement, read-only requests, and audit records.
+# ==============================================================================
+
+run_scenario_ipc_rpc_roundtrip() {
+    local scenario_dir="$1"
+    local temp_workspace
+    temp_workspace=$(mktemp -d /tmp/wa-e2e-ipc-XXXXXX)
+    local wa_pid=""
+    local result=0
+    local read_token="e2e-read-$(date +%s%N)"
+    local write_token="e2e-write-$(date +%s%N)"
+    local request_id_help="e2e-ipc-help-$(date +%s%N)"
+    local request_id_denied="e2e-ipc-denied-$(date +%s%N)"
+    local request_id_write="e2e-ipc-write-$(date +%s%N)"
+
+    log_info "Workspace: $temp_workspace"
+
+    export WA_DATA_DIR="$temp_workspace/.wa"
+    export WA_WORKSPACE="$temp_workspace"
+    mkdir -p "$WA_DATA_DIR"
+
+    local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
+    if [[ -f "$baseline_config" ]]; then
+        cp "$baseline_config" "$temp_workspace/wa.toml"
+        log_verbose "Using baseline config: $baseline_config"
+    fi
+
+    cat >> "$temp_workspace/wa.toml" <<EOF
+
+[ipc]
+enabled = true
+permissions = 0o600
+
+[[ipc.tokens]]
+token = "$read_token"
+scopes = ["read"]
+
+[[ipc.tokens]]
+token = "$write_token"
+scopes = ["write"]
+EOF
+
+    export WA_CONFIG="$temp_workspace/wa.toml"
+
+    cleanup_ipc_rpc_roundtrip() {
+        log_verbose "Cleaning up ipc_rpc_roundtrip scenario"
+        if [[ -n "$wa_pid" ]] && kill -0 "$wa_pid" 2>/dev/null; then
+            log_verbose "Stopping wa watch (pid $wa_pid)"
+            kill "$wa_pid" 2>/dev/null || true
+            wait "$wa_pid" 2>/dev/null || true
+        fi
+        if [[ -d "$temp_workspace" ]]; then
+            cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp "$temp_workspace/wa.toml" "$scenario_dir/" 2>/dev/null || true
+        fi
+        rm -rf "$temp_workspace"
+    }
+    trap cleanup_ipc_rpc_roundtrip EXIT
+
+    ipc_send() {
+        local socket_path="$1"
+        python3 - "$socket_path" <<'PY'
+import json
+import socket
+import sys
+
+sock_path = sys.argv[1]
+payload = json.loads(sys.stdin.read())
+
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(2.0)
+s.connect(sock_path)
+s.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+data = b""
+while not data.endswith(b"\n"):
+    chunk = s.recv(4096)
+    if not chunk:
+        break
+    data += chunk
+s.close()
+sys.stdout.write(data.decode("utf-8").strip())
+PY
+    }
+
+    # Step 1: Start wa watch
+    log_info "Step 1: Starting wa watch..."
+    "$WA_BINARY" watch --foreground --config "$temp_workspace/wa.toml" \
+        > "$scenario_dir/wa_watch.log" 2>&1 &
+    wa_pid=$!
+    echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
+
+    local wait_timeout=${TIMEOUT:-30}
+    local check_watch_cmd="kill -0 $wa_pid 2>/dev/null"
+    if ! wait_for_condition "wa watch running" "$check_watch_cmd" "$wait_timeout"; then
+        log_fail "wa watch failed to start"
+        return 1
+    fi
+
+    local socket_path="$WA_DATA_DIR/ipc.sock"
+    local check_socket_cmd="[[ -S \"$socket_path\" ]]"
+    if ! wait_for_condition "ipc socket ready" "$check_socket_cmd" "$wait_timeout"; then
+        log_fail "IPC socket not ready"
+        return 1
+    fi
+    log_pass "IPC socket ready"
+
+    # Step 2: Ping via IPC (read token)
+    log_info "Step 2: IPC ping with read token..."
+    cat > "$scenario_dir/ping_request.json" <<EOF
+{"token":"$read_token","type":"ping"}
+EOF
+    ipc_send "$socket_path" < "$scenario_dir/ping_request.json" \
+        > "$scenario_dir/ping_response.json" 2>&1 || true
+
+    if jq -e '.ok == true and (.elapsed_ms | type == "number")' \
+        "$scenario_dir/ping_response.json" >/dev/null 2>&1; then
+        log_pass "Ping ok"
+    else
+        log_fail "Ping failed"
+        result=1
+    fi
+
+    # Step 3: RPC help with read token
+    log_info "Step 3: IPC RPC help with read token..."
+    cat > "$scenario_dir/rpc_help_request.json" <<EOF
+{"token":"$read_token","request_id":"$request_id_help","type":"rpc","args":["help"]}
+EOF
+    ipc_send "$socket_path" < "$scenario_dir/rpc_help_request.json" \
+        > "$scenario_dir/rpc_help_response.json" 2>&1 || true
+
+    if jq -e '.ok == true and (.data | type == "object")' \
+        "$scenario_dir/rpc_help_response.json" >/dev/null 2>&1; then
+        log_pass "RPC help ok"
+    else
+        log_fail "RPC help failed"
+        result=1
+    fi
+
+    # Step 4: Mutating RPC blocked with read token
+    log_info "Step 4: RPC send denied with read token..."
+    cat > "$scenario_dir/rpc_send_denied_request.json" <<EOF
+{"token":"$read_token","request_id":"$request_id_denied","type":"rpc","args":["send","0","ls"]}
+EOF
+    ipc_send "$socket_path" < "$scenario_dir/rpc_send_denied_request.json" \
+        > "$scenario_dir/rpc_send_denied_response.json" 2>&1 || true
+
+    if jq -e '.ok == false and (.error // "" | contains("insufficient scope"))' \
+        "$scenario_dir/rpc_send_denied_response.json" >/dev/null 2>&1; then
+        log_pass "RPC send denied by scope"
+    else
+        log_fail "RPC send scope enforcement missing"
+        result=1
+    fi
+
+    # Step 5: Mutating RPC allowed with write token (may still fail in robot)
+    log_info "Step 5: RPC send with write token..."
+    cat > "$scenario_dir/rpc_send_write_request.json" <<EOF
+{"token":"$write_token","request_id":"$request_id_write","type":"rpc","args":["send","0","ls"]}
+EOF
+    ipc_send "$socket_path" < "$scenario_dir/rpc_send_write_request.json" \
+        > "$scenario_dir/rpc_send_write_response.json" 2>&1 || true
+
+    if jq -e '.ok == false and (.error // "" | contains("insufficient scope") | not)' \
+        "$scenario_dir/rpc_send_write_response.json" >/dev/null 2>&1; then
+        log_pass "RPC send reached robot handler"
+    else
+        log_fail "RPC send blocked by scope unexpectedly"
+        result=1
+    fi
+
+    # Step 6: Audit entries for RPC requests
+    log_info "Step 6: Checking audit trail for IPC RPC..."
+    "$WA_BINARY" audit -f json -l 50 > "$scenario_dir/audit_actions.json" 2>&1 || true
+
+    if jq -e --arg rid "$request_id_help" \
+        '.[]? | select(.action_kind == "ipc.rpc" and .correlation_id == $rid)' \
+        "$scenario_dir/audit_actions.json" >/dev/null 2>&1; then
+        log_pass "Audit entry found for RPC help"
+    else
+        log_fail "Audit entry missing for RPC help"
+        result=1
+    fi
+
+    trap - EXIT
+    cleanup_ipc_rpc_roundtrip
 
     return $result
 }
@@ -5704,6 +5962,9 @@ run_scenario() {
             capture_search)
                 run_scenario_capture_search "$scenario_dir" || result=$?
                 ;;
+            search_linting_rebuild)
+                run_scenario_search_linting_rebuild "$scenario_dir" || result=$?
+                ;;
             natural_language)
                 run_scenario_natural_language "$scenario_dir" || result=$?
                 ;;
@@ -5724,6 +5985,9 @@ run_scenario() {
             ;;
         audit_tail_streaming)
             run_scenario_audit_tail_streaming "$scenario_dir" || result=$?
+            ;;
+        ipc_rpc_roundtrip)
+            run_scenario_ipc_rpc_roundtrip "$scenario_dir" || result=$?
             ;;
         prepare_commit_approvals)
             run_scenario_prepare_commit_approvals "$scenario_dir" || result=$?
