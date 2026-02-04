@@ -4615,6 +4615,133 @@ pub struct SearchLint {
     pub suggestion: Option<String>,
 }
 
+/// Suggestion for completing a search query.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchSuggestion {
+    /// Suggested query fragment.
+    pub text: String,
+    /// Human-readable description.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+struct SearchSuggestionTemplate {
+    text: &'static str,
+    description: &'static str,
+}
+
+const SEARCH_SUGGESTION_TEMPLATES: &[SearchSuggestionTemplate] = &[
+    SearchSuggestionTemplate {
+        text: "error",
+        description: "Common errors",
+    },
+    SearchSuggestionTemplate {
+        text: "warning",
+        description: "Warnings in output",
+    },
+    SearchSuggestionTemplate {
+        text: "panic",
+        description: "Rust panics",
+    },
+    SearchSuggestionTemplate {
+        text: "\"usage limit\"",
+        description: "Usage limit messages",
+    },
+    SearchSuggestionTemplate {
+        text: "\"rate limit\"",
+        description: "Rate limit messages",
+    },
+    SearchSuggestionTemplate {
+        text: "\"approval needed\"",
+        description: "Approval prompts",
+    },
+    SearchSuggestionTemplate {
+        text: "compaction",
+        description: "Compaction output",
+    },
+    SearchSuggestionTemplate {
+        text: "AND",
+        description: "Boolean AND operator",
+    },
+    SearchSuggestionTemplate {
+        text: "OR",
+        description: "Boolean OR operator",
+    },
+    SearchSuggestionTemplate {
+        text: "NOT",
+        description: "Boolean NOT operator",
+    },
+    SearchSuggestionTemplate {
+        text: "\"exact phrase\"",
+        description: "Quoted phrase search",
+    },
+    SearchSuggestionTemplate {
+        text: "term*",
+        description: "Prefix wildcard search",
+    },
+    SearchSuggestionTemplate {
+        text: "content:term",
+        description: "Restrict to content column",
+    },
+];
+
+/// Provide deterministic search query suggestions for CLI/TUI autocomplete.
+#[must_use]
+pub fn search_query_suggestions(query: &str, limit: usize) -> Vec<SearchSuggestion> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let prefix = search_suggestion_prefix(query);
+    let prefix_lower = prefix.to_ascii_lowercase();
+    let mut suggestions = Vec::new();
+
+    for template in SEARCH_SUGGESTION_TEMPLATES {
+        if prefix.is_empty()
+            || template
+                .text
+                .to_ascii_lowercase()
+                .starts_with(prefix_lower.as_str())
+        {
+            suggestions.push(SearchSuggestion {
+                text: template.text.to_string(),
+                description: Some(template.description.to_string()),
+            });
+            if suggestions.len() >= limit {
+                return suggestions;
+            }
+        }
+    }
+
+    if suggestions.is_empty() && !prefix.is_empty() {
+        for template in SEARCH_SUGGESTION_TEMPLATES {
+            if template
+                .text
+                .to_ascii_lowercase()
+                .contains(prefix_lower.as_str())
+            {
+                suggestions.push(SearchSuggestion {
+                    text: template.text.to_string(),
+                    description: Some(template.description.to_string()),
+                });
+                if suggestions.len() >= limit {
+                    break;
+                }
+            }
+        }
+    }
+
+    suggestions
+}
+
+fn search_suggestion_prefix(query: &str) -> &str {
+    let trimmed = query.trim_end();
+    if trimmed.is_empty() {
+        return "";
+    }
+    trimmed.rsplit_whitespace().next().unwrap_or("")
+}
+
 /// Lint an FTS query for common mistakes.
 #[must_use]
 pub fn lint_fts_query(query: &str) -> Vec<SearchLint> {
