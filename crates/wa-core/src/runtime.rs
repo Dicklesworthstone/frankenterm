@@ -27,7 +27,9 @@ use tokio::sync::{RwLock, mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, error, info, instrument, warn};
 
-use crate::config::{HotReloadableConfig, PaneFilterConfig};
+use crate::config::{
+    CaptureBudgetConfig, HotReloadableConfig, PaneFilterConfig, PanePriorityConfig,
+};
 use crate::crash::{HealthSnapshot, ShutdownSummary};
 use crate::error::Result;
 use crate::events::EventBus;
@@ -51,6 +53,10 @@ pub struct RuntimeConfig {
     pub overlap_size: usize,
     /// Pane filter configuration
     pub pane_filter: PaneFilterConfig,
+    /// Pane priority configuration
+    pub pane_priorities: PanePriorityConfig,
+    /// Capture budget configuration
+    pub capture_budgets: CaptureBudgetConfig,
     /// Channel buffer size for internal queues
     pub channel_buffer: usize,
     /// Maximum concurrent capture operations
@@ -71,6 +77,8 @@ impl Default for RuntimeConfig {
             min_capture_interval: Duration::from_millis(50),
             overlap_size: 1_048_576, // 1MB default
             pane_filter: PaneFilterConfig::default(),
+            pane_priorities: PanePriorityConfig::default(),
+            capture_budgets: CaptureBudgetConfig::default(),
             channel_buffer: 1024,
             max_concurrent_captures: 10,
             retention_days: 30,
@@ -224,6 +232,8 @@ impl ObservationRuntime {
             poll_interval_ms: duration_ms_u64(config.capture_interval),
             min_poll_interval_ms: duration_ms_u64(config.min_capture_interval),
             max_concurrent_captures: config.max_concurrent_captures as u32,
+            pane_priorities: config.pane_priorities.clone(),
+            capture_budgets: config.capture_budgets.clone(),
             retention_days: config.retention_days,
             retention_max_mb: config.retention_max_mb,
             checkpoint_interval_secs: config.checkpoint_interval_secs,
@@ -282,7 +292,7 @@ impl ObservationRuntime {
         let persistence_handle = self.spawn_persistence_task(capture_rx, Arc::clone(&self.cursors));
 
         // Spawn maintenance task
-        let maintenance_handle = self.spawn_maintenance_task();
+        let maintenance_handle = self.spawn_maintenance_task(capture_tx_probe.clone());
 
         info!("Observation runtime started");
 
@@ -305,11 +315,14 @@ impl ObservationRuntime {
     }
 
     /// Spawn the maintenance task.
-    fn spawn_maintenance_task(&self) -> JoinHandle<()> {
+    fn spawn_maintenance_task(&self, capture_tx: mpsc::Sender<CaptureEvent>) -> JoinHandle<()> {
         let storage = Arc::clone(&self.storage);
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
         let mut config_rx = self.config_rx.clone();
         let heartbeats = Arc::clone(&self.heartbeats);
+        let registry = Arc::clone(&self.registry);
+        let cursors = Arc::clone(&self.cursors);
+        let metrics = Arc::clone(&self.metrics);
 
         let initial_retention_days = self.config.retention_days;
         let initial_checkpoint_secs = self.config.checkpoint_interval_secs;
@@ -317,6 +330,10 @@ impl ObservationRuntime {
         tokio::spawn(async move {
             let mut retention_days = initial_retention_days;
             let mut checkpoint_secs = initial_checkpoint_secs;
+            let mut last_health_snapshot = Instant::now()
+                .checked_sub(Duration::from_secs(60))
+                .unwrap_or_else(Instant::now);
+            let health_interval = Duration::from_secs(30);
 
             // Run maintenance every minute, but only do expensive ops when needed
             let mut interval = tokio::time::interval(Duration::from_secs(60));
@@ -389,6 +406,77 @@ impl ObservationRuntime {
                             }
                             drop(storage_guard);
                             last_checkpoint = now;
+                        }
+
+                        if now.duration_since(last_health_snapshot) >= health_interval {
+                            let observed_panes = {
+                                let reg = registry.read().await;
+                                reg.observed_pane_ids().len()
+                            };
+
+                            let last_seq_by_pane: Vec<(u64, i64)> = {
+                                let cursors = cursors.read().await;
+                                cursors
+                                    .iter()
+                                    .map(|(pane_id, cursor)| (*pane_id, cursor.last_seq()))
+                                    .collect()
+                            };
+
+                            let capture_cap = capture_tx.max_capacity();
+                            let capture_depth = capture_cap.saturating_sub(capture_tx.capacity());
+
+                            let (write_depth, write_cap, db_writable) = {
+                                let storage_guard = storage.lock().await;
+                                let wd = storage_guard.write_queue_depth();
+                                let wc = storage_guard.write_queue_capacity();
+                                let writable = storage_guard.is_writable().await;
+                                drop(storage_guard);
+                                (wd, wc, writable)
+                            };
+
+                            let mut warnings = Vec::new();
+
+                            #[allow(clippy::cast_precision_loss)]
+                            if capture_cap > 0 {
+                                let ratio = capture_depth as f64 / capture_cap as f64;
+                                if ratio >= BACKPRESSURE_WARN_RATIO {
+                                    warnings.push(format!(
+                                        "Capture queue backpressure: {capture_depth}/{capture_cap} ({:.0}%)",
+                                        ratio * 100.0
+                                    ));
+                                }
+                            }
+
+                            #[allow(clippy::cast_precision_loss)]
+                            if write_cap > 0 {
+                                let ratio = write_depth as f64 / write_cap as f64;
+                                if ratio >= BACKPRESSURE_WARN_RATIO {
+                                    warnings.push(format!(
+                                        "Write queue backpressure: {write_depth}/{write_cap} ({:.0}%)",
+                                        ratio * 100.0
+                                    ));
+                                }
+                            }
+
+                            if !db_writable {
+                                warnings.push("Database is not writable".to_string());
+                            }
+
+                            let snapshot = HealthSnapshot {
+                                timestamp: epoch_ms_u64(),
+                                observed_panes,
+                                capture_queue_depth: capture_depth,
+                                write_queue_depth: write_depth,
+                                last_seq_by_pane,
+                                warnings,
+                                ingest_lag_avg_ms: metrics.avg_ingest_lag_ms(),
+                                ingest_lag_max_ms: metrics.max_ingest_lag_ms(),
+                                db_writable,
+                                db_last_write_at: metrics.last_db_write(),
+                            };
+
+                            HealthSnapshot::update_global(snapshot);
+                            last_health_snapshot = now;
                         }
                     }
                 }

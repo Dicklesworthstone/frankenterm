@@ -19,6 +19,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{RwLock, mpsc};
 
+use crate::crash::HealthSnapshot;
 use crate::events::{Event, EventBus, UserVarError, UserVarPayload};
 use crate::ingest::PaneRegistry;
 
@@ -369,11 +370,16 @@ async fn handle_request_with_context(request: IpcRequest, ctx: &IpcHandlerContex
             let total_subscribers =
                 stats.delta_subscribers + stats.detection_subscribers + stats.signal_subscribers;
             let uptime_ms = u64::try_from(ctx.event_bus.uptime().as_millis()).unwrap_or(u64::MAX);
-            IpcResponse::ok_with_data(serde_json::json!({
+            let mut payload = serde_json::json!({
                 "uptime_ms": uptime_ms,
                 "events_queued": total_queued,
                 "subscriber_count": total_subscribers,
-            }))
+            });
+            let health = HealthSnapshot::get_global()
+                .and_then(|snapshot| serde_json::to_value(snapshot).ok())
+                .unwrap_or(serde_json::Value::Null);
+            payload["health"] = health;
+            IpcResponse::ok_with_data(payload)
         }
         IpcRequest::PaneState { pane_id } => handle_pane_state(pane_id, ctx).await,
     }

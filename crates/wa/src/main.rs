@@ -5029,6 +5029,8 @@ async fn run_watcher(
         min_capture_interval: Duration::from_millis(config.ingest.min_poll_interval_ms),
         overlap_size: 4096, // Default overlap window size
         pane_filter: config.ingest.panes.clone(),
+        pane_priorities: config.ingest.priorities.clone(),
+        capture_budgets: config.ingest.budgets.clone(),
         channel_buffer: 1024,
         max_concurrent_captures: config.ingest.max_concurrent_captures as usize,
         retention_days: config.storage.retention_days,
@@ -8850,10 +8852,32 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             agent,
             pane_id,
         }) => {
+            let watcher_status = {
+                #[cfg(unix)]
+                {
+                    let client = wa_core::ipc::IpcClient::new(&layout.ipc_socket_path);
+                    match client.status().await {
+                        Ok(response) => {
+                            if response.ok {
+                                Ok(response.data)
+                            } else {
+                                Err(response
+                                    .error
+                                    .unwrap_or_else(|| "unknown watcher error".to_string()))
+                            }
+                        }
+                        Err(err) => Err(err.to_string()),
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    Ok(None)
+                }
+            };
+
             if health {
                 // Health check mode: JSON status including runtime health snapshot
                 let wezterm = wa_core::wezterm::WeztermClient::new();
-                let snapshot = wa_core::crash::HealthSnapshot::get_global();
                 let mut payload = serde_json::json!({
                     "status": "ok",
                     "version": wa_core::VERSION,
@@ -8866,9 +8890,21 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     payload["vendored_compatibility"] =
                         serde_json::to_value(&compat).unwrap_or(serde_json::Value::Null);
                 }
-                if let Some(snap) = snapshot {
-                    payload["health"] =
-                        serde_json::to_value(&snap).unwrap_or(serde_json::Value::Null);
+                match watcher_status {
+                    Ok(Some(status)) => {
+                        payload["watcher_running"] = serde_json::Value::Bool(true);
+                        if let Some(health_value) = status.get("health") {
+                            payload["health"] = health_value.clone();
+                        }
+                        payload["watcher"] = status;
+                    }
+                    Ok(None) => {
+                        payload["watcher_running"] = serde_json::Value::Bool(false);
+                    }
+                    Err(err) => {
+                        payload["watcher_running"] = serde_json::Value::Bool(false);
+                        payload["watcher_error"] = serde_json::Value::String(err);
+                    }
                 }
                 if let Some(crash) = wa_core::crash::latest_crash_bundle(&layout.crash_dir) {
                     let mut crash_info = serde_json::json!({
@@ -8904,6 +8940,15 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     "plain" => OutputFormat::Plain,
                     _ => detect_format(),
                 };
+
+                let watcher_health = watcher_status
+                    .ok()
+                    .and_then(|status| status)
+                    .and_then(|status| status.get("health").cloned())
+                    .and_then(|value| {
+                        serde_json::from_value::<wa_core::crash::HealthSnapshot>(value).ok()
+                    })
+                    .or_else(wa_core::crash::HealthSnapshot::get_global);
 
                 let wezterm = wa_core::wezterm::WeztermClient::new();
                 match wezterm.list_panes().await {
@@ -8971,7 +9016,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         print!("{output}");
 
                         // Append health snapshot if daemon is running
-                        if let Some(snapshot) = wa_core::crash::HealthSnapshot::get_global() {
+                        if let Some(snapshot) = watcher_health {
                             if output_format.is_json() {
                                 // In JSON mode, print as separate object
                                 let health_json = HealthSnapshotRenderer::render(&snapshot, &ctx);
