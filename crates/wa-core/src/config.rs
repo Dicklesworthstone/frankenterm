@@ -1678,6 +1678,9 @@ pub struct IpcConfig {
 
     /// File permissions for the socket (octal), e.g. 0o600.
     pub permissions: u32,
+
+    /// Authentication tokens for IPC clients.
+    pub tokens: Vec<IpcAuthToken>,
 }
 
 impl Default for IpcConfig {
@@ -1686,7 +1689,79 @@ impl Default for IpcConfig {
             enabled: true,
             socket_path: "ipc.sock".to_string(),
             permissions: 0o600,
+            tokens: Vec::new(),
         }
+    }
+}
+
+/// IPC token scopes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IpcScope {
+    Read,
+    Write,
+    All,
+}
+
+impl IpcScope {
+    #[must_use]
+    pub fn allows(self, required: IpcScope) -> bool {
+        match self {
+            Self::All => true,
+            Self::Write => matches!(required, IpcScope::Write | IpcScope::Read),
+            Self::Read => matches!(required, IpcScope::Read),
+        }
+    }
+}
+
+/// IPC authentication token configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct IpcAuthToken {
+    /// Token value (shared secret).
+    pub token: String,
+
+    /// Allowed scopes for the token.
+    pub scopes: Vec<IpcScope>,
+
+    /// Optional expiry timestamp (epoch ms).
+    pub expires_at_ms: Option<u64>,
+}
+
+impl Default for IpcAuthToken {
+    fn default() -> Self {
+        Self {
+            token: String::new(),
+            scopes: vec![IpcScope::All],
+            expires_at_ms: None,
+        }
+    }
+}
+
+impl IpcConfig {
+    fn validate(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        if self.permissions == 0 || self.permissions > 0o777 {
+            return Err("ipc.permissions must be a valid unix mode (e.g. 0o600)".to_string());
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        for token in &self.tokens {
+            if token.token.trim().is_empty() {
+                return Err("ipc.tokens[].token must not be empty".to_string());
+            }
+            if !seen.insert(token.token.clone()) {
+                return Err(format!(
+                    "ipc.tokens contains duplicate token value: {}",
+                    token.token
+                ));
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -2582,6 +2657,10 @@ impl Config {
             )
             .into());
         }
+
+        self.ipc
+            .validate()
+            .map_err(crate::error::ConfigError::ValidationError)?;
 
         if self.native.enabled && self.native.socket_path.trim().is_empty() {
             return Err(crate::error::ConfigError::ValidationError(

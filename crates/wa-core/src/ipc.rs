@@ -15,12 +15,14 @@ use serde::{Deserialize, Serialize};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{RwLock, mpsc};
 
+use crate::config::{IpcAuthToken, IpcScope};
 use crate::crash::HealthSnapshot;
 use crate::events::{Event, EventBus, UserVarError, UserVarPayload};
 use crate::ingest::PaneRegistry;
@@ -30,6 +32,14 @@ pub const IPC_SOCKET_NAME: &str = "ipc.sock";
 
 /// Maximum message size in bytes (128KB).
 pub const MAX_MESSAGE_SIZE: usize = 131_072;
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
+        .unwrap_or(0)
+}
 
 // NOTE: StatusUpdate types (CursorPosition, PaneDimensions, StatusUpdate, StatusUpdateRateLimiter)
 // were removed in v0.2.0 to eliminate Lua performance bottleneck.
@@ -59,6 +69,16 @@ pub enum IpcRequest {
         /// Pane ID to inspect
         pane_id: u64,
     },
+}
+
+impl IpcRequest {
+    #[must_use]
+    fn required_scope(&self) -> IpcScope {
+        match self {
+            Self::UserVar { .. } => IpcScope::Write,
+            Self::Ping | Self::Status | Self::PaneState { .. } => IpcScope::Read,
+        }
+    }
 }
 
 /// Response message from server to client.
@@ -106,6 +126,84 @@ impl IpcResponse {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct IpcEnvelope {
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token: Option<String>,
+    #[serde(flatten)]
+    request: IpcRequest,
+}
+
+#[derive(Debug, Clone)]
+pub struct IpcAuth {
+    tokens: Vec<IpcAuthToken>,
+}
+
+impl IpcAuth {
+    #[must_use]
+    pub fn new(tokens: Vec<IpcAuthToken>) -> Self {
+        Self { tokens }
+    }
+
+    fn authorize(
+        &self,
+        token: Option<&str>,
+        required: IpcScope,
+    ) -> Result<(), IpcAuthError> {
+        if self.tokens.is_empty() {
+            return Ok(());
+        }
+
+        let token = token.ok_or(IpcAuthError::MissingToken)?;
+        let record = self
+            .tokens
+            .iter()
+            .find(|candidate| candidate.token == token)
+            .ok_or(IpcAuthError::InvalidToken)?;
+
+        if let Some(expires_at) = record.expires_at_ms {
+            if now_ms() >= expires_at {
+                return Err(IpcAuthError::ExpiredToken);
+            }
+        }
+
+        let default_scopes = [IpcScope::All];
+        let scopes = if record.scopes.is_empty() {
+            &default_scopes[..]
+        } else {
+            record.scopes.as_slice()
+        };
+
+        if scopes.iter().any(|scope| scope.allows(required)) {
+            Ok(())
+        } else {
+            Err(IpcAuthError::InsufficientScope { required })
+        }
+    }
+}
+
+#[derive(Debug)]
+enum IpcAuthError {
+    MissingToken,
+    InvalidToken,
+    ExpiredToken,
+    InsufficientScope { required: IpcScope },
+}
+
+impl IpcAuthError {
+    fn message(&self) -> String {
+        match self {
+            Self::MissingToken => "missing auth token".to_string(),
+            Self::InvalidToken => "invalid auth token".to_string(),
+            Self::ExpiredToken => "auth token expired".to_string(),
+            Self::InsufficientScope { required } => {
+                format!("insufficient scope (requires {required:?})")
+            }
+        }
+    }
+}
+
 /// Context shared by all IPC request handlers.
 ///
 /// This struct holds references to system components needed for handling
@@ -115,6 +213,8 @@ pub struct IpcHandlerContext {
     pub event_bus: Arc<EventBus>,
     /// Pane registry for pane state queries (optional for backward compatibility)
     pub registry: Option<Arc<RwLock<PaneRegistry>>>,
+    /// Optional IPC auth configuration
+    pub auth: Option<IpcAuth>,
     // NOTE: rate_limiter field was removed in v0.2.0 (StatusUpdate removed)
 }
 
@@ -125,6 +225,7 @@ impl IpcHandlerContext {
         Self {
             event_bus,
             registry: None,
+            auth: None,
         }
     }
 
@@ -134,6 +235,21 @@ impl IpcHandlerContext {
         Self {
             event_bus,
             registry: Some(registry),
+            auth: None,
+        }
+    }
+
+    /// Create a new handler context with optional auth configuration.
+    #[must_use]
+    pub fn with_auth(
+        event_bus: Arc<EventBus>,
+        registry: Option<Arc<RwLock<PaneRegistry>>>,
+        auth: Option<IpcAuth>,
+    ) -> Self {
+        Self {
+            event_bus,
+            registry,
+            auth,
         }
     }
 }
@@ -210,8 +326,7 @@ impl IpcServer {
     /// * `event_bus` - Event bus to publish received events
     /// * `shutdown_rx` - Channel to receive shutdown signal
     pub async fn run(self, event_bus: Arc<EventBus>, mut shutdown_rx: mpsc::Receiver<()>) {
-        let ctx = Arc::new(IpcHandlerContext::new(event_bus));
-        self.run_with_context(ctx, &mut shutdown_rx).await;
+        self.run_with_auth(event_bus, None, shutdown_rx).await;
     }
 
     /// Run the IPC server with full handler context (including pane registry).
@@ -228,7 +343,34 @@ impl IpcServer {
         registry: Arc<RwLock<PaneRegistry>>,
         mut shutdown_rx: mpsc::Receiver<()>,
     ) {
-        let ctx = Arc::new(IpcHandlerContext::with_registry(event_bus, registry));
+        self.run_with_registry_and_auth(event_bus, registry, None, shutdown_rx)
+            .await;
+    }
+
+    /// Run the IPC server with optional auth configuration.
+    pub async fn run_with_auth(
+        self,
+        event_bus: Arc<EventBus>,
+        auth: Option<IpcAuth>,
+        mut shutdown_rx: mpsc::Receiver<()>,
+    ) {
+        let ctx = Arc::new(IpcHandlerContext::with_auth(event_bus, None, auth));
+        self.run_with_context(ctx, &mut shutdown_rx).await;
+    }
+
+    /// Run the IPC server with registry and optional auth configuration.
+    pub async fn run_with_registry_and_auth(
+        self,
+        event_bus: Arc<EventBus>,
+        registry: Arc<RwLock<PaneRegistry>>,
+        auth: Option<IpcAuth>,
+        mut shutdown_rx: mpsc::Receiver<()>,
+    ) {
+        let ctx = Arc::new(IpcHandlerContext::with_auth(
+            event_bus,
+            Some(registry),
+            auth,
+        ));
         self.run_with_context(ctx, &mut shutdown_rx).await;
     }
 
