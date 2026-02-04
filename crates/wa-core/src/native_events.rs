@@ -88,6 +88,7 @@ struct WirePaneState {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WireEvent {
     Hello {
@@ -154,11 +155,7 @@ impl NativeEventListener {
         })
     }
 
-    pub async fn run(
-        mut self,
-        event_tx: mpsc::Sender<NativeEvent>,
-        shutdown_flag: Arc<AtomicBool>,
-    ) {
+    pub async fn run(self, event_tx: mpsc::Sender<NativeEvent>, shutdown_flag: Arc<AtomicBool>) {
         loop {
             if shutdown_flag.load(Ordering::SeqCst) {
                 break;

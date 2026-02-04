@@ -1079,7 +1079,7 @@ async fn handle_native_event(
                             name,
                             payload,
                         };
-                        bus.publish(event);
+                        let _ = bus.publish(event);
                     }
                     Err(err) => {
                         debug!(pane_id, error = %err, "Failed to decode native user-var payload");
