@@ -5158,7 +5158,8 @@ EOF
     mkdir -p "$WA_DATA_DIR"
 
     local refresh_output
-    refresh_output=$("$WA_BINARY" robot --format json accounts refresh --service openai 2>&1 || true)
+    refresh_output=$("$WA_BINARY" robot --format json accounts refresh --service openai \
+        2> "$scenario_dir/refresh_output.stderr" || true)
     echo "$refresh_output" > "$scenario_dir/refresh_output.json"
 
     if echo "$refresh_output" | jq -e '.ok == true and .data.service == "openai" and (.data.accounts | length == 2)' >/dev/null 2>&1; then
@@ -5178,7 +5179,8 @@ EOF
     # Step 2: List accounts with pick preview
     log_info "Step 2: Listing accounts with pick preview..."
     local list_output
-    list_output=$("$WA_BINARY" robot --format json accounts list --service openai --pick 2>&1 || true)
+    list_output=$("$WA_BINARY" robot --format json accounts list --service openai --pick \
+        2> "$scenario_dir/accounts_list.stderr" || true)
     echo "$list_output" > "$scenario_dir/accounts_list.json"
 
     if echo "$list_output" | jq -e '.ok == true and .data.pick_preview.selected_account_id == "acc-1"' >/dev/null 2>&1; then
@@ -5203,10 +5205,11 @@ EOF
     export CAUT_FAKE_MODE="fail"
 
     local fail_output
-    fail_output=$("$WA_BINARY" robot --format json accounts refresh --service openai 2>&1 || true)
+    fail_output=$("$WA_BINARY" robot --format json accounts refresh --service openai \
+        2> "$scenario_dir/refresh_fail_output.stderr" || true)
     echo "$fail_output" > "$scenario_dir/refresh_fail_output.json"
 
-    if echo "$fail_output" | jq -e '.ok == false and .error.code == "robot.caut_error"' >/dev/null 2>&1; then
+    if echo "$fail_output" | jq -e '.ok == false and .error_code == "robot.caut_error"' >/dev/null 2>&1; then
         log_pass "Refresh failure surfaced as robot.caut_error"
     else
         log_fail "Refresh failure did not return expected error code"
@@ -5228,10 +5231,11 @@ EOF
     export CAUT_FAKE_MODE="invalid_json"
 
     local invalid_output
-    invalid_output=$("$WA_BINARY" robot --format json accounts refresh --service openai 2>&1 || true)
+    invalid_output=$("$WA_BINARY" robot --format json accounts refresh --service openai \
+        2> "$scenario_dir/refresh_invalid_output.stderr" || true)
     echo "$invalid_output" > "$scenario_dir/refresh_invalid_output.json"
 
-    if echo "$invalid_output" | jq -e '.ok == false and .error.code == "robot.caut_error"' >/dev/null 2>&1; then
+    if echo "$invalid_output" | jq -e '.ok == false and .error_code == "robot.caut_error"' >/dev/null 2>&1; then
         log_pass "Invalid JSON surfaced as robot.caut_error"
     else
         log_fail "Invalid JSON did not return expected error code"
