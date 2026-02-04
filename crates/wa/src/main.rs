@@ -4,12 +4,12 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use wa_core::logging::{LogConfig, LogError, init_logging};
@@ -5078,6 +5078,143 @@ impl wa_core::webhook::WebhookTransport for ReqwestWebhookTransport {
     }
 }
 
+const WATCHER_CRASH_WINDOW: Duration = Duration::from_secs(5 * 60);
+const WATCHER_STABLE_RESET: Duration = Duration::from_secs(5 * 60);
+const WATCHER_BASE_BACKOFF: Duration = Duration::from_secs(2);
+const WATCHER_MAX_BACKOFF: Duration = Duration::from_secs(60);
+const WATCHER_CRASH_LOOP_THRESHOLD: usize = 3;
+
+struct WatcherCrashLoop {
+    crash_times: VecDeque<Instant>,
+}
+
+impl WatcherCrashLoop {
+    fn new() -> Self {
+        Self {
+            crash_times: VecDeque::new(),
+        }
+    }
+
+    fn register_crash(&mut self, runtime: Duration) -> CrashLoopStatus {
+        if runtime >= WATCHER_STABLE_RESET {
+            self.crash_times.clear();
+        }
+
+        let now = Instant::now();
+        self.crash_times.push_back(now);
+        while let Some(front) = self.crash_times.front().copied() {
+            if now.duration_since(front) > WATCHER_CRASH_WINDOW {
+                self.crash_times.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        let crash_count = self.crash_times.len();
+        let in_loop = crash_count >= WATCHER_CRASH_LOOP_THRESHOLD;
+        let backoff = compute_watcher_backoff(crash_count);
+
+        CrashLoopStatus {
+            crash_count,
+            in_loop,
+            backoff,
+        }
+    }
+}
+
+struct CrashLoopStatus {
+    crash_count: usize,
+    in_loop: bool,
+    backoff: Duration,
+}
+
+fn compute_watcher_backoff(crash_count: usize) -> Duration {
+    let mut backoff_secs = WATCHER_BASE_BACKOFF.as_secs().max(1);
+    let mut steps = crash_count.saturating_sub(1);
+    while steps > 0 {
+        backoff_secs = backoff_secs.saturating_mul(2);
+        steps -= 1;
+    }
+    backoff_secs = backoff_secs.min(WATCHER_MAX_BACKOFF.as_secs().max(1));
+    Duration::from_secs(backoff_secs)
+}
+
+fn watcher_error_is_non_retryable(err: &anyhow::Error) -> bool {
+    let message = err.to_string();
+    message.contains("Another watcher is already running")
+        || message.contains("Failed to acquire watcher lock")
+}
+
+/// Run the observation watcher daemon with crash-loop backoff.
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
+async fn run_watcher_with_backoff(
+    layout: &wa_core::config::WorkspaceLayout,
+    config: &wa_core::config::Config,
+    config_path: Option<&Path>,
+    auto_handle: bool,
+    foreground: bool,
+    poll_interval: u64,
+    no_patterns: bool,
+    disable_lock: bool,
+) -> anyhow::Result<()> {
+    let mut crash_loop = WatcherCrashLoop::new();
+
+    loop {
+        let started_at = Instant::now();
+        let result = run_watcher(
+            layout,
+            config,
+            config_path,
+            auto_handle,
+            foreground,
+            poll_interval,
+            no_patterns,
+            disable_lock,
+        )
+        .await;
+
+        match result {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                if watcher_error_is_non_retryable(&err) {
+                    return Err(err);
+                }
+
+                let runtime = started_at.elapsed();
+                let status = crash_loop.register_crash(runtime);
+                let error_message = err.to_string();
+                let backoff = status.backoff;
+
+                if status.in_loop {
+                    tracing::error!(
+                        crashes = status.crash_count,
+                        runtime_ms = runtime.as_millis(),
+                        backoff_ms = backoff.as_millis(),
+                        error = %error_message,
+                        "Watcher crash loop detected; backing off"
+                    );
+                } else {
+                    tracing::warn!(
+                        crashes = status.crash_count,
+                        runtime_ms = runtime.as_millis(),
+                        backoff_ms = backoff.as_millis(),
+                        error = %error_message,
+                        "Watcher exited with error; restarting"
+                    );
+                }
+
+                tokio::select! {
+                    () = tokio::time::sleep(backoff) => {}
+                    _ = tokio::signal::ctrl_c() => {
+                        tracing::info!("Watcher restart cancelled by Ctrl-C");
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Run the observation watcher daemon.
 #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 async fn run_watcher(
@@ -5950,7 +6087,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             no_patterns,
             dangerous_disable_lock,
         }) => {
-            run_watcher(
+            run_watcher_with_backoff(
                 &layout,
                 &config,
                 resolved_config_path.as_deref(),

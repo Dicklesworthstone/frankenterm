@@ -40,6 +40,7 @@ use crate::ingest::{PaneCursor, PaneRegistry, persist_captured_segment};
 #[cfg(feature = "native-wezterm")]
 use crate::native_events::{NativeEvent, NativeEventListener};
 use crate::patterns::{Detection, DetectionContext, PatternEngine};
+use crate::recording::RecordingManager;
 #[cfg(feature = "native-wezterm")]
 use crate::storage::PaneRecord;
 use crate::storage::{StorageHandle, StoredEvent};
@@ -215,6 +216,8 @@ pub struct ObservationRuntime {
     config_rx: watch::Receiver<HotReloadableConfig>,
     /// Optional event bus for publishing detection events to workflow runners
     event_bus: Option<Arc<EventBus>>,
+    /// Optional recording manager for capturing session recordings
+    recording: Option<Arc<RecordingManager>>,
     /// Heartbeat registry for watchdog monitoring
     heartbeats: Arc<HeartbeatRegistry>,
 }
@@ -265,6 +268,7 @@ impl ObservationRuntime {
             config_tx,
             config_rx,
             event_bus: None,
+            recording: None,
             heartbeats: Arc::new(HeartbeatRegistry::new()),
         }
     }
@@ -277,6 +281,13 @@ impl ObservationRuntime {
     #[must_use]
     pub fn with_event_bus(mut self, event_bus: Arc<EventBus>) -> Self {
         self.event_bus = Some(event_bus);
+        self
+    }
+
+    /// Set a recording manager for capturing pane output and events.
+    #[must_use]
+    pub fn with_recording_manager(mut self, recording: Arc<RecordingManager>) -> Self {
+        self.recording = Some(recording);
         self
     }
 
@@ -859,6 +870,7 @@ impl ObservationRuntime {
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
         let metrics = Arc::clone(&self.metrics);
         let event_bus = self.event_bus.clone();
+        let recording = self.recording.clone();
         let heartbeats = Arc::clone(&self.heartbeats);
 
         tokio::spawn(async move {
@@ -909,6 +921,16 @@ impl ObservationRuntime {
                             "Persisted segment"
                         );
 
+                        if let Some(ref manager) = recording {
+                            if let Err(err) = manager.record_segment(&event.segment).await {
+                                warn!(
+                                    pane_id = pane_id,
+                                    error = %err,
+                                    "Failed to record segment"
+                                );
+                            }
+                        }
+
                         // Run pattern detection on the content
                         let detections = {
                             let mut contexts = detection_contexts.write().await;
@@ -938,6 +960,18 @@ impl ObservationRuntime {
 
                             // Persist each detection as an event
                             for detection in detections {
+                                if let Some(ref manager) = recording {
+                                    if let Err(err) =
+                                        manager.record_event(pane_id, &detection, captured_at).await
+                                    {
+                                        warn!(
+                                            pane_id = pane_id,
+                                            rule_id = %detection.rule_id,
+                                            error = %err,
+                                            "Failed to record detection"
+                                        );
+                                    }
+                                }
                                 let stored_event = detection_to_stored_event(
                                     pane_id,
                                     &detection,
