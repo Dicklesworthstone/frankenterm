@@ -48,7 +48,7 @@ use crate::policy::Redactor;
 /// This is the target version that new databases will be initialized to,
 /// and existing databases will be migrated to.
 /// Uses SQLite's PRAGMA user_version for atomic version tracking.
-pub const SCHEMA_VERSION: i32 = 12;
+pub const SCHEMA_VERSION: i32 = 13;
 
 /// Schema initialization SQL
 ///
@@ -420,6 +420,20 @@ CREATE TABLE IF NOT EXISTS maintenance_log (
 
 CREATE INDEX IF NOT EXISTS idx_maintenance_timestamp ON maintenance_log(timestamp);
 
+-- Secret scan reports: incremental scan checkpoints + report payloads
+CREATE TABLE IF NOT EXISTS secret_scan_reports (
+    id INTEGER PRIMARY KEY,
+    scope_hash TEXT NOT NULL,
+    scope_json TEXT NOT NULL,
+    report_version INTEGER NOT NULL,
+    last_segment_id INTEGER,
+    report_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_secret_scan_reports_scope
+    ON secret_scan_reports(scope_hash, created_at);
+
 -- Action history view (audit + undo + workflow step info)
 CREATE VIEW IF NOT EXISTS action_history AS
 SELECT a.*,
@@ -769,6 +783,30 @@ static MIGRATIONS: &[Migration] = &[
             r"
             DROP INDEX IF EXISTS idx_audit_actions_correlation;
             ALTER TABLE audit_actions DROP COLUMN correlation_id;
+        ",
+        ),
+    },
+    Migration {
+        version: 13,
+        description: "Add secret_scan_reports for incremental scan checkpoints",
+        up_sql: r"
+            CREATE TABLE IF NOT EXISTS secret_scan_reports (
+                id INTEGER PRIMARY KEY,
+                scope_hash TEXT NOT NULL,
+                scope_json TEXT NOT NULL,
+                report_version INTEGER NOT NULL,
+                last_segment_id INTEGER,
+                report_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_secret_scan_reports_scope
+                ON secret_scan_reports(scope_hash, created_at);
+        ",
+        down_sql: Some(
+            r"
+            DROP INDEX IF EXISTS idx_secret_scan_reports_scope;
+            DROP TABLE IF EXISTS secret_scan_reports;
         ",
         ),
     },
@@ -1584,6 +1622,25 @@ pub struct MaintenanceRecord {
     pub metadata: Option<String>,
     /// Timestamp (epoch ms)
     pub timestamp: i64,
+}
+
+/// Secret scan report record stored for incremental resumes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretScanReportRecord {
+    /// Report ID
+    pub id: i64,
+    /// Stable hash of the scan scope (filters).
+    pub scope_hash: String,
+    /// JSON representation of the scan scope.
+    pub scope_json: String,
+    /// Report schema version.
+    pub report_version: i64,
+    /// Last segment ID scanned (checkpoint).
+    pub last_segment_id: Option<i64>,
+    /// Full report payload (JSON).
+    pub report_json: String,
+    /// Timestamp when the report was created (epoch ms).
+    pub created_at: i64,
 }
 
 /// Approval token record for allow-once approvals
@@ -3102,6 +3159,11 @@ enum WriteCommand {
         record: MaintenanceRecord,
         respond: oneshot::Sender<Result<i64>>,
     },
+    /// Record a secret scan report
+    RecordSecretScanReport {
+        record: SecretScanReportRecord,
+        respond: oneshot::Sender<Result<i64>>,
+    },
     /// Prune output segments older than a cutoff
     PruneSegments {
         before_ts: i64,
@@ -3442,6 +3504,21 @@ impl StorageHandle {
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send(WriteCommand::RecordMaintenance {
+                record,
+                respond: tx,
+            })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    /// Record a secret scan report (checkpoint + payload).
+    pub async fn record_secret_scan_report(&self, record: SecretScanReportRecord) -> Result<i64> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::RecordSecretScanReport {
                 record,
                 respond: tx,
             })
@@ -4173,6 +4250,25 @@ impl StorageHandle {
         .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
+    /// Fetch the most recent secret scan report for a scope hash.
+    pub async fn latest_secret_scan_report(
+        &self,
+        scope_hash: &str,
+    ) -> Result<Option<SecretScanReportRecord>> {
+        let db_path = Arc::clone(&self.db_path);
+        let scope_hash = scope_hash.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+
+            query_latest_secret_scan_report(&conn, &scope_hash)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+    }
+
     /// Get workflow by ID
     pub async fn get_workflow(&self, workflow_id: &str) -> Result<Option<WorkflowRecord>> {
         let db_path = Arc::clone(&self.db_path);
@@ -4754,7 +4850,7 @@ fn search_suggestion_prefix(query: &str) -> &str {
     if trimmed.is_empty() {
         return "";
     }
-    trimmed.rsplit_whitespace().next().unwrap_or("")
+    trimmed.split_whitespace().next_back().unwrap_or("")
 }
 
 /// Lint an FTS query for common mistakes.
@@ -5323,6 +5419,10 @@ fn dispatch_write_command(conn: &mut Connection, cmd: WriteCommand, should_break
         }
         WriteCommand::RecordMaintenance { record, respond } => {
             let result = record_maintenance_sync(conn, &record);
+            let _ = respond.send(result);
+        }
+        WriteCommand::RecordSecretScanReport { record, respond } => {
+            let result = record_secret_scan_report_sync(conn, &record);
             let _ = respond.send(result);
         }
         WriteCommand::PruneSegments { before_ts, respond } => {
@@ -5904,6 +6004,33 @@ fn record_maintenance_sync(conn: &Connection, record: &MaintenanceRecord) -> Res
         params![record.event_type, record.message, record.metadata, ts],
     )
     .map_err(|e| StorageError::Database(format!("Failed to record maintenance: {e}")))?;
+
+    Ok(conn.last_insert_rowid())
+}
+
+fn record_secret_scan_report_sync(
+    conn: &Connection,
+    record: &SecretScanReportRecord,
+) -> Result<i64> {
+    let created_at = if record.created_at == 0 {
+        now_ms()
+    } else {
+        record.created_at
+    };
+
+    conn.execute(
+        "INSERT INTO secret_scan_reports (scope_hash, scope_json, report_version, \
+         last_segment_id, report_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            record.scope_hash,
+            record.scope_json,
+            record.report_version,
+            record.last_segment_id,
+            record.report_json,
+            created_at
+        ],
+    )
+    .map_err(|e| StorageError::Database(format!("Failed to record secret scan report: {e}")))?;
 
     Ok(conn.last_insert_rowid())
 }
@@ -8945,6 +9072,34 @@ fn query_scan_segments(conn: &Connection, query: &SegmentScanQuery) -> Result<Ve
     Ok(results)
 }
 
+fn query_latest_secret_scan_report(
+    conn: &Connection,
+    scope_hash: &str,
+) -> Result<Option<SecretScanReportRecord>> {
+    conn.query_row(
+        "SELECT id, scope_hash, scope_json, report_version, last_segment_id, \
+         report_json, created_at
+         FROM secret_scan_reports
+         WHERE scope_hash = ?1
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1",
+        params![scope_hash],
+        |row| {
+            Ok(SecretScanReportRecord {
+                id: row.get(0)?,
+                scope_hash: row.get(1)?,
+                scope_json: row.get(2)?,
+                report_version: row.get(3)?,
+                last_segment_id: row.get(4)?,
+                report_json: row.get(5)?,
+                created_at: row.get(6)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|e| StorageError::Database(format!("Query failed: {e}")).into())
+}
+
 // =============================================================================
 // Export Query Functions
 // =============================================================================
@@ -10766,6 +10921,33 @@ mod tests {
             )
             .unwrap();
         assert_eq!(event_type, "retention_cleanup");
+    }
+
+    #[test]
+    fn secret_scan_report_roundtrip() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let record = SecretScanReportRecord {
+            id: 0,
+            scope_hash: "scope-hash".to_string(),
+            scope_json: "{\"pane_id\":1}".to_string(),
+            report_version: 1,
+            last_segment_id: Some(42),
+            report_json: "{\"report_version\":1}".to_string(),
+            created_at: 1_700_000_000_000,
+        };
+
+        let id = record_secret_scan_report_sync(&conn, &record).unwrap();
+        assert!(id > 0);
+
+        let fetched = query_latest_secret_scan_report(&conn, "scope-hash")
+            .unwrap()
+            .expect("report should exist");
+        assert_eq!(fetched.scope_hash, "scope-hash");
+        assert_eq!(fetched.last_segment_id, Some(42));
+        assert_eq!(fetched.report_version, 1);
+        assert_eq!(fetched.report_json, "{\"report_version\":1}");
     }
 
     #[test]
