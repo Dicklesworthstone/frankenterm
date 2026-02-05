@@ -320,10 +320,18 @@ pub fn detect_remotes_from_panes(panes: &[PaneInfo]) -> Vec<RemoteHost> {
         };
 
         let connection_type = if domain_lower.starts_with("ssh:") {
-            hostname = domain.splitn(2, ':').nth(1).unwrap_or("ssh").to_string();
+            hostname = domain
+                .split_once(':')
+                .map(|(_, host)| host)
+                .unwrap_or("ssh")
+                .to_string();
             ConnectionType::Ssh
         } else if domain_lower.starts_with("wsl:") {
-            hostname = domain.splitn(2, ':').nth(1).unwrap_or("wsl").to_string();
+            hostname = domain
+                .split_once(':')
+                .map(|(_, host)| host)
+                .unwrap_or("wsl")
+                .to_string();
             ConnectionType::Wsl
         } else if domain_lower.contains("docker") {
             ConnectionType::Docker
@@ -353,7 +361,6 @@ fn detect_memory_mb() -> Option<u64> {
     for line in contents.lines() {
         if let Some(rest) = line.strip_prefix("MemTotal:") {
             let kb = rest
-                .trim()
                 .split_whitespace()
                 .next()
                 .and_then(|val| val.parse::<u64>().ok())?;
