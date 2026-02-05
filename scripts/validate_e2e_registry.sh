@@ -42,15 +42,67 @@ for match in re.finditer(r"Scenario\(s\):([^\n]+)", checklist):
             continue
         scenario_refs.add(name)
 
-# Extract scenario names from SCENARIO_REGISTRY array.
-registry_names = set(re.findall(r'"([^"\s:]+):', registry))
+registry_block_match = re.search(r"SCENARIO_REGISTRY=\(\n(.*?)\n\)", registry, re.S)
+if not registry_block_match:
+    print("SCENARIO_REGISTRY block not found in registry script")
+    sys.exit(4)
+
+registry_block = registry_block_match.group(1)
+registry_entries = re.findall(r'"([^"]+)"', registry_block)
+
+registry_names = set()
+registry_errors = []
+for entry in registry_entries:
+    parts = entry.split("|")
+    if len(parts) != 5:
+        registry_errors.append(f"Invalid registry entry (expected 5 fields): {entry}")
+        continue
+    name, desc, default_flag, prereqs, why = [p.strip() for p in parts]
+    if not name or not desc or not why:
+        registry_errors.append(f"Registry entry missing required fields: {entry}")
+    if default_flag not in ("true", "false"):
+        registry_errors.append(f"Registry entry has invalid default flag: {entry}")
+    if name in registry_names:
+        registry_errors.append(f"Duplicate registry entry for scenario: {name}")
+    registry_names.add(name)
+
+if registry_errors:
+    print("Registry format errors:")
+    for err in registry_errors:
+        print(f"  - {err}")
+    sys.exit(2)
 
 missing = sorted(scenario_refs - registry_names)
 if missing:
     print("Checklist references scenarios not in SCENARIO_REGISTRY:")
     for name in missing:
         print(f"  - {name}")
-    sys.exit(2)
+    sys.exit(3)
+
+run_funcs = set(re.findall(r"^\s*run_scenario_([a-z0-9_]+)\(\)", registry, re.M))
+missing_impl = sorted(registry_names - run_funcs)
+if missing_impl:
+    print("Registry references scenarios without run_scenario_ implementation:")
+    for name in missing_impl:
+        print(f"  - {name}")
+    sys.exit(5)
+
+missing_from_registry = sorted(run_funcs - registry_names)
+if missing_from_registry:
+    print("run_scenario_ functions missing from SCENARIO_REGISTRY:")
+    for name in missing_from_registry:
+        print(f"  - {name}")
+    sys.exit(6)
+
+missing_case = []
+for name in sorted(registry_names):
+    if not re.search(rf"\n\s*{re.escape(name)}\)", registry):
+        missing_case.append(name)
+if missing_case:
+    print("Registry scenarios missing from run_scenario case dispatch:")
+    for name in missing_case:
+        print(f"  - {name}")
+    sys.exit(7)
 
 # Optional: check bead IDs referenced in checklist exist in br.
 bead_ids = sorted(set(re.findall(r"wa-[a-z0-9][a-z0-9.-]*", checklist)))
@@ -66,9 +118,9 @@ if bead_ids:
             print("Checklist references bead IDs not found by br:")
             for bead_id in missing_beads:
                 print(f"  - {bead_id}")
-            sys.exit(3)
+            sys.exit(8)
     else:
         print("br not available; skipping bead ID validation", file=sys.stderr)
 
-print("OK: checklist scenarios align with registry")
+print("OK: checklist and registry align; registry entries are complete")
 PY

@@ -333,35 +333,35 @@ run_self_check() {
 # ==============================================================================
 
 # List of available scenarios
-# Format: scenario_name:description
+# Format: name|description|default(true/false)|prereqs|why
 SCENARIO_REGISTRY=(
-    "capture_search:Validate ingest pipeline and FTS search"
-    "natural_language:Validate event summaries and wa why output"
-    "compaction_workflow:Validate pattern detection and workflow execution"
-    "unhandled_event_lifecycle:Validate unhandled event lifecycle and dedupe handling"
-    "workflow_lifecycle:Validate robot workflow list/run/status/abort (dry-run)"
-    "events_unhandled_alias:Validate robot events --unhandled alias"
-    "usage_limit_safe_pause:Validate usage-limit safe pause workflow (fallback plan persisted)"
-    "notification_webhook:Validate webhook notifications (delivery, retry, throttle, recovery)"
-    "watch_notify_only:Validate notify-only mode (no auto-handle, filters, throttling)"
-    "policy_denial:Validate safety gates block sends to protected panes"
-    "audit_tail_streaming:Validate audit tail JSONL streaming with redaction"
-    "ipc_rpc_roundtrip:Validate IPC RPC round-trip with auth + audit"
-    "prepare_commit_approvals:Validate prepare/commit approvals with hash mismatch guard"
-    "quickfix_suggestions:Validate quick-fix suggestions for events and errors"
-    "triage_multi_issue:Validate triage ordering and suggested actions with multiple issues"
-    "rules_explain_trace:Validate rules test trace + lint artifacts (explain-match)"
-    "stress_scale:Validate scaled stress test (panes + large transcript)"
-    "graceful_shutdown:Validate wa watch graceful shutdown (SIGINT flush, lock release, restart clean)"
-    "pane_exclude_filter:Validate pane selection filters protect privacy (ignored pane absent from search)"
-    "workspace_isolation:Validate workspace isolation (no cross-project DB leakage)"
-    "setup_idempotency:Validate wa setup idempotent patching (temp home, no leaks)"
-    "search_linting_rebuild:Validate search linting + FTS verify/rebuild commands"
-    "uservar_forwarding:Validate user-var forwarding lane (wezterm.lua -> wa event -> watcher)"
-    "alt_screen_detection:Validate alt-screen detection via escape sequences (no Lua status hook)"
-    "no_lua_status_hook:Validate wa setup does not inject update-status Lua"
-    "workflow_resume:Validate workflow resumes after watcher restart (no duplicate steps)"
-    "accounts_refresh:Validate accounts refresh via fake caut + pick preview + redaction"
+    "capture_search|Validate ingest pipeline and FTS search|true|wezterm,jq,sqlite3|Protects ingest + search indexing"
+    "natural_language|Validate event summaries and wa why output|true|wezterm,jq|Protects human-readable summaries"
+    "compaction_workflow|Validate pattern detection and workflow execution|true|wezterm,jq,sqlite3|Protects compaction workflow auto-handle"
+    "unhandled_event_lifecycle|Validate unhandled event lifecycle and dedupe handling|true|wezterm,jq,sqlite3|Protects dedupe + unhandled tracking"
+    "workflow_lifecycle|Validate robot workflow list/run/status/abort (dry-run)|true|wezterm,jq,sqlite3|Protects robot workflow surface"
+    "events_unhandled_alias|Validate robot events --unhandled alias|true|wezterm,jq,sqlite3|Protects events CLI aliases"
+    "usage_limit_safe_pause|Validate usage-limit safe pause workflow (fallback plan persisted)|true|wezterm,jq,sqlite3|Protects usage-limit fallback workflow"
+    "notification_webhook|Validate webhook notifications (delivery, retry, throttle, recovery)|true|wezterm,jq,sqlite3,python3,curl|Protects webhook notification pipeline"
+    "watch_notify_only|Validate notify-only mode (no auto-handle, filters, throttling)|true|wezterm,jq,sqlite3,python3,curl|Protects notify-only monitoring mode"
+    "policy_denial|Validate safety gates block sends to protected panes|true|wezterm,jq,sqlite3|Protects policy enforcement"
+    "audit_tail_streaming|Validate audit tail JSONL streaming with redaction|true|wezterm,jq,sqlite3|Protects audit tail + redaction"
+    "ipc_rpc_roundtrip|Validate IPC RPC round-trip with auth + audit|true|wezterm,jq,sqlite3|Protects IPC lane correctness"
+    "prepare_commit_approvals|Validate prepare/commit approvals with hash mismatch guard|true|wezterm,jq,sqlite3|Protects approval flow"
+    "quickfix_suggestions|Validate quick-fix suggestions for events and errors|true|wezterm,jq,sqlite3|Protects suggestion surfaces"
+    "triage_multi_issue|Validate triage ordering and suggested actions with multiple issues|true|wezterm,jq,sqlite3|Protects triage ranking output"
+    "rules_explain_trace|Validate rules test trace + lint artifacts (explain-match)|true|wezterm,jq,sqlite3|Protects rule explainability"
+    "stress_scale|Validate scaled stress test (panes + large transcript)|true|wezterm,jq,sqlite3|Protects scale handling"
+    "graceful_shutdown|Validate wa watch graceful shutdown (SIGINT flush, lock release, restart clean)|true|wezterm,jq,sqlite3|Protects shutdown and lock handling"
+    "pane_exclude_filter|Validate pane selection filters protect privacy (ignored pane absent from search)|true|wezterm,jq,sqlite3|Protects pane exclusion behavior"
+    "workspace_isolation|Validate workspace isolation (no cross-project DB leakage)|true|wezterm,jq,sqlite3|Protects workspace separation"
+    "setup_idempotency|Validate wa setup idempotent patching (temp home, no leaks)|true|wezterm,jq|Protects setup idempotency"
+    "search_linting_rebuild|Validate search linting + FTS verify/rebuild commands|true|wezterm,jq,sqlite3|Protects search maintenance commands"
+    "uservar_forwarding|Validate user-var forwarding lane (wezterm.lua -> wa event -> watcher)|true|wezterm,jq,sqlite3|Protects user-var IPC lane"
+    "alt_screen_detection|Validate alt-screen detection via escape sequences (no Lua status hook)|true|wezterm,jq,sqlite3|Protects alt-screen detection"
+    "no_lua_status_hook|Validate wa setup does not inject update-status Lua|true|wezterm,jq|Protects against legacy status hook"
+    "workflow_resume|Validate workflow resumes after watcher restart (no duplicate steps)|true|wezterm,jq,sqlite3|Protects workflow resume"
+    "accounts_refresh|Validate accounts refresh via fake caut + pick preview + redaction|true|wezterm,jq,sqlite3|Protects accounts refresh"
 )
 
 list_scenarios() {
@@ -369,9 +369,15 @@ list_scenarios() {
     echo "======================="
     echo ""
     for entry in "${SCENARIO_REGISTRY[@]}"; do
-        local name="${entry%%:*}"
-        local desc="${entry#*:}"
+        local name=""
+        local desc=""
+        local default_flag=""
+        local prereqs=""
+        local why=""
+        IFS='|' read -r name desc default_flag prereqs why <<< "$entry"
         printf "  %-25s %s\n" "$name" "$desc"
+        printf "  %-25s default=%s prereqs=%s\n" "" "$default_flag" "$prereqs"
+        printf "  %-25s why=%s\n" "" "$why"
     done
     echo ""
     echo "Run all: $0"
@@ -381,7 +387,9 @@ list_scenarios() {
 get_scenario_names() {
     local names=()
     for entry in "${SCENARIO_REGISTRY[@]}"; do
-        names+=("${entry%%:*}")
+        local name=""
+        IFS='|' read -r name _ <<< "$entry"
+        names+=("$name")
     done
     echo "${names[@]}"
 }
@@ -389,7 +397,9 @@ get_scenario_names() {
 is_valid_scenario() {
     local name="$1"
     for entry in "${SCENARIO_REGISTRY[@]}"; do
-        if [[ "${entry%%:*}" == "$name" ]]; then
+        local entry_name=""
+        IFS='|' read -r entry_name _ <<< "$entry"
+        if [[ "$entry_name" == "$name" ]]; then
             return 0
         fi
     done
