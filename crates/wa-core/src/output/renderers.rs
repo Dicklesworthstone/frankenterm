@@ -8,7 +8,9 @@
 use super::format::{OutputFormat, Style};
 use super::table::{Alignment, Column, Table};
 use crate::event_templates;
-use crate::storage::{AuditActionRecord, PaneRecord, SearchResult, StoredEvent};
+use crate::storage::{
+    ActionHistoryRecord, AuditActionRecord, PaneRecord, SearchResult, StoredEvent,
+};
 
 /// Rendering context with shared settings
 #[derive(Debug, Clone)]
@@ -1010,6 +1012,228 @@ impl AuditListRenderer {
 }
 
 // =============================================================================
+// Action History Renderer
+// =============================================================================
+
+/// Renderer for action history view (audit + undo + workflow step info)
+pub struct ActionHistoryRenderer;
+
+impl ActionHistoryRenderer {
+    /// Render action history list
+    #[must_use]
+    pub fn render(actions: &[ActionHistoryRecord], ctx: &RenderContext) -> String {
+        if ctx.format.is_json() {
+            return serde_json::to_string_pretty(actions).unwrap_or_else(|_| "[]".to_string());
+        }
+
+        let style = Style::from_format(ctx.format);
+
+        if actions.is_empty() {
+            return style.dim("No action history found\n");
+        }
+
+        let mut output = String::new();
+        output.push_str(&style.bold(&format!("Action history ({} records):\n", actions.len())));
+
+        let mut table = Table::new(vec![
+            Column::new("ID").align(Alignment::Right).min_width(5),
+            Column::new("TIME").min_width(19),
+            Column::new("PANE").align(Alignment::Right).min_width(4),
+            Column::new("ACTION").min_width(16),
+            Column::new("RESULT").min_width(8),
+            Column::new("UNDO").min_width(5),
+            Column::new("SUMMARY").min_width(30),
+        ])
+        .with_format(ctx.format);
+
+        let display_actions = if ctx.limit > 0 && actions.len() > ctx.limit {
+            &actions[..ctx.limit]
+        } else {
+            actions
+        };
+
+        for action in display_actions {
+            let result = match action.result.as_str() {
+                "success" | "completed" => style.green(&action.result),
+                "denied" | "failed" => style.red(&action.result),
+                "timeout" => style.yellow("timeout"),
+                other => other.to_string(),
+            };
+
+            let undo = match (action.undoable, action.undone_at) {
+                (Some(true), None) => style.green("✓"),
+                (Some(true), Some(_)) => style.gray("undone"),
+                _ => "-".to_string(),
+            };
+
+            let pane = action
+                .pane_id
+                .map_or_else(|| "-".to_string(), |id| id.to_string());
+
+            let summary = history_summary(action);
+
+            table.add_row(vec![
+                action.id.to_string(),
+                format_timestamp(action.ts),
+                pane,
+                action.action_kind.clone(),
+                result,
+                undo,
+                truncate(&summary, 60),
+            ]);
+        }
+
+        output.push_str(&table.render());
+
+        if ctx.limit > 0 && actions.len() > ctx.limit {
+            output.push_str(&style.dim(&format!(
+                "\n... and {} more records (use --limit to see more)\n",
+                actions.len() - ctx.limit
+            )));
+        }
+
+        output
+    }
+
+    /// Render workflow tree view (plain output)
+    #[must_use]
+    pub fn render_workflow(
+        actions: &[ActionHistoryRecord],
+        workflow_id: &str,
+        ctx: &RenderContext,
+    ) -> String {
+        if ctx.format.is_json() {
+            return serde_json::to_string_pretty(actions).unwrap_or_else(|_| "[]".to_string());
+        }
+
+        let style = Style::from_format(ctx.format);
+        if actions.is_empty() {
+            return style.dim(&format!(
+                "No action history found for workflow {workflow_id}\n"
+            ));
+        }
+
+        let workflow_name = actions
+            .iter()
+            .find_map(extract_workflow_name)
+            .unwrap_or_else(|| "workflow".to_string());
+
+        let mut ordered: Vec<ActionHistoryRecord> = actions.to_vec();
+        ordered.sort_by(|a, b| a.ts.cmp(&b.ts).then(a.id.cmp(&b.id)));
+
+        let mut output = String::new();
+        output.push_str(&style.bold(&format!("Workflow: {workflow_name} ({workflow_id})\n")));
+
+        let root_action_kinds = [
+            "workflow_start",
+            "workflow_completed",
+            "workflow_failed",
+            "workflow_aborted",
+        ];
+
+        for action in &ordered {
+            let is_root = root_action_kinds.contains(&action.action_kind.as_str());
+            let indent = if is_root { "" } else { "  " };
+            let summary = history_summary(action);
+            let line = format!(
+                "{indent}{}  {}  {}\n",
+                format_timestamp(action.ts),
+                action.action_kind,
+                summary
+            );
+            output.push_str(&line);
+        }
+
+        output
+    }
+
+    /// Render action history as CSV
+    #[must_use]
+    pub fn render_csv(actions: &[ActionHistoryRecord]) -> String {
+        let mut output = String::new();
+        output.push_str("id,ts,actor_kind,actor_id,correlation_id,pane_id,domain,action_kind,policy_decision,decision_reason,rule_id,input_summary,verification_summary,decision_context,result,undoable,undo_strategy,undo_hint,undone_at,undone_by,workflow_id,step_name\n");
+
+        for action in actions {
+            let cells = vec![
+                action.id.to_string(),
+                action.ts.to_string(),
+                action.actor_kind.clone(),
+                action.actor_id.clone().unwrap_or_default(),
+                action.correlation_id.clone().unwrap_or_default(),
+                action.pane_id.map_or_else(String::new, |id| id.to_string()),
+                action.domain.clone().unwrap_or_default(),
+                action.action_kind.clone(),
+                action.policy_decision.clone(),
+                action.decision_reason.clone().unwrap_or_default(),
+                action.rule_id.clone().unwrap_or_default(),
+                action.input_summary.clone().unwrap_or_default(),
+                action.verification_summary.clone().unwrap_or_default(),
+                action.decision_context.clone().unwrap_or_default(),
+                action.result.clone(),
+                action.undoable.map_or_else(String::new, |v| v.to_string()),
+                action.undo_strategy.clone().unwrap_or_default(),
+                action.undo_hint.clone().unwrap_or_default(),
+                action.undone_at.map_or_else(String::new, |v| v.to_string()),
+                action.undone_by.clone().unwrap_or_default(),
+                action.workflow_id.clone().unwrap_or_default(),
+                action.step_name.clone().unwrap_or_default(),
+            ];
+
+            let escaped: Vec<String> = cells.into_iter().map(csv_escape).collect();
+            output.push_str(&escaped.join(","));
+            output.push('\n');
+        }
+
+        output
+    }
+}
+
+fn history_summary(action: &ActionHistoryRecord) -> String {
+    if let Some(value) = parse_summary_json(action.input_summary.as_deref()) {
+        if let Some(step_name) = value.get("step_name").and_then(|v| v.as_str()) {
+            return format!("step: {step_name}");
+        }
+        if let Some(reason) = value.get("reason").and_then(|v| v.as_str()) {
+            return reason.to_string();
+        }
+        if let Some(workflow_name) = value.get("workflow_name").and_then(|v| v.as_str()) {
+            return workflow_name.to_string();
+        }
+    }
+
+    action
+        .input_summary
+        .as_deref()
+        .or(action.decision_reason.as_deref())
+        .or(action.undo_hint.as_deref())
+        .unwrap_or("-")
+        .to_string()
+}
+
+fn extract_workflow_name(action: &ActionHistoryRecord) -> Option<String> {
+    parse_summary_json(action.input_summary.as_deref()).and_then(|value| {
+        value
+            .get("workflow_name")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    })
+}
+
+fn parse_summary_json(summary: Option<&str>) -> Option<serde_json::Value> {
+    let summary = summary?;
+    serde_json::from_str::<serde_json::Value>(summary).ok()
+}
+
+fn csv_escape(value: String) -> String {
+    if value.contains('"') || value.contains(',') || value.contains('\n') || value.contains('\r') {
+        let escaped = value.replace('"', "\"\"");
+        format!("\"{escaped}\"")
+    } else {
+        value
+    }
+}
+
+// =============================================================================
 // Helper Functions
 // =============================================================================
 
@@ -1445,6 +1669,33 @@ mod tests {
         }
     }
 
+    fn sample_history_action(action_kind: &str, ts: i64) -> ActionHistoryRecord {
+        ActionHistoryRecord {
+            id: 1,
+            ts,
+            actor_kind: "workflow".to_string(),
+            actor_id: Some("wf-123".to_string()),
+            correlation_id: None,
+            pane_id: Some(2),
+            domain: Some("local".to_string()),
+            action_kind: action_kind.to_string(),
+            policy_decision: "allow".to_string(),
+            decision_reason: None,
+            rule_id: None,
+            input_summary: Some("echo hello".to_string()),
+            verification_summary: None,
+            decision_context: None,
+            result: "success".to_string(),
+            undoable: Some(true),
+            undo_strategy: Some("workflow_abort".to_string()),
+            undo_hint: Some("wa robot workflow abort wf-123".to_string()),
+            undone_at: None,
+            undone_by: None,
+            workflow_id: Some("wf-123".to_string()),
+            step_name: None,
+        }
+    }
+
     #[test]
     fn audit_list_render_plain() {
         let actions = vec![sample_audit_action()];
@@ -1457,6 +1708,71 @@ mod tests {
         assert!(output.contains("allow"));
         assert!(output.contains("success"));
         assert!(output.contains("echo hello"));
+    }
+
+    #[test]
+    fn history_list_render_plain() {
+        let actions = vec![sample_history_action("send_text", 1_737_446_400_000)];
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = ActionHistoryRenderer::render(&actions, &ctx);
+
+        assert!(output.contains("Action history"));
+        assert!(output.contains("send_text"));
+        assert!(output.contains("echo hello"));
+    }
+
+    #[test]
+    fn history_list_render_plain_no_ansi() {
+        let actions = vec![sample_history_action("send_text", 1_737_446_400_000)];
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = ActionHistoryRenderer::render(&actions, &ctx);
+
+        assert_no_ansi(&output, "ActionHistoryRenderer::render");
+    }
+
+    #[test]
+    fn history_list_render_json() {
+        let actions = vec![sample_history_action("send_text", 1_737_446_400_000)];
+        let ctx = RenderContext::new(OutputFormat::Json);
+        let output = ActionHistoryRenderer::render(&actions, &ctx);
+
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert!(parsed.is_array());
+        assert_eq!(parsed[0]["action_kind"], "send_text");
+        assert_eq!(parsed[0]["actor_kind"], "workflow");
+    }
+
+    #[test]
+    fn history_list_render_csv() {
+        let actions = vec![sample_history_action("send_text", 1_737_446_400_000)];
+        let output = ActionHistoryRenderer::render_csv(&actions);
+
+        let mut lines = output.lines();
+        let header = lines.next().unwrap_or_default();
+        let row = lines.next().unwrap_or_default();
+        assert!(header.starts_with("id,ts,actor_kind"));
+        assert!(row.contains(",send_text,"));
+    }
+
+    #[test]
+    fn history_workflow_render_plain() {
+        let mut start = sample_history_action("workflow_start", 1_737_446_400_000);
+        start.input_summary =
+            Some(r#"{"workflow_name":"handle_compaction","execution_id":"wf-123"}"#.to_string());
+        let mut step = sample_history_action("workflow_step", 1_737_446_401_000);
+        step.input_summary =
+            Some(r#"{"workflow_name":"handle_compaction","step_name":"step_0"}"#.to_string());
+        let mut done = sample_history_action("workflow_completed", 1_737_446_402_000);
+        done.input_summary =
+            Some(r#"{"workflow_name":"handle_compaction","reason":"success"}"#.to_string());
+
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = ActionHistoryRenderer::render_workflow(&[done, step, start], "wf-123", &ctx);
+
+        assert_no_ansi(&output, "ActionHistoryRenderer::render_workflow");
+        assert!(output.contains("Workflow: handle_compaction (wf-123)"));
+        assert!(output.contains("workflow_step"));
+        assert!(output.contains("step: step_0"));
     }
 
     #[test]

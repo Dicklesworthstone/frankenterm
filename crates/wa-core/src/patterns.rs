@@ -3,6 +3,7 @@
 //! Provides fast, reliable detection of agent state transitions.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -12,6 +13,7 @@ use fancy_regex::Regex;
 use memchr::memchr;
 use serde::{Deserialize, Serialize};
 
+use crate::config::{PackOverride, PatternsConfig};
 use crate::Result;
 use crate::error::PatternError;
 
@@ -681,11 +683,201 @@ fn merge_rules(packs: &[PatternPack]) -> Vec<RuleDef> {
 
 fn builtin_packs() -> Vec<PatternPack> {
     vec![
+        builtin_core_pack(),
         builtin_codex_pack(),
         builtin_claude_code_pack(),
         builtin_gemini_pack(),
         builtin_wezterm_pack(),
     ]
+}
+
+fn builtin_pack_by_name(name: &str) -> Option<PatternPack> {
+    match name {
+        "core" => Some(builtin_core_pack()),
+        "codex" => Some(builtin_codex_pack()),
+        "claude_code" => Some(builtin_claude_code_pack()),
+        "gemini" => Some(builtin_gemini_pack()),
+        "wezterm" => Some(builtin_wezterm_pack()),
+        _ => None,
+    }
+}
+
+fn load_packs_from_config(config: &PatternsConfig, root: Option<&Path>) -> Result<Vec<PatternPack>> {
+    let mut packs = Vec::with_capacity(config.packs.len());
+    for pack_id in &config.packs {
+        packs.push(load_pack_from_id(pack_id, root)?);
+    }
+    Ok(packs)
+}
+
+fn load_pack_from_id(pack_id: &str, root: Option<&Path>) -> Result<PatternPack> {
+    if let Some(name) = pack_id.strip_prefix("builtin:") {
+        return builtin_pack_by_name(name)
+            .ok_or_else(|| PatternError::PackNotFound(pack_id.to_string()).into());
+    }
+
+    if let Some(path) = pack_id.strip_prefix("file:") {
+        let mut pack = load_pack_from_file(path, root)?;
+        pack.name = pack_id.to_string();
+        return Ok(pack);
+    }
+
+    Err(PatternError::PackNotFound(pack_id.to_string()).into())
+}
+
+fn load_pack_from_file(path: &str, root: Option<&Path>) -> Result<PatternPack> {
+    let raw_path = PathBuf::from(path);
+    let resolved = if raw_path.is_absolute() {
+        raw_path
+    } else {
+        root.map(|r| r.join(&raw_path)).unwrap_or(raw_path)
+    };
+
+    let content = std::fs::read_to_string(&resolved).map_err(|e| {
+        PatternError::PackNotFound(format!(
+            "{} ({})",
+            resolved.display(),
+            e
+        ))
+    })?;
+
+    let ext = resolved
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    let pack = match ext.as_str() {
+        "yaml" | "yml" => serde_yaml::from_str(&content)
+            .map_err(|e| PatternError::InvalidRule(format!("invalid YAML pack: {e}")))?,
+        "json" => serde_json::from_str(&content)
+            .map_err(|e| PatternError::InvalidRule(format!("invalid JSON pack: {e}")))?,
+        "toml" => toml::from_str(&content)
+            .map_err(|e| PatternError::InvalidRule(format!("invalid TOML pack: {e}")))?,
+        other => {
+            return Err(PatternError::InvalidRule(format!(
+                "unsupported pack extension '{other}' (expected .yaml, .yml, .json, .toml)"
+            ))
+            .into())
+        }
+    };
+
+    Ok(pack)
+}
+
+fn apply_pack_overrides(
+    packs: Vec<PatternPack>,
+    overrides: &HashMap<String, PackOverride>,
+) -> Result<Vec<PatternPack>> {
+    if overrides.is_empty() {
+        return Ok(packs);
+    }
+
+    let normalized = normalize_pack_overrides(overrides, &packs)?;
+    let mut updated = Vec::with_capacity(packs.len());
+    for mut pack in packs {
+        if let Some(override_cfg) = normalized.get(&pack.name) {
+            apply_pack_override_to_pack(&mut pack, override_cfg)?;
+        }
+        updated.push(pack);
+    }
+    Ok(updated)
+}
+
+fn normalize_pack_overrides(
+    overrides: &HashMap<String, PackOverride>,
+    packs: &[PatternPack],
+) -> Result<HashMap<String, PackOverride>> {
+    let mut normalized: HashMap<String, PackOverride> = HashMap::new();
+    for (key, override_cfg) in overrides {
+        let canonical = normalize_pack_key(key, packs).ok_or_else(|| {
+            PatternError::InvalidRule(format!(
+                "pack override '{}' does not match any enabled pack",
+                key
+            ))
+        })?;
+
+        let entry = normalized
+            .entry(canonical)
+            .or_insert_with(PackOverride::default);
+        *entry = merge_pack_overrides(entry, override_cfg);
+    }
+    Ok(normalized)
+}
+
+fn normalize_pack_key(key: &str, packs: &[PatternPack]) -> Option<String> {
+    if packs.iter().any(|p| p.name == key) {
+        return Some(key.to_string());
+    }
+
+    if let Some(stripped) = key.strip_prefix("builtin:") {
+        let candidate = format!("builtin:{stripped}");
+        if packs.iter().any(|p| p.name == candidate) {
+            return Some(candidate);
+        }
+    }
+
+    packs
+        .iter()
+        .find(|p| p.name.strip_prefix("builtin:") == Some(key))
+        .map(|p| p.name.clone())
+}
+
+fn merge_pack_overrides(base: &PackOverride, overlay: &PackOverride) -> PackOverride {
+    let mut merged = base.clone();
+
+    for rule in &overlay.disabled_rules {
+        if !merged.disabled_rules.contains(rule) {
+            merged.disabled_rules.push(rule.clone());
+        }
+    }
+
+    for (rule_id, severity) in &overlay.severity_overrides {
+        merged
+            .severity_overrides
+            .insert(rule_id.clone(), severity.clone());
+    }
+
+    for (key, value) in &overlay.extra {
+        merged.extra.insert(key.clone(), value.clone());
+    }
+
+    merged
+}
+
+fn apply_pack_override_to_pack(pack: &mut PatternPack, override_cfg: &PackOverride) -> Result<()> {
+    if !override_cfg.severity_overrides.is_empty() {
+        for rule in &mut pack.rules {
+            if let Some(severity) = override_cfg.severity_overrides.get(&rule.id) {
+                rule.severity = parse_severity_override(severity)?;
+            }
+        }
+    }
+
+    if !override_cfg.disabled_rules.is_empty() {
+        let disabled: HashSet<&str> =
+            override_cfg.disabled_rules.iter().map(String::as_str).collect();
+        pack.rules.retain(|rule| !disabled.contains(rule.id.as_str()));
+    }
+
+    Ok(())
+}
+
+fn parse_severity_override(value: &str) -> Result<Severity> {
+    match value.trim().to_lowercase().as_str() {
+        "info" => Ok(Severity::Info),
+        "warning" => Ok(Severity::Warning),
+        "critical" => Ok(Severity::Critical),
+        _ => Err(PatternError::InvalidRule(format!(
+            "invalid severity override '{value}' (expected info, warning, critical)"
+        ))
+        .into()),
+    }
+}
+
+/// Builtin core pack (shared rules + placeholders)
+fn builtin_core_pack() -> PatternPack {
+    PatternPack::new("builtin:core", "0.1.0", Vec::new())
 }
 
 /// Builtin Codex pack with rules for OpenAI Codex CLI detection
@@ -1309,6 +1501,8 @@ pub struct PatternEngine {
     library: PatternLibrary,
     /// Lazily-initialized compiled index (first-use compilation)
     index: OnceLock<EngineIndex>,
+    /// Enable quick-reject optimization
+    quick_reject_enabled: bool,
 }
 
 impl Default for PatternEngine {
@@ -1326,16 +1520,42 @@ impl PatternEngine {
         Self {
             library,
             index: OnceLock::new(),
+            quick_reject_enabled: true,
         }
     }
 
     /// Create a new pattern engine from explicit packs
     pub fn with_packs(packs: Vec<PatternPack>) -> Result<Self> {
+        Self::with_packs_and_settings(packs, true)
+    }
+
+    /// Create a new pattern engine using a PatternsConfig.
+    pub fn from_config(config: &PatternsConfig) -> Result<Self> {
+        Self::from_config_with_root(config, None)
+    }
+
+    /// Create a new pattern engine using a PatternsConfig and optional root for file packs.
+    pub fn from_config_with_root(config: &PatternsConfig, root: Option<&Path>) -> Result<Self> {
+        let packs = load_packs_from_config(config, root)?;
+        let packs = apply_pack_overrides(packs, &config.pack_overrides)?;
+        let library = PatternLibrary::new(packs)?;
+        Ok(Self {
+            library,
+            index: OnceLock::new(),
+            quick_reject_enabled: config.quick_reject_enabled,
+        })
+    }
+
+    fn with_packs_and_settings(
+        packs: Vec<PatternPack>,
+        quick_reject_enabled: bool,
+    ) -> Result<Self> {
         let library = PatternLibrary::new(packs)?;
         let index = build_engine_index(library.rules())?;
         let engine = Self {
             library,
             index: OnceLock::new(),
+            quick_reject_enabled,
         };
         engine
             .index
@@ -1367,7 +1587,7 @@ impl PatternEngine {
 
         let index = self.index();
 
-        if !Self::quick_reject_with_index(index, text) {
+        if self.quick_reject_enabled && !Self::quick_reject_with_index(index, text) {
             return Vec::new();
         }
 
@@ -1592,6 +1812,9 @@ impl PatternEngine {
     /// Quick reject check - returns false if text definitely has no matches
     #[must_use]
     pub fn quick_reject(&self, text: &str) -> bool {
+        if !self.quick_reject_enabled {
+            return true;
+        }
         if text.is_empty() {
             return false;
         }
@@ -1661,6 +1884,7 @@ impl PatternEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{PackOverride, PatternsConfig};
     use serde::Deserialize;
     use std::collections::{HashMap, HashSet};
     use std::fs;
@@ -1672,6 +1896,47 @@ mod tests {
         assert!(!engine.is_initialized());
         let _ = engine.detect("warmup");
         assert!(engine.is_initialized());
+    }
+
+    #[test]
+    fn from_config_applies_pack_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack_path = dir.path().join("test_pack.yaml");
+        let yaml = r#"
+name: "test-pack"
+version: "0.1.0"
+rules:
+  - id: "codex.test"
+    agent_type: "codex"
+    event_type: "usage.warning"
+    severity: "info"
+    anchors: ["hello"]
+    regex: null
+    description: "test rule"
+"#;
+        fs::write(&pack_path, yaml).unwrap();
+
+        let mut config = PatternsConfig::default();
+        let pack_id = format!("file:{}", pack_path.display());
+        config.packs = vec![pack_id.clone()];
+        config.pack_overrides.clear();
+
+        let mut override_cfg = PackOverride::default();
+        override_cfg
+            .severity_overrides
+            .insert("codex.test".to_string(), "critical".to_string());
+        config.pack_overrides.insert(pack_id.clone(), override_cfg);
+
+        let engine = PatternEngine::from_config(&config).unwrap();
+        let rule = engine.rules().iter().find(|r| r.id == "codex.test").unwrap();
+        assert_eq!(rule.severity, Severity::Critical);
+
+        let mut disabled = PackOverride::default();
+        disabled.disabled_rules.push("codex.test".to_string());
+        config.pack_overrides.insert(pack_id, disabled);
+
+        let engine = PatternEngine::from_config(&config).unwrap();
+        assert!(engine.rules().iter().all(|r| r.id != "codex.test"));
     }
 
     #[test]
