@@ -679,6 +679,21 @@ SEE ALSO:
         command: NotifyCommands,
     },
 
+    /// Secret scanning utilities
+    #[command(after_help = r#"EXAMPLES:
+    wa secrets scan                    Scan stored output and store a report
+    wa secrets scan --pane 3           Scope scan to a single pane
+    wa secrets report                  Show latest report for scope
+    wa secrets report --format json    Machine-readable output
+
+SEE ALSO:
+    wa export     Export redacted data
+    wa audit      Review action history"#)]
+    Secrets {
+        #[command(subcommand)]
+        command: SecretsCommands,
+    },
+
     /// Run diagnostics
     #[command(after_help = r#"EXAMPLES:
     wa doctor                         Run all environment checks
@@ -1123,6 +1138,76 @@ NOTES:
         /// Output format: auto, plain, or json
         #[arg(long, short = 'f', default_value = "auto")]
         format: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum SecretsCommands {
+    /// Run a secret scan over stored segments and record the report
+    #[command(after_help = r#"EXAMPLES:
+    wa secrets scan
+    wa secrets scan --pane 3
+    wa secrets scan --since 1700000000000 --until 1700003600000
+    wa secrets scan --format json"#)]
+    Scan {
+        /// Output format: auto, plain, or json
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+
+        /// Filter by pane ID
+        #[arg(long)]
+        pane_id: Option<u64>,
+
+        /// Filter by start time (epoch ms)
+        #[arg(long)]
+        since: Option<i64>,
+
+        /// Filter by end time (epoch ms)
+        #[arg(long)]
+        until: Option<i64>,
+
+        /// Maximum segments to scan (None = unlimited)
+        #[arg(long)]
+        max_segments: Option<usize>,
+
+        /// Batch size for incremental reads
+        #[arg(long, default_value = "1000")]
+        batch_size: usize,
+
+        /// Maximum number of sample records to retain
+        #[arg(long, default_value = "200")]
+        sample_limit: usize,
+
+        /// Pretty-print JSON output
+        #[arg(long)]
+        pretty: bool,
+    },
+
+    /// Show the latest secret scan report for a scope
+    #[command(after_help = r#"EXAMPLES:
+    wa secrets report
+    wa secrets report --pane 3
+    wa secrets report --format json"#)]
+    Report {
+        /// Output format: auto, plain, or json
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+
+        /// Filter by pane ID
+        #[arg(long)]
+        pane_id: Option<u64>,
+
+        /// Filter by start time (epoch ms)
+        #[arg(long)]
+        since: Option<i64>,
+
+        /// Filter by end time (epoch ms)
+        #[arg(long)]
+        until: Option<i64>,
+
+        /// Pretty-print JSON output
+        #[arg(long)]
+        pretty: bool,
     },
 }
 

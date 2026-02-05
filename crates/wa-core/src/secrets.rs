@@ -60,13 +60,20 @@ pub struct SecretScanScope {
 }
 
 impl SecretScanScope {
-    fn from_options(options: &SecretScanOptions) -> Self {
+    pub fn from_options(options: &SecretScanOptions) -> Self {
         Self {
             pane_id: options.pane_id,
             since: options.since,
             until: options.until,
         }
     }
+}
+
+/// Compute a stable scope hash for secret scan reports.
+pub fn scope_hash(options: &SecretScanOptions) -> Result<String> {
+    let scope = SecretScanScope::from_options(options);
+    let scope_json = serde_json::to_string(&scope)?;
+    Ok(hash_bytes(scope_json.as_bytes()))
 }
 
 /// A single redaction-safe secret match sample.
