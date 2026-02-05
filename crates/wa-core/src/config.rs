@@ -981,6 +981,7 @@ impl Default for PatternsConfig {
                 "builtin:codex".to_string(),
                 "builtin:claude_code".to_string(),
                 "builtin:gemini".to_string(),
+                "builtin:wezterm".to_string(),
             ],
             pack_overrides: HashMap::new(),
             quick_reject_enabled: true,

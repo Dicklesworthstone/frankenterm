@@ -797,9 +797,7 @@ fn normalize_pack_overrides(
             ))
         })?;
 
-        let entry = normalized
-            .entry(canonical)
-            .or_insert_with(PackOverride::default);
+        let entry = normalized.entry(canonical).or_default();
         *entry = merge_pack_overrides(entry, override_cfg);
     }
     Ok(normalized)

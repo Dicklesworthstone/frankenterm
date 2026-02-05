@@ -69,6 +69,8 @@ pub struct RuntimeConfig {
     pub capture_budgets: CaptureBudgetConfig,
     /// Pattern detection configuration
     pub patterns: PatternsConfig,
+    /// Optional root for resolving file-based pattern packs
+    pub patterns_root: Option<PathBuf>,
     /// Channel buffer size for internal queues
     pub channel_buffer: usize,
     /// Maximum concurrent capture operations
@@ -94,6 +96,7 @@ impl Default for RuntimeConfig {
             pane_priorities: PanePriorityConfig::default(),
             capture_budgets: CaptureBudgetConfig::default(),
             patterns: PatternsConfig::default(),
+            patterns_root: None,
             channel_buffer: 1024,
             max_concurrent_captures: 10,
             retention_days: 30,
@@ -908,6 +911,7 @@ impl ObservationRuntime {
         let heartbeats = Arc::clone(&self.heartbeats);
         let mut config_rx = self.config_rx.clone();
         let mut current_patterns = self.config.patterns.clone();
+        let patterns_root = self.config.patterns_root.clone();
 
         tokio::spawn(async move {
             // Process events until channel closes or shutdown
@@ -922,7 +926,10 @@ impl ObservationRuntime {
                 if config_rx.has_changed().unwrap_or(false) {
                     let new_config = config_rx.borrow_and_update().clone();
                     if new_config.patterns != current_patterns {
-                        match PatternEngine::from_config(&new_config.patterns) {
+                        match PatternEngine::from_config_with_root(
+                            &new_config.patterns,
+                            patterns_root.as_deref(),
+                        ) {
                             Ok(engine) => {
                                 let mut guard = pattern_engine.write().await;
                                 *guard = engine;

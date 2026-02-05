@@ -81,6 +81,7 @@ pub mod plan;
 pub mod policy;
 pub mod recording;
 pub mod retry;
+pub mod rulesets;
 pub mod runtime;
 pub mod screen_state;
 pub mod secrets;

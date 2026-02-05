@@ -478,7 +478,7 @@ fn merge_external_meta(
 
     map.insert(
         "cass_summary".to_string(),
-        serde_json::to_value(summary).unwrap_or_else(|_| Value::Null),
+        serde_json::to_value(summary).unwrap_or(Value::Null),
     );
     map.insert(
         "cass_refreshed_at_ms".to_string(),
