@@ -12688,6 +12688,127 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             handle_notify_command(command, &config).await?;
         }
 
+        Some(Commands::Secrets { command }) => {
+            use wa_core::output::{OutputFormat, detect_format};
+            use wa_core::secrets::{SecretScanEngine, SecretScanOptions, SecretScanReport, scope_hash};
+
+            let layout = match config.workspace_layout(Some(&workspace_root)) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("Error: Failed to get workspace layout: {e}");
+                    eprintln!("Check --workspace or WA_WORKSPACE");
+                    std::process::exit(1);
+                }
+            };
+
+            let db_path = layout.db_path.to_string_lossy();
+            let storage = match wa_core::storage::StorageHandle::new(&db_path).await {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error: Failed to open storage: {e}");
+                    eprintln!("Is the database initialized? Run 'wa watch' first.");
+                    std::process::exit(1);
+                }
+            };
+
+            let render_report = |report: &SecretScanReport,
+                                 format: &str,
+                                 pretty: bool|
+             -> anyhow::Result<()> {
+                let output_format = match format.to_lowercase().as_str() {
+                    "json" => OutputFormat::Json,
+                    "plain" => OutputFormat::Plain,
+                    _ => detect_format(),
+                };
+                render_secret_scan_report(report, output_format, pretty)
+            };
+
+            match command {
+                SecretsCommands::Scan {
+                    format,
+                    pane_id,
+                    since,
+                    until,
+                    max_segments,
+                    batch_size,
+                    sample_limit,
+                    pretty,
+                } => {
+                    let options = SecretScanOptions {
+                        pane_id,
+                        since,
+                        until,
+                        max_segments,
+                        batch_size,
+                        sample_limit,
+                    };
+
+                    let engine = SecretScanEngine::new();
+                    let report = match engine
+                        .scan_storage_incremental(&storage, options)
+                        .await
+                    {
+                        Ok(report) => report,
+                        Err(e) => {
+                            eprintln!("Error: Secret scan failed: {e}");
+                            std::process::exit(1);
+                        }
+                    };
+
+                    render_report(&report, &format, pretty)?;
+                }
+                SecretsCommands::Report {
+                    format,
+                    pane_id,
+                    since,
+                    until,
+                    pretty,
+                } => {
+                    let options = SecretScanOptions {
+                        pane_id,
+                        since,
+                        until,
+                        ..Default::default()
+                    };
+                    let scope = match scope_hash(&options) {
+                        Ok(value) => value,
+                        Err(e) => {
+                            eprintln!("Error: Failed to compute scope hash: {e}");
+                            std::process::exit(1);
+                        }
+                    };
+
+                    let record = match storage.latest_secret_scan_report(&scope).await {
+                        Ok(record) => record,
+                        Err(e) => {
+                            eprintln!("Error: Failed to load secret scan report: {e}");
+                            std::process::exit(1);
+                        }
+                    };
+
+                    let record = match record {
+                        Some(record) => record,
+                        None => {
+                            eprintln!("No secret scan report found for this scope.");
+                            eprintln!("Hint: run `wa secrets scan` first.");
+                            std::process::exit(1);
+                        }
+                    };
+
+                    let report: SecretScanReport = match serde_json::from_str(&record.report_json)
+                    {
+                        Ok(report) => report,
+                        Err(e) => {
+                            eprintln!("Error: Failed to parse secret scan report: {e}");
+                            std::process::exit(1);
+                        }
+                    };
+
+                    render_report(&report, &format, pretty)?;
+                }
+            }
+        }
+
         Some(Commands::Doctor { circuits, json }) => {
             let checks = run_diagnostics(&permission_warnings, &config, &layout);
             let mut all_checks: Vec<DiagnosticCheck> = checks;
