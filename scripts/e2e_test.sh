@@ -343,6 +343,7 @@ SCENARIO_REGISTRY=(
     "events_unhandled_alias:Validate robot events --unhandled alias"
     "usage_limit_safe_pause:Validate usage-limit safe pause workflow (fallback plan persisted)"
     "notification_webhook:Validate webhook notifications (delivery, retry, throttle, recovery)"
+    "watch_notify_only:Validate notify-only mode (no auto-handle, filters, throttling)"
     "policy_denial:Validate safety gates block sends to protected panes"
     "audit_tail_streaming:Validate audit tail JSONL streaming with redaction"
     "ipc_rpc_roundtrip:Validate IPC RPC round-trip with auth + audit"
@@ -2173,6 +2174,581 @@ EOF
 
     trap - EXIT
     cleanup_notification_webhook
+
+    return $result
+}
+
+run_scenario_watch_notify_only() {
+    local scenario_dir="$1"
+    local temp_workspace
+    temp_workspace=$(mktemp -d /tmp/wa-e2e-notify-only-XXXXXX)
+    local wa_pid=""
+    local mock_pid=""
+    local pane_usage=""
+    local pane_token=""
+    local pane_burst=""
+    local result=0
+    local wait_timeout=${TIMEOUT:-120}
+    local secret_token="SECRET_NOTIFY_ONLY_$(date +%s%N)"
+    local mock_script="$temp_workspace/mock_webhook_server.py"
+    local usage_script="$temp_workspace/emit_usage_limit.sh"
+    local token_script="$temp_workspace/emit_token_usage.sh"
+    local burst_script="$temp_workspace/emit_usage_limit_burst.sh"
+    local mock_port=""
+    local mock_addr=""
+    local old_wa_data_dir="${WA_DATA_DIR:-}"
+    local old_wa_workspace="${WA_WORKSPACE:-}"
+    local old_wa_config="${WA_CONFIG:-}"
+
+    log_info "Workspace: $temp_workspace"
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        log_fail "python3 is required for mock webhook server"
+        return 1
+    fi
+    if ! command -v curl >/dev/null 2>&1; then
+        log_fail "curl is required for mock webhook server checks"
+        return 1
+    fi
+
+    cleanup_watch_notify_only() {
+        log_verbose "Cleaning up watch_notify_only scenario"
+        if [[ -n "${mock_pid:-}" ]] && kill -0 "$mock_pid" 2>/dev/null; then
+            log_verbose "Stopping mock webhook server (pid $mock_pid)"
+            kill "$mock_pid" 2>/dev/null || true
+            wait "$mock_pid" 2>/dev/null || true
+        fi
+        if [[ -n "${wa_pid:-}" ]] && kill -0 "$wa_pid" 2>/dev/null; then
+            log_verbose "Stopping wa watch (pid $wa_pid)"
+            kill "$wa_pid" 2>/dev/null || true
+            wait "$wa_pid" 2>/dev/null || true
+        fi
+        for pane in "$pane_usage" "$pane_token" "$pane_burst"; do
+            if [[ -n "$pane" ]]; then
+                log_verbose "Closing pane $pane"
+                wezterm cli kill-pane --pane-id "$pane" 2>/dev/null || true
+            fi
+        done
+        if [[ -n "$old_wa_data_dir" ]]; then
+            export WA_DATA_DIR="$old_wa_data_dir"
+        else
+            unset WA_DATA_DIR
+        fi
+        if [[ -n "$old_wa_workspace" ]]; then
+            export WA_WORKSPACE="$old_wa_workspace"
+        else
+            unset WA_WORKSPACE
+        fi
+        if [[ -n "$old_wa_config" ]]; then
+            export WA_CONFIG="$old_wa_config"
+        else
+            unset WA_CONFIG
+        fi
+        if [[ -d "${temp_workspace:-}" ]]; then
+            cp -r "${temp_workspace}/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp "${temp_workspace}/wa.toml" "$scenario_dir/" 2>/dev/null || true
+        fi
+        rm -rf "${temp_workspace:-}"
+    }
+    trap cleanup_watch_notify_only EXIT
+
+    # Prepare mock webhook server script
+    cat > "$mock_script" <<'PY'
+#!/usr/bin/env python3
+import argparse
+import json
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+
+class State:
+    def __init__(self, log_path):
+        self.log_path = log_path
+        self.received = []
+
+    def log(self, message):
+        if self.log_path:
+            with open(self.log_path, "a", encoding="utf-8") as handle:
+                handle.write(message + "\n")
+        else:
+            print(message, flush=True)
+
+
+STATE = None
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        return
+
+    def _send_json(self, code, payload):
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/health":
+            return self._send_json(200, {"ok": True})
+        if self.path == "/received":
+            return self._send_json(200, STATE.received)
+        return self._send_json(404, {"error": "not_found"})
+
+    def do_POST(self):
+        if self.path == "/reset":
+            STATE.received = []
+            return self._send_json(200, {"ok": True})
+        if self.path != "/webhook":
+            return self._send_json(404, {"error": "not_found"})
+
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length)
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except Exception:
+            payload = {"_raw": body.decode("utf-8", errors="replace")}
+        STATE.received.append(payload)
+        STATE.log(f"received bytes={len(body)}")
+        return self._send_json(200, {"ok": True})
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", type=int, default=0)
+    parser.add_argument("--log", default="")
+    args = parser.parse_args()
+
+    global STATE
+    STATE = State(args.log)
+    server = HTTPServer(("127.0.0.1", args.port), Handler)
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
+PY
+    chmod +x "$mock_script"
+
+    # Prepare usage-limit emitters
+    cat > "$usage_script" <<'EOS'
+#!/bin/bash
+set -euo pipefail
+secret="$1"
+reset_time="${2:-2026-02-01 00:00 UTC}"
+sleep_tail="${3:-120}"
+
+echo "$secret"
+echo "You've hit your usage limit. try again at ${reset_time}."
+echo "[CODEX] Waiting for operator action..."
+
+sleep "$sleep_tail"
+EOS
+    chmod +x "$usage_script"
+
+    cat > "$token_script" <<'EOS'
+#!/bin/bash
+set -euo pipefail
+secret="$1"
+sleep_tail="${2:-120}"
+
+echo "$secret"
+echo "Token usage: total=42 input=20 output=22"
+
+sleep "$sleep_tail"
+EOS
+    chmod +x "$token_script"
+
+    cat > "$burst_script" <<'EOS'
+#!/bin/bash
+set -euo pipefail
+secret="$1"
+burst_count="${2:-3}"
+burst_interval="${3:-0.1}"
+cooldown_delay="${4:-2}"
+sleep_tail="${5:-120}"
+reset_time="${6:-2026-02-01 00:00 UTC}"
+
+echo "$secret"
+for ((i=1; i<=burst_count; i++)); do
+    echo "You've hit your usage limit. try again at ${reset_time}."
+    echo "[CODEX] Waiting for operator action..."
+    if [[ "$i" -lt "$burst_count" ]]; then
+        sleep "$burst_interval"
+    fi
+done
+
+sleep "$cooldown_delay"
+echo "You've hit your usage limit. try again at ${reset_time}."
+echo "[CODEX] Waiting for operator action..."
+
+sleep "$sleep_tail"
+EOS
+    chmod +x "$burst_script"
+
+    # Pick a free port for the mock server
+    mock_port=$(python3 - <<'PY'
+import socket
+sock = socket.socket()
+sock.bind(("127.0.0.1", 0))
+print(sock.getsockname()[1])
+sock.close()
+PY
+    )
+
+    if [[ -z "$mock_port" ]]; then
+        log_fail "Failed to allocate mock webhook port"
+        return 1
+    fi
+    mock_addr="http://127.0.0.1:$mock_port"
+
+    echo "[NOTIFYONLY_E2E] workspace=$temp_workspace" >> "$scenario_dir/scenario.log"
+    echo "[NOTIFYONLY_E2E] mock_addr=$mock_addr" >> "$scenario_dir/scenario.log"
+    echo "[NOTIFYONLY_E2E] secret_token=$secret_token" >> "$scenario_dir/scenario.log"
+
+    start_mock_server() {
+        if [[ -n "${mock_pid:-}" ]] && kill -0 "$mock_pid" 2>/dev/null; then
+            kill "$mock_pid" 2>/dev/null || true
+            wait "$mock_pid" 2>/dev/null || true
+        fi
+
+        python3 "$mock_script" --port "$mock_port" --log "$scenario_dir/mock_server.log" \
+            > "$scenario_dir/mock_server.out" 2>&1 &
+        mock_pid=$!
+
+        local check_cmd="curl -fs \"$mock_addr/health\" >/dev/null 2>&1"
+        if ! wait_for_condition "mock server ready" "$check_cmd" "$wait_timeout"; then
+            log_fail "Mock webhook server failed to start"
+            return 1
+        fi
+        return 0
+    }
+
+    reset_mock_server() {
+        curl -s -X POST "$mock_addr/reset" >/dev/null 2>&1 || true
+    }
+
+    mock_received_count() {
+        local payload=""
+        payload=$(curl -s "$mock_addr/received" 2>/dev/null || true)
+        echo "$payload" | jq -r 'length' 2>/dev/null || echo "0"
+    }
+
+    wait_for_stable_received() {
+        local stable_seconds="$1"
+        local timeout="$2"
+        local start
+        start=$(date +%s)
+        local last=""
+        local stable_start=""
+
+        while true; do
+            local current
+            current=$(mock_received_count)
+            if [[ -n "$last" && "$current" == "$last" ]]; then
+                if [[ -z "$stable_start" ]]; then
+                    stable_start=$(date +%s)
+                fi
+                if [[ $(( $(date +%s) - stable_start )) -ge $stable_seconds ]]; then
+                    return 0
+                fi
+            else
+                last="$current"
+                stable_start=""
+            fi
+
+            if [[ $(( $(date +%s) - start )) -ge $timeout ]]; then
+                return 1
+            fi
+            sleep 0.5
+        done
+    }
+
+    spawn_pane() {
+        local script="$1"
+        shift
+        local spawn_output=""
+        spawn_output=$(wezterm cli spawn --cwd "$temp_workspace" -- bash "$script" "$@" 2>&1)
+        local new_pane_id
+        new_pane_id=$(echo "$spawn_output" | grep -oE '^[0-9]+$' | head -1)
+        if [[ -z "$new_pane_id" ]]; then
+            echo ""
+            return 1
+        fi
+        echo "$new_pane_id"
+        return 0
+    }
+
+    wait_for_pane_observed() {
+        local pane="$1"
+        local check_cmd="\"$WA_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane)' >/dev/null 2>&1"
+        wait_for_condition "pane $pane observed" "$check_cmd" "$wait_timeout"
+    }
+
+    start_wa_watch() {
+        local log_file="$1"
+        shift
+
+        if [[ -n "${wa_pid:-}" ]] && kill -0 "$wa_pid" 2>/dev/null; then
+            kill "$wa_pid" 2>/dev/null || true
+            wait "$wa_pid" 2>/dev/null || true
+        fi
+
+        "$WA_BINARY" watch --foreground --config "$temp_workspace/wa.toml" "$@" \
+            > "$log_file" 2>&1 &
+        wa_pid=$!
+        echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
+
+        local check_watch_cmd="kill -0 $wa_pid 2>/dev/null"
+        if ! wait_for_condition "wa watch running" "$check_watch_cmd" "$wait_timeout"; then
+            log_fail "wa watch failed to start"
+            return 1
+        fi
+        return 0
+    }
+
+    stop_wa_watch() {
+        if [[ -n "${wa_pid:-}" ]] && kill -0 "$wa_pid" 2>/dev/null; then
+            kill -TERM "$wa_pid" 2>/dev/null || true
+            wait "$wa_pid" 2>/dev/null || true
+        fi
+        wa_pid=""
+    }
+
+    # Step 1: Configure isolated workspace and notifications
+    log_info "Step 1: Preparing workspace + notifications config..."
+    export WA_DATA_DIR="$temp_workspace/.wa"
+    export WA_WORKSPACE="$temp_workspace"
+    mkdir -p "$WA_DATA_DIR"
+
+    local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
+    if [[ -f "$baseline_config" ]]; then
+        cp "$baseline_config" "$temp_workspace/wa.toml"
+    else
+        log_fail "Baseline config not found: $baseline_config"
+        return 1
+    fi
+
+    cat >> "$temp_workspace/wa.toml" <<EOF
+
+[notifications]
+enabled = true
+notify_only = true
+cooldown_ms = 1500
+dedup_window_ms = 1
+min_severity = "info"
+
+[[notifications.webhooks]]
+name = "e2e-notify-only"
+url = "${mock_addr}/webhook"
+template = "generic"
+EOF
+
+    export WA_CONFIG="$temp_workspace/wa.toml"
+    log_pass "Notify-only config written"
+
+    if ! start_mock_server; then
+        return 1
+    fi
+
+    # Step 2: Notify-only mode delivers notifications but does not auto-handle
+    log_info "Step 2: Starting wa watch (notify-only baseline)..."
+    if ! start_wa_watch "$scenario_dir/wa_watch_notify_only.log" --notify-only; then
+        return 1
+    fi
+    echo "[NOTIFYONLY_E2E] watcher started notify_only=true" >> "$scenario_dir/scenario.log"
+
+    log_info "Step 3: Spawning usage-limit pane..."
+    pane_usage=$(spawn_pane "$usage_script" "$secret_token" "2026-02-01 00:00 UTC" 90) || {
+        log_fail "Failed to spawn usage-limit pane"
+        return 1
+    }
+    log_info "Spawned usage-limit pane: $pane_usage"
+    echo "[NOTIFYONLY_E2E] pane_usage=$pane_usage" >> "$scenario_dir/scenario.log"
+
+    if ! wait_for_pane_observed "$pane_usage"; then
+        log_fail "Pane not observed for notify-only baseline"
+        result=1
+    fi
+
+    local check_notify_cmd='[[ $(mock_received_count) -ge 1 ]]'
+    if ! wait_for_condition "notify-only webhook received" "$check_notify_cmd" "$wait_timeout"; then
+        log_fail "Timeout waiting for notify-only webhook"
+        result=1
+    else
+        log_pass "Notify-only webhook delivery observed"
+    fi
+
+    curl -s "$mock_addr/received" > "$scenario_dir/notifications_received_notify_only.json" 2>/dev/null || true
+
+    if jq -e '.[-1].event_type == "codex.usage.reached"' \
+        "$scenario_dir/notifications_received_notify_only.json" >/dev/null 2>&1; then
+        log_pass "Payload contains usage-limit event"
+    else
+        log_fail "Payload missing usage-limit event_type"
+        result=1
+    fi
+
+    if jq -e '.[-1].quick_fix != null and (.[-1].quick_fix | contains("wa workflow run"))' \
+        "$scenario_dir/notifications_received_notify_only.json" >/dev/null 2>&1; then
+        log_pass "Suggested action included in notification"
+    else
+        log_fail "Suggested action missing from notification payload"
+        result=1
+    fi
+
+    if grep -q "$secret_token" "$scenario_dir/notifications_received_notify_only.json" 2>/dev/null; then
+        log_fail "Secret token leaked in notify-only payload"
+        result=1
+    else
+        log_pass "Notify-only payload redacted (no secret token)"
+    fi
+
+    log_info "Step 4: Verifying event remains unhandled + no workflow runs..."
+    "$WA_BINARY" events -f json --unhandled --rule-id "codex.usage.reached" --limit 20 \
+        > "$scenario_dir/events_unhandled_notify_only.json" 2>&1 || true
+
+    if jq -e ".[] | select(.pane_id == $pane_usage)" \
+        "$scenario_dir/events_unhandled_notify_only.json" >/dev/null 2>&1; then
+        log_pass "Usage-limit event remains unhandled"
+    else
+        log_fail "Usage-limit event no longer unhandled"
+        result=1
+    fi
+
+    local db_path="$temp_workspace/.wa/wa.db"
+    if [[ -f "$db_path" ]]; then
+        sqlite3 "$db_path" -json \
+            "SELECT id, workflow_name, status FROM workflow_executions ORDER BY started_at DESC LIMIT 50;" \
+            > "$scenario_dir/workflow_executions_notify_only.json" 2>/dev/null || true
+        local workflow_count
+        workflow_count=$(jq 'length' "$scenario_dir/workflow_executions_notify_only.json" 2>/dev/null || echo "0")
+        if [[ "$workflow_count" -eq 0 ]]; then
+            log_pass "No workflow executions recorded"
+        else
+            log_fail "Workflow executions found in notify-only mode"
+            result=1
+        fi
+
+        sqlite3 "$db_path" -json \
+            "SELECT action_kind FROM audit_actions ORDER BY id DESC LIMIT 50;" \
+            > "$scenario_dir/audit_actions_notify_only.json" 2>/dev/null || true
+        if jq -e '.[] | select(.action_kind == "workflow_run" or .action_kind == "workflow_start")' \
+            "$scenario_dir/audit_actions_notify_only.json" >/dev/null 2>&1; then
+            log_fail "Workflow audit actions found in notify-only mode"
+            result=1
+        else
+            log_pass "No workflow audit actions recorded"
+        fi
+    else
+        log_warn "Database file not found at $db_path"
+    fi
+
+    if [[ -n "$pane_usage" ]]; then
+        wezterm cli kill-pane --pane-id "$pane_usage" 2>/dev/null || true
+        pane_usage=""
+    fi
+
+    # Step 5: Notification filter only delivers matching events
+    log_info "Step 5: Restarting wa watch with notify filter..."
+    reset_mock_server
+    stop_wa_watch
+    if ! start_wa_watch "$scenario_dir/wa_watch_notify_filter.log" \
+        --notify-only --notify-filter "codex.usage.reached"; then
+        return 1
+    fi
+    echo "[NOTIFYONLY_E2E] watcher restarted notify_filter=codex.usage.reached" >> "$scenario_dir/scenario.log"
+
+    pane_usage=$(spawn_pane "$usage_script" "$secret_token" "2026-02-01 00:00 UTC" 90) || {
+        log_fail "Failed to spawn usage-limit pane for filter test"
+        return 1
+    }
+    pane_token=$(spawn_pane "$token_script" "$secret_token" 90) || {
+        log_fail "Failed to spawn token-usage pane for filter test"
+        return 1
+    }
+
+    if ! wait_for_pane_observed "$pane_usage"; then
+        log_fail "Usage-limit pane not observed for filter test"
+        result=1
+    fi
+    if ! wait_for_pane_observed "$pane_token"; then
+        log_fail "Token-usage pane not observed for filter test"
+        result=1
+    fi
+
+    if ! wait_for_condition "filtered webhook received" "$check_notify_cmd" "$wait_timeout"; then
+        log_fail "Timeout waiting for filtered webhook delivery"
+        result=1
+    fi
+
+    if ! wait_for_stable_received 2 "$wait_timeout"; then
+        log_warn "Webhook count did not stabilize after filter test"
+    fi
+
+    curl -s "$mock_addr/received" > "$scenario_dir/notifications_received_filter.json" 2>/dev/null || true
+    if jq -e 'length == 1' "$scenario_dir/notifications_received_filter.json" >/dev/null 2>&1; then
+        log_pass "Filter limited notifications to one event"
+    else
+        log_fail "Filter delivered unexpected number of notifications"
+        result=1
+    fi
+
+    if jq -e 'map(select(.event_type != "codex.usage.reached")) | length == 0' \
+        "$scenario_dir/notifications_received_filter.json" >/dev/null 2>&1; then
+        log_pass "Filter delivered only usage-limit notifications"
+    else
+        log_fail "Filter delivered non-matching notifications"
+        result=1
+    fi
+
+    for pane in "$pane_usage" "$pane_token"; do
+        if [[ -n "$pane" ]]; then
+            wezterm cli kill-pane --pane-id "$pane" 2>/dev/null || true
+        fi
+    done
+    pane_usage=""
+    pane_token=""
+
+    # Step 6: Throttling suppresses repeat notifications
+    log_info "Step 6: Throttling suppresses repeat notifications..."
+    reset_mock_server
+    pane_burst=$(spawn_pane "$burst_script" "$secret_token" 3 0.1 2 90) || {
+        log_fail "Failed to spawn burst pane for throttling test"
+        return 1
+    }
+
+    if ! wait_for_pane_observed "$pane_burst"; then
+        log_fail "Burst pane not observed for throttling test"
+        result=1
+    fi
+
+    local check_throttle_cmd='[[ $(mock_received_count) -ge 2 ]]'
+    if ! wait_for_condition "throttle second delivery" "$check_throttle_cmd" "$wait_timeout"; then
+        log_fail "Throttle second delivery not observed"
+        result=1
+    else
+        log_pass "Throttle delivery observed"
+    fi
+
+    curl -s "$mock_addr/received" > "$scenario_dir/notifications_received_throttle.json" 2>/dev/null || true
+    if jq -e '.[-1].suppressed_since_last >= 1' \
+        "$scenario_dir/notifications_received_throttle.json" >/dev/null 2>&1; then
+        log_pass "Throttle suppression count recorded"
+    else
+        log_fail "Throttle suppression count missing"
+        result=1
+    fi
+
+    if [[ -n "$pane_burst" ]]; then
+        wezterm cli kill-pane --pane-id "$pane_burst" 2>/dev/null || true
+        pane_burst=""
+    fi
+
+    stop_wa_watch
+
+    trap - EXIT
+    cleanup_watch_notify_only
 
     return $result
 }
@@ -6036,6 +6612,9 @@ run_scenario() {
             ;;
         notification_webhook)
             run_scenario_notification_webhook "$scenario_dir" || result=$?
+            ;;
+        watch_notify_only)
+            run_scenario_watch_notify_only "$scenario_dir" || result=$?
             ;;
         *)
             log_fail "Unknown scenario: $name"
