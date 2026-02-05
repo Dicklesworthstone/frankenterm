@@ -8547,6 +8547,137 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct MockWezterm;
+
+    impl MockWezterm {
+        fn pane_info(pane_id: u64) -> crate::wezterm::PaneInfo {
+            crate::wezterm::PaneInfo {
+                pane_id,
+                tab_id: 1,
+                window_id: 1,
+                domain_id: None,
+                domain_name: None,
+                workspace: None,
+                size: None,
+                rows: None,
+                cols: None,
+                title: None,
+                cwd: None,
+                tty_name: None,
+                cursor_x: None,
+                cursor_y: None,
+                cursor_visibility: None,
+                left_col: None,
+                top_row: None,
+                is_active: false,
+                is_zoomed: false,
+                extra: std::collections::HashMap::new(),
+            }
+        }
+    }
+
+    impl crate::wezterm::WeztermInterface for MockWezterm {
+        fn list_panes(&self) -> crate::wezterm::WeztermFuture<'_, Vec<crate::wezterm::PaneInfo>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn get_pane(
+            &self,
+            pane_id: u64,
+        ) -> crate::wezterm::WeztermFuture<'_, crate::wezterm::PaneInfo> {
+            Box::pin(async move { Ok(Self::pane_info(pane_id)) })
+        }
+
+        fn get_text(
+            &self,
+            _pane_id: u64,
+            _escapes: bool,
+        ) -> crate::wezterm::WeztermFuture<'_, String> {
+            Box::pin(async { Ok(String::new()) })
+        }
+
+        fn send_text(&self, _pane_id: u64, _text: &str) -> crate::wezterm::WeztermFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn send_text_no_paste(
+            &self,
+            _pane_id: u64,
+            _text: &str,
+        ) -> crate::wezterm::WeztermFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn send_text_with_options(
+            &self,
+            _pane_id: u64,
+            _text: &str,
+            _no_paste: bool,
+            _no_newline: bool,
+        ) -> crate::wezterm::WeztermFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn send_control(
+            &self,
+            _pane_id: u64,
+            _control_char: &str,
+        ) -> crate::wezterm::WeztermFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn send_ctrl_c(&self, _pane_id: u64) -> crate::wezterm::WeztermFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn send_ctrl_d(&self, _pane_id: u64) -> crate::wezterm::WeztermFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn spawn(
+            &self,
+            _cwd: Option<&str>,
+            _domain_name: Option<&str>,
+        ) -> crate::wezterm::WeztermFuture<'_, u64> {
+            Box::pin(async { Ok(1) })
+        }
+
+        fn split_pane(
+            &self,
+            _pane_id: u64,
+            _direction: crate::wezterm::SplitDirection,
+            _cwd: Option<&str>,
+            _percent: Option<u8>,
+        ) -> crate::wezterm::WeztermFuture<'_, u64> {
+            Box::pin(async { Ok(2) })
+        }
+
+        fn activate_pane(&self, _pane_id: u64) -> crate::wezterm::WeztermFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn get_pane_direction(
+            &self,
+            _pane_id: u64,
+            _direction: crate::wezterm::MoveDirection,
+        ) -> crate::wezterm::WeztermFuture<'_, Option<u64>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn kill_pane(&self, _pane_id: u64) -> crate::wezterm::WeztermFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn zoom_pane(&self, _pane_id: u64, _zoom: bool) -> crate::wezterm::WeztermFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn circuit_status(&self) -> crate::circuit_breaker::CircuitBreakerStatus {
+            crate::circuit_breaker::CircuitBreakerStatus::default()
+        }
+    }
+
     #[tokio::test]
     async fn pattern_wait_succeeds_on_immediate_match() {
         let source = MockPaneSource::new(vec![
@@ -11246,6 +11377,43 @@ steps:
         }
     }
 
+    /// Workflow that sets prompt capabilities before sending text.
+    struct PromptSendWorkflow;
+
+    impl Workflow for PromptSendWorkflow {
+        fn name(&self) -> &'static str {
+            "prompt_send"
+        }
+
+        fn description(&self) -> &'static str {
+            "Test workflow that sets prompt capabilities before SendText"
+        }
+
+        fn handles(&self, detection: &Detection) -> bool {
+            detection.rule_id.contains("prompt_send")
+        }
+
+        fn steps(&self) -> Vec<WorkflowStep> {
+            vec![WorkflowStep::new("send", "Send test text")]
+        }
+
+        fn execute_step(
+            &self,
+            ctx: &mut WorkflowContext,
+            step_idx: usize,
+        ) -> BoxFuture<'_, StepResult> {
+            if step_idx == 0 {
+                ctx.update_capabilities(PaneCapabilities::prompt());
+            }
+            Box::pin(async move {
+                match step_idx {
+                    0 => StepResult::send_text("hello"),
+                    _ => StepResult::abort("Unexpected step index"),
+                }
+            })
+        }
+    }
+
     /// Helper to create a test WorkflowRunner with storage
     async fn create_test_runner(
         db_path: &str,
@@ -11494,7 +11662,10 @@ steps:
             .run_workflow(pane_id, workflow, execution_id, 0)
             .await;
 
-        assert!(exec_result.is_completed(), "Workflow should complete");
+        assert!(
+            exec_result.is_completed(),
+            "Workflow should complete: {exec_result:?}"
+        );
 
         // Verify step logs were written
         let step_logs = storage.get_step_logs(execution_id).await.unwrap();
@@ -11517,6 +11688,81 @@ steps:
         assert_eq!(step_logs[1].result_type, "continue");
         assert_eq!(step_logs[2].result_type, "continue");
         assert_eq!(step_logs[3].result_type, "done");
+
+        storage.shutdown().await.unwrap();
+    }
+
+    /// Test: SendText step logs capture audit_action_id and join into action_history
+    #[tokio::test]
+    async fn send_text_step_logs_audit_action_id() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("test_send_text_audit.db")
+            .to_string_lossy()
+            .to_string();
+
+        let engine = WorkflowEngine::default();
+        let lock_manager = Arc::new(PaneWorkflowLockManager::new());
+        let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+        let wezterm: crate::wezterm::WeztermHandle = Arc::new(MockWezterm::default());
+        let injector = Arc::new(tokio::sync::Mutex::new(
+            crate::policy::PolicyGatedInjector::with_storage(
+                crate::policy::PolicyEngine::permissive(),
+                wezterm,
+                storage.as_ref().clone(),
+            ),
+        ));
+
+        let runner = WorkflowRunner::new(
+            engine,
+            Arc::clone(&lock_manager),
+            Arc::clone(&storage),
+            injector,
+            WorkflowRunnerConfig::default(),
+        );
+
+        let pane_id = 60u64;
+        create_test_pane(&storage, pane_id).await;
+        runner.register_workflow(Arc::new(PromptSendWorkflow));
+
+        let detection = make_test_detection("prompt_send.audit");
+        let start_result = runner.handle_detection(pane_id, &detection, None).await;
+        assert!(start_result.is_started());
+        let execution_id = start_result.execution_id().unwrap();
+
+        let workflow = runner.find_workflow_by_name("prompt_send").unwrap();
+        let exec_result = runner
+            .run_workflow(pane_id, workflow, execution_id, 0)
+            .await;
+        assert!(
+            exec_result.is_completed(),
+            "Workflow should complete: {exec_result:?}"
+        );
+
+        let step_logs = storage.get_step_logs(execution_id).await.unwrap();
+        let send_log = step_logs
+            .iter()
+            .find(|log| log.step_name == "send")
+            .expect("send_text step log missing");
+        let audit_action_id = send_log.audit_action_id.expect("audit_action_id missing");
+
+        let history = storage
+            .get_action_history(crate::storage::ActionHistoryQuery {
+                actor_id: Some(execution_id.to_string()),
+                action_kind: Some("send_text".to_string()),
+                limit: Some(10),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let entry = history
+            .iter()
+            .find(|row| row.id == audit_action_id)
+            .expect("action_history entry missing");
+
+        assert_eq!(entry.workflow_id.as_deref(), Some(execution_id));
+        assert_eq!(entry.step_name.as_deref(), Some("send"));
 
         storage.shutdown().await.unwrap();
     }
