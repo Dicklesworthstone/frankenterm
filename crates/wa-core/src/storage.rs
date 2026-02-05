@@ -38,6 +38,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{Result, StorageError};
+use crate::events::event_identity_key;
 use crate::policy::Redactor;
 
 // =============================================================================
@@ -49,7 +50,7 @@ use crate::policy::Redactor;
 /// This is the target version that new databases will be initialized to,
 /// and existing databases will be migrated to.
 /// Uses SQLite's PRAGMA user_version for atomic version tracking.
-pub const SCHEMA_VERSION: i32 = 14;
+pub const SCHEMA_VERSION: i32 = 15;
 
 /// Schema initialization SQL
 ///
@@ -182,6 +183,19 @@ CREATE INDEX IF NOT EXISTS idx_events_rule ON events(rule_id);
 CREATE INDEX IF NOT EXISTS idx_events_unhandled ON events(handled_at) WHERE handled_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_events_detected ON events(detected_at);
 CREATE INDEX IF NOT EXISTS idx_events_severity ON events(severity, detected_at);
+
+-- Event mutes: suppress noisy notifications by identity key
+CREATE TABLE IF NOT EXISTS event_mutes (
+    identity_key TEXT PRIMARY KEY,
+    scope TEXT NOT NULL DEFAULT 'workspace',
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER,
+    created_by TEXT,
+    reason TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_event_mutes_expires
+    ON event_mutes(expires_at) WHERE expires_at IS NOT NULL;
 
 -- Agent sessions: per-agent session timeline with token tracking
 CREATE TABLE IF NOT EXISTS agent_sessions (
@@ -866,6 +880,29 @@ static MIGRATIONS: &[Migration] = &[
         ",
         ),
     },
+    Migration {
+        version: 15,
+        description: "Add event_mutes for noise suppression by identity key",
+        up_sql: r"
+            CREATE TABLE IF NOT EXISTS event_mutes (
+                identity_key TEXT PRIMARY KEY,
+                scope TEXT NOT NULL DEFAULT 'workspace',
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER,
+                created_by TEXT,
+                reason TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_event_mutes_expires
+                ON event_mutes(expires_at) WHERE expires_at IS NOT NULL;
+        ",
+        down_sql: Some(
+            r"
+            DROP INDEX IF EXISTS idx_event_mutes_expires;
+            DROP TABLE IF EXISTS event_mutes;
+        ",
+        ),
+    },
 ];
 
 // =============================================================================
@@ -1088,12 +1125,31 @@ pub struct StoredEvent {
     pub segment_id: Option<i64>,
     /// Detection timestamp (epoch ms)
     pub detected_at: i64,
+    /// Dedupe/identity key for repeated events
+    pub dedupe_key: Option<String>,
     /// When handled (epoch ms, None = unhandled)
     pub handled_at: Option<i64>,
     /// Workflow that handled this
     pub handled_by_workflow_id: Option<String>,
     /// Handling status
     pub handled_status: Option<String>,
+}
+
+/// Persistent mute record for event identity keys.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventMuteRecord {
+    /// Identity key (hashed)
+    pub identity_key: String,
+    /// Scope of mute (workspace/global)
+    pub scope: String,
+    /// Creation timestamp (epoch ms)
+    pub created_at: i64,
+    /// Optional expiry timestamp (epoch ms)
+    pub expires_at: Option<i64>,
+    /// Optional actor identifier
+    pub created_by: Option<String>,
+    /// Optional reason
+    pub reason: Option<String>,
 }
 
 /// Agent session record for tracking agent timeline and token usage
@@ -3194,6 +3250,16 @@ enum WriteCommand {
         status: String,
         respond: oneshot::Sender<Result<()>>,
     },
+    /// Insert or update a persistent event mute
+    UpsertEventMute {
+        record: EventMuteRecord,
+        respond: oneshot::Sender<Result<()>>,
+    },
+    /// Delete a persistent event mute
+    DeleteEventMute {
+        identity_key: String,
+        respond: oneshot::Sender<Result<bool>>,
+    },
     /// Upsert a pane record
     UpsertPane {
         pane: PaneRecord,
@@ -3585,6 +3651,67 @@ impl StorageHandle {
 
         rx.await
             .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    /// Add or update a persistent event mute by identity key.
+    pub async fn add_event_mute(&self, record: EventMuteRecord) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::UpsertEventMute {
+                record,
+                respond: tx,
+            })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    /// Remove a persistent event mute by identity key.
+    pub async fn remove_event_mute(&self, identity_key: &str) -> Result<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::DeleteEventMute {
+                identity_key: identity_key.to_string(),
+                respond: tx,
+            })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    /// Check whether an identity key is muted (and not expired).
+    pub async fn is_event_muted(&self, identity_key: &str, now_ms: i64) -> Result<bool> {
+        let db_path = Arc::clone(&self.db_path);
+        let identity_key = identity_key.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+
+            query_event_mute(&conn, &identity_key, now_ms)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+    }
+
+    /// Fetch an event's dedupe/identity key by ID.
+    pub async fn get_event_identity_key(&self, event_id: i64) -> Result<Option<String>> {
+        let db_path = Arc::clone(&self.db_path);
+
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+
+            query_event_identity_key(&conn, event_id)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Record an audit action
@@ -5533,6 +5660,17 @@ fn dispatch_write_command(conn: &mut Connection, cmd: WriteCommand, should_break
             let result = mark_event_handled_sync(conn, event_id, workflow_id.as_deref(), &status);
             let _ = respond.send(result);
         }
+        WriteCommand::UpsertEventMute { record, respond } => {
+            let result = upsert_event_mute_sync(conn, &record);
+            let _ = respond.send(result);
+        }
+        WriteCommand::DeleteEventMute {
+            identity_key,
+            respond,
+        } => {
+            let result = delete_event_mute_sync(conn, &identity_key);
+            let _ = respond.send(result);
+        }
         WriteCommand::UpsertPane { pane, respond } => {
             let result = upsert_pane_sync(conn, &pane);
             let _ = respond.send(result);
@@ -5887,7 +6025,7 @@ fn record_event_sync(conn: &Connection, event: &StoredEvent) -> Result<i64> {
 
     let pane_id_i64 = u64_to_i64(event.pane_id, "pane_id")?;
 
-    conn.execute(
+    let insert = conn.execute(
         "INSERT INTO events (pane_id, rule_id, agent_type, event_type, severity, confidence,
          extracted, matched_text, segment_id, detected_at, dedupe_key)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
@@ -5902,12 +6040,37 @@ fn record_event_sync(conn: &Connection, event: &StoredEvent) -> Result<i64> {
             event.matched_text,
             event.segment_id,
             event.detected_at,
-            None::<String>, // dedupe_key - can be computed if needed
+            event.dedupe_key.clone(),
         ],
-    )
-    .map_err(|e| StorageError::Database(format!("Failed to insert event: {e}")))?;
+    );
 
-    Ok(conn.last_insert_rowid())
+    match insert {
+        Ok(_) => Ok(conn.last_insert_rowid()),
+        Err(rusqlite::Error::SqliteFailure(err, _))
+            if err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE =>
+        {
+            if let Some(ref dedupe_key) = event.dedupe_key {
+                let existing: Option<i64> = conn
+                    .query_row(
+                        "SELECT id FROM events WHERE dedupe_key = ?1",
+                        params![dedupe_key],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|e| {
+                        StorageError::Database(format!("Failed to resolve deduped event id: {e}"))
+                    })?;
+                if let Some(id) = existing {
+                    return Ok(id);
+                }
+            }
+            Err(
+                StorageError::Database(format!("Failed to insert event (dedupe conflict): {err}"))
+                    .into(),
+            )
+        }
+        Err(e) => Err(StorageError::Database(format!("Failed to insert event: {e}")).into()),
+    }
 }
 
 /// Mark event as handled (synchronous)
@@ -5927,6 +6090,116 @@ fn mark_event_handled_sync(
     .map_err(|e| StorageError::Database(format!("Failed to mark event handled: {e}")))?;
 
     Ok(())
+}
+
+/// Insert or update a persistent event mute.
+fn upsert_event_mute_sync(conn: &Connection, record: &EventMuteRecord) -> Result<()> {
+    conn.execute(
+        "INSERT INTO event_mutes (identity_key, scope, created_at, expires_at, created_by, reason)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(identity_key) DO UPDATE SET
+            scope = excluded.scope,
+            created_at = excluded.created_at,
+            expires_at = excluded.expires_at,
+            created_by = excluded.created_by,
+            reason = excluded.reason",
+        params![
+            record.identity_key,
+            record.scope,
+            record.created_at,
+            record.expires_at,
+            record.created_by,
+            record.reason
+        ],
+    )
+    .map_err(|e| StorageError::Database(format!("Failed to upsert event mute: {e}")))?;
+
+    Ok(())
+}
+
+/// Delete a persistent event mute by identity key.
+fn delete_event_mute_sync(conn: &Connection, identity_key: &str) -> Result<bool> {
+    let rows = conn
+        .execute(
+            "DELETE FROM event_mutes WHERE identity_key = ?1",
+            params![identity_key],
+        )
+        .map_err(|e| StorageError::Database(format!("Failed to delete event mute: {e}")))?;
+    Ok(rows > 0)
+}
+
+/// Check if an identity key is muted (and not expired).
+fn query_event_mute(conn: &Connection, identity_key: &str, now_ms: i64) -> Result<bool> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT 1 FROM event_mutes
+             WHERE identity_key = ?1
+               AND (expires_at IS NULL OR expires_at > ?2)
+             LIMIT 1",
+        )
+        .map_err(|e| StorageError::Database(format!("Failed to prepare mute query: {e}")))?;
+
+    let mut rows = stmt
+        .query(params![identity_key, now_ms])
+        .map_err(|e| StorageError::Database(format!("Mute query failed: {e}")))?;
+
+    Ok(rows
+        .next()
+        .transpose()
+        .map_err(|e| StorageError::Database(format!("Mute query row error: {e}")))?
+        .is_some())
+}
+
+/// Compute the event identity key for a stored event.
+fn query_event_identity_key(conn: &Connection, event_id: i64) -> Result<Option<String>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT e.rule_id, e.event_type, e.extracted, e.pane_id, p.pane_uuid
+             FROM events e
+             LEFT JOIN panes p ON p.pane_id = e.pane_id
+             WHERE e.id = ?1",
+        )
+        .map_err(|e| StorageError::Database(format!("Failed to prepare identity query: {e}")))?;
+
+    let mut rows = stmt
+        .query(params![event_id])
+        .map_err(|e| StorageError::Database(format!("Identity query failed: {e}")))?;
+
+    if let Some(row) = rows
+        .next()
+        .transpose()
+        .map_err(|e| StorageError::Database(format!("Identity query row error: {e}")))?
+    {
+        let rule_id: String = row.get(0)?;
+        let event_type: String = row.get(1)?;
+        let extracted_str: Option<String> = row.get(2)?;
+        let pane_id_i64: i64 = row.get(3)?;
+        let pane_uuid: Option<String> = row.get(4)?;
+        let extracted = extracted_str
+            .as_ref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or(serde_json::Value::Null);
+
+        let detection = crate::patterns::Detection {
+            rule_id,
+            agent_type: crate::patterns::AgentType::Unknown,
+            event_type,
+            severity: crate::patterns::Severity::Info,
+            confidence: 0.0,
+            extracted,
+            matched_text: String::new(),
+            span: (0, 0),
+        };
+
+        let pane_id = u64::try_from(pane_id_i64).unwrap_or(0);
+        return Ok(Some(event_identity_key(
+            &detection,
+            pane_id,
+            pane_uuid.as_deref(),
+        )));
+    }
+
+    Ok(None)
 }
 
 /// Upsert pane record (synchronous)
@@ -7935,7 +8208,7 @@ fn query_unhandled_events(conn: &Connection, limit: usize) -> Result<Vec<StoredE
     let mut stmt = conn
         .prepare(
             "SELECT id, pane_id, rule_id, agent_type, event_type, severity, confidence,
-             extracted, matched_text, segment_id, detected_at, handled_at,
+             extracted, matched_text, segment_id, detected_at, dedupe_key, handled_at,
              handled_by_workflow_id, handled_status
              FROM events
              WHERE handled_at IS NULL
@@ -7969,9 +8242,10 @@ fn query_unhandled_events(conn: &Connection, limit: usize) -> Result<Vec<StoredE
                 matched_text: row.get(8)?,
                 segment_id: row.get(9)?,
                 detected_at: row.get(10)?,
-                handled_at: row.get(11)?,
-                handled_by_workflow_id: row.get(12)?,
-                handled_status: row.get(13)?,
+                dedupe_key: row.get(11)?,
+                handled_at: row.get(12)?,
+                handled_by_workflow_id: row.get(13)?,
+                handled_status: row.get(14)?,
             })
         })
         .map_err(|e| StorageError::Database(format!("Query failed: {e}")))?;
@@ -8048,7 +8322,7 @@ fn query_last_activity_by_pane(conn: &Connection) -> Result<std::collections::Ha
 fn query_events(conn: &Connection, query: &EventQuery) -> Result<Vec<StoredEvent>> {
     let mut sql = String::from(
         "SELECT id, pane_id, rule_id, agent_type, event_type, severity, confidence,
-         extracted, matched_text, segment_id, detected_at, handled_at,
+         extracted, matched_text, segment_id, detected_at, dedupe_key, handled_at,
          handled_by_workflow_id, handled_status
          FROM events WHERE 1=1",
     );
@@ -8123,9 +8397,10 @@ fn query_events(conn: &Connection, query: &EventQuery) -> Result<Vec<StoredEvent
                 matched_text: row.get(8)?,
                 segment_id: row.get(9)?,
                 detected_at: row.get(10)?,
-                handled_at: row.get(11)?,
-                handled_by_workflow_id: row.get(12)?,
-                handled_status: row.get(13)?,
+                dedupe_key: row.get(11)?,
+                handled_at: row.get(12)?,
+                handled_by_workflow_id: row.get(13)?,
+                handled_status: row.get(14)?,
             })
         })
         .map_err(|e| StorageError::Database(format!("Query failed: {e}")))?;
@@ -10656,6 +10931,7 @@ mod tests {
             matched_text: Some("Usage limit reached".to_string()),
             segment_id: Some(123),
             detected_at: 1_700_000_000_000,
+            dedupe_key: None,
             handled_at: None,
             handled_by_workflow_id: None,
             handled_status: None,
@@ -14236,6 +14512,7 @@ mod storage_handle_tests {
             matched_text: Some("match".to_string()),
             segment_id: None,
             detected_at: now,
+            dedupe_key: None,
             handled_at: None,
             handled_by_workflow_id: None,
             handled_status: None,

@@ -39,9 +39,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 
 use crate::patterns::Detection;
+use crate::policy::Redactor;
 
 /// Payload for user-var events received via IPC from shell hooks.
 ///
@@ -149,6 +151,8 @@ pub enum Event {
     /// Pattern detected
     PatternDetected {
         pane_id: u64,
+        /// Stable pane UUID (if available)
+        pane_uuid: Option<String>,
         detection: Detection,
         /// Storage event ID (if persisted), for marking as handled by workflows
         event_id: Option<i64>,
@@ -228,6 +232,82 @@ impl Event {
             Self::WorkflowStep { .. } | Self::WorkflowCompleted { .. } => None,
         }
     }
+}
+
+// =============================================================================
+// Event Identity (dedupe/cooldown/mute key)
+// =============================================================================
+
+const IDENTITY_KEY_VERSION: &str = "v1";
+const IDENTITY_MAX_VALUE_LEN: usize = 120;
+
+/// Build a deterministic identity key for a detection event.
+///
+/// The key is based on rule_id + event_type + pane_uuid (or pane_id fallback),
+/// plus a redacted, bounded projection of extracted fields. The final key is
+/// a SHA-256 hash to avoid leaking sensitive values.
+#[must_use]
+pub fn event_identity_key(detection: &Detection, pane_id: u64, pane_uuid: Option<&str>) -> String {
+    let redactor = Redactor::new();
+    let mut parts: Vec<String> = Vec::new();
+    parts.push(IDENTITY_KEY_VERSION.to_string());
+    parts.push(detection.rule_id.clone());
+    parts.push(detection.event_type.clone());
+    parts.push(pane_uuid.map_or_else(|| format!("pane:{pane_id}"), |uuid| uuid.to_string()));
+
+    if let Some(extracted) = normalized_extracted(&detection.extracted, &redactor) {
+        parts.push(extracted);
+    }
+
+    let joined = parts.join("|");
+    let digest = Sha256::digest(joined.as_bytes());
+    format!("evt:{}", hex_encode(&digest))
+}
+
+fn normalized_extracted(extracted: &serde_json::Value, redactor: &Redactor) -> Option<String> {
+    let obj = extracted.as_object()?;
+    if obj.is_empty() {
+        return None;
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    for (key, value) in obj {
+        let mut rendered = match value {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::Bool(b) => b.to_string(),
+            serde_json::Value::Null => "null".to_string(),
+            _ => serde_json::to_string(value).unwrap_or_default(),
+        };
+
+        if rendered.is_empty() {
+            continue;
+        }
+
+        rendered = redactor.redact(&rendered);
+        if rendered.len() > IDENTITY_MAX_VALUE_LEN {
+            rendered.truncate(IDENTITY_MAX_VALUE_LEN);
+        }
+
+        parts.push(format!("{key}={rendered}"));
+    }
+
+    if parts.is_empty() {
+        return None;
+    }
+
+    parts.sort();
+    Some(parts.join(","))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+            s
+        })
 }
 
 /// Metrics for monitoring event bus health
@@ -1085,7 +1165,7 @@ impl Default for EventFilter {
 /// Typical usage in the runtime persistence task:
 ///
 /// ```ignore
-/// if gate.should_notify(&detection) == NotifyDecision::Send { … }
+/// if gate.should_notify(&detection, pane_id, None) == NotifyDecision::Send { … }
 /// ```
 #[derive(Debug)]
 pub struct NotificationGate {
@@ -1147,17 +1227,24 @@ impl NotificationGate {
 
     /// Decide whether a detection should produce a notification.
     ///
-    /// The dedup key is formed from `rule_id + pane_id` so that the same
-    /// detection from different panes is treated independently.
-    pub fn should_notify(&mut self, detection: &Detection, pane_id: u64) -> NotifyDecision {
+    /// The dedup key is derived from the event identity key (rule_id + event_type
+    /// + pane_uuid/pane_id + redacted extracted fields), so the same detection
+    /// from different panes is treated independently.
+    pub fn should_notify(
+        &mut self,
+        detection: &Detection,
+        pane_id: u64,
+        pane_uuid: Option<&str>,
+    ) -> NotifyDecision {
         // Step 1: apply filter
         if !self.filter.matches(detection) {
             return NotifyDecision::Filtered;
         }
 
+        let identity_key = event_identity_key(detection, pane_id, pane_uuid);
+
         // Step 2: dedup
-        let dedup_key = format!("{}:{}", detection.rule_id, pane_id);
-        match self.dedup.check(&dedup_key) {
+        match self.dedup.check(&identity_key) {
             DedupeVerdict::Duplicate { suppressed_count } => {
                 return NotifyDecision::Deduplicated { suppressed_count };
             }
@@ -1165,8 +1252,7 @@ impl NotificationGate {
         }
 
         // Step 3: cooldown
-        let cooldown_key = format!("{}:{}", detection.rule_id, pane_id);
-        match self.cooldown.check(&cooldown_key) {
+        match self.cooldown.check(&identity_key) {
             CooldownVerdict::Suppress { total_suppressed } => {
                 NotifyDecision::Throttled { total_suppressed }
             }
@@ -1325,6 +1411,7 @@ mod tests {
 
         let _ = bus.publish(Event::PatternDetected {
             pane_id: 1,
+            pane_uuid: None,
             detection,
             event_id: None,
         });
@@ -2222,7 +2309,7 @@ mod tests {
             crate::patterns::AgentType::Codex,
         );
         assert_eq!(
-            gate.should_notify(&d, 1),
+            gate.should_notify(&d, 1, None),
             NotifyDecision::Send {
                 suppressed_since_last: 0
             }
@@ -2242,7 +2329,7 @@ mod tests {
             crate::patterns::Severity::Warning,
             crate::patterns::AgentType::Codex,
         );
-        assert_eq!(gate.should_notify(&d, 1), NotifyDecision::Filtered);
+        assert_eq!(gate.should_notify(&d, 1, None), NotifyDecision::Filtered);
     }
 
     #[test]
@@ -2259,12 +2346,12 @@ mod tests {
         );
         // First: Send
         assert!(matches!(
-            gate.should_notify(&d, 1),
+            gate.should_notify(&d, 1, None),
             NotifyDecision::Send { .. }
         ));
         // Second: Deduplicated (within 300s dedup window)
         assert!(matches!(
-            gate.should_notify(&d, 1),
+            gate.should_notify(&d, 1, None),
             NotifyDecision::Deduplicated { .. }
         ));
     }
@@ -2284,14 +2371,14 @@ mod tests {
         );
         // First: Send
         assert!(matches!(
-            gate.should_notify(&d, 1),
+            gate.should_notify(&d, 1, None),
             NotifyDecision::Send { .. }
         ));
         // Wait for dedup to expire
         std::thread::sleep(Duration::from_millis(5));
         // Now dedup is expired but cooldown is still active → Throttled
         assert!(matches!(
-            gate.should_notify(&d, 1),
+            gate.should_notify(&d, 1, None),
             NotifyDecision::Throttled { .. }
         ));
     }
@@ -2310,12 +2397,12 @@ mod tests {
         );
         // Pane 1: Send
         assert!(matches!(
-            gate.should_notify(&d, 1),
+            gate.should_notify(&d, 1, None),
             NotifyDecision::Send { .. }
         ));
         // Pane 2: also Send (independent key)
         assert!(matches!(
-            gate.should_notify(&d, 2),
+            gate.should_notify(&d, 2, None),
             NotifyDecision::Send { .. }
         ));
     }

@@ -33,9 +33,9 @@ use crate::config::{
 };
 use crate::crash::{HealthSnapshot, ShutdownSummary};
 use crate::error::Result;
-use crate::events::EventBus;
 #[cfg(feature = "native-wezterm")]
 use crate::events::{Event, UserVarPayload};
+use crate::events::{EventBus, event_identity_key};
 use crate::ingest::{PaneCursor, PaneRegistry, persist_captured_segment};
 #[cfg(feature = "native-wezterm")]
 use crate::native_events::{NativeEvent, NativeEventListener};
@@ -373,7 +373,11 @@ impl ObservationRuntime {
         };
 
         // Spawn persistence and detection task
-        let persistence_handle = self.spawn_persistence_task(capture_rx, Arc::clone(&self.cursors));
+        let persistence_handle = self.spawn_persistence_task(
+            capture_rx,
+            Arc::clone(&self.cursors),
+            Arc::clone(&self.registry),
+        );
 
         // Spawn maintenance task
         let maintenance_handle = self.spawn_maintenance_task(capture_tx_probe.clone());
@@ -900,6 +904,7 @@ impl ObservationRuntime {
         &self,
         mut capture_rx: mpsc::Receiver<CaptureEvent>,
         cursors: Arc<RwLock<HashMap<u64, PaneCursor>>>,
+        registry: Arc<RwLock<PaneRegistry>>,
     ) -> JoinHandle<()> {
         let storage = Arc::clone(&self.storage);
         let pattern_engine = Arc::clone(&self.pattern_engine);
@@ -912,6 +917,7 @@ impl ObservationRuntime {
         let mut config_rx = self.config_rx.clone();
         let mut current_patterns = self.config.patterns.clone();
         let patterns_root = self.config.patterns_root.clone();
+        let registry = Arc::clone(&registry);
 
         tokio::spawn(async move {
             // Process events until channel closes or shutdown
@@ -1024,6 +1030,13 @@ impl ObservationRuntime {
                                 "Pattern detections"
                             );
 
+                            let pane_uuid = {
+                                let registry_guard = registry.read().await;
+                                registry_guard
+                                    .get_entry(pane_id)
+                                    .map(|entry| entry.pane_uuid.clone())
+                            };
+
                             // Persist each detection as an event
                             for detection in detections {
                                 if let Some(ref manager) = recording {
@@ -1040,6 +1053,7 @@ impl ObservationRuntime {
                                 }
                                 let stored_event = detection_to_stored_event(
                                     pane_id,
+                                    pane_uuid.as_deref(),
                                     &detection,
                                     Some(persisted.segment.id),
                                 );
@@ -1052,6 +1066,7 @@ impl ObservationRuntime {
                                         if let Some(ref bus) = event_bus {
                                             let event = crate::events::Event::PatternDetected {
                                                 pane_id,
+                                                pane_uuid: pane_uuid.clone(),
                                                 detection: detection.clone(),
                                                 event_id: Some(event_id),
                                             };
@@ -1528,9 +1543,19 @@ fn duration_ms_u64(duration: Duration) -> u64 {
 /// Convert a Detection to a StoredEvent for persistence.
 fn detection_to_stored_event(
     pane_id: u64,
+    pane_uuid: Option<&str>,
     detection: &Detection,
     segment_id: Option<i64>,
 ) -> StoredEvent {
+    const EVENT_DEDUPE_BUCKET_MS: i64 = 5 * 60 * 1000;
+    let detected_at = epoch_ms();
+    let identity_key = event_identity_key(detection, pane_id, pane_uuid);
+    let bucket = if EVENT_DEDUPE_BUCKET_MS > 0 {
+        detected_at / EVENT_DEDUPE_BUCKET_MS
+    } else {
+        0
+    };
+    let dedupe_key = format!("{identity_key}:{bucket}");
     StoredEvent {
         id: 0, // Will be assigned by storage
         pane_id,
@@ -1546,7 +1571,8 @@ fn detection_to_stored_event(
         extracted: Some(detection.extracted.clone()),
         matched_text: Some(detection.matched_text.clone()),
         segment_id,
-        detected_at: epoch_ms(),
+        detected_at,
+        dedupe_key: Some(dedupe_key),
         handled_at: None,
         handled_by_workflow_id: None,
         handled_status: None,
@@ -1599,12 +1625,13 @@ mod tests {
             span: (0, 0),
         };
 
-        let event = detection_to_stored_event(42, &detection, Some(123));
+        let event = detection_to_stored_event(42, Some("pane-uuid"), &detection, Some(123));
 
         assert_eq!(event.pane_id, 42);
         assert_eq!(event.rule_id, "test.rule");
         assert_eq!(event.event_type, "test_event");
         assert!((event.confidence - 0.95).abs() < f64::EPSILON);
+        assert!(event.dedupe_key.is_some());
         assert_eq!(event.segment_id, Some(123));
         assert!(event.handled_at.is_none());
     }

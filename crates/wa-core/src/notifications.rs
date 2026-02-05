@@ -6,14 +6,14 @@
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::event_templates::{RenderedEvent, render_event};
-use crate::events::{NotificationGate, NotifyDecision};
+use crate::events::{NotificationGate, NotifyDecision, event_identity_key};
 use crate::patterns::Detection;
 use crate::policy::Redactor;
-use crate::storage::StoredEvent;
+use crate::storage::{StorageHandle, StoredEvent};
 
 /// Unified notification payload for all senders.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -222,13 +222,32 @@ pub struct NotificationOutcome {
 pub struct NotificationPipeline {
     gate: NotificationGate,
     senders: Vec<Box<dyn NotificationSender>>,
+    mute_store: Option<Arc<tokio::sync::Mutex<StorageHandle>>>,
 }
 
 impl NotificationPipeline {
     /// Create a pipeline with a gate and sender list.
     #[must_use]
     pub fn new(gate: NotificationGate, senders: Vec<Box<dyn NotificationSender>>) -> Self {
-        Self { gate, senders }
+        Self {
+            gate,
+            senders,
+            mute_store: None,
+        }
+    }
+
+    /// Create a pipeline with access to persistent mute storage.
+    #[must_use]
+    pub fn with_mute_store(
+        gate: NotificationGate,
+        senders: Vec<Box<dyn NotificationSender>>,
+        storage: Arc<tokio::sync::Mutex<StorageHandle>>,
+    ) -> Self {
+        Self {
+            gate,
+            senders,
+            mute_store: Some(storage),
+        }
     }
 
     /// Number of active senders in this pipeline.
@@ -242,9 +261,28 @@ impl NotificationPipeline {
         &mut self,
         detection: &Detection,
         pane_id: u64,
+        pane_uuid: Option<&str>,
         event_id: Option<i64>,
     ) -> NotificationOutcome {
-        let decision = self.gate.should_notify(detection, pane_id);
+        if let Some(storage) = &self.mute_store {
+            let identity_key = event_identity_key(detection, pane_id, pane_uuid);
+            let now_ms = now_epoch_ms();
+            let muted = {
+                let storage_guard = storage.lock().await;
+                storage_guard
+                    .is_event_muted(&identity_key, now_ms)
+                    .await
+                    .unwrap_or(false)
+            };
+            if muted {
+                return NotificationOutcome {
+                    decision: NotifyDecision::Filtered,
+                    deliveries: Vec::new(),
+                };
+            }
+        }
+
+        let decision = self.gate.should_notify(detection, pane_id, pane_uuid);
         match decision {
             NotifyDecision::Send {
                 suppressed_since_last,
@@ -291,6 +329,7 @@ fn render_detection(detection: &Detection, pane_id: u64, event_id: Option<i64>) 
         matched_text: Some(detection.matched_text.clone()),
         segment_id: None,
         detected_at: now_epoch_ms(),
+        dedupe_key: None,
         handled_at: None,
         handled_by_workflow_id: None,
         handled_status: None,
@@ -398,7 +437,7 @@ mod tests {
         let mut pipeline = NotificationPipeline::new(gate, vec![Box::new(sender)]);
 
         let outcome = pipeline
-            .handle_detection(&test_detection(), 7, Some(42))
+            .handle_detection(&test_detection(), 7, None, Some(42))
             .await;
 
         assert!(matches!(outcome.decision, NotifyDecision::Send { .. }));
@@ -418,7 +457,9 @@ mod tests {
         let sender = MockSender::new("mock", Arc::clone(&sent));
         let mut pipeline = NotificationPipeline::new(gate, vec![Box::new(sender)]);
 
-        let outcome = pipeline.handle_detection(&test_detection(), 7, None).await;
+        let outcome = pipeline
+            .handle_detection(&test_detection(), 7, None, None)
+            .await;
 
         assert!(matches!(outcome.decision, NotifyDecision::Filtered));
         assert!(outcome.deliveries.is_empty());
@@ -437,8 +478,12 @@ mod tests {
         let sender = MockSender::new("mock", Arc::clone(&sent));
         let mut pipeline = NotificationPipeline::new(gate, vec![Box::new(sender)]);
 
-        let _ = pipeline.handle_detection(&test_detection(), 7, None).await;
-        let outcome = pipeline.handle_detection(&test_detection(), 7, None).await;
+        let _ = pipeline
+            .handle_detection(&test_detection(), 7, None, None)
+            .await;
+        let outcome = pipeline
+            .handle_detection(&test_detection(), 7, None, None)
+            .await;
 
         assert!(matches!(
             outcome.decision,

@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use crate::circuit_breaker::CircuitBreakerStatus;
 use crate::config::WorkspaceLayout;
-use crate::storage::StorageHandle;
+use crate::storage::{EventMuteRecord, StorageHandle};
 use crate::wezterm::{PaneInfo, WeztermHandle, default_wezterm_handle};
 
 /// Errors that can occur during query operations
@@ -568,12 +568,35 @@ impl QueryClient for ProductionQueryClient {
         };
 
         self.runtime.block_on(async {
+            if let Ok(Some(identity_key)) = storage.get_event_identity_key(event_id).await {
+                let record = EventMuteRecord {
+                    identity_key,
+                    scope: "workspace".to_string(),
+                    created_at: epoch_ms(),
+                    expires_at: None,
+                    created_by: None,
+                    reason: Some("tui mute".to_string()),
+                };
+                storage
+                    .add_event_mute(record)
+                    .await
+                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
+            }
+
             storage
                 .mark_event_handled(event_id, None, "muted")
                 .await
                 .map_err(|e| QueryError::StorageError(e.to_string()))
         })
     }
+}
+
+fn epoch_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_millis()).ok())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
