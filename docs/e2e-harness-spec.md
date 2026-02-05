@@ -34,6 +34,7 @@ This document specifies the end-to-end test harness for `wa`. The harness valida
 | `--parallel N` | Run N scenarios in parallel | 1 (sequential) |
 | `--workspace DIR` | Override workspace for isolation | temp directory |
 | `--config FILE` | Override wa.toml for testing | generated default |
+| `--default-only` | Run only scenarios marked `default=true` in registry | off |
 
 ### Arguments
 

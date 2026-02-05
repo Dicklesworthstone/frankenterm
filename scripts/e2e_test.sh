@@ -50,6 +50,7 @@ TIMEOUT="$DEFAULT_TIMEOUT"
 SELF_CHECK_ONLY=false
 SKIP_SELF_CHECK=false
 LIST_ONLY=false
+DEFAULT_ONLY=false
 PARALLEL=1
 WORKSPACE=""
 CONFIG_FILE=""
@@ -113,6 +114,7 @@ Options:
     --list                List available scenarios and exit
     --self-check          Run harness self-check only
     --skip-self-check     Skip prerequisites check (for CI setup-only scenarios)
+    --default-only        Run only scenarios marked default in the registry
     --parallel N          Run N scenarios in parallel (default: 1)
     --workspace DIR       Override workspace for isolation
     --config FILE         Override wa.toml for testing
@@ -182,6 +184,10 @@ parse_args() {
                 SKIP_SELF_CHECK=true
                 shift
                 ;;
+            --default-only)
+                DEFAULT_ONLY=true
+                shift
+                ;;
             --parallel)
                 PARALLEL="$2"
                 shift 2
@@ -199,7 +205,8 @@ parse_args() {
                 shift 2
                 ;;
             --all)
-                # Explicit --all is a no-op (default behavior)
+                # Explicit --all disables default-only filtering
+                DEFAULT_ONLY=false
                 shift
                 ;;
             -h|--help)
@@ -390,6 +397,19 @@ get_scenario_names() {
         local name=""
         IFS='|' read -r name _ <<< "$entry"
         names+=("$name")
+    done
+    echo "${names[@]}"
+}
+
+get_default_scenario_names() {
+    local names=()
+    for entry in "${SCENARIO_REGISTRY[@]}"; do
+        local name=""
+        local default_flag=""
+        IFS='|' read -r name _ default_flag _ <<< "$entry"
+        if [[ "$default_flag" == "true" ]]; then
+            names+=("$name")
+        fi
     done
     echo "${names[@]}"
 }
@@ -6705,8 +6725,12 @@ main() {
     # Determine which scenarios to run
     local scenarios_to_run=()
     if [[ ${#SCENARIOS[@]} -eq 0 ]]; then
-        # Run all scenarios
-        read -ra scenarios_to_run <<< "$(get_scenario_names)"
+        if [[ "$DEFAULT_ONLY" == "true" ]]; then
+            read -ra scenarios_to_run <<< "$(get_default_scenario_names)"
+        else
+            # Run all scenarios
+            read -ra scenarios_to_run <<< "$(get_scenario_names)"
+        fi
     else
         # Validate requested scenarios
         for name in "${SCENARIOS[@]}"; do
