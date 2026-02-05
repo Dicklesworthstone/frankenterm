@@ -13,8 +13,8 @@ use fancy_regex::Regex;
 use memchr::memchr;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{PackOverride, PatternsConfig};
 use crate::Result;
+use crate::config::{PackOverride, PatternsConfig};
 use crate::error::PatternError;
 
 /// Agent types we support
@@ -702,7 +702,10 @@ fn builtin_pack_by_name(name: &str) -> Option<PatternPack> {
     }
 }
 
-fn load_packs_from_config(config: &PatternsConfig, root: Option<&Path>) -> Result<Vec<PatternPack>> {
+fn load_packs_from_config(
+    config: &PatternsConfig,
+    root: Option<&Path>,
+) -> Result<Vec<PatternPack>> {
     let mut packs = Vec::with_capacity(config.packs.len());
     for pack_id in &config.packs {
         packs.push(load_pack_from_id(pack_id, root)?);
@@ -733,13 +736,8 @@ fn load_pack_from_file(path: &str, root: Option<&Path>) -> Result<PatternPack> {
         root.map(|r| r.join(&raw_path)).unwrap_or(raw_path)
     };
 
-    let content = std::fs::read_to_string(&resolved).map_err(|e| {
-        PatternError::PackNotFound(format!(
-            "{} ({})",
-            resolved.display(),
-            e
-        ))
-    })?;
+    let content = std::fs::read_to_string(&resolved)
+        .map_err(|e| PatternError::PackNotFound(format!("{} ({})", resolved.display(), e)))?;
 
     let ext = resolved
         .extension()
@@ -758,7 +756,7 @@ fn load_pack_from_file(path: &str, root: Option<&Path>) -> Result<PatternPack> {
             return Err(PatternError::InvalidRule(format!(
                 "unsupported pack extension '{other}' (expected .yaml, .yml, .json, .toml)"
             ))
-            .into())
+            .into());
         }
     };
 
@@ -853,9 +851,13 @@ fn apply_pack_override_to_pack(pack: &mut PatternPack, override_cfg: &PackOverri
     }
 
     if !override_cfg.disabled_rules.is_empty() {
-        let disabled: HashSet<&str> =
-            override_cfg.disabled_rules.iter().map(String::as_str).collect();
-        pack.rules.retain(|rule| !disabled.contains(rule.id.as_str()));
+        let disabled: HashSet<&str> = override_cfg
+            .disabled_rules
+            .iter()
+            .map(String::as_str)
+            .collect();
+        pack.rules
+            .retain(|rule| !disabled.contains(rule.id.as_str()));
     }
 
     Ok(())
@@ -1926,7 +1928,11 @@ rules:
         config.pack_overrides.insert(pack_id.clone(), override_cfg);
 
         let engine = PatternEngine::from_config(&config).unwrap();
-        let rule = engine.rules().iter().find(|r| r.id == "codex.test").unwrap();
+        let rule = engine
+            .rules()
+            .iter()
+            .find(|r| r.id == "codex.test")
+            .unwrap();
         assert_eq!(rule.severity, Severity::Critical);
 
         let mut disabled = PackOverride::default();

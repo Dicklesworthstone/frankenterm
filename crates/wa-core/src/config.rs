@@ -2224,8 +2224,8 @@ impl EffectivePaths {
 
 /// Settings that can be safely hot-reloaded without restarting the watcher.
 ///
-/// These settings do not require reinitialization of stateful components
-/// like storage handles or pattern engines.
+/// These settings are safe to hot-reload; the runtime will rebuild
+/// stateful components (like the pattern engine) when needed.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HotReloadableConfig {
     // General

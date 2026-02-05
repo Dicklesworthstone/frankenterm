@@ -766,6 +766,10 @@ SEE ALSO:
     wa config show --effective --json Machine-readable effective config
     wa config init                    Create default config file
     wa config validate                Check config for errors
+    wa config profile diff incident   Preview profile changes
+    wa config profile apply incident  Apply a profile overlay
+    wa config profile list            List available profiles
+    wa config profile create incident --from current
 
 SEE ALSO:
     wa setup      Setup helpers
@@ -860,6 +864,8 @@ SEE ALSO:
     wa rules list                     List all detection rules
     wa rules show codex.usage         Show a specific rule
     wa rules test "Usage limit"       Test text against rules
+    wa rules profile list             List ruleset profiles
+    wa rules profile apply incident   Apply a ruleset profile
 
 SEE ALSO:
     wa events     Detection events
@@ -1627,6 +1633,28 @@ enum RulesCommands {
         #[arg(long, short = 'f', default_value = "auto")]
         format: String,
     },
+
+    /// Manage ruleset profiles
+    Profile {
+        #[command(subcommand)]
+        command: RulesProfileCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum RulesProfileCommands {
+    /// List available ruleset profiles
+    List {
+        /// Output format: auto, plain, or json
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+    },
+
+    /// Apply a ruleset profile
+    Apply {
+        /// Profile name (e.g., "incident" or "default")
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1805,6 +1833,83 @@ enum ConfigCommands {
         yes: bool,
 
         /// Target config path
+        #[arg(long)]
+        path: Option<String>,
+    },
+
+    /// Manage configuration profiles (overlays)
+    Profile {
+        #[command(subcommand)]
+        command: ConfigProfileCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigProfileCommands {
+    /// List available config profiles
+    List {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Custom config path
+        #[arg(long)]
+        path: Option<String>,
+    },
+
+    /// Show the diff between base config and a profile overlay
+    Diff {
+        /// Profile name
+        name: String,
+
+        /// Custom config path
+        #[arg(long)]
+        path: Option<String>,
+    },
+
+    /// Create a new profile from the current config or another profile
+    Create {
+        /// Profile name
+        name: String,
+
+        /// Source profile name or "current" (default)
+        #[arg(long, default_value = "current")]
+        from: String,
+
+        /// Optional description stored in manifest
+        #[arg(long)]
+        description: Option<String>,
+
+        /// Overwrite existing profile file
+        #[arg(long)]
+        force: bool,
+
+        /// Custom config path
+        #[arg(long)]
+        path: Option<String>,
+    },
+
+    /// Apply a profile overlay to the base config
+    Apply {
+        /// Profile name
+        name: String,
+
+        /// Preview changes without applying
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Custom config path
+        #[arg(long)]
+        path: Option<String>,
+    },
+
+    /// Roll back to the previous config saved before profile apply
+    Rollback {
+        /// Skip confirmation prompt
+        #[arg(long)]
+        yes: bool,
+
+        /// Custom config path
         #[arg(long)]
         path: Option<String>,
     },
@@ -5450,14 +5555,21 @@ async fn run_watcher(
     let storage = StorageHandle::with_config(&db_path, storage_config).await?;
     tracing::info!(db_path = %db_path, "Storage initialized");
 
+    let patterns_root = config_path
+        .and_then(|path| path.parent())
+        .map(PathBuf::from);
+
     // Create pattern engine
-    let pattern_engine = Arc::new(if no_patterns {
+    let pattern_engine = if no_patterns {
         tracing::info!("Pattern detection: disabled");
-        PatternEngine::default()
+        PatternEngine::with_packs(Vec::new())
+            .map_err(|e| anyhow::anyhow!("Failed to initialize empty pattern engine: {e}"))?
     } else {
-        tracing::info!("Pattern detection: enabled with builtin packs");
-        PatternEngine::new()
-    });
+        tracing::info!("Pattern detection: enabled with configured packs");
+        PatternEngine::from_config_with_root(&config.patterns, patterns_root.as_deref())
+            .map_err(|e| anyhow::anyhow!("Failed to load pattern packs: {e}"))?
+    };
+    let pattern_engine = Arc::new(tokio::sync::RwLock::new(pattern_engine));
 
     // Create event bus for publishing detections to workflow runners
     let event_bus = Arc::new(EventBus::new(1000));
@@ -5672,6 +5784,8 @@ async fn run_watcher(
         pane_filter: config.ingest.panes.clone(),
         pane_priorities: config.ingest.priorities.clone(),
         capture_budgets: config.ingest.budgets.clone(),
+        patterns: config.patterns.clone(),
+        patterns_root: patterns_root.clone(),
         channel_buffer: 1024,
         max_concurrent_captures: config.ingest.max_concurrent_captures as usize,
         retention_days: config.storage.retention_days,
@@ -7019,12 +7133,28 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 Ok(events) => {
                                     let include_preview = would_handle || dry_run;
                                     let rule_index = if include_preview {
-                                        let engine = wa_core::patterns::PatternEngine::new();
-                                        let mut index = std::collections::HashMap::new();
-                                        for rule in engine.rules() {
-                                            index.insert(rule.id.clone(), rule.clone());
+                                        let patterns_root = resolved_config_path
+                                            .as_deref()
+                                            .and_then(|p| p.parent());
+                                        match wa_core::patterns::PatternEngine::from_config_with_root(
+                                            &config.patterns,
+                                            patterns_root,
+                                        ) {
+                                            Ok(engine) => {
+                                                let mut index = std::collections::HashMap::new();
+                                                for rule in engine.rules() {
+                                                    index.insert(rule.id.clone(), rule.clone());
+                                                }
+                                                Some(index)
+                                            }
+                                            Err(err) => {
+                                                tracing::warn!(
+                                                    error = %err,
+                                                    "Failed to load pattern engine for previews"
+                                                );
+                                                None
+                                            }
                                         }
-                                        Some(index)
                                     } else {
                                         None
                                     };
@@ -7962,7 +8092,24 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         RobotCommands::Rules { command } => {
                             use wa_core::patterns::{AgentType, PatternEngine};
 
-                            let engine = PatternEngine::new();
+                            let patterns_root =
+                                resolved_config_path.as_deref().and_then(|p| p.parent());
+                            let engine = match PatternEngine::from_config_with_root(
+                                &config.patterns,
+                                patterns_root,
+                            ) {
+                                Ok(engine) => engine,
+                                Err(err) => {
+                                    let response = RobotResponse::<()>::error_with_code(
+                                        ROBOT_ERR_CONFIG,
+                                        format!("Failed to load pattern packs: {err}"),
+                                        Some("Check [patterns] in wa.toml.".to_string()),
+                                        elapsed_ms(start),
+                                    );
+                                    print_robot_response(&response, format, stats)?;
+                                    return Ok(());
+                                }
+                            };
 
                             match command {
                                 RobotRulesCommands::List {
@@ -12914,7 +13061,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
         }
 
         Some(Commands::Rules { command }) => {
-            handle_rules_command(command);
+            handle_rules_command(
+                command,
+                &config,
+                cli_config_arg.as_deref(),
+                resolved_config_path.as_deref(),
+                &layout,
+            );
         }
 
         Some(Commands::Reserve {
@@ -14165,15 +14318,671 @@ fn parse_relative_duration_ms(raw: &str) -> Option<i64> {
     Some(value.saturating_mul(unit_ms))
 }
 
+fn resolve_config_path_for_edit(cli_config: Option<&str>) -> PathBuf {
+    if let Some(path) = cli_config {
+        return PathBuf::from(path);
+    }
+
+    let cwd_config = PathBuf::from("wa.toml");
+    if cwd_config.exists() {
+        return cwd_config;
+    }
+
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("~/.config"))
+        .join("wa")
+        .join("wa.toml")
+}
+
+fn update_patterns_in_doc(
+    doc: &mut toml_edit::DocumentMut,
+    patterns: &wa_core::config::PatternsConfig,
+) -> anyhow::Result<()> {
+    if !doc["patterns"].is_table() {
+        doc["patterns"] = toml_edit::table();
+    }
+    let patterns_table = doc["patterns"]
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("patterns must be a table"))?;
+
+    let mut packs = toml_edit::Array::default();
+    for pack in &patterns.packs {
+        packs.push(pack.as_str());
+    }
+    patterns_table["packs"] = toml_edit::Item::Value(packs.into());
+    patterns_table["quick_reject_enabled"] = toml_edit::value(patterns.quick_reject_enabled);
+
+    if patterns.pack_overrides.is_empty() {
+        patterns_table.remove("pack_overrides");
+    } else {
+        let overrides_toml = toml::to_string(&patterns.pack_overrides)?;
+        let overrides_doc = overrides_toml.parse::<toml_edit::DocumentMut>()?;
+        patterns_table["pack_overrides"] = toml_edit::Item::Table(overrides_doc.as_table().clone());
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ConfigProfileApplyMeta {
+    profile: String,
+    applied_at: u64,
+    backup_path: String,
+    config_path: String,
+}
+
+fn profile_backup_path(config_path: &Path) -> PathBuf {
+    config_path.with_extension("toml.profile.bak")
+}
+
+fn profile_meta_path(config_path: &Path) -> PathBuf {
+    config_path.with_extension("toml.profile.meta.json")
+}
+
+fn merge_toml_documents(base: &str, overlay: &str) -> anyhow::Result<String> {
+    let mut base_doc = base
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| anyhow::anyhow!("Failed to parse base config: {e}"))?;
+    let overlay_doc = overlay
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| anyhow::anyhow!("Failed to parse profile overlay: {e}"))?;
+
+    let overlay_table = overlay_doc.as_table();
+    let base_table = base_doc.as_table_mut();
+    merge_toml_tables(base_table, overlay_table);
+
+    Ok(base_doc.to_string())
+}
+
+fn merge_toml_tables(target: &mut toml_edit::Table, overlay: &toml_edit::Table) {
+    for (key, overlay_item) in overlay {
+        if target.contains_key(key) {
+            if let Some(target_item) = target.get_mut(key) {
+                merge_toml_item(target_item, overlay_item);
+            }
+        } else {
+            target.insert(key, overlay_item.clone());
+        }
+    }
+}
+
+fn merge_toml_item(target: &mut toml_edit::Item, overlay: &toml_edit::Item) {
+    if let toml_edit::Item::Table(target_table) = target {
+        if let toml_edit::Item::Table(overlay_table) = overlay {
+            merge_toml_tables(target_table, overlay_table);
+            return;
+        }
+    }
+    *target = overlay.clone();
+}
+
+fn update_profile_manifest_on_create(
+    manifest: &mut wa_core::config_profiles::ConfigProfileManifest,
+    name: &str,
+    rel_path: &str,
+    description: Option<String>,
+    timestamp_ms: u64,
+) {
+    if let Some(entry) = manifest
+        .profiles
+        .iter_mut()
+        .find(|entry| entry.name == name)
+    {
+        entry.path = rel_path.to_string();
+        if description.is_some() {
+            entry.description = description;
+        }
+        entry.updated_at = Some(timestamp_ms);
+        entry.created_at = entry.created_at.or(Some(timestamp_ms));
+        return;
+    }
+
+    manifest
+        .profiles
+        .push(wa_core::config_profiles::ConfigProfileManifestEntry {
+            name: name.to_string(),
+            path: rel_path.to_string(),
+            description,
+            created_at: Some(timestamp_ms),
+            updated_at: Some(timestamp_ms),
+            last_applied_at: None,
+        });
+    manifest.profiles.sort_by(|a, b| a.name.cmp(&b.name));
+}
+
+fn handle_config_profile_command(
+    command: ConfigProfileCommands,
+    cli_config: Option<&str>,
+) -> anyhow::Result<()> {
+    match command {
+        ConfigProfileCommands::List { json, path } => {
+            let config_path = if let Some(p) = path {
+                PathBuf::from(p)
+            } else {
+                resolve_config_path_for_edit(cli_config)
+            };
+            let profiles_dir = wa_core::config_profiles::resolve_profiles_dir(Some(&config_path));
+            let profiles = wa_core::config_profiles::list_profiles(&profiles_dir)?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&profiles)?);
+                return Ok(());
+            }
+
+            println!("Config profiles:");
+            for profile in profiles {
+                let description = profile.description.unwrap_or_default();
+                let suffix = if profile.implicit {
+                    "(implicit)".to_string()
+                } else if let Some(path) = profile.path {
+                    format!("({path})")
+                } else {
+                    String::new()
+                };
+                if description.is_empty() {
+                    if suffix.is_empty() {
+                        println!("  {}", profile.name);
+                    } else {
+                        println!("  {} {suffix}", profile.name);
+                    }
+                } else if suffix.is_empty() {
+                    println!("  {} - {description}", profile.name);
+                } else {
+                    println!("  {} - {description} {suffix}", profile.name);
+                }
+            }
+        }
+
+        ConfigProfileCommands::Diff { name, path } => {
+            let config_path = if let Some(p) = path {
+                PathBuf::from(p)
+            } else {
+                resolve_config_path_for_edit(cli_config)
+            };
+
+            let (base_toml, merged_toml) = load_and_merge_config_profile(&config_path, &name)?;
+
+            let diff_lines = compute_config_diff(&base_toml, &merged_toml);
+            if diff_lines.is_empty() {
+                println!("No changes detected — profile produces identical config.");
+                return Ok(());
+            }
+
+            println!(
+                "Profile diff ({} change{}):",
+                diff_lines.len(),
+                if diff_lines.len() == 1 { "" } else { "s" }
+            );
+            for line in diff_lines {
+                println!("  {line}");
+            }
+        }
+
+        ConfigProfileCommands::Apply {
+            name,
+            dry_run,
+            path,
+        } => {
+            let config_path = if let Some(p) = path {
+                PathBuf::from(p)
+            } else {
+                resolve_config_path_for_edit(cli_config)
+            };
+
+            let (base_toml, merged_toml) = load_and_merge_config_profile(&config_path, &name)?;
+
+            let diff_lines = compute_config_diff(&base_toml, &merged_toml);
+            if diff_lines.is_empty() {
+                println!("No changes detected — profile produces identical config.");
+                return Ok(());
+            }
+
+            println!(
+                "Profile apply preview ({} change{}):",
+                diff_lines.len(),
+                if diff_lines.len() == 1 { "" } else { "s" }
+            );
+            for line in &diff_lines {
+                println!("  {line}");
+            }
+
+            if dry_run {
+                println!("\n(dry run — no changes applied)");
+                println!("Config file: {}", config_path.display());
+                return Ok(());
+            }
+
+            if let Some(parent) = config_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+
+            let backup_path = profile_backup_path(&config_path);
+            std::fs::write(&backup_path, &base_toml)?;
+
+            std::fs::write(&config_path, &merged_toml)?;
+
+            let applied_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+
+            let meta = ConfigProfileApplyMeta {
+                profile: name.clone(),
+                applied_at,
+                backup_path: backup_path.display().to_string(),
+                config_path: config_path.display().to_string(),
+            };
+            let meta_path = profile_meta_path(&config_path);
+            std::fs::write(&meta_path, serde_json::to_string_pretty(&meta)?)?;
+
+            let profiles_dir = wa_core::config_profiles::resolve_profiles_dir(Some(&config_path));
+            let mut manifest = match wa_core::config_profiles::load_manifest(&profiles_dir) {
+                Ok(Some(manifest)) => manifest,
+                Ok(None) => wa_core::config_profiles::scan_profiles(&profiles_dir)?,
+                Err(err) => {
+                    eprintln!(
+                        "Warning: failed to read config profile manifest: {err}. Scanning directory."
+                    );
+                    wa_core::config_profiles::scan_profiles(&profiles_dir)?
+                }
+            };
+
+            let (canonical, _path, rel_path) = wa_core::config_profiles::resolve_profile_path(
+                &profiles_dir,
+                Some(&manifest),
+                &name,
+            )?;
+            wa_core::config_profiles::touch_last_applied(
+                &mut manifest,
+                &canonical,
+                &rel_path,
+                applied_at,
+            );
+            wa_core::config_profiles::write_manifest(&profiles_dir, &manifest)?;
+
+            println!("Applied profile '{canonical}' to {}", config_path.display());
+            println!("Backup saved to: {}", backup_path.display());
+        }
+
+        ConfigProfileCommands::Create {
+            name,
+            from,
+            description,
+            force,
+            path,
+        } => {
+            let config_path = if let Some(p) = path {
+                PathBuf::from(p)
+            } else {
+                resolve_config_path_for_edit(cli_config)
+            };
+
+            let profiles_dir = wa_core::config_profiles::resolve_profiles_dir(Some(&config_path));
+            if !profiles_dir.exists() {
+                std::fs::create_dir_all(&profiles_dir)?;
+            }
+
+            let canonical = wa_core::config_profiles::canonicalize_profile_name(&name)?;
+            if canonical == "default" {
+                anyhow::bail!("Profile name 'default' is reserved");
+            }
+
+            let manifest = match wa_core::config_profiles::load_manifest(&profiles_dir) {
+                Ok(Some(manifest)) => Some(manifest),
+                Ok(None) => Some(wa_core::config_profiles::scan_profiles(&profiles_dir)?),
+                Err(err) => {
+                    eprintln!(
+                        "Warning: failed to read config profile manifest: {err}. Scanning directory."
+                    );
+                    Some(wa_core::config_profiles::scan_profiles(&profiles_dir)?)
+                }
+            };
+
+            let (_canonical, profile_path, rel_path) =
+                wa_core::config_profiles::resolve_profile_path(
+                    &profiles_dir,
+                    manifest.as_ref(),
+                    &canonical,
+                )?;
+
+            if profile_path.exists() && !force {
+                anyhow::bail!(
+                    "Profile already exists at {}. Use --force to overwrite.",
+                    profile_path.display()
+                );
+            }
+
+            let source_toml = match from.trim() {
+                "current" => {
+                    if config_path.exists() {
+                        std::fs::read_to_string(&config_path)?
+                    } else {
+                        generate_default_config_toml()
+                    }
+                }
+                "empty" => String::new(),
+                other => {
+                    let source_name = wa_core::config_profiles::canonicalize_profile_name(other)?;
+                    let (_name, source_path, _) = wa_core::config_profiles::resolve_profile_path(
+                        &profiles_dir,
+                        manifest.as_ref(),
+                        &source_name,
+                    )?;
+                    if !source_path.exists() {
+                        anyhow::bail!(
+                            "Source profile '{source_name}' not found at {}",
+                            source_path.display()
+                        );
+                    }
+                    std::fs::read_to_string(&source_path)?
+                }
+            };
+
+            if !source_toml.trim().is_empty() {
+                let mut candidate = wa_core::config::Config::from_toml(&source_toml)?;
+                candidate.normalize_paths();
+                candidate.validate()?;
+            }
+
+            let tmp_path = profile_path.with_extension("toml.tmp");
+            std::fs::write(&tmp_path, &source_toml)?;
+            std::fs::rename(&tmp_path, &profile_path)?;
+
+            let applied_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+
+            let mut updated_manifest = manifest.unwrap_or_default();
+            update_profile_manifest_on_create(
+                &mut updated_manifest,
+                &canonical,
+                &rel_path,
+                description,
+                applied_at,
+            );
+            wa_core::config_profiles::write_manifest(&profiles_dir, &updated_manifest)?;
+
+            println!(
+                "Created profile '{canonical}' at {}",
+                profile_path.display()
+            );
+        }
+
+        ConfigProfileCommands::Rollback { yes, path } => {
+            let config_path = if let Some(p) = path {
+                PathBuf::from(p)
+            } else {
+                resolve_config_path_for_edit(cli_config)
+            };
+            let backup_path = profile_backup_path(&config_path);
+            if !backup_path.exists() {
+                anyhow::bail!("No profile backup found at {}", backup_path.display());
+            }
+
+            if !yes {
+                println!(
+                    "This will overwrite {} with the backup from {}.",
+                    config_path.display(),
+                    backup_path.display()
+                );
+                if let Ok(meta) = std::fs::read_to_string(profile_meta_path(&config_path)) {
+                    if let Ok(parsed) = serde_json::from_str::<ConfigProfileApplyMeta>(&meta) {
+                        println!(
+                            "Last applied profile: {} (applied_at {} ms)",
+                            parsed.profile, parsed.applied_at
+                        );
+                    }
+                }
+                if !prompt_confirm("Continue rollback? [y/N]: ")? {
+                    println!("Aborted.");
+                    return Ok(());
+                }
+            }
+
+            let backup_contents = std::fs::read_to_string(&backup_path)?;
+            if let Some(parent) = config_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&config_path, backup_contents)?;
+            println!("Rollback complete: {}", config_path.display());
+        }
+    }
+
+    Ok(())
+}
+
+fn load_and_merge_config_profile(
+    config_path: &Path,
+    profile_name: &str,
+) -> anyhow::Result<(String, String)> {
+    use wa_core::config::Config;
+
+    let base_toml = if config_path.exists() {
+        std::fs::read_to_string(config_path)?
+    } else {
+        generate_default_config_toml()
+    };
+
+    let profiles_dir = wa_core::config_profiles::resolve_profiles_dir(Some(config_path));
+    let manifest = match wa_core::config_profiles::load_manifest(&profiles_dir) {
+        Ok(Some(manifest)) => Some(manifest),
+        Ok(None) => Some(wa_core::config_profiles::scan_profiles(&profiles_dir)?),
+        Err(err) => {
+            eprintln!(
+                "Warning: failed to read config profile manifest: {err}. Scanning directory."
+            );
+            Some(wa_core::config_profiles::scan_profiles(&profiles_dir)?)
+        }
+    };
+
+    let canonical = wa_core::config_profiles::canonicalize_profile_name(profile_name)?;
+    if canonical == "default" {
+        return Ok((base_toml.clone(), base_toml));
+    }
+
+    let (canonical, profile_path, _rel_path) = wa_core::config_profiles::resolve_profile_path(
+        &profiles_dir,
+        manifest.as_ref(),
+        &canonical,
+    )?;
+    if !profile_path.exists() {
+        anyhow::bail!(
+            "Profile '{canonical}' not found at {}",
+            profile_path.display()
+        );
+    }
+
+    let overlay_toml = std::fs::read_to_string(&profile_path)?;
+    let merged_toml = merge_toml_documents(&base_toml, &overlay_toml)?;
+
+    let mut merged_config = Config::from_toml(&merged_toml)?;
+    merged_config.normalize_paths();
+    merged_config.validate()?;
+
+    Ok((base_toml, merged_toml))
+}
+
+fn handle_rules_profile_command(
+    command: RulesProfileCommands,
+    cli_config: Option<&str>,
+    resolved_config_path: Option<&Path>,
+    layout: &wa_core::config::WorkspaceLayout,
+) -> anyhow::Result<()> {
+    use wa_core::output::{OutputFormat, detect_format};
+    use wa_core::patterns::PatternEngine;
+
+    match command {
+        RulesProfileCommands::List { format } => {
+            let rulesets_dir = wa_core::rulesets::resolve_rulesets_dir(resolved_config_path);
+            let fmt = match format.to_lowercase().as_str() {
+                "json" => OutputFormat::Json,
+                "plain" => OutputFormat::Plain,
+                _ => detect_format(),
+            };
+
+            let profiles = wa_core::rulesets::list_profiles(&rulesets_dir)?;
+
+            if fmt == OutputFormat::Json {
+                println!("{}", serde_json::to_string_pretty(&profiles)?);
+                return Ok(());
+            }
+
+            println!("Ruleset profiles:");
+            for profile in profiles {
+                let description = profile.description.unwrap_or_default();
+                let suffix = if profile.implicit {
+                    "(implicit)".to_string()
+                } else if let Some(path) = profile.path {
+                    format!("({})", path)
+                } else {
+                    String::new()
+                };
+                if description.is_empty() {
+                    if suffix.is_empty() {
+                        println!("  {}", profile.name);
+                    } else {
+                        println!("  {} {}", profile.name, suffix);
+                    }
+                } else if suffix.is_empty() {
+                    println!("  {} - {}", profile.name, description);
+                } else {
+                    println!("  {} - {} {}", profile.name, description, suffix);
+                }
+            }
+        }
+
+        RulesProfileCommands::Apply { name } => {
+            use wa_core::config::{Config, ConfigOverrides};
+
+            let config_path = resolve_config_path_for_edit(cli_config);
+            let rulesets_dir = wa_core::rulesets::resolve_rulesets_dir(Some(&config_path));
+            let mut manifest = match wa_core::rulesets::load_manifest(&rulesets_dir) {
+                Ok(Some(manifest)) => manifest,
+                Ok(None) => wa_core::rulesets::scan_rulesets(&rulesets_dir)?,
+                Err(err) => {
+                    eprintln!(
+                        "Warning: failed to read ruleset manifest: {err}. Scanning directory."
+                    );
+                    wa_core::rulesets::scan_rulesets(&rulesets_dir)?
+                }
+            };
+
+            let base_config = Config::load_with_overrides(
+                Some(&config_path),
+                false,
+                &ConfigOverrides::default(),
+            )?;
+            let resolved_patterns = wa_core::rulesets::resolve_patterns_for_profile(
+                &base_config.patterns,
+                &rulesets_dir,
+                Some(&manifest),
+                &name,
+            )?;
+
+            let patterns_root = config_path.parent();
+            PatternEngine::from_config_with_root(&resolved_patterns, patterns_root)?;
+
+            let content = if config_path.exists() {
+                std::fs::read_to_string(&config_path)?
+            } else {
+                generate_default_config_toml()
+            };
+            let mut doc = content
+                .parse::<toml_edit::DocumentMut>()
+                .map_err(|e| anyhow::anyhow!("Failed to parse config: {e}"))?;
+
+            update_patterns_in_doc(&mut doc, &resolved_patterns)?;
+
+            if let Some(parent) = config_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&config_path, doc.to_string())?;
+
+            let canonical = name.trim().to_lowercase();
+            if canonical != "default" {
+                let profile_path = manifest
+                    .rulesets
+                    .iter()
+                    .find(|entry| entry.name == canonical)
+                    .map(|entry| entry.path.clone())
+                    .unwrap_or_else(|| format!("{canonical}.toml"));
+                wa_core::rulesets::touch_last_applied(
+                    &mut manifest,
+                    &canonical,
+                    &profile_path,
+                    now_ms(),
+                );
+                wa_core::rulesets::write_manifest(&rulesets_dir, &manifest)?;
+            }
+
+            println!(
+                "Applied ruleset profile '{}' to {}",
+                canonical,
+                config_path.display()
+            );
+
+            if let Some(meta) = wa_core::lock::check_running(&layout.lock_path) {
+                #[cfg(unix)]
+                {
+                    let status = std::process::Command::new("kill")
+                        .args(["-s", "HUP", &meta.pid.to_string()])
+                        .status();
+                    match status {
+                        Ok(s) if s.success() => {
+                            println!("Sent SIGHUP to watcher (pid {}).", meta.pid);
+                        }
+                        Ok(s) => {
+                            eprintln!(
+                                "Failed to signal watcher (pid {}) (exit code: {}).",
+                                meta.pid,
+                                s.code().unwrap_or(-1)
+                            );
+                        }
+                        Err(err) => {
+                            eprintln!("Failed to run kill command: {err}");
+                        }
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    println!(
+                        "Watcher reload not supported on this platform (pid {}).",
+                        meta.pid
+                    );
+                }
+            } else {
+                println!("No watcher running in workspace: {}", layout.root.display());
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Handle `wa rules` subcommands
-fn handle_rules_command(command: RulesCommands) {
+fn handle_rules_command(
+    command: RulesCommands,
+    config: &wa_core::config::Config,
+    cli_config: Option<&str>,
+    resolved_config_path: Option<&Path>,
+    layout: &wa_core::config::WorkspaceLayout,
+) {
     use wa_core::output::{
         OutputFormat, RenderContext, RuleDetail, RuleDetailRenderer, RuleListItem, RuleTestMatch,
         RulesListRenderer, RulesTestRenderer, detect_format,
     };
     use wa_core::patterns::{AgentType, PatternEngine};
 
-    let engine = PatternEngine::new();
+    let patterns_root = resolved_config_path.and_then(|p| p.parent());
+    let load_engine = || {
+        PatternEngine::from_config_with_root(&config.patterns, patterns_root).unwrap_or_else(
+            |err| {
+                eprintln!("Failed to load pattern packs: {err}");
+                std::process::exit(1);
+            },
+        )
+    };
 
     match command {
         RulesCommands::List {
@@ -14181,6 +14990,7 @@ fn handle_rules_command(command: RulesCommands) {
             verbose,
             format,
         } => {
+            let engine = load_engine();
             let fmt = match format.to_lowercase().as_str() {
                 "json" => OutputFormat::Json,
                 "plain" => OutputFormat::Plain,
@@ -14228,6 +15038,7 @@ fn handle_rules_command(command: RulesCommands) {
         }
 
         RulesCommands::Test { text, format } => {
+            let engine = load_engine();
             let fmt = match format.to_lowercase().as_str() {
                 "json" => OutputFormat::Json,
                 "plain" => OutputFormat::Plain,
@@ -14262,6 +15073,7 @@ fn handle_rules_command(command: RulesCommands) {
         }
 
         RulesCommands::Show { rule_id, format } => {
+            let engine = load_engine();
             let fmt = match format.to_lowercase().as_str() {
                 "json" => OutputFormat::Json,
                 "plain" => OutputFormat::Plain,
@@ -14289,6 +15101,15 @@ fn handle_rules_command(command: RulesCommands) {
             } else {
                 eprintln!("Rule '{}' not found.", rule_id);
                 eprintln!("Use 'wa rules list' to see available rules.");
+                std::process::exit(1);
+            }
+        }
+
+        RulesCommands::Profile { command } => {
+            if let Err(err) =
+                handle_rules_profile_command(command, cli_config, resolved_config_path, layout)
+            {
+                eprintln!("{err}");
                 std::process::exit(1);
             }
         }
@@ -14693,6 +15514,10 @@ async fn handle_config_command(
             }
 
             println!("Config updated: {}", config_path.display());
+        }
+
+        ConfigCommands::Profile { command } => {
+            handle_config_profile_command(command, cli_config)?;
         }
     }
 
@@ -17870,6 +18695,152 @@ mod tests {
         let _ = std::fs::remove_file(db_path);
         let _ = std::fs::remove_file(format!("{db_path}-wal"));
         let _ = std::fs::remove_file(format!("{db_path}-shm"));
+    }
+
+    fn unique_temp_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "wa_profile_test_{}_{}_{}",
+            label,
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_file(path: &std::path::Path, contents: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, contents).unwrap();
+    }
+
+    #[test]
+    fn merge_toml_documents_overlays_nested_tables() {
+        let base = r#"
+[general]
+log_level = "info"
+log_format = "pretty"
+
+[storage]
+retention_days = 30
+"#;
+        let overlay = r#"
+[general]
+log_level = "debug"
+"#;
+        let merged = merge_toml_documents(base, overlay).unwrap();
+        assert!(merged.contains("log_level = \"debug\""));
+        assert!(merged.contains("log_format = \"pretty\""));
+        assert!(merged.contains("retention_days = 30"));
+    }
+
+    #[test]
+    fn config_profile_create_updates_manifest() {
+        let root = unique_temp_dir("create_manifest");
+        let config_path = root.join("wa.toml");
+        write_file(&config_path, "[general]\nlog_level = \"info\"\n");
+
+        handle_config_profile_command(
+            ConfigProfileCommands::Create {
+                name: "incident".to_string(),
+                from: "current".to_string(),
+                description: Some("Incident response".to_string()),
+                force: false,
+                path: Some(config_path.display().to_string()),
+            },
+            None,
+        )
+        .unwrap();
+
+        let profiles_dir = wa_core::config_profiles::resolve_profiles_dir(Some(&config_path));
+        let manifest = wa_core::config_profiles::load_manifest(&profiles_dir)
+            .unwrap()
+            .unwrap();
+        assert!(
+            manifest
+                .profiles
+                .iter()
+                .any(|entry| entry.name == "incident" && entry.description.is_some())
+        );
+    }
+
+    #[test]
+    fn config_profile_diff_detects_change() {
+        let root = unique_temp_dir("diff");
+        let config_path = root.join("wa.toml");
+        write_file(&config_path, "[general]\nlog_level = \"info\"\n");
+
+        let profiles_dir = wa_core::config_profiles::resolve_profiles_dir(Some(&config_path));
+        let profile_path = profiles_dir.join("incident.toml");
+        write_file(&profile_path, "[general]\nlog_level = \"debug\"\n");
+
+        let (base_toml, merged_toml) =
+            load_and_merge_config_profile(&config_path, "incident").unwrap();
+        let diff_lines = compute_config_diff(&base_toml, &merged_toml);
+        assert!(
+            diff_lines
+                .iter()
+                .any(|line| line.contains("log_level = \"debug\""))
+        );
+        assert!(
+            diff_lines
+                .iter()
+                .any(|line| line.contains("log_level = \"info\""))
+        );
+    }
+
+    #[test]
+    fn config_profile_apply_and_rollback_restores_base() {
+        let root = unique_temp_dir("apply_rollback");
+        let config_path = root.join("wa.toml");
+        write_file(&config_path, "[general]\nlog_level = \"info\"\n");
+
+        let profiles_dir = wa_core::config_profiles::resolve_profiles_dir(Some(&config_path));
+        let profile_path = profiles_dir.join("incident.toml");
+        write_file(&profile_path, "[general]\nlog_level = \"debug\"\n");
+
+        handle_config_profile_command(
+            ConfigProfileCommands::Apply {
+                name: "incident".to_string(),
+                dry_run: false,
+                path: Some(config_path.display().to_string()),
+            },
+            None,
+        )
+        .unwrap();
+
+        let updated = std::fs::read_to_string(&config_path).unwrap();
+        assert!(updated.contains("log_level = \"debug\""));
+
+        handle_config_profile_command(
+            ConfigProfileCommands::Rollback {
+                yes: true,
+                path: Some(config_path.display().to_string()),
+            },
+            None,
+        )
+        .unwrap();
+
+        let rolled_back = std::fs::read_to_string(&config_path).unwrap();
+        assert!(rolled_back.contains("log_level = \"info\""));
+    }
+
+    #[test]
+    fn config_profile_invalid_toml_is_rejected() {
+        let root = unique_temp_dir("invalid");
+        let config_path = root.join("wa.toml");
+        write_file(&config_path, "[general]\nlog_level = \"info\"\n");
+
+        let profiles_dir = wa_core::config_profiles::resolve_profiles_dir(Some(&config_path));
+        let profile_path = profiles_dir.join("incident.toml");
+        write_file(&profile_path, "[general]\nlog_level = 42\n");
+
+        let err = load_and_merge_config_profile(&config_path, "incident").unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("invalid") || message.contains("parse") || message.contains("config")
+        );
     }
 
     async fn insert_token(

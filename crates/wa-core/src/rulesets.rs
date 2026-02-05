@@ -72,7 +72,7 @@ impl PatternsConfigPatch {
         let mut merged = base.clone();
 
         if let Some(packs) = &self.packs {
-            merged.packs = packs.clone();
+            merged.packs.clone_from(packs);
         }
 
         if let Some(overrides) = &self.pack_overrides {
@@ -374,7 +374,7 @@ fn canonicalize_profile_name(raw: &str) -> crate::Result<String> {
     let name = raw.trim().to_lowercase();
     if !is_valid_profile_name(&name) {
         return Err(crate::error::ConfigError::ValidationError(format!(
-            "invalid ruleset profile name '{raw}' (expected [a-z0-9_-]{1,32})"
+            "invalid ruleset profile name '{raw}' (expected [a-z0-9_-]{{1,32}})"
         ))
         .into());
     }
@@ -387,9 +387,8 @@ fn is_valid_profile_name(name: &str) -> bool {
         return false;
     }
 
-    name.chars().all(|c| {
-        c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-'
-    })
+    name.chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
 }
 
 fn merge_pack_overrides(
@@ -440,14 +439,8 @@ fn timestamps_for(path: &Path) -> (Option<u64>, Option<u64>) {
         Err(_) => return (None, None),
     };
 
-    let created_at = metadata
-        .created()
-        .ok()
-        .and_then(system_time_to_epoch_ms);
-    let updated_at = metadata
-        .modified()
-        .ok()
-        .and_then(system_time_to_epoch_ms);
+    let created_at = metadata.created().ok().and_then(system_time_to_epoch_ms);
+    let updated_at = metadata.modified().ok().and_then(system_time_to_epoch_ms);
 
     (created_at, updated_at)
 }
