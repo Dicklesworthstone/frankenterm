@@ -30,6 +30,7 @@ Registry lives in `scripts/e2e_test.sh` (SCENARIO_REGISTRY). Current entries:
 - events_unhandled_alias
 - usage_limit_safe_pause
 - notification_webhook
+- watch_notify_only
 - policy_denial
 - prepare_commit_approvals
 - quickfix_suggestions
@@ -115,6 +116,7 @@ Registry lives in `scripts/e2e_test.sh` (SCENARIO_REGISTRY). Current entries:
 - [x] E2E: throttling prevents spam. Scenario(s): notification_webhook
 - [x] E2E: failure recovery works (network down, endpoint 500). Scenario(s): notification_webhook
 - [x] Artifacts: delivery attempts, retry/backoff, persisted notification history. Scenario(s): notification_webhook
+- [x] E2E: notify-only mode delivers notifications without auto-handling; filters + throttling apply. Scenario(s): watch_notify_only
 
 #### CLI polish (wa-rnf)
 - [ ] E2E: shell completion generation works (smoke). Scenario(s): none

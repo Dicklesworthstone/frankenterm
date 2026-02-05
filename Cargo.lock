@@ -252,6 +252,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "asupersync"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "45551c816d1bb377e94e2633e48e6ab3cedfba821fa1d0eee52f1f2164b17db8"
+dependencies = [
+ "base64",
+ "bincode",
+ "crossbeam-queue",
+ "getrandom 0.3.4",
+ "libc",
+ "nix",
+ "parking_lot",
+ "pin-project",
+ "polling 2.8.0",
+ "rmp-serde",
+ "serde",
+ "serde_json",
+ "sha1",
+ "slab",
+ "socket2 0.6.1",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+ "tracing-subscriber",
+ "visibility",
+]
+
+[[package]]
 name = "async-channel"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1560,7 +1588,7 @@ dependencies = [
 name = "fastapi-core"
 version = "0.1.0"
 dependencies = [
- "asupersync",
+ "asupersync 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "futures-executor",
  "memchr",
  "parking_lot",
@@ -1572,7 +1600,7 @@ dependencies = [
 name = "fastapi-http"
 version = "0.1.0"
 dependencies = [
- "asupersync",
+ "asupersync 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "fastapi-core",
 ]
 
@@ -1604,7 +1632,7 @@ dependencies = [
  "crossterm 0.28.1",
  "parking_lot",
  "regex",
- "rich_rust 0.1.1 (git+https://github.com/Dicklesworthstone/rich_rust.git)",
+ "rich_rust 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "unicode-width",
 ]
 
@@ -1630,7 +1658,7 @@ dependencies = [
 name = "fastmcp"
 version = "0.1.0"
 dependencies = [
- "asupersync",
+ "asupersync 0.1.0",
  "fastmcp-client",
  "fastmcp-core",
  "fastmcp-macros",
@@ -1645,7 +1673,7 @@ dependencies = [
 name = "fastmcp-client"
 version = "0.1.0"
 dependencies = [
- "asupersync",
+ "asupersync 0.1.0",
  "dirs",
  "fastmcp-core",
  "fastmcp-protocol",
@@ -1677,7 +1705,7 @@ dependencies = [
 name = "fastmcp-core"
 version = "0.1.0"
 dependencies = [
- "asupersync",
+ "asupersync 0.1.0",
  "log",
  "serde",
  "serde_json",
@@ -1705,7 +1733,7 @@ dependencies = [
 name = "fastmcp-server"
 version = "0.1.0"
 dependencies = [
- "asupersync",
+ "asupersync 0.1.0",
  "chrono",
  "fastmcp-client",
  "fastmcp-console",
@@ -1721,7 +1749,7 @@ dependencies = [
 name = "fastmcp-transport"
 version = "0.1.0"
 dependencies = [
- "asupersync",
+ "asupersync 0.1.0",
  "fastmcp-core",
  "fastmcp-protocol",
  "getrandom 0.3.4",
@@ -5049,7 +5077,8 @@ dependencies = [
 [[package]]
 name = "rich_rust"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/rich_rust.git#232a35595682328d0c5d110d64fc5e93771d431e"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a7c2ecb6193f75fc8143648beb454f8b1d3a4fbd2fe13813a504760867d91b1"
 dependencies = [
  "bitflags 2.10.0",
  "crossterm 0.29.0",
@@ -5058,7 +5087,6 @@ dependencies = [
  "num-rational",
  "once_cell",
  "regex",
- "smallvec",
  "time",
  "unicode-width",
 ]
@@ -6509,7 +6537,7 @@ name = "wa-core"
 version = "0.1.0"
 dependencies = [
  "aho-corasick",
- "asupersync",
+ "asupersync 0.1.0",
  "base64",
  "bloomfilter",
  "chrono",
