@@ -879,7 +879,7 @@ url = "http://localhost:8080/hook"
         );
 
         let d = test_detection(); // core.codex:usage_reached — should be excluded
-        let decision = gate.should_notify(&d, 3);
+        let decision = gate.should_notify(&d, 3, None);
         assert_eq!(decision, NotifyDecision::Filtered);
 
         // Since it's filtered, dispatcher should not be called
@@ -916,7 +916,7 @@ url = "http://localhost:8080/hook"
         );
 
         let d = test_detection();
-        let decision = gate.should_notify(&d, 3);
+        let decision = gate.should_notify(&d, 3, None);
 
         let suppressed = match decision {
             NotifyDecision::Send {
@@ -967,7 +967,7 @@ url = "http://localhost:8080/hook"
         let dispatcher = WebhookDispatcher::new(endpoints, Box::new(transport.clone()));
 
         // First event — should pass through
-        let d1 = gate.should_notify(&d, 3);
+        let d1 = gate.should_notify(&d, 3, None);
         assert!(matches!(d1, NotifyDecision::Send { .. }));
         if let NotifyDecision::Send {
             suppressed_since_last,
@@ -980,7 +980,7 @@ url = "http://localhost:8080/hook"
         assert_eq!(transport.requests().len(), 1);
 
         // Second identical event — should be deduplicated
-        let d2 = gate.should_notify(&d, 3);
+        let d2 = gate.should_notify(&d, 3, None);
         assert!(matches!(d2, NotifyDecision::Deduplicated { .. }));
         // No dispatch for deduplicated events
     }
@@ -1003,12 +1003,15 @@ url = "http://localhost:8080/hook"
 
         let mut info_event = test_detection();
         info_event.severity = Severity::Info;
-        assert_eq!(gate.should_notify(&info_event, 1), NotifyDecision::Filtered);
+        assert_eq!(
+            gate.should_notify(&info_event, 1, None),
+            NotifyDecision::Filtered
+        );
 
         // Warning should pass
         let warning_event = test_detection(); // already Warning
         assert!(matches!(
-            gate.should_notify(&warning_event, 1),
+            gate.should_notify(&warning_event, 1, None),
             NotifyDecision::Send { .. }
         ));
     }
@@ -1100,7 +1103,7 @@ url = "http://localhost:8080/hook"
         let mut info = test_detection();
         info.severity = Severity::Info;
         assert_eq!(
-            gate.should_notify(&info, 1),
+            gate.should_notify(&info, 1, None),
             crate::events::NotifyDecision::Filtered,
         );
     }

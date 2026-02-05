@@ -1579,6 +1579,7 @@ mod tests {
             matched_text: Some("Usage at 95%".to_string()),
             segment_id: Some(100),
             detected_at: 1_737_446_400_000,
+            dedupe_key: None,
             handled_at: None,
             handled_by_workflow_id: None,
             handled_status: None,

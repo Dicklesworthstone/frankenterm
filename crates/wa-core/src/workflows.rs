@@ -4967,6 +4967,7 @@ impl WorkflowRunner {
                 Ok(event) => {
                     if let crate::events::Event::PatternDetected {
                         pane_id,
+                        pane_uuid: _,
                         detection,
                         event_id,
                     } = event

@@ -1687,6 +1687,7 @@ mod tests {
             matched_text: None,
             segment_id: None,
             detected_at,
+            dedupe_key: None,
             handled_at: None,
             handled_by_workflow_id: None,
             handled_status: None,

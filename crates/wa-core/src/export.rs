@@ -422,6 +422,7 @@ mod tests {
             matched_text: Some("Error: sk-abc123def456ghi789jkl012mno345pqr678stu901v".to_string()),
             segment_id: None,
             detected_at: 1000,
+            dedupe_key: None,
             handled_at: None,
             handled_by_workflow_id: None,
             handled_status: None,

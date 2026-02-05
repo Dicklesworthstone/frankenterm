@@ -5783,8 +5783,12 @@ async fn run_watcher(
             tracing::info!("Notification pipeline disabled (no active senders)");
             None
         } else {
-            let mut pipeline =
-                NotificationPipeline::new(config.notifications.to_notification_gate(), senders);
+            let mute_storage = Arc::new(tokio::sync::Mutex::new(storage.clone()));
+            let mut pipeline = NotificationPipeline::with_mute_store(
+                config.notifications.to_notification_gate(),
+                senders,
+                mute_storage,
+            );
             let mut subscriber = event_bus.subscribe_detections();
             let handle = tokio::spawn(async move {
                 tracing::info!("Notification pipeline started, listening for detection events");
@@ -5792,11 +5796,17 @@ async fn run_watcher(
                     match subscriber.recv().await {
                         Ok(Event::PatternDetected {
                             pane_id,
+                            pane_uuid,
                             detection,
                             event_id,
                         }) => {
                             let outcome = pipeline
-                                .handle_detection(&detection, pane_id, event_id)
+                                .handle_detection(
+                                    &detection,
+                                    pane_id,
+                                    pane_uuid.as_deref(),
+                                    event_id,
+                                )
                                 .await;
                             match &outcome.decision {
                                 NotifyDecision::Send {
@@ -12690,7 +12700,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
         Some(Commands::Secrets { command }) => {
             use wa_core::output::{OutputFormat, detect_format};
-            use wa_core::secrets::{SecretScanEngine, SecretScanOptions, SecretScanReport, scope_hash};
+            use wa_core::secrets::{
+                SecretScanEngine, SecretScanOptions, SecretScanReport, scope_hash,
+            };
 
             let layout = match config.workspace_layout(Some(&workspace_root)) {
                 Ok(l) => l,
@@ -12711,17 +12723,15 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 }
             };
 
-            let render_report = |report: &SecretScanReport,
-                                 format: &str,
-                                 pretty: bool|
-             -> anyhow::Result<()> {
-                let output_format = match format.to_lowercase().as_str() {
-                    "json" => OutputFormat::Json,
-                    "plain" => OutputFormat::Plain,
-                    _ => detect_format(),
+            let render_report =
+                |report: &SecretScanReport, format: &str, pretty: bool| -> anyhow::Result<()> {
+                    let output_format = match format.to_lowercase().as_str() {
+                        "json" => OutputFormat::Json,
+                        "plain" => OutputFormat::Plain,
+                        _ => detect_format(),
+                    };
+                    render_secret_scan_report(report, output_format, pretty)
                 };
-                render_secret_scan_report(report, output_format, pretty)
-            };
 
             match command {
                 SecretsCommands::Scan {
@@ -12744,10 +12754,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     };
 
                     let engine = SecretScanEngine::new();
-                    let report = match engine
-                        .scan_storage_incremental(&storage, options)
-                        .await
-                    {
+                    let report = match engine.scan_storage_incremental(&storage, options).await {
                         Ok(report) => report,
                         Err(e) => {
                             eprintln!("Error: Secret scan failed: {e}");
@@ -12795,8 +12802,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         }
                     };
 
-                    let report: SecretScanReport = match serde_json::from_str(&record.report_json)
-                    {
+                    let report: SecretScanReport = match serde_json::from_str(&record.report_json) {
                         Ok(report) => report,
                         Err(e) => {
                             eprintln!("Error: Failed to parse secret scan report: {e}");
