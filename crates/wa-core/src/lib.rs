@@ -51,6 +51,7 @@ pub mod caut;
 pub mod chaos;
 pub mod circuit_breaker;
 pub mod config;
+pub mod config_profiles;
 pub mod crash;
 pub mod degradation;
 pub mod desktop_notify;
