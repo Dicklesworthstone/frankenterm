@@ -29,7 +29,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::config::{
-    CaptureBudgetConfig, HotReloadableConfig, PaneFilterConfig, PanePriorityConfig,
+    CaptureBudgetConfig, HotReloadableConfig, PaneFilterConfig, PanePriorityConfig, PatternsConfig,
 };
 use crate::crash::{HealthSnapshot, ShutdownSummary};
 use crate::error::Result;
@@ -67,6 +67,8 @@ pub struct RuntimeConfig {
     pub pane_priorities: PanePriorityConfig,
     /// Capture budget configuration
     pub capture_budgets: CaptureBudgetConfig,
+    /// Pattern detection configuration
+    pub patterns: PatternsConfig,
     /// Channel buffer size for internal queues
     pub channel_buffer: usize,
     /// Maximum concurrent capture operations
@@ -91,6 +93,7 @@ impl Default for RuntimeConfig {
             pane_filter: PaneFilterConfig::default(),
             pane_priorities: PanePriorityConfig::default(),
             capture_budgets: CaptureBudgetConfig::default(),
+            patterns: PatternsConfig::default(),
             channel_buffer: 1024,
             max_concurrent_captures: 10,
             retention_days: 30,
@@ -223,7 +226,7 @@ pub struct ObservationRuntime {
     /// Storage handle for persistence (wrapped for async sharing)
     storage: Arc<tokio::sync::Mutex<StorageHandle>>,
     /// Pattern detection engine
-    pattern_engine: Arc<PatternEngine>,
+    pattern_engine: Arc<RwLock<PatternEngine>>,
     /// Pane registry for discovery and tracking
     registry: Arc<RwLock<PaneRegistry>>,
     /// Per-pane cursors for delta extraction
@@ -257,7 +260,7 @@ impl ObservationRuntime {
     pub fn new(
         config: RuntimeConfig,
         storage: StorageHandle,
-        pattern_engine: Arc<PatternEngine>,
+        pattern_engine: Arc<RwLock<PatternEngine>>,
     ) -> Self {
         let registry = PaneRegistry::with_filter(config.pane_filter.clone());
         let metrics = Arc::new(RuntimeMetrics::default());
@@ -274,7 +277,7 @@ impl ObservationRuntime {
             retention_days: config.retention_days,
             retention_max_mb: config.retention_max_mb,
             checkpoint_interval_secs: config.checkpoint_interval_secs,
-            pattern_packs: vec![],
+            patterns: config.patterns.clone(),
             workflows_enabled: vec![],
             auto_run_allowlist: vec![],
         };
@@ -903,6 +906,8 @@ impl ObservationRuntime {
         let event_bus = self.event_bus.clone();
         let recording = self.recording.clone();
         let heartbeats = Arc::clone(&self.heartbeats);
+        let mut config_rx = self.config_rx.clone();
+        let mut current_patterns = self.config.patterns.clone();
 
         tokio::spawn(async move {
             // Process events until channel closes or shutdown
@@ -912,6 +917,26 @@ impl ObservationRuntime {
                 if shutdown_flag.load(Ordering::SeqCst) {
                     debug!("Persistence task: shutdown signal received, draining remaining events");
                     // Continue to drain but don't block forever
+                }
+
+                if config_rx.has_changed().unwrap_or(false) {
+                    let new_config = config_rx.borrow_and_update().clone();
+                    if new_config.patterns != current_patterns {
+                        match PatternEngine::from_config(&new_config.patterns) {
+                            Ok(engine) => {
+                                let mut guard = pattern_engine.write().await;
+                                *guard = engine;
+                                current_patterns = new_config.patterns;
+                                info!("Pattern engine reloaded from updated config");
+                            }
+                            Err(err) => {
+                                warn!(
+                                    error = %err,
+                                    "Failed to reload pattern engine from updated config"
+                                );
+                            }
+                        }
+                    }
                 }
                 let pane_id = event.segment.pane_id;
                 let content = event.segment.content.clone();
@@ -977,7 +1002,10 @@ impl ObservationRuntime {
                                 ctx.tail_buffer.clear();
                             }
 
-                            let detections = pattern_engine.detect_with_context(&content, ctx);
+                            let detections = {
+                                let engine = pattern_engine.read().await;
+                                engine.detect_with_context(&content, ctx)
+                            };
                             drop(contexts);
                             detections
                         };
@@ -1591,7 +1619,7 @@ mod tests {
         let engine = PatternEngine::new();
 
         let config = RuntimeConfig::default();
-        let _runtime = ObservationRuntime::new(config, storage, engine.into());
+        let _runtime = ObservationRuntime::new(config, storage, Arc::new(RwLock::new(engine)));
     }
 
     #[test]

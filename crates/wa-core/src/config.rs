@@ -958,7 +958,7 @@ impl DistributedConfig {
 // =============================================================================
 
 /// Pattern detection configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PatternsConfig {
     /// Enabled pattern packs (order matters for overrides)
@@ -989,7 +989,7 @@ impl Default for PatternsConfig {
 }
 
 /// Per-pack configuration override
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct PackOverride {
     /// Disable specific rules by ID
@@ -2225,7 +2225,7 @@ impl EffectivePaths {
 ///
 /// These settings do not require reinitialization of stateful components
 /// like storage handles or pattern engines.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct HotReloadableConfig {
     // General
     /// Log level (trace, debug, info, warn, error)
@@ -2252,8 +2252,8 @@ pub struct HotReloadableConfig {
     pub checkpoint_interval_secs: u32,
 
     // Patterns
-    /// Enabled pattern packs
-    pub pattern_packs: Vec<String>,
+    /// Pattern detection settings
+    pub patterns: PatternsConfig,
 
     // Workflows
     /// Enabled workflows
@@ -2276,7 +2276,7 @@ impl HotReloadableConfig {
             retention_days: config.storage.retention_days,
             retention_max_mb: config.storage.retention_max_mb,
             checkpoint_interval_secs: config.storage.checkpoint_interval_secs,
-            pattern_packs: config.patterns.packs.clone(),
+            patterns: config.patterns.clone(),
             workflows_enabled: config.workflows.enabled.clone(),
             auto_run_allowlist: config.workflows.auto_run_allowlist.clone(),
         }
@@ -2479,6 +2479,22 @@ impl Config {
                 name: "patterns.packs".to_string(),
                 old_value: format!("{:?}", self.patterns.packs),
                 new_value: format!("{:?}", new_config.patterns.packs),
+            });
+        }
+
+        if self.patterns.pack_overrides != new_config.patterns.pack_overrides {
+            changes.push(HotReloadChange {
+                name: "patterns.pack_overrides".to_string(),
+                old_value: format!("{:?}", self.patterns.pack_overrides),
+                new_value: format!("{:?}", new_config.patterns.pack_overrides),
+            });
+        }
+
+        if self.patterns.quick_reject_enabled != new_config.patterns.quick_reject_enabled {
+            changes.push(HotReloadChange {
+                name: "patterns.quick_reject_enabled".to_string(),
+                old_value: self.patterns.quick_reject_enabled.to_string(),
+                new_value: new_config.patterns.quick_reject_enabled.to_string(),
             });
         }
 
@@ -4051,7 +4067,7 @@ max_bytes_per_sec = 1048576
         assert_eq!(hot.pane_priorities.default_priority, 42);
         assert_eq!(hot.capture_budgets.max_captures_per_sec, 25);
         assert_eq!(hot.retention_days, 45);
-        assert_eq!(hot.pattern_packs, vec!["builtin:core".to_string()]);
+        assert_eq!(hot.patterns.packs, vec!["builtin:core".to_string()]);
     }
 
     #[test]

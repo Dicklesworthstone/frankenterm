@@ -570,7 +570,7 @@ SEE ALSO:
         limit: usize,
 
         /// Filter by pane ID
-        #[arg(long, short = 'p', global = true)]
+        #[arg(long = "pane", short = 'p', global = true, visible_alias = "pane-id")]
         pane_id: Option<u64>,
 
         /// Filter by actor kind (human, robot, mcp, workflow)
@@ -596,6 +596,70 @@ SEE ALSO:
         /// Only show records since this timestamp (epoch ms)
         #[arg(long, short = 's', global = true)]
         since: Option<i64>,
+    },
+
+    /// Review action history (audit + undo + workflow context)
+    #[command(after_help = r#"EXAMPLES:
+    wa history
+    wa history --pane 0 --limit 20
+    wa history --workflow wf-abc123
+    wa history --undoable
+    wa history --since "1 hour ago"
+    wa history --since "2026-01-18T12:00:00" --until "2026-01-18T14:00:00"
+    wa history --export json > history.json
+    wa history --export csv > history.csv
+
+SEE ALSO:
+    wa audit      Audit trail (policy decisions)
+    wa workflow   Workflow status and controls"#)]
+    History {
+        /// Output format: auto, plain, or json
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+
+        /// Export format: json or csv (overrides --format)
+        #[arg(long)]
+        export: Option<String>,
+
+        /// Maximum number of records to return
+        #[arg(long, short = 'l', default_value = "50", global = true)]
+        limit: usize,
+
+        /// Filter by pane ID
+        #[arg(long = "pane", short = 'p', global = true, visible_alias = "pane-id")]
+        pane_id: Option<u64>,
+
+        /// Filter by actor kind (human, robot, mcp, workflow)
+        #[arg(long, short = 'a', global = true)]
+        actor: Option<String>,
+
+        /// Filter by workflow execution ID (tree view)
+        #[arg(long)]
+        workflow: Option<String>,
+
+        /// Filter by action kind (send_text, workflow_step, workflow_start, etc.)
+        #[arg(long, short = 'k', global = true)]
+        action: Option<String>,
+
+        /// Filter by policy decision (allow, deny, require_approval)
+        #[arg(long, short = 'd', global = true)]
+        decision: Option<String>,
+
+        /// Filter by result (success, denied, failed, timeout)
+        #[arg(long, short = 'r', global = true)]
+        result: Option<String>,
+
+        /// Only show undoable actions
+        #[arg(long)]
+        undoable: bool,
+
+        /// Only show records since this timestamp (epoch ms, RFC3339, or "1 hour ago")
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Only show records until this timestamp (epoch ms, RFC3339, or "1 hour ago")
+        #[arg(long)]
+        until: Option<String>,
     },
 
     /// Notification utilities (test channels)
@@ -11773,6 +11837,183 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             }
         }
 
+        Some(Commands::History {
+            format,
+            export,
+            limit,
+            pane_id,
+            actor,
+            workflow,
+            action,
+            decision,
+            result,
+            undoable,
+            since,
+            until,
+        }) => {
+            use wa_core::output::{
+                ActionHistoryRenderer, OutputFormat, RenderContext, detect_format,
+            };
+
+            let export_format = export.as_ref().map(|value| value.to_lowercase());
+
+            let output_format = match format.to_lowercase().as_str() {
+                "json" => OutputFormat::Json,
+                "plain" => OutputFormat::Plain,
+                _ => detect_format(),
+            };
+
+            let wants_json_error =
+                matches!(export_format.as_deref(), Some("json")) || output_format.is_json();
+
+            let fail = |message: &str| -> ! {
+                if wants_json_error {
+                    println!(
+                        r#"{{"ok": false, "error": "{}", "version": "{}"}}"#,
+                        message,
+                        wa_core::VERSION
+                    );
+                } else {
+                    eprintln!("Error: {message}");
+                }
+                std::process::exit(1);
+            };
+
+            if let Some(format) = &export_format {
+                if format != "json" && format != "csv" {
+                    fail(&format!(
+                        "Unknown export format '{format}'. Valid values: json, csv"
+                    ));
+                }
+            }
+
+            let actor_kind = if workflow.is_some() {
+                match actor.as_deref() {
+                    None => Some("workflow".to_string()),
+                    Some(value) if value.eq_ignore_ascii_case("workflow") => {
+                        Some("workflow".to_string())
+                    }
+                    Some(value) => {
+                        fail(&format!(
+                            "--workflow implies --actor workflow (got {value})"
+                        ));
+                    }
+                }
+            } else {
+                actor.clone()
+            };
+
+            let since_ms = match since.as_deref() {
+                Some(raw) => match parse_history_time_ms(raw) {
+                    Ok(value) => Some(value),
+                    Err(err) => fail(&err),
+                },
+                None => None,
+            };
+            let until_ms = match until.as_deref() {
+                Some(raw) => match parse_history_time_ms(raw) {
+                    Ok(value) => Some(value),
+                    Err(err) => fail(&err),
+                },
+                None => None,
+            };
+
+            let layout = match config.workspace_layout(Some(&workspace_root)) {
+                Ok(l) => l,
+                Err(e) => {
+                    fail(&format!("Failed to get workspace layout: {e}"));
+                }
+            };
+
+            let db_path = layout.db_path.to_string_lossy();
+            let storage = match wa_core::storage::StorageHandle::new(&db_path).await {
+                Ok(s) => s,
+                Err(e) => {
+                    fail(&format!("Failed to open storage: {e}"));
+                }
+            };
+
+            let query = wa_core::storage::ActionHistoryQuery {
+                limit: Some(limit),
+                pane_id,
+                actor_kind,
+                actor_id: workflow.clone(),
+                action_kind: action.clone(),
+                policy_decision: decision.clone(),
+                result: result.clone(),
+                undoable: if undoable { Some(true) } else { None },
+                since: since_ms,
+                until: until_ms,
+                ..Default::default()
+            };
+
+            if cli.verbose > 0 {
+                eprintln!("Workspace: {}", layout.root.display());
+                eprintln!("Database:  {}", layout.db_path.display());
+                if let Some(pane_id) = pane_id {
+                    eprintln!("Filter:    pane_id={pane_id}");
+                }
+                if let Some(actor) = &actor {
+                    eprintln!("Filter:    actor={actor}");
+                }
+                if let Some(workflow) = &workflow {
+                    eprintln!("Filter:    workflow={workflow}");
+                }
+                if let Some(action) = &action {
+                    eprintln!("Filter:    action={action}");
+                }
+                if let Some(decision) = &decision {
+                    eprintln!("Filter:    decision={decision}");
+                }
+                if let Some(result) = &result {
+                    eprintln!("Filter:    result={result}");
+                }
+                if let Some(since) = &since {
+                    eprintln!("Filter:    since={since}");
+                }
+                if let Some(until) = &until {
+                    eprintln!("Filter:    until={until}");
+                }
+                if undoable {
+                    eprintln!("Filter:    undoable=true");
+                }
+                eprintln!("Limit:     {limit}");
+            }
+
+            match storage.get_action_history(query).await {
+                Ok(actions) => {
+                    if matches!(export_format.as_deref(), Some("csv")) {
+                        let output = ActionHistoryRenderer::render_csv(&actions);
+                        print!("{output}");
+                        return Ok(());
+                    }
+
+                    let effective_format = if matches!(export_format.as_deref(), Some("json")) {
+                        OutputFormat::Json
+                    } else {
+                        output_format
+                    };
+                    let ctx = RenderContext::new(effective_format)
+                        .verbose(cli.verbose)
+                        .limit(limit);
+
+                    let output = if let Some(workflow_id) = &workflow {
+                        if ctx.format.is_json() {
+                            ActionHistoryRenderer::render(&actions, &ctx)
+                        } else {
+                            ActionHistoryRenderer::render_workflow(&actions, workflow_id, &ctx)
+                        }
+                    } else {
+                        ActionHistoryRenderer::render(&actions, &ctx)
+                    };
+                    print!("{output}");
+                }
+                Err(e) => {
+                    fail(&format!("Failed to query action history: {e}"));
+                }
+            }
+        }
+
         Some(Commands::Notify { command }) => {
             handle_notify_command(command, &config).await?;
         }
@@ -13872,6 +14113,56 @@ fn format_epoch_ms(ms: i64) -> String {
         "{y:04}-{:02}-{d:02}T{hours:02}:{mins:02}:{s:02}.{subsec_ms:03}Z",
         m + 1
     )
+}
+
+fn parse_history_time_ms(raw: &str) -> Result<i64, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("Time filter cannot be empty".to_string());
+    }
+
+    if let Some(relative_ms) = parse_relative_duration_ms(raw) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        return Ok(now_ms.saturating_sub(relative_ms));
+    }
+
+    if let Some(parsed) = wa_core::cass::parse_cass_timestamp_ms(raw) {
+        return Ok(parsed);
+    }
+
+    if raw.contains('T') {
+        let replaced = raw.replace('T', " ");
+        if let Some(parsed) = wa_core::cass::parse_cass_timestamp_ms(&replaced) {
+            return Ok(parsed);
+        }
+    }
+
+    Err(format!(
+        "Invalid time '{raw}'. Expected epoch seconds/ms, RFC3339, or \"1 hour ago\""
+    ))
+}
+
+fn parse_relative_duration_ms(raw: &str) -> Option<i64> {
+    let lower = raw.trim().to_lowercase();
+    let parts: Vec<&str> = lower.split_whitespace().collect();
+    if parts.len() != 3 || parts[2] != "ago" {
+        return None;
+    }
+
+    let value: i64 = parts[0].parse().ok()?;
+    let unit_ms: i64 = match parts[1] {
+        "s" | "sec" | "secs" | "second" | "seconds" => 1_000,
+        "m" | "min" | "mins" | "minute" | "minutes" => 60_000,
+        "h" | "hr" | "hrs" | "hour" | "hours" => 3_600_000,
+        "d" | "day" | "days" => 86_400_000,
+        "w" | "week" | "weeks" => 604_800_000,
+        _ => return None,
+    };
+
+    Some(value.saturating_mul(unit_ms))
 }
 
 /// Handle `wa rules` subcommands
@@ -20601,6 +20892,62 @@ mod tests {
             }
             _ => panic!("expected Workflow::Status"),
         }
+    }
+
+    // ========================================================================
+    // History CLI parsing tests (wa-5em.7)
+    // ========================================================================
+
+    #[test]
+    fn cli_history_parses_filters() {
+        let cli = Cli::try_parse_from([
+            "wa",
+            "history",
+            "--pane",
+            "3",
+            "--limit",
+            "25",
+            "--workflow",
+            "wf-123",
+            "--undoable",
+            "--since",
+            "1 hour ago",
+            "--until",
+            "2026-01-18T12:00:00",
+        ])
+        .expect("history should parse");
+
+        match cli.command {
+            Some(Commands::History {
+                pane_id,
+                limit,
+                workflow,
+                undoable,
+                since,
+                until,
+                ..
+            }) => {
+                assert_eq!(pane_id, Some(3));
+                assert_eq!(limit, 25);
+                assert_eq!(workflow.as_deref(), Some("wf-123"));
+                assert!(undoable);
+                assert_eq!(since.as_deref(), Some("1 hour ago"));
+                assert_eq!(until.as_deref(), Some("2026-01-18T12:00:00"));
+            }
+            _ => panic!("expected History command"),
+        }
+    }
+
+    #[test]
+    fn parse_history_time_relative() {
+        let value = parse_relative_duration_ms("1 hour ago").expect("relative parse");
+        assert_eq!(value, 3_600_000);
+    }
+
+    #[test]
+    fn parse_history_time_iso_basic() {
+        let parsed = parse_history_time_ms("2026-01-18T12:00:00").expect("parse ISO");
+        assert!(parsed > 0);
     }
 
     // ========================================================================
