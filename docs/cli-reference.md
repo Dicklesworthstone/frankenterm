@@ -62,6 +62,9 @@ wa rules test "<text>"
 wa rules show <rule_id>
 ```
 
+For explain-match traces and how to interpret robot `--trace` output, see
+`docs/explain-match.md`.
+
 ### Diagnostics and bundles
 
 ```bash

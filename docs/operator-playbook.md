@@ -121,6 +121,28 @@ Note: Disabling rules prevents those detections from firing entirely.
 
 ---
 
+## Flow 4: search explain → fix
+
+Use this for missing or incomplete search results.
+
+1) Run safe checks:
+
+```bash
+wa search "error"
+wa search fts verify
+wa doctor
+```
+
+2) If the index is inconsistent, rebuild:
+
+```bash
+wa search fts rebuild
+```
+
+3) For detailed reason codes and remediation, see `docs/search-explainability.md`.
+
+---
+
 ## Common commands (copy/paste)
 
 ```bash
