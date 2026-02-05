@@ -183,6 +183,10 @@ SEE ALSO:
     wa search "error" -f json         Machine-readable output
     wa search fts verify              Verify FTS index health
     wa search fts rebuild             Rebuild FTS index
+    wa search save errors "error OR warning"
+    wa search saved list
+    wa search saved run errors
+    wa search saved delete errors
 
 SEE ALSO:
     wa list       List available panes
@@ -1136,6 +1140,38 @@ SEE ALSO:
         #[command(subcommand)]
         command: FtsCommands,
     },
+    /// Save a search query for reuse
+    #[command(after_help = r#"EXAMPLES:
+    wa search save errors "error OR warning"
+    wa search save codex-errors "usage limit" --pane 0 --limit 50
+
+SEE ALSO:
+    wa search saved list
+    wa search saved run <name>"#)]
+    Save {
+        /// Saved search name
+        name: String,
+
+        /// FTS query string
+        query: String,
+
+        /// Optional pane ID scope
+        #[arg(long)]
+        pane: Option<u64>,
+
+        /// Maximum results to store for this search
+        #[arg(long, default_value = "50")]
+        limit: usize,
+
+        /// Fixed since timestamp (epoch ms). If set, uses fixed since mode.
+        #[arg(long)]
+        since: Option<i64>,
+    },
+    /// Manage saved searches
+    Saved {
+        #[command(subcommand)]
+        command: SavedSearchCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1145,6 +1181,22 @@ enum FtsCommands {
 
     /// Rebuild the FTS index from stored segments
     Rebuild,
+}
+
+#[derive(Subcommand)]
+enum SavedSearchCommands {
+    /// List saved searches
+    List,
+    /// Run a saved search by name
+    Run {
+        /// Saved search name
+        name: String,
+    },
+    /// Delete a saved search by name
+    Delete {
+        /// Saved search name
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -3287,6 +3339,46 @@ fn format_search_lints_plain(lints: &[wa_core::storage::SearchLint]) -> String {
         output.push_str(&format!("  - [{severity}] {}\n", lint.message));
         if let Some(suggestion) = &lint.suggestion {
             output.push_str(&format!("    Suggestion: {suggestion}\n"));
+        }
+    }
+    output
+}
+
+fn format_saved_searches_plain(searches: &[wa_core::storage::SavedSearchRecord]) -> String {
+    if searches.is_empty() {
+        return "No saved searches.\n".to_string();
+    }
+
+    let mut output = String::new();
+    output.push_str(&format!("Saved searches ({}):\n", searches.len()));
+    for search in searches {
+        let pane = search
+            .pane_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "any".to_string());
+        let last_run = search
+            .last_run_at
+            .map(|ts| ts.to_string())
+            .unwrap_or_else(|| "never".to_string());
+        let last_count = search
+            .last_result_count
+            .map(|count| count.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let enabled = if search.enabled { "on" } else { "off" };
+        let query = redact_for_output(&search.query);
+        output.push_str(&format!(
+            "  - {}: query=\"{}\" pane={} limit={} since_mode={} last_run_at={} last_count={} enabled={}\n",
+            search.name,
+            query,
+            pane,
+            search.limit,
+            search.since_mode,
+            last_run,
+            last_count,
+            enabled
+        ));
+        if let Some(err) = &search.last_error {
+            output.push_str(&format!("    last_error: {err}\n"));
         }
     }
     output
@@ -9138,6 +9230,352 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     );
                                 } else {
                                     eprintln!("Error: FTS rebuild failed: {e}");
+                                }
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                },
+                Some(SearchCommands::Save {
+                    name,
+                    query,
+                    pane,
+                    limit,
+                    since,
+                }) => {
+                    if limit == 0 {
+                        if output_format.is_json() {
+                            println!(
+                                r#"{{"ok": false, "error": "Limit must be greater than 0.", "version": "{}"}}"#,
+                                wa_core::VERSION
+                            );
+                        } else {
+                            eprintln!("Error: Limit must be greater than 0.");
+                        }
+                        std::process::exit(1);
+                    }
+
+                    let lints = wa_core::storage::lint_fts_query(&query);
+                    if search_lints_have_errors(&lints) {
+                        if output_format.is_json() {
+                            let payload = serde_json::json!({
+                                "ok": false,
+                                "error": "Invalid search query.",
+                                "lint": lints,
+                                "version": wa_core::VERSION,
+                            });
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&payload).unwrap_or_default()
+                            );
+                        } else {
+                            eprintln!("Error: Invalid search query.");
+                            eprint!("{}", format_search_lints_plain(&lints));
+                        }
+                        std::process::exit(1);
+                    }
+                    if !lints.is_empty() && !output_format.is_json() {
+                        eprint!("{}", format_search_lints_plain(&lints));
+                    }
+
+                    match storage.get_saved_search_by_name(&name).await {
+                        Ok(Some(_)) => {
+                            if output_format.is_json() {
+                                println!(
+                                    r#"{{"ok": false, "error": "Saved search already exists: {}", "version": "{}"}}"#,
+                                    name,
+                                    wa_core::VERSION
+                                );
+                            } else {
+                                eprintln!("Error: Saved search already exists: {name}");
+                            }
+                            std::process::exit(1);
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            if output_format.is_json() {
+                                println!(
+                                    r#"{{"ok": false, "error": "Failed to load saved searches: {}", "version": "{}"}}"#,
+                                    e,
+                                    wa_core::VERSION
+                                );
+                            } else {
+                                eprintln!("Error: Failed to load saved searches: {e}");
+                            }
+                            std::process::exit(1);
+                        }
+                    }
+
+                    let limit_i64 = i64::try_from(limit)
+                        .ok()
+                        .filter(|v| *v > 0)
+                        .unwrap_or(wa_core::storage::SAVED_SEARCH_DEFAULT_LIMIT);
+                    let since_mode = if since.is_some() {
+                        wa_core::storage::SAVED_SEARCH_SINCE_MODE_FIXED
+                    } else {
+                        wa_core::storage::SAVED_SEARCH_SINCE_MODE_LAST_RUN
+                    };
+                    let record = wa_core::storage::SavedSearchRecord::new(
+                        name.clone(),
+                        query.clone(),
+                        pane,
+                        limit_i64,
+                        since_mode.to_string(),
+                        since,
+                    );
+
+                    match storage.insert_saved_search(record.clone()).await {
+                        Ok(()) => {
+                            if output_format.is_json() {
+                                let payload = serde_json::json!({
+                                    "ok": true,
+                                    "saved_search": record,
+                                    "version": wa_core::VERSION,
+                                });
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&payload).unwrap_or_default()
+                                );
+                            } else {
+                                println!("Saved search '{name}' created.");
+                            }
+                        }
+                        Err(e) => {
+                            if output_format.is_json() {
+                                println!(
+                                    r#"{{"ok": false, "error": "Failed to save search: {}", "version": "{}"}}"#,
+                                    e,
+                                    wa_core::VERSION
+                                );
+                            } else {
+                                eprintln!("Error: Failed to save search: {e}");
+                            }
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                Some(SearchCommands::Saved { command }) => match command {
+                    SavedSearchCommands::List => match storage.list_saved_searches().await {
+                        Ok(searches) => {
+                            if output_format.is_json() {
+                                let payload = serde_json::json!({
+                                    "ok": true,
+                                    "saved_searches": searches,
+                                    "total": searches.len(),
+                                    "version": wa_core::VERSION,
+                                });
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&payload).unwrap_or_default()
+                                );
+                            } else {
+                                print!("{}", format_saved_searches_plain(&searches));
+                            }
+                        }
+                        Err(e) => {
+                            if output_format.is_json() {
+                                println!(
+                                    r#"{{"ok": false, "error": "Failed to list saved searches: {}", "version": "{}"}}"#,
+                                    e,
+                                    wa_core::VERSION
+                                );
+                            } else {
+                                eprintln!("Error: Failed to list saved searches: {e}");
+                            }
+                            std::process::exit(1);
+                        }
+                    },
+                    SavedSearchCommands::Run { name } => {
+                        let saved = match storage.get_saved_search_by_name(&name).await {
+                            Ok(Some(search)) => search,
+                            Ok(None) => {
+                                if output_format.is_json() {
+                                    println!(
+                                        r#"{{"ok": false, "error": "Saved search not found: {}", "version": "{}"}}"#,
+                                        name,
+                                        wa_core::VERSION
+                                    );
+                                } else {
+                                    eprintln!("Error: Saved search not found: {name}");
+                                }
+                                std::process::exit(1);
+                            }
+                            Err(e) => {
+                                if output_format.is_json() {
+                                    println!(
+                                        r#"{{"ok": false, "error": "Failed to load saved search: {}", "version": "{}"}}"#,
+                                        e,
+                                        wa_core::VERSION
+                                    );
+                                } else {
+                                    eprintln!("Error: Failed to load saved search: {e}");
+                                }
+                                std::process::exit(1);
+                            }
+                        };
+
+                        let now_ms_i64 = i64::try_from(now_ms()).unwrap_or(i64::MAX);
+
+                        let lints = wa_core::storage::lint_fts_query(&saved.query);
+                        if search_lints_have_errors(&lints) {
+                            let summary = lints
+                                .iter()
+                                .find(|lint| {
+                                    lint.severity == wa_core::storage::SearchLintSeverity::Error
+                                })
+                                .map(|lint| lint.message.clone())
+                                .unwrap_or_else(|| "Invalid search query.".to_string());
+                            let stored_error = format!("Invalid search query: {summary}");
+                            if let Err(e) = storage
+                                .update_saved_search_run(
+                                    &saved.id,
+                                    now_ms_i64,
+                                    None,
+                                    Some(stored_error.clone()),
+                                )
+                                .await
+                            {
+                                tracing::warn!("Failed to update saved search run: {e}");
+                            }
+
+                            if output_format.is_json() {
+                                let payload = serde_json::json!({
+                                    "ok": false,
+                                    "error": "Invalid search query.",
+                                    "lint": lints,
+                                    "version": wa_core::VERSION,
+                                });
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&payload).unwrap_or_default()
+                                );
+                            } else {
+                                eprintln!("Error: Invalid search query.");
+                                eprint!("{}", format_search_lints_plain(&lints));
+                            }
+                            std::process::exit(1);
+                        }
+                        if !lints.is_empty() && !output_format.is_json() {
+                            eprint!("{}", format_search_lints_plain(&lints));
+                        }
+
+                        let limit = if saved.limit > 0 {
+                            saved.limit as usize
+                        } else {
+                            wa_core::storage::SAVED_SEARCH_DEFAULT_LIMIT as usize
+                        };
+                        let since = if saved.since_mode
+                            == wa_core::storage::SAVED_SEARCH_SINCE_MODE_FIXED
+                        {
+                            saved.since_ms
+                        } else {
+                            saved.last_run_at
+                        };
+
+                        let options = wa_core::storage::SearchOptions {
+                            limit: Some(limit),
+                            pane_id: saved.pane_id,
+                            since,
+                            until: None,
+                            include_snippets: Some(true),
+                            snippet_max_tokens: Some(30),
+                            highlight_prefix: Some(">>".to_string()),
+                            highlight_suffix: Some("<<".to_string()),
+                        };
+
+                        match storage.search_with_results(&saved.query, options).await {
+                            Ok(results) => {
+                                if let Err(e) = storage
+                                    .update_saved_search_run(
+                                        &saved.id,
+                                        now_ms_i64,
+                                        Some(results.len() as i64),
+                                        None,
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!("Failed to update saved search run: {e}");
+                                }
+
+                                let ctx = RenderContext::new(output_format)
+                                    .verbose(cli.verbose)
+                                    .limit(limit);
+                                let output =
+                                    SearchResultRenderer::render(&results, &saved.query, &ctx);
+                                print!("{output}");
+                            }
+                            Err(e) => {
+                                let error_msg = format!("Search failed: {e}");
+                                if let Err(e) = storage
+                                    .update_saved_search_run(
+                                        &saved.id,
+                                        now_ms_i64,
+                                        None,
+                                        Some(error_msg.clone()),
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!("Failed to update saved search run: {e}");
+                                }
+
+                                if output_format.is_json() {
+                                    println!(
+                                        r#"{{"ok": false, "error": "Search failed: {}", "version": "{}"}}"#,
+                                        e,
+                                        wa_core::VERSION
+                                    );
+                                } else {
+                                    eprintln!("Error: Search failed: {e}");
+                                    if e.to_string().contains("fts5")
+                                        || e.to_string().contains("syntax")
+                                    {
+                                        eprintln!("Check your FTS query syntax.");
+                                    }
+                                }
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                    SavedSearchCommands::Delete { name } => {
+                        match storage.delete_saved_search(&name).await {
+                            Ok(deleted) => {
+                                if deleted == 0 {
+                                    if output_format.is_json() {
+                                        println!(
+                                            r#"{{"ok": false, "error": "Saved search not found: {}", "version": "{}"}}"#,
+                                            name,
+                                            wa_core::VERSION
+                                        );
+                                    } else {
+                                        eprintln!("Error: Saved search not found: {name}");
+                                    }
+                                    std::process::exit(1);
+                                }
+
+                                if output_format.is_json() {
+                                    let payload = serde_json::json!({
+                                        "ok": true,
+                                        "deleted": true,
+                                        "name": name,
+                                        "version": wa_core::VERSION,
+                                    });
+                                    println!(
+                                        "{}",
+                                        serde_json::to_string_pretty(&payload).unwrap_or_default()
+                                    );
+                                } else {
+                                    println!("Deleted saved search '{name}'.");
+                                }
+                            }
+                            Err(e) => {
+                                if output_format.is_json() {
+                                    println!(
+                                        r#"{{"ok": false, "error": "Failed to delete saved search: {}", "version": "{}"}}"#,
+                                        e,
+                                        wa_core::VERSION
+                                    );
+                                } else {
+                                    eprintln!("Error: Failed to delete saved search: {e}");
                                 }
                                 std::process::exit(1);
                             }

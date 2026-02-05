@@ -22,6 +22,7 @@
 //! - `action_history`: View joining audit + undo + workflow step info
 //! - `approval_tokens`: Allow-once approvals scoped to actions
 //! - `config`: Key-value settings
+//! - `saved_searches`: Persisted search definitions
 //! - `maintenance_log`: System events and metrics
 //!
 //! FTS5 virtual table `output_segments_fts` enables full-text search.
@@ -48,7 +49,7 @@ use crate::policy::Redactor;
 /// This is the target version that new databases will be initialized to,
 /// and existing databases will be migrated to.
 /// Uses SQLite's PRAGMA user_version for atomic version tracking.
-pub const SCHEMA_VERSION: i32 = 13;
+pub const SCHEMA_VERSION: i32 = 14;
 
 /// Schema initialization SQL
 ///
@@ -408,6 +409,27 @@ CREATE TABLE IF NOT EXISTS config (
     value TEXT NOT NULL,              -- JSON value
     updated_at INTEGER NOT NULL       -- epoch ms
 );
+
+-- Saved searches: persisted query definitions for reuse/scheduling
+CREATE TABLE IF NOT EXISTS saved_searches (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    query TEXT NOT NULL,
+    pane_id INTEGER,
+    limit INTEGER NOT NULL DEFAULT 50,
+    since_mode TEXT NOT NULL DEFAULT 'last_run',
+    since_ms INTEGER,
+    schedule_interval_ms INTEGER,
+    enabled INTEGER NOT NULL DEFAULT 0,
+    last_run_at INTEGER,
+    last_result_count INTEGER,
+    last_error TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_saved_searches_enabled ON saved_searches(enabled);
+CREATE INDEX IF NOT EXISTS idx_saved_searches_last_run ON saved_searches(last_run_at);
 
 -- Maintenance log: system events and metrics
 CREATE TABLE IF NOT EXISTS maintenance_log (
@@ -807,6 +829,40 @@ static MIGRATIONS: &[Migration] = &[
             r"
             DROP INDEX IF EXISTS idx_secret_scan_reports_scope;
             DROP TABLE IF EXISTS secret_scan_reports;
+        ",
+        ),
+    },
+    Migration {
+        version: 14,
+        description: "Add saved_searches for persisted search definitions",
+        up_sql: r"
+            CREATE TABLE IF NOT EXISTS saved_searches (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                query TEXT NOT NULL,
+                pane_id INTEGER,
+                limit INTEGER NOT NULL DEFAULT 50,
+                since_mode TEXT NOT NULL DEFAULT 'last_run',
+                since_ms INTEGER,
+                schedule_interval_ms INTEGER,
+                enabled INTEGER NOT NULL DEFAULT 0,
+                last_run_at INTEGER,
+                last_result_count INTEGER,
+                last_error TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_saved_searches_enabled
+                ON saved_searches(enabled);
+            CREATE INDEX IF NOT EXISTS idx_saved_searches_last_run
+                ON saved_searches(last_run_at);
+        ",
+        down_sql: Some(
+            r"
+            DROP INDEX IF EXISTS idx_saved_searches_last_run;
+            DROP INDEX IF EXISTS idx_saved_searches_enabled;
+            DROP TABLE IF EXISTS saved_searches;
         ",
         ),
     },
@@ -1641,6 +1697,79 @@ pub struct SecretScanReportRecord {
     pub report_json: String,
     /// Timestamp when the report was created (epoch ms).
     pub created_at: i64,
+}
+
+/// Saved search record for reusable queries and scheduling.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedSearchRecord {
+    /// Stable saved search identifier.
+    pub id: String,
+    /// Human-friendly name (unique).
+    pub name: String,
+    /// FTS query string.
+    pub query: String,
+    /// Optional scope to a pane.
+    pub pane_id: Option<u64>,
+    /// Maximum number of results.
+    pub limit: i64,
+    /// Since window mode ("last_run" or "fixed").
+    pub since_mode: String,
+    /// Fixed since timestamp (epoch ms) when since_mode="fixed".
+    pub since_ms: Option<i64>,
+    /// Optional schedule interval (ms). None means manual-only.
+    pub schedule_interval_ms: Option<i64>,
+    /// Whether the search is enabled for scheduling.
+    pub enabled: bool,
+    /// Last run timestamp (epoch ms).
+    pub last_run_at: Option<i64>,
+    /// Last run result count.
+    pub last_result_count: Option<i64>,
+    /// Last run error (if any).
+    pub last_error: Option<String>,
+    /// Created timestamp (epoch ms).
+    pub created_at: i64,
+    /// Updated timestamp (epoch ms).
+    pub updated_at: i64,
+}
+
+/// Default since-mode: last_run.
+pub const SAVED_SEARCH_SINCE_MODE_LAST_RUN: &str = "last_run";
+/// Fixed since-mode uses the stored since_ms value.
+pub const SAVED_SEARCH_SINCE_MODE_FIXED: &str = "fixed";
+/// Default maximum results for saved searches.
+pub const SAVED_SEARCH_DEFAULT_LIMIT: i64 = 50;
+
+impl SavedSearchRecord {
+    /// Build a new saved search record with defaults.
+    #[must_use]
+    pub fn new(
+        name: String,
+        query: String,
+        pane_id: Option<u64>,
+        limit: i64,
+        since_mode: String,
+        since_ms: Option<i64>,
+    ) -> Self {
+        let now = now_ms();
+        let random: u32 = rand::random();
+        let id = format!("ss-{now}-{random:08x}");
+        Self {
+            id,
+            name,
+            query,
+            pane_id,
+            limit,
+            since_mode,
+            since_ms,
+            schedule_interval_ms: None,
+            enabled: false,
+            last_run_at: None,
+            last_result_count: None,
+            last_error: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
 }
 
 /// Approval token record for allow-once approvals
@@ -3164,6 +3293,24 @@ enum WriteCommand {
         record: SecretScanReportRecord,
         respond: oneshot::Sender<Result<i64>>,
     },
+    /// Insert a saved search definition
+    InsertSavedSearch {
+        record: SavedSearchRecord,
+        respond: oneshot::Sender<Result<()>>,
+    },
+    /// Update last-run metadata for a saved search
+    UpdateSavedSearchRun {
+        id: String,
+        last_run_at: i64,
+        last_result_count: Option<i64>,
+        last_error: Option<String>,
+        respond: oneshot::Sender<Result<()>>,
+    },
+    /// Delete a saved search by name
+    DeleteSavedSearch {
+        name: String,
+        respond: oneshot::Sender<Result<usize>>,
+    },
     /// Prune output segments older than a cutoff
     PruneSegments {
         before_ts: i64,
@@ -3527,6 +3674,87 @@ impl StorageHandle {
 
         rx.await
             .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    /// Insert a saved search definition.
+    pub async fn insert_saved_search(&self, record: SavedSearchRecord) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::InsertSavedSearch {
+                record,
+                respond: tx,
+            })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    /// Update last-run metadata for a saved search.
+    pub async fn update_saved_search_run(
+        &self,
+        id: &str,
+        last_run_at: i64,
+        last_result_count: Option<i64>,
+        last_error: Option<String>,
+    ) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::UpdateSavedSearchRun {
+                id: id.to_string(),
+                last_run_at,
+                last_result_count,
+                last_error,
+                respond: tx,
+            })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    /// Delete a saved search by name. Returns number of rows deleted.
+    pub async fn delete_saved_search(&self, name: &str) -> Result<usize> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::DeleteSavedSearch {
+                name: name.to_string(),
+                respond: tx,
+            })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    /// Fetch a saved search by name.
+    pub async fn get_saved_search_by_name(&self, name: &str) -> Result<Option<SavedSearchRecord>> {
+        let db_path = Arc::clone(&self.db_path);
+        let name = name.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            query_saved_search_by_name(&conn, &name)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+    }
+
+    /// List saved searches in deterministic order.
+    pub async fn list_saved_searches(&self) -> Result<Vec<SavedSearchRecord>> {
+        let db_path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            list_saved_searches_sync(&conn)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Prune output segments older than a cutoff timestamp
@@ -5425,6 +5653,30 @@ fn dispatch_write_command(conn: &mut Connection, cmd: WriteCommand, should_break
             let result = record_secret_scan_report_sync(conn, &record);
             let _ = respond.send(result);
         }
+        WriteCommand::InsertSavedSearch { record, respond } => {
+            let result = insert_saved_search_sync(conn, &record);
+            let _ = respond.send(result);
+        }
+        WriteCommand::UpdateSavedSearchRun {
+            id,
+            last_run_at,
+            last_result_count,
+            last_error,
+            respond,
+        } => {
+            let result = update_saved_search_run_sync(
+                conn,
+                &id,
+                last_run_at,
+                last_result_count,
+                last_error.as_deref(),
+            );
+            let _ = respond.send(result);
+        }
+        WriteCommand::DeleteSavedSearch { name, respond } => {
+            let result = delete_saved_search_sync(conn, &name);
+            let _ = respond.send(result);
+        }
         WriteCommand::PruneSegments { before_ts, respond } => {
             let result = prune_segments_sync(conn, before_ts);
             let _ = respond.send(result);
@@ -6033,6 +6285,126 @@ fn record_secret_scan_report_sync(
     .map_err(|e| StorageError::Database(format!("Failed to record secret scan report: {e}")))?;
 
     Ok(conn.last_insert_rowid())
+}
+
+fn insert_saved_search_sync(conn: &Connection, record: &SavedSearchRecord) -> Result<()> {
+    let enabled = i64::from(record.enabled);
+    let limit = if record.limit <= 0 {
+        SAVED_SEARCH_DEFAULT_LIMIT
+    } else {
+        record.limit
+    };
+
+    conn.execute(
+        "INSERT INTO saved_searches (
+            id, name, query, pane_id, limit, since_mode, since_ms,
+            schedule_interval_ms, enabled, last_run_at, last_result_count, last_error,
+            created_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        params![
+            record.id,
+            record.name,
+            record.query,
+            record.pane_id,
+            limit,
+            record.since_mode,
+            record.since_ms,
+            record.schedule_interval_ms,
+            enabled,
+            record.last_run_at,
+            record.last_result_count,
+            record.last_error,
+            record.created_at,
+            record.updated_at,
+        ],
+    )
+    .map_err(|e| StorageError::Database(format!("Failed to insert saved search: {e}")))?;
+
+    Ok(())
+}
+
+fn update_saved_search_run_sync(
+    conn: &Connection,
+    id: &str,
+    last_run_at: i64,
+    last_result_count: Option<i64>,
+    last_error: Option<&str>,
+) -> Result<()> {
+    let updated = conn
+        .execute(
+            "UPDATE saved_searches
+             SET last_run_at = ?1,
+                 last_result_count = ?2,
+                 last_error = ?3,
+                 updated_at = ?4
+             WHERE id = ?5",
+            params![last_run_at, last_result_count, last_error, now_ms(), id],
+        )
+        .map_err(|e| StorageError::Database(format!("Failed to update saved search: {e}")))?;
+
+    if updated == 0 {
+        return Err(StorageError::NotFound(format!("Saved search not found: {id}")).into());
+    }
+    Ok(())
+}
+
+fn delete_saved_search_sync(conn: &Connection, name: &str) -> Result<usize> {
+    let deleted = conn
+        .execute("DELETE FROM saved_searches WHERE name = ?1", [name])
+        .map_err(|e| StorageError::Database(format!("Failed to delete saved search: {e}")))?;
+    Ok(deleted)
+}
+
+fn saved_search_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SavedSearchRecord> {
+    let enabled: i64 = row.get(8)?;
+    Ok(SavedSearchRecord {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        query: row.get(2)?,
+        pane_id: row.get(3)?,
+        limit: row.get(4)?,
+        since_mode: row.get(5)?,
+        since_ms: row.get(6)?,
+        schedule_interval_ms: row.get(7)?,
+        enabled: enabled != 0,
+        last_run_at: row.get(9)?,
+        last_result_count: row.get(10)?,
+        last_error: row.get(11)?,
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
+    })
+}
+
+fn query_saved_search_by_name(conn: &Connection, name: &str) -> Result<Option<SavedSearchRecord>> {
+    conn.query_row(
+        "SELECT id, name, query, pane_id, limit, since_mode, since_ms, schedule_interval_ms,
+                enabled, last_run_at, last_result_count, last_error, created_at, updated_at
+         FROM saved_searches
+         WHERE name = ?1",
+        [name],
+        saved_search_from_row,
+    )
+    .optional()
+    .map_err(|e| StorageError::Database(format!("Failed to query saved search: {e}")))
+}
+
+fn list_saved_searches_sync(conn: &Connection) -> Result<Vec<SavedSearchRecord>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, name, query, pane_id, limit, since_mode, since_ms, schedule_interval_ms,
+                    enabled, last_run_at, last_result_count, last_error, created_at, updated_at
+             FROM saved_searches
+             ORDER BY name ASC",
+        )
+        .map_err(|e| StorageError::Database(format!("Failed to list saved searches: {e}")))?;
+    let rows = stmt
+        .query_map([], saved_search_from_row)
+        .map_err(|e| StorageError::Database(format!("Failed to list saved searches: {e}")))?;
+    let mut searches = Vec::new();
+    for row in rows {
+        searches.push(row.map_err(|e| StorageError::Database(format!("{e}")))?);
+    }
+    Ok(searches)
 }
 
 fn prune_segments_sync(conn: &Connection, before_ts: i64) -> Result<usize> {
@@ -9499,6 +9871,7 @@ mod tests {
             "action_undo",
             "approval_tokens",
             "config",
+            "saved_searches",
             "maintenance_log",
         ];
 
@@ -11234,6 +11607,60 @@ mod tests {
         assert_eq!(fetched.last_segment_id, Some(42));
         assert_eq!(fetched.report_version, 1);
         assert_eq!(fetched.report_json, "{\"report_version\":1}");
+    }
+
+    #[test]
+    fn saved_search_roundtrip() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let record = SavedSearchRecord::new(
+            "errors".to_string(),
+            "error OR warning".to_string(),
+            Some(1),
+            25,
+            SAVED_SEARCH_SINCE_MODE_LAST_RUN.to_string(),
+            None,
+        );
+        insert_saved_search_sync(&conn, &record).unwrap();
+
+        let fetched = query_saved_search_by_name(&conn, "errors")
+            .unwrap()
+            .expect("saved search should exist");
+        assert_eq!(fetched.name, "errors");
+        assert_eq!(fetched.query, "error OR warning");
+        assert_eq!(fetched.pane_id, Some(1));
+        assert_eq!(fetched.limit, 25);
+        assert_eq!(fetched.since_mode, SAVED_SEARCH_SINCE_MODE_LAST_RUN);
+
+        let record2 = SavedSearchRecord::new(
+            "alpha".to_string(),
+            "panic".to_string(),
+            None,
+            10,
+            SAVED_SEARCH_SINCE_MODE_FIXED.to_string(),
+            Some(1_700_000_000_000),
+        );
+        insert_saved_search_sync(&conn, &record2).unwrap();
+
+        let list = list_saved_searches_sync(&conn).unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].name, "alpha");
+        assert_eq!(list[1].name, "errors");
+
+        let run_ts = now_ms();
+        update_saved_search_run_sync(&conn, &fetched.id, run_ts, Some(3), None).unwrap();
+        let updated = query_saved_search_by_name(&conn, "errors")
+            .unwrap()
+            .expect("saved search should exist");
+        assert_eq!(updated.last_run_at, Some(run_ts));
+        assert_eq!(updated.last_result_count, Some(3));
+        assert!(updated.last_error.is_none());
+
+        let deleted = delete_saved_search_sync(&conn, "errors").unwrap();
+        assert_eq!(deleted, 1);
+        let missing = query_saved_search_by_name(&conn, "errors").unwrap();
+        assert!(missing.is_none());
     }
 
     #[test]
