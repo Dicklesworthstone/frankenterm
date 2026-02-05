@@ -11534,10 +11534,9 @@ steps:
         let engine = WorkflowEngine::default();
         let lock_manager = Arc::new(PaneWorkflowLockManager::new());
         let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
-        let wezterm: crate::wezterm::WeztermHandle =
-            Arc::new(crate::wezterm::WeztermClient::with_socket(
-                "/tmp/wa-test-nonexistent.sock",
-            ));
+        let wezterm: crate::wezterm::WeztermHandle = Arc::new(
+            crate::wezterm::WeztermClient::with_socket("/tmp/wa-test-nonexistent.sock"),
+        );
         let injector = Arc::new(tokio::sync::Mutex::new(
             crate::policy::PolicyGatedInjector::new(
                 crate::policy::PolicyEngine::permissive(),

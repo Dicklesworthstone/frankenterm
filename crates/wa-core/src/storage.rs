@@ -10531,6 +10531,292 @@ mod tests {
     }
 
     #[test]
+    fn action_undo_index_exists_after_init() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_action_undo_undoable'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "idx_action_undo_undoable index should exist");
+    }
+
+    #[test]
+    fn action_history_orders_by_ts_and_id() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let now_ms = 1_700_000_000_000i64;
+
+        conn.execute(
+            "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![1i64, "local", now_ms, now_ms, 1],
+        )
+        .unwrap();
+
+        let base = AuditActionRecord {
+            id: 0,
+            ts: 1_000,
+            actor_kind: "human".to_string(),
+            actor_id: Some("cli".to_string()),
+            correlation_id: None,
+            pane_id: Some(1),
+            domain: Some("local".to_string()),
+            action_kind: "send_text".to_string(),
+            policy_decision: "allow".to_string(),
+            decision_reason: None,
+            rule_id: None,
+            input_summary: Some("first".to_string()),
+            verification_summary: None,
+            decision_context: None,
+            result: "success".to_string(),
+        };
+
+        let id1 = record_audit_action_sync(&conn, &base).unwrap();
+        let id2 = record_audit_action_sync(
+            &conn,
+            &AuditActionRecord {
+                ts: 2_000,
+                input_summary: Some("second".to_string()),
+                ..base.clone()
+            },
+        )
+        .unwrap();
+        let id3 = record_audit_action_sync(
+            &conn,
+            &AuditActionRecord {
+                ts: 2_000,
+                input_summary: Some("third".to_string()),
+                ..base
+            },
+        )
+        .unwrap();
+
+        let rows = query_action_history(
+            &conn,
+            &ActionHistoryQuery {
+                limit: Some(10),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].id, id3);
+        assert_eq!(rows[1].id, id2);
+        assert_eq!(rows[2].id, id1);
+    }
+
+    #[test]
+    fn action_history_filters_undoable() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let now_ms = 1_700_000_000_000i64;
+
+        conn.execute(
+            "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![1i64, "local", now_ms, now_ms, 1],
+        )
+        .unwrap();
+
+        let base = AuditActionRecord {
+            id: 0,
+            ts: 1_000,
+            actor_kind: "human".to_string(),
+            actor_id: None,
+            correlation_id: None,
+            pane_id: Some(1),
+            domain: Some("local".to_string()),
+            action_kind: "send_text".to_string(),
+            policy_decision: "allow".to_string(),
+            decision_reason: None,
+            rule_id: None,
+            input_summary: Some("first".to_string()),
+            verification_summary: None,
+            decision_context: None,
+            result: "success".to_string(),
+        };
+
+        let undoable_id = record_audit_action_sync(&conn, &base).unwrap();
+        let non_undoable_id = record_audit_action_sync(
+            &conn,
+            &AuditActionRecord {
+                ts: 2_000,
+                input_summary: Some("second".to_string()),
+                ..base
+            },
+        )
+        .unwrap();
+
+        upsert_action_undo_sync(
+            &conn,
+            &ActionUndoRecord {
+                audit_action_id: undoable_id,
+                undoable: true,
+                undo_strategy: "manual".to_string(),
+                undo_hint: None,
+                undo_payload: None,
+                undone_at: None,
+                undone_by: None,
+            },
+        )
+        .unwrap();
+        upsert_action_undo_sync(
+            &conn,
+            &ActionUndoRecord {
+                audit_action_id: non_undoable_id,
+                undoable: false,
+                undo_strategy: "none".to_string(),
+                undo_hint: None,
+                undo_payload: None,
+                undone_at: None,
+                undone_by: None,
+            },
+        )
+        .unwrap();
+
+        let undoable = query_action_history(
+            &conn,
+            &ActionHistoryQuery {
+                undoable: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(undoable.len(), 1);
+        assert_eq!(undoable[0].id, undoable_id);
+
+        let non_undoable = query_action_history(
+            &conn,
+            &ActionHistoryQuery {
+                undoable: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(non_undoable.iter().any(|row| row.id == non_undoable_id));
+    }
+
+    #[test]
+    fn action_history_includes_workflow_step_info() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let now_ms = 1_700_000_000_000i64;
+
+        conn.execute(
+            "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![1i64, "local", now_ms, now_ms, 1],
+        )
+        .unwrap();
+
+        let action = AuditActionRecord {
+            id: 0,
+            ts: now_ms,
+            actor_kind: "workflow".to_string(),
+            actor_id: Some("wf-1".to_string()),
+            correlation_id: None,
+            pane_id: Some(1),
+            domain: Some("local".to_string()),
+            action_kind: "workflow_step".to_string(),
+            policy_decision: "allow".to_string(),
+            decision_reason: None,
+            rule_id: None,
+            input_summary: Some("step".to_string()),
+            verification_summary: None,
+            decision_context: None,
+            result: "success".to_string(),
+        };
+        let action_id = record_audit_action_sync(&conn, &action).unwrap();
+
+        conn.execute(
+            "INSERT INTO workflow_executions (id, workflow_name, pane_id, current_step, status, started_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params!["wf-1", "test", 1i64, 0i64, "running", now_ms, now_ms],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO workflow_step_logs (workflow_id, audit_action_id, step_index, step_name, result_type, started_at, completed_at, duration_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params!["wf-1", action_id, 0i64, "step-0", "done", now_ms, now_ms, 0i64],
+        )
+        .unwrap();
+
+        let rows = query_action_history(&conn, &ActionHistoryQuery::default()).unwrap();
+        let row = rows.iter().find(|row| row.id == action_id).unwrap();
+        assert_eq!(row.workflow_id.as_deref(), Some("wf-1"));
+        assert_eq!(row.step_name.as_deref(), Some("step-0"));
+    }
+
+    #[test]
+    fn action_undo_redaction_applied() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let now_ms = 1_700_000_000_000i64;
+
+        conn.execute(
+            "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![1i64, "local", now_ms, now_ms, 1],
+        )
+        .unwrap();
+
+        let action = AuditActionRecord {
+            id: 0,
+            ts: now_ms,
+            actor_kind: "human".to_string(),
+            actor_id: None,
+            correlation_id: None,
+            pane_id: Some(1),
+            domain: Some("local".to_string()),
+            action_kind: "send_text".to_string(),
+            policy_decision: "allow".to_string(),
+            decision_reason: None,
+            rule_id: None,
+            input_summary: Some("hi".to_string()),
+            verification_summary: None,
+            decision_context: None,
+            result: "success".to_string(),
+        };
+        let action_id = record_audit_action_sync(&conn, &action).unwrap();
+
+        let secret = "sk-abc123456789012345678901234567890123456789012345678901";
+        let mut undo = ActionUndoRecord {
+            audit_action_id: action_id,
+            undoable: true,
+            undo_strategy: "manual".to_string(),
+            undo_hint: Some(format!("token {secret}")),
+            undo_payload: Some(format!(r#"{{"token":"{secret}"}}"#)),
+            undone_at: None,
+            undone_by: None,
+        };
+        let redactor = Redactor::new();
+        undo.redact_fields(&redactor);
+        upsert_action_undo_sync(&conn, &undo).unwrap();
+
+        let (hint, payload): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT undo_hint, undo_payload FROM action_undo WHERE audit_action_id = ?1",
+                params![action_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        let hint = hint.expect("undo_hint missing");
+        let payload = payload.expect("undo_payload missing");
+        assert!(hint.contains("[REDACTED]"));
+        assert!(payload.contains("[REDACTED]"));
+        assert!(!hint.contains("sk-abc"));
+        assert!(!payload.contains("sk-abc"));
+    }
+
+    #[test]
     fn purge_audit_actions_removes_old_entries() {
         let conn = Connection::open_in_memory().unwrap();
         initialize_schema(&conn).unwrap();
