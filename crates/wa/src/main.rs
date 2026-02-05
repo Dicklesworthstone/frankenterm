@@ -14863,6 +14863,92 @@ fn resolve_template_id(record: &wa_core::storage::AuditActionRecord) -> Option<S
     None
 }
 
+fn render_secret_scan_report(
+    report: &wa_core::secrets::SecretScanReport,
+    format: wa_core::output::OutputFormat,
+    pretty: bool,
+) -> anyhow::Result<()> {
+    match format {
+        wa_core::output::OutputFormat::Json => {
+            let output = if pretty {
+                serde_json::to_string_pretty(report)?
+            } else {
+                serde_json::to_string(report)?
+            };
+            println!("{output}");
+        }
+        wa_core::output::OutputFormat::Plain => {
+            render_secret_scan_report_plain(report);
+        }
+    }
+    Ok(())
+}
+
+fn render_secret_scan_report_plain(report: &wa_core::secrets::SecretScanReport) {
+    let pane = report
+        .scope
+        .pane_id
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "any".to_string());
+    let since = report
+        .scope
+        .since
+        .map(|value| format!("{value} ({})", format_epoch_ms(value)))
+        .unwrap_or_else(|| "any".to_string());
+    let until = report
+        .scope
+        .until
+        .map(|value| format!("{value} ({})", format_epoch_ms(value)))
+        .unwrap_or_else(|| "any".to_string());
+
+    println!("Secret scan report");
+    println!("Report version: {}", report.report_version);
+    println!("Scope: pane_id={pane}, since={since}, until={until}");
+    println!(
+        "Started: {}  Completed: {}",
+        format_epoch_ms(report.started_at),
+        format_epoch_ms(report.completed_at)
+    );
+    if let Some(resume) = report.resume_after_id {
+        println!("Resume after segment ID: {resume}");
+    }
+    if let Some(last) = report.last_segment_id {
+        println!("Last segment ID: {last}");
+    }
+    println!(
+        "Segments scanned: {}  Bytes scanned: {}",
+        report.scanned_segments, report.scanned_bytes
+    );
+    println!("Matches total: {}", report.matches_total);
+
+    if report.matches_by_pattern.is_empty() {
+        println!("Matches by pattern: none");
+    } else {
+        println!("Matches by pattern:");
+        for (pattern, count) in &report.matches_by_pattern {
+            println!("  {pattern}: {count}");
+        }
+    }
+
+    if report.samples.is_empty() {
+        println!("Samples: none");
+        return;
+    }
+
+    println!("Samples (redacted):");
+    for sample in &report.samples {
+        println!(
+            "  pattern={} pane={} segment_id={} captured_at={} hash={} len={}",
+            sample.pattern,
+            sample.pane_id,
+            sample.segment_id,
+            format_epoch_ms(sample.captured_at),
+            sample.secret_hash,
+            sample.match_len
+        );
+    }
+}
+
 /// Format epoch milliseconds as ISO 8601 string (basic, no chrono dependency).
 fn format_epoch_ms(ms: i64) -> String {
     let secs = ms / 1000;
