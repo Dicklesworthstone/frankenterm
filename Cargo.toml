@@ -213,7 +213,7 @@ trybuild = { version = "1", default-features = false }
 rustls = "0.23"
 tokio-rustls = "0.26"
 rustls-pemfile = "2"
-fastmcp = { path = "../fastmcp_rust/crates/fastmcp" }
+fastmcp = { path = "../fastmcp_rust/crates/fastmcp", package = "fastmcp-rust" }
 fastmcp-core = { path = "../fastmcp_rust/crates/fastmcp-core" }
 fastmcp-transport = { path = "../fastmcp_rust/crates/fastmcp-transport" }
 fastmcp-protocol = { path = "../fastmcp_rust/crates/fastmcp-protocol" }

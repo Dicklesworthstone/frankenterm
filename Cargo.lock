@@ -1655,21 +1655,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fastmcp"
-version = "0.1.0"
-dependencies = [
- "asupersync 0.1.0",
- "fastmcp-client",
- "fastmcp-core",
- "fastmcp-derive",
- "fastmcp-protocol",
- "fastmcp-server",
- "fastmcp-transport",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "fastmcp-client"
 version = "0.1.0"
 dependencies = [
@@ -1725,6 +1710,21 @@ name = "fastmcp-protocol"
 version = "0.1.0"
 dependencies = [
  "fastmcp-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "fastmcp-rust"
+version = "0.1.0"
+dependencies = [
+ "asupersync 0.1.0",
+ "fastmcp-client",
+ "fastmcp-core",
+ "fastmcp-derive",
+ "fastmcp-protocol",
+ "fastmcp-server",
+ "fastmcp-transport",
  "serde",
  "serde_json",
 ]
@@ -6517,7 +6517,7 @@ dependencies = [
  "clap",
  "dirs",
  "fancy-regex 0.14.0",
- "fastmcp",
+ "fastmcp-rust",
  "predicates",
  "reqwest",
  "rusqlite",
@@ -6549,7 +6549,7 @@ dependencies = [
  "fancy-regex 0.14.0",
  "fastapi",
  "fastapi-core",
- "fastmcp",
+ "fastmcp-rust",
  "fs2",
  "hex",
  "memchr",

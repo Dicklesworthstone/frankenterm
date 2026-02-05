@@ -313,15 +313,29 @@ run_self_check() {
 
     # Check 6: Required tools
     local missing_tools=()
-    for tool in jq timeout mktemp; do
+    for tool in jq timeout mktemp sqlite3 python3 curl; do
         if ! command -v "$tool" &>/dev/null; then
             missing_tools+=("$tool")
         fi
     done
     if [[ ${#missing_tools[@]} -eq 0 ]]; then
-        check_pass "Required tools: all present (jq, timeout, mktemp)"
+        check_pass "Required tools: all present (jq, timeout, mktemp, sqlite3, python3, curl)"
     else
         check_fail "Missing tools: ${missing_tools[*]}"
+        all_passed=false
+    fi
+
+    # Check 7: Registry validation
+    local registry_validator="$PROJECT_ROOT/scripts/validate_e2e_registry.sh"
+    if [[ -f "$registry_validator" ]]; then
+        if bash "$registry_validator" >/dev/null 2>&1; then
+            check_pass "E2E registry validation"
+        else
+            check_fail "E2E registry validation failed"
+            all_passed=false
+        fi
+    else
+        check_fail "Registry validator missing: $registry_validator"
         all_passed=false
     fi
 
