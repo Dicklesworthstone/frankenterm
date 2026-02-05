@@ -26,6 +26,9 @@ use tokio::time::{Instant, sleep};
 /// Boxed future for WezTerm interface operations.
 pub type WeztermFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
+/// Shared handle to a WezTerm interface implementation.
+pub type WeztermHandle = Arc<dyn WeztermInterface>;
+
 /// Abstraction layer over WezTerm interactions.
 ///
 /// This allows swapping real CLI clients with mock implementations for
@@ -77,6 +80,20 @@ pub trait WeztermInterface: Send + Sync {
     fn kill_pane(&self, pane_id: u64) -> WeztermFuture<'_, ()>;
     /// Zoom or unzoom a pane.
     fn zoom_pane(&self, pane_id: u64, zoom: bool) -> WeztermFuture<'_, ()>;
+    /// Get current circuit breaker status.
+    fn circuit_status(&self) -> CircuitBreakerStatus;
+}
+
+/// Create a default WezTerm interface handle.
+#[must_use]
+pub fn default_wezterm_handle() -> WeztermHandle {
+    Arc::new(WeztermClient::new())
+}
+
+/// Create a WezTerm handle with a custom timeout.
+#[must_use]
+pub fn wezterm_handle_with_timeout(timeout_secs: u64) -> WeztermHandle {
+    Arc::new(WeztermClient::new().with_timeout(timeout_secs))
 }
 
 /// Pane size information
@@ -1090,6 +1107,106 @@ impl WeztermInterface for WeztermClient {
     fn zoom_pane(&self, pane_id: u64, zoom: bool) -> WeztermFuture<'_, ()> {
         Box::pin(async move { WeztermClient::zoom_pane(self, pane_id, zoom).await })
     }
+
+    fn circuit_status(&self) -> CircuitBreakerStatus {
+        WeztermClient::circuit_status(self)
+    }
+}
+
+impl WeztermInterface for Arc<dyn WeztermInterface> {
+    fn list_panes(&self) -> WeztermFuture<'_, Vec<PaneInfo>> {
+        self.as_ref().list_panes()
+    }
+
+    fn get_pane(&self, pane_id: u64) -> WeztermFuture<'_, PaneInfo> {
+        self.as_ref().get_pane(pane_id)
+    }
+
+    fn get_text(&self, pane_id: u64, escapes: bool) -> WeztermFuture<'_, String> {
+        self.as_ref().get_text(pane_id, escapes)
+    }
+
+    fn send_text(&self, pane_id: u64, text: &str) -> WeztermFuture<'_, ()> {
+        self.as_ref().send_text(pane_id, text)
+    }
+
+    fn send_text_no_paste(&self, pane_id: u64, text: &str) -> WeztermFuture<'_, ()> {
+        self.as_ref().send_text_no_paste(pane_id, text)
+    }
+
+    fn send_text_with_options(
+        &self,
+        pane_id: u64,
+        text: &str,
+        no_paste: bool,
+        no_newline: bool,
+    ) -> WeztermFuture<'_, ()> {
+        self.as_ref()
+            .send_text_with_options(pane_id, text, no_paste, no_newline)
+    }
+
+    fn send_control(&self, pane_id: u64, control_char: &str) -> WeztermFuture<'_, ()> {
+        self.as_ref().send_control(pane_id, control_char)
+    }
+
+    fn send_ctrl_c(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
+        self.as_ref().send_ctrl_c(pane_id)
+    }
+
+    fn send_ctrl_d(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
+        self.as_ref().send_ctrl_d(pane_id)
+    }
+
+    fn spawn(&self, cwd: Option<&str>, domain_name: Option<&str>) -> WeztermFuture<'_, u64> {
+        self.as_ref().spawn(cwd, domain_name)
+    }
+
+    fn split_pane(
+        &self,
+        pane_id: u64,
+        direction: SplitDirection,
+        cwd: Option<&str>,
+        percent: Option<u8>,
+    ) -> WeztermFuture<'_, u64> {
+        self.as_ref().split_pane(pane_id, direction, cwd, percent)
+    }
+
+    fn activate_pane(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
+        self.as_ref().activate_pane(pane_id)
+    }
+
+    fn get_pane_direction(
+        &self,
+        pane_id: u64,
+        direction: MoveDirection,
+    ) -> WeztermFuture<'_, Option<u64>> {
+        self.as_ref().get_pane_direction(pane_id, direction)
+    }
+
+    fn kill_pane(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
+        self.as_ref().kill_pane(pane_id)
+    }
+
+    fn zoom_pane(&self, pane_id: u64, zoom: bool) -> WeztermFuture<'_, ()> {
+        self.as_ref().zoom_pane(pane_id, zoom)
+    }
+
+    fn circuit_status(&self) -> CircuitBreakerStatus {
+        self.as_ref().circuit_status()
+    }
+}
+
+/// Pane text source backed by a WezTerm handle.
+#[derive(Clone)]
+pub struct WeztermHandleSource {
+    handle: WeztermHandle,
+}
+
+impl WeztermHandleSource {
+    #[must_use]
+    pub fn new(handle: WeztermHandle) -> Self {
+        Self { handle }
+    }
 }
 
 // =============================================================================
@@ -1114,6 +1231,14 @@ impl PaneTextSource for WeztermClient {
 
     fn get_text(&self, pane_id: u64, escapes: bool) -> Self::Fut<'_> {
         Box::pin(async move { self.get_text(pane_id, escapes).await })
+    }
+}
+
+impl PaneTextSource for WeztermHandleSource {
+    type Fut<'a> = WeztermFuture<'a, String>;
+
+    fn get_text(&self, pane_id: u64, escapes: bool) -> Self::Fut<'_> {
+        self.handle.get_text(pane_id, escapes)
     }
 }
 
