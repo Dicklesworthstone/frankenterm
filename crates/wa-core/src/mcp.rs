@@ -24,7 +24,10 @@ use crate::policy::{
     PolicyGatedInjector, PolicyInput,
 };
 use crate::storage::{EventQuery, PaneReservation, SearchOptions, StorageHandle};
-use crate::wezterm::{PaneInfo, PaneWaiter, WaitMatcher, WaitOptions, WaitResult, WeztermClient};
+use crate::wezterm::{
+    PaneInfo, PaneWaiter, WaitMatcher, WaitOptions, WaitResult, WeztermHandleSource,
+    default_wezterm_handle,
+};
 use crate::workflows::{
     HandleAuthRequired, HandleClaudeCodeLimits, HandleCompaction, HandleGeminiQuota,
     HandleSessionEnd, HandleUsageLimits, PaneWorkflowLockManager, WorkflowEngine,
@@ -631,7 +634,7 @@ impl ToolHandler for WaStateTool {
             .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
 
         let result = runtime.block_on(async {
-            let wezterm = WeztermClient::new();
+            let wezterm = default_wezterm_handle();
             wezterm.list_panes().await
         });
 
@@ -710,7 +713,7 @@ impl ToolHandler for WaGetTextTool {
             .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
 
         let result = runtime.block_on(async {
-            let wezterm = WeztermClient::new();
+            let wezterm = default_wezterm_handle();
             wezterm.get_text(params.pane_id, params.escapes).await
         });
 
@@ -843,7 +846,7 @@ impl ToolHandler for WaWaitForTool {
         let is_regex = params.regex;
 
         let result = runtime.block_on(async move {
-            let wezterm = WeztermClient::new();
+            let wezterm = default_wezterm_handle();
             let panes = wezterm.list_panes().await?;
             if !panes.iter().any(|p| p.pane_id == pane_id) {
                 return Err(WeztermError::PaneNotFound(pane_id).into());
@@ -854,7 +857,8 @@ impl ToolHandler for WaWaitForTool {
                 escapes: false,
                 ..WaitOptions::default()
             };
-            let waiter = PaneWaiter::new(&wezterm).with_options(options);
+            let source = WeztermHandleSource::new(Arc::clone(&wezterm));
+            let waiter = PaneWaiter::new(&source).with_options(options);
             let timeout = std::time::Duration::from_secs(timeout_secs);
             waiter.wait_for(pane_id, &matcher, timeout).await
         });
@@ -961,7 +965,7 @@ impl ToolHandler for WaSendTool {
 
         let result = runtime.block_on(async move {
             let storage = StorageHandle::new(&db_path.to_string_lossy()).await?;
-            let wezterm = WeztermClient::new();
+            let wezterm = default_wezterm_handle();
             let pane_info = wezterm.get_pane(params.pane_id).await?;
             let domain = pane_info.inferred_domain();
 
@@ -1003,9 +1007,8 @@ impl ToolHandler for WaSendTool {
                 });
             }
 
-            let wezterm_for_injector = WeztermClient::new();
             let mut injector =
-                PolicyGatedInjector::with_storage(engine, wezterm_for_injector, storage.clone());
+                PolicyGatedInjector::with_storage(engine, Arc::clone(&wezterm), storage.clone());
             let mut injection = injector
                 .send_text(
                     params.pane_id,
@@ -1061,7 +1064,8 @@ impl ToolHandler for WaSendTool {
                             escapes: false,
                             ..WaitOptions::default()
                         };
-                        let waiter = PaneWaiter::new(&wezterm).with_options(options);
+                        let source = WeztermHandleSource::new(Arc::clone(&wezterm));
+                        let waiter = PaneWaiter::new(&source).with_options(options);
                         let timeout = std::time::Duration::from_secs(params.timeout_secs);
                         match waiter.wait_for(params.pane_id, &matcher, timeout).await {
                             Ok(WaitResult::Matched { elapsed_ms, polls }) => {
@@ -1444,7 +1448,7 @@ impl ToolHandler for WaWorkflowRunTool {
                 .map_err(McpToolError::from_error)?;
             let storage = Arc::new(storage);
 
-            let wezterm = WeztermClient::new();
+            let wezterm = default_wezterm_handle();
             let pane_info = wezterm
                 .get_pane(params.pane_id)
                 .await
@@ -1517,7 +1521,7 @@ impl ToolHandler for WaWorkflowRunTool {
             let injector_engine = build_policy_engine(&config, config.safety.require_prompt_active);
             let injector = Arc::new(tokio::sync::Mutex::new(PolicyGatedInjector::with_storage(
                 injector_engine,
-                WeztermClient::new(),
+                Arc::clone(&wezterm),
                 storage.as_ref().clone(),
             )));
             let runner = WorkflowRunner::new(

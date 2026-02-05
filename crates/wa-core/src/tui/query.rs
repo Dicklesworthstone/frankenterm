@@ -8,12 +8,11 @@
 //! - Decoupling: UI doesn't know about SQLite or storage internals
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use crate::circuit_breaker::CircuitBreakerStatus;
 use crate::config::WorkspaceLayout;
 use crate::storage::StorageHandle;
-use crate::wezterm::{PaneInfo, WeztermClient, WeztermInterface};
+use crate::wezterm::{PaneInfo, WeztermHandle, default_wezterm_handle};
 
 /// Errors that can occur during query operations
 #[derive(Debug, thiserror::Error)]
@@ -156,7 +155,7 @@ pub trait QueryClient: Send + Sync {
 /// runs in a separate thread from the main async context.
 pub struct ProductionQueryClient {
     workspace_layout: WorkspaceLayout,
-    wezterm: Arc<dyn WeztermInterface>,
+    wezterm: WeztermHandle,
     #[allow(dead_code)]
     storage: Option<StorageHandle>,
     /// Dedicated runtime for async operations - avoids nested runtime panics
@@ -179,7 +178,7 @@ impl ProductionQueryClient {
 
         Self {
             workspace_layout,
-            wezterm: Arc::new(WeztermClient::new()),
+            wezterm: default_wezterm_handle(),
             storage: None,
             runtime,
         }
@@ -200,7 +199,7 @@ impl ProductionQueryClient {
 
         Self {
             workspace_layout,
-            wezterm: Arc::new(WeztermClient::new()),
+            wezterm: default_wezterm_handle(),
             storage: Some(storage),
             runtime,
         }
@@ -208,10 +207,7 @@ impl ProductionQueryClient {
 
     /// Create with a custom WezTerm interface (useful for tests/mocks).
     #[must_use]
-    pub fn with_wezterm(
-        workspace_layout: WorkspaceLayout,
-        wezterm: Arc<dyn WeztermInterface>,
-    ) -> Self {
+    pub fn with_wezterm(workspace_layout: WorkspaceLayout, wezterm: WeztermHandle) -> Self {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -232,7 +228,7 @@ impl ProductionQueryClient {
     pub fn with_storage_and_wezterm(
         workspace_layout: WorkspaceLayout,
         storage: StorageHandle,
-        wezterm: Arc<dyn WeztermInterface>,
+        wezterm: WeztermHandle,
     ) -> Self {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)

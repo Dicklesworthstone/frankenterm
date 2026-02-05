@@ -1066,6 +1066,7 @@ url = "http://localhost:8080/hook"
         // Verify that NotificationConfig can produce working components
         let nc = crate::config::NotificationConfig {
             enabled: true,
+            notify_only: false,
             cooldown_ms: 1000,
             dedup_window_ms: 5000,
             include: vec!["codex.*".to_string()],

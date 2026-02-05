@@ -46,7 +46,9 @@ use crate::storage::PaneRecord;
 use crate::storage::{StorageHandle, StoredEvent};
 use crate::tailer::{CaptureEvent, TailerConfig, TailerSupervisor};
 use crate::watchdog::HeartbeatRegistry;
-use crate::wezterm::{PaneInfo, WeztermClient};
+use crate::wezterm::{
+    PaneInfo, WeztermHandle, WeztermHandleSource, WeztermInterface, wezterm_handle_with_timeout,
+};
 
 /// Configuration for the observation runtime.
 #[derive(Debug, Clone)]
@@ -216,6 +218,8 @@ impl RuntimeMetrics {
 pub struct ObservationRuntime {
     /// Runtime configuration
     config: RuntimeConfig,
+    /// WezTerm interface handle (real or mock)
+    wezterm_handle: WeztermHandle,
     /// Storage handle for persistence (wrapped for async sharing)
     storage: Arc<tokio::sync::Mutex<StorageHandle>>,
     /// Pattern detection engine
@@ -278,6 +282,7 @@ impl ObservationRuntime {
 
         Self {
             config,
+            wezterm_handle: wezterm_handle_with_timeout(5),
             storage: Arc::new(tokio::sync::Mutex::new(storage)),
             pattern_engine,
             registry: Arc::new(RwLock::new(registry)),
@@ -308,6 +313,13 @@ impl ObservationRuntime {
     #[must_use]
     pub fn with_recording_manager(mut self, recording: Arc<RecordingManager>) -> Self {
         self.recording = Some(recording);
+        self
+    }
+
+    /// Override the WezTerm interface handle (for mocks or custom clients).
+    #[must_use]
+    pub fn with_wezterm_handle(mut self, wezterm_handle: WeztermHandle) -> Self {
+        self.wezterm_handle = wezterm_handle;
         self
     }
 
@@ -561,10 +573,9 @@ impl ObservationRuntime {
         let initial_interval = self.config.discovery_interval;
         let mut config_rx = self.config_rx.clone();
         let heartbeats = Arc::clone(&self.heartbeats);
+        let wezterm = Arc::clone(&self.wezterm_handle);
 
         tokio::spawn(async move {
-            // Create a fresh WezTerm client for this task with shorter timeout
-            let wezterm = WeztermClient::new().with_timeout(5);
             let mut current_interval = initial_interval;
 
             loop {
@@ -718,6 +729,7 @@ impl ObservationRuntime {
         let discovery_interval = self.config.discovery_interval;
         let mut config_rx = self.config_rx.clone();
         let heartbeats = Arc::clone(&self.heartbeats);
+        let wezterm_handle = Arc::clone(&self.wezterm_handle);
 
         // Create tailer config from runtime config
         // Capture overlap_size for use in the async block (not hot-reloadable)
@@ -732,8 +744,7 @@ impl ObservationRuntime {
         };
 
         tokio::spawn(async move {
-            // Use shorter timeout for capture to prevent head-of-line blocking
-            let source = Arc::new(WeztermClient::new().with_timeout(5));
+            let source = Arc::new(WeztermHandleSource::new(wezterm_handle));
             // Create tailer supervisor
             let mut supervisor = TailerSupervisor::new(
                 initial_config,

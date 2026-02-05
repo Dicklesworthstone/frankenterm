@@ -1871,6 +1871,9 @@ pub struct NotificationConfig {
     /// Master switch for the notification pipeline
     pub enabled: bool,
 
+    /// Notify-only mode: deliver notifications without auto-handling workflows.
+    pub notify_only: bool,
+
     /// Notification cooldown period in milliseconds.
     /// Within this window, repeated notifications for the same event key
     /// are suppressed and the suppressed count is included in the next
@@ -1924,6 +1927,7 @@ impl Default for NotificationConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            notify_only: false,
             cooldown_ms: 30_000,      // 30 seconds
             dedup_window_ms: 300_000, // 5 minutes
             include: Vec::new(),
@@ -4120,6 +4124,7 @@ agent_types = ["codex", "claude_code"]
     fn notification_config_builds_event_filter() {
         let nc = NotificationConfig {
             enabled: true,
+            notify_only: false,
             cooldown_ms: 1000,
             dedup_window_ms: 5000,
             include: vec!["codex.*".to_string()],

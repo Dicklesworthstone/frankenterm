@@ -106,6 +106,18 @@ SEE ALSO:
         #[arg(long)]
         no_patterns: bool,
 
+        /// Run in notify-only mode (no workflows, notifications only)
+        #[arg(long)]
+        notify_only: bool,
+
+        /// Notification filter (comma-separated rule_id globs)
+        #[arg(long, value_delimiter = ',')]
+        notify_filter: Vec<String>,
+
+        /// Notification channels to use (comma-separated)
+        #[arg(long, value_delimiter = ',', value_enum)]
+        notify_via: Vec<NotifyChannel>,
+
         /// Enable Prometheus metrics endpoint
         #[arg(long)]
         metrics: bool,
@@ -2056,6 +2068,13 @@ const ROBOT_REFRESH_COOLDOWN_MS: i64 = 30_000;
 enum RobotOutputFormat {
     Json,
     Toon,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum NotifyChannel {
+    Webhook,
+    Desktop,
+    Email,
 }
 
 #[cfg(feature = "sync")]
@@ -5167,6 +5186,9 @@ async fn run_watcher_with_backoff(
     foreground: bool,
     poll_interval: u64,
     no_patterns: bool,
+    notify_only: bool,
+    notify_filter: Vec<String>,
+    notify_via: Vec<NotifyChannel>,
     disable_lock: bool,
 ) -> anyhow::Result<()> {
     let mut crash_loop = WatcherCrashLoop::new();
@@ -5181,6 +5203,9 @@ async fn run_watcher_with_backoff(
             foreground,
             poll_interval,
             no_patterns,
+            notify_only,
+            notify_filter.clone(),
+            notify_via.clone(),
             disable_lock,
         )
         .await;
@@ -5237,6 +5262,9 @@ async fn run_watcher(
     _foreground: bool,
     poll_interval: u64,
     no_patterns: bool,
+    notify_only: bool,
+    notify_filter: Vec<String>,
+    notify_via: Vec<NotifyChannel>,
     disable_lock: bool,
 ) -> anyhow::Result<()> {
     use std::time::Duration;
@@ -5254,6 +5282,54 @@ async fn run_watcher(
         HandleCompaction, PaneWorkflowLockManager, WorkflowEngine, WorkflowRunner,
         WorkflowRunnerConfig,
     };
+
+    let mut config = config.clone();
+    let mut auto_handle = auto_handle;
+    let notify_only = notify_only || config.notifications.notify_only;
+
+    if notify_only {
+        if auto_handle {
+            tracing::warn!("Notify-only mode requested; disabling automatic workflow handling");
+        }
+        auto_handle = false;
+        if !config.notifications.enabled {
+            config.notifications.enabled = true;
+        }
+        tracing::info!("Notify-only mode enabled (notifications only)");
+    }
+
+    if !notify_filter.is_empty() {
+        tracing::info!(filter = ?notify_filter, "Applying notify-only filter override");
+        config.notifications.include = notify_filter;
+    }
+
+    if !notify_via.is_empty() {
+        if !config.notifications.enabled {
+            config.notifications.enabled = true;
+        }
+        let allow_webhook = notify_via.contains(&NotifyChannel::Webhook);
+        let allow_desktop = notify_via.contains(&NotifyChannel::Desktop);
+        let allow_email = notify_via.contains(&NotifyChannel::Email);
+
+        if !allow_webhook {
+            config.notifications.webhooks.clear();
+        }
+        config.notifications.desktop.enabled = allow_desktop;
+        config.notifications.email.enabled = allow_email;
+
+        tracing::info!(
+            webhook = allow_webhook,
+            desktop = allow_desktop,
+            email = allow_email,
+            "Notification channel override applied"
+        );
+    }
+
+    if config.notifications.enabled {
+        if let Err(err) = config.notifications.validate() {
+            anyhow::bail!("Invalid notification configuration: {err}");
+        }
+    }
 
     // Print resolved paths for diagnostic visibility
     tracing::info!(
@@ -5463,10 +5539,10 @@ async fn run_watcher(
 
         // Create policy engine (permissive defaults for auto-handling)
         let policy_engine = PolicyEngine::permissive();
-        let wezterm_client = wa_core::wezterm::WeztermClient::new();
+        let wezterm_handle = wa_core::wezterm::default_wezterm_handle();
         let injector = Arc::new(tokio::sync::Mutex::new(PolicyGatedInjector::with_storage(
             policy_engine,
-            wezterm_client,
+            wezterm_handle,
             storage_for_workflows.as_ref().clone(),
         )));
 
@@ -5546,41 +5622,37 @@ async fn run_watcher(
     let handle = Arc::new(runtime.start().await?);
     tracing::info!("Observation runtime started");
 
-    let metrics_handle = if config.metrics.enabled {
-        #[cfg(feature = "metrics")]
-        {
-            let collector = wa_core::metrics::RuntimeMetricsCollector::new(Arc::clone(&handle));
-            let server = wa_core::metrics::MetricsServer::new(
-                config.metrics.bind.clone(),
-                config.metrics.prefix.clone(),
-                Arc::new(collector),
-                Arc::clone(&handle.shutdown_flag),
-            );
-            match server.start().await {
-                Ok(handle) => {
-                    tracing::info!(
-                        bind = %handle.local_addr(),
-                        prefix = %config.metrics.prefix,
-                        "Metrics endpoint enabled"
-                    );
-                    Some(handle)
-                }
-                Err(err) => {
-                    tracing::error!(error = %err, "Failed to start metrics endpoint");
-                    None
-                }
+    #[cfg(feature = "metrics")]
+    let metrics_handle: Option<wa_core::metrics::MetricsServerHandle> = if config.metrics.enabled {
+        let collector = wa_core::metrics::RuntimeMetricsCollector::new(Arc::clone(&handle));
+        let server = wa_core::metrics::MetricsServer::new(
+            config.metrics.bind.clone(),
+            config.metrics.prefix.clone(),
+            Arc::new(collector),
+            Arc::clone(&handle.shutdown_flag),
+        );
+        match server.start().await {
+            Ok(handle) => {
+                tracing::info!(
+                    bind = %handle.local_addr(),
+                    prefix = %config.metrics.prefix,
+                    "Metrics endpoint enabled"
+                );
+                Some(handle)
             }
-        }
-        #[cfg(not(feature = "metrics"))]
-        {
-            tracing::warn!(
-                "Metrics enabled in config, but wa was built without the metrics feature"
-            );
-            None
+            Err(err) => {
+                tracing::error!(error = %err, "Failed to start metrics endpoint");
+                None
+            }
         }
     } else {
         None
     };
+
+    #[cfg(not(feature = "metrics"))]
+    if config.metrics.enabled {
+        tracing::warn!("Metrics enabled in config, but wa was built without the metrics feature");
+    }
 
     let config_path_buf = config_path.map(Path::to_path_buf);
     let ipc_handle = if config.ipc.enabled {
@@ -5751,12 +5823,21 @@ async fn run_watcher(
     }
 
     tracing::info!("Shutting down observation runtime...");
-    handle.shutdown().await;
-    tracing::info!("Watcher shutdown complete");
-
+    handle.signal_shutdown();
+    #[cfg(feature = "metrics")]
     if let Some(metrics_handle) = metrics_handle {
         metrics_handle.wait().await;
     }
+    match Arc::try_unwrap(handle) {
+        Ok(handle) => handle.shutdown().await,
+        Err(handle) => {
+            tracing::warn!(
+                strong_count = Arc::strong_count(&handle),
+                "Runtime handle still has outstanding references; skipping join"
+            );
+        }
+    }
+    tracing::info!("Watcher shutdown complete");
 
     if let Some(backup_handle) = scheduled_backup_handle {
         let _ = backup_handle.await;
@@ -6156,6 +6237,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             foreground,
             poll_interval,
             no_patterns,
+            notify_only,
+            notify_filter,
+            notify_via,
             metrics: _metrics,
             metrics_bind: _metrics_bind,
             metrics_prefix: _metrics_prefix,
@@ -6169,6 +6253,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 foreground,
                 poll_interval,
                 no_patterns,
+                notify_only,
+                notify_filter,
+                notify_via,
                 dangerous_disable_lock,
             )
             .await?;
@@ -6210,7 +6297,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                     match other {
                         RobotCommands::State => {
-                            let wezterm = wa_core::wezterm::WeztermClient::new();
+                            let wezterm = wa_core::wezterm::default_wezterm_handle();
                             match wezterm.list_panes().await {
                                 Ok(panes) => {
                                     let filter = &config.ingest.panes;
@@ -6238,7 +6325,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             tail,
                             escapes,
                         } => {
-                            let wezterm = wa_core::wezterm::WeztermClient::new();
+                            let wezterm = wa_core::wezterm::default_wezterm_handle();
                             match wezterm.get_text(pane_id, escapes).await {
                                 Ok(full_text) => {
                                     // Apply tail truncation
@@ -6298,7 +6385,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 wa_core::dry_run::CommandContext::new(command, dry_run);
 
                             if command_ctx.is_dry_run() {
-                                let wezterm = wa_core::wezterm::WeztermClient::new();
+                                let wezterm = wa_core::wezterm::default_wezterm_handle();
                                 let pane_info = wezterm.get_pane(pane_id).await.ok();
                                 let storage = wa_core::storage::StorageHandle::new(
                                     &ctx.effective.paths.db_path,
@@ -6357,7 +6444,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     }
                                 };
 
-                                let wezterm = wa_core::wezterm::WeztermClient::new();
+                                let wezterm = wa_core::wezterm::default_wezterm_handle();
                                 let pane_info = match wezterm.get_pane(pane_id).await {
                                     Ok(info) => info,
                                     Err(e) => {
@@ -6503,8 +6590,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 escapes: false,
                                                 ..WaitOptions::default()
                                             };
+                                            let source = wa_core::wezterm::WeztermHandleSource::new(
+                                                Arc::clone(&wezterm),
+                                            );
                                             let waiter =
-                                                PaneWaiter::new(&wezterm).with_options(options);
+                                                PaneWaiter::new(&source).with_options(options);
                                             let timeout =
                                                 std::time::Duration::from_secs(timeout_secs);
                                             match waiter.wait_for(pane_id, &matcher, timeout).await
@@ -6567,7 +6657,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         } => {
                             use std::time::Duration;
                             use wa_core::wezterm::{
-                                PaneWaiter, WaitMatcher, WaitOptions, WaitResult, WeztermClient,
+                                PaneWaiter, WaitMatcher, WaitOptions, WaitResult,
+                                WeztermHandleSource, default_wezterm_handle,
                             };
 
                             // Build the matcher
@@ -6591,7 +6682,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             };
 
                             // Create WezTerm client
-                            let wezterm = WeztermClient::new();
+                            let wezterm = default_wezterm_handle();
 
                             // First verify the pane exists
                             match wezterm.list_panes().await {
@@ -6632,7 +6723,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             };
 
                             // Create waiter and wait
-                            let waiter = PaneWaiter::new(&wezterm).with_options(options);
+                            let source = WeztermHandleSource::new(Arc::clone(&wezterm));
+                            let waiter = PaneWaiter::new(&source).with_options(options);
                             let timeout = Duration::from_secs(timeout_secs);
 
                             tracing::info!(
@@ -6956,10 +7048,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             "workflow run",
                                             true,
                                         );
-                                        let pane_info = wa_core::wezterm::WeztermClient::new()
-                                            .get_pane(pane_id)
-                                            .await
-                                            .ok();
+                                        let wezterm = wa_core::wezterm::default_wezterm_handle();
+                                        let pane_info = wezterm.get_pane(pane_id).await.ok();
                                         let report = build_workflow_dry_run_report(
                                             &command_ctx,
                                             &name,
@@ -6976,7 +7066,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     }
 
                                     // Verify pane exists
-                                    let wezterm = wa_core::wezterm::WeztermClient::new();
+                                    let wezterm = wa_core::wezterm::default_wezterm_handle();
                                     match wezterm.list_panes().await {
                                         Ok(panes) => {
                                             if !panes.iter().any(|p| p.pane_id == pane_id) {
@@ -7039,11 +7129,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     );
 
                                     // Create policy-gated injector with WezTerm client
-                                    let wezterm_client = wa_core::wezterm::WeztermClient::new();
+                                    let wezterm_handle = wa_core::wezterm::default_wezterm_handle();
                                     let injector = Arc::new(tokio::sync::Mutex::new(
                                         PolicyGatedInjector::with_storage(
                                             policy_engine,
-                                            wezterm_client,
+                                            wezterm_handle,
                                             storage.as_ref().clone(),
                                         ),
                                     ));
@@ -7735,11 +7825,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         config.safety.rate_limit_global,
                                         false,
                                     );
-                                    let wezterm_client = wa_core::wezterm::WeztermClient::new();
+                                    let wezterm_handle = wa_core::wezterm::default_wezterm_handle();
                                     let injector = Arc::new(tokio::sync::Mutex::new(
                                         PolicyGatedInjector::with_storage(
                                             policy_engine,
-                                            wezterm_client,
+                                            wezterm_handle,
                                             storage.as_ref().clone(),
                                         ),
                                     ));
@@ -8935,7 +9025,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
         }
 
         Some(Commands::List { json }) => {
-            let wezterm = wa_core::wezterm::WeztermClient::new();
+            let wezterm = wa_core::wezterm::default_wezterm_handle();
             let panes = match wezterm.list_panes().await {
                 Ok(panes) => panes,
                 Err(e) => {
@@ -9017,7 +9107,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             let command_ctx = wa_core::dry_run::CommandContext::new(command, dry_run);
 
             if command_ctx.is_dry_run() {
-                let wezterm = wa_core::wezterm::WeztermClient::new();
+                let wezterm = wa_core::wezterm::default_wezterm_handle();
                 let pane_info = wezterm.get_pane(pane_id).await.ok();
                 let db_path = layout.db_path.to_string_lossy();
                 let storage = wa_core::storage::StorageHandle::new(&db_path).await.ok();
@@ -9083,7 +9173,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     }
                 };
 
-                let wezterm = wa_core::wezterm::WeztermClient::new();
+                let wezterm = wa_core::wezterm::default_wezterm_handle();
                 let pane_info = match wezterm.get_pane(pane_id).await {
                     Ok(info) => info,
                     Err(e) => {
@@ -9223,8 +9313,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 escapes: false,
                                 ..wa_core::wezterm::WaitOptions::default()
                             };
+                            let source =
+                                wa_core::wezterm::WeztermHandleSource::new(Arc::clone(&wezterm));
                             let waiter =
-                                wa_core::wezterm::PaneWaiter::new(&wezterm).with_options(options);
+                                wa_core::wezterm::PaneWaiter::new(&source).with_options(options);
                             let timeout = std::time::Duration::from_secs(timeout_secs);
                             match waiter.wait_for(pane_id, &matcher, timeout).await {
                                 Ok(wa_core::wezterm::WaitResult::Matched { elapsed_ms, polls }) => {
@@ -9344,7 +9436,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     let command_ctx = wa_core::dry_run::CommandContext::new(command, dry_run);
 
                     if command_ctx.is_dry_run() {
-                        let wezterm = wa_core::wezterm::WeztermClient::new();
+                        let wezterm = wa_core::wezterm::default_wezterm_handle();
                         let pane_info = wezterm.get_pane(pane).await.ok();
                         let report = build_workflow_dry_run_report(
                             &command_ctx,
@@ -9366,7 +9458,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         tracing::info!("Running workflow '{}' on pane {}", name, pane);
 
                         // Verify pane exists
-                        let wezterm = wa_core::wezterm::WeztermClient::new();
+                        let wezterm = wa_core::wezterm::default_wezterm_handle();
                         match wezterm.list_panes().await {
                             Ok(panes) => {
                                 if !panes.iter().any(|p| p.pane_id == pane) {
@@ -9405,11 +9497,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             true, // Require prompt active for human mode
                         );
 
-                        let wezterm_client = wa_core::wezterm::WeztermClient::new();
+                        let wezterm_handle = wa_core::wezterm::default_wezterm_handle();
                         let injector =
                             Arc::new(tokio::sync::Mutex::new(PolicyGatedInjector::with_storage(
                                 policy_engine,
-                                wezterm_client,
+                                wezterm_handle,
                                 storage.as_ref().clone(),
                             )));
                         let runner_config = WorkflowRunnerConfig::default();
@@ -9660,7 +9752,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
             if health {
                 // Health check mode: JSON status including runtime health snapshot
-                let wezterm = wa_core::wezterm::WeztermClient::new();
+                let wezterm = wa_core::wezterm::default_wezterm_handle();
                 let mut payload = serde_json::json!({
                     "status": "ok",
                     "version": wa_core::VERSION,
@@ -9733,7 +9825,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     })
                     .or_else(wa_core::crash::HealthSnapshot::get_global);
 
-                let wezterm = wa_core::wezterm::WeztermClient::new();
+                let wezterm = wa_core::wezterm::default_wezterm_handle();
                 match wezterm.list_panes().await {
                     Ok(panes) => {
                         let filter = &config.ingest.panes;
@@ -10257,7 +10349,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 let workspace_id = layout.root.to_string_lossy().to_string();
                 let now = now_ms_i64();
 
-                let wezterm = wa_core::wezterm::WeztermClient::new();
+                let wezterm = wa_core::wezterm::default_wezterm_handle();
                 let pane_info = match wezterm.get_pane(pane_id).await {
                     Ok(info) => info,
                     Err(e) => {
@@ -10796,7 +10888,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         exit_on_commit_validation_error(err, &plan_id);
                     }
 
-                    let wezterm = wa_core::wezterm::WeztermClient::new();
+                    let wezterm = wa_core::wezterm::default_wezterm_handle();
                     let pane_info = match wezterm.get_pane(pane_id).await {
                         Ok(info) => info,
                         Err(e) => {
@@ -10957,7 +11049,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     escapes: false,
                                     ..wa_core::wezterm::WaitOptions::default()
                                 };
-                                let waiter = wa_core::wezterm::PaneWaiter::new(&wezterm)
+                                let source = wa_core::wezterm::WeztermHandleSource::new(
+                                    Arc::clone(&wezterm),
+                                );
+                                let waiter = wa_core::wezterm::PaneWaiter::new(&source)
                                     .with_options(options);
                                 let timeout = std::time::Duration::from_secs(timeout_secs);
                                 match waiter.wait_for(pane_id, &matcher, timeout).await {
@@ -11143,11 +11238,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         config.safety.rate_limit_global,
                         true,
                     );
-                    let wezterm_client = wa_core::wezterm::WeztermClient::new();
+                    let wezterm_handle = wa_core::wezterm::default_wezterm_handle();
                     let injector = std::sync::Arc::new(tokio::sync::Mutex::new(
                         wa_core::policy::PolicyGatedInjector::with_storage(
                             policy_engine,
-                            wezterm_client,
+                            wezterm_handle,
                             storage.as_ref().clone(),
                         ),
                     ));
