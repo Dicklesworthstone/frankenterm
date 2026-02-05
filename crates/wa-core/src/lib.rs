@@ -25,6 +25,7 @@
 //! - `suggestions`: Context-aware suggestion system for actionable errors
 //! - `workflows`: Durable workflow execution
 //! - `config`: Configuration management
+//! - `environment`: Environment detection (WezTerm, shell, agents, system)
 //! - `approval`: Allow-once approvals for RequireApproval decisions
 //! - `policy`: Safety and rate limiting
 //! - `wait`: Wait-for utilities (no fixed sleeps)
@@ -56,6 +57,7 @@ pub mod desktop_notify;
 pub mod diagnostic;
 pub mod dry_run;
 pub mod email_notify;
+pub mod environment;
 pub mod error;
 pub mod error_codes;
 pub mod event_templates;
