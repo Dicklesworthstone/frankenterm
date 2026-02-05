@@ -11846,6 +11846,90 @@ steps:
         storage.shutdown().await.unwrap();
     }
 
+    /// Test: workflow abort updates undo metadata and records abort action.
+    #[tokio::test]
+    async fn workflow_abort_updates_undo_metadata() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("test_workflow_abort_audit.db")
+            .to_string_lossy()
+            .to_string();
+
+        let (runner, storage, _lock_manager) = create_test_runner(&db_path).await;
+        let pane_id = 62u64;
+
+        create_test_pane(&storage, pane_id).await;
+        runner.register_workflow(Arc::new(MultiStepWorkflow::failing_at(2)));
+
+        let detection = make_test_detection("multi_step.abort_audit");
+        let start_result = runner.handle_detection(pane_id, &detection, None).await;
+        assert!(start_result.is_started());
+        let execution_id = start_result.execution_id().unwrap();
+
+        let workflow = runner.find_workflow_by_name("multi_step").unwrap();
+        let exec_result = runner
+            .run_workflow(pane_id, workflow, execution_id, 0)
+            .await;
+        assert!(
+            exec_result.is_aborted(),
+            "Workflow should abort: {exec_result:?}"
+        );
+
+        let start_actions = storage
+            .get_action_history(crate::storage::ActionHistoryQuery {
+                actor_id: Some(execution_id.to_string()),
+                action_kind: Some("workflow_start".to_string()),
+                limit: Some(5),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let start = start_actions
+            .first()
+            .expect("workflow_start action missing");
+        assert_eq!(start.undoable, Some(false));
+        assert_eq!(start.undo_strategy.as_deref(), Some("workflow_abort"));
+        assert_eq!(
+            start.undo_hint.as_deref(),
+            Some("workflow no longer running")
+        );
+
+        let aborted = storage
+            .get_action_history(crate::storage::ActionHistoryQuery {
+                actor_id: Some(execution_id.to_string()),
+                action_kind: Some("workflow_aborted".to_string()),
+                limit: Some(5),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(!aborted.is_empty(), "workflow_aborted action missing");
+
+        let steps = storage
+            .get_action_history(crate::storage::ActionHistoryQuery {
+                actor_id: Some(execution_id.to_string()),
+                action_kind: Some("workflow_step".to_string()),
+                limit: Some(10),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            steps.iter().any(|row| {
+                row.input_summary.as_ref().is_some_and(|summary| {
+                    serde_json::from_str::<serde_json::Value>(summary)
+                        .ok()
+                        .and_then(|value| value.get("parent_action_id").and_then(|v| v.as_i64()))
+                        == Some(start.id)
+                })
+            }),
+            "workflow_step input_summary should include parent_action_id"
+        );
+
+        storage.shutdown().await.unwrap();
+    }
+
     /// Test: idempotent steps are skipped on retry to avoid double-apply.
     #[tokio::test]
     async fn idempotent_step_skip_prevents_double_send() {
