@@ -93,6 +93,7 @@ pub mod secrets;
 pub mod session_correlation;
 pub mod setup;
 pub mod storage;
+pub mod storage_targets;
 pub mod suggestions;
 pub mod tailer;
 pub mod wait;
