@@ -180,10 +180,7 @@ fn crash_bundle_redacts_aws_access_key() {
 
     // Avoid embedding the full key literal; assert the prefix is gone after redaction.
     let prefix = join_parts(&["AKI", "A"]);
-    assert!(
-        !content.contains(&prefix),
-        "AWS access key leaked"
-    );
+    assert!(!content.contains(&prefix), "AWS access key leaked");
 }
 
 #[test]
@@ -205,8 +202,14 @@ fn crash_bundle_redacts_multiple_secrets_in_one_message() {
 
     let anthropic_prefix = join_parts(&["sk", "-ant-api03"]);
     let github_prefix = join_parts(&["ghp", "_"]);
-    assert!(!all_content.contains(&anthropic_prefix), "Anthropic key in bundle");
-    assert!(!all_content.contains(&github_prefix), "GitHub token in bundle");
+    assert!(
+        !all_content.contains(&anthropic_prefix),
+        "Anthropic key in bundle"
+    );
+    assert!(
+        !all_content.contains(&github_prefix),
+        "GitHub token in bundle"
+    );
     assert!(!all_content.contains("eyJhbGci"), "JWT token in bundle");
 }
 
@@ -823,8 +826,7 @@ fn collect_incident_bundle_with_config_redacts_secrets() {
     fs::create_dir_all(&out_dir).unwrap();
 
     let config_path = tmp.path().join("config.toml");
-    let anthropic_key =
-        join_parts(&["sk", "-ant-api03-", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"]);
+    let anthropic_key = join_parts(&["sk", "-ant-api03-", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"]);
     fs::write(
         &config_path,
         format!("api_key = \"{anthropic_key}\"\nname = \"test\"\n"),
