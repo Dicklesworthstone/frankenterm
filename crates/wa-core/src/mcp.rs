@@ -875,12 +875,15 @@ impl ToolHandler for WaWaitForTool {
         });
 
         match result {
-            Ok(WaitResult::Matched { elapsed_ms, polls }) => {
+            Ok(WaitResult::Matched {
+                elapsed_ms: wait_elapsed_ms,
+                polls,
+            }) => {
                 let data = McpWaitForData {
                     pane_id,
                     pattern,
                     matched: true,
-                    elapsed_ms,
+                    elapsed_ms: wait_elapsed_ms,
                     polls,
                     is_regex,
                 };
@@ -888,12 +891,14 @@ impl ToolHandler for WaWaitForTool {
                 envelope_to_content(envelope)
             }
             Ok(WaitResult::TimedOut {
-                elapsed_ms, polls, ..
+                elapsed_ms: wait_elapsed_ms,
+                polls,
+                ..
             }) => {
                 let envelope = McpEnvelope::<()>::error(
                     MCP_ERR_TIMEOUT,
                     format!(
-                        "Timeout waiting for pattern '{pattern}' after {elapsed_ms}ms ({polls} polls)"
+                        "Timeout waiting for pattern '{pattern}' after {wait_elapsed_ms}ms ({polls} polls)"
                     ),
                     Some("Increase timeout_secs or verify the pattern.".to_string()),
                     elapsed_ms(start),
@@ -1954,100 +1959,104 @@ impl ToolHandler for WaWorkflowRunTool {
             .build()
             .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
 
-        let result: Result<McpWorkflowRunData, McpToolError> = runtime.block_on(async move {
-            let storage = StorageHandle::new(&db_path.to_string_lossy())
-                .await
-                .map_err(McpToolError::from_error)?;
-            let storage = Arc::new(storage);
-
-            let wezterm = default_wezterm_handle();
-            let pane_info = wezterm
-                .get_pane(params.pane_id)
-                .await
-                .map_err(McpToolError::from_error)?;
-            let domain = pane_info.inferred_domain();
-
-            let resolution =
-                resolve_pane_capabilities(&config, Some(storage.as_ref()), params.pane_id).await;
-            let capabilities = resolution.capabilities;
-
-            let mut policy_engine =
-                build_policy_engine(&config, config.safety.require_prompt_active);
-            let summary = format!("workflow run {}", params.name);
-
-            let mut input = PolicyInput::new(ActionKind::WorkflowRun, ActorKind::Mcp)
-                .with_pane(params.pane_id)
-                .with_domain(domain)
-                .with_capabilities(capabilities.clone())
-                .with_text_summary(summary.clone());
-
-            if let Some(title) = &pane_info.title {
-                input = input.with_pane_title(title.clone());
-            }
-            if let Some(cwd) = &pane_info.cwd {
-                input = input.with_pane_cwd(cwd.clone());
-            }
-
-            let decision = policy_engine.authorize(&input);
-            if decision.is_denied() {
-                let reason = policy_reason(&decision)
-                    .unwrap_or("Workflow denied by policy")
-                    .to_string();
-                return Err(McpToolError::new(MCP_ERR_POLICY, reason, None));
-            }
-            if decision.requires_approval() {
-                let workspace_id =
-                    resolve_workspace_id(&config).map_err(McpToolError::from_error)?;
-                let store = ApprovalStore::new(
-                    storage.as_ref(),
-                    config.safety.approval.clone(),
-                    workspace_id,
-                );
-                let updated = store
-                    .attach_to_decision(decision, &input, Some(summary))
+        let result: std::result::Result<McpWorkflowRunData, McpToolError> =
+            runtime.block_on(async move {
+                let storage = StorageHandle::new(&db_path.to_string_lossy())
                     .await
                     .map_err(McpToolError::from_error)?;
-                let reason = policy_reason(&updated)
-                    .unwrap_or("Workflow requires approval")
-                    .to_string();
-                let hint = approval_command(&updated);
-                return Err(McpToolError::new(MCP_ERR_POLICY, reason, hint));
-            }
+                let storage = Arc::new(storage);
 
-            if params.dry_run {
-                return Ok(McpWorkflowRunData {
-                    workflow_name: params.name,
-                    pane_id: params.pane_id,
-                    execution_id: None,
-                    status: "dry_run".to_string(),
-                    message: Some("Dry-run: workflow not executed".to_string()),
-                    result: None,
-                    steps_executed: None,
-                    step_index: None,
-                    elapsed_ms: Some(elapsed_ms(start)),
-                });
-            }
+                let wezterm = default_wezterm_handle();
+                let pane_info = wezterm
+                    .get_pane(params.pane_id)
+                    .await
+                    .map_err(McpToolError::from_error)?;
+                let domain = pane_info.inferred_domain();
 
-            let engine = WorkflowEngine::new(10);
-            let lock_manager = Arc::new(PaneWorkflowLockManager::new());
-            let injector_engine = build_policy_engine(&config, config.safety.require_prompt_active);
-            let injector = Arc::new(tokio::sync::Mutex::new(PolicyGatedInjector::with_storage(
-                injector_engine,
-                Arc::clone(&wezterm),
-                storage.as_ref().clone(),
-            )));
-            let runner = WorkflowRunner::new(
-                engine,
-                lock_manager,
-                Arc::clone(&storage),
-                injector,
-                WorkflowRunnerConfig::default(),
-            );
-            register_builtin_workflows(&runner, &config);
+                let resolution =
+                    resolve_pane_capabilities(&config, Some(storage.as_ref()), params.pane_id)
+                        .await;
+                let capabilities = resolution.capabilities;
 
-            let _ = params.force;
-            let workflow = runner.find_workflow_by_name(&params.name).ok_or_else(|| {
-                McpToolError::new(
+                let mut policy_engine =
+                    build_policy_engine(&config, config.safety.require_prompt_active);
+                let summary = format!("workflow run {}", params.name);
+
+                let mut input = PolicyInput::new(ActionKind::WorkflowRun, ActorKind::Mcp)
+                    .with_pane(params.pane_id)
+                    .with_domain(domain)
+                    .with_capabilities(capabilities.clone())
+                    .with_text_summary(summary.clone());
+
+                if let Some(title) = &pane_info.title {
+                    input = input.with_pane_title(title.clone());
+                }
+                if let Some(cwd) = &pane_info.cwd {
+                    input = input.with_pane_cwd(cwd.clone());
+                }
+
+                let decision = policy_engine.authorize(&input);
+                if decision.is_denied() {
+                    let reason = policy_reason(&decision)
+                        .unwrap_or("Workflow denied by policy")
+                        .to_string();
+                    return Err(McpToolError::new(MCP_ERR_POLICY, reason, None));
+                }
+                if decision.requires_approval() {
+                    let workspace_id =
+                        resolve_workspace_id(&config).map_err(McpToolError::from_error)?;
+                    let store = ApprovalStore::new(
+                        storage.as_ref(),
+                        config.safety.approval.clone(),
+                        workspace_id,
+                    );
+                    let updated = store
+                        .attach_to_decision(decision, &input, Some(summary))
+                        .await
+                        .map_err(McpToolError::from_error)?;
+                    let reason = policy_reason(&updated)
+                        .unwrap_or("Workflow requires approval")
+                        .to_string();
+                    let hint = approval_command(&updated);
+                    return Err(McpToolError::new(MCP_ERR_POLICY, reason, hint));
+                }
+
+                if params.dry_run {
+                    return Ok(McpWorkflowRunData {
+                        workflow_name: params.name,
+                        pane_id: params.pane_id,
+                        execution_id: None,
+                        status: "dry_run".to_string(),
+                        message: Some("Dry-run: workflow not executed".to_string()),
+                        result: None,
+                        steps_executed: None,
+                        step_index: None,
+                        elapsed_ms: Some(elapsed_ms(start)),
+                    });
+                }
+
+                let engine = WorkflowEngine::new(10);
+                let lock_manager = Arc::new(PaneWorkflowLockManager::new());
+                let injector_engine =
+                    build_policy_engine(&config, config.safety.require_prompt_active);
+                let injector =
+                    Arc::new(tokio::sync::Mutex::new(PolicyGatedInjector::with_storage(
+                        injector_engine,
+                        Arc::clone(&wezterm),
+                        storage.as_ref().clone(),
+                    )));
+                let runner = WorkflowRunner::new(
+                    engine,
+                    lock_manager,
+                    Arc::clone(&storage),
+                    injector,
+                    WorkflowRunnerConfig::default(),
+                );
+                register_builtin_workflows(&runner, &config);
+
+                let _ = params.force;
+                let workflow = runner.find_workflow_by_name(&params.name).ok_or_else(|| {
+                    McpToolError::new(
                     MCP_ERR_WORKFLOW,
                     format!("Workflow '{}' not found", params.name),
                     Some(
@@ -2055,42 +2064,42 @@ impl ToolHandler for WaWorkflowRunTool {
                             .to_string(),
                     ),
                 )
-            })?;
+                })?;
 
-            let execution_id = format!("mcp-{}-{}", params.name, now_ms());
-            let result = runner
-                .run_workflow(params.pane_id, workflow, &execution_id, 0)
-                .await;
+                let execution_id = format!("mcp-{}-{}", params.name, now_ms());
+                let result = runner
+                    .run_workflow(params.pane_id, workflow, &execution_id, 0)
+                    .await;
 
-            let (status, message, result_value, steps_executed, step_index) = match result {
-                WorkflowExecutionResult::Completed {
-                    result,
+                let (status, message, result_value, steps_executed, step_index) = match result {
+                    WorkflowExecutionResult::Completed {
+                        result,
+                        steps_executed,
+                        ..
+                    } => ("completed", None, Some(result), Some(steps_executed), None),
+                    WorkflowExecutionResult::Aborted {
+                        reason, step_index, ..
+                    } => ("aborted", Some(reason), None, None, Some(step_index)),
+                    WorkflowExecutionResult::PolicyDenied {
+                        reason, step_index, ..
+                    } => ("policy_denied", Some(reason), None, None, Some(step_index)),
+                    WorkflowExecutionResult::Error { error, .. } => {
+                        ("error", Some(error), None, None, None)
+                    }
+                };
+
+                Ok(McpWorkflowRunData {
+                    workflow_name: params.name,
+                    pane_id: params.pane_id,
+                    execution_id: Some(execution_id),
+                    status: status.to_string(),
+                    message,
+                    result: result_value,
                     steps_executed,
-                    ..
-                } => ("completed", None, Some(result), Some(steps_executed), None),
-                WorkflowExecutionResult::Aborted {
-                    reason, step_index, ..
-                } => ("aborted", Some(reason), None, None, Some(step_index)),
-                WorkflowExecutionResult::PolicyDenied {
-                    reason, step_index, ..
-                } => ("policy_denied", Some(reason), None, None, Some(step_index)),
-                WorkflowExecutionResult::Error { error, .. } => {
-                    ("error", Some(error), None, None, None)
-                }
-            };
-
-            Ok(McpWorkflowRunData {
-                workflow_name: params.name,
-                pane_id: params.pane_id,
-                execution_id: Some(execution_id),
-                status: status.to_string(),
-                message,
-                result: result_value,
-                steps_executed,
-                step_index,
-                elapsed_ms: Some(elapsed_ms(start)),
-            })
-        });
+                    step_index,
+                    elapsed_ms: Some(elapsed_ms(start)),
+                })
+            });
 
         match result {
             Ok(data) => {
@@ -2476,56 +2485,57 @@ impl ToolHandler for WaReserveTool {
             .build()
             .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
 
-        let result: Result<McpReserveData, McpToolError> = runtime.block_on(async move {
-            let storage = StorageHandle::new(&db_path.to_string_lossy())
-                .await
-                .map_err(McpToolError::from_error)?;
-
-            let mut engine = build_policy_engine(&config, config.safety.require_prompt_active);
-            let mut input = PolicyInput::new(ActionKind::ReservePane, ActorKind::Mcp)
-                .with_pane(params.pane_id)
-                .with_capabilities(PaneCapabilities::unknown())
-                .with_text_summary(format!("reserve pane {}", params.pane_id));
-            input = input.with_command_text("reserve_pane");
-
-            let decision = engine.authorize(&input);
-            if decision.is_denied() {
-                let reason = policy_reason(&decision)
-                    .unwrap_or("Reservation denied by policy")
-                    .to_string();
-                return Err(McpToolError::new(MCP_ERR_POLICY, reason, None));
-            }
-            if decision.requires_approval() {
-                let workspace_id =
-                    resolve_workspace_id(&config).map_err(McpToolError::from_error)?;
-                let store =
-                    ApprovalStore::new(&storage, config.safety.approval.clone(), workspace_id);
-                let updated = store
-                    .attach_to_decision(decision, &input, None)
+        let result: std::result::Result<McpReserveData, McpToolError> =
+            runtime.block_on(async move {
+                let storage = StorageHandle::new(&db_path.to_string_lossy())
                     .await
                     .map_err(McpToolError::from_error)?;
-                let reason = policy_reason(&updated)
-                    .unwrap_or("Reservation requires approval")
-                    .to_string();
-                let hint = approval_command(&updated);
-                return Err(McpToolError::new(MCP_ERR_POLICY, reason, hint));
-            }
 
-            let reservation = storage
-                .create_reservation(
-                    params.pane_id,
-                    &params.owner_kind,
-                    &params.owner_id,
-                    params.reason.as_deref(),
-                    params.ttl_ms,
-                )
-                .await
-                .map_err(McpToolError::from_error)?;
+                let mut engine = build_policy_engine(&config, config.safety.require_prompt_active);
+                let mut input = PolicyInput::new(ActionKind::ReservePane, ActorKind::Mcp)
+                    .with_pane(params.pane_id)
+                    .with_capabilities(PaneCapabilities::unknown())
+                    .with_text_summary(format!("reserve pane {}", params.pane_id));
+                input = input.with_command_text("reserve_pane");
 
-            Ok(McpReserveData {
-                reservation: reservation_to_mcp_info(&reservation),
-            })
-        });
+                let decision = engine.authorize(&input);
+                if decision.is_denied() {
+                    let reason = policy_reason(&decision)
+                        .unwrap_or("Reservation denied by policy")
+                        .to_string();
+                    return Err(McpToolError::new(MCP_ERR_POLICY, reason, None));
+                }
+                if decision.requires_approval() {
+                    let workspace_id =
+                        resolve_workspace_id(&config).map_err(McpToolError::from_error)?;
+                    let store =
+                        ApprovalStore::new(&storage, config.safety.approval.clone(), workspace_id);
+                    let updated = store
+                        .attach_to_decision(decision, &input, None)
+                        .await
+                        .map_err(McpToolError::from_error)?;
+                    let reason = policy_reason(&updated)
+                        .unwrap_or("Reservation requires approval")
+                        .to_string();
+                    let hint = approval_command(&updated);
+                    return Err(McpToolError::new(MCP_ERR_POLICY, reason, hint));
+                }
+
+                let reservation = storage
+                    .create_reservation(
+                        params.pane_id,
+                        &params.owner_kind,
+                        &params.owner_id,
+                        params.reason.as_deref(),
+                        params.ttl_ms,
+                    )
+                    .await
+                    .map_err(McpToolError::from_error)?;
+
+                Ok(McpReserveData {
+                    reservation: reservation_to_mcp_info(&reservation),
+                })
+            });
 
         match result {
             Ok(data) => {
@@ -2609,61 +2619,62 @@ impl ToolHandler for WaReleaseTool {
             .build()
             .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
 
-        let result: Result<McpReleaseData, McpToolError> = runtime.block_on(async move {
-            let storage = StorageHandle::new(&db_path.to_string_lossy())
-                .await
-                .map_err(McpToolError::from_error)?;
-
-            let active = storage
-                .list_active_reservations()
-                .await
-                .map_err(McpToolError::from_error)?;
-            let pane_id = active
-                .iter()
-                .find(|r| r.id == params.reservation_id)
-                .map(|r| r.pane_id);
-
-            let mut engine = build_policy_engine(&config, config.safety.require_prompt_active);
-            let mut input = PolicyInput::new(ActionKind::ReleasePane, ActorKind::Mcp)
-                .with_capabilities(PaneCapabilities::unknown())
-                .with_text_summary(format!("release reservation {}", params.reservation_id));
-            if let Some(pane_id) = pane_id {
-                input = input.with_pane(pane_id);
-            }
-            input = input.with_command_text("release_reservation");
-
-            let decision = engine.authorize(&input);
-            if decision.is_denied() {
-                let reason = policy_reason(&decision)
-                    .unwrap_or("Release denied by policy")
-                    .to_string();
-                return Err(McpToolError::new(MCP_ERR_POLICY, reason, None));
-            }
-            if decision.requires_approval() {
-                let workspace_id =
-                    resolve_workspace_id(&config).map_err(McpToolError::from_error)?;
-                let store =
-                    ApprovalStore::new(&storage, config.safety.approval.clone(), workspace_id);
-                let updated = store
-                    .attach_to_decision(decision, &input, None)
+        let result: std::result::Result<McpReleaseData, McpToolError> =
+            runtime.block_on(async move {
+                let storage = StorageHandle::new(&db_path.to_string_lossy())
                     .await
                     .map_err(McpToolError::from_error)?;
-                let reason = policy_reason(&updated)
-                    .unwrap_or("Release requires approval")
-                    .to_string();
-                let hint = approval_command(&updated);
-                return Err(McpToolError::new(MCP_ERR_POLICY, reason, hint));
-            }
 
-            let released = storage
-                .release_reservation(params.reservation_id)
-                .await
-                .map_err(McpToolError::from_error)?;
-            Ok(McpReleaseData {
-                reservation_id: params.reservation_id,
-                released,
-            })
-        });
+                let active = storage
+                    .list_active_reservations()
+                    .await
+                    .map_err(McpToolError::from_error)?;
+                let pane_id = active
+                    .iter()
+                    .find(|r| r.id == params.reservation_id)
+                    .map(|r| r.pane_id);
+
+                let mut engine = build_policy_engine(&config, config.safety.require_prompt_active);
+                let mut input = PolicyInput::new(ActionKind::ReleasePane, ActorKind::Mcp)
+                    .with_capabilities(PaneCapabilities::unknown())
+                    .with_text_summary(format!("release reservation {}", params.reservation_id));
+                if let Some(pane_id) = pane_id {
+                    input = input.with_pane(pane_id);
+                }
+                input = input.with_command_text("release_reservation");
+
+                let decision = engine.authorize(&input);
+                if decision.is_denied() {
+                    let reason = policy_reason(&decision)
+                        .unwrap_or("Release denied by policy")
+                        .to_string();
+                    return Err(McpToolError::new(MCP_ERR_POLICY, reason, None));
+                }
+                if decision.requires_approval() {
+                    let workspace_id =
+                        resolve_workspace_id(&config).map_err(McpToolError::from_error)?;
+                    let store =
+                        ApprovalStore::new(&storage, config.safety.approval.clone(), workspace_id);
+                    let updated = store
+                        .attach_to_decision(decision, &input, None)
+                        .await
+                        .map_err(McpToolError::from_error)?;
+                    let reason = policy_reason(&updated)
+                        .unwrap_or("Release requires approval")
+                        .to_string();
+                    let hint = approval_command(&updated);
+                    return Err(McpToolError::new(MCP_ERR_POLICY, reason, hint));
+                }
+
+                let released = storage
+                    .release_reservation(params.reservation_id)
+                    .await
+                    .map_err(McpToolError::from_error)?;
+                Ok(McpReleaseData {
+                    reservation_id: params.reservation_id,
+                    released,
+                })
+            });
 
         match result {
             Ok(data) => {
@@ -2868,7 +2879,8 @@ impl ToolHandler for WaAccountsRefreshTool {
             .build()
             .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
 
-        let result: Result<McpAccountsRefreshData, McpToolError> = runtime.block_on(async move {
+        let result: std::result::Result<McpAccountsRefreshData, McpToolError> =
+            runtime.block_on(async move {
             let service = params
                 .service
                 .unwrap_or_else(|| "openai".to_string());
@@ -3011,8 +3023,8 @@ impl McpToolError {
         }
     }
 
-    fn from_error(err: &Error) -> Self {
-        let (code, hint) = map_mcp_error(err);
+    fn from_error(err: Error) -> Self {
+        let (code, hint) = map_mcp_error(&err);
         Self {
             code,
             message: err.to_string(),
@@ -3050,7 +3062,7 @@ struct IpcPaneState {
 
 struct CapabilityResolution {
     capabilities: PaneCapabilities,
-    warnings: Vec<String>,
+    _warnings: Vec<String>,
 }
 
 fn build_policy_engine(config: &Config, require_prompt_active: bool) -> PolicyEngine {
@@ -3099,7 +3111,7 @@ fn policy_reason(decision: &PolicyDecision) -> Option<&str> {
         PolicyDecision::Deny { reason, .. } | PolicyDecision::RequireApproval { reason, .. } => {
             Some(reason)
         }
-        _ => None,
+        PolicyDecision::Allow { .. } => None,
     }
 }
 
@@ -3144,7 +3156,7 @@ fn check_refresh_cooldown(
 async fn derive_osc_state_from_storage(
     storage: &StorageHandle,
     pane_id: u64,
-) -> Result<Option<Osc133State>, String> {
+) -> std::result::Result<Option<Osc133State>, String> {
     let segments = storage
         .get_segments(pane_id, SEND_OSC_SEGMENT_LIMIT)
         .await
@@ -3169,7 +3181,7 @@ async fn derive_osc_state_from_storage(
 async fn fetch_pane_state_from_ipc(
     socket_path: &std::path::Path,
     pane_id: u64,
-) -> Result<Option<IpcPaneState>, String> {
+) -> std::result::Result<Option<IpcPaneState>, String> {
     let client = crate::ipc::IpcClient::new(socket_path);
     match client.pane_state(pane_id).await {
         Ok(response) => {
@@ -3195,7 +3207,7 @@ async fn fetch_pane_state_from_ipc(
 async fn fetch_pane_state_from_ipc(
     _socket_path: &std::path::Path,
     _pane_id: u64,
-) -> Result<Option<IpcPaneState>, String> {
+) -> std::result::Result<Option<IpcPaneState>, String> {
     Err("IPC not supported on this platform".to_string())
 }
 
@@ -3311,7 +3323,7 @@ async fn resolve_pane_capabilities(
 
     CapabilityResolution {
         capabilities,
-        warnings,
+        _warnings: warnings,
     }
 }
 

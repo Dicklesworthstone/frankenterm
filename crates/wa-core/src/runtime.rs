@@ -769,14 +769,16 @@ impl ObservationRuntime {
 
         tokio::spawn(async move {
             let source = Arc::new(WeztermHandleSource::new(wezterm_handle));
-            // Create tailer supervisor
-            let mut supervisor = TailerSupervisor::new(
+            // Create tailer supervisor with budget enforcement
+            let initial_budget = config_rx.borrow().capture_budgets.clone();
+            let mut supervisor = TailerSupervisor::with_budget(
                 initial_config,
                 capture_tx,
                 cursors,
                 Arc::clone(&registry), // Pass registry for authoritative state
                 Arc::clone(&shutdown_flag),
                 source,
+                initial_budget,
             );
 
             // Cache hot-reloadable pane priority config for scheduling.
@@ -814,6 +816,7 @@ impl ObservationRuntime {
                                 send_timeout: Duration::from_millis(100),
                             };
                             supervisor.update_config(new_tailer_config);
+                            supervisor.update_budget(new_config.capture_budgets.clone());
                             pane_priorities = new_config.pane_priorities.clone();
                         }
 

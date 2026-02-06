@@ -79,6 +79,9 @@ pub struct Config {
 
     /// Notification filtering and throttling settings
     pub notifications: NotificationConfig,
+
+    /// Backpressure policy settings (tiered queue-depth responses)
+    pub backpressure: crate::backpressure::BackpressureConfig,
 }
 
 // =============================================================================
