@@ -432,20 +432,15 @@ pub(crate) async fn refresh_and_select_account(
         .map_err(AccountSelectionStepError::Caut)?;
 
     // Step 2: Update accounts mirror in DB
-    let now_ms = crate::accounts::now_ms();
     let accounts_refreshed = refresh_result.accounts.len();
-
-    for usage in &refresh_result.accounts {
-        let record = crate::accounts::AccountRecord::from_caut(
-            usage,
-            crate::caut::CautService::OpenAI,
-            now_ms,
-        );
-        storage
-            .upsert_account(record)
-            .await
-            .map_err(|e| AccountSelectionStepError::Storage(e.to_string()))?;
-    }
+    let now_ms = crate::accounts::now_ms();
+    persist_caut_refresh_accounts(
+        storage,
+        crate::caut::CautService::OpenAI,
+        &refresh_result,
+        now_ms,
+    )
+    .await?;
 
     // Step 3: Select best account
     let selection = storage
@@ -458,6 +453,90 @@ pub(crate) async fn refresh_and_select_account(
         explanation: selection.explanation,
         accounts_refreshed,
     })
+}
+
+async fn persist_caut_refresh_accounts(
+    storage: &StorageHandle,
+    service: crate::caut::CautService,
+    refresh: &crate::caut::CautRefresh,
+    now_ms: i64,
+) -> Result<usize, AccountSelectionStepError> {
+    fn extra_f64(
+        extra: &std::collections::HashMap<String, serde_json::Value>,
+        key: &str,
+    ) -> Option<f64> {
+        extra.get(key).and_then(|v| match v {
+            serde_json::Value::Number(n) => n.as_f64(),
+            serde_json::Value::String(s) => s.parse::<f64>().ok(),
+            _ => None,
+        })
+    }
+
+    fn estimated_cost_usd(usage: &crate::caut::CautAccountUsage) -> Option<f64> {
+        // Best-effort: caut schemas drift; accept a few common spellings.
+        for key in [
+            "estimated_cost_usd",
+            "estimatedCostUsd",
+            "estimated_cost",
+            "estimatedCost",
+            "cost_usd",
+            "costUsd",
+        ] {
+            if let Some(v) = extra_f64(&usage.extra, key) {
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    let mut metrics: Vec<crate::storage::UsageMetricRecord> = Vec::new();
+
+    for usage in &refresh.accounts {
+        let record = crate::accounts::AccountRecord::from_caut(usage, service, now_ms);
+        let account_id = record.account_id.clone();
+
+        storage
+            .upsert_account(record)
+            .await
+            .map_err(|e| AccountSelectionStepError::Storage(e.to_string()))?;
+
+        // Usage metric is intentionally "agent-agnostic" here: it's account pool state,
+        // not a single agent session. The service is kept in metadata.
+        metrics.push(crate::storage::UsageMetricRecord {
+            id: 0,
+            timestamp: now_ms,
+            metric_type: crate::storage::MetricType::TokenUsage,
+            pane_id: None,
+            agent_type: None,
+            account_id: Some(account_id),
+            workflow_id: None,
+            count: None,
+            amount: estimated_cost_usd(usage),
+            tokens: usage.tokens_used.and_then(|v| i64::try_from(v).ok()),
+            metadata: Some(
+                serde_json::json!({
+                    "source": "caut.refresh",
+                    "service": service.as_str(),
+                    "percent_remaining": usage.percent_remaining,
+                    "reset_at": usage.reset_at,
+                    "tokens_used": usage.tokens_used,
+                    "tokens_remaining": usage.tokens_remaining,
+                    "tokens_limit": usage.tokens_limit,
+                })
+                .to_string(),
+            ),
+            created_at: now_ms,
+        });
+    }
+
+    // Best-effort: avoid breaking account selection due to metrics storage failure.
+    if !metrics.is_empty() {
+        if let Err(err) = storage.record_usage_metrics_batch(metrics).await {
+            tracing::warn!(error = %err, "Failed to record caut refresh usage metrics");
+        }
+    }
+
+    Ok(refresh.accounts.len())
 }
 
 /// Mark an account as used (update `last_used_at`) after successful failover.
@@ -3961,7 +4040,30 @@ impl WorkflowRunner {
         }
 
         // Start workflow execution via engine
+        let agent_type_str = match detection.agent_type {
+            crate::patterns::AgentType::Codex => "codex",
+            crate::patterns::AgentType::ClaudeCode => "claude_code",
+            crate::patterns::AgentType::Gemini => "gemini",
+            crate::patterns::AgentType::Wezterm => "wezterm",
+            crate::patterns::AgentType::Unknown => "unknown",
+        };
+        let severity_str = format!("{:?}", detection.severity).to_lowercase();
+
+        // IMPORTANT: workflows expect ctx.trigger() to include at least:
+        // - agent_type
+        // - event_type
+        // - extracted
+        //
+        // Keep the legacy nested "detection" object for backward compatibility.
         let context = serde_json::json!({
+            "rule_id": detection.rule_id,
+            "agent_type": agent_type_str,
+            "event_type": detection.event_type,
+            "severity": severity_str,
+            "confidence": detection.confidence,
+            "extracted": detection.extracted,
+            "matched_text": detection.matched_text,
+            "span": { "start": detection.span.0, "end": detection.span.1 },
             "detection": {
                 "rule_id": detection.rule_id,
                 "matched_text": detection.matched_text,
@@ -4041,6 +4143,13 @@ impl WorkflowRunner {
             execution_id,
         )
         .with_injector(Arc::clone(&self.injector));
+
+        // Attach persisted trigger context (if any) so workflows can interpret extracted fields.
+        if let Ok(Some(record)) = self.storage.get_workflow(execution_id).await {
+            if let Some(trigger) = record.context {
+                ctx = ctx.with_trigger(trigger);
+            }
+        }
 
         if let Ok(Some(record)) = self.storage.get_pane(pane_id).await {
             ctx.set_pane_meta(PaneMetadata::from_record(&record));
@@ -5256,10 +5365,41 @@ impl WorkflowRunner {
 
         record.status = "completed".to_string();
         record.result = result;
-        record.updated_at = now_ms();
-        record.completed_at = Some(now_ms());
+        let now = now_ms();
+        record.updated_at = now;
+        record.completed_at = Some(now);
 
-        self.storage.upsert_workflow(record).await
+        let duration_ms = now.saturating_sub(record.started_at);
+        let workflow_name = record.workflow_name.clone();
+        let pane_id = record.pane_id;
+        let metric = crate::storage::UsageMetricRecord {
+            id: 0,
+            timestamp: now,
+            metric_type: crate::storage::MetricType::WorkflowCost,
+            pane_id: Some(pane_id),
+            agent_type: None,
+            account_id: None,
+            workflow_id: Some(record.id.clone()),
+            count: Some(1),
+            amount: None,
+            tokens: None,
+            metadata: Some(
+                serde_json::json!({
+                    "source": "workflow.runner",
+                    "workflow_name": workflow_name,
+                    "status": "completed",
+                    "duration_ms": duration_ms,
+                })
+                .to_string(),
+            ),
+            created_at: now,
+        };
+
+        self.storage.upsert_workflow(record).await?;
+        if let Err(err) = self.storage.record_usage_metric(metric).await {
+            tracing::warn!(pane_id, error = %err, "Failed to record workflow completion metric");
+        }
+        Ok(())
     }
 
     async fn fail_execution(&self, execution_id: &str, error: &str) -> crate::Result<()> {
@@ -5275,10 +5415,41 @@ impl WorkflowRunner {
 
         record.status = "failed".to_string();
         record.error = Some(error.to_string());
-        record.updated_at = now_ms();
-        record.completed_at = Some(now_ms());
+        let now = now_ms();
+        record.updated_at = now;
+        record.completed_at = Some(now);
 
-        self.storage.upsert_workflow(record).await
+        let duration_ms = now.saturating_sub(record.started_at);
+        let workflow_name = record.workflow_name.clone();
+        let pane_id = record.pane_id;
+        let metric = crate::storage::UsageMetricRecord {
+            id: 0,
+            timestamp: now,
+            metric_type: crate::storage::MetricType::WorkflowCost,
+            pane_id: Some(pane_id),
+            agent_type: None,
+            account_id: None,
+            workflow_id: Some(record.id.clone()),
+            count: Some(1),
+            amount: None,
+            tokens: None,
+            metadata: Some(
+                serde_json::json!({
+                    "source": "workflow.runner",
+                    "workflow_name": workflow_name,
+                    "status": "failed",
+                    "duration_ms": duration_ms,
+                })
+                .to_string(),
+            ),
+            created_at: now,
+        };
+
+        self.storage.upsert_workflow(record).await?;
+        if let Err(err) = self.storage.record_usage_metric(metric).await {
+            tracing::warn!(pane_id, error = %err, "Failed to record workflow failure metric");
+        }
+        Ok(())
     }
 
     /// Mark the triggering event as handled after workflow completion.
@@ -6097,6 +6268,53 @@ impl Workflow for HandleUsageLimits {
         Box::pin(async move {
             match step_idx {
                 0 => {
+                    // Best-effort usage-limit metric (do not fail the workflow on storage errors).
+                    let trigger = ctx_clone
+                        .trigger()
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    let now = now_ms();
+                    let agent_type = trigger
+                        .get("agent_type")
+                        .and_then(|v| v.as_str())
+                        .map(ToString::to_string);
+                    let rule_id = trigger.get("rule_id").and_then(|v| v.as_str());
+                    let extracted = trigger
+                        .get("extracted")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+
+                    if let Err(err) = storage
+                        .record_usage_metric(crate::storage::UsageMetricRecord {
+                            id: 0,
+                            timestamp: now,
+                            metric_type: crate::storage::MetricType::RateLimitHit,
+                            pane_id: Some(pane_id),
+                            agent_type,
+                            account_id: None,
+                            workflow_id: None,
+                            count: Some(1),
+                            amount: None,
+                            tokens: None,
+                            metadata: Some(
+                                serde_json::json!({
+                                    "source": "workflow.handle_usage_limits",
+                                    "rule_id": rule_id,
+                                    "extracted": extracted,
+                                })
+                                .to_string(),
+                            ),
+                            created_at: now,
+                        })
+                        .await
+                    {
+                        tracing::warn!(
+                            pane_id,
+                            error = %err,
+                            "handle_usage_limits: failed to record rate limit metric"
+                        );
+                    }
+
                     let caps = ctx_clone.capabilities();
                     if caps.alt_screen == Some(true) {
                         return StepResult::abort("Pane is in alt-screen mode");
@@ -6392,15 +6610,138 @@ impl Workflow for HandleSessionEnd {
 
                 // Step 1: Build and persist the session record
                 1 => {
-                    let record = Self::record_from_detection(pane_id, &trigger);
+                    let mut record = Self::record_from_detection(pane_id, &trigger);
+
+                    // If we already have an active session for this pane, prefer updating it
+                    // rather than inserting a second record. This makes duration metrics meaningful.
+                    if let Ok(existing) = storage.get_sessions_for_pane(pane_id).await {
+                        let want_session_id = record.session_id.as_deref();
+                        let candidate = existing
+                            .into_iter()
+                            .filter(|s| s.ended_at.is_none() && s.agent_type == record.agent_type)
+                            .filter(|s| {
+                                want_session_id.is_none_or(|id| s.session_id.as_deref() == Some(id))
+                            })
+                            .max_by_key(|s| s.started_at);
+
+                        if let Some(active) = candidate {
+                            record.id = active.id;
+                            record.started_at = active.started_at;
+                            if record.session_id.is_none() {
+                                record.session_id = active.session_id;
+                            }
+                            if record.external_id.is_none() {
+                                record.external_id = active.external_id;
+                            }
+                            if record.external_meta.is_none() {
+                                record.external_meta = active.external_meta;
+                            }
+                        }
+                    }
 
                     let agent_type = record.agent_type.clone();
                     let session_id = record.session_id.clone();
                     let has_tokens = record.total_tokens.is_some();
                     let has_cost = record.estimated_cost_usd.is_some();
+                    let record_for_metrics = record.clone();
 
                     match storage.upsert_agent_session(record).await {
                         Ok(db_id) => {
+                            // Best-effort usage metrics derived from the persisted session record.
+                            // If these fail, don't fail the workflow.
+                            let mut metrics: Vec<crate::storage::UsageMetricRecord> = Vec::new();
+                            let now = now_ms();
+
+                            if let Some(total) = record_for_metrics.total_tokens {
+                                metrics.push(crate::storage::UsageMetricRecord {
+                                    id: 0,
+                                    timestamp: now,
+                                    metric_type: crate::storage::MetricType::TokenUsage,
+                                    pane_id: Some(pane_id),
+                                    agent_type: Some(record_for_metrics.agent_type.clone()),
+                                    account_id: None,
+                                    workflow_id: None,
+                                    count: None,
+                                    amount: None,
+                                    tokens: Some(total),
+                                    metadata: Some(
+                                        serde_json::json!({
+                                            "source": "workflow.handle_session_end",
+                                            "session_id": record_for_metrics.session_id.clone(),
+                                            "input_tokens": record_for_metrics.input_tokens,
+                                            "output_tokens": record_for_metrics.output_tokens,
+                                            "cached_tokens": record_for_metrics.cached_tokens,
+                                            "reasoning_tokens": record_for_metrics.reasoning_tokens,
+                                            "model": record_for_metrics.model_name.clone(),
+                                        })
+                                        .to_string(),
+                                    ),
+                                    created_at: now,
+                                });
+                            }
+
+                            if let Some(cost) = record_for_metrics.estimated_cost_usd {
+                                metrics.push(crate::storage::UsageMetricRecord {
+                                    id: 0,
+                                    timestamp: now,
+                                    metric_type: crate::storage::MetricType::ApiCost,
+                                    pane_id: Some(pane_id),
+                                    agent_type: Some(record_for_metrics.agent_type.clone()),
+                                    account_id: None,
+                                    workflow_id: None,
+                                    count: None,
+                                    amount: Some(cost),
+                                    tokens: None,
+                                    metadata: Some(
+                                        serde_json::json!({
+                                            "source": "workflow.handle_session_end",
+                                            "session_id": record_for_metrics.session_id.clone(),
+                                            "model": record_for_metrics.model_name.clone(),
+                                        })
+                                        .to_string(),
+                                    ),
+                                    created_at: now,
+                                });
+                            }
+
+                            if let Some(ended_at) = record_for_metrics.ended_at {
+                                let duration_ms =
+                                    ended_at.saturating_sub(record_for_metrics.started_at);
+                                let duration_secs = duration_ms / 1000;
+                                metrics.push(crate::storage::UsageMetricRecord {
+                                    id: 0,
+                                    timestamp: ended_at,
+                                    metric_type: crate::storage::MetricType::SessionDuration,
+                                    pane_id: Some(pane_id),
+                                    agent_type: Some(record_for_metrics.agent_type.clone()),
+                                    account_id: None,
+                                    workflow_id: None,
+                                    count: Some(duration_secs),
+                                    amount: None,
+                                    tokens: None,
+                                    metadata: Some(
+                                        serde_json::json!({
+                                            "source": "workflow.handle_session_end",
+                                            "session_id": record_for_metrics.session_id.clone(),
+                                            "duration_ms": duration_ms,
+                                        })
+                                        .to_string(),
+                                    ),
+                                    created_at: now,
+                                });
+                            }
+
+                            if !metrics.is_empty() {
+                                if let Err(err) = storage.record_usage_metrics_batch(metrics).await
+                                {
+                                    tracing::warn!(
+                                        pane_id,
+                                        error = %err,
+                                        "handle_session_end: failed to record usage metrics"
+                                    );
+                                }
+                            }
+
                             tracing::info!(
                                 pane_id,
                                 db_id,
@@ -13084,6 +13425,82 @@ Try again at 3:00 PM UTC.
         assert_eq!(session.end_reason.as_deref(), Some("completed"));
     }
 
+    #[tokio::test]
+    async fn persist_caut_refresh_accounts_records_metrics() {
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::SeqCst);
+        let db_path = std::env::temp_dir().join(format!(
+            "wa_test_caut_metrics_{}_{}_{n}.db",
+            std::process::id(),
+            line!()
+        ));
+        let storage = crate::storage::StorageHandle::new(&db_path.to_string_lossy())
+            .await
+            .expect("temp DB");
+
+        let refresh = crate::caut::CautRefresh {
+            service: Some("openai".to_string()),
+            refreshed_at: Some("2026-02-06T00:00:00Z".to_string()),
+            accounts: vec![
+                crate::caut::CautAccountUsage {
+                    id: Some("acct-1".to_string()),
+                    name: Some("Account 1".to_string()),
+                    percent_remaining: Some(42.0),
+                    limit_hours: None,
+                    reset_at: Some("2026-02-06T01:00:00Z".to_string()),
+                    tokens_used: Some(1000),
+                    tokens_remaining: Some(2000),
+                    tokens_limit: Some(3000),
+                    extra: HashMap::new(),
+                },
+                crate::caut::CautAccountUsage {
+                    id: Some("acct-2".to_string()),
+                    name: Some("Account 2".to_string()),
+                    percent_remaining: Some(7.0),
+                    limit_hours: None,
+                    reset_at: None,
+                    tokens_used: Some(10),
+                    tokens_remaining: Some(20),
+                    tokens_limit: Some(30),
+                    extra: HashMap::new(),
+                },
+            ],
+            extra: HashMap::new(),
+        };
+
+        let now = 10_000_i64;
+        let refreshed = super::persist_caut_refresh_accounts(
+            &storage,
+            crate::caut::CautService::OpenAI,
+            &refresh,
+            now,
+        )
+        .await
+        .expect("persist refresh");
+        assert_eq!(refreshed, 2);
+
+        // Query by account_id to avoid relying on agent_type filtering (we store agent_type=None here).
+        let acct1 = storage
+            .query_usage_metrics(crate::storage::MetricQuery {
+                metric_type: Some(crate::storage::MetricType::TokenUsage),
+                agent_type: None,
+                account_id: Some("acct-1".to_string()),
+                since: Some(0),
+                until: None,
+                limit: Some(10),
+            })
+            .await
+            .expect("query metrics");
+        assert_eq!(acct1.len(), 1);
+        assert_eq!(acct1[0].tokens, Some(1000));
+        assert_eq!(acct1[0].amount, None);
+
+        storage.shutdown().await.expect("shutdown");
+        let _ = std::fs::remove_file(&db_path);
+    }
+
     // ========================================================================
     // HandleAuthRequired Tests (wa-nu4.2.2.4)
     // ========================================================================
@@ -13934,6 +14351,31 @@ Try again at 3:00 PM UTC.
         // Verify session persisted
         // (The record was persisted via upsert_agent_session; we verify via step log result data)
         assert_eq!(logs[1].result_type, "done");
+
+        // Verify usage metrics were recorded (token usage + duration)
+        let metrics = storage
+            .query_usage_metrics(crate::storage::MetricQuery {
+                metric_type: None,
+                agent_type: Some("codex".to_string()),
+                account_id: None,
+                since: Some(0),
+                until: None,
+                limit: Some(50),
+            })
+            .await
+            .expect("query usage metrics");
+        assert!(
+            metrics
+                .iter()
+                .any(|m| m.metric_type == crate::storage::MetricType::TokenUsage),
+            "Expected token usage metric"
+        );
+        assert!(
+            metrics
+                .iter()
+                .any(|m| m.metric_type == crate::storage::MetricType::SessionDuration),
+            "Expected session duration metric"
+        );
     }
 
     #[tokio::test]

@@ -3902,6 +3902,14 @@ enum WriteCommand {
         record: UsageMetricRecord,
         respond: oneshot::Sender<Result<i64>>,
     },
+    /// Record multiple usage metrics in a single transaction.
+    ///
+    /// This is used by higher-level collectors to avoid DB spam when a single
+    /// event produces multiple metric rows (eg, caut refresh -> N accounts).
+    RecordUsageMetricsBatch {
+        records: Vec<UsageMetricRecord>,
+        respond: oneshot::Sender<Result<usize>>,
+    },
     /// Purge usage metrics older than a cutoff timestamp
     PurgeUsageMetrics {
         before_ts: i64,
@@ -4574,6 +4582,26 @@ impl StorageHandle {
         self.write_tx
             .send(WriteCommand::RecordUsageMetric {
                 record,
+                respond: tx,
+            })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    /// Record multiple usage metrics for analytics tracking in a single transaction.
+    ///
+    /// Returns the number of rows inserted.
+    pub async fn record_usage_metrics_batch(
+        &self,
+        records: Vec<UsageMetricRecord>,
+    ) -> Result<usize> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::RecordUsageMetricsBatch {
+                records,
                 respond: tx,
             })
             .await
@@ -6772,6 +6800,10 @@ fn dispatch_write_command(conn: &mut Connection, cmd: WriteCommand, should_break
             let result = record_usage_metric_sync(conn, &record);
             let _ = respond.send(result);
         }
+        WriteCommand::RecordUsageMetricsBatch { records, respond } => {
+            let result = record_usage_metrics_batch_sync(conn, &records);
+            let _ = respond.send(result);
+        }
         WriteCommand::PurgeUsageMetrics { before_ts, respond } => {
             let result = purge_usage_metrics_sync(conn, before_ts);
             let _ = respond.send(result);
@@ -7901,6 +7933,64 @@ fn record_usage_metric_sync(conn: &Connection, record: &UsageMetricRecord) -> Re
     .map_err(|e| StorageError::Database(format!("Failed to record usage metric: {e}")))?;
 
     Ok(conn.last_insert_rowid())
+}
+
+fn record_usage_metrics_batch_sync(
+    conn: &mut Connection,
+    records: &[UsageMetricRecord],
+) -> Result<usize> {
+    if records.is_empty() {
+        return Ok(0);
+    }
+
+    let tx = conn
+        .transaction()
+        .map_err(|e| StorageError::Database(format!("Failed to start metrics batch tx: {e}")))?;
+
+    {
+        let mut stmt = tx
+            .prepare(
+                "INSERT INTO usage_metrics (timestamp, metric_type, pane_id, agent_type, account_id, workflow_id, count, amount, tokens, metadata, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            )
+            .map_err(|e| {
+                StorageError::Database(format!("Failed to prepare metrics batch insert: {e}"))
+            })?;
+
+        for record in records {
+            let ts = if record.timestamp == 0 {
+                now_ms()
+            } else {
+                record.timestamp
+            };
+            let created = if record.created_at == 0 {
+                now_ms()
+            } else {
+                record.created_at
+            };
+            let pane_id = record.pane_id.map(|id| id as i64);
+
+            stmt.execute(params![
+                ts,
+                record.metric_type.as_str(),
+                pane_id,
+                record.agent_type,
+                record.account_id,
+                record.workflow_id,
+                record.count,
+                record.amount,
+                record.tokens,
+                record.metadata,
+                created,
+            ])
+            .map_err(|e| StorageError::Database(format!("Failed to insert usage metric: {e}")))?;
+        }
+    }
+
+    tx.commit()
+        .map_err(|e| StorageError::Database(format!("Failed to commit metrics batch tx: {e}")))?;
+
+    Ok(records.len())
 }
 
 fn purge_usage_metrics_sync(conn: &Connection, before_ts: i64) -> Result<usize> {
@@ -15918,6 +16008,89 @@ mod storage_handle_tests {
         // Returned in descending seq order
         assert_eq!(recent[0].seq, 1);
         assert_eq!(recent[1].seq, 0);
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn storage_handle_records_usage_metrics_batch() {
+        let db_path = temp_db_path();
+        let handle: StorageHandle = StorageHandle::new(&db_path).await.unwrap();
+
+        // Single insert
+        let id1 = handle
+            .record_usage_metric(UsageMetricRecord {
+                id: 0,
+                timestamp: 1_000,
+                metric_type: MetricType::ApiCall,
+                pane_id: Some(1),
+                agent_type: Some("codex".to_string()),
+                account_id: None,
+                workflow_id: None,
+                count: Some(1),
+                amount: None,
+                tokens: None,
+                metadata: Some("{\"tool\":\"wa.robot.state\"}".to_string()),
+                created_at: 1_000,
+            })
+            .await
+            .unwrap();
+        assert!(id1 > 0);
+
+        // Batch insert
+        let inserted = handle
+            .record_usage_metrics_batch(vec![
+                UsageMetricRecord {
+                    id: 0,
+                    timestamp: 2_000,
+                    metric_type: MetricType::TokenUsage,
+                    pane_id: Some(1),
+                    agent_type: Some("codex".to_string()),
+                    account_id: Some("acct-1".to_string()),
+                    workflow_id: None,
+                    count: None,
+                    amount: None,
+                    tokens: Some(123),
+                    metadata: None,
+                    created_at: 2_000,
+                },
+                UsageMetricRecord {
+                    id: 0,
+                    timestamp: 3_000,
+                    metric_type: MetricType::ApiCost,
+                    pane_id: Some(1),
+                    agent_type: Some("codex".to_string()),
+                    account_id: Some("acct-1".to_string()),
+                    workflow_id: None,
+                    count: None,
+                    amount: Some(0.42),
+                    tokens: None,
+                    metadata: Some("{\"source\":\"test\"}".to_string()),
+                    created_at: 3_000,
+                },
+            ])
+            .await
+            .unwrap();
+        assert_eq!(inserted, 2);
+
+        let rows = handle
+            .query_usage_metrics(MetricQuery {
+                metric_type: None,
+                agent_type: Some("codex".to_string()),
+                account_id: None,
+                since: Some(0),
+                until: None,
+                limit: Some(10),
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+
+        // Sorted DESC by timestamp
+        assert_eq!(rows[0].timestamp, 3_000);
+        assert_eq!(rows[1].timestamp, 2_000);
+        assert_eq!(rows[2].timestamp, 1_000);
 
         handle.shutdown().await.unwrap();
         let _ = std::fs::remove_file(&db_path);

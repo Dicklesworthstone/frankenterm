@@ -24,6 +24,9 @@ Cargo.lock.bak
 # Beads viewer local config
 .bv/
 
+# bv creates a local lock file inside .beads/; it must not be committed.
+.beads/.bv.lock
+
 # Legacy WezTerm source (vendored for reference)
 legacy_wezterm/
 
