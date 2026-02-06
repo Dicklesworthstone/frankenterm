@@ -99,6 +99,10 @@ harness = false
 name = "sizing_benchmark"
 harness = false
 
+[[bench]]
+name = "storage_regression"
+harness = false
+
 [features]
 default = []
 # Public feature flags (stable surface)

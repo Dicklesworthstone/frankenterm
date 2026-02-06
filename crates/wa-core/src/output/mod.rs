@@ -35,9 +35,10 @@ mod table;
 pub use error_renderer::{ErrorRenderer, get_code_for_error, render_error};
 pub use format::{OutputFormat, detect_format};
 pub use renderers::{
-    ActionHistoryRenderer, AuditListRenderer, EventListRenderer, HealthDiagnostic,
-    HealthDiagnosticStatus, HealthSnapshotRenderer, PaneTableRenderer, Render, RenderContext,
-    RuleDetail, RuleDetailRenderer, RuleListItem, RuleTestMatch, RulesListRenderer,
+    ActionHistoryRenderer, AnalyticsAgentRenderer, AnalyticsDailyRenderer, AnalyticsExportRenderer,
+    AnalyticsSummaryData, AnalyticsSummaryRenderer, AuditListRenderer, EventListRenderer,
+    HealthDiagnostic, HealthDiagnosticStatus, HealthSnapshotRenderer, PaneTableRenderer, Render,
+    RenderContext, RuleDetail, RuleDetailRenderer, RuleListItem, RuleTestMatch, RulesListRenderer,
     RulesTestRenderer, SearchResultRenderer, WorkflowResultRenderer,
 };
 pub use table::{Alignment, Column, Table};

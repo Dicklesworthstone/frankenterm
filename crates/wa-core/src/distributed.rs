@@ -660,7 +660,7 @@ fn build_client_config(
 }
 
 #[cfg(feature = "distributed")]
-#[must_use]
+#[must_use = "the returned TLS bundle is required to configure distributed mode"]
 pub fn build_tls_bundle(
     config: &DistributedConfig,
     server_ca_path: Option<&Path>,
@@ -672,7 +672,7 @@ pub fn build_tls_bundle(
 }
 
 #[cfg(feature = "distributed")]
-#[must_use]
+#[must_use = "the returned server name is required for TLS/SNI verification"]
 pub fn build_tls_server_name(bind_addr: &str) -> Result<ServerName<'static>, DistributedTlsError> {
     let host = bind_addr.split(':').next().unwrap_or(bind_addr).trim();
     let name = if host.is_empty() { "localhost" } else { host };
@@ -684,6 +684,8 @@ pub fn build_tls_server_name(bind_addr: &str) -> Result<ServerName<'static>, Dis
 mod tests {
     use super::*;
 
+    #[cfg(feature = "distributed")]
+    use proptest::prelude::*;
     #[cfg(feature = "distributed")]
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     #[cfg(feature = "distributed")]
@@ -1225,5 +1227,42 @@ mod tests {
             DistributedSecurityError::HandshakeTimeout.code(),
             "dist.handshake_timeout"
         );
+    }
+
+    #[cfg(feature = "distributed")]
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 32,
+            .. ProptestConfig::default()
+        })]
+
+        #[test]
+        fn token_parts_parse_round_trip_with_identity(
+            identity in "[a-zA-Z0-9_-]{1,12}",
+            secret in "[a-zA-Z0-9_-]{1,24}"
+        ) {
+            let token = format!("{identity}:{secret}");
+            let parts = TokenParts::parse(&token);
+            prop_assert_eq!(parts.identity, Some(identity.as_str()));
+            prop_assert_eq!(parts.secret, secret.as_str());
+        }
+
+        #[test]
+        fn token_validation_errors_do_not_leak_inputs(
+            expected in "[a-zA-Z0-9_-]{1,24}",
+            presented in "[a-zA-Z0-9_-]{1,24}"
+        ) {
+            prop_assume!(expected != presented);
+            let err = validate_token(
+                DistributedAuthMode::Token,
+                Some(expected.as_str()),
+                Some(presented.as_str()),
+                None
+            )
+            .expect_err("auth failure");
+            let message = err.to_string();
+            prop_assert!(!message.contains(expected.as_str()));
+            prop_assert!(!message.contains(presented.as_str()));
+        }
     }
 }

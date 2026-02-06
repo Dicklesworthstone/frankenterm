@@ -50,7 +50,7 @@ use crate::policy::Redactor;
 /// This is the target version that new databases will be initialized to,
 /// and existing databases will be migrated to.
 /// Uses SQLite's PRAGMA user_version for atomic version tracking.
-pub const SCHEMA_VERSION: i32 = 15;
+pub const SCHEMA_VERSION: i32 = 18;
 
 /// Schema initialization SQL
 ///
@@ -172,6 +172,11 @@ CREATE TABLE IF NOT EXISTS events (
     handled_by_workflow_id TEXT,      -- links to workflow_executions.id
     handled_status TEXT,              -- completed, aborted, failed, paused
 
+    -- Triage state tracking (bd-1yk8)
+    triage_state TEXT,                -- e.g. new, investigating, resolved
+    triage_updated_at INTEGER,        -- epoch ms
+    triage_updated_by TEXT,           -- actor identifier (optional)
+
     -- Idempotency: optional dedupe key (pane_id + rule_id + time_window)
     dedupe_key TEXT,                  -- computed key for duplicate prevention
 
@@ -183,6 +188,30 @@ CREATE INDEX IF NOT EXISTS idx_events_rule ON events(rule_id);
 CREATE INDEX IF NOT EXISTS idx_events_unhandled ON events(handled_at) WHERE handled_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_events_detected ON events(detected_at);
 CREATE INDEX IF NOT EXISTS idx_events_severity ON events(severity, detected_at);
+CREATE INDEX IF NOT EXISTS idx_events_triage_state
+    ON events(triage_state) WHERE triage_state IS NOT NULL;
+
+-- Event labels (many-to-one) for triage and filtering (bd-1yk8)
+CREATE TABLE IF NOT EXISTS event_labels (
+    event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+    label TEXT NOT NULL,
+    created_at INTEGER NOT NULL,      -- epoch ms
+    created_by TEXT,                 -- actor identifier (optional)
+    PRIMARY KEY (event_id, label)
+);
+
+CREATE INDEX IF NOT EXISTS idx_event_labels_event ON event_labels(event_id);
+CREATE INDEX IF NOT EXISTS idx_event_labels_label ON event_labels(label);
+
+-- Event notes (one-to-one) for operator annotations (bd-1yk8)
+CREATE TABLE IF NOT EXISTS event_notes (
+    event_id INTEGER PRIMARY KEY REFERENCES events(id) ON DELETE CASCADE,
+    note TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,      -- epoch ms
+    updated_by TEXT                  -- actor identifier (optional)
+);
+
+CREATE INDEX IF NOT EXISTS idx_event_notes_updated_at ON event_notes(updated_at);
 
 -- Event mutes: suppress noisy notifications by identity key
 CREATE TABLE IF NOT EXISTS event_mutes (
@@ -469,6 +498,51 @@ CREATE TABLE IF NOT EXISTS secret_scan_reports (
 
 CREATE INDEX IF NOT EXISTS idx_secret_scan_reports_scope
     ON secret_scan_reports(scope_hash, created_at);
+
+-- Usage metrics: analytics data model for token/cost/API tracking
+CREATE TABLE IF NOT EXISTS usage_metrics (
+    id INTEGER PRIMARY KEY,
+    timestamp INTEGER NOT NULL,          -- epoch ms
+    metric_type TEXT NOT NULL,           -- token_usage, api_cost, api_call, rate_limit_hit, workflow_cost, session_duration
+    pane_id INTEGER,                     -- NULL for global metrics
+    agent_type TEXT,                     -- codex, claude_code, gemini, NULL
+    account_id TEXT,                     -- caut account reference
+    workflow_id TEXT,                    -- workflow execution reference
+    count INTEGER,                       -- for countable metrics
+    amount REAL,                         -- for costs (USD)
+    tokens INTEGER,                      -- for token counts
+    metadata TEXT,                       -- JSON for extensibility
+    created_at INTEGER NOT NULL          -- epoch ms
+);
+
+CREATE INDEX IF NOT EXISTS idx_usage_metrics_timestamp ON usage_metrics(timestamp);
+CREATE INDEX IF NOT EXISTS idx_usage_metrics_type_ts ON usage_metrics(metric_type, timestamp);
+CREATE INDEX IF NOT EXISTS idx_usage_metrics_agent_ts ON usage_metrics(agent_type, timestamp);
+CREATE INDEX IF NOT EXISTS idx_usage_metrics_account_ts ON usage_metrics(account_id, timestamp);
+
+-- Notification history: persistent log of all sent notifications
+CREATE TABLE IF NOT EXISTS notification_history (
+    id INTEGER PRIMARY KEY,
+    timestamp INTEGER NOT NULL,          -- epoch ms when notification was created
+    event_id INTEGER,                    -- optional FK to events(id)
+    channel TEXT NOT NULL,               -- webhook, desktop, slack, etc.
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    severity TEXT NOT NULL,              -- info, warning, error, critical
+    status TEXT NOT NULL DEFAULT 'pending', -- pending, sent, failed, throttled
+    error_message TEXT,                  -- error details on failure
+    acknowledged_at INTEGER,             -- epoch ms
+    acknowledged_by TEXT,
+    action_taken TEXT,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    metadata TEXT,                       -- JSON blob for channel-specific data
+    created_at Integer NOT NULL          -- epoch ms
+);
+
+CREATE INDEX IF NOT EXISTS idx_notification_history_timestamp ON notification_history(timestamp);
+CREATE INDEX IF NOT EXISTS idx_notification_history_status ON notification_history(status);
+CREATE INDEX IF NOT EXISTS idx_notification_history_event ON notification_history(event_id);
+CREATE INDEX IF NOT EXISTS idx_notification_history_channel_ts ON notification_history(channel, timestamp);
 
 -- Action history view (audit + undo + workflow step info)
 CREATE VIEW IF NOT EXISTS action_history AS
@@ -903,6 +977,125 @@ static MIGRATIONS: &[Migration] = &[
         ",
         ),
     },
+    Migration {
+        version: 16,
+        description: "Add usage_metrics table for analytics tracking",
+        up_sql: r"
+            CREATE TABLE IF NOT EXISTS usage_metrics (
+                id INTEGER PRIMARY KEY,
+                timestamp INTEGER NOT NULL,
+                metric_type TEXT NOT NULL,
+                pane_id INTEGER,
+                agent_type TEXT,
+                account_id TEXT,
+                workflow_id TEXT,
+                count INTEGER,
+                amount REAL,
+                tokens INTEGER,
+                metadata TEXT,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_usage_metrics_timestamp ON usage_metrics(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_usage_metrics_type_ts ON usage_metrics(metric_type, timestamp);
+            CREATE INDEX IF NOT EXISTS idx_usage_metrics_agent_ts ON usage_metrics(agent_type, timestamp);
+            CREATE INDEX IF NOT EXISTS idx_usage_metrics_account_ts ON usage_metrics(account_id, timestamp);
+        ",
+        down_sql: Some(
+            r"
+            DROP INDEX IF EXISTS idx_usage_metrics_account_ts;
+            DROP INDEX IF EXISTS idx_usage_metrics_agent_ts;
+            DROP INDEX IF EXISTS idx_usage_metrics_type_ts;
+            DROP INDEX IF EXISTS idx_usage_metrics_timestamp;
+            DROP TABLE IF EXISTS usage_metrics;
+        ",
+        ),
+    },
+    Migration {
+        version: 17,
+        description: "Add notification_history table for persistent notification log",
+        up_sql: r"
+            CREATE TABLE IF NOT EXISTS notification_history (
+                id INTEGER PRIMARY KEY,
+                timestamp INTEGER NOT NULL,
+                event_id INTEGER,
+                channel TEXT NOT NULL,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                error_message TEXT,
+                acknowledged_at INTEGER,
+                acknowledged_by TEXT,
+                action_taken TEXT,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                metadata TEXT,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_notification_history_timestamp ON notification_history(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_notification_history_status ON notification_history(status);
+            CREATE INDEX IF NOT EXISTS idx_notification_history_event ON notification_history(event_id);
+            CREATE INDEX IF NOT EXISTS idx_notification_history_channel_ts ON notification_history(channel, timestamp);
+        ",
+        down_sql: Some(
+            r"
+            DROP INDEX IF EXISTS idx_notification_history_channel_ts;
+            DROP INDEX IF EXISTS idx_notification_history_event;
+            DROP INDEX IF EXISTS idx_notification_history_status;
+            DROP INDEX IF EXISTS idx_notification_history_timestamp;
+            DROP TABLE IF EXISTS notification_history;
+        ",
+        ),
+    },
+    Migration {
+        version: 18,
+        description: "Add event triage state + annotations (labels/notes)",
+        up_sql: r"
+            ALTER TABLE events ADD COLUMN triage_state TEXT;
+            ALTER TABLE events ADD COLUMN triage_updated_at INTEGER;
+            ALTER TABLE events ADD COLUMN triage_updated_by TEXT;
+
+            CREATE INDEX IF NOT EXISTS idx_events_triage_state
+                ON events(triage_state) WHERE triage_state IS NOT NULL;
+
+            CREATE TABLE IF NOT EXISTS event_labels (
+                event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+                label TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                created_by TEXT,
+                PRIMARY KEY (event_id, label)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_event_labels_event ON event_labels(event_id);
+            CREATE INDEX IF NOT EXISTS idx_event_labels_label ON event_labels(label);
+
+            CREATE TABLE IF NOT EXISTS event_notes (
+                event_id INTEGER PRIMARY KEY REFERENCES events(id) ON DELETE CASCADE,
+                note TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                updated_by TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_event_notes_updated_at ON event_notes(updated_at);
+        ",
+        down_sql: Some(
+            r"
+            DROP INDEX IF EXISTS idx_event_notes_updated_at;
+            DROP TABLE IF EXISTS event_notes;
+
+            DROP INDEX IF EXISTS idx_event_labels_label;
+            DROP INDEX IF EXISTS idx_event_labels_event;
+            DROP TABLE IF EXISTS event_labels;
+
+            DROP INDEX IF EXISTS idx_events_triage_state;
+
+            ALTER TABLE events DROP COLUMN triage_updated_by;
+            ALTER TABLE events DROP COLUMN triage_updated_at;
+            ALTER TABLE events DROP COLUMN triage_state;
+        ",
+        ),
+    },
 ];
 
 // =============================================================================
@@ -1133,6 +1326,25 @@ pub struct StoredEvent {
     pub handled_by_workflow_id: Option<String>,
     /// Handling status
     pub handled_status: Option<String>,
+}
+
+/// Stored annotations for an event (bd-1yk8).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EventAnnotations {
+    /// Current triage state, if set.
+    pub triage_state: Option<String>,
+    /// When triage state last changed (epoch ms).
+    pub triage_updated_at: Option<i64>,
+    /// Who changed triage state last (optional).
+    pub triage_updated_by: Option<String>,
+    /// Free-form operator note (redacted at write time).
+    pub note: Option<String>,
+    /// When note was last updated (epoch ms).
+    pub note_updated_at: Option<i64>,
+    /// Who updated the note last (optional).
+    pub note_updated_by: Option<String>,
+    /// Labels attached to the event (sorted).
+    pub labels: Vec<String>,
 }
 
 /// Persistent mute record for event identity keys.
@@ -1753,6 +1965,231 @@ pub struct SecretScanReportRecord {
     pub report_json: String,
     /// Timestamp when the report was created (epoch ms).
     pub created_at: i64,
+}
+
+/// Type of usage metric being recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricType {
+    /// Tokens consumed by an API call
+    TokenUsage,
+    /// Cost in USD
+    ApiCost,
+    /// API call count
+    ApiCall,
+    /// Rate limit event
+    RateLimitHit,
+    /// Workflow execution cost
+    WorkflowCost,
+    /// Session duration in seconds
+    SessionDuration,
+}
+
+impl MetricType {
+    /// Convert to the SQL-stored string representation.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MetricType::TokenUsage => "token_usage",
+            MetricType::ApiCost => "api_cost",
+            MetricType::ApiCall => "api_call",
+            MetricType::RateLimitHit => "rate_limit_hit",
+            MetricType::WorkflowCost => "workflow_cost",
+            MetricType::SessionDuration => "session_duration",
+        }
+    }
+}
+
+impl std::str::FromStr for MetricType {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "token_usage" => Ok(MetricType::TokenUsage),
+            "api_cost" => Ok(MetricType::ApiCost),
+            "api_call" => Ok(MetricType::ApiCall),
+            "rate_limit_hit" => Ok(MetricType::RateLimitHit),
+            "workflow_cost" => Ok(MetricType::WorkflowCost),
+            "session_duration" => Ok(MetricType::SessionDuration),
+            _ => Err(format!("Unknown metric type: {s}")),
+        }
+    }
+}
+
+impl std::fmt::Display for MetricType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A usage metric record for analytics tracking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageMetricRecord {
+    /// Record ID (0 for new records)
+    pub id: i64,
+    /// When the metric was recorded (epoch ms)
+    pub timestamp: i64,
+    /// Type of metric
+    pub metric_type: MetricType,
+    /// Optional pane ID (None for global metrics)
+    pub pane_id: Option<u64>,
+    /// Optional agent type (codex, claude_code, gemini)
+    pub agent_type: Option<String>,
+    /// Optional account reference
+    pub account_id: Option<String>,
+    /// Optional workflow execution reference
+    pub workflow_id: Option<String>,
+    /// For countable metrics
+    pub count: Option<i64>,
+    /// For costs (USD)
+    pub amount: Option<f64>,
+    /// For token counts
+    pub tokens: Option<i64>,
+    /// Optional JSON metadata
+    pub metadata: Option<String>,
+    /// When the record was created (epoch ms)
+    pub created_at: i64,
+}
+
+/// Aggregated daily summary row.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DailyMetricSummary {
+    /// Day as epoch ms (midnight UTC)
+    pub day_ts: i64,
+    /// Agent type (None for mixed)
+    pub agent_type: Option<String>,
+    /// Total tokens across all metrics for the day
+    pub total_tokens: i64,
+    /// Total cost in USD
+    pub total_cost: f64,
+    /// Number of metric events
+    pub event_count: i64,
+}
+
+/// Per-agent metric breakdown.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentMetricBreakdown {
+    /// Agent type
+    pub agent_type: String,
+    /// Total tokens consumed
+    pub total_tokens: i64,
+    /// Total cost in USD
+    pub total_cost: f64,
+    /// Average tokens per event
+    pub avg_tokens_per_event: f64,
+}
+
+/// Query filter for usage metrics.
+#[derive(Debug, Clone, Default)]
+pub struct MetricQuery {
+    /// Filter by metric type
+    pub metric_type: Option<MetricType>,
+    /// Filter by agent type
+    pub agent_type: Option<String>,
+    /// Filter by account ID
+    pub account_id: Option<String>,
+    /// Filter since timestamp (epoch ms)
+    pub since: Option<i64>,
+    /// Filter until timestamp (epoch ms)
+    pub until: Option<i64>,
+    /// Maximum results
+    pub limit: Option<usize>,
+}
+
+/// Status of a notification delivery attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NotificationStatus {
+    /// Notification created, delivery not yet attempted
+    Pending,
+    /// Successfully delivered
+    Sent,
+    /// Delivery failed
+    Failed,
+    /// Delivery was throttled / rate-limited
+    Throttled,
+}
+
+impl NotificationStatus {
+    /// Convert to the SQL-stored string representation.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            NotificationStatus::Pending => "pending",
+            NotificationStatus::Sent => "sent",
+            NotificationStatus::Failed => "failed",
+            NotificationStatus::Throttled => "throttled",
+        }
+    }
+}
+
+impl std::str::FromStr for NotificationStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "pending" => Ok(NotificationStatus::Pending),
+            "sent" => Ok(NotificationStatus::Sent),
+            "failed" => Ok(NotificationStatus::Failed),
+            "throttled" => Ok(NotificationStatus::Throttled),
+            _ => Err(format!("Unknown notification status: {s}")),
+        }
+    }
+}
+
+impl std::fmt::Display for NotificationStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A notification history record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationHistoryRecord {
+    /// Record ID (0 for new records)
+    pub id: i64,
+    /// When the notification was created (epoch ms)
+    pub timestamp: i64,
+    /// Optional event ID that triggered the notification
+    pub event_id: Option<i64>,
+    /// Delivery channel (webhook, desktop, slack, etc.)
+    pub channel: String,
+    /// Notification title
+    pub title: String,
+    /// Notification body
+    pub body: String,
+    /// Severity level (info, warning, error, critical)
+    pub severity: String,
+    /// Delivery status
+    pub status: NotificationStatus,
+    /// Error message if delivery failed
+    pub error_message: Option<String>,
+    /// When notification was acknowledged (epoch ms)
+    pub acknowledged_at: Option<i64>,
+    /// Who acknowledged the notification
+    pub acknowledged_by: Option<String>,
+    /// Action taken in response
+    pub action_taken: Option<String>,
+    /// Number of retry attempts
+    pub retry_count: i64,
+    /// Optional JSON metadata
+    pub metadata: Option<String>,
+    /// When the record was created (epoch ms)
+    pub created_at: i64,
+}
+
+/// Query filter for notification history.
+#[derive(Debug, Clone, Default)]
+pub struct NotificationHistoryQuery {
+    /// Filter since timestamp (epoch ms)
+    pub since: Option<i64>,
+    /// Filter until timestamp (epoch ms)
+    pub until: Option<i64>,
+    /// Filter by channel
+    pub channel: Option<String>,
+    /// Filter by status
+    pub status: Option<NotificationStatus>,
+    /// Filter by event ID
+    pub event_id: Option<i64>,
+    /// Maximum results (default 100)
+    pub limit: Option<usize>,
 }
 
 /// Saved search record for reusable queries and scheduling.
@@ -3250,6 +3687,33 @@ enum WriteCommand {
         status: String,
         respond: oneshot::Sender<Result<()>>,
     },
+    /// Set or clear triage state for an event.
+    SetEventTriageState {
+        event_id: i64,
+        triage_state: Option<String>,
+        updated_by: Option<String>,
+        respond: oneshot::Sender<Result<bool>>,
+    },
+    /// Set or clear the note for an event (note text is redacted before persist).
+    SetEventNote {
+        event_id: i64,
+        note: Option<String>,
+        updated_by: Option<String>,
+        respond: oneshot::Sender<Result<()>>,
+    },
+    /// Add a label to an event (idempotent).
+    AddEventLabel {
+        event_id: i64,
+        label: String,
+        created_by: Option<String>,
+        respond: oneshot::Sender<Result<bool>>,
+    },
+    /// Remove a label from an event.
+    RemoveEventLabel {
+        event_id: i64,
+        label: String,
+        respond: oneshot::Sender<Result<bool>>,
+    },
     /// Insert or update a persistent event mute
     UpsertEventMute {
         record: EventMuteRecord,
@@ -3432,6 +3896,45 @@ enum WriteCommand {
     /// Checkpoint WAL (incremental, non-blocking)
     Checkpoint {
         respond: oneshot::Sender<Result<CheckpointResult>>,
+    },
+    /// Record a usage metric
+    RecordUsageMetric {
+        record: UsageMetricRecord,
+        respond: oneshot::Sender<Result<i64>>,
+    },
+    /// Purge usage metrics older than a cutoff timestamp
+    PurgeUsageMetrics {
+        before_ts: i64,
+        respond: oneshot::Sender<Result<usize>>,
+    },
+    /// Record a notification in the history log
+    RecordNotification {
+        record: NotificationHistoryRecord,
+        respond: oneshot::Sender<Result<i64>>,
+    },
+    /// Update the status of a notification
+    UpdateNotificationStatus {
+        id: i64,
+        status: NotificationStatus,
+        error_message: Option<String>,
+        respond: oneshot::Sender<Result<()>>,
+    },
+    /// Acknowledge a notification
+    AcknowledgeNotification {
+        id: i64,
+        acknowledged_by: String,
+        action_taken: Option<String>,
+        respond: oneshot::Sender<Result<()>>,
+    },
+    /// Increment retry count for a notification
+    IncrementNotificationRetry {
+        id: i64,
+        respond: oneshot::Sender<Result<()>>,
+    },
+    /// Purge notification history older than a cutoff timestamp
+    PurgeNotificationHistory {
+        before_ts: i64,
+        respond: oneshot::Sender<Result<usize>>,
     },
     /// Shutdown the writer thread (flush pending writes)
     Shutdown { respond: oneshot::Sender<()> },
@@ -3658,6 +4161,109 @@ impl StorageHandle {
 
         rx.await
             .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    /// Set or clear an event's triage state.
+    ///
+    /// Returns true if an event row was updated.
+    pub async fn set_event_triage_state(
+        &self,
+        event_id: i64,
+        triage_state: Option<String>,
+        updated_by: Option<String>,
+    ) -> Result<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::SetEventTriageState {
+                event_id,
+                triage_state,
+                updated_by,
+                respond: tx,
+            })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    /// Set or clear an event's note.
+    ///
+    /// Note text is redacted before being persisted.
+    pub async fn set_event_note(
+        &self,
+        event_id: i64,
+        note: Option<String>,
+        updated_by: Option<String>,
+    ) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::SetEventNote {
+                event_id,
+                note,
+                updated_by,
+                respond: tx,
+            })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    /// Add a label to an event.
+    ///
+    /// Returns true if a new label row was inserted.
+    pub async fn add_event_label(
+        &self,
+        event_id: i64,
+        label: String,
+        created_by: Option<String>,
+    ) -> Result<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::AddEventLabel {
+                event_id,
+                label,
+                created_by,
+                respond: tx,
+            })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    /// Remove a label from an event.
+    ///
+    /// Returns true if a label row was deleted.
+    pub async fn remove_event_label(&self, event_id: i64, label: String) -> Result<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::RemoveEventLabel {
+                event_id,
+                label,
+                respond: tx,
+            })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    /// Fetch triage state, note, and labels for an event.
+    pub async fn get_event_annotations(&self, event_id: i64) -> Result<Option<EventAnnotations>> {
+        let db_path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            query_event_annotations_sync(&conn, event_id)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
     /// Add or update a persistent event mute by identity key.
@@ -3960,6 +4566,192 @@ impl StorageHandle {
         };
         let _ = self.record_maintenance(record).await?;
         Ok(deleted)
+    }
+
+    /// Record a usage metric for analytics tracking.
+    pub async fn record_usage_metric(&self, record: UsageMetricRecord) -> Result<i64> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::RecordUsageMetric {
+                record,
+                respond: tx,
+            })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    /// Purge usage metrics older than a cutoff timestamp.
+    pub async fn purge_usage_metrics(&self, before_ts: i64) -> Result<usize> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::PurgeUsageMetrics {
+                before_ts,
+                respond: tx,
+            })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    /// Query usage metrics with filters (read-only, uses read connection).
+    pub async fn query_usage_metrics(&self, query: MetricQuery) -> Result<Vec<UsageMetricRecord>> {
+        let db_path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            query_usage_metrics_sync(&conn, &query)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Spawn blocking failed: {e}")))?
+    }
+
+    /// Get daily aggregated metric summaries since a given timestamp.
+    pub async fn aggregate_daily_metrics(&self, since_ts: i64) -> Result<Vec<DailyMetricSummary>> {
+        let db_path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            aggregate_daily_sync(&conn, since_ts)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Spawn blocking failed: {e}")))?
+    }
+
+    /// Get per-agent metric breakdown since a given timestamp.
+    pub async fn aggregate_by_agent(&self, since_ts: i64) -> Result<Vec<AgentMetricBreakdown>> {
+        let db_path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            aggregate_by_agent_sync(&conn, since_ts)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Spawn blocking failed: {e}")))?
+    }
+
+    // ---- Notification History ----
+
+    /// Record a notification in the persistent history log.
+    pub async fn record_notification(&self, record: NotificationHistoryRecord) -> Result<i64> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::RecordNotification {
+                record,
+                respond: tx,
+            })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    /// Update the delivery status of a notification.
+    pub async fn update_notification_status(
+        &self,
+        id: i64,
+        status: NotificationStatus,
+        error_message: Option<String>,
+    ) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::UpdateNotificationStatus {
+                id,
+                status,
+                error_message,
+                respond: tx,
+            })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    /// Acknowledge a notification (marks when and by whom).
+    pub async fn acknowledge_notification(
+        &self,
+        id: i64,
+        acknowledged_by: String,
+        action_taken: Option<String>,
+    ) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::AcknowledgeNotification {
+                id,
+                acknowledged_by,
+                action_taken,
+                respond: tx,
+            })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    /// Increment the retry count for a notification and reset its status to pending.
+    pub async fn increment_notification_retry(&self, id: i64) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::IncrementNotificationRetry { id, respond: tx })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    /// Purge notification history older than the given timestamp.
+    pub async fn purge_notification_history(&self, before_ts: i64) -> Result<usize> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::PurgeNotificationHistory {
+                before_ts,
+                respond: tx,
+            })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    /// Query notification history with filters.
+    pub async fn query_notification_history(
+        &self,
+        query: NotificationHistoryQuery,
+    ) -> Result<Vec<NotificationHistoryRecord>> {
+        let db_path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            query_notification_history_sync(&conn, &query)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Spawn blocking failed: {e}")))?
+    }
+
+    /// Get a single notification by ID.
+    pub async fn get_notification(&self, id: i64) -> Result<NotificationHistoryRecord> {
+        let db_path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            get_notification_sync(&conn, id)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Spawn blocking failed: {e}")))?
     }
 
     /// Current write queue depth (pending commands waiting for the writer thread).
@@ -5557,6 +6349,10 @@ pub struct EventQuery {
     pub rule_id: Option<String>,
     /// Filter by event type (e.g., "compaction_warning")
     pub event_type: Option<String>,
+    /// Filter by triage state (exact match)
+    pub triage_state: Option<String>,
+    /// Filter by label (exact match)
+    pub label: Option<String>,
     /// Only return unhandled events
     pub unhandled_only: bool,
     /// Filter by time range start (epoch ms)
@@ -5702,6 +6498,47 @@ fn dispatch_write_command(conn: &mut Connection, cmd: WriteCommand, should_break
             respond,
         } => {
             let result = mark_event_handled_sync(conn, event_id, workflow_id.as_deref(), &status);
+            let _ = respond.send(result);
+        }
+        WriteCommand::SetEventTriageState {
+            event_id,
+            triage_state,
+            updated_by,
+            respond,
+        } => {
+            let result = set_event_triage_state_sync(
+                conn,
+                event_id,
+                triage_state.as_deref(),
+                updated_by.as_deref(),
+            );
+            let _ = respond.send(result);
+        }
+        WriteCommand::SetEventNote {
+            event_id,
+            note,
+            updated_by,
+            respond,
+        } => {
+            let result =
+                set_event_note_sync(conn, event_id, note.as_deref(), updated_by.as_deref());
+            let _ = respond.send(result);
+        }
+        WriteCommand::AddEventLabel {
+            event_id,
+            label,
+            created_by,
+            respond,
+        } => {
+            let result = add_event_label_sync(conn, event_id, &label, created_by.as_deref());
+            let _ = respond.send(result);
+        }
+        WriteCommand::RemoveEventLabel {
+            event_id,
+            label,
+            respond,
+        } => {
+            let result = remove_event_label_sync(conn, event_id, &label);
             let _ = respond.send(result);
         }
         WriteCommand::UpsertEventMute { record, respond } => {
@@ -5931,6 +6768,45 @@ fn dispatch_write_command(conn: &mut Connection, cmd: WriteCommand, should_break
             let result = expire_stale_reservations_sync(conn);
             let _ = respond.send(result);
         }
+        WriteCommand::RecordUsageMetric { record, respond } => {
+            let result = record_usage_metric_sync(conn, &record);
+            let _ = respond.send(result);
+        }
+        WriteCommand::PurgeUsageMetrics { before_ts, respond } => {
+            let result = purge_usage_metrics_sync(conn, before_ts);
+            let _ = respond.send(result);
+        }
+        WriteCommand::RecordNotification { record, respond } => {
+            let result = record_notification_sync(conn, &record);
+            let _ = respond.send(result);
+        }
+        WriteCommand::UpdateNotificationStatus {
+            id,
+            status,
+            error_message,
+            respond,
+        } => {
+            let result = update_notification_status_sync(conn, id, status, error_message);
+            let _ = respond.send(result);
+        }
+        WriteCommand::AcknowledgeNotification {
+            id,
+            acknowledged_by,
+            action_taken,
+            respond,
+        } => {
+            let result =
+                acknowledge_notification_sync(conn, id, &acknowledged_by, action_taken.as_deref());
+            let _ = respond.send(result);
+        }
+        WriteCommand::IncrementNotificationRetry { id, respond } => {
+            let result = increment_notification_retry_sync(conn, id);
+            let _ = respond.send(result);
+        }
+        WriteCommand::PurgeNotificationHistory { before_ts, respond } => {
+            let result = purge_notification_history_sync(conn, before_ts);
+            let _ = respond.send(result);
+        }
         WriteCommand::Shutdown { respond } => {
             let _ = respond.send(());
             *should_break = true;
@@ -6144,6 +7020,163 @@ fn mark_event_handled_sync(
     .map_err(|e| StorageError::Database(format!("Failed to mark event handled: {e}")))?;
 
     Ok(())
+}
+
+/// Set or clear triage state on an event row.
+///
+/// Returns true if an event row was updated.
+fn set_event_triage_state_sync(
+    conn: &Connection,
+    event_id: i64,
+    triage_state: Option<&str>,
+    updated_by: Option<&str>,
+) -> Result<bool> {
+    let rows = if let Some(state) = triage_state {
+        let now = now_ms();
+        conn.execute(
+            "UPDATE events
+             SET triage_state = ?1,
+                 triage_updated_at = ?2,
+                 triage_updated_by = ?3
+             WHERE id = ?4",
+            params![state, now, updated_by, event_id],
+        )
+    } else {
+        conn.execute(
+            "UPDATE events
+             SET triage_state = NULL,
+                 triage_updated_at = NULL,
+                 triage_updated_by = NULL
+             WHERE id = ?1",
+            params![event_id],
+        )
+    }
+    .map_err(|e| StorageError::Database(format!("Failed to set triage state: {e}")))?;
+
+    Ok(rows > 0)
+}
+
+/// Set or clear the note associated with an event.
+///
+/// Note content is redacted before persistence to avoid storing secrets.
+fn set_event_note_sync(
+    conn: &Connection,
+    event_id: i64,
+    note: Option<&str>,
+    updated_by: Option<&str>,
+) -> Result<()> {
+    if let Some(note) = note {
+        let redactor = Redactor::new();
+        let note = redactor.redact(note);
+        let now = now_ms();
+        conn.execute(
+            "INSERT INTO event_notes (event_id, note, updated_at, updated_by)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(event_id) DO UPDATE SET
+                note = excluded.note,
+                updated_at = excluded.updated_at,
+                updated_by = excluded.updated_by",
+            params![event_id, note, now, updated_by],
+        )
+        .map_err(|e| StorageError::Database(format!("Failed to set event note: {e}")))?;
+        return Ok(());
+    }
+
+    conn.execute(
+        "DELETE FROM event_notes WHERE event_id = ?1",
+        params![event_id],
+    )
+    .map_err(|e| StorageError::Database(format!("Failed to clear event note: {e}")))?;
+
+    Ok(())
+}
+
+/// Add a label to an event (idempotent).
+///
+/// Returns true if a new label was inserted.
+fn add_event_label_sync(
+    conn: &Connection,
+    event_id: i64,
+    label: &str,
+    created_by: Option<&str>,
+) -> Result<bool> {
+    let now = now_ms();
+    let rows = conn
+        .execute(
+            "INSERT OR IGNORE INTO event_labels (event_id, label, created_at, created_by)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![event_id, label, now, created_by],
+        )
+        .map_err(|e| StorageError::Database(format!("Failed to add event label: {e}")))?;
+
+    Ok(rows > 0)
+}
+
+/// Remove a label from an event.
+///
+/// Returns true if a label row was deleted.
+fn remove_event_label_sync(conn: &Connection, event_id: i64, label: &str) -> Result<bool> {
+    let rows = conn
+        .execute(
+            "DELETE FROM event_labels WHERE event_id = ?1 AND label = ?2",
+            params![event_id, label],
+        )
+        .map_err(|e| StorageError::Database(format!("Failed to remove event label: {e}")))?;
+    Ok(rows > 0)
+}
+
+/// Query all annotations for an event.
+fn query_event_annotations_sync(
+    conn: &Connection,
+    event_id: i64,
+) -> Result<Option<EventAnnotations>> {
+    let triage: Option<(Option<String>, Option<i64>, Option<String>)> = conn
+        .query_row(
+            "SELECT triage_state, triage_updated_at, triage_updated_by FROM events WHERE id = ?1",
+            params![event_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|e| StorageError::Database(format!("Failed to query triage state: {e}")))?;
+
+    let Some((triage_state, triage_updated_at, triage_updated_by)) = triage else {
+        return Ok(None);
+    };
+
+    let note_row: Option<(String, i64, Option<String>)> = conn
+        .query_row(
+            "SELECT note, updated_at, updated_by FROM event_notes WHERE event_id = ?1",
+            params![event_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|e| StorageError::Database(format!("Failed to query event note: {e}")))?;
+
+    let (note, note_updated_at, note_updated_by) = note_row
+        .map(|(n, ts, by)| (Some(n), Some(ts), by))
+        .unwrap_or((None, None, None));
+
+    let mut stmt = conn
+        .prepare("SELECT label FROM event_labels WHERE event_id = ?1 ORDER BY label ASC")
+        .map_err(|e| StorageError::Database(format!("Failed to prepare labels query: {e}")))?;
+    let rows = stmt
+        .query_map(params![event_id], |row| row.get::<_, String>(0))
+        .map_err(|e| StorageError::Database(format!("Labels query failed: {e}")))?;
+
+    let mut labels = Vec::new();
+    for row in rows {
+        labels.push(row.map_err(|e| StorageError::Database(format!("Label row error: {e}")))?);
+    }
+
+    Ok(Some(EventAnnotations {
+        triage_state,
+        triage_updated_at,
+        triage_updated_by,
+        note,
+        note_updated_at,
+        note_updated_by,
+        labels,
+    }))
 }
 
 /// Insert or update a persistent event mute.
@@ -6828,6 +7861,402 @@ fn checkpoint_sync(conn: &Connection) -> Result<CheckpointResult> {
     Ok(CheckpointResult {
         wal_pages,
         optimized: true,
+    })
+}
+
+// =============================================================================
+// Usage Metrics Operations (Synchronous)
+// =============================================================================
+
+fn record_usage_metric_sync(conn: &Connection, record: &UsageMetricRecord) -> Result<i64> {
+    let ts = if record.timestamp == 0 {
+        now_ms()
+    } else {
+        record.timestamp
+    };
+    let created = if record.created_at == 0 {
+        now_ms()
+    } else {
+        record.created_at
+    };
+    let pane_id = record.pane_id.map(|id| id as i64);
+
+    conn.execute(
+        "INSERT INTO usage_metrics (timestamp, metric_type, pane_id, agent_type, account_id, workflow_id, count, amount, tokens, metadata, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            ts,
+            record.metric_type.as_str(),
+            pane_id,
+            record.agent_type,
+            record.account_id,
+            record.workflow_id,
+            record.count,
+            record.amount,
+            record.tokens,
+            record.metadata,
+            created,
+        ],
+    )
+    .map_err(|e| StorageError::Database(format!("Failed to record usage metric: {e}")))?;
+
+    Ok(conn.last_insert_rowid())
+}
+
+fn purge_usage_metrics_sync(conn: &Connection, before_ts: i64) -> Result<usize> {
+    let deleted = conn
+        .execute(
+            "DELETE FROM usage_metrics WHERE timestamp < ?1",
+            params![before_ts],
+        )
+        .map_err(|e| StorageError::Database(format!("Failed to purge usage metrics: {e}")))?;
+    Ok(deleted)
+}
+
+fn query_usage_metrics_sync(
+    conn: &Connection,
+    query: &MetricQuery,
+) -> Result<Vec<UsageMetricRecord>> {
+    let mut sql = String::from(
+        "SELECT id, timestamp, metric_type, pane_id, agent_type, account_id, workflow_id, count, amount, tokens, metadata, created_at FROM usage_metrics WHERE 1=1",
+    );
+    let mut param_values: Vec<SqlValue> = Vec::new();
+
+    if let Some(ref mt) = query.metric_type {
+        sql.push_str(" AND metric_type = ?");
+        param_values.push(SqlValue::Text(mt.as_str().to_string()));
+    }
+    if let Some(ref agent) = query.agent_type {
+        sql.push_str(" AND agent_type = ?");
+        param_values.push(SqlValue::Text(agent.clone()));
+    }
+    if let Some(ref account) = query.account_id {
+        sql.push_str(" AND account_id = ?");
+        param_values.push(SqlValue::Text(account.clone()));
+    }
+    if let Some(since) = query.since {
+        sql.push_str(" AND timestamp >= ?");
+        param_values.push(SqlValue::Integer(since));
+    }
+    if let Some(until) = query.until {
+        sql.push_str(" AND timestamp < ?");
+        param_values.push(SqlValue::Integer(until));
+    }
+    sql.push_str(" ORDER BY timestamp DESC");
+    if let Some(limit) = query.limit {
+        sql.push_str(" LIMIT ?");
+        param_values.push(SqlValue::Integer(limit as i64));
+    }
+
+    let params_ref: Vec<&dyn rusqlite::types::ToSql> = param_values
+        .iter()
+        .map(|v| v as &dyn rusqlite::types::ToSql)
+        .collect();
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| StorageError::Database(format!("Failed to prepare metric query: {e}")))?;
+    let rows = stmt
+        .query_map(params_ref.as_slice(), |row| {
+            let metric_type_str: String = row.get(2)?;
+            let pane_id_raw: Option<i64> = row.get(3)?;
+            Ok(UsageMetricRecord {
+                id: row.get(0)?,
+                timestamp: row.get(1)?,
+                metric_type: metric_type_str.parse().unwrap_or(MetricType::ApiCall),
+                pane_id: pane_id_raw.map(|v| v as u64),
+                agent_type: row.get(4)?,
+                account_id: row.get(5)?,
+                workflow_id: row.get(6)?,
+                count: row.get(7)?,
+                amount: row.get(8)?,
+                tokens: row.get(9)?,
+                metadata: row.get(10)?,
+                created_at: row.get(11)?,
+            })
+        })
+        .map_err(|e| StorageError::Database(format!("Failed to query metrics: {e}")))?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row.map_err(|e| StorageError::Database(format!("Row error: {e}")))?);
+    }
+    Ok(results)
+}
+
+fn aggregate_daily_sync(conn: &Connection, since_ts: i64) -> Result<Vec<DailyMetricSummary>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT (timestamp / 86400000) * 86400000 AS day_ts,
+                    agent_type,
+                    COALESCE(SUM(tokens), 0),
+                    COALESCE(SUM(amount), 0.0),
+                    COUNT(*)
+             FROM usage_metrics
+             WHERE timestamp >= ?1
+             GROUP BY day_ts, agent_type
+             ORDER BY day_ts DESC",
+        )
+        .map_err(|e| StorageError::Database(format!("Failed to prepare daily aggregate: {e}")))?;
+
+    let rows = stmt
+        .query_map(params![since_ts], |row| {
+            Ok(DailyMetricSummary {
+                day_ts: row.get(0)?,
+                agent_type: row.get(1)?,
+                total_tokens: row.get(2)?,
+                total_cost: row.get(3)?,
+                event_count: row.get(4)?,
+            })
+        })
+        .map_err(|e| StorageError::Database(format!("Failed to aggregate daily: {e}")))?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row.map_err(|e| StorageError::Database(format!("Row error: {e}")))?);
+    }
+    Ok(results)
+}
+
+fn aggregate_by_agent_sync(conn: &Connection, since_ts: i64) -> Result<Vec<AgentMetricBreakdown>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT COALESCE(agent_type, 'unknown'),
+                    COALESCE(SUM(tokens), 0),
+                    COALESCE(SUM(amount), 0.0),
+                    CASE WHEN COUNT(*) > 0 THEN CAST(COALESCE(SUM(tokens), 0) AS REAL) / COUNT(*) ELSE 0.0 END
+             FROM usage_metrics
+             WHERE timestamp >= ?1
+             GROUP BY agent_type
+             ORDER BY SUM(amount) DESC",
+        )
+        .map_err(|e| StorageError::Database(format!("Failed to prepare agent aggregate: {e}")))?;
+
+    let rows = stmt
+        .query_map(params![since_ts], |row| {
+            Ok(AgentMetricBreakdown {
+                agent_type: row.get(0)?,
+                total_tokens: row.get(1)?,
+                total_cost: row.get(2)?,
+                avg_tokens_per_event: row.get(3)?,
+            })
+        })
+        .map_err(|e| StorageError::Database(format!("Failed to aggregate by agent: {e}")))?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row.map_err(|e| StorageError::Database(format!("Row error: {e}")))?);
+    }
+    Ok(results)
+}
+
+// =============================================================================
+// Notification History Operations (Synchronous)
+// =============================================================================
+
+fn record_notification_sync(conn: &Connection, record: &NotificationHistoryRecord) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO notification_history (
+            timestamp, event_id, channel, title, body, severity,
+            status, error_message, acknowledged_at, acknowledged_by,
+            action_taken, retry_count, metadata, created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        rusqlite::params![
+            record.timestamp,
+            record.event_id,
+            record.channel,
+            record.title,
+            record.body,
+            record.severity,
+            record.status.as_str(),
+            record.error_message,
+            record.acknowledged_at,
+            record.acknowledged_by,
+            record.action_taken,
+            record.retry_count,
+            record.metadata,
+            record.created_at,
+        ],
+    )
+    .map_err(|e| StorageError::Database(format!("Failed to record notification: {e}")))?;
+    Ok(conn.last_insert_rowid())
+}
+
+fn update_notification_status_sync(
+    conn: &Connection,
+    id: i64,
+    status: NotificationStatus,
+    error_message: Option<String>,
+) -> Result<()> {
+    let changed = conn
+        .execute(
+            "UPDATE notification_history SET status = ?1, error_message = ?2 WHERE id = ?3",
+            rusqlite::params![status.as_str(), error_message, id],
+        )
+        .map_err(|e| {
+            StorageError::Database(format!("Failed to update notification status: {e}"))
+        })?;
+    if changed == 0 {
+        return Err(StorageError::Database(format!("Notification {id} not found")).into());
+    }
+    Ok(())
+}
+
+fn acknowledge_notification_sync(
+    conn: &Connection,
+    id: i64,
+    acknowledged_by: &str,
+    action_taken: Option<&str>,
+) -> Result<()> {
+    let now = now_ms();
+    let changed = conn
+        .execute(
+            "UPDATE notification_history SET acknowledged_at = ?1, acknowledged_by = ?2, action_taken = ?3 WHERE id = ?4",
+            rusqlite::params![now, acknowledged_by, action_taken, id],
+        )
+        .map_err(|e| StorageError::Database(format!("Failed to acknowledge notification: {e}")))?;
+    if changed == 0 {
+        return Err(StorageError::Database(format!("Notification {id} not found")).into());
+    }
+    Ok(())
+}
+
+fn increment_notification_retry_sync(conn: &Connection, id: i64) -> Result<()> {
+    let changed = conn
+        .execute(
+            "UPDATE notification_history SET retry_count = retry_count + 1, status = 'pending' WHERE id = ?1",
+            rusqlite::params![id],
+        )
+        .map_err(|e| {
+            StorageError::Database(format!("Failed to increment notification retry: {e}"))
+        })?;
+    if changed == 0 {
+        return Err(StorageError::Database(format!("Notification {id} not found")).into());
+    }
+    Ok(())
+}
+
+fn purge_notification_history_sync(conn: &Connection, before_ts: i64) -> Result<usize> {
+    let deleted = conn
+        .execute(
+            "DELETE FROM notification_history WHERE timestamp < ?1",
+            rusqlite::params![before_ts],
+        )
+        .map_err(|e| {
+            StorageError::Database(format!("Failed to purge notification history: {e}"))
+        })?;
+    Ok(deleted)
+}
+
+fn query_notification_history_sync(
+    conn: &Connection,
+    query: &NotificationHistoryQuery,
+) -> Result<Vec<NotificationHistoryRecord>> {
+    let mut sql = String::from(
+        "SELECT id, timestamp, event_id, channel, title, body, severity,
+                status, error_message, acknowledged_at, acknowledged_by,
+                action_taken, retry_count, metadata, created_at
+         FROM notification_history WHERE 1=1",
+    );
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+    if let Some(since) = query.since {
+        params.push(Box::new(since));
+        sql.push_str(&format!(" AND timestamp >= ?{}", params.len()));
+    }
+    if let Some(until) = query.until {
+        params.push(Box::new(until));
+        sql.push_str(&format!(" AND timestamp <= ?{}", params.len()));
+    }
+    if let Some(ref channel) = query.channel {
+        params.push(Box::new(channel.clone()));
+        sql.push_str(&format!(" AND channel = ?{}", params.len()));
+    }
+    if let Some(status) = query.status {
+        params.push(Box::new(status.as_str().to_string()));
+        sql.push_str(&format!(" AND status = ?{}", params.len()));
+    }
+    if let Some(event_id) = query.event_id {
+        params.push(Box::new(event_id));
+        sql.push_str(&format!(" AND event_id = ?{}", params.len()));
+    }
+
+    sql.push_str(" ORDER BY timestamp DESC");
+
+    let limit = query.limit.unwrap_or(100);
+    params.push(Box::new(limit as i64));
+    sql.push_str(&format!(" LIMIT ?{}", params.len()));
+
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| StorageError::Database(format!("Failed to prepare query: {e}")))?;
+    let rows = stmt
+        .query_map(param_refs.as_slice(), |row| {
+            let status_str: String = row.get(7)?;
+            let status: NotificationStatus =
+                status_str.parse().unwrap_or(NotificationStatus::Pending);
+            let pane_id_i64: Option<i64> = row.get(2)?;
+            Ok(NotificationHistoryRecord {
+                id: row.get(0)?,
+                timestamp: row.get(1)?,
+                event_id: pane_id_i64,
+                channel: row.get(3)?,
+                title: row.get(4)?,
+                body: row.get(5)?,
+                severity: row.get(6)?,
+                status,
+                error_message: row.get(8)?,
+                acknowledged_at: row.get(9)?,
+                acknowledged_by: row.get(10)?,
+                action_taken: row.get(11)?,
+                retry_count: row.get(12)?,
+                metadata: row.get(13)?,
+                created_at: row.get(14)?,
+            })
+        })
+        .map_err(|e| {
+            StorageError::Database(format!("Failed to query notification history: {e}"))
+        })?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row.map_err(|e| StorageError::Database(format!("Row error: {e}")))?);
+    }
+    Ok(results)
+}
+
+fn get_notification_sync(conn: &Connection, id: i64) -> Result<NotificationHistoryRecord> {
+    conn.query_row(
+        "SELECT id, timestamp, event_id, channel, title, body, severity,
+                status, error_message, acknowledged_at, acknowledged_by,
+                action_taken, retry_count, metadata, created_at
+         FROM notification_history WHERE id = ?1",
+        rusqlite::params![id],
+        |row| {
+            let status_str: String = row.get(7)?;
+            let status: NotificationStatus =
+                status_str.parse().unwrap_or(NotificationStatus::Pending);
+            Ok(NotificationHistoryRecord {
+                id: row.get(0)?,
+                timestamp: row.get(1)?,
+                event_id: row.get(2)?,
+                channel: row.get(3)?,
+                title: row.get(4)?,
+                body: row.get(5)?,
+                severity: row.get(6)?,
+                status,
+                error_message: row.get(8)?,
+                acknowledged_at: row.get(9)?,
+                acknowledged_by: row.get(10)?,
+                action_taken: row.get(11)?,
+                retry_count: row.get(12)?,
+                metadata: row.get(13)?,
+                created_at: row.get(14)?,
+            })
+        },
+    )
+    .map_err(|e| -> crate::error::Error {
+        StorageError::Database(format!("Notification {id} not found: {e}")).into()
     })
 }
 
@@ -8466,6 +9895,16 @@ fn query_events(conn: &Connection, query: &EventQuery) -> Result<Vec<StoredEvent
     if let Some(ref event_type) = query.event_type {
         sql.push_str(" AND event_type = ?");
         params.push(Box::new(event_type.clone()));
+    }
+
+    if let Some(ref triage_state) = query.triage_state {
+        sql.push_str(" AND triage_state = ?");
+        params.push(Box::new(triage_state.clone()));
+    }
+
+    if let Some(ref label) = query.label {
+        sql.push_str(" AND id IN (SELECT event_id FROM event_labels WHERE label = ?)");
+        params.push(Box::new(label.clone()));
     }
 
     if let Some(since) = query.since {
@@ -10259,6 +11698,8 @@ mod tests {
             "output_segments",
             "output_gaps",
             "events",
+            "event_labels",
+            "event_notes",
             "workflow_executions",
             "workflow_step_logs",
             "audit_actions",
@@ -10306,6 +11747,65 @@ mod tests {
         let up_plan = build_migration_plan(downgrade_target, SCHEMA_VERSION).unwrap();
         apply_migration_plan(&conn, &up_plan).unwrap();
         assert_eq!(get_user_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn migration_v18_preserves_existing_events() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        // Downgrade just the newest migration (v18 -> v17).
+        let down_plan = build_migration_plan(SCHEMA_VERSION, 17).unwrap();
+        apply_migration_plan(&conn, &down_plan).unwrap();
+        assert_eq!(get_user_version(&conn).unwrap(), 17);
+
+        let now_ms = 1_700_000_000_000i64;
+
+        // Insert pane + event using the pre-v18 schema (no triage columns/tables).
+        conn.execute(
+            "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![1i64, "local", now_ms, now_ms, 1],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO events (pane_id, rule_id, agent_type, event_type, severity, confidence, detected_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![1i64, "codex.usage_limit", "codex", "usage", "warning", 0.95, now_ms],
+        )
+        .unwrap();
+
+        let count_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count_before, 1);
+
+        // Upgrade back to current schema and verify event row is preserved.
+        let up_plan = build_migration_plan(17, SCHEMA_VERSION).unwrap();
+        apply_migration_plan(&conn, &up_plan).unwrap();
+        assert_eq!(get_user_version(&conn).unwrap(), SCHEMA_VERSION);
+
+        let count_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count_after, 1);
+
+        // New columns/tables should exist after upgrade.
+        let triage_state: Option<String> = conn
+            .query_row("SELECT triage_state FROM events WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(triage_state.is_none());
+
+        let labels_table: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='event_labels'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(labels_table, 1);
     }
 
     #[test]
@@ -14652,6 +16152,103 @@ mod storage_handle_tests {
             .mark_event_handled(event_id, Some("wf-123".to_string()), "completed")
             .await
             .unwrap();
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn storage_handle_event_annotations_roundtrip() {
+        let db_path = temp_db_path();
+        let handle: StorageHandle = StorageHandle::new(&db_path).await.unwrap();
+
+        let now = now_ms();
+
+        // Create pane first (foreign key constraint)
+        handle.upsert_pane(test_pane(1)).await.unwrap();
+
+        let event = StoredEvent {
+            id: 0,
+            pane_id: 1,
+            rule_id: "test.rule".to_string(),
+            agent_type: "codex".to_string(),
+            event_type: "usage".to_string(),
+            severity: "warning".to_string(),
+            confidence: 0.9,
+            extracted: None,
+            matched_text: Some("match".to_string()),
+            segment_id: None,
+            detected_at: now,
+            dedupe_key: None,
+            handled_at: None,
+            handled_by_workflow_id: None,
+            handled_status: None,
+        };
+
+        let event_id: i64 = handle.record_event(event).await.unwrap();
+        assert!(event_id > 0);
+
+        // Triage state
+        let changed = handle
+            .set_event_triage_state(
+                event_id,
+                Some("new".to_string()),
+                Some("tester".to_string()),
+            )
+            .await
+            .unwrap();
+        assert!(changed);
+
+        // Labels (idempotent)
+        let inserted = handle
+            .add_event_label(
+                event_id,
+                "needs-attn".to_string(),
+                Some("tester".to_string()),
+            )
+            .await
+            .unwrap();
+        assert!(inserted);
+        let inserted_again = handle
+            .add_event_label(
+                event_id,
+                "needs-attn".to_string(),
+                Some("tester".to_string()),
+            )
+            .await
+            .unwrap();
+        assert!(!inserted_again);
+
+        // Note (should be redacted at write time)
+        let note = "token sk-abc123456789012345678901234567890123456789012345678901";
+        handle
+            .set_event_note(event_id, Some(note.to_string()), Some("tester".to_string()))
+            .await
+            .unwrap();
+
+        let annotations = handle
+            .get_event_annotations(event_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(annotations.triage_state.as_deref(), Some("new"));
+        assert_eq!(annotations.triage_updated_by.as_deref(), Some("tester"));
+        assert_eq!(annotations.labels, vec!["needs-attn".to_string()]);
+        let stored_note = annotations.note.unwrap_or_default();
+        assert!(stored_note.contains("[REDACTED]"));
+        assert!(!stored_note.contains("sk-abc"));
+
+        // Query filters should work (label + triage state)
+        let events = handle
+            .get_events(EventQuery {
+                triage_state: Some("new".to_string()),
+                label: Some("needs-attn".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].id, event_id);
 
         handle.shutdown().await.unwrap();
         let _ = std::fs::remove_file(&db_path);

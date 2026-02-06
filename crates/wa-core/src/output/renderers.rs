@@ -272,6 +272,111 @@ impl EventListRenderer {
         output
     }
 
+    /// Render events with noise control annotations (muted keys, suppression counts).
+    ///
+    /// `muted_keys` is a set of identity keys that are currently muted.
+    /// `active_mute_count` is the total number of active mutes (shown in footer).
+    #[must_use]
+    pub fn render_with_noise_info(
+        events: &[StoredEvent],
+        ctx: &RenderContext,
+        muted_keys: &std::collections::HashSet<String>,
+        active_mute_count: usize,
+    ) -> String {
+        if ctx.format.is_json() {
+            let annotated: Vec<serde_json::Value> = events
+                .iter()
+                .map(|e| {
+                    let is_muted = e
+                        .dedupe_key
+                        .as_ref()
+                        .is_some_and(|k| muted_keys.contains(k));
+                    let mut obj = serde_json::to_value(e).unwrap_or_else(|_| serde_json::json!({}));
+                    if let Some(map) = obj.as_object_mut() {
+                        map.insert("muted".to_string(), serde_json::json!(is_muted));
+                    }
+                    obj
+                })
+                .collect();
+            return serde_json::to_string_pretty(&annotated).unwrap_or_else(|_| "[]".to_string());
+        }
+
+        let style = Style::from_format(ctx.format);
+
+        if events.is_empty() {
+            let mut output = style.dim("No events found\n");
+            if active_mute_count > 0 {
+                output.push_str(&style.dim(&format!(
+                    "({active_mute_count} active mute(s) filtering events)\n"
+                )));
+            }
+            return output;
+        }
+
+        let mut output = String::new();
+        output.push_str(&style.bold(&format!("Events ({}):\n", events.len())));
+
+        let mut table = Table::new(vec![
+            Column::new("ID").align(Alignment::Right).min_width(5),
+            Column::new("PANE").align(Alignment::Right).min_width(4),
+            Column::new("RULE").min_width(16),
+            Column::new("SUMMARY").min_width(24),
+            Column::new("SEV").min_width(8),
+            Column::new("TIME").min_width(20),
+            Column::new("STATUS").min_width(10),
+        ])
+        .with_format(ctx.format);
+
+        let display_events = if ctx.limit > 0 && events.len() > ctx.limit {
+            &events[..ctx.limit]
+        } else {
+            events
+        };
+
+        for event in display_events {
+            let severity = style.severity(&event.severity, &event.severity);
+            let summary = event_templates::render_event(event).summary;
+            let is_muted = event
+                .dedupe_key
+                .as_ref()
+                .is_some_and(|k| muted_keys.contains(k));
+            let status = if is_muted {
+                style.dim("muted")
+            } else if event.handled_at.is_some() {
+                style.green("handled")
+            } else {
+                style.yellow("pending")
+            };
+
+            table.add_row(vec![
+                event.id.to_string(),
+                event.pane_id.to_string(),
+                event.rule_id.clone(),
+                truncate(&summary, 60),
+                severity,
+                format_timestamp(event.detected_at),
+                status,
+            ]);
+        }
+
+        output.push_str(&table.render());
+
+        if ctx.limit > 0 && events.len() > ctx.limit {
+            output.push_str(&style.dim(&format!(
+                "\n... and {} more events (use --limit to see more)\n",
+                events.len() - ctx.limit
+            )));
+        }
+
+        if active_mute_count > 0 {
+            output.push_str(&style.dim(&format!(
+                "\n{active_mute_count} active mute(s). Use 'wa mute list' to view.\n"
+            )));
+        }
+
+        output
+    }
+
     /// Render a single event detail view
     #[must_use]
     pub fn render_detail(event: &StoredEvent, ctx: &RenderContext) -> String {
@@ -1585,6 +1690,244 @@ pub struct HealthDiagnostic {
     pub detail: String,
 }
 
+// =============================================================================
+// Analytics Renderers (wa-985.3)
+// =============================================================================
+
+/// Summary data for analytics overview
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AnalyticsSummaryData {
+    /// Period label (e.g. "Last 7 Days")
+    pub period_label: String,
+    /// Total tokens across all agents
+    pub total_tokens: i64,
+    /// Estimated cost in USD
+    pub total_cost: f64,
+    /// Number of rate limit events
+    pub rate_limit_hits: i64,
+    /// Number of workflow executions
+    pub workflow_runs: i64,
+}
+
+/// Renderer for analytics summary
+pub struct AnalyticsSummaryRenderer;
+
+impl AnalyticsSummaryRenderer {
+    /// Render analytics summary
+    #[must_use]
+    pub fn render(data: &AnalyticsSummaryData, ctx: &RenderContext) -> String {
+        if ctx.format.is_json() {
+            return serde_json::to_string_pretty(data).unwrap_or_else(|_| "{}".to_string());
+        }
+
+        let style = Style::from_format(ctx.format);
+        let mut output = String::new();
+
+        output.push_str(&format!(
+            "{}\n",
+            style.bold(&format!("Usage Analytics ({})", data.period_label))
+        ));
+        output.push_str(&format!(
+            "  Total Tokens:    {}\n",
+            format_number(data.total_tokens)
+        ));
+        output.push_str(&format!("  Estimated Cost:  ${:.2}\n", data.total_cost));
+        output.push_str(&format!("  Rate Limits Hit: {}\n", data.rate_limit_hits));
+        output.push_str(&format!("  Workflows Run:   {}\n", data.workflow_runs));
+
+        output
+    }
+}
+
+/// Renderer for daily metrics breakdown
+pub struct AnalyticsDailyRenderer;
+
+impl AnalyticsDailyRenderer {
+    /// Render daily metrics table
+    #[must_use]
+    pub fn render(days: &[crate::storage::DailyMetricSummary], ctx: &RenderContext) -> String {
+        if ctx.format.is_json() {
+            return serde_json::to_string_pretty(days).unwrap_or_else(|_| "[]".to_string());
+        }
+
+        let style = Style::from_format(ctx.format);
+
+        if days.is_empty() {
+            return style.dim("No daily metrics found\n");
+        }
+
+        let mut output = String::new();
+        output.push_str(&format!("{}\n", style.bold("Daily Metrics:")));
+
+        let mut table = Table::new(vec![
+            Column::new("DATE").min_width(12),
+            Column::new("TOKENS").align(Alignment::Right).min_width(12),
+            Column::new("COST").align(Alignment::Right).min_width(10),
+            Column::new("EVENTS").align(Alignment::Right).min_width(8),
+        ])
+        .with_format(ctx.format);
+
+        for day in days {
+            let date_str = format_epoch_date(day.day_ts);
+            table.add_row(vec![
+                date_str,
+                format_number(day.total_tokens),
+                format!("${:.2}", day.total_cost),
+                day.event_count.to_string(),
+            ]);
+        }
+
+        output.push_str(&table.render());
+        output
+    }
+}
+
+/// Renderer for per-agent metrics breakdown
+pub struct AnalyticsAgentRenderer;
+
+impl AnalyticsAgentRenderer {
+    /// Render agent breakdown table
+    #[must_use]
+    pub fn render(agents: &[crate::storage::AgentMetricBreakdown], ctx: &RenderContext) -> String {
+        if ctx.format.is_json() {
+            return serde_json::to_string_pretty(agents).unwrap_or_else(|_| "[]".to_string());
+        }
+
+        let style = Style::from_format(ctx.format);
+
+        if agents.is_empty() {
+            return style.dim("No agent metrics found\n");
+        }
+
+        let total_tokens: i64 = agents.iter().map(|a| a.total_tokens).sum();
+
+        let mut output = String::new();
+        output.push_str(&format!("{}\n", style.bold("Breakdown by Agent:")));
+
+        let mut table = Table::new(vec![
+            Column::new("AGENT").min_width(14),
+            Column::new("TOKENS").align(Alignment::Right).min_width(12),
+            Column::new("COST").align(Alignment::Right).min_width(10),
+            Column::new("% OF TOTAL")
+                .align(Alignment::Right)
+                .min_width(10),
+            Column::new("AVG/EVENT")
+                .align(Alignment::Right)
+                .min_width(10),
+        ])
+        .with_format(ctx.format);
+
+        for agent in agents {
+            let pct = if total_tokens > 0 {
+                #[allow(clippy::cast_precision_loss)]
+                let p = (agent.total_tokens as f64 / total_tokens as f64) * 100.0;
+                format!("{p:.0}%")
+            } else {
+                "0%".to_string()
+            };
+
+            table.add_row(vec![
+                agent.agent_type.clone(),
+                format_number(agent.total_tokens),
+                format!("${:.2}", agent.total_cost),
+                pct,
+                format!("{:.0}", agent.avg_tokens_per_event),
+            ]);
+        }
+
+        output.push_str(&table.render());
+        output
+    }
+}
+
+/// Renderer for metrics export (CSV format)
+pub struct AnalyticsExportRenderer;
+
+impl AnalyticsExportRenderer {
+    /// Render metrics as CSV
+    #[must_use]
+    pub fn render_csv(metrics: &[crate::storage::UsageMetricRecord]) -> String {
+        let mut output =
+            String::from("timestamp,metric_type,agent_type,account_id,tokens,amount,count\n");
+        for m in metrics {
+            output.push_str(&format!(
+                "{},{},{},{},{},{},{}\n",
+                m.timestamp,
+                m.metric_type,
+                m.agent_type.as_deref().unwrap_or(""),
+                m.account_id.as_deref().unwrap_or(""),
+                m.tokens.map_or(String::new(), |t| t.to_string()),
+                m.amount.map_or(String::new(), |a| format!("{a:.4}")),
+                m.count.map_or(String::new(), |c| c.to_string()),
+            ));
+        }
+        output
+    }
+
+    /// Render metrics as JSON
+    #[must_use]
+    pub fn render_json(metrics: &[crate::storage::UsageMetricRecord]) -> String {
+        serde_json::to_string_pretty(metrics).unwrap_or_else(|_| "[]".to_string())
+    }
+}
+
+/// Format a large number with comma separators
+fn format_number(n: i64) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut result = String::new();
+    let len = bytes.len();
+    for (i, &b) in bytes.iter().enumerate() {
+        if i > 0 && (len - i) % 3 == 0 {
+            result.push(',');
+        }
+        result.push(b as char);
+    }
+    result
+}
+
+/// Format an epoch-ms timestamp as a date string (YYYY-MM-DD)
+fn format_epoch_date(epoch_ms: i64) -> String {
+    let secs = epoch_ms / 1000;
+    let days = secs / 86400;
+    // Simple date calculation from epoch days
+    let mut y = 1970i64;
+    let mut remaining = days;
+    loop {
+        let days_in_year = if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) {
+            366
+        } else {
+            365
+        };
+        if remaining < days_in_year {
+            break;
+        }
+        remaining -= days_in_year;
+        y += 1;
+    }
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let month_days: [i64; 12] = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    let mut m = 0usize;
+    while m < 12 && remaining >= month_days[m] {
+        remaining -= month_days[m];
+        m += 1;
+    }
+    format!("{y:04}-{:02}-{:02}", m + 1, remaining + 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2837,5 +3180,90 @@ mod tests {
         let output = HealthSnapshotRenderer::render(&snapshot, &ctx);
 
         assert!(output.contains("0 pending (idle)"));
+    }
+
+    // ── render_with_noise_info tests ─────────────────────────────────────
+
+    #[test]
+    fn noise_info_shows_muted_status_for_matching_key() {
+        let mut event = sample_event();
+        event.dedupe_key = Some("evt:abc123".to_string());
+        let events = vec![event];
+
+        let mut muted_keys = std::collections::HashSet::new();
+        muted_keys.insert("evt:abc123".to_string());
+
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = EventListRenderer::render_with_noise_info(&events, &ctx, &muted_keys, 1);
+
+        assert!(output.contains("muted"));
+        assert!(output.contains("1 active mute(s)"));
+    }
+
+    #[test]
+    fn noise_info_shows_pending_for_non_muted_event() {
+        let mut event = sample_event();
+        event.dedupe_key = Some("evt:different".to_string());
+        let events = vec![event];
+
+        let mut muted_keys = std::collections::HashSet::new();
+        muted_keys.insert("evt:abc123".to_string());
+
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = EventListRenderer::render_with_noise_info(&events, &ctx, &muted_keys, 1);
+
+        assert!(output.contains("pending"));
+    }
+
+    #[test]
+    fn noise_info_json_includes_muted_field() {
+        let mut event = sample_event();
+        event.dedupe_key = Some("evt:key1".to_string());
+        let events = vec![event];
+
+        let mut muted_keys = std::collections::HashSet::new();
+        muted_keys.insert("evt:key1".to_string());
+
+        let ctx = RenderContext::new(OutputFormat::Json);
+        let output = EventListRenderer::render_with_noise_info(&events, &ctx, &muted_keys, 1);
+
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0]["muted"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn noise_info_json_muted_false_when_no_match() {
+        let mut event = sample_event();
+        event.dedupe_key = Some("evt:other".to_string());
+        let events = vec![event];
+
+        let muted_keys = std::collections::HashSet::new();
+
+        let ctx = RenderContext::new(OutputFormat::Json);
+        let output = EventListRenderer::render_with_noise_info(&events, &ctx, &muted_keys, 0);
+
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed[0]["muted"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn noise_info_empty_events_shows_mute_hint() {
+        let muted_keys = std::collections::HashSet::new();
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = EventListRenderer::render_with_noise_info(&[], &ctx, &muted_keys, 3);
+
+        assert!(output.contains("No events found"));
+        assert!(output.contains("3 active mute(s)"));
+    }
+
+    #[test]
+    fn noise_info_no_mutes_no_footer() {
+        let events = vec![sample_event()];
+        let muted_keys = std::collections::HashSet::new();
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = EventListRenderer::render_with_noise_info(&events, &ctx, &muted_keys, 0);
+
+        assert!(!output.contains("active mute"));
     }
 }

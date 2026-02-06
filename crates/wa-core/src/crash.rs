@@ -604,8 +604,662 @@ pub fn export_incident_bundle(
 }
 
 // ---------------------------------------------------------------------------
-// Helpers (continued)
+// Enhanced incident bundle collector
 // ---------------------------------------------------------------------------
+
+/// Summary of what was redacted during bundle collection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RedactionReport {
+    /// Total number of redaction replacements across all files
+    pub total_redactions: usize,
+    /// Per-file redaction counts
+    pub per_file: Vec<FileRedactionEntry>,
+}
+
+/// Redaction details for a single file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileRedactionEntry {
+    /// File name within the bundle
+    pub file: String,
+    /// Number of secrets redacted in this file
+    pub count: usize,
+}
+
+/// Database metadata collected for the bundle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbMetadata {
+    /// Schema version (from wa_meta table)
+    pub schema_version: Option<i64>,
+    /// Database file size in bytes
+    pub db_size_bytes: Option<u64>,
+    /// SQLite journal mode (e.g., "wal")
+    pub journal_mode: Option<String>,
+    /// Number of events in the database
+    pub event_count: Option<i64>,
+    /// Number of segments in the database
+    pub segment_count: Option<i64>,
+}
+
+/// Options for the enhanced incident bundle collector.
+pub struct IncidentBundleOptions<'a> {
+    /// Crash directory path
+    pub crash_dir: &'a Path,
+    /// Optional config file path
+    pub config_path: Option<&'a Path>,
+    /// Output directory
+    pub out_dir: &'a Path,
+    /// Kind of incident
+    pub kind: IncidentKind,
+    /// Optional path to the database file
+    pub db_path: Option<&'a Path>,
+    /// Maximum number of recent events to include
+    pub max_events: usize,
+}
+
+/// Collect a comprehensive incident bundle with DB metadata, recent events,
+/// and a redaction report.
+///
+/// This is an enhanced version of [`export_incident_bundle`] that additionally
+/// gathers storage metadata and recent event summaries.
+pub fn collect_incident_bundle(
+    opts: &IncidentBundleOptions<'_>,
+) -> std::io::Result<IncidentBundleResult> {
+    let ts = epoch_secs();
+    let ts_str = format_timestamp(ts);
+    let bundle_name = format!("wa_incident_{kind}_{ts_str}", kind = opts.kind);
+    let bundle_dir = opts.out_dir.join(&bundle_name);
+
+    fs::create_dir_all(&bundle_dir)?;
+
+    let redactor = Redactor::with_debug_markers();
+    let mut files = Vec::new();
+    let mut total_size: u64 = 0;
+    let mut redaction_entries: Vec<FileRedactionEntry> = Vec::new();
+
+    // 1. Include latest crash bundle contents (if crash kind)
+    if opts.kind == IncidentKind::Crash {
+        if let Some(crash) = latest_crash_bundle(opts.crash_dir) {
+            if let Some(ref report) = crash.report {
+                let json = serde_json::to_string_pretty(report).map_err(std::io::Error::other)?;
+                write_redacted_file(
+                    "crash_report.json",
+                    &json,
+                    &bundle_dir,
+                    &redactor,
+                    &mut files,
+                    &mut total_size,
+                    &mut redaction_entries,
+                )?;
+            }
+
+            if let Some(ref manifest) = crash.manifest {
+                let json = serde_json::to_string_pretty(manifest).map_err(std::io::Error::other)?;
+                write_redacted_file(
+                    "crash_manifest.json",
+                    &json,
+                    &bundle_dir,
+                    &redactor,
+                    &mut files,
+                    &mut total_size,
+                    &mut redaction_entries,
+                )?;
+            }
+
+            let health_path = crash.path.join("health_snapshot.json");
+            if health_path.exists() {
+                if let Ok(contents) = fs::read_to_string(&health_path) {
+                    write_redacted_file(
+                        "health_snapshot.json",
+                        &contents,
+                        &bundle_dir,
+                        &redactor,
+                        &mut files,
+                        &mut total_size,
+                        &mut redaction_entries,
+                    )?;
+                }
+            }
+        }
+    }
+
+    // 2. Include config summary (redacted, max 64 KiB)
+    if let Some(cfg_path) = opts.config_path {
+        if cfg_path.exists() {
+            if let Ok(contents) = fs::read_to_string(cfg_path) {
+                let truncated = if contents.len() > 64 * 1024 {
+                    format!("{}\n... [truncated at 64 KiB]", &contents[..64 * 1024])
+                } else {
+                    contents
+                };
+                write_redacted_file(
+                    "config_summary.toml",
+                    &truncated,
+                    &bundle_dir,
+                    &redactor,
+                    &mut files,
+                    &mut total_size,
+                    &mut redaction_entries,
+                )?;
+            }
+        }
+    }
+
+    // 3. Gather DB metadata + recent events
+    if let Some(db_path) = opts.db_path {
+        if db_path.exists() {
+            let db_meta = collect_db_metadata(db_path);
+            let meta_json =
+                serde_json::to_string_pretty(&db_meta).map_err(std::io::Error::other)?;
+            write_redacted_file(
+                "db_metadata.json",
+                &meta_json,
+                &bundle_dir,
+                &redactor,
+                &mut files,
+                &mut total_size,
+                &mut redaction_entries,
+            )?;
+
+            // Recent events (sanitized summaries)
+            if opts.max_events > 0 {
+                if let Some(events_json) = collect_recent_events_summary(db_path, opts.max_events) {
+                    write_redacted_file(
+                        "recent_events.json",
+                        &events_json,
+                        &bundle_dir,
+                        &redactor,
+                        &mut files,
+                        &mut total_size,
+                        &mut redaction_entries,
+                    )?;
+                }
+            }
+        }
+    }
+
+    // 4. Write redaction report
+    let total_redactions: usize = redaction_entries.iter().map(|e| e.count).sum();
+    let redaction_report = RedactionReport {
+        total_redactions,
+        per_file: redaction_entries,
+    };
+    let report_json =
+        serde_json::to_string_pretty(&redaction_report).map_err(std::io::Error::other)?;
+    let report_bytes = report_json.as_bytes();
+    total_size += report_bytes.len() as u64;
+    write_file_sync(&bundle_dir.join("redaction_report.json"), report_bytes)?;
+    files.push("redaction_report.json".to_string());
+
+    // 5. Write incident manifest
+    let result = IncidentBundleResult {
+        path: bundle_dir.clone(),
+        kind: opts.kind,
+        files: files.clone(),
+        total_size_bytes: total_size,
+        wa_version: crate::VERSION.to_string(),
+        exported_at: format_iso8601(ts),
+    };
+
+    let manifest_json = serde_json::to_string_pretty(&result).map_err(std::io::Error::other)?;
+    write_file_sync(
+        &bundle_dir.join("incident_manifest.json"),
+        manifest_json.as_bytes(),
+    )?;
+
+    Ok(result)
+}
+
+/// Collect database metadata from a SQLite database file.
+fn collect_db_metadata(db_path: &Path) -> DbMetadata {
+    let conn = match rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(c) => c,
+        Err(_) => {
+            return DbMetadata {
+                schema_version: None,
+                db_size_bytes: fs::metadata(db_path).ok().map(|m| m.len()),
+                journal_mode: None,
+                event_count: None,
+                segment_count: None,
+            };
+        }
+    };
+
+    let schema_version = conn
+        .query_row(
+            "SELECT value FROM wa_meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok());
+
+    let journal_mode = conn
+        .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+        .ok();
+
+    let event_count = conn
+        .query_row("SELECT count(*) FROM events", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .ok();
+
+    let segment_count = conn
+        .query_row("SELECT count(*) FROM segments", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .ok();
+
+    DbMetadata {
+        schema_version,
+        db_size_bytes: fs::metadata(db_path).ok().map(|m| m.len()),
+        journal_mode,
+        event_count,
+        segment_count,
+    }
+}
+
+/// Collect summaries of recent events from the database (redacted by caller).
+fn collect_recent_events_summary(db_path: &Path, max_events: usize) -> Option<String> {
+    let conn = rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, pane_id, rule_id, event_type, severity, detected_at, \
+             COALESCE(matched_text, '') as matched_text \
+             FROM events ORDER BY detected_at DESC LIMIT ?1",
+        )
+        .ok()?;
+
+    let rows = stmt
+        .query_map([max_events as i64], |row| {
+            let id: i64 = row.get(0)?;
+            let pane_id: i64 = row.get(1)?;
+            let rule_id: String = row.get(2)?;
+            let event_type: String = row.get(3)?;
+            let severity: String = row.get(4)?;
+            let detected_at: i64 = row.get(5)?;
+            let text: String = row.get(6)?;
+            let preview: String = text.chars().take(200).collect();
+            Ok(serde_json::json!({
+                "id": id,
+                "pane_id": pane_id,
+                "rule_id": rule_id,
+                "event_type": event_type,
+                "severity": severity,
+                "detected_at": detected_at,
+                "matched_text_preview": preview,
+            }))
+        })
+        .ok()?;
+
+    let events: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
+    serde_json::to_string_pretty(&events).ok()
+}
+
+// ---------------------------------------------------------------------------
+// Replay
+// ---------------------------------------------------------------------------
+
+/// Mode for deterministic bundle replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayMode {
+    /// Re-run policy evaluation on recorded decision context.
+    Policy,
+    /// Re-run rule/pattern engine on recorded segments.
+    Rules,
+}
+
+impl std::fmt::Display for ReplayMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReplayMode::Policy => write!(f, "policy"),
+            ReplayMode::Rules => write!(f, "rules"),
+        }
+    }
+}
+
+/// A single check result within a replay.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayCheck {
+    /// Name of the check.
+    pub name: String,
+    /// Whether this check passed.
+    pub passed: bool,
+    /// Optional detail about the result.
+    pub detail: Option<String>,
+}
+
+/// Result of replaying an incident bundle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayResult {
+    /// The replay mode used.
+    pub mode: ReplayMode,
+    /// Overall status: "pass", "fail", or "incomplete".
+    pub status: String,
+    /// Individual check results.
+    pub checks: Vec<ReplayCheck>,
+    /// Warnings (non-fatal issues).
+    pub warnings: Vec<String>,
+}
+
+/// Replay an incident bundle for deterministic analysis.
+///
+/// Loads the bundle manifest and runs checks based on the selected mode:
+/// - `Policy`: validates that crash/incident data is internally consistent
+///   and that redaction was applied correctly.
+/// - `Rules`: validates that event data in the bundle matches expected patterns
+///   and that no secrets leaked through redaction.
+pub fn replay_incident_bundle(
+    bundle_path: &Path,
+    mode: ReplayMode,
+) -> std::io::Result<ReplayResult> {
+    if !bundle_path.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("Bundle directory not found: {}", bundle_path.display()),
+        ));
+    }
+
+    let mut checks = Vec::new();
+    let mut warnings = Vec::new();
+
+    // Check 1: manifest exists and is valid JSON
+    let manifest_path = bundle_path.join("incident_manifest.json");
+    let manifest_ok = if manifest_path.exists() {
+        match fs::read_to_string(&manifest_path) {
+            Ok(content) => match serde_json::from_str::<IncidentBundleResult>(&content) {
+                Ok(_) => {
+                    checks.push(ReplayCheck {
+                        name: "manifest_valid".to_string(),
+                        passed: true,
+                        detail: Some("incident_manifest.json is valid".to_string()),
+                    });
+                    true
+                }
+                Err(e) => {
+                    checks.push(ReplayCheck {
+                        name: "manifest_valid".to_string(),
+                        passed: false,
+                        detail: Some(format!("Invalid manifest JSON: {e}")),
+                    });
+                    false
+                }
+            },
+            Err(e) => {
+                checks.push(ReplayCheck {
+                    name: "manifest_valid".to_string(),
+                    passed: false,
+                    detail: Some(format!("Cannot read manifest: {e}")),
+                });
+                false
+            }
+        }
+    } else {
+        checks.push(ReplayCheck {
+            name: "manifest_valid".to_string(),
+            passed: false,
+            detail: Some("incident_manifest.json not found".to_string()),
+        });
+        false
+    };
+
+    // Check 2: redaction report exists and shows no leaks
+    let redaction_path = bundle_path.join("redaction_report.json");
+    if redaction_path.exists() {
+        if let Ok(content) = fs::read_to_string(&redaction_path) {
+            match serde_json::from_str::<RedactionReport>(&content) {
+                Ok(report) => {
+                    checks.push(ReplayCheck {
+                        name: "redaction_report_valid".to_string(),
+                        passed: true,
+                        detail: Some(format!(
+                            "{} total redactions across {} files",
+                            report.total_redactions,
+                            report.per_file.len()
+                        )),
+                    });
+                }
+                Err(e) => {
+                    checks.push(ReplayCheck {
+                        name: "redaction_report_valid".to_string(),
+                        passed: false,
+                        detail: Some(format!("Invalid redaction report: {e}")),
+                    });
+                }
+            }
+        }
+    } else {
+        warnings.push("No redaction_report.json found".to_string());
+    }
+
+    // Check 3: verify no secrets remain in any bundle file
+    let redactor = Redactor::new();
+    let mut leak_found = false;
+    if let Ok(entries) = fs::read_dir(bundle_path) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path
+                .extension()
+                .is_some_and(|ext| ext == "json" || ext == "toml")
+            {
+                if let Ok(content) = fs::read_to_string(&path) {
+                    let detections = redactor.detect(&content);
+                    if !detections.is_empty() {
+                        leak_found = true;
+                        let fname = path.file_name().unwrap_or_default().to_string_lossy();
+                        checks.push(ReplayCheck {
+                            name: format!("no_secrets_{fname}"),
+                            passed: false,
+                            detail: Some(format!(
+                                "{} potential secret(s) detected in {fname}",
+                                detections.len()
+                            )),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    if !leak_found {
+        checks.push(ReplayCheck {
+            name: "no_secrets_leaked".to_string(),
+            passed: true,
+            detail: Some("No secrets detected in bundle files".to_string()),
+        });
+    }
+
+    // Mode-specific checks
+    match mode {
+        ReplayMode::Policy => {
+            // Check 4: if crash_report exists, validate structure
+            let crash_report_path = bundle_path.join("crash_report.json");
+            if crash_report_path.exists() {
+                if let Ok(content) = fs::read_to_string(&crash_report_path) {
+                    match serde_json::from_str::<CrashReport>(&content) {
+                        Ok(report) => {
+                            checks.push(ReplayCheck {
+                                name: "crash_report_valid".to_string(),
+                                passed: true,
+                                detail: Some(format!(
+                                    "Crash at {} (pid {})",
+                                    report.timestamp, report.pid
+                                )),
+                            });
+                        }
+                        Err(e) => {
+                            checks.push(ReplayCheck {
+                                name: "crash_report_valid".to_string(),
+                                passed: false,
+                                detail: Some(format!("Invalid crash report: {e}")),
+                            });
+                        }
+                    }
+                }
+            }
+
+            // Check 5: if db_metadata exists, validate schema version
+            let db_meta_path = bundle_path.join("db_metadata.json");
+            if db_meta_path.exists() {
+                if let Ok(content) = fs::read_to_string(&db_meta_path) {
+                    match serde_json::from_str::<DbMetadata>(&content) {
+                        Ok(meta) => {
+                            let sv = meta
+                                .schema_version
+                                .map_or_else(|| "unknown".to_string(), |v| v.to_string());
+                            let ec = meta
+                                .event_count
+                                .map_or_else(|| "unknown".to_string(), |v| v.to_string());
+                            let sc = meta
+                                .segment_count
+                                .map_or_else(|| "unknown".to_string(), |v| v.to_string());
+                            let detail =
+                                format!("schema_version={sv}, events={ec}, segments={sc}",);
+                            checks.push(ReplayCheck {
+                                name: "db_metadata_valid".to_string(),
+                                passed: true,
+                                detail: Some(detail),
+                            });
+                        }
+                        Err(e) => {
+                            checks.push(ReplayCheck {
+                                name: "db_metadata_valid".to_string(),
+                                passed: false,
+                                detail: Some(format!("Invalid db metadata: {e}")),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        ReplayMode::Rules => {
+            // Check 4: if recent_events exists, validate event structure
+            let events_path = bundle_path.join("recent_events.json");
+            if events_path.exists() {
+                if let Ok(content) = fs::read_to_string(&events_path) {
+                    match serde_json::from_str::<Vec<serde_json::Value>>(&content) {
+                        Ok(events) => {
+                            let valid_count = events
+                                .iter()
+                                .filter(|e| {
+                                    e.get("rule_id").is_some()
+                                        && e.get("event_type").is_some()
+                                        && e.get("severity").is_some()
+                                })
+                                .count();
+                            checks.push(ReplayCheck {
+                                name: "events_structure_valid".to_string(),
+                                passed: valid_count == events.len(),
+                                detail: Some(format!(
+                                    "{valid_count}/{} events have required fields",
+                                    events.len()
+                                )),
+                            });
+
+                            // Check that matched_text_preview is bounded
+                            let oversized = events
+                                .iter()
+                                .filter(|e| {
+                                    e.get("matched_text_preview")
+                                        .and_then(|v| v.as_str())
+                                        .is_some_and(|s| s.len() > 200)
+                                })
+                                .count();
+                            checks.push(ReplayCheck {
+                                name: "events_text_bounded".to_string(),
+                                passed: oversized == 0,
+                                detail: Some(if oversized == 0 {
+                                    "All matched_text_preview values are bounded".to_string()
+                                } else {
+                                    format!("{oversized} events have oversized text previews")
+                                }),
+                            });
+                        }
+                        Err(e) => {
+                            checks.push(ReplayCheck {
+                                name: "events_structure_valid".to_string(),
+                                passed: false,
+                                detail: Some(format!("Invalid events JSON: {e}")),
+                            });
+                        }
+                    }
+                }
+            } else {
+                warnings.push("No recent_events.json in bundle".to_string());
+            }
+        }
+    }
+
+    // File completeness check (if manifest is valid)
+    if manifest_ok {
+        if let Ok(content) = fs::read_to_string(&manifest_path) {
+            if let Ok(manifest) = serde_json::from_str::<IncidentBundleResult>(&content) {
+                let missing: Vec<&str> = manifest
+                    .files
+                    .iter()
+                    .filter(|f| !bundle_path.join(f).exists())
+                    .map(|f| f.as_str())
+                    .collect();
+                checks.push(ReplayCheck {
+                    name: "files_complete".to_string(),
+                    passed: missing.is_empty(),
+                    detail: Some(if missing.is_empty() {
+                        format!("All {} listed files present", manifest.files.len())
+                    } else {
+                        format!("Missing files: {}", missing.join(", "))
+                    }),
+                });
+            }
+        }
+    }
+
+    let all_passed = checks.iter().all(|c| c.passed);
+    let status = if all_passed {
+        "pass".to_string()
+    } else {
+        "fail".to_string()
+    };
+
+    Ok(ReplayResult {
+        mode,
+        status,
+        checks,
+        warnings,
+    })
+}
+
+/// Write a file to the bundle directory, redacting secrets and tracking metadata.
+fn write_redacted_file(
+    name: &str,
+    content: &str,
+    bundle_dir: &Path,
+    redactor: &Redactor,
+    files: &mut Vec<String>,
+    total_size: &mut u64,
+    redaction_entries: &mut Vec<FileRedactionEntry>,
+) -> std::io::Result<()> {
+    let before_count = redactor.detect(content).len();
+    let redacted = redactor.redact(content);
+    let bytes = redacted.as_bytes();
+    *total_size += bytes.len() as u64;
+    write_file_sync(&bundle_dir.join(name), bytes)?;
+    files.push(name.to_string());
+    if before_count > 0 {
+        redaction_entries.push(FileRedactionEntry {
+            file: name.to_string(),
+            count: before_count,
+        });
+    }
+    Ok(())
+}
 
 /// Convert days since epoch to (year, month, day).
 fn days_to_ymd(days: u64) -> (u64, u64, u64) {

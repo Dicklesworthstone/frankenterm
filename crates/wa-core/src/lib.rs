@@ -43,6 +43,7 @@
 #![feature(stmt_expr_attributes)]
 
 pub mod accounts;
+pub mod alerts;
 pub mod approval;
 pub mod backup;
 pub mod cass;
