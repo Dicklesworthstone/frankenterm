@@ -103,6 +103,10 @@ harness = false
 name = "storage_regression"
 harness = false
 
+[[bench]]
+name = "backpressure_performance"
+harness = false
+
 [features]
 default = []
 # Public feature flags (stable surface)
