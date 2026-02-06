@@ -146,6 +146,29 @@ pub struct SchedulerMetrics {
     pub throttle_events: u64,
 }
 
+/// Serializable snapshot of scheduler state for health reporting.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct SchedulerSnapshot {
+    /// Whether budget enforcement is active (any non-zero limit).
+    pub budget_active: bool,
+    /// Configured captures per second (0 = unlimited).
+    pub max_captures_per_sec: u32,
+    /// Configured bytes per second (0 = unlimited).
+    pub max_bytes_per_sec: u64,
+    /// Captures remaining in the current window.
+    pub captures_remaining: u32,
+    /// Bytes remaining in the current window.
+    pub bytes_remaining: u64,
+    /// Total captures throttled by global rate limit.
+    pub total_rate_limited: u64,
+    /// Total captures throttled by byte budget.
+    pub total_byte_budget_exceeded: u64,
+    /// Total throttle events.
+    pub total_throttle_events: u64,
+    /// Number of panes being tracked.
+    pub tracked_panes: usize,
+}
+
 /// Per-pane budget tracking within a sliding window.
 #[derive(Debug)]
 struct PaneBudgetTracker {
@@ -331,6 +354,23 @@ impl CaptureScheduler {
     #[must_use]
     pub fn metrics(&self) -> &SchedulerMetrics {
         &self.metrics
+    }
+
+    /// Export a serializable snapshot of the current scheduler state.
+    #[must_use]
+    pub fn snapshot(&self) -> SchedulerSnapshot {
+        SchedulerSnapshot {
+            budget_active: self.budget.max_captures_per_sec > 0
+                || self.budget.max_bytes_per_sec > 0,
+            max_captures_per_sec: self.budget.max_captures_per_sec,
+            max_bytes_per_sec: self.budget.max_bytes_per_sec,
+            captures_remaining: self.global_captures_remaining,
+            bytes_remaining: self.global_bytes_remaining,
+            total_rate_limited: self.metrics.global_rate_limited,
+            total_byte_budget_exceeded: self.metrics.pane_byte_budget_exceeded,
+            total_throttle_events: self.metrics.throttle_events,
+            tracked_panes: self.pane_trackers.len(),
+        }
     }
 
     /// Refill the global token bucket if a full second has elapsed.
@@ -534,6 +574,12 @@ where
     #[must_use]
     pub fn scheduler_metrics(&self) -> &SchedulerMetrics {
         self.scheduler.metrics()
+    }
+
+    /// Export a serializable snapshot of the scheduler state.
+    #[must_use]
+    pub fn scheduler_snapshot(&self) -> SchedulerSnapshot {
+        self.scheduler.snapshot()
     }
 
     /// Spawn tasks for all ready panes that are not currently being captured.

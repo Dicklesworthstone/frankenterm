@@ -47,6 +47,8 @@ fn basic_snapshot() -> HealthSnapshot {
         db_writable: true,
         db_last_write_at: Some(1_700_000_000_000),
         pane_priority_overrides: vec![],
+        scheduler: None,
+        backpressure_tier: None,
     }
 }
 

@@ -17394,6 +17394,8 @@ mod backpressure_integration_tests {
             db_writable: true,
             db_last_write_at: Some(1000),
             pane_priority_overrides: vec![],
+            scheduler: None,
+            backpressure_tier: None,
         };
 
         assert!(!snapshot.warnings.is_empty());

@@ -2,10 +2,11 @@
 //!
 //! This module provides a thin MCP surface that mirrors robot-mode semantics.
 
+use std::collections::HashMap;
 use std::time::Instant;
 
-use fastmcp::ToolHandler;
 use fastmcp::prelude::*;
+use fastmcp::{ResourceHandler, ResourceTemplate, ToolHandler};
 use serde::{Deserialize, Serialize};
 
 use std::path::PathBuf;
@@ -30,7 +31,7 @@ use crate::wezterm::{
 };
 use crate::workflows::{
     HandleAuthRequired, HandleClaudeCodeLimits, HandleCompaction, HandleGeminiQuota,
-    HandleSessionEnd, HandleUsageLimits, PaneWorkflowLockManager, WorkflowEngine,
+    HandleSessionEnd, HandleUsageLimits, PaneWorkflowLockManager, Workflow, WorkflowEngine,
     WorkflowExecutionResult, WorkflowRunner, WorkflowRunnerConfig,
 };
 
@@ -507,6 +508,26 @@ struct McpPaneState {
     ignore_reason: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct McpWorkflowsData {
+    workflows: Vec<McpWorkflowItem>,
+    total: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct McpWorkflowItem {
+    name: String,
+    description: String,
+    step_count: usize,
+    trigger_event_types: Vec<String>,
+    trigger_rule_ids: Vec<String>,
+    supported_agent_types: Vec<String>,
+    requires_pane: bool,
+    requires_approval: bool,
+    can_abort: bool,
+    destructive: bool,
+}
+
 impl McpPaneState {
     fn from_pane_info(info: &PaneInfo, filter: &PaneFilterConfig) -> Self {
         let domain = info.inferred_domain();
@@ -553,7 +574,10 @@ pub fn build_server_with_db(config: &Config, db_path: Option<PathBuf>) -> Result
         .tool(WaGetTextTool)
         .tool(WaWaitForTool)
         .tool(WaRulesListTool)
-        .tool(WaRulesTestTool);
+        .tool(WaRulesTestTool)
+        .resource(WaPanesResource::new(config.ingest.panes.clone()))
+        .resource(WaWorkflowsResource::new(Arc::clone(&config)))
+        .resource(WaRulesResource);
 
     if let Some(ref db_path) = db_path {
         builder = builder
@@ -574,12 +598,371 @@ pub fn build_server_with_db(config: &Config, db_path: Option<PathBuf>) -> Result
             .tool(WaAccountsRefreshTool::new(
                 Arc::clone(&config),
                 Arc::clone(db_path),
-            ));
+            ))
+            .resource(WaEventsResource::new(Arc::clone(db_path)))
+            .resource(WaAccountsResource::new(Arc::clone(db_path)))
+            .resource(WaReservationsResource::new(Arc::clone(db_path)));
     }
 
     let server = builder.build();
 
     Ok(server)
+}
+
+fn tool_output_as_resource(uri: &str, contents: Vec<Content>) -> McpResult<Vec<ResourceContent>> {
+    let text = contents
+        .into_iter()
+        .find_map(|content| match content {
+            Content::Text { text } => Some(text),
+            _ => None,
+        })
+        .ok_or_else(|| McpError::internal_error("Tool output missing text payload"))?;
+
+    Ok(vec![ResourceContent {
+        uri: uri.to_string(),
+        mime_type: Some("application/json".to_string()),
+        text: Some(text),
+        blob: None,
+    }])
+}
+
+fn envelope_as_resource<T: Serialize>(
+    uri: &str,
+    envelope: McpEnvelope<T>,
+) -> McpResult<Vec<ResourceContent>> {
+    let text = serde_json::to_string(&envelope)
+        .map_err(|e| McpError::internal_error(format!("Serialize resource payload: {e}")))?;
+    Ok(vec![ResourceContent {
+        uri: uri.to_string(),
+        mime_type: Some("application/json".to_string()),
+        text: Some(text),
+        blob: None,
+    }])
+}
+
+struct WaPanesResource {
+    filter: PaneFilterConfig,
+}
+
+impl WaPanesResource {
+    fn new(filter: PaneFilterConfig) -> Self {
+        Self { filter }
+    }
+}
+
+impl ResourceHandler for WaPanesResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "wa://panes".to_string(),
+            name: "wa panes".to_string(),
+            description: Some("Pane snapshot (same data surface as wa.state)".to_string()),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "panes".to_string()],
+        }
+    }
+
+    fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        let tool = WaStateTool::new(self.filter.clone());
+        let contents = tool.call(ctx, serde_json::Value::Null)?;
+        tool_output_as_resource("wa://panes", contents)
+    }
+}
+
+struct WaEventsResource {
+    db_path: Arc<PathBuf>,
+}
+
+impl WaEventsResource {
+    fn new(db_path: Arc<PathBuf>) -> Self {
+        Self { db_path }
+    }
+}
+
+impl ResourceHandler for WaEventsResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "wa://events".to_string(),
+            name: "wa events".to_string(),
+            description: Some(
+                "Recent detection events (default limit 50; template supports limit override)"
+                    .to_string(),
+            ),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "events".to_string()],
+        }
+    }
+
+    fn template(&self) -> Option<ResourceTemplate> {
+        Some(ResourceTemplate {
+            uri_template: "wa://events/{limit}".to_string(),
+            name: "wa events (paged)".to_string(),
+            description: Some("Override page size for events resource".to_string()),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "events".to_string()],
+        })
+    }
+
+    fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        let tool = WaEventsTool::new(Arc::clone(&self.db_path));
+        let contents = tool.call(ctx, serde_json::json!({ "limit": 50 }))?;
+        tool_output_as_resource("wa://events", contents)
+    }
+
+    fn read_with_uri(
+        &self,
+        ctx: &McpContext,
+        uri: &str,
+        params: &HashMap<String, String>,
+    ) -> McpResult<Vec<ResourceContent>> {
+        let limit = params
+            .get("limit")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(50)
+            .clamp(1, 1000);
+        let tool = WaEventsTool::new(Arc::clone(&self.db_path));
+        let contents = tool.call(ctx, serde_json::json!({ "limit": limit }))?;
+        tool_output_as_resource(uri, contents)
+    }
+}
+
+struct WaAccountsResource {
+    db_path: Arc<PathBuf>,
+}
+
+impl WaAccountsResource {
+    fn new(db_path: Arc<PathBuf>) -> Self {
+        Self { db_path }
+    }
+}
+
+impl ResourceHandler for WaAccountsResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "wa://accounts".to_string(),
+            name: "wa accounts".to_string(),
+            description: Some(
+                "Account usage snapshot (default service openai; template supports service override)"
+                    .to_string(),
+            ),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "accounts".to_string()],
+        }
+    }
+
+    fn template(&self) -> Option<ResourceTemplate> {
+        Some(ResourceTemplate {
+            uri_template: "wa://accounts/{service}".to_string(),
+            name: "wa accounts by service".to_string(),
+            description: Some("Read account snapshot for a specific service".to_string()),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "accounts".to_string()],
+        })
+    }
+
+    fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        let tool = WaAccountsTool::new(Arc::clone(&self.db_path));
+        let contents = tool.call(ctx, serde_json::json!({ "service": "openai" }))?;
+        tool_output_as_resource("wa://accounts", contents)
+    }
+
+    fn read_with_uri(
+        &self,
+        ctx: &McpContext,
+        uri: &str,
+        params: &HashMap<String, String>,
+    ) -> McpResult<Vec<ResourceContent>> {
+        let service = params
+            .get("service")
+            .cloned()
+            .unwrap_or_else(|| "openai".to_string());
+        let tool = WaAccountsTool::new(Arc::clone(&self.db_path));
+        let contents = tool.call(ctx, serde_json::json!({ "service": service }))?;
+        tool_output_as_resource(uri, contents)
+    }
+}
+
+struct WaRulesResource;
+
+impl ResourceHandler for WaRulesResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "wa://rules".to_string(),
+            name: "wa rules".to_string(),
+            description: Some(
+                "Rule catalog (same data surface as wa.rules_list with verbose output)".to_string(),
+            ),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "rules".to_string()],
+        }
+    }
+
+    fn template(&self) -> Option<ResourceTemplate> {
+        Some(ResourceTemplate {
+            uri_template: "wa://rules/{agent_type}".to_string(),
+            name: "wa rules by agent".to_string(),
+            description: Some("Filter rule catalog by agent type".to_string()),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "rules".to_string()],
+        })
+    }
+
+    fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        let tool = WaRulesListTool;
+        let contents = tool.call(ctx, serde_json::json!({ "verbose": true }))?;
+        tool_output_as_resource("wa://rules", contents)
+    }
+
+    fn read_with_uri(
+        &self,
+        ctx: &McpContext,
+        uri: &str,
+        params: &HashMap<String, String>,
+    ) -> McpResult<Vec<ResourceContent>> {
+        let args = if let Some(agent_type) = params.get("agent_type") {
+            serde_json::json!({ "verbose": true, "agent_type": agent_type })
+        } else {
+            serde_json::json!({ "verbose": true })
+        };
+        let tool = WaRulesListTool;
+        let contents = tool.call(ctx, args)?;
+        tool_output_as_resource(uri, contents)
+    }
+}
+
+struct WaWorkflowsResource {
+    config: Arc<Config>,
+}
+
+impl WaWorkflowsResource {
+    fn new(config: Arc<Config>) -> Self {
+        Self { config }
+    }
+}
+
+impl ResourceHandler for WaWorkflowsResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "wa://workflows".to_string(),
+            name: "wa workflows".to_string(),
+            description: Some("Builtin workflow catalog and metadata".to_string()),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "workflows".to_string()],
+        }
+    }
+
+    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        let start = Instant::now();
+        let workflows: Vec<McpWorkflowItem> = builtin_workflows(&self.config)
+            .iter()
+            .map(|workflow| McpWorkflowItem {
+                name: workflow.name().to_string(),
+                description: workflow.description().to_string(),
+                step_count: workflow.step_count(),
+                trigger_event_types: workflow
+                    .trigger_event_types()
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect(),
+                trigger_rule_ids: workflow
+                    .trigger_rule_ids()
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect(),
+                supported_agent_types: workflow
+                    .supported_agent_types()
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect(),
+                requires_pane: workflow.requires_pane(),
+                requires_approval: workflow.requires_approval(),
+                can_abort: workflow.can_abort(),
+                destructive: workflow.is_destructive(),
+            })
+            .collect();
+
+        let data = McpWorkflowsData {
+            total: workflows.len(),
+            workflows,
+        };
+        let envelope = McpEnvelope::success(data, elapsed_ms(start));
+        envelope_as_resource("wa://workflows", envelope)
+    }
+}
+
+struct WaReservationsResource {
+    db_path: Arc<PathBuf>,
+}
+
+impl WaReservationsResource {
+    fn new(db_path: Arc<PathBuf>) -> Self {
+        Self { db_path }
+    }
+}
+
+impl ResourceHandler for WaReservationsResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "wa://reservations".to_string(),
+            name: "wa reservations".to_string(),
+            description: Some(
+                "Active pane reservations (same data surface as wa.reservations)".to_string(),
+            ),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "reservations".to_string()],
+        }
+    }
+
+    fn template(&self) -> Option<ResourceTemplate> {
+        Some(ResourceTemplate {
+            uri_template: "wa://reservations/{pane_id}".to_string(),
+            name: "wa reservations by pane".to_string(),
+            description: Some("Filter reservations by pane id".to_string()),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "reservations".to_string()],
+        })
+    }
+
+    fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        let tool = WaReservationsTool::new(Arc::clone(&self.db_path));
+        let contents = tool.call(ctx, serde_json::Value::Null)?;
+        tool_output_as_resource("wa://reservations", contents)
+    }
+
+    fn read_with_uri(
+        &self,
+        ctx: &McpContext,
+        uri: &str,
+        params: &HashMap<String, String>,
+    ) -> McpResult<Vec<ResourceContent>> {
+        let pane_id = params
+            .get("pane_id")
+            .ok_or_else(|| McpError::invalid_params("Missing pane_id in resource URI"))?
+            .parse::<u64>()
+            .map_err(|_| McpError::invalid_params("pane_id must be an unsigned integer"))?;
+        let tool = WaReservationsTool::new(Arc::clone(&self.db_path));
+        let contents = tool.call(ctx, serde_json::json!({ "pane_id": pane_id }))?;
+        tool_output_as_resource(uri, contents)
+    }
 }
 
 struct WaStateTool {
@@ -3328,14 +3711,22 @@ async fn resolve_pane_capabilities(
 }
 
 fn register_builtin_workflows(runner: &WorkflowRunner, config: &Config) {
-    runner.register_workflow(Arc::new(
-        HandleCompaction::new().with_prompt_config(config.workflows.compaction_prompts.clone()),
-    ));
-    runner.register_workflow(Arc::new(HandleUsageLimits::new()));
-    runner.register_workflow(Arc::new(HandleSessionEnd::new()));
-    runner.register_workflow(Arc::new(HandleAuthRequired::new()));
-    runner.register_workflow(Arc::new(HandleClaudeCodeLimits::new()));
-    runner.register_workflow(Arc::new(HandleGeminiQuota::new()));
+    for workflow in builtin_workflows(config) {
+        runner.register_workflow(workflow);
+    }
+}
+
+fn builtin_workflows(config: &Config) -> Vec<Arc<dyn Workflow>> {
+    vec![
+        Arc::new(
+            HandleCompaction::new().with_prompt_config(config.workflows.compaction_prompts.clone()),
+        ),
+        Arc::new(HandleUsageLimits::new()),
+        Arc::new(HandleSessionEnd::new()),
+        Arc::new(HandleAuthRequired::new()),
+        Arc::new(HandleClaudeCodeLimits::new()),
+        Arc::new(HandleGeminiQuota::new()),
+    ]
 }
 
 fn map_caut_error(error: &CautError) -> (&'static str, Option<String>) {

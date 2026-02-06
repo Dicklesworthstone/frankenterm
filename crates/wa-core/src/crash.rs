@@ -65,6 +65,14 @@ pub struct HealthSnapshot {
     /// Active runtime pane priority overrides (operator-set).
     #[serde(default)]
     pub pane_priority_overrides: Vec<PanePriorityOverrideSnapshot>,
+
+    /// Capture scheduler state (budget enforcement + throttling).
+    #[serde(default)]
+    pub scheduler: Option<crate::tailer::SchedulerSnapshot>,
+
+    /// Current backpressure tier (Green/Yellow/Red/Black).
+    #[serde(default)]
+    pub backpressure_tier: Option<String>,
 }
 
 /// Health snapshot view of a runtime pane priority override.
@@ -1294,6 +1302,8 @@ mod tests {
             db_writable: true,
             db_last_write_at: Some(1_234_567_800),
             pane_priority_overrides: vec![],
+            scheduler: None,
+            backpressure_tier: None,
         }
     }
 
@@ -1355,6 +1365,8 @@ mod tests {
             db_writable: true,
             db_last_write_at: None,
             pane_priority_overrides: vec![],
+            scheduler: None,
+            backpressure_tier: None,
         };
 
         HealthSnapshot::update_global(snapshot);

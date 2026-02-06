@@ -1498,6 +1498,25 @@ impl HealthSnapshotRenderer {
             }
         }
 
+        // Capture scheduler (budget enforcement)
+        if let Some(sched) = &snapshot.scheduler {
+            output.push_str(&format!(
+                "  Scheduler:     captures {}/s, bytes {}/s, tracked {} pane(s)\n",
+                sched.max_captures_per_sec, sched.max_bytes_per_sec, sched.tracked_panes,
+            ));
+            if sched.total_rate_limited > 0 || sched.total_byte_budget_exceeded > 0 {
+                output.push_str(&format!(
+                    "    throttled: {} rate-limited, {} byte-budget exceeded\n",
+                    sched.total_rate_limited, sched.total_byte_budget_exceeded,
+                ));
+            }
+        }
+
+        // Backpressure tier
+        if let Some(tier) = &snapshot.backpressure_tier {
+            output.push_str(&format!("  Backpressure:  {tier}\n"));
+        }
+
         // Verbose: per-pane sequence numbers
         if ctx.is_verbose() && !snapshot.last_seq_by_pane.is_empty() {
             output.push_str("  Sequences:     ");
@@ -2990,6 +3009,8 @@ mod tests {
             db_writable: true,
             db_last_write_at: Some(1_700_000_000_000),
             pane_priority_overrides: vec![],
+            scheduler: None,
+            backpressure_tier: None,
         }
     }
 
@@ -3269,5 +3290,60 @@ mod tests {
         let output = EventListRenderer::render_with_noise_info(&events, &ctx, &muted_keys, 0);
 
         assert!(!output.contains("active mute"));
+    }
+
+    #[test]
+    fn health_snapshot_renders_scheduler_info() {
+        use crate::tailer::SchedulerSnapshot;
+
+        let mut snapshot = sample_health_snapshot();
+        snapshot.scheduler = Some(SchedulerSnapshot {
+            budget_active: true,
+            max_captures_per_sec: 50,
+            max_bytes_per_sec: 1_000_000,
+            captures_remaining: 42,
+            bytes_remaining: 500_000,
+            total_rate_limited: 7,
+            total_byte_budget_exceeded: 2,
+            total_throttle_events: 9,
+            tracked_panes: 3,
+        });
+        snapshot.backpressure_tier = Some("Yellow".to_string());
+
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = HealthSnapshotRenderer::render(&snapshot, &ctx);
+
+        assert!(output.contains("Scheduler:"));
+        assert!(output.contains("50/s"));
+        assert!(output.contains("3 pane(s)"));
+        assert!(output.contains("7 rate-limited"));
+        assert!(output.contains("2 byte-budget exceeded"));
+        assert!(output.contains("Backpressure:  Yellow"));
+    }
+
+    #[test]
+    fn health_snapshot_json_includes_scheduler() {
+        use crate::tailer::SchedulerSnapshot;
+
+        let mut snapshot = sample_health_snapshot();
+        snapshot.scheduler = Some(SchedulerSnapshot {
+            budget_active: true,
+            max_captures_per_sec: 10,
+            max_bytes_per_sec: 500,
+            captures_remaining: 8,
+            bytes_remaining: 400,
+            total_rate_limited: 0,
+            total_byte_budget_exceeded: 0,
+            total_throttle_events: 0,
+            tracked_panes: 1,
+        });
+
+        let ctx = RenderContext::new(OutputFormat::Json);
+        let output = HealthSnapshotRenderer::render(&snapshot, &ctx);
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(parsed["scheduler"]["max_captures_per_sec"], 10);
+        assert_eq!(parsed["scheduler"]["tracked_panes"], 1);
+        assert!(parsed["scheduler"]["budget_active"].as_bool().unwrap());
     }
 }

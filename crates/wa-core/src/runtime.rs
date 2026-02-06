@@ -250,6 +250,8 @@ pub struct ObservationRuntime {
     recording: Option<Arc<RecordingManager>>,
     /// Heartbeat registry for watchdog monitoring
     heartbeats: Arc<HeartbeatRegistry>,
+    /// Shared scheduler snapshot for health reporting (written by capture task).
+    scheduler_snapshot: Arc<RwLock<crate::tailer::SchedulerSnapshot>>,
 }
 
 impl ObservationRuntime {
@@ -301,6 +303,7 @@ impl ObservationRuntime {
             event_bus: None,
             recording: None,
             heartbeats: Arc::new(HeartbeatRegistry::new()),
+            scheduler_snapshot: Arc::new(RwLock::new(crate::tailer::SchedulerSnapshot::default())),
         }
     }
 
@@ -400,6 +403,7 @@ impl ObservationRuntime {
             heartbeats: Arc::clone(&self.heartbeats),
             capture_tx: capture_tx_probe,
             native_events: native_handle,
+            scheduler_snapshot: Arc::clone(&self.scheduler_snapshot),
         })
     }
 
@@ -412,6 +416,7 @@ impl ObservationRuntime {
         let registry = Arc::clone(&self.registry);
         let cursors = Arc::clone(&self.cursors);
         let metrics = Arc::clone(&self.metrics);
+        let scheduler_snapshot = Arc::clone(&self.scheduler_snapshot);
 
         let initial_retention_days = self.config.retention_days;
         let initial_checkpoint_secs = self.config.checkpoint_interval_secs;
@@ -576,6 +581,11 @@ impl ObservationRuntime {
                                         })
                                         .collect()
                                 },
+                                scheduler: {
+                                    let snap = scheduler_snapshot.read().await;
+                                    if snap.budget_active { Some(snap.clone()) } else { None }
+                                },
+                                backpressure_tier: None,
                             };
 
                             HealthSnapshot::update_global(snapshot);
@@ -754,6 +764,7 @@ impl ObservationRuntime {
         let mut config_rx = self.config_rx.clone();
         let heartbeats = Arc::clone(&self.heartbeats);
         let wezterm_handle = Arc::clone(&self.wezterm_handle);
+        let scheduler_snapshot = Arc::clone(&self.scheduler_snapshot);
 
         // Create tailer config from runtime config
         // Capture overlap_size for use in the async block (not hot-reloadable)
@@ -865,6 +876,9 @@ impl ObservationRuntime {
                                 .collect()
                         };
                         supervisor.update_pane_priorities(effective_priorities);
+
+                        // Publish scheduler snapshot for health reporting.
+                        *scheduler_snapshot.write().await = supervisor.scheduler_snapshot();
 
                         debug!(
                             active_tailers = supervisor.active_count(),
@@ -1353,6 +1367,8 @@ pub struct RuntimeHandle {
     pub heartbeats: Arc<HeartbeatRegistry>,
     /// Capture channel sender (cloned for queue depth instrumentation)
     capture_tx: mpsc::Sender<CaptureEvent>,
+    /// Shared scheduler snapshot for health reporting (written by capture task).
+    scheduler_snapshot: Arc<RwLock<crate::tailer::SchedulerSnapshot>>,
 }
 
 /// Backpressure warning threshold as a fraction of channel capacity.
@@ -1555,6 +1571,15 @@ impl RuntimeHandle {
                     })
                     .collect()
             },
+            scheduler: {
+                let snap = self.scheduler_snapshot.read().await;
+                if snap.budget_active {
+                    Some(snap.clone())
+                } else {
+                    None
+                }
+            },
+            backpressure_tier: None,
         };
 
         HealthSnapshot::update_global(snapshot);
@@ -1798,6 +1823,8 @@ mod tests {
             db_writable: true,
             db_last_write_at: metrics.last_db_write(),
             pane_priority_overrides: vec![],
+            scheduler: None,
+            backpressure_tier: None,
         };
 
         // Verify metrics are correctly reflected in snapshot
@@ -1910,11 +1937,115 @@ mod tests {
             db_writable: true,
             db_last_write_at: None,
             pane_priority_overrides: vec![],
+            scheduler: None,
+            backpressure_tier: None,
         };
 
         assert_eq!(snapshot.capture_queue_depth, 500);
         assert_eq!(snapshot.write_queue_depth, 200);
         assert_eq!(snapshot.warnings.len(), 1);
         assert!(snapshot.warnings[0].contains("backpressure"));
+    }
+
+    #[test]
+    fn health_snapshot_includes_scheduler_when_active() {
+        use crate::crash::HealthSnapshot;
+        use crate::tailer::SchedulerSnapshot;
+
+        let sched = SchedulerSnapshot {
+            budget_active: true,
+            max_captures_per_sec: 50,
+            max_bytes_per_sec: 1_000_000,
+            captures_remaining: 42,
+            bytes_remaining: 500_000,
+            total_rate_limited: 3,
+            total_byte_budget_exceeded: 1,
+            total_throttle_events: 4,
+            tracked_panes: 5,
+        };
+
+        let snapshot = HealthSnapshot {
+            timestamp: 0,
+            observed_panes: 5,
+            capture_queue_depth: 0,
+            write_queue_depth: 0,
+            last_seq_by_pane: vec![],
+            warnings: vec![],
+            ingest_lag_avg_ms: 0.0,
+            ingest_lag_max_ms: 0,
+            db_writable: true,
+            db_last_write_at: None,
+            pane_priority_overrides: vec![],
+            scheduler: Some(sched),
+            backpressure_tier: Some("Green".to_string()),
+        };
+
+        let sched = snapshot.scheduler.as_ref().unwrap();
+        assert!(sched.budget_active);
+        assert_eq!(sched.max_captures_per_sec, 50);
+        assert_eq!(sched.total_rate_limited, 3);
+        assert_eq!(sched.tracked_panes, 5);
+        assert_eq!(snapshot.backpressure_tier.as_deref(), Some("Green"));
+    }
+
+    #[test]
+    fn health_snapshot_scheduler_serializes_roundtrip() {
+        use crate::crash::HealthSnapshot;
+        use crate::tailer::SchedulerSnapshot;
+
+        let snapshot = HealthSnapshot {
+            timestamp: 100,
+            observed_panes: 1,
+            capture_queue_depth: 0,
+            write_queue_depth: 0,
+            last_seq_by_pane: vec![],
+            warnings: vec![],
+            ingest_lag_avg_ms: 0.0,
+            ingest_lag_max_ms: 0,
+            db_writable: true,
+            db_last_write_at: None,
+            pane_priority_overrides: vec![],
+            scheduler: Some(SchedulerSnapshot {
+                budget_active: true,
+                max_captures_per_sec: 10,
+                max_bytes_per_sec: 500,
+                captures_remaining: 8,
+                bytes_remaining: 400,
+                total_rate_limited: 0,
+                total_byte_budget_exceeded: 0,
+                total_throttle_events: 0,
+                tracked_panes: 2,
+            }),
+            backpressure_tier: None,
+        };
+
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let deser: HealthSnapshot = serde_json::from_str(&json).unwrap();
+        let sched = deser.scheduler.unwrap();
+        assert_eq!(sched.max_captures_per_sec, 10);
+        assert_eq!(sched.tracked_panes, 2);
+        assert!(deser.backpressure_tier.is_none());
+    }
+
+    #[test]
+    fn health_snapshot_without_scheduler_deserializes() {
+        // Old snapshots without scheduler/backpressure fields should deserialize fine
+        let json = r#"{
+            "timestamp": 1,
+            "observed_panes": 0,
+            "capture_queue_depth": 0,
+            "write_queue_depth": 0,
+            "last_seq_by_pane": [],
+            "warnings": [],
+            "ingest_lag_avg_ms": 0.0,
+            "ingest_lag_max_ms": 0,
+            "db_writable": true,
+            "db_last_write_at": null,
+            "pane_priority_overrides": []
+        }"#;
+
+        let snapshot: crate::crash::HealthSnapshot = serde_json::from_str(json).unwrap();
+        assert!(snapshot.scheduler.is_none());
+        assert!(snapshot.backpressure_tier.is_none());
     }
 }
