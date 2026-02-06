@@ -59,6 +59,7 @@ pub mod crash;
 pub mod degradation;
 pub mod desktop_notify;
 pub mod diagnostic;
+pub mod docs_gen;
 pub mod dry_run;
 pub mod email_notify;
 pub mod environment;
