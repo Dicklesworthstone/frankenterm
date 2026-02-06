@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::Result;
 use crate::config::{PackOverride, PatternsConfig};
 use crate::error::PatternError;
+use crate::policy::Redactor;
 
 /// Agent types we support
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -508,6 +509,7 @@ impl PatternPack {
 pub struct PatternLibrary {
     packs: Vec<PatternPack>,
     merged_rules: Vec<RuleDef>,
+    rule_to_pack: HashMap<String, String>,
 }
 
 impl PatternLibrary {
@@ -517,11 +519,20 @@ impl PatternLibrary {
             pack.validate()?;
         }
 
+        // Track the effective source pack for each rule id. Later packs override earlier packs.
+        let mut rule_to_pack: HashMap<String, String> = HashMap::new();
+        for pack in &packs {
+            for rule in &pack.rules {
+                rule_to_pack.insert(rule.id.clone(), pack.name.clone());
+            }
+        }
+
         let merged_rules = merge_rules(&packs);
 
         Ok(Self {
             packs,
             merged_rules,
+            rule_to_pack,
         })
     }
 
@@ -531,6 +542,7 @@ impl PatternLibrary {
         Self {
             packs: Vec::new(),
             merged_rules: Vec::new(),
+            rule_to_pack: HashMap::new(),
         }
     }
 
@@ -544,6 +556,10 @@ impl PatternLibrary {
     #[must_use]
     pub fn rules(&self) -> &[RuleDef] {
         &self.merged_rules
+    }
+
+    fn pack_id_for_rule_id(&self, rule_id: &str) -> Option<&str> {
+        self.rule_to_pack.get(rule_id).map(String::as_str)
     }
 }
 
@@ -1785,6 +1801,534 @@ impl PatternEngine {
         }
 
         result
+    }
+
+    /// Detect patterns in text with context filtering/deduplication, and optionally
+    /// generate bounded + redacted explain-match traces.
+    ///
+    /// This method is intentionally separate from `detect_with_context` so that the
+    /// hot path is not penalized when tracing is not needed.
+    #[must_use]
+    pub fn detect_with_context_and_trace(
+        &self,
+        text: &str,
+        context: &mut DetectionContext,
+        opts: &TraceOptions,
+    ) -> (Vec<Detection>, Vec<MatchTrace>) {
+        if text.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+
+        // Combine with tail buffer for cross-segment matching (same semantics as detect_with_context).
+        let (input_text, overlap_len) = if context.tail_buffer.is_empty() {
+            (std::borrow::Cow::Borrowed(text), 0)
+        } else {
+            let mut s = String::with_capacity(context.tail_buffer.len() + text.len());
+            s.push_str(&context.tail_buffer);
+            s.push_str(text);
+            (std::borrow::Cow::Owned(s), context.tail_buffer.len())
+        };
+
+        // Update tail buffer for next time; keep last N chars.
+        let full_len = input_text.len();
+        if full_len > DetectionContext::MAX_TAIL_SIZE {
+            let mut start = full_len - DetectionContext::MAX_TAIL_SIZE;
+            while !input_text.is_char_boundary(start) && start < full_len {
+                start += 1;
+            }
+            context.tail_buffer = input_text[start..].to_string();
+        } else {
+            context.tail_buffer = input_text.to_string();
+        }
+
+        self.detect_with_context_and_trace_inner(&input_text, overlap_len, context, opts)
+    }
+
+    fn detect_with_context_and_trace_inner(
+        &self,
+        text: &str,
+        overlap_len: usize,
+        context: &mut DetectionContext,
+        opts: &TraceOptions,
+    ) -> (Vec<Detection>, Vec<MatchTrace>) {
+        let index = self.index();
+
+        if self.quick_reject_enabled && !Self::quick_reject_with_index(index, text) {
+            return (Vec::new(), Vec::new());
+        }
+
+        let Some(matcher) = index.anchor_matcher.as_ref() else {
+            return (Vec::new(), Vec::new());
+        };
+
+        let redactor = Redactor::new();
+
+        let mut candidate_rules: HashSet<usize> = HashSet::new();
+        let mut matched_anchor_by_rule: HashMap<usize, (String, (usize, usize))> = HashMap::new();
+
+        for matched in matcher.find_overlapping_iter(text) {
+            let Some(anchor) = index.anchor_list.get(matched.pattern().as_usize()) else {
+                continue;
+            };
+
+            if let Some(rule_indices) = index.anchor_to_rules.get(anchor) {
+                for &idx in rule_indices {
+                    candidate_rules.insert(idx);
+                    matched_anchor_by_rule
+                        .entry(idx)
+                        .or_insert_with(|| (anchor.clone(), (matched.start(), matched.end())));
+                }
+            }
+        }
+
+        if candidate_rules.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+
+        let mut indices: Vec<usize> = candidate_rules.into_iter().collect();
+        indices.sort_unstable();
+
+        let mut detections: Vec<Detection> = Vec::new();
+        let mut traces: Vec<MatchTrace> = Vec::new();
+
+        for idx in indices {
+            let compiled = &index.compiled_rules[idx];
+            let rule = &compiled.def;
+
+            let (fallback_anchor, fallback_span) = matched_anchor_by_rule
+                .get(&idx)
+                .cloned()
+                .unwrap_or_default();
+
+            let pack_id = self
+                .library
+                .pack_id_for_rule_id(&rule.id)
+                .unwrap_or("unknown")
+                .to_string();
+
+            let anchor_evidence =
+                Self::trace_anchor_evidence(text, &redactor, &fallback_anchor, fallback_span, opts);
+
+            if let Some(regex) = compiled.regex.as_ref() {
+                let mut any_capture = false;
+
+                for capture_result in regex.captures_iter(text) {
+                    let Ok(captures) = capture_result else {
+                        continue;
+                    };
+                    any_capture = true;
+
+                    let mut extracted = serde_json::Map::new();
+                    for name in regex.capture_names().flatten() {
+                        if let Some(value) = captures.name(name) {
+                            extracted.insert(
+                                name.to_string(),
+                                serde_json::Value::String(value.as_str().to_string()),
+                            );
+                        }
+                    }
+
+                    let (raw_matched_text, span) = captures.get(0).map_or_else(
+                        || (fallback_anchor.clone(), fallback_span),
+                        |m| (m.as_str().to_string(), (m.start(), m.end())),
+                    );
+
+                    let detection = Detection {
+                        rule_id: rule.id.clone(),
+                        agent_type: rule.agent_type,
+                        event_type: rule.event_type.clone(),
+                        severity: rule.severity,
+                        confidence: 0.95,
+                        extracted: serde_json::Value::Object(extracted),
+                        matched_text: raw_matched_text.clone(),
+                        span,
+                    };
+
+                    let (eligible, gates) =
+                        Self::evaluate_trace_gates(&detection, overlap_len, context);
+
+                    if eligible {
+                        context.mark_seen(&detection);
+                        detections.push(detection.clone());
+                    }
+
+                    if eligible || opts.include_non_matches {
+                        let trace = Self::build_match_trace(
+                            text,
+                            &redactor,
+                            pack_id.clone(),
+                            Some("regex".to_string()),
+                            &detection,
+                            eligible,
+                            gates,
+                            anchor_evidence.as_ref(),
+                            Some((&captures, regex)),
+                            opts,
+                        );
+                        traces.push(trace);
+                    }
+                }
+
+                if !any_capture && opts.include_non_matches {
+                    // Anchor hit, but regex didn't produce a match.
+                    let mut gates = Self::trace_gates_skeleton();
+
+                    // Agent-type gate can still be evaluated.
+                    let agent_passed = context.agent_type.is_none_or(|expected_agent| {
+                        expected_agent == AgentType::Unknown
+                            || rule.agent_type == AgentType::Wezterm
+                            || rule.agent_type == expected_agent
+                    });
+                    gates[0].passed = agent_passed;
+                    if !agent_passed {
+                        gates[0].reason =
+                            Some("rule agent_type does not match inferred pane agent".to_string());
+                    }
+
+                    gates[3].passed = false;
+                    gates[3].reason = Some("regex_no_match".to_string());
+
+                    let eligible = false;
+
+                    let trace = Self::build_match_trace_no_detection(
+                        text,
+                        &redactor,
+                        pack_id.clone(),
+                        rule.id.clone(),
+                        Some("regex".to_string()),
+                        eligible,
+                        gates,
+                        anchor_evidence.as_ref(),
+                        opts,
+                    );
+                    traces.push(trace);
+                }
+            } else {
+                // Anchor-only rule: anchor hit implies a match.
+                let detection = Detection {
+                    rule_id: rule.id.clone(),
+                    agent_type: rule.agent_type,
+                    event_type: rule.event_type.clone(),
+                    severity: rule.severity,
+                    confidence: 0.6,
+                    extracted: serde_json::Value::Object(serde_json::Map::new()),
+                    matched_text: fallback_anchor.clone(),
+                    span: fallback_span,
+                };
+
+                let (eligible, gates) =
+                    Self::evaluate_trace_gates(&detection, overlap_len, context);
+
+                if eligible {
+                    context.mark_seen(&detection);
+                    detections.push(detection.clone());
+                }
+
+                if eligible || opts.include_non_matches {
+                    let trace = Self::build_match_trace(
+                        text,
+                        &redactor,
+                        pack_id.clone(),
+                        Some("anchor".to_string()),
+                        &detection,
+                        eligible,
+                        gates,
+                        anchor_evidence.as_ref(),
+                        None,
+                        opts,
+                    );
+                    traces.push(trace);
+                }
+            }
+        }
+
+        (detections, traces)
+    }
+
+    fn trace_gates_skeleton() -> Vec<TraceGate> {
+        vec![
+            TraceGate {
+                gate: "agent_type".to_string(),
+                passed: true,
+                reason: None,
+            },
+            TraceGate {
+                gate: "overlap".to_string(),
+                passed: true,
+                reason: None,
+            },
+            TraceGate {
+                gate: "dedupe".to_string(),
+                passed: true,
+                reason: None,
+            },
+            TraceGate {
+                gate: "match".to_string(),
+                passed: true,
+                reason: None,
+            },
+        ]
+    }
+
+    fn evaluate_trace_gates(
+        detection: &Detection,
+        overlap_len: usize,
+        context: &DetectionContext,
+    ) -> (bool, Vec<TraceGate>) {
+        let mut gates = Self::trace_gates_skeleton();
+
+        // agent_type gate
+        if let Some(expected_agent) = context.agent_type {
+            let applies = Self::rule_applies_to_agent(detection, expected_agent);
+            gates[0].passed = applies;
+            if !applies {
+                gates[0].reason =
+                    Some("rule agent_type does not match inferred pane agent".to_string());
+            }
+        }
+
+        // overlap gate
+        if overlap_len > 0 && detection.span.1 <= overlap_len {
+            gates[1].passed = false;
+            gates[1].reason = Some("match within overlap window".to_string());
+        }
+
+        // dedupe gate
+        if context.is_seen(detection) {
+            gates[2].passed = false;
+            gates[2].reason = Some("already seen within TTL".to_string());
+        }
+
+        // match gate is always true for a constructed Detection.
+        gates[3].passed = true;
+
+        let eligible = gates.iter().all(|g| g.passed);
+        (eligible, gates)
+    }
+
+    fn trace_anchor_evidence(
+        text: &str,
+        redactor: &Redactor,
+        anchor: &str,
+        span: (usize, usize),
+        opts: &TraceOptions,
+    ) -> Option<TraceEvidence> {
+        if anchor.is_empty() && span == (0, 0) {
+            return None;
+        }
+
+        let excerpt_raw = Self::slice_bytes(text, span.0, span.1).unwrap_or(anchor);
+        let excerpt_redacted = redactor.redact(excerpt_raw);
+        let (excerpt, truncated) = Self::bound_utf8(&excerpt_redacted, opts.max_excerpt_bytes);
+
+        Some(TraceEvidence {
+            kind: "anchor".to_string(),
+            label: if anchor.is_empty() {
+                None
+            } else {
+                Some(anchor.to_string())
+            },
+            span: Some(TraceSpan {
+                start: span.0,
+                end: span.1,
+            }),
+            excerpt: Some(excerpt),
+            truncated,
+        })
+    }
+
+    fn build_match_trace(
+        text: &str,
+        redactor: &Redactor,
+        pack_id: String,
+        extractor_id: Option<String>,
+        detection: &Detection,
+        eligible: bool,
+        mut gates: Vec<TraceGate>,
+        anchor_evidence: Option<&TraceEvidence>,
+        regex_context: Option<(&fancy_regex::Captures<'_>, &Regex)>,
+        opts: &TraceOptions,
+    ) -> MatchTrace {
+        // Ensure gate list includes "match" in stable position.
+        // (evaluate_trace_gates always sets match=true; callers may override for non-detections.)
+        if gates.len() != 4 || gates[3].gate != "match" {
+            gates = Self::trace_gates_skeleton();
+        }
+
+        let mut truncated_fields: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+
+        let matched_text_redacted = redactor.redact(&detection.matched_text);
+        let (matched_text_bounded, matched_text_truncated) =
+            Self::bound_utf8(&matched_text_redacted, opts.max_excerpt_bytes);
+        if matched_text_truncated {
+            truncated_fields.insert("matched_text".to_string());
+        }
+
+        let mut evidence: Vec<TraceEvidence> = Vec::new();
+        if let Some(anchor) = anchor_evidence {
+            if anchor.truncated {
+                truncated_fields.insert("excerpt".to_string());
+            }
+            evidence.push(anchor.clone());
+        }
+
+        // Match evidence (best-effort excerpt from span).
+        let match_excerpt_raw =
+            Self::slice_bytes(text, detection.span.0, detection.span.1).unwrap_or("");
+        let match_excerpt_redacted = redactor.redact(match_excerpt_raw);
+        let (match_excerpt, match_excerpt_truncated) =
+            Self::bound_utf8(&match_excerpt_redacted, opts.max_excerpt_bytes);
+        if match_excerpt_truncated {
+            truncated_fields.insert("excerpt".to_string());
+        }
+
+        evidence.push(TraceEvidence {
+            kind: "match".to_string(),
+            label: None,
+            span: Some(TraceSpan {
+                start: detection.span.0,
+                end: detection.span.1,
+            }),
+            excerpt: if match_excerpt.is_empty() {
+                None
+            } else {
+                Some(match_excerpt)
+            },
+            truncated: match_excerpt_truncated,
+        });
+
+        // Capture evidence (stable ordering by capture name).
+        if let Some((captures, regex)) = regex_context {
+            let mut names: Vec<&str> = regex.capture_names().flatten().collect();
+            names.sort_unstable();
+
+            for name in names {
+                let Some(value) = captures.name(name) else {
+                    continue;
+                };
+
+                let cap_redacted = redactor.redact(value.as_str());
+                let (cap_bounded, cap_truncated) =
+                    Self::bound_utf8(&cap_redacted, opts.max_capture_bytes);
+                if cap_truncated {
+                    truncated_fields.insert(format!("capture.{name}"));
+                }
+
+                evidence.push(TraceEvidence {
+                    kind: "capture".to_string(),
+                    label: Some(name.to_string()),
+                    span: Some(TraceSpan {
+                        start: value.start(),
+                        end: value.end(),
+                    }),
+                    excerpt: Some(cap_bounded),
+                    truncated: cap_truncated,
+                });
+            }
+        }
+
+        let evidence_total = evidence.len();
+        let mut evidence_truncated = false;
+        if evidence.len() > opts.max_evidence_items {
+            evidence.truncate(opts.max_evidence_items);
+            evidence_truncated = true;
+            truncated_fields.insert("evidence".to_string());
+        }
+
+        let bounds = TraceBounds {
+            max_evidence_items: opts.max_evidence_items,
+            max_excerpt_bytes: opts.max_excerpt_bytes,
+            max_capture_bytes: opts.max_capture_bytes,
+            evidence_total,
+            evidence_truncated,
+            truncated_fields: truncated_fields.into_iter().collect(),
+        };
+
+        MatchTrace {
+            pack_id,
+            rule_id: detection.rule_id.clone(),
+            extractor_id,
+            matched_text: Some(matched_text_bounded),
+            confidence: Some(detection.confidence),
+            eligible,
+            gates,
+            evidence,
+            bounds,
+        }
+    }
+
+    fn build_match_trace_no_detection(
+        _text: &str,
+        _redactor: &Redactor,
+        pack_id: String,
+        rule_id: String,
+        extractor_id: Option<String>,
+        eligible: bool,
+        gates: Vec<TraceGate>,
+        anchor_evidence: Option<&TraceEvidence>,
+        opts: &TraceOptions,
+    ) -> MatchTrace {
+        let mut truncated_fields: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+
+        let mut evidence: Vec<TraceEvidence> = Vec::new();
+        if let Some(anchor) = anchor_evidence {
+            if anchor.truncated {
+                truncated_fields.insert("excerpt".to_string());
+            }
+            evidence.push(anchor.clone());
+        }
+
+        let evidence_total = evidence.len();
+        let mut evidence_truncated = false;
+        if evidence.len() > opts.max_evidence_items {
+            evidence.truncate(opts.max_evidence_items);
+            evidence_truncated = true;
+            truncated_fields.insert("evidence".to_string());
+        }
+
+        let bounds = TraceBounds {
+            max_evidence_items: opts.max_evidence_items,
+            max_excerpt_bytes: opts.max_excerpt_bytes,
+            max_capture_bytes: opts.max_capture_bytes,
+            evidence_total,
+            evidence_truncated,
+            truncated_fields: truncated_fields.into_iter().collect(),
+        };
+
+        MatchTrace {
+            pack_id,
+            rule_id,
+            extractor_id,
+            matched_text: None,
+            confidence: None,
+            eligible,
+            gates,
+            evidence,
+            bounds,
+        }
+    }
+
+    fn slice_bytes(text: &str, start: usize, end: usize) -> Option<&str> {
+        if start > end || end > text.len() {
+            return None;
+        }
+        if !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+            return None;
+        }
+        Some(&text[start..end])
+    }
+
+    fn bound_utf8(s: &str, max_bytes: usize) -> (String, bool) {
+        if s.len() <= max_bytes {
+            return (s.to_string(), false);
+        }
+        let mut end = max_bytes.min(s.len());
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        (s[..end].to_string(), true)
     }
 
     /// Check if a detection's rule applies to the given agent type.
@@ -3248,5 +3792,131 @@ rules:
                 d.rule_id
             );
         }
+    }
+
+    #[test]
+    fn detect_with_context_and_trace_includes_pack_id_for_emitted_detection() {
+        let engine = engine_with_rules(vec![rule_with_anchor("codex.anchor", "hello", None)]);
+        let mut ctx = DetectionContext::new();
+        let opts = TraceOptions::default();
+
+        let (detections, traces) =
+            engine.detect_with_context_and_trace("say hello to the world", &mut ctx, &opts);
+
+        assert_eq!(detections.len(), 1);
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0].pack_id, "pack");
+        assert_eq!(traces[0].rule_id, "codex.anchor");
+        assert!(traces[0].eligible);
+    }
+
+    #[test]
+    fn detect_with_context_and_trace_emits_regex_miss_trace_when_enabled() {
+        let engine = engine_with_rules(vec![rule_with_anchor(
+            "codex.regex",
+            "limit",
+            Some(r"limit (?P<value>\d+)"),
+        )]);
+
+        let mut ctx = DetectionContext::new();
+        let mut opts = TraceOptions::default();
+        opts.include_non_matches = true;
+
+        let (detections, traces) =
+            engine.detect_with_context_and_trace("limit xx", &mut ctx, &opts);
+
+        assert!(detections.is_empty());
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0].pack_id, "pack");
+        assert_eq!(traces[0].rule_id, "codex.regex");
+        assert!(!traces[0].eligible);
+
+        let match_gate = traces[0]
+            .gates
+            .iter()
+            .find(|g| g.gate == "match")
+            .expect("match gate should exist");
+        assert!(!match_gate.passed);
+    }
+
+    #[test]
+    fn detect_with_context_and_trace_reports_dedupe_gate_failure_on_second_run() {
+        let engine = engine_with_rules(vec![rule_with_anchor("codex.anchor", "hello", None)]);
+
+        let mut ctx = DetectionContext::new();
+        let mut opts = TraceOptions::default();
+        opts.include_non_matches = true;
+
+        let (detections1, traces1) = engine.detect_with_context_and_trace("hello", &mut ctx, &opts);
+        assert_eq!(detections1.len(), 1);
+        assert_eq!(traces1.len(), 1);
+        assert!(traces1[0].eligible);
+
+        let (detections2, traces2) = engine.detect_with_context_and_trace("hello", &mut ctx, &opts);
+        assert!(detections2.is_empty());
+        assert_eq!(traces2.len(), 1);
+        assert!(!traces2[0].eligible);
+
+        let dedupe_gate = traces2[0]
+            .gates
+            .iter()
+            .find(|g| g.gate == "dedupe")
+            .expect("dedupe gate should exist");
+        assert!(!dedupe_gate.passed);
+    }
+
+    #[test]
+    fn detect_with_context_and_trace_redacts_matched_text_and_captures() {
+        let p1 = "sk";
+        let p2 = "-";
+        let p3 = "abc123";
+        let p4 = "456789012345678901234567890123456789012345678901";
+        let secret = format!("{p1}{p2}{p3}{p4}");
+
+        // Ensure the secret is detectable by the redactor before asserting on output.
+        let redactor = Redactor::new();
+        assert!(redactor.contains_secrets(&secret));
+
+        let engine = engine_with_rules(vec![rule_with_anchor(
+            "codex.secret",
+            "Key:",
+            Some(r"Key: (?P<key>.+)"),
+        )]);
+
+        let mut ctx = DetectionContext::new();
+        let mut opts = TraceOptions::default();
+        opts.include_non_matches = true;
+        opts.max_excerpt_bytes = 1024;
+        opts.max_capture_bytes = 1024;
+
+        let text = format!("Key: {secret}");
+        let (_detections, traces) = engine.detect_with_context_and_trace(&text, &mut ctx, &opts);
+
+        assert_eq!(traces.len(), 1);
+        let trace = &traces[0];
+        let mt = trace
+            .matched_text
+            .as_ref()
+            .expect("matched_text should exist");
+        assert!(!mt.contains(&secret), "matched_text must not leak secrets");
+        assert!(mt.contains("[REDACTED]"), "expected redaction marker");
+
+        let capture = trace
+            .evidence
+            .iter()
+            .find(|ev| ev.kind == "capture" && ev.label.as_deref() == Some("key"))
+            .expect("capture evidence should exist");
+        let cap_excerpt = capture
+            .excerpt
+            .as_ref()
+            .expect("capture excerpt should exist");
+        assert!(
+            !cap_excerpt.contains(&secret),
+            "capture excerpt must not leak secrets"
+        );
+        assert!(
+            cap_excerpt.contains("[REDACTED]"),
+            "expected redaction marker in capture"
+        );
     }
 }
