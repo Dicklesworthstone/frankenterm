@@ -373,6 +373,9 @@ SEE ALSO:
     wa events --pane-id 3             Events for specific pane
     wa events --unhandled             Only unhandled events
     wa events --rule-id codex.usage   Filter by detection rule
+    wa events annotate 123 --note "Investigating"
+    wa events triage 123 --state investigating
+    wa events label 123 --add urgent
 
 SEE ALSO:
     wa why        Explain event decisions
@@ -401,6 +404,9 @@ SEE ALSO:
         /// Only return unhandled events
         #[arg(long, short = 'u')]
         unhandled: bool,
+
+        #[command(subcommand)]
+        command: Option<EventsCommands>,
     },
 
     /// Ingest external events (e.g., WezTerm user-var signals from shell hooks)
@@ -757,28 +763,21 @@ SEE ALSO:
         command: DiagCommands,
     },
 
-    /// Export an incident bundle for sharing or analysis
+    /// Export or replay incident bundles
     #[command(after_help = r#"EXAMPLES:
-    wa reproduce                      Export latest crash as incident bundle
-    wa reproduce --kind manual        Export a manual incident bundle
-    wa reproduce --out /tmp/bundle    Export to specific directory
-    wa reproduce --format json        Machine-readable output
+    wa reproduce export                      Export latest crash as incident bundle
+    wa reproduce export --kind manual        Export a manual incident bundle
+    wa reproduce export --out /tmp/bundle    Export to specific directory
+    wa reproduce replay /path/to/bundle      Replay a bundle for deterministic analysis
+    wa reproduce replay /path/to/bundle --mode policy   Re-run policy evaluation
+    wa reproduce replay /path/to/bundle --mode rules    Re-run rule/pattern matching
 
 SEE ALSO:
     wa doctor     Run diagnostics
     wa status     System and pane overview"#)]
     Reproduce {
-        /// Incident kind to export
-        #[arg(long, default_value = "crash")]
-        kind: String,
-
-        /// Output directory for the bundle (default: crash_dir)
-        #[arg(long)]
-        out: Option<PathBuf>,
-
-        /// Output format (text or json)
-        #[arg(short = 'f', long, default_value = "text")]
-        format: String,
+        #[command(subcommand)]
+        command: ReproduceCommands,
     },
 
     /// Setup helpers
@@ -1131,6 +1130,48 @@ SEE ALSO:
         #[command(subcommand)]
         command: McpCommands,
     },
+
+    /// Usage analytics: costs, tokens, rate limits, and trends
+    #[command(after_help = r#"EXAMPLES:
+    wa analytics                      Summary of last 7 days
+    wa analytics --period 30d         Summary of last 30 days
+    wa analytics daily                Daily breakdown table
+    wa analytics by-agent             Per-agent breakdown
+    wa analytics export --format csv  Export raw metrics as CSV
+    wa analytics export --format json Export raw metrics as JSON
+
+SEE ALSO:
+    wa events     View detected events
+    wa status     Show watcher overview"#)]
+    Analytics {
+        #[command(subcommand)]
+        command: Option<AnalyticsCommands>,
+
+        /// Time period: 1d, 7d, 30d, 90d (default: 7d)
+        #[arg(long, default_value = "7d")]
+        period: String,
+
+        /// Output format: auto, plain, json
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum AnalyticsCommands {
+    /// Daily metrics breakdown
+    Daily,
+    /// Per-agent breakdown
+    ByAgent,
+    /// Export raw metrics
+    Export {
+        /// Export format: csv or json
+        #[arg(long, short = 'f', default_value = "json")]
+        format: String,
+        /// Output file path (defaults to stdout)
+        #[arg(long, short = 'o')]
+        output: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1234,6 +1275,112 @@ enum MuteCommands {
     List {
         /// Output format: auto, plain, or json
         #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum EventsCommands {
+    /// Set or clear the note on an event
+    #[command(after_help = r#"EXAMPLES:
+    wa events annotate 123 --note "Investigating"
+    wa events annotate 123 --clear
+
+NOTES:
+    Note text is redacted before being persisted."#)]
+    Annotate {
+        /// Event ID to annotate
+        event_id: i64,
+
+        /// Note text to set
+        #[arg(long)]
+        note: Option<String>,
+
+        /// Clear the note
+        #[arg(long)]
+        clear: bool,
+
+        /// Actor identifier to record (optional)
+        #[arg(long)]
+        by: Option<String>,
+    },
+
+    /// Set or clear the triage state for an event
+    #[command(after_help = r#"EXAMPLES:
+    wa events triage 123 --state investigating
+    wa events triage 123 --clear"#)]
+    Triage {
+        /// Event ID to triage
+        event_id: i64,
+
+        /// Triage state to set (string, exact-match)
+        #[arg(long)]
+        state: Option<String>,
+
+        /// Clear the triage state
+        #[arg(long)]
+        clear: bool,
+
+        /// Actor identifier to record (optional)
+        #[arg(long)]
+        by: Option<String>,
+    },
+
+    /// Add/remove/list event labels
+    #[command(after_help = r#"EXAMPLES:
+    wa events label 123 --add urgent
+    wa events label 123 --remove urgent
+    wa events label 123 --list"#)]
+    Label {
+        /// Event ID to modify
+        event_id: i64,
+
+        /// Label to add (idempotent)
+        #[arg(long)]
+        add: Option<String>,
+
+        /// Label to remove
+        #[arg(long)]
+        remove: Option<String>,
+
+        /// List labels (and current annotations)
+        #[arg(long)]
+        list: bool,
+
+        /// Actor identifier to record (optional; applies to --add)
+        #[arg(long)]
+        by: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ReproduceCommands {
+    /// Export an incident bundle for sharing or analysis
+    Export {
+        /// Incident kind to export
+        #[arg(long, default_value = "crash")]
+        kind: String,
+
+        /// Output directory for the bundle (default: crash_dir)
+        #[arg(long)]
+        out: Option<PathBuf>,
+
+        /// Output format (text or json)
+        #[arg(short = 'f', long, default_value = "text")]
+        format: String,
+    },
+
+    /// Replay a bundle for deterministic analysis
+    Replay {
+        /// Path to the incident bundle directory
+        bundle: PathBuf,
+
+        /// Replay mode: policy (re-run policy eval) or rules (re-run pattern matching)
+        #[arg(long, default_value = "policy")]
+        mode: String,
+
+        /// Output format (text or json)
+        #[arg(short = 'f', long, default_value = "text")]
         format: String,
     },
 }
@@ -1516,6 +1663,14 @@ enum RobotCommands {
         #[arg(long)]
         event_type: Option<String>,
 
+        /// Filter by triage state (exact match)
+        #[arg(long)]
+        triage_state: Option<String>,
+
+        /// Filter by label (exact match)
+        #[arg(long)]
+        label: Option<String>,
+
         /// Only return unhandled events
         #[arg(long, visible_alias = "unhandled-only")]
         unhandled: bool,
@@ -1531,6 +1686,9 @@ enum RobotCommands {
         /// Mark output as dry-run preview (implies --would-handle)
         #[arg(long)]
         dry_run: bool,
+
+        #[command(subcommand)]
+        command: Option<RobotEventsCommands>,
     },
 
     /// Workflow management commands
@@ -1579,6 +1737,68 @@ enum RobotCommands {
         /// Check approval status without consuming
         #[arg(long)]
         dry_run: bool,
+    },
+}
+
+/// Robot event triage/annotation subcommands (bd-2gce)
+#[derive(Subcommand)]
+enum RobotEventsCommands {
+    /// Set or clear the note on an event
+    Annotate {
+        /// Event ID to annotate
+        event_id: i64,
+
+        /// Note text to set
+        #[arg(long)]
+        note: Option<String>,
+
+        /// Clear the note
+        #[arg(long)]
+        clear: bool,
+
+        /// Actor identifier to record (optional)
+        #[arg(long)]
+        by: Option<String>,
+    },
+
+    /// Set or clear the triage state for an event
+    Triage {
+        /// Event ID to triage
+        event_id: i64,
+
+        /// Triage state to set (string, exact-match)
+        #[arg(long)]
+        state: Option<String>,
+
+        /// Clear the triage state
+        #[arg(long)]
+        clear: bool,
+
+        /// Actor identifier to record (optional)
+        #[arg(long)]
+        by: Option<String>,
+    },
+
+    /// Add/remove/list event labels
+    Label {
+        /// Event ID to modify
+        event_id: i64,
+
+        /// Label to add (idempotent)
+        #[arg(long)]
+        add: Option<String>,
+
+        /// Label to remove
+        #[arg(long)]
+        remove: Option<String>,
+
+        /// List labels (and current annotations)
+        #[arg(long)]
+        list: bool,
+
+        /// Actor identifier to record (optional; applies to --add)
+        #[arg(long)]
+        by: Option<String>,
     },
 }
 
@@ -3049,6 +3269,10 @@ struct RobotEventsData {
     rule_id_filter: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     event_type_filter: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    triage_state_filter: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    label_filter: Option<String>,
     unhandled_only: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     since_filter: Option<i64>,
@@ -3070,6 +3294,9 @@ struct RobotEventItem {
     confidence: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     extracted: Option<serde_json::Value>,
+    /// Optional triage/annotation fields (bd-2gce)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    annotations: Option<wa_core::storage::EventAnnotations>,
     captured_at: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     handled_at: Option<i64>,
@@ -3093,6 +3320,15 @@ struct RobotEventWouldHandle {
     would_run: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
+}
+
+/// Robot event annotation/triage mutation response data (bd-2gce).
+#[derive(serde::Serialize)]
+struct RobotEventMutationData {
+    event_id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    changed: Option<bool>,
+    annotations: wa_core::storage::EventAnnotations,
 }
 
 /// Workflow execution result for robot mode
@@ -5308,6 +5544,34 @@ fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |dur| u64::try_from(dur.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// Return current epoch in milliseconds as i64 (for storage queries).
+fn now_epoch_ms() -> i64 {
+    i64::try_from(now_ms()).unwrap_or(i64::MAX)
+}
+
+/// Parse a period string (e.g. "7d", "30d", "90d", "1d") into milliseconds.
+fn parse_period_ms(period: &str) -> i64 {
+    let s = period.trim().to_lowercase();
+    if let Some(days_str) = s.strip_suffix('d') {
+        if let Ok(days) = days_str.parse::<i64>() {
+            return days * 86_400_000;
+        }
+    }
+    // Default: 7 days
+    7 * 86_400_000
+}
+
+/// Format a period string into a human-readable label.
+fn format_period_label(period: &str) -> String {
+    let s = period.trim().to_lowercase();
+    if let Some(days_str) = s.strip_suffix('d') {
+        if let Ok(days) = days_str.parse::<i64>() {
+            return format!("Last {days} Day{}", if days == 1 { "" } else { "s" });
+        }
+    }
+    "Last 7 Days".to_string()
 }
 
 /// Check if a refresh is rate-limited based on the most recent refresh timestamp.
@@ -7923,10 +8187,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             pane,
                             rule_id,
                             event_type,
+                            triage_state,
+                            label,
                             unhandled,
                             since,
                             would_handle,
                             dry_run,
+                            command,
                         } => {
                             // Get workspace layout for DB path
                             let layout = match config.workspace_layout(Some(&workspace_root)) {
@@ -7961,12 +8228,352 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 }
                             };
 
+                            // Mutating subcommands (bd-2gce)
+                            if let Some(cmd) = command {
+                                use wa_core::storage::{AuditActionRecord, EventAnnotations};
+                                let now = now_ms_i64();
+
+                                let (event_id, changed) = match cmd {
+                                    RobotEventsCommands::Annotate {
+                                        event_id,
+                                        note,
+                                        clear,
+                                        by,
+                                    } => {
+                                        if clear == note.is_some() {
+                                            let response = RobotResponse::<RobotEventMutationData>::error_with_code(
+                                                ROBOT_ERR_INVALID_ARGS,
+                                                "Invalid annotate params: specify exactly one of --note or --clear".to_string(),
+                                                Some("Example: wa robot events annotate 123 --note \"Investigating\"".to_string()),
+                                                elapsed_ms(start),
+                                            );
+                                            print_robot_response(&response, format, stats)?;
+                                            return Ok(());
+                                        }
+
+                                        if let Err(e) =
+                                            storage.set_event_note(event_id, note, by.clone()).await
+                                        {
+                                            let response = RobotResponse::<RobotEventMutationData>::error_with_code(
+                                                ROBOT_ERR_STORAGE,
+                                                format!("Failed to update note: {e}"),
+                                                None,
+                                                elapsed_ms(start),
+                                            );
+                                            print_robot_response(&response, format, stats)?;
+                                            return Ok(());
+                                        }
+
+                                        let audit = AuditActionRecord {
+                                            id: 0,
+                                            ts: now,
+                                            actor_kind: "robot".to_string(),
+                                            actor_id: by.clone(),
+                                            correlation_id: None,
+                                            pane_id: None,
+                                            domain: None,
+                                            action_kind: "event.annotate".to_string(),
+                                            policy_decision: "allow".to_string(),
+                                            decision_reason: Some(
+                                                "Robot updated event note".to_string(),
+                                            ),
+                                            rule_id: None,
+                                            input_summary: Some(if clear {
+                                                format!(
+                                                    "wa robot events annotate {event_id} --clear"
+                                                )
+                                            } else {
+                                                format!(
+                                                    "wa robot events annotate {event_id} --note <redacted>"
+                                                )
+                                            }),
+                                            verification_summary: None,
+                                            decision_context: None,
+                                            result: "success".to_string(),
+                                        };
+                                        if let Err(e) =
+                                            storage.record_audit_action_redacted(audit).await
+                                        {
+                                            tracing::warn!(
+                                                "Failed to record event annotation audit: {e}"
+                                            );
+                                        }
+
+                                        (event_id, None)
+                                    }
+                                    RobotEventsCommands::Triage {
+                                        event_id,
+                                        state,
+                                        clear,
+                                        by,
+                                    } => {
+                                        if clear == state.is_some() {
+                                            let response = RobotResponse::<RobotEventMutationData>::error_with_code(
+                                                ROBOT_ERR_INVALID_ARGS,
+                                                "Invalid triage params: specify exactly one of --state or --clear".to_string(),
+                                                Some("Example: wa robot events triage 123 --state investigating".to_string()),
+                                                elapsed_ms(start),
+                                            );
+                                            print_robot_response(&response, format, stats)?;
+                                            return Ok(());
+                                        }
+
+                                        let changed = match storage
+                                            .set_event_triage_state(
+                                                event_id,
+                                                state.clone(),
+                                                by.clone(),
+                                            )
+                                            .await
+                                        {
+                                            Ok(v) => v,
+                                            Err(e) => {
+                                                let response = RobotResponse::<
+                                                    RobotEventMutationData,
+                                                >::error_with_code(
+                                                    ROBOT_ERR_STORAGE,
+                                                    format!("Failed to update triage state: {e}"),
+                                                    None,
+                                                    elapsed_ms(start),
+                                                );
+                                                print_robot_response(&response, format, stats)?;
+                                                return Ok(());
+                                            }
+                                        };
+
+                                        let audit = AuditActionRecord {
+                                            id: 0,
+                                            ts: now,
+                                            actor_kind: "robot".to_string(),
+                                            actor_id: by.clone(),
+                                            correlation_id: None,
+                                            pane_id: None,
+                                            domain: None,
+                                            action_kind: "event.triage".to_string(),
+                                            policy_decision: "allow".to_string(),
+                                            decision_reason: Some(
+                                                "Robot updated event triage state".to_string(),
+                                            ),
+                                            rule_id: None,
+                                            input_summary: Some(if clear {
+                                                format!("wa robot events triage {event_id} --clear")
+                                            } else {
+                                                format!(
+                                                    "wa robot events triage {event_id} --state {}",
+                                                    state.unwrap_or_default()
+                                                )
+                                            }),
+                                            verification_summary: None,
+                                            decision_context: None,
+                                            result: if changed {
+                                                "success".to_string()
+                                            } else {
+                                                "noop".to_string()
+                                            },
+                                        };
+                                        if let Err(e) =
+                                            storage.record_audit_action_redacted(audit).await
+                                        {
+                                            tracing::warn!(
+                                                "Failed to record event triage audit: {e}"
+                                            );
+                                        }
+
+                                        (event_id, Some(changed))
+                                    }
+                                    RobotEventsCommands::Label {
+                                        event_id,
+                                        add,
+                                        remove,
+                                        list,
+                                        by,
+                                    } => {
+                                        let mut ops = 0;
+                                        if add.is_some() {
+                                            ops += 1;
+                                        }
+                                        if remove.is_some() {
+                                            ops += 1;
+                                        }
+                                        if list {
+                                            ops += 1;
+                                        }
+                                        if ops != 1 {
+                                            let response = RobotResponse::<RobotEventMutationData>::error_with_code(
+                                                ROBOT_ERR_INVALID_ARGS,
+                                                "Invalid label params: specify exactly one of --add, --remove, or --list".to_string(),
+                                                Some("Example: wa robot events label 123 --add urgent".to_string()),
+                                                elapsed_ms(start),
+                                            );
+                                            print_robot_response(&response, format, stats)?;
+                                            return Ok(());
+                                        }
+
+                                        let changed = if let Some(label) = add.clone() {
+                                            let inserted = match storage
+                                                .add_event_label(
+                                                    event_id,
+                                                    label.clone(),
+                                                    by.clone(),
+                                                )
+                                                .await
+                                            {
+                                                Ok(v) => v,
+                                                Err(e) => {
+                                                    let response = RobotResponse::<
+                                                        RobotEventMutationData,
+                                                    >::error_with_code(
+                                                        ROBOT_ERR_STORAGE,
+                                                        format!("Failed to add label: {e}"),
+                                                        None,
+                                                        elapsed_ms(start),
+                                                    );
+                                                    print_robot_response(&response, format, stats)?;
+                                                    return Ok(());
+                                                }
+                                            };
+
+                                            let audit = AuditActionRecord {
+                                                id: 0,
+                                                ts: now,
+                                                actor_kind: "robot".to_string(),
+                                                actor_id: by.clone(),
+                                                correlation_id: None,
+                                                pane_id: None,
+                                                domain: None,
+                                                action_kind: "event.label.add".to_string(),
+                                                policy_decision: "allow".to_string(),
+                                                decision_reason: Some(
+                                                    "Robot added event label".to_string(),
+                                                ),
+                                                rule_id: None,
+                                                input_summary: Some(format!(
+                                                    "wa robot events label {event_id} --add {label}"
+                                                )),
+                                                verification_summary: None,
+                                                decision_context: None,
+                                                result: if inserted {
+                                                    "success".to_string()
+                                                } else {
+                                                    "noop".to_string()
+                                                },
+                                            };
+                                            if let Err(e) =
+                                                storage.record_audit_action_redacted(audit).await
+                                            {
+                                                tracing::warn!(
+                                                    "Failed to record event label audit: {e}"
+                                                );
+                                            }
+
+                                            Some(inserted)
+                                        } else if let Some(label) = remove.clone() {
+                                            let removed = match storage
+                                                .remove_event_label(event_id, label.clone())
+                                                .await
+                                            {
+                                                Ok(v) => v,
+                                                Err(e) => {
+                                                    let response = RobotResponse::<
+                                                        RobotEventMutationData,
+                                                    >::error_with_code(
+                                                        ROBOT_ERR_STORAGE,
+                                                        format!("Failed to remove label: {e}"),
+                                                        None,
+                                                        elapsed_ms(start),
+                                                    );
+                                                    print_robot_response(&response, format, stats)?;
+                                                    return Ok(());
+                                                }
+                                            };
+
+                                            let audit = AuditActionRecord {
+                                                id: 0,
+                                                ts: now,
+                                                actor_kind: "robot".to_string(),
+                                                actor_id: by.clone(),
+                                                correlation_id: None,
+                                                pane_id: None,
+                                                domain: None,
+                                                action_kind: "event.label.remove".to_string(),
+                                                policy_decision: "allow".to_string(),
+                                                decision_reason: Some(
+                                                    "Robot removed event label".to_string(),
+                                                ),
+                                                rule_id: None,
+                                                input_summary: Some(format!(
+                                                    "wa robot events label {event_id} --remove {label}"
+                                                )),
+                                                verification_summary: None,
+                                                decision_context: None,
+                                                result: if removed {
+                                                    "success".to_string()
+                                                } else {
+                                                    "noop".to_string()
+                                                },
+                                            };
+                                            if let Err(e) =
+                                                storage.record_audit_action_redacted(audit).await
+                                            {
+                                                tracing::warn!(
+                                                    "Failed to record event label audit: {e}"
+                                                );
+                                            }
+
+                                            Some(removed)
+                                        } else {
+                                            None
+                                        };
+
+                                        (event_id, changed)
+                                    }
+                                };
+
+                                let annotations: EventAnnotations = match storage
+                                    .get_event_annotations(event_id)
+                                    .await
+                                {
+                                    Ok(Some(a)) => a,
+                                    Ok(None) => {
+                                        let response = RobotResponse::<RobotEventMutationData>::error_with_code(
+                                                "robot.event_not_found",
+                                                format!("Event {event_id} not found"),
+                                                Some("Use 'wa robot events' to list events and IDs".to_string()),
+                                                elapsed_ms(start),
+                                            );
+                                        print_robot_response(&response, format, stats)?;
+                                        return Ok(());
+                                    }
+                                    Err(e) => {
+                                        let response = RobotResponse::<RobotEventMutationData>::error_with_code(
+                                                ROBOT_ERR_STORAGE,
+                                                format!("Failed to fetch annotations: {e}"),
+                                                None,
+                                                elapsed_ms(start),
+                                            );
+                                        print_robot_response(&response, format, stats)?;
+                                        return Ok(());
+                                    }
+                                };
+
+                                let data = RobotEventMutationData {
+                                    event_id,
+                                    changed,
+                                    annotations,
+                                };
+                                let response = RobotResponse::success(data, elapsed_ms(start));
+                                print_robot_response(&response, format, stats)?;
+                                return Ok(());
+                            }
+
                             // Build event query
                             let query = wa_core::storage::EventQuery {
                                 limit: Some(limit),
                                 pane_id: pane,
                                 rule_id: rule_id.clone(),
                                 event_type: event_type.clone(),
+                                triage_state: triage_state.clone(),
+                                label: label.clone(),
                                 unhandled_only: unhandled,
                                 since,
                                 until: None,
@@ -8003,38 +8610,49 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         None
                                     };
                                     let total_count = events.len();
-                                    let items: Vec<RobotEventItem> = events
-                                        .into_iter()
-                                        .map(|e| {
-                                            // Derive pack_id from rule_id (e.g., "codex.usage.reached" -> "builtin:codex")
-                                            let pack_id = e.rule_id.split('.').next().map_or_else(
-                                                || "builtin:unknown".to_string(),
-                                                |agent| format!("builtin:{agent}"),
-                                            );
-                                            let preview = if include_preview {
-                                                let rule = rule_index
-                                                    .as_ref()
-                                                    .and_then(|index| index.get(&e.rule_id));
-                                                build_event_would_handle(&e, rule, &config)
-                                            } else {
+                                    let mut items: Vec<RobotEventItem> =
+                                        Vec::with_capacity(events.len());
+                                    for e in events {
+                                        let annotations = match storage
+                                            .get_event_annotations(e.id)
+                                            .await
+                                        {
+                                            Ok(Some(a)) => Some(a),
+                                            Ok(None) => None,
+                                            Err(err) => {
+                                                tracing::warn!(error = %err, event_id = e.id, "Failed to load event annotations");
                                                 None
-                                            };
-                                            RobotEventItem {
-                                                id: e.id,
-                                                pane_id: e.pane_id,
-                                                rule_id: e.rule_id,
-                                                pack_id,
-                                                event_type: e.event_type,
-                                                severity: e.severity,
-                                                confidence: e.confidence,
-                                                extracted: e.extracted,
-                                                captured_at: e.detected_at,
-                                                handled_at: e.handled_at,
-                                                workflow_id: e.handled_by_workflow_id,
-                                                would_handle_with: preview,
                                             }
-                                        })
-                                        .collect();
+                                        };
+                                        // Derive pack_id from rule_id (e.g., "codex.usage.reached" -> "builtin:codex")
+                                        let pack_id = e.rule_id.split('.').next().map_or_else(
+                                            || "builtin:unknown".to_string(),
+                                            |agent| format!("builtin:{agent}"),
+                                        );
+                                        let preview = if include_preview {
+                                            let rule = rule_index
+                                                .as_ref()
+                                                .and_then(|index| index.get(&e.rule_id));
+                                            build_event_would_handle(&e, rule, &config)
+                                        } else {
+                                            None
+                                        };
+                                        items.push(RobotEventItem {
+                                            id: e.id,
+                                            pane_id: e.pane_id,
+                                            rule_id: e.rule_id,
+                                            pack_id,
+                                            event_type: e.event_type,
+                                            severity: e.severity,
+                                            confidence: e.confidence,
+                                            extracted: e.extracted,
+                                            annotations,
+                                            captured_at: e.detected_at,
+                                            handled_at: e.handled_at,
+                                            workflow_id: e.handled_by_workflow_id,
+                                            would_handle_with: preview,
+                                        });
+                                    }
 
                                     let data = RobotEventsData {
                                         events: items,
@@ -8043,6 +8661,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         pane_filter: pane,
                                         rule_id_filter: rule_id,
                                         event_type_filter: event_type,
+                                        triage_state_filter: triage_state,
+                                        label_filter: label,
                                         unhandled_only: unhandled,
                                         since_filter: since,
                                         would_handle: include_preview,
@@ -11887,6 +12507,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             rule_id,
             event_type,
             unhandled,
+            command,
         }) => {
             use wa_core::output::{EventListRenderer, OutputFormat, RenderContext, detect_format};
 
@@ -11896,21 +12517,37 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 _ => detect_format(),
             };
 
+            let die = |msg: &str, hint: Option<&str>| -> ! {
+                if output_format.is_json() {
+                    let mut payload = serde_json::json!({
+                        "ok": false,
+                        "error": msg,
+                        "version": wa_core::VERSION,
+                    });
+                    if let Some(h) = hint {
+                        payload["hint"] = serde_json::Value::String(h.to_string());
+                    }
+                    println!(
+                        "{}",
+                        serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string())
+                    );
+                } else {
+                    eprintln!("Error: {msg}");
+                    if let Some(h) = hint {
+                        eprintln!("{h}");
+                    }
+                }
+                std::process::exit(1);
+            };
+
             // Get workspace layout for DB path
             let layout = match config.workspace_layout(Some(&workspace_root)) {
                 Ok(l) => l,
                 Err(e) => {
-                    if output_format.is_json() {
-                        println!(
-                            r#"{{"ok": false, "error": "Failed to get workspace layout: {}", "version": "{}"}}"#,
-                            e,
-                            wa_core::VERSION
-                        );
-                    } else {
-                        eprintln!("Error: Failed to get workspace layout: {e}");
-                        eprintln!("Check --workspace or WA_WORKSPACE");
-                    }
-                    std::process::exit(1);
+                    die(
+                        &format!("Failed to get workspace layout: {e}"),
+                        Some("Check --workspace or WA_WORKSPACE"),
+                    );
                 }
             };
 
@@ -11919,19 +12556,260 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             let storage = match wa_core::storage::StorageHandle::new(&db_path).await {
                 Ok(s) => s,
                 Err(e) => {
-                    if output_format.is_json() {
-                        println!(
-                            r#"{{"ok": false, "error": "Failed to open storage: {}", "version": "{}"}}"#,
-                            e,
-                            wa_core::VERSION
-                        );
-                    } else {
-                        eprintln!("Error: Failed to open storage: {e}");
-                        eprintln!("Is the database initialized? Run 'wa watch' first.");
-                    }
-                    std::process::exit(1);
+                    die(
+                        &format!("Failed to open storage: {e}"),
+                        Some("Is the database initialized? Run 'wa watch' first."),
+                    );
                 }
             };
+
+            // Mutating subcommands
+            if let Some(cmd) = command {
+                use wa_core::storage::AuditActionRecord;
+
+                let now = now_ms_i64();
+
+                #[derive(serde::Serialize)]
+                struct EventsMutateResponse {
+                    ok: bool,
+                    event_id: i64,
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    changed: Option<bool>,
+                    annotations: wa_core::storage::EventAnnotations,
+                    version: &'static str,
+                }
+
+                let (event_id, changed) = match cmd {
+                    EventsCommands::Annotate {
+                        event_id,
+                        note,
+                        clear,
+                        by,
+                    } => {
+                        if clear == note.is_some() {
+                            die(
+                                "Invalid annotate params: specify exactly one of --note or --clear",
+                                Some("Example: wa events annotate 123 --note \"Investigating\""),
+                            );
+                        }
+
+                        if let Err(e) = storage.set_event_note(event_id, note, by.clone()).await {
+                            die(&format!("Failed to update note: {e}"), None);
+                        }
+
+                        let audit = AuditActionRecord {
+                            id: 0,
+                            ts: now,
+                            actor_kind: "human".to_string(),
+                            actor_id: by.clone(),
+                            correlation_id: None,
+                            pane_id: None,
+                            domain: None,
+                            action_kind: "event.annotate".to_string(),
+                            policy_decision: "allow".to_string(),
+                            decision_reason: Some("Human updated event note".to_string()),
+                            rule_id: None,
+                            input_summary: Some(if clear {
+                                format!("wa events annotate {event_id} --clear")
+                            } else {
+                                format!("wa events annotate {event_id} --note <redacted>")
+                            }),
+                            verification_summary: None,
+                            decision_context: None,
+                            result: "success".to_string(),
+                        };
+                        if let Err(e) = storage.record_audit_action_redacted(audit).await {
+                            tracing::warn!("Failed to record event annotation audit: {e}");
+                        }
+
+                        (event_id, None)
+                    }
+                    EventsCommands::Triage {
+                        event_id,
+                        state,
+                        clear,
+                        by,
+                    } => {
+                        if clear == state.is_some() {
+                            die(
+                                "Invalid triage params: specify exactly one of --state or --clear",
+                                Some("Example: wa events triage 123 --state investigating"),
+                            );
+                        }
+
+                        let changed = match storage
+                            .set_event_triage_state(event_id, state.clone(), by.clone())
+                            .await
+                        {
+                            Ok(v) => v,
+                            Err(e) => die(&format!("Failed to update triage state: {e}"), None),
+                        };
+
+                        let audit = AuditActionRecord {
+                            id: 0,
+                            ts: now,
+                            actor_kind: "human".to_string(),
+                            actor_id: by.clone(),
+                            correlation_id: None,
+                            pane_id: None,
+                            domain: None,
+                            action_kind: "event.triage".to_string(),
+                            policy_decision: "allow".to_string(),
+                            decision_reason: Some("Human updated event triage state".to_string()),
+                            rule_id: None,
+                            input_summary: Some(if clear {
+                                format!("wa events triage {event_id} --clear")
+                            } else {
+                                format!(
+                                    "wa events triage {event_id} --state {}",
+                                    state.unwrap_or_default()
+                                )
+                            }),
+                            verification_summary: None,
+                            decision_context: None,
+                            result: if changed {
+                                "success".to_string()
+                            } else {
+                                "noop".to_string()
+                            },
+                        };
+                        if let Err(e) = storage.record_audit_action_redacted(audit).await {
+                            tracing::warn!("Failed to record event triage audit: {e}");
+                        }
+
+                        (event_id, Some(changed))
+                    }
+                    EventsCommands::Label {
+                        event_id,
+                        add,
+                        remove,
+                        list,
+                        by,
+                    } => {
+                        let mut ops = 0;
+                        if add.is_some() {
+                            ops += 1;
+                        }
+                        if remove.is_some() {
+                            ops += 1;
+                        }
+                        if list {
+                            ops += 1;
+                        }
+                        if ops != 1 {
+                            die(
+                                "Invalid label params: specify exactly one of --add, --remove, or --list",
+                                Some("Example: wa events label 123 --add urgent"),
+                            );
+                        }
+
+                        let changed = if let Some(label) = add.clone() {
+                            let inserted = match storage
+                                .add_event_label(event_id, label.clone(), by.clone())
+                                .await
+                            {
+                                Ok(v) => v,
+                                Err(e) => die(&format!("Failed to add label: {e}"), None),
+                            };
+
+                            let audit = AuditActionRecord {
+                                id: 0,
+                                ts: now,
+                                actor_kind: "human".to_string(),
+                                actor_id: by.clone(),
+                                correlation_id: None,
+                                pane_id: None,
+                                domain: None,
+                                action_kind: "event.label.add".to_string(),
+                                policy_decision: "allow".to_string(),
+                                decision_reason: Some("Human added event label".to_string()),
+                                rule_id: None,
+                                input_summary: Some(format!(
+                                    "wa events label {event_id} --add {label}"
+                                )),
+                                verification_summary: None,
+                                decision_context: None,
+                                result: if inserted {
+                                    "success".to_string()
+                                } else {
+                                    "noop".to_string()
+                                },
+                            };
+                            if let Err(e) = storage.record_audit_action_redacted(audit).await {
+                                tracing::warn!("Failed to record event label audit: {e}");
+                            }
+
+                            Some(inserted)
+                        } else if let Some(label) = remove.clone() {
+                            let removed =
+                                match storage.remove_event_label(event_id, label.clone()).await {
+                                    Ok(v) => v,
+                                    Err(e) => die(&format!("Failed to remove label: {e}"), None),
+                                };
+
+                            let audit = AuditActionRecord {
+                                id: 0,
+                                ts: now,
+                                actor_kind: "human".to_string(),
+                                actor_id: by.clone(),
+                                correlation_id: None,
+                                pane_id: None,
+                                domain: None,
+                                action_kind: "event.label.remove".to_string(),
+                                policy_decision: "allow".to_string(),
+                                decision_reason: Some("Human removed event label".to_string()),
+                                rule_id: None,
+                                input_summary: Some(format!(
+                                    "wa events label {event_id} --remove {label}"
+                                )),
+                                verification_summary: None,
+                                decision_context: None,
+                                result: if removed {
+                                    "success".to_string()
+                                } else {
+                                    "noop".to_string()
+                                },
+                            };
+                            if let Err(e) = storage.record_audit_action_redacted(audit).await {
+                                tracing::warn!("Failed to record event label audit: {e}");
+                            }
+
+                            Some(removed)
+                        } else {
+                            None
+                        };
+
+                        (event_id, changed)
+                    }
+                };
+
+                let annotations = match storage.get_event_annotations(event_id).await {
+                    Ok(Some(a)) => a,
+                    Ok(None) => die(
+                        &format!("Event {event_id} not found"),
+                        Some("Use 'wa events --format json' to list events and IDs."),
+                    ),
+                    Err(e) => die(&format!("Failed to fetch annotations: {e}"), None),
+                };
+
+                if output_format.is_json() {
+                    let response = EventsMutateResponse {
+                        ok: true,
+                        event_id,
+                        changed,
+                        annotations,
+                        version: wa_core::VERSION,
+                    };
+                    println!(
+                        "{}",
+                        serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string())
+                    );
+                } else {
+                    println!("Updated event {event_id}");
+                }
+
+                return Ok(());
+            }
 
             // Build event query
             let query = wa_core::storage::EventQuery {
@@ -11939,10 +12817,23 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 pane_id,
                 rule_id: rule_id.clone(),
                 event_type: event_type.clone(),
+                triage_state: None,
+                label: None,
                 unhandled_only: unhandled,
                 since: None,
                 until: None,
             };
+
+            // Fetch active mutes for noise control annotations
+            let now_events = now_ms_i64();
+            let active_mutes = storage
+                .list_active_mutes(now_events)
+                .await
+                .unwrap_or_default();
+            let muted_keys: std::collections::HashSet<String> = active_mutes
+                .iter()
+                .map(|m| m.identity_key.clone())
+                .collect();
 
             // Query events
             match storage.get_events(query).await {
@@ -11950,20 +12841,16 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     let ctx = RenderContext::new(output_format)
                         .verbose(cli.verbose)
                         .limit(limit);
-                    let output = EventListRenderer::render(&events, &ctx);
+                    let output = EventListRenderer::render_with_noise_info(
+                        &events,
+                        &ctx,
+                        &muted_keys,
+                        active_mutes.len(),
+                    );
                     print!("{output}");
                 }
                 Err(e) => {
-                    if output_format.is_json() {
-                        println!(
-                            r#"{{"ok": false, "error": "Failed to query events: {}", "version": "{}"}}"#,
-                            e,
-                            wa_core::VERSION
-                        );
-                    } else {
-                        eprintln!("Error: Failed to query events: {e}");
-                    }
-                    std::process::exit(1);
+                    die(&format!("Failed to query events: {e}"), None);
                 }
             }
         }
@@ -13820,185 +14707,6 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             handle_notify_command(command, &config).await?;
         }
 
-        Some(Commands::Mute { command }) => {
-            use wa_core::output::OutputFormat;
-            use wa_core::storage::EventMuteRecord;
-
-            let layout = match config.workspace_layout(Some(&workspace_root)) {
-                Ok(l) => l,
-                Err(e) => {
-                    eprintln!("Error: Failed to get workspace layout: {e}");
-                    eprintln!("Check --workspace or WA_WORKSPACE");
-                    std::process::exit(1);
-                }
-            };
-
-            let db_path = layout.db_path.to_string_lossy();
-            let storage = match wa_core::storage::StorageHandle::new(&db_path).await {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("Error: Failed to open storage: {e}");
-                    eprintln!("Is the database initialized? Run 'wa watch' first.");
-                    std::process::exit(1);
-                }
-            };
-
-            match command {
-                MuteCommands::Add {
-                    identity_key,
-                    r#for: duration,
-                    scope,
-                    reason,
-                    format,
-                } => {
-                    let fmt = resolve_prepare_output_format(&format);
-                    let now = now_ms_i64();
-                    let expires_at = match duration {
-                        Some(ref dur) => match parse_duration_to_ms(dur) {
-                            Some(ms) => Some(now + ms),
-                            None => {
-                                eprintln!(
-                                    "Error: Invalid duration '{dur}'. Use e.g. 30s, 5m, 1h, 7d, 2w."
-                                );
-                                std::process::exit(1);
-                            }
-                        },
-                        None => None,
-                    };
-
-                    let record = EventMuteRecord {
-                        identity_key: identity_key.clone(),
-                        scope: scope.clone(),
-                        created_at: now,
-                        expires_at,
-                        created_by: Some("cli".to_string()),
-                        reason: reason.clone(),
-                    };
-
-                    if let Err(e) = storage.add_event_mute(record).await {
-                        eprintln!("Error: Failed to add mute: {e}");
-                        std::process::exit(1);
-                    }
-
-                    match fmt {
-                        OutputFormat::Json => {
-                            let obj = serde_json::json!({
-                                "status": "muted",
-                                "identity_key": identity_key,
-                                "scope": scope,
-                                "expires_at": expires_at,
-                                "reason": reason,
-                            });
-                            println!("{}", serde_json::to_string_pretty(&obj).unwrap());
-                        }
-                        _ => {
-                            let expiry_desc = match expires_at {
-                                Some(ts) => format!("until epoch ms {ts}"),
-                                None => "permanently".to_string(),
-                            };
-                            println!("Muted event key '{identity_key}' ({scope}) {expiry_desc}");
-                            if let Some(ref r) = reason {
-                                println!("Reason: {r}");
-                            }
-                        }
-                    }
-                }
-
-                MuteCommands::Remove {
-                    identity_key,
-                    format,
-                } => {
-                    let fmt = resolve_prepare_output_format(&format);
-
-                    match storage.remove_event_mute(&identity_key).await {
-                        Ok(removed) => match fmt {
-                            OutputFormat::Json => {
-                                let obj = serde_json::json!({
-                                    "status": if removed { "removed" } else { "not_found" },
-                                    "identity_key": identity_key,
-                                });
-                                println!("{}", serde_json::to_string_pretty(&obj).unwrap());
-                            }
-                            _ => {
-                                if removed {
-                                    println!("Unmuted event key '{identity_key}'");
-                                } else {
-                                    println!("No active mute found for '{identity_key}'");
-                                }
-                            }
-                        },
-                        Err(e) => {
-                            eprintln!("Error: Failed to remove mute: {e}");
-                            std::process::exit(1);
-                        }
-                    }
-                }
-
-                MuteCommands::List { format } => {
-                    let fmt = resolve_prepare_output_format(&format);
-                    let now = now_ms_i64();
-
-                    match storage.list_active_mutes(now).await {
-                        Ok(mutes) => match fmt {
-                            OutputFormat::Json => {
-                                let arr: Vec<serde_json::Value> = mutes
-                                    .iter()
-                                    .map(|m| {
-                                        serde_json::json!({
-                                            "identity_key": m.identity_key,
-                                            "scope": m.scope,
-                                            "created_at": m.created_at,
-                                            "expires_at": m.expires_at,
-                                            "created_by": m.created_by,
-                                            "reason": m.reason,
-                                        })
-                                    })
-                                    .collect();
-                                println!("{}", serde_json::to_string_pretty(&arr).unwrap());
-                            }
-                            _ => {
-                                if mutes.is_empty() {
-                                    println!("No active mutes.");
-                                } else {
-                                    println!(
-                                        "{:<44}  {:<12}  {:<14}  {}",
-                                        "IDENTITY KEY", "SCOPE", "EXPIRES", "REASON"
-                                    );
-                                    for m in &mutes {
-                                        let expires = match m.expires_at {
-                                            Some(ts) => {
-                                                let remaining_s = (ts - now) / 1000;
-                                                if remaining_s < 60 {
-                                                    format!("{remaining_s}s")
-                                                } else if remaining_s < 3600 {
-                                                    format!("{}m", remaining_s / 60)
-                                                } else if remaining_s < 86400 {
-                                                    format!("{}h", remaining_s / 3600)
-                                                } else {
-                                                    format!("{}d", remaining_s / 86400)
-                                                }
-                                            }
-                                            None => "permanent".to_string(),
-                                        };
-                                        let reason = m.reason.as_deref().unwrap_or("-");
-                                        println!(
-                                            "{:<44}  {:<12}  {:<14}  {}",
-                                            m.identity_key, m.scope, expires, reason
-                                        );
-                                    }
-                                    println!("\n{} active mute(s)", mutes.len());
-                                }
-                            }
-                        },
-                        Err(e) => {
-                            eprintln!("Error: Failed to list mutes: {e}");
-                            std::process::exit(1);
-                        }
-                    }
-                }
-            }
-        }
-
         Some(Commands::Secrets { command }) => {
             use wa_core::output::{OutputFormat, detect_format};
             use wa_core::secrets::{
@@ -14396,59 +15104,129 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             }
         }
 
-        Some(Commands::Reproduce { kind, out, format }) => {
-            use wa_core::crash::{IncidentKind, export_incident_bundle};
+        Some(Commands::Reproduce { command }) => match command {
+            ReproduceCommands::Export { kind, out, format } => {
+                use wa_core::crash::{
+                    IncidentBundleOptions, IncidentKind, collect_incident_bundle,
+                };
 
-            let incident_kind = match kind.to_lowercase().as_str() {
-                "crash" => IncidentKind::Crash,
-                "manual" => IncidentKind::Manual,
-                other => {
-                    eprintln!("Error: Unknown incident kind '{other}'. Use 'crash' or 'manual'.");
-                    std::process::exit(1);
-                }
-            };
+                let incident_kind = match kind.to_lowercase().as_str() {
+                    "crash" => IncidentKind::Crash,
+                    "manual" => IncidentKind::Manual,
+                    other => {
+                        eprintln!(
+                            "Error: Unknown incident kind '{other}'. Use 'crash' or 'manual'."
+                        );
+                        std::process::exit(1);
+                    }
+                };
 
-            let out_dir = out.unwrap_or_else(|| layout.crash_dir.clone());
-            let config_path = wa_core::config::resolve_config_path(None);
+                let out_dir = out.unwrap_or_else(|| layout.crash_dir.clone());
+                let config_path = wa_core::config::resolve_config_path(None);
 
-            match export_incident_bundle(
-                &layout.crash_dir,
-                config_path.as_deref(),
-                &out_dir,
-                incident_kind,
-            ) {
-                Ok(result) => {
-                    if format.to_lowercase() == "json" {
-                        let json = serde_json::to_string_pretty(&result)
-                            .unwrap_or_else(|_| "{}".to_string());
-                        println!("{json}");
-                    } else {
-                        println!("wa reproduce - Incident bundle exported\n");
-                        println!("  Kind:    {}", result.kind);
-                        println!("  Path:    {}", result.path.display());
-                        println!("  Files:   {}", result.files.len());
-                        println!("  Size:    {} bytes", result.total_size_bytes);
-                        println!("  Version: {}", result.wa_version);
-                        println!("  Time:    {}", result.exported_at);
-                        if !result.files.is_empty() {
-                            println!("\nIncluded files:");
-                            for f in &result.files {
-                                println!("  - {f}");
+                let opts = IncidentBundleOptions {
+                    crash_dir: &layout.crash_dir,
+                    config_path: config_path.as_deref(),
+                    out_dir: &out_dir,
+                    kind: incident_kind,
+                    db_path: Some(&layout.db_path),
+                    max_events: 50,
+                };
+
+                match collect_incident_bundle(&opts) {
+                    Ok(result) => {
+                        if format.to_lowercase() == "json" {
+                            let json = serde_json::to_string_pretty(&result)
+                                .unwrap_or_else(|_| "{}".to_string());
+                            println!("{json}");
+                        } else {
+                            println!("wa reproduce export - Incident bundle exported\n");
+                            println!("  Kind:    {}", result.kind);
+                            println!("  Path:    {}", result.path.display());
+                            println!("  Files:   {}", result.files.len());
+                            println!("  Size:    {} bytes", result.total_size_bytes);
+                            println!("  Version: {}", result.wa_version);
+                            println!("  Time:    {}", result.exported_at);
+                            if !result.files.is_empty() {
+                                println!("\nIncluded files:");
+                                for f in &result.files {
+                                    println!("  - {f}");
+                                }
                             }
+                            println!("\nNext steps:");
+                            println!("  1. Review the bundle for sensitive data");
+                            println!("  2. Share the bundle directory for analysis");
+                            println!(
+                                "  3. Run 'wa reproduce replay {}' to replay",
+                                result.path.display()
+                            );
                         }
-                        println!("\nNext steps:");
-                        println!("  1. Review the bundle for sensitive data");
-                        println!("  2. Share the bundle directory for analysis");
-                        println!("  3. Run 'wa doctor' to check system health");
+                    }
+                    Err(e) => {
+                        eprintln!("Error: Failed to export incident bundle: {e}");
+                        eprintln!("Run 'wa doctor' to check system health.");
+                        std::process::exit(1);
                     }
                 }
-                Err(e) => {
-                    eprintln!("Error: Failed to export incident bundle: {e}");
-                    eprintln!("Run 'wa doctor' to check system health.");
-                    std::process::exit(1);
+            }
+
+            ReproduceCommands::Replay {
+                bundle,
+                mode,
+                format,
+            } => {
+                use wa_core::crash::replay_incident_bundle;
+
+                let replay_mode = match mode.to_lowercase().as_str() {
+                    "policy" => wa_core::crash::ReplayMode::Policy,
+                    "rules" => wa_core::crash::ReplayMode::Rules,
+                    other => {
+                        eprintln!("Error: Unknown replay mode '{other}'. Use 'policy' or 'rules'.");
+                        std::process::exit(1);
+                    }
+                };
+
+                match replay_incident_bundle(&bundle, replay_mode) {
+                    Ok(result) => {
+                        if format.to_lowercase() == "json" {
+                            let json = serde_json::to_string_pretty(&result)
+                                .unwrap_or_else(|_| "{}".to_string());
+                            println!("{json}");
+                        } else {
+                            println!("wa reproduce replay - Bundle analysis\n");
+                            println!("  Bundle:  {}", bundle.display());
+                            println!("  Mode:    {}", result.mode);
+                            println!("  Status:  {}", result.status);
+                            println!("  Checks:  {}", result.checks.len());
+                            let passed = result.checks.iter().filter(|c| c.passed).count();
+                            let failed = result.checks.len() - passed;
+                            println!("  Passed:  {passed}");
+                            println!("  Failed:  {failed}");
+                            if !result.checks.is_empty() {
+                                println!("\nResults:");
+                                for check in &result.checks {
+                                    let icon = if check.passed { "PASS" } else { "FAIL" };
+                                    println!("  [{icon}] {}", check.name);
+                                    if let Some(ref detail) = check.detail {
+                                        println!("         {detail}");
+                                    }
+                                }
+                            }
+                            if !result.warnings.is_empty() {
+                                println!("\nWarnings:");
+                                for w in &result.warnings {
+                                    println!("  - {w}");
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error: Failed to replay bundle: {e}");
+                        std::process::exit(1);
+                    }
                 }
             }
-        }
+        },
 
         Some(Commands::Setup {
             list_hosts,
@@ -15348,9 +16126,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         "severity": "warning",
                         "title": "Recent crash",
                         "detail": detail,
-                        "action": "wa reproduce --kind crash",
+                        "action": "wa reproduce export --kind crash",
                         "actions": [
-                            {"command": "wa reproduce --kind crash", "label": "Export incident bundle"},
+                            {"command": "wa reproduce export --kind crash", "label": "Export incident bundle"},
                             {"command": "wa doctor", "label": "Check system health"},
                         ],
                         "explain": format!(
@@ -15370,6 +16148,17 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                 match storage_result {
                     Ok(storage) => {
+                        // Fetch active mutes for noise control annotations
+                        let now_triage = now_ms_i64();
+                        let active_mutes = storage
+                            .list_active_mutes(now_triage)
+                            .await
+                            .unwrap_or_default();
+                        let muted_keys: std::collections::HashSet<String> = active_mutes
+                            .iter()
+                            .map(|m| m.identity_key.clone())
+                            .collect();
+
                         // Unhandled events
                         if show_all || section == "events" {
                             let query = wa_core::storage::EventQuery {
@@ -15377,17 +16166,60 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 pane_id: None,
                                 rule_id: None,
                                 event_type: None,
+                                triage_state: None,
+                                label: None,
                                 unhandled_only: true,
                                 since: None,
                                 until: None,
                             };
                             if let Ok(events) = storage.get_events(query).await {
                                 for event in &events {
+                                    let is_muted = event
+                                        .dedupe_key
+                                        .as_ref()
+                                        .is_some_and(|k| muted_keys.contains(k));
+
+                                    let mut actions = vec![
+                                        serde_json::json!({
+                                            "command": format!(
+                                                "wa events --pane {} --unhandled",
+                                                event.pane_id
+                                            ),
+                                            "label": "List unhandled events"
+                                        }),
+                                        serde_json::json!({
+                                            "command": format!(
+                                                "wa why --recent --pane {}",
+                                                event.pane_id
+                                            ),
+                                            "label": "Explain detection"
+                                        }),
+                                        serde_json::json!({
+                                            "command": format!(
+                                                "wa show {}",
+                                                event.pane_id
+                                            ),
+                                            "label": "Show pane details"
+                                        }),
+                                    ];
+                                    if !is_muted {
+                                        if let Some(ref key) = event.dedupe_key {
+                                            actions.push(serde_json::json!({
+                                                "command": format!(
+                                                    "wa mute add {} --for 1h",
+                                                    key
+                                                ),
+                                                "label": "Mute for 1 hour"
+                                            }));
+                                        }
+                                    }
+
                                     items.push(serde_json::json!({
                                         "section": "events",
                                         "severity": event.severity,
                                         "title": format!(
-                                            "[pane {}] {}: {}",
+                                            "{}[pane {}] {}: {}",
+                                            if is_muted { "(muted) " } else { "" },
                                             event.pane_id,
                                             event.event_type,
                                             event.rule_id
@@ -15402,29 +16234,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             "wa events --pane {} --unhandled",
                                             event.pane_id
                                         ),
-                                        "actions": [
-                                            {
-                                                "command": format!(
-                                                    "wa events --pane {} --unhandled",
-                                                    event.pane_id
-                                                ),
-                                                "label": "List unhandled events"
-                                            },
-                                            {
-                                                "command": format!(
-                                                    "wa why --recent --pane {}",
-                                                    event.pane_id
-                                                ),
-                                                "label": "Explain detection"
-                                            },
-                                            {
-                                                "command": format!(
-                                                    "wa show {}",
-                                                    event.pane_id
-                                                ),
-                                                "label": "Show pane details"
-                                            },
-                                        ],
+                                        "actions": actions,
                                         "explain": format!(
                                             "wa why --recent --pane {}",
                                             event.pane_id
@@ -15432,6 +16242,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         "event_id": event.id,
                                         "pane_id": event.pane_id,
                                         "detected_at": event.detected_at,
+                                        "muted": is_muted,
                                     }));
                                 }
                             }
@@ -15489,6 +16300,37 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     }));
                                 }
                             }
+                        }
+
+                        // Noise control summary
+                        if (show_all || section == "mutes") && !active_mutes.is_empty() {
+                            items.push(serde_json::json!({
+                                "section": "mutes",
+                                "severity": "info",
+                                "title": format!(
+                                    "{} active mute(s) suppressing notifications",
+                                    active_mutes.len()
+                                ),
+                                "detail": active_mutes.iter().take(5).map(|m| {
+                                    let expiry = match m.expires_at {
+                                        Some(ts) => {
+                                            let remaining_s = (ts - now_triage) / 1000;
+                                            if remaining_s < 3600 {
+                                                format!("{}m left", remaining_s / 60)
+                                            } else {
+                                                format!("{}h left", remaining_s / 3600)
+                                            }
+                                        }
+                                        None => "permanent".to_string(),
+                                    };
+                                    format!("{} ({})", m.identity_key, expiry)
+                                }).collect::<Vec<_>>().join(", "),
+                                "action": "wa mute list",
+                                "actions": [
+                                    {"command": "wa mute list", "label": "List all mutes"},
+                                    {"command": "wa mute list --format json", "label": "JSON output"},
+                                ],
+                            }));
                         }
                     }
                     Err(e) => {
@@ -15565,6 +16407,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             "crashes" => "Recent Crashes",
                             "events" => "Unhandled Events",
                             "workflows" => "Active Workflows",
+                            "mutes" => "Noise Control",
                             _ => sec,
                         };
                         println!("{header}:");
@@ -15631,6 +16474,185 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             }
         }
 
+        Some(Commands::Mute { command }) => {
+            use wa_core::output::OutputFormat;
+            use wa_core::storage::EventMuteRecord;
+
+            let layout = match config.workspace_layout(Some(&workspace_root)) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("Error: Failed to get workspace layout: {e}");
+                    eprintln!("Check --workspace or WA_WORKSPACE");
+                    std::process::exit(1);
+                }
+            };
+
+            let db_path = layout.db_path.to_string_lossy();
+            let storage = match wa_core::storage::StorageHandle::new(&db_path).await {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error: Failed to open storage: {e}");
+                    eprintln!("Is the database initialized? Run 'wa watch' first.");
+                    std::process::exit(1);
+                }
+            };
+
+            match command {
+                MuteCommands::Add {
+                    identity_key,
+                    r#for: duration,
+                    scope,
+                    reason,
+                    format,
+                } => {
+                    let fmt = resolve_prepare_output_format(&format);
+                    let now = now_ms_i64();
+                    let expires_at = match duration {
+                        Some(ref dur) => match parse_duration_to_ms(dur) {
+                            Some(ms) => Some(now + ms),
+                            None => {
+                                eprintln!(
+                                    "Error: Invalid duration '{dur}'. Use e.g. 30s, 5m, 1h, 7d, 2w."
+                                );
+                                std::process::exit(1);
+                            }
+                        },
+                        None => None,
+                    };
+
+                    let record = EventMuteRecord {
+                        identity_key: identity_key.clone(),
+                        scope: scope.clone(),
+                        created_at: now,
+                        expires_at,
+                        created_by: Some("cli".to_string()),
+                        reason: reason.clone(),
+                    };
+
+                    if let Err(e) = storage.add_event_mute(record).await {
+                        eprintln!("Error: Failed to add mute: {e}");
+                        std::process::exit(1);
+                    }
+
+                    match fmt {
+                        OutputFormat::Json => {
+                            let obj = serde_json::json!({
+                                "status": "muted",
+                                "identity_key": identity_key,
+                                "scope": scope,
+                                "expires_at": expires_at,
+                                "reason": reason,
+                            });
+                            println!("{}", serde_json::to_string_pretty(&obj).unwrap());
+                        }
+                        _ => {
+                            let expiry_desc = match expires_at {
+                                Some(ts) => format!("until epoch ms {ts}"),
+                                None => "permanently".to_string(),
+                            };
+                            println!("Muted event key '{identity_key}' ({scope}) {expiry_desc}");
+                            if let Some(ref r) = reason {
+                                println!("Reason: {r}");
+                            }
+                        }
+                    }
+                }
+
+                MuteCommands::Remove {
+                    identity_key,
+                    format,
+                } => {
+                    let fmt = resolve_prepare_output_format(&format);
+
+                    match storage.remove_event_mute(&identity_key).await {
+                        Ok(removed) => match fmt {
+                            OutputFormat::Json => {
+                                let obj = serde_json::json!({
+                                    "status": if removed { "removed" } else { "not_found" },
+                                    "identity_key": identity_key,
+                                });
+                                println!("{}", serde_json::to_string_pretty(&obj).unwrap());
+                            }
+                            _ => {
+                                if removed {
+                                    println!("Unmuted event key '{identity_key}'");
+                                } else {
+                                    println!("No active mute found for '{identity_key}'");
+                                }
+                            }
+                        },
+                        Err(e) => {
+                            eprintln!("Error: Failed to remove mute: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+
+                MuteCommands::List { format } => {
+                    let fmt = resolve_prepare_output_format(&format);
+                    let now = now_ms_i64();
+
+                    match storage.list_active_mutes(now).await {
+                        Ok(mutes) => match fmt {
+                            OutputFormat::Json => {
+                                let arr: Vec<serde_json::Value> = mutes
+                                    .iter()
+                                    .map(|m| {
+                                        serde_json::json!({
+                                            "identity_key": m.identity_key,
+                                            "scope": m.scope,
+                                            "created_at": m.created_at,
+                                            "expires_at": m.expires_at,
+                                            "created_by": m.created_by,
+                                            "reason": m.reason,
+                                        })
+                                    })
+                                    .collect();
+                                println!("{}", serde_json::to_string_pretty(&arr).unwrap());
+                            }
+                            _ => {
+                                if mutes.is_empty() {
+                                    println!("No active mutes.");
+                                } else {
+                                    println!(
+                                        "{:<44}  {:<12}  {:<14}  {}",
+                                        "IDENTITY KEY", "SCOPE", "EXPIRES", "REASON"
+                                    );
+                                    for m in &mutes {
+                                        let expires = match m.expires_at {
+                                            Some(ts) => {
+                                                let remaining_s = (ts - now) / 1000;
+                                                if remaining_s < 60 {
+                                                    format!("{remaining_s}s")
+                                                } else if remaining_s < 3600 {
+                                                    format!("{}m", remaining_s / 60)
+                                                } else if remaining_s < 86400 {
+                                                    format!("{}h", remaining_s / 3600)
+                                                } else {
+                                                    format!("{}d", remaining_s / 86400)
+                                                }
+                                            }
+                                            None => "permanent".to_string(),
+                                        };
+                                        let reason = m.reason.as_deref().unwrap_or("-");
+                                        println!(
+                                            "{:<44}  {:<12}  {:<14}  {}",
+                                            m.identity_key, m.scope, expires, reason
+                                        );
+                                    }
+                                    println!("\n{} active mute(s)", mutes.len());
+                                }
+                            }
+                        },
+                        Err(e) => {
+                            eprintln!("Error: Failed to list mutes: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
+        }
+
         #[cfg(feature = "web")]
         Some(Commands::Web { port }) => {
             let config = wa_core::web::WebServerConfig::new(port);
@@ -15670,6 +16692,126 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             if let Err(e) = result {
                 eprintln!("TUI error: {e}");
                 return Err(e.into());
+            }
+        }
+
+        Some(Commands::Analytics {
+            command,
+            period,
+            format,
+        }) => {
+            use wa_core::output::{
+                AnalyticsAgentRenderer, AnalyticsDailyRenderer, AnalyticsExportRenderer,
+                AnalyticsSummaryData, AnalyticsSummaryRenderer, OutputFormat, RenderContext,
+                detect_format,
+            };
+            use wa_core::storage::MetricQuery;
+
+            let output_format = match format.to_lowercase().as_str() {
+                "json" => OutputFormat::Json,
+                "plain" => OutputFormat::Plain,
+                _ => detect_format(),
+            };
+
+            let period_ms = parse_period_ms(&period);
+            let since_ts = now_epoch_ms() - period_ms;
+            let period_label = format_period_label(&period);
+
+            let db_path = layout.db_path.to_string_lossy();
+            let storage = match wa_core::storage::StorageHandle::new(&db_path).await {
+                Ok(s) => s,
+                Err(e) => {
+                    if output_format.is_json() {
+                        println!(
+                            r#"{{"ok": false, "error": "Failed to open storage: {}", "version": "{}"}}"#,
+                            e,
+                            wa_core::VERSION
+                        );
+                    } else {
+                        eprintln!("Error: Failed to open storage: {e}");
+                        eprintln!("Is the database initialized? Run 'wa watch' first.");
+                    }
+                    std::process::exit(1);
+                }
+            };
+
+            let ctx = RenderContext::new(output_format);
+
+            match command {
+                Some(AnalyticsCommands::Daily) => {
+                    let days = storage.aggregate_daily_metrics(since_ts).await?;
+                    print!("{}", AnalyticsDailyRenderer::render(&days, &ctx));
+                }
+                Some(AnalyticsCommands::ByAgent) => {
+                    let agents = storage.aggregate_by_agent(since_ts).await?;
+                    print!("{}", AnalyticsAgentRenderer::render(&agents, &ctx));
+                }
+                Some(AnalyticsCommands::Export {
+                    format: export_format,
+                    output: output_path,
+                }) => {
+                    let metrics = storage
+                        .query_usage_metrics(MetricQuery {
+                            since: Some(since_ts),
+                            ..Default::default()
+                        })
+                        .await?;
+
+                    let rendered = match export_format.to_lowercase().as_str() {
+                        "csv" => AnalyticsExportRenderer::render_csv(&metrics),
+                        _ => AnalyticsExportRenderer::render_json(&metrics),
+                    };
+
+                    if let Some(path) = output_path {
+                        std::fs::write(&path, &rendered)?;
+                        eprintln!("Exported {} metrics to {path}", metrics.len());
+                    } else {
+                        print!("{rendered}");
+                    }
+                }
+                None => {
+                    // Default: summary view
+                    let query_tokens = MetricQuery {
+                        metric_type: Some(wa_core::storage::MetricType::TokenUsage),
+                        since: Some(since_ts),
+                        ..Default::default()
+                    };
+                    let query_cost = MetricQuery {
+                        metric_type: Some(wa_core::storage::MetricType::ApiCost),
+                        since: Some(since_ts),
+                        ..Default::default()
+                    };
+                    let query_rl = MetricQuery {
+                        metric_type: Some(wa_core::storage::MetricType::RateLimitHit),
+                        since: Some(since_ts),
+                        ..Default::default()
+                    };
+                    let query_wf = MetricQuery {
+                        metric_type: Some(wa_core::storage::MetricType::WorkflowCost),
+                        since: Some(since_ts),
+                        ..Default::default()
+                    };
+
+                    let token_metrics = storage.query_usage_metrics(query_tokens).await?;
+                    let cost_metrics = storage.query_usage_metrics(query_cost).await?;
+                    let rl_metrics = storage.query_usage_metrics(query_rl).await?;
+                    let wf_metrics = storage.query_usage_metrics(query_wf).await?;
+
+                    let total_tokens: i64 = token_metrics.iter().filter_map(|m| m.tokens).sum();
+                    let total_cost: f64 = cost_metrics.iter().filter_map(|m| m.amount).sum();
+                    let rate_limit_hits: i64 = rl_metrics.iter().filter_map(|m| m.count).sum();
+                    let workflow_runs: i64 = i64::try_from(wf_metrics.len()).unwrap_or(0);
+
+                    let summary = AnalyticsSummaryData {
+                        period_label,
+                        total_tokens,
+                        total_cost,
+                        rate_limit_hits,
+                        workflow_runs,
+                    };
+
+                    print!("{}", AnalyticsSummaryRenderer::render(&summary, &ctx));
+                }
             }
         }
 
@@ -21993,7 +23135,7 @@ log_level = "debug"
             "warning",
             "Recent crash",
             vec![
-                ("wa reproduce --kind crash", "Export incident bundle"),
+                ("wa reproduce export --kind crash", "Export incident bundle"),
                 ("wa doctor", "Check system health"),
             ],
             None,
@@ -22029,7 +23171,7 @@ log_level = "debug"
         // Every section type should produce at least one suggested action
         let section_actions: Vec<(&str, &str)> = vec![
             ("health", "wa doctor"),
-            ("crashes", "wa reproduce --kind crash"),
+            ("crashes", "wa reproduce export --kind crash"),
             ("events", "wa events --pane 1 --unhandled"),
             ("workflows", "wa workflow status wf-1"),
         ];
@@ -22092,7 +23234,7 @@ log_level = "debug"
             "warning",
             "Recent crash",
             vec![
-                ("wa reproduce --kind crash", "Export incident bundle"),
+                ("wa reproduce export --kind crash", "Export incident bundle"),
                 ("wa doctor", "Check system health"),
             ],
             Some("ls /tmp/crash_dir"),
@@ -24645,5 +25787,105 @@ log_level = "debug"
         assert!(mutes.is_empty());
 
         cleanup_storage(storage, &db_path).await;
+    }
+
+    // ========================================================================
+    // Analytics CLI parsing (wa-985.3)
+    // ========================================================================
+
+    #[test]
+    fn cli_analytics_default_parses() {
+        let cli =
+            Cli::try_parse_from(["wa", "analytics"]).expect("analytics should parse with defaults");
+        match cli.command {
+            Some(Commands::Analytics {
+                command,
+                period,
+                format,
+            }) => {
+                assert!(command.is_none());
+                assert_eq!(period, "7d");
+                assert_eq!(format, "auto");
+            }
+            _ => panic!("expected Analytics command"),
+        }
+    }
+
+    #[test]
+    fn cli_analytics_daily_parses() {
+        let cli = Cli::try_parse_from(["wa", "analytics", "daily"])
+            .expect("analytics daily should parse");
+        match cli.command {
+            Some(Commands::Analytics { command, .. }) => {
+                assert!(matches!(command, Some(AnalyticsCommands::Daily)));
+            }
+            _ => panic!("expected Analytics command"),
+        }
+    }
+
+    #[test]
+    fn cli_analytics_by_agent_parses() {
+        let cli = Cli::try_parse_from(["wa", "analytics", "by-agent"])
+            .expect("analytics by-agent should parse");
+        match cli.command {
+            Some(Commands::Analytics { command, .. }) => {
+                assert!(matches!(command, Some(AnalyticsCommands::ByAgent)));
+            }
+            _ => panic!("expected Analytics command"),
+        }
+    }
+
+    #[test]
+    fn cli_analytics_export_csv_parses() {
+        let cli = Cli::try_parse_from([
+            "wa",
+            "analytics",
+            "export",
+            "--format",
+            "csv",
+            "--output",
+            "usage.csv",
+        ])
+        .expect("analytics export should parse");
+        match cli.command {
+            Some(Commands::Analytics { command, .. }) => match command {
+                Some(AnalyticsCommands::Export { format, output }) => {
+                    assert_eq!(format, "csv");
+                    assert_eq!(output.as_deref(), Some("usage.csv"));
+                }
+                _ => panic!("expected Export subcommand"),
+            },
+            _ => panic!("expected Analytics command"),
+        }
+    }
+
+    #[test]
+    fn cli_analytics_period_flag() {
+        let cli = Cli::try_parse_from(["wa", "analytics", "--period", "30d"])
+            .expect("analytics with period should parse");
+        match cli.command {
+            Some(Commands::Analytics { period, .. }) => {
+                assert_eq!(period, "30d");
+            }
+            _ => panic!("expected Analytics command"),
+        }
+    }
+
+    #[test]
+    fn parse_period_ms_various() {
+        assert_eq!(parse_period_ms("1d"), 86_400_000);
+        assert_eq!(parse_period_ms("7d"), 7 * 86_400_000);
+        assert_eq!(parse_period_ms("30d"), 30 * 86_400_000);
+        assert_eq!(parse_period_ms("90d"), 90 * 86_400_000);
+        // Invalid falls back to 7d
+        assert_eq!(parse_period_ms("xyz"), 7 * 86_400_000);
+    }
+
+    #[test]
+    fn format_period_label_various() {
+        assert_eq!(format_period_label("1d"), "Last 1 Day");
+        assert_eq!(format_period_label("7d"), "Last 7 Days");
+        assert_eq!(format_period_label("30d"), "Last 30 Days");
+        assert_eq!(format_period_label("xyz"), "Last 7 Days");
     }
 }

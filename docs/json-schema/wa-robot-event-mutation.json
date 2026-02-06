@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wezterm-automata.dev/schemas/wa-robot-event-mutation.json",
+  "title": "WA Robot Event Mutation Response",
+  "description": "Schema for the data field when mutating event annotations (note/labels/triage) via robot mode or MCP.",
+  "type": "object",
+  "required": ["event_id", "annotations"],
+  "properties": {
+    "event_id": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Event ID that was mutated"
+    },
+    "changed": {
+      "type": ["boolean", "null"],
+      "description": "Whether the mutation changed state (if applicable)"
+    },
+    "annotations": {
+      "type": "object",
+      "description": "Persisted annotations for the event after the mutation",
+      "properties": {
+        "triage_state": { "type": ["string", "null"] },
+        "triage_updated_at": { "type": ["integer", "null"] },
+        "triage_updated_by": { "type": ["string", "null"] },
+        "note": { "type": ["string", "null"] },
+        "note_updated_at": { "type": ["integer", "null"] },
+        "note_updated_by": { "type": ["string", "null"] },
+        "labels": { "type": "array", "items": { "type": "string" } }
+      },
+      "required": ["labels"],
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
+

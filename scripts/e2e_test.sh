@@ -361,6 +361,7 @@ SCENARIO_REGISTRY=(
     "compaction_workflow|Validate pattern detection and workflow execution|true|wezterm,jq,sqlite3|Protects compaction workflow auto-handle"
     "unhandled_event_lifecycle|Validate unhandled event lifecycle and dedupe handling|true|wezterm,jq,sqlite3|Protects dedupe + unhandled tracking"
     "workflow_lifecycle|Validate robot workflow list/run/status/abort (dry-run)|true|wezterm,jq,sqlite3|Protects robot workflow surface"
+    "dry_run_mode|Validate dry-run previews for send/workflow (human+robot) without side effects|true|wezterm,jq,sqlite3|Protects dry-run trust surface"
     "events_unhandled_alias|Validate robot events --unhandled alias|true|wezterm,jq,sqlite3|Protects events CLI aliases"
     "usage_limit_safe_pause|Validate usage-limit safe pause workflow (fallback plan persisted)|true|wezterm,jq,sqlite3|Protects usage-limit fallback workflow"
     "notification_webhook|Validate webhook notifications (delivery, retry, throttle, recovery)|true|wezterm,jq,sqlite3,python3,curl|Protects webhook notification pipeline"
@@ -631,9 +632,6 @@ run_scenario_capture_search() {
     log_verbose "wa watch started with PID $wa_pid"
     echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
 
-    # Give wa watch a moment to initialize
-    sleep 1
-
     # Verify wa watch is running
     if ! kill -0 "$wa_pid" 2>/dev/null; then
         log_fail "wa watch exited immediately"
@@ -655,7 +653,10 @@ run_scenario_capture_search() {
 
     # Step 4: Wait for dummy script to complete (check for "Done:" marker)
     log_info "Step 4: Waiting for dummy script completion..."
-    sleep 3  # Give time for output to be captured
+    local done_check_cmd="\"$WA_BINARY\" robot get-text $pane_id --tail 200 2>/dev/null | grep -q \"Done:\""
+    if ! wait_for_condition "dummy script done marker captured" "$done_check_cmd" "$wait_timeout"; then
+        log_warn "Timed out waiting for Done: marker; proceeding with best-effort capture"
+    fi
 
     # Capture robot state
     "$WA_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
@@ -834,8 +835,6 @@ run_scenario_natural_language() {
     log_verbose "wa watch started with PID $wa_pid"
     echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
 
-    sleep 1
-
     if ! kill -0 "$wa_pid" 2>/dev/null; then
         log_fail "wa watch exited immediately"
         return 1
@@ -958,8 +957,6 @@ run_scenario_compaction_workflow() {
     log_verbose "wa watch started with PID $wa_pid"
     echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
 
-    sleep 2
-
     # Verify wa watch is running
     if ! kill -0 "$wa_pid" 2>/dev/null; then
         log_fail "wa watch exited immediately"
@@ -1002,9 +999,15 @@ run_scenario_compaction_workflow() {
     # Step 4: Wait for compaction event to be detected
     # The dummy_agent.sh will print "[CODEX] Compaction required:" after delay
     log_info "Step 4: Waiting for compaction detection..."
-    sleep 5  # Give time for agent to emit compaction marker and wa to detect
+    # Wait for the compaction marker to be captured in pane output (deterministic).
+    local compaction_marker_cmd="\"$WA_BINARY\" robot get-text $pane_id --tail 200 2>/dev/null | grep -q \"Compaction required\""
+    if ! wait_for_condition "compaction marker captured" "$compaction_marker_cmd" "$wait_timeout"; then
+        log_warn "Compaction marker not observed within timeout; workflow may still run"
+    else
+        log_pass "Compaction marker observed"
+    fi
 
-    # Check for detection event (if events endpoint exists)
+    # Capture robot state for diagnostics.
     "$WA_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
 
     # Step 5: Wait for workflow to execute and send text to pane
@@ -1118,8 +1121,6 @@ run_scenario_unhandled_event_lifecycle() {
     wa_pid=$!
     log_verbose "wa watch started with PID $wa_pid"
     echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
-
-    sleep 2
 
     if ! kill -0 "$wa_pid" 2>/dev/null; then
         log_fail "wa watch exited immediately"
@@ -1486,7 +1487,6 @@ EOF
     log_verbose "wa watch started with PID $wa_pid"
     echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
 
-    sleep 2
     if ! kill -0 "$wa_pid" 2>/dev/null; then
         log_fail "wa watch exited immediately"
         return 1
@@ -1641,7 +1641,6 @@ EOF
     log_verbose "wa watch restart PID $wa_pid_restart"
     echo "wa_pid_restart: $wa_pid_restart" >> "$scenario_dir/scenario.log"
 
-    sleep 2
     if ! kill -0 "$wa_pid_restart" 2>/dev/null; then
         log_fail "wa watch restart exited immediately"
         result=1
@@ -2864,8 +2863,11 @@ run_scenario_policy_denial() {
     log_info "Spawned alt-screen pane: $pane_id"
     echo "alt_screen_pane_id: $pane_id" >> "$scenario_dir/scenario.log"
 
-    # Give time for pane to enter alt screen
-    sleep 2
+    # Wait for the pane to render its alt-screen banner (deterministic).
+    local alt_ready_cmd="wezterm cli get-text --pane-id $pane_id 2>/dev/null | grep -q \"ALTERNATE SCREEN MODE\""
+    if ! wait_for_condition "alt-screen banner visible" "$alt_ready_cmd" 10; then
+        log_warn "Alt-screen banner not observed yet; continuing (policy may still block)"
+    fi
 
     # Step 2: Start wa watch in background
     log_info "Step 2: Starting wa watch..."
@@ -2874,8 +2876,6 @@ run_scenario_policy_denial() {
     wa_pid=$!
     log_verbose "wa watch started with PID $wa_pid"
     echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
-
-    sleep 2
 
     # Verify wa watch is running
     if ! kill -0 "$wa_pid" 2>/dev/null; then
@@ -3046,7 +3046,11 @@ run_scenario_audit_tail_streaming() {
     log_info "Spawned alt-screen pane: $pane_id"
     echo "alt_screen_pane_id: $pane_id" >> "$scenario_dir/scenario.log"
 
-    sleep 2
+    # Wait for the pane to render its alt-screen banner (deterministic).
+    local alt_ready_cmd="wezterm cli get-text --pane-id $pane_id 2>/dev/null | grep -q \"ALTERNATE SCREEN MODE\""
+    if ! wait_for_condition "alt-screen banner visible" "$alt_ready_cmd" 10; then
+        log_warn "Alt-screen banner not observed yet; continuing (denial may still work)"
+    fi
 
     # Step 2: Start wa watch in background
     log_info "Step 2: Starting wa watch..."
@@ -3055,8 +3059,6 @@ run_scenario_audit_tail_streaming() {
     wa_pid=$!
     log_verbose "wa watch started with PID $wa_pid"
     echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
-
-    sleep 2
 
     # Step 3: Wait for pane to be observed
     log_info "Step 3: Waiting for pane to be observed..."
@@ -3081,7 +3083,10 @@ run_scenario_audit_tail_streaming() {
     echo "audit_tail_pid: $tail_pid" >> "$scenario_dir/scenario.log"
     echo "audit_tail_since_ms: $since_ms" >> "$scenario_dir/scenario.log"
 
-    sleep 1
+    if ! wait_for_condition "audit tail process started" "kill -0 $tail_pid 2>/dev/null" 5; then
+        log_fail "audit tail did not start"
+        return 1
+    fi
 
     # Step 5: Generate an audit action (intentional denial) with redaction
     log_info "Step 5: Triggering audit action..."
@@ -3653,7 +3658,8 @@ PY
 set -euo pipefail
 echo "Conversation compacted 120 tokens to 45"
 echo "Auto-compact"
-sleep 5
+# Keep pane alive until the harness cleans up (avoid fixed sleeps).
+tail -f /dev/null
 EOS
     chmod +x "$compaction_script"
 
@@ -4587,9 +4593,6 @@ run_scenario_graceful_shutdown() {
     log_verbose "wa watch started with PID $wa_pid"
     echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
 
-    # Give wa watch time to initialize
-    sleep 1
-
     # Verify wa watch is running
     if ! kill -0 "$wa_pid" 2>/dev/null; then
         log_fail "wa watch exited immediately"
@@ -4685,14 +4688,12 @@ run_scenario_graceful_shutdown() {
         > "$scenario_dir/wa_watch_restart.log" 2>&1 &
     restart_pid=$!
 
-    sleep 2
-
-    if kill -0 "$restart_pid" 2>/dev/null; then
+    local restart_check_cmd="kill -0 $restart_pid 2>/dev/null"
+    if wait_for_condition "wa watch restarted" "$restart_check_cmd" 5; then
         log_pass "wa watch restarted successfully (lock was released)"
         # Clean up the restarted process
         kill -INT "$restart_pid" 2>/dev/null || true
-        sleep 1
-        if kill -0 "$restart_pid" 2>/dev/null; then
+        if ! wait_for_condition "wa watch restart exited" "! kill -0 $restart_pid 2>/dev/null" 5; then
             kill -9 "$restart_pid" 2>/dev/null || true
         fi
         wait "$restart_pid" 2>/dev/null || true
@@ -4817,8 +4818,8 @@ run_scenario_pane_exclude_filter() {
     fi
 
     local spawn_output
-    # Run dummy_print.sh then sleep to keep pane alive for observation
-    spawn_output=$(wezterm cli spawn --cwd "$temp_workspace" -- bash -c "'$dummy_script' '$observed_marker' 50; sleep 300" 2>&1)
+    # Run dummy_print.sh then keep pane alive for observation (avoid fixed sleeps).
+    spawn_output=$(wezterm cli spawn --cwd "$temp_workspace" -- bash -c "'$dummy_script' '$observed_marker' 50; tail -f /dev/null" 2>&1)
     observed_pane_id=$(echo "$spawn_output" | grep -oE '^[0-9]+$' | head -1)
 
     if [[ -z "$observed_pane_id" ]]; then
@@ -4848,8 +4849,11 @@ run_scenario_pane_exclude_filter() {
     log_info "Spawned ignored pane: $ignored_pane_id"
     echo "ignored_pane_id: $ignored_pane_id" >> "$scenario_dir/scenario.log"
 
-    # Give time for title change to propagate
-    sleep 2
+    # Wait for the title OSC sequences to propagate (deterministic).
+    local title_check_cmd="wezterm cli list --format json 2>/dev/null | jq -e '.[]? | select(.pane_id == $ignored_pane_id) | (.title // \"\") | contains(\"IGNORED_PANE\")' >/dev/null 2>&1"
+    if ! wait_for_condition "ignored pane title propagated" "$title_check_cmd" 10; then
+        log_warn "Ignored pane title not observed in wezterm cli list yet; continuing"
+    fi
 
     # Step 3: Start wa watch in background with custom config
     log_info "Step 3: Starting wa watch with exclude config..."
@@ -4858,9 +4862,6 @@ run_scenario_pane_exclude_filter() {
     wa_pid=$!
     log_verbose "wa watch started with PID $wa_pid"
     echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
-
-    # Give wa watch a moment to initialize
-    sleep 2
 
     # Verify wa watch is running
     if ! kill -0 "$wa_pid" 2>/dev/null; then
@@ -5057,7 +5058,7 @@ run_scenario_workspace_isolation() {
     fi
 
     local spawn_output
-    spawn_output=$(wezterm cli spawn --cwd "$workspace_a" -- bash -c "'$dummy_script' '$token_a' 80; sleep 300" 2>&1)
+    spawn_output=$(wezterm cli spawn --cwd "$workspace_a" -- bash -c "'$dummy_script' '$token_a' 80; tail -f /dev/null" 2>&1)
     pane_a_id=$(echo "$spawn_output" | grep -oE '^[0-9]+$' | head -1)
 
     if [[ -z "$pane_a_id" ]]; then
@@ -5077,7 +5078,6 @@ run_scenario_workspace_isolation() {
     log_verbose "wa watch (A) started with PID $wa_pid"
     echo "wa_pid_a: $wa_pid" >> "$scenario_dir/scenario.log"
 
-    sleep 2
     if ! kill -0 "$wa_pid" 2>/dev/null; then
         log_fail "wa watch (A) exited immediately"
         return 1
@@ -5122,7 +5122,7 @@ run_scenario_workspace_isolation() {
 
     # Step 6: Spawn workspace B pane
     log_info "Step 6: Spawning workspace B pane..."
-    spawn_output=$(wezterm cli spawn --cwd "$workspace_b" -- bash -c "'$dummy_script' '$token_b' 80; sleep 300" 2>&1)
+    spawn_output=$(wezterm cli spawn --cwd "$workspace_b" -- bash -c "'$dummy_script' '$token_b' 80; tail -f /dev/null" 2>&1)
     pane_b_id=$(echo "$spawn_output" | grep -oE '^[0-9]+$' | head -1)
 
     if [[ -z "$pane_b_id" ]]; then
@@ -5142,7 +5142,6 @@ run_scenario_workspace_isolation() {
     log_verbose "wa watch (B) started with PID $wa_pid"
     echo "wa_pid_b: $wa_pid" >> "$scenario_dir/scenario.log"
 
-    sleep 2
     if ! kill -0 "$wa_pid" 2>/dev/null; then
         log_fail "wa watch (B) exited immediately"
         return 1
@@ -5543,7 +5542,6 @@ EOF
     log_verbose "wa watch started with PID $wa_pid"
     echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
 
-    sleep 2
     if ! kill -0 "$wa_pid" 2>/dev/null; then
         log_fail "wa watch exited immediately"
         result=1
@@ -5683,8 +5681,6 @@ run_scenario_workflow_resume() {
     log_verbose "wa watch started with PID $wa_pid"
     echo "wa_pid_1: $wa_pid" >> "$scenario_dir/scenario.log"
 
-    sleep 2
-
     # Verify wa watch is running
     if ! kill -0 "$wa_pid" 2>/dev/null; then
         log_fail "wa watch exited immediately"
@@ -5725,10 +5721,8 @@ run_scenario_workflow_resume() {
 
     # Step 4: Wait for compaction detection and workflow to start
     log_info "Step 4: Waiting for compaction detection and workflow start..."
-    sleep 4  # Give time for agent to emit marker and workflow to start
-
-    # Check for workflow start in logs
-    if grep -qi "workflow.*started\|handle_compaction" "$scenario_dir/wa_watch_1.log" 2>/dev/null; then
+    local workflow_started_cmd="grep -qi \"workflow.*started\\|handle_compaction\" \"$scenario_dir/wa_watch_1.log\" 2>/dev/null"
+    if wait_for_condition "workflow start observed in logs" "$workflow_started_cmd" "$wait_timeout"; then
         log_pass "Workflow started"
     else
         log_warn "Workflow may not have started (checking anyway)"
@@ -5772,8 +5766,6 @@ run_scenario_workflow_resume() {
     log_verbose "wa watch restarted with PID $wa_pid"
     echo "wa_pid_2: $wa_pid" >> "$scenario_dir/scenario.log"
 
-    sleep 2
-
     # Verify wa watch is running
     if ! kill -0 "$wa_pid" 2>/dev/null; then
         log_fail "wa watch (restart) exited immediately"
@@ -5783,10 +5775,8 @@ run_scenario_workflow_resume() {
 
     # Step 8: Wait for workflow resume activity
     log_info "Step 8: Waiting for workflow resume..."
-    sleep 5  # Give time for resume logic to execute
-
-    # Check for resume activity in logs
-    if grep -qi "resume\|incomplete" "$scenario_dir/wa_watch_2.log" 2>/dev/null; then
+    local resume_cmd="grep -qi \"resume\\|incomplete\" \"$scenario_dir/wa_watch_2.log\" 2>/dev/null"
+    if wait_for_condition "resume activity in logs" "$resume_cmd" "$wait_timeout"; then
         log_pass "Resume activity detected in logs"
     else
         log_warn "No explicit resume activity in logs (may be normal if workflow completed before kill)"
@@ -5848,6 +5838,285 @@ run_scenario_workflow_resume() {
     # Cleanup trap will handle the rest
     trap - EXIT
     cleanup_workflow_resume
+
+    return $result
+}
+
+# ==============================================================================
+# Scenario: Dry-Run Mode (Send + Workflow)
+# ==============================================================================
+# Validates that:
+# - `wa send --dry-run` and `wa workflow run --dry-run` produce informative previews (JSON in non-TTY)
+# - `wa robot send --dry-run` / `wa robot workflow run --dry-run` produce schema-valid envelopes
+# - Dry-run does not execute side effects:
+#   - no send_text audit action recorded
+#   - no workflow_executions row created
+#   - dummy pane does not echo the dry-run marker
+# - Preview vs actual stable-field checks (robot JSON):
+#   - pane_id matches
+#   - allow/deny signal matches (policy checks passed vs injection status)
+# ==============================================================================
+
+run_scenario_dry_run_mode() {
+    local scenario_dir="$1"
+    local temp_workspace
+    temp_workspace=$(mktemp -d /tmp/wa-e2e-dry-run-XXXXXX)
+    local wa_pid=""
+    local pane_id=""
+    local result=0
+
+    log_info "Workspace: $temp_workspace"
+
+    export WA_DATA_DIR="$temp_workspace/.wa"
+    export WA_WORKSPACE="$temp_workspace"
+    mkdir -p "$WA_DATA_DIR"
+
+    # Copy baseline config for permissive, deterministic policy behavior
+    local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
+    if [[ -f "$baseline_config" ]]; then
+        cp "$baseline_config" "$temp_workspace/wa.toml"
+        export WA_CONFIG="$temp_workspace/wa.toml"
+        log_verbose "Using baseline config: $baseline_config"
+    fi
+
+    cleanup_dry_run_mode() {
+        log_verbose "Cleaning up dry_run_mode scenario"
+        if [[ -n "$wa_pid" ]] && kill -0 "$wa_pid" 2>/dev/null; then
+            log_verbose "Stopping wa watch (pid $wa_pid)"
+            kill "$wa_pid" 2>/dev/null || true
+            wait "$wa_pid" 2>/dev/null || true
+        fi
+        if [[ -n "$pane_id" ]]; then
+            log_verbose "Closing dummy pane $pane_id"
+            wezterm cli kill-pane --pane-id "$pane_id" 2>/dev/null || true
+        fi
+        if [[ -d "$temp_workspace" ]]; then
+            cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp "$temp_workspace/wa.toml" "$scenario_dir/" 2>/dev/null || true
+        fi
+        rm -rf "$temp_workspace"
+    }
+    trap cleanup_dry_run_mode EXIT
+
+    # Step 1: Start wa watch (no auto-handle; we want to control side effects)
+    log_info "Step 1: Starting wa watch..."
+    "$WA_BINARY" watch --foreground > "$scenario_dir/wa_watch.log" 2>&1 &
+    wa_pid=$!
+    echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
+
+    if ! kill -0 "$wa_pid" 2>/dev/null; then
+        log_fail "wa watch exited immediately"
+        return 1
+    fi
+
+    # Step 2: Spawn dummy agent pane (echoes received input)
+    log_info "Step 2: Spawning dummy agent pane..."
+    local agent_script="$PROJECT_ROOT/fixtures/e2e/dummy_agent.sh"
+    if [[ ! -x "$agent_script" ]]; then
+        log_fail "Dummy agent script not found or not executable: $agent_script"
+        return 1
+    fi
+
+    local spawn_output
+    spawn_output=$(wezterm cli spawn --cwd "$temp_workspace" -- bash "$agent_script" 2 2>&1)
+    pane_id=$(echo "$spawn_output" | grep -oE '^[0-9]+$' | head -1)
+    if [[ -z "$pane_id" ]]; then
+        log_fail "Failed to spawn dummy agent pane"
+        echo "Spawn output: $spawn_output" >> "$scenario_dir/scenario.log"
+        return 1
+    fi
+    log_info "Spawned pane: $pane_id"
+    echo "pane_id: $pane_id" >> "$scenario_dir/scenario.log"
+
+    # Step 3: Wait for pane to be observed
+    log_info "Step 3: Waiting for pane to be observed..."
+    local wait_timeout=${TIMEOUT:-30}
+    local observe_cmd="\"$WA_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane_id)' >/dev/null 2>&1"
+    if ! wait_for_condition "pane $pane_id observed" "$observe_cmd" "$wait_timeout"; then
+        log_fail "Timeout waiting for pane to be observed"
+        "$WA_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
+        return 1
+    fi
+    log_pass "Pane observed"
+
+    # Step 4: Wait for a compaction event so workflow dry-run has a realistic precondition
+    log_info "Step 4: Waiting for compaction detection..."
+    local compaction_cmd="\"$WA_BINARY\" events -f json --unhandled --rule-id \"codex:compaction\" --limit 20 2>/dev/null | jq -e 'length > 0' >/dev/null 2>&1"
+    if ! wait_for_condition "compaction event detected" "$compaction_cmd" "$wait_timeout"; then
+        log_fail "Timeout waiting for compaction event"
+        "$WA_BINARY" events -f json --rule-id "codex:compaction" --limit 20 > "$scenario_dir/events_debug.json" 2>&1 || true
+        result=1
+    else
+        log_pass "Compaction event detected"
+    fi
+
+    # Ensure DB exists for audit/workflow assertions
+    local db_path="$temp_workspace/.wa/wa.db"
+    if [[ ! -f "$db_path" ]]; then
+        log_warn "DB not found at $db_path (some checks will be skipped)"
+    fi
+
+    # Snapshot baseline counts (we allow dry-run to record a dry-run audit action, but not send_text / workflow_executions)
+    local send_text_before="0"
+    local workflow_exec_before="0"
+    if [[ -f "$db_path" ]]; then
+        send_text_before=$(sqlite3 "$db_path" "SELECT COUNT(*) FROM audit_actions WHERE action_kind = 'send_text';" 2>/dev/null || echo "0")
+        workflow_exec_before=$(sqlite3 "$db_path" "SELECT COUNT(*) FROM workflow_executions;" 2>/dev/null || echo "0")
+    fi
+    echo "send_text_before: $send_text_before" >> "$scenario_dir/scenario.log"
+    echo "workflow_exec_before: $workflow_exec_before" >> "$scenario_dir/scenario.log"
+
+    # Step 5: Human send dry-run (JSON in non-TTY)
+    local marker_send=""
+    marker_send="E2E_DRYRUN_SEND_$(date +%s%N)"
+    log_info "Step 5: wa send --dry-run (human)..."
+    "$WA_BINARY" send "$pane_id" "$marker_send" --dry-run > "$scenario_dir/human_send_dry_run.json" 2>&1 || true
+    if jq -e ".target_resolution.pane_id == $pane_id and (.expected_actions | length) > 0" \
+        "$scenario_dir/human_send_dry_run.json" >/dev/null 2>&1; then
+        log_pass "human send dry-run: report looks valid"
+    else
+        log_fail "human send dry-run: missing expected fields"
+        result=1
+    fi
+
+    # Step 6: Robot send dry-run (enveloped JSON)
+    log_info "Step 6: wa robot send --dry-run..."
+    "$WA_BINARY" robot send "$pane_id" "$marker_send" --dry-run --format json \
+        > "$scenario_dir/robot_send_dry_run.json" 2>&1 || true
+    if jq -e ".ok == true and (.data.target_resolution.pane_id == $pane_id) and ((.data.expected_actions | length) > 0)" \
+        "$scenario_dir/robot_send_dry_run.json" >/dev/null 2>&1; then
+        log_pass "robot send dry-run: ok"
+    else
+        log_fail "robot send dry-run failed"
+        result=1
+    fi
+
+    # Step 7: No side effects for dry-run send
+    if [[ -f "$db_path" ]]; then
+        local send_text_after
+        send_text_after=$(sqlite3 "$db_path" "SELECT COUNT(*) FROM audit_actions WHERE action_kind = 'send_text';" 2>/dev/null || echo "0")
+        echo "send_text_after_dry_run: $send_text_after" >> "$scenario_dir/scenario.log"
+        if [[ "$send_text_after" == "$send_text_before" ]]; then
+            log_pass "dry-run send did not record send_text audit action"
+        else
+            log_fail "dry-run send recorded send_text audit action (unexpected): $send_text_before -> $send_text_after"
+            result=1
+        fi
+    fi
+
+    log_info "Step 7b: Verify dummy pane did not echo dry-run marker..."
+    "$WA_BINARY" robot wait-for "$pane_id" "Received: $marker_send" --timeout-secs 2 --format json \
+        > "$scenario_dir/no_echo_wait.json" 2>&1 || true
+    if jq -e '.ok == false and .error.code == "WA-ROBOT-TIMEOUT"' "$scenario_dir/no_echo_wait.json" >/dev/null 2>&1; then
+        log_pass "dry-run marker not observed (expected)"
+    else
+        log_fail "dry-run marker appeared in pane output (unexpected)"
+        result=1
+    fi
+
+    # Step 8: Preview vs actual stable-field checks (robot send)
+    log_info "Step 8: wa robot send (actual)..."
+    "$WA_BINARY" robot send "$pane_id" "$marker_send" --format json \
+        > "$scenario_dir/robot_send_actual.json" 2>&1 || true
+    if jq -e ".ok == true and (.data.pane_id == $pane_id)" "$scenario_dir/robot_send_actual.json" >/dev/null 2>&1; then
+        log_pass "robot send actual: ok"
+    else
+        log_fail "robot send actual failed"
+        result=1
+    fi
+
+    log_info "Step 8b: Waiting for echo of actual send..."
+    "$WA_BINARY" robot wait-for "$pane_id" "Received: $marker_send" --timeout-secs 10 --format json \
+        > "$scenario_dir/echo_wait.json" 2>&1 || true
+    if jq -e '.ok == true and .data.matched == true' "$scenario_dir/echo_wait.json" >/dev/null 2>&1; then
+        log_pass "actual send echoed by dummy pane"
+    else
+        log_fail "did not observe dummy echo for actual send"
+        result=1
+    fi
+
+    # Compare allow/deny signal: dry-run policy checks passed <-> injection status
+    local dry_policy_passed="unknown"
+    local actual_injection_status="unknown"
+    dry_policy_passed=$(jq -r '(.data.policy_evaluation.checks // []) | all(.passed == true)' \
+        "$scenario_dir/robot_send_dry_run.json" 2>/dev/null || echo "unknown")
+    actual_injection_status=$(jq -r '.data.injection.status // "unknown"' \
+        "$scenario_dir/robot_send_actual.json" 2>/dev/null || echo "unknown")
+    echo "robot_send_dry_policy_passed: $dry_policy_passed" >> "$scenario_dir/scenario.log"
+    echo "robot_send_actual_injection_status: $actual_injection_status" >> "$scenario_dir/scenario.log"
+
+    if [[ "$dry_policy_passed" == "true" && "$actual_injection_status" == "allowed" ]] \
+        || [[ "$dry_policy_passed" == "false" && "$actual_injection_status" != "allowed" ]]; then
+        log_pass "preview vs actual: policy signal consistent"
+    else
+        log_fail "preview vs actual: policy signal mismatch (dry=$dry_policy_passed actual=$actual_injection_status)"
+        result=1
+    fi
+
+    # Step 9: Workflow dry-run (human + robot) without workflow_executions side effects
+    log_info "Step 9: wa workflow run --dry-run (human)..."
+    "$WA_BINARY" workflow run --pane "$pane_id" handle_compaction --dry-run \
+        > "$scenario_dir/human_workflow_dry_run.json" 2>&1 || true
+    if jq -e "(.expected_actions | length) > 0" "$scenario_dir/human_workflow_dry_run.json" >/dev/null 2>&1; then
+        log_pass "human workflow dry-run: report looks valid"
+    else
+        log_fail "human workflow dry-run failed"
+        result=1
+    fi
+
+    log_info "Step 9b: wa robot workflow run --dry-run..."
+    "$WA_BINARY" robot workflow run handle_compaction "$pane_id" --dry-run --format json \
+        > "$scenario_dir/robot_workflow_dry_run.json" 2>&1 || true
+    if jq -e ".ok == true and (.data.target_resolution.pane_id == $pane_id) and ((.data.expected_actions | length) > 0)" \
+        "$scenario_dir/robot_workflow_dry_run.json" >/dev/null 2>&1; then
+        log_pass "robot workflow dry-run: ok"
+    else
+        log_fail "robot workflow dry-run failed"
+        result=1
+    fi
+
+    if [[ -f "$db_path" ]]; then
+        local workflow_exec_after
+        workflow_exec_after=$(sqlite3 "$db_path" "SELECT COUNT(*) FROM workflow_executions;" 2>/dev/null || echo "0")
+        echo "workflow_exec_after_dry_run: $workflow_exec_after" >> "$scenario_dir/scenario.log"
+        if [[ "$workflow_exec_after" == "$workflow_exec_before" ]]; then
+            log_pass "dry-run workflow did not create workflow_executions row"
+        else
+            log_fail "dry-run workflow created workflow_executions row (unexpected): $workflow_exec_before -> $workflow_exec_after"
+            result=1
+        fi
+    fi
+
+    # Step 10: Actual robot workflow run should create an execution (sanity check + stable-field match)
+    log_info "Step 10: wa robot workflow run (actual)..."
+    "$WA_BINARY" robot workflow run handle_compaction "$pane_id" --format json \
+        > "$scenario_dir/robot_workflow_actual.json" 2>&1 || true
+    if jq -e ".ok == true and (.data.pane_id == $pane_id)" "$scenario_dir/robot_workflow_actual.json" >/dev/null 2>&1; then
+        log_pass "robot workflow run: ok"
+    else
+        log_fail "robot workflow run failed"
+        result=1
+    fi
+
+    if [[ -f "$db_path" ]]; then
+        local workflow_exec_final
+        workflow_exec_final=$(sqlite3 "$db_path" "SELECT COUNT(*) FROM workflow_executions;" 2>/dev/null || echo "0")
+        echo "workflow_exec_after_actual: $workflow_exec_final" >> "$scenario_dir/scenario.log"
+        if [[ "$workflow_exec_final" -gt "$workflow_exec_before" ]]; then
+            log_pass "actual workflow created workflow_executions row"
+        else
+            log_warn "workflow_executions count did not increase (may be due to workflow denial)"
+        fi
+    fi
+
+    # Step 11: Stop wa watch
+    log_info "Step 11: Stopping wa watch..."
+    kill -TERM "$wa_pid" 2>/dev/null || true
+    wait "$wa_pid" 2>/dev/null || true
+    wa_pid=""
+
+    trap - EXIT
+    cleanup_dry_run_mode
 
     return $result
 }
@@ -6596,6 +6865,9 @@ run_scenario() {
                 ;;
             workflow_lifecycle)
                 run_scenario_workflow_lifecycle "$scenario_dir" || result=$?
+                ;;
+            dry_run_mode)
+                run_scenario_dry_run_mode "$scenario_dir" || result=$?
                 ;;
             events_unhandled_alias)
                 run_scenario_events_unhandled_alias "$scenario_dir" || result=$?

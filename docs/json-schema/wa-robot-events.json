@@ -36,6 +36,14 @@
       "type": "string",
       "description": "If set, events were filtered to this event_type"
     },
+    "triage_state_filter": {
+      "type": "string",
+      "description": "If set, events were filtered to this triage_state"
+    },
+    "label_filter": {
+      "type": "string",
+      "description": "If set, events were filtered to those with this label"
+    },
     "type_filter": {
       "type": "string",
       "description": "Deprecated alias for event_type_filter"
@@ -108,6 +116,10 @@
           "description": "Values extracted from the matched pattern (e.g., percentage, token counts)",
           "additionalProperties": true
         },
+        "annotations": {
+          "$ref": "#/$defs/annotations",
+          "description": "Optional persisted annotations (triage state, note, labels)"
+        },
         "matched_text": {
           "type": "string",
           "description": "The text that matched the pattern (may be redacted)"
@@ -131,6 +143,21 @@
           "description": "Preview of the workflow that would handle this event (if requested)"
         }
       },
+      "additionalProperties": false
+    },
+    "annotations": {
+      "type": "object",
+      "description": "Persisted annotations for an event",
+      "properties": {
+        "triage_state": { "type": ["string", "null"] },
+        "triage_updated_at": { "type": ["integer", "null"] },
+        "triage_updated_by": { "type": ["string", "null"] },
+        "note": { "type": ["string", "null"] },
+        "note_updated_at": { "type": ["integer", "null"] },
+        "note_updated_by": { "type": ["string", "null"] },
+        "labels": { "type": "array", "items": { "type": "string" } }
+      },
+      "required": ["labels"],
       "additionalProperties": false
     },
     "would_handle_with": {

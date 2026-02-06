@@ -22,6 +22,13 @@ wa get-text <pane_id> [--escapes]   # stub (not yet implemented)
 wa search "<fts query>" [--pane <id>] [--limit <n>] [--since <epoch_ms>]
 wa query "<fts query>"             # alias for wa search
 wa events [--unhandled] [--pane-id <id>] [--rule-id <id>] [--event-type <type>]
+wa events annotate <event_id> --note "<text>" [--by <actor>]
+wa events annotate <event_id> --clear [--by <actor>]
+wa events triage <event_id> --state <state> [--by <actor>]
+wa events triage <event_id> --clear [--by <actor>]
+wa events label <event_id> --add <label> [--by <actor>]
+wa events label <event_id> --remove <label>
+wa events label <event_id> --list
 wa triage [--severity <error|warning|info>] [--only <section>] [--details]
 ```
 
@@ -143,7 +150,14 @@ wa robot get-text <pane_id> [--tail <n>] [--escapes]
 wa robot send <pane_id> "<text>" [--dry-run] [--wait-for "<pat>"] [--timeout-secs <n>]
 wa robot wait-for <pane_id> "<pat>" [--timeout-secs <n>] [--regex]
 wa robot search "<fts query>" [--pane <id>] [--since <epoch_ms>] [--limit <n>]
-wa robot events [--unhandled] [--pane <id>] [--rule-id <id>] [--event-type <type>]
+wa robot events [--unhandled] [--pane <id>] [--rule-id <id>] [--event-type <type>] [--triage-state <state>] [--label <label>]
+wa robot events annotate <event_id> --note "<text>" [--by <actor>]
+wa robot events annotate <event_id> --clear [--by <actor>]
+wa robot events triage <event_id> --state <state> [--by <actor>]
+wa robot events triage <event_id> --clear [--by <actor>]
+wa robot events label <event_id> --add <label> [--by <actor>]
+wa robot events label <event_id> --remove <label>
+wa robot events label <event_id> --list
 
 wa robot workflow list
 wa robot workflow run <name> <pane_id> [--force] [--dry-run]
@@ -177,6 +191,9 @@ Tools:
 - wa.wait_for
 - wa.search
 - wa.events
+- wa.events_annotate
+- wa.events_triage
+- wa.events_label
 - wa.workflow_run
 - wa.accounts
 - wa.accounts_refresh

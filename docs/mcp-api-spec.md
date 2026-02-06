@@ -57,6 +57,9 @@ All tools mirror `wa robot` semantics and schemas.
 | `wa.wait_for` | Wait for pattern match | `docs/json-schema/wa-robot-wait-for.json` |
 | `wa.search` | FTS search across captures | `docs/json-schema/wa-robot-search.json` |
 | `wa.events` | Query events | `docs/json-schema/wa-robot-events.json` |
+| `wa.events_annotate` | Set/clear an event note | `docs/json-schema/wa-robot-event-mutation.json` |
+| `wa.events_triage` | Set/clear an event triage state | `docs/json-schema/wa-robot-event-mutation.json` |
+| `wa.events_label` | Add/remove/list event labels | `docs/json-schema/wa-robot-event-mutation.json` |
 | `wa.workflow_run` | Execute workflow | `docs/json-schema/wa-robot-workflow-run.json` |
 | `wa.accounts` | List accounts | `docs/json-schema/wa-robot-accounts.json` |
 | `wa.accounts_refresh` | Refresh account usage | `docs/json-schema/wa-robot-accounts-refresh.json` |
@@ -93,7 +96,16 @@ Parameter types use JSON primitives; `u64` fields are JSON numbers.
   - Params: `{ query: string, limit?: u64=20, pane?: u64, since?: i64, snippets?: bool=false }`
 
 - `wa.events`
-  - Params: `{ limit?: u64=20, pane?: u64, rule_id?: string, event_type?: string, unhandled?: bool=false, since?: i64, would_handle?: bool=false, dry_run?: bool=false }`
+  - Params: `{ limit?: u64=20, pane?: u64, rule_id?: string, event_type?: string, triage_state?: string, label?: string, unhandled?: bool=false, since?: i64, would_handle?: bool=false, dry_run?: bool=false }`
+
+- `wa.events_annotate`
+  - Params: `{ event_id: i64, note?: string, clear?: bool=false, by?: string }`
+
+- `wa.events_triage`
+  - Params: `{ event_id: i64, state?: string, clear?: bool=false, by?: string }`
+
+- `wa.events_label`
+  - Params: `{ event_id: i64, add?: string, remove?: string, list?: bool=false, by?: string }`
 
 - `wa.workflow_run`
   - Params: `{ name: string, pane_id: u64, force?: bool=false, dry_run?: bool=false }`
