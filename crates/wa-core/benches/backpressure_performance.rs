@@ -221,13 +221,9 @@ fn bench_scheduler_select_panes(c: &mut Criterion) {
             max_bytes_per_sec: 0,
         });
 
-        group.bench_with_input(
-            BenchmarkId::new("unlimited", n),
-            &panes,
-            |b, panes| {
-                b.iter(|| scheduler.select_panes(panes, 8));
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("unlimited", n), &panes, |b, panes| {
+            b.iter(|| scheduler.select_panes(panes, 8));
+        });
 
         // With rate limit active
         let mut scheduler_limited = CaptureScheduler::new(CaptureBudgetConfig {
@@ -235,13 +231,9 @@ fn bench_scheduler_select_panes(c: &mut Criterion) {
             max_bytes_per_sec: 1_000_000,
         });
 
-        group.bench_with_input(
-            BenchmarkId::new("rate_limited", n),
-            &panes,
-            |b, panes| {
-                b.iter(|| scheduler_limited.select_panes(panes, 8));
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("rate_limited", n), &panes, |b, panes| {
+            b.iter(|| scheduler_limited.select_panes(panes, 8));
+        });
     }
 
     group.finish();

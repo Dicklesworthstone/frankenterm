@@ -387,6 +387,269 @@ fn detect_load_average() -> Option<f64> {
     None
 }
 
+// ---------------------------------------------------------------------------
+// Auto-configuration engine
+// ---------------------------------------------------------------------------
+
+/// Source of a configuration value in the resolution chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigSource {
+    /// Hard-coded default.
+    Default,
+    /// Auto-detected from the environment.
+    AutoDetected,
+    /// Explicitly set in the config file.
+    ConfigFile,
+}
+
+/// A single configuration recommendation produced by the auto-config engine.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfigRecommendation {
+    /// Config key path (e.g. `ingest.poll_interval_ms`).
+    pub key: String,
+    /// Recommended value (human-readable).
+    pub value: String,
+    /// Why this value was chosen.
+    pub reason: String,
+    /// Where the recommendation came from.
+    pub source: ConfigSource,
+}
+
+/// Aggregated auto-configuration output from environment detection.
+#[derive(Debug, Clone, Serialize)]
+pub struct AutoConfig {
+    /// Recommended poll interval in milliseconds.
+    pub poll_interval_ms: u64,
+    /// Recommended minimum poll interval in milliseconds.
+    pub min_poll_interval_ms: u64,
+    /// Recommended maximum concurrent captures.
+    pub max_concurrent_captures: u32,
+    /// Recommended pattern packs based on detected agents.
+    pub pattern_packs: Vec<String>,
+    /// Whether safety should be stricter (remote/production detected).
+    pub strict_safety: bool,
+    /// Recommended per-pane rate limit (actions/min).
+    pub rate_limit_per_pane: u32,
+    /// Human-readable recommendations for `wa doctor` output.
+    pub recommendations: Vec<ConfigRecommendation>,
+}
+
+impl AutoConfig {
+    /// Derive optimal configuration from a detected environment.
+    #[must_use]
+    pub fn from_environment(env: &DetectedEnvironment) -> Self {
+        let mut recs = Vec::new();
+
+        // --- Poll interval ---
+        let poll_interval_ms = auto_poll_interval(env, &mut recs);
+        let min_poll_interval_ms = auto_min_poll_interval(env);
+
+        // --- Concurrency ---
+        let max_concurrent_captures = auto_concurrent_captures(env, &mut recs);
+
+        // --- Pattern packs ---
+        let pattern_packs = auto_pattern_packs(env, &mut recs);
+
+        // --- Safety ---
+        let (strict_safety, rate_limit_per_pane) = auto_safety(env, &mut recs);
+
+        Self {
+            poll_interval_ms,
+            min_poll_interval_ms,
+            max_concurrent_captures,
+            pattern_packs,
+            strict_safety,
+            rate_limit_per_pane,
+            recommendations: recs,
+        }
+    }
+}
+
+/// Choose poll interval based on system load, memory, and remote pane presence.
+fn auto_poll_interval(env: &DetectedEnvironment, recs: &mut Vec<ConfigRecommendation>) -> u64 {
+    let mut interval: u64 = 100; // Base: aggressive polling
+
+    // Back off under high system load.
+    if let Some(load) = env.system.load_average {
+        #[allow(clippy::cast_precision_loss)]
+        let per_core = load / env.system.cpu_count.max(1) as f64;
+        if per_core > 2.0 {
+            interval = interval.max(500);
+            recs.push(ConfigRecommendation {
+                key: "ingest.poll_interval_ms".into(),
+                value: "500".into(),
+                reason: format!(
+                    "High per-core load ({per_core:.1}); throttling to reduce overhead"
+                ),
+                source: ConfigSource::AutoDetected,
+            });
+        } else if per_core > 1.0 {
+            interval = interval.max(200);
+            recs.push(ConfigRecommendation {
+                key: "ingest.poll_interval_ms".into(),
+                value: "200".into(),
+                reason: format!(
+                    "Moderate per-core load ({per_core:.1}); using conservative interval"
+                ),
+                source: ConfigSource::AutoDetected,
+            });
+        }
+    }
+
+    // Remote panes add network latency; poll slower to avoid timeout cascades.
+    if !env.remotes.is_empty() {
+        let prev = interval;
+        interval = interval.max(200);
+        if interval != prev {
+            recs.push(ConfigRecommendation {
+                key: "ingest.poll_interval_ms".into(),
+                value: format!("{interval}"),
+                reason: format!(
+                    "Remote panes detected ({} host(s)); increased interval for network latency",
+                    env.remotes.len()
+                ),
+                source: ConfigSource::AutoDetected,
+            });
+        }
+    }
+
+    // Low memory: be gentle.
+    if let Some(mem) = env.system.memory_mb {
+        if mem < 2048 {
+            let prev = interval;
+            interval = interval.max(300);
+            if interval != prev {
+                recs.push(ConfigRecommendation {
+                    key: "ingest.poll_interval_ms".into(),
+                    value: format!("{interval}"),
+                    reason: format!("Low memory ({mem} MB); reduced polling frequency"),
+                    source: ConfigSource::AutoDetected,
+                });
+            }
+        }
+    }
+
+    interval
+}
+
+/// Minimum poll interval adapts to CPU cores.
+fn auto_min_poll_interval(env: &DetectedEnvironment) -> u64 {
+    if env.system.cpu_count >= 8 {
+        25 // Fast CPUs can handle aggressive min interval
+    } else if env.system.cpu_count >= 4 {
+        50
+    } else {
+        100
+    }
+}
+
+/// Scale concurrency with CPU count, capped by observed pane count.
+fn auto_concurrent_captures(
+    env: &DetectedEnvironment,
+    recs: &mut Vec<ConfigRecommendation>,
+) -> u32 {
+    let cpu_based = (env.system.cpu_count * 2).min(32) as u32;
+    let result = cpu_based.max(4); // At least 4
+
+    if result != 10 {
+        // 10 is the hard-coded default
+        recs.push(ConfigRecommendation {
+            key: "ingest.max_concurrent_captures".into(),
+            value: format!("{result}"),
+            reason: format!(
+                "Scaled to {} CPUs (2× cores, min 4, max 32)",
+                env.system.cpu_count
+            ),
+            source: ConfigSource::AutoDetected,
+        });
+    }
+
+    result
+}
+
+/// Select pattern packs based on detected agent types.
+fn auto_pattern_packs(
+    env: &DetectedEnvironment,
+    recs: &mut Vec<ConfigRecommendation>,
+) -> Vec<String> {
+    let mut packs = vec!["builtin:core".to_string()];
+
+    let mut agent_packs = Vec::new();
+    for agent in &env.agents {
+        let pack = match agent.agent_type {
+            AgentType::Codex => "builtin:codex",
+            AgentType::ClaudeCode => "builtin:claude_code",
+            AgentType::Gemini => "builtin:gemini",
+            _ => continue,
+        };
+        if !packs.contains(&pack.to_string()) {
+            packs.push(pack.to_string());
+            agent_packs.push(pack);
+        }
+    }
+
+    if !agent_packs.is_empty() {
+        recs.push(ConfigRecommendation {
+            key: "patterns.packs".into(),
+            value: format!("{agent_packs:?}"),
+            reason: format!(
+                "Detected {} agent(s) in panes; enabled matching pattern packs",
+                env.agents.len()
+            ),
+            source: ConfigSource::AutoDetected,
+        });
+    }
+
+    packs.dedup();
+    packs
+}
+
+/// Determine safety strictness from remote hosts and production indicators.
+fn auto_safety(env: &DetectedEnvironment, recs: &mut Vec<ConfigRecommendation>) -> (bool, u32) {
+    let mut strict = false;
+    let mut rate = 30_u32; // Default per-pane rate
+
+    // Remote panes need stricter safety.
+    if !env.remotes.is_empty() {
+        strict = true;
+        rate = 15;
+        recs.push(ConfigRecommendation {
+            key: "safety.rate_limit_per_pane".into(),
+            value: format!("{rate}"),
+            reason: format!(
+                "Remote panes detected ({} host(s)); reduced per-pane rate limit",
+                env.remotes.len()
+            ),
+            source: ConfigSource::AutoDetected,
+        });
+    }
+
+    // Production hostnames trigger maximum caution.
+    for remote in &env.remotes {
+        let host_lower = remote.hostname.to_lowercase();
+        if host_lower.contains("prod")
+            || host_lower.contains("live")
+            || host_lower.contains("production")
+        {
+            strict = true;
+            rate = rate.min(10);
+            recs.push(ConfigRecommendation {
+                key: "safety".into(),
+                value: "strict".into(),
+                reason: format!(
+                    "Production host detected ({}); enabling strict safety mode",
+                    remote.hostname
+                ),
+                source: ConfigSource::AutoDetected,
+            });
+            break;
+        }
+    }
+
+    (strict, rate)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -443,5 +706,207 @@ mod tests {
     fn shell_info_from_path_sets_type() {
         let info = ShellInfo::from_shell_path(Some("/bin/bash"));
         assert_eq!(info.shell_type.as_deref(), Some("bash"));
+    }
+
+    // --- AutoConfig tests ---
+
+    fn make_env(
+        cpu_count: usize,
+        memory_mb: Option<u64>,
+        load_average: Option<f64>,
+        agents: Vec<DetectedAgent>,
+        remotes: Vec<RemoteHost>,
+    ) -> DetectedEnvironment {
+        DetectedEnvironment {
+            wezterm: WeztermInfo {
+                version: None,
+                socket_path: None,
+                is_running: false,
+                capabilities: WeztermCapabilities::default(),
+            },
+            shell: ShellInfo {
+                shell_path: Some("/bin/zsh".into()),
+                shell_type: Some("zsh".into()),
+                version: None,
+                config_file: None,
+                osc_133_enabled: false,
+            },
+            agents,
+            remotes,
+            system: SystemInfo {
+                os: "linux".into(),
+                arch: "x86_64".into(),
+                cpu_count,
+                memory_mb,
+                load_average,
+                detected_at_epoch_ms: 0,
+            },
+            detected_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn auto_config_idle_system_uses_fast_polling() {
+        let env = make_env(8, Some(16384), Some(0.5), vec![], vec![]);
+        let auto = AutoConfig::from_environment(&env);
+        assert_eq!(auto.poll_interval_ms, 100);
+        assert_eq!(auto.min_poll_interval_ms, 25);
+    }
+
+    #[test]
+    fn auto_config_high_load_throttles_polling() {
+        // 4 cores, load 10.0 → per-core 2.5 → 500ms
+        let env = make_env(4, Some(8192), Some(10.0), vec![], vec![]);
+        let auto = AutoConfig::from_environment(&env);
+        assert_eq!(auto.poll_interval_ms, 500);
+    }
+
+    #[test]
+    fn auto_config_moderate_load_uses_200ms() {
+        // 4 cores, load 6.0 → per-core 1.5 → 200ms
+        let env = make_env(4, Some(8192), Some(6.0), vec![], vec![]);
+        let auto = AutoConfig::from_environment(&env);
+        assert_eq!(auto.poll_interval_ms, 200);
+    }
+
+    #[test]
+    fn auto_config_low_memory_increases_interval() {
+        let env = make_env(2, Some(1024), Some(0.1), vec![], vec![]);
+        let auto = AutoConfig::from_environment(&env);
+        assert!(auto.poll_interval_ms >= 300);
+    }
+
+    #[test]
+    fn auto_config_remote_panes_increase_interval() {
+        let remotes = vec![RemoteHost {
+            hostname: "dev-server".into(),
+            connection_type: ConnectionType::Ssh,
+            pane_ids: vec![1, 2],
+        }];
+        let env = make_env(8, Some(16384), Some(0.5), vec![], remotes);
+        let auto = AutoConfig::from_environment(&env);
+        assert!(auto.poll_interval_ms >= 200);
+        assert!(auto.strict_safety);
+        assert!(auto.rate_limit_per_pane < 30);
+    }
+
+    #[test]
+    fn auto_config_production_host_enables_strict() {
+        let remotes = vec![RemoteHost {
+            hostname: "web-prod-01".into(),
+            connection_type: ConnectionType::Ssh,
+            pane_ids: vec![1],
+        }];
+        let env = make_env(8, Some(16384), Some(0.5), vec![], remotes);
+        let auto = AutoConfig::from_environment(&env);
+        assert!(auto.strict_safety);
+        assert!(auto.rate_limit_per_pane <= 10);
+    }
+
+    #[test]
+    fn auto_config_agent_packs_selected() {
+        let agents = vec![
+            DetectedAgent {
+                agent_type: AgentType::Codex,
+                pane_id: 1,
+                confidence: 0.9,
+                indicators: vec!["title:codex".into()],
+            },
+            DetectedAgent {
+                agent_type: AgentType::ClaudeCode,
+                pane_id: 2,
+                confidence: 0.8,
+                indicators: vec!["title:claude".into()],
+            },
+        ];
+        let env = make_env(4, Some(8192), None, agents, vec![]);
+        let auto = AutoConfig::from_environment(&env);
+        assert!(auto.pattern_packs.contains(&"builtin:core".to_string()));
+        assert!(auto.pattern_packs.contains(&"builtin:codex".to_string()));
+        assert!(
+            auto.pattern_packs
+                .contains(&"builtin:claude_code".to_string())
+        );
+    }
+
+    #[test]
+    fn auto_config_no_agents_only_core_pack() {
+        let env = make_env(4, Some(8192), None, vec![], vec![]);
+        let auto = AutoConfig::from_environment(&env);
+        assert_eq!(auto.pattern_packs, vec!["builtin:core"]);
+    }
+
+    #[test]
+    fn auto_config_concurrent_captures_scales_with_cpus() {
+        let env_small = make_env(2, Some(4096), None, vec![], vec![]);
+        let env_large = make_env(16, Some(32768), None, vec![], vec![]);
+        let auto_small = AutoConfig::from_environment(&env_small);
+        let auto_large = AutoConfig::from_environment(&env_large);
+        assert_eq!(auto_small.max_concurrent_captures, 4);
+        assert_eq!(auto_large.max_concurrent_captures, 32);
+    }
+
+    #[test]
+    fn auto_config_min_poll_scales_with_cpus() {
+        let env_2 = make_env(2, Some(4096), None, vec![], vec![]);
+        let env_4 = make_env(4, Some(8192), None, vec![], vec![]);
+        let env_8 = make_env(8, Some(16384), None, vec![], vec![]);
+        assert_eq!(
+            AutoConfig::from_environment(&env_2).min_poll_interval_ms,
+            100
+        );
+        assert_eq!(
+            AutoConfig::from_environment(&env_4).min_poll_interval_ms,
+            50
+        );
+        assert_eq!(
+            AutoConfig::from_environment(&env_8).min_poll_interval_ms,
+            25
+        );
+    }
+
+    #[test]
+    fn auto_config_serializes() {
+        let env = make_env(4, Some(8192), Some(1.0), vec![], vec![]);
+        let auto = AutoConfig::from_environment(&env);
+        let json = serde_json::to_string(&auto).unwrap();
+        assert!(json.contains("poll_interval_ms"));
+        assert!(json.contains("pattern_packs"));
+    }
+
+    #[test]
+    fn auto_config_recommendations_populated_for_non_defaults() {
+        let agents = vec![DetectedAgent {
+            agent_type: AgentType::Gemini,
+            pane_id: 3,
+            confidence: 0.7,
+            indicators: vec!["title:gemini".into()],
+        }];
+        let remotes = vec![RemoteHost {
+            hostname: "staging".into(),
+            connection_type: ConnectionType::Ssh,
+            pane_ids: vec![4],
+        }];
+        let env = make_env(2, Some(1024), Some(8.0), agents, remotes);
+        let auto = AutoConfig::from_environment(&env);
+        assert!(!auto.recommendations.is_empty());
+        let keys: Vec<&str> = auto
+            .recommendations
+            .iter()
+            .map(|r| r.key.as_str())
+            .collect();
+        assert!(keys.contains(&"ingest.poll_interval_ms"));
+        assert!(keys.contains(&"patterns.packs"));
+        assert!(keys.contains(&"safety.rate_limit_per_pane"));
+    }
+
+    #[test]
+    fn auto_config_empty_env_uses_safe_defaults() {
+        let env = make_env(1, None, None, vec![], vec![]);
+        let auto = AutoConfig::from_environment(&env);
+        assert_eq!(auto.poll_interval_ms, 100);
+        assert!(!auto.strict_safety);
+        assert_eq!(auto.rate_limit_per_pane, 30);
+        assert_eq!(auto.pattern_packs, vec!["builtin:core"]);
     }
 }
