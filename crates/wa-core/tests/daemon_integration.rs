@@ -110,6 +110,7 @@ fn detection_to_stored_event(
         matched_text: Some(detection.matched_text.clone()),
         segment_id,
         detected_at,
+        dedupe_key: None,
         handled_at: None,
         handled_by_workflow_id: None,
         handled_status: None,

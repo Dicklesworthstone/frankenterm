@@ -231,6 +231,20 @@ SEE ALSO:
         json: bool,
     },
 
+    /// Pane management commands
+    #[command(after_help = r#"EXAMPLES:
+    wa panes priority 3 --weight 10         Prefer pane 3 during capture scheduling
+    wa panes priority 3 --weight 10 --ttl-secs 600
+    wa panes priority 3 --clear
+
+NOTES:
+  - Lower numbers indicate higher priority (consistent with config `ingest.priorities`)
+  - Priority overrides are runtime-only (stored in the watcher process)"#)]
+    Panes {
+        #[command(subcommand)]
+        command: PanesCommands,
+    },
+
     /// Show detailed pane information
     #[command(after_help = r#"EXAMPLES:
     wa show 3                         Show details for pane 3
@@ -679,6 +693,22 @@ SEE ALSO:
         command: NotifyCommands,
     },
 
+    /// Mute/unmute noisy events
+    #[command(after_help = r#"EXAMPLES:
+    wa mute add evt:abc --for 1h       Mute event key for 1 hour
+    wa mute add evt:abc                Mute permanently
+    wa mute remove evt:abc             Unmute an event key
+    wa mute list                       List active mutes
+    wa mute list --format json         Machine-readable output
+
+SEE ALSO:
+    wa events     View detected events
+    wa notify     Notification management"#)]
+    Mute {
+        #[command(subcommand)]
+        command: MuteCommands,
+    },
+
     /// Secret scanning utilities
     #[command(after_help = r#"EXAMPLES:
     wa secrets scan                    Scan stored output and store a report
@@ -1104,6 +1134,31 @@ SEE ALSO:
 }
 
 #[derive(Subcommand)]
+enum PanesCommands {
+    /// Set/clear a runtime pane capture priority override (watcher only)
+    Priority {
+        /// Pane ID to modify
+        pane_id: u64,
+
+        /// Priority override value (lower = higher priority)
+        #[arg(long, alias = "priority")]
+        weight: Option<u32>,
+
+        /// TTL for the override (seconds). 0 = until cleared.
+        #[arg(long, default_value = "3600")]
+        ttl_secs: u64,
+
+        /// Clear any existing override
+        #[arg(long)]
+        clear: bool,
+
+        /// Output raw IPC JSON response
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum AuditCommands {
     /// Stream audit log as JSONL
     #[command(after_help = r#"EXAMPLES:
@@ -1135,6 +1190,48 @@ NOTES:
         #[arg(long)]
         channel: String,
 
+        /// Output format: auto, plain, or json
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum MuteCommands {
+    /// Mute an event identity key (suppress notifications)
+    Add {
+        /// Event identity key to mute (use `wa events --format json` to find keys)
+        identity_key: String,
+
+        /// Duration to mute (e.g., "1h", "30m", "7d"). Omit for permanent mute.
+        #[arg(long, value_name = "DURATION")]
+        r#for: Option<String>,
+
+        /// Scope: workspace (default) or global
+        #[arg(long, default_value = "workspace")]
+        scope: String,
+
+        /// Reason for muting
+        #[arg(long)]
+        reason: Option<String>,
+
+        /// Output format: auto, plain, or json
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+    },
+
+    /// Unmute an event identity key
+    Remove {
+        /// Event identity key to unmute
+        identity_key: String,
+
+        /// Output format: auto, plain, or json
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+    },
+
+    /// List active mutes
+    List {
         /// Output format: auto, plain, or json
         #[arg(long, short = 'f', default_value = "auto")]
         format: String,
@@ -1274,6 +1371,29 @@ enum SavedSearchCommands {
     List,
     /// Run a saved search by name
     Run {
+        /// Saved search name
+        name: String,
+    },
+    /// Enable and schedule a saved search (sets interval + enabled=on)
+    Schedule {
+        /// Saved search name
+        name: String,
+
+        /// Interval in milliseconds (minimum 1000)
+        interval_ms: i64,
+    },
+    /// Disable scheduling and clear interval (enabled=off, schedule=NULL)
+    Unschedule {
+        /// Saved search name
+        name: String,
+    },
+    /// Enable scheduling for an already-scheduled search (enabled=on)
+    Enable {
+        /// Saved search name
+        name: String,
+    },
+    /// Disable scheduling without clearing interval (enabled=off)
+    Disable {
         /// Saved search name
         name: String,
     },
@@ -3450,17 +3570,22 @@ fn format_saved_searches_plain(searches: &[wa_core::storage::SavedSearchRecord])
             .map(|count| count.to_string())
             .unwrap_or_else(|| "-".to_string());
         let enabled = if search.enabled { "on" } else { "off" };
+        let schedule = search
+            .schedule_interval_ms
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "-".to_string());
         let query = redact_for_output(&search.query);
         output.push_str(&format!(
-            "  - {}: query=\"{}\" pane={} limit={} since_mode={} last_run_at={} last_count={} enabled={}\n",
+            "  - {}: query=\"{}\" pane={} limit={} since_mode={} schedule_ms={} enabled={} last_run_at={} last_count={}\n",
             search.name,
             query,
             pane,
             search.limit,
             search.since_mode,
+            schedule,
+            enabled,
             last_run,
-            last_count,
-            enabled
+            last_count
         ));
         if let Some(err) = &search.last_error {
             output.push_str(&format!("    last_error: {err}\n"));
@@ -4194,6 +4319,30 @@ fn now_ms_i64() -> i64 {
         .map_or(0, |d| d.as_millis() as i64)
 }
 
+/// Parse a human-friendly duration string into milliseconds.
+///
+/// Supports: "30s", "5m", "1h", "7d", "2w". Returns `None` if the format is invalid.
+fn parse_duration_to_ms(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (num_str, suffix) = s.split_at(s.len().saturating_sub(1));
+    let value: i64 = num_str.parse().ok()?;
+    if value < 0 {
+        return None;
+    }
+    let multiplier: i64 = match suffix {
+        "s" => 1_000,
+        "m" => 60_000,
+        "h" => 3_600_000,
+        "d" => 86_400_000,
+        "w" => 604_800_000,
+        _ => return None,
+    };
+    value.checked_mul(multiplier)
+}
+
 fn resolve_prepare_output_format(format: &str) -> wa_core::output::OutputFormat {
     use wa_core::output::{OutputFormat, detect_format};
 
@@ -4472,17 +4621,168 @@ fn resolve_workflow(
     }
 }
 
-fn infer_workflow_action_type(step_name: &str) -> wa_core::dry_run::ActionType {
-    let name = step_name.to_lowercase();
-    if name.contains("send") {
-        wa_core::dry_run::ActionType::SendText
-    } else if name.contains("wait") || name.contains("stabilize") || name.contains("verify") {
-        wa_core::dry_run::ActionType::WaitFor
-    } else if name.contains("lock") {
-        wa_core::dry_run::ActionType::AcquireLock
-    } else {
-        wa_core::dry_run::ActionType::WorkflowStep
+/// Map a plan `StepAction` to the dry-run `ActionType`.
+///
+/// For `Custom` actions (the default from `steps_to_plans()`), infer the type
+/// from the action_type string which encodes `workflow_step:<step_name>`.
+fn step_action_to_dry_run_type(action: &wa_core::plan::StepAction) -> wa_core::dry_run::ActionType {
+    use wa_core::dry_run::ActionType;
+    use wa_core::plan::StepAction;
+    match action {
+        StepAction::SendText { .. } => ActionType::SendText,
+        StepAction::WaitFor { .. } => ActionType::WaitFor,
+        StepAction::AcquireLock { .. } => ActionType::AcquireLock,
+        StepAction::ReleaseLock { .. } => ActionType::ReleaseLock,
+        StepAction::StoreData { .. } => ActionType::StoreData,
+        StepAction::RunWorkflow { .. } => ActionType::WorkflowStep,
+        StepAction::MarkEventHandled { .. } => ActionType::MarkEventHandled,
+        StepAction::ValidateApproval { .. } => ActionType::ValidateApproval,
+        StepAction::NestedPlan { .. } => ActionType::WorkflowStep,
+        StepAction::Custom { action_type, .. } => infer_action_type_from_name(action_type),
     }
+}
+
+/// Infer a dry-run `ActionType` from a step/action name string.
+fn infer_action_type_from_name(name: &str) -> wa_core::dry_run::ActionType {
+    use wa_core::dry_run::ActionType;
+    let lower = name.to_lowercase();
+    if lower.contains("send") {
+        ActionType::SendText
+    } else if lower.contains("wait")
+        || lower.contains("stabilize")
+        || lower.contains("verify")
+        || lower.contains("check")
+    {
+        ActionType::WaitFor
+    } else if lower.contains("lock") {
+        ActionType::AcquireLock
+    } else if lower.contains("mark") && lower.contains("handled") {
+        ActionType::MarkEventHandled
+    } else {
+        ActionType::WorkflowStep
+    }
+}
+
+/// Extract metadata from a `StepPlan` for the dry-run report.
+fn step_plan_metadata(step: &wa_core::plan::StepPlan) -> serde_json::Value {
+    use wa_core::plan::StepAction;
+    let mut meta = serde_json::Map::new();
+
+    meta.insert(
+        "step_id".to_string(),
+        serde_json::Value::String(step.step_id.to_string()),
+    );
+    meta.insert(
+        "idempotent".to_string(),
+        serde_json::Value::Bool(step.idempotent),
+    );
+
+    if let Some(timeout_ms) = step.timeout_ms {
+        meta.insert(
+            "timeout_ms".to_string(),
+            serde_json::Value::Number(timeout_ms.into()),
+        );
+    }
+
+    if !step.preconditions.is_empty() {
+        meta.insert(
+            "precondition_count".to_string(),
+            serde_json::Value::Number(step.preconditions.len().into()),
+        );
+    }
+
+    if step.verification.is_some() {
+        meta.insert(
+            "has_verification".to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
+
+    // Action-specific metadata
+    match &step.action {
+        StepAction::SendText {
+            pane_id,
+            text,
+            paste_mode,
+        } => {
+            meta.insert("policy_gated".to_string(), serde_json::Value::Bool(true));
+            meta.insert(
+                "pane_id".to_string(),
+                serde_json::Value::Number((*pane_id).into()),
+            );
+            meta.insert(
+                "text_len".to_string(),
+                serde_json::Value::Number(text.len().into()),
+            );
+            // Show truncated preview (redacted at report level)
+            let preview = if text.len() > 60 {
+                format!("{}...", &text[..60])
+            } else {
+                text.clone()
+            };
+            meta.insert(
+                "text_preview".to_string(),
+                serde_json::Value::String(preview),
+            );
+            if let Some(paste) = paste_mode {
+                meta.insert("paste_mode".to_string(), serde_json::Value::Bool(*paste));
+            }
+        }
+        StepAction::WaitFor {
+            pane_id,
+            condition,
+            timeout_ms,
+        } => {
+            if let Some(pid) = pane_id {
+                meta.insert(
+                    "pane_id".to_string(),
+                    serde_json::Value::Number((*pid).into()),
+                );
+            }
+            meta.insert(
+                "wait_timeout_ms".to_string(),
+                serde_json::Value::Number((*timeout_ms).into()),
+            );
+            meta.insert(
+                "condition".to_string(),
+                serde_json::Value::String(condition.canonical_string()),
+            );
+        }
+        StepAction::AcquireLock {
+            lock_name,
+            timeout_ms,
+        } => {
+            meta.insert(
+                "lock_name".to_string(),
+                serde_json::Value::String(lock_name.clone()),
+            );
+            if let Some(t) = timeout_ms {
+                meta.insert(
+                    "lock_timeout_ms".to_string(),
+                    serde_json::Value::Number((*t).into()),
+                );
+            }
+        }
+        StepAction::ReleaseLock { lock_name } => {
+            meta.insert(
+                "lock_name".to_string(),
+                serde_json::Value::String(lock_name.clone()),
+            );
+        }
+        StepAction::Custom {
+            action_type,
+            payload,
+        } => {
+            meta.insert(
+                "custom_action_type".to_string(),
+                serde_json::Value::String(action_type.clone()),
+            );
+            meta.insert("custom_payload".to_string(), payload.clone());
+        }
+        _ => {}
+    }
+
+    serde_json::Value::Object(meta)
 }
 
 fn build_workflow_dry_run_report(
@@ -4583,10 +4883,11 @@ fn build_workflow_dry_run_report(
     );
     ctx.set_policy_evaluation(eval);
 
-    // Expected workflow steps
+    // Expected workflow steps — use structured StepPlans when available
     if let Some(wf) = workflow.as_ref() {
         let mut step = 1u32;
 
+        // Step 1: Acquire workflow lock
         ctx.add_action(PlannedAction::new(
             step,
             ActionType::AcquireLock,
@@ -4594,22 +4895,26 @@ fn build_workflow_dry_run_report(
         ));
         step += 1;
 
-        for workflow_step in wf.steps() {
-            let action_type = infer_workflow_action_type(&workflow_step.name);
-            let mut description = format!("{}: {}", workflow_step.name, workflow_step.description);
+        // Workflow body steps via structured StepPlan
+        let step_plans = wf.steps_to_plans(pane);
+        for sp in &step_plans {
+            let action_type = step_action_to_dry_run_type(&sp.action);
+            let mut description = sp.description.clone();
             if action_type == ActionType::SendText {
                 description.push_str(" [policy-gated]");
             }
-            let mut action = PlannedAction::new(step, action_type, description);
+            let mut meta = step_plan_metadata(sp);
             if action_type == ActionType::SendText {
-                action = action.with_metadata(serde_json::json!({
-                    "policy_gated": true,
-                }));
+                if let serde_json::Value::Object(ref mut map) = meta {
+                    map.insert("policy_gated".to_string(), serde_json::Value::Bool(true));
+                }
             }
+            let action = PlannedAction::new(step, action_type, description).with_metadata(meta);
             ctx.add_action(action);
             step += 1;
         }
 
+        // Mark event handled (if workflow has triggers)
         let trigger_event_types = wf.trigger_event_types();
         let trigger_rule_ids = wf.trigger_rule_ids();
         if !trigger_event_types.is_empty() || !trigger_rule_ids.is_empty() {
@@ -4629,6 +4934,7 @@ fn build_workflow_dry_run_report(
             step += 1;
         }
 
+        // Final step: Release lock
         ctx.add_action(PlannedAction::new(
             step,
             ActionType::ReleaseLock,
@@ -5731,6 +6037,7 @@ async fn run_watcher(
     };
     let storage = StorageHandle::with_config(&db_path, storage_config).await?;
     tracing::info!(db_path = %db_path, "Storage initialized");
+    let scheduler_storage = storage.clone();
 
     let patterns_root = config_path
         .and_then(|path| path.parent())
@@ -5987,6 +6294,19 @@ async fn run_watcher(
     let handle = Arc::new(runtime.start().await?);
     tracing::info!("Observation runtime started");
 
+    // Background scheduler for saved searches (scheduled alerts).
+    //
+    // Runs inside the watcher process and publishes synthetic PatternDetected
+    // events onto the EventBus so the existing notification pipeline can fire.
+    let _saved_search_scheduler_handle = {
+        let storage = scheduler_storage.clone();
+        let event_bus = Arc::clone(&event_bus);
+        let shutdown_flag = Arc::clone(&handle.shutdown_flag);
+        tokio::spawn(async move {
+            run_saved_search_scheduler(storage, event_bus, shutdown_flag).await;
+        })
+    };
+
     #[cfg(feature = "metrics")]
     let metrics_handle: Option<wa_core::metrics::MetricsServerHandle> = if config.metrics.enabled {
         let collector = wa_core::metrics::RuntimeMetricsCollector::new(Arc::clone(&handle));
@@ -6209,6 +6529,343 @@ async fn run_watcher(
     }
 
     Ok(())
+}
+
+async fn run_saved_search_scheduler(
+    storage: wa_core::storage::StorageHandle,
+    event_bus: Arc<wa_core::events::EventBus>,
+    shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::collections::HashMap;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    use wa_core::events::Event;
+    use wa_core::patterns::{AgentType, Detection, Severity};
+    use wa_core::policy::Redactor;
+    use wa_core::storage::{
+        SAVED_SEARCH_SINCE_MODE_FIXED, SAVED_SEARCH_SINCE_MODE_LAST_RUN, SavedSearchRecord,
+        SearchOptions, StoredEvent,
+    };
+
+    const DEFAULT_IDLE_SLEEP_MS: i64 = 5_000;
+    const MIN_SLEEP_MS: i64 = 250;
+    const MIN_SCHEDULE_INTERVAL_MS: i64 = 1_000;
+    const ALERT_MIN_INTERVAL_MS: i64 = 60_000;
+    const ERROR_BACKOFF_BASE_MS: i64 = 5_000;
+    const ERROR_BACKOFF_MAX_MS: i64 = 5 * 60_000;
+    const EVENT_DEDUPE_BUCKET_MS: i64 = 5 * 60_000;
+
+    fn epoch_ms() -> i64 {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        i64::try_from(ts.as_millis()).unwrap_or(0)
+    }
+
+    fn clamp_schedule_interval(ms: i64) -> i64 {
+        if ms <= 0 {
+            0
+        } else {
+            ms.max(MIN_SCHEDULE_INTERVAL_MS)
+        }
+    }
+
+    fn compute_since_ms(search: &SavedSearchRecord) -> Option<i64> {
+        if search.since_mode == SAVED_SEARCH_SINCE_MODE_FIXED {
+            search.since_ms
+        } else if search.since_mode == SAVED_SEARCH_SINCE_MODE_LAST_RUN {
+            search.last_run_at
+        } else {
+            // Unknown mode: fall back to last_run semantics.
+            search.last_run_at
+        }
+    }
+
+    fn compute_next_due_ms(now: i64, search: &SavedSearchRecord, interval_ms: i64) -> i64 {
+        let Some(last) = search.last_run_at else {
+            return now;
+        };
+        last.saturating_add(interval_ms)
+    }
+
+    fn backoff_ms_for_errors(consecutive_errors: u32) -> i64 {
+        // Exponential backoff capped at ERROR_BACKOFF_MAX_MS.
+        let shift = consecutive_errors.saturating_sub(1).min(8);
+        let factor: i64 = 1_i64.checked_shl(shift).unwrap_or(i64::MAX);
+        (ERROR_BACKOFF_BASE_MS.saturating_mul(factor)).min(ERROR_BACKOFF_MAX_MS)
+    }
+
+    fn to_usize_limit(value: i64) -> Option<usize> {
+        if value <= 0 {
+            return None;
+        }
+        usize::try_from(value).ok()
+    }
+
+    fn bounded_string(mut value: String, max_len: usize) -> String {
+        if value.len() > max_len {
+            value.truncate(max_len);
+        }
+        value
+    }
+
+    let redactor = Redactor::new();
+    let mut consecutive_errors_by_id: HashMap<String, u32> = HashMap::new();
+    let mut next_allowed_run_at_by_id: HashMap<String, i64> = HashMap::new();
+    let mut last_alert_at_by_id: HashMap<String, i64> = HashMap::new();
+
+    loop {
+        if shutdown_flag.load(Ordering::SeqCst) {
+            break;
+        }
+
+        let now = epoch_ms();
+
+        let searches = match storage.list_saved_searches().await {
+            Ok(searches) => searches,
+            Err(err) => {
+                tracing::warn!(error = %err, "Saved search scheduler: failed to list searches");
+                tokio::select! {
+                    () = tokio::time::sleep(Duration::from_secs(1)) => {}
+                    () = wait_for_shutdown(Arc::clone(&shutdown_flag)) => break,
+                }
+                continue;
+            }
+        };
+
+        let mut any_scheduled = false;
+        let mut next_wake_at = now.saturating_add(DEFAULT_IDLE_SLEEP_MS);
+
+        for search in searches {
+            if shutdown_flag.load(Ordering::SeqCst) {
+                break;
+            }
+            let search_id = search.id.clone();
+            let search_name = search.name.clone();
+            let search_query = search.query.clone();
+            if !search.enabled {
+                continue;
+            }
+
+            let Some(raw_interval_ms) = search.schedule_interval_ms else {
+                continue;
+            };
+
+            let interval_ms = clamp_schedule_interval(raw_interval_ms);
+            if interval_ms == 0 {
+                continue;
+            }
+
+            any_scheduled = true;
+
+            // Backoff gate (typically for invalid query / persistent DB errors).
+            let next_allowed_run_at = next_allowed_run_at_by_id
+                .get(&search_id)
+                .copied()
+                .unwrap_or(0);
+            if next_allowed_run_at > now {
+                next_wake_at = next_wake_at.min(next_allowed_run_at);
+                continue;
+            }
+
+            let due_at = compute_next_due_ms(now, &search, interval_ms);
+            if due_at > now {
+                next_wake_at = next_wake_at.min(due_at);
+                continue;
+            }
+
+            let since_ms = compute_since_ms(&search);
+            let mut options = SearchOptions::default();
+            options.pane_id = search.pane_id;
+            options.since = since_ms;
+            options.limit = to_usize_limit(search.limit);
+            options.include_snippets = Some(true);
+            options.snippet_max_tokens = Some(64);
+
+            let results = match storage.search_with_results(&search.query, options).await {
+                Ok(results) => {
+                    consecutive_errors_by_id.remove(&search_id);
+                    next_allowed_run_at_by_id.remove(&search_id);
+                    results
+                }
+                Err(err) => {
+                    let entry = consecutive_errors_by_id
+                        .entry(search_id.clone())
+                        .or_insert(0);
+                    *entry = entry.saturating_add(1);
+                    let backoff_ms = backoff_ms_for_errors(*entry);
+                    let next_allowed = now.saturating_add(backoff_ms);
+                    next_allowed_run_at_by_id.insert(search_id.clone(), next_allowed);
+                    next_wake_at = next_wake_at.min(next_allowed);
+
+                    let message = bounded_string(err.to_string(), 600);
+                    if let Err(update_err) = storage
+                        .update_saved_search_run(&search_id, now, None, Some(message.clone()))
+                        .await
+                    {
+                        tracing::warn!(
+                            search = %search_name,
+                            error = %update_err,
+                            "Saved search scheduler: failed to persist last_error"
+                        );
+                    }
+
+                    tracing::warn!(
+                        search = %search_name,
+                        error = %message,
+                        backoff_ms,
+                        "Saved search scheduler: search execution failed; backing off"
+                    );
+                    continue;
+                }
+            };
+
+            #[allow(clippy::cast_possible_truncation)]
+            let match_count: i64 = results.len() as i64;
+
+            if let Err(update_err) = storage
+                .update_saved_search_run(&search_id, now, Some(match_count), None)
+                .await
+            {
+                tracing::warn!(
+                    search = %search_name,
+                    error = %update_err,
+                    "Saved search scheduler: failed to persist run metadata"
+                );
+            }
+
+            if match_count <= 0 {
+                continue;
+            }
+
+            // Enforce a simple alert cooldown per saved search to avoid notification storms.
+            let last_alert_at = last_alert_at_by_id.get(&search_id).copied().unwrap_or(0);
+            if now.saturating_sub(last_alert_at) < ALERT_MIN_INTERVAL_MS {
+                continue;
+            }
+            last_alert_at_by_id.insert(search_id.clone(), now);
+
+            // For unscoped searches, bind the alert to the first match's pane.
+            let pane_id_for_event = search
+                .pane_id
+                .or_else(|| results.first().map(|r| r.segment.pane_id))
+                .unwrap_or(0);
+
+            let scope = search
+                .pane_id
+                .map_or_else(|| "all panes".to_string(), |pid| format!("pane {pid}"));
+
+            let snippet = results
+                .first()
+                .and_then(|r| r.snippet.as_deref())
+                .map(|s| bounded_string(redactor.redact(s), 280))
+                .filter(|s| !s.trim().is_empty());
+
+            let extracted = {
+                let mut map = serde_json::Map::new();
+                map.insert(
+                    "search_name".to_string(),
+                    serde_json::Value::String(search_name),
+                );
+                map.insert(
+                    "query".to_string(),
+                    serde_json::Value::String(bounded_string(redactor.redact(&search_query), 400)),
+                );
+                map.insert("scope".to_string(), serde_json::Value::String(scope));
+                map.insert(
+                    "match_count".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(match_count)),
+                );
+                if let Some(value) = snippet {
+                    map.insert("snippet".to_string(), serde_json::Value::String(value));
+                }
+                serde_json::Value::Object(map)
+            };
+
+            let detection = Detection {
+                rule_id: "wezterm.saved_search.alert".to_string(),
+                agent_type: AgentType::Wezterm,
+                event_type: "saved_search.alert".to_string(),
+                severity: Severity::Info,
+                confidence: 1.0,
+                extracted,
+                matched_text: String::new(),
+                span: (0, 0),
+            };
+
+            let bucket = if EVENT_DEDUPE_BUCKET_MS > 0 {
+                now / EVENT_DEDUPE_BUCKET_MS
+            } else {
+                0
+            };
+            let dedupe_key = format!("ss_alert:{search_id}:{bucket}");
+
+            let stored_event = StoredEvent {
+                id: 0,
+                pane_id: pane_id_for_event,
+                rule_id: detection.rule_id.clone(),
+                agent_type: detection.agent_type.to_string(),
+                event_type: detection.event_type.clone(),
+                severity: "info".to_string(),
+                confidence: detection.confidence,
+                extracted: Some(detection.extracted.clone()),
+                matched_text: None,
+                segment_id: results.first().map(|r| r.segment.id),
+                detected_at: now,
+                dedupe_key: Some(dedupe_key),
+                handled_at: None,
+                handled_by_workflow_id: None,
+                handled_status: None,
+            };
+
+            let event_id = match storage.record_event(stored_event).await {
+                Ok(id) => id,
+                Err(err) => {
+                    tracing::warn!(
+                        pane_id = pane_id_for_event,
+                        search = %search_id,
+                        error = %err,
+                        "Saved search scheduler: failed to record alert event"
+                    );
+                    continue;
+                }
+            };
+
+            let delivered = event_bus.publish(Event::PatternDetected {
+                pane_id: pane_id_for_event,
+                pane_uuid: None,
+                detection,
+                event_id: Some(event_id),
+            });
+            if delivered == 0 {
+                tracing::debug!(
+                    pane_id = pane_id_for_event,
+                    search = %search_id,
+                    "Saved search scheduler: alert published but no subscribers"
+                );
+            }
+
+            // Aim for fairness: after doing work, wake quickly to consider other due searches.
+            next_wake_at = next_wake_at.min(now.saturating_add(MIN_SLEEP_MS));
+        }
+
+        let now = epoch_ms();
+        let mut sleep_ms = if any_scheduled {
+            next_wake_at.saturating_sub(now)
+        } else {
+            DEFAULT_IDLE_SLEEP_MS
+        };
+        sleep_ms = sleep_ms.max(MIN_SLEEP_MS);
+        let sleep_ms_u64 = u64::try_from(sleep_ms).unwrap_or(1_000);
+
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_millis(sleep_ms_u64)) => {}
+            () = wait_for_shutdown(Arc::clone(&shutdown_flag)) => break,
+        }
+    }
+
+    tracing::info!("Saved search scheduler stopped");
 }
 
 async fn run_scheduled_backups(
@@ -9631,6 +10288,383 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             }
                         }
                     }
+                    SavedSearchCommands::Schedule { name, interval_ms } => {
+                        if interval_ms < 1000 {
+                            if output_format.is_json() {
+                                println!(
+                                    r#"{{"ok": false, "error": "interval_ms must be >= 1000", "version": "{}"}}"#,
+                                    wa_core::VERSION
+                                );
+                            } else {
+                                eprintln!("Error: interval_ms must be >= 1000");
+                            }
+                            std::process::exit(1);
+                        }
+
+                        let saved = match storage.get_saved_search_by_name(&name).await {
+                            Ok(Some(search)) => search,
+                            Ok(None) => {
+                                if output_format.is_json() {
+                                    println!(
+                                        r#"{{"ok": false, "error": "Saved search not found: {}", "version": "{}"}}"#,
+                                        name,
+                                        wa_core::VERSION
+                                    );
+                                } else {
+                                    eprintln!("Error: Saved search not found: {name}");
+                                }
+                                std::process::exit(1);
+                            }
+                            Err(e) => {
+                                if output_format.is_json() {
+                                    println!(
+                                        r#"{{"ok": false, "error": "Failed to load saved search: {}", "version": "{}"}}"#,
+                                        e,
+                                        wa_core::VERSION
+                                    );
+                                } else {
+                                    eprintln!("Error: Failed to load saved search: {e}");
+                                }
+                                std::process::exit(1);
+                            }
+                        };
+
+                        if let Err(e) = storage
+                            .update_saved_search_schedule(&saved.id, true, Some(interval_ms))
+                            .await
+                        {
+                            if output_format.is_json() {
+                                println!(
+                                    r#"{{"ok": false, "error": "Failed to update schedule: {}", "version": "{}"}}"#,
+                                    e,
+                                    wa_core::VERSION
+                                );
+                            } else {
+                                eprintln!("Error: Failed to update schedule: {e}");
+                            }
+                            std::process::exit(1);
+                        }
+
+                        let updated = match storage.get_saved_search_by_name(&name).await {
+                            Ok(Some(search)) => search,
+                            Ok(None) => {
+                                if output_format.is_json() {
+                                    println!(
+                                        r#"{{"ok": false, "error": "Saved search not found: {}", "version": "{}"}}"#,
+                                        name,
+                                        wa_core::VERSION
+                                    );
+                                } else {
+                                    eprintln!("Error: Saved search not found: {name}");
+                                }
+                                std::process::exit(1);
+                            }
+                            Err(e) => {
+                                if output_format.is_json() {
+                                    println!(
+                                        r#"{{"ok": false, "error": "Failed to load saved search: {}", "version": "{}"}}"#,
+                                        e,
+                                        wa_core::VERSION
+                                    );
+                                } else {
+                                    eprintln!("Error: Failed to load saved search: {e}");
+                                }
+                                std::process::exit(1);
+                            }
+                        };
+                        if output_format.is_json() {
+                            let payload = serde_json::json!({
+                                "ok": true,
+                                "saved_search": updated,
+                                "version": wa_core::VERSION,
+                            });
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&payload).unwrap_or_default()
+                            );
+                        } else {
+                            println!("Scheduled saved search '{name}' every {interval_ms}ms.");
+                        }
+                    }
+                    SavedSearchCommands::Unschedule { name } => {
+                        let saved = match storage.get_saved_search_by_name(&name).await {
+                            Ok(Some(search)) => search,
+                            Ok(None) => {
+                                if output_format.is_json() {
+                                    println!(
+                                        r#"{{"ok": false, "error": "Saved search not found: {}", "version": "{}"}}"#,
+                                        name,
+                                        wa_core::VERSION
+                                    );
+                                } else {
+                                    eprintln!("Error: Saved search not found: {name}");
+                                }
+                                std::process::exit(1);
+                            }
+                            Err(e) => {
+                                if output_format.is_json() {
+                                    println!(
+                                        r#"{{"ok": false, "error": "Failed to load saved search: {}", "version": "{}"}}"#,
+                                        e,
+                                        wa_core::VERSION
+                                    );
+                                } else {
+                                    eprintln!("Error: Failed to load saved search: {e}");
+                                }
+                                std::process::exit(1);
+                            }
+                        };
+
+                        if let Err(e) = storage
+                            .update_saved_search_schedule(&saved.id, false, None)
+                            .await
+                        {
+                            if output_format.is_json() {
+                                println!(
+                                    r#"{{"ok": false, "error": "Failed to update schedule: {}", "version": "{}"}}"#,
+                                    e,
+                                    wa_core::VERSION
+                                );
+                            } else {
+                                eprintln!("Error: Failed to update schedule: {e}");
+                            }
+                            std::process::exit(1);
+                        }
+
+                        let updated = match storage.get_saved_search_by_name(&name).await {
+                            Ok(Some(search)) => search,
+                            Ok(None) => {
+                                if output_format.is_json() {
+                                    println!(
+                                        r#"{{"ok": false, "error": "Saved search not found: {}", "version": "{}"}}"#,
+                                        name,
+                                        wa_core::VERSION
+                                    );
+                                } else {
+                                    eprintln!("Error: Saved search not found: {name}");
+                                }
+                                std::process::exit(1);
+                            }
+                            Err(e) => {
+                                if output_format.is_json() {
+                                    println!(
+                                        r#"{{"ok": false, "error": "Failed to load saved search: {}", "version": "{}"}}"#,
+                                        e,
+                                        wa_core::VERSION
+                                    );
+                                } else {
+                                    eprintln!("Error: Failed to load saved search: {e}");
+                                }
+                                std::process::exit(1);
+                            }
+                        };
+                        if output_format.is_json() {
+                            let payload = serde_json::json!({
+                                "ok": true,
+                                "saved_search": updated,
+                                "version": wa_core::VERSION,
+                            });
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&payload).unwrap_or_default()
+                            );
+                        } else {
+                            println!("Unscheduled saved search '{name}'.");
+                        }
+                    }
+                    SavedSearchCommands::Enable { name } => {
+                        let saved = match storage.get_saved_search_by_name(&name).await {
+                            Ok(Some(search)) => search,
+                            Ok(None) => {
+                                if output_format.is_json() {
+                                    println!(
+                                        r#"{{"ok": false, "error": "Saved search not found: {}", "version": "{}"}}"#,
+                                        name,
+                                        wa_core::VERSION
+                                    );
+                                } else {
+                                    eprintln!("Error: Saved search not found: {name}");
+                                }
+                                std::process::exit(1);
+                            }
+                            Err(e) => {
+                                if output_format.is_json() {
+                                    println!(
+                                        r#"{{"ok": false, "error": "Failed to load saved search: {}", "version": "{}"}}"#,
+                                        e,
+                                        wa_core::VERSION
+                                    );
+                                } else {
+                                    eprintln!("Error: Failed to load saved search: {e}");
+                                }
+                                std::process::exit(1);
+                            }
+                        };
+
+                        let interval = match saved.schedule_interval_ms {
+                            Some(v) => v,
+                            None => {
+                                if output_format.is_json() {
+                                    println!(
+                                        r#"{{"ok": false, "error": "Saved search has no schedule interval; use 'wa search saved schedule'.", "version": "{}"}}"#,
+                                        wa_core::VERSION
+                                    );
+                                } else {
+                                    eprintln!(
+                                        "Error: Saved search has no schedule interval; use 'wa search saved schedule'."
+                                    );
+                                }
+                                std::process::exit(1);
+                            }
+                        };
+
+                        if let Err(e) = storage
+                            .update_saved_search_schedule(&saved.id, true, Some(interval))
+                            .await
+                        {
+                            if output_format.is_json() {
+                                println!(
+                                    r#"{{"ok": false, "error": "Failed to update schedule: {}", "version": "{}"}}"#,
+                                    e,
+                                    wa_core::VERSION
+                                );
+                            } else {
+                                eprintln!("Error: Failed to update schedule: {e}");
+                            }
+                            std::process::exit(1);
+                        }
+
+                        let updated = match storage.get_saved_search_by_name(&name).await {
+                            Ok(Some(search)) => search,
+                            Ok(None) => {
+                                if output_format.is_json() {
+                                    println!(
+                                        r#"{{"ok": false, "error": "Saved search not found: {}", "version": "{}"}}"#,
+                                        name,
+                                        wa_core::VERSION
+                                    );
+                                } else {
+                                    eprintln!("Error: Saved search not found: {name}");
+                                }
+                                std::process::exit(1);
+                            }
+                            Err(e) => {
+                                if output_format.is_json() {
+                                    println!(
+                                        r#"{{"ok": false, "error": "Failed to load saved search: {}", "version": "{}"}}"#,
+                                        e,
+                                        wa_core::VERSION
+                                    );
+                                } else {
+                                    eprintln!("Error: Failed to load saved search: {e}");
+                                }
+                                std::process::exit(1);
+                            }
+                        };
+                        if output_format.is_json() {
+                            let payload = serde_json::json!({
+                                "ok": true,
+                                "saved_search": updated,
+                                "version": wa_core::VERSION,
+                            });
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&payload).unwrap_or_default()
+                            );
+                        } else {
+                            println!("Enabled scheduling for saved search '{name}'.");
+                        }
+                    }
+                    SavedSearchCommands::Disable { name } => {
+                        let saved = match storage.get_saved_search_by_name(&name).await {
+                            Ok(Some(search)) => search,
+                            Ok(None) => {
+                                if output_format.is_json() {
+                                    println!(
+                                        r#"{{"ok": false, "error": "Saved search not found: {}", "version": "{}"}}"#,
+                                        name,
+                                        wa_core::VERSION
+                                    );
+                                } else {
+                                    eprintln!("Error: Saved search not found: {name}");
+                                }
+                                std::process::exit(1);
+                            }
+                            Err(e) => {
+                                if output_format.is_json() {
+                                    println!(
+                                        r#"{{"ok": false, "error": "Failed to load saved search: {}", "version": "{}"}}"#,
+                                        e,
+                                        wa_core::VERSION
+                                    );
+                                } else {
+                                    eprintln!("Error: Failed to load saved search: {e}");
+                                }
+                                std::process::exit(1);
+                            }
+                        };
+
+                        if let Err(e) = storage
+                            .update_saved_search_schedule(
+                                &saved.id,
+                                false,
+                                saved.schedule_interval_ms,
+                            )
+                            .await
+                        {
+                            if output_format.is_json() {
+                                println!(
+                                    r#"{{"ok": false, "error": "Failed to update schedule: {}", "version": "{}"}}"#,
+                                    e,
+                                    wa_core::VERSION
+                                );
+                            } else {
+                                eprintln!("Error: Failed to update schedule: {e}");
+                            }
+                            std::process::exit(1);
+                        }
+
+                        let updated = match storage.get_saved_search_by_name(&name).await {
+                            Ok(Some(search)) => search,
+                            Ok(None) => {
+                                if output_format.is_json() {
+                                    println!(
+                                        r#"{{"ok": false, "error": "Saved search not found: {}", "version": "{}"}}"#,
+                                        name,
+                                        wa_core::VERSION
+                                    );
+                                } else {
+                                    eprintln!("Error: Saved search not found: {name}");
+                                }
+                                std::process::exit(1);
+                            }
+                            Err(e) => {
+                                if output_format.is_json() {
+                                    println!(
+                                        r#"{{"ok": false, "error": "Failed to load saved search: {}", "version": "{}"}}"#,
+                                        e,
+                                        wa_core::VERSION
+                                    );
+                                } else {
+                                    eprintln!("Error: Failed to load saved search: {e}");
+                                }
+                                std::process::exit(1);
+                            }
+                        };
+                        if output_format.is_json() {
+                            let payload = serde_json::json!({
+                                "ok": true,
+                                "saved_search": updated,
+                                "version": wa_core::VERSION,
+                            });
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&payload).unwrap_or_default()
+                            );
+                        } else {
+                            println!("Disabled scheduling for saved search '{name}'.");
+                        }
+                    }
                     SavedSearchCommands::Delete { name } => {
                         match storage.delete_saved_search(&name).await {
                             Ok(deleted) => {
@@ -9802,6 +10836,83 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 }
             }
         }
+
+        Some(Commands::Panes { command }) => match command {
+            PanesCommands::Priority {
+                pane_id,
+                weight,
+                ttl_secs,
+                clear,
+                json,
+            } => {
+                #[cfg(unix)]
+                {
+                    let client = wa_core::ipc::IpcClient::new(&layout.ipc_socket_path);
+
+                    let response = if clear {
+                        client.clear_pane_priority(pane_id).await
+                    } else {
+                        let Some(weight) = weight else {
+                            eprintln!("Error: missing --weight (or use --clear)");
+                            std::process::exit(2);
+                        };
+                        let ttl_ms = ttl_secs.saturating_mul(1000);
+                        client
+                            .set_pane_priority(pane_id, weight, Some(ttl_ms))
+                            .await
+                    };
+
+                    match response {
+                        Ok(response) => {
+                            if json {
+                                println!("{}", serde_json::to_string_pretty(&response)?);
+                            } else if response.ok {
+                                if clear {
+                                    println!("Cleared pane {pane_id} priority override");
+                                } else {
+                                    let Some(weight) = weight else {
+                                        // Should be unreachable due to earlier validation.
+                                        eprintln!("Error: missing --weight");
+                                        std::process::exit(2);
+                                    };
+                                    if ttl_secs == 0 {
+                                        println!(
+                                            "Set pane {pane_id} priority override to {weight} (until cleared)"
+                                        );
+                                    } else {
+                                        println!(
+                                            "Set pane {pane_id} priority override to {weight} (ttl {ttl_secs}s)"
+                                        );
+                                    }
+                                }
+                            } else {
+                                eprintln!(
+                                    "Error: {}",
+                                    response
+                                        .error
+                                        .clone()
+                                        .unwrap_or_else(|| "request failed".to_string())
+                                );
+                                if let Some(hint) = response.hint {
+                                    eprintln!("Hint: {hint}");
+                                }
+                                std::process::exit(1);
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!("Error: {err}");
+                            eprintln!("Hint: start the watcher with `wa watch` in this workspace.");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    eprintln!("Error: IPC is not supported on this platform");
+                    std::process::exit(1);
+                }
+            }
+        },
 
         Some(Commands::Show { pane_id, output }) => {
             tracing::info!("Showing pane {} (output={})", pane_id, output);
@@ -10180,6 +11291,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     let command_ctx = wa_core::dry_run::CommandContext::new(command, dry_run);
 
                     if command_ctx.is_dry_run() {
+                        use wa_core::output::{OutputFormat, detect_format};
+
+                        let output_format = detect_format();
+                        let emit_json = matches!(output_format, OutputFormat::Json)
+                            || (matches!(output_format, OutputFormat::Auto)
+                                && !std::io::stdout().is_terminal());
+
                         let wezterm = wa_core::wezterm::default_wezterm_handle();
                         let pane_info = wezterm.get_pane(pane).await.ok();
                         let report = build_workflow_dry_run_report(
@@ -10189,7 +11307,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             pane_info.as_ref(),
                             &config,
                         );
-                        println!("{}", wa_core::dry_run::format_human(&report));
+                        if emit_json {
+                            println!("{}", serde_json::to_string_pretty(&report.redacted())?);
+                        } else {
+                            println!("{}", wa_core::dry_run::format_human(&report));
+                        }
                     } else {
                         use std::sync::Arc;
                         use wa_core::policy::{PolicyEngine, PolicyGatedInjector};
@@ -12698,6 +13820,185 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             handle_notify_command(command, &config).await?;
         }
 
+        Some(Commands::Mute { command }) => {
+            use wa_core::output::OutputFormat;
+            use wa_core::storage::EventMuteRecord;
+
+            let layout = match config.workspace_layout(Some(&workspace_root)) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("Error: Failed to get workspace layout: {e}");
+                    eprintln!("Check --workspace or WA_WORKSPACE");
+                    std::process::exit(1);
+                }
+            };
+
+            let db_path = layout.db_path.to_string_lossy();
+            let storage = match wa_core::storage::StorageHandle::new(&db_path).await {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error: Failed to open storage: {e}");
+                    eprintln!("Is the database initialized? Run 'wa watch' first.");
+                    std::process::exit(1);
+                }
+            };
+
+            match command {
+                MuteCommands::Add {
+                    identity_key,
+                    r#for: duration,
+                    scope,
+                    reason,
+                    format,
+                } => {
+                    let fmt = resolve_prepare_output_format(&format);
+                    let now = now_ms_i64();
+                    let expires_at = match duration {
+                        Some(ref dur) => match parse_duration_to_ms(dur) {
+                            Some(ms) => Some(now + ms),
+                            None => {
+                                eprintln!(
+                                    "Error: Invalid duration '{dur}'. Use e.g. 30s, 5m, 1h, 7d, 2w."
+                                );
+                                std::process::exit(1);
+                            }
+                        },
+                        None => None,
+                    };
+
+                    let record = EventMuteRecord {
+                        identity_key: identity_key.clone(),
+                        scope: scope.clone(),
+                        created_at: now,
+                        expires_at,
+                        created_by: Some("cli".to_string()),
+                        reason: reason.clone(),
+                    };
+
+                    if let Err(e) = storage.add_event_mute(record).await {
+                        eprintln!("Error: Failed to add mute: {e}");
+                        std::process::exit(1);
+                    }
+
+                    match fmt {
+                        OutputFormat::Json => {
+                            let obj = serde_json::json!({
+                                "status": "muted",
+                                "identity_key": identity_key,
+                                "scope": scope,
+                                "expires_at": expires_at,
+                                "reason": reason,
+                            });
+                            println!("{}", serde_json::to_string_pretty(&obj).unwrap());
+                        }
+                        _ => {
+                            let expiry_desc = match expires_at {
+                                Some(ts) => format!("until epoch ms {ts}"),
+                                None => "permanently".to_string(),
+                            };
+                            println!("Muted event key '{identity_key}' ({scope}) {expiry_desc}");
+                            if let Some(ref r) = reason {
+                                println!("Reason: {r}");
+                            }
+                        }
+                    }
+                }
+
+                MuteCommands::Remove {
+                    identity_key,
+                    format,
+                } => {
+                    let fmt = resolve_prepare_output_format(&format);
+
+                    match storage.remove_event_mute(&identity_key).await {
+                        Ok(removed) => match fmt {
+                            OutputFormat::Json => {
+                                let obj = serde_json::json!({
+                                    "status": if removed { "removed" } else { "not_found" },
+                                    "identity_key": identity_key,
+                                });
+                                println!("{}", serde_json::to_string_pretty(&obj).unwrap());
+                            }
+                            _ => {
+                                if removed {
+                                    println!("Unmuted event key '{identity_key}'");
+                                } else {
+                                    println!("No active mute found for '{identity_key}'");
+                                }
+                            }
+                        },
+                        Err(e) => {
+                            eprintln!("Error: Failed to remove mute: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+
+                MuteCommands::List { format } => {
+                    let fmt = resolve_prepare_output_format(&format);
+                    let now = now_ms_i64();
+
+                    match storage.list_active_mutes(now).await {
+                        Ok(mutes) => match fmt {
+                            OutputFormat::Json => {
+                                let arr: Vec<serde_json::Value> = mutes
+                                    .iter()
+                                    .map(|m| {
+                                        serde_json::json!({
+                                            "identity_key": m.identity_key,
+                                            "scope": m.scope,
+                                            "created_at": m.created_at,
+                                            "expires_at": m.expires_at,
+                                            "created_by": m.created_by,
+                                            "reason": m.reason,
+                                        })
+                                    })
+                                    .collect();
+                                println!("{}", serde_json::to_string_pretty(&arr).unwrap());
+                            }
+                            _ => {
+                                if mutes.is_empty() {
+                                    println!("No active mutes.");
+                                } else {
+                                    println!(
+                                        "{:<44}  {:<12}  {:<14}  {}",
+                                        "IDENTITY KEY", "SCOPE", "EXPIRES", "REASON"
+                                    );
+                                    for m in &mutes {
+                                        let expires = match m.expires_at {
+                                            Some(ts) => {
+                                                let remaining_s = (ts - now) / 1000;
+                                                if remaining_s < 60 {
+                                                    format!("{remaining_s}s")
+                                                } else if remaining_s < 3600 {
+                                                    format!("{}m", remaining_s / 60)
+                                                } else if remaining_s < 86400 {
+                                                    format!("{}h", remaining_s / 3600)
+                                                } else {
+                                                    format!("{}d", remaining_s / 86400)
+                                                }
+                                            }
+                                            None => "permanent".to_string(),
+                                        };
+                                        let reason = m.reason.as_deref().unwrap_or("-");
+                                        println!(
+                                            "{:<44}  {:<12}  {:<14}  {}",
+                                            m.identity_key, m.scope, expires, reason
+                                        );
+                                    }
+                                    println!("\n{} active mute(s)", mutes.len());
+                                }
+                            }
+                        },
+                        Err(e) => {
+                            eprintln!("Error: Failed to list mutes: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
+        }
+
         Some(Commands::Secrets { command }) => {
             use wa_core::output::{OutputFormat, detect_format};
             use wa_core::secrets::{
@@ -14883,7 +16184,7 @@ fn render_secret_scan_report(
             };
             println!("{output}");
         }
-        wa_core::output::OutputFormat::Plain => {
+        wa_core::output::OutputFormat::Plain | wa_core::output::OutputFormat::Auto => {
             render_secret_scan_report_plain(report);
         }
     }
@@ -17039,7 +18340,7 @@ async fn handle_notify_command(
 
             let detection = build_notify_test_detection(&event_type, agent_type, severity);
             let pane_id = 0;
-            let decision = gate.should_notify(&detection, pane_id);
+            let decision = gate.should_notify(&detection, pane_id, None);
             let suppressed_since_last = match decision {
                 NotifyDecision::Send {
                     suppressed_since_last,
@@ -19712,6 +21013,141 @@ log_level = "debug"
             .and_then(|policy| policy.checks.iter().find(|check| check.name == "workflow"));
         assert!(workflow_check.is_some());
         assert!(!workflow_check.unwrap().passed);
+    }
+
+    #[test]
+    fn workflow_dry_run_report_step_metadata_includes_step_id() {
+        let command_ctx = wa_core::dry_run::CommandContext::new("workflow run", true);
+        let config = wa_core::config::Config::default();
+        let report =
+            build_workflow_dry_run_report(&command_ctx, "handle_compaction", 42, None, &config);
+
+        // Workflow body steps (not lock/unlock) should have metadata with a step_id
+        let body_steps: Vec<_> = report
+            .expected_actions
+            .iter()
+            .filter(|a| {
+                a.action_type != wa_core::dry_run::ActionType::AcquireLock
+                    && a.action_type != wa_core::dry_run::ActionType::ReleaseLock
+                    && a.action_type != wa_core::dry_run::ActionType::MarkEventHandled
+            })
+            .collect();
+        assert!(!body_steps.is_empty(), "should have workflow body steps");
+        for action in &body_steps {
+            let meta = action
+                .metadata
+                .as_ref()
+                .expect("body step metadata should be present");
+            assert!(meta["step_id"].is_string(), "step_id should be a string");
+            assert!(
+                meta.get("idempotent").is_some(),
+                "idempotent field should be present"
+            );
+        }
+    }
+
+    #[test]
+    fn workflow_dry_run_report_has_lock_and_release() {
+        let command_ctx = wa_core::dry_run::CommandContext::new("workflow run", true);
+        let config = wa_core::config::Config::default();
+        let report =
+            build_workflow_dry_run_report(&command_ctx, "handle_compaction", 7, None, &config);
+
+        // First action must be AcquireLock
+        assert_eq!(
+            report.expected_actions.first().unwrap().action_type,
+            wa_core::dry_run::ActionType::AcquireLock
+        );
+        // Last action must be ReleaseLock
+        assert_eq!(
+            report.expected_actions.last().unwrap().action_type,
+            wa_core::dry_run::ActionType::ReleaseLock
+        );
+    }
+
+    #[test]
+    fn workflow_dry_run_report_json_roundtrip() {
+        let command_ctx = wa_core::dry_run::CommandContext::new("workflow run", true);
+        let config = wa_core::config::Config::default();
+        let report =
+            build_workflow_dry_run_report(&command_ctx, "handle_compaction", 7, None, &config);
+
+        // JSON serialization should succeed
+        let json_str =
+            wa_core::dry_run::format_json(&report).expect("JSON serialization should succeed");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json_str).expect("should be valid JSON");
+
+        assert!(parsed.get("command").is_some());
+        assert!(parsed.get("expected_actions").is_some());
+        let actions = parsed["expected_actions"].as_array().unwrap();
+        assert!(!actions.is_empty());
+    }
+
+    #[test]
+    fn workflow_dry_run_report_triggers_shown_for_claude_code_limits() {
+        let command_ctx = wa_core::dry_run::CommandContext::new("workflow run", true);
+        let config = wa_core::config::Config::default();
+        let report = build_workflow_dry_run_report(
+            &command_ctx,
+            "handle_claude_code_limits",
+            7,
+            None,
+            &config,
+        );
+
+        // handle_claude_code_limits has trigger_event_types; should show MarkEventHandled
+        let mark_actions: Vec<_> = report
+            .expected_actions
+            .iter()
+            .filter(|a| a.action_type == wa_core::dry_run::ActionType::MarkEventHandled)
+            .collect();
+        assert!(
+            !mark_actions.is_empty(),
+            "should show MarkEventHandled for trigger events"
+        );
+        assert!(mark_actions[0].description.contains("usage"));
+    }
+
+    #[test]
+    fn workflow_dry_run_report_usage_limits_steps() {
+        let command_ctx = wa_core::dry_run::CommandContext::new("workflow run", true);
+        let config = wa_core::config::Config::default();
+        let report =
+            build_workflow_dry_run_report(&command_ctx, "handle_usage_limits", 10, None, &config);
+
+        // Should have steps (lock + workflow steps + release)
+        assert!(
+            report.expected_actions.len() >= 3,
+            "usage limits workflow should have at least 3 actions"
+        );
+
+        // Workflow check should pass
+        let workflow_check = report
+            .policy_evaluation
+            .as_ref()
+            .and_then(|p| p.checks.iter().find(|c| c.name == "workflow"));
+        assert!(workflow_check.unwrap().passed);
+    }
+
+    #[test]
+    fn workflow_dry_run_human_format_completeness() {
+        let command_ctx = wa_core::dry_run::CommandContext::new("workflow run", true);
+        let config = wa_core::config::Config::default();
+        let report =
+            build_workflow_dry_run_report(&command_ctx, "handle_compaction", 7, None, &config);
+
+        let formatted = wa_core::dry_run::format_human(&report);
+
+        // Human format should include key sections
+        assert!(formatted.contains("DRY RUN"));
+        assert!(formatted.contains("Command:"));
+        assert!(formatted.contains("Policy Evaluation:"));
+        assert!(formatted.contains("Expected Actions:"));
+        assert!(formatted.contains("[send-text]"));
+        assert!(formatted.contains("[acquire-lock]"));
+        assert!(formatted.contains("[release-lock]"));
+        assert!(formatted.contains("remove --dry-run"));
     }
 
     #[cfg(unix)]
@@ -22815,5 +24251,399 @@ log_level = "debug"
         config.distributed.token = None;
         let check = distributed_security_check(&config);
         assert_eq!(check.status, DiagnosticStatus::Error);
+    }
+
+    // -------------------------------------------------------------------------
+    // Saved Search Scheduler Tests (bd-3iar)
+    // -------------------------------------------------------------------------
+
+    fn secret_token() -> &'static str {
+        // Long enough to trigger Redactor sk- pattern.
+        "sk-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+
+    async fn wait_for_saved_search_error(
+        storage: &StorageHandle,
+        name: &str,
+        timeout: std::time::Duration,
+    ) -> wa_core::storage::SavedSearchRecord {
+        let start = std::time::Instant::now();
+        loop {
+            assert!(
+                start.elapsed() <= timeout,
+                "timeout waiting for last_error to be set"
+            );
+            let record = storage
+                .get_saved_search_by_name(name)
+                .await
+                .unwrap()
+                .unwrap();
+            if record.last_error.is_some() {
+                return record;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn saved_search_scheduler_emits_alert_and_redacts_snippet() {
+        use wa_core::events::Event;
+        use wa_core::storage::{
+            PaneRecord, SAVED_SEARCH_DEFAULT_LIMIT, SAVED_SEARCH_SINCE_MODE_LAST_RUN,
+            SavedSearchRecord,
+        };
+
+        let (storage, db_path) = setup_storage("saved_search_scheduler_alert").await;
+        let bus = Arc::new(wa_core::events::EventBus::new(256));
+        let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Register pane 1 so the foreign key constraint is satisfied.
+        let now = now_ms();
+        storage
+            .upsert_pane(PaneRecord {
+                pane_id: 1,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: None,
+                cwd: None,
+                tty_name: None,
+                first_seen_at: now,
+                last_seen_at: now,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            })
+            .await
+            .unwrap();
+
+        // Ensure there is content to match (and to redact).
+        let content = format!("error: something happened {}", secret_token());
+        storage.append_segment(1, &content, None).await.unwrap();
+
+        let mut record = SavedSearchRecord::new(
+            "errors".to_string(),
+            "error".to_string(),
+            None,
+            SAVED_SEARCH_DEFAULT_LIMIT,
+            SAVED_SEARCH_SINCE_MODE_LAST_RUN.to_string(),
+            None,
+        );
+        record.enabled = true;
+        record.schedule_interval_ms = Some(1_000);
+        storage.insert_saved_search(record.clone()).await.unwrap();
+
+        let scheduler_handle = tokio::spawn(run_saved_search_scheduler(
+            storage.clone(),
+            Arc::clone(&bus),
+            Arc::clone(&shutdown_flag),
+        ));
+
+        let mut sub = bus.subscribe_detections();
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), sub.recv())
+            .await
+            .expect("timeout waiting for saved_search.alert")
+            .unwrap();
+
+        let Event::PatternDetected { detection, .. } = event else {
+            panic!("unexpected event variant");
+        };
+
+        assert_eq!(detection.rule_id, "wezterm.saved_search.alert");
+        assert_eq!(detection.event_type, "saved_search.alert");
+
+        let extracted = detection.extracted.as_object().unwrap();
+        assert_eq!(
+            extracted.get("search_name").and_then(|v| v.as_str()),
+            Some("errors")
+        );
+        assert!(
+            extracted
+                .get("match_count")
+                .and_then(|v| v.as_i64())
+                .is_some_and(|n| n >= 1)
+        );
+
+        let snippet = extracted
+            .get("snippet")
+            .and_then(|v| v.as_str())
+            .expect("expected snippet in extracted payload");
+        assert!(snippet.contains("[REDACTED]"));
+        assert!(!snippet.contains("sk-"));
+
+        // Drain any queued events (avoid confusing the cooldown test below).
+        while sub.try_recv().is_some() {}
+
+        // Force the search to be due again quickly; the scheduler should run,
+        // but the alert should be suppressed by per-search cooldown.
+        let now = now_ms();
+        let force_due_at = now - 10_000;
+        storage
+            .update_saved_search_run(&record.id, force_due_at, Some(1), None)
+            .await
+            .unwrap();
+
+        // Give the scheduler a chance to tick and update last_run_at.
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let updated = storage
+            .get_saved_search_by_name("errors")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(updated.last_run_at.is_some_and(|v| v >= force_due_at));
+
+        // No second alert within the cooldown window.
+        let second = tokio::time::timeout(std::time::Duration::from_secs(1), sub.recv()).await;
+        assert!(
+            second.is_err(),
+            "expected cooldown to suppress second alert"
+        );
+
+        shutdown_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = scheduler_handle.await;
+        cleanup_storage(storage, &db_path).await;
+    }
+
+    #[tokio::test]
+    async fn saved_search_scheduler_invalid_query_sets_last_error_and_backs_off() {
+        use wa_core::storage::{
+            SAVED_SEARCH_DEFAULT_LIMIT, SAVED_SEARCH_SINCE_MODE_LAST_RUN, SavedSearchRecord,
+        };
+
+        let (storage, db_path) = setup_storage("saved_search_scheduler_invalid").await;
+        let bus = Arc::new(wa_core::events::EventBus::new(16));
+        let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let mut record = SavedSearchRecord::new(
+            "invalid".to_string(),
+            "\"unterminated".to_string(),
+            None,
+            SAVED_SEARCH_DEFAULT_LIMIT,
+            SAVED_SEARCH_SINCE_MODE_LAST_RUN.to_string(),
+            None,
+        );
+        record.enabled = true;
+        record.schedule_interval_ms = Some(1_000);
+        storage.insert_saved_search(record.clone()).await.unwrap();
+
+        let scheduler_handle = tokio::spawn(run_saved_search_scheduler(
+            storage.clone(),
+            Arc::clone(&bus),
+            Arc::clone(&shutdown_flag),
+        ));
+
+        let first =
+            wait_for_saved_search_error(&storage, "invalid", std::time::Duration::from_secs(3))
+                .await;
+        let first_run_at = first
+            .last_run_at
+            .expect("expected last_run_at set on error");
+
+        // Interval would make it due again quickly, but backoff should prevent
+        // repeated executions for a short window.
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let second = storage
+            .get_saved_search_by_name("invalid")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.last_run_at, Some(first_run_at));
+        assert!(second.last_error.is_some());
+
+        shutdown_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = scheduler_handle.await;
+        cleanup_storage(storage, &db_path).await;
+    }
+
+    #[tokio::test]
+    async fn saved_search_scheduler_respects_interval_when_not_due() {
+        use wa_core::storage::{
+            SAVED_SEARCH_DEFAULT_LIMIT, SAVED_SEARCH_SINCE_MODE_LAST_RUN, SavedSearchRecord,
+        };
+
+        let (storage, db_path) = setup_storage("saved_search_scheduler_interval").await;
+        let bus = Arc::new(wa_core::events::EventBus::new(16));
+        let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let now = now_ms();
+        let mut record = SavedSearchRecord::new(
+            "not_due".to_string(),
+            "error".to_string(),
+            None,
+            SAVED_SEARCH_DEFAULT_LIMIT,
+            SAVED_SEARCH_SINCE_MODE_LAST_RUN.to_string(),
+            None,
+        );
+        record.enabled = true;
+        record.schedule_interval_ms = Some(60_000);
+        record.last_run_at = Some(now);
+        storage.insert_saved_search(record.clone()).await.unwrap();
+
+        let scheduler_handle = tokio::spawn(run_saved_search_scheduler(
+            storage.clone(),
+            Arc::clone(&bus),
+            Arc::clone(&shutdown_flag),
+        ));
+
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let fetched = storage
+            .get_saved_search_by_name("not_due")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched.last_run_at, Some(now));
+
+        shutdown_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = scheduler_handle.await;
+        cleanup_storage(storage, &db_path).await;
+    }
+
+    // ── parse_duration_to_ms tests ────────────────────────────────────────
+
+    #[test]
+    fn parse_duration_seconds() {
+        assert_eq!(parse_duration_to_ms("30s"), Some(30_000));
+    }
+
+    #[test]
+    fn parse_duration_minutes() {
+        assert_eq!(parse_duration_to_ms("5m"), Some(300_000));
+    }
+
+    #[test]
+    fn parse_duration_hours() {
+        assert_eq!(parse_duration_to_ms("1h"), Some(3_600_000));
+    }
+
+    #[test]
+    fn parse_duration_days() {
+        assert_eq!(parse_duration_to_ms("7d"), Some(604_800_000));
+    }
+
+    #[test]
+    fn parse_duration_weeks() {
+        assert_eq!(parse_duration_to_ms("2w"), Some(1_209_600_000));
+    }
+
+    #[test]
+    fn parse_duration_zero() {
+        assert_eq!(parse_duration_to_ms("0h"), Some(0));
+    }
+
+    #[test]
+    fn parse_duration_invalid_suffix() {
+        assert_eq!(parse_duration_to_ms("5x"), None);
+    }
+
+    #[test]
+    fn parse_duration_empty() {
+        assert_eq!(parse_duration_to_ms(""), None);
+    }
+
+    #[test]
+    fn parse_duration_no_number() {
+        assert_eq!(parse_duration_to_ms("h"), None);
+    }
+
+    #[test]
+    fn parse_duration_negative() {
+        assert_eq!(parse_duration_to_ms("-1h"), None);
+    }
+
+    // ── mute CLI storage round-trip tests ─────────────────────────────────
+
+    #[tokio::test]
+    async fn mute_add_list_remove_roundtrip() {
+        use wa_core::storage::EventMuteRecord;
+
+        let (storage, db_path) = setup_storage("mute_roundtrip").await;
+        let now = now_ms();
+
+        // Initially no mutes
+        let mutes = storage.list_active_mutes(now).await.unwrap();
+        assert!(mutes.is_empty());
+
+        // Add a mute
+        let record = EventMuteRecord {
+            identity_key: "evt:test_key_1".to_string(),
+            scope: "workspace".to_string(),
+            created_at: now,
+            expires_at: Some(now + 3_600_000),
+            created_by: Some("cli".to_string()),
+            reason: Some("too noisy".to_string()),
+        };
+        storage.add_event_mute(record).await.unwrap();
+
+        // List should show one mute
+        let mutes = storage.list_active_mutes(now).await.unwrap();
+        assert_eq!(mutes.len(), 1);
+        assert_eq!(mutes[0].identity_key, "evt:test_key_1");
+        assert_eq!(mutes[0].scope, "workspace");
+        assert_eq!(mutes[0].reason.as_deref(), Some("too noisy"));
+
+        // Remove the mute
+        let removed = storage.remove_event_mute("evt:test_key_1").await.unwrap();
+        assert!(removed);
+
+        // List should be empty again
+        let mutes = storage.list_active_mutes(now).await.unwrap();
+        assert!(mutes.is_empty());
+
+        // Removing again should return false
+        let removed = storage.remove_event_mute("evt:test_key_1").await.unwrap();
+        assert!(!removed);
+
+        cleanup_storage(storage, &db_path).await;
+    }
+
+    #[tokio::test]
+    async fn mute_permanent_no_expiry() {
+        use wa_core::storage::EventMuteRecord;
+
+        let (storage, db_path) = setup_storage("mute_permanent").await;
+        let now = now_ms();
+
+        let record = EventMuteRecord {
+            identity_key: "evt:permanent".to_string(),
+            scope: "global".to_string(),
+            created_at: now,
+            expires_at: None,
+            created_by: Some("cli".to_string()),
+            reason: None,
+        };
+        storage.add_event_mute(record).await.unwrap();
+
+        // Should be listed even far in the future
+        let far_future = now + 365 * 86_400_000;
+        let mutes = storage.list_active_mutes(far_future).await.unwrap();
+        assert_eq!(mutes.len(), 1);
+        assert_eq!(mutes[0].identity_key, "evt:permanent");
+        assert!(mutes[0].expires_at.is_none());
+
+        cleanup_storage(storage, &db_path).await;
+    }
+
+    #[tokio::test]
+    async fn mute_expired_not_listed() {
+        use wa_core::storage::EventMuteRecord;
+
+        let (storage, db_path) = setup_storage("mute_expired").await;
+        let now = now_ms();
+
+        let record = EventMuteRecord {
+            identity_key: "evt:expired".to_string(),
+            scope: "workspace".to_string(),
+            created_at: now - 7_200_000,
+            expires_at: Some(now - 3_600_000), // expired 1h ago
+            created_by: Some("cli".to_string()),
+            reason: None,
+        };
+        storage.add_event_mute(record).await.unwrap();
+
+        let mutes = storage.list_active_mutes(now).await.unwrap();
+        assert!(mutes.is_empty());
+
+        cleanup_storage(storage, &db_path).await;
     }
 }

@@ -221,7 +221,7 @@ fastmcp-server = { path = "../fastmcp_rust/crates/fastmcp-server" }
 fastmcp-client = { path = "../fastmcp_rust/crates/fastmcp-client" }
 fastmcp-macros = { path = "../fastmcp_rust/crates/fastmcp-macros" }
 fastmcp-console = { path = "../fastmcp_rust/crates/fastmcp-console" }
-fastapi = { path = "../fastapi_rust/crates/fastapi" }
+fastapi = { path = "../fastapi_rust/crates/fastapi", package = "fastapi-rust" }
 fastapi-core = { path = "../fastapi_rust/crates/fastapi-core" }
 fastapi-http = { path = "../fastapi_rust/crates/fastapi-http" }
 fastapi-router = { path = "../fastapi_rust/crates/fastapi-router" }

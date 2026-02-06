@@ -243,6 +243,7 @@ dependencies = [
  "serde_json",
  "sha1",
  "slab",
+ "smallvec",
  "socket2 0.6.1",
  "tempfile",
  "thiserror 2.0.18",
@@ -1571,22 +1572,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "fastapi"
-version = "0.1.0"
-dependencies = [
- "fastapi-core",
- "fastapi-http",
- "fastapi-macros",
- "fastapi-openapi",
- "fastapi-output",
- "fastapi-router",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "fastapi-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "asupersync 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "futures-executor",
@@ -1598,7 +1585,7 @@ dependencies = [
 
 [[package]]
 name = "fastapi-http"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "asupersync 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "fastapi-core",
@@ -1606,7 +1593,7 @@ dependencies = [
 
 [[package]]
 name = "fastapi-macros"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1617,7 +1604,7 @@ dependencies = [
 
 [[package]]
 name = "fastapi-openapi"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "fastapi-core",
  "fastapi-router",
@@ -1627,7 +1614,7 @@ dependencies = [
 
 [[package]]
 name = "fastapi-output"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "crossterm 0.28.1",
  "parking_lot",
@@ -1638,9 +1625,23 @@ dependencies = [
 
 [[package]]
 name = "fastapi-router"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "fastapi-core",
+ "serde_json",
+]
+
+[[package]]
+name = "fastapi-rust"
+version = "0.1.2"
+dependencies = [
+ "fastapi-core",
+ "fastapi-http",
+ "fastapi-macros",
+ "fastapi-openapi",
+ "fastapi-output",
+ "fastapi-router",
+ "serde",
  "serde_json",
 ]
 
@@ -6547,8 +6548,8 @@ dependencies = [
  "crossterm 0.29.0",
  "dirs",
  "fancy-regex 0.14.0",
- "fastapi",
  "fastapi-core",
+ "fastapi-rust",
  "fastmcp-rust",
  "fs2",
  "hex",
