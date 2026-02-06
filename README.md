@@ -212,6 +212,11 @@ wa query "error"
 # Events feed (recent detections)
 wa events
 
+# Annotate/triage events
+wa events annotate 123 --note "Investigating"
+wa events triage 123 --state investigating
+wa events label 123 --add urgent
+
 # Robot mode with structured results
 wa robot search "compilation failed" --limit 20
 ```
@@ -528,6 +533,26 @@ Every detection has a stable `rule_id` like `core.codex:usage_reached`. Use thes
 - `wa robot wait-for <pane_id> <rule_id>` — wait for specific condition
 - Workflow triggers — automatically react to patterns
 - Allowlists — suppress false positives
+
+---
+
+## Performance Benchmarks
+
+Benchmarks live under `crates/wa-core/benches/` and use Criterion. Each bench includes a short, human-readable budget and emits machine-readable artifacts under `target/criterion/`.
+
+```bash
+# Compile benches (fast sanity check)
+cargo bench -p wa-core --benches --no-run
+
+# Run a specific bench
+cargo bench -p wa-core --bench pattern_detection
+cargo bench -p wa-core --bench delta_extraction
+cargo bench -p wa-core --bench fts_query
+```
+
+When a bench runs, it prints a `[BENCH] {...}` metadata line and writes:
+- `target/criterion/wa-bench-meta.jsonl` (budgets + environment)
+- `target/criterion/wa-bench-manifest-<bench>.json` (artifact manifest)
 
 ---
 

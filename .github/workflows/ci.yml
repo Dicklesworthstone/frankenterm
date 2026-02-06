@@ -44,6 +44,9 @@ jobs:
       - name: Clippy (all features)
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+      - name: Compile benches (wa-core)
+        run: cargo bench -p wa-core --benches --no-run
+
   generated-artifacts:
     name: Generated Artifacts
     runs-on: ubuntu-latest
