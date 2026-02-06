@@ -73,6 +73,20 @@ pub enum IpcRequest {
         /// Pane ID to inspect
         pane_id: u64,
     },
+    /// Set a runtime pane capture priority override (watcher only).
+    SetPanePriority {
+        /// Pane ID to modify
+        pane_id: u64,
+        /// Priority value (lower = higher priority)
+        priority: u32,
+        /// Optional TTL in milliseconds (0 or None = until cleared)
+        ttl_ms: Option<u64>,
+    },
+    /// Clear any runtime pane capture priority override (watcher only).
+    ClearPanePriority {
+        /// Pane ID to modify
+        pane_id: u64,
+    },
     /// RPC request forwarded to robot handlers.
     Rpc {
         /// Robot command arguments (e.g., ["state"] or ["send", "1", "ls"]).
@@ -86,6 +100,7 @@ impl IpcRequest {
         match self {
             Self::UserVar { .. } => IpcScope::Write,
             Self::Ping | Self::Status | Self::PaneState { .. } => IpcScope::Read,
+            Self::SetPanePriority { .. } | Self::ClearPanePriority { .. } => IpcScope::Write,
             Self::Rpc { args } => rpc_required_scope(args),
         }
     }
@@ -738,6 +753,12 @@ async fn handle_request_with_context(
             IpcResponse::ok_with_data(payload)
         }
         IpcRequest::PaneState { pane_id } => handle_pane_state(pane_id, ctx).await,
+        IpcRequest::SetPanePriority {
+            pane_id,
+            priority,
+            ttl_ms,
+        } => handle_set_pane_priority(pane_id, priority, ttl_ms, ctx).await,
+        IpcRequest::ClearPanePriority { pane_id } => handle_clear_pane_priority(pane_id, ctx).await,
         IpcRequest::Rpc { args } => {
             let Some(handler) = ctx.rpc_handler.as_ref() else {
                 return IpcResponse::error("rpc handler not configured");
@@ -782,6 +803,75 @@ async fn handle_pane_state(pane_id: u64, ctx: &IpcHandlerContext) -> IpcResponse
         "last_status_at": entry.last_status_at,  // DEPRECATED: always null
         "in_gap": cursor.as_ref().map(|c| c.in_gap),
         "cursor_alt_screen": cursor.as_ref().map(|c| c.in_alt_screen),  // Authoritative alt-screen state
+    }))
+}
+
+async fn handle_set_pane_priority(
+    pane_id: u64,
+    priority: u32,
+    ttl_ms: Option<u64>,
+    ctx: &IpcHandlerContext,
+) -> IpcResponse {
+    let Some(ref registry_lock) = ctx.registry else {
+        return IpcResponse::error_with_code(
+            "ipc.no_registry",
+            "pane registry not available",
+            Some("Start the watcher with `wa watch` in this workspace.".to_string()),
+        );
+    };
+
+    let installed = {
+        let mut registry = registry_lock.write().await;
+        match registry.set_priority_override(pane_id, priority, ttl_ms) {
+            Ok(ov) => ov,
+            Err(e) => {
+                return IpcResponse::error_with_code(
+                    "ipc.pane_not_found",
+                    format!("pane {pane_id} not found: {e}"),
+                    Some(
+                        "Use `wa robot state` or `wezterm cli list` to find valid pane IDs."
+                            .to_string(),
+                    ),
+                );
+            }
+        }
+    };
+
+    IpcResponse::ok_with_data(serde_json::json!({
+        "pane_id": pane_id,
+        "priority": installed.priority,
+        "set_at": installed.set_at,
+        "expires_at": installed.expires_at,
+        "ttl_ms": ttl_ms,
+    }))
+}
+
+async fn handle_clear_pane_priority(pane_id: u64, ctx: &IpcHandlerContext) -> IpcResponse {
+    let Some(ref registry_lock) = ctx.registry else {
+        return IpcResponse::error_with_code(
+            "ipc.no_registry",
+            "pane registry not available",
+            Some("Start the watcher with `wa watch` in this workspace.".to_string()),
+        );
+    };
+
+    {
+        let mut registry = registry_lock.write().await;
+        if let Err(e) = registry.clear_priority_override(pane_id) {
+            return IpcResponse::error_with_code(
+                "ipc.pane_not_found",
+                format!("pane {pane_id} not found: {e}"),
+                Some(
+                    "Use `wa robot state` or `wezterm cli list` to find valid pane IDs."
+                        .to_string(),
+                ),
+            );
+        }
+    }
+
+    IpcResponse::ok_with_data(serde_json::json!({
+        "pane_id": pane_id,
+        "cleared": true,
     }))
 }
 
@@ -872,6 +962,27 @@ impl IpcClient {
     /// Returns error if connection fails.
     pub async fn pane_state(&self, pane_id: u64) -> Result<IpcResponse, UserVarError> {
         self.send_request(IpcRequest::PaneState { pane_id }).await
+    }
+
+    /// Set a runtime pane capture priority override.
+    pub async fn set_pane_priority(
+        &self,
+        pane_id: u64,
+        priority: u32,
+        ttl_ms: Option<u64>,
+    ) -> Result<IpcResponse, UserVarError> {
+        self.send_request(IpcRequest::SetPanePriority {
+            pane_id,
+            priority,
+            ttl_ms,
+        })
+        .await
+    }
+
+    /// Clear any runtime pane capture priority override.
+    pub async fn clear_pane_priority(&self, pane_id: u64) -> Result<IpcResponse, UserVarError> {
+        self.send_request(IpcRequest::ClearPanePriority { pane_id })
+            .await
     }
 
     /// Call a robot RPC command over IPC.

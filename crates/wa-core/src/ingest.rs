@@ -18,6 +18,7 @@ use std::hash::Hash;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::config::PaneFilterConfig;
@@ -186,6 +187,20 @@ impl ObservationDecision {
 // Extended Pane Entry
 // =============================================================================
 
+/// Runtime override for pane capture priority.
+///
+/// This is an operator knob intended for incident response. It is stored
+/// in-memory only (watcher process); callers may optionally set a TTL.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PanePriorityOverride {
+    /// Priority value (lower = higher priority).
+    pub priority: u32,
+    /// When the override was set (epoch ms).
+    pub set_at: i64,
+    /// When the override expires (epoch ms). `None` means "until cleared".
+    pub expires_at: Option<i64>,
+}
+
 /// Extended pane state with fingerprint and observation tracking
 #[derive(Debug, Clone)]
 pub struct PaneEntry {
@@ -220,6 +235,9 @@ pub struct PaneEntry {
     /// DEPRECATED: This field was populated by Lua status updates which were removed
     /// in v0.2.0. It is now always `None`. Kept for backward compatibility.
     pub last_status_at: Option<i64>,
+
+    /// Optional operator-set priority override for capture scheduling.
+    pub priority_override: Option<PanePriorityOverride>,
 }
 
 impl PaneEntry {
@@ -248,6 +266,7 @@ impl PaneEntry {
             generation: 0,
             is_alt_screen: false,
             last_status_at: None,
+            priority_override: None,
         }
     }
 
@@ -271,6 +290,7 @@ impl PaneEntry {
             generation: 0,
             is_alt_screen: false,
             last_status_at: None,
+            priority_override: None,
         }
     }
 
@@ -642,6 +662,91 @@ impl PaneRegistry {
     /// Update the filter configuration
     pub fn set_filter(&mut self, filter_config: PaneFilterConfig) {
         self.filter_config = filter_config;
+    }
+
+    /// Set or update a runtime capture priority override for a pane.
+    ///
+    /// Returns the installed override if the pane is known.
+    pub fn set_priority_override(
+        &mut self,
+        pane_id: u64,
+        priority: u32,
+        ttl_ms: Option<u64>,
+    ) -> Result<PanePriorityOverride> {
+        let Some(entry) = self.entries.get_mut(&pane_id) else {
+            return Err(crate::Error::Wezterm(
+                crate::error::WeztermError::PaneNotFound(pane_id),
+            ));
+        };
+
+        let now = epoch_ms();
+        let expires_at = ttl_ms.and_then(|ttl| {
+            if ttl == 0 {
+                None
+            } else {
+                i64::try_from(ttl)
+                    .ok()
+                    .and_then(|ttl_i64| now.checked_add(ttl_i64))
+            }
+        });
+
+        let override_state = PanePriorityOverride {
+            priority,
+            set_at: now,
+            expires_at,
+        };
+        entry.priority_override = Some(override_state.clone());
+        Ok(override_state)
+    }
+
+    /// Clear any runtime capture priority override for a pane.
+    pub fn clear_priority_override(&mut self, pane_id: u64) -> Result<()> {
+        let Some(entry) = self.entries.get_mut(&pane_id) else {
+            return Err(crate::Error::Wezterm(
+                crate::error::WeztermError::PaneNotFound(pane_id),
+            ));
+        };
+        entry.priority_override = None;
+        Ok(())
+    }
+
+    /// Remove any expired priority overrides.
+    ///
+    /// Returns the number of overrides cleared.
+    pub fn purge_expired_priority_overrides(&mut self, now_ms: i64) -> usize {
+        let mut cleared = 0usize;
+        for entry in self.entries.values_mut() {
+            let Some(ref ov) = entry.priority_override else {
+                continue;
+            };
+            if ov.expires_at.is_some_and(|exp| exp <= now_ms) {
+                entry.priority_override = None;
+                cleared = cleared.saturating_add(1);
+            }
+        }
+        cleared
+    }
+
+    /// List active priority overrides for observed panes.
+    ///
+    /// Expired overrides are not returned (but are not purged here).
+    #[must_use]
+    pub fn list_active_priority_overrides(&self, now_ms: i64) -> Vec<(u64, PanePriorityOverride)> {
+        let mut overrides = Vec::new();
+        for (pane_id, entry) in &self.entries {
+            if !entry.should_observe() {
+                continue;
+            }
+            let Some(ov) = entry.priority_override.clone() else {
+                continue;
+            };
+            if ov.expires_at.is_some_and(|exp| exp <= now_ms) {
+                continue;
+            }
+            overrides.push((*pane_id, ov));
+        }
+        overrides.sort_by_key(|(pane_id, _)| *pane_id);
+        overrides
     }
 
     /// Perform a discovery tick: update registry with new pane list

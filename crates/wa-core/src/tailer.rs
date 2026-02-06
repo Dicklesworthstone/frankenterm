@@ -155,6 +155,10 @@ where
     tailers: HashMap<u64, PaneTailer>,
     /// Panes currently being captured (to prevent duplicate polling)
     capturing_panes: HashSet<u64>,
+    /// Effective pane priorities for scheduling (lower = higher priority).
+    ///
+    /// This is updated by the runtime at sync ticks (config rules + runtime overrides).
+    pane_priorities: HashMap<u64, u32>,
     /// Metrics
     metrics: TailerMetrics,
     /// Supervisor metrics
@@ -185,6 +189,7 @@ where
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
             tailers: HashMap::new(),
             capturing_panes: HashSet::new(),
+            pane_priorities: HashMap::new(),
             metrics: TailerMetrics::default(),
             supervisor_metrics: SupervisorMetrics::default(),
         }
@@ -261,21 +266,41 @@ where
         self.config = config;
     }
 
+    /// Update the effective pane priorities used for scheduling.
+    pub fn update_pane_priorities(&mut self, pane_priorities: HashMap<u64, u32>) {
+        self.pane_priorities = pane_priorities;
+    }
+
     /// Spawn tasks for all ready panes that are not currently being captured.
     pub fn spawn_ready(&mut self, join_set: &mut JoinSet<(u64, PollOutcome)>) {
         if self.shutdown_flag.load(Ordering::SeqCst) {
             return;
         }
 
-        // Find panes ready for polling AND not currently capturing
-        let ready_panes: Vec<u64> = self
+        // Find panes ready for polling AND not currently capturing.
+        let mut ready_panes: Vec<u64> = self
             .tailers
             .iter()
             .filter(|(id, t)| t.should_poll() && !self.capturing_panes.contains(id))
             .map(|(id, _)| *id)
             .collect();
 
-        for pane_id in ready_panes {
+        // Order by priority (lower = higher), tie-breaker pane_id for determinism.
+        ready_panes.sort_by_key(|pane_id| {
+            let prio = self
+                .pane_priorities
+                .get(pane_id)
+                .copied()
+                .unwrap_or(u32::MAX);
+            (prio, *pane_id)
+        });
+
+        // Only spawn up to available permits to ensure priority ordering is honored
+        // when max_concurrent is saturated.
+        let available = self.semaphore.available_permits();
+        let spawn_count = ready_panes.len().min(available);
+
+        for pane_id in ready_panes.into_iter().take(spawn_count) {
             // Check if this pane needs an overflow gap emitted before normal capture
             let overflow_gap_pending = self
                 .tailers
@@ -688,6 +713,55 @@ mod tests {
                 supervisor.handle_poll_result(pane_id, outcome);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn supervisor_spawns_higher_priority_panes_first() {
+        let config = TailerConfig {
+            min_interval: Duration::from_millis(1),
+            max_interval: Duration::from_millis(50),
+            max_concurrent: 1,
+            send_timeout: Duration::from_millis(50),
+            ..Default::default()
+        };
+
+        let (tx, rx) = mpsc::channel(10);
+        let _keep_rx_alive = rx;
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+
+        {
+            let mut cursor_guard = cursors.write().await;
+            cursor_guard.insert(1, PaneCursor::new(1));
+            cursor_guard.insert(2, PaneCursor::new(2));
+        }
+
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+        let mut panes = HashMap::new();
+        panes.insert(1, make_pane(1));
+        panes.insert(2, make_pane(2));
+        supervisor.sync_tailers(&panes);
+
+        // Lower value => higher priority. Pane 2 should be spawned before pane 1.
+        supervisor.update_pane_priorities(HashMap::from([(1, 100), (2, 10)]));
+
+        // Wait for tailers to become ready to poll.
+        tokio::time::sleep(Duration::from_millis(2)).await;
+
+        let mut join_set = JoinSet::new();
+        supervisor.spawn_ready(&mut join_set);
+
+        let (pane_id, outcome) = join_set
+            .join_next()
+            .await
+            .expect("expected one task")
+            .expect("task should not panic");
+        supervisor.handle_poll_result(pane_id, outcome);
+
+        assert_eq!(pane_id, 2, "higher priority pane should spawn first");
     }
 
     #[tokio::test]

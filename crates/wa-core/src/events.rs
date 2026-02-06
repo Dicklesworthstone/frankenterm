@@ -1227,9 +1227,9 @@ impl NotificationGate {
 
     /// Decide whether a detection should produce a notification.
     ///
-    /// The dedup key is derived from the event identity key (rule_id + event_type
-    /// + pane_uuid/pane_id + redacted extracted fields), so the same detection
-    /// from different panes is treated independently.
+    /// The dedup key is derived from the event identity key
+    /// (`rule_id`, `event_type`, `pane_uuid`/`pane_id`, and redacted extracted fields),
+    /// so the same detection from different panes is treated independently.
     pub fn should_notify(
         &mut self,
         detection: &Detection,

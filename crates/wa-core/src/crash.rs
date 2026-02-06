@@ -61,6 +61,21 @@ pub struct HealthSnapshot {
     pub db_writable: bool,
     /// Last database write timestamp (epoch ms)
     pub db_last_write_at: Option<u64>,
+
+    /// Active runtime pane priority overrides (operator-set).
+    #[serde(default)]
+    pub pane_priority_overrides: Vec<PanePriorityOverrideSnapshot>,
+}
+
+/// Health snapshot view of a runtime pane priority override.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PanePriorityOverrideSnapshot {
+    /// Pane ID
+    pub pane_id: u64,
+    /// Priority value (lower = higher priority)
+    pub priority: u32,
+    /// Expiration timestamp (epoch ms), if any
+    pub expires_at: Option<u64>,
 }
 
 impl HealthSnapshot {
@@ -624,6 +639,7 @@ mod tests {
             ingest_lag_max_ms: 50,
             db_writable: true,
             db_last_write_at: Some(1_234_567_800),
+            pane_priority_overrides: vec![],
         }
     }
 
@@ -684,6 +700,7 @@ mod tests {
             ingest_lag_max_ms: 0,
             db_writable: true,
             db_last_write_at: None,
+            pane_priority_overrides: vec![],
         };
 
         HealthSnapshot::update_global(snapshot);

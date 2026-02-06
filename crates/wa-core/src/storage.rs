@@ -430,7 +430,7 @@ CREATE TABLE IF NOT EXISTS saved_searches (
     name TEXT NOT NULL UNIQUE,
     query TEXT NOT NULL,
     pane_id INTEGER,
-    limit INTEGER NOT NULL DEFAULT 50,
+    "limit" INTEGER NOT NULL DEFAULT 50,
     since_mode TEXT NOT NULL DEFAULT 'last_run',
     since_ms INTEGER,
     schedule_interval_ms INTEGER,
@@ -849,13 +849,13 @@ static MIGRATIONS: &[Migration] = &[
     Migration {
         version: 14,
         description: "Add saved_searches for persisted search definitions",
-        up_sql: r"
+        up_sql: r#"
             CREATE TABLE IF NOT EXISTS saved_searches (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL UNIQUE,
                 query TEXT NOT NULL,
                 pane_id INTEGER,
-                limit INTEGER NOT NULL DEFAULT 50,
+                "limit" INTEGER NOT NULL DEFAULT 50,
                 since_mode TEXT NOT NULL DEFAULT 'last_run',
                 since_ms INTEGER,
                 schedule_interval_ms INTEGER,
@@ -871,7 +871,7 @@ static MIGRATIONS: &[Migration] = &[
                 ON saved_searches(enabled);
             CREATE INDEX IF NOT EXISTS idx_saved_searches_last_run
                 ON saved_searches(last_run_at);
-        ",
+        "#,
         down_sql: Some(
             r"
             DROP INDEX IF EXISTS idx_saved_searches_last_run;
@@ -3372,6 +3372,13 @@ enum WriteCommand {
         last_error: Option<String>,
         respond: oneshot::Sender<Result<()>>,
     },
+    /// Update scheduling settings for a saved search
+    UpdateSavedSearchSchedule {
+        id: String,
+        enabled: bool,
+        schedule_interval_ms: Option<i64>,
+        respond: oneshot::Sender<Result<()>>,
+    },
     /// Delete a saved search by name
     DeleteSavedSearch {
         name: String,
@@ -3699,6 +3706,21 @@ impl StorageHandle {
         .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
+    /// List all active (non-expired) mutes.
+    pub async fn list_active_mutes(&self, now_ms: i64) -> Result<Vec<EventMuteRecord>> {
+        let db_path = Arc::clone(&self.db_path);
+
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+
+            list_active_mutes_sync(&conn, now_ms)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+    }
+
     /// Fetch an event's dedupe/identity key by ID.
     pub async fn get_event_identity_key(&self, event_id: i64) -> Result<Option<String>> {
         let db_path = Arc::clone(&self.db_path);
@@ -3833,6 +3855,28 @@ impl StorageHandle {
                 last_run_at,
                 last_result_count,
                 last_error,
+                respond: tx,
+            })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    /// Update scheduling settings for a saved search.
+    pub async fn update_saved_search_schedule(
+        &self,
+        id: &str,
+        enabled: bool,
+        schedule_interval_ms: Option<i64>,
+    ) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::UpdateSavedSearchSchedule {
+                id: id.to_string(),
+                enabled,
+                schedule_interval_ms,
                 respond: tx,
             })
             .await
@@ -5811,6 +5855,16 @@ fn dispatch_write_command(conn: &mut Connection, cmd: WriteCommand, should_break
             );
             let _ = respond.send(result);
         }
+        WriteCommand::UpdateSavedSearchSchedule {
+            id,
+            enabled,
+            schedule_interval_ms,
+            respond,
+        } => {
+            let result =
+                update_saved_search_schedule_sync(conn, &id, enabled, schedule_interval_ms);
+            let _ = respond.send(result);
+        }
         WriteCommand::DeleteSavedSearch { name, respond } => {
             let result = delete_saved_search_sync(conn, &name);
             let _ = respond.send(result);
@@ -6145,9 +6199,39 @@ fn query_event_mute(conn: &Connection, identity_key: &str, now_ms: i64) -> Resul
 
     Ok(rows
         .next()
-        .transpose()
         .map_err(|e| StorageError::Database(format!("Mute query row error: {e}")))?
         .is_some())
+}
+
+/// List all active (non-expired) mutes.
+fn list_active_mutes_sync(conn: &Connection, now_ms: i64) -> Result<Vec<EventMuteRecord>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT identity_key, scope, created_at, expires_at, created_by, reason
+             FROM event_mutes
+             WHERE expires_at IS NULL OR expires_at > ?1
+             ORDER BY created_at DESC",
+        )
+        .map_err(|e| StorageError::Database(format!("Failed to prepare mute list query: {e}")))?;
+
+    let rows = stmt
+        .query_map(params![now_ms], |row| {
+            Ok(EventMuteRecord {
+                identity_key: row.get(0)?,
+                scope: row.get(1)?,
+                created_at: row.get(2)?,
+                expires_at: row.get(3)?,
+                created_by: row.get(4)?,
+                reason: row.get(5)?,
+            })
+        })
+        .map_err(|e| StorageError::Database(format!("Mute list query failed: {e}")))?;
+
+    let mut mutes = Vec::new();
+    for row in rows {
+        mutes.push(row.map_err(|e| StorageError::Database(format!("Mute list row error: {e}")))?);
+    }
+    Ok(mutes)
 }
 
 /// Compute the event identity key for a stored event.
@@ -6167,14 +6251,23 @@ fn query_event_identity_key(conn: &Connection, event_id: i64) -> Result<Option<S
 
     if let Some(row) = rows
         .next()
-        .transpose()
         .map_err(|e| StorageError::Database(format!("Identity query row error: {e}")))?
     {
-        let rule_id: String = row.get(0)?;
-        let event_type: String = row.get(1)?;
-        let extracted_str: Option<String> = row.get(2)?;
-        let pane_id_i64: i64 = row.get(3)?;
-        let pane_uuid: Option<String> = row.get(4)?;
+        let rule_id: String = row
+            .get(0)
+            .map_err(|e| StorageError::Database(format!("Failed to read rule_id: {e}")))?;
+        let event_type: String = row
+            .get(1)
+            .map_err(|e| StorageError::Database(format!("Failed to read event_type: {e}")))?;
+        let extracted_str: Option<String> = row
+            .get(2)
+            .map_err(|e| StorageError::Database(format!("Failed to read extracted: {e}")))?;
+        let pane_id_i64: i64 = row
+            .get(3)
+            .map_err(|e| StorageError::Database(format!("Failed to read pane_id: {e}")))?;
+        let pane_uuid: Option<String> = row
+            .get(4)
+            .map_err(|e| StorageError::Database(format!("Failed to read pane_uuid: {e}")))?;
         let extracted = extracted_str
             .as_ref()
             .and_then(|s| serde_json::from_str(s).ok())
@@ -6570,7 +6663,7 @@ fn insert_saved_search_sync(conn: &Connection, record: &SavedSearchRecord) -> Re
 
     conn.execute(
         "INSERT INTO saved_searches (
-            id, name, query, pane_id, limit, since_mode, since_ms,
+            id, name, query, pane_id, \"limit\", since_mode, since_ms,
             schedule_interval_ms, enabled, last_run_at, last_result_count, last_error,
             created_at, updated_at
         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
@@ -6578,7 +6671,7 @@ fn insert_saved_search_sync(conn: &Connection, record: &SavedSearchRecord) -> Re
             record.id,
             record.name,
             record.query,
-            record.pane_id,
+            record.pane_id.map(|v| v as i64),
             limit,
             record.since_mode,
             record.since_ms,
@@ -6621,6 +6714,30 @@ fn update_saved_search_run_sync(
     Ok(())
 }
 
+fn update_saved_search_schedule_sync(
+    conn: &Connection,
+    id: &str,
+    enabled: bool,
+    schedule_interval_ms: Option<i64>,
+) -> Result<()> {
+    let enabled_i64 = i64::from(enabled);
+    let updated = conn
+        .execute(
+            "UPDATE saved_searches
+             SET enabled = ?1,
+                 schedule_interval_ms = ?2,
+                 updated_at = ?3
+             WHERE id = ?4",
+            params![enabled_i64, schedule_interval_ms, now_ms(), id],
+        )
+        .map_err(|e| StorageError::Database(format!("Failed to update saved search: {e}")))?;
+
+    if updated == 0 {
+        return Err(StorageError::NotFound(format!("Saved search not found: {id}")).into());
+    }
+    Ok(())
+}
+
 fn delete_saved_search_sync(conn: &Connection, name: &str) -> Result<usize> {
     let deleted = conn
         .execute("DELETE FROM saved_searches WHERE name = ?1", [name])
@@ -6630,11 +6747,12 @@ fn delete_saved_search_sync(conn: &Connection, name: &str) -> Result<usize> {
 
 fn saved_search_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SavedSearchRecord> {
     let enabled: i64 = row.get(8)?;
+    let pane_id_raw: Option<i64> = row.get(3)?;
     Ok(SavedSearchRecord {
         id: row.get(0)?,
         name: row.get(1)?,
         query: row.get(2)?,
-        pane_id: row.get(3)?,
+        pane_id: pane_id_raw.map(|v| v as u64),
         limit: row.get(4)?,
         since_mode: row.get(5)?,
         since_ms: row.get(6)?,
@@ -6649,22 +6767,23 @@ fn saved_search_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SavedSearc
 }
 
 fn query_saved_search_by_name(conn: &Connection, name: &str) -> Result<Option<SavedSearchRecord>> {
-    conn.query_row(
-        "SELECT id, name, query, pane_id, limit, since_mode, since_ms, schedule_interval_ms,
-                enabled, last_run_at, last_result_count, last_error, created_at, updated_at
-         FROM saved_searches
-         WHERE name = ?1",
-        [name],
-        saved_search_from_row,
-    )
-    .optional()
-    .map_err(|e| StorageError::Database(format!("Failed to query saved search: {e}")))
+    Ok(conn
+        .query_row(
+            "SELECT id, name, query, pane_id, \"limit\", since_mode, since_ms, schedule_interval_ms,
+                    enabled, last_run_at, last_result_count, last_error, created_at, updated_at
+             FROM saved_searches
+             WHERE name = ?1",
+            [name],
+            saved_search_from_row,
+        )
+        .optional()
+        .map_err(|e| StorageError::Database(format!("Failed to query saved search: {e}")))?)
 }
 
 fn list_saved_searches_sync(conn: &Connection) -> Result<Vec<SavedSearchRecord>> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, name, query, pane_id, limit, since_mode, since_ms, schedule_interval_ms,
+            "SELECT id, name, query, pane_id, \"limit\", since_mode, since_ms, schedule_interval_ms,
                     enabled, last_run_at, last_result_count, last_error, created_at, updated_at
              FROM saved_searches
              ORDER BY name ASC",
@@ -11909,6 +12028,13 @@ mod tests {
         assert_eq!(fetched.limit, 25);
         assert_eq!(fetched.since_mode, SAVED_SEARCH_SINCE_MODE_LAST_RUN);
 
+        update_saved_search_schedule_sync(&conn, &fetched.id, true, Some(60_000)).unwrap();
+        let scheduled = query_saved_search_by_name(&conn, "errors")
+            .unwrap()
+            .expect("saved search should exist");
+        assert!(scheduled.enabled);
+        assert_eq!(scheduled.schedule_interval_ms, Some(60_000));
+
         let record2 = SavedSearchRecord::new(
             "alpha".to_string(),
             "panic".to_string(),
@@ -15497,6 +15623,7 @@ mod backpressure_integration_tests {
             ingest_lag_max_ms: 500,
             db_writable: true,
             db_last_write_at: Some(1000),
+            pane_priority_overrides: vec![],
         };
 
         assert!(!snapshot.warnings.is_empty());

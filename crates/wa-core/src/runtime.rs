@@ -562,6 +562,20 @@ impl ObservationRuntime {
                                 ingest_lag_max_ms: metrics.max_ingest_lag_ms(),
                                 db_writable,
                                 db_last_write_at: metrics.last_db_write(),
+                                pane_priority_overrides: {
+                                    let now = epoch_ms();
+                                    let reg = registry.read().await;
+                                    reg.list_active_priority_overrides(now)
+                                        .into_iter()
+                                        .map(|(pane_id, ov)| crate::crash::PanePriorityOverrideSnapshot {
+                                            pane_id,
+                                            priority: ov.priority,
+                                            expires_at: ov
+                                                .expires_at
+                                                .and_then(|e| u64::try_from(e).ok()),
+                                        })
+                                        .collect()
+                                },
                             };
 
                             HealthSnapshot::update_global(snapshot);
@@ -765,6 +779,9 @@ impl ObservationRuntime {
                 source,
             );
 
+            // Cache hot-reloadable pane priority config for scheduling.
+            let mut pane_priorities = config_rx.borrow().pane_priorities.clone();
+
             // Sync tailers periodically with discovery interval
             let mut sync_tick = tokio::time::interval(discovery_interval);
             let mut join_set = JoinSet::new();
@@ -797,6 +814,7 @@ impl ObservationRuntime {
                                 send_timeout: Duration::from_millis(100),
                             };
                             supervisor.update_config(new_tailer_config);
+                            pane_priorities = new_config.pane_priorities.clone();
                         }
 
                         // Get current observed panes from registry
@@ -809,6 +827,41 @@ impl ObservationRuntime {
                         };
 
                         supervisor.sync_tailers(&observed_panes);
+
+                        // Update effective priorities (config rules + runtime overrides).
+                        //
+                        // This is intentionally computed in the runtime (not the tailer) so:
+                        // - the tailer stays transport/scheduler focused
+                        // - overrides can be set via IPC without restarting
+                        let effective_priorities: HashMap<u64, u32> = {
+                            let now = epoch_ms();
+                            let mut reg = registry.write().await;
+                            reg.purge_expired_priority_overrides(now);
+
+                            reg.observed_pane_ids()
+                                .into_iter()
+                                .filter_map(|id| {
+                                    let entry = reg.get_entry(id)?;
+                                    let domain = entry.info.inferred_domain();
+                                    let title = entry.info.title.as_deref().unwrap_or("");
+                                    let cwd = entry.info.cwd.as_deref().unwrap_or("");
+                                    let base =
+                                        pane_priorities.priority_for_pane(&domain, title, cwd);
+                                    let override_priority = entry
+                                        .priority_override
+                                        .as_ref()
+                                        .and_then(|ov| {
+                                            if ov.expires_at.is_some_and(|exp| exp <= now) {
+                                                None
+                                            } else {
+                                                Some(ov.priority)
+                                            }
+                                        });
+                                    Some((id, override_priority.unwrap_or(base)))
+                                })
+                                .collect()
+                        };
+                        supervisor.update_pane_priorities(effective_priorities);
 
                         debug!(
                             active_tailers = supervisor.active_count(),
@@ -1487,6 +1540,18 @@ impl RuntimeHandle {
             ingest_lag_max_ms: self.metrics.max_ingest_lag_ms(),
             db_writable,
             db_last_write_at: self.metrics.last_db_write(),
+            pane_priority_overrides: {
+                let now = epoch_ms();
+                let reg = self.registry.read().await;
+                reg.list_active_priority_overrides(now)
+                    .into_iter()
+                    .map(|(pane_id, ov)| crate::crash::PanePriorityOverrideSnapshot {
+                        pane_id,
+                        priority: ov.priority,
+                        expires_at: ov.expires_at.and_then(|e| u64::try_from(e).ok()),
+                    })
+                    .collect()
+            },
         };
 
         HealthSnapshot::update_global(snapshot);
@@ -1729,6 +1794,7 @@ mod tests {
             ingest_lag_max_ms: metrics.max_ingest_lag_ms(),
             db_writable: true,
             db_last_write_at: metrics.last_db_write(),
+            pane_priority_overrides: vec![],
         };
 
         // Verify metrics are correctly reflected in snapshot
@@ -1840,6 +1906,7 @@ mod tests {
             ingest_lag_max_ms: 0,
             db_writable: true,
             db_last_write_at: None,
+            pane_priority_overrides: vec![],
         };
 
         assert_eq!(snapshot.capture_queue_depth, 500);

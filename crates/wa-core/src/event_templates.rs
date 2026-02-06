@@ -196,6 +196,34 @@ fn build_registry() -> TemplateRegistry {
             .or_insert_with(|| template_from_rule(rule));
     }
 
+    // Non-pack events emitted by wa itself (not from pattern packs).
+    templates.insert(
+        "saved_search.alert".to_string(),
+        EventTemplate::new(
+            "saved_search.alert",
+            "Saved search {search_name}: {match_count} {match_count|match|matches}",
+            "Query: {query}\nScope: {scope}{?snippet}\nSnippet: {snippet}{/?snippet}",
+            Severity::Info,
+        )
+        .with_context_keys({
+            let mut keys = default_context_keys();
+            keys.push(ContextKey::new(
+                "search_name",
+                "Saved search name",
+                "errors",
+            ));
+            keys.push(ContextKey::new("query", "FTS query", "error OR warning"));
+            keys.push(ContextKey::new("scope", "Pane scope", "pane 3"));
+            keys.push(ContextKey::new("match_count", "Result count", "5"));
+            keys.push(ContextKey::new("snippet", "Snippet preview", "..."));
+            keys
+        })
+        .with_suggestions(vec![Suggestion::with_command(
+            "Run saved search",
+            "wa search saved run {search_name}".to_string(),
+        )]),
+    );
+
     let fallback = EventTemplate::new(
         "unknown",
         "Unknown event {event_type}",

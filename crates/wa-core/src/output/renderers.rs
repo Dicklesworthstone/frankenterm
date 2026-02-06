@@ -1373,6 +1373,26 @@ impl HealthSnapshotRenderer {
             snapshot.observed_panes
         ));
 
+        // Runtime pane priority overrides (operator-set).
+        if !snapshot.pane_priority_overrides.is_empty() {
+            output.push_str(&format!(
+                "  Overrides:    {} pane(s) with priority overrides\n",
+                snapshot.pane_priority_overrides.len()
+            ));
+            if ctx.is_verbose() {
+                for ov in &snapshot.pane_priority_overrides {
+                    let expires = ov.expires_at.map_or_else(
+                        || "expires <never>".to_string(),
+                        |ts| format!("expires {ts}"),
+                    );
+                    output.push_str(&format!(
+                        "    - pane {}: priority {} ({expires})\n",
+                        ov.pane_id, ov.priority
+                    ));
+                }
+            }
+        }
+
         // Verbose: per-pane sequence numbers
         if ctx.is_verbose() && !snapshot.last_seq_by_pane.is_empty() {
             output.push_str("  Sequences:     ");
@@ -1423,6 +1443,27 @@ impl HealthSnapshotRenderer {
             "  Health: {} queued, {}, {}\n",
             queue_total, lag_label, db_label
         ));
+
+        if !snapshot.pane_priority_overrides.is_empty() {
+            let shown: Vec<String> = snapshot
+                .pane_priority_overrides
+                .iter()
+                .take(3)
+                .map(|ov| format!("pane {}={}", ov.pane_id, ov.priority))
+                .collect();
+            let more = snapshot
+                .pane_priority_overrides
+                .len()
+                .saturating_sub(shown.len());
+            if more == 0 {
+                output.push_str(&format!("  Overrides: {}\n", shown.join(", ")));
+            } else {
+                output.push_str(&format!(
+                    "  Overrides: {} (+{more} more)\n",
+                    shown.join(", ")
+                ));
+            }
+        }
 
         // Surface warnings inline
         for w in &snapshot.warnings {
@@ -2601,6 +2642,7 @@ mod tests {
             ingest_lag_max_ms: 42,
             db_writable: true,
             db_last_write_at: Some(1_700_000_000_000),
+            pane_priority_overrides: vec![],
         }
     }
 
