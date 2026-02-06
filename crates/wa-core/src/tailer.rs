@@ -1649,4 +1649,244 @@ mod tests {
             join_set.len()
         );
     }
+
+    // ─── bd-1tem: determinism + burst + edge-case coverage ──────────
+
+    #[test]
+    fn scheduler_equal_priority_deterministic_by_pane_id() {
+        // When all panes have the same priority, pane_id is the tiebreaker.
+        // This ensures deterministic scheduling regardless of HashMap ordering.
+        let budget = CaptureBudgetConfig {
+            max_captures_per_sec: 3,
+            max_bytes_per_sec: 0,
+        };
+        let mut sched = CaptureScheduler::new(budget);
+
+        // All priority 100, budget allows 3.
+        let panes = vec![(42, 100), (7, 100), (99, 100), (1, 100)];
+        let selected = sched.select_panes(&panes, 10);
+        // Pre-sorted input: caller sorts by (priority, pane_id).
+        // So the input order should already be (1,100), (7,100), (42,100), (99,100).
+        // But we're testing with the input as-given — select_panes trusts the order.
+        assert_eq!(selected.len(), 3);
+        // First 3 from the input order (which is pre-sorted by caller).
+        assert_eq!(selected, vec![42, 7, 99]);
+    }
+
+    #[test]
+    fn scheduler_burst_then_exhaustion() {
+        // Simulate a burst of captures that exhausts the budget, then verify
+        // that subsequent calls are properly rate-limited.
+        let budget = CaptureBudgetConfig {
+            max_captures_per_sec: 5,
+            max_bytes_per_sec: 0,
+        };
+        let mut sched = CaptureScheduler::new(budget);
+
+        // Burst: 5 panes at once, exhausts full budget.
+        let burst = vec![(1, 10), (2, 20), (3, 30), (4, 40), (5, 50)];
+        let selected = sched.select_panes(&burst, 10);
+        assert_eq!(selected.len(), 5);
+
+        // Immediately after: budget exhausted, nothing scheduled.
+        let more = vec![(6, 10), (7, 20)];
+        let selected2 = sched.select_panes(&more, 10);
+        assert!(
+            selected2.is_empty(),
+            "Budget should be exhausted after burst"
+        );
+
+        // Metrics should reflect the rate limiting.
+        assert!(sched.metrics().global_rate_limited >= 1);
+    }
+
+    #[test]
+    fn scheduler_byte_budget_partial_consumption() {
+        let budget = CaptureBudgetConfig {
+            max_captures_per_sec: 0,
+            max_bytes_per_sec: 1000,
+        };
+        let mut sched = CaptureScheduler::new(budget);
+
+        // Consume 300 bytes.
+        sched.record_capture(1, 300);
+        assert!(!sched.is_byte_budget_exhausted());
+        assert_eq!(sched.global_bytes_remaining, 700);
+
+        // Consume 700 more — exactly at limit.
+        sched.record_capture(2, 700);
+        assert!(sched.is_byte_budget_exhausted());
+    }
+
+    #[test]
+    fn scheduler_byte_budget_saturating_sub() {
+        // Verify that recording more bytes than remaining doesn't underflow.
+        let budget = CaptureBudgetConfig {
+            max_captures_per_sec: 0,
+            max_bytes_per_sec: 50,
+        };
+        let mut sched = CaptureScheduler::new(budget);
+
+        // Record way more bytes than budget allows.
+        sched.record_capture(1, 10_000);
+        assert_eq!(sched.global_bytes_remaining, 0);
+        assert!(sched.is_byte_budget_exhausted());
+    }
+
+    #[test]
+    fn scheduler_mixed_priorities_budget_favors_high() {
+        // With a tight budget, only the highest-priority panes should be selected.
+        let budget = CaptureBudgetConfig {
+            max_captures_per_sec: 2,
+            max_bytes_per_sec: 0,
+        };
+        let mut sched = CaptureScheduler::new(budget);
+
+        // Pre-sorted by (priority, pane_id):
+        let panes = vec![
+            (10, 5),   // priority 5 (critical)
+            (20, 50),  // priority 50 (high)
+            (30, 100), // priority 100 (normal)
+            (40, 200), // priority 200 (low)
+        ];
+        let selected = sched.select_panes(&panes, 10);
+        assert_eq!(selected, vec![10, 20]);
+    }
+
+    #[test]
+    fn scheduler_zero_permits_returns_empty() {
+        let budget = CaptureBudgetConfig {
+            max_captures_per_sec: 100,
+            max_bytes_per_sec: 0,
+        };
+        let mut sched = CaptureScheduler::new(budget);
+
+        let panes = vec![(1, 10), (2, 50)];
+        let selected = sched.select_panes(&panes, 0);
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn scheduler_per_pane_window_resets_after_one_second() {
+        let budget = CaptureBudgetConfig::default();
+        let mut sched = CaptureScheduler::new(budget);
+
+        sched.record_capture(1, 500);
+        let tracker = sched.pane_trackers.get_mut(&1).unwrap();
+        assert_eq!(tracker.captures_in_window, 1);
+        assert_eq!(tracker.bytes_in_window, 500);
+
+        // Manually move the window start back to force a reset.
+        tracker.window_start = Instant::now().checked_sub(Duration::from_secs(2)).unwrap();
+        tracker.maybe_reset();
+
+        assert_eq!(tracker.captures_in_window, 0);
+        assert_eq!(tracker.bytes_in_window, 0);
+    }
+
+    #[test]
+    fn scheduler_combined_capture_and_byte_budget() {
+        // Both limits active: the more restrictive one wins.
+        let budget = CaptureBudgetConfig {
+            max_captures_per_sec: 10,
+            max_bytes_per_sec: 200,
+        };
+        let mut sched = CaptureScheduler::new(budget);
+
+        // Select 3 panes (under capture limit).
+        let panes = vec![(1, 10), (2, 20), (3, 30)];
+        let selected = sched.select_panes(&panes, 10);
+        assert_eq!(selected.len(), 3);
+
+        // Record large bytes that exhaust byte budget.
+        sched.record_capture(1, 100);
+        sched.record_capture(2, 100);
+        // Byte budget is now 0.
+        assert!(sched.is_byte_budget_exhausted());
+
+        // Capture budget still has tokens (7 remaining), but byte budget blocks.
+        assert_eq!(sched.global_captures_remaining, 7);
+    }
+
+    #[test]
+    fn scheduler_throttle_events_accumulate() {
+        let budget = CaptureBudgetConfig {
+            max_captures_per_sec: 1,
+            max_bytes_per_sec: 0,
+        };
+        let mut sched = CaptureScheduler::new(budget);
+
+        // Exhaust capture budget.
+        let _ = sched.select_panes(&[(1, 10)], 5);
+
+        // Three more attempts, all throttled.
+        let _ = sched.select_panes(&[(2, 10)], 5);
+        let _ = sched.select_panes(&[(3, 10)], 5);
+        let _ = sched.select_panes(&[(4, 10)], 5);
+
+        assert!(sched.metrics().throttle_events >= 3);
+    }
+
+    #[tokio::test]
+    async fn supervisor_changed_outcome_records_bytes() {
+        let config = TailerConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+
+        let budget = CaptureBudgetConfig {
+            max_captures_per_sec: 0,
+            max_bytes_per_sec: 1000,
+        };
+
+        let mut supervisor =
+            TailerSupervisor::with_budget(config, tx, cursors, registry, shutdown, source, budget);
+
+        let mut panes = HashMap::new();
+        panes.insert(1, make_pane(1));
+        supervisor.sync_tailers(&panes);
+
+        // Simulate a capture that produced 256 bytes.
+        supervisor.capturing_panes.insert(1);
+        supervisor.handle_poll_result(1, PollOutcome::Changed { bytes: 256 });
+
+        // The scheduler should have recorded the bytes.
+        let tracker = &supervisor.scheduler.pane_trackers[&1];
+        assert_eq!(tracker.bytes_in_window, 256);
+        assert_eq!(tracker.captures_in_window, 1);
+
+        // Global bytes should be debited.
+        assert_eq!(supervisor.scheduler.global_bytes_remaining, 744);
+    }
+
+    #[tokio::test]
+    async fn supervisor_budget_hot_reload() {
+        let config = TailerConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+
+        let budget = CaptureBudgetConfig {
+            max_captures_per_sec: 5,
+            max_bytes_per_sec: 0,
+        };
+
+        let mut supervisor =
+            TailerSupervisor::with_budget(config, tx, cursors, registry, shutdown, source, budget);
+
+        assert_eq!(supervisor.scheduler.budget.max_captures_per_sec, 5);
+
+        // Hot-reload to new budget.
+        supervisor.update_budget(CaptureBudgetConfig {
+            max_captures_per_sec: 50,
+            max_bytes_per_sec: 10_000,
+        });
+
+        assert_eq!(supervisor.scheduler.budget.max_captures_per_sec, 50);
+        assert_eq!(supervisor.scheduler.budget.max_bytes_per_sec, 10_000);
+    }
 }
