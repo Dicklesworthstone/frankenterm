@@ -112,6 +112,14 @@ pub struct ViewState {
     pub health: Option<HealthStatus>,
     /// Search query input
     pub search_query: String,
+    /// Free-text pane filter (matches title/cwd/domain/pane id)
+    pub panes_filter_query: String,
+    /// Only show panes with unhandled events
+    pub panes_unhandled_only: bool,
+    /// Optional agent filter (codex/claude/gemini/unknown)
+    pub panes_agent_filter: Option<String>,
+    /// Optional domain filter (e.g., local/ssh)
+    pub panes_domain_filter: Option<String>,
     /// Error message to display (if any)
     pub error_message: Option<String>,
     /// Selected index in list views
@@ -130,6 +138,55 @@ impl ViewState {
     pub fn set_error(&mut self, msg: impl Into<String>) {
         self.error_message = Some(msg.into());
     }
+}
+
+/// Return pane indices that match active pane filters.
+#[must_use]
+pub fn filtered_pane_indices(state: &ViewState) -> Vec<usize> {
+    let query = state.panes_filter_query.trim().to_ascii_lowercase();
+    state
+        .panes
+        .iter()
+        .enumerate()
+        .filter(|(_, pane)| {
+            if state.panes_unhandled_only && pane.unhandled_event_count == 0 {
+                return false;
+            }
+
+            if let Some(agent_filter) = &state.panes_agent_filter {
+                let agent = pane.agent_type.as_deref().unwrap_or("unknown");
+                if !agent.eq_ignore_ascii_case(agent_filter) {
+                    return false;
+                }
+            }
+
+            if let Some(domain_filter) = &state.panes_domain_filter {
+                let domain = pane.domain.to_ascii_lowercase();
+                let filter = domain_filter.to_ascii_lowercase();
+                if filter == "ssh" {
+                    if !domain.contains("ssh") {
+                        return false;
+                    }
+                } else if !domain.contains(&filter) {
+                    return false;
+                }
+            }
+
+            if query.is_empty() {
+                return true;
+            }
+
+            let pane_id = pane.pane_id.to_string();
+            let title = pane.title.to_ascii_lowercase();
+            let domain = pane.domain.to_ascii_lowercase();
+            let cwd = pane.cwd.as_deref().unwrap_or("").to_ascii_lowercase();
+            pane_id.contains(&query)
+                || title.contains(&query)
+                || domain.contains(&query)
+                || cwd.contains(&query)
+        })
+        .map(|(idx, _)| idx)
+        .collect()
 }
 
 /// Render the navigation tabs at the top
@@ -263,47 +320,127 @@ pub fn render_home_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
 
 /// Render the panes list view
 pub fn render_panes_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
-    let block = Block::default().title("Panes").borders(Borders::ALL);
-    let inner = block.inner(area);
-    block.render(area, buf);
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(67), Constraint::Percentage(33)])
+        .split(area);
 
-    if state.panes.is_empty() {
-        let empty_msg = Paragraph::new(Span::styled(
-            "No panes found. Is WezTerm running?",
+    let filtered_indices = filtered_pane_indices(state);
+    let selected_filtered_index = state
+        .selected_index
+        .min(filtered_indices.len().saturating_sub(1));
+    let selected_pane = filtered_indices
+        .get(selected_filtered_index)
+        .and_then(|idx| state.panes.get(*idx));
+
+    let list_block = Block::default()
+        .title(format!(
+            "Panes ({}/{})",
+            filtered_indices.len(),
+            state.panes.len()
+        ))
+        .borders(Borders::ALL);
+    let list_inner = list_block.inner(chunks[0]);
+    list_block.render(chunks[0], buf);
+
+    let list_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(1)])
+        .split(list_inner);
+
+    let filter_summary = format!(
+        "filter='{}'  unhandled_only={}  agent={}  domain={}",
+        state.panes_filter_query,
+        state.panes_unhandled_only,
+        state.panes_agent_filter.as_deref().unwrap_or("all"),
+        state.panes_domain_filter.as_deref().unwrap_or("all")
+    );
+    Paragraph::new(vec![
+        Line::from("id  agent    state          unhandled  title"),
+        Line::from(Span::styled(
+            filter_summary,
+            Style::default().fg(Color::Gray),
+        )),
+    ])
+    .render(list_chunks[0], buf);
+
+    if filtered_indices.is_empty() {
+        Paragraph::new(Span::styled(
+            "No panes match the current filters.",
             Style::default().fg(Color::Yellow),
-        ));
-        empty_msg.render(inner, buf);
-        return;
+        ))
+        .render(list_chunks[1], buf);
+    } else {
+        let mut lines: Vec<Line> = Vec::with_capacity(filtered_indices.len());
+        for (pos, pane_index) in filtered_indices.iter().enumerate() {
+            let pane = &state.panes[*pane_index];
+            let style = if pos == selected_filtered_index {
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD)
+            } else if pane.unhandled_event_count > 0 {
+                Style::default().fg(Color::Yellow)
+            } else if pane.pane_state == "AltScreen" {
+                Style::default().fg(Color::Magenta)
+            } else {
+                Style::default()
+            };
+            let agent = pane.agent_type.as_deref().unwrap_or("unknown");
+            lines.push(Line::styled(
+                format!(
+                    "{:>3} {:8} {:12} {:>9}  {}",
+                    pane.pane_id,
+                    truncate_str(agent, 8),
+                    truncate_str(&pane.pane_state, 12),
+                    pane.unhandled_event_count,
+                    truncate_str(&pane.title, 30)
+                ),
+                style,
+            ));
+        }
+        Paragraph::new(lines).render(list_chunks[1], buf);
     }
 
-    let mut lines: Vec<Line> = Vec::new();
-    for (i, pane) in state.panes.iter().enumerate() {
-        let style = if i == state.selected_index {
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD)
+    let detail_block = Block::default().title("Pane Details").borders(Borders::ALL);
+    let detail_inner = detail_block.inner(chunks[1]);
+    detail_block.render(chunks[1], buf);
+
+    if let Some(pane) = selected_pane {
+        let last_activity = pane
+            .last_activity_ts
+            .map_or_else(|| "unknown".to_string(), |ts| ts.to_string());
+        let next_action = if pane.unhandled_event_count > 0 {
+            format!("Run: wa workflow list --pane {}", pane.pane_id)
         } else {
-            Style::default()
+            format!("Inspect: wa get-text {} --tail 120", pane.pane_id)
         };
-
-        let excluded_marker = if pane.is_excluded { " [excluded]" } else { "" };
-        let agent_info = pane.agent_type.as_deref().unwrap_or("unknown");
-
-        lines.push(Line::styled(
-            format!(
-                "{:>3} | {:20} | {:10} | {}{}",
-                pane.pane_id,
-                truncate_str(&pane.title, 20),
-                agent_info,
-                pane.domain,
-                excluded_marker
-            ),
-            style,
-        ));
+        let details = vec![
+            Line::from(format!("Pane ID: {}", pane.pane_id)),
+            Line::from(format!("Title: {}", pane.title)),
+            Line::from(format!("Domain: {}", pane.domain)),
+            Line::from(format!(
+                "Agent: {}",
+                pane.agent_type.as_deref().unwrap_or("unknown")
+            )),
+            Line::from(format!("State: {}", pane.pane_state)),
+            Line::from(format!("CWD: {}", pane.cwd.as_deref().unwrap_or("unknown"))),
+            Line::from(format!("Last Activity: {}", last_activity)),
+            Line::from(format!("Unhandled Events: {}", pane.unhandled_event_count)),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Next best action:",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::from(next_action),
+        ];
+        Paragraph::new(details).render(detail_inner, buf);
+    } else {
+        Paragraph::new(Span::styled(
+            "No pane selected.",
+            Style::default().fg(Color::Yellow),
+        ))
+        .render(detail_inner, buf);
     }
-
-    let list = Paragraph::new(lines);
-    list.render(inner, buf);
 }
 
 /// Render the events feed view
@@ -499,6 +636,8 @@ pub fn render_help_view(area: Rect, buf: &mut Buffer) {
         Line::from("  Enter      Run primary action (triage)"),
         Line::from("  1-9        Run action by number (triage)"),
         Line::from("  m          Mute selected event (triage)"),
+        Line::from("  [Panes] type text to filter, Backspace to edit, Esc to clear"),
+        Line::from("  [Panes] u=unhandled-only, a=agent filter, d=domain filter"),
         Line::from(""),
         Line::from(Span::styled(
             "Views:",
@@ -580,5 +719,61 @@ mod tests {
         }];
 
         render_triage_view(&state, area, &mut buf);
+    }
+
+    fn pane(id: u64, title: &str, agent: Option<&str>, unhandled: u32, domain: &str) -> PaneView {
+        PaneView {
+            pane_id: id,
+            title: title.to_string(),
+            domain: domain.to_string(),
+            cwd: Some(format!("/tmp/{title}")),
+            is_excluded: false,
+            agent_type: agent.map(str::to_string),
+            pane_state: "PromptActive".to_string(),
+            last_activity_ts: Some(1_700_000_000_000),
+            unhandled_event_count: unhandled,
+        }
+    }
+
+    #[test]
+    fn filtered_pane_indices_applies_query_and_toggles() {
+        let mut state = ViewState::default();
+        state.panes = vec![
+            pane(1, "codex-main", Some("codex"), 2, "local"),
+            pane(2, "claude-docs", Some("claude"), 0, "ssh:prod"),
+            pane(3, "shell", None, 1, "local"),
+        ];
+
+        state.panes_filter_query = "codex".to_string();
+        let filtered = filtered_pane_indices(&state);
+        assert_eq!(filtered, vec![0]);
+
+        state.panes_filter_query.clear();
+        state.panes_unhandled_only = true;
+        let filtered = filtered_pane_indices(&state);
+        assert_eq!(filtered, vec![0, 2]);
+
+        state.panes_unhandled_only = false;
+        state.panes_agent_filter = Some("claude".to_string());
+        let filtered = filtered_pane_indices(&state);
+        assert_eq!(filtered, vec![1]);
+
+        state.panes_agent_filter = None;
+        state.panes_domain_filter = Some("ssh".to_string());
+        let filtered = filtered_pane_indices(&state);
+        assert_eq!(filtered, vec![1]);
+    }
+
+    #[test]
+    fn filtered_pane_indices_is_stable_for_large_lists() {
+        let mut state = ViewState::default();
+        state.panes = (0..1000)
+            .map(|id| pane(id, &format!("pane-{id}"), Some("codex"), 0, "local"))
+            .collect();
+        state.panes_filter_query = "pane-9".to_string();
+
+        let filtered = filtered_pane_indices(&state);
+        assert!(!filtered.is_empty());
+        assert!(filtered.windows(2).all(|w| w[0] < w[1]));
     }
 }

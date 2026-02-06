@@ -42,6 +42,9 @@ pub struct PaneView {
     pub cwd: Option<String>,
     pub is_excluded: bool,
     pub agent_type: Option<String>,
+    pub pane_state: String,
+    pub last_activity_ts: Option<i64>,
+    pub unhandled_event_count: u32,
 }
 
 impl From<&PaneInfo> for PaneView {
@@ -52,9 +55,45 @@ impl From<&PaneInfo> for PaneView {
             domain: info.effective_domain().to_string(),
             cwd: info.cwd.clone(),
             is_excluded: false,
-            agent_type: None,
+            agent_type: infer_agent_type(info.title.as_deref(), info.cwd.as_deref()),
+            pane_state: infer_pane_state(info),
+            last_activity_ts: None,
+            unhandled_event_count: 0,
         }
     }
+}
+
+fn infer_agent_type(title: Option<&str>, cwd: Option<&str>) -> Option<String> {
+    let title_lower = title.unwrap_or("").to_ascii_lowercase();
+    let cwd_lower = cwd.unwrap_or("").to_ascii_lowercase();
+    if title_lower.contains("codex") || cwd_lower.contains("codex") {
+        return Some("codex".to_string());
+    }
+    if title_lower.contains("claude") || cwd_lower.contains("claude") {
+        return Some("claude".to_string());
+    }
+    if title_lower.contains("gemini") || cwd_lower.contains("gemini") {
+        return Some("gemini".to_string());
+    }
+    None
+}
+
+fn infer_pane_state(info: &PaneInfo) -> String {
+    let alt_screen = info
+        .extra
+        .get("is_alt_screen_active")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if alt_screen {
+        return "AltScreen".to_string();
+    }
+    if info.cursor_visibility == Some(crate::wezterm::CursorVisibility::Hidden) {
+        return "CommandRunning".to_string();
+    }
+    if info.is_active {
+        return "PromptActive".to_string();
+    }
+    "unknown".to_string()
 }
 
 /// Event information for TUI display
@@ -259,16 +298,34 @@ impl ProductionQueryClient {
 impl QueryClient for ProductionQueryClient {
     fn list_panes(&self) -> Result<Vec<PaneView>, QueryError> {
         let wezterm = &self.wezterm;
+        let storage = self.storage.clone();
 
         // Use the dedicated runtime to run async code from sync context.
         // This avoids "cannot start a runtime from within a runtime" panics
         // because this runtime is separate from any parent async context.
         self.runtime.block_on(async {
-            wezterm
+            let panes = wezterm
                 .list_panes()
                 .await
-                .map(|panes| panes.iter().map(PaneView::from).collect())
-                .map_err(|e| QueryError::WeztermError(e.to_string()))
+                .map_err(|e| QueryError::WeztermError(e.to_string()))?;
+            let mut pane_views: Vec<PaneView> = panes.iter().map(PaneView::from).collect();
+
+            if let Some(storage) = storage {
+                let (unhandled_res, last_activity_res) = tokio::join!(
+                    storage.count_unhandled_events_by_pane(),
+                    storage.get_last_activity_by_pane()
+                );
+                let unhandled_by_pane = unhandled_res.unwrap_or_default();
+                let last_activity_by_pane = last_activity_res.unwrap_or_default();
+
+                for pane in &mut pane_views {
+                    pane.unhandled_event_count =
+                        *unhandled_by_pane.get(&pane.pane_id).unwrap_or(&0_u32);
+                    pane.last_activity_ts = last_activity_by_pane.get(&pane.pane_id).copied();
+                }
+            }
+
+            Ok(pane_views)
         })
     }
 
@@ -349,8 +406,8 @@ impl QueryClient for ProductionQueryClient {
                 items.push(TriageItemView {
                     section: "health".to_string(),
                     severity: severity.to_string(),
-                    title: check.name.clone(),
-                    detail: check.detail.clone(),
+                    title: check.name.to_string(),
+                    detail: check.detail.to_string(),
                     actions: vec![
                         action("Run diagnostics", "wa doctor".to_string()),
                         action("Machine diagnostics", "wa doctor --json".to_string()),
@@ -625,6 +682,9 @@ mod tests {
                     cwd: Some("/home/test".to_string()),
                     is_excluded: false,
                     agent_type: Some("claude-code".to_string()),
+                    pane_state: "PromptActive".to_string(),
+                    last_activity_ts: Some(1_700_000_000_000),
+                    unhandled_event_count: 1,
                 }],
                 events: Vec::new(),
                 triage_items: vec![TriageItemView {
@@ -699,5 +759,22 @@ mod tests {
         assert!(health.watcher_running);
         assert!(health.db_accessible);
         assert_eq!(health.pane_count, 1);
+    }
+
+    #[test]
+    fn infer_agent_type_detects_known_agents() {
+        assert_eq!(
+            infer_agent_type(Some("codex terminal"), None),
+            Some("codex".to_string())
+        );
+        assert_eq!(
+            infer_agent_type(Some("Claude Code"), None),
+            Some("claude".to_string())
+        );
+        assert_eq!(
+            infer_agent_type(None, Some("/tmp/gemini-run")),
+            Some("gemini".to_string())
+        );
+        assert_eq!(infer_agent_type(Some("plain shell"), None), None);
     }
 }

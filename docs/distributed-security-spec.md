@@ -1,143 +1,146 @@
-# Distributed Security Spec (wa distributed mode)
+# Distributed Security Guide (wa distributed mode)
 
 ## Summary
-This document defines the security model for distributed mode (agent ↔ aggregator).
-The goal is **secure‑by‑default** behavior with explicit configuration, deterministic
-tests, and stable error codes.
+This guide covers operator setup and operations for secure distributed mode
+(agent <-> aggregator): safe defaults, TLS/token/mTLS configuration, rotation,
+doctor verification, and troubleshooting.
 
-## Threat Model (explicit)
-At minimum, defend against:
-- **Accidental exposure**: binding to `0.0.0.0` without realizing it.
-- **Unauthorized clients**: unknown agents attempting to connect.
-- **Replay/injection**: forged or replayed deltas/events.
-- **Traffic sniffing**: plaintext on LAN/WAN.
-- **Credential leakage**: secrets in logs/artifacts.
+## Scope and Feature Gate
+Distributed mode is feature-gated at compile time.
 
-## Security Goals
-- No plaintext remote connections by default.
-- No silent downgrade from TLS to plaintext.
-- Strong identity where enabled (mTLS).
-- Deterministic failure modes with stable error codes.
-- Logs never include secrets, keys, or tokens.
+```bash
+# Build from source with distributed mode enabled
+cargo build -p wa --release --features distributed
+```
 
-## Transport Security (TLS / mTLS)
-Baseline rules:
-- **Loopback only** by default.
-- If binding to non‑loopback, **TLS is required** unless an explicit dangerous
-  override is set.
-- Optional **mTLS**: verify client cert + optional allowlist of identities.
+If `distributed` is not compiled in, distributed runtime behavior is unavailable.
 
-Certificate handling:
-- Support operator‑provided cert/key paths.
-- Support self‑signed dev certs (explicit, non‑default).
-- Never generate or write keys without explicit user intent.
+## Security Model
+Distributed mode is designed to defend against:
+- accidental exposure (`0.0.0.0` without TLS)
+- unauthorized clients
+- replay/injection attempts
+- plaintext sniffing on LAN/WAN
+- secret leakage in logs/artifacts
 
-## Authentication / Identity
-Supported modes (configurable):
-- **Shared token** (baseline).
-- **mTLS client identity** (recommended for serious deployments).
+Security invariants:
+- default bind is loopback (`127.0.0.1:4141`)
+- TLS is required for non-loopback unless you explicitly set `allow_insecure = true`
+- token checks are constant-time
+- replay detection rejects non-monotonic sequence numbers per session
+- logs/artifacts must not contain tokens, private keys, or raw secret payloads
 
-Rules:
-- Constant‑time comparisons for tokens.
-- Log only safe metadata (peer addr, session id, TLS version, client CN/SAN if
-  allowlisted).
-- No secrets in logs or artifacts.
+## Config Defaults and Meaning
+`[distributed]` defaults are conservative:
 
-## Rotation Workflow (Operator)
-Recommended rotation steps (safe-by-default):
-1. Generate new token / certs offline.
-2. Prefer file-based tokens: write the token to `distributed.token_path` and rotate by
-   updating the file contents (atomic replace) without embedding secrets in `wa.toml`.
-3. Update `distributed.tls.*` paths in `wa.toml` for TLS cert rotation (server restart may be required).
-4. Run `wa doctor` to confirm the effective distributed security status.
+| Field | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | Distributed mode is opt-in |
+| `bind_addr` | `127.0.0.1:4141` | Loopback-only by default |
+| `allow_insecure` | `false` | Plaintext override is off |
+| `require_tls_for_non_loopback` | `true` | Remote bind requires TLS unless dangerous override |
+| `auth_mode` | `token` | Shared token auth mode |
+| `token` / `token_env` / `token_path` | unset | Exactly one source required when token auth is enabled |
+| `allow_agent_ids` | empty | Optional identity allowlist |
+| `tls.enabled` | `false` | TLS opt-in (required for non-loopback unless insecure override) |
+| `tls.min_tls_version` | `1.2` | Minimum protocol version |
 
-Notes:
-- Do not log or paste secret material into logs or diagnostics.
-- Prefer path-based certs/keys; avoid inline PEM in config.
-
-## Replay Protection & Session Semantics
-Define a session per connection:
-- **session_id** per connection
-- **monotonic seq** per session
-- Optional session expiration/rotation (time‑based only if deterministic tests
-  can control time)
-
-Reject:
-- Non‑monotonic seq values
-- Duplicate message IDs within a session
-- Messages missing required auth context
-
-## Safe Defaults
-Defaults must be conservative:
-- Bind to `127.0.0.1` unless explicitly configured otherwise.
-- TLS required for non‑loopback.
-- `allow_insecure = false` unless explicitly set.
-- `distributed.enabled = false` unless explicitly set.
-
-If `allow_insecure = true`, emit:
-- Prominent warnings in CLI output
-- `wa doctor` warning entry
-- Structured audit note
-
-## Configuration (proposed schema)
+## Minimal Remote-Safe Setup (token + TLS)
+1. Create a token file with strict permissions:
+```bash
+umask 077
+openssl rand -hex 32 > ~/.config/wa/distributed.token
+```
+2. Provision server cert and key (from your CA or dev self-signed certs).
+3. Configure `wa.toml`:
 ```toml
 [distributed]
-enabled = false
-bind_addr = "127.0.0.1:4141"
+enabled = true
+bind_addr = "0.0.0.0:4141"
 allow_insecure = false
 require_tls_for_non_loopback = true
-auth_mode = "token"          # token | mtls | token+mtls
-# Token source (set exactly one when auth_mode includes token):
-token_path = "/path/to/token.txt"   # recommended (supports rotation via file update)
-# token_env = "WA_DISTRIBUTED_TOKEN" # alternative
-# token = "..."                     # inline (discouraged)
-allow_agent_ids = ["agent-a", "agent-b"]  # optional allowlist
+auth_mode = "token"
+token_path = "/home/you/.config/wa/distributed.token"
+allow_agent_ids = []
 
 [distributed.tls]
 enabled = true
-cert_path = "/path/to/server.crt"
-key_path = "/path/to/server.key"
-client_ca_path = "/path/to/clients.pem"   # for mTLS
+cert_path = "/etc/wa/tls/server.crt"
+key_path = "/etc/wa/tls/server.key"
+min_tls_version = "1.2"
+```
+4. Start wa with your normal runtime entrypoint.
+5. Verify effective security posture:
+```bash
+wa doctor
+wa doctor --json
+```
+
+## mTLS and Mixed Mode (`token+mtls`)
+For stronger identity guarantees, enable mTLS:
+
+```toml
+[distributed]
+auth_mode = "token+mtls"
+token_path = "/home/you/.config/wa/distributed.token"
+allow_agent_ids = ["agent-a", "agent-b"]
+
+[distributed.tls]
+enabled = true
+cert_path = "/etc/wa/tls/server.crt"
+key_path = "/etc/wa/tls/server.key"
+client_ca_path = "/etc/wa/tls/clients-ca.pem"
 min_tls_version = "1.2"
 ```
 
-## Error Codes (stable)
-Proposed error codes (example names):
-- `dist.tls_required` — TLS required for non‑loopback
-- `dist.tls_handshake_failed` — TLS handshake failure
-- `dist.auth_failed` — token/mTLS auth failed
-- `dist.replay_detected` — non‑monotonic seq or duplicate msg
-- `dist.insecure_disabled` — rejected due to allow_insecure=false
+Validation rules enforced by config checks:
+- mTLS modes require `distributed.tls.enabled = true`
+- mTLS modes require `distributed.tls.client_ca_path`
+- token auth requires exactly one token source (`token`, `token_env`, or `token_path`)
 
-## Logging & Redaction Rules
-- Never log tokens, private keys, or raw cert PEM contents.
-- Redact any auth headers or bearer tokens.
-- Safe metadata only:
-  - peer addr
-  - session id (opaque)
-  - TLS version/cipher
-  - client cert CN/SAN (if allowlisted)
+## Rotation Runbook
+Token rotation (recommended via `token_path`):
+1. Generate new token.
+2. Write to a temp file with strict permissions.
+3. Atomically replace the old token file (`mv` temp file into place).
+4. Restart wa distributed services if your deployment caches credentials.
+5. Run `wa doctor` and a client smoke test.
 
-## Deterministic Tests (required)
-Testing must be deterministic and offline:
-- Valid TLS handshake succeeds (test certs).
-- Invalid/expired certs fail.
-- Plaintext connection rejected when TLS required.
-- Token auth fails with wrong token.
-- Replay rejection for duplicate seq.
-- No secrets in logs/artifacts.
+Certificate rotation:
+1. Stage new cert/key files.
+2. Update `distributed.tls.cert_path`/`key_path` (or rotate symlink targets).
+3. Restart services to pick up new TLS material.
+4. Re-run `wa doctor` and connection checks.
 
-## Invariants (non‑negotiable)
-- No plaintext remote connections by default.
-- No silent downgrade from TLS to plaintext.
-- Replay protection enforced per session.
-- Secrets never logged or exported.
+## Troubleshooting
+Start with:
+```bash
+wa doctor
+wa doctor --json
+```
 
-## Implementation Checklist
-- Config parsing + validation
-- TLS server/client wiring
-- Auth/mTLS verification + allowlist
-- Replay guard (monotonic seq)
-- Structured error codes
-- `wa doctor` diagnostics
-- Deterministic integration tests
+Runtime distributed security codes currently emitted:
+
+| Code | Meaning | Typical Action |
+|---|---|---|
+| `dist.auth_failed` | Missing/wrong token or identity mismatch | Verify token source and presented credentials |
+| `dist.replay_detected` | Duplicate or non-monotonic sequence | Check client session/sequence logic |
+| `dist.session_limit` | Too many tracked sessions | Increase limits or reduce stale sessions |
+| `dist.connection_limit` | Too many active connections | Increase connection budget or reduce fanout |
+| `dist.message_too_large` | Message exceeds limit | Lower payload size/chunk data |
+| `dist.rate_limited` | Sender exceeded rate policy | Backoff and retry with pacing |
+| `dist.handshake_timeout` | Handshake did not complete in time | Check latency/network/TLS mismatch |
+| `dist.message_timeout` | Message read timed out | Check sender behavior and timeouts |
+
+Common config errors (from validation/doctor detail):
+- `distributed.tls.enabled must be true for non-loopback binds ...`
+- `distributed token source is ambiguous: set exactly one of ...`
+- `distributed.tls.cert_path must be set when TLS is enabled`
+- `distributed.tls.key_path must be set when TLS is enabled`
+- `distributed.tls.client_ca_path must be set when auth_mode includes mtls`
+
+## Logs and Artifacts
+- Keep `general.log_file` configured for persistent operational logs.
+- For E2E debugging, keep test artifacts (`./e2e-artifacts/<timestamp>/...`) and
+  include manifest + structured logs per `docs/test-logging-contract.md`.
+- Do not store raw secrets in logs/artifacts.

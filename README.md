@@ -114,6 +114,22 @@ Robot Mode returns structured JSON with consistent schemas. Every response inclu
 - **No silent gaps**: capture gaps are recorded explicitly and surfaced in events/diagnostics.
 - **Policy-gated sending**: `wa send` and workflows enforce prompt/alt-screen checks, rate limits, and approvals.
 
+## Secure Distributed Mode
+
+Secure distributed mode is available as an optional feature-gated build and is
+off by default.
+
+```bash
+# Build wa with distributed mode support
+cargo build -p wa --release --features distributed
+```
+
+Operator guidance:
+- Keep `distributed.bind_addr` on loopback unless you explicitly need remote access.
+- For non-loopback binds, enable TLS and use file/env token sources (avoid inline tokens).
+- Use `wa doctor` (or `wa doctor --json`) to verify effective distributed security status.
+- Follow `docs/distributed-security-spec.md` for setup, rotation, and troubleshooting.
+
 ---
 
 ## How wa Compares
@@ -628,7 +644,7 @@ wa robot send 0 "test" --dry-run
 - **Non-WezTerm terminals**: Relies on WezTerm's CLI protocol. tmux/iTerm2 not supported.
 - **Remote panes without SSH**: WezTerm SSH domains work; raw remote terminals don't.
 - **GUI interaction**: Detects terminal output only, not graphical elements.
-- **Distributed coordination**: Single-host only; multi-host federation planned for v2.
+- **Multi-host federation**: Full fleet/federation orchestration is not implemented yet.
 
 ### Known Limitations
 

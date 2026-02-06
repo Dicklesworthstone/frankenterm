@@ -24,8 +24,8 @@ use ratatui::{
 
 use super::query::{EventFilters, QueryClient, QueryError};
 use super::views::{
-    View, ViewState, render_events_view, render_help_view, render_home_view, render_panes_view,
-    render_search_view, render_tabs, render_triage_view,
+    View, ViewState, filtered_pane_indices, render_events_view, render_help_view, render_home_view,
+    render_panes_view, render_search_view, render_tabs, render_triage_view,
 };
 
 /// Application configuration
@@ -233,23 +233,68 @@ impl<Q: QueryClient> App<Q> {
 
     /// Handle key events in the panes view
     fn handle_panes_key(&mut self, key: KeyEvent) {
+        let filtered_len = filtered_pane_indices(&self.view_state).len();
         match key.code {
             KeyCode::Down | KeyCode::Char('j') => {
-                if !self.view_state.panes.is_empty() {
+                if filtered_len > 0 {
                     self.view_state.selected_index =
-                        (self.view_state.selected_index + 1) % self.view_state.panes.len();
+                        (self.view_state.selected_index + 1) % filtered_len;
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                if !self.view_state.panes.is_empty() {
+                if filtered_len > 0 {
                     self.view_state.selected_index = self
                         .view_state
                         .selected_index
                         .checked_sub(1)
-                        .unwrap_or(self.view_state.panes.len() - 1);
+                        .unwrap_or(filtered_len - 1);
                 }
             }
+            KeyCode::Char('u') => {
+                self.view_state.panes_unhandled_only = !self.view_state.panes_unhandled_only;
+                self.view_state.selected_index = 0;
+            }
+            KeyCode::Char('a') => {
+                self.view_state.panes_agent_filter =
+                    Self::next_agent_filter(self.view_state.panes_agent_filter.as_deref());
+                self.view_state.selected_index = 0;
+            }
+            KeyCode::Char('d') => {
+                self.view_state.panes_domain_filter =
+                    Self::next_domain_filter(self.view_state.panes_domain_filter.as_deref());
+                self.view_state.selected_index = 0;
+            }
+            KeyCode::Backspace => {
+                self.view_state.panes_filter_query.pop();
+                self.view_state.selected_index = 0;
+            }
+            KeyCode::Esc => {
+                self.view_state.panes_filter_query.clear();
+                self.view_state.selected_index = 0;
+            }
+            KeyCode::Char(c) if !c.is_control() => {
+                self.view_state.panes_filter_query.push(c);
+                self.view_state.selected_index = 0;
+            }
             _ => {}
+        }
+    }
+
+    fn next_agent_filter(current: Option<&str>) -> Option<String> {
+        match current {
+            None => Some("codex".to_string()),
+            Some("codex") => Some("claude".to_string()),
+            Some("claude") => Some("gemini".to_string()),
+            Some("gemini") => Some("unknown".to_string()),
+            _ => None,
+        }
+    }
+
+    fn next_domain_filter(current: Option<&str>) -> Option<String> {
+        match current {
+            None => Some("local".to_string()),
+            Some("local") => Some("ssh".to_string()),
+            _ => None,
         }
     }
 
@@ -350,7 +395,8 @@ impl<Q: QueryClient> App<Q> {
             Ok(panes) => {
                 self.view_state.panes = panes;
                 // Reset selection if out of bounds
-                if self.view_state.selected_index >= self.view_state.panes.len() {
+                let filtered_count = filtered_pane_indices(&self.view_state).len();
+                if self.view_state.selected_index >= filtered_count {
                     self.view_state.selected_index = 0;
                 }
             }
@@ -515,6 +561,7 @@ pub fn run_tui<Q: QueryClient>(query_client: Q, config: AppConfig) -> TuiResult<
 mod tests {
     use super::*;
     use crate::tui::query::{EventView, HealthStatus, PaneView, SearchResultView};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     struct TestQueryClient;
 
@@ -527,6 +574,9 @@ mod tests {
                 cwd: None,
                 is_excluded: false,
                 agent_type: None,
+                pane_state: "PromptActive".to_string(),
+                last_activity_ts: Some(1_700_000_000_000),
+                unhandled_event_count: 0,
             }])
         }
 
@@ -576,5 +626,86 @@ mod tests {
         app.refresh_data();
         assert!(app.view_state.health.is_some());
         assert_eq!(app.view_state.panes.len(), 1);
+    }
+
+    struct MultiPaneQueryClient;
+
+    fn pane(id: u64, title: &str, agent: Option<&str>, unhandled: u32) -> PaneView {
+        PaneView {
+            pane_id: id,
+            title: title.to_string(),
+            domain: "local".to_string(),
+            cwd: Some(format!("/tmp/{title}")),
+            is_excluded: false,
+            agent_type: agent.map(str::to_string),
+            pane_state: "PromptActive".to_string(),
+            last_activity_ts: Some(1_700_000_000_000),
+            unhandled_event_count: unhandled,
+        }
+    }
+
+    impl QueryClient for MultiPaneQueryClient {
+        fn list_panes(&self) -> Result<Vec<PaneView>, QueryError> {
+            Ok(vec![
+                pane(1, "codex-main", Some("codex"), 1),
+                pane(2, "claude-docs", Some("claude"), 0),
+                pane(3, "shell", None, 0),
+            ])
+        }
+
+        fn list_events(&self, _: &EventFilters) -> Result<Vec<EventView>, QueryError> {
+            Ok(Vec::new())
+        }
+
+        fn list_triage_items(&self) -> Result<Vec<crate::tui::query::TriageItemView>, QueryError> {
+            Ok(Vec::new())
+        }
+
+        fn search(&self, _: &str, _: usize) -> Result<Vec<SearchResultView>, QueryError> {
+            Ok(Vec::new())
+        }
+
+        fn health(&self) -> Result<HealthStatus, QueryError> {
+            Ok(HealthStatus {
+                watcher_running: true,
+                db_accessible: true,
+                wezterm_accessible: true,
+                wezterm_circuit: crate::circuit_breaker::CircuitBreakerStatus::default(),
+                pane_count: 3,
+                event_count: 0,
+                last_capture_ts: None,
+            })
+        }
+
+        fn is_watcher_running(&self) -> bool {
+            true
+        }
+
+        fn mark_event_muted(&self, _event_id: i64) -> Result<(), QueryError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn panes_filters_and_navigation_update_state() {
+        let mut app = App::new(MultiPaneQueryClient, AppConfig::default());
+        app.refresh_data();
+
+        app.handle_panes_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
+        assert!(app.view_state.panes_unhandled_only);
+
+        app.handle_panes_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert_eq!(app.view_state.panes_filter_query, "c");
+
+        app.handle_panes_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert!(app.view_state.panes_filter_query.is_empty());
+
+        app.handle_panes_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert_eq!(app.view_state.panes_agent_filter.as_deref(), Some("codex"));
+        app.handle_panes_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert_eq!(app.view_state.panes_agent_filter.as_deref(), Some("claude"));
+
+        app.handle_panes_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.view_state.selected_index, 0);
     }
 }
