@@ -2,7 +2,7 @@
 
 use std::io::{Seek, SeekFrom};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -21,6 +21,12 @@ const ROTATED_CA_CERT: &str = "-----BEGIN CERTIFICATE-----\nMIIDEzCCAfugAwIBAgIU
 const ROTATED_SERVER_CERT: &str = "-----BEGIN CERTIFICATE-----\nMIIDPDCCAiSgAwIBAgIUW9LnrD8WsN2vZrz6UcK8/V0wZVowDQYJKoZIhvcNAQEL\nBQAwGTEXMBUGA1UEAwwOd2EtdGVzdC1jYS1yb3QwHhcNMjYwMjA2MTY0NDQ1WhcN\nMjYwMzA4MTY0NDQ1WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwggEiMA0GCSqGSIb3\nDQEBAQUAA4IBDwAwggEKAoIBAQC23VIKJUtNl2qf6xeoELYIXy/YAELikEuZL5lh\nSxk3yIgD8lY/O8jerXu7pcqpkCNEjf5SE4+9CloZQhZMqHgc0jwwnRBwIyqrzcRQ\n52lgO635aPyNq/rxpNULtDcHlZUznuUs4M5UMR7jt7UnUZsZD4N3uEbjn8KshZBJ\nscfnQP9iefLvttqb/RjFm73kdESKahTduB6bH/ZtYK+8ha7afKHym+6nKyzjGD3u\nxfmDcjnTa9CoUac5fG8molNYSH5Jfg56604jYLDkD6zSKUoubdc1Af2UokNGnM/z\nWH7hWafkQGPOFVhwxTBlMva06d6lmL+l0afCqfLyJxLVyBtjAgMBAAGjgYAwfjAa\nBgNVHREEEzARgglsb2NhbGhvc3SHBH8AAAEwEwYDVR0lBAwwCgYIKwYBBQUHAwEw\nCwYDVR0PBAQDAgWgMB0GA1UdDgQWBBTqo8T2w7dxaPaxS/UXiAq1NMpTBjAfBgNV\nHSMEGDAWgBTxLEVwoMBFF71K1xBVpu0sAgODqjANBgkqhkiG9w0BAQsFAAOCAQEA\nhrNWN5N/mpz8+tHe5bFy5h7uV9cY1rnSMY0YlsJ+Wo2LWqWBEkMXIDM4Rc3Wk/Hg\npaAgGNzH9dDBlwc6a1fM8lzyNUR9lsskuTR7KoPnBze9e6TOjr0GFGRm6PXRZsVY\nZ4hoOIzYJj0Rh1XoCjZTnj3bmRnXuAIRK/WkOflbdtRUanhsC83FCv4laaj3T6tE\n9gqjcZoJVHpm3zGqzNlCd6LlILuiaeiBWrQOrCEnjL6pyqVr3OoFHrEknR0vYp7h\nwWzOEOhFoi6+5LiSVU5SSRanWR6WeEM+uiGa/shr3fTnaOpLjqUHtgySq2sR9iFJ\nNsLfP5Dfhno2CA0Vpu1ZKw==\n-----END CERTIFICATE-----\n";
 const ROTATED_SERVER_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQC23VIKJUtNl2qf\n6xeoELYIXy/YAELikEuZL5lhSxk3yIgD8lY/O8jerXu7pcqpkCNEjf5SE4+9CloZ\nQhZMqHgc0jwwnRBwIyqrzcRQ52lgO635aPyNq/rxpNULtDcHlZUznuUs4M5UMR7j\nt7UnUZsZD4N3uEbjn8KshZBJscfnQP9iefLvttqb/RjFm73kdESKahTduB6bH/Zt\nYK+8ha7afKHym+6nKyzjGD3uxfmDcjnTa9CoUac5fG8molNYSH5Jfg56604jYLDk\nD6zSKUoubdc1Af2UokNGnM/zWH7hWafkQGPOFVhwxTBlMva06d6lmL+l0afCqfLy\nJxLVyBtjAgMBAAECggEANw9axW1HSDygQTiTLeqiNNEcYchqWzehW6WGZFItbKt3\nsOCF8ZI5wDqyN+UKqZWZ2Ol8OxBixkPYryRD/J75U4xFzUltiqY8EfDp/IZBJ1Ww\n45kl+i5fZ+T+tQB1VVZHz3w3exTRa25C48QLyqP6tEgEiMa2qZEQF8w7jsT18P4R\nNuFJvaRYSDUKH04eXw/a2Tf4RrT8ARrq2LPGt++HfbtxX9mvNdXM/L0IDoJ+thoC\ncljF2aGP3Ac0MdvRApM0nS8L96Tn5lsM0DvLYWwmxOJ46uBfDNE0oBdnzbvPxOYt\nxb/vTYzjczx8XlWzswj868VF3VRjHOU5VMNcRdAf+QKBgQDu/O4T/uuyZNelJuRH\nbypBuLtiaAnW0CqT/dwxgXUUnM6CDcVRwdMxZZpJHZcw0xRcC9SqIagcnYDPKCs+\nMN71JVBqDtEr6sWc1YQK8BVrhV43PmcsWUlbFwhp1TroagTgU4gekhm7yQd4uQjW\nb79BkzMDs4n2cU0htxjHwpCchQKBgQDD4aeFixHWBeiq/4GqxtXtlLyZE0npHQCE\nIcYrwDtAuPccQfI4Ew+iGRD4n8y0KFirgQAdMWxNNmbpDubtHRUxzP1n7qp6tTbE\ndm1HtCH0x3rjyFoBExM/h89ZtqV5tVSqxAhXHjhJnLpI4j+2h3NXg0L71OEo5qqq\nn2T+HaewxwKBgQDcRCxeK58q3bzPj6fomvG0f0Hd8gvXfCcyHVD8I9g4NkozHeQW\ndXFkXsOzzd0SeAmUyKaqY7jhHt2gkOJCQKLOCSUzixKIyqp14WkA98SWQ+bRPeez\nvVtZ5EGx4YCYw1ZZN0QHARtMs3z6bHhTw8zf8H6dU7W9eTHg+DOTsaS9TQKBgCjz\nUvdbNJZe095z3iLawLyTfL4vxyLh+kqlWO2qmXiVcqvIqZ/JdFo6DU888Sm0yZzJ\nMkHoJDEcL3WHtQVbMCQiK9P/lEpk+hcmfwAfi33F+k4Gg7J3z21XsiSaR4vjOdkd\ndHTqD3BsQJGeIx3AwX9JJMbLIWtQldtnyVBK2NTfAoGBAM77wP0jNVpE/yCFedfX\nXvhk4gK7EVQSvrjcO/m+qPe8p1wxThxi6MYPbOCD43ziaEQRE+eFnxKnU7JuOeRJ\n9bjmJJruQ5suVIrhj8M2jYYYdDpaOFkhbikF2ElJK2/8FKpShGkIJrFVtosXH3Ro\n3yY4kwI9byl3+kOsCncB3BuN\n-----END PRIVATE KEY-----\n";
 
+const PERF_HANDSHAKE_ROUNDS: usize = 12;
+const PERF_VERIFY_ITERATIONS: usize = 5_000;
+const PERF_HANDSHAKE_P95_BUDGET_MS: u128 = 400;
+const PERF_VERIFY_P95_BUDGET_US: u128 = 250;
+const PERF_VERIFY_THROUGHPUT_BUDGET_MSGS_PER_SEC: f64 = 2_000.0;
+
 fn temp_pem(contents: &str) -> tempfile::NamedTempFile {
     let mut file = tempfile::NamedTempFile::new().expect("temp file");
     std::io::Write::write_all(file.as_file_mut(), contents.as_bytes()).expect("write pem");
@@ -29,6 +35,15 @@ fn temp_pem(contents: &str) -> tempfile::NamedTempFile {
 
 fn emit_e2e_artifact(label: &str, value: serde_json::Value) {
     eprintln!("[ARTIFACT][distributed-e2e] {label}={value}");
+}
+
+fn percentile_u128(samples: &mut [u128], percentile: usize) -> u128 {
+    assert!(!samples.is_empty(), "percentile requires non-empty samples");
+    assert!(percentile <= 100, "percentile must be <= 100");
+    samples.sort_unstable();
+    let max_index = samples.len() - 1;
+    let rank = (max_index * percentile) / 100;
+    samples[rank]
 }
 
 async fn tls_round_trip(
@@ -412,6 +427,100 @@ async fn distributed_security_e2e_auth_replay_and_rotation() {
             "replay_rejected": replay_err.code(),
             "old_cert_rejected_after_rotation": true,
             "new_cert_accepted_after_rotation": true
+        }),
+    );
+}
+
+#[tokio::test]
+async fn distributed_security_perf_budgets_within_initial_thresholds() {
+    let ca_cert = temp_pem(OLD_CA_CERT);
+    let server_cert = temp_pem(OLD_SERVER_CERT);
+    let server_key = temp_pem(OLD_SERVER_KEY);
+
+    let mut config = DistributedConfig::default();
+    config.enabled = true;
+    config.auth_mode = DistributedAuthMode::Token;
+    config.token = Some("agent-a:token-v1".to_string());
+    config.tls.enabled = true;
+    config.tls.cert_path = Some(server_cert.path().display().to_string());
+    config.tls.key_path = Some(server_key.path().display().to_string());
+
+    let bundle = build_tls_bundle(&config, Some(ca_cert.path())).expect("tls bundle");
+
+    let mut handshake_samples_ms = Vec::with_capacity(PERF_HANDSHAKE_ROUNDS);
+    for _ in 0..PERF_HANDSHAKE_ROUNDS {
+        let start = Instant::now();
+        let received = tls_round_trip(
+            Arc::clone(&bundle.server),
+            Arc::clone(&bundle.client),
+            b"perf",
+        )
+        .await
+        .expect("tls round trip");
+        assert_eq!(received.as_slice(), b"perf");
+        handshake_samples_ms.push(start.elapsed().as_millis());
+    }
+    let handshake_p95_ms = percentile_u128(&mut handshake_samples_ms, 95);
+    assert!(
+        handshake_p95_ms <= PERF_HANDSHAKE_P95_BUDGET_MS,
+        "TLS connection budget exceeded: p95={}ms > {}ms",
+        handshake_p95_ms,
+        PERF_HANDSHAKE_P95_BUDGET_MS
+    );
+
+    let mut replay_guard = SessionReplayGuard::new(PERF_VERIFY_ITERATIONS + 8);
+    let expected_token = "agent-a:token-v1";
+    let verify_start = Instant::now();
+    let mut verify_samples_us = Vec::with_capacity(PERF_VERIFY_ITERATIONS);
+    for seq in 1..=u64::try_from(PERF_VERIFY_ITERATIONS).expect("iteration count fits u64") {
+        let sample_start = Instant::now();
+        validate_token(
+            DistributedAuthMode::TokenAndMtls,
+            Some(expected_token),
+            Some(expected_token),
+            Some("agent-a"),
+        )
+        .expect("token should validate");
+        replay_guard
+            .validate("perf-session", seq)
+            .expect("replay guard should accept monotonic sequence");
+        verify_samples_us.push(sample_start.elapsed().as_micros());
+    }
+    let verify_elapsed = verify_start.elapsed();
+    let verify_p95_us = percentile_u128(&mut verify_samples_us, 95);
+    let verify_throughput = PERF_VERIFY_ITERATIONS as f64 / verify_elapsed.as_secs_f64();
+
+    assert!(
+        verify_p95_us <= PERF_VERIFY_P95_BUDGET_US,
+        "Message verification budget exceeded: p95={}us > {}us",
+        verify_p95_us,
+        PERF_VERIFY_P95_BUDGET_US
+    );
+    assert!(
+        verify_throughput >= PERF_VERIFY_THROUGHPUT_BUDGET_MSGS_PER_SEC,
+        "Verification throughput budget missed: {:.0} msg/s < {:.0} msg/s",
+        verify_throughput,
+        PERF_VERIFY_THROUGHPUT_BUDGET_MSGS_PER_SEC
+    );
+
+    emit_e2e_artifact(
+        "perf_budget_report",
+        serde_json::json!({
+            "scenario": "perf_budgets",
+            "budgets": {
+                "tls_connection_p95_ms_max": PERF_HANDSHAKE_P95_BUDGET_MS,
+                "verify_p95_us_max": PERF_VERIFY_P95_BUDGET_US,
+                "verify_throughput_msgs_per_sec_min": PERF_VERIFY_THROUGHPUT_BUDGET_MSGS_PER_SEC
+            },
+            "observed": {
+                "tls_connection_p95_ms": handshake_p95_ms,
+                "verify_p95_us": verify_p95_us,
+                "verify_throughput_msgs_per_sec": verify_throughput
+            },
+            "samples": {
+                "tls_connection_rounds": PERF_HANDSHAKE_ROUNDS,
+                "verify_iterations": PERF_VERIFY_ITERATIONS
+            }
         }),
     );
 }
