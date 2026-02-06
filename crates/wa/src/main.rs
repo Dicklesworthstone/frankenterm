@@ -6303,6 +6303,8 @@ async fn run_watcher(
     tracing::info!(db_path = %db_path, "Storage initialized");
     let scheduler_storage = storage.clone();
 
+    maybe_trigger_e2e_watcher_panic_once(layout);
+
     let patterns_root = config_path
         .and_then(|path| path.parent())
         .map(PathBuf::from);
@@ -6793,6 +6795,34 @@ async fn run_watcher(
     }
 
     Ok(())
+}
+
+fn maybe_trigger_e2e_watcher_panic_once(layout: &wa_core::config::WorkspaceLayout) {
+    // E2E-only crash trigger: crash once, write a bundle, then allow subsequent runs.
+    // This is intentionally environment-gated and uses an on-disk marker for one-shot behavior.
+    const ENV_VAR: &str = "WA_E2E_WATCHER_PANIC_ONCE";
+
+    let enabled = std::env::var(ENV_VAR)
+        .ok()
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    if !enabled {
+        return;
+    }
+
+    let marker = layout.wa_dir.join("e2e_watcher_panic_once.done");
+    if marker.exists() {
+        return;
+    }
+
+    if let Err(err) = std::fs::write(&marker, b"1\n") {
+        tracing::warn!(
+            marker = %marker.display(),
+            error = %err,
+            "Failed to write E2E crash marker"
+        );
+    }
+
+    panic!("wa-e2e: intentional watcher panic (one-shot)");
 }
 
 async fn run_saved_search_scheduler(
@@ -7531,6 +7561,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             metrics_prefix: _metrics_prefix,
             dangerous_disable_lock,
         }) => {
+            // Install panic hook so panics write a bounded, redacted crash bundle under
+            // `layout.crash_dir` (required for crash-only diagnosability + E2E coverage).
+            wa_core::crash::install_panic_hook(&wa_core::crash::CrashConfig {
+                crash_dir: Some(layout.crash_dir.clone()),
+                include_backtrace: true,
+            });
+
             run_watcher_with_backoff(
                 &layout,
                 &config,

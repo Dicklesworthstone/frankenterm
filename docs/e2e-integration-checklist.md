@@ -38,6 +38,7 @@ Registry lives in `scripts/e2e_test.sh` (SCENARIO_REGISTRY). Current entries:
 - rules_explain_trace
 - stress_scale
 - graceful_shutdown
+- watcher_crash_bundle
 - pane_exclude_filter
 - workspace_isolation
 - setup_idempotency
@@ -66,6 +67,7 @@ Registry lives in `scripts/e2e_test.sh` (SCENARIO_REGISTRY). Current entries:
 
 #### Daemon/runtime (wa-4vx.6)
 - [x] E2E: `wa watch` starts, runs, and exits cleanly. Scenario(s): graceful_shutdown
+- [x] E2E: intentional watcher crash writes crash bundle and is surfaced by triage/doctor/reproduce. Scenario(s): watcher_crash_bundle (wa-upg.13.6)
 - [ ] E2E: graceful shutdown flushes storage queue and releases lock. Scenario(s): graceful_shutdown (partial; lacks explicit lock/queue assertions)
 - [ ] E2E: restart recovers cleanly (no corrupt state). Scenario(s): workflow_resume (partial; restart focused on workflow, not general state)
 - [ ] Artifacts: health snapshot (queues/lag), watcher logs, lock state. Scenario(s): none

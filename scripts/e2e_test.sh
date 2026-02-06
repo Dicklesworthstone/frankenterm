@@ -375,6 +375,7 @@ SCENARIO_REGISTRY=(
     "rules_explain_trace|Validate rules test trace + lint artifacts (explain-match)|true|wezterm,jq,sqlite3|Protects rule explainability"
     "stress_scale|Validate scaled stress test (panes + large transcript)|true|wezterm,jq,sqlite3|Protects scale handling"
     "graceful_shutdown|Validate wa watch graceful shutdown (SIGINT flush, lock release, restart clean)|true|wezterm,jq,sqlite3|Protects shutdown and lock handling"
+    "watcher_crash_bundle|Validate crash bundles surfaced via triage/doctor/reproduce|true|wezterm,jq,sqlite3|Protects crash-only diagnosability surfaces"
     "pane_exclude_filter|Validate pane selection filters protect privacy (ignored pane absent from search)|true|wezterm,jq,sqlite3|Protects pane exclusion behavior"
     "workspace_isolation|Validate workspace isolation (no cross-project DB leakage)|true|wezterm,jq,sqlite3|Protects workspace separation"
     "setup_idempotency|Validate wa setup idempotent patching (temp home, no leaks)|true|wezterm,jq|Protects setup idempotency"
@@ -6835,6 +6836,125 @@ EOF
     return $result
 }
 
+run_scenario_watcher_crash_bundle() {
+    local scenario_dir="$1"
+    local temp_workspace
+    temp_workspace=$(mktemp -d /tmp/wa-e2e-crash-bundle-XXXXXX)
+    local wa_pid=""
+    local result=0
+    local wait_timeout=${TIMEOUT:-60}
+    local old_wa_workspace="${WA_WORKSPACE:-}"
+    local old_wa_data_dir="${WA_DATA_DIR:-}"
+    local old_crash_flag="${WA_E2E_WATCHER_PANIC_ONCE:-}"
+
+    log_info "Workspace: $temp_workspace"
+
+    cleanup_watcher_crash_bundle() {
+        log_verbose "Cleaning up watcher_crash_bundle scenario"
+        if [[ -n "${wa_pid:-}" ]] && kill -0 "$wa_pid" 2>/dev/null; then
+            log_verbose "Stopping wa watch (pid $wa_pid)"
+            kill "$wa_pid" 2>/dev/null || true
+            wait "$wa_pid" 2>/dev/null || true
+        fi
+        if [[ -n "$old_wa_data_dir" ]]; then
+            export WA_DATA_DIR="$old_wa_data_dir"
+        else
+            unset WA_DATA_DIR
+        fi
+        if [[ -n "$old_wa_workspace" ]]; then
+            export WA_WORKSPACE="$old_wa_workspace"
+        else
+            unset WA_WORKSPACE
+        fi
+        if [[ -n "$old_crash_flag" ]]; then
+            export WA_E2E_WATCHER_PANIC_ONCE="$old_crash_flag"
+        else
+            unset WA_E2E_WATCHER_PANIC_ONCE
+        fi
+        if [[ -d "${temp_workspace:-}" ]]; then
+            cp -r "${temp_workspace}/.wa"/* "$scenario_dir/" 2>/dev/null || true
+        fi
+        rm -rf "${temp_workspace:-}"
+    }
+    trap cleanup_watcher_crash_bundle EXIT
+
+    export WA_WORKSPACE="$temp_workspace"
+    export WA_DATA_DIR="$temp_workspace/.wa"
+    export WA_E2E_WATCHER_PANIC_ONCE="1"
+
+    echo "workspace: $temp_workspace" >> "$scenario_dir/scenario.log"
+
+    # Step 1: Start watcher in foreground (should intentionally panic once)
+    log_info "Step 1: Starting watcher (intentional panic once)..."
+    "$WA_BINARY" watch --foreground > "$scenario_dir/wa_watch.log" 2>&1 &
+    wa_pid=$!
+    echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
+
+    # Step 2: Wait for crash bundle to exist and watcher to exit
+    log_info "Step 2: Waiting for crash bundle + watcher exit..."
+    local crash_glob="$temp_workspace/.wa/crash/wa_crash_*"
+    local crash_check="[ -d \"$temp_workspace/.wa/crash\" ] && ls -d $crash_glob >/dev/null 2>&1"
+    if ! wait_for_condition "crash bundle written" "$crash_check" "$wait_timeout"; then
+        log_fail "Crash bundle not written within timeout"
+        result=1
+    fi
+
+    local exit_check="! kill -0 $wa_pid 2>/dev/null"
+    if ! wait_for_condition "watcher process exited" "$exit_check" "$wait_timeout"; then
+        log_fail "Watcher did not exit within timeout"
+        result=1
+    fi
+
+    # Capture exit status for artifacts (ignore because crash is expected)
+    wait "$wa_pid" 2>/dev/null || true
+    wa_pid=""
+
+    # Step 3: Verify triage surfaces crash
+    log_info "Step 3: Verifying wa triage surfaces crash..."
+    "$WA_BINARY" triage -f json > "$scenario_dir/triage.json" 2>&1 || result=1
+    if ! jq -e '.ok == true' "$scenario_dir/triage.json" >/dev/null 2>&1; then
+        log_fail "triage.json did not have ok=true"
+        result=1
+    fi
+    if ! jq -e '.items[]? | select(.section == "crashes")' "$scenario_dir/triage.json" \
+        >/dev/null 2>&1; then
+        log_fail "triage.json did not include a crashes item"
+        result=1
+    fi
+
+    # Step 4: Verify doctor surfaces crash
+    log_info "Step 4: Verifying wa doctor surfaces crash..."
+    "$WA_BINARY" doctor --json > "$scenario_dir/doctor.json" 2>&1 || result=1
+    if ! jq -e '.checks[]? | select(.name == "Recent crash" and .status == "warning")' \
+        "$scenario_dir/doctor.json" >/dev/null 2>&1; then
+        log_fail "doctor.json did not include Recent crash warning"
+        result=1
+    fi
+
+    # Step 5: Verify reproduce export works for crash bundle
+    log_info "Step 5: Verifying wa reproduce export --kind crash..."
+    local out_dir="$temp_workspace/reproduce_out"
+    mkdir -p "$out_dir"
+    "$WA_BINARY" reproduce export --kind crash --out "$out_dir" --format json \
+        > "$scenario_dir/reproduce.json" 2>&1 || result=1
+    if ! jq -e '.path and (.files | length >= 1)' "$scenario_dir/reproduce.json" \
+        >/dev/null 2>&1; then
+        log_fail "reproduce.json missing expected fields"
+        result=1
+    fi
+    local exported_path
+    exported_path=$(jq -r '.path' "$scenario_dir/reproduce.json" 2>/dev/null || echo "")
+    if [[ -z "$exported_path" || ! -d "$exported_path" ]]; then
+        log_fail "Exported incident bundle path does not exist: $exported_path"
+        result=1
+    fi
+
+    trap - EXIT
+    cleanup_watcher_crash_bundle
+
+    return $result
+}
+
 run_scenario() {
     local name="$1"
     local scenario_num="$2"
@@ -6896,12 +7016,15 @@ run_scenario() {
         stress_scale)
             run_scenario_stress_scale "$scenario_dir" || result=$?
             ;;
-        graceful_shutdown)
-            run_scenario_graceful_shutdown "$scenario_dir" || result=$?
-            ;;
-        pane_exclude_filter)
-            run_scenario_pane_exclude_filter "$scenario_dir" || result=$?
-            ;;
+	        graceful_shutdown)
+	            run_scenario_graceful_shutdown "$scenario_dir" || result=$?
+	            ;;
+	        watcher_crash_bundle)
+	            run_scenario_watcher_crash_bundle "$scenario_dir" || result=$?
+	            ;;
+	        pane_exclude_filter)
+	            run_scenario_pane_exclude_filter "$scenario_dir" || result=$?
+	            ;;
         workspace_isolation)
             run_scenario_workspace_isolation "$scenario_dir" || result=$?
             ;;
