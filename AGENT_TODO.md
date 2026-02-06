@@ -163,3 +163,77 @@ For each dependency (completed; tests need rerun once locks clear):
 - [ ] Post progress update to Agent Mail thread `wa-4vx.10.13` with files touched
 - [ ] Release file reservations
 - [ ] Mark bead `wa-4vx.10.13` closed with reason + tests run
+
+---
+
+# Agent TODO (CalmLynx)
+
+## 0) Session Bootstrap
+- [x] Read `AGENTS.md` and `README.md` fully
+- [x] Deep codebase exploration (architecture, patterns, workflows, storage)
+- [x] Register with Agent Mail as CalmLynx (opus-4.6)
+- [x] Send intro to TopazStone + CC to GoldHarbor, CopperWolf, CyanForge
+- [x] Check inbox and reply to TopazStone's progress update
+
+## 1) Build Fixes (pre-existing compilation errors)
+- [x] Fix fastapi package rename: add `package = "fastapi-rust"` to workspace Cargo.toml
+- [x] Fix storage.rs: `rows.next().transpose()` → `rows.next()` (rusqlite API)
+- [x] Fix storage.rs: u64 ToSql/FromSql for SavedSearchRecord.pane_id (cast via i64)
+- [x] Fix storage.rs: return type mismatch in query_saved_search_by_name
+- [x] Fix storage.rs: rusqlite::Error → error::Error conversion
+- [x] Fix missing `dedupe_key` field in StoredEvent test initializers
+- [x] Fix missing `priority_override` in PaneEntry::with_uuid
+- [x] Fix missing `pane_priority_overrides` in HealthSnapshot test initializers
+- [x] Fix PaneNotFound struct→tuple variant in ingest.rs
+- [x] Fix should_notify() 3-arg signature in main.rs
+- [x] Fix OutputFormat::Auto not covered in match
+- [x] Fix clippy doc_lazy_continuation lint in events.rs
+- [x] Fix SQL `limit` reserved word: quote as `"limit"` in DDL and `\"limit\"` in queries
+- [x] Fix `saturating_shl` → `checked_shl` for i64
+- [x] Fix `Duration::from_millis(1_000)` → `Duration::from_secs(1)` (clippy)
+- [x] Remove broken `run_saved_search_scheduler` reference (function not yet defined)
+- [x] All checks pass: cargo fmt, cargo check, cargo clippy, cargo test (1929 tests)
+
+## 2) Implement wa-1pe.3: `wa workflow run --dry-run`
+- [x] Replace name-based action type inference with structured StepPlan-based approach
+- [x] Add `step_action_to_dry_run_type()`: maps StepAction → ActionType with Custom fallback
+- [x] Add `step_plan_metadata()`: extracts step_id, idempotent, timeouts, preconditions from StepPlan
+- [x] Add `infer_action_type_from_name()`: fallback for Custom steps from `steps_to_plans()`
+- [x] Update `build_workflow_dry_run_report()` to use `wf.steps_to_plans(pane)`
+- [x] Add JSON output support: detect_format() + emit_json for `--dry-run`
+- [x] Add 6 new tests (step metadata, lock/release, JSON roundtrip, triggers, usage_limits, human format)
+- [x] All 8 workflow dry-run tests pass
+- [x] Full test suite: 1929 tests, 0 failures
+
+## 3) Implement wa-1pe.5: Dry-run testing suite
+- [x] Created `crates/wa-core/tests/dry_run_integration.rs` with 33 tests across 7 categories
+- [x] Fixed PolicyDecision::allow() call signature (no args)
+- [x] Fixed serde roundtrip (skip_serializing_if on warnings field)
+- [x] All 33 tests pass, full suite green
+
+## 4) Build fixes (pre-existing from other agents)
+- [x] Fix FK constraint in `saved_search_scheduler_emits_alert_and_redacts_snippet` (register pane before append_segment)
+- [x] Fix `manual_assert` clippy lint in `wait_for_saved_search_error`
+- [x] Fix formatting in saved search CLI code (TopazStone's code)
+
+## 5) Implement wa-upg.8.5: Noise control tests (dedupe/cooldown/mute)
+- [x] Created `crates/wa-core/tests/noise_control_tests.rs` with 34 tests
+- [x] Mute storage CRUD: add/query, nonexistent, remove, expiry past/future/boundary (7 tests)
+- [x] Mute determinism: upsert overwrites, idempotent, multiple keys (3 tests)
+- [x] Identity key + mute integration: round-trip, UUID determinism (2 tests)
+- [x] Dedup edge cases: zero window, capacity-1, suppressed count, expired get, defaults (5 tests)
+- [x] Cooldown edge cases: zero period, capacity-1, accumulation, expired count, get entry (5 tests)
+- [x] NotificationGate composite: filter, severity, agent type, sequence, include/exclude (6 tests)
+- [x] EventFilter standalone: allow_all, permissive, glob, exact match (6 tests)
+- [x] All checks pass: fmt, clippy, 1999 tests, 0 failures
+
+## 6) Implement wa-upg.8.3: Mute/unmute CLI commands
+- [x] Added `Mute` variant to `Commands` enum with after_help examples
+- [x] Added `MuteCommands` enum: `Add`, `Remove`, `List` subcommands
+- [x] Added `list_active_mutes` async method + `list_active_mutes_sync` in storage.rs
+- [x] Added `parse_duration_to_ms` helper (supports s/m/h/d/w suffixes)
+- [x] Added `Some(Commands::Mute { command })` handler dispatch in main match block
+- [x] JSON and human-readable output for all three subcommands
+- [x] Duration parsing: `--for 1h`, `--for 30m`, `--for 7d`, permanent if omitted
+- [x] 10 unit tests (parse_duration) + 3 storage round-trip tests (add/list/remove, permanent, expired)
+- [x] All checks pass: fmt, clippy, 2012 tests, 0 failures
