@@ -44,6 +44,7 @@
 
 pub mod accounts;
 pub mod alerts;
+pub mod api_schema;
 pub mod approval;
 pub mod backpressure;
 pub mod backup;
