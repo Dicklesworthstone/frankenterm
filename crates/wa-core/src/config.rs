@@ -861,8 +861,12 @@ pub struct DistributedConfig {
     pub require_tls_for_non_loopback: bool,
     /// Authentication mode
     pub auth_mode: DistributedAuthMode,
-    /// Shared token (required when auth_mode includes token)
+    /// Shared token (inline; discouraged for long-lived deployments)
     pub token: Option<String>,
+    /// Load token from environment variable (recommended)
+    pub token_env: Option<String>,
+    /// Load token from file path (recommended)
+    pub token_path: Option<String>,
     /// Optional allowlist of agent identifiers
     pub allow_agent_ids: Vec<String>,
     /// TLS configuration
@@ -878,6 +882,8 @@ impl Default for DistributedConfig {
             require_tls_for_non_loopback: true,
             auth_mode: DistributedAuthMode::default(),
             token: None,
+            token_env: None,
+            token_path: None,
             allow_agent_ids: Vec::new(),
             tls: DistributedTlsConfig::default(),
         }
@@ -920,11 +926,31 @@ impl DistributedConfig {
         }
 
         if self.auth_mode.requires_token() {
-            let token = self.token.as_deref().unwrap_or("").trim();
-            if token.is_empty() {
-                return Err(
-                    "distributed.token must be set when auth_mode includes token".to_string(),
-                );
+            let token_inline = self.token.as_deref().unwrap_or("").trim();
+            let token_env = self.token_env.as_deref().unwrap_or("").trim();
+            let token_path = self.token_path.as_deref().unwrap_or("").trim();
+
+            let mut sources = 0;
+            if !token_inline.is_empty() {
+                sources += 1;
+            }
+            if !token_env.is_empty() {
+                sources += 1;
+            }
+            if !token_path.is_empty() {
+                sources += 1;
+            }
+
+            match sources {
+                0 => {
+                    return Err("distributed.token_env or distributed.token_path (or distributed.token) must be set when auth_mode includes token".to_string());
+                }
+                1 => {}
+                _ => {
+                    return Err(
+                        "distributed token source is ambiguous: set exactly one of distributed.token, distributed.token_env, distributed.token_path".to_string(),
+                    );
+                }
             }
         }
 

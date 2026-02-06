@@ -2,11 +2,14 @@
 #![forbid(unsafe_code)]
 
 use std::path::Path;
+#[cfg(feature = "distributed")]
 use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::config::{DistributedAuthMode, DistributedConfig, DistributedTlsConfig};
+#[cfg(feature = "distributed")]
+use crate::config::DistributedTlsConfig;
+use crate::config::{DistributedAuthMode, DistributedConfig};
 
 #[cfg(feature = "distributed")]
 use rustls::client::danger::HandshakeSignatureValid;
@@ -80,6 +83,7 @@ pub enum DistributedTlsError {
 }
 
 impl DistributedTlsError {
+    #[cfg(feature = "distributed")]
     fn io(path: &Path, source: std::io::Error) -> Self {
         Self::Io {
             path: path.display().to_string(),
@@ -131,7 +135,6 @@ fn add_to_root_store(root_store: &mut RootCertStore, certs: Vec<CertificateDer<'
     let _ = root_store.add_parsable_certificates(certs);
 }
 
-#[cfg(feature = "distributed")]
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum DistributedSecurityError {
     #[error("distributed token required")]
@@ -154,7 +157,6 @@ pub enum DistributedSecurityError {
     MessageTimeout,
 }
 
-#[cfg(feature = "distributed")]
 impl DistributedSecurityError {
     #[must_use]
     pub const fn code(&self) -> &'static str {
@@ -171,12 +173,10 @@ impl DistributedSecurityError {
     }
 }
 
-#[cfg(feature = "distributed")]
 fn normalize_identity(value: &str) -> String {
     value.trim().to_ascii_lowercase()
 }
 
-#[cfg(feature = "distributed")]
 fn constant_time_eq(expected: &str, presented: &str) -> bool {
     let expected_bytes = expected.as_bytes();
     let presented_bytes = presented.as_bytes();
@@ -192,14 +192,12 @@ fn constant_time_eq(expected: &str, presented: &str) -> bool {
     diff == 0
 }
 
-#[cfg(feature = "distributed")]
 #[derive(Debug, Clone, Copy)]
 struct TokenParts<'a> {
     identity: Option<&'a str>,
     secret: &'a str,
 }
 
-#[cfg(feature = "distributed")]
 impl<'a> TokenParts<'a> {
     fn parse(token: &'a str) -> Self {
         if let Some((identity, secret)) = token.split_once(':') {
@@ -218,7 +216,6 @@ impl<'a> TokenParts<'a> {
     }
 }
 
-#[cfg(feature = "distributed")]
 pub fn validate_token(
     auth_mode: DistributedAuthMode,
     expected_token: Option<&str>,
@@ -252,6 +249,126 @@ pub fn validate_token(
     }
 
     Ok(())
+}
+
+/// Where the distributed token is sourced from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DistributedTokenSourceKind {
+    Inline,
+    Env,
+    File,
+}
+
+/// Errors when resolving distributed credentials from config (env/files).
+#[derive(Error, Debug)]
+pub enum DistributedCredentialError {
+    #[error("distributed token required but no token source configured")]
+    TokenMissing,
+    #[error(
+        "distributed token is ambiguous: set exactly one of distributed.token, distributed.token_env, distributed.token_path"
+    )]
+    TokenAmbiguous,
+    #[error("distributed token environment variable not set: {0}")]
+    TokenEnvMissing(String),
+    #[error("failed to read distributed token file {path}: {source}")]
+    TokenFileRead {
+        path: String,
+        source: std::io::Error,
+    },
+    #[error("distributed token is empty")]
+    TokenEmpty,
+}
+
+/// Determine the configured token source kind without reading secrets.
+#[must_use]
+pub fn configured_token_source_kind(
+    config: &DistributedConfig,
+) -> Option<DistributedTokenSourceKind> {
+    let inline = config.token.as_deref().unwrap_or("").trim();
+    let env = config.token_env.as_deref().unwrap_or("").trim();
+    let path = config.token_path.as_deref().unwrap_or("").trim();
+
+    let mut kinds = Vec::new();
+    if !inline.is_empty() {
+        kinds.push(DistributedTokenSourceKind::Inline);
+    }
+    if !env.is_empty() {
+        kinds.push(DistributedTokenSourceKind::Env);
+    }
+    if !path.is_empty() {
+        kinds.push(DistributedTokenSourceKind::File);
+    }
+
+    if kinds.len() == 1 {
+        Some(kinds[0])
+    } else {
+        None
+    }
+}
+
+/// Resolve the expected distributed token from config.
+///
+/// This reads from env/file sources at the time of call, enabling operator-friendly
+/// rotation by updating the token file content without changing `wa.toml`.
+///
+/// Never log the returned token.
+pub fn resolve_expected_token(
+    config: &DistributedConfig,
+) -> Result<Option<String>, DistributedCredentialError> {
+    if !config.auth_mode.requires_token() {
+        return Ok(None);
+    }
+
+    let inline = config.token.as_deref().unwrap_or("").trim();
+    let env = config.token_env.as_deref().unwrap_or("").trim();
+    let path = config.token_path.as_deref().unwrap_or("").trim();
+
+    let mut sources = 0;
+    if !inline.is_empty() {
+        sources += 1;
+    }
+    if !env.is_empty() {
+        sources += 1;
+    }
+    if !path.is_empty() {
+        sources += 1;
+    }
+
+    match sources {
+        0 => return Err(DistributedCredentialError::TokenMissing),
+        1 => {}
+        _ => return Err(DistributedCredentialError::TokenAmbiguous),
+    }
+
+    if !env.is_empty() {
+        let value = std::env::var(env)
+            .map_err(|_| DistributedCredentialError::TokenEnvMissing(env.to_string()))?;
+        let value = value.trim().to_string();
+        if value.is_empty() {
+            return Err(DistributedCredentialError::TokenEmpty);
+        }
+        return Ok(Some(value));
+    }
+
+    if !path.is_empty() {
+        let p = Path::new(path);
+        let value =
+            std::fs::read_to_string(p).map_err(|e| DistributedCredentialError::TokenFileRead {
+                path: p.display().to_string(),
+                source: e,
+            })?;
+        let value = value.trim().to_string();
+        if value.is_empty() {
+            return Err(DistributedCredentialError::TokenEmpty);
+        }
+        return Ok(Some(value));
+    }
+
+    let value = inline.to_string();
+    if value.is_empty() {
+        return Err(DistributedCredentialError::TokenEmpty);
+    }
+    Ok(Some(value))
 }
 
 #[cfg(feature = "distributed")]
@@ -683,6 +800,51 @@ pub fn build_tls_server_name(bind_addr: &str) -> Result<ServerName<'static>, Dis
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_expected_token_from_file_supports_rotation() {
+        use std::io::{Seek, SeekFrom};
+
+        let mut file = tempfile::NamedTempFile::new().expect("temp file");
+        std::io::Write::write_all(file.as_file_mut(), b"token-1").expect("write token");
+
+        let mut config = DistributedConfig::default();
+        config.enabled = true;
+        config.auth_mode = DistributedAuthMode::Token;
+        config.token_path = Some(file.path().display().to_string());
+
+        let tok1 = resolve_expected_token(&config)
+            .expect("resolve token")
+            .expect("token required");
+        assert_eq!(tok1, "token-1");
+        assert!(validate_token(config.auth_mode, Some(&tok1), Some(&tok1), None).is_ok());
+
+        // Rotate in-place by updating the file contents.
+        file.as_file_mut().set_len(0).expect("truncate");
+        file.as_file_mut()
+            .seek(SeekFrom::Start(0))
+            .expect("seek start");
+        std::io::Write::write_all(file.as_file_mut(), b"token-2").expect("write token");
+
+        let tok2 = resolve_expected_token(&config)
+            .expect("resolve token")
+            .expect("token required");
+        assert_eq!(tok2, "token-2");
+        assert!(validate_token(config.auth_mode, Some(&tok2), Some(&tok2), None).is_ok());
+        assert!(validate_token(config.auth_mode, Some(&tok2), Some(&tok1), None).is_err());
+    }
+
+    #[test]
+    fn resolve_expected_token_rejects_ambiguous_sources() {
+        let mut config = DistributedConfig::default();
+        config.enabled = true;
+        config.auth_mode = DistributedAuthMode::Token;
+        config.token = Some("inline".to_string());
+        config.token_env = Some("ENV".to_string());
+
+        let err = resolve_expected_token(&config).expect_err("should be ambiguous");
+        assert!(matches!(err, DistributedCredentialError::TokenAmbiguous));
+    }
 
     #[cfg(feature = "distributed")]
     use proptest::prelude::*;

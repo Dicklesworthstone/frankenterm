@@ -46,8 +46,9 @@ Rules:
 ## Rotation Workflow (Operator)
 Recommended rotation steps (safe-by-default):
 1. Generate new token / certs offline.
-2. Update `distributed.token` and/or `distributed.tls.*` paths in `wa.toml`.
-3. Restart `wa` (distributed settings require restart today).
+2. Prefer file-based tokens: write the token to `distributed.token_path` and rotate by
+   updating the file contents (atomic replace) without embedding secrets in `wa.toml`.
+3. Update `distributed.tls.*` paths in `wa.toml` for TLS cert rotation (server restart may be required).
 4. Run `wa doctor` to confirm the effective distributed security status.
 
 Notes:
@@ -86,7 +87,10 @@ bind_addr = "127.0.0.1:4141"
 allow_insecure = false
 require_tls_for_non_loopback = true
 auth_mode = "token"          # token | mtls | token+mtls
-token = "..."                # only if auth_mode includes token
+# Token source (set exactly one when auth_mode includes token):
+token_path = "/path/to/token.txt"   # recommended (supports rotation via file update)
+# token_env = "WA_DISTRIBUTED_TOKEN" # alternative
+# token = "..."                     # inline (discouraged)
 allow_agent_ids = ["agent-a", "agent-b"]  # optional allowlist
 
 [distributed.tls]

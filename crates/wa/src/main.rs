@@ -21419,17 +21419,28 @@ fn distributed_security_check(config: &wa_core::config::Config) -> DiagnosticChe
         wa_core::config::DistributedAuthMode::TokenAndMtls => "token+mtls",
     };
 
-    let token_label = if dist.token.as_deref().unwrap_or("").trim().is_empty() {
-        "missing"
+    let (token_label, token_resolve_err) = if dist.auth_mode.requires_token() {
+        let kind_label = match wa_core::distributed::configured_token_source_kind(dist) {
+            Some(wa_core::distributed::DistributedTokenSourceKind::Inline) => "inline",
+            Some(wa_core::distributed::DistributedTokenSourceKind::Env) => "env",
+            Some(wa_core::distributed::DistributedTokenSourceKind::File) => "file",
+            None => "missing",
+        };
+
+        match wa_core::distributed::resolve_expected_token(dist) {
+            Ok(Some(_)) => (format!("{kind_label}:ok"), None),
+            Ok(None) => (format!("{kind_label}:n/a"), None),
+            Err(e) => (format!("{kind_label}:err"), Some(e.to_string())),
+        }
     } else {
-        "set"
+        ("n/a".to_string(), None)
     };
     let tls_label = if dist.tls.enabled {
         format!("on (min {})", dist.tls.min_tls_version)
     } else {
         "off".to_string()
     };
-    let detail = format!(
+    let mut detail = format!(
         "bind={}, auth={}, tls={}, token={}, allowlist={}",
         dist.bind_addr,
         auth_label,
@@ -21437,14 +21448,28 @@ fn distributed_security_check(config: &wa_core::config::Config) -> DiagnosticChe
         token_label,
         dist.allow_agent_ids.len()
     );
+    if let Some(err) = &token_resolve_err {
+        detail.push_str(&format!(", token_err={err}"));
+    }
 
     let mut status = DiagnosticStatus::Ok;
-    let mut recommendation = if dist.auth_mode.requires_token() && token_label == "missing" {
-        status = DiagnosticStatus::Error;
-        Some("Set distributed.token".to_string())
-    } else {
-        None
-    };
+    let mut recommendation = None;
+
+    if dist.auth_mode.requires_token() {
+        if token_label.starts_with("missing") {
+            status = DiagnosticStatus::Error;
+            recommendation =
+                Some("Set distributed.token_env or distributed.token_path".to_string());
+        } else if token_resolve_err.is_some() {
+            status = DiagnosticStatus::Error;
+            recommendation = Some("Fix distributed token source (env/file)".to_string());
+        } else if token_label.starts_with("inline") && status != DiagnosticStatus::Error {
+            status = DiagnosticStatus::Warning;
+            recommendation.get_or_insert_with(|| {
+                "Prefer distributed.token_path (file) for rotation; avoid inline tokens".to_string()
+            });
+        }
+    }
 
     if dist.allow_insecure {
         if status != DiagnosticStatus::Error {

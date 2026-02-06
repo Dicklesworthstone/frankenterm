@@ -116,7 +116,6 @@ pub mod tui;
 #[cfg(feature = "web")]
 pub mod web;
 
-#[cfg(feature = "distributed")]
 pub mod distributed;
 
 #[cfg(feature = "sync")]
