@@ -24,8 +24,9 @@ use ratatui::{
 
 use super::query::{EventFilters, QueryClient, QueryError};
 use super::views::{
-    View, ViewState, filtered_pane_indices, render_events_view, render_help_view, render_home_view,
-    render_panes_view, render_search_view, render_tabs, render_triage_view,
+    View, ViewState, filtered_event_indices, filtered_pane_indices, render_events_view,
+    render_help_view, render_home_view, render_panes_view, render_search_view, render_tabs,
+    render_triage_view,
 };
 
 /// Application configuration
@@ -300,21 +301,38 @@ impl<Q: QueryClient> App<Q> {
 
     /// Handle key events in the events view
     fn handle_events_key(&mut self, key: KeyEvent) {
+        let filtered_len = filtered_event_indices(&self.view_state).len();
         match key.code {
             KeyCode::Down | KeyCode::Char('j') => {
-                if !self.view_state.events.is_empty() {
-                    self.view_state.selected_index =
-                        (self.view_state.selected_index + 1) % self.view_state.events.len();
+                if filtered_len > 0 {
+                    self.view_state.events_selected_index =
+                        (self.view_state.events_selected_index + 1) % filtered_len;
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                if !self.view_state.events.is_empty() {
-                    self.view_state.selected_index = self
+                if filtered_len > 0 {
+                    self.view_state.events_selected_index = self
                         .view_state
-                        .selected_index
+                        .events_selected_index
                         .checked_sub(1)
-                        .unwrap_or(self.view_state.events.len() - 1);
+                        .unwrap_or(filtered_len - 1);
                 }
+            }
+            KeyCode::Char('u') => {
+                self.view_state.events_unhandled_only = !self.view_state.events_unhandled_only;
+                self.view_state.events_selected_index = 0;
+            }
+            KeyCode::Backspace => {
+                self.view_state.events_pane_filter.pop();
+                self.view_state.events_selected_index = 0;
+            }
+            KeyCode::Esc => {
+                self.view_state.events_pane_filter.clear();
+                self.view_state.events_selected_index = 0;
+            }
+            KeyCode::Char(c) if c.is_ascii_digit() => {
+                self.view_state.events_pane_filter.push(c);
+                self.view_state.events_selected_index = 0;
             }
             _ => {}
         }
@@ -707,5 +725,134 @@ mod tests {
 
         app.handle_panes_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(app.view_state.selected_index, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Events view keybinding tests (wa-nu4.3.7.3)
+    // -----------------------------------------------------------------------
+
+    struct EventQueryClient;
+
+    impl QueryClient for EventQueryClient {
+        fn list_panes(&self) -> Result<Vec<PaneView>, QueryError> {
+            Ok(vec![pane(1, "test", None, 0)])
+        }
+
+        fn list_events(&self, _: &EventFilters) -> Result<Vec<EventView>, QueryError> {
+            Ok(vec![
+                EventView {
+                    id: 1,
+                    rule_id: "codex.usage_reached".to_string(),
+                    pane_id: 10,
+                    severity: "warning".to_string(),
+                    message: "usage limit hit".to_string(),
+                    timestamp: 1_700_000_000_000,
+                    handled: false,
+                },
+                EventView {
+                    id: 2,
+                    rule_id: "claude.error".to_string(),
+                    pane_id: 20,
+                    severity: "critical".to_string(),
+                    message: "agent error".to_string(),
+                    timestamp: 1_700_000_001_000,
+                    handled: true,
+                },
+                EventView {
+                    id: 3,
+                    rule_id: "core.idle".to_string(),
+                    pane_id: 10,
+                    severity: "info".to_string(),
+                    message: "pane idle".to_string(),
+                    timestamp: 1_700_000_002_000,
+                    handled: false,
+                },
+            ])
+        }
+
+        fn list_triage_items(&self) -> Result<Vec<crate::tui::query::TriageItemView>, QueryError> {
+            Ok(Vec::new())
+        }
+
+        fn search(&self, _: &str, _: usize) -> Result<Vec<SearchResultView>, QueryError> {
+            Ok(Vec::new())
+        }
+
+        fn health(&self) -> Result<HealthStatus, QueryError> {
+            Ok(HealthStatus {
+                watcher_running: true,
+                db_accessible: true,
+                wezterm_accessible: true,
+                wezterm_circuit: crate::circuit_breaker::CircuitBreakerStatus::default(),
+                pane_count: 1,
+                event_count: 3,
+                last_capture_ts: None,
+            })
+        }
+
+        fn is_watcher_running(&self) -> bool {
+            true
+        }
+
+        fn mark_event_muted(&self, _event_id: i64) -> Result<(), QueryError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn events_navigation_wraps() {
+        let mut app = App::new(EventQueryClient, AppConfig::default());
+        app.refresh_data();
+        assert_eq!(app.view_state.events.len(), 3);
+        assert_eq!(app.view_state.events_selected_index, 0);
+
+        // Navigate down
+        app.handle_events_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.view_state.events_selected_index, 1);
+
+        app.handle_events_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.view_state.events_selected_index, 2);
+
+        // Wrap around
+        app.handle_events_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.view_state.events_selected_index, 0);
+
+        // Navigate up wraps
+        app.handle_events_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(app.view_state.events_selected_index, 2);
+    }
+
+    #[test]
+    fn events_unhandled_toggle_resets_selection() {
+        let mut app = App::new(EventQueryClient, AppConfig::default());
+        app.refresh_data();
+        app.view_state.events_selected_index = 2;
+
+        app.handle_events_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
+        assert!(app.view_state.events_unhandled_only);
+        assert_eq!(app.view_state.events_selected_index, 0);
+
+        // Toggle off
+        app.handle_events_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
+        assert!(!app.view_state.events_unhandled_only);
+    }
+
+    #[test]
+    fn events_pane_filter_accepts_digits() {
+        let mut app = App::new(EventQueryClient, AppConfig::default());
+        app.refresh_data();
+
+        app.handle_events_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        assert_eq!(app.view_state.events_pane_filter, "2");
+        app.handle_events_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE));
+        assert_eq!(app.view_state.events_pane_filter, "20");
+
+        // Backspace
+        app.handle_events_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(app.view_state.events_pane_filter, "2");
+
+        // Esc clears
+        app.handle_events_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.view_state.events_pane_filter.is_empty());
     }
 }

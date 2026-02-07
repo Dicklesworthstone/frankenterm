@@ -126,6 +126,12 @@ pub struct ViewState {
     pub selected_index: usize,
     /// Selected index in triage view
     pub triage_selected_index: usize,
+    /// Events: show only unhandled events
+    pub events_unhandled_only: bool,
+    /// Events: filter by pane id (text)
+    pub events_pane_filter: String,
+    /// Events: selected index (separate from panes)
+    pub events_selected_index: usize,
 }
 
 impl ViewState {
@@ -184,6 +190,30 @@ pub fn filtered_pane_indices(state: &ViewState) -> Vec<usize> {
                 || title.contains(&query)
                 || domain.contains(&query)
                 || cwd.contains(&query)
+        })
+        .map(|(idx, _)| idx)
+        .collect()
+}
+
+/// Return event indices that match active event filters.
+#[must_use]
+pub fn filtered_event_indices(state: &ViewState) -> Vec<usize> {
+    let pane_query = state.events_pane_filter.trim();
+    state
+        .events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| {
+            if state.events_unhandled_only && event.handled {
+                return false;
+            }
+            if !pane_query.is_empty() {
+                let pane_str = event.pane_id.to_string();
+                if !pane_str.contains(pane_query) && !event.rule_id.contains(pane_query) {
+                    return false;
+                }
+            }
+            true
         })
         .map(|(idx, _)| idx)
         .collect()
@@ -445,44 +475,183 @@ pub fn render_panes_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
 
 /// Render the events feed view
 pub fn render_events_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
-    let block = Block::default().title("Events").borders(Borders::ALL);
-    let inner = block.inner(area);
-    block.render(area, buf);
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .split(area);
 
-    if state.events.is_empty() {
-        let empty_msg = Paragraph::new(Span::styled(
-            "No events yet. Watcher will capture pattern matches here.",
-            Style::default().fg(Color::Yellow),
-        ));
-        empty_msg.render(inner, buf);
-        return;
+    let filtered_indices = filtered_event_indices(state);
+    let selected_filtered = state
+        .events_selected_index
+        .min(filtered_indices.len().saturating_sub(1));
+    let selected_event = filtered_indices
+        .get(selected_filtered)
+        .and_then(|idx| state.events.get(*idx));
+
+    // --- Left: event list ---
+    let list_block = Block::default()
+        .title(format!(
+            "Events ({}/{})",
+            filtered_indices.len(),
+            state.events.len()
+        ))
+        .borders(Borders::ALL);
+    let list_inner = list_block.inner(chunks[0]);
+    list_block.render(chunks[0], buf);
+
+    let list_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(1)])
+        .split(list_inner);
+
+    // Filter summary header
+    let filter_summary = format!(
+        "unhandled_only={}  pane/rule='{}'",
+        state.events_unhandled_only, state.events_pane_filter,
+    );
+    Paragraph::new(vec![
+        Line::from("sev       pane  rule                          status"),
+        Line::from(Span::styled(
+            filter_summary,
+            Style::default().fg(Color::Gray),
+        )),
+    ])
+    .render(list_chunks[0], buf);
+
+    if filtered_indices.is_empty() {
+        let msg = if state.events.is_empty() {
+            "No events yet. Watcher will capture pattern matches here."
+        } else {
+            "No events match the current filters."
+        };
+        Paragraph::new(Span::styled(msg, Style::default().fg(Color::Yellow)))
+            .render(list_chunks[1], buf);
+    } else {
+        let mut lines: Vec<Line> = Vec::with_capacity(filtered_indices.len());
+        for (pos, event_index) in filtered_indices.iter().enumerate() {
+            let event = &state.events[*event_index];
+            let severity_style = severity_color(&event.severity);
+            let handled_marker = if event.handled { " " } else { "*" };
+
+            if pos == selected_filtered {
+                lines.push(Line::styled(
+                    format!(
+                        "[{:8}] {:>4}  {:28} {}",
+                        truncate_str(&event.severity, 8),
+                        event.pane_id,
+                        truncate_str(&event.rule_id, 28),
+                        handled_marker,
+                    ),
+                    Style::default()
+                        .bg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("[{:8}]", truncate_str(&event.severity, 8)),
+                        severity_style,
+                    ),
+                    Span::raw(format!(
+                        " {:>4}  {:28} {}",
+                        event.pane_id,
+                        truncate_str(&event.rule_id, 28),
+                        handled_marker,
+                    )),
+                ]));
+            }
+        }
+        Paragraph::new(lines).render(list_chunks[1], buf);
     }
 
-    let mut lines: Vec<Line> = Vec::new();
-    for event in &state.events {
-        let severity_style = match event.severity.as_str() {
-            "critical" | "error" => Style::default().fg(Color::Red),
-            "warning" => Style::default().fg(Color::Yellow),
-            "info" => Style::default().fg(Color::Blue),
-            _ => Style::default().fg(Color::Gray),
+    // --- Right: event detail panel ---
+    let detail_block = Block::default()
+        .title("Event Details")
+        .borders(Borders::ALL);
+    let detail_inner = detail_block.inner(chunks[1]);
+    detail_block.render(chunks[1], buf);
+
+    if let Some(event) = selected_event {
+        let severity_style = severity_color(&event.severity);
+        let handled_label = if event.handled { "handled" } else { "UNHANDLED" };
+        let handled_style = if event.handled {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default()
+                .fg(Color::Red)
+                .add_modifier(Modifier::BOLD)
         };
 
-        let handled_marker = if event.handled { "" } else { "*" };
-
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("[{:8}]", truncate_str(&event.severity, 8)),
-                severity_style,
-            ),
-            Span::raw(format!(
-                " Pane {} | {} {}",
-                event.pane_id, event.rule_id, handled_marker
+        let mut details = vec![
+            Line::from(vec![
+                Span::raw("ID: "),
+                Span::styled(
+                    event.id.to_string(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(format!("Pane: {}", event.pane_id)),
+            Line::from(vec![
+                Span::raw("Severity: "),
+                Span::styled(event.severity.clone(), severity_style),
+            ]),
+            Line::from(vec![
+                Span::raw("Status: "),
+                Span::styled(handled_label, handled_style),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Rule:",
+                Style::default().add_modifier(Modifier::BOLD),
             )),
-        ]));
-    }
+            Line::from(format!("  {}", event.rule_id)),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Match (redacted):",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::from(format!("  {}", truncate_str(&event.message, 60))),
+        ];
 
-    let list = Paragraph::new(lines);
-    list.render(inner, buf);
+        // Timestamp
+        details.push(Line::from(""));
+        details.push(Line::from(format!("Captured: {}", event.timestamp)));
+
+        // Suggested next actions
+        details.push(Line::from(""));
+        details.push(Line::from(Span::styled(
+            "Actions:",
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        if !event.handled {
+            details.push(Line::from(format!(
+                "  wa events --pane {} --unhandled",
+                event.pane_id
+            )));
+        }
+        details.push(Line::from(format!(
+            "  wa why --recent --pane {}",
+            event.pane_id
+        )));
+
+        Paragraph::new(details).render(detail_inner, buf);
+    } else {
+        Paragraph::new(Span::styled(
+            "No event selected.",
+            Style::default().fg(Color::Yellow),
+        ))
+        .render(detail_inner, buf);
+    }
+}
+
+/// Map severity string to a color style.
+fn severity_color(severity: &str) -> Style {
+    match severity {
+        "critical" | "error" => Style::default().fg(Color::Red),
+        "warning" => Style::default().fg(Color::Yellow),
+        "info" => Style::default().fg(Color::Blue),
+        _ => Style::default().fg(Color::Gray),
+    }
 }
 
 /// Render the search view
@@ -638,6 +807,7 @@ pub fn render_help_view(area: Rect, buf: &mut Buffer) {
         Line::from("  m          Mute selected event (triage)"),
         Line::from("  [Panes] type text to filter, Backspace to edit, Esc to clear"),
         Line::from("  [Panes] u=unhandled-only, a=agent filter, d=domain filter"),
+        Line::from("  [Events] type digits to filter by pane/rule, u=unhandled-only"),
         Line::from(""),
         Line::from(Span::styled(
             "Views:",
@@ -775,5 +945,171 @@ mod tests {
         let filtered = filtered_pane_indices(&state);
         assert!(!filtered.is_empty());
         assert!(filtered.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    // -----------------------------------------------------------------------
+    // Events view tests (wa-nu4.3.7.3)
+    // -----------------------------------------------------------------------
+
+    fn event(id: i64, pane_id: u64, rule: &str, severity: &str, handled: bool) -> EventView {
+        EventView {
+            id,
+            rule_id: rule.to_string(),
+            pane_id,
+            severity: severity.to_string(),
+            message: format!("matched text for {rule}"),
+            timestamp: 1_700_000_000_000 + id,
+            handled,
+        }
+    }
+
+    #[test]
+    fn filtered_event_indices_returns_all_when_no_filters() {
+        let mut state = ViewState::default();
+        state.events = vec![
+            event(1, 10, "codex.usage_reached", "warning", false),
+            event(2, 20, "claude.error", "critical", true),
+            event(3, 10, "core.prompt_idle", "info", false),
+        ];
+        let filtered = filtered_event_indices(&state);
+        assert_eq!(filtered, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn filtered_event_indices_unhandled_only() {
+        let mut state = ViewState::default();
+        state.events = vec![
+            event(1, 10, "codex.usage_reached", "warning", false),
+            event(2, 20, "claude.error", "critical", true),
+            event(3, 10, "core.prompt_idle", "info", false),
+        ];
+        state.events_unhandled_only = true;
+        let filtered = filtered_event_indices(&state);
+        assert_eq!(filtered, vec![0, 2]);
+    }
+
+    #[test]
+    fn filtered_event_indices_pane_filter() {
+        let mut state = ViewState::default();
+        state.events = vec![
+            event(1, 10, "codex.usage_reached", "warning", false),
+            event(2, 20, "claude.error", "critical", true),
+            event(3, 10, "core.prompt_idle", "info", false),
+        ];
+        state.events_pane_filter = "20".to_string();
+        let filtered = filtered_event_indices(&state);
+        assert_eq!(filtered, vec![1]);
+    }
+
+    #[test]
+    fn filtered_event_indices_rule_filter() {
+        let mut state = ViewState::default();
+        state.events = vec![
+            event(1, 10, "codex.usage_reached", "warning", false),
+            event(2, 20, "claude.error", "critical", true),
+            event(3, 10, "core.prompt_idle", "info", false),
+        ];
+        state.events_pane_filter = "codex".to_string();
+        let filtered = filtered_event_indices(&state);
+        assert_eq!(filtered, vec![0]);
+    }
+
+    #[test]
+    fn filtered_event_indices_combined_filters() {
+        let mut state = ViewState::default();
+        state.events = vec![
+            event(1, 10, "codex.usage_reached", "warning", false),
+            event(2, 20, "claude.error", "critical", true),
+            event(3, 10, "core.prompt_idle", "info", false),
+        ];
+        state.events_unhandled_only = true;
+        state.events_pane_filter = "10".to_string();
+        let filtered = filtered_event_indices(&state);
+        assert_eq!(filtered, vec![0, 2]);
+    }
+
+    #[test]
+    fn filtered_event_indices_empty_events() {
+        let state = ViewState::default();
+        let filtered = filtered_event_indices(&state);
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn render_events_view_handles_empty_state() {
+        let state = ViewState::default();
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        render_events_view(&state, area, &mut buf);
+        // Should not panic with empty events
+    }
+
+    #[test]
+    fn render_events_view_handles_populated_state() {
+        let mut state = ViewState::default();
+        state.events = vec![
+            event(1, 10, "codex.usage_reached", "warning", false),
+            event(2, 20, "claude.error", "critical", true),
+            event(3, 10, "core.prompt_idle", "info", false),
+        ];
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        render_events_view(&state, area, &mut buf);
+        // Should render without panic
+    }
+
+    #[test]
+    fn render_events_view_with_selection() {
+        let mut state = ViewState::default();
+        state.events = vec![
+            event(1, 10, "codex.usage_reached", "warning", false),
+            event(2, 20, "claude.error", "critical", true),
+        ];
+        state.events_selected_index = 1;
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        render_events_view(&state, area, &mut buf);
+        // Should render detail panel for second event
+    }
+
+    #[test]
+    fn render_events_view_with_filters_active() {
+        let mut state = ViewState::default();
+        state.events = vec![
+            event(1, 10, "codex.usage_reached", "warning", false),
+            event(2, 20, "claude.error", "critical", true),
+        ];
+        state.events_unhandled_only = true;
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        render_events_view(&state, area, &mut buf);
+        // Only unhandled events should appear
+    }
+
+    #[test]
+    fn severity_color_maps_correctly() {
+        let critical = severity_color("critical");
+        assert_eq!(critical.fg, Some(Color::Red));
+        let warning = severity_color("warning");
+        assert_eq!(warning.fg, Some(Color::Yellow));
+        let info = severity_color("info");
+        assert_eq!(info.fg, Some(Color::Blue));
+        let unknown = severity_color("other");
+        assert_eq!(unknown.fg, Some(Color::Gray));
+        let error = severity_color("error");
+        assert_eq!(error.fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn events_selected_index_clamps_to_filtered() {
+        let mut state = ViewState::default();
+        state.events = vec![
+            event(1, 10, "codex.usage_reached", "warning", false),
+            event(2, 20, "claude.error", "critical", true),
+        ];
+        state.events_selected_index = 99; // Beyond range
+        let filtered = filtered_event_indices(&state);
+        let clamped = state.events_selected_index.min(filtered.len().saturating_sub(1));
+        assert_eq!(clamped, 1); // Clamped to last index
     }
 }
