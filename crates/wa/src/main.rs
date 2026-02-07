@@ -15659,7 +15659,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     }
                 }
             } else {
-                run_guided_setup(apply, dry_run, cli.verbose)?;
+                run_guided_setup(apply, dry_run, cli.verbose).await?;
             }
         }
 
@@ -20854,38 +20854,15 @@ fn check_wezterm_scrollback() -> Result<(u64, std::path::PathBuf), String> {
     )
 }
 
-fn detect_wezterm_version() -> Option<String> {
-    let output = std::process::Command::new("wezterm")
-        .arg("--version")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let text = stdout.trim();
-    if text.is_empty() {
-        let text = stderr.trim();
-        if text.is_empty() {
-            None
-        } else {
-            Some(text.to_string())
-        }
-    } else {
-        Some(text.to_string())
-    }
-}
-
 fn format_backup_hint(path: &Path) -> String {
     let filename = path.file_name().unwrap_or_default().to_string_lossy();
     let backup_name = format!("{filename}.bak.<timestamp>");
     path.with_file_name(backup_name).display().to_string()
 }
 
-fn run_guided_setup(apply: bool, dry_run: bool, verbose: u8) -> anyhow::Result<()> {
-    use wa_core::setup::{self, ShellType};
+async fn run_guided_setup(apply: bool, dry_run: bool, verbose: u8) -> anyhow::Result<()> {
+    use wa_core::environment::DetectedEnvironment;
+    use wa_core::setup::{self, SetupWizard, ShellType, WizardChoice, default_config_save_path};
 
     let apply_changes = apply && !dry_run;
 
@@ -20898,58 +20875,83 @@ fn run_guided_setup(apply: bool, dry_run: bool, verbose: u8) -> anyhow::Result<(
         println!("Run with --apply to make changes automatically.\n");
     }
 
-    // Step 1: WezTerm CLI availability
-    if let Some(version) = detect_wezterm_version() {
-        println!("✓ WezTerm CLI detected: {version}");
-    } else {
-        println!("⚠ WezTerm CLI not detected in PATH.");
-        println!("  Install WezTerm and ensure `wezterm` is available.");
+    // ---- Phase 1: Environment detection ----
+    println!("Detecting your setup...\n");
+    let env = DetectedEnvironment::detect(None).await;
+    let wizard = SetupWizard::new(env);
+    let steps = wizard.detect();
+
+    for step in &steps {
+        if step.ok {
+            println!("  ✓ {}: {}", step.label, step.detail);
+        } else {
+            println!("  ⚠ {}: {}", step.label, step.detail);
+        }
     }
 
-    // Step 2: scrollback configuration
+    // ---- Phase 1b: Scrollback check (not part of wizard but useful) ----
     match check_wezterm_scrollback() {
         Ok((lines, path)) => {
             if verbose > 0 {
                 println!("  WezTerm config: {}", path.display());
             }
             if lines >= RECOMMENDED_SCROLLBACK_LINES {
-                println!("✓ scrollback_lines = {} (ok)", lines);
+                println!("  ✓ scrollback_lines = {} (ok)", lines);
             } else {
                 println!(
-                    "⚠ scrollback_lines = {} (recommended ≥ {})",
+                    "  ⚠ scrollback_lines = {} (recommended ≥ {})",
                     lines, RECOMMENDED_SCROLLBACK_LINES
-                );
-                println!(
-                    "  Add to {}: config.scrollback_lines = {}",
-                    path.display(),
-                    RECOMMENDED_SCROLLBACK_LINES
                 );
             }
         }
         Err(err) => {
-            println!("⚠ scrollback_lines check: {err}");
-            println!("  Add: config.scrollback_lines = {RECOMMENDED_SCROLLBACK_LINES}");
+            if verbose > 0 {
+                println!("  ⚠ scrollback check: {err}");
+            }
         }
     }
 
-    // Step 3: WezTerm user-var forwarding + status update block
+    // ---- Phase 2: Recommended configuration ----
+    let auto = wizard.auto_config();
+    println!("\nRecommended configuration:\n");
+    println!("  Poll interval:    {}ms", auto.poll_interval_ms);
+    println!("  Min poll:         {}ms", auto.min_poll_interval_ms);
+    println!("  Concurrency:      {} captures", auto.max_concurrent_captures);
+    println!(
+        "  Pattern packs:    {}",
+        auto.pattern_packs.join(", ")
+    );
+    println!(
+        "  Safety mode:      {}",
+        if auto.strict_safety { "strict" } else { "standard" }
+    );
+    println!("  Rate limit:       {}/min per pane", auto.rate_limit_per_pane);
+
+    if !auto.recommendations.is_empty() {
+        println!("\n  Reasons:");
+        for rec in &auto.recommendations {
+            println!("    {} = {} ({})", rec.key, rec.value, rec.reason);
+        }
+    }
+
+    // ---- Phase 3: WezTerm patching ----
     match setup::locate_wezterm_config() {
         Ok(path) => {
             if verbose > 0 {
-                println!("  WezTerm config path: {}", path.display());
+                println!("\n  WezTerm config: {}", path.display());
             }
             match std::fs::read_to_string(&path) {
                 Ok(content) => {
                     if setup::has_wa_block(&content) {
-                        println!("✓ wezterm.lua already patched (wa block present)");
+                        println!("\n✓ wezterm.lua already patched (wa block present)");
                     } else if apply_changes {
                         let result = setup::patch_wezterm_config_at(&path)?;
-                        println!("✓ {}", result.message);
+                        println!("\n✓ {}", result.message);
                         if let Some(backup) = result.backup_path {
                             println!("  Backup: {}", backup.display());
                         }
                     } else {
-                        println!("⚠ wezterm.lua missing wa block: {}", path.display());
+                        println!("\n⚠ wezterm.lua missing wa block: {}", path.display());
                         println!(
                             "  Would patch and create backup: {}",
                             format_backup_hint(&path)
@@ -20958,22 +20960,22 @@ fn run_guided_setup(apply: bool, dry_run: bool, verbose: u8) -> anyhow::Result<(
                     }
                 }
                 Err(err) => {
-                    println!("⚠ Failed to read {}: {}", path.display(), err);
+                    println!("\n⚠ Failed to read {}: {}", path.display(), err);
                 }
             }
         }
         Err(err) => {
-            println!("⚠ WezTerm config not found: {err}");
+            println!("\n⚠ WezTerm config not found: {err}");
             println!("  Create ~/.config/wezterm/wezterm.lua then run: wa setup patch");
         }
     }
 
-    // Step 4: Shell OSC 133 integration
+    // ---- Phase 4: Shell OSC 133 ----
     match ShellType::detect() {
         Some(shell_type) => match setup::locate_shell_rc(shell_type) {
             Ok(rc_path) => {
                 if verbose > 0 {
-                    println!("  Shell rc path: {}", rc_path.display());
+                    println!("  Shell rc: {}", rc_path.display());
                 }
                 let content = if rc_path.exists() {
                     std::fs::read_to_string(&rc_path).unwrap_or_default()
@@ -20990,14 +20992,6 @@ fn run_guided_setup(apply: bool, dry_run: bool, verbose: u8) -> anyhow::Result<(
                     }
                 } else {
                     println!("⚠ shell rc missing OSC 133 markers ({})", shell_type.name());
-                    if rc_path.exists() {
-                        println!(
-                            "  Would patch and create backup: {}",
-                            format_backup_hint(&rc_path)
-                        );
-                    } else {
-                        println!("  Would create {}", rc_path.display());
-                    }
                     println!("  Run: wa setup shell");
                 }
             }
@@ -21010,7 +21004,7 @@ fn run_guided_setup(apply: bool, dry_run: bool, verbose: u8) -> anyhow::Result<(
         }
     }
 
-    // Step 5: SSH hosts (optional)
+    // ---- Phase 5: SSH hosts (optional) ----
     match setup::locate_ssh_config() {
         Ok(path) => match setup::load_ssh_hosts(&path) {
             Ok(hosts) => {
@@ -21019,7 +21013,6 @@ fn run_guided_setup(apply: bool, dry_run: bool, verbose: u8) -> anyhow::Result<(
                     path.display(),
                     hosts.len()
                 );
-                println!("  Run: wa setup --list-hosts");
             }
             Err(err) => {
                 println!("⚠ Failed to parse SSH config: {err}");
@@ -21027,6 +21020,24 @@ fn run_guided_setup(apply: bool, dry_run: bool, verbose: u8) -> anyhow::Result<(
         },
         Err(_) => {
             println!("• No SSH config detected (optional).");
+        }
+    }
+
+    // ---- Phase 6: Save config ----
+    if apply_changes {
+        let choice = WizardChoice::Accept;
+        let save_path = default_config_save_path();
+        let result = wizard.finish(choice, false, save_path.as_deref())?;
+
+        if let Some(ref path) = result.config_path {
+            println!("\n✓ Configuration saved to: {}", path.display());
+        }
+    } else if !dry_run {
+        if let Some(save_path) = default_config_save_path() {
+            println!(
+                "\nRun with --apply to save configuration to: {}",
+                save_path.display()
+            );
         }
     }
 

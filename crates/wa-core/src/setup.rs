@@ -1068,6 +1068,310 @@ pub fn unpatch_wezterm_config_at(config_path: &Path) -> Result<PatchResult> {
     })
 }
 
+// =============================================================================
+// Setup Wizard: Guided First-Run Configuration
+// =============================================================================
+
+use crate::config::Config;
+use crate::environment::{AutoConfig, ConfigRecommendation, DetectedEnvironment};
+
+/// Result of a single wizard detection step.
+#[derive(Debug, Clone)]
+pub struct DetectionStep {
+    /// Display label (e.g. "WezTerm CLI")
+    pub label: String,
+    /// Whether the check passed
+    pub ok: bool,
+    /// Human-readable detail
+    pub detail: String,
+}
+
+/// Wizard configuration choice made by the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WizardChoice {
+    /// Accept auto-detected recommendations as-is
+    Accept,
+    /// Skip setup entirely (use defaults)
+    Skip,
+}
+
+/// Result of running the setup wizard.
+#[derive(Debug, Clone)]
+pub struct WizardResult {
+    /// Detection steps that were executed
+    pub steps: Vec<DetectionStep>,
+    /// Auto-config recommendations
+    pub recommendations: Vec<ConfigRecommendation>,
+    /// Generated config (if not skipped)
+    pub config: Option<Config>,
+    /// Path where config was saved (if any)
+    pub config_path: Option<PathBuf>,
+    /// Patches applied (WezTerm, shell)
+    pub patches: Vec<PatchResult>,
+}
+
+/// Guided first-run setup wizard.
+///
+/// Uses [`DetectedEnvironment`] and [`AutoConfig`] to probe the system
+/// and generate an optimal `wa.toml`.
+pub struct SetupWizard {
+    env: DetectedEnvironment,
+    auto: AutoConfig,
+}
+
+impl SetupWizard {
+    /// Create a wizard from a pre-detected environment.
+    #[must_use]
+    pub fn new(env: DetectedEnvironment) -> Self {
+        let auto = AutoConfig::from_environment(&env);
+        Self { env, auto }
+    }
+
+    /// Run the detection phase and return human-readable steps.
+    #[must_use]
+    pub fn detect(&self) -> Vec<DetectionStep> {
+        let mut steps = Vec::new();
+
+        // WezTerm CLI
+        if let Some(ref ver) = self.env.wezterm.version {
+            steps.push(DetectionStep {
+                label: "WezTerm CLI".into(),
+                ok: true,
+                detail: format!("{ver} detected"),
+            });
+        } else {
+            steps.push(DetectionStep {
+                label: "WezTerm CLI".into(),
+                ok: false,
+                detail: "not found in PATH".into(),
+            });
+        }
+
+        // WezTerm socket
+        if let Some(ref sock) = self.env.wezterm.socket_path {
+            steps.push(DetectionStep {
+                label: "Socket".into(),
+                ok: true,
+                detail: format!("found at {}", sock.display()),
+            });
+        }
+
+        // Shell
+        if let Some(ref shell_type) = self.env.shell.shell_type {
+            let ver_suffix = self
+                .env
+                .shell
+                .version
+                .as_deref()
+                .map(|v| format!(" {v}"))
+                .unwrap_or_default();
+            steps.push(DetectionStep {
+                label: "Shell".into(),
+                ok: true,
+                detail: format!("{shell_type}{ver_suffix}"),
+            });
+        } else {
+            steps.push(DetectionStep {
+                label: "Shell".into(),
+                ok: false,
+                detail: "could not detect from $SHELL".into(),
+            });
+        }
+
+        // OSC 133
+        if self.env.shell.osc_133_enabled {
+            steps.push(DetectionStep {
+                label: "OSC 133".into(),
+                ok: true,
+                detail: "enabled".into(),
+            });
+        } else {
+            steps.push(DetectionStep {
+                label: "OSC 133".into(),
+                ok: false,
+                detail: "not enabled (optional but recommended)".into(),
+            });
+        }
+
+        // Running panes
+        if self.env.wezterm.is_running {
+            steps.push(DetectionStep {
+                label: "Panes".into(),
+                ok: true,
+                detail: "WezTerm responding".into(),
+            });
+        }
+
+        // Detected agents
+        for agent in &self.env.agents {
+            steps.push(DetectionStep {
+                label: "Agent".into(),
+                ok: true,
+                detail: format!("{:?} in pane {}", agent.agent_type, agent.pane_id),
+            });
+        }
+
+        // Remote hosts
+        for remote in &self.env.remotes {
+            steps.push(DetectionStep {
+                label: "Remote".into(),
+                ok: true,
+                detail: format!(
+                    "{} ({:?}, {} pane(s))",
+                    remote.hostname,
+                    remote.connection_type,
+                    remote.pane_ids.len()
+                ),
+            });
+        }
+
+        // System summary
+        let mem_str = self
+            .env
+            .system
+            .memory_mb
+            .map(|mb| format!(", {mb} MB RAM"))
+            .unwrap_or_default();
+        steps.push(DetectionStep {
+            label: "System".into(),
+            ok: true,
+            detail: format!(
+                "{} {} ({} CPUs{})",
+                self.env.system.os, self.env.system.arch, self.env.system.cpu_count, mem_str
+            ),
+        });
+
+        steps
+    }
+
+    /// Access the auto-configuration recommendations.
+    #[must_use]
+    pub fn recommendations(&self) -> &[ConfigRecommendation] {
+        &self.auto.recommendations
+    }
+
+    /// Access the auto-config.
+    #[must_use]
+    pub fn auto_config(&self) -> &AutoConfig {
+        &self.auto
+    }
+
+    /// Access the detected environment.
+    #[must_use]
+    pub fn environment(&self) -> &DetectedEnvironment {
+        &self.env
+    }
+
+    /// Generate a [`Config`] from the auto-detected settings.
+    #[must_use]
+    pub fn generate_config(&self) -> Config {
+        let mut config = Config::default();
+        config.ingest.poll_interval_ms = self.auto.poll_interval_ms;
+        config.ingest.min_poll_interval_ms = self.auto.min_poll_interval_ms;
+        config.ingest.max_concurrent_captures = self.auto.max_concurrent_captures;
+        config.patterns.packs.clone_from(&self.auto.pattern_packs);
+        config.safety.rate_limit_per_pane = self.auto.rate_limit_per_pane;
+        config
+    }
+
+    /// Build the full wizard result.
+    ///
+    /// `choice` controls whether a config is generated.
+    /// When `apply_patches` is true, WezTerm and shell configs are patched.
+    pub fn finish(
+        &self,
+        choice: WizardChoice,
+        apply_patches: bool,
+        config_save_path: Option<&Path>,
+    ) -> Result<WizardResult> {
+        let steps = self.detect();
+        let recommendations = self.auto.recommendations.clone();
+        let mut patches = Vec::new();
+
+        let config = match choice {
+            WizardChoice::Accept => Some(self.generate_config()),
+            WizardChoice::Skip => None,
+        };
+
+        // Optionally save config
+        let config_path = if let Some(ref cfg) = config {
+            if let Some(path) = config_save_path {
+                let toml_str = cfg.to_toml()?;
+                if let Some(parent) = path.parent() {
+                    if !parent.exists() {
+                        fs::create_dir_all(parent).map_err(|e| {
+                            Error::SetupError(format!(
+                                "Failed to create config directory {}: {}",
+                                parent.display(),
+                                e
+                            ))
+                        })?;
+                    }
+                }
+                fs::write(path, &toml_str).map_err(|e| {
+                    Error::SetupError(format!(
+                        "Failed to write config to {}: {}",
+                        path.display(),
+                        e
+                    ))
+                })?;
+                Some(path.to_path_buf())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Optionally apply patches
+        if apply_patches {
+            // WezTerm config
+            if let Ok(wez_path) = locate_wezterm_config() {
+                if let Ok(result) = patch_wezterm_config_at(&wez_path) {
+                    patches.push(result);
+                }
+            }
+
+            // Shell rc
+            if let Some(shell_type) = ShellType::detect() {
+                if let Ok(result) = patch_shell_rc(shell_type) {
+                    patches.push(result);
+                }
+            }
+        }
+
+        Ok(WizardResult {
+            steps,
+            recommendations,
+            config,
+            config_path,
+            patches,
+        })
+    }
+}
+
+/// Return the default config save path (~/.config/wa/wa.toml or platform equivalent).
+#[must_use]
+pub fn default_config_save_path() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        dirs::home_dir().map(|h| {
+            h.join("Library")
+                .join("Application Support")
+                .join("wa")
+                .join("wa.toml")
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::env::var("XDG_CONFIG_HOME")
+            .ok()
+            .map(PathBuf::from)
+            .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
+            .map(|p| p.join("wa").join("wa.toml"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1704,5 +2008,221 @@ alias ll='ls -la'
         assert_eq!(host.user.as_deref(), Some("alice"));
         assert_eq!(host.port, Some(2200));
         assert_eq!(host.identity_files, vec!["~/.ssh/id_rsa"]);
+    }
+
+    // =========================================================================
+    // Setup Wizard Tests
+    // =========================================================================
+
+    use crate::environment::{
+        ConnectionType, DetectedAgent, DetectedEnvironment, RemoteHost, ShellInfo, SystemInfo,
+        WeztermCapabilities, WeztermInfo,
+    };
+    use crate::patterns::AgentType;
+    use chrono::Utc;
+
+    fn make_test_env(
+        wezterm_version: Option<&str>,
+        shell: Option<&str>,
+        osc_133: bool,
+        agents: Vec<(AgentType, u64)>,
+        remotes: Vec<(&str, ConnectionType)>,
+    ) -> DetectedEnvironment {
+        DetectedEnvironment {
+            wezterm: WeztermInfo {
+                version: wezterm_version.map(str::to_string),
+                socket_path: wezterm_version
+                    .map(|_| std::path::PathBuf::from("/run/user/1000/wezterm-mux")),
+                is_running: wezterm_version.is_some(),
+                capabilities: WeztermCapabilities::default(),
+            },
+            shell: ShellInfo {
+                shell_path: shell.map(|s| format!("/bin/{s}")),
+                shell_type: shell.map(str::to_string),
+                version: shell.map(|_| "5.9".to_string()),
+                config_file: None,
+                osc_133_enabled: osc_133,
+            },
+            agents: agents
+                .into_iter()
+                .map(|(at, pid)| DetectedAgent {
+                    agent_type: at,
+                    pane_id: pid,
+                    confidence: 0.7,
+                    indicators: vec!["test".into()],
+                })
+                .collect(),
+            remotes: remotes
+                .into_iter()
+                .map(|(host, ct)| RemoteHost {
+                    hostname: host.to_string(),
+                    connection_type: ct,
+                    pane_ids: vec![1],
+                })
+                .collect(),
+            system: SystemInfo {
+                os: "linux".into(),
+                arch: "x86_64".into(),
+                cpu_count: 8,
+                memory_mb: Some(16384),
+                load_average: Some(0.5),
+                detected_at_epoch_ms: 0,
+            },
+            detected_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn wizard_detect_shows_wezterm() {
+        let env = make_test_env(Some("20260101"), Some("zsh"), true, vec![], vec![]);
+        let wizard = SetupWizard::new(env);
+        let steps = wizard.detect();
+        let labels: Vec<&str> = steps.iter().map(|s| s.label.as_str()).collect();
+        assert!(labels.contains(&"WezTerm CLI"));
+        assert!(labels.contains(&"Shell"));
+        assert!(labels.contains(&"OSC 133"));
+        assert!(labels.contains(&"System"));
+
+        let wez = steps.iter().find(|s| s.label == "WezTerm CLI").unwrap();
+        assert!(wez.ok);
+        assert!(wez.detail.contains("20260101"));
+    }
+
+    #[test]
+    fn wizard_detect_missing_wezterm() {
+        let env = make_test_env(None, Some("bash"), false, vec![], vec![]);
+        let wizard = SetupWizard::new(env);
+        let steps = wizard.detect();
+        let wez = steps.iter().find(|s| s.label == "WezTerm CLI").unwrap();
+        assert!(!wez.ok);
+        assert!(wez.detail.contains("not found"));
+    }
+
+    #[test]
+    fn wizard_detect_shows_agents() {
+        let env = make_test_env(
+            Some("20260101"),
+            Some("zsh"),
+            false,
+            vec![(AgentType::Codex, 0), (AgentType::ClaudeCode, 1)],
+            vec![],
+        );
+        let wizard = SetupWizard::new(env);
+        let steps = wizard.detect();
+        assert_eq!(steps.iter().filter(|s| s.label == "Agent").count(), 2);
+    }
+
+    #[test]
+    fn wizard_detect_shows_remotes() {
+        let env = make_test_env(
+            Some("20260101"),
+            Some("zsh"),
+            false,
+            vec![],
+            vec![("prod.example.com", ConnectionType::Ssh)],
+        );
+        let wizard = SetupWizard::new(env);
+        let steps = wizard.detect();
+        let remote_steps: Vec<_> = steps.iter().filter(|s| s.label == "Remote").collect();
+        assert_eq!(remote_steps.len(), 1);
+        assert!(remote_steps[0].detail.contains("prod.example.com"));
+    }
+
+    #[test]
+    fn wizard_generate_config_applies_autoconfig() {
+        let env = make_test_env(
+            Some("20260101"),
+            Some("zsh"),
+            true,
+            vec![(AgentType::Codex, 0)],
+            vec![],
+        );
+        let wizard = SetupWizard::new(env);
+        let config = wizard.generate_config();
+        assert_eq!(config.ingest.poll_interval_ms, 100);
+        assert_eq!(config.ingest.min_poll_interval_ms, 25);
+        assert!(config.patterns.packs.contains(&"builtin:core".to_string()));
+        assert!(config.patterns.packs.contains(&"builtin:codex".to_string()));
+    }
+
+    #[test]
+    fn wizard_generate_config_strict_for_production() {
+        let env = make_test_env(
+            Some("20260101"),
+            Some("zsh"),
+            false,
+            vec![],
+            vec![("web-prod-01", ConnectionType::Ssh)],
+        );
+        let wizard = SetupWizard::new(env);
+        let config = wizard.generate_config();
+        assert!(config.safety.rate_limit_per_pane <= 10);
+    }
+
+    #[test]
+    fn wizard_finish_skip_produces_no_config() {
+        let env = make_test_env(None, None, false, vec![], vec![]);
+        let wizard = SetupWizard::new(env);
+        let result = wizard.finish(WizardChoice::Skip, false, None).unwrap();
+        assert!(result.config.is_none());
+        assert!(result.config_path.is_none());
+    }
+
+    #[test]
+    fn wizard_finish_accept_saves_config() {
+        let env = make_test_env(Some("20260101"), Some("zsh"), true, vec![], vec![]);
+        let wizard = SetupWizard::new(env);
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("wa.toml");
+        let result = wizard
+            .finish(WizardChoice::Accept, false, Some(&config_path))
+            .unwrap();
+
+        assert!(result.config.is_some());
+        assert_eq!(result.config_path.as_deref(), Some(config_path.as_path()));
+        assert!(config_path.exists());
+
+        let saved = fs::read_to_string(&config_path).unwrap();
+        assert!(saved.contains("poll_interval_ms"));
+    }
+
+    #[test]
+    fn wizard_finish_accept_creates_parent_dirs() {
+        let env = make_test_env(None, None, false, vec![], vec![]);
+        let wizard = SetupWizard::new(env);
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("sub").join("deep").join("wa.toml");
+        let result = wizard
+            .finish(WizardChoice::Accept, false, Some(&config_path))
+            .unwrap();
+
+        assert!(config_path.exists());
+        assert!(result.config.is_some());
+    }
+
+    #[test]
+    fn wizard_default_config_save_path_not_none() {
+        // On CI/test machines, home dir should generally exist
+        if dirs::home_dir().is_some() {
+            let path = default_config_save_path();
+            assert!(path.is_some());
+            let p = path.unwrap();
+            assert!(p.to_string_lossy().contains("wa.toml"));
+        }
+    }
+
+    #[test]
+    fn wizard_recommendations_populated() {
+        let env = make_test_env(
+            Some("20260101"),
+            Some("zsh"),
+            false,
+            vec![(AgentType::Codex, 0)],
+            vec![("staging", ConnectionType::Ssh)],
+        );
+        let wizard = SetupWizard::new(env);
+        assert!(!wizard.recommendations().is_empty());
     }
 }
