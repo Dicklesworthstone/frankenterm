@@ -10,8 +10,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
-use crate::recording::{FrameHeader, FrameType, RecordingFrame};
 use crate::Result;
+use crate::recording::{FrameHeader, FrameType, RecordingFrame};
 
 // ---------------------------------------------------------------------------
 // Frame parsing
@@ -181,12 +181,8 @@ pub fn decode_frame(frame: &RecordingFrame) -> Result<DecodedFrame> {
         FrameType::Output => Ok(DecodedFrame::Output(frame.payload.clone())),
         FrameType::Resize => {
             if frame.payload.len() >= 4 {
-                let cols = u16::from_le_bytes(
-                    frame.payload[0..2].try_into().unwrap(),
-                );
-                let rows = u16::from_le_bytes(
-                    frame.payload[2..4].try_into().unwrap(),
-                );
+                let cols = u16::from_le_bytes(frame.payload[0..2].try_into().unwrap());
+                let rows = u16::from_le_bytes(frame.payload[2..4].try_into().unwrap());
                 Ok(DecodedFrame::Resize { cols, rows })
             } else {
                 Err(crate::Error::Runtime(
@@ -333,9 +329,7 @@ impl PlaybackSpeed {
     /// Create a custom speed multiplier. Must be > 0.
     pub fn new(speed: f32) -> Result<Self> {
         if speed <= 0.0 {
-            return Err(crate::Error::Runtime(
-                "playback speed must be > 0".into(),
-            ));
+            return Err(crate::Error::Runtime("playback speed must be > 0".into()));
         }
         Ok(Self(speed))
     }
@@ -478,9 +472,10 @@ impl Player {
             PlayerControl::Pause => {
                 self.state = PlayerState::Paused;
                 loop {
-                    control_rx.changed().await.map_err(|_| {
-                        crate::Error::Runtime("control channel closed".into())
-                    })?;
+                    control_rx
+                        .changed()
+                        .await
+                        .map_err(|_| crate::Error::Runtime("control channel closed".into()))?;
                     let sig = *control_rx.borrow();
                     match sig {
                         PlayerControl::Play => {
@@ -533,8 +528,7 @@ impl Player {
                 let raw_delay_ms = frame_ts - self.position.timestamp_ms;
                 let scaled_delay = (raw_delay_ms as f64) / (self.speed.as_f32() as f64);
                 if scaled_delay > 0.5 {
-                    tokio::time::sleep(Duration::from_micros((scaled_delay * 1000.0) as u64))
-                        .await;
+                    tokio::time::sleep(Duration::from_micros((scaled_delay * 1000.0) as u64)).await;
                 }
 
                 // Re-check controls after sleep (signal may have arrived during delay).
@@ -696,14 +690,8 @@ pub fn export_asciinema<W: std::io::Write>(
     // Write header
     let mut header = serde_json::Map::new();
     header.insert("version".into(), serde_json::Value::Number(2.into()));
-    header.insert(
-        "width".into(),
-        serde_json::Value::Number(cols.into()),
-    );
-    header.insert(
-        "height".into(),
-        serde_json::Value::Number(rows.into()),
-    );
+    header.insert("width".into(), serde_json::Value::Number(cols.into()));
+    header.insert("height".into(), serde_json::Value::Number(rows.into()));
     if let Some(ref title) = opts.title {
         header.insert("title".into(), serde_json::Value::String(title.clone()));
     }
@@ -717,12 +705,10 @@ pub fn export_asciinema<W: std::io::Write>(
             ),
         );
     }
-    let header_json = serde_json::to_string(&header).map_err(|e| {
-        crate::Error::Runtime(format!("Failed to serialize cast header: {e}"))
-    })?;
-    writeln!(writer, "{header_json}").map_err(|e| {
-        crate::Error::Runtime(format!("Failed to write cast header: {e}"))
-    })?;
+    let header_json = serde_json::to_string(&header)
+        .map_err(|e| crate::Error::Runtime(format!("Failed to serialize cast header: {e}")))?;
+    writeln!(writer, "{header_json}")
+        .map_err(|e| crate::Error::Runtime(format!("Failed to write cast header: {e}")))?;
 
     // Write events
     let base_ts = source
@@ -796,10 +782,7 @@ pub fn export_html<W: std::io::Write>(
     let event_count = export_asciinema(recording, opts, &mut cast_buf)?;
     let cast_data = String::from_utf8_lossy(&cast_buf);
 
-    let title = opts
-        .title
-        .as_deref()
-        .unwrap_or("wa Session Recording");
+    let title = opts.title.as_deref().unwrap_or("wa Session Recording");
     let (cols, rows) = find_terminal_size(
         &if opts.redact {
             redact_recording(recording, &opts.extra_redact_patterns)?
@@ -997,9 +980,9 @@ pub fn parse_duration_ms(s: &str) -> Result<u64> {
 
     // Trailing number without unit → treat as seconds
     if !num_buf.is_empty() {
-        let val: f64 = num_buf.parse().map_err(|_| {
-            crate::Error::Runtime(format!("Invalid duration: '{s}'"))
-        })?;
+        let val: f64 = num_buf
+            .parse()
+            .map_err(|_| crate::Error::Runtime(format!("Invalid duration: '{s}'")))?;
         total_ms += (val * 1_000.0) as u64;
     }
 
@@ -1026,9 +1009,7 @@ mod tests {
     use serde_json::json;
 
     /// Build a test recording from frame specs: (timestamp_ms, frame_type, payload).
-    fn build_recording(
-        specs: &[(u64, FrameType, Vec<u8>)],
-    ) -> Vec<u8> {
+    fn build_recording(specs: &[(u64, FrameType, Vec<u8>)]) -> Vec<u8> {
         let mut data = Vec::new();
         for (ts, ft, payload) in specs {
             let frame = RecordingFrame {
@@ -1123,7 +1104,10 @@ mod tests {
             payload,
         };
         let decoded = decode_frame(&frame).unwrap();
-        assert!(matches!(decoded, DecodedFrame::Resize { cols: 80, rows: 24 }));
+        assert!(matches!(
+            decoded,
+            DecodedFrame::Resize { cols: 80, rows: 24 }
+        ));
     }
 
     #[test]
@@ -1232,9 +1216,7 @@ mod tests {
 
     #[test]
     fn seek_beyond_end() {
-        let data = build_recording(&[
-            (0, FrameType::Output, b"only".to_vec()),
-        ]);
+        let data = build_recording(&[(0, FrameType::Output, b"only".to_vec())]);
         let recording = Recording::from_bytes(&data).unwrap();
         let mut player = Player::new(recording);
         let mut sink = HeadlessSink;
@@ -1374,7 +1356,11 @@ mod tests {
                 p.extend_from_slice(&40u16.to_le_bytes());
                 p
             }),
-            (100, FrameType::Event, serde_json::to_vec(&json!({"id": 1})).unwrap()),
+            (
+                100,
+                FrameType::Event,
+                serde_json::to_vec(&json!({"id": 1})).unwrap(),
+            ),
             (200, FrameType::Marker, b"checkpoint".to_vec()),
             (300, FrameType::Input, b"ls -la\n".to_vec()),
         ];
@@ -1389,7 +1375,13 @@ mod tests {
         assert!(matches!(d0, DecodedFrame::Output(ref b) if b == b"hello world"));
 
         let d1 = decode_frame(&recording.frames[1]).unwrap();
-        assert!(matches!(d1, DecodedFrame::Resize { cols: 120, rows: 40 }));
+        assert!(matches!(
+            d1,
+            DecodedFrame::Resize {
+                cols: 120,
+                rows: 40
+            }
+        ));
 
         let d2 = decode_frame(&recording.frames[2]).unwrap();
         if let DecodedFrame::Event(v) = d2 {
@@ -1411,16 +1403,12 @@ mod tests {
 
     fn build_test_recording_with_resize() -> Recording {
         let data = build_recording(&[
-            (
-                0,
-                FrameType::Resize,
-                {
-                    let mut p = Vec::new();
-                    p.extend_from_slice(&120u16.to_le_bytes());
-                    p.extend_from_slice(&40u16.to_le_bytes());
-                    p
-                },
-            ),
+            (0, FrameType::Resize, {
+                let mut p = Vec::new();
+                p.extend_from_slice(&120u16.to_le_bytes());
+                p.extend_from_slice(&40u16.to_le_bytes());
+                p
+            }),
             (100, FrameType::Output, b"$ hello world\r\n".to_vec()),
             (200, FrameType::Output, b"output line 2\r\n".to_vec()),
             (300, FrameType::Marker, b"checkpoint-1".to_vec()),
@@ -1527,11 +1515,7 @@ mod tests {
 
     #[test]
     fn export_asciinema_extra_redact_patterns() {
-        let data = build_recording(&[(
-            0,
-            FrameType::Output,
-            b"token=MYSECRET123 ok".to_vec(),
-        )]);
+        let data = build_recording(&[(0, FrameType::Output, b"token=MYSECRET123 ok".to_vec())]);
         let rec = Recording::from_bytes(&data).unwrap();
         let opts = ExportOptions {
             redact: true,
@@ -1724,7 +1708,7 @@ mod tests {
     #[test]
     fn recording_info_total_bytes() {
         let data = build_recording(&[
-            (0, FrameType::Output, b"hello".to_vec()), // 5 bytes
+            (0, FrameType::Output, b"hello".to_vec()),   // 5 bytes
             (10, FrameType::Output, b"world!".to_vec()), // 6 bytes
         ]);
         let rec = Recording::from_bytes(&data).unwrap();

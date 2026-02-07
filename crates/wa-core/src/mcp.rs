@@ -577,7 +577,8 @@ pub fn build_server_with_db(config: &Config, db_path: Option<PathBuf>) -> Result
         .tool(WaRulesTestTool)
         .resource(WaPanesResource::new(config.ingest.panes.clone()))
         .resource(WaWorkflowsResource::new(Arc::clone(&config)))
-        .resource(WaRulesResource);
+        .resource(WaRulesResource)
+        .resource(WaRulesByAgentTemplateResource);
 
     if let Some(ref db_path) = db_path {
         builder = builder
@@ -600,8 +601,16 @@ pub fn build_server_with_db(config: &Config, db_path: Option<PathBuf>) -> Result
                 Arc::clone(db_path),
             ))
             .resource(WaEventsResource::new(Arc::clone(db_path)))
+            .resource(WaEventsTemplateResource::new(Arc::clone(db_path)))
+            .resource(WaEventsUnhandledTemplateResource::new(Arc::clone(db_path)))
             .resource(WaAccountsResource::new(Arc::clone(db_path)))
-            .resource(WaReservationsResource::new(Arc::clone(db_path)));
+            .resource(WaAccountsByServiceTemplateResource::new(Arc::clone(
+                db_path,
+            )))
+            .resource(WaReservationsResource::new(Arc::clone(db_path)))
+            .resource(WaReservationsByPaneTemplateResource::new(Arc::clone(
+                db_path,
+            )));
     }
 
     let server = builder.build();
@@ -638,6 +647,66 @@ fn envelope_as_resource<T: Serialize>(
         text: Some(text),
         blob: None,
     }])
+}
+
+fn read_events_resource(
+    ctx: &McpContext,
+    db_path: &Arc<PathBuf>,
+    uri: &str,
+    limit: usize,
+    unhandled: bool,
+) -> McpResult<Vec<ResourceContent>> {
+    let tool = WaEventsTool::new(Arc::clone(db_path));
+    let contents = tool.call(
+        ctx,
+        serde_json::json!({
+            "limit": limit.clamp(1, 1000),
+            "unhandled": unhandled,
+        }),
+    )?;
+    tool_output_as_resource(uri, contents)
+}
+
+fn read_accounts_resource(
+    ctx: &McpContext,
+    db_path: &Arc<PathBuf>,
+    uri: &str,
+    service: &str,
+) -> McpResult<Vec<ResourceContent>> {
+    let tool = WaAccountsTool::new(Arc::clone(db_path));
+    let contents = tool.call(ctx, serde_json::json!({ "service": service }))?;
+    tool_output_as_resource(uri, contents)
+}
+
+fn read_rules_resource(
+    ctx: &McpContext,
+    uri: &str,
+    agent_type: Option<&str>,
+) -> McpResult<Vec<ResourceContent>> {
+    let args = if let Some(agent_type) = agent_type {
+        serde_json::json!({ "verbose": true, "agent_type": agent_type })
+    } else {
+        serde_json::json!({ "verbose": true })
+    };
+    let tool = WaRulesListTool;
+    let contents = tool.call(ctx, args)?;
+    tool_output_as_resource(uri, contents)
+}
+
+fn read_reservations_resource(
+    ctx: &McpContext,
+    db_path: &Arc<PathBuf>,
+    uri: &str,
+    pane_id: Option<u64>,
+) -> McpResult<Vec<ResourceContent>> {
+    let tool = WaReservationsTool::new(Arc::clone(db_path));
+    let args = if let Some(pane_id) = pane_id {
+        serde_json::json!({ "pane_id": pane_id })
+    } else {
+        serde_json::Value::Null
+    };
+    let contents = tool.call(ctx, args)?;
+    tool_output_as_resource(uri, contents)
 }
 
 struct WaPanesResource {
@@ -685,10 +754,35 @@ impl ResourceHandler for WaEventsResource {
         Resource {
             uri: "wa://events".to_string(),
             name: "wa events".to_string(),
-            description: Some(
-                "Recent detection events (default limit 50; template supports limit override)"
-                    .to_string(),
-            ),
+            description: Some("Recent detection events (default limit 50)".to_string()),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "events".to_string()],
+        }
+    }
+
+    fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        read_events_resource(ctx, &self.db_path, "wa://events", 50, false)
+    }
+}
+
+struct WaEventsTemplateResource {
+    db_path: Arc<PathBuf>,
+}
+
+impl WaEventsTemplateResource {
+    fn new(db_path: Arc<PathBuf>) -> Self {
+        Self { db_path }
+    }
+}
+
+impl ResourceHandler for WaEventsTemplateResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "wa://events/template".to_string(),
+            name: "wa events template".to_string(),
+            description: Some("Template for page-sized events resource".to_string()),
             mime_type: Some("application/json".to_string()),
             icon: None,
             version: Some(crate::VERSION.to_string()),
@@ -709,9 +803,7 @@ impl ResourceHandler for WaEventsResource {
     }
 
     fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-        let tool = WaEventsTool::new(Arc::clone(&self.db_path));
-        let contents = tool.call(ctx, serde_json::json!({ "limit": 50 }))?;
-        tool_output_as_resource("wa://events", contents)
+        read_events_resource(ctx, &self.db_path, "wa://events", 50, false)
     }
 
     fn read_with_uri(
@@ -725,9 +817,65 @@ impl ResourceHandler for WaEventsResource {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(50)
             .clamp(1, 1000);
-        let tool = WaEventsTool::new(Arc::clone(&self.db_path));
-        let contents = tool.call(ctx, serde_json::json!({ "limit": limit }))?;
-        tool_output_as_resource(uri, contents)
+        read_events_resource(ctx, &self.db_path, uri, limit, false)
+    }
+}
+
+struct WaEventsUnhandledTemplateResource {
+    db_path: Arc<PathBuf>,
+}
+
+impl WaEventsUnhandledTemplateResource {
+    fn new(db_path: Arc<PathBuf>) -> Self {
+        Self { db_path }
+    }
+}
+
+impl ResourceHandler for WaEventsUnhandledTemplateResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "wa://events/unhandled/template".to_string(),
+            name: "wa events unhandled template".to_string(),
+            description: Some("Template for unhandled events resource".to_string()),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "events".to_string()],
+        }
+    }
+
+    fn template(&self) -> Option<ResourceTemplate> {
+        Some(ResourceTemplate {
+            uri_template: "wa://events/unhandled/{limit}".to_string(),
+            name: "wa events (unhandled)".to_string(),
+            description: Some("Read only unhandled events with configurable limit".to_string()),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "events".to_string(),
+                "unhandled".to_string(),
+            ],
+        })
+    }
+
+    fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        read_events_resource(ctx, &self.db_path, "wa://events/unhandled/50", 50, true)
+    }
+
+    fn read_with_uri(
+        &self,
+        ctx: &McpContext,
+        uri: &str,
+        params: &HashMap<String, String>,
+    ) -> McpResult<Vec<ResourceContent>> {
+        let limit = params
+            .get("limit")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(50)
+            .clamp(1, 1000);
+        read_events_resource(ctx, &self.db_path, uri, limit, true)
     }
 }
 
@@ -746,10 +894,35 @@ impl ResourceHandler for WaAccountsResource {
         Resource {
             uri: "wa://accounts".to_string(),
             name: "wa accounts".to_string(),
-            description: Some(
-                "Account usage snapshot (default service openai; template supports service override)"
-                    .to_string(),
-            ),
+            description: Some("Account usage snapshot (default service openai)".to_string()),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "accounts".to_string()],
+        }
+    }
+
+    fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        read_accounts_resource(ctx, &self.db_path, "wa://accounts", "openai")
+    }
+}
+
+struct WaAccountsByServiceTemplateResource {
+    db_path: Arc<PathBuf>,
+}
+
+impl WaAccountsByServiceTemplateResource {
+    fn new(db_path: Arc<PathBuf>) -> Self {
+        Self { db_path }
+    }
+}
+
+impl ResourceHandler for WaAccountsByServiceTemplateResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "wa://accounts/template".to_string(),
+            name: "wa accounts template".to_string(),
+            description: Some("Template for service-specific account snapshots".to_string()),
             mime_type: Some("application/json".to_string()),
             icon: None,
             version: Some(crate::VERSION.to_string()),
@@ -770,9 +943,7 @@ impl ResourceHandler for WaAccountsResource {
     }
 
     fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-        let tool = WaAccountsTool::new(Arc::clone(&self.db_path));
-        let contents = tool.call(ctx, serde_json::json!({ "service": "openai" }))?;
-        tool_output_as_resource("wa://accounts", contents)
+        read_accounts_resource(ctx, &self.db_path, "wa://accounts/openai", "openai")
     }
 
     fn read_with_uri(
@@ -785,9 +956,7 @@ impl ResourceHandler for WaAccountsResource {
             .get("service")
             .cloned()
             .unwrap_or_else(|| "openai".to_string());
-        let tool = WaAccountsTool::new(Arc::clone(&self.db_path));
-        let contents = tool.call(ctx, serde_json::json!({ "service": service }))?;
-        tool_output_as_resource(uri, contents)
+        read_accounts_resource(ctx, &self.db_path, uri, &service)
     }
 }
 
@@ -808,6 +977,26 @@ impl ResourceHandler for WaRulesResource {
         }
     }
 
+    fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        read_rules_resource(ctx, "wa://rules", None)
+    }
+}
+
+struct WaRulesByAgentTemplateResource;
+
+impl ResourceHandler for WaRulesByAgentTemplateResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "wa://rules/template".to_string(),
+            name: "wa rules template".to_string(),
+            description: Some("Template for rules filtered by agent type".to_string()),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "rules".to_string()],
+        }
+    }
+
     fn template(&self) -> Option<ResourceTemplate> {
         Some(ResourceTemplate {
             uri_template: "wa://rules/{agent_type}".to_string(),
@@ -821,9 +1010,7 @@ impl ResourceHandler for WaRulesResource {
     }
 
     fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-        let tool = WaRulesListTool;
-        let contents = tool.call(ctx, serde_json::json!({ "verbose": true }))?;
-        tool_output_as_resource("wa://rules", contents)
+        read_rules_resource(ctx, "wa://rules", None)
     }
 
     fn read_with_uri(
@@ -832,14 +1019,7 @@ impl ResourceHandler for WaRulesResource {
         uri: &str,
         params: &HashMap<String, String>,
     ) -> McpResult<Vec<ResourceContent>> {
-        let args = if let Some(agent_type) = params.get("agent_type") {
-            serde_json::json!({ "verbose": true, "agent_type": agent_type })
-        } else {
-            serde_json::json!({ "verbose": true })
-        };
-        let tool = WaRulesListTool;
-        let contents = tool.call(ctx, args)?;
-        tool_output_as_resource(uri, contents)
+        read_rules_resource(ctx, uri, params.get("agent_type").map(String::as_str))
     }
 }
 
@@ -930,6 +1110,34 @@ impl ResourceHandler for WaReservationsResource {
         }
     }
 
+    fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        read_reservations_resource(ctx, &self.db_path, "wa://reservations", None)
+    }
+}
+
+struct WaReservationsByPaneTemplateResource {
+    db_path: Arc<PathBuf>,
+}
+
+impl WaReservationsByPaneTemplateResource {
+    fn new(db_path: Arc<PathBuf>) -> Self {
+        Self { db_path }
+    }
+}
+
+impl ResourceHandler for WaReservationsByPaneTemplateResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "wa://reservations/template".to_string(),
+            name: "wa reservations template".to_string(),
+            description: Some("Template for pane-filtered reservations".to_string()),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "reservations".to_string()],
+        }
+    }
+
     fn template(&self) -> Option<ResourceTemplate> {
         Some(ResourceTemplate {
             uri_template: "wa://reservations/{pane_id}".to_string(),
@@ -943,9 +1151,7 @@ impl ResourceHandler for WaReservationsResource {
     }
 
     fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-        let tool = WaReservationsTool::new(Arc::clone(&self.db_path));
-        let contents = tool.call(ctx, serde_json::Value::Null)?;
-        tool_output_as_resource("wa://reservations", contents)
+        read_reservations_resource(ctx, &self.db_path, "wa://reservations", None)
     }
 
     fn read_with_uri(
@@ -959,9 +1165,7 @@ impl ResourceHandler for WaReservationsResource {
             .ok_or_else(|| McpError::invalid_params("Missing pane_id in resource URI"))?
             .parse::<u64>()
             .map_err(|_| McpError::invalid_params("pane_id must be an unsigned integer"))?;
-        let tool = WaReservationsTool::new(Arc::clone(&self.db_path));
-        let contents = tool.call(ctx, serde_json::json!({ "pane_id": pane_id }))?;
-        tool_output_as_resource(uri, contents)
+        read_reservations_resource(ctx, &self.db_path, uri, Some(pane_id))
     }
 }
 
@@ -3785,4 +3989,73 @@ fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |dur| u64::try_from(dur.as_millis()).unwrap_or(u64::MAX))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn uri_set(values: impl IntoIterator<Item = String>) -> BTreeSet<String> {
+        values.into_iter().collect()
+    }
+
+    #[test]
+    fn mcp_server_with_db_exposes_expected_resources_and_templates() {
+        let server = build_server_with_db(&Config::default(), Some(PathBuf::from("wa-test.db")))
+            .expect("build mcp server");
+
+        let resources = uri_set(server.resources().into_iter().map(|r| r.uri));
+        let templates = uri_set(
+            server
+                .resource_templates()
+                .into_iter()
+                .map(|t| t.uri_template),
+        );
+
+        assert_eq!(
+            resources,
+            uri_set([
+                "wa://panes".to_string(),
+                "wa://events".to_string(),
+                "wa://accounts".to_string(),
+                "wa://rules".to_string(),
+                "wa://workflows".to_string(),
+                "wa://reservations".to_string(),
+            ])
+        );
+        assert_eq!(
+            templates,
+            uri_set([
+                "wa://events/{limit}".to_string(),
+                "wa://events/unhandled/{limit}".to_string(),
+                "wa://accounts/{service}".to_string(),
+                "wa://rules/{agent_type}".to_string(),
+                "wa://reservations/{pane_id}".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn mcp_server_without_db_only_exposes_non_storage_resources() {
+        let server = build_server_with_db(&Config::default(), None).expect("build mcp server");
+
+        let resources = uri_set(server.resources().into_iter().map(|r| r.uri));
+        let templates = uri_set(
+            server
+                .resource_templates()
+                .into_iter()
+                .map(|t| t.uri_template),
+        );
+
+        assert_eq!(
+            resources,
+            uri_set([
+                "wa://panes".to_string(),
+                "wa://rules".to_string(),
+                "wa://workflows".to_string(),
+            ])
+        );
+        assert_eq!(templates, uri_set(["wa://rules/{agent_type}".to_string()]));
+    }
 }

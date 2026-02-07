@@ -1003,12 +1003,7 @@ mod tests {
     }
 
     fn expected_session_fields() -> Vec<&'static str> {
-        vec![
-            "id",
-            "pane_id",
-            "agent_type",
-            "started_at",
-        ]
+        vec!["id", "pane_id", "agent_type", "started_at"]
     }
 
     fn expected_audit_fields() -> Vec<&'static str> {
@@ -1048,7 +1043,10 @@ mod tests {
     /// Helper: parse JSONL output into header + records
     fn parse_jsonl(output: &str) -> (serde_json::Value, Vec<serde_json::Value>) {
         let lines: Vec<&str> = output.trim().lines().collect();
-        assert!(!lines.is_empty(), "Export output must have at least a header line");
+        assert!(
+            !lines.is_empty(),
+            "Export output must have at least a header line"
+        );
         let header: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
         let records: Vec<serde_json::Value> = lines[1..]
             .iter()
@@ -1058,11 +1056,7 @@ mod tests {
     }
 
     /// Validate that a JSON object contains all expected fields.
-    fn assert_fields_present(
-        obj: &serde_json::Value,
-        expected: &[&str],
-        context: &str,
-    ) {
+    fn assert_fields_present(obj: &serde_json::Value, expected: &[&str], context: &str) {
         let map = obj.as_object().expect("Expected JSON object");
         for field in expected {
             assert!(
@@ -1074,10 +1068,8 @@ mod tests {
 
     /// Helper to create a test DB with one pane already inserted.
     async fn test_db_with_pane(suffix: &str) -> (StorageHandle, std::path::PathBuf) {
-        let tmp = std::env::temp_dir().join(format!(
-            "wa_test_export_{suffix}_{}.db",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("wa_test_export_{suffix}_{}.db", std::process::id()));
         let db_path = tmp.to_string_lossy().to_string();
         let storage = StorageHandle::new(&db_path).await.unwrap();
 
@@ -1121,7 +1113,13 @@ mod tests {
         // Also check no unexpected fields crept in without updating schema docs
         let map = val.as_object().unwrap();
         let known: std::collections::HashSet<&str> = [
-            "id", "pane_id", "seq", "content", "content_len", "content_hash", "captured_at",
+            "id",
+            "pane_id",
+            "seq",
+            "content",
+            "content_len",
+            "content_hash",
+            "captured_at",
         ]
         .into_iter()
         .collect();
@@ -1147,7 +1145,12 @@ mod tests {
         assert_fields_present(&val, &expected_gap_fields(), "Gap");
         let map = val.as_object().unwrap();
         let known: std::collections::HashSet<&str> = [
-            "id", "pane_id", "seq_before", "seq_after", "reason", "detected_at",
+            "id",
+            "pane_id",
+            "seq_before",
+            "seq_after",
+            "reason",
+            "detected_at",
         ]
         .into_iter()
         .collect();
@@ -1182,9 +1185,21 @@ mod tests {
         assert_fields_present(&val, &expected_event_fields(), "StoredEvent");
         let map = val.as_object().unwrap();
         let known: std::collections::HashSet<&str> = [
-            "id", "pane_id", "rule_id", "agent_type", "event_type", "severity",
-            "confidence", "extracted", "matched_text", "segment_id", "detected_at",
-            "dedupe_key", "handled_at", "handled_by_workflow_id", "handled_status",
+            "id",
+            "pane_id",
+            "rule_id",
+            "agent_type",
+            "event_type",
+            "severity",
+            "confidence",
+            "extracted",
+            "matched_text",
+            "segment_id",
+            "detected_at",
+            "dedupe_key",
+            "handled_at",
+            "handled_by_workflow_id",
+            "handled_status",
         ]
         .into_iter()
         .collect();
@@ -1217,9 +1232,19 @@ mod tests {
         assert_fields_present(&val, &expected_workflow_fields(), "WorkflowRecord");
         let map = val.as_object().unwrap();
         let known: std::collections::HashSet<&str> = [
-            "id", "workflow_name", "pane_id", "trigger_event_id", "current_step",
-            "status", "wait_condition", "context", "result", "error",
-            "started_at", "updated_at", "completed_at",
+            "id",
+            "workflow_name",
+            "pane_id",
+            "trigger_event_id",
+            "current_step",
+            "status",
+            "wait_condition",
+            "context",
+            "result",
+            "error",
+            "started_at",
+            "updated_at",
+            "completed_at",
         ]
         .into_iter()
         .collect();
@@ -1254,9 +1279,21 @@ mod tests {
         assert_fields_present(&val, &expected_step_log_fields(), "WorkflowStepLogRecord");
         let map = val.as_object().unwrap();
         let known: std::collections::HashSet<&str> = [
-            "id", "workflow_id", "audit_action_id", "step_index", "step_name",
-            "step_id", "step_kind", "result_type", "result_data", "policy_summary",
-            "verification_refs", "error_code", "started_at", "completed_at", "duration_ms",
+            "id",
+            "workflow_id",
+            "audit_action_id",
+            "step_index",
+            "step_name",
+            "step_id",
+            "step_kind",
+            "result_type",
+            "result_data",
+            "policy_summary",
+            "verification_refs",
+            "error_code",
+            "started_at",
+            "completed_at",
+            "duration_ms",
         ]
         .into_iter()
         .collect();
@@ -1292,10 +1329,22 @@ mod tests {
         assert_fields_present(&val, &expected_session_fields(), "AgentSessionRecord");
         let map = val.as_object().unwrap();
         let known: std::collections::HashSet<&str> = [
-            "id", "pane_id", "agent_type", "session_id", "external_id",
-            "external_meta", "started_at", "ended_at", "end_reason",
-            "total_tokens", "input_tokens", "output_tokens", "cached_tokens",
-            "reasoning_tokens", "model_name", "estimated_cost_usd",
+            "id",
+            "pane_id",
+            "agent_type",
+            "session_id",
+            "external_id",
+            "external_meta",
+            "started_at",
+            "ended_at",
+            "end_reason",
+            "total_tokens",
+            "input_tokens",
+            "output_tokens",
+            "cached_tokens",
+            "reasoning_tokens",
+            "model_name",
+            "estimated_cost_usd",
         ]
         .into_iter()
         .collect();
@@ -1330,9 +1379,20 @@ mod tests {
         assert_fields_present(&val, &expected_audit_fields(), "AuditActionRecord");
         let map = val.as_object().unwrap();
         let known: std::collections::HashSet<&str> = [
-            "id", "ts", "actor_kind", "actor_id", "correlation_id", "pane_id",
-            "domain", "action_kind", "policy_decision", "decision_reason",
-            "rule_id", "input_summary", "verification_summary", "decision_context",
+            "id",
+            "ts",
+            "actor_kind",
+            "actor_id",
+            "correlation_id",
+            "pane_id",
+            "domain",
+            "action_kind",
+            "policy_decision",
+            "decision_reason",
+            "rule_id",
+            "input_summary",
+            "verification_summary",
+            "decision_context",
             "result",
         ]
         .into_iter()
@@ -1362,8 +1422,15 @@ mod tests {
         assert_fields_present(&val, &expected_reservation_fields(), "PaneReservation");
         let map = val.as_object().unwrap();
         let known: std::collections::HashSet<&str> = [
-            "id", "pane_id", "owner_kind", "owner_id", "reason",
-            "created_at", "expires_at", "released_at", "status",
+            "id",
+            "pane_id",
+            "owner_kind",
+            "owner_id",
+            "reason",
+            "created_at",
+            "expires_at",
+            "released_at",
+            "status",
         ]
         .into_iter()
         .collect();
@@ -1393,8 +1460,16 @@ mod tests {
         assert_fields_present(&val, &expected_header_fields(), "ExportHeader");
         let map = val.as_object().unwrap();
         let known: std::collections::HashSet<&str> = [
-            "_export", "version", "kind", "redacted", "exported_at_ms",
-            "pane_id", "since", "until", "limit", "record_count",
+            "_export",
+            "version",
+            "kind",
+            "redacted",
+            "exported_at_ms",
+            "pane_id",
+            "since",
+            "until",
+            "limit",
+            "record_count",
         ]
         .into_iter()
         .collect();
@@ -1436,7 +1511,11 @@ mod tests {
         };
         let redacted = redact_step_log(step, &r);
         assert!(
-            redacted.result_data.as_ref().unwrap().contains("[REDACTED]"),
+            redacted
+                .result_data
+                .as_ref()
+                .unwrap()
+                .contains("[REDACTED]"),
             "result_data should be redacted"
         );
         assert!(
@@ -1452,11 +1531,7 @@ mod tests {
             "policy_summary should be redacted"
         );
         assert!(
-            !redacted
-                .policy_summary
-                .as_ref()
-                .unwrap()
-                .contains("ghp_"),
+            !redacted.policy_summary.as_ref().unwrap().contains("ghp_"),
             "GitHub PAT should not survive redaction"
         );
     }
@@ -1996,10 +2071,7 @@ mod tests {
             ExportKind::from_str_loose("Events"),
             Some(ExportKind::Events)
         );
-        assert_eq!(
-            ExportKind::from_str_loose("AUDIT"),
-            Some(ExportKind::Audit)
-        );
+        assert_eq!(ExportKind::from_str_loose("AUDIT"), Some(ExportKind::Audit));
         assert_eq!(
             ExportKind::from_str_loose("Reservations"),
             Some(ExportKind::Reservations)
@@ -2020,7 +2092,10 @@ mod tests {
         let mut buf = Vec::new();
         write_record(&mut buf, &seg, true).unwrap();
         let output = String::from_utf8(buf).unwrap();
-        assert!(output.contains("  \""), "Pretty output should have indentation");
+        assert!(
+            output.contains("  \""),
+            "Pretty output should have indentation"
+        );
     }
 
     #[test]

@@ -578,10 +578,7 @@ mod tests {
     #[test]
     fn diff_op_serde_roundtrip() {
         let ops = vec![
-            DiffOp::Copy {
-                offset: 0,
-                len: 10,
-            },
+            DiffOp::Copy { offset: 0, len: 10 },
             DiffOp::Insert {
                 data: vec![1, 2, 3],
             },

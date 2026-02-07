@@ -386,12 +386,9 @@ impl<Q: QueryClient> App<Q> {
     /// Handle key events in the search view
     fn handle_search_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Down | KeyCode::Char('j')
-                if !self.view_state.search_results.is_empty() =>
-            {
-                self.view_state.search_selected_index =
-                    (self.view_state.search_selected_index + 1)
-                        % self.view_state.search_results.len();
+            KeyCode::Down | KeyCode::Char('j') if !self.view_state.search_results.is_empty() => {
+                self.view_state.search_selected_index = (self.view_state.search_selected_index + 1)
+                    % self.view_state.search_results.len();
             }
             KeyCode::Up | KeyCode::Char('k') if !self.view_state.search_results.is_empty() => {
                 self.view_state.search_selected_index = self
@@ -641,7 +638,9 @@ pub fn run_tui<Q: QueryClient>(query_client: Q, config: AppConfig) -> TuiResult<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::query::{EventView, HealthStatus, PaneView, SearchResultView, WorkflowProgressView};
+    use crate::tui::query::{
+        EventView, HealthStatus, PaneView, SearchResultView, WorkflowProgressView,
+    };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     struct TestQueryClient;
@@ -1515,9 +1514,7 @@ mod tests {
             Ok(filtered)
         }
 
-        fn list_triage_items(
-            &self,
-        ) -> Result<Vec<crate::tui::query::TriageItemView>, QueryError> {
+        fn list_triage_items(&self) -> Result<Vec<crate::tui::query::TriageItemView>, QueryError> {
             Ok(fixture_triage_items())
         }
 
@@ -1593,12 +1590,13 @@ mod tests {
         let mut transcript = String::new();
         let mut step = 0u32;
 
-        let record = |transcript: &mut String, step: &mut u32, desc: &str, app: &App<FixtureQueryClient>| {
-            *step += 1;
-            let lines = render_snapshot(app, 100, 30);
-            let snapshot = lines.join("\n");
-            transcript.push_str(&format!("--- Step {step}: {desc} ---\n{snapshot}\n\n"));
-        };
+        let record =
+            |transcript: &mut String, step: &mut u32, desc: &str, app: &App<FixtureQueryClient>| {
+                *step += 1;
+                let lines = render_snapshot(app, 100, 30);
+                let snapshot = lines.join("\n");
+                transcript.push_str(&format!("--- Step {step}: {desc} ---\n{snapshot}\n\n"));
+            };
 
         // Step 1: Home view (default)
         record(&mut transcript, &mut step, "Home view (initial)", &app);
@@ -1626,7 +1624,9 @@ mod tests {
         record(&mut transcript, &mut step, "Events view", &app);
         let lines = render_snapshot(&app, 100, 30);
         assert!(
-            lines.iter().any(|l| l.contains("auth.prompt") || l.contains("secret_detected") || l.contains("auth_prompt")),
+            lines.iter().any(|l| l.contains("auth.prompt")
+                || l.contains("secret_detected")
+                || l.contains("auth_prompt")),
             "Events view should show fixture events"
         );
 
@@ -1643,7 +1643,9 @@ mod tests {
         record(&mut transcript, &mut step, "Triage view", &app);
         let lines = render_snapshot(&app, 100, 30);
         assert!(
-            lines.iter().any(|l| l.contains("auth.prompt") || l.contains("compilation") || l.contains("Events")),
+            lines.iter().any(|l| l.contains("auth.prompt")
+                || l.contains("compilation")
+                || l.contains("Events")),
             "Triage view should show triage items"
         );
 
@@ -1657,7 +1659,12 @@ mod tests {
 
         // Step 10: Collapse workflow panel
         app.handle_key_event(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
-        record(&mut transcript, &mut step, "Triage: collapse workflows", &app);
+        record(
+            &mut transcript,
+            &mut step,
+            "Triage: collapse workflows",
+            &app,
+        );
 
         // Step 11: Navigate to Search view
         app.handle_key_event(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE));
@@ -1687,7 +1694,9 @@ mod tests {
         record(&mut transcript, &mut step, "Help view", &app);
         let lines = render_snapshot(&app, 100, 30);
         assert!(
-            lines.iter().any(|l| l.contains("Keybindings") || l.contains("Help")),
+            lines
+                .iter()
+                .any(|l| l.contains("Keybindings") || l.contains("Help")),
             "Help view should show help content"
         );
 
@@ -1698,7 +1707,12 @@ mod tests {
         // Step 20: Tab through views
         for i in 0..6 {
             app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-            record(&mut transcript, &mut step, &format!("Tab cycle {}", i + 1), &app);
+            record(
+                &mut transcript,
+                &mut step,
+                &format!("Tab cycle {}", i + 1),
+                &app,
+            );
         }
 
         // Step 21: Refresh
@@ -1706,7 +1720,10 @@ mod tests {
         record(&mut transcript, &mut step, "Refresh", &app);
 
         // Final: verify app is still functional
-        assert!(!app.should_quit, "App should not have quit during smoke test");
+        assert!(
+            !app.should_quit,
+            "App should not have quit during smoke test"
+        );
 
         // Emit full transcript as artifact
         emit_artifact("session_transcript", &transcript);
@@ -1720,12 +1737,12 @@ mod tests {
 
         // Test rendering at various terminal sizes without panicking
         let sizes: Vec<(u16, u16)> = vec![
-            (80, 24),   // Standard
-            (120, 40),  // Large
-            (40, 10),   // Minimum viable
-            (200, 60),  // Extra wide
-            (60, 15),   // Narrow
-            (80, 12),   // Short
+            (80, 24),  // Standard
+            (120, 40), // Large
+            (40, 10),  // Minimum viable
+            (200, 60), // Extra wide
+            (60, 15),  // Narrow
+            (80, 12),  // Short
         ];
 
         let views = [
@@ -1758,35 +1775,35 @@ mod tests {
 
         // Rapid-fire key sequence that exercises many code paths
         let keys = vec![
-            KeyCode::Char('2'),        // Panes
-            KeyCode::Down,             // Nav down
-            KeyCode::Down,             // Nav down
-            KeyCode::Up,               // Nav up
-            KeyCode::Char('u'),        // Toggle unhandled
-            KeyCode::Char('a'),        // Cycle agent filter
-            KeyCode::Char('a'),        // Cycle again
-            KeyCode::Esc,              // Clear filter
-            KeyCode::Char('3'),        // Events
-            KeyCode::Char('j'),        // Nav down
-            KeyCode::Char('k'),        // Nav up
-            KeyCode::Char('u'),        // Toggle unhandled
-            KeyCode::Char('4'),        // Triage
-            KeyCode::Char('j'),        // Nav down
-            KeyCode::Char('e'),        // Expand workflows
-            KeyCode::Char('e'),        // Collapse
-            KeyCode::Char('a'),        // Queue action
-            KeyCode::Char('5'),        // Search
-            KeyCode::Char('h'),        // Type search
+            KeyCode::Char('2'), // Panes
+            KeyCode::Down,      // Nav down
+            KeyCode::Down,      // Nav down
+            KeyCode::Up,        // Nav up
+            KeyCode::Char('u'), // Toggle unhandled
+            KeyCode::Char('a'), // Cycle agent filter
+            KeyCode::Char('a'), // Cycle again
+            KeyCode::Esc,       // Clear filter
+            KeyCode::Char('3'), // Events
+            KeyCode::Char('j'), // Nav down
+            KeyCode::Char('k'), // Nav up
+            KeyCode::Char('u'), // Toggle unhandled
+            KeyCode::Char('4'), // Triage
+            KeyCode::Char('j'), // Nav down
+            KeyCode::Char('e'), // Expand workflows
+            KeyCode::Char('e'), // Collapse
+            KeyCode::Char('a'), // Queue action
+            KeyCode::Char('5'), // Search
+            KeyCode::Char('h'), // Type search
             KeyCode::Char('i'),
-            KeyCode::Enter,            // Execute
-            KeyCode::Char('j'),        // Nav down in results
-            KeyCode::Esc,              // Clear
-            KeyCode::Char('6'),        // Help
-            KeyCode::Char('1'),        // Home
-            KeyCode::Tab,              // Tab through
+            KeyCode::Enter,     // Execute
+            KeyCode::Char('j'), // Nav down in results
+            KeyCode::Esc,       // Clear
+            KeyCode::Char('6'), // Help
+            KeyCode::Char('1'), // Home
+            KeyCode::Tab,       // Tab through
             KeyCode::Tab,
-            KeyCode::BackTab,          // Back-tab
-            KeyCode::Char('r'),        // Refresh
+            KeyCode::BackTab,   // Back-tab
+            KeyCode::Char('r'), // Refresh
         ];
 
         for key in &keys {
@@ -1810,7 +1827,10 @@ mod tests {
         // All fixture panes should be visible
         assert!(text.contains("claude-code"), "Should show claude-code pane");
         assert!(text.contains("codex"), "Should show codex pane");
-        assert!(text.contains("manual shell") || text.contains("shell"), "Should show manual pane");
+        assert!(
+            text.contains("manual shell") || text.contains("shell"),
+            "Should show manual pane"
+        );
     }
 
     #[test]

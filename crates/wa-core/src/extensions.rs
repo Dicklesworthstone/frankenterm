@@ -8,9 +8,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::Result;
 use crate::config::PatternsConfig;
 use crate::patterns::{PatternPack, RuleDef};
-use crate::Result;
 
 // ---------------------------------------------------------------------------
 // Extension info
@@ -187,17 +187,14 @@ pub fn list_extensions(
                         .map(|s| s.strip_prefix("file:").unwrap_or(s).to_string());
                     let already_listed = extensions.iter().any(|e| {
                         e.path.as_deref() == Some(path_str.as_str())
-                            || (rel_stem.is_some()
-                                && e.path.as_deref() == rel_stem.as_deref())
+                            || (rel_stem.is_some() && e.path.as_deref() == rel_stem.as_deref())
                     });
                     if already_listed {
                         continue;
                     }
 
                     let active = config.packs.contains(&file_id)
-                        || rel_id
-                            .as_ref()
-                            .is_some_and(|id| config.packs.contains(id));
+                        || rel_id.as_ref().is_some_and(|id| config.packs.contains(id));
 
                     if let Ok(pack) = load_pack_safe(&file_id, None) {
                         extensions.push(ExtensionInfo {
@@ -237,9 +234,8 @@ pub fn extension_info(
         format!("builtin:{name}")
     };
 
-    let pack = load_pack_safe(&pack_id, config_root).map_err(|_| {
-        crate::Error::Runtime(format!("extension '{name}' not found"))
-    })?;
+    let pack = load_pack_safe(&pack_id, config_root)
+        .map_err(|_| crate::Error::Runtime(format!("extension '{name}' not found")))?;
 
     let source = if pack_id.starts_with("builtin:") {
         ExtensionSource::Builtin
@@ -284,7 +280,9 @@ pub fn validate_extension(path: &Path) -> ValidationResult {
 
     // Check file exists.
     if !path.exists() {
-        result.errors.push(format!("file not found: {}", path.display()));
+        result
+            .errors
+            .push(format!("file not found: {}", path.display()));
         return result;
     }
 
@@ -358,10 +356,7 @@ pub fn validate_extension(path: &Path) -> ValidationResult {
 /// Install an extension from a local file path into the extensions directory.
 ///
 /// Returns the pack ID that should be added to `config.patterns.packs`.
-pub fn install_extension(
-    source_path: &Path,
-    config_path: Option<&Path>,
-) -> Result<String> {
+pub fn install_extension(source_path: &Path, config_path: Option<&Path>) -> Result<String> {
     // Validate first.
     let validation = validate_extension(source_path);
     if !validation.valid {
@@ -486,8 +481,7 @@ fn find_extensions_dir(config_root: Option<&Path>) -> Option<PathBuf> {
         );
     }
 
-    crate::config::resolve_config_path(None)
-        .and_then(|p| p.parent().map(|d| d.join("extensions")))
+    crate::config::resolve_config_path(None).and_then(|p| p.parent().map(|d| d.join("extensions")))
 }
 
 fn try_resolve_name(
@@ -654,8 +648,7 @@ anchors = ["custom anchor"]
         let mut config = PatternsConfig::default();
         config.packs.push(pack_id.clone());
 
-        let removed =
-            remove_extension("my-ext", &config, Some(&config_path)).unwrap();
+        let removed = remove_extension("my-ext", &config, Some(&config_path)).unwrap();
         assert_eq!(removed, Some(pack_id));
         assert!(!ext_dir.join("my-ext.toml").exists());
     }

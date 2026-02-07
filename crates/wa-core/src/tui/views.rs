@@ -11,7 +11,9 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Tabs, Widget},
 };
 
-use super::query::{EventView, HealthStatus, PaneView, SearchResultView, TriageItemView, WorkflowProgressView};
+use super::query::{
+    EventView, HealthStatus, PaneView, SearchResultView, TriageItemView, WorkflowProgressView,
+};
 use crate::circuit_breaker::CircuitStateKind;
 
 /// Available views in the TUI
@@ -264,9 +266,7 @@ fn aggregate_health_indicator(health: &HealthStatus) -> (&'static str, Style) {
     if has_error {
         (
             "ERROR",
-            Style::default()
-                .fg(Color::Red)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         )
     } else if has_warning {
         ("WARNING", Style::default().fg(Color::Yellow))
@@ -280,9 +280,9 @@ pub fn render_home_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // Title + aggregate health
-            Constraint::Length(9),  // Health status detail
-            Constraint::Length(7),  // Metrics snapshot
+            Constraint::Length(3), // Title + aggregate health
+            Constraint::Length(9), // Health status detail
+            Constraint::Length(7), // Metrics snapshot
             Constraint::Min(3),    // Quick help
             Constraint::Length(3), // Footer
         ])
@@ -355,10 +355,7 @@ pub fn render_home_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
                         .unwrap_or(0);
                     let lag_ms = now_ms.saturating_sub(ts);
                     if lag_ms > 10_000 {
-                        Span::styled(
-                            format!("{lag_ms} ms"),
-                            Style::default().fg(Color::Yellow),
-                        )
+                        Span::styled(format!("{lag_ms} ms"), Style::default().fg(Color::Yellow))
                     } else {
                         Span::styled(format!("{lag_ms} ms"), Style::default().fg(Color::Green))
                     }
@@ -366,26 +363,11 @@ pub fn render_home_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
             );
 
             vec![
-                Line::from(vec![
-                    Span::raw("  Watcher:       "),
-                    watcher_status,
-                ]),
-                Line::from(vec![
-                    Span::raw("  Database:      "),
-                    db_status,
-                ]),
-                Line::from(vec![
-                    Span::raw("  WezTerm CLI:   "),
-                    wezterm_status,
-                ]),
-                Line::from(vec![
-                    Span::raw("  Circuit:       "),
-                    circuit_status,
-                ]),
-                Line::from(vec![
-                    Span::raw("  Capture lag:   "),
-                    capture_lag,
-                ]),
+                Line::from(vec![Span::raw("  Watcher:       "), watcher_status]),
+                Line::from(vec![Span::raw("  Database:      "), db_status]),
+                Line::from(vec![Span::raw("  WezTerm CLI:   "), wezterm_status]),
+                Line::from(vec![Span::raw("  Circuit:       "), circuit_status]),
+                Line::from(vec![Span::raw("  Capture lag:   "), capture_lag]),
                 Line::from(vec![
                     Span::raw("  Failures:      "),
                     Span::raw(format!(
@@ -407,7 +389,12 @@ pub fn render_home_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
 
     // Metrics snapshot
     let metrics_text = state.health.as_ref().map_or_else(
-        || vec![Line::from(Span::styled("...", Style::default().fg(Color::Gray)))],
+        || {
+            vec![Line::from(Span::styled(
+                "...",
+                Style::default().fg(Color::Gray),
+            ))]
+        },
         |health| {
             let pane_count_style = if health.pane_count == 0 {
                 Style::default().fg(Color::Yellow)
@@ -419,11 +406,7 @@ pub fn render_home_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
             } else {
                 Style::default().fg(Color::Green)
             };
-            let unhandled = state
-                .events
-                .iter()
-                .filter(|e| !e.handled)
-                .count();
+            let unhandled = state.events.iter().filter(|e| !e.handled).count();
             let unhandled_style = if unhandled > 0 {
                 Style::default()
                     .fg(Color::Yellow)
@@ -458,11 +441,8 @@ pub fn render_home_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
             ]
         },
     );
-    let metrics_block = Paragraph::new(metrics_text).block(
-        Block::default()
-            .title("Metrics")
-            .borders(Borders::ALL),
-    );
+    let metrics_block =
+        Paragraph::new(metrics_text).block(Block::default().title("Metrics").borders(Borders::ALL));
     metrics_block.render(chunks[2], buf);
 
     // Quick help
@@ -712,13 +692,15 @@ pub fn render_events_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
 
     if let Some(event) = selected_event {
         let severity_style = severity_color(&event.severity);
-        let handled_label = if event.handled { "handled" } else { "UNHANDLED" };
+        let handled_label = if event.handled {
+            "handled"
+        } else {
+            "UNHANDLED"
+        };
         let handled_style = if event.handled {
             Style::default().fg(Color::Green)
         } else {
-            Style::default()
-                .fg(Color::Red)
-                .add_modifier(Modifier::BOLD)
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
         };
 
         let mut details = vec![
@@ -894,24 +876,15 @@ pub fn render_search_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
     if let Some(result) = state.search_results.get(selected) {
         let details = vec![
             Line::from(vec![
-                Span::styled(
-                    "Pane: ",
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
+                Span::styled("Pane: ", Style::default().add_modifier(Modifier::BOLD)),
                 Span::raw(result.pane_id.to_string()),
             ]),
             Line::from(vec![
-                Span::styled(
-                    "Rank: ",
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
+                Span::styled("Rank: ", Style::default().add_modifier(Modifier::BOLD)),
                 Span::raw(format!("{:.4}", result.rank)),
             ]),
             Line::from(vec![
-                Span::styled(
-                    "Captured: ",
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
+                Span::styled("Captured: ", Style::default().add_modifier(Modifier::BOLD)),
                 Span::raw(result.timestamp.to_string()),
             ]),
             Line::from(""),
@@ -947,7 +920,10 @@ fn render_progress_bar(current: usize, total: usize, width: usize) -> Vec<Span<'
     vec![
         Span::raw("["),
         Span::styled(filled_char.repeat(filled), bar_style),
-        Span::styled(empty_char.repeat(empty), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            empty_char.repeat(empty),
+            Style::default().fg(Color::DarkGray),
+        ),
         Span::raw(format!("] {current}/{total}")),
     ]
 }
@@ -1060,10 +1036,7 @@ pub fn render_triage_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(format!(" P{} ", wf.pane_id)),
-                Span::styled(
-                    format!("{:8}", truncate_str(&wf.status, 8)),
-                    status_style,
-                ),
+                Span::styled(format!("{:8}", truncate_str(&wf.status, 8)), status_style),
                 Span::raw(" "),
             ];
             spans.extend(render_progress_bar(wf.current_step, wf.total_steps, 12));
@@ -1472,7 +1445,9 @@ mod tests {
         ];
         state.events_selected_index = 99; // Beyond range
         let filtered = filtered_event_indices(&state);
-        let clamped = state.events_selected_index.min(filtered.len().saturating_sub(1));
+        let clamped = state
+            .events_selected_index
+            .min(filtered.len().saturating_sub(1));
         assert_eq!(clamped, 1); // Clamped to last index
     }
 
@@ -1654,7 +1629,14 @@ mod tests {
     // Workflow progress panel tests (wa-nu4.3.7.5)
     // -----------------------------------------------------------------------
 
-    fn workflow(id: &str, name: &str, pane: u64, step: usize, total: usize, status: &str) -> WorkflowProgressView {
+    fn workflow(
+        id: &str,
+        name: &str,
+        pane: u64,
+        step: usize,
+        total: usize,
+        status: &str,
+    ) -> WorkflowProgressView {
         WorkflowProgressView {
             id: id.to_string(),
             workflow_name: name.to_string(),
@@ -1731,9 +1713,7 @@ mod tests {
     #[test]
     fn render_triage_view_with_expanded_workflow() {
         let mut state = ViewState::default();
-        state.workflows = vec![
-            workflow("wf-1", "notify_user", 10, 2, 4, "running"),
-        ];
+        state.workflows = vec![workflow("wf-1", "notify_user", 10, 2, 4, "running")];
         state.triage_expanded = Some(0);
         let area = Rect::new(0, 0, 120, 40);
         let mut buf = Buffer::empty(area);
@@ -1776,9 +1756,7 @@ mod tests {
     #[test]
     fn render_triage_view_only_workflows_no_triage() {
         let mut state = ViewState::default();
-        state.workflows = vec![
-            workflow("wf-1", "notify_user", 10, 1, 3, "running"),
-        ];
+        state.workflows = vec![workflow("wf-1", "notify_user", 10, 1, 3, "running")];
         let area = Rect::new(0, 0, 120, 40);
         let mut buf = Buffer::empty(area);
         render_triage_view(&state, area, &mut buf);
@@ -1924,9 +1902,7 @@ mod tests {
     #[test]
     fn render_events_view_selected_index_beyond_filtered() {
         let mut state = ViewState::default();
-        state.events = vec![
-            event(1, 10, "rule1", "warning", true),
-        ];
+        state.events = vec![event(1, 10, "rule1", "warning", true)];
         state.events_unhandled_only = true; // Filters out the only event
         state.events_selected_index = 5;
         let area = Rect::new(0, 0, 120, 30);
@@ -1941,9 +1917,7 @@ mod tests {
     fn render_search_view_selected_beyond_results() {
         let mut state = ViewState::default();
         state.search_last_query = "test".to_string();
-        state.search_results = vec![
-            search_result(10, "one result", 0.5),
-        ];
+        state.search_results = vec![search_result(10, "one result", 0.5)];
         state.search_selected_index = 99; // Way out of bounds
         let area = Rect::new(0, 0, 120, 30);
         let mut buf = Buffer::empty(area);

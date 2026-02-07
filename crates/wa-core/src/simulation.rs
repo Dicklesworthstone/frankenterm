@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::wezterm::{MockEvent, MockPane, MockWezterm};
 use crate::Result;
+use crate::wezterm::{MockEvent, MockPane, MockWezterm};
 
 // ---------------------------------------------------------------------------
 // Scenario types
@@ -166,9 +166,8 @@ impl Scenario {
 
     /// Parse a scenario from a YAML string.
     pub fn from_yaml(yaml: &str) -> Result<Self> {
-        let scenario: Scenario = serde_yaml::from_str(yaml).map_err(|e| {
-            crate::Error::Runtime(format!("Failed to parse scenario YAML: {e}"))
-        })?;
+        let scenario: Scenario = serde_yaml::from_str(yaml)
+            .map_err(|e| crate::Error::Runtime(format!("Failed to parse scenario YAML: {e}")))?;
         scenario.validate()?;
         Ok(scenario)
     }
@@ -255,10 +254,7 @@ impl Scenario {
             EventAction::Marker => {
                 // Markers don't produce a MockEvent; they're used for expectations.
                 // Emit as AppendOutput with a marker prefix so tests can detect it.
-                Ok(MockEvent::AppendOutput(format!(
-                    "[MARKER:{}]",
-                    event.name
-                )))
+                Ok(MockEvent::AppendOutput(format!("[MARKER:{}]", event.name)))
             }
         }
     }
@@ -266,11 +262,7 @@ impl Scenario {
     /// Execute all scenario events on a MockWezterm up to `elapsed` time.
     ///
     /// Returns the number of events executed.
-    pub async fn execute_until(
-        &self,
-        mock: &MockWezterm,
-        elapsed: Duration,
-    ) -> Result<usize> {
+    pub async fn execute_until(&self, mock: &MockWezterm, elapsed: Duration) -> Result<usize> {
         let mut count = 0;
         for event in &self.events {
             if event.at > elapsed {
@@ -476,7 +468,9 @@ impl TutorialSandbox {
                     cwd: "/home/user/projects".to_string(),
                     cols: 80,
                     rows: 24,
-                    initial_content: "codex> Ready to help with your project.\nWhat would you like to work on?\n".to_string(),
+                    initial_content:
+                        "codex> Ready to help with your project.\nWhat would you like to work on?\n"
+                            .to_string(),
                 },
                 ScenarioPane {
                     id: 2,
@@ -501,7 +495,9 @@ impl TutorialSandbox {
                     at: Duration::from_secs(10),
                     pane: 2,
                     action: EventAction::Append,
-                    content: "\n[Context Compaction]\nContext window approaching limit. Summarizing...\n".to_string(),
+                    content:
+                        "\n[Context Compaction]\nContext window approaching limit. Summarizing...\n"
+                            .to_string(),
                     name: String::new(),
                     comment: Some("Triggers compaction detection exercise".to_string()),
                 },
@@ -884,18 +880,9 @@ events:
     fn parse_duration_values() {
         assert_eq!(parse_duration("30s").unwrap(), Duration::from_secs(30));
         assert_eq!(parse_duration("2m").unwrap(), Duration::from_secs(120));
-        assert_eq!(
-            parse_duration("1m30s").unwrap(),
-            Duration::from_secs(90)
-        );
-        assert_eq!(
-            parse_duration("1h").unwrap(),
-            Duration::from_secs(3600)
-        );
-        assert_eq!(
-            parse_duration("0.5s").unwrap(),
-            Duration::from_millis(500)
-        );
+        assert_eq!(parse_duration("1m30s").unwrap(), Duration::from_secs(90));
+        assert_eq!(parse_duration("1h").unwrap(), Duration::from_secs(3600));
+        assert_eq!(parse_duration("0.5s").unwrap(), Duration::from_millis(500));
     }
 
     #[test]
@@ -1046,7 +1033,10 @@ events:
     comment: "This is a test event"
 "#;
         let scenario = Scenario::from_yaml(yaml).unwrap();
-        assert_eq!(scenario.events[0].comment.as_deref(), Some("This is a test event"));
+        assert_eq!(
+            scenario.events[0].comment.as_deref(),
+            Some("This is a test event")
+        );
     }
 
     #[test]
@@ -1096,15 +1086,9 @@ events:
         // Pure seconds as float
         assert_eq!(parse_duration("0.1s").unwrap(), Duration::from_millis(100));
         // Hour + minute
-        assert_eq!(
-            parse_duration("1h30m").unwrap(),
-            Duration::from_secs(5400)
-        );
+        assert_eq!(parse_duration("1h30m").unwrap(), Duration::from_secs(5400));
         // All units
-        assert_eq!(
-            parse_duration("1h1m1s").unwrap(),
-            Duration::from_secs(3661)
-        );
+        assert_eq!(parse_duration("1h1m1s").unwrap(), Duration::from_secs(3661));
     }
 
     #[test]

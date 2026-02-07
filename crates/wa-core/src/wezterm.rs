@@ -2067,10 +2067,9 @@ impl MockWezterm {
         let id = pane.pane_id;
         panes.insert(id, pane);
         // Ensure next_pane_id stays above any manually inserted pane
-        let _ = self.next_pane_id.fetch_max(
-            id + 1,
-            std::sync::atomic::Ordering::SeqCst,
-        );
+        let _ = self
+            .next_pane_id
+            .fetch_max(id + 1, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Create a simple mock pane with defaults.
@@ -2166,7 +2165,9 @@ impl WeztermInterface for MockWezterm {
         let text = text.to_string();
         Box::pin(async move {
             let mut panes = self.panes.write().await;
-            let pane = panes.get_mut(&pane_id).ok_or(crate::Error::Wezterm(WeztermError::PaneNotFound(pane_id)))?;
+            let pane = panes
+                .get_mut(&pane_id)
+                .ok_or(crate::Error::Wezterm(WeztermError::PaneNotFound(pane_id)))?;
             // Echo sent text to content (simulating terminal echo)
             pane.content.push_str(&text);
             Ok(())
@@ -2247,7 +2248,9 @@ impl WeztermInterface for MockWezterm {
             for pane in panes.values_mut() {
                 pane.is_active = false;
             }
-            let pane = panes.get_mut(&pane_id).ok_or(crate::Error::Wezterm(WeztermError::PaneNotFound(pane_id)))?;
+            let pane = panes
+                .get_mut(&pane_id)
+                .ok_or(crate::Error::Wezterm(WeztermError::PaneNotFound(pane_id)))?;
             pane.is_active = true;
             Ok(())
         })
@@ -2272,7 +2275,9 @@ impl WeztermInterface for MockWezterm {
     fn zoom_pane(&self, pane_id: u64, zoom: bool) -> WeztermFuture<'_, ()> {
         Box::pin(async move {
             let mut panes = self.panes.write().await;
-            let pane = panes.get_mut(&pane_id).ok_or(crate::Error::Wezterm(WeztermError::PaneNotFound(pane_id)))?;
+            let pane = panes
+                .get_mut(&pane_id)
+                .ok_or(crate::Error::Wezterm(WeztermError::PaneNotFound(pane_id)))?;
             pane.is_zoomed = zoom;
             Ok(())
         })
@@ -2328,9 +2333,7 @@ mod mock_tests {
         mock.inject(0, MockEvent::SetTitle("New Title".to_string()))
             .await
             .unwrap();
-        mock.inject(0, MockEvent::Resize(120, 40))
-            .await
-            .unwrap();
+        mock.inject(0, MockEvent::Resize(120, 40)).await.unwrap();
 
         let state = mock.pane_state(0).await.unwrap();
         assert_eq!(state.content, "line 1\n");
@@ -2501,7 +2504,10 @@ mod mock_tests {
     async fn mock_split_ignores_parent_creates_new() {
         let mock = MockWezterm::new();
         // split_pane delegates to spawn, ignoring parent pane ID
-        let new_id = mock.split_pane(99, SplitDirection::Right, None, None).await.unwrap();
+        let new_id = mock
+            .split_pane(99, SplitDirection::Right, None, None)
+            .await
+            .unwrap();
         assert_eq!(mock.pane_count().await, 1);
         assert!(new_id > 0 || new_id == 0); // any valid ID
     }
