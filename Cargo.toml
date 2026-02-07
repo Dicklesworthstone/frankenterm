@@ -241,3 +241,6 @@ strip = true        # Remove debug symbols
 
 [patch."https://github.com/Dicklesworthstone/asupersync.git"]
 asupersync = { path = "../asupersync" }
+
+[patch.crates-io]
+asupersync = { path = "../asupersync" }

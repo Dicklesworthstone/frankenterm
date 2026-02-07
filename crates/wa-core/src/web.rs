@@ -1,12 +1,16 @@
 //! Web server scaffolding for wa (feature-gated: web).
 //!
-//! Provides a minimal `wa web` HTTP server with /health and lifecycle
-//! management for graceful shutdown.
+//! Provides a minimal `wa web` HTTP server with /health and read-only
+//! data endpoints (/panes, /events, /search) backed by [`StorageHandle`].
 
+use crate::policy::Redactor;
+use crate::storage::{EventQuery, PaneRecord, SearchOptions, SearchResult, StorageHandle};
 use crate::{Error, Result, VERSION};
 use asupersync::net::TcpListener;
 use fastapi::core::{ControlFlow, Cx, Handler, Middleware, StartupOutcome};
-use fastapi::prelude::{App, Method, Request, RequestContext, Response};
+use fastapi::http::QueryString;
+use fastapi::prelude::{App, Method, Request, RequestContext, Response, StatusCode};
+use fastapi::ResponseBody;
 use fastapi::{ServerConfig, ServerError, TcpServer};
 use serde::Serialize;
 use std::net::{SocketAddr, TcpStream};
@@ -17,11 +21,27 @@ use tracing::{info, warn};
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 8000;
 
+/// Hard ceiling on list endpoint results.
+const MAX_LIMIT: usize = 500;
+/// Default limit when none is provided.
+const DEFAULT_LIMIT: usize = 50;
+
 /// Configuration for the web server.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WebServerConfig {
     host: String,
     port: u16,
+    storage: Option<StorageHandle>,
+}
+
+impl std::fmt::Debug for WebServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebServerConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("storage", &self.storage.is_some())
+            .finish()
+    }
 }
 
 impl WebServerConfig {
@@ -31,6 +51,7 @@ impl WebServerConfig {
         Self {
             host: DEFAULT_HOST.to_string(),
             port,
+            storage: None,
         }
     }
 
@@ -45,6 +66,13 @@ impl WebServerConfig {
     #[must_use]
     pub fn with_host(mut self, host: impl Into<String>) -> Self {
         self.host = host.into();
+        self
+    }
+
+    /// Attach a storage handle for data endpoints.
+    #[must_use]
+    pub fn with_storage(mut self, storage: StorageHandle) -> Self {
+        self.storage = Some(storage);
         self
     }
 
@@ -131,16 +159,128 @@ impl Middleware for RequestSpanLogger {
     }
 }
 
-fn build_app() -> App {
-    App::builder()
-        .middleware(RequestSpanLogger::default())
-        .route(
-            "/health",
-            Method::Get,
-            |_ctx: &RequestContext, _req: &mut Request| async { health_response() },
-        )
-        .build()
+// =============================================================================
+// Shared state injected via request extensions
+// =============================================================================
+
+/// Shared application state available to all handlers.
+#[derive(Clone)]
+struct AppState {
+    storage: Option<StorageHandle>,
+    redactor: Arc<Redactor>,
 }
+
+/// Middleware that injects [`AppState`] into every request.
+#[derive(Clone)]
+struct StateInjector {
+    state: AppState,
+}
+
+impl Middleware for StateInjector {
+    fn before<'a>(
+        &'a self,
+        _ctx: &'a RequestContext,
+        req: &'a mut Request,
+    ) -> fastapi::core::BoxFuture<'a, ControlFlow> {
+        req.insert_extension(self.state.clone());
+        Box::pin(async { ControlFlow::Continue })
+    }
+
+    fn name(&self) -> &'static str {
+        "StateInjector"
+    }
+}
+
+// =============================================================================
+// Response envelope
+// =============================================================================
+
+#[derive(Serialize)]
+struct ApiResponse<T> {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<T>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_code: Option<String>,
+    version: &'static str,
+}
+
+impl<T: Serialize> ApiResponse<T> {
+    fn success(data: T) -> Self {
+        Self {
+            ok: true,
+            data: Some(data),
+            error: None,
+            error_code: None,
+            version: VERSION,
+        }
+    }
+}
+
+impl ApiResponse<()> {
+    fn error(code: &str, message: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            data: None,
+            error: Some(message.into()),
+            error_code: Some(code.to_string()),
+            version: VERSION,
+        }
+    }
+}
+
+fn json_ok<T: Serialize>(data: T) -> Response {
+    let resp = ApiResponse::success(data);
+    Response::json(&resp).unwrap_or_else(|_| Response::internal_error())
+}
+
+fn json_err(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
+    let resp = ApiResponse::<()>::error(code, message);
+    let body = serde_json::to_vec(&resp).unwrap_or_default();
+    Response::with_status(status)
+        .header("content-type", b"application/json".to_vec())
+        .body(ResponseBody::Bytes(body))
+}
+
+fn require_storage(req: &Request) -> std::result::Result<(StorageHandle, Arc<Redactor>), Response> {
+    let state = req
+        .get_extension::<AppState>()
+        .ok_or_else(|| json_err(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", "App state not configured"))?;
+    let storage = state
+        .storage
+        .clone()
+        .ok_or_else(|| json_err(StatusCode::SERVICE_UNAVAILABLE, "no_storage", "No database connected"))?;
+    Ok((storage, Arc::clone(&state.redactor)))
+}
+
+// =============================================================================
+// Query parameter helpers
+// =============================================================================
+
+fn parse_limit(qs: &QueryString<'_>) -> usize {
+    qs.get("limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_LIMIT)
+        .min(MAX_LIMIT)
+}
+
+fn parse_u64(qs: &QueryString<'_>, key: &str) -> Option<u64> {
+    qs.get(key).and_then(|v| v.parse::<u64>().ok())
+}
+
+fn parse_i64(qs: &QueryString<'_>, key: &str) -> Option<i64> {
+    qs.get(key).and_then(|v| v.parse::<i64>().ok())
+}
+
+fn parse_bool(qs: &QueryString<'_>, key: &str) -> bool {
+    matches!(qs.get(key), Some("1" | "true" | "yes"))
+}
+
+// =============================================================================
+// /health
+// =============================================================================
 
 #[derive(Serialize)]
 struct HealthResponse {
@@ -156,9 +296,265 @@ fn health_response() -> Response {
     Response::json(&payload).unwrap_or_else(|_| Response::internal_error())
 }
 
+// =============================================================================
+// /panes
+// =============================================================================
+
+#[derive(Serialize)]
+struct PanesResponse {
+    panes: Vec<PaneView>,
+    total: usize,
+}
+
+#[derive(Serialize)]
+struct PaneView {
+    pane_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pane_uuid: Option<String>,
+    domain: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    window_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tab_id: Option<u64>,
+    first_seen_at: i64,
+    last_seen_at: i64,
+}
+
+impl PaneView {
+    fn from_record(r: PaneRecord, redactor: &Redactor) -> Self {
+        Self {
+            pane_id: r.pane_id,
+            pane_uuid: r.pane_uuid,
+            domain: r.domain,
+            title: r.title.map(|t| redactor.redact(&t)),
+            cwd: r.cwd.map(|c| redactor.redact(&c)),
+            window_id: r.window_id,
+            tab_id: r.tab_id,
+            first_seen_at: r.first_seen_at,
+            last_seen_at: r.last_seen_at,
+        }
+    }
+}
+
+fn handle_panes(req: &Request) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>> {
+    let result = require_storage(req);
+    Box::pin(async move {
+        let (storage, redactor) = match result {
+            Ok(s) => s,
+            Err(resp) => return resp,
+        };
+        match storage.get_panes().await {
+            Ok(panes) => {
+                let total = panes.len();
+                let views: Vec<PaneView> = panes
+                    .into_iter()
+                    .map(|p| PaneView::from_record(p, &redactor))
+                    .collect();
+                json_ok(PanesResponse {
+                    panes: views,
+                    total,
+                })
+            }
+            Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", format!("Failed to query panes: {e}")),
+        }
+    })
+}
+
+// =============================================================================
+// /events
+// =============================================================================
+
+#[derive(Serialize)]
+struct EventsResponse {
+    events: Vec<EventView>,
+    total: usize,
+}
+
+#[derive(Serialize)]
+struct EventView {
+    id: i64,
+    pane_id: u64,
+    rule_id: String,
+    event_type: String,
+    severity: String,
+    confidence: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extracted: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    matched_text: Option<String>,
+    detected_at: i64,
+}
+
+impl EventView {
+    fn from_stored(e: crate::storage::StoredEvent, redactor: &Redactor) -> Self {
+        Self {
+            id: e.id,
+            pane_id: e.pane_id,
+            rule_id: e.rule_id,
+            event_type: e.event_type,
+            severity: e.severity,
+            confidence: e.confidence,
+            extracted: e.extracted,
+            matched_text: e.matched_text.map(|t| redactor.redact(&t)),
+            detected_at: e.detected_at,
+        }
+    }
+}
+
+fn handle_events(req: &Request) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>> {
+    let result = require_storage(req);
+    let qs_raw = req.query().unwrap_or("").to_string();
+    let qs = QueryString::parse(&qs_raw);
+
+    let query = EventQuery {
+        limit: Some(parse_limit(&qs)),
+        pane_id: parse_u64(&qs, "pane_id"),
+        rule_id: qs.get("rule_id").map(String::from),
+        event_type: qs.get("event_type").map(String::from),
+        triage_state: qs.get("triage_state").map(String::from),
+        label: qs.get("label").map(String::from),
+        unhandled_only: parse_bool(&qs, "unhandled"),
+        since: parse_i64(&qs, "since"),
+        until: parse_i64(&qs, "until"),
+    };
+
+    Box::pin(async move {
+        let (storage, redactor) = match result {
+            Ok(s) => s,
+            Err(resp) => return resp,
+        };
+        match storage.get_events(query).await {
+            Ok(events) => {
+                let total = events.len();
+                let views: Vec<EventView> = events
+                    .into_iter()
+                    .map(|e| EventView::from_stored(e, &redactor))
+                    .collect();
+                json_ok(EventsResponse {
+                    events: views,
+                    total,
+                })
+            }
+            Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", format!("Failed to query events: {e}")),
+        }
+    })
+}
+
+// =============================================================================
+// /search
+// =============================================================================
+
+#[derive(Serialize)]
+struct SearchResponse {
+    results: Vec<SearchHit>,
+    total: usize,
+}
+
+#[derive(Serialize)]
+struct SearchHit {
+    segment_id: i64,
+    pane_id: u64,
+    score: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snippet: Option<String>,
+    captured_at: i64,
+    content_len: usize,
+}
+
+impl SearchHit {
+    fn from_result(r: SearchResult, redactor: &Redactor) -> Self {
+        Self {
+            segment_id: r.segment.id,
+            pane_id: r.segment.pane_id,
+            score: r.score,
+            snippet: r.snippet.map(|s| redactor.redact(&s)),
+            captured_at: r.segment.captured_at,
+            content_len: r.segment.content_len,
+        }
+    }
+}
+
+fn handle_search(req: &Request) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>> {
+    let result = require_storage(req);
+    let qs_raw = req.query().unwrap_or("").to_string();
+    let qs = QueryString::parse(&qs_raw);
+
+    let query_str = qs.get("q").map(String::from);
+    let options = SearchOptions {
+        limit: Some(parse_limit(&qs)),
+        pane_id: parse_u64(&qs, "pane_id"),
+        since: parse_i64(&qs, "since"),
+        until: parse_i64(&qs, "until"),
+        include_snippets: Some(true),
+        snippet_max_tokens: Some(64),
+        highlight_prefix: None,
+        highlight_suffix: None,
+    };
+
+    Box::pin(async move {
+        let query = match query_str {
+            Some(q) if !q.is_empty() => q,
+            _ => return json_err(StatusCode::BAD_REQUEST, "missing_query", "Query parameter 'q' is required"),
+        };
+        let (storage, redactor) = match result {
+            Ok(s) => s,
+            Err(resp) => return resp,
+        };
+        match storage.search_with_results(&query, options).await {
+            Ok(results) => {
+                let total = results.len();
+                let hits: Vec<SearchHit> = results
+                    .into_iter()
+                    .map(|r| SearchHit::from_result(r, &redactor))
+                    .collect();
+                json_ok(SearchResponse {
+                    results: hits,
+                    total,
+                })
+            }
+            Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", format!("Search failed: {e}")),
+        }
+    })
+}
+
+// =============================================================================
+// App builder
+// =============================================================================
+
+fn build_app(storage: Option<StorageHandle>) -> App {
+    let state = AppState {
+        storage,
+        redactor: Arc::new(Redactor::new()),
+    };
+
+    App::builder()
+        .middleware(RequestSpanLogger::default())
+        .middleware(StateInjector { state })
+        .route(
+            "/health",
+            Method::Get,
+            |_ctx: &RequestContext, _req: &mut Request| async { health_response() },
+        )
+        .route("/panes", Method::Get, |_ctx: &RequestContext, req: &mut Request| {
+            handle_panes(req)
+        })
+        .route("/events", Method::Get, |_ctx: &RequestContext, req: &mut Request| {
+            handle_events(req)
+        })
+        .route("/search", Method::Get, |_ctx: &RequestContext, req: &mut Request| {
+            handle_search(req)
+        })
+        .build()
+}
+
 /// Start the web server and return a handle for shutdown.
 pub async fn start_web_server(config: WebServerConfig) -> Result<WebServerHandle> {
-    let app = build_app();
+    let bind_addr = config.bind_addr();
+    let app = build_app(config.storage);
 
     match app.run_startup_hooks().await {
         StartupOutcome::Success => {}
@@ -174,7 +570,6 @@ pub async fn start_web_server(config: WebServerConfig) -> Result<WebServerHandle
     }
 
     let app = Arc::new(app);
-    let bind_addr = config.bind_addr();
     let listener = TcpListener::bind(bind_addr.clone())
         .await
         .map_err(Error::Io)?;
