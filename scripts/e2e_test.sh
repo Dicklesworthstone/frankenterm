@@ -390,6 +390,7 @@ SCENARIO_REGISTRY=(
     "storage_stress|Validate storage/indexing stability under load (many panes, large transcripts)|true|cargo,jq|Protects storage perf at scale"
     "search_perf|Validate FTS search stays fast at 1K/10K/100K segments with perf artifacts|true|cargo,jq|Protects search performance at scale"
     "pane_uuid_stability|Validate pane_uuid stable across rename, tab move, cwd change|true|cargo,jq|Protects pane identity stability"
+    "incident_bundle|Validate incident bundle export, redaction, replay (policy + rules modes)|true|cargo,jq|Protects incident bundle lifecycle"
 )
 
 list_scenarios() {
