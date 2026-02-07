@@ -4,73 +4,56 @@
   "title": "WA Robot Reserve Response",
   "description": "Schema for the data field when calling 'wa robot reserve <pane_id>'. Creates a pane reservation.",
   "type": "object",
-  "required": ["pane_id", "reservation_id", "created"],
+  "required": ["reservation"],
   "properties": {
-    "pane_id": {
-      "type": "integer",
-      "minimum": 0,
-      "description": "The pane ID that was reserved"
-    },
-    "reservation_id": {
-      "type": "string",
-      "description": "Unique identifier for this reservation"
-    },
-    "created": {
-      "type": "boolean",
-      "description": "True if a new reservation was created, false if extended/renewed"
-    },
-    "owner_kind": {
-      "type": "string",
-      "enum": ["human", "robot", "mcp", "workflow"],
-      "description": "Type of actor making the reservation"
-    },
-    "owner_id": {
-      "type": "string",
-      "description": "Identifier of the reservation owner"
-    },
-    "reason": {
-      "type": "string",
-      "description": "Reason provided for the reservation"
-    },
-    "ttl_seconds": {
-      "type": "integer",
-      "minimum": 1,
-      "description": "Time-to-live in seconds"
-    },
-    "exclusive": {
-      "type": "boolean",
-      "description": "Whether this is an exclusive reservation"
-    },
-    "expires_at": {
-      "type": "integer",
-      "minimum": 0,
-      "description": "Unix timestamp (ms) when reservation expires"
-    },
-    "conflict": {
-      "$ref": "#/$defs/conflict_info",
-      "description": "Present if the reservation failed due to a conflict"
+    "reservation": {
+      "$ref": "#/$defs/reservation_info",
+      "description": "The created or renewed reservation"
     }
   },
   "additionalProperties": false,
   "$defs": {
-    "conflict_info": {
+    "reservation_info": {
       "type": "object",
-      "description": "Details about a reservation conflict",
-      "required": ["existing_owner_kind", "existing_owner_id", "existing_expires_at"],
+      "description": "Reservation details",
+      "required": ["id", "pane_id", "owner_kind", "owner_id", "created_at", "expires_at", "status"],
       "properties": {
-        "existing_owner_kind": {
-          "type": "string",
-          "enum": ["human", "robot", "mcp", "workflow"]
-        },
-        "existing_owner_id": {
-          "type": "string"
-        },
-        "existing_reason": {
-          "type": "string"
-        },
-        "existing_expires_at": {
+        "id": {
           "type": "integer",
-          "minimum": 0
+          "description": "Reservation identifier"
+        },
+        "pane_id": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Reserved pane ID"
+        },
+        "owner_kind": {
+          "type": "string",
+          "description": "Type of actor holding the reservation"
+        },
+        "owner_id": {
+          "type": "string",
+          "description": "Identifier of the reservation owner"
+        },
+        "reason": {
+          "type": "string",
+          "description": "Why the pane was reserved"
+        },
+        "created_at": {
+          "type": "integer",
+          "description": "Unix timestamp (ms) when reservation was created"
+        },
+        "expires_at": {
+          "type": "integer",
+          "description": "Unix timestamp (ms) when reservation expires"
+        },
+        "released_at": {
+          "type": "integer",
+          "description": "Unix timestamp (ms) when reservation was released (null if active)"
+        },
+        "status": {
+          "type": "string",
+          "description": "Reservation status (e.g., 'active', 'released', 'expired')"
         }
       },
       "additionalProperties": false

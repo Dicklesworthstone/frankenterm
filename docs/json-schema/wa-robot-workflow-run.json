@@ -4,7 +4,7 @@
   "title": "WA Robot Workflow Run Response",
   "description": "Schema for the data field when calling 'wa robot workflow run <name> --pane <id>'. Triggers a workflow execution.",
   "type": "object",
-  "required": ["workflow_name", "pane_id", "execution_id", "status"],
+  "required": ["workflow_name", "pane_id", "status"],
   "properties": {
     "workflow_name": {
       "type": "string",
@@ -17,120 +17,31 @@
     },
     "execution_id": {
       "type": "string",
-      "format": "uuid",
-      "description": "Unique identifier for this execution (UUID)"
+      "description": "Unique identifier for this execution"
     },
     "status": {
       "type": "string",
-      "enum": ["started", "completed", "failed", "aborted", "policy_denied"],
       "description": "Current status of the workflow execution"
     },
-    "dry_run": {
-      "type": "boolean",
-      "description": "True if this was a dry-run (no actual execution)"
-    },
-    "trigger_event_id": {
-      "type": "integer",
-      "description": "Event ID that triggered this workflow (if event-driven)"
-    },
-    "steps_planned": {
-      "type": "integer",
-      "minimum": 0,
-      "description": "Number of steps in the workflow"
-    },
-    "steps_completed": {
-      "type": "integer",
-      "minimum": 0,
-      "description": "Number of steps completed so far"
-    },
-    "current_step": {
+    "message": {
       "type": "string",
-      "description": "Name of the currently executing step"
+      "description": "Human-readable status message"
     },
     "started_at": {
       "type": "integer",
       "minimum": 0,
       "description": "Unix timestamp (ms) when execution started"
     },
-    "completed_at": {
-      "type": ["integer", "null"],
+    "step_index": {
+      "type": "integer",
       "minimum": 0,
-      "description": "Unix timestamp (ms) when execution completed (null if still running)"
+      "description": "Current step index (0-based)"
     },
-    "result": {
-      "$ref": "#/$defs/workflow_result",
-      "description": "Workflow result (present when status is completed/failed/aborted)"
-    },
-    "policy_decision": {
-      "type": "string",
-      "enum": ["allow", "deny", "require_approval"],
-      "description": "Policy decision for running this workflow"
-    },
-    "policy_reason": {
-      "type": "string",
-      "description": "Explanation of the policy decision"
+    "elapsed_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Time elapsed since workflow started (ms)"
     }
   },
-  "additionalProperties": false,
-  "$defs": {
-    "workflow_result": {
-      "type": "object",
-      "description": "Final result of workflow execution",
-      "properties": {
-        "outcome": {
-          "type": "string",
-          "enum": ["success", "failure", "aborted", "timeout"],
-          "description": "Final outcome"
-        },
-        "message": {
-          "type": "string",
-          "description": "Human-readable result message"
-        },
-        "data": {
-          "type": "object",
-          "description": "Workflow-specific result data",
-          "additionalProperties": true
-        },
-        "error": {
-          "type": "string",
-          "description": "Error message if outcome is failure"
-        },
-        "step_logs": {
-          "type": "array",
-          "description": "Summary of each step executed",
-          "items": {
-            "$ref": "#/$defs/step_log"
-          }
-        }
-      },
-      "additionalProperties": false
-    },
-    "step_log": {
-      "type": "object",
-      "description": "Log entry for a workflow step",
-      "required": ["step_index", "step_name", "result_type"],
-      "properties": {
-        "step_index": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "step_name": {
-          "type": "string"
-        },
-        "result_type": {
-          "type": "string",
-          "enum": ["continue", "done", "retry", "abort", "wait_for"]
-        },
-        "duration_ms": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "result_data": {
-          "type": "object",
-          "additionalProperties": true
-        }
-      },
-      "additionalProperties": false
-    }
-  }
+  "additionalProperties": false
 }

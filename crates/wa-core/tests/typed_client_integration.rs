@@ -111,40 +111,7 @@ fn validate_required_fields_present(data: &Value, schema: &Value, schema_name: &
 ///
 /// Each entry maps schema_file -> brief description of drift.
 fn known_drift_schemas() -> BTreeMap<&'static str, &'static str> {
-    BTreeMap::from([
-        (
-            "wa-robot-rules-list.json",
-            "Schema uses packs/total_rules; Rust uses rules[]",
-        ),
-        (
-            "wa-robot-rules-test.json",
-            "Schema uses detections/input_length/elapsed_us; Rust uses matches/text_length/match_count",
-        ),
-        (
-            "wa-robot-accounts.json",
-            "Schema uses last_refresh; Rust uses total/service",
-        ),
-        (
-            "wa-robot-accounts-refresh.json",
-            "Schema uses accounts_updated/changes; Rust uses refreshed_count/accounts",
-        ),
-        (
-            "wa-robot-reserve.json",
-            "Schema uses flat pane_id/reservation_id; Rust uses nested reservation object",
-        ),
-        (
-            "wa-robot-workflow-run.json",
-            "Schema uses steps_planned/policy_decision; Rust uses step_index/message",
-        ),
-        (
-            "wa-robot-workflow-status.json",
-            "Schema uses step_logs/action_plan/context; Rust uses plan/created_at/message",
-        ),
-        (
-            "wa-robot-workflow-abort.json",
-            "Schema uses cleanup_performed/aborted_at; Rust uses message (not in schema)",
-        ),
-    ])
+    BTreeMap::new()
 }
 
 // ============================================================================
@@ -731,6 +698,137 @@ schema_match_test!(
     })
 );
 
+schema_match_test!(
+    schema_reserve,
+    ReserveData,
+    "wa-robot-reserve.json",
+    json!({
+        "reservation": {
+            "id": 7,
+            "pane_id": 3,
+            "owner_kind": "agent",
+            "owner_id": "codex-1",
+            "created_at": 1700000000000i64,
+            "expires_at": 1700000060000i64,
+            "status": "active"
+        }
+    })
+);
+
+schema_match_test!(
+    schema_workflow_abort,
+    WorkflowAbortData,
+    "wa-robot-workflow-abort.json",
+    json!({
+        "execution_id": "exec-xyz",
+        "aborted": true,
+        "forced": false,
+        "workflow_name": "fix_build",
+        "previous_status": "running"
+    })
+);
+
+schema_match_test!(
+    schema_rules_list,
+    RulesListData,
+    "wa-robot-rules-list.json",
+    json!({
+        "rules": [{
+            "id": "codex.build_error",
+            "agent_type": "codex",
+            "event_type": "error",
+            "severity": "high",
+            "description": "Detects build errors",
+            "workflow": "fix_build",
+            "anchor_count": 3,
+            "has_regex": true
+        }]
+    })
+);
+
+schema_match_test!(
+    schema_rules_test,
+    RulesTestData,
+    "wa-robot-rules-test.json",
+    json!({
+        "text_length": 500,
+        "match_count": 1,
+        "matches": [{
+            "rule_id": "codex.build_error",
+            "start": 10,
+            "end": 40,
+            "matched_text": "error[E0308]: mismatched types",
+            "trace": {
+                "anchors_checked": true,
+                "regex_matched": true
+            }
+        }]
+    })
+);
+
+schema_match_test!(
+    schema_accounts,
+    AccountsListData,
+    "wa-robot-accounts.json",
+    json!({
+        "accounts": [{
+            "account_id": "acc-1",
+            "service": "anthropic",
+            "name": "main",
+            "percent_remaining": 85.5,
+            "last_refreshed_at": 1700000000000i64
+        }],
+        "total": 1,
+        "service": "anthropic"
+    })
+);
+
+schema_match_test!(
+    schema_accounts_refresh,
+    AccountsRefreshData,
+    "wa-robot-accounts-refresh.json",
+    json!({
+        "service": "anthropic",
+        "refreshed_count": 2,
+        "refreshed_at": "2026-02-06T19:00:00Z",
+        "accounts": [{
+            "account_id": "acc-1",
+            "service": "anthropic",
+            "percent_remaining": 90.0,
+            "last_refreshed_at": 0
+        }]
+    })
+);
+
+schema_match_test!(
+    schema_workflow_run,
+    WorkflowRunData,
+    "wa-robot-workflow-run.json",
+    json!({
+        "workflow_name": "fix_build",
+        "pane_id": 1,
+        "execution_id": "exec-abc123",
+        "status": "running",
+        "started_at": 1700000000000i64
+    })
+);
+
+schema_match_test!(
+    schema_workflow_status,
+    WorkflowStatusData,
+    "wa-robot-workflow-status.json",
+    json!({
+        "execution_id": "exec-xyz",
+        "workflow_name": "fix_build",
+        "pane_id": 1,
+        "status": "completed",
+        "started_at": 1700000000000i64,
+        "completed_at": 1700000005000i64,
+        "current_step": 3,
+        "total_steps": 3
+    })
+);
+
 // ============================================================================
 // Drift detection — document and freeze known schema↔type mismatches
 // ============================================================================
@@ -741,7 +839,7 @@ fn drift_set_is_stable() {
     // If a schema is fixed to match the Rust types, remove it from known_drift_schemas().
     // If a new schema is added that doesn't match, this test will fail and prompt an update.
     let known = known_drift_schemas();
-    let expected_count = 8;
+    let expected_count = 0;
     assert_eq!(
         known.len(),
         expected_count,

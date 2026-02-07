@@ -4,97 +4,63 @@
   "title": "WA Robot Rules List Response",
   "description": "Schema for the data field when calling 'wa robot rules list'. Lists pattern detection rules.",
   "type": "object",
-  "required": ["packs", "total_rules"],
+  "required": ["rules"],
   "properties": {
-    "packs": {
+    "rules": {
       "type": "array",
-      "description": "Pattern packs and their rules",
+      "description": "Pattern detection rules",
       "items": {
-        "$ref": "#/$defs/pack"
+        "$ref": "#/$defs/rule_item"
       }
     },
-    "total_rules": {
-      "type": "integer",
-      "minimum": 0,
-      "description": "Total number of rules across all packs"
+    "pack_filter": {
+      "type": "string",
+      "description": "Pack ID filter applied (if any)"
     },
-    "enabled_packs": {
-      "type": "array",
-      "description": "List of enabled pack IDs",
-      "items": {
-        "type": "string"
-      }
+    "agent_type_filter": {
+      "type": "string",
+      "description": "Agent type filter applied (if any)"
     }
   },
   "additionalProperties": false,
   "$defs": {
-    "pack": {
-      "type": "object",
-      "description": "A pattern pack containing detection rules",
-      "required": ["id", "name", "enabled", "rules"],
-      "properties": {
-        "id": {
-          "type": "string",
-          "description": "Pack identifier (e.g., 'core.codex')"
-        },
-        "name": {
-          "type": "string",
-          "description": "Human-readable pack name"
-        },
-        "description": {
-          "type": "string",
-          "description": "Pack description"
-        },
-        "enabled": {
-          "type": "boolean",
-          "description": "Whether the pack is currently enabled"
-        },
-        "version": {
-          "type": "string",
-          "description": "Pack version"
-        },
-        "rules": {
-          "type": "array",
-          "description": "Rules in this pack",
-          "items": {
-            "$ref": "#/$defs/rule"
-          }
-        }
-      },
-      "additionalProperties": false
-    },
-    "rule": {
+    "rule_item": {
       "type": "object",
       "description": "A pattern detection rule",
-      "required": ["id", "event_type", "severity"],
+      "required": ["id", "agent_type", "event_type", "severity", "description", "anchor_count", "has_regex"],
       "properties": {
         "id": {
           "type": "string",
           "description": "Full rule ID (e.g., 'core.codex:usage_warning_25')"
         },
+        "agent_type": {
+          "type": "string",
+          "description": "Agent type this rule applies to"
+        },
         "event_type": {
           "type": "string",
           "description": "Event type produced (e.g., 'usage.warning')"
+        },
+        "severity": {
+          "type": "string",
+          "description": "Severity level (e.g., 'info', 'warning', 'critical')"
         },
         "description": {
           "type": "string",
           "description": "What this rule detects"
         },
-        "severity": {
+        "workflow": {
           "type": "string",
-          "enum": ["info", "warning", "critical"]
+          "description": "Associated workflow (if any)"
         },
-        "agent_type": {
-          "type": "string",
-          "enum": ["codex", "claude_code", "gemini", "wezterm", "any"],
-          "description": "Agent type this rule applies to"
+        "anchor_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of anchor patterns in this rule"
         },
-        "extracts": {
-          "type": "array",
-          "description": "Field names extracted by this rule",
-          "items": {
-            "type": "string"
-          }
+        "has_regex": {
+          "type": "boolean",
+          "description": "Whether this rule uses regex matching"
         }
       },
       "additionalProperties": false

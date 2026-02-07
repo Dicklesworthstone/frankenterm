@@ -4,76 +4,28 @@
   "title": "WA Robot Accounts Refresh Response",
   "description": "Schema for the data field when calling 'wa robot accounts refresh'. Refreshes account usage from caut.",
   "type": "object",
-  "required": ["refreshed_at", "accounts_updated"],
+  "required": ["service", "refreshed_count", "accounts"],
   "properties": {
-    "refreshed_at": {
-      "type": "integer",
-      "minimum": 0,
-      "description": "Unix timestamp (ms) of this refresh"
+    "service": {
+      "type": "string",
+      "description": "Service that was refreshed"
     },
-    "accounts_updated": {
+    "refreshed_count": {
       "type": "integer",
       "minimum": 0,
       "description": "Number of accounts that had usage updated"
     },
-    "changes": {
-      "type": "array",
-      "description": "Accounts whose status changed during refresh",
-      "items": {
-        "$ref": "#/$defs/status_change"
-      }
-    },
-    "caut_version": {
+    "refreshed_at": {
       "type": "string",
-      "description": "Version of caut that provided the data"
+      "description": "ISO-8601 timestamp of this refresh"
     },
-    "errors": {
+    "accounts": {
       "type": "array",
-      "description": "Per-account refresh errors (non-fatal)",
+      "description": "Refreshed account details",
       "items": {
-        "$ref": "#/$defs/refresh_error"
+        "$ref": "wa-robot-accounts.json#/$defs/account_info"
       }
     }
   },
-  "additionalProperties": false,
-  "$defs": {
-    "status_change": {
-      "type": "object",
-      "description": "An account status change",
-      "required": ["account_id", "old_status", "new_status"],
-      "properties": {
-        "account_id": {
-          "type": "string"
-        },
-        "old_status": {
-          "type": "string"
-        },
-        "new_status": {
-          "type": "string"
-        },
-        "reason": {
-          "type": "string",
-          "description": "Why status changed"
-        }
-      },
-      "additionalProperties": false
-    },
-    "refresh_error": {
-      "type": "object",
-      "description": "Error during account refresh",
-      "required": ["account_id", "error"],
-      "properties": {
-        "account_id": {
-          "type": "string"
-        },
-        "error": {
-          "type": "string"
-        },
-        "error_code": {
-          "type": "string"
-        }
-      },
-      "additionalProperties": false
-    }
-  }
+  "additionalProperties": false
 }

@@ -14,50 +14,21 @@
       "type": "boolean",
       "description": "Whether the workflow was successfully aborted"
     },
-    "workflow_name": {
-      "type": "string",
-      "description": "Name of the workflow that was aborted"
-    },
-    "pane_id": {
-      "type": ["integer", "null"],
-      "minimum": 0,
-      "description": "Pane ID the workflow was targeting (null if not pane-specific)"
-    },
-    "previous_status": {
-      "type": "string",
-      "enum": ["pending", "running", "waiting", "paused", "completed", "aborted", "failed"],
-      "description": "Status before abort was requested"
-    },
-    "aborted_at_step": {
-      "type": ["integer", "null"],
-      "minimum": 0,
-      "description": "Step index where abort occurred (null if not started)"
-    },
-    "step_name": {
-      "type": "string",
-      "description": "Human-readable name of step where abort occurred"
-    },
-    "reason": {
-      "type": "string",
-      "description": "Reason provided for the abort (from --reason flag)"
-    },
     "forced": {
       "type": "boolean",
       "description": "Whether abort was forced (--force flag, skips cleanup)"
     },
-    "cleanup_performed": {
-      "type": "boolean",
-      "description": "Whether cleanup steps were executed (false if forced or no cleanup defined)"
-    },
-    "aborted_at": {
-      "type": "integer",
-      "minimum": 0,
-      "description": "Unix timestamp (ms) when abort was recorded"
-    },
-    "error_reason": {
+    "workflow_name": {
       "type": "string",
-      "description": "Why the abort failed (present when aborted=false)",
-      "enum": ["not_found", "already_completed", "already_aborted", "already_failed"]
+      "description": "Name of the workflow that was aborted"
+    },
+    "previous_status": {
+      "type": "string",
+      "description": "Status before abort was requested"
+    },
+    "message": {
+      "type": "string",
+      "description": "Human-readable message about the abort result"
     }
   },
   "additionalProperties": false

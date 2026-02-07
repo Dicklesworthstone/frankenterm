@@ -4,200 +4,70 @@
   "title": "WA Robot Rules Test Response",
   "description": "Schema for the data field when calling 'wa robot rules test <content>'. Tests pattern detection on input.",
   "type": "object",
-  "required": ["input_length", "detections", "elapsed_us"],
+  "required": ["text_length", "match_count", "matches"],
   "properties": {
-    "input_length": {
+    "text_length": {
       "type": "integer",
       "minimum": 0,
       "description": "Length of input content tested"
     },
-    "detections": {
+    "match_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total number of rule matches"
+    },
+    "matches": {
       "type": "array",
       "description": "All patterns that matched the input",
       "items": {
-        "$ref": "#/$defs/detection"
-      }
-    },
-    "elapsed_us": {
-      "type": "integer",
-      "minimum": 0,
-      "description": "Time taken for pattern detection in microseconds"
-    },
-    "quick_rejected": {
-      "type": "boolean",
-      "description": "True if the input was quick-rejected (no keywords found)"
-    },
-    "packs_tested": {
-      "type": "array",
-      "description": "Pack IDs that were tested",
-      "items": {
-        "type": "string"
+        "$ref": "#/$defs/rule_match_item"
       }
     }
   },
   "additionalProperties": false,
   "$defs": {
-    "detection": {
+    "rule_match_item": {
       "type": "object",
       "description": "A pattern match result",
-      "required": ["rule_id", "event_type", "severity", "confidence"],
+      "required": ["rule_id", "start", "end", "matched_text"],
       "properties": {
         "rule_id": {
           "type": "string",
           "description": "Full rule ID that matched"
         },
-        "event_type": {
-          "type": "string",
-          "description": "Event type produced"
-        },
-        "agent_type": {
-          "type": "string",
-          "enum": ["codex", "claude_code", "gemini", "wezterm", "unknown"]
-        },
-        "severity": {
-          "type": "string",
-          "enum": ["info", "warning", "critical"]
-        },
-        "confidence": {
-          "type": "number",
-          "minimum": 0,
-          "maximum": 1
-        },
-        "extracted": {
-          "type": "object",
-          "description": "Values extracted by the pattern",
-          "additionalProperties": true
-        },
-        "matched_span": {
-          "type": "object",
-          "description": "Where in the input the pattern matched",
-          "properties": {
-            "start": {
-              "type": "integer",
-              "minimum": 0
-            },
-            "end": {
-              "type": "integer",
-              "minimum": 0
-            }
-          },
-          "additionalProperties": false
-        },
-        "match_time_us": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "Time taken for this specific rule in microseconds"
-        },
-        "match_trace": {
-          "$ref": "#/$defs/match_trace"
-        }
-      },
-      "additionalProperties": false
-    },
-    "match_trace": {
-      "type": "object",
-      "description": "Optional debug trace for rule evaluation (bounded + redacted)",
-      "required": ["rule_id", "spans", "eval_path", "bounds", "redaction"],
-      "properties": {
-        "rule_id": {
-          "type": "string",
-          "description": "Stable rule id for this trace"
-        },
-        "spans": {
-          "type": "array",
-          "description": "Match spans (indices only; no raw text)",
-          "items": {
-            "$ref": "#/$defs/trace_span"
-          }
-        },
-        "extracted_keys": {
-          "type": "array",
-          "description": "Keys present in extracted values (values omitted)",
-          "items": {
-            "type": "string"
-          }
-        },
-        "confidence": {
-          "type": "number",
-          "minimum": 0,
-          "maximum": 1,
-          "description": "Optional confidence score for this match"
-        },
-        "eval_path": {
-          "type": "array",
-          "description": "Evaluation path (which subpatterns/stages matched)",
-          "items": {
-            "$ref": "#/$defs/trace_step"
-          }
-        },
-        "bounds": {
-          "$ref": "#/$defs/trace_bounds"
-        },
-        "redaction": {
-          "$ref": "#/$defs/trace_redaction"
-        }
-      },
-      "additionalProperties": false
-    },
-    "trace_span": {
-      "type": "object",
-      "required": ["start", "end", "kind"],
-      "properties": {
         "start": {
           "type": "integer",
-          "minimum": 0
+          "minimum": 0,
+          "description": "Start byte offset of match"
         },
         "end": {
           "type": "integer",
-          "minimum": 0
+          "minimum": 0,
+          "description": "End byte offset of match"
         },
-        "kind": {
+        "matched_text": {
           "type": "string",
-          "enum": ["anchor", "regex", "context", "unknown"]
+          "description": "The text that matched"
         },
-        "capture_keys": {
-          "type": "array",
-          "items": { "type": "string" }
+        "trace": {
+          "$ref": "#/$defs/rule_trace_info",
+          "description": "Optional debug trace for rule evaluation"
         }
       },
       "additionalProperties": false
     },
-    "trace_step": {
+    "rule_trace_info": {
       "type": "object",
-      "required": ["stage", "matched"],
+      "description": "Trace info for rule match debugging",
+      "required": ["anchors_checked", "regex_matched"],
       "properties": {
-        "stage": { "type": "string" },
-        "matched": { "type": "boolean" },
-        "hits": {
-          "type": "array",
-          "items": { "type": "string" }
-        }
-      },
-      "additionalProperties": false
-    },
-    "trace_bounds": {
-      "type": "object",
-      "required": ["max_spans", "max_bytes", "truncated"],
-      "properties": {
-        "max_spans": { "type": "integer", "minimum": 0 },
-        "max_bytes": { "type": "integer", "minimum": 0 },
-        "truncated": { "type": "boolean" },
-        "truncated_fields": {
-          "type": "array",
-          "items": { "type": "string" }
-        }
-      },
-      "additionalProperties": false
-    },
-    "trace_redaction": {
-      "type": "object",
-      "required": ["enabled", "policy"],
-      "properties": {
-        "enabled": { "type": "boolean" },
-        "policy": { "type": "string" },
-        "redacted_fields": {
-          "type": "array",
-          "items": { "type": "string" }
+        "anchors_checked": {
+          "type": "boolean",
+          "description": "Whether anchor patterns were checked"
+        },
+        "regex_matched": {
+          "type": "boolean",
+          "description": "Whether regex pattern matched"
         }
       },
       "additionalProperties": false

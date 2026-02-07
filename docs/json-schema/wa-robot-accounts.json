@@ -4,93 +4,112 @@
   "title": "WA Robot Accounts Response",
   "description": "Schema for the data field when calling 'wa robot accounts'. Lists AI coding service accounts and their usage.",
   "type": "object",
-  "required": ["accounts", "last_refresh"],
+  "required": ["accounts", "total", "service"],
   "properties": {
     "accounts": {
       "type": "array",
       "description": "All configured accounts",
       "items": {
-        "$ref": "#/$defs/account"
+        "$ref": "#/$defs/account_info"
       }
     },
-    "last_refresh": {
-      "type": ["integer", "null"],
+    "total": {
+      "type": "integer",
       "minimum": 0,
-      "description": "Unix timestamp (ms) of last caut refresh (null if never refreshed)"
+      "description": "Total number of accounts"
     },
-    "selected_account": {
+    "service": {
       "type": "string",
-      "description": "Currently selected account ID for automatic failover"
+      "description": "Service filter applied (e.g., 'anthropic', 'openai')"
     },
-    "selection_reason": {
-      "type": "string",
-      "description": "Why this account was selected (e.g., 'highest percent remaining')"
+    "pick_preview": {
+      "$ref": "#/$defs/account_pick_preview",
+      "description": "Preview of which account would be selected next (if requested)"
     }
   },
   "additionalProperties": false,
   "$defs": {
-    "account": {
+    "account_info": {
       "type": "object",
       "description": "A configured AI service account",
-      "required": ["id", "service", "status"],
+      "required": ["account_id", "service", "percent_remaining", "last_refreshed_at"],
       "properties": {
-        "id": {
+        "account_id": {
           "type": "string",
           "description": "Unique account identifier"
         },
         "service": {
           "type": "string",
-          "enum": ["openai", "anthropic", "google"],
           "description": "The AI service provider"
         },
-        "label": {
+        "name": {
           "type": "string",
-          "description": "Human-readable account label"
+          "description": "Human-readable account name"
         },
-        "status": {
-          "type": "string",
-          "enum": ["available", "at_limit", "auth_required", "disabled", "unknown"],
-          "description": "Current account status"
-        },
-        "usage": {
-          "$ref": "#/$defs/usage_info",
-          "description": "Usage information (if available)"
-        },
-        "last_used_at": {
-          "type": ["integer", "null"],
-          "minimum": 0,
-          "description": "Unix timestamp (ms) when this account was last used"
-        },
-        "auth_expires_at": {
-          "type": ["integer", "null"],
-          "minimum": 0,
-          "description": "Unix timestamp (ms) when authentication expires"
-        }
-      },
-      "additionalProperties": false
-    },
-    "usage_info": {
-      "type": "object",
-      "description": "Account usage details",
-      "properties": {
         "percent_remaining": {
           "type": "number",
           "minimum": 0,
           "maximum": 100,
           "description": "Percentage of quota remaining"
         },
-        "limit_type": {
+        "reset_at": {
           "type": "string",
-          "description": "Type of limit (e.g., '20h', 'tokens', 'requests')"
+          "description": "When usage resets (ISO-8601 or human-readable)"
         },
-        "resets_at": {
-          "type": ["integer", "null"],
+        "tokens_used": {
+          "type": "integer",
+          "description": "Tokens used in current period"
+        },
+        "tokens_remaining": {
+          "type": "integer",
+          "description": "Tokens remaining in current period"
+        },
+        "tokens_limit": {
+          "type": "integer",
+          "description": "Token limit for current period"
+        },
+        "last_refreshed_at": {
+          "type": "integer",
+          "description": "Unix timestamp (ms) when account data was last refreshed"
+        },
+        "last_used_at": {
+          "type": "integer",
+          "description": "Unix timestamp (ms) when this account was last used"
+        }
+      },
+      "additionalProperties": false
+    },
+    "account_pick_preview": {
+      "type": "object",
+      "description": "Preview of automatic account selection",
+      "required": ["selection_reason", "threshold_percent", "candidates_count", "filtered_count"],
+      "properties": {
+        "selected_account_id": {
+          "type": "string",
+          "description": "Account ID that would be selected"
+        },
+        "selected_name": {
+          "type": "string",
+          "description": "Human-readable name of selected account"
+        },
+        "selection_reason": {
+          "type": "string",
+          "description": "Why this account was selected"
+        },
+        "threshold_percent": {
+          "type": "number",
           "minimum": 0,
-          "description": "Unix timestamp (ms) when usage resets"
+          "description": "Minimum percent remaining threshold"
         },
-        "current_usage": {
-          "type": "string",
-          "description": "Human-readable current usage (e.g., '15h used of 20h')"
+        "candidates_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of candidate accounts considered"
+        },
+        "filtered_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of accounts after filtering"
         }
       },
       "additionalProperties": false
