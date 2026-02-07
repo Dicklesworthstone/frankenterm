@@ -88,6 +88,7 @@ pub mod plan;
 pub mod policy;
 pub mod recording;
 pub mod replay;
+pub mod reports;
 pub mod retry;
 pub mod robot_types;
 pub mod rulesets;
