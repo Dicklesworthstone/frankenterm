@@ -118,6 +118,93 @@ impl<'a> ApprovalStore<'a> {
         })
     }
 
+    /// Issue a plan-bound allow-once approval for a specific ActionPlan.
+    ///
+    /// The token will only be consumable when the caller presents the same
+    /// `plan_hash`. This prevents TOCTOU attacks where the plan changes
+    /// between approval and execution.
+    pub async fn issue_for_plan(
+        &self,
+        input: &PolicyInput,
+        plan_hash: &str,
+        plan_version: Option<i32>,
+        risk_summary: Option<String>,
+    ) -> Result<ApprovalRequest> {
+        let now = now_ms();
+        let active = self
+            .storage
+            .count_active_approvals(&self.workspace_id, now)
+            .await?;
+        if active >= self.config.max_active_tokens {
+            return Err(Error::Policy(format!(
+                "Approval token limit reached ({active}/{})",
+                self.config.max_active_tokens
+            )));
+        }
+
+        let code = generate_allow_once_code(DEFAULT_CODE_LEN);
+        let code_hash = hash_allow_once_code(&code);
+        let fingerprint = fingerprint_for_input(input);
+        let expires_at = now.saturating_add(expiry_ms(self.config.token_expiry_secs));
+
+        let summary_text = risk_summary
+            .clone()
+            .unwrap_or_else(|| summary_for_input(input));
+
+        let token = ApprovalTokenRecord {
+            id: 0,
+            code_hash: code_hash.clone(),
+            created_at: now,
+            expires_at,
+            used_at: None,
+            workspace_id: self.workspace_id.clone(),
+            action_kind: input.action.as_str().to_string(),
+            pane_id: input.pane_id,
+            action_fingerprint: fingerprint,
+            plan_hash: Some(plan_hash.to_string()),
+            plan_version,
+            risk_summary: risk_summary.clone(),
+        };
+        self.storage.insert_approval_token(token).await?;
+
+        Ok(ApprovalRequest {
+            allow_once_code: code.clone(),
+            allow_once_full_hash: code_hash,
+            expires_at,
+            summary: summary_text,
+            command: format!("wa approve {code}"),
+        })
+    }
+
+    /// Consume a plan-bound approval, validating that the plan_hash matches.
+    ///
+    /// Returns `None` if the token doesn't exist, has expired, was already
+    /// consumed, or the plan_hash doesn't match.
+    pub async fn consume_for_plan(
+        &self,
+        allow_once_code: &str,
+        input: &PolicyInput,
+        plan_hash: &str,
+    ) -> Result<Option<ApprovalTokenRecord>> {
+        let record = self.consume(allow_once_code, input).await?;
+        match record {
+            Some(ref token) => {
+                // If the token was issued with a plan_hash, validate it matches
+                if let Some(ref stored_hash) = token.plan_hash {
+                    if stored_hash != plan_hash {
+                        // Plan changed since approval — reject.
+                        // The token is already consumed, which is intentional:
+                        // a mismatched plan_hash is a potential TOCTOU attack
+                        // and the token should be invalidated.
+                        return Ok(None);
+                    }
+                }
+                Ok(record)
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Attach an allow-once approval payload to a RequireApproval decision
     pub async fn attach_to_decision(
         &self,
@@ -658,5 +745,178 @@ mod tests {
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
         let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+    }
+
+    /// Helper to create a test storage handle with a pane registered
+    async fn setup_test_storage(suffix: &str) -> (StorageHandle, std::path::PathBuf) {
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join(format!(
+            "wa_test_plan_hash_{suffix}_{}.db",
+            std::process::id()
+        ));
+        let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+        let pane = PaneRecord {
+            pane_id: 1,
+            pane_uuid: None,
+            domain: "local".to_string(),
+            window_id: None,
+            tab_id: None,
+            title: Some("test".to_string()),
+            cwd: None,
+            tty_name: None,
+            first_seen_at: 1_700_000_000_000,
+            last_seen_at: 1_700_000_000_000,
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        };
+        storage.upsert_pane(pane).await.unwrap();
+        (storage, db_path)
+    }
+
+    async fn cleanup_storage(storage: StorageHandle, db_path: &std::path::Path) {
+        storage.shutdown().await.unwrap();
+        let db_path_str = db_path.to_string_lossy();
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+    }
+
+    #[tokio::test]
+    async fn issue_and_consume_plan_bound_approval() {
+        let (storage, db_path) = setup_test_storage("issue_consume").await;
+        let store = ApprovalStore::new(&storage, ApprovalConfig::default(), "ws");
+        let input = base_input();
+        let plan_hash = "sha256:plan123abc";
+
+        let request = store
+            .issue_for_plan(&input, plan_hash, Some(1), Some("Low risk".to_string()))
+            .await
+            .unwrap();
+
+        assert!(request.allow_once_full_hash.starts_with("sha256:"));
+
+        // Consume with matching plan_hash succeeds
+        let consumed = store
+            .consume_for_plan(&request.allow_once_code, &input, plan_hash)
+            .await
+            .unwrap();
+        assert!(consumed.is_some(), "Matching plan_hash should succeed");
+
+        let token = consumed.unwrap();
+        assert_eq!(token.plan_hash.as_deref(), Some(plan_hash));
+        assert_eq!(token.plan_version, Some(1));
+        assert_eq!(token.risk_summary.as_deref(), Some("Low risk"));
+
+        cleanup_storage(storage, &db_path).await;
+    }
+
+    #[tokio::test]
+    async fn plan_hash_mismatch_rejects_consumption() {
+        let (storage, db_path) = setup_test_storage("mismatch").await;
+        let store = ApprovalStore::new(&storage, ApprovalConfig::default(), "ws");
+        let input = base_input();
+        let plan_hash = "sha256:originalplan";
+
+        let request = store
+            .issue_for_plan(&input, plan_hash, Some(1), None)
+            .await
+            .unwrap();
+
+        // Consume with different plan_hash is rejected
+        let consumed = store
+            .consume_for_plan(&request.allow_once_code, &input, "sha256:differentplan")
+            .await
+            .unwrap();
+        assert!(
+            consumed.is_none(),
+            "Mismatched plan_hash must be rejected"
+        );
+
+        cleanup_storage(storage, &db_path).await;
+    }
+
+    #[tokio::test]
+    async fn plan_bound_token_expired_cannot_consume() {
+        let (storage, db_path) = setup_test_storage("expired").await;
+        let config = ApprovalConfig {
+            token_expiry_secs: 0, // Expire immediately
+            ..ApprovalConfig::default()
+        };
+        let store = ApprovalStore::new(&storage, config, "ws");
+        let input = base_input();
+        let plan_hash = "sha256:expiredplan";
+
+        let request = store
+            .issue_for_plan(&input, plan_hash, Some(1), None)
+            .await
+            .unwrap();
+
+        // Wait for expiry
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let consumed = store
+            .consume_for_plan(&request.allow_once_code, &input, plan_hash)
+            .await
+            .unwrap();
+        assert!(
+            consumed.is_none(),
+            "Expired plan-bound token should not be consumable"
+        );
+
+        cleanup_storage(storage, &db_path).await;
+    }
+
+    #[tokio::test]
+    async fn plan_bound_scope_violation_rejected() {
+        let (storage, db_path) = setup_test_storage("scope").await;
+        let store = ApprovalStore::new(&storage, ApprovalConfig::default(), "ws");
+        let input = base_input();
+        let plan_hash = "sha256:scopedplan";
+
+        let request = store
+            .issue_for_plan(&input, plan_hash, Some(1), None)
+            .await
+            .unwrap();
+
+        // Wrong pane = scope violation
+        let wrong_pane = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(99)
+            .with_domain("local")
+            .with_text_summary("echo hi")
+            .with_capabilities(PaneCapabilities::prompt());
+
+        let consumed = store
+            .consume_for_plan(&request.allow_once_code, &wrong_pane, plan_hash)
+            .await
+            .unwrap();
+        assert!(
+            consumed.is_none(),
+            "Wrong pane scope should reject even with correct plan_hash"
+        );
+
+        cleanup_storage(storage, &db_path).await;
+    }
+
+    #[tokio::test]
+    async fn non_plan_bound_token_works_with_consume_for_plan() {
+        let (storage, db_path) = setup_test_storage("noplan").await;
+        let store = ApprovalStore::new(&storage, ApprovalConfig::default(), "ws");
+        let input = base_input();
+
+        // Issue without plan binding
+        let request = store.issue(&input, None).await.unwrap();
+
+        // consume_for_plan should still work (token has no plan_hash to validate)
+        let consumed = store
+            .consume_for_plan(&request.allow_once_code, &input, "sha256:anyplan")
+            .await
+            .unwrap();
+        assert!(
+            consumed.is_some(),
+            "Non-plan-bound token should not reject based on plan_hash"
+        );
+
+        cleanup_storage(storage, &db_path).await;
     }
 }

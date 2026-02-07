@@ -23691,6 +23691,9 @@ log_level = "debug"
             action_kind: "send_text".to_string(),
             pane_id,
             action_fingerprint: fingerprint.to_string(),
+            plan_hash: None,
+            plan_version: None,
+            risk_summary: None,
         };
         storage.insert_approval_token(token).await.unwrap();
     }
