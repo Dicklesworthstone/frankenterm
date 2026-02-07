@@ -290,6 +290,241 @@ impl Scenario {
 }
 
 // ---------------------------------------------------------------------------
+// Tutorial Sandbox
+// ---------------------------------------------------------------------------
+
+/// A sandboxed simulation environment for tutorial exercises.
+///
+/// Wraps a [`MockWezterm`] with a pre-configured [`Scenario`] and adds
+/// tutorial-specific features: visual indicators, command logging, hints,
+/// and exercise-triggered events.
+pub struct TutorialSandbox {
+    /// The underlying mock terminal.
+    mock: MockWezterm,
+    /// Active scenario (if loaded).
+    scenario: Option<Scenario>,
+    /// Commands executed in the sandbox (for progress feedback).
+    command_log: Vec<SandboxCommand>,
+    /// Whether to prefix output with `[SANDBOX]`.
+    show_indicator: bool,
+}
+
+/// A command executed within the sandbox.
+#[derive(Debug, Clone, Serialize)]
+pub struct SandboxCommand {
+    /// The command string as entered.
+    pub command: String,
+    /// Timestamp of execution.
+    pub timestamp_ms: u64,
+    /// Which exercise was active (if any).
+    pub exercise_id: Option<String>,
+}
+
+impl TutorialSandbox {
+    /// Create a new sandbox with default mock panes for the tutorial.
+    pub async fn new() -> Self {
+        let mock = MockWezterm::new();
+        let scenario = Self::default_scenario();
+
+        if let Err(e) = scenario.setup(&mock).await {
+            tracing::warn!("Failed to set up tutorial sandbox scenario: {e}");
+        }
+
+        Self {
+            mock,
+            scenario: Some(scenario),
+            command_log: Vec::new(),
+            show_indicator: true,
+        }
+    }
+
+    /// Create a sandbox with a custom scenario.
+    pub async fn with_scenario(scenario: Scenario) -> Result<Self> {
+        let mock = MockWezterm::new();
+        scenario.setup(&mock).await?;
+
+        Ok(Self {
+            mock,
+            scenario: Some(scenario),
+            command_log: Vec::new(),
+            show_indicator: true,
+        })
+    }
+
+    /// Create an empty sandbox with no pre-configured panes.
+    pub fn empty() -> Self {
+        Self {
+            mock: MockWezterm::new(),
+            scenario: None,
+            command_log: Vec::new(),
+            show_indicator: true,
+        }
+    }
+
+    /// Access the underlying mock terminal.
+    pub fn mock(&self) -> &MockWezterm {
+        &self.mock
+    }
+
+    /// Log a command execution within the sandbox.
+    pub fn log_command(&mut self, command: &str, exercise_id: Option<&str>) {
+        self.command_log.push(SandboxCommand {
+            command: command.to_string(),
+            timestamp_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            exercise_id: exercise_id.map(|s| s.to_string()),
+        });
+    }
+
+    /// Get all commands logged so far.
+    pub fn command_log(&self) -> &[SandboxCommand] {
+        &self.command_log
+    }
+
+    /// Format output with the sandbox indicator.
+    pub fn format_output(&self, text: &str) -> String {
+        if self.show_indicator {
+            format!("[SANDBOX] {text}")
+        } else {
+            text.to_string()
+        }
+    }
+
+    /// Enable or disable the `[SANDBOX]` prefix.
+    pub fn set_show_indicator(&mut self, show: bool) {
+        self.show_indicator = show;
+    }
+
+    /// Inject exercise-triggered events into the sandbox.
+    ///
+    /// This fires all events in the scenario that haven't already been
+    /// injected, simulating activity for the current exercise.
+    pub async fn trigger_exercise_events(&self) -> Result<usize> {
+        match &self.scenario {
+            Some(s) => s.execute_all(&self.mock).await,
+            None => Ok(0),
+        }
+    }
+
+    /// Check an expectation against the current sandbox state.
+    pub async fn check_expectation(&self, kind: &ExpectationKind) -> bool {
+        use crate::wezterm::WeztermInterface;
+
+        match kind {
+            ExpectationKind::Contains { pane, text } => {
+                if let Ok(content) = self.mock.get_text(*pane, false).await {
+                    content.contains(text)
+                } else {
+                    false
+                }
+            }
+            // Event/Workflow expectations need runtime integration
+            _ => false,
+        }
+    }
+
+    /// Check all expectations from the loaded scenario.
+    /// Returns (passed, failed, skipped) counts.
+    pub async fn check_all_expectations(&self) -> (usize, usize, usize) {
+        let expectations = match &self.scenario {
+            Some(s) => &s.expectations,
+            None => return (0, 0, 0),
+        };
+
+        let mut pass = 0;
+        let mut fail = 0;
+        let mut skip = 0;
+
+        for exp in expectations {
+            match &exp.kind {
+                ExpectationKind::Contains { .. } => {
+                    if self.check_expectation(&exp.kind).await {
+                        pass += 1;
+                    } else {
+                        fail += 1;
+                    }
+                }
+                _ => skip += 1,
+            }
+        }
+
+        (pass, fail, skip)
+    }
+
+    /// Build the default tutorial sandbox scenario.
+    fn default_scenario() -> Scenario {
+        Scenario {
+            name: "tutorial_sandbox".to_string(),
+            description: "Pre-configured environment for wa learn exercises".to_string(),
+            duration: Duration::from_secs(300),
+            panes: vec![
+                ScenarioPane {
+                    id: 0,
+                    title: "Local Shell".to_string(),
+                    domain: "local".to_string(),
+                    cwd: "/home/user/projects".to_string(),
+                    cols: 80,
+                    rows: 24,
+                    initial_content: "$ ".to_string(),
+                },
+                ScenarioPane {
+                    id: 1,
+                    title: "Codex Agent".to_string(),
+                    domain: "local".to_string(),
+                    cwd: "/home/user/projects".to_string(),
+                    cols: 80,
+                    rows: 24,
+                    initial_content: "codex> Ready to help with your project.\nWhat would you like to work on?\n".to_string(),
+                },
+                ScenarioPane {
+                    id: 2,
+                    title: "Claude Code".to_string(),
+                    domain: "local".to_string(),
+                    cwd: "/home/user/projects".to_string(),
+                    cols: 80,
+                    rows: 24,
+                    initial_content: "claude> Analyzing your codebase...\n".to_string(),
+                },
+            ],
+            events: vec![
+                ScenarioEvent {
+                    at: Duration::from_secs(5),
+                    pane: 1,
+                    action: EventAction::Append,
+                    content: "\n[Usage Warning]\nApproaching daily usage limit.\n".to_string(),
+                    name: String::new(),
+                    comment: Some("Triggers usage detection exercise".to_string()),
+                },
+                ScenarioEvent {
+                    at: Duration::from_secs(10),
+                    pane: 2,
+                    action: EventAction::Append,
+                    content: "\n[Context Compaction]\nContext window approaching limit. Summarizing...\n".to_string(),
+                    name: String::new(),
+                    comment: Some("Triggers compaction detection exercise".to_string()),
+                },
+            ],
+            expectations: vec![
+                Expectation {
+                    kind: ExpectationKind::Contains {
+                        pane: 1,
+                        text: "Usage Warning".to_string(),
+                    },
+                },
+                Expectation {
+                    kind: ExpectationKind::Contains {
+                        pane: 2,
+                        text: "Context Compaction".to_string(),
+                    },
+                },
+            ],
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Duration deserialization
 // ---------------------------------------------------------------------------
 
@@ -952,5 +1187,137 @@ panes: []
 events: []
 "#;
         assert!(Scenario::from_yaml(yaml).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // TutorialSandbox tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn sandbox_creates_default_panes() {
+        let sandbox = TutorialSandbox::new().await;
+        assert_eq!(sandbox.mock().pane_count().await, 3);
+
+        let p0 = sandbox.mock().pane_state(0).await.unwrap();
+        assert_eq!(p0.title, "Local Shell");
+        let p1 = sandbox.mock().pane_state(1).await.unwrap();
+        assert_eq!(p1.title, "Codex Agent");
+        let p2 = sandbox.mock().pane_state(2).await.unwrap();
+        assert_eq!(p2.title, "Claude Code");
+    }
+
+    #[tokio::test]
+    async fn sandbox_initial_content() {
+        let sandbox = TutorialSandbox::new().await;
+
+        let t0 = sandbox.mock().get_text(0, false).await.unwrap();
+        assert_eq!(t0, "$ ");
+        let t1 = sandbox.mock().get_text(1, false).await.unwrap();
+        assert!(t1.contains("codex>"));
+    }
+
+    #[tokio::test]
+    async fn sandbox_format_output_with_indicator() {
+        let sandbox = TutorialSandbox::new().await;
+        assert_eq!(sandbox.format_output("hello"), "[SANDBOX] hello");
+    }
+
+    #[tokio::test]
+    async fn sandbox_format_output_without_indicator() {
+        let mut sandbox = TutorialSandbox::new().await;
+        sandbox.set_show_indicator(false);
+        assert_eq!(sandbox.format_output("hello"), "hello");
+    }
+
+    #[tokio::test]
+    async fn sandbox_command_logging() {
+        let mut sandbox = TutorialSandbox::new().await;
+        assert!(sandbox.command_log().is_empty());
+
+        sandbox.log_command("wa status", Some("basics.1"));
+        sandbox.log_command("wa list", None);
+
+        assert_eq!(sandbox.command_log().len(), 2);
+        assert_eq!(sandbox.command_log()[0].command, "wa status");
+        assert_eq!(
+            sandbox.command_log()[0].exercise_id.as_deref(),
+            Some("basics.1")
+        );
+        assert_eq!(sandbox.command_log()[1].command, "wa list");
+        assert!(sandbox.command_log()[1].exercise_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn sandbox_trigger_events() {
+        let sandbox = TutorialSandbox::new().await;
+        let count = sandbox.trigger_exercise_events().await.unwrap();
+        assert_eq!(count, 2);
+
+        let t1 = sandbox.mock().get_text(1, false).await.unwrap();
+        assert!(t1.contains("Usage Warning"));
+        let t2 = sandbox.mock().get_text(2, false).await.unwrap();
+        assert!(t2.contains("Context Compaction"));
+    }
+
+    #[tokio::test]
+    async fn sandbox_check_expectations_after_events() {
+        let sandbox = TutorialSandbox::new().await;
+        sandbox.trigger_exercise_events().await.unwrap();
+
+        let (pass, fail, skip) = sandbox.check_all_expectations().await;
+        assert_eq!(pass, 2);
+        assert_eq!(fail, 0);
+        assert_eq!(skip, 0);
+    }
+
+    #[tokio::test]
+    async fn sandbox_check_expectations_before_events() {
+        let sandbox = TutorialSandbox::new().await;
+        // Don't trigger events — expectations should fail
+        let (pass, fail, skip) = sandbox.check_all_expectations().await;
+        assert_eq!(pass, 0);
+        assert_eq!(fail, 2);
+        assert_eq!(skip, 0);
+    }
+
+    #[tokio::test]
+    async fn sandbox_with_custom_scenario() {
+        let yaml = r#"
+name: custom_sandbox
+duration: "5s"
+panes:
+  - id: 0
+    title: "Custom"
+    initial_content: "custom> "
+events: []
+"#;
+        let scenario = Scenario::from_yaml(yaml).unwrap();
+        let sandbox = TutorialSandbox::with_scenario(scenario).await.unwrap();
+
+        assert_eq!(sandbox.mock().pane_count().await, 1);
+        let text = sandbox.mock().get_text(0, false).await.unwrap();
+        assert_eq!(text, "custom> ");
+    }
+
+    #[tokio::test]
+    async fn sandbox_empty_has_no_panes() {
+        let sandbox = TutorialSandbox::empty();
+        assert_eq!(sandbox.mock().pane_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn sandbox_empty_trigger_events_returns_zero() {
+        let sandbox = TutorialSandbox::empty();
+        let count = sandbox.trigger_exercise_events().await.unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn sandbox_empty_check_expectations() {
+        let sandbox = TutorialSandbox::empty();
+        let (pass, fail, skip) = sandbox.check_all_expectations().await;
+        assert_eq!(pass, 0);
+        assert_eq!(fail, 0);
+        assert_eq!(skip, 0);
     }
 }
