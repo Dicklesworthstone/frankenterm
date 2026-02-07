@@ -1784,4 +1784,370 @@ mod tests {
         render_triage_view(&state, area, &mut buf);
         // Should not panic; shows empty triage + workflow panel
     }
+
+    // -----------------------------------------------------------------------
+    // Comprehensive TUI tests (wa-nu4.3.7.7)
+    // -----------------------------------------------------------------------
+
+    // --- View state transition tests ---
+
+    #[test]
+    fn view_state_default_is_clean() {
+        let state = ViewState::default();
+        assert!(state.panes.is_empty());
+        assert!(state.events.is_empty());
+        assert!(state.triage_items.is_empty());
+        assert!(state.workflows.is_empty());
+        assert!(state.health.is_none());
+        assert!(state.search_query.is_empty());
+        assert!(state.error_message.is_none());
+        assert_eq!(state.selected_index, 0);
+        assert_eq!(state.triage_selected_index, 0);
+        assert!(!state.panes_unhandled_only);
+        assert!(!state.events_unhandled_only);
+        assert!(state.triage_expanded.is_none());
+    }
+
+    #[test]
+    fn view_state_error_set_and_clear() {
+        let mut state = ViewState::default();
+        assert!(state.error_message.is_none());
+
+        state.set_error("something broke");
+        assert_eq!(state.error_message.as_deref(), Some("something broke"));
+
+        state.clear_error();
+        assert!(state.error_message.is_none());
+    }
+
+    #[test]
+    fn view_all_returns_six_views() {
+        assert_eq!(View::all().len(), 6);
+    }
+
+    #[test]
+    fn view_next_prev_are_inverse() {
+        for view in View::all() {
+            assert_eq!(view.next().prev(), *view);
+            assert_eq!(view.prev().next(), *view);
+        }
+    }
+
+    #[test]
+    fn view_name_non_empty() {
+        for view in View::all() {
+            assert!(!view.name().is_empty());
+        }
+    }
+
+    // --- Truncation edge cases ---
+
+    #[test]
+    fn truncate_handles_unicode_boundary() {
+        // If truncation hits a multi-byte char boundary, it should not panic
+        let result = truncate_str("héllo wörld", 7);
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn truncate_exact_max() {
+        assert_eq!(truncate_str("abcde", 5), "abcde");
+    }
+
+    #[test]
+    fn truncate_one_over() {
+        assert_eq!(truncate_str("abcdef", 5), "ab...");
+    }
+
+    #[test]
+    fn truncate_empty_string() {
+        assert_eq!(truncate_str("", 10), "");
+    }
+
+    #[test]
+    fn truncate_max_three() {
+        // When max_len == 3, should truncate without ellipsis
+        assert_eq!(truncate_str("abcdef", 3), "abc");
+    }
+
+    // --- Pane rendering edge cases ---
+
+    #[test]
+    fn render_panes_view_empty_panes() {
+        let state = ViewState::default();
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        render_panes_view(&state, area, &mut buf);
+        // Should render "No panes match" gracefully
+    }
+
+    #[test]
+    fn render_panes_view_with_selection_out_of_bounds() {
+        let mut state = ViewState::default();
+        state.panes = vec![pane(1, "test", Some("codex"), 0, "local")];
+        state.selected_index = 99; // Way out of bounds
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        render_panes_view(&state, area, &mut buf);
+        // Should clamp and render without panic
+    }
+
+    #[test]
+    fn render_panes_view_alt_screen_pane() {
+        let mut state = ViewState::default();
+        let mut p = pane(1, "vim", None, 0, "local");
+        p.pane_state = "AltScreen".to_string();
+        state.panes = vec![p];
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        render_panes_view(&state, area, &mut buf);
+    }
+
+    #[test]
+    fn render_panes_view_with_all_filters() {
+        let mut state = ViewState::default();
+        state.panes = vec![
+            pane(1, "codex-main", Some("codex"), 2, "local"),
+            pane(2, "claude-docs", Some("claude"), 0, "ssh:prod"),
+        ];
+        state.panes_filter_query = "codex".to_string();
+        state.panes_unhandled_only = true;
+        state.panes_agent_filter = Some("codex".to_string());
+        state.panes_domain_filter = Some("local".to_string());
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        render_panes_view(&state, area, &mut buf);
+    }
+
+    // --- Events rendering edge cases ---
+
+    #[test]
+    fn render_events_view_selected_index_beyond_filtered() {
+        let mut state = ViewState::default();
+        state.events = vec![
+            event(1, 10, "rule1", "warning", true),
+        ];
+        state.events_unhandled_only = true; // Filters out the only event
+        state.events_selected_index = 5;
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        render_events_view(&state, area, &mut buf);
+        // Should render "No events match" without panic
+    }
+
+    // --- Search rendering edge cases ---
+
+    #[test]
+    fn render_search_view_selected_beyond_results() {
+        let mut state = ViewState::default();
+        state.search_last_query = "test".to_string();
+        state.search_results = vec![
+            search_result(10, "one result", 0.5),
+        ];
+        state.search_selected_index = 99; // Way out of bounds
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        render_search_view(&state, area, &mut buf);
+        // Should clamp and render without panic
+    }
+
+    // --- Tab rendering ---
+
+    #[test]
+    fn render_tabs_for_each_view() {
+        let area = Rect::new(0, 0, 80, 2);
+        for view in View::all() {
+            let mut buf = Buffer::empty(area);
+            render_tabs(*view, area, &mut buf);
+            // Should not panic for any view
+        }
+    }
+
+    // --- Help view ---
+
+    #[test]
+    fn render_help_view_does_not_panic() {
+        let area = Rect::new(0, 0, 80, 30);
+        let mut buf = Buffer::empty(area);
+        render_help_view(area, &mut buf);
+    }
+
+    // --- Triage edge cases ---
+
+    #[test]
+    fn render_triage_view_selected_beyond_items() {
+        let mut state = ViewState::default();
+        state.triage_items = vec![TriageItemView {
+            section: "events".to_string(),
+            severity: "error".to_string(),
+            title: "test".to_string(),
+            detail: "detail".to_string(),
+            actions: vec![],
+            event_id: None,
+            pane_id: None,
+            workflow_id: None,
+        }];
+        state.triage_selected_index = 99;
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        render_triage_view(&state, area, &mut buf);
+        // Should not panic; detail panel may be empty
+    }
+
+    #[test]
+    fn render_triage_view_with_multiple_actions() {
+        let mut state = ViewState::default();
+        state.triage_items = vec![TriageItemView {
+            section: "events".to_string(),
+            severity: "error".to_string(),
+            title: "multi-action item".to_string(),
+            detail: "multiple fixes available".to_string(),
+            actions: vec![
+                super::super::query::TriageAction {
+                    label: "Action 1".to_string(),
+                    command: "wa fix --auto".to_string(),
+                },
+                super::super::query::TriageAction {
+                    label: "Action 2".to_string(),
+                    command: "wa restart".to_string(),
+                },
+                super::super::query::TriageAction {
+                    label: "Action 3".to_string(),
+                    command: "wa why --recent".to_string(),
+                },
+            ],
+            event_id: Some(42),
+            pane_id: Some(10),
+            workflow_id: None,
+        }];
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        render_triage_view(&state, area, &mut buf);
+    }
+
+    // --- Home view edge cases ---
+
+    #[test]
+    fn render_home_view_zero_panes_and_events() {
+        let mut state = ViewState::default();
+        let health = make_health(true, true, true);
+        state.health = Some(health);
+        // pane_count=3, event_count=10 from make_health defaults; override
+        state.health.as_mut().unwrap().pane_count = 0;
+        state.health.as_mut().unwrap().event_count = 0;
+        let area = Rect::new(0, 0, 80, 30);
+        let mut buf = Buffer::empty(area);
+        render_home_view(&state, area, &mut buf);
+    }
+
+    #[test]
+    fn render_home_view_high_event_count() {
+        let mut state = ViewState::default();
+        state.health = Some(make_health(true, true, true));
+        state.health.as_mut().unwrap().event_count = 500;
+        let area = Rect::new(0, 0, 80, 30);
+        let mut buf = Buffer::empty(area);
+        render_home_view(&state, area, &mut buf);
+        // Should show event count in yellow (>100)
+    }
+
+    #[test]
+    fn render_home_view_no_capture_timestamp() {
+        let mut state = ViewState::default();
+        let mut health = make_health(true, true, true);
+        health.last_capture_ts = None;
+        state.health = Some(health);
+        let area = Rect::new(0, 0, 80, 30);
+        let mut buf = Buffer::empty(area);
+        render_home_view(&state, area, &mut buf);
+        // Should show "no captures yet"
+    }
+
+    #[test]
+    fn render_home_view_circuit_open_with_cooldown() {
+        let mut state = ViewState::default();
+        let mut health = make_health(true, true, true);
+        health.wezterm_circuit.state = CircuitStateKind::Open;
+        health.wezterm_circuit.cooldown_remaining_ms = Some(5000);
+        state.health = Some(health);
+        let area = Rect::new(0, 0, 80, 30);
+        let mut buf = Buffer::empty(area);
+        render_home_view(&state, area, &mut buf);
+    }
+
+    // --- Small terminal size rendering ---
+
+    #[test]
+    fn render_all_views_at_minimum_size() {
+        let area = Rect::new(0, 0, 40, 10);
+        let state = ViewState::default();
+        let mut buf = Buffer::empty(area);
+
+        render_home_view(&state, area, &mut buf);
+        render_panes_view(&state, area, &mut buf);
+        render_events_view(&state, area, &mut buf);
+        render_triage_view(&state, area, &mut buf);
+        render_search_view(&state, area, &mut buf);
+        render_help_view(area, &mut buf);
+        // None should panic at small terminal size
+    }
+
+    // --- Pane filter combinations ---
+
+    #[test]
+    fn filtered_pane_indices_empty_query_returns_all() {
+        let mut state = ViewState::default();
+        state.panes = vec![
+            pane(1, "test", None, 0, "local"),
+            pane(2, "test2", None, 0, "local"),
+        ];
+        let filtered = filtered_pane_indices(&state);
+        assert_eq!(filtered, vec![0, 1]);
+    }
+
+    #[test]
+    fn filtered_pane_indices_by_cwd() {
+        let mut state = ViewState::default();
+        state.panes = vec![
+            pane(1, "test", None, 0, "local"),
+            pane(2, "test2", None, 0, "local"),
+        ];
+        // cwd is "/tmp/{title}" - filter by test2
+        state.panes_filter_query = "test2".to_string();
+        let filtered = filtered_pane_indices(&state);
+        assert_eq!(filtered, vec![1]);
+    }
+
+    #[test]
+    fn filtered_pane_indices_domain_ssh() {
+        let mut state = ViewState::default();
+        state.panes = vec![
+            pane(1, "local-shell", None, 0, "local"),
+            pane(2, "remote", None, 0, "ssh:myhost"),
+        ];
+        state.panes_domain_filter = Some("ssh".to_string());
+        let filtered = filtered_pane_indices(&state);
+        assert_eq!(filtered, vec![1]);
+    }
+
+    // --- Progress bar edge cases ---
+
+    #[test]
+    fn progress_bar_single_step() {
+        let spans = render_progress_bar(1, 1, 12);
+        assert!(spans[3].content.contains("1/1"));
+    }
+
+    #[test]
+    fn progress_bar_large_values() {
+        let spans = render_progress_bar(50, 100, 22);
+        assert!(spans[3].content.contains("50/100"));
+    }
+
+    #[test]
+    fn progress_bar_minimum_width() {
+        let spans = render_progress_bar(1, 2, 2);
+        // Width 2 means bar_width = 0, should still produce valid output
+        assert_eq!(spans.len(), 4);
+    }
 }

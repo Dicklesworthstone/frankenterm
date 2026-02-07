@@ -1117,4 +1117,279 @@ mod tests {
         app.handle_triage_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
         assert!(app.view_state.triage_expanded.is_none());
     }
+
+    // -----------------------------------------------------------------------
+    // Comprehensive keybinding & state transition tests (wa-nu4.3.7.7)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn global_q_quits() {
+        let mut app = App::new(TestQueryClient, AppConfig::default());
+        assert!(!app.should_quit);
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn global_question_mark_goes_to_help() {
+        let mut app = App::new(TestQueryClient, AppConfig::default());
+        assert_eq!(app.current_view, View::Home);
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert_eq!(app.current_view, View::Help);
+    }
+
+    #[test]
+    fn global_tab_cycles_forward() {
+        let mut app = App::new(TestQueryClient, AppConfig::default());
+        assert_eq!(app.current_view, View::Home);
+        app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.current_view, View::Panes);
+        app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.current_view, View::Events);
+        app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.current_view, View::Triage);
+        app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.current_view, View::Search);
+        app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.current_view, View::Help);
+        app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.current_view, View::Home); // Wraps
+    }
+
+    #[test]
+    fn global_shift_tab_cycles_backward() {
+        let mut app = App::new(TestQueryClient, AppConfig::default());
+        assert_eq!(app.current_view, View::Home);
+        app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT));
+        assert_eq!(app.current_view, View::Help);
+        app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT));
+        assert_eq!(app.current_view, View::Search);
+    }
+
+    #[test]
+    fn global_backtab_cycles_backward() {
+        let mut app = App::new(TestQueryClient, AppConfig::default());
+        app.handle_key_event(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
+        assert_eq!(app.current_view, View::Help);
+    }
+
+    #[test]
+    fn global_number_keys_switch_views() {
+        let mut app = App::new(TestQueryClient, AppConfig::default());
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        assert_eq!(app.current_view, View::Panes);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+        assert_eq!(app.current_view, View::Events);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
+        assert_eq!(app.current_view, View::Triage);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE));
+        assert_eq!(app.current_view, View::Search);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('6'), KeyModifiers::NONE));
+        assert_eq!(app.current_view, View::Help);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+        assert_eq!(app.current_view, View::Home);
+    }
+
+    #[test]
+    fn global_r_refreshes() {
+        let mut app = App::new(TestQueryClient, AppConfig::default());
+        // Clear health to prove refresh restores it
+        app.view_state.health = None;
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(app.view_state.health.is_some());
+    }
+
+    #[test]
+    fn panes_navigation_down_up_wraps() {
+        let mut app = App::new(MultiPaneQueryClient, AppConfig::default());
+        app.refresh_data();
+        assert_eq!(app.view_state.panes.len(), 3);
+
+        // Navigate down through all panes
+        app.handle_panes_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.view_state.selected_index, 1);
+        app.handle_panes_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.view_state.selected_index, 2);
+        // Wrap
+        app.handle_panes_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.view_state.selected_index, 0);
+
+        // Up wraps
+        app.handle_panes_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.view_state.selected_index, 2);
+    }
+
+    #[test]
+    fn panes_domain_filter_cycles() {
+        let mut app = App::new(MultiPaneQueryClient, AppConfig::default());
+        app.refresh_data();
+
+        app.handle_panes_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert_eq!(app.view_state.panes_domain_filter.as_deref(), Some("local"));
+
+        app.handle_panes_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert_eq!(app.view_state.panes_domain_filter.as_deref(), Some("ssh"));
+
+        app.handle_panes_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert!(app.view_state.panes_domain_filter.is_none());
+    }
+
+    #[test]
+    fn panes_esc_clears_filter() {
+        let mut app = App::new(MultiPaneQueryClient, AppConfig::default());
+        app.refresh_data();
+        app.view_state.panes_filter_query = "test".to_string();
+        app.handle_panes_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.view_state.panes_filter_query.is_empty());
+    }
+
+    #[test]
+    fn triage_navigation_down_up_wraps() {
+        let mut app = App::new(TestQueryClient, AppConfig::default());
+        app.refresh_data();
+        // TestQueryClient doesn't provide triage items; add manually
+        app.view_state.triage_items = vec![
+            crate::tui::query::TriageItemView {
+                section: "events".to_string(),
+                severity: "warning".to_string(),
+                title: "item 1".to_string(),
+                detail: "d1".to_string(),
+                actions: vec![],
+                event_id: Some(1),
+                pane_id: Some(0),
+                workflow_id: None,
+            },
+            crate::tui::query::TriageItemView {
+                section: "events".to_string(),
+                severity: "error".to_string(),
+                title: "item 2".to_string(),
+                detail: "d2".to_string(),
+                actions: vec![],
+                event_id: Some(2),
+                pane_id: Some(0),
+                workflow_id: None,
+            },
+        ];
+
+        app.handle_triage_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.view_state.triage_selected_index, 1);
+
+        // Wrap
+        app.handle_triage_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.view_state.triage_selected_index, 0);
+
+        // Up wraps
+        app.handle_triage_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(app.view_state.triage_selected_index, 1);
+    }
+
+    #[test]
+    fn triage_action_queues_pending_command() {
+        let mut app = App::new(TestQueryClient, AppConfig::default());
+        app.view_state.triage_items = vec![crate::tui::query::TriageItemView {
+            section: "events".to_string(),
+            severity: "warning".to_string(),
+            title: "test".to_string(),
+            detail: "".to_string(),
+            actions: vec![crate::tui::query::TriageAction {
+                label: "Explain".to_string(),
+                command: "wa why --recent".to_string(),
+            }],
+            event_id: Some(1),
+            pane_id: Some(0),
+            workflow_id: None,
+        }];
+
+        app.handle_triage_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.pending_command.as_deref(), Some("wa why --recent"));
+    }
+
+    #[test]
+    fn triage_action_by_number() {
+        let mut app = App::new(TestQueryClient, AppConfig::default());
+        app.view_state.triage_items = vec![crate::tui::query::TriageItemView {
+            section: "events".to_string(),
+            severity: "warning".to_string(),
+            title: "test".to_string(),
+            detail: "".to_string(),
+            actions: vec![
+                crate::tui::query::TriageAction {
+                    label: "First".to_string(),
+                    command: "wa first".to_string(),
+                },
+                crate::tui::query::TriageAction {
+                    label: "Second".to_string(),
+                    command: "wa second".to_string(),
+                },
+            ],
+            event_id: Some(1),
+            pane_id: Some(0),
+            workflow_id: None,
+        }];
+
+        app.handle_triage_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        assert_eq!(app.pending_command.as_deref(), Some("wa second"));
+    }
+
+    #[test]
+    fn triage_invalid_action_sets_error() {
+        let mut app = App::new(TestQueryClient, AppConfig::default());
+        app.view_state.triage_items = vec![crate::tui::query::TriageItemView {
+            section: "events".to_string(),
+            severity: "warning".to_string(),
+            title: "test".to_string(),
+            detail: "".to_string(),
+            actions: vec![],
+            event_id: Some(1),
+            pane_id: Some(0),
+            workflow_id: None,
+        }];
+
+        app.handle_triage_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.view_state.error_message.is_some());
+    }
+
+    #[test]
+    fn search_j_k_noop_without_results() {
+        let mut app = App::new(SearchQueryClient, AppConfig::default());
+        app.refresh_data();
+        assert!(app.view_state.search_results.is_empty());
+
+        // j/k should not panic with empty results
+        app.handle_search_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.view_state.search_selected_index, 0);
+        app.handle_search_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(app.view_state.search_selected_index, 0);
+    }
+
+    #[test]
+    fn refresh_data_clears_previous_error() {
+        let mut app = App::new(TestQueryClient, AppConfig::default());
+        app.view_state.set_error("old error");
+        app.refresh_data();
+        // Should clear error on successful refresh
+        assert!(app.view_state.error_message.is_none());
+    }
+
+    #[test]
+    fn refresh_data_resets_selected_index_when_out_of_bounds() {
+        let mut app = App::new(TestQueryClient, AppConfig::default());
+        app.view_state.selected_index = 99;
+        app.refresh_data();
+        // TestQueryClient returns 1 pane, so selected_index should reset
+        assert_eq!(app.view_state.selected_index, 0);
+    }
+
+    #[test]
+    fn app_config_default_values() {
+        let config = AppConfig::default();
+        assert_eq!(config.refresh_interval, std::time::Duration::from_secs(5));
+        assert!(!config.debug);
+    }
 }
