@@ -1765,6 +1765,132 @@ pub struct HealthDiagnostic {
 }
 
 // =============================================================================
+// Account List Renderer (wa-nu4.3.2.5)
+// =============================================================================
+
+use crate::accounts::{AccountRecord, AccountSelectionResult};
+
+/// Renderer for account list with optional pick preview.
+pub struct AccountListRenderer;
+
+impl AccountListRenderer {
+    /// Render account list with optional selection preview.
+    #[must_use]
+    pub fn render(
+        accounts: &[AccountRecord],
+        pick: Option<&AccountSelectionResult>,
+        service: &str,
+        ctx: &RenderContext,
+    ) -> String {
+        if ctx.format.is_json() {
+            let mut payload = serde_json::json!({
+                "accounts": accounts,
+                "total": accounts.len(),
+                "service": service,
+            });
+            if let Some(pick_result) = pick {
+                payload["pick_preview"] = serde_json::json!({
+                    "selected_account_id": pick_result.selected.as_ref().map(|a| &a.account_id),
+                    "selected_name": pick_result.selected.as_ref().and_then(|a| a.name.as_ref()),
+                    "selection_reason": &pick_result.explanation.selection_reason,
+                    "candidates_count": pick_result.explanation.candidates.len(),
+                    "filtered_count": pick_result.explanation.filtered_out.len(),
+                });
+            }
+            return serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string());
+        }
+
+        let style = Style::from_format(ctx.format);
+
+        if accounts.is_empty() {
+            return style.dim(&format!("No accounts found for service \"{service}\"\n"));
+        }
+
+        let mut output = String::new();
+        output.push_str(&style.bold(&format!(
+            "Accounts ({}, service: {service}):\n",
+            accounts.len()
+        )));
+
+        let mut table = Table::new(vec![
+            Column::new("ACCOUNT").min_width(16),
+            Column::new("NAME").min_width(12),
+            Column::new("REMAINING").align(Alignment::Right).min_width(10),
+            Column::new("USED").align(Alignment::Right).min_width(10),
+            Column::new("LIMIT").align(Alignment::Right).min_width(10),
+            Column::new("REFRESHED").min_width(20),
+        ])
+        .with_format(ctx.format);
+
+        for acct in accounts {
+            let name = acct.name.as_deref().unwrap_or("-");
+            let remaining = format!("{:.1}%", acct.percent_remaining);
+            let used = acct
+                .tokens_used
+                .map_or_else(|| "-".to_string(), format_token_count);
+            let limit = acct
+                .tokens_limit
+                .map_or_else(|| "-".to_string(), format_token_count);
+            let refreshed = format_timestamp(acct.last_refreshed_at);
+
+            table.add_row(vec![
+                truncate(&acct.account_id, 24),
+                truncate(name, 16),
+                remaining,
+                used,
+                limit,
+                refreshed,
+            ]);
+        }
+
+        output.push_str(&table.render());
+
+        // Pick preview
+        if let Some(pick_result) = pick {
+            output.push('\n');
+            if let Some(ref selected) = pick_result.selected {
+                let display_name = selected
+                    .name
+                    .as_deref()
+                    .unwrap_or(&selected.account_id);
+                output.push_str(&style.bold("Pick: "));
+                output.push_str(&style.green(display_name));
+                output.push_str(&format!(
+                    " ({:.1}%) - {}\n",
+                    selected.percent_remaining,
+                    pick_result.explanation.selection_reason
+                ));
+            } else {
+                output.push_str(&style.yellow(&format!(
+                    "Pick: none - {}\n",
+                    pick_result.explanation.selection_reason
+                )));
+            }
+
+            if !pick_result.explanation.filtered_out.is_empty() {
+                output.push_str(&style.dim(&format!(
+                    "  {} account(s) filtered (below threshold)\n",
+                    pick_result.explanation.filtered_out.len()
+                )));
+            }
+        }
+
+        output
+    }
+}
+
+/// Format a token count in human-readable form (e.g. 1.2M, 500K).
+fn format_token_count(tokens: i64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.0}K", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
+// =============================================================================
 // Analytics Renderers (wa-985.3)
 // =============================================================================
 
@@ -3604,5 +3730,135 @@ mod tests {
         let checks = HealthSnapshotRenderer::diagnostic_checks(&snapshot);
         let activity = checks.iter().find(|c| c.name == "pane activity").unwrap();
         assert_eq!(activity.status, HealthDiagnosticStatus::Ok);
+    }
+
+    // =========================================================================
+    // Account List Renderer tests (wa-nu4.3.2.5)
+    // =========================================================================
+
+    fn sample_accounts() -> Vec<crate::accounts::AccountRecord> {
+        vec![
+            crate::accounts::AccountRecord {
+                id: 1,
+                account_id: "acct-alpha".to_string(),
+                service: "openai".to_string(),
+                name: Some("Alpha".to_string()),
+                percent_remaining: 82.5,
+                reset_at: None,
+                tokens_used: Some(175_000),
+                tokens_remaining: Some(825_000),
+                tokens_limit: Some(1_000_000),
+                last_refreshed_at: 1_700_000_000_000,
+                last_used_at: Some(1_699_999_000_000),
+                created_at: 1_699_000_000_000,
+                updated_at: 1_700_000_000_000,
+            },
+            crate::accounts::AccountRecord {
+                id: 2,
+                account_id: "acct-beta".to_string(),
+                service: "openai".to_string(),
+                name: Some("Beta".to_string()),
+                percent_remaining: 45.0,
+                reset_at: None,
+                tokens_used: Some(550_000),
+                tokens_remaining: Some(450_000),
+                tokens_limit: Some(1_000_000),
+                last_refreshed_at: 1_700_000_000_000,
+                last_used_at: None,
+                created_at: 1_699_000_000_000,
+                updated_at: 1_700_000_000_000,
+            },
+        ]
+    }
+
+    #[test]
+    fn account_list_plain_shows_table() {
+        let accounts = sample_accounts();
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = AccountListRenderer::render(&accounts, None, "openai", &ctx);
+        assert!(output.contains("Accounts (2"), "{output}");
+        assert!(output.contains("openai"), "{output}");
+        assert!(output.contains("Alpha"), "{output}");
+        assert!(output.contains("Beta"), "{output}");
+        assert!(output.contains("82.5%"), "{output}");
+        assert!(output.contains("45.0%"), "{output}");
+        assert_no_ansi(&output, "AccountListRenderer");
+    }
+
+    #[test]
+    fn account_list_json_is_valid() {
+        let accounts = sample_accounts();
+        let ctx = RenderContext::new(OutputFormat::Json);
+        let output = AccountListRenderer::render(&accounts, None, "openai", &ctx);
+        let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+        assert_eq!(parsed["total"], 2);
+        assert_eq!(parsed["service"], "openai");
+        assert!(parsed["accounts"].is_array());
+        assert_eq!(parsed["accounts"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn account_list_empty() {
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = AccountListRenderer::render(&[], None, "openai", &ctx);
+        assert!(output.contains("No accounts found"), "{output}");
+    }
+
+    #[test]
+    fn account_list_with_pick_preview() {
+        let accounts = sample_accounts();
+        let sel_config = crate::accounts::AccountSelectionConfig::default();
+        let pick = crate::accounts::select_account(&accounts, &sel_config);
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = AccountListRenderer::render(&accounts, Some(&pick), "openai", &ctx);
+        assert!(output.contains("Pick:"), "{output}");
+        assert!(output.contains("Alpha"), "{output}");
+        assert_no_ansi(&output, "AccountListRenderer(pick)");
+    }
+
+    #[test]
+    fn account_list_json_with_pick_preview() {
+        let accounts = sample_accounts();
+        let sel_config = crate::accounts::AccountSelectionConfig::default();
+        let pick = crate::accounts::select_account(&accounts, &sel_config);
+        let ctx = RenderContext::new(OutputFormat::Json);
+        let output = AccountListRenderer::render(&accounts, Some(&pick), "openai", &ctx);
+        let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+        assert!(parsed["pick_preview"].is_object(), "should have pick_preview");
+        assert_eq!(parsed["pick_preview"]["selected_account_id"], "acct-alpha");
+    }
+
+    #[test]
+    fn account_list_pick_none_when_all_below_threshold() {
+        let accounts = vec![crate::accounts::AccountRecord {
+            id: 1,
+            account_id: "acct-low".to_string(),
+            service: "openai".to_string(),
+            name: Some("Low".to_string()),
+            percent_remaining: 2.0,
+            reset_at: None,
+            tokens_used: Some(980_000),
+            tokens_remaining: Some(20_000),
+            tokens_limit: Some(1_000_000),
+            last_refreshed_at: 1_700_000_000_000,
+            last_used_at: None,
+            created_at: 1_699_000_000_000,
+            updated_at: 1_700_000_000_000,
+        }];
+        let sel_config = crate::accounts::AccountSelectionConfig::default();
+        let pick = crate::accounts::select_account(&accounts, &sel_config);
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = AccountListRenderer::render(&accounts, Some(&pick), "openai", &ctx);
+        assert!(output.contains("Pick: none"), "{output}");
+        assert!(output.contains("filtered"), "{output}");
+    }
+
+    #[test]
+    fn account_list_format_token_count() {
+        assert_eq!(super::format_token_count(500), "500");
+        assert_eq!(super::format_token_count(1_500), "2K");
+        assert_eq!(super::format_token_count(175_000), "175K");
+        assert_eq!(super::format_token_count(1_500_000), "1.5M");
+        assert_eq!(super::format_token_count(0), "0");
     }
 }

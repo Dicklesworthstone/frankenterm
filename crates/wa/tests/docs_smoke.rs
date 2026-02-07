@@ -305,7 +305,29 @@ fn smoke_help_contains_subcommands() {
         .success()
         .stdout(predicate::str::contains("doctor"))
         .stdout(predicate::str::contains("setup"))
-        .stdout(predicate::str::contains("export"));
+        .stdout(predicate::str::contains("export"))
+        .stdout(predicate::str::contains("accounts"));
+}
+
+#[test]
+fn smoke_wa_accounts_help() {
+    let output = wa_cmd()
+        .args(["accounts", "--help"])
+        .output()
+        .expect("wa accounts --help should execute");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    save_artifact("accounts_help_stdout.txt", &stdout);
+
+    assert!(output.status.success(), "wa accounts --help should exit 0");
+    assert!(
+        stdout.contains("accounts") || stdout.contains("Accounts"),
+        "wa accounts --help should mention accounts"
+    );
+    assert!(
+        stdout.contains("refresh") || stdout.contains("Refresh"),
+        "wa accounts --help should mention refresh subcommand"
+    );
 }
 
 #[test]

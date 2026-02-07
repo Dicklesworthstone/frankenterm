@@ -1053,6 +1053,34 @@ SEE ALSO:
         command: AuthCommands,
     },
 
+    /// View and manage API accounts (usage, selection, refresh)
+    #[command(after_help = r#"EXAMPLES:
+    wa accounts                           List accounts (default: openai)
+    wa accounts --service openai          List OpenAI accounts
+    wa accounts --pick                    Show which account would be selected next
+    wa accounts -f json                   Machine-readable output
+    wa accounts refresh                   Refresh usage data from caut
+
+SEE ALSO:
+    wa auth       Browser authentication
+    wa doctor     System diagnostics"#)]
+    Accounts {
+        /// Output format: auto, plain, or json
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+
+        /// Service filter (default: "openai")
+        #[arg(long, default_value = "openai")]
+        service: String,
+
+        /// Show pick preview (which account would be selected next)
+        #[arg(long)]
+        pick: bool,
+
+        #[command(subcommand)]
+        command: Option<AccountsCommands>,
+    },
+
     /// Export data to JSONL/NDJSON (segments, events, workflows, etc.)
     #[command(after_help = r#"EXAMPLES:
     wa export segments                    Export all output segments
@@ -2142,6 +2170,17 @@ enum RobotRulesCommands {
         /// Fail on warnings (exit non-zero)
         #[arg(long)]
         strict: bool,
+    },
+}
+
+/// Human accounts subcommands
+#[derive(Subcommand)]
+enum AccountsCommands {
+    /// Refresh account usage data from caut
+    Refresh {
+        /// Service to refresh (default: "openai")
+        #[arg(long, default_value = "openai")]
+        service: String,
     },
 }
 
@@ -16930,6 +16969,204 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
         Some(Commands::Auth { command }) => {
             handle_auth_command(command, &layout, cli.verbose > 0).await?;
+        }
+
+        Some(Commands::Accounts {
+            format,
+            service,
+            pick,
+            command,
+        }) => {
+            use wa_core::output::{AccountListRenderer, OutputFormat, RenderContext, detect_format};
+
+            let output_format = match format.to_lowercase().as_str() {
+                "json" => OutputFormat::Json,
+                "plain" => OutputFormat::Plain,
+                _ => detect_format(),
+            };
+
+            let die = |msg: &str, hint: Option<&str>| -> ! {
+                if output_format.is_json() {
+                    let mut payload = serde_json::json!({
+                        "ok": false,
+                        "error": msg,
+                        "version": wa_core::VERSION,
+                    });
+                    if let Some(h) = hint {
+                        payload["hint"] = serde_json::Value::String(h.to_string());
+                    }
+                    println!(
+                        "{}",
+                        serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string())
+                    );
+                } else {
+                    eprintln!("Error: {msg}");
+                    if let Some(h) = hint {
+                        eprintln!("{h}");
+                    }
+                }
+                std::process::exit(1);
+            };
+
+            // Handle refresh subcommand
+            if let Some(AccountsCommands::Refresh {
+                service: ref_service,
+            }) = command
+            {
+                let caut_service = match ref_service.as_str() {
+                    "openai" => wa_core::caut::CautService::OpenAI,
+                    other => {
+                        die(
+                            &format!("Unknown service: {other}"),
+                            Some("Supported services: openai"),
+                        );
+                    }
+                };
+
+                // Open storage for rate-limit check
+                let db_path = layout.db_path.to_string_lossy();
+                if let Ok(storage_check) =
+                    wa_core::storage::StorageHandle::new(&db_path).await
+                {
+                    if let Ok(accounts) = storage_check
+                        .get_accounts_by_service(&ref_service)
+                        .await
+                    {
+                        let now_check = now_ms_i64();
+                        let most_recent = accounts
+                            .iter()
+                            .map(|a| a.last_refreshed_at)
+                            .max()
+                            .unwrap_or(0);
+                        // 60-second cooldown
+                        let cooldown_ms: i64 = 60_000;
+                        let elapsed_ms_val = now_check.saturating_sub(most_recent);
+                        if elapsed_ms_val < cooldown_ms && most_recent > 0 {
+                            let wait_secs = (cooldown_ms - elapsed_ms_val) / 1000 + 1;
+                            die(
+                                &format!(
+                                    "Refresh rate limited: last refresh was {}s ago",
+                                    elapsed_ms_val / 1000
+                                ),
+                                Some(&format!(
+                                    "Wait {wait_secs}s before refreshing again, or use 'wa accounts' to see cached data."
+                                )),
+                            );
+                        }
+                    }
+                    let _ = storage_check.shutdown().await;
+                }
+
+                // Call caut refresh
+                let caut = wa_core::caut::CautClient::new();
+                let refresh_result = match caut.refresh(caut_service).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        die(
+                            &format!("caut refresh failed: {e}"),
+                            Some(&e.remediation().summary),
+                        );
+                    }
+                };
+
+                // Persist refreshed data
+                let db_path = layout.db_path.to_string_lossy();
+                let storage = match wa_core::storage::StorageHandle::new(&db_path).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        die(
+                            &format!("Failed to open storage: {e}"),
+                            Some("Is the database initialized? Run 'wa watch' first."),
+                        );
+                    }
+                };
+
+                let now = now_ms_i64();
+                let mut count = 0usize;
+                for usage in &refresh_result.accounts {
+                    let record = wa_core::accounts::AccountRecord::from_caut(
+                        usage,
+                        caut_service,
+                        now,
+                    );
+                    if let Err(e) = storage.upsert_account(record.clone()).await {
+                        tracing::warn!(
+                            "Failed to upsert account {}: {e}",
+                            record.account_id
+                        );
+                    }
+                    count += 1;
+                }
+
+                // Now render the refreshed list
+                let accounts = storage
+                    .get_accounts_by_service(&ref_service)
+                    .await
+                    .unwrap_or_default();
+
+                let pick_result = if pick {
+                    let sel_config = wa_core::accounts::AccountSelectionConfig::default();
+                    Some(wa_core::accounts::select_account(&accounts, &sel_config))
+                } else {
+                    None
+                };
+
+                let ctx = RenderContext::new(output_format).verbose(cli.verbose);
+                let rendered = AccountListRenderer::render(
+                    &accounts,
+                    pick_result.as_ref(),
+                    &ref_service,
+                    &ctx,
+                );
+
+                if !output_format.is_json() {
+                    eprintln!("Refreshed {count} account(s) for service \"{ref_service}\"");
+                }
+                print!("{rendered}");
+
+                if let Err(e) = storage.shutdown().await {
+                    tracing::warn!("Failed to shutdown storage cleanly: {e}");
+                }
+            } else {
+                // Default: list accounts
+                let db_path = layout.db_path.to_string_lossy();
+                let storage = match wa_core::storage::StorageHandle::new(&db_path).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        die(
+                            &format!("Failed to open storage: {e}"),
+                            Some("Is the database initialized? Run 'wa watch' first."),
+                        );
+                    }
+                };
+
+                let accounts = match storage.get_accounts_by_service(&service).await {
+                    Ok(a) => a,
+                    Err(e) => {
+                        die(&format!("Failed to fetch accounts: {e}"), None);
+                    }
+                };
+
+                let pick_result = if pick {
+                    let sel_config = wa_core::accounts::AccountSelectionConfig::default();
+                    Some(wa_core::accounts::select_account(&accounts, &sel_config))
+                } else {
+                    None
+                };
+
+                let ctx = RenderContext::new(output_format).verbose(cli.verbose);
+                let rendered = AccountListRenderer::render(
+                    &accounts,
+                    pick_result.as_ref(),
+                    &service,
+                    &ctx,
+                );
+                print!("{rendered}");
+
+                if let Err(e) = storage.shutdown().await {
+                    tracing::warn!("Failed to shutdown storage cleanly: {e}");
+                }
+            }
         }
 
         Some(Commands::Triage {
