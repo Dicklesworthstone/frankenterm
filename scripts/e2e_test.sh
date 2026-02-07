@@ -393,6 +393,7 @@ SCENARIO_REGISTRY=(
     "incident_bundle|Validate incident bundle export, redaction, replay (policy + rules modes)|true|cargo,jq|Protects incident bundle lifecycle"
     "prioritized_capture|Validate pane priority scheduling, capture budgets, throttle under load|true|cargo,jq|Protects prioritized capture under contention"
     "sleep_audit|Audit E2E scripts for unjustified fixed sleeps; enforce wait-for/quiescence|true|cargo|Protects deterministic timing contract"
+    "flake_guard|Repeat-run representative test suites to detect timing flakiness|false|cargo,jq|Catches timing regressions early"
 )
 
 list_scenarios() {
