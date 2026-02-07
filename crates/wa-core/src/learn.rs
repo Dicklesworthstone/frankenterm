@@ -26,6 +26,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{debug, info, instrument, warn};
 
+use crate::environment::DetectedEnvironment;
+
 /// Errors that can occur in the tutorial engine
 #[derive(Debug, Error)]
 pub enum LearnError {
@@ -287,6 +289,33 @@ pub struct Track {
     pub exercises: Vec<Exercise>,
 }
 
+/// Environment requirement for an exercise.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Requirement {
+    /// WezTerm must be running and reachable via CLI.
+    WeztermRunning,
+    /// At least one agent pane must be detected.
+    AgentPresent,
+    /// The wa watcher daemon must be running.
+    WatcherRunning,
+    /// The wa database must contain data (segments/events).
+    DbHasData,
+    /// wa configuration (wa.toml) must exist.
+    WaConfigured,
+}
+
+/// Result of checking whether an exercise can run in the current environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CanRun {
+    /// All requirements are satisfied.
+    Yes,
+    /// Requirements not met but exercise supports sandbox/simulation mode.
+    Simulation(&'static str),
+    /// Requirements not met and exercise cannot be simulated.
+    No(&'static str),
+}
+
 /// Single exercise within a track
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Exercise {
@@ -298,6 +327,12 @@ pub struct Exercise {
     pub verification_command: Option<String>,
     /// Expected output pattern for verification
     pub verification_pattern: Option<String>,
+    /// Environment requirements for this exercise
+    #[serde(default)]
+    pub requirements: Vec<Requirement>,
+    /// Whether the exercise can run in sandbox/simulation mode when requirements aren't met
+    #[serde(default)]
+    pub can_simulate: bool,
 }
 
 /// Tutorial engine managing state and progress
@@ -362,6 +397,8 @@ impl TutorialEngine {
                         ],
                         verification_command: Some("wa doctor --json".into()),
                         verification_pattern: Some("wezterm.*ok".into()),
+                        requirements: vec![],
+                        can_simulate: true,
                     },
                     Exercise {
                         id: "basics.2".into(),
@@ -373,6 +410,8 @@ impl TutorialEngine {
                         ],
                         verification_command: Some("wa status --json".into()),
                         verification_pattern: Some("running.*true".into()),
+                        requirements: vec![Requirement::WeztermRunning],
+                        can_simulate: false,
                     },
                     Exercise {
                         id: "basics.3".into(),
@@ -381,6 +420,8 @@ impl TutorialEngine {
                         instructions: vec!["Run: wa list".into(), "Run: wa status".into()],
                         verification_command: None,
                         verification_pattern: None,
+                        requirements: vec![Requirement::WatcherRunning],
+                        can_simulate: true,
                     },
                 ],
             },
@@ -400,6 +441,8 @@ impl TutorialEngine {
                         ],
                         verification_command: None,
                         verification_pattern: None,
+                        requirements: vec![Requirement::DbHasData],
+                        can_simulate: true,
                     },
                     Exercise {
                         id: "events.2".into(),
@@ -411,6 +454,8 @@ impl TutorialEngine {
                         ],
                         verification_command: None,
                         verification_pattern: None,
+                        requirements: vec![Requirement::DbHasData],
+                        can_simulate: true,
                     },
                 ],
             },
@@ -427,6 +472,8 @@ impl TutorialEngine {
                         instructions: vec!["Run: wa workflow list".into()],
                         verification_command: None,
                         verification_pattern: None,
+                        requirements: vec![Requirement::WaConfigured],
+                        can_simulate: true,
                     },
                     Exercise {
                         id: "workflows.2".into(),
@@ -438,6 +485,8 @@ impl TutorialEngine {
                         ],
                         verification_command: None,
                         verification_pattern: None,
+                        requirements: vec![Requirement::WaConfigured, Requirement::WatcherRunning],
+                        can_simulate: false,
                     },
                 ],
             },
@@ -602,10 +651,8 @@ impl TutorialEngine {
 
             if all_complete && !has(&achievement_id) {
                 let def = achievement_definition(&achievement_id);
-                let name = def.map_or_else(
-                    || format!("{} Master", track.name),
-                    |d| d.name.to_string(),
-                );
+                let name =
+                    def.map_or_else(|| format!("{} Master", track.name), |d| d.name.to_string());
                 let desc = def.map_or_else(
                     || format!("Completed all {} exercises", track.name),
                     |d| d.description.to_string(),
@@ -650,10 +697,11 @@ impl TutorialEngine {
 
         // wa Master — all tracks completed (same condition as completionist but Epic tier)
         if !has("wa_master") {
-            let all_tracks = self
-                .tracks
-                .iter()
-                .all(|t| t.exercises.iter().all(|e| self.state.completed_exercises.contains(&e.id)));
+            let all_tracks = self.tracks.iter().all(|t| {
+                t.exercises
+                    .iter()
+                    .all(|e| self.state.completed_exercises.contains(&e.id))
+            });
             if all_tracks {
                 to_add.push((
                     "wa_master".into(),
@@ -786,11 +834,7 @@ impl TutorialEngine {
         BUILTIN_ACHIEVEMENTS
             .iter()
             .map(|def| {
-                let unlocked = self
-                    .state
-                    .achievements
-                    .iter()
-                    .find(|a| a.id == def.id);
+                let unlocked = self.state.achievements.iter().find(|a| a.id == def.id);
                 AchievementEntry {
                     id: def.id.to_string(),
                     name: def.name.to_string(),
@@ -852,7 +896,10 @@ impl TutorialEngine {
     /// Format the full achievement collection for terminal display
     pub fn format_achievement_list(&self) -> String {
         let collection = self.achievement_collection();
-        let unlocked_count = collection.iter().filter(|a| a.unlocked_at.is_some()).count();
+        let unlocked_count = collection
+            .iter()
+            .filter(|a| a.unlocked_at.is_some())
+            .count();
         let total = collection.len();
 
         let mut lines = Vec::new();
@@ -944,6 +991,102 @@ impl From<&TutorialEngine> for TutorialStatus {
             total_time_minutes: engine.state().total_time_minutes,
             tracks,
         }
+    }
+}
+
+// =============================================================================
+// TutorialEnvironment: adapt exercises to the user's detected environment
+// =============================================================================
+
+/// Snapshot of the user's environment for contextual exercise adaptation.
+///
+/// Built from [`DetectedEnvironment`] plus lightweight DB/config checks.
+/// Each field maps to a [`Requirement`] variant so `can_run_exercise` can
+/// decide whether to run, simulate, or skip an exercise.
+#[derive(Debug, Clone, Serialize)]
+pub struct TutorialEnvironment {
+    pub wezterm_running: bool,
+    pub wezterm_version: Option<String>,
+    pub pane_count: usize,
+    pub agent_panes: Vec<AgentInfo>,
+    pub wa_configured: bool,
+    pub db_has_data: bool,
+    pub shell_integration: bool,
+}
+
+/// Minimal agent info surfaced to the tutorial.
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentInfo {
+    pub agent_type: String,
+    pub pane_id: u64,
+}
+
+impl TutorialEnvironment {
+    /// Build a tutorial environment from a detected environment plus extra checks.
+    ///
+    /// `wa_configured` and `db_has_data` must be supplied by the caller because
+    /// they depend on workspace layout / DB access that `DetectedEnvironment`
+    /// doesn't cover.
+    pub fn from_detected(
+        env: &DetectedEnvironment,
+        wa_configured: bool,
+        db_has_data: bool,
+    ) -> Self {
+        Self {
+            wezterm_running: env.wezterm.is_running,
+            wezterm_version: env.wezterm.version.clone(),
+            pane_count: env.agents.len()
+                + env
+                    .remotes
+                    .iter()
+                    .map(|r| r.pane_ids.len())
+                    .sum::<usize>(),
+            agent_panes: env
+                .agents
+                .iter()
+                .map(|a| AgentInfo {
+                    agent_type: format!("{:?}", a.agent_type),
+                    pane_id: a.pane_id,
+                })
+                .collect(),
+            wa_configured,
+            db_has_data,
+            shell_integration: env.shell.osc_133_enabled,
+        }
+    }
+
+    /// Check whether an exercise can run in this environment.
+    pub fn can_run_exercise(&self, exercise: &Exercise) -> CanRun {
+        for req in &exercise.requirements {
+            let met = match req {
+                Requirement::WeztermRunning => self.wezterm_running,
+                Requirement::AgentPresent => !self.agent_panes.is_empty(),
+                Requirement::WatcherRunning => {
+                    // Approximation: if WezTerm is running and we have data, watcher is likely up
+                    self.wezterm_running && self.db_has_data
+                }
+                Requirement::DbHasData => self.db_has_data,
+                Requirement::WaConfigured => self.wa_configured,
+            };
+
+            if !met {
+                let reason = match req {
+                    Requirement::WeztermRunning => "Start WezTerm first",
+                    Requirement::AgentPresent => "No agents detected",
+                    Requirement::WatcherRunning => "Start the watcher first (wa watch)",
+                    Requirement::DbHasData => "No captured data yet",
+                    Requirement::WaConfigured => "Run wa setup first",
+                };
+
+                return if exercise.can_simulate {
+                    CanRun::Simulation(reason)
+                } else {
+                    CanRun::No(reason)
+                };
+            }
+        }
+
+        CanRun::Yes
     }
 }
 
@@ -1464,10 +1607,7 @@ mod tests {
             .handle_event(TutorialEvent::StartTrack("events".into()))
             .unwrap();
         assert_eq!(engine.state().current_track.as_deref(), Some("events"));
-        assert_eq!(
-            engine.state().current_exercise.as_deref(),
-            Some("events.1")
-        );
+        assert_eq!(engine.state().current_exercise.as_deref(), Some("events.1"));
     }
 
     #[test]
@@ -1492,10 +1632,7 @@ mod tests {
             .unwrap();
 
         // Should resume at basics.2 (first incomplete)
-        assert_eq!(
-            engine.state().current_exercise.as_deref(),
-            Some("basics.2")
-        );
+        assert_eq!(engine.state().current_exercise.as_deref(), Some("basics.2"));
     }
 
     // -----------------------------------------------------------------------
@@ -1621,12 +1758,24 @@ mod tests {
         engine
             .handle_event(TutorialEvent::CompleteExercise("basics.1".into()))
             .unwrap();
-        assert!(!engine.state().achievements.iter().any(|a| a.id == "explorer"));
+        assert!(
+            !engine
+                .state()
+                .achievements
+                .iter()
+                .any(|a| a.id == "explorer")
+        );
 
         engine
             .handle_event(TutorialEvent::CompleteExercise("events.1".into()))
             .unwrap();
-        assert!(!engine.state().achievements.iter().any(|a| a.id == "explorer"));
+        assert!(
+            !engine
+                .state()
+                .achievements
+                .iter()
+                .any(|a| a.id == "explorer")
+        );
 
         engine
             .handle_event(TutorialEvent::CompleteExercise("workflows.1".into()))
@@ -1733,7 +1882,10 @@ mod tests {
             .unwrap();
 
         let collection = engine.achievement_collection();
-        let unlocked: Vec<_> = collection.iter().filter(|e| e.unlocked_at.is_some()).collect();
+        let unlocked: Vec<_> = collection
+            .iter()
+            .filter(|e| e.unlocked_at.is_some())
+            .collect();
         assert!(unlocked.len() >= 2); // first_step + first_watch at minimum
         assert!(unlocked.iter().any(|e| e.id == "first_step"));
         assert!(unlocked.iter().any(|e| e.id == "first_watch"));
@@ -1848,7 +2000,12 @@ mod tests {
             .handle_event(TutorialEvent::CompleteExercise("basics.2".into()))
             .unwrap();
 
-        let ids: Vec<&str> = engine.state().achievements.iter().map(|a| a.id.as_str()).collect();
+        let ids: Vec<&str> = engine
+            .state()
+            .achievements
+            .iter()
+            .map(|a| a.id.as_str())
+            .collect();
         assert!(ids.contains(&"first_step"));
         assert!(ids.contains(&"first_watch"));
     }
@@ -1882,5 +2039,320 @@ mod tests {
         assert_eq!(json, r#""uncommon""#);
         let back: Rarity = serde_json::from_str(&json).unwrap();
         assert_eq!(back, Rarity::Uncommon);
+    }
+
+    // -----------------------------------------------------------------------
+    // TutorialEnvironment and CanRun tests (wa-ogc.2)
+    // -----------------------------------------------------------------------
+
+    use crate::environment::{
+        DetectedAgent, DetectedEnvironment, RemoteHost, ShellInfo, SystemInfo, WeztermCapabilities,
+        WeztermInfo,
+    };
+    use crate::patterns::AgentType;
+
+    /// Build a minimal `DetectedEnvironment` for testing.
+    fn make_env(wezterm_running: bool, osc_133: bool, agents: Vec<DetectedAgent>) -> DetectedEnvironment {
+        DetectedEnvironment {
+            wezterm: WeztermInfo {
+                version: if wezterm_running {
+                    Some("20240101-000000-abc".into())
+                } else {
+                    None
+                },
+                socket_path: None,
+                is_running: wezterm_running,
+                capabilities: WeztermCapabilities::default(),
+            },
+            shell: ShellInfo {
+                shell_path: Some("/bin/bash".into()),
+                shell_type: Some("bash".into()),
+                version: None,
+                config_file: None,
+                osc_133_enabled: osc_133,
+            },
+            agents,
+            remotes: vec![],
+            system: SystemInfo {
+                os: "linux".into(),
+                arch: "x86_64".into(),
+                cpu_count: 4,
+                memory_mb: Some(8192),
+                load_average: None,
+                detected_at_epoch_ms: 0,
+            },
+            detected_at: Utc::now(),
+        }
+    }
+
+    fn make_agent(pane_id: u64) -> DetectedAgent {
+        DetectedAgent {
+            agent_type: AgentType::ClaudeCode,
+            pane_id,
+            confidence: 0.95,
+            indicators: vec!["claude-code".into()],
+        }
+    }
+
+    #[test]
+    fn test_tutorial_env_from_detected_basic() {
+        let env = make_env(true, true, vec![make_agent(1)]);
+        let tenv = TutorialEnvironment::from_detected(&env, true, true);
+
+        assert!(tenv.wezterm_running);
+        assert!(tenv.wezterm_version.is_some());
+        assert_eq!(tenv.agent_panes.len(), 1);
+        assert!(tenv.wa_configured);
+        assert!(tenv.db_has_data);
+        assert!(tenv.shell_integration);
+    }
+
+    #[test]
+    fn test_tutorial_env_from_detected_nothing_running() {
+        let env = make_env(false, false, vec![]);
+        let tenv = TutorialEnvironment::from_detected(&env, false, false);
+
+        assert!(!tenv.wezterm_running);
+        assert!(tenv.wezterm_version.is_none());
+        assert!(tenv.agent_panes.is_empty());
+        assert!(!tenv.wa_configured);
+        assert!(!tenv.db_has_data);
+        assert!(!tenv.shell_integration);
+    }
+
+    #[test]
+    fn test_can_run_no_requirements_returns_yes() {
+        let env = make_env(false, false, vec![]);
+        let tenv = TutorialEnvironment::from_detected(&env, false, false);
+
+        let exercise = Exercise {
+            id: "test.1".into(),
+            title: "No reqs".into(),
+            description: String::new(),
+            instructions: vec![],
+            verification_command: None,
+            verification_pattern: None,
+            requirements: vec![],
+            can_simulate: false,
+        };
+
+        assert_eq!(tenv.can_run_exercise(&exercise), CanRun::Yes);
+    }
+
+    #[test]
+    fn test_can_run_wezterm_requirement_met() {
+        let env = make_env(true, false, vec![]);
+        let tenv = TutorialEnvironment::from_detected(&env, false, false);
+
+        let exercise = Exercise {
+            id: "test.1".into(),
+            title: "Needs WezTerm".into(),
+            description: String::new(),
+            instructions: vec![],
+            verification_command: None,
+            verification_pattern: None,
+            requirements: vec![Requirement::WeztermRunning],
+            can_simulate: false,
+        };
+
+        assert_eq!(tenv.can_run_exercise(&exercise), CanRun::Yes);
+    }
+
+    #[test]
+    fn test_can_run_wezterm_requirement_not_met_no_simulate() {
+        let env = make_env(false, false, vec![]);
+        let tenv = TutorialEnvironment::from_detected(&env, false, false);
+
+        let exercise = Exercise {
+            id: "test.1".into(),
+            title: "Needs WezTerm".into(),
+            description: String::new(),
+            instructions: vec![],
+            verification_command: None,
+            verification_pattern: None,
+            requirements: vec![Requirement::WeztermRunning],
+            can_simulate: false,
+        };
+
+        assert_eq!(
+            tenv.can_run_exercise(&exercise),
+            CanRun::No("Start WezTerm first")
+        );
+    }
+
+    #[test]
+    fn test_can_run_requirement_not_met_with_simulate() {
+        let env = make_env(false, false, vec![]);
+        let tenv = TutorialEnvironment::from_detected(&env, false, false);
+
+        let exercise = Exercise {
+            id: "test.1".into(),
+            title: "Needs WezTerm".into(),
+            description: String::new(),
+            instructions: vec![],
+            verification_command: None,
+            verification_pattern: None,
+            requirements: vec![Requirement::WeztermRunning],
+            can_simulate: true,
+        };
+
+        assert_eq!(
+            tenv.can_run_exercise(&exercise),
+            CanRun::Simulation("Start WezTerm first")
+        );
+    }
+
+    #[test]
+    fn test_can_run_agent_present_requirement() {
+        let env = make_env(true, false, vec![make_agent(1)]);
+        let tenv = TutorialEnvironment::from_detected(&env, false, false);
+
+        let exercise = Exercise {
+            id: "test.1".into(),
+            title: "Needs agent".into(),
+            description: String::new(),
+            instructions: vec![],
+            verification_command: None,
+            verification_pattern: None,
+            requirements: vec![Requirement::AgentPresent],
+            can_simulate: false,
+        };
+
+        assert_eq!(tenv.can_run_exercise(&exercise), CanRun::Yes);
+    }
+
+    #[test]
+    fn test_can_run_agent_not_present() {
+        let env = make_env(true, false, vec![]);
+        let tenv = TutorialEnvironment::from_detected(&env, false, false);
+
+        let exercise = Exercise {
+            id: "test.1".into(),
+            title: "Needs agent".into(),
+            description: String::new(),
+            instructions: vec![],
+            verification_command: None,
+            verification_pattern: None,
+            requirements: vec![Requirement::AgentPresent],
+            can_simulate: true,
+        };
+
+        assert_eq!(
+            tenv.can_run_exercise(&exercise),
+            CanRun::Simulation("No agents detected")
+        );
+    }
+
+    #[test]
+    fn test_can_run_db_has_data_requirement() {
+        let env = make_env(false, false, vec![]);
+        let tenv = TutorialEnvironment::from_detected(&env, false, true);
+
+        let exercise = Exercise {
+            id: "test.1".into(),
+            title: "Needs data".into(),
+            description: String::new(),
+            instructions: vec![],
+            verification_command: None,
+            verification_pattern: None,
+            requirements: vec![Requirement::DbHasData],
+            can_simulate: false,
+        };
+
+        assert_eq!(tenv.can_run_exercise(&exercise), CanRun::Yes);
+    }
+
+    #[test]
+    fn test_can_run_multiple_requirements_first_fails() {
+        let env = make_env(false, false, vec![]);
+        let tenv = TutorialEnvironment::from_detected(&env, true, true);
+
+        let exercise = Exercise {
+            id: "test.1".into(),
+            title: "Needs wezterm + watcher".into(),
+            description: String::new(),
+            instructions: vec![],
+            verification_command: None,
+            verification_pattern: None,
+            requirements: vec![Requirement::WeztermRunning, Requirement::WatcherRunning],
+            can_simulate: false,
+        };
+
+        // First unsatisfied requirement should be reported
+        assert_eq!(
+            tenv.can_run_exercise(&exercise),
+            CanRun::No("Start WezTerm first")
+        );
+    }
+
+    #[test]
+    fn test_can_run_wa_configured_requirement() {
+        let env = make_env(false, false, vec![]);
+        let tenv_yes = TutorialEnvironment::from_detected(&env, true, false);
+        let tenv_no = TutorialEnvironment::from_detected(&env, false, false);
+
+        let exercise = Exercise {
+            id: "test.1".into(),
+            title: "Needs config".into(),
+            description: String::new(),
+            instructions: vec![],
+            verification_command: None,
+            verification_pattern: None,
+            requirements: vec![Requirement::WaConfigured],
+            can_simulate: true,
+        };
+
+        assert_eq!(tenv_yes.can_run_exercise(&exercise), CanRun::Yes);
+        assert_eq!(
+            tenv_no.can_run_exercise(&exercise),
+            CanRun::Simulation("Run wa setup first")
+        );
+    }
+
+    #[test]
+    fn test_pane_count_includes_remotes() {
+        let mut env = make_env(true, false, vec![make_agent(1)]);
+        env.remotes = vec![RemoteHost {
+            hostname: "remote-host".into(),
+            connection_type: crate::environment::ConnectionType::Ssh,
+            pane_ids: vec![10, 11, 12],
+        }];
+        let tenv = TutorialEnvironment::from_detected(&env, false, false);
+
+        // 1 agent + 3 remote panes = 4
+        assert_eq!(tenv.pane_count, 4);
+    }
+
+    #[test]
+    fn test_builtin_exercises_have_requirements_field() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("learn.json");
+        let engine = TutorialEngine::load_or_create_at(path).unwrap();
+
+        // basics.1 should have no requirements (can always run)
+        let basics = engine.get_track("basics").unwrap();
+        assert!(basics.exercises[0].requirements.is_empty());
+        assert!(basics.exercises[0].can_simulate);
+
+        // basics.2 requires WezTerm
+        assert!(basics.exercises[1]
+            .requirements
+            .contains(&Requirement::WeztermRunning));
+        assert!(!basics.exercises[1].can_simulate);
+
+        // events.1 requires data
+        let events = engine.get_track("events").unwrap();
+        assert!(events.exercises[0]
+            .requirements
+            .contains(&Requirement::DbHasData));
+
+        // workflows.2 requires WaConfigured + WatcherRunning
+        let workflows = engine.get_track("workflows").unwrap();
+        assert!(workflows.exercises[1]
+            .requirements
+            .contains(&Requirement::WaConfigured));
+        assert!(workflows.exercises[1]
+            .requirements
+            .contains(&Requirement::WatcherRunning));
     }
 }
