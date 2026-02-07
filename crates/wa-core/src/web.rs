@@ -26,12 +26,17 @@ const MAX_LIMIT: usize = 500;
 /// Default limit when none is provided.
 const DEFAULT_LIMIT: usize = 50;
 
+/// Maximum request body size (64 KB). Rejects oversized requests early.
+const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
+
 /// Configuration for the web server.
 #[derive(Clone)]
 pub struct WebServerConfig {
     host: String,
     port: u16,
     storage: Option<StorageHandle>,
+    /// Must be set to `true` to bind on a non-localhost address.
+    allow_public_bind: bool,
 }
 
 impl std::fmt::Debug for WebServerConfig {
@@ -40,6 +45,7 @@ impl std::fmt::Debug for WebServerConfig {
             .field("host", &self.host)
             .field("port", &self.port)
             .field("storage", &self.storage.is_some())
+            .field("allow_public_bind", &self.allow_public_bind)
             .finish()
     }
 }
@@ -52,6 +58,7 @@ impl WebServerConfig {
             host: DEFAULT_HOST.to_string(),
             port,
             storage: None,
+            allow_public_bind: false,
         }
     }
 
@@ -63,6 +70,8 @@ impl WebServerConfig {
     }
 
     /// Override the bind host.
+    ///
+    /// Non-localhost addresses require [`Self::with_dangerous_public_bind`].
     #[must_use]
     pub fn with_host(mut self, host: impl Into<String>) -> Self {
         self.host = host.into();
@@ -76,9 +85,26 @@ impl WebServerConfig {
         self
     }
 
+    /// Explicitly opt in to binding on a non-localhost address.
+    ///
+    /// Without this, [`start_web_server`] refuses to bind publicly.
+    #[must_use]
+    pub fn with_dangerous_public_bind(mut self) -> Self {
+        self.allow_public_bind = true;
+        self
+    }
+
     #[must_use]
     fn bind_addr(&self) -> String {
         format!("{}:{}", self.host, self.port)
+    }
+
+    /// Returns `true` when the configured host is a loopback address.
+    fn is_localhost(&self) -> bool {
+        matches!(
+            self.host.as_str(),
+            "127.0.0.1" | "::1" | "localhost" | "[::1]"
+        )
     }
 }
 
@@ -188,6 +214,41 @@ impl Middleware for StateInjector {
 
     fn name(&self) -> &'static str {
         "StateInjector"
+    }
+}
+
+/// Rejects requests whose Content-Length exceeds [`MAX_REQUEST_BODY_BYTES`].
+#[derive(Clone, Default)]
+struct BodySizeGuard;
+
+impl Middleware for BodySizeGuard {
+    fn before<'a>(
+        &'a self,
+        _ctx: &'a RequestContext,
+        req: &'a mut Request,
+    ) -> fastapi::core::BoxFuture<'a, ControlFlow> {
+        if let Some(cl) = req
+            .headers()
+            .get("content-length")
+            .and_then(|v| std::str::from_utf8(v).ok())
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            if cl > MAX_REQUEST_BODY_BYTES {
+                let resp = json_err(
+                    StatusCode::BAD_REQUEST,
+                    "body_too_large",
+                    format!(
+                        "Request body too large ({cl} bytes); max is {MAX_REQUEST_BODY_BYTES}"
+                    ),
+                );
+                return Box::pin(async move { ControlFlow::Break(resp) });
+            }
+        }
+        Box::pin(async { ControlFlow::Continue })
+    }
+
+    fn name(&self) -> &'static str {
+        "BodySizeGuard"
     }
 }
 
@@ -532,6 +593,7 @@ fn build_app(storage: Option<StorageHandle>) -> App {
     };
 
     App::builder()
+        .middleware(BodySizeGuard)
         .middleware(RequestSpanLogger::default())
         .middleware(StateInjector { state })
         .route(
@@ -552,7 +614,24 @@ fn build_app(storage: Option<StorageHandle>) -> App {
 }
 
 /// Start the web server and return a handle for shutdown.
+///
+/// Refuses to bind on non-localhost addresses unless the config was
+/// created with [`WebServerConfig::with_dangerous_public_bind`].
 pub async fn start_web_server(config: WebServerConfig) -> Result<WebServerHandle> {
+    if !config.is_localhost() && !config.allow_public_bind {
+        return Err(Error::Runtime(format!(
+            "refusing to bind on public address '{}' — \
+             use --dangerous-bind-any or with_dangerous_public_bind() to override",
+            config.host
+        )));
+    }
+    if !config.is_localhost() {
+        warn!(
+            target: "wa.web",
+            host = %config.host,
+            "binding web server on non-localhost address — endpoints may be remotely reachable"
+        );
+    }
     let bind_addr = config.bind_addr();
     let app = build_app(config.storage);
 
