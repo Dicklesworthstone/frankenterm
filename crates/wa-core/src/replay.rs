@@ -588,6 +588,334 @@ fn output_decoded(sink: &mut dyn OutputSink, decoded: &DecodedFrame) -> Result<(
 }
 
 // ---------------------------------------------------------------------------
+// Recording Export: Asciinema V2 cast + standalone HTML
+// ---------------------------------------------------------------------------
+
+/// Options for exporting a recording.
+#[derive(Debug, Clone)]
+pub struct ExportOptions {
+    /// Terminal columns (for cast header).
+    pub cols: u16,
+    /// Terminal rows (for cast header).
+    pub rows: u16,
+    /// Apply secret redaction to output frames.
+    pub redact: bool,
+    /// Additional regex patterns to redact (beyond built-in secrets).
+    pub extra_redact_patterns: Vec<String>,
+    /// Title for the recording (used in cast header and HTML).
+    pub title: Option<String>,
+}
+
+impl Default for ExportOptions {
+    fn default() -> Self {
+        Self {
+            cols: 80,
+            rows: 24,
+            redact: true,
+            extra_redact_patterns: Vec::new(),
+            title: None,
+        }
+    }
+}
+
+/// Export format for recordings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportFormat {
+    /// Asciinema V2 cast format (.cast)
+    Asciinema,
+    /// Self-contained HTML player (.html)
+    Html,
+}
+
+/// Redact the output bytes of a recording, returning a new Recording with
+/// all `Output` and `Input` frame payloads redacted.
+fn redact_recording(recording: &Recording, redact_extra: &[String]) -> Result<Recording> {
+    use crate::policy::Redactor;
+
+    let redactor = Redactor::new();
+    let mut extra_patterns: Vec<regex::Regex> = Vec::new();
+    for pat in redact_extra {
+        let re = regex::Regex::new(pat).map_err(|e| {
+            crate::Error::Runtime(format!("Invalid redaction pattern '{pat}': {e}"))
+        })?;
+        extra_patterns.push(re);
+    }
+
+    let mut new_frames = Vec::with_capacity(recording.frames.len());
+    for frame in &recording.frames {
+        match frame.header.frame_type {
+            FrameType::Output | FrameType::Input => {
+                let text = String::from_utf8_lossy(&frame.payload);
+                let mut redacted = redactor.redact(&text);
+                for re in &extra_patterns {
+                    redacted = re.replace_all(&redacted, "[REDACTED]").to_string();
+                }
+                let payload = redacted.into_bytes();
+                new_frames.push(RecordingFrame {
+                    header: FrameHeader {
+                        payload_len: payload.len() as u32,
+                        ..frame.header
+                    },
+                    payload,
+                });
+            }
+            _ => {
+                new_frames.push(frame.clone());
+            }
+        }
+    }
+
+    Ok(Recording {
+        duration_ms: recording.duration_ms,
+        frames: new_frames,
+        keyframes: Vec::new(), // keyframes not needed for export
+    })
+}
+
+/// Export a recording to Asciinema V2 cast format.
+///
+/// The V2 format is newline-delimited JSON:
+/// - Line 1: header object `{"version": 2, "width": N, "height": N, ...}`
+/// - Subsequent lines: event arrays `[time, "o", "data"]`
+///
+/// See <https://docs.asciinema.org/manual/asciicast/v2/> for the specification.
+pub fn export_asciinema<W: std::io::Write>(
+    recording: &Recording,
+    opts: &ExportOptions,
+    writer: &mut W,
+) -> Result<usize> {
+    let source = if opts.redact {
+        redact_recording(recording, &opts.extra_redact_patterns)?
+    } else {
+        recording.clone()
+    };
+
+    // Determine terminal size from resize frames or defaults
+    let (cols, rows) = find_terminal_size(&source, opts.cols, opts.rows);
+
+    // Write header
+    let mut header = serde_json::Map::new();
+    header.insert("version".into(), serde_json::Value::Number(2.into()));
+    header.insert(
+        "width".into(),
+        serde_json::Value::Number(cols.into()),
+    );
+    header.insert(
+        "height".into(),
+        serde_json::Value::Number(rows.into()),
+    );
+    if let Some(ref title) = opts.title {
+        header.insert("title".into(), serde_json::Value::String(title.clone()));
+    }
+    if source.duration_ms > 0 {
+        let duration_secs = source.duration_ms as f64 / 1000.0;
+        header.insert(
+            "duration".into(),
+            serde_json::Value::Number(
+                serde_json::Number::from_f64(duration_secs)
+                    .unwrap_or_else(|| serde_json::Number::from(0)),
+            ),
+        );
+    }
+    let header_json = serde_json::to_string(&header).map_err(|e| {
+        crate::Error::Runtime(format!("Failed to serialize cast header: {e}"))
+    })?;
+    writeln!(writer, "{header_json}").map_err(|e| {
+        crate::Error::Runtime(format!("Failed to write cast header: {e}"))
+    })?;
+
+    // Write events
+    let base_ts = source
+        .frames
+        .first()
+        .map(|f| f.header.timestamp_ms)
+        .unwrap_or(0);
+    let mut event_count = 0usize;
+
+    for frame in &source.frames {
+        let rel_secs = (frame.header.timestamp_ms.saturating_sub(base_ts)) as f64 / 1000.0;
+
+        match frame.header.frame_type {
+            FrameType::Output => {
+                let text = String::from_utf8_lossy(&frame.payload);
+                let event = serde_json::json!([rel_secs, "o", text]);
+                let line = serde_json::to_string(&event).map_err(|e| {
+                    crate::Error::Runtime(format!("Failed to serialize cast event: {e}"))
+                })?;
+                writeln!(writer, "{line}").map_err(|e| {
+                    crate::Error::Runtime(format!("Failed to write cast event: {e}"))
+                })?;
+                event_count += 1;
+            }
+            FrameType::Resize => {
+                if frame.payload.len() >= 4 {
+                    let c = u16::from_le_bytes([frame.payload[0], frame.payload[1]]);
+                    let r = u16::from_le_bytes([frame.payload[2], frame.payload[3]]);
+                    let event = serde_json::json!([rel_secs, "r", format!("{c}x{r}")]);
+                    let line = serde_json::to_string(&event).map_err(|e| {
+                        crate::Error::Runtime(format!("Failed to serialize cast event: {e}"))
+                    })?;
+                    writeln!(writer, "{line}").map_err(|e| {
+                        crate::Error::Runtime(format!("Failed to write cast event: {e}"))
+                    })?;
+                    event_count += 1;
+                }
+            }
+            FrameType::Marker => {
+                // Emit markers as comments (non-standard but harmless)
+                let text = String::from_utf8_lossy(&frame.payload);
+                let event = serde_json::json!([rel_secs, "m", text]);
+                let line = serde_json::to_string(&event).map_err(|e| {
+                    crate::Error::Runtime(format!("Failed to serialize cast event: {e}"))
+                })?;
+                writeln!(writer, "{line}").map_err(|e| {
+                    crate::Error::Runtime(format!("Failed to write cast event: {e}"))
+                })?;
+                event_count += 1;
+            }
+            _ => {} // Skip Input and Event frames in cast export
+        }
+    }
+
+    Ok(event_count)
+}
+
+/// Export a recording as a self-contained HTML page with an embedded player.
+///
+/// The HTML includes:
+/// - Inline asciinema-player CSS/JS (loaded from CDN link)
+/// - The cast data embedded as a `<script>` block
+/// - Speed control, pause/seek/play
+pub fn export_html<W: std::io::Write>(
+    recording: &Recording,
+    opts: &ExportOptions,
+    writer: &mut W,
+) -> Result<usize> {
+    // First generate the cast data into a buffer
+    let mut cast_buf = Vec::new();
+    let event_count = export_asciinema(recording, opts, &mut cast_buf)?;
+    let cast_data = String::from_utf8_lossy(&cast_buf);
+
+    let title = opts
+        .title
+        .as_deref()
+        .unwrap_or("wa Session Recording");
+    let (cols, rows) = find_terminal_size(
+        &if opts.redact {
+            redact_recording(recording, &opts.extra_redact_patterns)?
+        } else {
+            recording.clone()
+        },
+        opts.cols,
+        opts.rows,
+    );
+
+    // Emit self-contained HTML
+    write!(
+        writer,
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{title}</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/asciinema-player@3.8.2/dist/bundle/asciinema-player.css">
+<style>
+  body {{
+    margin: 0;
+    padding: 20px;
+    background: #1a1a2e;
+    color: #e0e0e0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    min-height: 100vh;
+  }}
+  h1 {{
+    font-size: 1.4em;
+    margin-bottom: 16px;
+    color: #e0e0e0;
+  }}
+  .info {{
+    font-size: 0.85em;
+    color: #888;
+    margin-bottom: 12px;
+  }}
+  #player-container {{
+    max-width: 100%;
+    overflow-x: auto;
+  }}
+  .footer {{
+    margin-top: 16px;
+    font-size: 0.75em;
+    color: #666;
+  }}
+</style>
+</head>
+<body>
+<h1>{title}</h1>
+<div class="info">{cols}x{rows} &middot; {event_count} events</div>
+<div id="player-container"></div>
+<div class="footer">Exported by wa (WezTerm Automata)</div>
+
+<script id="cast-data" type="application/x-asciicast">{cast_data}</script>
+
+<script src="https://cdn.jsdelivr.net/npm/asciinema-player@3.8.2/dist/bundle/asciinema-player.min.js"></script>
+<script>
+(function() {{
+  var castText = document.getElementById('cast-data').textContent;
+  var blob = new Blob([castText], {{ type: 'text/plain' }});
+  var url = URL.createObjectURL(blob);
+  AsciinemaPlayer.create(url, document.getElementById('player-container'), {{
+    cols: {cols},
+    rows: {rows},
+    autoPlay: false,
+    speed: 1,
+    idleTimeLimit: 2,
+    theme: 'monokai',
+    fit: 'width'
+  }});
+}})();
+</script>
+</body>
+</html>
+"#,
+        title = html_escape(title),
+        cols = cols,
+        rows = rows,
+        event_count = event_count,
+        cast_data = html_escape(&cast_data),
+    )
+    .map_err(|e| crate::Error::Runtime(format!("Failed to write HTML: {e}")))?;
+
+    Ok(event_count)
+}
+
+/// Find terminal size from resize frames, falling back to defaults.
+fn find_terminal_size(recording: &Recording, default_cols: u16, default_rows: u16) -> (u16, u16) {
+    for frame in &recording.frames {
+        if frame.header.frame_type == FrameType::Resize && frame.payload.len() >= 4 {
+            let cols = u16::from_le_bytes([frame.payload[0], frame.payload[1]]);
+            let rows = u16::from_le_bytes([frame.payload[2], frame.payload[3]]);
+            if cols > 0 && rows > 0 {
+                return (cols, rows);
+            }
+        }
+    }
+    (default_cols, default_rows)
+}
+
+/// Minimal HTML escaping for embedding in HTML attributes and text content.
+fn html_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -975,5 +1303,245 @@ mod tests {
 
         let d4 = decode_frame(&recording.frames[4]).unwrap();
         assert!(matches!(d4, DecodedFrame::Input(ref b) if b == b"ls -la\n"));
+    }
+
+    // =========================================================================
+    // Export Tests
+    // =========================================================================
+
+    fn build_test_recording_with_resize() -> Recording {
+        let data = build_recording(&[
+            (
+                0,
+                FrameType::Resize,
+                {
+                    let mut p = Vec::new();
+                    p.extend_from_slice(&120u16.to_le_bytes());
+                    p.extend_from_slice(&40u16.to_le_bytes());
+                    p
+                },
+            ),
+            (100, FrameType::Output, b"$ hello world\r\n".to_vec()),
+            (200, FrameType::Output, b"output line 2\r\n".to_vec()),
+            (300, FrameType::Marker, b"checkpoint-1".to_vec()),
+            (500, FrameType::Output, b"done\r\n".to_vec()),
+        ]);
+        Recording::from_bytes(&data).unwrap()
+    }
+
+    #[test]
+    fn export_asciinema_header_and_events() {
+        let rec = build_test_recording_with_resize();
+        let opts = ExportOptions {
+            redact: false,
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        let count = export_asciinema(&rec, &opts, &mut buf).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+
+        // Header line
+        let header: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(header["version"], 2);
+        assert_eq!(header["width"], 120);
+        assert_eq!(header["height"], 40);
+
+        // Should have: 1 resize + 3 output + 1 marker = 5 events
+        assert_eq!(count, 5);
+        assert_eq!(lines.len(), 6); // header + 5 events
+
+        // First event is a resize
+        let ev1: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(ev1[1], "r");
+        assert_eq!(ev1[2], "120x40");
+
+        // Second event is output
+        let ev2: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
+        assert_eq!(ev2[1], "o");
+        assert!(ev2[2].as_str().unwrap().contains("hello world"));
+
+        // Marker event
+        let ev4: serde_json::Value = serde_json::from_str(lines[4]).unwrap();
+        assert_eq!(ev4[1], "m");
+        assert!(ev4[2].as_str().unwrap().contains("checkpoint"));
+    }
+
+    #[test]
+    fn export_asciinema_with_title() {
+        let rec = build_test_recording_with_resize();
+        let opts = ExportOptions {
+            title: Some("Test Session".to_string()),
+            redact: false,
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        export_asciinema(&rec, &opts, &mut buf).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        let header: serde_json::Value =
+            serde_json::from_str(output.lines().next().unwrap()).unwrap();
+        assert_eq!(header["title"], "Test Session");
+    }
+
+    #[test]
+    fn export_asciinema_timing_relative() {
+        let data = build_recording(&[
+            (1000, FrameType::Output, b"first".to_vec()),
+            (2500, FrameType::Output, b"second".to_vec()),
+        ]);
+        let rec = Recording::from_bytes(&data).unwrap();
+        let opts = ExportOptions {
+            redact: false,
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        export_asciinema(&rec, &opts, &mut buf).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+
+        let ev1: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        let ev2: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
+        // First event at 0.0s (relative), second at 1.5s
+        assert!((ev1[0].as_f64().unwrap() - 0.0).abs() < 0.001);
+        assert!((ev2[0].as_f64().unwrap() - 1.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn export_asciinema_redaction() {
+        let data = build_recording(&[(
+            0,
+            FrameType::Output,
+            b"key=sk-proj-abcdefghijklmnop1234567890 done".to_vec(),
+        )]);
+        let rec = Recording::from_bytes(&data).unwrap();
+        let opts = ExportOptions {
+            redact: true,
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        export_asciinema(&rec, &opts, &mut buf).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains("[REDACTED]"));
+        assert!(!output.contains("sk-proj-abcdefghijklmnop1234567890"));
+    }
+
+    #[test]
+    fn export_asciinema_extra_redact_patterns() {
+        let data = build_recording(&[(
+            0,
+            FrameType::Output,
+            b"token=MYSECRET123 ok".to_vec(),
+        )]);
+        let rec = Recording::from_bytes(&data).unwrap();
+        let opts = ExportOptions {
+            redact: true,
+            extra_redact_patterns: vec!["MYSECRET\\d+".to_string()],
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        export_asciinema(&rec, &opts, &mut buf).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains("[REDACTED]"));
+        assert!(!output.contains("MYSECRET123"));
+    }
+
+    #[test]
+    fn export_html_self_contained() {
+        let rec = build_test_recording_with_resize();
+        let opts = ExportOptions {
+            title: Some("Demo".to_string()),
+            redact: false,
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        let count = export_html(&rec, &opts, &mut buf).unwrap();
+        let html = String::from_utf8(buf).unwrap();
+
+        assert!(count > 0);
+        assert!(html.contains("<!DOCTYPE html>"));
+        assert!(html.contains("asciinema-player"));
+        assert!(html.contains("Demo"));
+        assert!(html.contains("120x40"));
+        // Cast data should be embedded
+        assert!(html.contains("cast-data"));
+        assert!(html.contains("hello world"));
+    }
+
+    #[test]
+    fn export_html_redacts_secrets() {
+        let data = build_recording(&[(
+            0,
+            FrameType::Output,
+            b"ANTHROPIC_API_KEY=sk-ant-test-abc123def456 ok".to_vec(),
+        )]);
+        let rec = Recording::from_bytes(&data).unwrap();
+        let opts = ExportOptions {
+            redact: true,
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        export_html(&rec, &opts, &mut buf).unwrap();
+        let html = String::from_utf8(buf).unwrap();
+        assert!(!html.contains("sk-ant-test-abc123def456"));
+        assert!(html.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn export_empty_recording() {
+        let rec = Recording::from_bytes(&[]).unwrap();
+        let opts = ExportOptions::default();
+
+        let mut cast_buf = Vec::new();
+        let count = export_asciinema(&rec, &opts, &mut cast_buf).unwrap();
+        assert_eq!(count, 0);
+        let output = String::from_utf8(cast_buf).unwrap();
+        // Should still have a header
+        assert!(output.lines().count() >= 1);
+
+        let mut html_buf = Vec::new();
+        let html_count = export_html(&rec, &opts, &mut html_buf).unwrap();
+        assert_eq!(html_count, 0);
+    }
+
+    #[test]
+    fn export_no_redact_preserves_secrets() {
+        let data = build_recording(&[(
+            0,
+            FrameType::Output,
+            b"sk-proj-abcdefghijklmnop1234567890".to_vec(),
+        )]);
+        let rec = Recording::from_bytes(&data).unwrap();
+        let opts = ExportOptions {
+            redact: false,
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        export_asciinema(&rec, &opts, &mut buf).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains("sk-proj-abcdefghijklmnop1234567890"));
+    }
+
+    #[test]
+    fn find_terminal_size_from_resize_frame() {
+        let rec = build_test_recording_with_resize();
+        let (cols, rows) = find_terminal_size(&rec, 80, 24);
+        assert_eq!(cols, 120);
+        assert_eq!(rows, 40);
+    }
+
+    #[test]
+    fn find_terminal_size_uses_defaults() {
+        let data = build_recording(&[(0, FrameType::Output, b"hi".to_vec())]);
+        let rec = Recording::from_bytes(&data).unwrap();
+        let (cols, rows) = find_terminal_size(&rec, 80, 24);
+        assert_eq!(cols, 80);
+        assert_eq!(rows, 24);
+    }
+
+    #[test]
+    fn html_escape_special_chars() {
+        assert_eq!(html_escape("<script>"), "&lt;script&gt;");
+        assert_eq!(html_escape("a&b"), "a&amp;b");
+        assert_eq!(html_escape("\"hello\""), "&quot;hello&quot;");
     }
 }

@@ -939,6 +939,22 @@ SEE ALSO:
         command: ExtCommands,
     },
 
+    /// Export session recordings to Asciinema or HTML
+    #[command(after_help = r#"EXAMPLES:
+    wa record export session.war                        Export to Asciinema cast
+    wa record export session.war --format html -o out.html  Export to HTML player
+    wa record export session.war --no-redact            Keep secrets in output
+    wa record export session.war --title "Demo Session" Set recording title
+    wa record export session.war --redact-pattern "TOKEN_\w+" Add custom redaction
+
+SEE ALSO:
+    wa reproduce    Incident bundles
+    wa export       Data export to JSONL"#)]
+    Record {
+        #[command(subcommand)]
+        command: RecordCommands,
+    },
+
     /// Reserve a pane for exclusive use
     #[command(after_help = r#"EXAMPLES:
     wa reserve 3 --owner-id agent-1   Reserve pane 3 for agent-1
@@ -1398,6 +1414,43 @@ enum ReproduceCommands {
         /// Output format (text or json)
         #[arg(short = 'f', long, default_value = "text")]
         format: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum RecordCommands {
+    /// Export a .war recording to Asciinema cast or self-contained HTML
+    Export {
+        /// Path to the .war recording file
+        file: PathBuf,
+
+        /// Export format: asciinema or html
+        #[arg(short = 'f', long, default_value = "asciinema")]
+        format: String,
+
+        /// Output file path (default: stdout for asciinema, required for html)
+        #[arg(short = 'o', long)]
+        output: Option<PathBuf>,
+
+        /// Terminal columns (overrides auto-detection from recording)
+        #[arg(long)]
+        cols: Option<u16>,
+
+        /// Terminal rows (overrides auto-detection from recording)
+        #[arg(long)]
+        rows: Option<u16>,
+
+        /// Title for the recording
+        #[arg(long)]
+        title: Option<String>,
+
+        /// Disable secret redaction (WARNING: may expose credentials)
+        #[arg(long)]
+        no_redact: bool,
+
+        /// Additional regex patterns to redact
+        #[arg(long = "redact-pattern")]
+        redact_patterns: Vec<String>,
     },
 }
 
@@ -15901,6 +15954,87 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 resolved_config_path.as_deref(),
             );
         }
+
+        Some(Commands::Record { command }) => match command {
+            RecordCommands::Export {
+                file,
+                format,
+                output,
+                cols,
+                rows,
+                title,
+                no_redact,
+                redact_patterns,
+            } => {
+                use wa_core::replay::{
+                    ExportFormat, ExportOptions, Recording, export_asciinema, export_html,
+                };
+
+                let recording = Recording::load(&file).map_err(|e| {
+                    anyhow::anyhow!("Failed to load recording '{}': {e}", file.display())
+                })?;
+
+                let export_fmt = match format.to_lowercase().as_str() {
+                    "asciinema" | "cast" => ExportFormat::Asciinema,
+                    "html" => ExportFormat::Html,
+                    other => {
+                        eprintln!(
+                            "Error: Unknown format '{other}'. Use 'asciinema' or 'html'."
+                        );
+                        std::process::exit(1);
+                    }
+                };
+
+                let opts = ExportOptions {
+                    cols: cols.unwrap_or(80),
+                    rows: rows.unwrap_or(24),
+                    redact: !no_redact,
+                    extra_redact_patterns: redact_patterns,
+                    title,
+                };
+
+                match export_fmt {
+                    ExportFormat::Asciinema => {
+                        if let Some(ref path) = output {
+                            let mut f = std::fs::File::create(path).map_err(|e| {
+                                anyhow::anyhow!(
+                                    "Failed to create '{}': {e}",
+                                    path.display()
+                                )
+                            })?;
+                            let count = export_asciinema(&recording, &opts, &mut f)?;
+                            eprintln!(
+                                "Exported {count} events to {} (asciinema cast)",
+                                path.display()
+                            );
+                        } else {
+                            let stdout = std::io::stdout();
+                            let mut handle = stdout.lock();
+                            export_asciinema(&recording, &opts, &mut handle)?;
+                        }
+                    }
+                    ExportFormat::Html => {
+                        if let Some(ref path) = output {
+                            let mut f = std::fs::File::create(path).map_err(|e| {
+                                anyhow::anyhow!(
+                                    "Failed to create '{}': {e}",
+                                    path.display()
+                                )
+                            })?;
+                            let count = export_html(&recording, &opts, &mut f)?;
+                            eprintln!(
+                                "Exported {count} events to {} (HTML player)",
+                                path.display()
+                            );
+                        } else {
+                            let stdout = std::io::stdout();
+                            let mut handle = stdout.lock();
+                            export_html(&recording, &opts, &mut handle)?;
+                        }
+                    }
+                }
+            }
+        },
 
         Some(Commands::Reserve {
             pane_id,
