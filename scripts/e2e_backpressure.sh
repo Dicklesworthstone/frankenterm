@@ -515,14 +515,17 @@ scenario_bounded_execution() {
         log_fail "S8.2: Suite exceeded 60s budget (${duration_s}s)"
     fi
 
-    # Count test results from output
-    local test_count
-    test_count=$(grep -c 'test result:' "$test_output" 2>/dev/null || echo "0")
-    if [[ "$test_count" -gt 0 ]]; then
-        local passed_count
-        passed_count=$(grep 'test result:' "$test_output" | grep -oP '\d+ passed' | grep -oP '\d+' | tail -1 || echo "0")
+    # Count test results from output (sum across all test binaries)
+    local passed_count=0
+    while IFS= read -r line; do
+        local n
+        n=$(echo "$line" | command grep -oP '\d+ passed' | command grep -oP '\d+' || echo "0")
+        passed_count=$((passed_count + n))
+    done < <(command grep 'test result:' "$test_output" 2>/dev/null)
+
+    if [[ "$passed_count" -gt 0 ]]; then
         log_pass "S8.3: Test suite ran ($passed_count tests passed)"
-        e2e_add_file "test_counts.json" "{\"suites\": $test_count, \"passed\": $passed_count}"
+        e2e_add_file "test_counts.json" "{\"passed\": $passed_count}"
     else
         log_fail "S8.3: Could not parse test results"
     fi

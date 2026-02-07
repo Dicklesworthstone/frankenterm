@@ -387,6 +387,7 @@ SCENARIO_REGISTRY=(
     "accounts_refresh|Validate accounts refresh via fake caut + pick preview + redaction|true|wezterm,jq,sqlite3|Protects accounts refresh"
     "environment_detection|Validate environment detection API (shell, agents, remotes, auto-config)|true|wezterm,jq|Protects environment detection and auto-config"
     "backpressure_stress|Validate backpressure tiers, overflow GAP, hysteresis, and bounded execution|true|cargo,jq|Protects backpressure graceful degradation"
+    "storage_stress|Validate storage/indexing stability under load (many panes, large transcripts)|true|cargo,jq|Protects storage perf at scale"
 )
 
 list_scenarios() {
