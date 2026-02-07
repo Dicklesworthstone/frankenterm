@@ -249,29 +249,59 @@ pub fn render_tabs(current_view: View, area: Rect, buf: &mut Buffer) {
     tabs.render(area, buf);
 }
 
+/// Compute aggregate health status indicator from `HealthStatus`.
+fn aggregate_health_indicator(health: &HealthStatus) -> (&'static str, Style) {
+    let has_error = !health.watcher_running
+        || !health.db_accessible
+        || matches!(health.wezterm_circuit.state, CircuitStateKind::Open);
+    let has_warning = !health.wezterm_accessible
+        || matches!(health.wezterm_circuit.state, CircuitStateKind::HalfOpen);
+
+    if has_error {
+        (
+            "ERROR",
+            Style::default()
+                .fg(Color::Red)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else if has_warning {
+        ("WARNING", Style::default().fg(Color::Yellow))
+    } else {
+        ("OK", Style::default().fg(Color::Green))
+    }
+}
+
 /// Render the home/dashboard view
 pub fn render_home_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // Title
-            Constraint::Length(7), // Health status
-            Constraint::Min(5),    // Quick stats
+            Constraint::Length(3),  // Title + aggregate health
+            Constraint::Length(9),  // Health status detail
+            Constraint::Length(7),  // Metrics snapshot
+            Constraint::Min(3),    // Quick help
             Constraint::Length(3), // Footer
         ])
         .split(area);
 
-    // Title
-    let title = Paragraph::new("WezTerm Automata")
-        .style(
+    // Title + aggregate status
+    let (aggregate_label, aggregate_style) = state.health.as_ref().map_or_else(
+        || ("LOADING", Style::default().fg(Color::Yellow)),
+        |h| aggregate_health_indicator(h),
+    );
+    let title = Paragraph::new(Line::from(vec![
+        Span::styled(
+            "WezTerm Automata  ",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
-        )
-        .block(Block::default().borders(Borders::NONE));
+        ),
+        Span::styled(aggregate_label, aggregate_style),
+    ]))
+    .block(Block::default().borders(Borders::NONE));
     title.render(chunks[0], buf);
 
-    // Health status
+    // Health status detail
     let health_text = state.health.as_ref().map_or_else(
         || {
             vec![Line::from(Span::styled(
@@ -305,18 +335,61 @@ pub fn render_home_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
                 CircuitStateKind::Open => {
                     let remaining = health.wezterm_circuit.cooldown_remaining_ms.unwrap_or(0);
                     Span::styled(
-                        format!("OPEN ({} ms)", remaining),
+                        format!("OPEN ({remaining} ms cooldown)"),
                         Style::default().fg(Color::Red),
                     )
                 }
             };
 
+            let capture_lag = health.last_capture_ts.map_or_else(
+                || Span::styled("no captures yet", Style::default().fg(Color::Gray)),
+                |ts| {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .and_then(|d| i64::try_from(d.as_millis()).ok())
+                        .unwrap_or(0);
+                    let lag_ms = now_ms.saturating_sub(ts);
+                    if lag_ms > 10_000 {
+                        Span::styled(
+                            format!("{lag_ms} ms"),
+                            Style::default().fg(Color::Yellow),
+                        )
+                    } else {
+                        Span::styled(format!("{lag_ms} ms"), Style::default().fg(Color::Green))
+                    }
+                },
+            );
+
             vec![
-                Line::from(vec![Span::raw("Watcher: "), watcher_status]),
-                Line::from(vec![Span::raw("Database: "), db_status]),
-                Line::from(vec![Span::raw("WezTerm: "), wezterm_status]),
-                Line::from(vec![Span::raw("Circuit: "), circuit_status]),
-                Line::from(Span::raw(format!("Panes: {}", health.pane_count))),
+                Line::from(vec![
+                    Span::raw("  Watcher:       "),
+                    watcher_status,
+                ]),
+                Line::from(vec![
+                    Span::raw("  Database:      "),
+                    db_status,
+                ]),
+                Line::from(vec![
+                    Span::raw("  WezTerm CLI:   "),
+                    wezterm_status,
+                ]),
+                Line::from(vec![
+                    Span::raw("  Circuit:       "),
+                    circuit_status,
+                ]),
+                Line::from(vec![
+                    Span::raw("  Capture lag:   "),
+                    capture_lag,
+                ]),
+                Line::from(vec![
+                    Span::raw("  Failures:      "),
+                    Span::raw(format!(
+                        "{}/{}",
+                        health.wezterm_circuit.consecutive_failures,
+                        health.wezterm_circuit.failure_threshold
+                    )),
+                ]),
             ]
         },
     );
@@ -328,20 +401,76 @@ pub fn render_home_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
     );
     health_block.render(chunks[1], buf);
 
-    // Instructions
+    // Metrics snapshot
+    let metrics_text = state.health.as_ref().map_or_else(
+        || vec![Line::from(Span::styled("...", Style::default().fg(Color::Gray)))],
+        |health| {
+            let pane_count_style = if health.pane_count == 0 {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::Green)
+            };
+            let event_count_style = if health.event_count > 100 {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::Green)
+            };
+            let unhandled = state
+                .events
+                .iter()
+                .filter(|e| !e.handled)
+                .count();
+            let unhandled_style = if unhandled > 0 {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Green)
+            };
+            let triage_count = state.triage_items.len();
+            let triage_style = if triage_count > 0 {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::Green)
+            };
+
+            vec![
+                Line::from(vec![
+                    Span::raw("  Panes:         "),
+                    Span::styled(health.pane_count.to_string(), pane_count_style),
+                ]),
+                Line::from(vec![
+                    Span::raw("  Events:        "),
+                    Span::styled(health.event_count.to_string(), event_count_style),
+                ]),
+                Line::from(vec![
+                    Span::raw("  Unhandled:     "),
+                    Span::styled(unhandled.to_string(), unhandled_style),
+                ]),
+                Line::from(vec![
+                    Span::raw("  Triage items:  "),
+                    Span::styled(triage_count.to_string(), triage_style),
+                ]),
+            ]
+        },
+    );
+    let metrics_block = Paragraph::new(metrics_text).block(
+        Block::default()
+            .title("Metrics")
+            .borders(Borders::ALL),
+    );
+    metrics_block.render(chunks[2], buf);
+
+    // Quick help
     let instructions = Paragraph::new(vec![
-        Line::from(""),
         Line::from(Span::styled(
             "Navigation:",
             Style::default().add_modifier(Modifier::BOLD),
         )),
-        Line::from("  Tab / Shift+Tab: Switch views"),
-        Line::from("  q: Quit"),
-        Line::from("  r: Refresh data"),
-        Line::from("  ?: Help"),
+        Line::from("  Tab / Shift+Tab: Switch views   q: Quit   r: Refresh   ?: Help"),
     ])
     .block(Block::default().title("Quick Help").borders(Borders::ALL));
-    instructions.render(chunks[2], buf);
+    instructions.render(chunks[3], buf);
 
     // Footer with error if any
     if let Some(ref error) = state.error_message {
@@ -350,7 +479,7 @@ pub fn render_home_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
             Style::default().fg(Color::Red),
         ))
         .block(Block::default().borders(Borders::TOP));
-        error_widget.render(chunks[3], buf);
+        error_widget.render(chunks[4], buf);
     }
 }
 
@@ -951,6 +1080,7 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::circuit_breaker::CircuitBreakerStatus;
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
 
@@ -1293,5 +1423,108 @@ mod tests {
         let mut buf = Buffer::empty(area);
         render_search_view(&state, area, &mut buf);
         // Should show "hello_" in the input area
+    }
+
+    // -----------------------------------------------------------------------
+    // Health metrics panel tests (wa-nu4.3.7.6)
+    // -----------------------------------------------------------------------
+
+    fn make_health(watcher: bool, db: bool, wezterm: bool) -> HealthStatus {
+        HealthStatus {
+            watcher_running: watcher,
+            db_accessible: db,
+            wezterm_accessible: wezterm,
+            wezterm_circuit: CircuitBreakerStatus::default(),
+            pane_count: 3,
+            event_count: 10,
+            last_capture_ts: Some(1_700_000_000_000),
+        }
+    }
+
+    #[test]
+    fn aggregate_health_ok_when_all_healthy() {
+        let health = make_health(true, true, true);
+        let (label, _) = aggregate_health_indicator(&health);
+        assert_eq!(label, "OK");
+    }
+
+    #[test]
+    fn aggregate_health_error_when_watcher_stopped() {
+        let health = make_health(false, true, true);
+        let (label, _) = aggregate_health_indicator(&health);
+        assert_eq!(label, "ERROR");
+    }
+
+    #[test]
+    fn aggregate_health_error_when_db_inaccessible() {
+        let health = make_health(true, false, true);
+        let (label, _) = aggregate_health_indicator(&health);
+        assert_eq!(label, "ERROR");
+    }
+
+    #[test]
+    fn aggregate_health_warning_when_wezterm_inaccessible() {
+        let health = make_health(true, true, false);
+        let (label, _) = aggregate_health_indicator(&health);
+        assert_eq!(label, "WARNING");
+    }
+
+    #[test]
+    fn aggregate_health_error_when_circuit_open() {
+        let mut health = make_health(true, true, true);
+        health.wezterm_circuit.state = CircuitStateKind::Open;
+        let (label, _) = aggregate_health_indicator(&health);
+        assert_eq!(label, "ERROR");
+    }
+
+    #[test]
+    fn aggregate_health_warning_when_circuit_half_open() {
+        let mut health = make_health(true, true, true);
+        health.wezterm_circuit.state = CircuitStateKind::HalfOpen;
+        let (label, _) = aggregate_health_indicator(&health);
+        assert_eq!(label, "WARNING");
+    }
+
+    #[test]
+    fn render_home_view_healthy() {
+        let mut state = ViewState::default();
+        state.health = Some(make_health(true, true, true));
+        let area = Rect::new(0, 0, 80, 30);
+        let mut buf = Buffer::empty(area);
+        render_home_view(&state, area, &mut buf);
+        // Should render without panic, show OK status
+    }
+
+    #[test]
+    fn render_home_view_degraded() {
+        let mut state = ViewState::default();
+        let mut health = make_health(true, true, false);
+        health.wezterm_circuit.state = CircuitStateKind::HalfOpen;
+        state.health = Some(health);
+        state.events = vec![event(1, 10, "codex.error", "critical", false)];
+        let area = Rect::new(0, 0, 80, 30);
+        let mut buf = Buffer::empty(area);
+        render_home_view(&state, area, &mut buf);
+        // Should show WARNING aggregate with unhandled count
+    }
+
+    #[test]
+    fn render_home_view_no_health() {
+        let state = ViewState::default();
+        let area = Rect::new(0, 0, 80, 30);
+        let mut buf = Buffer::empty(area);
+        render_home_view(&state, area, &mut buf);
+        // Should show "Loading..." gracefully
+    }
+
+    #[test]
+    fn render_home_view_with_error_message() {
+        let mut state = ViewState::default();
+        state.health = Some(make_health(true, true, true));
+        state.set_error("Connection lost");
+        let area = Rect::new(0, 0, 80, 30);
+        let mut buf = Buffer::empty(area);
+        render_home_view(&state, area, &mut buf);
+        // Should render error footer
     }
 }
