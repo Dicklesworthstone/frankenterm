@@ -834,6 +834,7 @@ SEE ALSO:
     wa learn basics --complete        Mark current exercise as done
     wa learn basics --skip            Skip current exercise
     wa learn --status                 Show completion summary
+    wa learn --achievements           Show achievement collection
     wa learn --reset                  Clear all progress
 
 SEE ALSO:
@@ -846,6 +847,10 @@ SEE ALSO:
         /// Show completion summary
         #[arg(long)]
         status: bool,
+
+        /// Show achievement collection
+        #[arg(long)]
+        achievements: bool,
 
         /// Clear all progress
         #[arg(long)]
@@ -15875,12 +15880,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
         Some(Commands::Learn {
             track,
             status,
+            achievements,
             reset,
             complete,
             skip,
             json,
         }) => {
-            handle_learn_command(track, status, reset, complete, skip, json)?;
+            handle_learn_command(track, status, achievements, reset, complete, skip, json)?;
         }
 
         Some(Commands::Db { command }) => {
@@ -19971,6 +19977,7 @@ fn compute_config_diff(existing: &str, incoming: &str) -> Vec<String> {
 fn handle_learn_command(
     track: Option<String>,
     status: bool,
+    achievements: bool,
     reset: bool,
     complete: bool,
     skip: bool,
@@ -19988,6 +19995,17 @@ fn handle_learn_command(
             println!(r#"{{"reset": true}}"#);
         } else {
             println!("Tutorial progress has been reset.");
+        }
+        return Ok(());
+    }
+
+    // Handle achievements
+    if achievements {
+        if json {
+            let collection = engine.achievement_collection();
+            println!("{}", serde_json::to_string_pretty(&collection)?);
+        } else {
+            println!("{}", engine.format_achievement_list());
         }
         return Ok(());
     }
@@ -20026,6 +20044,7 @@ fn handle_learn_command(
     if complete || skip {
         if let Some(exercise_id) = engine.state().current_exercise.clone() {
             let track_id = engine.state().current_track.clone();
+            let before_count = engine.state().achievements.len();
             let event = if complete {
                 TutorialEvent::CompleteExercise(exercise_id.clone())
             } else {
@@ -20036,14 +20055,26 @@ fn handle_learn_command(
 
             if json {
                 let action = if complete { "completed" } else { "skipped" };
+                let new_achievements: Vec<_> = engine
+                    .state()
+                    .achievements
+                    .iter()
+                    .skip(before_count)
+                    .collect();
                 let response = serde_json::json!({
                     "exercise": exercise_id,
-                    "action": action
+                    "action": action,
+                    "new_achievements": new_achievements,
                 });
                 println!("{}", response);
             } else {
                 let action = if complete { "completed" } else { "skipped" };
                 println!("Exercise {} {}!", exercise_id, action);
+
+                // Show any newly unlocked achievements
+                for achievement in engine.state().achievements.iter().skip(before_count) {
+                    println!("\n{}", TutorialEngine::format_achievement_unlock(achievement));
+                }
 
                 // Show next exercise or completion
                 if let Some(next) = engine.current_exercise() {

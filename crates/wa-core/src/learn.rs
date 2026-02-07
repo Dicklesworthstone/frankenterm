@@ -21,7 +21,7 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{debug, info, instrument, warn};
@@ -47,6 +47,164 @@ pub type TrackId = String;
 
 /// Exercise identifier (e.g., "basics.1", "events.2")
 pub type ExerciseId = String;
+
+/// Achievement rarity tier
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum Rarity {
+    Common,
+    Uncommon,
+    Rare,
+    Epic,
+}
+
+impl Rarity {
+    /// Display label for this rarity
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Common => "Common",
+            Self::Uncommon => "Uncommon",
+            Self::Rare => "Rare",
+            Self::Epic => "Epic",
+        }
+    }
+}
+
+impl std::fmt::Display for Rarity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// Static definition of an achievable milestone
+#[derive(Debug, Clone)]
+pub struct AchievementDefinition {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub description: &'static str,
+    pub icon: char,
+    pub rarity: Rarity,
+    /// Secret achievements are hidden until unlocked
+    pub secret: bool,
+}
+
+/// All built-in achievement definitions
+pub const BUILTIN_ACHIEVEMENTS: &[AchievementDefinition] = &[
+    // --- Exercise milestones (Common) ---
+    AchievementDefinition {
+        id: "first_step",
+        name: "First Step",
+        description: "Completed your very first exercise",
+        icon: '\u{1F463}', // footprints
+        rarity: Rarity::Common,
+        secret: false,
+    },
+    AchievementDefinition {
+        id: "first_watch",
+        name: "First Watch",
+        description: "Started the wa watcher for the first time",
+        icon: '\u{1F440}', // eyes
+        rarity: Rarity::Common,
+        secret: false,
+    },
+    AchievementDefinition {
+        id: "first_event",
+        name: "Event Spotter",
+        description: "Viewed your first detected event",
+        icon: '\u{1F50D}', // magnifying glass
+        rarity: Rarity::Common,
+        secret: false,
+    },
+    AchievementDefinition {
+        id: "searcher",
+        name: "Data Detective",
+        description: "Searched captured pane output with FTS5",
+        icon: '\u{1F50E}', // magnifying glass right
+        rarity: Rarity::Common,
+        secret: false,
+    },
+    AchievementDefinition {
+        id: "workflow_runner",
+        name: "Workflow Runner",
+        description: "Explored available workflow definitions",
+        icon: '\u{2699}', // gear
+        rarity: Rarity::Common,
+        secret: false,
+    },
+    // --- Track completions (Uncommon) ---
+    AchievementDefinition {
+        id: "track_basics_complete",
+        name: "Basics Master",
+        description: "Completed all Basics exercises",
+        icon: '\u{2B50}', // star
+        rarity: Rarity::Uncommon,
+        secret: false,
+    },
+    AchievementDefinition {
+        id: "track_events_complete",
+        name: "Pattern Detective",
+        description: "Completed all Events exercises",
+        icon: '\u{1F3AF}', // dart
+        rarity: Rarity::Uncommon,
+        secret: false,
+    },
+    AchievementDefinition {
+        id: "track_workflows_complete",
+        name: "Workflow Wizard",
+        description: "Completed all Workflows exercises",
+        icon: '\u{1FA84}', // magic wand
+        rarity: Rarity::Uncommon,
+        secret: false,
+    },
+    // --- Cross-track milestones (Uncommon/Rare) ---
+    AchievementDefinition {
+        id: "explorer",
+        name: "Explorer",
+        description: "Completed at least one exercise in every track",
+        icon: '\u{1F9ED}', // compass
+        rarity: Rarity::Uncommon,
+        secret: false,
+    },
+    AchievementDefinition {
+        id: "completionist",
+        name: "Completionist",
+        description: "Completed every single exercise across all tracks",
+        icon: '\u{1F3C6}', // trophy
+        rarity: Rarity::Rare,
+        secret: false,
+    },
+    // --- Ultimate (Epic) ---
+    AchievementDefinition {
+        id: "wa_master",
+        name: "wa Master",
+        description: "Completed all tracks and mastered wa",
+        icon: '\u{1F451}', // crown
+        rarity: Rarity::Epic,
+        secret: false,
+    },
+    // --- Secret achievements ---
+    AchievementDefinition {
+        id: "speed_runner",
+        name: "Speed Runner",
+        description: "Completed the Basics track in under 3 minutes",
+        icon: '\u{26A1}', // lightning
+        rarity: Rarity::Rare,
+        secret: true,
+    },
+    AchievementDefinition {
+        id: "night_owl",
+        name: "Night Owl",
+        description: "Completed an exercise after midnight",
+        icon: '\u{1F989}', // owl
+        rarity: Rarity::Rare,
+        secret: true,
+    },
+];
+
+/// Look up an achievement definition by ID
+pub fn achievement_definition(id: &str) -> Option<&'static AchievementDefinition> {
+    BUILTIN_ACHIEVEMENTS.iter().find(|d| d.id == id)
+}
 
 /// Achievement unlocked during tutorial
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -387,14 +545,19 @@ impl TutorialEngine {
         // Collect achievements to add (avoiding borrow issues)
         let mut to_add: Vec<(String, String, String)> = Vec::new();
 
+        let has = |id: &str| self.state.achievements.iter().any(|a| a.id == id);
+
+        // First step — any exercise completed
+        if !self.state.completed_exercises.is_empty() && !has("first_step") {
+            to_add.push((
+                "first_step".into(),
+                "First Step".into(),
+                "Completed your very first exercise".into(),
+            ));
+        }
+
         // First watch achievement
-        if self.state.completed_exercises.contains("basics.2")
-            && !self
-                .state
-                .achievements
-                .iter()
-                .any(|a| a.id == "first_watch")
-        {
+        if self.state.completed_exercises.contains("basics.2") && !has("first_watch") {
             to_add.push((
                 "first_watch".into(),
                 "First Watch".into(),
@@ -403,17 +566,29 @@ impl TutorialEngine {
         }
 
         // First event achievement
-        if self.state.completed_exercises.contains("events.1")
-            && !self
-                .state
-                .achievements
-                .iter()
-                .any(|a| a.id == "first_event")
-        {
+        if self.state.completed_exercises.contains("events.1") && !has("first_event") {
             to_add.push((
                 "first_event".into(),
                 "Event Spotter".into(),
                 "Viewed your first detected event".into(),
+            ));
+        }
+
+        // Searcher — FTS5 search exercise
+        if self.state.completed_exercises.contains("events.2") && !has("searcher") {
+            to_add.push((
+                "searcher".into(),
+                "Data Detective".into(),
+                "Searched captured pane output with FTS5".into(),
+            ));
+        }
+
+        // Workflow runner — listed workflows
+        if self.state.completed_exercises.contains("workflows.1") && !has("workflow_runner") {
+            to_add.push((
+                "workflow_runner".into(),
+                "Workflow Runner".into(),
+                "Explored available workflow definitions".into(),
             ));
         }
 
@@ -425,17 +600,89 @@ impl TutorialEngine {
                 .all(|e| self.state.completed_exercises.contains(&e.id));
             let achievement_id = format!("track_{}_complete", track.id);
 
-            if all_complete
-                && !self
-                    .state
-                    .achievements
+            if all_complete && !has(&achievement_id) {
+                let def = achievement_definition(&achievement_id);
+                let name = def.map_or_else(
+                    || format!("{} Master", track.name),
+                    |d| d.name.to_string(),
+                );
+                let desc = def.map_or_else(
+                    || format!("Completed all {} exercises", track.name),
+                    |d| d.description.to_string(),
+                );
+                to_add.push((achievement_id, name, desc));
+            }
+        }
+
+        // Explorer — at least one exercise completed in every track
+        if !has("explorer") {
+            let touched_all = self.tracks.iter().all(|track| {
+                track
+                    .exercises
                     .iter()
-                    .any(|a| a.id == achievement_id)
-            {
+                    .any(|e| self.state.completed_exercises.contains(&e.id))
+            });
+            if touched_all {
                 to_add.push((
-                    achievement_id,
-                    format!("{} Master", track.name),
-                    format!("Completed all {} exercises", track.name),
+                    "explorer".into(),
+                    "Explorer".into(),
+                    "Completed at least one exercise in every track".into(),
+                ));
+            }
+        }
+
+        // Completionist — every exercise in every track
+        if !has("completionist") {
+            let all_done = self.tracks.iter().all(|track| {
+                track
+                    .exercises
+                    .iter()
+                    .all(|e| self.state.completed_exercises.contains(&e.id))
+            });
+            if all_done {
+                to_add.push((
+                    "completionist".into(),
+                    "Completionist".into(),
+                    "Completed every single exercise across all tracks".into(),
+                ));
+            }
+        }
+
+        // wa Master — all tracks completed (same condition as completionist but Epic tier)
+        if !has("wa_master") {
+            let all_tracks = self
+                .tracks
+                .iter()
+                .all(|t| t.exercises.iter().all(|e| self.state.completed_exercises.contains(&e.id)));
+            if all_tracks {
+                to_add.push((
+                    "wa_master".into(),
+                    "wa Master".into(),
+                    "Completed all tracks and mastered wa".into(),
+                ));
+            }
+        }
+
+        // Speed runner — basics complete and total time <= 3 minutes (secret)
+        if !has("speed_runner") && self.is_track_complete_internal("basics") {
+            if self.state.total_time_minutes <= 3 {
+                to_add.push((
+                    "speed_runner".into(),
+                    "Speed Runner".into(),
+                    "Completed the Basics track in under 3 minutes".into(),
+                ));
+            }
+        }
+
+        // Night owl — exercise completed after midnight local time (secret)
+        // We check the current last_active time hour
+        if !has("night_owl") {
+            let hour = self.state.last_active.time().hour();
+            if hour < 5 {
+                to_add.push((
+                    "night_owl".into(),
+                    "Night Owl".into(),
+                    "Completed an exercise after midnight".into(),
                 ));
             }
         }
@@ -448,6 +695,20 @@ impl TutorialEngine {
                 description,
             });
         }
+    }
+
+    /// Internal helper — checks track completion without borrowing &self.tracks
+    fn is_track_complete_internal(&self, track_id: &str) -> bool {
+        self.tracks
+            .iter()
+            .find(|t| t.id == track_id)
+            .map(|track| {
+                track
+                    .exercises
+                    .iter()
+                    .all(|e| self.state.completed_exercises.contains(&e.id))
+            })
+            .unwrap_or(false)
     }
 
     /// Save current state to progress file
@@ -519,6 +780,120 @@ impl TutorialEngine {
         let completed = self.state.completed_exercises.len();
         (completed, total)
     }
+
+    /// Get the full achievement collection: all definitions with unlock status
+    pub fn achievement_collection(&self) -> Vec<AchievementEntry> {
+        BUILTIN_ACHIEVEMENTS
+            .iter()
+            .map(|def| {
+                let unlocked = self
+                    .state
+                    .achievements
+                    .iter()
+                    .find(|a| a.id == def.id);
+                AchievementEntry {
+                    id: def.id.to_string(),
+                    name: def.name.to_string(),
+                    description: def.description.to_string(),
+                    icon: def.icon,
+                    rarity: def.rarity,
+                    secret: def.secret,
+                    unlocked_at: unlocked.map(|a| a.unlocked_at),
+                }
+            })
+            .collect()
+    }
+
+    /// Format a single achievement unlock notification for terminal display
+    pub fn format_achievement_unlock(achievement: &Achievement) -> String {
+        let def = achievement_definition(&achievement.id);
+        let icon = def.map_or('\u{1F3C6}', |d| d.icon);
+        let rarity = def.map_or(Rarity::Common, |d| d.rarity);
+
+        let inner_width = 42;
+        let top = format!("\u{256D}{}\u{256E}", "\u{2500}".repeat(inner_width));
+        let bot = format!("\u{2570}{}\u{256F}", "\u{2500}".repeat(inner_width));
+        let blank = format!("\u{2502}{}\u{2502}", " ".repeat(inner_width));
+
+        let header = format!(
+            "\u{2502} \u{1F3C6} Achievement Unlocked!{}\u{2502}",
+            " ".repeat(inner_width - 24)
+        );
+        let name_line = format!(" {} {}", icon, achievement.name);
+        let name_padded = format!(
+            "\u{2502}{}{}\u{2502}",
+            name_line,
+            " ".repeat(inner_width - name_line.len())
+        );
+        let desc_line = format!(" \"{}\"", achievement.description);
+        // Truncate long descriptions
+        let desc_truncated = if desc_line.len() > inner_width - 1 {
+            format!("{}...", &desc_line[..inner_width - 4])
+        } else {
+            desc_line.clone()
+        };
+        let desc_padded = format!(
+            "\u{2502}{}{}\u{2502}",
+            desc_truncated,
+            " ".repeat(inner_width - desc_truncated.len())
+        );
+        let rarity_line = format!(" [{}]", rarity);
+        let rarity_padded = format!(
+            "\u{2502}{}{}\u{2502}",
+            rarity_line,
+            " ".repeat(inner_width - rarity_line.len())
+        );
+
+        format!(
+            "{top}\n{header}\n{blank}\n{name_padded}\n{desc_padded}\n{blank}\n{rarity_padded}\n{bot}"
+        )
+    }
+
+    /// Format the full achievement collection for terminal display
+    pub fn format_achievement_list(&self) -> String {
+        let collection = self.achievement_collection();
+        let unlocked_count = collection.iter().filter(|a| a.unlocked_at.is_some()).count();
+        let total = collection.len();
+
+        let mut lines = Vec::new();
+        lines.push(format!("Achievements [{}/{}]\n", unlocked_count, total));
+
+        for entry in &collection {
+            if entry.secret && entry.unlocked_at.is_none() {
+                lines.push(format!("  \u{2753} ??? — [{}] (secret)", entry.rarity));
+            } else if entry.unlocked_at.is_some() {
+                lines.push(format!(
+                    "  {} {} — {} [{}]",
+                    entry.icon, entry.name, entry.description, entry.rarity
+                ));
+            } else {
+                lines.push(format!(
+                    "  \u{25CB} {} — {} [{}]",
+                    entry.name, entry.description, entry.rarity
+                ));
+            }
+        }
+
+        lines.join("\n")
+    }
+}
+
+/// Achievement entry combining definition with unlock status (for CLI/JSON output)
+#[derive(Debug, Clone, Serialize)]
+pub struct AchievementEntry {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    #[serde(serialize_with = "serialize_char")]
+    pub icon: char,
+    pub rarity: Rarity,
+    pub secret: bool,
+    pub unlocked_at: Option<DateTime<Utc>>,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde requires &T signature
+fn serialize_char<S: serde::Serializer>(c: &char, s: S) -> std::result::Result<S::Ok, S::Error> {
+    s.serialize_str(&c.to_string())
 }
 
 /// Summary for CLI status output
@@ -1121,5 +1496,391 @@ mod tests {
             engine.state().current_exercise.as_deref(),
             Some("basics.2")
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Achievement system tests (wa-ogc.9)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_builtin_achievements_count() {
+        // Spec requires 10+ achievements
+        assert!(BUILTIN_ACHIEVEMENTS.len() >= 10);
+    }
+
+    #[test]
+    fn test_builtin_achievements_unique_ids() {
+        let ids: HashSet<&str> = BUILTIN_ACHIEVEMENTS.iter().map(|d| d.id).collect();
+        assert_eq!(ids.len(), BUILTIN_ACHIEVEMENTS.len());
+    }
+
+    #[test]
+    fn test_achievement_definition_lookup() {
+        let def = achievement_definition("first_watch").unwrap();
+        assert_eq!(def.name, "First Watch");
+        assert_eq!(def.rarity, Rarity::Common);
+        assert!(!def.secret);
+
+        assert!(achievement_definition("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_secret_achievements_exist() {
+        let secrets: Vec<_> = BUILTIN_ACHIEVEMENTS.iter().filter(|d| d.secret).collect();
+        assert!(
+            secrets.len() >= 2,
+            "Expected at least 2 secret achievements"
+        );
+        assert!(secrets.iter().any(|d| d.id == "speed_runner"));
+        assert!(secrets.iter().any(|d| d.id == "night_owl"));
+    }
+
+    #[test]
+    fn test_rarity_tiers_present() {
+        let rarities: HashSet<Rarity> = BUILTIN_ACHIEVEMENTS.iter().map(|d| d.rarity).collect();
+        assert!(rarities.contains(&Rarity::Common));
+        assert!(rarities.contains(&Rarity::Uncommon));
+        assert!(rarities.contains(&Rarity::Rare));
+        assert!(rarities.contains(&Rarity::Epic));
+    }
+
+    #[test]
+    fn test_rarity_display() {
+        assert_eq!(Rarity::Common.label(), "Common");
+        assert_eq!(Rarity::Uncommon.label(), "Uncommon");
+        assert_eq!(Rarity::Rare.label(), "Rare");
+        assert_eq!(Rarity::Epic.label(), "Epic");
+        assert_eq!(format!("{}", Rarity::Epic), "Epic");
+    }
+
+    #[test]
+    fn test_first_step_achievement() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("learn.json");
+        let mut engine = TutorialEngine::load_or_create_at(path).unwrap();
+
+        // Any exercise completion should trigger first_step
+        engine
+            .handle_event(TutorialEvent::CompleteExercise("workflows.1".into()))
+            .unwrap();
+
+        assert!(
+            engine
+                .state()
+                .achievements
+                .iter()
+                .any(|a| a.id == "first_step")
+        );
+    }
+
+    #[test]
+    fn test_searcher_achievement() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("learn.json");
+        let mut engine = TutorialEngine::load_or_create_at(path).unwrap();
+
+        engine
+            .handle_event(TutorialEvent::CompleteExercise("events.2".into()))
+            .unwrap();
+
+        assert!(
+            engine
+                .state()
+                .achievements
+                .iter()
+                .any(|a| a.id == "searcher")
+        );
+    }
+
+    #[test]
+    fn test_workflow_runner_achievement() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("learn.json");
+        let mut engine = TutorialEngine::load_or_create_at(path).unwrap();
+
+        engine
+            .handle_event(TutorialEvent::CompleteExercise("workflows.1".into()))
+            .unwrap();
+
+        assert!(
+            engine
+                .state()
+                .achievements
+                .iter()
+                .any(|a| a.id == "workflow_runner")
+        );
+    }
+
+    #[test]
+    fn test_explorer_achievement() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("learn.json");
+        let mut engine = TutorialEngine::load_or_create_at(path).unwrap();
+
+        // Complete one exercise from each track
+        engine
+            .handle_event(TutorialEvent::CompleteExercise("basics.1".into()))
+            .unwrap();
+        assert!(!engine.state().achievements.iter().any(|a| a.id == "explorer"));
+
+        engine
+            .handle_event(TutorialEvent::CompleteExercise("events.1".into()))
+            .unwrap();
+        assert!(!engine.state().achievements.iter().any(|a| a.id == "explorer"));
+
+        engine
+            .handle_event(TutorialEvent::CompleteExercise("workflows.1".into()))
+            .unwrap();
+        assert!(
+            engine
+                .state()
+                .achievements
+                .iter()
+                .any(|a| a.id == "explorer"),
+            "Explorer should unlock after touching all tracks"
+        );
+    }
+
+    #[test]
+    fn test_completionist_and_wa_master_achievements() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("learn.json");
+        let mut engine = TutorialEngine::load_or_create_at(path).unwrap();
+
+        // Complete everything
+        let all_exercises = [
+            "basics.1",
+            "basics.2",
+            "basics.3",
+            "events.1",
+            "events.2",
+            "workflows.1",
+            "workflows.2",
+        ];
+        for ex in &all_exercises {
+            engine
+                .handle_event(TutorialEvent::CompleteExercise((*ex).into()))
+                .unwrap();
+        }
+
+        assert!(
+            engine
+                .state()
+                .achievements
+                .iter()
+                .any(|a| a.id == "completionist")
+        );
+        assert!(
+            engine
+                .state()
+                .achievements
+                .iter()
+                .any(|a| a.id == "wa_master")
+        );
+    }
+
+    #[test]
+    fn test_speed_runner_achievement_with_low_time() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("learn.json");
+        let mut engine = TutorialEngine::load_or_create_at(path).unwrap();
+
+        // total_time_minutes starts at 0 (default), which is <= 3
+        // Complete all basics exercises
+        engine
+            .handle_event(TutorialEvent::CompleteExercise("basics.1".into()))
+            .unwrap();
+        engine
+            .handle_event(TutorialEvent::CompleteExercise("basics.2".into()))
+            .unwrap();
+        engine
+            .handle_event(TutorialEvent::CompleteExercise("basics.3".into()))
+            .unwrap();
+
+        assert!(
+            engine
+                .state()
+                .achievements
+                .iter()
+                .any(|a| a.id == "speed_runner"),
+            "Speed runner should unlock when basics complete with low time"
+        );
+    }
+
+    #[test]
+    fn test_achievement_collection_all_definitions() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("learn.json");
+        let engine = TutorialEngine::load_or_create_at(path).unwrap();
+
+        let collection = engine.achievement_collection();
+        assert_eq!(collection.len(), BUILTIN_ACHIEVEMENTS.len());
+
+        // All should be locked initially
+        for entry in &collection {
+            assert!(entry.unlocked_at.is_none());
+        }
+    }
+
+    #[test]
+    fn test_achievement_collection_shows_unlocked() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("learn.json");
+        let mut engine = TutorialEngine::load_or_create_at(path).unwrap();
+
+        engine
+            .handle_event(TutorialEvent::CompleteExercise("basics.2".into()))
+            .unwrap();
+
+        let collection = engine.achievement_collection();
+        let unlocked: Vec<_> = collection.iter().filter(|e| e.unlocked_at.is_some()).collect();
+        assert!(unlocked.len() >= 2); // first_step + first_watch at minimum
+        assert!(unlocked.iter().any(|e| e.id == "first_step"));
+        assert!(unlocked.iter().any(|e| e.id == "first_watch"));
+    }
+
+    #[test]
+    fn test_achievement_collection_secret_flag() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("learn.json");
+        let engine = TutorialEngine::load_or_create_at(path).unwrap();
+
+        let collection = engine.achievement_collection();
+        let secrets: Vec<_> = collection.iter().filter(|e| e.secret).collect();
+        assert!(secrets.len() >= 2);
+        // Locked secrets should be in collection but marked secret
+        for s in &secrets {
+            assert!(s.unlocked_at.is_none());
+            assert!(s.secret);
+        }
+    }
+
+    #[test]
+    fn test_achievement_collection_json_serializable() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("learn.json");
+        let mut engine = TutorialEngine::load_or_create_at(path).unwrap();
+
+        engine
+            .handle_event(TutorialEvent::CompleteExercise("events.1".into()))
+            .unwrap();
+
+        let collection = engine.achievement_collection();
+        let json = serde_json::to_string_pretty(&collection).unwrap();
+        assert!(json.contains("first_step"));
+        assert!(json.contains("first_event"));
+        assert!(json.contains("rarity"));
+        assert!(json.contains("icon"));
+    }
+
+    #[test]
+    fn test_format_achievement_unlock() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("learn.json");
+        let mut engine = TutorialEngine::load_or_create_at(path).unwrap();
+
+        engine
+            .handle_event(TutorialEvent::CompleteExercise("basics.2".into()))
+            .unwrap();
+
+        let achievement = engine
+            .state()
+            .achievements
+            .iter()
+            .find(|a| a.id == "first_watch")
+            .unwrap();
+
+        let display = TutorialEngine::format_achievement_unlock(achievement);
+        assert!(display.contains("Achievement Unlocked!"));
+        assert!(display.contains("First Watch"));
+    }
+
+    #[test]
+    fn test_format_achievement_list_locked() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("learn.json");
+        let engine = TutorialEngine::load_or_create_at(path).unwrap();
+
+        let list = engine.format_achievement_list();
+        assert!(list.contains("Achievements [0/"));
+        // Secret achievements should show as ???
+        assert!(list.contains("???"));
+        // Non-secret locked should show name
+        assert!(list.contains("First Watch"));
+    }
+
+    #[test]
+    fn test_format_achievement_list_mixed() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("learn.json");
+        let mut engine = TutorialEngine::load_or_create_at(path).unwrap();
+
+        engine
+            .handle_event(TutorialEvent::CompleteExercise("basics.2".into()))
+            .unwrap();
+
+        let list = engine.format_achievement_list();
+        // Should show some unlocked
+        assert!(!list.starts_with("Achievements [0/"));
+        // Should still contain secret ???
+        assert!(list.contains("???"));
+    }
+
+    #[test]
+    fn test_achievement_definitions_have_icons() {
+        for def in BUILTIN_ACHIEVEMENTS {
+            assert!(
+                def.icon != '\0',
+                "Achievement {} should have a non-null icon",
+                def.id
+            );
+        }
+    }
+
+    #[test]
+    fn test_multiple_achievements_single_completion() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("learn.json");
+        let mut engine = TutorialEngine::load_or_create_at(path).unwrap();
+
+        // Completing basics.2 should unlock both first_step and first_watch
+        engine
+            .handle_event(TutorialEvent::CompleteExercise("basics.2".into()))
+            .unwrap();
+
+        let ids: Vec<&str> = engine.state().achievements.iter().map(|a| a.id.as_str()).collect();
+        assert!(ids.contains(&"first_step"));
+        assert!(ids.contains(&"first_watch"));
+    }
+
+    #[test]
+    fn test_achievement_persists_across_sessions() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("learn.json");
+
+        // Session 1: earn an achievement
+        {
+            let mut engine = TutorialEngine::load_or_create_at(path.clone()).unwrap();
+            engine
+                .handle_event(TutorialEvent::CompleteExercise("events.1".into()))
+                .unwrap();
+            engine.save().unwrap();
+        }
+
+        // Session 2: check it's still there
+        {
+            let engine = TutorialEngine::load_or_create_at(path).unwrap();
+            let collection = engine.achievement_collection();
+            let first_event = collection.iter().find(|e| e.id == "first_event").unwrap();
+            assert!(first_event.unlocked_at.is_some());
+        }
+    }
+
+    #[test]
+    fn test_rarity_serde_roundtrip() {
+        let json = serde_json::to_string(&Rarity::Uncommon).unwrap();
+        assert_eq!(json, r#""uncommon""#);
+        let back: Rarity = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, Rarity::Uncommon);
     }
 }
