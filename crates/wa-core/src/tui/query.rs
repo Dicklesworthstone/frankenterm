@@ -151,6 +151,39 @@ pub struct WorkflowProgressView {
     pub updated_at: i64,
 }
 
+/// Action history entry for TUI display
+#[derive(Debug, Clone)]
+pub struct HistoryEntryView {
+    /// Audit action record ID
+    pub audit_id: i64,
+    /// Timestamp (epoch ms)
+    pub timestamp: i64,
+    /// Pane associated with the action, when available
+    pub pane_id: Option<u64>,
+    /// Workflow associated with the action, when available
+    pub workflow_id: Option<String>,
+    /// Action kind (send_text, workflow_step, etc.)
+    pub action_kind: String,
+    /// Result status (success, denied, failed, ...)
+    pub result: String,
+    /// Actor kind (human/robot/mcp/workflow)
+    pub actor_kind: String,
+    /// Optional workflow step name
+    pub step_name: Option<String>,
+    /// Whether action can still be undone
+    pub undoable: bool,
+    /// Whether undo has already been executed
+    pub undone: bool,
+    /// Undo strategy label (manual/workflow_abort/...)
+    pub undo_strategy: Option<String>,
+    /// Redacted undo hint, if present
+    pub undo_hint: Option<String>,
+    /// Optional policy rule id associated with this action
+    pub rule_id: Option<String>,
+    /// Best-effort summary for list/detail panels
+    pub summary: String,
+}
+
 /// Event filters for querying
 #[derive(Debug, Default, Clone)]
 pub struct EventFilters {
@@ -201,6 +234,14 @@ pub trait QueryClient: Send + Sync {
 
     /// List active (incomplete) workflows with progress info
     fn list_active_workflows(&self) -> Result<Vec<WorkflowProgressView>, QueryError>;
+
+    /// List recent action history (audit + undo metadata) for TUI display.
+    ///
+    /// Implementations may return an empty vector when history storage
+    /// is unavailable.
+    fn list_action_history(&self, _limit: usize) -> Result<Vec<HistoryEntryView>, QueryError> {
+        Ok(Vec::new())
+    }
 }
 
 /// Production implementation of QueryClient
@@ -695,6 +736,53 @@ impl QueryClient for ProductionQueryClient {
                     error: wf.error,
                     started_at: wf.started_at,
                     updated_at: wf.updated_at,
+                }
+            })
+            .collect())
+    }
+
+    fn list_action_history(&self, limit: usize) -> Result<Vec<HistoryEntryView>, QueryError> {
+        let Some(storage) = &self.storage else {
+            return Ok(Vec::new());
+        };
+
+        let query = crate::storage::ActionHistoryQuery {
+            limit: Some(limit),
+            ..Default::default()
+        };
+
+        let records = self.runtime.block_on(async {
+            storage
+                .get_action_history(query)
+                .await
+                .map_err(|e| QueryError::StorageError(e.to_string()))
+        })?;
+
+        Ok(records
+            .into_iter()
+            .map(|row| {
+                let summary = row
+                    .input_summary
+                    .clone()
+                    .or(row.verification_summary.clone())
+                    .or(row.decision_reason.clone())
+                    .unwrap_or_default();
+
+                HistoryEntryView {
+                    audit_id: row.id,
+                    timestamp: row.ts,
+                    pane_id: row.pane_id,
+                    workflow_id: row.workflow_id,
+                    action_kind: row.action_kind,
+                    result: row.result,
+                    actor_kind: row.actor_kind,
+                    step_name: row.step_name,
+                    undoable: row.undoable.unwrap_or(false) && row.undone_at.is_none(),
+                    undone: row.undone_at.is_some(),
+                    undo_strategy: row.undo_strategy,
+                    undo_hint: row.undo_hint,
+                    rule_id: row.rule_id,
+                    summary,
                 }
             })
             .collect())

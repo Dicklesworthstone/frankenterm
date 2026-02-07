@@ -24,9 +24,9 @@ use ratatui::{
 
 use super::query::{EventFilters, QueryClient, QueryError};
 use super::views::{
-    View, ViewState, filtered_event_indices, filtered_pane_indices, render_events_view,
-    render_help_view, render_home_view, render_panes_view, render_search_view, render_tabs,
-    render_triage_view,
+    View, ViewState, filtered_event_indices, filtered_history_indices, filtered_pane_indices,
+    render_events_view, render_help_view, render_history_view, render_home_view, render_panes_view,
+    render_search_view, render_tabs, render_triage_view,
 };
 
 /// Application configuration
@@ -212,10 +212,14 @@ impl<Q: QueryClient> App<Q> {
                 return;
             }
             KeyCode::Char('5') => {
-                self.current_view = View::Search;
+                self.current_view = View::History;
                 return;
             }
             KeyCode::Char('6') => {
+                self.current_view = View::Search;
+                return;
+            }
+            KeyCode::Char('7') => {
                 self.current_view = View::Help;
                 return;
             }
@@ -226,6 +230,7 @@ impl<Q: QueryClient> App<Q> {
         match self.current_view {
             View::Panes => self.handle_panes_key(key),
             View::Events => self.handle_events_key(key),
+            View::History => self.handle_history_key(key),
             View::Triage => self.handle_triage_key(key),
             View::Search => self.handle_search_key(key),
             View::Home | View::Help => {}
@@ -416,6 +421,46 @@ impl<Q: QueryClient> App<Q> {
         }
     }
 
+    /// Handle key events in the history view
+    fn handle_history_key(&mut self, key: KeyEvent) {
+        let filtered_len = filtered_history_indices(&self.view_state).len();
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => {
+                if filtered_len > 0 {
+                    self.view_state.history_selected_index =
+                        (self.view_state.history_selected_index + 1) % filtered_len;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if filtered_len > 0 {
+                    self.view_state.history_selected_index = self
+                        .view_state
+                        .history_selected_index
+                        .checked_sub(1)
+                        .unwrap_or(filtered_len - 1);
+                }
+            }
+            KeyCode::Char('u') => {
+                self.view_state.history_undoable_only = !self.view_state.history_undoable_only;
+                self.view_state.history_selected_index = 0;
+            }
+            KeyCode::Backspace => {
+                self.view_state.history_filter_query.pop();
+                self.view_state.history_selected_index = 0;
+            }
+            KeyCode::Esc => {
+                self.view_state.history_filter_query.clear();
+                self.view_state.history_undoable_only = false;
+                self.view_state.history_selected_index = 0;
+            }
+            KeyCode::Char(c) if !c.is_control() => {
+                self.view_state.history_filter_query.push(c);
+                self.view_state.history_selected_index = 0;
+            }
+            _ => {}
+        }
+    }
+
     /// Execute FTS search using query client
     fn execute_search(&mut self) {
         let query = self.view_state.search_query.trim().to_string();
@@ -485,6 +530,24 @@ impl<Q: QueryClient> App<Q> {
             }
         }
 
+        // Refresh action history
+        match self.query_client.list_action_history(200) {
+            Ok(entries) => {
+                self.view_state.history_entries = entries;
+                let filtered_count = filtered_history_indices(&self.view_state).len();
+                if self.view_state.history_selected_index >= filtered_count {
+                    self.view_state.history_selected_index = 0;
+                }
+            }
+            Err(QueryError::DatabaseNotInitialized(_)) => {
+                // Expected when watcher/storage has not been initialized yet
+            }
+            Err(e) => {
+                self.view_state
+                    .set_error(format!("Failed to list action history: {e}"));
+            }
+        }
+
         // Refresh active workflows
         match self.query_client.list_active_workflows() {
             Ok(workflows) => {
@@ -537,6 +600,7 @@ impl<Q: QueryClient> App<Q> {
             View::Home => render_home_view(&self.view_state, chunks[1], buf),
             View::Panes => render_panes_view(&self.view_state, chunks[1], buf),
             View::Events => render_events_view(&self.view_state, chunks[1], buf),
+            View::History => render_history_view(&self.view_state, chunks[1], buf),
             View::Triage => render_triage_view(&self.view_state, chunks[1], buf),
             View::Search => render_search_view(&self.view_state, chunks[1], buf),
             View::Help => render_help_view(chunks[1], buf),
@@ -639,7 +703,7 @@ pub fn run_tui<Q: QueryClient>(query_client: Q, config: AppConfig) -> TuiResult<
 mod tests {
     use super::*;
     use crate::tui::query::{
-        EventView, HealthStatus, PaneView, SearchResultView, WorkflowProgressView,
+        EventView, HealthStatus, HistoryEntryView, PaneView, SearchResultView, WorkflowProgressView,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -1075,6 +1139,32 @@ mod tests {
         assert_eq!(app.view_state.search_query, "tes");
     }
 
+    #[test]
+    fn history_navigation_filter_and_toggle() {
+        let mut app = App::new(FixtureQueryClient, AppConfig::default());
+        app.refresh_data();
+        app.current_view = View::History;
+        assert!(app.view_state.history_entries.len() >= 2);
+
+        app.handle_history_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.view_state.history_selected_index, 1);
+
+        app.handle_history_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
+        assert!(app.view_state.history_undoable_only);
+        assert_eq!(app.view_state.history_selected_index, 0);
+
+        app.handle_history_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        app.handle_history_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        assert_eq!(app.view_state.history_filter_query, "wf");
+
+        app.handle_history_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(app.view_state.history_filter_query, "w");
+
+        app.handle_history_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.view_state.history_filter_query.is_empty());
+        assert!(!app.view_state.history_undoable_only);
+    }
+
     // -----------------------------------------------------------------------
     // Triage expand/collapse tests (wa-nu4.3.7.5)
     // -----------------------------------------------------------------------
@@ -1148,6 +1238,8 @@ mod tests {
         app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.current_view, View::Triage);
         app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.current_view, View::History);
+        app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.current_view, View::Search);
         app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.current_view, View::Help);
@@ -1186,9 +1278,12 @@ mod tests {
         assert_eq!(app.current_view, View::Triage);
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE));
-        assert_eq!(app.current_view, View::Search);
+        assert_eq!(app.current_view, View::History);
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('6'), KeyModifiers::NONE));
+        assert_eq!(app.current_view, View::Search);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('7'), KeyModifiers::NONE));
         assert_eq!(app.current_view, View::Help);
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
@@ -1495,6 +1590,43 @@ mod tests {
         }]
     }
 
+    fn fixture_history() -> Vec<HistoryEntryView> {
+        vec![
+            HistoryEntryView {
+                audit_id: 101,
+                timestamp: 1_700_000_001_500,
+                pane_id: Some(1),
+                workflow_id: Some("wf-auth-1".to_string()),
+                action_kind: "workflow_step".to_string(),
+                result: "success".to_string(),
+                actor_kind: "workflow".to_string(),
+                step_name: Some("request_auth".to_string()),
+                undoable: true,
+                undone: false,
+                undo_strategy: Some("workflow_abort".to_string()),
+                undo_hint: Some("Abort wf-auth-1 to rollback".to_string()),
+                rule_id: Some("auth_prompt".to_string()),
+                summary: "Prompted user to authenticate".to_string(),
+            },
+            HistoryEntryView {
+                audit_id: 102,
+                timestamp: 1_700_000_001_800,
+                pane_id: Some(3),
+                workflow_id: None,
+                action_kind: "send_text".to_string(),
+                result: "denied".to_string(),
+                actor_kind: "robot".to_string(),
+                step_name: None,
+                undoable: false,
+                undone: false,
+                undo_strategy: None,
+                undo_hint: None,
+                rule_id: Some("policy.command_gate".to_string()),
+                summary: "Blocked unsafe command".to_string(),
+            },
+        ]
+    }
+
     impl QueryClient for FixtureQueryClient {
         fn list_panes(&self) -> Result<Vec<PaneView>, QueryError> {
             Ok(fixture_panes())
@@ -1552,6 +1684,10 @@ mod tests {
 
         fn list_active_workflows(&self) -> Result<Vec<WorkflowProgressView>, QueryError> {
             Ok(fixture_workflows())
+        }
+
+        fn list_action_history(&self, _limit: usize) -> Result<Vec<HistoryEntryView>, QueryError> {
+            Ok(fixture_history())
         }
     }
 
@@ -1666,17 +1802,28 @@ mod tests {
             &app,
         );
 
-        // Step 11: Navigate to Search view
+        // Step 11: Navigate to History view
         app.handle_key_event(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE));
+        record(&mut transcript, &mut step, "History view", &app);
+        let lines = render_snapshot(&app, 100, 30);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("workflow_step") || l.contains("#   101")),
+            "History view should show fixture history entries"
+        );
+
+        // Step 12: Navigate to Search view
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('6'), KeyModifiers::NONE));
         record(&mut transcript, &mut step, "Search view", &app);
 
-        // Step 12-15: Type search query
+        // Step 13-16: Type search query
         for ch in "test".chars() {
             app.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
         }
         record(&mut transcript, &mut step, "Search: typed 'test'", &app);
 
-        // Step 16: Execute search
+        // Step 17: Execute search
         app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         record(&mut transcript, &mut step, "Search: execute", &app);
         let lines = render_snapshot(&app, 100, 30);
@@ -1685,11 +1832,11 @@ mod tests {
             "Search results should contain query match"
         );
 
-        // Step 17: Clear search
+        // Step 18: Clear search
         app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         record(&mut transcript, &mut step, "Search: clear", &app);
 
-        // Step 18: Navigate to Help view
+        // Step 19: Navigate to Help view
         app.handle_key_event(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
         record(&mut transcript, &mut step, "Help view", &app);
         let lines = render_snapshot(&app, 100, 30);
@@ -1700,12 +1847,12 @@ mod tests {
             "Help view should show help content"
         );
 
-        // Step 19: Go back to Home
+        // Step 20: Go back to Home
         app.handle_key_event(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
         record(&mut transcript, &mut step, "Back to Home", &app);
 
-        // Step 20: Tab through views
-        for i in 0..6 {
+        // Step 21: Tab through views
+        for i in 0..7 {
             app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
             record(
                 &mut transcript,
@@ -1715,7 +1862,7 @@ mod tests {
             );
         }
 
-        // Step 21: Refresh
+        // Step 22: Refresh
         app.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
         record(&mut transcript, &mut step, "Refresh", &app);
 
@@ -1750,6 +1897,7 @@ mod tests {
             View::Panes,
             View::Events,
             View::Triage,
+            View::History,
             View::Search,
             View::Help,
         ];
@@ -1792,13 +1940,16 @@ mod tests {
             KeyCode::Char('e'), // Expand workflows
             KeyCode::Char('e'), // Collapse
             KeyCode::Char('a'), // Queue action
-            KeyCode::Char('5'), // Search
+            KeyCode::Char('5'), // History
+            KeyCode::Char('w'), // History filter
+            KeyCode::Esc,       // Clear history filter
+            KeyCode::Char('6'), // Search
             KeyCode::Char('h'), // Type search
             KeyCode::Char('i'),
             KeyCode::Enter,     // Execute
             KeyCode::Char('j'), // Nav down in results
             KeyCode::Esc,       // Clear
-            KeyCode::Char('6'), // Help
+            KeyCode::Char('7'), // Help
             KeyCode::Char('1'), // Home
             KeyCode::Tab,       // Tab through
             KeyCode::Tab,

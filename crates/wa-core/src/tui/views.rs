@@ -12,7 +12,8 @@ use ratatui::{
 };
 
 use super::query::{
-    EventView, HealthStatus, PaneView, SearchResultView, TriageItemView, WorkflowProgressView,
+    EventView, HealthStatus, HistoryEntryView, PaneView, SearchResultView, TriageItemView,
+    WorkflowProgressView,
 };
 use crate::circuit_breaker::CircuitStateKind;
 
@@ -28,6 +29,8 @@ pub enum View {
     Events,
     /// Triage view (prioritized issues + quick actions)
     Triage,
+    /// Action history view (audit + undo metadata)
+    History,
     /// Search interface
     Search,
     /// Help screen
@@ -43,6 +46,7 @@ impl View {
             Self::Panes => "Panes",
             Self::Events => "Events",
             Self::Triage => "Triage",
+            Self::History => "History",
             Self::Search => "Search",
             Self::Help => "Help",
         }
@@ -56,6 +60,7 @@ impl View {
             Self::Panes,
             Self::Events,
             Self::Triage,
+            Self::History,
             Self::Search,
             Self::Help,
         ]
@@ -69,8 +74,9 @@ impl View {
             Self::Panes => 1,
             Self::Events => 2,
             Self::Triage => 3,
-            Self::Search => 4,
-            Self::Help => 5,
+            Self::History => 4,
+            Self::Search => 5,
+            Self::Help => 6,
         }
     }
 
@@ -81,7 +87,8 @@ impl View {
             Self::Home => Self::Panes,
             Self::Panes => Self::Events,
             Self::Events => Self::Triage,
-            Self::Triage => Self::Search,
+            Self::Triage => Self::History,
+            Self::History => Self::Search,
             Self::Search => Self::Help,
             Self::Help => Self::Home,
         }
@@ -95,7 +102,8 @@ impl View {
             Self::Panes => Self::Home,
             Self::Events => Self::Panes,
             Self::Triage => Self::Events,
-            Self::Search => Self::Triage,
+            Self::History => Self::Triage,
+            Self::Search => Self::History,
             Self::Help => Self::Search,
         }
     }
@@ -108,6 +116,8 @@ pub struct ViewState {
     pub panes: Vec<PaneView>,
     /// Events list for display
     pub events: Vec<EventView>,
+    /// Action history entries for display
+    pub history_entries: Vec<HistoryEntryView>,
     /// Triage items for display
     pub triage_items: Vec<TriageItemView>,
     /// Current health status
@@ -134,6 +144,12 @@ pub struct ViewState {
     pub events_pane_filter: String,
     /// Events: selected index (separate from panes)
     pub events_selected_index: usize,
+    /// History: selected index
+    pub history_selected_index: usize,
+    /// History: free-text filter (pane/workflow/action/audit id)
+    pub history_filter_query: String,
+    /// History: show only currently undoable actions
+    pub history_undoable_only: bool,
     /// Search: last executed query (for display)
     pub search_last_query: String,
     /// Search: results from last query
@@ -226,6 +242,42 @@ pub fn filtered_event_indices(state: &ViewState) -> Vec<usize> {
                 }
             }
             true
+        })
+        .map(|(idx, _)| idx)
+        .collect()
+}
+
+/// Return action-history indices that match active history filters.
+#[must_use]
+pub fn filtered_history_indices(state: &ViewState) -> Vec<usize> {
+    let query = state.history_filter_query.trim().to_ascii_lowercase();
+    state
+        .history_entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| {
+            if state.history_undoable_only && !entry.undoable {
+                return false;
+            }
+
+            if query.is_empty() {
+                return true;
+            }
+
+            let pane = entry
+                .pane_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let workflow = entry.workflow_id.as_deref().unwrap_or("-");
+            let step = entry.step_name.as_deref().unwrap_or("-");
+            let rule = entry.rule_id.as_deref().unwrap_or("-");
+            let audit = entry.audit_id.to_string();
+            let haystack = format!(
+                "{pane} {workflow} {} {} {} {step} {rule} {audit}",
+                entry.action_kind, entry.result, entry.actor_kind
+            )
+            .to_ascii_lowercase();
+            haystack.contains(&query)
         })
         .map(|(idx, _)| idx)
         .collect()
@@ -775,6 +827,238 @@ fn severity_color(severity: &str) -> Style {
     }
 }
 
+fn history_group_key(entry: &HistoryEntryView) -> String {
+    if let Some(workflow_id) = &entry.workflow_id {
+        format!("workflow:{workflow_id}")
+    } else if let Some(pane_id) = entry.pane_id {
+        format!("pane:{pane_id}")
+    } else {
+        "global".to_string()
+    }
+}
+
+fn history_group_title(group_key: &str) -> String {
+    if let Some(workflow_id) = group_key.strip_prefix("workflow:") {
+        format!("Workflow {workflow_id}")
+    } else if let Some(pane_id) = group_key.strip_prefix("pane:") {
+        format!("Pane {pane_id}")
+    } else {
+        "Global".to_string()
+    }
+}
+
+fn history_result_style(result: &str) -> Style {
+    match result {
+        "success" | "completed" => Style::default().fg(Color::Green),
+        "denied" | "failed" => Style::default().fg(Color::Red),
+        "timeout" => Style::default().fg(Color::Yellow),
+        _ => Style::default().fg(Color::Gray),
+    }
+}
+
+/// Render the action-history view.
+pub fn render_history_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .split(area);
+
+    let filtered_indices = filtered_history_indices(state);
+    let selected_filtered = state
+        .history_selected_index
+        .min(filtered_indices.len().saturating_sub(1));
+    let selected_entry = filtered_indices
+        .get(selected_filtered)
+        .and_then(|idx| state.history_entries.get(*idx));
+
+    // --- Left: grouped history list ---
+    let list_block = Block::default()
+        .title(format!(
+            "History ({}/{})",
+            filtered_indices.len(),
+            state.history_entries.len()
+        ))
+        .borders(Borders::ALL);
+    let list_inner = list_block.inner(chunks[0]);
+    list_block.render(chunks[0], buf);
+
+    let list_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(1)])
+        .split(list_inner);
+
+    let filter_summary = format!(
+        "undoable_only={}  q='{}'",
+        state.history_undoable_only, state.history_filter_query,
+    );
+    Paragraph::new(vec![
+        Line::from("audit     action             result    undo  actor"),
+        Line::from(Span::styled(
+            filter_summary,
+            Style::default().fg(Color::Gray),
+        )),
+    ])
+    .render(list_chunks[0], buf);
+
+    if filtered_indices.is_empty() {
+        let msg = if state.history_entries.is_empty() {
+            "No action history yet. Run workflows or wa send to populate audit records."
+        } else {
+            "No history entries match the current filters."
+        };
+        Paragraph::new(Span::styled(msg, Style::default().fg(Color::Yellow)))
+            .render(list_chunks[1], buf);
+    } else {
+        let mut lines: Vec<Line> = Vec::new();
+        let mut current_group: Option<String> = None;
+
+        for (pos, entry_idx) in filtered_indices.iter().enumerate() {
+            let entry = &state.history_entries[*entry_idx];
+            let group_key = history_group_key(entry);
+            if current_group.as_deref() != Some(group_key.as_str()) {
+                current_group = Some(group_key.clone());
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    format!("-- {} --", history_group_title(&group_key)),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )));
+            }
+
+            let undo_tag = if entry.undoable {
+                "UNDO"
+            } else if entry.undone {
+                "done"
+            } else {
+                "-"
+            };
+            let result_style = history_result_style(&entry.result);
+            let action = truncate_str(&entry.action_kind, 18);
+            let actor = truncate_str(&entry.actor_kind, 8);
+            let line_text = format!(
+                "#{:>6} {:18} {:8} {:>5} {}",
+                entry.audit_id, action, entry.result, undo_tag, actor
+            );
+
+            if pos == selected_filtered {
+                lines.push(Line::styled(
+                    line_text,
+                    Style::default()
+                        .bg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            } else if entry.undoable {
+                lines.push(Line::styled(
+                    line_text,
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::raw(format!(
+                        "#{:>6} {:18} ",
+                        entry.audit_id,
+                        truncate_str(&entry.action_kind, 18)
+                    )),
+                    Span::styled(format!("{:8}", entry.result), result_style),
+                    Span::raw(format!(" {:>5} {}", undo_tag, actor)),
+                ]));
+            }
+        }
+
+        Paragraph::new(lines).render(list_chunks[1], buf);
+    }
+
+    // --- Right: selected history detail ---
+    let detail_block = Block::default()
+        .title("History Details")
+        .borders(Borders::ALL);
+    let detail_inner = detail_block.inner(chunks[1]);
+    detail_block.render(chunks[1], buf);
+
+    if let Some(entry) = selected_entry {
+        let undo_status = if entry.undoable {
+            "undoable"
+        } else if entry.undone {
+            "undone"
+        } else {
+            "not-undoable"
+        };
+        let group = history_group_title(&history_group_key(entry));
+
+        let mut details = vec![
+            Line::from(vec![
+                Span::raw("Audit ID: "),
+                Span::styled(
+                    format!("#{}", entry.audit_id),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(format!("Group: {}", group)),
+            Line::from(format!("Action: {}", entry.action_kind)),
+            Line::from(format!("Result: {}", entry.result)),
+            Line::from(format!("Actor: {}", entry.actor_kind)),
+            Line::from(format!("Undo: {}", undo_status)),
+            Line::from(format!("Timestamp: {}", entry.timestamp)),
+        ];
+
+        if let Some(pane_id) = entry.pane_id {
+            details.push(Line::from(format!("Pane: {}", pane_id)));
+        }
+        if let Some(workflow_id) = &entry.workflow_id {
+            details.push(Line::from(format!("Workflow: {}", workflow_id)));
+        }
+        if let Some(step_name) = &entry.step_name {
+            details.push(Line::from(format!("Step: {}", step_name)));
+        }
+        if let Some(strategy) = &entry.undo_strategy {
+            details.push(Line::from(format!("Undo Strategy: {}", strategy)));
+        }
+        if let Some(hint) = &entry.undo_hint {
+            details.push(Line::from(format!("Undo Hint: {}", truncate_str(hint, 80))));
+        }
+        if !entry.summary.is_empty() {
+            details.push(Line::from(format!(
+                "Summary: {}",
+                truncate_str(&entry.summary, 80)
+            )));
+        }
+
+        details.push(Line::from(""));
+        details.push(Line::from(Span::styled(
+            "Quick Jumps:",
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        if let Some(workflow_id) = &entry.workflow_id {
+            details.push(Line::from(format!("  wa history --workflow {workflow_id}")));
+            details.push(Line::from(format!("  wa workflow status {workflow_id}")));
+        }
+        if let Some(pane_id) = entry.pane_id {
+            details.push(Line::from(format!(
+                "  wa history --pane {pane_id} --limit 50"
+            )));
+            details.push(Line::from(format!(
+                "  wa events --pane-id {pane_id} --limit 20"
+            )));
+            if let Some(rule_id) = &entry.rule_id {
+                details.push(Line::from(format!(
+                    "  wa events --pane-id {pane_id} --rule-id {rule_id}"
+                )));
+            }
+        }
+
+        Paragraph::new(details).render(detail_inner, buf);
+    } else {
+        Paragraph::new(Span::styled(
+            "No history entry selected.",
+            Style::default().fg(Color::Yellow),
+        ))
+        .render(detail_inner, buf);
+    }
+}
+
 /// Render the search view
 pub fn render_search_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
     let chunks = Layout::default()
@@ -1128,7 +1412,7 @@ pub fn render_help_view(area: Rect, buf: &mut Buffer) {
         Line::from("  r          Refresh current view"),
         Line::from("  Tab        Next view"),
         Line::from("  Shift+Tab  Previous view"),
-        Line::from("  1-5        Jump to view by number"),
+        Line::from("  1-7        Jump to view by number"),
         Line::from(""),
         Line::from(Span::styled(
             "List Navigation:",
@@ -1142,6 +1426,7 @@ pub fn render_help_view(area: Rect, buf: &mut Buffer) {
         Line::from("  [Panes] type text to filter, Backspace to edit, Esc to clear"),
         Line::from("  [Panes] u=unhandled-only, a=agent filter, d=domain filter"),
         Line::from("  [Events] type digits to filter by pane/rule, u=unhandled-only"),
+        Line::from("  [History] type text to filter, u=undoable-only"),
         Line::from("  [Triage] e=expand/collapse workflow progress"),
         Line::from(""),
         Line::from(Span::styled(
@@ -1152,8 +1437,9 @@ pub fn render_help_view(area: Rect, buf: &mut Buffer) {
         Line::from("  2. Panes   List all WezTerm panes"),
         Line::from("  3. Events  Recent detection events"),
         Line::from("  4. Triage  Prioritized issues + actions"),
-        Line::from("  5. Search  Full-text search"),
-        Line::from("  6. Help    This screen"),
+        Line::from("  5. History Audit action timeline"),
+        Line::from("  6. Search  Full-text search"),
+        Line::from("  7. Help    This screen"),
     ];
 
     let help =
@@ -1449,6 +1735,83 @@ mod tests {
             .events_selected_index
             .min(filtered.len().saturating_sub(1));
         assert_eq!(clamped, 1); // Clamped to last index
+    }
+
+    // -----------------------------------------------------------------------
+    // History view tests (wa-5em.3)
+    // -----------------------------------------------------------------------
+
+    fn history_entry(
+        id: i64,
+        pane_id: Option<u64>,
+        workflow_id: Option<&str>,
+        action_kind: &str,
+        undoable: bool,
+        undone: bool,
+    ) -> HistoryEntryView {
+        HistoryEntryView {
+            audit_id: id,
+            timestamp: 1_700_000_000_000 + id,
+            pane_id,
+            workflow_id: workflow_id.map(str::to_string),
+            action_kind: action_kind.to_string(),
+            result: "success".to_string(),
+            actor_kind: "workflow".to_string(),
+            step_name: Some("step".to_string()),
+            undoable,
+            undone,
+            undo_strategy: Some("manual".to_string()),
+            undo_hint: Some("run manual rollback".to_string()),
+            rule_id: Some("codex.usage".to_string()),
+            summary: "redacted summary".to_string(),
+        }
+    }
+
+    #[test]
+    fn filtered_history_indices_without_filters_returns_all() {
+        let mut state = ViewState::default();
+        state.history_entries = vec![
+            history_entry(1, Some(10), None, "send_text", true, false),
+            history_entry(2, Some(10), Some("wf-1"), "workflow_step", false, false),
+            history_entry(3, Some(20), None, "workflow_completed", false, true),
+        ];
+        let filtered = filtered_history_indices(&state);
+        assert_eq!(filtered, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn filtered_history_indices_applies_query_and_undoable_filter() {
+        let mut state = ViewState::default();
+        state.history_entries = vec![
+            history_entry(1, Some(10), None, "send_text", true, false),
+            history_entry(2, Some(10), Some("wf-1"), "workflow_step", false, false),
+            history_entry(3, Some(20), None, "workflow_completed", false, true),
+        ];
+
+        state.history_filter_query = "wf-1".to_string();
+        let filtered = filtered_history_indices(&state);
+        assert_eq!(filtered, vec![1]);
+
+        state.history_filter_query.clear();
+        state.history_undoable_only = true;
+        let filtered = filtered_history_indices(&state);
+        assert_eq!(filtered, vec![0]);
+    }
+
+    #[test]
+    fn render_history_view_handles_empty_and_populated_state() {
+        let mut state = ViewState::default();
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        render_history_view(&state, area, &mut buf);
+
+        state.history_entries = vec![
+            history_entry(1, Some(10), Some("wf-1"), "workflow_step", true, false),
+            history_entry(2, Some(10), Some("wf-1"), "workflow_completed", false, true),
+            history_entry(3, Some(20), None, "send_text", false, false),
+        ];
+        state.history_selected_index = 1;
+        render_history_view(&state, area, &mut buf);
     }
 
     // -----------------------------------------------------------------------
@@ -1774,15 +2137,19 @@ mod tests {
         let state = ViewState::default();
         assert!(state.panes.is_empty());
         assert!(state.events.is_empty());
+        assert!(state.history_entries.is_empty());
         assert!(state.triage_items.is_empty());
         assert!(state.workflows.is_empty());
         assert!(state.health.is_none());
         assert!(state.search_query.is_empty());
+        assert!(state.history_filter_query.is_empty());
         assert!(state.error_message.is_none());
         assert_eq!(state.selected_index, 0);
         assert_eq!(state.triage_selected_index, 0);
+        assert_eq!(state.history_selected_index, 0);
         assert!(!state.panes_unhandled_only);
         assert!(!state.events_unhandled_only);
+        assert!(!state.history_undoable_only);
         assert!(state.triage_expanded.is_none());
     }
 
@@ -1799,8 +2166,8 @@ mod tests {
     }
 
     #[test]
-    fn view_all_returns_six_views() {
-        assert_eq!(View::all().len(), 6);
+    fn view_all_returns_seven_views() {
+        assert_eq!(View::all().len(), 7);
     }
 
     #[test]
@@ -2060,6 +2427,7 @@ mod tests {
         render_home_view(&state, area, &mut buf);
         render_panes_view(&state, area, &mut buf);
         render_events_view(&state, area, &mut buf);
+        render_history_view(&state, area, &mut buf);
         render_triage_view(&state, area, &mut buf);
         render_search_view(&state, area, &mut buf);
         render_help_view(area, &mut buf);
