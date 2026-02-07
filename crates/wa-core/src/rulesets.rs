@@ -214,7 +214,7 @@ pub fn touch_last_applied(
         .find(|entry| entry.name == profile_name)
     {
         entry.last_applied_at = Some(applied_at);
-        entry.updated_at = entry.updated_at.or(Some(applied_at));
+        entry.updated_at = Some(applied_at);
         return;
     }
 
@@ -449,4 +449,30 @@ fn system_time_to_epoch_ms(ts: SystemTime) -> Option<u64> {
     ts.duration_since(UNIX_EPOCH)
         .ok()
         .map(|d| u64::try_from(d.as_millis()).unwrap_or(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn touch_last_applied_updates_existing_ruleset_timestamps() {
+        let mut manifest = RulesetManifest {
+            version: RULESET_MANIFEST_VERSION,
+            rulesets: vec![RulesetManifestEntry {
+                name: "ops".to_string(),
+                path: "ops.toml".to_string(),
+                description: Some("Ops profile".to_string()),
+                created_at: Some(100),
+                updated_at: Some(200),
+                last_applied_at: Some(200),
+            }],
+        };
+
+        touch_last_applied(&mut manifest, "ops", "ops.toml", 700);
+
+        assert_eq!(manifest.rulesets[0].last_applied_at, Some(700));
+        assert_eq!(manifest.rulesets[0].updated_at, Some(700));
+        assert_eq!(manifest.rulesets[0].created_at, Some(100));
+    }
 }

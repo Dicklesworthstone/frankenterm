@@ -386,8 +386,9 @@ impl ActivityTracker {
         let offset = Instant::now()
             .saturating_duration_since(self.epoch)
             .as_nanos() as u64;
+        let encoded = offset.max(1);
         // Monotonic: never go backwards.
-        self.last_offset_nanos.fetch_max(offset, Ordering::SeqCst);
+        self.last_offset_nanos.fetch_max(encoded, Ordering::SeqCst);
     }
 
     /// Returns the instant of the last recorded activity, or `None` if
@@ -398,7 +399,7 @@ impl ActivityTracker {
         if offset == 0 {
             None
         } else {
-            Some(self.epoch + Duration::from_nanos(offset))
+            Some(self.epoch + Duration::from_nanos(offset - 1))
         }
     }
 
@@ -1082,6 +1083,14 @@ mod tests {
         let t = ActivityTracker::new();
         assert!(t.is_idle());
         assert!(t.last_activity().is_none());
+    }
+
+    #[test]
+    fn tracker_last_activity_decodes_encoded_offset() {
+        let t = ActivityTracker::new();
+        t.last_offset_nanos.store(1, Ordering::SeqCst); // encoded zero offset
+        assert_eq!(t.last_activity(), Some(t.epoch));
+        assert!(!t.is_idle());
     }
 
     #[test]

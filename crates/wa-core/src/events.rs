@@ -286,7 +286,7 @@ fn normalized_extracted(extracted: &serde_json::Value, redactor: &Redactor) -> O
 
         rendered = redactor.redact(&rendered);
         if rendered.len() > IDENTITY_MAX_VALUE_LEN {
-            rendered.truncate(IDENTITY_MAX_VALUE_LEN);
+            truncate_to_char_boundary(&mut rendered, IDENTITY_MAX_VALUE_LEN);
         }
 
         parts.push(format!("{key}={rendered}"));
@@ -298,6 +298,19 @@ fn normalized_extracted(extracted: &serde_json::Value, redactor: &Redactor) -> O
 
     parts.sort();
     Some(parts.join(","))
+}
+
+fn truncate_to_char_boundary(value: &mut String, max_len: usize) {
+    if value.len() <= max_len {
+        return;
+    }
+    let boundary = value
+        .char_indices()
+        .map(|(idx, _)| idx)
+        .take_while(|idx| *idx <= max_len)
+        .last()
+        .unwrap_or(0);
+    value.truncate(boundary);
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -2034,6 +2047,32 @@ mod tests {
             matched_text: "test".to_string(),
             span: (0, 4),
         }
+    }
+
+    #[test]
+    fn truncate_to_char_boundary_avoids_utf8_split_panics() {
+        let mut value = format!("{}é", "a".repeat(119));
+        assert_eq!(value.len(), 121);
+
+        truncate_to_char_boundary(&mut value, IDENTITY_MAX_VALUE_LEN);
+        assert_eq!(value.len(), 119);
+        assert!(!value.ends_with('é'));
+    }
+
+    #[test]
+    fn event_identity_key_handles_multibyte_extracted_values() {
+        let mut detection = make_detection(
+            "core.codex:usage_reached",
+            crate::patterns::Severity::Warning,
+            crate::patterns::AgentType::Codex,
+        );
+        detection.extracted = serde_json::json!({
+            "long_text": format!("{}é", "a".repeat(119))
+        });
+
+        let key = event_identity_key(&detection, 7, None);
+        assert!(key.starts_with("evt:"));
+        assert_eq!(key.len(), 68); // "evt:" + 64 hex chars
     }
 
     #[test]

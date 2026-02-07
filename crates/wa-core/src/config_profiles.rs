@@ -165,7 +165,7 @@ pub fn touch_last_applied(
         .find(|entry| entry.name == profile_name)
     {
         entry.last_applied_at = Some(applied_at);
-        entry.updated_at = entry.updated_at.or(Some(applied_at));
+        entry.updated_at = Some(applied_at);
         return;
     }
 
@@ -299,4 +299,34 @@ fn system_time_to_ms(time: SystemTime) -> Option<u64> {
     time.duration_since(UNIX_EPOCH)
         .ok()
         .map(|d| d.as_millis() as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn touch_last_applied_updates_existing_entry_timestamps() {
+        let mut manifest = ConfigProfileManifest {
+            version: CONFIG_PROFILE_MANIFEST_VERSION,
+            profiles: vec![ConfigProfileManifestEntry {
+                name: "dev".to_string(),
+                path: "dev.toml".to_string(),
+                description: Some("Dev profile".to_string()),
+                created_at: Some(100),
+                updated_at: Some(200),
+                last_applied_at: Some(200),
+            }],
+            last_applied_profile: None,
+            last_applied_at: None,
+        };
+
+        touch_last_applied(&mut manifest, "dev", "dev.toml", 500);
+
+        assert_eq!(manifest.last_applied_profile.as_deref(), Some("dev"));
+        assert_eq!(manifest.last_applied_at, Some(500));
+        assert_eq!(manifest.profiles[0].last_applied_at, Some(500));
+        assert_eq!(manifest.profiles[0].updated_at, Some(500));
+        assert_eq!(manifest.profiles[0].created_at, Some(100));
+    }
 }
