@@ -1218,6 +1218,48 @@ SEE ALSO:
         #[arg(long, short = 'f', default_value = "auto")]
         format: String,
     },
+
+    /// Simulation mode: run wa with a mock WezTerm driven by YAML scenarios
+    #[command(after_help = r#"EXAMPLES:
+    wa simulate run scenario.yaml        Run a scenario file
+    wa simulate run scenario.yaml -s 4   Run at 4x speed
+    wa simulate list                     List built-in scenarios
+    wa simulate validate scenario.yaml   Check scenario syntax
+
+SEE ALSO:
+    wa demo       Interactive demo mode
+    wa record     Session recording"#)]
+    Simulate {
+        #[command(subcommand)]
+        command: SimulateCommands,
+    },
+
+    /// Interactive demo mode for presentations
+    #[command(after_help = r#"EXAMPLES:
+    wa demo                        List available demos
+    wa demo quickstart             Run quickstart demo
+    wa demo quickstart --speed 2   Run at 2x speed
+    wa demo quickstart --narrate   Show explanatory text
+
+SEE ALSO:
+    wa simulate   Run simulation scenarios
+    wa learn      Interactive tutorial"#)]
+    Demo {
+        /// Demo name to run (omit to list available demos)
+        name: Option<String>,
+
+        /// Playback speed multiplier
+        #[arg(long, default_value = "1")]
+        speed: f64,
+
+        /// Show explanatory narration text
+        #[arg(long)]
+        narrate: bool,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1234,6 +1276,34 @@ enum AnalyticsCommands {
         /// Output file path (defaults to stdout)
         #[arg(long, short = 'o')]
         output: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum SimulateCommands {
+    /// Run a simulation scenario from a YAML file
+    Run {
+        /// Path to scenario YAML file
+        scenario: PathBuf,
+
+        /// Playback speed multiplier (e.g., 0.5, 1, 2, 4)
+        #[arg(long, short = 's', default_value = "1")]
+        speed: f64,
+
+        /// Output as JSON (events and state changes)
+        #[arg(long)]
+        json: bool,
+    },
+    /// List available built-in scenarios
+    List,
+    /// Validate a scenario YAML file without running it
+    Validate {
+        /// Path to scenario YAML file
+        scenario: PathBuf,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -17490,6 +17560,264 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     };
 
                     print!("{}", AnalyticsSummaryRenderer::render(&summary, &ctx));
+                }
+            }
+        }
+
+        Some(Commands::Simulate { command }) => match command {
+            SimulateCommands::Run {
+                scenario,
+                speed,
+                json,
+            } => {
+                use wa_core::simulation::Scenario;
+                use wa_core::wezterm::{MockWezterm, WeztermInterface};
+
+                let scenario = Scenario::load(&scenario)?;
+                let mock = MockWezterm::new();
+                scenario.setup(&mock).await?;
+
+                if json {
+                    // Output scenario metadata
+                    let meta = serde_json::json!({
+                        "name": scenario.name,
+                        "description": scenario.description,
+                        "duration_ms": scenario.duration.as_millis() as u64,
+                        "pane_count": scenario.panes.len(),
+                        "event_count": scenario.events.len(),
+                        "expectation_count": scenario.expectations.len(),
+                    });
+                    println!("{}", serde_json::to_string_pretty(&meta)?);
+                } else {
+                    println!("Simulation: {}", scenario.name);
+                    if !scenario.description.is_empty() {
+                        println!("  {}", scenario.description);
+                    }
+                    println!(
+                        "  Panes: {}  Events: {}  Duration: {:.1}s  Speed: {speed}x",
+                        scenario.panes.len(),
+                        scenario.events.len(),
+                        scenario.duration.as_secs_f64(),
+                    );
+                    println!();
+                }
+
+                // Execute events with timing
+                let speed_factor = if speed > 0.0 { speed } else { 1.0 };
+                let start = std::time::Instant::now();
+
+                for (i, event) in scenario.events.iter().enumerate() {
+                    // Wait until the scaled time for this event
+                    let target_elapsed = std::time::Duration::from_secs_f64(
+                        event.at.as_secs_f64() / speed_factor,
+                    );
+                    let actual_elapsed = start.elapsed();
+                    if let Some(wait) = target_elapsed.checked_sub(actual_elapsed) {
+                        tokio::time::sleep(wait).await;
+                    }
+
+                    let mock_event = Scenario::to_mock_event(event)?;
+                    mock.inject(event.pane, mock_event).await?;
+
+                    if json {
+                        let ev = serde_json::json!({
+                            "index": i,
+                            "at_ms": event.at.as_millis() as u64,
+                            "pane": event.pane,
+                            "action": format!("{:?}", event.action),
+                        });
+                        println!("{}", serde_json::to_string(&ev)?);
+                    } else {
+                        let action_str = match &event.action {
+                            wa_core::simulation::EventAction::Append => "append",
+                            wa_core::simulation::EventAction::Clear => "clear",
+                            wa_core::simulation::EventAction::SetTitle => "set_title",
+                            wa_core::simulation::EventAction::Resize => "resize",
+                            wa_core::simulation::EventAction::Marker => "marker",
+                        };
+                        println!(
+                            "  [{:>6.1}s] pane {} \u{2192} {}",
+                            event.at.as_secs_f64(),
+                            event.pane,
+                            action_str,
+                        );
+                    }
+                }
+
+                // Check expectations
+                let mut pass_count = 0;
+                let mut fail_count = 0;
+                for exp in &scenario.expectations {
+                    match &exp.kind {
+                        wa_core::simulation::ExpectationKind::Contains { pane, text } => {
+                            let content = mock.get_text(*pane, false).await.unwrap_or_default();
+                            if content.contains(text) {
+                                pass_count += 1;
+                                if !json {
+                                    println!("  \u{2713} pane {} contains \"{}\"", pane, text);
+                                }
+                            } else {
+                                fail_count += 1;
+                                if !json {
+                                    eprintln!("  \u{2717} pane {} missing \"{}\"", pane, text);
+                                }
+                            }
+                        }
+                        _ => {
+                            // Event/Workflow expectations need pattern engine integration
+                            if !json {
+                                println!("  - expectation skipped (needs pattern engine)");
+                            }
+                        }
+                    }
+                }
+
+                if json {
+                    let result = serde_json::json!({
+                        "completed": true,
+                        "events_executed": scenario.events.len(),
+                        "expectations_passed": pass_count,
+                        "expectations_failed": fail_count,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                } else if pass_count + fail_count > 0 {
+                    println!();
+                    println!(
+                        "Results: {} passed, {} failed",
+                        pass_count, fail_count
+                    );
+                } else {
+                    println!();
+                    println!("Simulation complete ({} events executed)", scenario.events.len());
+                }
+
+                if fail_count > 0 {
+                    std::process::exit(1);
+                }
+            }
+            SimulateCommands::List => {
+                println!("Built-in scenarios:");
+                println!();
+                println!("  (none yet — use 'wa simulate run <file.yaml>' with custom scenarios)");
+                println!();
+                println!("Scenario YAML format:");
+                println!("  name: my_scenario");
+                println!("  description: \"What this scenario tests\"");
+                println!("  duration: \"30s\"");
+                println!("  panes:");
+                println!("    - id: 0");
+                println!("      title: \"Agent\"");
+                println!("      initial_content: \"$ \"");
+                println!("  events:");
+                println!("    - at: \"2s\"");
+                println!("      pane: 0");
+                println!("      action: append");
+                println!("      content: \"output text\"");
+                println!("  expectations:");
+                println!("    - pane: 0");
+                println!("      text: \"output text\"");
+            }
+            SimulateCommands::Validate { scenario, json } => {
+                use wa_core::simulation::Scenario;
+
+                match Scenario::load(&scenario) {
+                    Ok(s) => {
+                        if json {
+                            let info = serde_json::json!({
+                                "valid": true,
+                                "name": s.name,
+                                "description": s.description,
+                                "duration_ms": s.duration.as_millis() as u64,
+                                "pane_count": s.panes.len(),
+                                "event_count": s.events.len(),
+                                "expectation_count": s.expectations.len(),
+                            });
+                            println!("{}", serde_json::to_string_pretty(&info)?);
+                        } else {
+                            println!("Valid scenario: {}", s.name);
+                            println!("  Description: {}", s.description);
+                            println!("  Duration:    {:.1}s", s.duration.as_secs_f64());
+                            println!("  Panes:       {}", s.panes.len());
+                            println!("  Events:      {}", s.events.len());
+                            println!("  Expectations: {}", s.expectations.len());
+                        }
+                    }
+                    Err(e) => {
+                        if json {
+                            let info = serde_json::json!({
+                                "valid": false,
+                                "error": e.to_string(),
+                            });
+                            println!("{}", serde_json::to_string_pretty(&info)?);
+                        } else {
+                            eprintln!("Invalid scenario: {e}");
+                        }
+                        std::process::exit(1);
+                    }
+                }
+            }
+        },
+
+        Some(Commands::Demo {
+            name,
+            speed,
+            narrate,
+            json,
+        }) => {
+            let demos: &[(&str, &str)] = &[
+                ("quickstart", "Basic wa setup and first detection"),
+                ("usage_limit", "Agent hits usage limit, wa auto-rotates"),
+                ("compaction", "Context compaction detection and handling"),
+            ];
+
+            match name {
+                None => {
+                    if json {
+                        let list: Vec<_> = demos
+                            .iter()
+                            .map(|(name, desc)| {
+                                serde_json::json!({"name": name, "description": desc})
+                            })
+                            .collect();
+                        println!("{}", serde_json::to_string_pretty(&list)?);
+                    } else {
+                        println!("Available demos:");
+                        println!();
+                        for (name, desc) in demos {
+                            println!("  {name:<20} {desc}");
+                        }
+                        println!();
+                        println!("Run a demo: wa demo <name>");
+                        println!("Note: Demo scenarios are not yet bundled. Use 'wa simulate run' with custom YAML.");
+                    }
+                }
+                Some(name) => {
+                    if demos.iter().any(|(n, _)| *n == name.as_str()) {
+                        if json {
+                            let msg = serde_json::json!({
+                                "demo": name,
+                                "status": "not_yet_bundled",
+                                "message": "Demo scenario files are not yet included. Use 'wa simulate run <file.yaml>' with a custom scenario."
+                            });
+                            println!("{}", serde_json::to_string_pretty(&msg)?);
+                        } else {
+                            println!("Demo: {name}");
+                            if narrate {
+                                println!("  (narration enabled)");
+                            }
+                            println!("  Speed: {speed}x");
+                            println!();
+                            println!("  Demo scenario files are not yet bundled.");
+                            println!("  Use 'wa simulate run <file.yaml>' with a custom scenario.");
+                        }
+                    } else {
+                        eprintln!("Unknown demo: {name}");
+                        eprintln!("Available demos:");
+                        for (n, _) in demos {
+                            eprintln!("  {n}");
+                        }
+                        std::process::exit(1);
+                    }
                 }
             }
         }
