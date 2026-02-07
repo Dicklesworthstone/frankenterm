@@ -19124,4 +19124,223 @@ mod timeline_correlation_tests {
         assert_eq!(fetched.pane_id, 99);
         assert_eq!(fetched.description.as_deref(), Some("survives restart"));
     }
+
+    #[test]
+    fn pane_bookmark_nonexistent_alias_returns_none() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let result = query_pane_bookmark_by_alias(&conn, "ghost").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn pane_bookmark_multiple_for_same_pane() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let now = now_ms();
+        for alias in ["build-1", "build-2", "build-3"] {
+            insert_pane_bookmark_sync(
+                &conn,
+                &PaneBookmarkRecord {
+                    id: 0,
+                    pane_id: 42,
+                    alias: alias.to_string(),
+                    tags: None,
+                    description: None,
+                    created_at: now,
+                    updated_at: now,
+                },
+            )
+            .unwrap();
+        }
+
+        let list = list_pane_bookmarks_sync(&conn).unwrap();
+        assert_eq!(list.len(), 3);
+        assert!(list.iter().all(|bm| bm.pane_id == 42));
+    }
+
+    #[test]
+    fn pane_bookmark_null_tags_vs_empty_tags() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let now = now_ms();
+        insert_pane_bookmark_sync(
+            &conn,
+            &PaneBookmarkRecord {
+                id: 0,
+                pane_id: 1,
+                alias: "notags".to_string(),
+                tags: None,
+                description: None,
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .unwrap();
+
+        insert_pane_bookmark_sync(
+            &conn,
+            &PaneBookmarkRecord {
+                id: 0,
+                pane_id: 2,
+                alias: "emptytags".to_string(),
+                tags: Some(vec![]),
+                description: None,
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .unwrap();
+
+        let no_tags = query_pane_bookmark_by_alias(&conn, "notags")
+            .unwrap()
+            .unwrap();
+        assert!(no_tags.tags.is_none());
+
+        let empty_tags = query_pane_bookmark_by_alias(&conn, "emptytags")
+            .unwrap()
+            .unwrap();
+        assert_eq!(empty_tags.tags, Some(vec![]));
+    }
+
+    #[test]
+    fn pane_bookmark_case_sensitive_aliases() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let now = now_ms();
+        for alias in ["build", "Build", "BUILD"] {
+            insert_pane_bookmark_sync(
+                &conn,
+                &PaneBookmarkRecord {
+                    id: 0,
+                    pane_id: 1,
+                    alias: alias.to_string(),
+                    tags: None,
+                    description: None,
+                    created_at: now,
+                    updated_at: now,
+                },
+            )
+            .unwrap();
+        }
+
+        let list = list_pane_bookmarks_sync(&conn).unwrap();
+        assert_eq!(list.len(), 3, "Case-different aliases should be distinct");
+    }
+
+    #[test]
+    fn pane_bookmark_nonexistent_pane_id_allowed() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let now = now_ms();
+        let result = insert_pane_bookmark_sync(
+            &conn,
+            &PaneBookmarkRecord {
+                id: 0,
+                pane_id: 999_999,
+                alias: "phantom".to_string(),
+                tags: None,
+                description: None,
+                created_at: now,
+                updated_at: now,
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "Should allow bookmark for non-existent pane"
+        );
+    }
+
+    #[test]
+    fn pane_bookmark_empty_description_vs_none() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let now = now_ms();
+        insert_pane_bookmark_sync(
+            &conn,
+            &PaneBookmarkRecord {
+                id: 0,
+                pane_id: 1,
+                alias: "nodesc".to_string(),
+                tags: None,
+                description: None,
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .unwrap();
+
+        insert_pane_bookmark_sync(
+            &conn,
+            &PaneBookmarkRecord {
+                id: 0,
+                pane_id: 2,
+                alias: "emptydesc".to_string(),
+                tags: None,
+                description: Some(String::new()),
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .unwrap();
+
+        let no_desc = query_pane_bookmark_by_alias(&conn, "nodesc")
+            .unwrap()
+            .unwrap();
+        assert!(no_desc.description.is_none());
+
+        let empty_desc = query_pane_bookmark_by_alias(&conn, "emptydesc")
+            .unwrap()
+            .unwrap();
+        assert_eq!(empty_desc.description, Some(String::new()));
+    }
+
+    #[test]
+    fn pane_bookmark_tag_with_special_chars() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let now = now_ms();
+        let tags = vec![
+            "normal".to_string(),
+            "has spaces".to_string(),
+            "quote\"in".to_string(),
+        ];
+        insert_pane_bookmark_sync(
+            &conn,
+            &PaneBookmarkRecord {
+                id: 0,
+                pane_id: 1,
+                alias: "specialtags".to_string(),
+                tags: Some(tags.clone()),
+                description: None,
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .unwrap();
+
+        let fetched = query_pane_bookmark_by_alias(&conn, "specialtags")
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched.tags.unwrap(), tags);
+    }
+
+    #[test]
+    fn pane_bookmark_list_empty_db() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let list = list_pane_bookmarks_sync(&conn).unwrap();
+        assert!(list.is_empty());
+
+        let by_tag = list_pane_bookmarks_by_tag_sync(&conn, "anything").unwrap();
+        assert!(by_tag.is_empty());
+    }
 }

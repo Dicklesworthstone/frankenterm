@@ -475,4 +475,186 @@ mod tests {
         assert_eq!(manifest.rulesets[0].updated_at, Some(700));
         assert_eq!(manifest.rulesets[0].created_at, Some(100));
     }
+
+    #[test]
+    fn touch_last_applied_creates_entry_when_missing() {
+        let mut manifest = RulesetManifest::default();
+
+        touch_last_applied(&mut manifest, "newruleset", "newruleset.toml", 1000);
+
+        assert_eq!(manifest.rulesets.len(), 1);
+        assert_eq!(manifest.rulesets[0].name, "newruleset");
+        assert_eq!(manifest.rulesets[0].path, "newruleset.toml");
+        assert_eq!(manifest.rulesets[0].created_at, Some(1000));
+    }
+
+    // =========================================================================
+    // Profile Name Validation (rulesets)
+    // =========================================================================
+
+    #[test]
+    fn valid_ruleset_profile_names() {
+        for name in ["ops", "dev-ci", "staging_1", "a", "abc-123_def"] {
+            assert!(
+                canonicalize_profile_name(name).is_ok(),
+                "'{name}' should be valid"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_ruleset_name_rejected() {
+        assert!(canonicalize_profile_name("").is_err());
+        assert!(canonicalize_profile_name("  ").is_err());
+    }
+
+    #[test]
+    fn too_long_ruleset_name_rejected() {
+        let long = "x".repeat(33);
+        assert!(canonicalize_profile_name(&long).is_err());
+        let exact = "x".repeat(32);
+        assert!(canonicalize_profile_name(&exact).is_ok());
+    }
+
+    #[test]
+    fn special_chars_in_ruleset_name_rejected() {
+        for name in ["has space", "dot.name", "slash/name", "excl!", "пример"] {
+            assert!(
+                canonicalize_profile_name(name).is_err(),
+                "'{name}' should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn ruleset_name_canonicalization() {
+        assert_eq!(canonicalize_profile_name("OPS").unwrap(), "ops");
+        assert_eq!(canonicalize_profile_name("  Dev  ").unwrap(), "dev");
+    }
+
+    // =========================================================================
+    // PatternsConfigPatch Tests
+    // =========================================================================
+
+    #[test]
+    fn patch_apply_replaces_packs() {
+        let base = PatternsConfig {
+            packs: vec!["agent-codex".to_string()],
+            ..Default::default()
+        };
+        let patch = PatternsConfigPatch {
+            packs: Some(vec!["agent-claude".to_string(), "agent-gemini".to_string()]),
+            ..Default::default()
+        };
+        let result = patch.apply_to(&base);
+        assert_eq!(result.packs, vec!["agent-claude", "agent-gemini"]);
+    }
+
+    #[test]
+    fn patch_apply_preserves_base_when_none() {
+        let base = PatternsConfig {
+            packs: vec!["agent-codex".to_string()],
+            quick_reject_enabled: true,
+            ..Default::default()
+        };
+        let patch = PatternsConfigPatch::default();
+        let result = patch.apply_to(&base);
+        assert_eq!(result.packs, vec!["agent-codex"]);
+        assert!(result.quick_reject_enabled);
+    }
+
+    #[test]
+    fn patch_apply_overrides_quick_reject() {
+        let base = PatternsConfig {
+            quick_reject_enabled: true,
+            ..Default::default()
+        };
+        let patch = PatternsConfigPatch {
+            quick_reject_enabled: Some(false),
+            ..Default::default()
+        };
+        let result = patch.apply_to(&base);
+        assert!(!result.quick_reject_enabled);
+    }
+
+    #[test]
+    fn patch_merges_pack_overrides() {
+        let mut base_overrides = HashMap::new();
+        base_overrides.insert(
+            "agent-codex".to_string(),
+            PackOverride {
+                disabled_rules: vec!["rule1".to_string()],
+                ..Default::default()
+            },
+        );
+        let base = PatternsConfig {
+            pack_overrides: base_overrides,
+            ..Default::default()
+        };
+
+        let mut overlay_overrides = HashMap::new();
+        overlay_overrides.insert(
+            "agent-codex".to_string(),
+            PackOverride {
+                disabled_rules: vec!["rule2".to_string()],
+                ..Default::default()
+            },
+        );
+        let patch = PatternsConfigPatch {
+            pack_overrides: Some(overlay_overrides),
+            ..Default::default()
+        };
+
+        let result = patch.apply_to(&base);
+        let codex_override = result.pack_overrides.get("agent-codex").unwrap();
+        assert!(codex_override.disabled_rules.contains(&"rule1".to_string()));
+        assert!(codex_override.disabled_rules.contains(&"rule2".to_string()));
+    }
+
+    // =========================================================================
+    // Profile Name Boundary Tests
+    // =========================================================================
+
+    #[test]
+    fn is_valid_profile_name_accepts_all_allowed_chars() {
+        assert!(is_valid_profile_name("abcdefghijklmnopqrstuvwxyz"));
+        assert!(is_valid_profile_name("0123456789"));
+        assert!(is_valid_profile_name("_"));
+        assert!(is_valid_profile_name("-"));
+        assert!(is_valid_profile_name("a-b_c-0"));
+    }
+
+    #[test]
+    fn is_valid_profile_name_rejects_uppercase() {
+        assert!(!is_valid_profile_name("A"));
+        assert!(!is_valid_profile_name("Dev"));
+    }
+
+    #[test]
+    fn default_profile_resolves_to_base() {
+        let base = PatternsConfig {
+            packs: vec!["default-pack".to_string()],
+            ..Default::default()
+        };
+        let dir = std::env::temp_dir().join("wa_test_rulesets_default");
+        let _ = std::fs::create_dir_all(&dir);
+        let result = resolve_patterns_for_profile(&base, &dir, None, "default").unwrap();
+        assert_eq!(result.packs, base.packs);
+    }
+
+    #[test]
+    fn load_default_profile_by_name_is_rejected() {
+        let dir = std::env::temp_dir().join("wa_test_rulesets_load_default");
+        let _ = std::fs::create_dir_all(&dir);
+        let result = load_profile_by_name(&dir, None, "default");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn missing_profile_file_produces_error() {
+        let dir = std::env::temp_dir().join("wa_test_rulesets_missing");
+        let _ = std::fs::create_dir_all(&dir);
+        let result = load_profile_by_name(&dir, None, "nonexistent");
+        assert!(result.is_err());
+    }
 }

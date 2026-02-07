@@ -329,4 +329,102 @@ mod tests {
         assert_eq!(manifest.profiles[0].updated_at, Some(500));
         assert_eq!(manifest.profiles[0].created_at, Some(100));
     }
+
+    #[test]
+    fn touch_last_applied_creates_new_entry_when_missing() {
+        let mut manifest = ConfigProfileManifest {
+            version: CONFIG_PROFILE_MANIFEST_VERSION,
+            profiles: vec![],
+            last_applied_profile: None,
+            last_applied_at: None,
+        };
+
+        touch_last_applied(&mut manifest, "staging", "staging.toml", 900);
+
+        assert_eq!(manifest.last_applied_profile.as_deref(), Some("staging"));
+        assert_eq!(manifest.last_applied_at, Some(900));
+        assert_eq!(manifest.profiles.len(), 1);
+        assert_eq!(manifest.profiles[0].name, "staging");
+        assert_eq!(manifest.profiles[0].path, "staging.toml");
+        assert_eq!(manifest.profiles[0].created_at, Some(900));
+    }
+
+    // =========================================================================
+    // Profile Name Validation Tests
+    // =========================================================================
+
+    #[test]
+    fn valid_profile_names() {
+        for name in [
+            "dev",
+            "production",
+            "my-profile",
+            "test_env",
+            "abc123",
+            "a",
+            "a-b_c",
+        ] {
+            assert!(
+                canonicalize_profile_name(name).is_ok(),
+                "'{name}' should be valid"
+            );
+        }
+    }
+
+    #[test]
+    fn profile_name_trims_and_lowercases() {
+        assert_eq!(canonicalize_profile_name("  Dev  ").unwrap(), "dev");
+        assert_eq!(
+            canonicalize_profile_name("PRODUCTION").unwrap(),
+            "production"
+        );
+        assert_eq!(
+            canonicalize_profile_name(" My-Profile ").unwrap(),
+            "my-profile"
+        );
+    }
+
+    #[test]
+    fn empty_profile_name_rejected() {
+        assert!(canonicalize_profile_name("").is_err());
+        assert!(canonicalize_profile_name("   ").is_err());
+    }
+
+    #[test]
+    fn profile_name_too_long_rejected() {
+        let long_name = "a".repeat(33);
+        assert!(canonicalize_profile_name(&long_name).is_err());
+        // Exactly 32 should be fine
+        let exact = "a".repeat(32);
+        assert!(canonicalize_profile_name(&exact).is_ok());
+    }
+
+    #[test]
+    fn profile_name_special_chars_rejected() {
+        for name in [
+            "my profile",
+            "test!",
+            "foo@bar",
+            "a/b",
+            "a.b",
+            "café",
+            "日本語",
+        ] {
+            assert!(
+                canonicalize_profile_name(name).is_err(),
+                "'{name}' should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn is_valid_profile_name_boundary() {
+        assert!(is_valid_profile_name("a"));
+        assert!(is_valid_profile_name("0"));
+        assert!(is_valid_profile_name("-"));
+        assert!(is_valid_profile_name("_"));
+        assert!(!is_valid_profile_name(""));
+        assert!(!is_valid_profile_name("A")); // uppercase
+        assert!(!is_valid_profile_name(" ")); // space
+    }
 }
