@@ -125,6 +125,7 @@ pub mod tui;
 pub mod web;
 
 pub mod distributed;
+pub mod simulation;
 
 #[cfg(feature = "sync")]
 pub mod sync;
