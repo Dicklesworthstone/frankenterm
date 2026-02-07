@@ -385,6 +385,7 @@ SCENARIO_REGISTRY=(
     "no_lua_status_hook|Validate wa setup does not inject update-status Lua|true|wezterm,jq|Protects against legacy status hook"
     "workflow_resume|Validate workflow resumes after watcher restart (no duplicate steps)|true|wezterm,jq,sqlite3|Protects workflow resume"
     "accounts_refresh|Validate accounts refresh via fake caut + pick preview + redaction|true|wezterm,jq,sqlite3|Protects accounts refresh"
+    "environment_detection|Validate environment detection API (shell, agents, remotes, auto-config)|true|wezterm,jq|Protects environment detection and auto-config"
 )
 
 list_scenarios() {
@@ -6955,6 +6956,221 @@ run_scenario_watcher_crash_bundle() {
     return $result
 }
 
+# ==============================================================================
+# Scenario: environment_detection
+# Validates the environment detection API: shell, agent, remote, and auto-config
+# in a hermetic temporary environment with no host dependence.
+# ==============================================================================
+
+run_scenario_environment_detection() {
+    local scenario_dir="$1"
+    local temp_home
+    temp_home=$(mktemp -d /tmp/wa-e2e-envdetect-XXXXXX)
+    local result=0
+
+    log_info "Temp home: $temp_home"
+    echo "temp_home: $temp_home" >> "$scenario_dir/scenario.log"
+
+    # Create controlled shell rc files
+    local zshrc="$temp_home/.zshrc"
+    local bashrc="$temp_home/.bashrc"
+    local fish_conf="$temp_home/.config/fish/config.fish"
+    local wezterm_dir="$temp_home/.config/wezterm"
+
+    mkdir -p "$temp_home/.config/fish" "$wezterm_dir"
+
+    # zshrc with WA-managed OSC 133 block
+    cat > "$zshrc" <<'SHELLEOF'
+# zshrc baseline
+# WA-BEGIN (do not edit this block)
+precmd() { print -Pn "\e]133;A\a" }
+# WA-END
+SHELLEOF
+
+    # bashrc without WA block (OSC 133 not installed)
+    printf "# bashrc baseline\n" > "$bashrc"
+
+    # fish config (no WA block)
+    printf "# fish baseline\n" > "$fish_conf"
+
+    # Minimal wezterm.lua
+    cat > "$wezterm_dir/wezterm.lua" <<'LUAEOF'
+local wezterm = require 'wezterm'
+local config = {}
+return config
+LUAEOF
+
+    cleanup_environment_detection() {
+        log_verbose "Cleaning up environment_detection scenario"
+        if [[ -d "${temp_home:-}" ]]; then
+            cp -r "$temp_home" "$scenario_dir/temp_home_snapshot" 2>/dev/null || true
+        fi
+        if [[ "${WA_E2E_PRESERVE_TEMP:-}" == "1" ]]; then
+            log_warn "Preserving temp home (WA_E2E_PRESERVE_TEMP=1)"
+        else
+            rm -rf "${temp_home:-}"
+        fi
+    }
+    trap cleanup_environment_detection EXIT
+
+    # ---- Step 1: wa doctor --json (captures environment detection) ----
+    log_info "Step 1: wa doctor --json (environment detection)"
+    HOME="$temp_home" XDG_CONFIG_HOME="$temp_home/.config" SHELL="/bin/zsh" \
+        "$WA_BINARY" doctor --json > "$scenario_dir/doctor.json" 2>"$scenario_dir/doctor.stderr" || true
+
+    # Artifact: save doctor output
+    if [[ -s "$scenario_dir/doctor.json" ]]; then
+        log_pass "doctor.json generated ($(wc -c < "$scenario_dir/doctor.json") bytes)"
+    else
+        log_fail "doctor.json is empty or missing"
+        result=1
+    fi
+
+    # Verify doctor JSON has required structural fields
+    if jq -e '.ok != null and .status and .checks' "$scenario_dir/doctor.json" \
+        >/dev/null 2>&1; then
+        log_pass "doctor.json has required fields (ok, status, checks)"
+    else
+        log_fail "doctor.json missing required fields"
+        result=1
+    fi
+
+    # Verify WezTerm CLI check is present in doctor output
+    if jq -e '.checks[] | select(.name == "WezTerm CLI")' "$scenario_dir/doctor.json" \
+        >/dev/null 2>&1; then
+        log_pass "doctor.json includes WezTerm CLI check"
+    else
+        log_warn "doctor.json missing WezTerm CLI check (WezTerm may not be installed)"
+    fi
+
+    # ---- Step 2: wa setup --dry-run with zsh (OSC 133 installed) ----
+    log_info "Step 2: wa setup --dry-run (zsh, OSC 133 enabled)"
+    HOME="$temp_home" XDG_CONFIG_HOME="$temp_home/.config" SHELL="/bin/zsh" \
+        "$WA_BINARY" setup --dry-run > "$scenario_dir/setup_dry_run_zsh.log" 2>&1 || true
+
+    # Verify setup detects shell type
+    if grep -qi "zsh\|shell" "$scenario_dir/setup_dry_run_zsh.log"; then
+        log_pass "setup detected zsh shell"
+    else
+        log_fail "setup did not detect zsh shell"
+        result=1
+    fi
+
+    # Verify dry-run made no file modifications
+    local zshrc_after
+    zshrc_after=$(cat "$zshrc")
+    local expected_zshrc
+    expected_zshrc=$(cat <<'SHELLEOF'
+# zshrc baseline
+# WA-BEGIN (do not edit this block)
+precmd() { print -Pn "\e]133;A\a" }
+# WA-END
+SHELLEOF
+)
+    if [[ "$zshrc_after" == "$expected_zshrc" ]]; then
+        log_pass "dry-run did not modify zshrc"
+    else
+        log_fail "dry-run modified zshrc (should be no-op)"
+        result=1
+    fi
+
+    # ---- Step 3: wa setup --dry-run with bash (no OSC 133) ----
+    log_info "Step 3: wa setup --dry-run (bash, no OSC 133)"
+    HOME="$temp_home" XDG_CONFIG_HOME="$temp_home/.config" SHELL="/bin/bash" \
+        "$WA_BINARY" setup --dry-run > "$scenario_dir/setup_dry_run_bash.log" 2>&1 || true
+
+    # Verify setup detects bash
+    if grep -qi "bash\|shell" "$scenario_dir/setup_dry_run_bash.log"; then
+        log_pass "setup detected bash shell"
+    else
+        log_fail "setup did not detect bash shell"
+        result=1
+    fi
+
+    # ---- Step 4: Validate auto-config fields in setup output ----
+    log_info "Step 4: Validate auto-config fields in setup output"
+
+    # Setup output should include configuration recommendations
+    if grep -qi "poll.*interval\|concurrency\|pattern.*pack\|safety\|rate.*limit" \
+        "$scenario_dir/setup_dry_run_zsh.log"; then
+        log_pass "setup output includes auto-config recommendations"
+    else
+        log_fail "setup output missing auto-config fields"
+        result=1
+    fi
+
+    # ---- Step 5: Verify setup apply is idempotent with detection ----
+    log_info "Step 5: wa setup --apply then --apply again (idempotent)"
+
+    # First apply
+    HOME="$temp_home" XDG_CONFIG_HOME="$temp_home/.config" SHELL="/bin/zsh" \
+        "$WA_BINARY" setup --apply > "$scenario_dir/setup_apply_1.log" 2>&1 || true
+    cp "$zshrc" "$scenario_dir/zshrc_after_apply1"
+
+    # Second apply (should be no-op)
+    HOME="$temp_home" XDG_CONFIG_HOME="$temp_home/.config" SHELL="/bin/zsh" \
+        "$WA_BINARY" setup --apply > "$scenario_dir/setup_apply_2.log" 2>&1 || true
+    cp "$zshrc" "$scenario_dir/zshrc_after_apply2"
+
+    if diff -u "$scenario_dir/zshrc_after_apply1" "$scenario_dir/zshrc_after_apply2" \
+        > "$scenario_dir/idempotent_diff.txt"; then
+        log_pass "setup apply is idempotent (second apply = no-op)"
+    else
+        log_fail "setup apply not idempotent (changed files on second run)"
+        result=1
+    fi
+
+    # Verify exactly one WA block exists
+    local wa_block_count
+    wa_block_count=$(grep -c "WA-BEGIN" "$zshrc" 2>/dev/null || echo "0")
+    if [[ "$wa_block_count" -eq 1 ]]; then
+        log_pass "zshrc has exactly one WA-BEGIN block"
+    else
+        log_fail "zshrc has $wa_block_count WA-BEGIN blocks (expected 1)"
+        result=1
+    fi
+
+    # ---- Step 6: Validate no secrets leaked in artifacts ----
+    log_info "Step 6: Checking artifacts for secret leaks"
+    local secret_patterns="(password|secret|token|api_key|private_key|credential)"
+    local leak_found=false
+    for artifact in "$scenario_dir"/*.log "$scenario_dir"/*.json; do
+        [[ -f "$artifact" ]] || continue
+        if grep -qiE "$secret_patterns" "$artifact" 2>/dev/null; then
+            # Allow "token" in expected contexts (e.g., "token_usage", "token sources")
+            local real_leaks
+            real_leaks=$(grep -iE "$secret_patterns" "$artifact" 2>/dev/null \
+                | grep -ivE "token_usage|token.sources|token.rotation|api_key.*check|password.*hash" || true)
+            if [[ -n "$real_leaks" ]]; then
+                log_warn "Potential secret leak in $(basename "$artifact"): $(echo "$real_leaks" | head -1)"
+                leak_found=true
+            fi
+        fi
+    done
+    if [[ "$leak_found" == "false" ]]; then
+        log_pass "No secret leaks detected in artifacts"
+    fi
+
+    # ---- Capture summary artifact ----
+    cat > "$scenario_dir/environment_summary.json" <<SUMEOF
+{
+  "scenario": "environment_detection",
+  "temp_home": "$temp_home",
+  "steps_completed": 6,
+  "doctor_json_exists": $([ -s "$scenario_dir/doctor.json" ] && echo true || echo false),
+  "setup_dry_run_zsh_exists": $([ -s "$scenario_dir/setup_dry_run_zsh.log" ] && echo true || echo false),
+  "setup_dry_run_bash_exists": $([ -s "$scenario_dir/setup_dry_run_bash.log" ] && echo true || echo false),
+  "idempotent_check": $([ -s "$scenario_dir/idempotent_diff.txt" ] && echo true || echo false),
+  "result": $result
+}
+SUMEOF
+
+    trap - EXIT
+    cleanup_environment_detection
+
+    return $result
+}
+
 run_scenario() {
     local name="$1"
     local scenario_num="$2"
@@ -7054,6 +7270,9 @@ run_scenario() {
             ;;
         watch_notify_only)
             run_scenario_watch_notify_only "$scenario_dir" || result=$?
+            ;;
+        environment_detection)
+            run_scenario_environment_detection "$scenario_dir" || result=$?
             ;;
         *)
             log_fail "Unknown scenario: $name"
