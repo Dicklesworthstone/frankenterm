@@ -2936,6 +2936,12 @@ impl WorkspaceLayout {
         }
     }
 
+    /// Directory for session recordings (.war files).
+    #[must_use]
+    pub fn recordings_dir(&self) -> PathBuf {
+        self.wa_dir.join("recordings")
+    }
+
     /// Ensure workspace directories exist and are writable
     pub fn ensure_directories(&self) -> crate::Result<()> {
         ensure_dir(&self.wa_dir)?;

@@ -955,6 +955,37 @@ SEE ALSO:
         command: RecordCommands,
     },
 
+    /// Replay a session recording
+    #[command(after_help = r#"EXAMPLES:
+    wa replay session.war                       Replay at normal speed
+    wa replay session.war --speed 4             Replay at 4x speed
+    wa replay session.war --from 1m30s          Start from 1m30s
+    wa replay session.war --events-only         Show only event annotations
+
+SEE ALSO:
+    wa record list      List available recordings
+    wa record export    Export to HTML or Asciinema"#)]
+    Replay {
+        /// Path to the .war recording file
+        file: PathBuf,
+
+        /// Playback speed multiplier (0.5, 1, 2, 4)
+        #[arg(long, default_value = "1")]
+        speed: f64,
+
+        /// Start playback from this timestamp (e.g., "1m30s", "90s", "5000" for ms)
+        #[arg(long)]
+        from: Option<String>,
+
+        /// Show only event annotations (skip terminal output)
+        #[arg(long)]
+        events_only: bool,
+
+        /// Output as JSON (events and metadata)
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Reserve a pane for exclusive use
     #[command(after_help = r#"EXAMPLES:
     wa reserve 3 --owner-id agent-1   Reserve pane 3 for agent-1
@@ -1419,6 +1450,57 @@ enum ReproduceCommands {
 
 #[derive(Subcommand)]
 enum RecordCommands {
+    /// Start recording a pane's terminal output
+    Start {
+        /// Pane ID to record (default: current pane)
+        #[arg(long)]
+        pane: Option<u64>,
+
+        /// Title/label for this recording
+        #[arg(long)]
+        title: Option<String>,
+
+        /// Auto-stop after this duration (e.g., "30m", "1h")
+        #[arg(long)]
+        auto_stop: Option<String>,
+
+        /// Output .war file path (default: .wa/recordings/<timestamp>.war)
+        #[arg(short = 'o', long)]
+        output: Option<PathBuf>,
+    },
+
+    /// Stop an active recording
+    Stop {
+        /// Pane ID to stop recording (default: current pane)
+        #[arg(long)]
+        pane: Option<u64>,
+
+        /// Stop all active recordings
+        #[arg(long)]
+        all: bool,
+    },
+
+    /// List available recordings
+    List {
+        /// Maximum number of recordings to show
+        #[arg(short = 'l', long, default_value = "20")]
+        limit: usize,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Show detailed info about a recording
+    Info {
+        /// Path to the .war recording file
+        file: PathBuf,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Export a .war recording to Asciinema cast or self-contained HTML
     Export {
         /// Path to the .war recording file
@@ -15956,6 +16038,226 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
         }
 
         Some(Commands::Record { command }) => match command {
+            RecordCommands::Start {
+                pane,
+                title,
+                auto_stop,
+                output,
+            } => {
+                use wa_core::recording::{Recorder, RecordingOptions};
+
+                let pane_id = pane.unwrap_or(0);
+                let recordings_dir = layout.recordings_dir();
+                std::fs::create_dir_all(&recordings_dir).map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to create recordings directory '{}': {e}",
+                        recordings_dir.display()
+                    )
+                })?;
+
+                let out_path = output.unwrap_or_else(|| {
+                    let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+                    recordings_dir.join(format!("pane{pane_id}-{ts}.war"))
+                });
+
+                let auto_stop_ms = if let Some(ref dur) = auto_stop {
+                    Some(wa_core::replay::parse_duration_ms(dur)?)
+                } else {
+                    None
+                };
+
+                let opts = RecordingOptions::default();
+                let mut recorder = Recorder::new(pane_id, &out_path, opts.flush_threshold)?;
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                recorder.start(now_ms);
+
+                println!("Recording pane {pane_id} to {}", out_path.display());
+                if let Some(ref t) = title {
+                    println!("Title: {t}");
+                }
+                if let Some(ms) = auto_stop_ms {
+                    println!("Auto-stop after {}s", ms / 1000);
+                }
+                println!("Press Ctrl+C to stop...");
+
+                // Poll pane output via WezTerm CLI
+                let wez = wa_core::wezterm::WeztermClient::new();
+                let mut last_text = String::new();
+                let start = std::time::Instant::now();
+
+                loop {
+                    if let Some(ms) = auto_stop_ms {
+                        if start.elapsed().as_millis() as u64 >= ms {
+                            break;
+                        }
+                    }
+
+                    match wez.get_text(pane_id, false).await {
+                        Ok(text) => {
+                            if text != last_text {
+                                let delta = if last_text.is_empty() {
+                                    text.as_bytes().to_vec()
+                                } else {
+                                    // Simple: record full text each time (works for short sessions)
+                                    text.as_bytes().to_vec()
+                                };
+                                let cap_ms = chrono::Utc::now().timestamp_millis();
+                                if let Err(e) = recorder.record_output(cap_ms, false, &delta) {
+                                    eprintln!("Recording error: {e}");
+                                    break;
+                                }
+                                last_text = text;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to capture pane {pane_id}: {e}");
+                            break;
+                        }
+                    }
+
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+
+                recorder.stop()?;
+                let stats = recorder.stats();
+                println!(
+                    "\nRecording stopped. {} frames, {} bytes written.",
+                    stats.frames_written, stats.bytes_written
+                );
+                println!("Saved: {}", out_path.display());
+            }
+
+            RecordCommands::Stop { pane, all } => {
+                // Stop requires IPC to the running watcher
+                let _ = (pane, all);
+                eprintln!(
+                    "wa record stop: requires an active watcher with recording enabled.\n\
+                     For standalone recordings started with `wa record start`, press Ctrl+C.\n\
+                     To stop a watcher-managed recording, use `wa robot rpc record-stop`."
+                );
+                std::process::exit(1);
+            }
+
+            RecordCommands::List { limit, json: as_json } => {
+                let recordings_dir = layout.recordings_dir();
+                let mut entries = Vec::new();
+
+                if recordings_dir.is_dir() {
+                    if let Ok(read_dir) = std::fs::read_dir(&recordings_dir) {
+                        for entry in read_dir.flatten() {
+                            let path = entry.path();
+                            if path.extension().and_then(|e| e.to_str()) == Some("war") {
+                                let metadata = std::fs::metadata(&path).ok();
+                                let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+                                let modified = metadata
+                                    .as_ref()
+                                    .and_then(|m| m.modified().ok())
+                                    .and_then(|t| {
+                                        t.duration_since(std::time::UNIX_EPOCH).ok()
+                                    })
+                                    .map(|d| d.as_millis() as i64)
+                                    .unwrap_or(0);
+
+                                // Try to load recording for frame count/duration
+                                let (duration_ms, frame_count) =
+                                    if let Ok(rec) = wa_core::replay::Recording::load(&path) {
+                                        (rec.duration_ms, rec.frames.len())
+                                    } else {
+                                        (0, 0)
+                                    };
+
+                                entries.push((
+                                    path.file_name()
+                                        .unwrap_or_default()
+                                        .to_string_lossy()
+                                        .to_string(),
+                                    path.clone(),
+                                    size,
+                                    modified,
+                                    duration_ms,
+                                    frame_count,
+                                ));
+                            }
+                        }
+                    }
+                }
+
+                // Sort by modification time descending
+                entries.sort_by_key(|e| std::cmp::Reverse(e.3));
+                entries.truncate(limit);
+
+                if as_json {
+                    let json_entries: Vec<_> = entries
+                        .iter()
+                        .map(|(name, path, size, _modified, duration_ms, frame_count)| {
+                            serde_json::json!({
+                                "name": name,
+                                "path": path.display().to_string(),
+                                "size_bytes": size,
+                                "duration_ms": duration_ms,
+                                "frame_count": frame_count,
+                            })
+                        })
+                        .collect();
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json_entries)
+                            .unwrap_or_else(|_| "[]".to_string())
+                    );
+                } else if entries.is_empty() {
+                    println!("No recordings found in {}", recordings_dir.display());
+                } else {
+                    println!(
+                        "{:<40} {:>10} {:>8} {:>8}",
+                        "Name", "Duration", "Frames", "Size"
+                    );
+                    println!("{}", "-".repeat(70));
+                    for (name, _path, size, _modified, duration_ms, frame_count) in &entries {
+                        let dur = format_duration_short(*duration_ms);
+                        let sz = format_size_short(*size);
+                        println!("{name:<40} {dur:>10} {frame_count:>8} {sz:>8}");
+                    }
+                    println!(
+                        "\n{} recording(s) in {}",
+                        entries.len(),
+                        recordings_dir.display()
+                    );
+                }
+            }
+
+            RecordCommands::Info { file, json: as_json } => {
+                let recording = wa_core::replay::Recording::load(&file).map_err(|e| {
+                    anyhow::anyhow!("Failed to load recording '{}': {e}", file.display())
+                })?;
+                let info = recording.info();
+
+                if as_json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&info)
+                            .unwrap_or_else(|_| "{}".to_string())
+                    );
+                } else {
+                    println!("Recording: {}", file.display());
+                    println!(
+                        "Duration:  {}",
+                        format_duration_short(info.duration_ms)
+                    );
+                    println!("Terminal:  {}x{}", info.terminal_cols, info.terminal_rows);
+                    println!("Frames:    {} total", info.frame_count);
+                    println!("  Output:  {}", info.output_frames);
+                    println!("  Resize:  {}", info.resize_frames);
+                    println!("  Events:  {}", info.event_frames);
+                    println!("  Markers: {}", info.marker_frames);
+                    println!("  Input:   {}", info.input_frames);
+                    println!(
+                        "Size:      {} ({} bytes)",
+                        format_size_short(info.total_bytes as u64),
+                        info.total_bytes
+                    );
+                }
+            }
+
             RecordCommands::Export {
                 file,
                 format,
@@ -16035,6 +16337,146 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 }
             }
         },
+
+        Some(Commands::Replay {
+            file,
+            speed,
+            from,
+            events_only,
+            json: as_json,
+        }) => {
+            use wa_core::replay::{
+                CollectorSink, HeadlessSink, PlaybackSpeed, Player, Recording, decode_frame,
+                DecodedFrame,
+            };
+
+            let recording = Recording::load(&file).map_err(|e| {
+                anyhow::anyhow!("Failed to load recording '{}': {e}", file.display())
+            })?;
+
+            let info = recording.info();
+
+            if events_only {
+                // Just list events and markers
+                let base_ts = recording
+                    .frames
+                    .first()
+                    .map(|f| f.header.timestamp_ms)
+                    .unwrap_or(0);
+
+                let mut events = Vec::new();
+                for frame in &recording.frames {
+                    let rel_ms = frame.header.timestamp_ms.saturating_sub(base_ts);
+                    match decode_frame(frame)? {
+                        DecodedFrame::Event(value) => {
+                            events.push(serde_json::json!({
+                                "time_ms": rel_ms,
+                                "type": "event",
+                                "data": value,
+                            }));
+                        }
+                        DecodedFrame::Marker(text) => {
+                            events.push(serde_json::json!({
+                                "time_ms": rel_ms,
+                                "type": "marker",
+                                "text": text,
+                            }));
+                        }
+                        _ => {}
+                    }
+                }
+
+                if as_json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&events)
+                            .unwrap_or_else(|_| "[]".to_string())
+                    );
+                } else if events.is_empty() {
+                    println!("No events or markers in recording.");
+                } else {
+                        for ev in &events {
+                            let t = ev["time_ms"].as_u64().unwrap_or(0);
+                            let kind = ev["type"].as_str().unwrap_or("?");
+                            let detail = if kind == "marker" {
+                                ev["text"].as_str().unwrap_or("").to_string()
+                            } else {
+                                ev["data"].to_string()
+                            };
+                            println!(
+                                "[{:>8}ms] {kind}: {detail}",
+                                t
+                            );
+                        }
+                    }
+            } else {
+                // Full playback
+                let playback_speed = PlaybackSpeed::new(speed as f32).map_err(|e| {
+                    anyhow::anyhow!("Invalid speed {speed}: {e}")
+                })?;
+
+                let mut player = Player::new(recording);
+                player.set_speed(playback_speed);
+
+                // Seek if --from specified
+                if let Some(ref from_str) = from {
+                    let seek_ms = wa_core::replay::parse_duration_ms(from_str)?;
+                    let mut seek_sink = HeadlessSink;
+                    player.seek_to(seek_ms, &mut seek_sink)?;
+                }
+
+                if as_json {
+                    // Collect all output and events
+                    let mut sink = CollectorSink::new();
+                    player.play_simple(&mut sink).await?;
+                    let result = serde_json::json!({
+                        "duration_ms": info.duration_ms,
+                        "frames": info.frame_count,
+                        "output_bytes": sink.output.len(),
+                        "events": sink.events,
+                        "markers": sink.markers,
+                    });
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&result)
+                            .unwrap_or_else(|_| "{}".to_string())
+                    );
+                } else {
+                    eprintln!(
+                        "Replaying {} ({}, {} frames, {speed}x speed)",
+                        file.display(),
+                        format_duration_short(info.duration_ms),
+                        info.frame_count,
+                    );
+
+                    // Write output to stdout
+                    struct StdoutSink;
+                    impl wa_core::replay::OutputSink for StdoutSink {
+                        fn write_output(&mut self, bytes: &[u8]) -> wa_core::Result<()> {
+                            use std::io::Write;
+                            std::io::stdout().write_all(bytes).map_err(|e| {
+                                wa_core::Error::Runtime(format!("stdout write error: {e}"))
+                            })
+                        }
+                        fn show_event(
+                            &mut self,
+                            event: &serde_json::Value,
+                        ) -> wa_core::Result<()> {
+                            eprintln!("\n[event] {event}");
+                            Ok(())
+                        }
+                        fn show_marker(&mut self, text: &str) -> wa_core::Result<()> {
+                            eprintln!("\n[marker] {text}");
+                            Ok(())
+                        }
+                    }
+
+                    let mut sink = StdoutSink;
+                    player.play_simple(&mut sink).await?;
+                    eprintln!("\nReplay complete.");
+                }
+            }
+        }
 
         Some(Commands::Reserve {
             pane_id,
@@ -22285,6 +22727,37 @@ fn parse_toml_value(value: &str) -> toml_edit::Item {
 
     // Default to string
     toml_edit::value(value)
+}
+
+/// Format a duration in milliseconds as a short human-readable string.
+fn format_duration_short(ms: u64) -> String {
+    if ms < 1_000 {
+        return format!("{ms}ms");
+    }
+    let total_secs = ms / 1_000;
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let seconds = total_secs % 60;
+    if hours > 0 {
+        format!("{hours}h{minutes:02}m{seconds:02}s")
+    } else if minutes > 0 {
+        format!("{minutes}m{seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+/// Format a byte size as a short human-readable string.
+fn format_size_short(bytes: u64) -> String {
+    if bytes < 1024 {
+        return format!("{bytes}B");
+    }
+    let kb = bytes as f64 / 1024.0;
+    if kb < 1024.0 {
+        return format!("{kb:.0}KB");
+    }
+    let mb = kb / 1024.0;
+    format!("{mb:.1}MB")
 }
 
 #[cfg(test)]

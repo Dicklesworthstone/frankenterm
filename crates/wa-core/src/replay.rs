@@ -906,6 +906,106 @@ fn find_terminal_size(recording: &Recording, default_cols: u16, default_rows: u1
     (default_cols, default_rows)
 }
 
+/// Summary information about a recording.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RecordingInfo {
+    pub duration_ms: u64,
+    pub frame_count: usize,
+    pub output_frames: usize,
+    pub event_frames: usize,
+    pub resize_frames: usize,
+    pub marker_frames: usize,
+    pub input_frames: usize,
+    pub total_bytes: usize,
+    pub terminal_cols: u16,
+    pub terminal_rows: u16,
+}
+
+impl Recording {
+    /// Compute summary information about this recording.
+    #[must_use]
+    pub fn info(&self) -> RecordingInfo {
+        let mut output_frames = 0usize;
+        let mut event_frames = 0usize;
+        let mut resize_frames = 0usize;
+        let mut marker_frames = 0usize;
+        let mut input_frames = 0usize;
+        let mut total_bytes = 0usize;
+
+        for frame in &self.frames {
+            total_bytes += frame.payload.len();
+            match frame.header.frame_type {
+                FrameType::Output => output_frames += 1,
+                FrameType::Resize => resize_frames += 1,
+                FrameType::Event => event_frames += 1,
+                FrameType::Marker => marker_frames += 1,
+                FrameType::Input => input_frames += 1,
+            }
+        }
+
+        let (cols, rows) = find_terminal_size(self, 80, 24);
+
+        RecordingInfo {
+            duration_ms: self.duration_ms,
+            frame_count: self.frames.len(),
+            output_frames,
+            event_frames,
+            resize_frames,
+            marker_frames,
+            input_frames,
+            total_bytes,
+            terminal_cols: cols,
+            terminal_rows: rows,
+        }
+    }
+}
+
+/// Parse a duration string like "1m30s", "90s", "2m", or raw milliseconds "5000".
+///
+/// Returns duration in milliseconds.
+pub fn parse_duration_ms(s: &str) -> Result<u64> {
+    let s = s.trim();
+
+    // Try raw integer (milliseconds)
+    if let Ok(ms) = s.parse::<u64>() {
+        return Ok(ms);
+    }
+
+    let mut total_ms: u64 = 0;
+    let mut num_buf = String::new();
+
+    for ch in s.chars() {
+        if ch.is_ascii_digit() || ch == '.' {
+            num_buf.push(ch);
+        } else {
+            let val: f64 = num_buf.parse().map_err(|_| {
+                crate::Error::Runtime(format!("Invalid duration component: '{num_buf}'"))
+            })?;
+            num_buf.clear();
+            match ch {
+                'h' => total_ms += (val * 3_600_000.0) as u64,
+                'm' => total_ms += (val * 60_000.0) as u64,
+                's' => total_ms += (val * 1_000.0) as u64,
+                _ => {
+                    return Err(crate::Error::Runtime(format!(
+                        "Unknown duration unit '{ch}' in '{s}'"
+                    )));
+                }
+            }
+        }
+    }
+
+    // Trailing number without unit → treat as seconds
+    if !num_buf.is_empty() {
+        let val: f64 = num_buf.parse().map_err(|_| {
+            crate::Error::Runtime(format!("Invalid duration: '{s}'"))
+        })?;
+        total_ms += (val * 1_000.0) as u64;
+    }
+
+    Ok(total_ms)
+}
+
 /// Minimal HTML escaping for embedding in HTML attributes and text content.
 fn html_escape(text: &str) -> String {
     text.replace('&', "&amp;")
@@ -1543,5 +1643,35 @@ mod tests {
         assert_eq!(html_escape("<script>"), "&lt;script&gt;");
         assert_eq!(html_escape("a&b"), "a&amp;b");
         assert_eq!(html_escape("\"hello\""), "&quot;hello&quot;");
+    }
+
+    #[test]
+    fn parse_duration_ms_raw_ms() {
+        assert_eq!(parse_duration_ms("5000").unwrap(), 5000);
+        assert_eq!(parse_duration_ms("0").unwrap(), 0);
+    }
+
+    #[test]
+    fn parse_duration_ms_seconds() {
+        assert_eq!(parse_duration_ms("90s").unwrap(), 90_000);
+        assert_eq!(parse_duration_ms("1.5s").unwrap(), 1_500);
+    }
+
+    #[test]
+    fn parse_duration_ms_minutes() {
+        assert_eq!(parse_duration_ms("2m").unwrap(), 120_000);
+        assert_eq!(parse_duration_ms("1m30s").unwrap(), 90_000);
+    }
+
+    #[test]
+    fn parse_duration_ms_hours() {
+        assert_eq!(parse_duration_ms("1h").unwrap(), 3_600_000);
+        assert_eq!(parse_duration_ms("1h30m").unwrap(), 5_400_000);
+    }
+
+    #[test]
+    fn parse_duration_ms_trailing_bare_number_as_seconds() {
+        // "90" without unit is raw ms (parsed first), but "1m30" treats 30 as seconds
+        assert_eq!(parse_duration_ms("1m30").unwrap(), 90_000);
     }
 }
