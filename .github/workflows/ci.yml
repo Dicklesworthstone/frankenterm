@@ -186,6 +186,35 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  # Performance budget enforcement: run Criterion benchmarks and check against
+  # coarse thresholds (10x design budgets) to catch gross regressions.
+  benchmarks:
+    name: Benchmarks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: benchmarks
+
+      - name: Run benchmarks and check budgets
+        run: scripts/check_bench_budgets.sh
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: |
+            target/criterion/wa-budget-report.json
+            target/criterion/wa-bench-meta.jsonl
+            target/criterion/wa-bench-manifest-*.json
+            target/criterion/bench-output.log
+          if-no-files-found: ignore
+          retention-days: 14
+
   # Security audit for dependency vulnerabilities
   security:
     name: Security Audit

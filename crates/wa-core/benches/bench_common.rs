@@ -12,6 +12,125 @@ pub struct BenchBudget {
     pub budget: &'static str,
 }
 
+/// Machine-readable budget threshold for CI enforcement.
+///
+/// Each entry maps a Criterion benchmark group prefix to a coarse
+/// median-nanosecond ceiling.  The CI script (`scripts/check_bench_budgets.sh`)
+/// reads `target/criterion/wa-budgets.json` and fails the build when any
+/// benchmark's median exceeds the corresponding threshold.
+///
+/// Thresholds are intentionally 10x the design budgets to absorb CI noise
+/// while still catching gross regressions (order-of-magnitude slowdowns).
+#[derive(Serialize)]
+#[allow(dead_code)]
+pub struct CiBudgetEntry {
+    /// Criterion group prefix (matched via starts-with on the group/bench path).
+    pub group_prefix: &'static str,
+    /// Maximum allowed median in nanoseconds (~10x observed current perf).
+    pub max_median_ns: u64,
+    /// Human-readable note.
+    pub note: &'static str,
+}
+
+/// Canonical CI budget table.  One row per benchmark group.
+///
+/// Ceilings are set at ~10x the *observed* current performance (not the
+/// aspirational design targets) so that CI catches gross regressions without
+/// false positives from normal variance or CI machine differences.
+#[allow(dead_code)]
+pub const CI_BUDGETS: &[CiBudgetEntry] = &[
+    // Pattern quick reject: observed ~100µs-2.7ms (varies by input size) → ceiling 5ms
+    CiBudgetEntry {
+        group_prefix: "pattern_quick_reject",
+        max_median_ns: 5_000_000,
+        note: "quick reject: observed ~100us-2.7ms, ceiling 5ms",
+    },
+    // Pattern detection: observed ~300-400µs → ceiling 5ms
+    CiBudgetEntry {
+        group_prefix: "pattern_detection/",
+        max_median_ns: 5_000_000,
+        note: "pattern detect: observed ~300-400us, ceiling 5ms",
+    },
+    // Pattern throughput (64KB can take ~20ms): ceiling 200ms
+    CiBudgetEntry {
+        group_prefix: "pattern_throughput",
+        max_median_ns: 200_000_000,
+        note: "pattern throughput: observed ~20ms at 64KB, ceiling 200ms",
+    },
+    // Pattern detection with context: similar to base detection
+    CiBudgetEntry {
+        group_prefix: "pattern_detection_context",
+        max_median_ns: 5_000_000,
+        note: "pattern w/ context: observed ~350us, ceiling 5ms",
+    },
+    // Delta extraction: design < 200µs → ceiling 5ms
+    CiBudgetEntry {
+        group_prefix: "delta_extraction",
+        max_median_ns: 5_000_000,
+        note: "delta extraction: ceiling 5ms",
+    },
+    // FTS query: design < 10ms, DB-bound → ceiling 500ms
+    CiBudgetEntry {
+        group_prefix: "fts_query",
+        max_median_ns: 500_000_000,
+        note: "FTS query: DB-bound, ceiling 500ms",
+    },
+    // Storage append: design p95 < 2ms → ceiling 50ms
+    CiBudgetEntry {
+        group_prefix: "storage_single_append",
+        max_median_ns: 50_000_000,
+        note: "segment append: ceiling 50ms",
+    },
+    // Storage batch: DB-bound, can be slow → ceiling 500ms
+    CiBudgetEntry {
+        group_prefix: "storage_batch_append",
+        max_median_ns: 500_000_000,
+        note: "batch append: DB-bound, ceiling 500ms",
+    },
+    // FTS regression: DB-bound → ceiling 500ms
+    CiBudgetEntry {
+        group_prefix: "storage_fts_regression",
+        max_median_ns: 500_000_000,
+        note: "FTS search regression: DB-bound, ceiling 500ms",
+    },
+    // Upsert pane: design p95 < 1ms → ceiling 20ms
+    CiBudgetEntry {
+        group_prefix: "storage_upsert_pane",
+        max_median_ns: 20_000_000,
+        note: "upsert pane: ceiling 20ms",
+    },
+    // Watcher loop: design < 100µs → ceiling 5ms
+    CiBudgetEntry {
+        group_prefix: "watcher_loop",
+        max_median_ns: 5_000_000,
+        note: "watcher loop: ceiling 5ms",
+    },
+    // Backpressure tier classify: design < 100ns → ceiling 10µs
+    CiBudgetEntry {
+        group_prefix: "backpressure_tier",
+        max_median_ns: 10_000,
+        note: "bp tier classify: ceiling 10us",
+    },
+    // Scheduler select: design < 5µs (100 panes) → ceiling 500µs
+    CiBudgetEntry {
+        group_prefix: "backpressure_scheduler",
+        max_median_ns: 500_000,
+        note: "bp scheduler: ceiling 500us",
+    },
+    // Sizing insert: DB-bound, can be slow → ceiling 2s
+    CiBudgetEntry {
+        group_prefix: "sizing_insert",
+        max_median_ns: 2_000_000_000,
+        note: "sizing insert: DB-bound, ceiling 2s",
+    },
+    // Sizing query at scale: DB-bound → ceiling 1s
+    CiBudgetEntry {
+        group_prefix: "sizing_query",
+        max_median_ns: 1_000_000_000,
+        note: "sizing query at scale: DB-bound, ceiling 1s",
+    },
+];
+
 #[derive(Serialize)]
 struct BenchEnvironment {
     os: &'static str,
