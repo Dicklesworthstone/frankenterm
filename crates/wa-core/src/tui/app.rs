@@ -363,6 +363,16 @@ impl<Q: QueryClient> App<Q> {
             KeyCode::Char('m') => {
                 self.mute_selected_event();
             }
+            KeyCode::Char('e') => {
+                // Toggle expand/collapse for workflow progress
+                if !self.view_state.workflows.is_empty() {
+                    if self.view_state.triage_expanded.is_some() {
+                        self.view_state.triage_expanded = None;
+                    } else {
+                        self.view_state.triage_expanded = Some(0);
+                    }
+                }
+            }
             KeyCode::Char(c) if c.is_ascii_digit() => {
                 let idx = c.to_digit(10).unwrap_or(0);
                 if idx > 0 {
@@ -475,6 +485,23 @@ impl<Q: QueryClient> App<Q> {
             Err(e) => {
                 self.view_state
                     .set_error(format!("Failed to list events: {e}"));
+            }
+        }
+
+        // Refresh active workflows
+        match self.query_client.list_active_workflows() {
+            Ok(workflows) => {
+                self.view_state.workflows = workflows;
+                // Reset expanded if workflow list changed
+                if let Some(idx) = self.view_state.triage_expanded {
+                    if idx >= self.view_state.workflows.len() {
+                        self.view_state.triage_expanded = None;
+                    }
+                }
+            }
+            Err(e) => {
+                self.view_state
+                    .set_error(format!("Failed to list workflows: {e}"));
             }
         }
 
@@ -614,7 +641,7 @@ pub fn run_tui<Q: QueryClient>(query_client: Q, config: AppConfig) -> TuiResult<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::query::{EventView, HealthStatus, PaneView, SearchResultView};
+    use crate::tui::query::{EventView, HealthStatus, PaneView, SearchResultView, WorkflowProgressView};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     struct TestQueryClient;
@@ -664,6 +691,10 @@ mod tests {
 
         fn mark_event_muted(&self, _event_id: i64) -> Result<(), QueryError> {
             Ok(())
+        }
+
+        fn list_active_workflows(&self) -> Result<Vec<WorkflowProgressView>, QueryError> {
+            Ok(Vec::new())
         }
     }
 
@@ -737,6 +768,10 @@ mod tests {
 
         fn mark_event_muted(&self, _event_id: i64) -> Result<(), QueryError> {
             Ok(())
+        }
+
+        fn list_active_workflows(&self) -> Result<Vec<WorkflowProgressView>, QueryError> {
+            Ok(Vec::new())
         }
     }
 
@@ -832,6 +867,10 @@ mod tests {
 
         fn mark_event_muted(&self, _event_id: i64) -> Result<(), QueryError> {
             Ok(())
+        }
+
+        fn list_active_workflows(&self) -> Result<Vec<WorkflowProgressView>, QueryError> {
+            Ok(Vec::new())
         }
     }
 
@@ -953,6 +992,10 @@ mod tests {
         fn mark_event_muted(&self, _event_id: i64) -> Result<(), QueryError> {
             Ok(())
         }
+
+        fn list_active_workflows(&self) -> Result<Vec<WorkflowProgressView>, QueryError> {
+            Ok(Vec::new())
+        }
     }
 
     #[test]
@@ -1031,5 +1074,47 @@ mod tests {
         app.view_state.search_query = "test".to_string();
         app.handle_search_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
         assert_eq!(app.view_state.search_query, "tes");
+    }
+
+    // -----------------------------------------------------------------------
+    // Triage expand/collapse tests (wa-nu4.3.7.5)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn triage_expand_toggles_with_workflows() {
+        let mut app = App::new(TestQueryClient, AppConfig::default());
+        app.refresh_data();
+        // Add workflows to state
+        app.view_state.workflows = vec![WorkflowProgressView {
+            id: "wf-1".to_string(),
+            workflow_name: "notify_user".to_string(),
+            pane_id: 10,
+            current_step: 1,
+            total_steps: 3,
+            status: "running".to_string(),
+            error: None,
+            started_at: 1_700_000_000_000,
+            updated_at: 1_700_000_001_000,
+        }];
+
+        assert!(app.view_state.triage_expanded.is_none());
+
+        // Press 'e' to expand
+        app.handle_triage_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        assert_eq!(app.view_state.triage_expanded, Some(0));
+
+        // Press 'e' again to collapse
+        app.handle_triage_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        assert!(app.view_state.triage_expanded.is_none());
+    }
+
+    #[test]
+    fn triage_expand_noop_without_workflows() {
+        let mut app = App::new(TestQueryClient, AppConfig::default());
+        app.refresh_data();
+        assert!(app.view_state.workflows.is_empty());
+
+        app.handle_triage_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        assert!(app.view_state.triage_expanded.is_none());
     }
 }

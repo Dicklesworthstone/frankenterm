@@ -137,6 +137,20 @@ pub struct SearchResultView {
     pub rank: f64,
 }
 
+/// Active workflow progress for TUI display
+#[derive(Debug, Clone)]
+pub struct WorkflowProgressView {
+    pub id: String,
+    pub workflow_name: String,
+    pub pane_id: u64,
+    pub current_step: usize,
+    pub total_steps: usize,
+    pub status: String,
+    pub error: Option<String>,
+    pub started_at: i64,
+    pub updated_at: i64,
+}
+
 /// Event filters for querying
 #[derive(Debug, Default, Clone)]
 pub struct EventFilters {
@@ -184,6 +198,9 @@ pub trait QueryClient: Send + Sync {
 
     /// Mark an event as muted (handled without workflow)
     fn mark_event_muted(&self, event_id: i64) -> Result<(), QueryError>;
+
+    /// List active (incomplete) workflows with progress info
+    fn list_active_workflows(&self) -> Result<Vec<WorkflowProgressView>, QueryError>;
 }
 
 /// Production implementation of QueryClient
@@ -650,6 +667,38 @@ impl QueryClient for ProductionQueryClient {
                 .map_err(|e| QueryError::StorageError(e.to_string()))
         })
     }
+
+    fn list_active_workflows(&self) -> Result<Vec<WorkflowProgressView>, QueryError> {
+        let Some(storage) = &self.storage else {
+            return Ok(Vec::new());
+        };
+
+        let workflows = self.runtime.block_on(async {
+            storage
+                .find_incomplete_workflows()
+                .await
+                .map_err(|e| QueryError::StorageError(e.to_string()))
+        })?;
+
+        Ok(workflows
+            .into_iter()
+            .map(|wf| {
+                // Estimate total steps: at least current_step + 1 for incomplete
+                let total_steps = (wf.current_step + 1).max(2);
+                WorkflowProgressView {
+                    id: wf.id,
+                    workflow_name: wf.workflow_name,
+                    pane_id: wf.pane_id,
+                    current_step: wf.current_step,
+                    total_steps,
+                    status: wf.status,
+                    error: wf.error,
+                    started_at: wf.started_at,
+                    updated_at: wf.updated_at,
+                }
+            })
+            .collect())
+    }
 }
 
 fn epoch_ms() -> i64 {
@@ -740,6 +789,10 @@ mod tests {
 
         fn mark_event_muted(&self, _event_id: i64) -> Result<(), QueryError> {
             Ok(())
+        }
+
+        fn list_active_workflows(&self) -> Result<Vec<WorkflowProgressView>, QueryError> {
+            Ok(Vec::new())
         }
     }
 

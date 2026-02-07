@@ -11,7 +11,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Tabs, Widget},
 };
 
-use super::query::{EventView, HealthStatus, PaneView, SearchResultView, TriageItemView};
+use super::query::{EventView, HealthStatus, PaneView, SearchResultView, TriageItemView, WorkflowProgressView};
 use crate::circuit_breaker::CircuitStateKind;
 
 /// Available views in the TUI
@@ -138,6 +138,10 @@ pub struct ViewState {
     pub search_results: Vec<SearchResultView>,
     /// Search: selected result index
     pub search_selected_index: usize,
+    /// Active workflows for progress display
+    pub workflows: Vec<WorkflowProgressView>,
+    /// Expanded workflow index in triage view (None = collapsed)
+    pub triage_expanded: Option<usize>,
 }
 
 impl ViewState {
@@ -921,14 +925,63 @@ pub fn render_search_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
     }
 }
 
+/// Render an ASCII progress bar: `[████░░░░] 2/5`
+fn render_progress_bar(current: usize, total: usize, width: usize) -> Vec<Span<'static>> {
+    let bar_width = width.saturating_sub(2); // account for [ ]
+    let filled = if total == 0 {
+        0
+    } else {
+        (current * bar_width) / total
+    };
+    let empty = bar_width.saturating_sub(filled);
+
+    let filled_char = "\u{2588}"; // █
+    let empty_char = "\u{2591}"; // ░
+
+    let bar_style = if current >= total {
+        Style::default().fg(Color::Green)
+    } else {
+        Style::default().fg(Color::Cyan)
+    };
+
+    vec![
+        Span::raw("["),
+        Span::styled(filled_char.repeat(filled), bar_style),
+        Span::styled(empty_char.repeat(empty), Style::default().fg(Color::DarkGray)),
+        Span::raw(format!("] {current}/{total}")),
+    ]
+}
+
+/// Color style for a workflow status string.
+fn workflow_status_style(status: &str) -> Style {
+    match status {
+        "running" => Style::default().fg(Color::Cyan),
+        "waiting" => Style::default().fg(Color::Yellow),
+        "failed" => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        "completed" => Style::default().fg(Color::Green),
+        _ => Style::default().fg(Color::Gray),
+    }
+}
+
 /// Render the triage view
 pub fn render_triage_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
+    let has_workflows = !state.workflows.is_empty();
+    let constraints = if has_workflows {
+        vec![
+            Constraint::Percentage(50), // Triage list
+            Constraint::Percentage(25), // Workflow progress
+            Constraint::Length(6),      // Details + actions
+        ]
+    } else {
+        vec![
             Constraint::Min(8),    // Triage list
             Constraint::Length(6), // Details + actions
-        ])
+        ]
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
         .split(area);
 
     let block = Block::default()
@@ -937,7 +990,7 @@ pub fn render_triage_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
     let inner = block.inner(chunks[0]);
     block.render(chunks[0], buf);
 
-    if state.triage_items.is_empty() {
+    if state.triage_items.is_empty() && !has_workflows {
         let empty_msg = Paragraph::new(Span::styled(
             "All clear. No items need attention.",
             Style::default().fg(Color::Green),
@@ -985,12 +1038,70 @@ pub fn render_triage_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
     let list = Paragraph::new(lines);
     list.render(inner, buf);
 
+    // Workflow progress panel (if workflows exist)
+    let detail_chunk_idx = if has_workflows {
+        let wf_block = Block::default()
+            .title(format!("Active Workflows ({})", state.workflows.len()))
+            .borders(Borders::ALL);
+        let wf_inner = wf_block.inner(chunks[1]);
+        wf_block.render(chunks[1], buf);
+
+        let mut wf_lines: Vec<Line> = Vec::new();
+        for (i, wf) in state.workflows.iter().enumerate() {
+            let status_style = workflow_status_style(&wf.status);
+            let is_expanded = state.triage_expanded == Some(i);
+            let expand_marker = if is_expanded { "▼" } else { "▶" };
+
+            // Main workflow line with progress bar
+            let mut spans: Vec<Span> = vec![
+                Span::raw(format!("{expand_marker} ")),
+                Span::styled(
+                    truncate_str(&wf.workflow_name, 20),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!(" P{} ", wf.pane_id)),
+                Span::styled(
+                    format!("{:8}", truncate_str(&wf.status, 8)),
+                    status_style,
+                ),
+                Span::raw(" "),
+            ];
+            spans.extend(render_progress_bar(wf.current_step, wf.total_steps, 12));
+            wf_lines.push(Line::from(spans));
+
+            // Expanded detail: step info + error
+            if is_expanded {
+                wf_lines.push(Line::from(vec![
+                    Span::raw("    ID: "),
+                    Span::styled(&*wf.id, Style::default().fg(Color::Gray)),
+                ]));
+                wf_lines.push(Line::from(format!(
+                    "    Step {}/{} | started {} ms ago",
+                    wf.current_step + 1,
+                    wf.total_steps,
+                    epoch_ms_ago(wf.started_at),
+                )));
+                if let Some(ref error) = wf.error {
+                    wf_lines.push(Line::from(Span::styled(
+                        format!("    ERROR: {}", truncate_str(error, 60)),
+                        Style::default().fg(Color::Red),
+                    )));
+                }
+                wf_lines.push(Line::from(""));
+            }
+        }
+        Paragraph::new(wf_lines).render(wf_inner, buf);
+        2
+    } else {
+        1
+    };
+
     // Details + actions panel
     let detail_block = Block::default()
-        .title("Details / Actions (Enter or 1-9 to run, m to mute)")
+        .title("Details / Actions (Enter or 1-9 to run, m to mute, e to expand)")
         .borders(Borders::ALL);
-    let detail_inner = detail_block.inner(chunks[1]);
-    detail_block.render(chunks[1], buf);
+    let detail_inner = detail_block.inner(chunks[detail_chunk_idx]);
+    detail_block.render(chunks[detail_chunk_idx], buf);
 
     if let Some(item) = state.triage_items.get(state.triage_selected_index) {
         let mut detail_lines: Vec<Line> = Vec::new();
@@ -1015,6 +1126,16 @@ pub fn render_triage_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
         let details = Paragraph::new(detail_lines);
         details.render(detail_inner, buf);
     }
+}
+
+/// Compute how many ms ago a timestamp was (for display).
+fn epoch_ms_ago(ts: i64) -> i64 {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_millis()).ok())
+        .unwrap_or(0);
+    now_ms.saturating_sub(ts)
 }
 
 /// Render the help view
@@ -1048,6 +1169,7 @@ pub fn render_help_view(area: Rect, buf: &mut Buffer) {
         Line::from("  [Panes] type text to filter, Backspace to edit, Esc to clear"),
         Line::from("  [Panes] u=unhandled-only, a=agent filter, d=domain filter"),
         Line::from("  [Events] type digits to filter by pane/rule, u=unhandled-only"),
+        Line::from("  [Triage] e=expand/collapse workflow progress"),
         Line::from(""),
         Line::from(Span::styled(
             "Views:",
@@ -1526,5 +1648,140 @@ mod tests {
         let mut buf = Buffer::empty(area);
         render_home_view(&state, area, &mut buf);
         // Should render error footer
+    }
+
+    // -----------------------------------------------------------------------
+    // Workflow progress panel tests (wa-nu4.3.7.5)
+    // -----------------------------------------------------------------------
+
+    fn workflow(id: &str, name: &str, pane: u64, step: usize, total: usize, status: &str) -> WorkflowProgressView {
+        WorkflowProgressView {
+            id: id.to_string(),
+            workflow_name: name.to_string(),
+            pane_id: pane,
+            current_step: step,
+            total_steps: total,
+            status: status.to_string(),
+            error: None,
+            started_at: 1_700_000_000_000,
+            updated_at: 1_700_000_001_000,
+        }
+    }
+
+    #[test]
+    fn progress_bar_renders_correctly() {
+        let spans = render_progress_bar(2, 5, 12);
+        // Should produce [, filled, empty, ] N/M
+        assert_eq!(spans.len(), 4);
+        // First span is "["
+        assert_eq!(spans[0].content.as_ref(), "[");
+        // Last span contains "] 2/5"
+        assert!(spans[3].content.contains("2/5"));
+    }
+
+    #[test]
+    fn progress_bar_full() {
+        let spans = render_progress_bar(5, 5, 12);
+        assert!(spans[3].content.contains("5/5"));
+    }
+
+    #[test]
+    fn progress_bar_zero_total() {
+        let spans = render_progress_bar(0, 0, 12);
+        assert!(spans[3].content.contains("0/0"));
+    }
+
+    #[test]
+    fn workflow_status_style_maps_correctly() {
+        let running = workflow_status_style("running");
+        assert_eq!(running.fg, Some(Color::Cyan));
+        let waiting = workflow_status_style("waiting");
+        assert_eq!(waiting.fg, Some(Color::Yellow));
+        let failed = workflow_status_style("failed");
+        assert_eq!(failed.fg, Some(Color::Red));
+        let completed = workflow_status_style("completed");
+        assert_eq!(completed.fg, Some(Color::Green));
+        let unknown = workflow_status_style("other");
+        assert_eq!(unknown.fg, Some(Color::Gray));
+    }
+
+    #[test]
+    fn render_triage_view_with_workflows() {
+        let mut state = ViewState::default();
+        state.triage_items = vec![TriageItemView {
+            section: "events".to_string(),
+            severity: "warning".to_string(),
+            title: "test event".to_string(),
+            detail: "detail".to_string(),
+            actions: vec![],
+            event_id: Some(1),
+            pane_id: Some(0),
+            workflow_id: None,
+        }];
+        state.workflows = vec![
+            workflow("wf-1", "notify_user", 10, 1, 3, "running"),
+            workflow("wf-2", "restart_agent", 20, 0, 2, "waiting"),
+        ];
+        let area = Rect::new(0, 0, 120, 40);
+        let mut buf = Buffer::empty(area);
+        render_triage_view(&state, area, &mut buf);
+        // Should render without panic, showing workflow panel
+    }
+
+    #[test]
+    fn render_triage_view_with_expanded_workflow() {
+        let mut state = ViewState::default();
+        state.workflows = vec![
+            workflow("wf-1", "notify_user", 10, 2, 4, "running"),
+        ];
+        state.triage_expanded = Some(0);
+        let area = Rect::new(0, 0, 120, 40);
+        let mut buf = Buffer::empty(area);
+        render_triage_view(&state, area, &mut buf);
+        // Should show expanded details for workflow
+    }
+
+    #[test]
+    fn render_triage_view_with_failed_workflow() {
+        let mut state = ViewState::default();
+        let mut wf = workflow("wf-err", "deploy_check", 5, 1, 3, "failed");
+        wf.error = Some("Connection refused to remote host".to_string());
+        state.workflows = vec![wf];
+        state.triage_expanded = Some(0);
+        let area = Rect::new(0, 0, 120, 40);
+        let mut buf = Buffer::empty(area);
+        render_triage_view(&state, area, &mut buf);
+        // Should show error in red when expanded
+    }
+
+    #[test]
+    fn render_triage_view_no_workflows() {
+        let mut state = ViewState::default();
+        state.triage_items = vec![TriageItemView {
+            section: "events".to_string(),
+            severity: "warning".to_string(),
+            title: "test".to_string(),
+            detail: "detail".to_string(),
+            actions: vec![],
+            event_id: Some(1),
+            pane_id: Some(0),
+            workflow_id: None,
+        }];
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        render_triage_view(&state, area, &mut buf);
+        // Should render without workflow panel (original layout)
+    }
+
+    #[test]
+    fn render_triage_view_only_workflows_no_triage() {
+        let mut state = ViewState::default();
+        state.workflows = vec![
+            workflow("wf-1", "notify_user", 10, 1, 3, "running"),
+        ];
+        let area = Rect::new(0, 0, 120, 40);
+        let mut buf = Buffer::empty(area);
+        render_triage_view(&state, area, &mut buf);
+        // Should not panic; shows empty triage + workflow panel
     }
 }
