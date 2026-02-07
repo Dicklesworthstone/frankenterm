@@ -1211,7 +1211,7 @@ mod tests {
         player.seek_to(450, &mut sink).unwrap();
         assert_eq!(player.position().frame_index, 5);
         // Frames 0-4 (timestamps 0, 100, 200, 300, 400) should have been replayed.
-        assert!(sink.output.len() > 0);
+        assert!(!sink.output.is_empty());
     }
 
     #[test]
@@ -1271,7 +1271,7 @@ mod tests {
         let tx2 = tx.clone();
         tokio::spawn(async move {
             // Stop fires at t=1s, before frame B at t=5s.
-            tokio::time::sleep(Duration::from_millis(1000)).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
             let _ = tx2.send(PlayerControl::Stop);
         });
 
@@ -1935,9 +1935,9 @@ mod tests {
         let tx2 = tx.clone();
         tokio::spawn(async move {
             // Pause at 1s, resume at 2s
-            tokio::time::sleep(Duration::from_millis(1000)).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
             let _ = tx2.send(PlayerControl::Pause);
-            tokio::time::sleep(Duration::from_millis(1000)).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
             let _ = tx2.send(PlayerControl::Play);
         });
 
@@ -1995,8 +1995,7 @@ mod tests {
         // Only Output frames are exported; Input and Event are skipped
         assert_eq!(count, 1);
         let output = String::from_utf8(buf).unwrap();
-        let lines: Vec<&str> = output.lines().collect();
-        assert_eq!(lines.len(), 2); // header + 1 output event
+        assert_eq!(output.lines().count(), 2); // header + 1 output event
     }
 
     #[tokio::test]

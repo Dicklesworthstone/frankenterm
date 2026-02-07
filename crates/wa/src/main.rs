@@ -28189,7 +28189,7 @@ log_level = "debug"
 
     #[test]
     fn doctor_json_envelope_ok_when_no_errors() {
-        let checks = vec![
+        let checks = [
             DiagnosticCheck::ok_with_detail("wa-core loaded", "v0.1.0"),
             DiagnosticCheck::ok_with_detail("workspace root", "/home/user/project"),
             DiagnosticCheck::warning("daemon status", "not running", "Start with wa watch"),
@@ -28220,7 +28220,7 @@ log_level = "debug"
 
     #[test]
     fn doctor_json_envelope_error_when_errors_present() {
-        let checks = vec![
+        let checks = [
             DiagnosticCheck::ok_with_detail("wa-core loaded", "v0.1.0"),
             DiagnosticCheck::error("database", "corrupt", "Rebuild database"),
         ];
@@ -28240,7 +28240,7 @@ log_level = "debug"
 
     #[test]
     fn doctor_json_envelope_ok_when_all_pass() {
-        let checks = vec![
+        let checks = [
             DiagnosticCheck::ok("a"),
             DiagnosticCheck::ok_with_detail("b", "detail"),
         ];

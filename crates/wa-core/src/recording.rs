@@ -712,7 +712,7 @@ mod tests {
         assert_eq!(stats.bytes_written, 10); // "hello" + "world"
 
         let bytes = std::fs::read(&path).unwrap();
-        assert!(bytes.len() > 0);
+        assert!(!bytes.is_empty());
     }
 
     #[test]

@@ -2509,6 +2509,6 @@ mod mock_tests {
             .await
             .unwrap();
         assert_eq!(mock.pane_count().await, 1);
-        assert!(new_id > 0 || new_id == 0); // any valid ID
+        assert_eq!(new_id, 0);
     }
 }
