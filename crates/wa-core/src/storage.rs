@@ -8865,7 +8865,7 @@ fn consume_approval_token_sync(
 
     let mut sql = String::from(
         "SELECT id, code_hash, created_at, expires_at, used_at, workspace_id, action_kind,
-         pane_id, action_fingerprint
+         pane_id, action_fingerprint, plan_hash, plan_version, risk_summary
          FROM approval_tokens
          WHERE code_hash = ?
            AND workspace_id = ?
@@ -8910,6 +8910,9 @@ fn consume_approval_token_sync(
                     val.map(|v| v as u64)
                 },
                 action_fingerprint: row.get(8)?,
+                plan_hash: row.get(9)?,
+                plan_version: row.get(10)?,
+                risk_summary: row.get(11)?,
             })
         })
         .optional()
@@ -8951,7 +8954,7 @@ fn get_approval_token_by_code_sync(
     workspace_id: &str,
 ) -> Result<Option<ApprovalTokenRecord>> {
     let sql = "SELECT id, code_hash, created_at, expires_at, used_at, workspace_id, action_kind,
-               pane_id, action_fingerprint
+               pane_id, action_fingerprint, plan_hash, plan_version, risk_summary
                FROM approval_tokens
                WHERE code_hash = ?
                  AND workspace_id = ?
@@ -8976,6 +8979,9 @@ fn get_approval_token_by_code_sync(
                 val.map(|v| v as u64)
             },
             action_fingerprint: row.get(8)?,
+            plan_hash: row.get(9)?,
+            plan_version: row.get(10)?,
+            risk_summary: row.get(11)?,
         })
     })
     .optional()
@@ -8994,7 +9000,7 @@ fn consume_approval_token_by_code_sync(
         .map_err(|e| StorageError::Database(format!("Failed to start transaction: {e}")))?;
 
     let sql = "SELECT id, code_hash, created_at, expires_at, used_at, workspace_id, action_kind,
-               pane_id, action_fingerprint
+               pane_id, action_fingerprint, plan_hash, plan_version, risk_summary
                FROM approval_tokens
                WHERE code_hash = ?
                  AND workspace_id = ?
@@ -9022,6 +9028,9 @@ fn consume_approval_token_by_code_sync(
                     val.map(|v| v as u64)
                 },
                 action_fingerprint: row.get(8)?,
+                plan_hash: row.get(9)?,
+                plan_version: row.get(10)?,
+                risk_summary: row.get(11)?,
             })
         })
         .optional()
