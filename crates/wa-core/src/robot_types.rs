@@ -1111,7 +1111,7 @@ mod tests {
         let resp: RobotResponse<SearchData> = serde_json::from_value(json).unwrap();
         let data = resp.into_result().unwrap();
         assert_eq!(data.total_hits, 1);
-        assert_eq!(data.results[0].score, 1.5);
+        assert!((data.results[0].score - 1.5).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1141,7 +1141,7 @@ mod tests {
         let data = resp.into_result().unwrap();
         assert_eq!(data.events.len(), 1);
         assert_eq!(data.events[0].rule_id, "codex.build_error");
-        assert_eq!(data.events[0].confidence, 0.95);
+        assert!((data.events[0].confidence - 0.95).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1307,7 +1307,7 @@ mod tests {
         });
         let resp: RobotResponse<AccountsListData> = serde_json::from_value(json).unwrap();
         let data = resp.into_result().unwrap();
-        assert_eq!(data.accounts[0].percent_remaining, 85.5);
+        assert!((data.accounts[0].percent_remaining - 85.5).abs() < f64::EPSILON);
     }
 
     #[test]

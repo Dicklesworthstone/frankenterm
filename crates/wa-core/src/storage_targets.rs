@@ -645,7 +645,7 @@ mod tests {
     fn indexing_lag_red() {
         let th = IndexingLagThresholds::default();
         assert_eq!(th.classify(Duration::from_millis(500)), HealthTier::Red);
-        assert_eq!(th.classify(Duration::from_millis(5000)), HealthTier::Red);
+        assert_eq!(th.classify(Duration::from_secs(5)), HealthTier::Red);
     }
 
     // --- Storage health snapshot ---
