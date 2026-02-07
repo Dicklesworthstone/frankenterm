@@ -1392,4 +1392,455 @@ mod tests {
         assert_eq!(config.refresh_interval, std::time::Duration::from_secs(5));
         assert!(!config.debug);
     }
+
+    // =========================================================================
+    // E2E TUI smoke test (bd-12f4)
+    // =========================================================================
+    //
+    // Drives a scripted TUI session through all views using a rich mock
+    // query client with deterministic fixture data. Renders to a Buffer
+    // after each interaction to verify no panics and stable output.
+
+    /// Rich fixture query client with panes, events, triage items, workflows
+    struct FixtureQueryClient;
+
+    fn fixture_panes() -> Vec<PaneView> {
+        vec![
+            pane(1, "claude-code session", Some("claude_code"), 3),
+            pane(2, "codex build", Some("codex"), 0),
+            pane(3, "manual shell", None, 1),
+        ]
+    }
+
+    fn fixture_events() -> Vec<EventView> {
+        vec![
+            EventView {
+                id: 1,
+                rule_id: "auth_prompt".to_string(),
+                pane_id: 1,
+                severity: "warning".to_string(),
+                message: "auth.prompt: Please authenticate".to_string(),
+                timestamp: 1_700_000_000_000,
+                handled: false,
+            },
+            EventView {
+                id: 2,
+                rule_id: "secret_leak".to_string(),
+                pane_id: 1,
+                severity: "critical".to_string(),
+                message: "secret_detected: API key found in output".to_string(),
+                timestamp: 1_700_000_001_000,
+                handled: true,
+            },
+            EventView {
+                id: 3,
+                rule_id: "build_error".to_string(),
+                pane_id: 3,
+                severity: "error".to_string(),
+                message: "error.compilation: cargo build failed".to_string(),
+                timestamp: 1_700_000_002_000,
+                handled: false,
+            },
+        ]
+    }
+
+    fn fixture_triage_items() -> Vec<crate::tui::query::TriageItemView> {
+        use crate::tui::query::TriageAction;
+        vec![
+            crate::tui::query::TriageItemView {
+                section: "Events".to_string(),
+                severity: "warning".to_string(),
+                title: "auth.prompt on pane 1".to_string(),
+                detail: "Please authenticate".to_string(),
+                actions: vec![TriageAction {
+                    label: "Run auth workflow".to_string(),
+                    command: "wa workflow run auth_recovery --pane 1".to_string(),
+                }],
+                event_id: Some(1),
+                pane_id: Some(1),
+                workflow_id: None,
+            },
+            crate::tui::query::TriageItemView {
+                section: "Events".to_string(),
+                severity: "error".to_string(),
+                title: "error.compilation on pane 3".to_string(),
+                detail: "cargo build failed".to_string(),
+                actions: vec![
+                    TriageAction {
+                        label: "View build log".to_string(),
+                        command: "wa export segments --pane-id 3".to_string(),
+                    },
+                    TriageAction {
+                        label: "Retry build".to_string(),
+                        command: "wa robot send 3 'cargo build'".to_string(),
+                    },
+                ],
+                event_id: Some(3),
+                pane_id: Some(3),
+                workflow_id: None,
+            },
+        ]
+    }
+
+    fn fixture_workflows() -> Vec<WorkflowProgressView> {
+        vec![WorkflowProgressView {
+            id: "wf-auth-1".to_string(),
+            workflow_name: "auth_recovery".to_string(),
+            pane_id: 1,
+            current_step: 2,
+            total_steps: 4,
+            status: "running".to_string(),
+            error: None,
+            started_at: 1_700_000_000_000,
+            updated_at: 1_700_000_001_000,
+        }]
+    }
+
+    impl QueryClient for FixtureQueryClient {
+        fn list_panes(&self) -> Result<Vec<PaneView>, QueryError> {
+            Ok(fixture_panes())
+        }
+
+        fn list_events(&self, filters: &EventFilters) -> Result<Vec<EventView>, QueryError> {
+            let events = fixture_events();
+            let filtered: Vec<_> = events
+                .into_iter()
+                .filter(|e| {
+                    if filters.unhandled_only && e.handled {
+                        return false;
+                    }
+                    true
+                })
+                .collect();
+            Ok(filtered)
+        }
+
+        fn list_triage_items(
+            &self,
+        ) -> Result<Vec<crate::tui::query::TriageItemView>, QueryError> {
+            Ok(fixture_triage_items())
+        }
+
+        fn search(&self, query: &str, _limit: usize) -> Result<Vec<SearchResultView>, QueryError> {
+            if query.is_empty() {
+                return Ok(Vec::new());
+            }
+            Ok(vec![SearchResultView {
+                pane_id: 1,
+                timestamp: 1_700_000_000_000,
+                snippet: format!("…match for '{query}'…"),
+                rank: 0.95,
+            }])
+        }
+
+        fn health(&self) -> Result<HealthStatus, QueryError> {
+            Ok(HealthStatus {
+                watcher_running: true,
+                db_accessible: true,
+                wezterm_accessible: true,
+                wezterm_circuit: crate::circuit_breaker::CircuitBreakerStatus::default(),
+                pane_count: 3,
+                event_count: 3,
+                last_capture_ts: Some(1_700_000_002_000),
+            })
+        }
+
+        fn is_watcher_running(&self) -> bool {
+            true
+        }
+
+        fn mark_event_muted(&self, _event_id: i64) -> Result<(), QueryError> {
+            Ok(())
+        }
+
+        fn list_active_workflows(&self) -> Result<Vec<WorkflowProgressView>, QueryError> {
+            Ok(fixture_workflows())
+        }
+    }
+
+    /// Extract text content from a Buffer as a vector of line strings.
+    fn buffer_to_lines(buf: &Buffer, area: Rect) -> Vec<String> {
+        let mut lines = Vec::new();
+        for y in area.y..area.y + area.height {
+            let mut line = String::new();
+            for x in area.x..area.x + area.width {
+                let cell = buf.cell((x, y)).unwrap();
+                line.push_str(cell.symbol());
+            }
+            lines.push(line.trim_end().to_string());
+        }
+        lines
+    }
+
+    /// Emit an E2E artifact for CI debugging.
+    fn emit_artifact(label: &str, content: &str) {
+        eprintln!("[ARTIFACT][tui-e2e] {label}:\n{content}\n");
+    }
+
+    /// Render the app into a fresh buffer and return the text lines.
+    fn render_snapshot(app: &App<FixtureQueryClient>, width: u16, height: u16) -> Vec<String> {
+        let area = Rect::new(0, 0, width, height);
+        let mut buf = Buffer::empty(area);
+        app.render(area, &mut buf);
+        buffer_to_lines(&buf, area)
+    }
+
+    #[test]
+    fn e2e_smoke_full_interaction_flow() {
+        let mut app = App::new(FixtureQueryClient, AppConfig::default());
+        app.refresh_data();
+
+        let mut transcript = String::new();
+        let mut step = 0u32;
+
+        let record = |transcript: &mut String, step: &mut u32, desc: &str, app: &App<FixtureQueryClient>| {
+            *step += 1;
+            let lines = render_snapshot(app, 100, 30);
+            let snapshot = lines.join("\n");
+            transcript.push_str(&format!("--- Step {step}: {desc} ---\n{snapshot}\n\n"));
+        };
+
+        // Step 1: Home view (default)
+        record(&mut transcript, &mut step, "Home view (initial)", &app);
+        let lines = render_snapshot(&app, 100, 30);
+        assert!(
+            lines.iter().any(|l| l.contains("Home")),
+            "Home view should show Home tab"
+        );
+
+        // Step 2: Navigate to Panes view
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        record(&mut transcript, &mut step, "Panes view", &app);
+        let lines = render_snapshot(&app, 100, 30);
+        assert!(
+            lines.iter().any(|l| l.contains("claude-code")),
+            "Panes view should show fixture pane"
+        );
+
+        // Step 3: Navigate down in panes
+        app.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        record(&mut transcript, &mut step, "Panes: down", &app);
+
+        // Step 4: Navigate to Events view
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+        record(&mut transcript, &mut step, "Events view", &app);
+        let lines = render_snapshot(&app, 100, 30);
+        assert!(
+            lines.iter().any(|l| l.contains("auth.prompt") || l.contains("secret_detected") || l.contains("auth_prompt")),
+            "Events view should show fixture events"
+        );
+
+        // Step 5: Toggle unhandled filter
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
+        record(&mut transcript, &mut step, "Events: toggle unhandled", &app);
+
+        // Step 6: Navigate down in events
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        record(&mut transcript, &mut step, "Events: down", &app);
+
+        // Step 7: Navigate to Triage view
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
+        record(&mut transcript, &mut step, "Triage view", &app);
+        let lines = render_snapshot(&app, 100, 30);
+        assert!(
+            lines.iter().any(|l| l.contains("auth.prompt") || l.contains("compilation") || l.contains("Events")),
+            "Triage view should show triage items"
+        );
+
+        // Step 8: Navigate down in triage
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        record(&mut transcript, &mut step, "Triage: down", &app);
+
+        // Step 9: Expand workflow panel
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        record(&mut transcript, &mut step, "Triage: expand workflows", &app);
+
+        // Step 10: Collapse workflow panel
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        record(&mut transcript, &mut step, "Triage: collapse workflows", &app);
+
+        // Step 11: Navigate to Search view
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE));
+        record(&mut transcript, &mut step, "Search view", &app);
+
+        // Step 12-15: Type search query
+        for ch in "test".chars() {
+            app.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        record(&mut transcript, &mut step, "Search: typed 'test'", &app);
+
+        // Step 16: Execute search
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        record(&mut transcript, &mut step, "Search: execute", &app);
+        let lines = render_snapshot(&app, 100, 30);
+        assert!(
+            lines.iter().any(|l| l.contains("test")),
+            "Search results should contain query match"
+        );
+
+        // Step 17: Clear search
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        record(&mut transcript, &mut step, "Search: clear", &app);
+
+        // Step 18: Navigate to Help view
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        record(&mut transcript, &mut step, "Help view", &app);
+        let lines = render_snapshot(&app, 100, 30);
+        assert!(
+            lines.iter().any(|l| l.contains("Keybindings") || l.contains("Help")),
+            "Help view should show help content"
+        );
+
+        // Step 19: Go back to Home
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+        record(&mut transcript, &mut step, "Back to Home", &app);
+
+        // Step 20: Tab through views
+        for i in 0..6 {
+            app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+            record(&mut transcript, &mut step, &format!("Tab cycle {}", i + 1), &app);
+        }
+
+        // Step 21: Refresh
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        record(&mut transcript, &mut step, "Refresh", &app);
+
+        // Final: verify app is still functional
+        assert!(!app.should_quit, "App should not have quit during smoke test");
+
+        // Emit full transcript as artifact
+        emit_artifact("session_transcript", &transcript);
+        emit_artifact("total_steps", &format!("{step}"));
+    }
+
+    #[test]
+    fn e2e_smoke_resize_stability() {
+        let mut app = App::new(FixtureQueryClient, AppConfig::default());
+        app.refresh_data();
+
+        // Test rendering at various terminal sizes without panicking
+        let sizes: Vec<(u16, u16)> = vec![
+            (80, 24),   // Standard
+            (120, 40),  // Large
+            (40, 10),   // Minimum viable
+            (200, 60),  // Extra wide
+            (60, 15),   // Narrow
+            (80, 12),   // Short
+        ];
+
+        let views = [
+            View::Home,
+            View::Panes,
+            View::Events,
+            View::Triage,
+            View::Search,
+            View::Help,
+        ];
+
+        for &(width, height) in &sizes {
+            for &view in &views {
+                app.current_view = view;
+                let lines = render_snapshot(&app, width, height);
+                // Should have rendered something (not all empty)
+                assert!(
+                    lines.iter().any(|l| !l.is_empty()),
+                    "Render at {width}x{height} in {:?} should produce output",
+                    view
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn e2e_smoke_rapid_key_sequence() {
+        let mut app = App::new(FixtureQueryClient, AppConfig::default());
+        app.refresh_data();
+
+        // Rapid-fire key sequence that exercises many code paths
+        let keys = vec![
+            KeyCode::Char('2'),        // Panes
+            KeyCode::Down,             // Nav down
+            KeyCode::Down,             // Nav down
+            KeyCode::Up,               // Nav up
+            KeyCode::Char('u'),        // Toggle unhandled
+            KeyCode::Char('a'),        // Cycle agent filter
+            KeyCode::Char('a'),        // Cycle again
+            KeyCode::Esc,              // Clear filter
+            KeyCode::Char('3'),        // Events
+            KeyCode::Char('j'),        // Nav down
+            KeyCode::Char('k'),        // Nav up
+            KeyCode::Char('u'),        // Toggle unhandled
+            KeyCode::Char('4'),        // Triage
+            KeyCode::Char('j'),        // Nav down
+            KeyCode::Char('e'),        // Expand workflows
+            KeyCode::Char('e'),        // Collapse
+            KeyCode::Char('a'),        // Queue action
+            KeyCode::Char('5'),        // Search
+            KeyCode::Char('h'),        // Type search
+            KeyCode::Char('i'),
+            KeyCode::Enter,            // Execute
+            KeyCode::Char('j'),        // Nav down in results
+            KeyCode::Esc,              // Clear
+            KeyCode::Char('6'),        // Help
+            KeyCode::Char('1'),        // Home
+            KeyCode::Tab,              // Tab through
+            KeyCode::Tab,
+            KeyCode::BackTab,          // Back-tab
+            KeyCode::Char('r'),        // Refresh
+        ];
+
+        for key in &keys {
+            app.handle_key_event(KeyEvent::new(*key, KeyModifiers::NONE));
+            // Render after every key to catch any panic
+            let _ = render_snapshot(&app, 80, 24);
+        }
+
+        assert!(!app.should_quit, "App should survive rapid key sequence");
+    }
+
+    #[test]
+    fn e2e_smoke_pane_view_renders_all_fixture_data() {
+        let mut app = App::new(FixtureQueryClient, AppConfig::default());
+        app.refresh_data();
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+
+        let lines = render_snapshot(&app, 120, 30);
+        let text = lines.join("\n");
+
+        // All fixture panes should be visible
+        assert!(text.contains("claude-code"), "Should show claude-code pane");
+        assert!(text.contains("codex"), "Should show codex pane");
+        assert!(text.contains("manual shell") || text.contains("shell"), "Should show manual pane");
+    }
+
+    #[test]
+    fn e2e_smoke_workflow_panel_in_triage() {
+        let mut app = App::new(FixtureQueryClient, AppConfig::default());
+        app.refresh_data();
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
+
+        let lines = render_snapshot(&app, 120, 30);
+        let text = lines.join("\n");
+
+        // Workflow panel should show the running workflow
+        assert!(
+            text.contains("auth_recovery") || text.contains("running"),
+            "Triage view should show workflow progress"
+        );
+    }
+
+    #[test]
+    fn e2e_smoke_home_view_shows_health() {
+        let mut app = App::new(FixtureQueryClient, AppConfig::default());
+        app.refresh_data();
+
+        let lines = render_snapshot(&app, 100, 30);
+        let text = lines.join("\n");
+
+        // Health info should appear
+        assert!(
+            text.contains("Watcher") || text.contains("watcher") || text.contains("Panes"),
+            "Home view should show health/status info"
+        );
+    }
 }
