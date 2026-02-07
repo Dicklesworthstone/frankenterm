@@ -1979,3 +1979,455 @@ mod tests {
         assert_eq!(tail, "three\nfour\n");
     }
 }
+
+// ---------------------------------------------------------------------------
+// MockWezterm: in-memory pane state for testing and simulation
+// ---------------------------------------------------------------------------
+
+/// In-memory mock of WezTerm for testing, simulation, and demo scenarios.
+///
+/// Maintains pane state (content, titles, dimensions) and supports
+/// event injection (append output, resize, clear) without a running
+/// WezTerm instance.
+pub struct MockWezterm {
+    panes: tokio::sync::RwLock<std::collections::HashMap<u64, MockPane>>,
+    next_pane_id: std::sync::atomic::AtomicU64,
+}
+
+/// State of a single mock pane.
+#[derive(Debug, Clone)]
+pub struct MockPane {
+    pub pane_id: u64,
+    pub window_id: u64,
+    pub tab_id: u64,
+    pub title: String,
+    pub domain: String,
+    pub cwd: String,
+    pub is_active: bool,
+    pub is_zoomed: bool,
+    pub cols: u32,
+    pub rows: u32,
+    /// Accumulated text content (scrollback).
+    pub content: String,
+}
+
+impl MockPane {
+    fn to_pane_info(&self) -> PaneInfo {
+        PaneInfo {
+            pane_id: self.pane_id,
+            window_id: self.window_id,
+            tab_id: self.tab_id,
+            domain_id: None,
+            domain_name: Some(self.domain.clone()),
+            workspace: None,
+            size: None,
+            rows: Some(self.rows),
+            cols: Some(self.cols),
+            title: Some(self.title.clone()),
+            cwd: Some(self.cwd.clone()),
+            tty_name: None,
+            cursor_x: None,
+            cursor_y: None,
+            cursor_visibility: None,
+            left_col: None,
+            top_row: None,
+            is_active: self.is_active,
+            is_zoomed: self.is_zoomed,
+            extra: std::collections::HashMap::new(),
+        }
+    }
+}
+
+/// Injection events for the mock.
+#[derive(Debug, Clone)]
+pub enum MockEvent {
+    /// Append text to a pane's content buffer.
+    AppendOutput(String),
+    /// Clear a pane's content buffer.
+    ClearScreen,
+    /// Resize a pane.
+    Resize(u32, u32),
+    /// Set a pane's title.
+    SetTitle(String),
+}
+
+impl MockWezterm {
+    /// Create a new MockWezterm with no panes.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            panes: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            next_pane_id: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Add a pre-configured pane.
+    pub async fn add_pane(&self, pane: MockPane) {
+        let mut panes = self.panes.write().await;
+        let id = pane.pane_id;
+        panes.insert(id, pane);
+        // Ensure next_pane_id stays above any manually inserted pane
+        let _ = self.next_pane_id.fetch_max(
+            id + 1,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
+
+    /// Create a simple mock pane with defaults.
+    pub async fn add_default_pane(&self, pane_id: u64) -> MockPane {
+        let pane = MockPane {
+            pane_id,
+            window_id: 0,
+            tab_id: 0,
+            title: format!("pane-{pane_id}"),
+            domain: "local".to_string(),
+            cwd: "/home/user".to_string(),
+            is_active: pane_id == 0,
+            is_zoomed: false,
+            cols: 80,
+            rows: 24,
+            content: String::new(),
+        };
+        self.add_pane(pane.clone()).await;
+        pane
+    }
+
+    /// Inject an event into a specific pane.
+    pub async fn inject(&self, pane_id: u64, event: MockEvent) -> crate::Result<()> {
+        let mut panes = self.panes.write().await;
+        let pane = panes.get_mut(&pane_id).ok_or_else(|| {
+            crate::Error::Runtime(format!("MockWezterm: pane {pane_id} not found"))
+        })?;
+        match event {
+            MockEvent::AppendOutput(text) => pane.content.push_str(&text),
+            MockEvent::ClearScreen => pane.content.clear(),
+            MockEvent::Resize(cols, rows) => {
+                pane.cols = cols;
+                pane.rows = rows;
+            }
+            MockEvent::SetTitle(title) => pane.title = title,
+        }
+        Ok(())
+    }
+
+    /// Inject output text into a pane (convenience wrapper).
+    pub async fn inject_output(&self, pane_id: u64, text: &str) -> crate::Result<()> {
+        self.inject(pane_id, MockEvent::AppendOutput(text.to_string()))
+            .await
+    }
+
+    /// Get a snapshot of a pane's state.
+    pub async fn pane_state(&self, pane_id: u64) -> Option<MockPane> {
+        let panes = self.panes.read().await;
+        panes.get(&pane_id).cloned()
+    }
+
+    /// Get the number of panes.
+    pub async fn pane_count(&self) -> usize {
+        self.panes.read().await.len()
+    }
+}
+
+impl Default for MockWezterm {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WeztermInterface for MockWezterm {
+    fn list_panes(&self) -> WeztermFuture<'_, Vec<PaneInfo>> {
+        Box::pin(async move {
+            let panes = self.panes.read().await;
+            Ok(panes.values().map(MockPane::to_pane_info).collect())
+        })
+    }
+
+    fn get_pane(&self, pane_id: u64) -> WeztermFuture<'_, PaneInfo> {
+        Box::pin(async move {
+            let panes = self.panes.read().await;
+            panes
+                .get(&pane_id)
+                .map(MockPane::to_pane_info)
+                .ok_or(crate::Error::Wezterm(WeztermError::PaneNotFound(pane_id)))
+        })
+    }
+
+    fn get_text(&self, pane_id: u64, _escapes: bool) -> WeztermFuture<'_, String> {
+        Box::pin(async move {
+            let panes = self.panes.read().await;
+            panes
+                .get(&pane_id)
+                .map(|p| p.content.clone())
+                .ok_or(crate::Error::Wezterm(WeztermError::PaneNotFound(pane_id)))
+        })
+    }
+
+    fn send_text(&self, pane_id: u64, text: &str) -> WeztermFuture<'_, ()> {
+        let text = text.to_string();
+        Box::pin(async move {
+            let mut panes = self.panes.write().await;
+            let pane = panes.get_mut(&pane_id).ok_or(crate::Error::Wezterm(WeztermError::PaneNotFound(pane_id)))?;
+            // Echo sent text to content (simulating terminal echo)
+            pane.content.push_str(&text);
+            Ok(())
+        })
+    }
+
+    fn send_text_no_paste(&self, pane_id: u64, text: &str) -> WeztermFuture<'_, ()> {
+        self.send_text(pane_id, text)
+    }
+
+    fn send_text_with_options(
+        &self,
+        pane_id: u64,
+        text: &str,
+        _no_paste: bool,
+        _no_newline: bool,
+    ) -> WeztermFuture<'_, ()> {
+        self.send_text(pane_id, text)
+    }
+
+    fn send_control(&self, pane_id: u64, _control_char: &str) -> WeztermFuture<'_, ()> {
+        Box::pin(async move {
+            let panes = self.panes.read().await;
+            if !panes.contains_key(&pane_id) {
+                return Err(crate::Error::Wezterm(WeztermError::PaneNotFound(pane_id)));
+            }
+            Ok(())
+        })
+    }
+
+    fn send_ctrl_c(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
+        self.send_control(pane_id, "\x03")
+    }
+
+    fn send_ctrl_d(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
+        self.send_control(pane_id, "\x04")
+    }
+
+    fn spawn(&self, cwd: Option<&str>, domain_name: Option<&str>) -> WeztermFuture<'_, u64> {
+        let cwd = cwd.unwrap_or("/home/user").to_string();
+        let domain = domain_name.unwrap_or("local").to_string();
+        Box::pin(async move {
+            let pane_id = self
+                .next_pane_id
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let pane = MockPane {
+                pane_id,
+                window_id: 0,
+                tab_id: 0,
+                title: format!("pane-{pane_id}"),
+                domain,
+                cwd,
+                is_active: false,
+                is_zoomed: false,
+                cols: 80,
+                rows: 24,
+                content: String::new(),
+            };
+            self.panes.write().await.insert(pane_id, pane);
+            Ok(pane_id)
+        })
+    }
+
+    fn split_pane(
+        &self,
+        _pane_id: u64,
+        _direction: SplitDirection,
+        cwd: Option<&str>,
+        _percent: Option<u8>,
+    ) -> WeztermFuture<'_, u64> {
+        self.spawn(cwd, None)
+    }
+
+    fn activate_pane(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
+        Box::pin(async move {
+            let mut panes = self.panes.write().await;
+            // Deactivate all, then activate target
+            for pane in panes.values_mut() {
+                pane.is_active = false;
+            }
+            let pane = panes.get_mut(&pane_id).ok_or(crate::Error::Wezterm(WeztermError::PaneNotFound(pane_id)))?;
+            pane.is_active = true;
+            Ok(())
+        })
+    }
+
+    fn get_pane_direction(
+        &self,
+        _pane_id: u64,
+        _direction: MoveDirection,
+    ) -> WeztermFuture<'_, Option<u64>> {
+        Box::pin(async move { Ok(None) })
+    }
+
+    fn kill_pane(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
+        Box::pin(async move {
+            let mut panes = self.panes.write().await;
+            panes.remove(&pane_id);
+            Ok(())
+        })
+    }
+
+    fn zoom_pane(&self, pane_id: u64, zoom: bool) -> WeztermFuture<'_, ()> {
+        Box::pin(async move {
+            let mut panes = self.panes.write().await;
+            let pane = panes.get_mut(&pane_id).ok_or(crate::Error::Wezterm(WeztermError::PaneNotFound(pane_id)))?;
+            pane.is_zoomed = zoom;
+            Ok(())
+        })
+    }
+
+    fn circuit_status(&self) -> CircuitBreakerStatus {
+        CircuitBreakerStatus::default()
+    }
+}
+
+#[cfg(test)]
+mod mock_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn mock_add_and_list_panes() {
+        let mock = MockWezterm::new();
+        mock.add_default_pane(0).await;
+        mock.add_default_pane(1).await;
+
+        let panes = mock.list_panes().await.unwrap();
+        assert_eq!(panes.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn mock_get_text_returns_content() {
+        let mock = MockWezterm::new();
+        mock.add_default_pane(0).await;
+        mock.inject_output(0, "hello world\n").await.unwrap();
+
+        let text = mock.get_text(0, false).await.unwrap();
+        assert_eq!(text, "hello world\n");
+    }
+
+    #[tokio::test]
+    async fn mock_send_text_echoes() {
+        let mock = MockWezterm::new();
+        mock.add_default_pane(0).await;
+        mock.send_text(0, "ls -la\n").await.unwrap();
+
+        let text = mock.get_text(0, false).await.unwrap();
+        assert_eq!(text, "ls -la\n");
+    }
+
+    #[tokio::test]
+    async fn mock_inject_events() {
+        let mock = MockWezterm::new();
+        mock.add_default_pane(0).await;
+
+        mock.inject(0, MockEvent::AppendOutput("line 1\n".to_string()))
+            .await
+            .unwrap();
+        mock.inject(0, MockEvent::SetTitle("New Title".to_string()))
+            .await
+            .unwrap();
+        mock.inject(0, MockEvent::Resize(120, 40))
+            .await
+            .unwrap();
+
+        let state = mock.pane_state(0).await.unwrap();
+        assert_eq!(state.content, "line 1\n");
+        assert_eq!(state.title, "New Title");
+        assert_eq!(state.cols, 120);
+        assert_eq!(state.rows, 40);
+    }
+
+    #[tokio::test]
+    async fn mock_spawn_creates_pane() {
+        let mock = MockWezterm::new();
+        let id = mock.spawn(Some("/tmp"), None).await.unwrap();
+        assert_eq!(mock.pane_count().await, 1);
+
+        let pane = mock.get_pane(id).await.unwrap();
+        assert_eq!(pane.cwd.as_deref(), Some("/tmp"));
+    }
+
+    #[tokio::test]
+    async fn mock_kill_pane_removes() {
+        let mock = MockWezterm::new();
+        mock.add_default_pane(0).await;
+        assert_eq!(mock.pane_count().await, 1);
+
+        mock.kill_pane(0).await.unwrap();
+        assert_eq!(mock.pane_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn mock_activate_pane() {
+        let mock = MockWezterm::new();
+        mock.add_default_pane(0).await;
+        mock.add_default_pane(1).await;
+
+        mock.activate_pane(1).await.unwrap();
+
+        let p0 = mock.pane_state(0).await.unwrap();
+        let p1 = mock.pane_state(1).await.unwrap();
+        assert!(!p0.is_active);
+        assert!(p1.is_active);
+    }
+
+    #[tokio::test]
+    async fn mock_zoom_pane() {
+        let mock = MockWezterm::new();
+        mock.add_default_pane(0).await;
+
+        mock.zoom_pane(0, true).await.unwrap();
+        let state = mock.pane_state(0).await.unwrap();
+        assert!(state.is_zoomed);
+
+        mock.zoom_pane(0, false).await.unwrap();
+        let state = mock.pane_state(0).await.unwrap();
+        assert!(!state.is_zoomed);
+    }
+
+    #[tokio::test]
+    async fn mock_clear_screen() {
+        let mock = MockWezterm::new();
+        mock.add_default_pane(0).await;
+        mock.inject_output(0, "some text").await.unwrap();
+        mock.inject(0, MockEvent::ClearScreen).await.unwrap();
+
+        let text = mock.get_text(0, false).await.unwrap();
+        assert!(text.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mock_pane_not_found() {
+        let mock = MockWezterm::new();
+        assert!(mock.get_text(99, false).await.is_err());
+        assert!(mock.send_text(99, "x").await.is_err());
+        assert!(mock.inject_output(99, "x").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn mock_split_pane_creates_new() {
+        let mock = MockWezterm::new();
+        mock.add_default_pane(0).await;
+
+        let new_id = mock
+            .split_pane(0, SplitDirection::Right, None, None)
+            .await
+            .unwrap();
+        assert_eq!(mock.pane_count().await, 2);
+        assert_ne!(new_id, 0);
+    }
+
+    #[tokio::test]
+    async fn mock_as_wezterm_handle() {
+        // Verify MockWezterm works as a WeztermHandle (Arc<dyn WeztermInterface>)
+        let mock = MockWezterm::new();
+        mock.add_default_pane(0).await;
+        mock.inject_output(0, "test").await.unwrap();
+
+        let handle: WeztermHandle = std::sync::Arc::new(mock);
+        let text = handle.get_text(0, false).await.unwrap();
+        assert_eq!(text, "test");
+    }
+}
