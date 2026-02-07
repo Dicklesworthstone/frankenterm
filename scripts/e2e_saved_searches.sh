@@ -142,7 +142,12 @@ scenario_disable_prevents_future_alerts() {
   PANE_B=$(echo "$spawn_output" | grep -oE '^[0-9]+$' | head -1 || true)
   echo "pane_b=$PANE_B"
 
-  sleep 3
+  # Wait for pane B output to be ingested (replaces bare sleep 3)
+  if [[ -n "$PANE_B" ]]; then
+    wait_for_json_condition \
+      "pane $PANE_B observed by watcher" 10 \
+      "$WA_BINARY status -f json 2>/dev/null | jq -e '.observed_panes[]? | select(.pane_id == $PANE_B)' >/dev/null 2>&1"
+  fi
 
   local after
   after=$("$WA_BINARY" events -f json --limit 500 | jq '[.events[]? | select(.event_type == "saved_search.alert" and .rule_id == "wezterm.saved_search.alert")] | length')

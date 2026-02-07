@@ -392,6 +392,7 @@ SCENARIO_REGISTRY=(
     "pane_uuid_stability|Validate pane_uuid stable across rename, tab move, cwd change|true|cargo,jq|Protects pane identity stability"
     "incident_bundle|Validate incident bundle export, redaction, replay (policy + rules modes)|true|cargo,jq|Protects incident bundle lifecycle"
     "prioritized_capture|Validate pane priority scheduling, capture budgets, throttle under load|true|cargo,jq|Protects prioritized capture under contention"
+    "sleep_audit|Audit E2E scripts for unjustified fixed sleeps; enforce wait-for/quiescence|true|cargo|Protects deterministic timing contract"
 )
 
 list_scenarios() {
