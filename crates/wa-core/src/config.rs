@@ -2053,6 +2053,8 @@ impl NotificationConfig {
             }
         }
 
+        self.email.validate()?;
+
         Ok(())
     }
 
@@ -4252,6 +4254,21 @@ log_level = "debug"
 
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("duplicate name"));
+    }
+
+    #[test]
+    fn notification_config_validation_rejects_invalid_email_settings() {
+        let mut config = Config::default();
+        config.notifications.email.enabled = true;
+        config.notifications.email.smtp_host = "smtp.example.com".to_string();
+        config.notifications.email.from = "wa@example.com".to_string();
+        config.notifications.email.to = vec!["ops@example.com".to_string()];
+        config.notifications.email.username = Some("mailer".to_string());
+        config.notifications.email.password = None;
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("notifications.email.username"));
+        assert!(err.contains("notifications.email.password"));
     }
 
     #[test]
