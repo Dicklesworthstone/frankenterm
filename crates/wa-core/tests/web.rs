@@ -8,6 +8,19 @@ mod web_tests {
 
     use wa_core::web::{WebServerConfig, start_web_server};
 
+    /// Extract the HTTP response body from a raw HTTP response string.
+    fn extract_body(raw: &str) -> &str {
+        raw.split("\r\n\r\n").nth(1).unwrap_or("")
+    }
+
+    /// Extract the HTTP status code from a raw HTTP response string.
+    fn extract_status(raw: &str) -> u16 {
+        raw.split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    }
+
     async fn fetch_health(addr: SocketAddr) -> std::io::Result<String> {
         let request = b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
         let mut last_err = None;
@@ -138,8 +151,7 @@ mod web_tests {
         let response = response?;
         shutdown?;
 
-        // Should return 400 since storage is absent (503) or missing query param (400).
-        // Without storage, 503 takes precedence. With storage, it'd be 400.
+        // Without storage, 503 takes precedence over the missing-query 400.
         assert!(
             response.contains("503") || response.contains("400"),
             "should reject missing q: {response}"
@@ -147,4 +159,102 @@ mod web_tests {
         Ok(())
     }
 
+    // =========================================================================
+    // Schema / contract tests (wa-nu4.3.6.4)
+    // =========================================================================
+
+    #[tokio::test]
+    async fn health_schema_parseable() -> Result<(), Box<dyn std::error::Error>> {
+        let server = start_web_server(WebServerConfig::default().with_port(0)).await?;
+        let addr = server.bound_addr();
+
+        let response = fetch_health(addr).await;
+        let shutdown = server.shutdown().await;
+        let response = response?;
+        shutdown?;
+
+        let body = extract_body(&response);
+        let json: serde_json::Value = serde_json::from_str(body)
+            .unwrap_or_else(|e| panic!("health response not valid JSON: {e}\nbody: {body}"));
+
+        assert_eq!(json["ok"], true, "health.ok should be true");
+        assert!(json["version"].is_string(), "health.version should be a string");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn events_returns_503_without_storage() -> Result<(), Box<dyn std::error::Error>> {
+        let server = start_web_server(WebServerConfig::default().with_port(0)).await?;
+        let addr = server.bound_addr();
+
+        let req = b"GET /events HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        let response = fetch_raw(addr, req).await;
+        let shutdown = server.shutdown().await;
+        let response = response?;
+        shutdown?;
+
+        assert_eq!(extract_status(&response), 503);
+
+        // Response body should be valid JSON with the error envelope
+        let body = extract_body(&response);
+        let json: serde_json::Value = serde_json::from_str(body)
+            .unwrap_or_else(|e| panic!("events 503 not valid JSON: {e}\nbody: {body}"));
+        assert_eq!(json["ok"], false, "error response ok should be false");
+        assert!(json["error_code"].is_string(), "should include error_code");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn panes_503_has_json_envelope() -> Result<(), Box<dyn std::error::Error>> {
+        let server = start_web_server(WebServerConfig::default().with_port(0)).await?;
+        let addr = server.bound_addr();
+
+        let req = b"GET /panes HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        let response = fetch_raw(addr, req).await;
+        let shutdown = server.shutdown().await;
+        let response = response?;
+        shutdown?;
+
+        let body = extract_body(&response);
+        let json: serde_json::Value = serde_json::from_str(body)
+            .unwrap_or_else(|e| panic!("panes 503 not valid JSON: {e}\nbody: {body}"));
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["error_code"], "no_storage");
+        assert!(json["version"].is_string(), "envelope should include version");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unknown_route_returns_404() -> Result<(), Box<dyn std::error::Error>> {
+        let server = start_web_server(WebServerConfig::default().with_port(0)).await?;
+        let addr = server.bound_addr();
+
+        let req = b"GET /not-a-route HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        let response = fetch_raw(addr, req).await;
+        let shutdown = server.shutdown().await;
+        let response = response?;
+        shutdown?;
+
+        assert_eq!(extract_status(&response), 404, "unknown route should 404: {response}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn post_method_not_allowed() -> Result<(), Box<dyn std::error::Error>> {
+        let server = start_web_server(WebServerConfig::default().with_port(0)).await?;
+        let addr = server.bound_addr();
+
+        let req = b"POST /health HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let response = fetch_raw(addr, req).await;
+        let shutdown = server.shutdown().await;
+        let response = response?;
+        shutdown?;
+
+        let status = extract_status(&response);
+        assert!(
+            status == 404 || status == 405,
+            "POST should be rejected (404 or 405), got {status}: {response}"
+        );
+        Ok(())
+    }
 }
