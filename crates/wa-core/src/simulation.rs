@@ -717,4 +717,240 @@ events: []
         assert_eq!(pane.rows, 24);
         assert!(pane.initial_content.is_empty());
     }
+
+    #[tokio::test]
+    async fn multi_pane_execution() {
+        let yaml = r#"
+name: multi_exec
+duration: "5s"
+panes:
+  - id: 0
+    title: "Agent A"
+  - id: 1
+    title: "Agent B"
+events:
+  - at: "1s"
+    pane: 0
+    action: append
+    content: "output-a"
+  - at: "2s"
+    pane: 1
+    action: append
+    content: "output-b"
+  - at: "3s"
+    pane: 0
+    action: append
+    content: " more-a"
+"#;
+        let scenario = Scenario::from_yaml(yaml).unwrap();
+        let mock = MockWezterm::new();
+        scenario.setup(&mock).await.unwrap();
+        let count = scenario.execute_all(&mock).await.unwrap();
+        assert_eq!(count, 3);
+
+        let t0 = mock.get_text(0, false).await.unwrap();
+        let t1 = mock.get_text(1, false).await.unwrap();
+        assert!(t0.contains("output-a"));
+        assert!(t0.contains("more-a"));
+        assert!(t1.contains("output-b"));
+        assert!(!t1.contains("output-a"));
+    }
+
+    #[tokio::test]
+    async fn marker_event_injects_marker_text() {
+        let yaml = r#"
+name: marker_test
+duration: "5s"
+panes:
+  - id: 0
+events:
+  - at: "1s"
+    pane: 0
+    action: marker
+    name: checkpoint_1
+"#;
+        let scenario = Scenario::from_yaml(yaml).unwrap();
+        let mock = MockWezterm::new();
+        scenario.setup(&mock).await.unwrap();
+        scenario.execute_all(&mock).await.unwrap();
+
+        let text = mock.get_text(0, false).await.unwrap();
+        assert!(text.contains("[MARKER:checkpoint_1]"));
+    }
+
+    #[tokio::test]
+    async fn contains_expectation_passes() {
+        let scenario = Scenario::from_yaml(BASIC_SCENARIO).unwrap();
+        let mock = MockWezterm::new();
+        scenario.setup(&mock).await.unwrap();
+        scenario.execute_all(&mock).await.unwrap();
+
+        // Verify the expectation programmatically
+        assert_eq!(scenario.expectations.len(), 1);
+        match &scenario.expectations[0].kind {
+            ExpectationKind::Contains { pane, text } => {
+                let content = mock.get_text(*pane, false).await.unwrap();
+                assert!(content.contains(text));
+            }
+            _ => panic!("Expected Contains expectation"),
+        }
+    }
+
+    #[test]
+    fn comments_are_ignored() {
+        let yaml = r#"
+name: with_comments
+duration: "5s"
+panes:
+  - id: 0
+events:
+  - at: "1s"
+    pane: 0
+    action: append
+    content: "hello"
+    comment: "This is a test event"
+"#;
+        let scenario = Scenario::from_yaml(yaml).unwrap();
+        assert_eq!(scenario.events[0].comment.as_deref(), Some("This is a test event"));
+    }
+
+    #[test]
+    fn to_mock_event_clear() {
+        let event = ScenarioEvent {
+            at: Duration::from_secs(1),
+            pane: 0,
+            action: EventAction::Clear,
+            content: String::new(),
+            name: String::new(),
+            comment: None,
+        };
+        let mock_event = Scenario::to_mock_event(&event).unwrap();
+        assert!(matches!(mock_event, MockEvent::ClearScreen));
+    }
+
+    #[test]
+    fn to_mock_event_set_title() {
+        let event = ScenarioEvent {
+            at: Duration::from_secs(1),
+            pane: 0,
+            action: EventAction::SetTitle,
+            content: "My Title".to_string(),
+            name: String::new(),
+            comment: None,
+        };
+        let mock_event = Scenario::to_mock_event(&event).unwrap();
+        assert!(matches!(mock_event, MockEvent::SetTitle(ref s) if s == "My Title"));
+    }
+
+    #[test]
+    fn to_mock_event_marker() {
+        let event = ScenarioEvent {
+            at: Duration::from_secs(1),
+            pane: 0,
+            action: EventAction::Marker,
+            content: String::new(),
+            name: "my_marker".to_string(),
+            comment: None,
+        };
+        let mock_event = Scenario::to_mock_event(&event).unwrap();
+        assert!(matches!(mock_event, MockEvent::AppendOutput(ref s) if s.contains("my_marker")));
+    }
+
+    #[test]
+    fn duration_parse_edge_cases() {
+        // Pure seconds as float
+        assert_eq!(parse_duration("0.1s").unwrap(), Duration::from_millis(100));
+        // Hour + minute
+        assert_eq!(
+            parse_duration("1h30m").unwrap(),
+            Duration::from_secs(5400)
+        );
+        // All units
+        assert_eq!(
+            parse_duration("1h1m1s").unwrap(),
+            Duration::from_secs(3661)
+        );
+    }
+
+    #[test]
+    fn duration_parse_bad_unit() {
+        assert!(parse_duration("5x").is_err());
+    }
+
+    #[test]
+    fn duration_parse_empty_number() {
+        assert!(parse_duration("s").is_err());
+    }
+
+    #[tokio::test]
+    async fn execute_until_zero_runs_nothing() {
+        let scenario = Scenario::from_yaml(BASIC_SCENARIO).unwrap();
+        let mock = MockWezterm::new();
+        scenario.setup(&mock).await.unwrap();
+
+        let count = scenario
+            .execute_until(&mock, Duration::from_millis(0))
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+
+        let text = mock.get_text(0, false).await.unwrap();
+        assert_eq!(text, "$ ");
+    }
+
+    #[test]
+    fn scenario_round_trip_yaml() {
+        let scenario = Scenario::from_yaml(BASIC_SCENARIO).unwrap();
+        let serialized = serde_yaml::to_string(&scenario).unwrap();
+        // Verify it can be deserialized back (not a perfect round-trip due to Duration,
+        // but the key fields survive)
+        assert!(serialized.contains("basic_test"));
+        assert!(serialized.contains("hello world"));
+    }
+
+    #[tokio::test]
+    async fn scenario_load_from_temp_file() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.yaml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        write!(f, "{}", BASIC_SCENARIO).unwrap();
+        drop(f);
+
+        let scenario = Scenario::load(&path).unwrap();
+        assert_eq!(scenario.name, "basic_test");
+        assert_eq!(scenario.events.len(), 2);
+    }
+
+    #[test]
+    fn scenario_load_nonexistent_file() {
+        let result = Scenario::load(std::path::Path::new("/nonexistent/scenario.yaml"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn scenario_invalid_yaml_returns_error() {
+        let yaml = "this is not valid yaml: [[[";
+        assert!(Scenario::from_yaml(yaml).is_err());
+    }
+
+    #[test]
+    fn scenario_missing_name_field() {
+        let yaml = r#"
+duration: "5s"
+panes: []
+events: []
+"#;
+        assert!(Scenario::from_yaml(yaml).is_err());
+    }
+
+    #[test]
+    fn scenario_missing_duration_field() {
+        let yaml = r#"
+name: no_duration
+panes: []
+events: []
+"#;
+        assert!(Scenario::from_yaml(yaml).is_err());
+    }
 }

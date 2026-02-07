@@ -2430,4 +2430,79 @@ mod mock_tests {
         let text = handle.get_text(0, false).await.unwrap();
         assert_eq!(text, "test");
     }
+
+    #[tokio::test]
+    async fn mock_pane_content_isolation() {
+        // Content in one pane doesn't leak to another
+        let mock = MockWezterm::new();
+        mock.add_default_pane(0).await;
+        mock.add_default_pane(1).await;
+
+        mock.inject_output(0, "pane-zero-only").await.unwrap();
+        mock.inject_output(1, "pane-one-only").await.unwrap();
+
+        let t0 = mock.get_text(0, false).await.unwrap();
+        let t1 = mock.get_text(1, false).await.unwrap();
+        assert!(t0.contains("pane-zero-only"));
+        assert!(!t0.contains("pane-one-only"));
+        assert!(t1.contains("pane-one-only"));
+        assert!(!t1.contains("pane-zero-only"));
+    }
+
+    #[tokio::test]
+    async fn mock_pane_size_via_state() {
+        let mock = MockWezterm::new();
+        mock.add_default_pane(0).await;
+
+        let state = mock.pane_state(0).await.unwrap();
+        assert_eq!(state.cols, 80);
+        assert_eq!(state.rows, 24);
+
+        // After resize
+        mock.inject(0, MockEvent::Resize(200, 50)).await.unwrap();
+        let state = mock.pane_state(0).await.unwrap();
+        assert_eq!(state.cols, 200);
+        assert_eq!(state.rows, 50);
+    }
+
+    #[tokio::test]
+    async fn mock_multiple_appends_accumulate() {
+        let mock = MockWezterm::new();
+        mock.add_default_pane(0).await;
+
+        mock.inject_output(0, "a").await.unwrap();
+        mock.inject_output(0, "b").await.unwrap();
+        mock.inject_output(0, "c").await.unwrap();
+
+        let text = mock.get_text(0, false).await.unwrap();
+        assert_eq!(text, "abc");
+    }
+
+    #[tokio::test]
+    async fn mock_spawn_multiple_gets_unique_ids() {
+        let mock = MockWezterm::new();
+        let id1 = mock.spawn(None, None).await.unwrap();
+        let id2 = mock.spawn(None, None).await.unwrap();
+        let id3 = mock.spawn(None, None).await.unwrap();
+
+        assert_ne!(id1, id2);
+        assert_ne!(id2, id3);
+        assert_eq!(mock.pane_count().await, 3);
+    }
+
+    #[tokio::test]
+    async fn mock_kill_nonexistent_pane_is_noop() {
+        let mock = MockWezterm::new();
+        // kill_pane on nonexistent pane succeeds silently (HashMap::remove returns None)
+        assert!(mock.kill_pane(99).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn mock_split_ignores_parent_creates_new() {
+        let mock = MockWezterm::new();
+        // split_pane delegates to spawn, ignoring parent pane ID
+        let new_id = mock.split_pane(99, SplitDirection::Right, None, None).await.unwrap();
+        assert_eq!(mock.pane_count().await, 1);
+        assert!(new_id > 0 || new_id == 0); // any valid ID
+    }
 }
