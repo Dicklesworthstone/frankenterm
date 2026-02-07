@@ -118,7 +118,10 @@ fn integration_pane_agents_to_pattern_packs() {
     // Then all three agent packs are selected plus core
     assert!(auto.pattern_packs.contains(&"builtin:core".to_string()));
     assert!(auto.pattern_packs.contains(&"builtin:codex".to_string()));
-    assert!(auto.pattern_packs.contains(&"builtin:claude_code".to_string()));
+    assert!(
+        auto.pattern_packs
+            .contains(&"builtin:claude_code".to_string())
+    );
     assert!(auto.pattern_packs.contains(&"builtin:gemini".to_string()));
     assert_eq!(auto.pattern_packs.len(), 4);
 }
@@ -155,7 +158,15 @@ fn integration_ssh_remotes_enable_strict_safety() {
     assert_eq!(remotes[0].connection_type, ConnectionType::Ssh);
     assert_eq!(remotes[0].pane_ids.len(), 2);
 
-    let env = make_env(8, Some(16384), Some(0.5), vec![], remotes, Some("zsh"), true);
+    let env = make_env(
+        8,
+        Some(16384),
+        Some(0.5),
+        vec![],
+        remotes,
+        Some("zsh"),
+        true,
+    );
     let auto = AutoConfig::from_environment(&env);
     assert!(auto.strict_safety);
     assert!(auto.rate_limit_per_pane < 30);
@@ -172,7 +183,15 @@ fn integration_production_remotes_max_caution() {
     let remotes = wa_core::environment::detect_remotes_from_panes(&panes);
     assert_eq!(remotes.len(), 1);
 
-    let env = make_env(8, Some(16384), Some(0.5), vec![], remotes, Some("bash"), false);
+    let env = make_env(
+        8,
+        Some(16384),
+        Some(0.5),
+        vec![],
+        remotes,
+        Some("bash"),
+        false,
+    );
     let auto = AutoConfig::from_environment(&env);
     assert!(auto.strict_safety);
     assert!(auto.rate_limit_per_pane <= 10);
@@ -254,22 +273,35 @@ fn integration_shell_detection_paths() {
 #[test]
 fn integration_system_scaling_low_resource() {
     // 2 cores, 1GB RAM, load 5.0 → constrained system
-    let env = make_env(2, Some(1024), Some(5.0), vec![], vec![], Some("bash"), false);
+    let env = make_env(
+        2,
+        Some(1024),
+        Some(5.0),
+        vec![],
+        vec![],
+        Some("bash"),
+        false,
+    );
     let auto = AutoConfig::from_environment(&env);
 
     // Low resources → conservative settings
     assert!(auto.poll_interval_ms >= 300, "low memory → slow polling");
-    assert_eq!(
-        auto.max_concurrent_captures, 4,
-        "low CPU → min captures"
-    );
+    assert_eq!(auto.max_concurrent_captures, 4, "low CPU → min captures");
     assert_eq!(auto.min_poll_interval_ms, 100, "2 CPUs → 100ms min");
 }
 
 #[test]
 fn integration_system_scaling_high_resource() {
     // 16 cores, 64GB RAM, idle
-    let env = make_env(16, Some(65536), Some(0.1), vec![], vec![], Some("zsh"), true);
+    let env = make_env(
+        16,
+        Some(65536),
+        Some(0.1),
+        vec![],
+        vec![],
+        Some("zsh"),
+        true,
+    );
     let auto = AutoConfig::from_environment(&env);
 
     // Abundant resources → aggressive settings
@@ -324,7 +356,11 @@ fn integration_full_detection_to_autoconfig() {
 
     // Recommendations generated
     assert!(!auto.recommendations.is_empty());
-    let rec_keys: Vec<&str> = auto.recommendations.iter().map(|r| r.key.as_str()).collect();
+    let rec_keys: Vec<&str> = auto
+        .recommendations
+        .iter()
+        .map(|r| r.key.as_str())
+        .collect();
     assert!(rec_keys.contains(&"patterns.packs"));
     assert!(rec_keys.contains(&"safety.rate_limit_per_pane"));
 }
@@ -382,7 +418,15 @@ fn integration_autoconfig_json_stable() {
         pane_ids: vec![3],
     }];
 
-    let env = make_env(4, Some(8192), Some(6.0), agents, remotes, Some("bash"), false);
+    let env = make_env(
+        4,
+        Some(8192),
+        Some(6.0),
+        agents,
+        remotes,
+        Some("bash"),
+        false,
+    );
     let auto = AutoConfig::from_environment(&env);
     let json = serde_json::to_string_pretty(&auto).unwrap();
 
@@ -432,17 +476,22 @@ fn integration_autoconfig_deterministic() {
         Some("fish"),
         true,
     );
-    let env2 = make_env(8, Some(16384), Some(2.5), agents, remotes, Some("fish"), true);
+    let env2 = make_env(
+        8,
+        Some(16384),
+        Some(2.5),
+        agents,
+        remotes,
+        Some("fish"),
+        true,
+    );
 
     let auto1 = AutoConfig::from_environment(&env1);
     let auto2 = AutoConfig::from_environment(&env2);
 
     assert_eq!(auto1.poll_interval_ms, auto2.poll_interval_ms);
     assert_eq!(auto1.min_poll_interval_ms, auto2.min_poll_interval_ms);
-    assert_eq!(
-        auto1.max_concurrent_captures,
-        auto2.max_concurrent_captures
-    );
+    assert_eq!(auto1.max_concurrent_captures, auto2.max_concurrent_captures);
     assert_eq!(auto1.pattern_packs, auto2.pattern_packs);
     assert_eq!(auto1.strict_safety, auto2.strict_safety);
     assert_eq!(auto1.rate_limit_per_pane, auto2.rate_limit_per_pane);

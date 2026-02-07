@@ -644,11 +644,41 @@ fn batch_record_then_aggregate_daily() {
         let day1 = 1_700_000_000_000i64;
         let day2 = day1 + 86_400_000;
         let batch = vec![
-            make_metric(MetricType::TokenUsage, Some("codex"), Some(1000), Some(0.10), day1),
-            make_metric(MetricType::TokenUsage, Some("codex"), Some(2000), Some(0.20), day1 + 60_000),
-            make_metric(MetricType::ApiCost, Some("claude_code"), None, Some(0.50), day1 + 120_000),
-            make_metric(MetricType::TokenUsage, Some("codex"), Some(3000), Some(0.30), day2),
-            make_metric(MetricType::ApiCost, Some("claude_code"), None, Some(0.75), day2 + 60_000),
+            make_metric(
+                MetricType::TokenUsage,
+                Some("codex"),
+                Some(1000),
+                Some(0.10),
+                day1,
+            ),
+            make_metric(
+                MetricType::TokenUsage,
+                Some("codex"),
+                Some(2000),
+                Some(0.20),
+                day1 + 60_000,
+            ),
+            make_metric(
+                MetricType::ApiCost,
+                Some("claude_code"),
+                None,
+                Some(0.50),
+                day1 + 120_000,
+            ),
+            make_metric(
+                MetricType::TokenUsage,
+                Some("codex"),
+                Some(3000),
+                Some(0.30),
+                day2,
+            ),
+            make_metric(
+                MetricType::ApiCost,
+                Some("claude_code"),
+                None,
+                Some(0.75),
+                day2 + 60_000,
+            ),
         ];
 
         let inserted = storage.record_usage_metrics_batch(batch).await.unwrap();
@@ -656,7 +686,10 @@ fn batch_record_then_aggregate_daily() {
 
         // Aggregate daily should show both days
         let daily = storage.aggregate_daily_metrics(day1 - 1).await.unwrap();
-        assert!(daily.len() >= 2, "should have summaries for 2+ day/agent combos");
+        assert!(
+            daily.len() >= 2,
+            "should have summaries for 2+ day/agent combos"
+        );
 
         // Aggregate by agent should show both agents
         let by_agent = storage.aggregate_by_agent(day1 - 1).await.unwrap();
@@ -664,7 +697,10 @@ fn batch_record_then_aggregate_daily() {
         let codex = by_agent.iter().find(|b| b.agent_type == "codex").unwrap();
         assert_eq!(codex.total_tokens, 6000); // 1000 + 2000 + 3000
 
-        let claude = by_agent.iter().find(|b| b.agent_type == "claude_code").unwrap();
+        let claude = by_agent
+            .iter()
+            .find(|b| b.agent_type == "claude_code")
+            .unwrap();
         assert!((claude.total_cost - 1.25).abs() < 0.01); // 0.50 + 0.75
 
         storage.shutdown().await.expect("shutdown");
@@ -900,7 +936,13 @@ fn purge_all_metrics() {
         let ts = now_ms();
         for i in 0..10 {
             storage
-                .record_usage_metric(make_metric(MetricType::ApiCall, None, None, None, ts + i * 100))
+                .record_usage_metric(make_metric(
+                    MetricType::ApiCall,
+                    None,
+                    None,
+                    None,
+                    ts + i * 100,
+                ))
                 .await
                 .unwrap();
         }
@@ -964,7 +1006,9 @@ fn query_results_ordered_desc_by_timestamp() {
 
 #[test]
 fn integration_record_aggregate_render_summary() {
-    use wa_core::output::{AnalyticsSummaryData, AnalyticsSummaryRenderer, OutputFormat, RenderContext};
+    use wa_core::output::{
+        AnalyticsSummaryData, AnalyticsSummaryRenderer, OutputFormat, RenderContext,
+    };
 
     let rt = runtime();
     rt.block_on(async {
@@ -973,16 +1017,37 @@ fn integration_record_aggregate_render_summary() {
 
         let ts = now_ms();
         let batch = vec![
-            make_metric(MetricType::TokenUsage, Some("codex"), Some(10_000), Some(1.0), ts),
-            make_metric(MetricType::TokenUsage, Some("claude_code"), Some(20_000), Some(2.0), ts + 100),
-            make_metric(MetricType::RateLimitHit, Some("codex"), None, None, ts + 200),
+            make_metric(
+                MetricType::TokenUsage,
+                Some("codex"),
+                Some(10_000),
+                Some(1.0),
+                ts,
+            ),
+            make_metric(
+                MetricType::TokenUsage,
+                Some("claude_code"),
+                Some(20_000),
+                Some(2.0),
+                ts + 100,
+            ),
+            make_metric(
+                MetricType::RateLimitHit,
+                Some("codex"),
+                None,
+                None,
+                ts + 200,
+            ),
             make_metric(MetricType::WorkflowCost, None, None, Some(0.5), ts + 300),
         ];
         storage.record_usage_metrics_batch(batch).await.unwrap();
 
         // Query all and build summary data
         let all = storage
-            .query_usage_metrics(MetricQuery { since: Some(ts - 1), ..Default::default() })
+            .query_usage_metrics(MetricQuery {
+                since: Some(ts - 1),
+                ..Default::default()
+            })
             .await
             .unwrap();
 
@@ -1037,8 +1102,20 @@ fn integration_record_aggregate_render_daily() {
 
         let ts = now_ms();
         let batch = vec![
-            make_metric(MetricType::TokenUsage, Some("codex"), Some(5000), Some(0.50), ts),
-            make_metric(MetricType::TokenUsage, Some("codex"), Some(3000), Some(0.30), ts + 1000),
+            make_metric(
+                MetricType::TokenUsage,
+                Some("codex"),
+                Some(5000),
+                Some(0.50),
+                ts,
+            ),
+            make_metric(
+                MetricType::TokenUsage,
+                Some("codex"),
+                Some(3000),
+                Some(0.30),
+                ts + 1000,
+            ),
         ];
         storage.record_usage_metrics_batch(batch).await.unwrap();
 
@@ -1067,8 +1144,20 @@ fn integration_record_aggregate_render_by_agent() {
 
         let ts = now_ms();
         let batch = vec![
-            make_metric(MetricType::TokenUsage, Some("codex"), Some(10_000), Some(1.0), ts),
-            make_metric(MetricType::TokenUsage, Some("claude_code"), Some(5_000), Some(0.50), ts + 100),
+            make_metric(
+                MetricType::TokenUsage,
+                Some("codex"),
+                Some(10_000),
+                Some(1.0),
+                ts,
+            ),
+            make_metric(
+                MetricType::TokenUsage,
+                Some("claude_code"),
+                Some(5_000),
+                Some(0.50),
+                ts + 100,
+            ),
         ];
         storage.record_usage_metrics_batch(batch).await.unwrap();
 
@@ -1098,12 +1187,21 @@ fn integration_record_aggregate_export_csv() {
         let ts = 1_700_000_000_000i64;
         let batch = vec![
             make_metric(MetricType::TokenUsage, Some("codex"), Some(5000), None, ts),
-            make_metric(MetricType::ApiCost, Some("claude_code"), None, Some(1.25), ts + 1000),
+            make_metric(
+                MetricType::ApiCost,
+                Some("claude_code"),
+                None,
+                Some(1.25),
+                ts + 1000,
+            ),
         ];
         storage.record_usage_metrics_batch(batch).await.unwrap();
 
         let results = storage
-            .query_usage_metrics(MetricQuery { since: Some(ts - 1), ..Default::default() })
+            .query_usage_metrics(MetricQuery {
+                since: Some(ts - 1),
+                ..Default::default()
+            })
             .await
             .unwrap();
         assert_eq!(results.len(), 2);
@@ -1141,14 +1239,32 @@ fn integration_record_metrics_then_check_alerts() {
         // Record cost metrics totaling $45 (90% of $50 threshold)
         let batch = vec![
             make_metric(MetricType::ApiCost, Some("codex"), None, Some(20.0), ts),
-            make_metric(MetricType::ApiCost, Some("claude_code"), None, Some(25.0), ts + 100),
+            make_metric(
+                MetricType::ApiCost,
+                Some("claude_code"),
+                None,
+                Some(25.0),
+                ts + 100,
+            ),
         ];
         storage.record_usage_metrics_batch(batch).await.unwrap();
 
         // Record token metrics totaling 80,000 (80% of 100K threshold)
         let batch2 = vec![
-            make_metric(MetricType::TokenUsage, Some("codex"), Some(50_000), None, ts + 200),
-            make_metric(MetricType::TokenUsage, Some("claude_code"), Some(30_000), None, ts + 300),
+            make_metric(
+                MetricType::TokenUsage,
+                Some("codex"),
+                Some(50_000),
+                None,
+                ts + 200,
+            ),
+            make_metric(
+                MetricType::TokenUsage,
+                Some("claude_code"),
+                Some(30_000),
+                None,
+                ts + 300,
+            ),
         ];
         storage.record_usage_metrics_batch(batch2).await.unwrap();
 
@@ -1186,7 +1302,13 @@ fn integration_purge_removes_old_metrics_from_alert_window() {
 
         // Record old expensive metrics
         storage
-            .record_usage_metric(make_metric(MetricType::ApiCost, None, None, Some(100.0), old_ts))
+            .record_usage_metric(make_metric(
+                MetricType::ApiCost,
+                None,
+                None,
+                Some(100.0),
+                old_ts,
+            ))
             .await
             .unwrap();
         // Record recent small metric
@@ -1196,7 +1318,8 @@ fn integration_purge_removes_old_metrics_from_alert_window() {
             .unwrap();
 
         // Before purge: old metrics are outside daily window anyway
-        let monitor = AlertMonitor::new(vec![AlertRule::cost("daily-cost", 50.0, AlertPeriod::Day)]);
+        let monitor =
+            AlertMonitor::new(vec![AlertRule::cost("daily-cost", 50.0, AlertPeriod::Day)]);
         let alerts_before = monitor.check_alerts(&storage).await.unwrap();
         // Only $5 in daily window — no alert
         assert!(alerts_before.is_empty());
