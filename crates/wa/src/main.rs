@@ -23843,6 +23843,519 @@ log_level = "debug"
         assert!(!redacted.command.contains("sk-abc"));
     }
 
+    // ========================================================================
+    // wa-y2e: Robot mode dry-run tests
+    // ========================================================================
+
+    /// Helper to create a StoredEvent for testing.
+    fn make_stored_event(id: i64, rule_id: &str, handled: bool) -> wa_core::storage::StoredEvent {
+        wa_core::storage::StoredEvent {
+            id,
+            pane_id: 3,
+            rule_id: rule_id.to_string(),
+            agent_type: "codex".to_string(),
+            event_type: "usage.warning".to_string(),
+            severity: "warning".to_string(),
+            confidence: 0.95,
+            extracted: None,
+            matched_text: None,
+            segment_id: None,
+            detected_at: 1700000000000,
+            dedupe_key: None,
+            handled_at: if handled { Some(1700000001000) } else { None },
+            handled_by_workflow_id: if handled {
+                Some("wf-123".to_string())
+            } else {
+                None
+            },
+            handled_status: if handled {
+                Some("completed".to_string())
+            } else {
+                None
+            },
+        }
+    }
+
+    /// Helper to create a RuleDef with an optional workflow.
+    fn make_rule_def(id: &str, workflow: Option<&str>) -> wa_core::patterns::RuleDef {
+        wa_core::patterns::RuleDef {
+            id: id.to_string(),
+            agent_type: wa_core::patterns::AgentType::Codex,
+            event_type: "usage.warning".to_string(),
+            severity: wa_core::patterns::Severity::Warning,
+            anchors: vec!["usage".to_string()],
+            regex: None,
+            description: "Test rule".to_string(),
+            remediation: None,
+            workflow: workflow.map(String::from),
+            manual_fix: None,
+            preview_command: Some("wa robot workflow run {workflow} --pane {pane}".to_string()),
+            learn_more_url: None,
+        }
+    }
+
+    #[test]
+    fn event_would_handle_with_workflow_rule() {
+        let event = make_stored_event(1, "core.codex:session_compaction", false);
+        let rule = make_rule_def("core.codex:session_compaction", Some("handle_compaction"));
+        let config = wa_core::config::Config::default();
+
+        let result = build_event_would_handle(&event, Some(&rule), &config);
+        assert!(result.is_some());
+        let preview = result.unwrap();
+        assert_eq!(preview.workflow, "handle_compaction");
+        // handle_compaction is in both enabled and auto_run_allowlist by default
+        assert_eq!(preview.would_run, Some(true));
+        assert!(preview.reason.is_none());
+    }
+
+    #[test]
+    fn event_would_handle_without_workflow_returns_none() {
+        let event = make_stored_event(2, "codex.info", false);
+        let rule = make_rule_def("codex.info", None);
+        let config = wa_core::config::Config::default();
+
+        let result = build_event_would_handle(&event, Some(&rule), &config);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn event_would_handle_no_rule_returns_none() {
+        let event = make_stored_event(3, "unknown.rule", false);
+        let config = wa_core::config::Config::default();
+
+        let result = build_event_would_handle(&event, None, &config);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn event_would_handle_already_handled_event() {
+        let event = make_stored_event(4, "codex.usage_limit_reached", true);
+        let rule = make_rule_def("codex.usage_limit_reached", Some("handle_usage_limits"));
+        let config = wa_core::config::Config::default();
+
+        let result = build_event_would_handle(&event, Some(&rule), &config);
+        assert!(result.is_some());
+        let preview = result.unwrap();
+        assert_eq!(preview.would_run, Some(false));
+        assert!(preview.reason.as_deref().unwrap().contains("already handled"));
+    }
+
+    #[test]
+    fn event_would_handle_workflow_disabled_by_config() {
+        let event = make_stored_event(5, "codex.usage_limit_reached", false);
+        let rule = make_rule_def("codex.usage_limit_reached", Some("handle_usage_limits"));
+        let mut config = wa_core::config::Config::default();
+        // Set enabled list to only include a different workflow
+        config.workflows.enabled = vec!["handle_compaction".to_string()];
+
+        let result = build_event_would_handle(&event, Some(&rule), &config);
+        assert!(result.is_some());
+        let preview = result.unwrap();
+        assert_eq!(preview.would_run, Some(false));
+        assert!(
+            preview
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("disabled by config")
+        );
+    }
+
+    #[test]
+    fn event_would_handle_workflow_not_in_auto_run() {
+        let event = make_stored_event(6, "codex.usage_limit_reached", false);
+        let rule = make_rule_def("codex.usage_limit_reached", Some("handle_usage_limits"));
+        let mut config = wa_core::config::Config::default();
+        config
+            .workflows
+            .auto_run_denylist
+            .push("handle_usage_limits".to_string());
+
+        let result = build_event_would_handle(&event, Some(&rule), &config);
+        assert!(result.is_some());
+        let preview = result.unwrap();
+        assert_eq!(preview.would_run, Some(false));
+        assert!(
+            preview
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("not in auto-run allowlist")
+        );
+    }
+
+    #[test]
+    fn event_would_handle_preview_fields_serializable() {
+        let event = make_stored_event(7, "core.codex:session_compaction", false);
+        let rule = make_rule_def("core.codex:session_compaction", Some("handle_compaction"));
+        let config = wa_core::config::Config::default();
+
+        let preview = build_event_would_handle(&event, Some(&rule), &config).unwrap();
+        let json = serde_json::to_value(&preview).expect("should serialize");
+        assert_eq!(json["workflow"], "handle_compaction");
+        assert_eq!(json["would_run"], true);
+        // reason should be absent (serialized as null or missing via skip_serializing_if)
+    }
+
+    #[test]
+    fn send_dry_run_report_json_roundtrip() {
+        let config = wa_core::config::Config::default();
+        let command_ctx = wa_core::dry_run::CommandContext::new("wa robot send 0 \"echo hi\" --dry-run", true);
+        let report = build_send_dry_run_report(
+            &command_ctx,
+            0,
+            None,
+            None,
+            "echo hi",
+            false,
+            None,
+            10,
+            &config,
+            wa_core::policy::ActorKind::Robot,
+        );
+
+        let json_str =
+            wa_core::dry_run::format_json(&report).expect("JSON serialization should succeed");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json_str).expect("should be valid JSON");
+
+        assert!(parsed.get("command").is_some());
+        assert!(parsed.get("target_resolution").is_some());
+        assert!(parsed.get("policy_evaluation").is_some());
+        assert!(parsed.get("expected_actions").is_some());
+        let actions = parsed["expected_actions"].as_array().unwrap();
+        assert!(!actions.is_empty());
+    }
+
+    #[test]
+    fn send_dry_run_report_policy_evaluation_always_present() {
+        let config = wa_core::config::Config::default();
+        let command_ctx = wa_core::dry_run::CommandContext::new("wa robot send 0 \"test\"", true);
+        let report = build_send_dry_run_report(
+            &command_ctx,
+            0,
+            None,
+            None,
+            "test",
+            false,
+            None,
+            10,
+            &config,
+            wa_core::policy::ActorKind::Robot,
+        );
+
+        assert!(
+            report.policy_evaluation.is_some(),
+            "policy evaluation must always be present in dry-run"
+        );
+        let eval = report.policy_evaluation.unwrap();
+        assert!(
+            !eval.checks.is_empty(),
+            "policy checks must not be empty"
+        );
+    }
+
+    #[test]
+    fn send_dry_run_report_without_wait_for_has_no_wait_action() {
+        let config = wa_core::config::Config::default();
+        let command_ctx = wa_core::dry_run::CommandContext::new("wa robot send 0 \"x\"", true);
+        let report = build_send_dry_run_report(
+            &command_ctx,
+            0,
+            None,
+            None,
+            "x",
+            false,
+            None, // no wait-for
+            10,
+            &config,
+            wa_core::policy::ActorKind::Robot,
+        );
+
+        assert!(
+            !report
+                .expected_actions
+                .iter()
+                .any(|a| a.action_type == wa_core::dry_run::ActionType::WaitFor),
+            "should not have WaitFor action when no --wait-for provided"
+        );
+        assert!(
+            report
+                .expected_actions
+                .iter()
+                .any(|a| a.action_type == wa_core::dry_run::ActionType::SendText),
+            "should always have SendText action"
+        );
+    }
+
+    #[test]
+    fn send_dry_run_report_with_wait_for_has_both_actions() {
+        let config = wa_core::config::Config::default();
+        let command_ctx = wa_core::dry_run::CommandContext::new(
+            "wa robot send 0 \"test\" --wait-for READY",
+            true,
+        );
+        let report = build_send_dry_run_report(
+            &command_ctx,
+            0,
+            None,
+            None,
+            "test",
+            false,
+            Some("READY"),
+            15,
+            &config,
+            wa_core::policy::ActorKind::Robot,
+        );
+
+        assert!(
+            report
+                .expected_actions
+                .iter()
+                .any(|a| a.action_type == wa_core::dry_run::ActionType::SendText)
+        );
+        assert!(
+            report
+                .expected_actions
+                .iter()
+                .any(|a| a.action_type == wa_core::dry_run::ActionType::WaitFor)
+        );
+        // WaitFor description should contain the pattern and timeout
+        let wait_action = report
+            .expected_actions
+            .iter()
+            .find(|a| a.action_type == wa_core::dry_run::ActionType::WaitFor)
+            .unwrap();
+        assert!(wait_action.description.contains("READY"));
+        assert!(wait_action.description.contains("15000"));
+    }
+
+    #[test]
+    fn send_dry_run_report_deterministic() {
+        let config = wa_core::config::Config::default();
+        let build = || {
+            let ctx = wa_core::dry_run::CommandContext::new("wa robot send 0 \"hello\"", true);
+            build_send_dry_run_report(
+                &ctx,
+                0,
+                None,
+                None,
+                "hello",
+                false,
+                None,
+                10,
+                &config,
+                wa_core::policy::ActorKind::Robot,
+            )
+        };
+
+        let r1 = build();
+        let r2 = build();
+
+        let j1 = wa_core::dry_run::format_json(&r1).unwrap();
+        let j2 = wa_core::dry_run::format_json(&r2).unwrap();
+        assert_eq!(j1, j2, "dry-run reports must be deterministic");
+    }
+
+    #[test]
+    fn workflow_dry_run_report_deterministic() {
+        let config = wa_core::config::Config::default();
+        let build = || {
+            let ctx = wa_core::dry_run::CommandContext::new("workflow run", true);
+            build_workflow_dry_run_report(&ctx, "handle_compaction", 7, None, &config)
+        };
+
+        let r1 = build();
+        let r2 = build();
+
+        let j1 = wa_core::dry_run::format_json(&r1).unwrap();
+        let j2 = wa_core::dry_run::format_json(&r2).unwrap();
+        assert_eq!(j1, j2, "workflow dry-run reports must be deterministic");
+    }
+
+    #[test]
+    fn workflow_dry_run_report_no_mutation_fields() {
+        let command_ctx = wa_core::dry_run::CommandContext::new("workflow run", true);
+        let config = wa_core::config::Config::default();
+        let report =
+            build_workflow_dry_run_report(&command_ctx, "handle_compaction", 7, None, &config);
+
+        let json_str = wa_core::dry_run::format_json(&report).unwrap();
+
+        // Dry-run should never contain execution-specific mutation markers
+        assert!(!json_str.contains("\"execution_id\""));
+        assert!(!json_str.contains("\"executed\":true"));
+        assert!(!json_str.contains("\"started_at\""));
+        assert!(!json_str.contains("\"completed_at\""));
+    }
+
+    #[test]
+    fn step_action_to_dry_run_type_maps_all_variants() {
+        use wa_core::dry_run::ActionType;
+        use wa_core::plan::StepAction;
+
+        assert_eq!(
+            step_action_to_dry_run_type(&StepAction::SendText {
+                pane_id: 0,
+                text: String::new(),
+                paste_mode: None,
+            }),
+            ActionType::SendText
+        );
+
+        assert_eq!(
+            step_action_to_dry_run_type(&StepAction::AcquireLock {
+                lock_name: "test".to_string(),
+                timeout_ms: None,
+            }),
+            ActionType::AcquireLock
+        );
+
+        assert_eq!(
+            step_action_to_dry_run_type(&StepAction::ReleaseLock {
+                lock_name: "test".to_string(),
+            }),
+            ActionType::ReleaseLock
+        );
+
+        assert_eq!(
+            step_action_to_dry_run_type(&StepAction::MarkEventHandled {
+                event_id: 1,
+            }),
+            ActionType::MarkEventHandled
+        );
+    }
+
+    #[test]
+    fn infer_action_type_from_name_covers_variants() {
+        use wa_core::dry_run::ActionType;
+
+        assert_eq!(
+            infer_action_type_from_name("send_text_to_pane"),
+            ActionType::SendText
+        );
+        assert_eq!(
+            infer_action_type_from_name("wait_for_prompt"),
+            ActionType::WaitFor
+        );
+        assert_eq!(
+            infer_action_type_from_name("verify_compaction"),
+            ActionType::WaitFor
+        );
+        assert_eq!(
+            infer_action_type_from_name("check_status"),
+            ActionType::WaitFor
+        );
+        assert_eq!(
+            infer_action_type_from_name("stabilize_output"),
+            ActionType::WaitFor
+        );
+        assert_eq!(
+            infer_action_type_from_name("acquire_lock"),
+            ActionType::AcquireLock
+        );
+        assert_eq!(
+            infer_action_type_from_name("mark_event_handled"),
+            ActionType::MarkEventHandled
+        );
+        assert_eq!(
+            infer_action_type_from_name("run_workflow"),
+            ActionType::WorkflowStep
+        );
+    }
+
+    #[test]
+    fn event_would_handle_first_step_for_handle_compaction() {
+        let event = make_stored_event(8, "core.codex:session_compaction", false);
+        let rule = make_rule_def("core.codex:session_compaction", Some("handle_compaction"));
+        let config = wa_core::config::Config::default();
+
+        let preview = build_event_would_handle(&event, Some(&rule), &config).unwrap();
+        assert_eq!(preview.workflow, "handle_compaction");
+        // handle_compaction is the only workflow with first_step support
+        assert!(preview.first_step.is_some());
+    }
+
+    #[test]
+    fn event_would_handle_first_step_unknown_workflow_is_none() {
+        let event = make_stored_event(9, "codex.usage_limit_reached", false);
+        let rule = make_rule_def("codex.usage_limit_reached", Some("handle_custom_workflow"));
+        let config = wa_core::config::Config::default();
+
+        let preview = build_event_would_handle(&event, Some(&rule), &config).unwrap();
+        assert!(
+            preview.first_step.is_none(),
+            "first_step should be None for unknown workflows"
+        );
+    }
+
+    #[test]
+    fn cli_robot_events_dry_run_flag() {
+        let cli = Cli::try_parse_from([
+            "wa",
+            "robot",
+            "events",
+            "--dry-run",
+        ])
+        .expect("robot events --dry-run should parse");
+
+        match cli.command {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::Events { dry_run, .. }) => {
+                    assert!(dry_run, "--dry-run flag should be true");
+                }
+                _ => panic!("expected Events"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn cli_robot_events_would_handle_flag() {
+        let cli = Cli::try_parse_from([
+            "wa",
+            "robot",
+            "events",
+            "--would-handle",
+        ])
+        .expect("robot events --would-handle should parse");
+
+        match cli.command {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::Events { would_handle, dry_run, .. }) => {
+                    assert!(would_handle, "--would-handle flag should be true");
+                    assert!(!dry_run, "--dry-run should be false when not set");
+                }
+                _ => panic!("expected Events"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn cli_robot_send_dry_run_flag() {
+        let cli = Cli::try_parse_from([
+            "wa",
+            "robot",
+            "send",
+            "0",
+            "echo hello",
+            "--dry-run",
+        ])
+        .expect("robot send --dry-run should parse");
+
+        match cli.command {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::Send { dry_run, .. }) => {
+                    assert!(dry_run, "--dry-run flag should be true");
+                }
+                _ => panic!("expected Send"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
     #[test]
     fn validate_uservar_rejects_empty_fields() {
         assert!(validate_uservar_request(1, "", "x").is_err());
