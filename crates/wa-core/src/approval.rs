@@ -102,6 +102,9 @@ impl<'a> ApprovalStore<'a> {
             action_kind: input.action.as_str().to_string(),
             pane_id: input.pane_id,
             action_fingerprint: fingerprint,
+            plan_hash: None,
+            plan_version: None,
+            risk_summary: None,
         };
         self.storage.insert_approval_token(token).await?;
 

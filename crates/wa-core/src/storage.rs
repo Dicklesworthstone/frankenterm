@@ -10850,7 +10850,7 @@ fn query_approval_token_by_hash(
 ) -> Result<Option<ApprovalTokenRecord>> {
     let result = conn.query_row(
         "SELECT id, code_hash, created_at, expires_at, used_at, workspace_id, action_kind,
-         pane_id, action_fingerprint
+         pane_id, action_fingerprint, plan_hash, plan_version, risk_summary
          FROM approval_tokens
          WHERE code_hash = ?1",
         params![code_hash],
@@ -10869,6 +10869,9 @@ fn query_approval_token_by_hash(
                     val.map(|v| v as u64)
                 },
                 action_fingerprint: row.get(8)?,
+                plan_hash: row.get(9)?,
+                plan_version: row.get(10)?,
+                risk_summary: row.get(11)?,
             })
         },
     );
@@ -13529,6 +13532,9 @@ mod tests {
             action_kind: "send_text".to_string(),
             pane_id: Some(42),
             action_fingerprint: "sha256:fingerprint".to_string(),
+            plan_hash: None,
+            plan_version: None,
+            risk_summary: None,
         };
 
         let json = serde_json::to_string(&token).unwrap();
@@ -13718,6 +13724,9 @@ mod tests {
             action_kind: "send_text".to_string(),
             pane_id: Some(1),
             action_fingerprint: "sha256:fp".to_string(),
+            plan_hash: None,
+            plan_version: None,
+            risk_summary: None,
         };
 
         insert_approval_token_sync(&conn, &token).unwrap();
