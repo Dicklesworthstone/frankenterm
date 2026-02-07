@@ -1165,11 +1165,11 @@ events: []
 
     #[test]
     fn scenario_missing_duration_field() {
-        let yaml = r#"
+        let yaml = r"
 name: no_duration
 panes: []
 events: []
-"#;
+";
         assert!(Scenario::from_yaml(yaml).is_err());
     }
 

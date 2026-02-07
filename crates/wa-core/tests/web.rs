@@ -93,7 +93,10 @@ mod web_tests {
         let config = WebServerConfig::default();
         // Default should produce 127.0.0.1:8000
         let debug = format!("{config:?}");
-        assert!(debug.contains("127.0.0.1"), "default host must be 127.0.0.1");
+        assert!(
+            debug.contains("127.0.0.1"),
+            "default host must be 127.0.0.1"
+        );
     }
 
     #[tokio::test]
@@ -133,8 +136,14 @@ mod web_tests {
         let response = response?;
         shutdown?;
 
-        assert!(response.contains("503"), "should return 503 without storage: {response}");
-        assert!(response.contains("no_storage"), "should include error code: {response}");
+        assert!(
+            response.contains("503"),
+            "should return 503 without storage: {response}"
+        );
+        assert!(
+            response.contains("no_storage"),
+            "should include error code: {response}"
+        );
         Ok(())
     }
 
@@ -178,7 +187,10 @@ mod web_tests {
             .unwrap_or_else(|e| panic!("health response not valid JSON: {e}\nbody: {body}"));
 
         assert_eq!(json["ok"], true, "health.ok should be true");
-        assert!(json["version"].is_string(), "health.version should be a string");
+        assert!(
+            json["version"].is_string(),
+            "health.version should be a string"
+        );
         Ok(())
     }
 
@@ -220,7 +232,10 @@ mod web_tests {
             .unwrap_or_else(|e| panic!("panes 503 not valid JSON: {e}\nbody: {body}"));
         assert_eq!(json["ok"], false);
         assert_eq!(json["error_code"], "no_storage");
-        assert!(json["version"].is_string(), "envelope should include version");
+        assert!(
+            json["version"].is_string(),
+            "envelope should include version"
+        );
         Ok(())
     }
 
@@ -235,7 +250,11 @@ mod web_tests {
         let response = response?;
         shutdown?;
 
-        assert_eq!(extract_status(&response), 404, "unknown route should 404: {response}");
+        assert_eq!(
+            extract_status(&response),
+            404,
+            "unknown route should 404: {response}"
+        );
         Ok(())
     }
 

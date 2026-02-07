@@ -7,10 +7,10 @@ use crate::policy::Redactor;
 use crate::storage::{EventQuery, PaneRecord, SearchOptions, SearchResult, StorageHandle};
 use crate::{Error, Result, VERSION};
 use asupersync::net::TcpListener;
+use fastapi::ResponseBody;
 use fastapi::core::{ControlFlow, Cx, Handler, Middleware, StartupOutcome};
 use fastapi::http::QueryString;
 use fastapi::prelude::{App, Method, Request, RequestContext, Response, StatusCode};
-use fastapi::ResponseBody;
 use fastapi::{ServerConfig, ServerError, TcpServer};
 use serde::Serialize;
 use std::net::{SocketAddr, TcpStream};
@@ -237,9 +237,7 @@ impl Middleware for BodySizeGuard {
                 let resp = json_err(
                     StatusCode::BAD_REQUEST,
                     "body_too_large",
-                    format!(
-                        "Request body too large ({cl} bytes); max is {MAX_REQUEST_BODY_BYTES}"
-                    ),
+                    format!("Request body too large ({cl} bytes); max is {MAX_REQUEST_BODY_BYTES}"),
                 );
                 return Box::pin(async move { ControlFlow::Break(resp) });
             }
@@ -306,13 +304,20 @@ fn json_err(status: StatusCode, code: &str, message: impl Into<String>) -> Respo
 }
 
 fn require_storage(req: &Request) -> std::result::Result<(StorageHandle, Arc<Redactor>), Response> {
-    let state = req
-        .get_extension::<AppState>()
-        .ok_or_else(|| json_err(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", "App state not configured"))?;
-    let storage = state
-        .storage
-        .clone()
-        .ok_or_else(|| json_err(StatusCode::SERVICE_UNAVAILABLE, "no_storage", "No database connected"))?;
+    let state = req.get_extension::<AppState>().ok_or_else(|| {
+        json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "App state not configured",
+        )
+    })?;
+    let storage = state.storage.clone().ok_or_else(|| {
+        json_err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no_storage",
+            "No database connected",
+        )
+    })?;
     Ok((storage, Arc::clone(&state.redactor)))
 }
 
@@ -401,7 +406,9 @@ impl PaneView {
     }
 }
 
-fn handle_panes(req: &Request) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>> {
+fn handle_panes(
+    req: &Request,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>> {
     let result = require_storage(req);
     Box::pin(async move {
         let (storage, redactor) = match result {
@@ -420,7 +427,11 @@ fn handle_panes(req: &Request) -> std::pin::Pin<Box<dyn std::future::Future<Outp
                     total,
                 })
             }
-            Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", format!("Failed to query panes: {e}")),
+            Err(e) => json_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_error",
+                format!("Failed to query panes: {e}"),
+            ),
         }
     })
 }
@@ -466,7 +477,9 @@ impl EventView {
     }
 }
 
-fn handle_events(req: &Request) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>> {
+fn handle_events(
+    req: &Request,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>> {
     let result = require_storage(req);
     let qs_raw = req.query().unwrap_or("").to_string();
     let qs = QueryString::parse(&qs_raw);
@@ -500,7 +513,11 @@ fn handle_events(req: &Request) -> std::pin::Pin<Box<dyn std::future::Future<Out
                     total,
                 })
             }
-            Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", format!("Failed to query events: {e}")),
+            Err(e) => json_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_error",
+                format!("Failed to query events: {e}"),
+            ),
         }
     })
 }
@@ -539,7 +556,9 @@ impl SearchHit {
     }
 }
 
-fn handle_search(req: &Request) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>> {
+fn handle_search(
+    req: &Request,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>> {
     let result = require_storage(req);
     let qs_raw = req.query().unwrap_or("").to_string();
     let qs = QueryString::parse(&qs_raw);
@@ -559,7 +578,13 @@ fn handle_search(req: &Request) -> std::pin::Pin<Box<dyn std::future::Future<Out
     Box::pin(async move {
         let query = match query_str {
             Some(q) if !q.is_empty() => q,
-            _ => return json_err(StatusCode::BAD_REQUEST, "missing_query", "Query parameter 'q' is required"),
+            _ => {
+                return json_err(
+                    StatusCode::BAD_REQUEST,
+                    "missing_query",
+                    "Query parameter 'q' is required",
+                );
+            }
         };
         let (storage, redactor) = match result {
             Ok(s) => s,
@@ -577,7 +602,11 @@ fn handle_search(req: &Request) -> std::pin::Pin<Box<dyn std::future::Future<Out
                     total,
                 })
             }
-            Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", format!("Search failed: {e}")),
+            Err(e) => json_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_error",
+                format!("Search failed: {e}"),
+            ),
         }
     })
 }
@@ -601,15 +630,21 @@ fn build_app(storage: Option<StorageHandle>) -> App {
             Method::Get,
             |_ctx: &RequestContext, _req: &mut Request| async { health_response() },
         )
-        .route("/panes", Method::Get, |_ctx: &RequestContext, req: &mut Request| {
-            handle_panes(req)
-        })
-        .route("/events", Method::Get, |_ctx: &RequestContext, req: &mut Request| {
-            handle_events(req)
-        })
-        .route("/search", Method::Get, |_ctx: &RequestContext, req: &mut Request| {
-            handle_search(req)
-        })
+        .route(
+            "/panes",
+            Method::Get,
+            |_ctx: &RequestContext, req: &mut Request| handle_panes(req),
+        )
+        .route(
+            "/events",
+            Method::Get,
+            |_ctx: &RequestContext, req: &mut Request| handle_events(req),
+        )
+        .route(
+            "/search",
+            Method::Get,
+            |_ctx: &RequestContext, req: &mut Request| handle_search(req),
+        )
         .build()
 }
 

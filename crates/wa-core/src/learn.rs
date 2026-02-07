@@ -1036,11 +1036,7 @@ impl TutorialEnvironment {
             wezterm_running: env.wezterm.is_running,
             wezterm_version: env.wezterm.version.clone(),
             pane_count: env.agents.len()
-                + env
-                    .remotes
-                    .iter()
-                    .map(|r| r.pane_ids.len())
-                    .sum::<usize>(),
+                + env.remotes.iter().map(|r| r.pane_ids.len()).sum::<usize>(),
             agent_panes: env
                 .agents
                 .iter()
@@ -2052,7 +2048,11 @@ mod tests {
     use crate::patterns::AgentType;
 
     /// Build a minimal `DetectedEnvironment` for testing.
-    fn make_env(wezterm_running: bool, osc_133: bool, agents: Vec<DetectedAgent>) -> DetectedEnvironment {
+    fn make_env(
+        wezterm_running: bool,
+        osc_133: bool,
+        agents: Vec<DetectedAgent>,
+    ) -> DetectedEnvironment {
         DetectedEnvironment {
             wezterm: WeztermInfo {
                 version: if wezterm_running {
@@ -2335,24 +2335,32 @@ mod tests {
         assert!(basics.exercises[0].can_simulate);
 
         // basics.2 requires WezTerm
-        assert!(basics.exercises[1]
-            .requirements
-            .contains(&Requirement::WeztermRunning));
+        assert!(
+            basics.exercises[1]
+                .requirements
+                .contains(&Requirement::WeztermRunning)
+        );
         assert!(!basics.exercises[1].can_simulate);
 
         // events.1 requires data
         let events = engine.get_track("events").unwrap();
-        assert!(events.exercises[0]
-            .requirements
-            .contains(&Requirement::DbHasData));
+        assert!(
+            events.exercises[0]
+                .requirements
+                .contains(&Requirement::DbHasData)
+        );
 
         // workflows.2 requires WaConfigured + WatcherRunning
         let workflows = engine.get_track("workflows").unwrap();
-        assert!(workflows.exercises[1]
-            .requirements
-            .contains(&Requirement::WaConfigured));
-        assert!(workflows.exercises[1]
-            .requirements
-            .contains(&Requirement::WatcherRunning));
+        assert!(
+            workflows.exercises[1]
+                .requirements
+                .contains(&Requirement::WaConfigured)
+        );
+        assert!(
+            workflows.exercises[1]
+                .requirements
+                .contains(&Requirement::WatcherRunning)
+        );
     }
 }

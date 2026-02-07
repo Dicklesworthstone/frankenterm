@@ -2009,7 +2009,7 @@ mod tests {
         assert_fields_present(&header, &expected_header_fields(), "Segment export header");
         assert_eq!(header["_export"], true);
         assert_eq!(header["kind"], "segments");
-        assert!(header["version"].as_str().unwrap().len() > 0);
+        assert!(!header["version"].as_str().unwrap().is_empty());
 
         // Validate record schema
         assert_eq!(records.len(), 1);
