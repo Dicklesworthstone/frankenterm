@@ -27676,4 +27676,512 @@ log_level = "debug"
         assert_eq!(format_period_label("30d"), "Last 30 Days");
         assert_eq!(format_period_label("xyz"), "Last 7 Days");
     }
+
+    // -----------------------------------------------------------------------
+    // Doctor diagnostic tests (wa-nu4.3.4.8)
+    // -----------------------------------------------------------------------
+
+    // --- DiagnosticCheck construction ---
+
+    #[test]
+    fn diagnostic_check_ok_no_detail() {
+        let check = DiagnosticCheck::ok("test-check");
+        assert_eq!(check.name, "test-check");
+        assert_eq!(check.status, DiagnosticStatus::Ok);
+        assert!(check.detail.is_none());
+        assert!(check.recommendation.is_none());
+    }
+
+    #[test]
+    fn diagnostic_check_ok_with_detail() {
+        let check = DiagnosticCheck::ok_with_detail("core loaded", "v0.1.0");
+        assert_eq!(check.name, "core loaded");
+        assert_eq!(check.status, DiagnosticStatus::Ok);
+        assert_eq!(check.detail.as_deref(), Some("v0.1.0"));
+        assert!(check.recommendation.is_none());
+    }
+
+    #[test]
+    fn diagnostic_check_warning() {
+        let check = DiagnosticCheck::warning(
+            "database",
+            "schema v1 (needs migration to v2)",
+            "Run 'wa daemon start' to auto-migrate",
+        );
+        assert_eq!(check.status, DiagnosticStatus::Warning);
+        assert!(check.detail.unwrap().contains("schema v1"));
+        assert!(check.recommendation.unwrap().contains("auto-migrate"));
+    }
+
+    #[test]
+    fn diagnostic_check_error() {
+        let check = DiagnosticCheck::error(
+            "database",
+            "could not open: permission denied",
+            "Check file permissions",
+        );
+        assert_eq!(check.status, DiagnosticStatus::Error);
+        assert!(check.detail.unwrap().contains("permission denied"));
+        assert!(check.recommendation.unwrap().contains("permissions"));
+    }
+
+    // --- DiagnosticStatus ---
+
+    #[test]
+    fn diagnostic_status_as_str() {
+        assert_eq!(DiagnosticStatus::Ok.as_str(), "ok");
+        assert_eq!(DiagnosticStatus::Warning.as_str(), "warning");
+        assert_eq!(DiagnosticStatus::Error.as_str(), "error");
+    }
+
+    #[test]
+    fn diagnostic_status_equality() {
+        assert_eq!(DiagnosticStatus::Ok, DiagnosticStatus::Ok);
+        assert_ne!(DiagnosticStatus::Ok, DiagnosticStatus::Warning);
+        assert_ne!(DiagnosticStatus::Warning, DiagnosticStatus::Error);
+    }
+
+    // --- JSON output shape stability ---
+
+    #[test]
+    fn diagnostic_check_json_ok_shape() {
+        let check = DiagnosticCheck::ok_with_detail("wa-core loaded", "v0.1.2");
+        let json = check.to_json_value();
+        assert_eq!(json["name"], "wa-core loaded");
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["detail"], "v0.1.2");
+        // No recommendation for OK check
+        assert!(json.get("recommendation").is_none());
+    }
+
+    #[test]
+    fn diagnostic_check_json_warning_shape() {
+        let check = DiagnosticCheck::warning(
+            "daemon status",
+            "stale lock (PID 12345 not running)",
+            "Remove lock: rm /tmp/wa.lock",
+        );
+        let json = check.to_json_value();
+        assert_eq!(json["name"], "daemon status");
+        assert_eq!(json["status"], "warning");
+        assert_eq!(json["detail"], "stale lock (PID 12345 not running)");
+        assert_eq!(json["recommendation"], "Remove lock: rm /tmp/wa.lock");
+    }
+
+    #[test]
+    fn diagnostic_check_json_error_shape() {
+        let check = DiagnosticCheck::error(
+            "database",
+            "could not open: locked by another process",
+            "Check if another wa instance is running",
+        );
+        let json = check.to_json_value();
+        assert_eq!(json["name"], "database");
+        assert_eq!(json["status"], "error");
+        assert!(json["detail"].as_str().unwrap().contains("locked"));
+        assert!(json["recommendation"].as_str().unwrap().contains("another wa"));
+    }
+
+    #[test]
+    fn diagnostic_check_json_ok_no_detail_shape() {
+        let check = DiagnosticCheck::ok("features");
+        let json = check.to_json_value();
+        assert_eq!(json["name"], "features");
+        assert_eq!(json["status"], "ok");
+        // detail and recommendation should not be present
+        assert!(json.get("detail").is_none());
+        assert!(json.get("recommendation").is_none());
+    }
+
+    #[test]
+    fn diagnostic_check_json_no_ansi_escapes() {
+        // JSON output must never contain ANSI escape codes
+        let checks = vec![
+            DiagnosticCheck::ok("basic"),
+            DiagnosticCheck::ok_with_detail("detailed", "with content"),
+            DiagnosticCheck::warning("warn", "issue found", "fix suggestion"),
+            DiagnosticCheck::error("err", "critical issue", "immediate action"),
+        ];
+        for check in &checks {
+            let json = check.to_json_value();
+            let json_str = serde_json::to_string(&json).unwrap();
+            assert!(
+                !json_str.contains('\x1b'),
+                "JSON for '{}' contains ANSI escape",
+                check.name
+            );
+            assert!(
+                !json_str.contains("\\u001b"),
+                "JSON for '{}' contains escaped ANSI",
+                check.name
+            );
+        }
+    }
+
+    #[test]
+    fn diagnostic_check_json_field_names_stable() {
+        // Verify field names are consistent across all status types
+        let ok = DiagnosticCheck::ok_with_detail("test", "detail").to_json_value();
+        let warn = DiagnosticCheck::warning("test", "detail", "rec").to_json_value();
+        let err = DiagnosticCheck::error("test", "detail", "rec").to_json_value();
+
+        // All have name and status
+        for json in [&ok, &warn, &err] {
+            assert!(json.get("name").is_some(), "missing 'name' field");
+            assert!(json.get("status").is_some(), "missing 'status' field");
+        }
+
+        // Warning and error have recommendation; ok does not
+        assert!(ok.get("recommendation").is_none());
+        assert!(warn.get("recommendation").is_some());
+        assert!(err.get("recommendation").is_some());
+    }
+
+    // --- Overall doctor JSON envelope ---
+
+    #[test]
+    fn doctor_json_envelope_ok_when_no_errors() {
+        let checks = vec![
+            DiagnosticCheck::ok_with_detail("wa-core loaded", "v0.1.0"),
+            DiagnosticCheck::ok_with_detail("workspace root", "/home/user/project"),
+            DiagnosticCheck::warning("daemon status", "not running", "Start with wa watch"),
+        ];
+
+        let has_errors = checks.iter().any(|c| c.status == DiagnosticStatus::Error);
+        let has_warnings = checks.iter().any(|c| c.status == DiagnosticStatus::Warning);
+
+        let overall = if has_errors {
+            "error"
+        } else if has_warnings {
+            "warning"
+        } else {
+            "ok"
+        };
+
+        let result = serde_json::json!({
+            "ok": !has_errors,
+            "status": overall,
+            "version": "0.1.0",
+            "checks": checks.iter().map(|c| c.to_json_value()).collect::<Vec<_>>(),
+        });
+
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["status"], "warning");
+        assert_eq!(result["checks"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn doctor_json_envelope_error_when_errors_present() {
+        let checks = vec![
+            DiagnosticCheck::ok_with_detail("wa-core loaded", "v0.1.0"),
+            DiagnosticCheck::error("database", "corrupt", "Rebuild database"),
+        ];
+
+        let has_errors = checks.iter().any(|c| c.status == DiagnosticStatus::Error);
+        let overall = if has_errors { "error" } else { "ok" };
+
+        let result = serde_json::json!({
+            "ok": !has_errors,
+            "status": overall,
+            "checks": checks.iter().map(|c| c.to_json_value()).collect::<Vec<_>>(),
+        });
+
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["status"], "error");
+    }
+
+    #[test]
+    fn doctor_json_envelope_ok_when_all_pass() {
+        let checks = vec![
+            DiagnosticCheck::ok("a"),
+            DiagnosticCheck::ok_with_detail("b", "detail"),
+        ];
+
+        let has_errors = checks.iter().any(|c| c.status == DiagnosticStatus::Error);
+        let has_warnings = checks.iter().any(|c| c.status == DiagnosticStatus::Warning);
+
+        let overall = if has_errors {
+            "error"
+        } else if has_warnings {
+            "warning"
+        } else {
+            "ok"
+        };
+
+        assert_eq!(overall, "ok");
+        assert!(!has_errors);
+    }
+
+    // --- is_loopback_bind_addr helper ---
+
+    #[test]
+    fn loopback_addr_detection() {
+        assert!(is_loopback_bind_addr("127.0.0.1:8080"));
+        assert!(is_loopback_bind_addr("localhost:8080"));
+        assert!(is_loopback_bind_addr("127.0.0.1:0"));
+        assert!(is_loopback_bind_addr("[::1]:8080"));
+        assert!(!is_loopback_bind_addr("0.0.0.0:8080"));
+        assert!(!is_loopback_bind_addr("192.168.1.1:8080"));
+    }
+
+    // --- Distributed security check fixture tests ---
+
+    #[test]
+    fn distributed_security_disabled_is_ok() {
+        let config = wa_core::config::Config::default();
+        // Default config has distributed.enabled = false
+        let check = distributed_security_check(&config);
+        assert_eq!(check.status, DiagnosticStatus::Ok);
+        assert!(check.detail.unwrap().contains("disabled"));
+    }
+
+    // --- Secret redaction in diagnostic output ---
+
+    #[test]
+    fn diagnostic_detail_does_not_contain_raw_secrets() {
+        // Simulate what doctor does: it shows config summaries, never raw tokens
+        let check = DiagnosticCheck::ok_with_detail(
+            "distributed security",
+            "bind=127.0.0.1:9090, auth=token, tls=on, token=env:ok, allowlist=2",
+        );
+        let json = check.to_json_value();
+        let json_str = serde_json::to_string(&json).unwrap();
+        // Should not contain actual secret patterns
+        assert!(!json_str.contains("sk-"));
+        assert!(!json_str.contains("Bearer "));
+        assert!(!json_str.contains("password="));
+    }
+
+    // --- Fixture-based: run_diagnostics with controlled workspace ---
+
+    fn make_test_layout(temp: &std::path::Path) -> wa_core::config::WorkspaceLayout {
+        let wa_dir = temp.join(".wa");
+        wa_core::config::WorkspaceLayout {
+            root: temp.to_path_buf(),
+            wa_dir: wa_dir.clone(),
+            db_path: wa_dir.join("wa.db"),
+            lock_path: wa_dir.join("wa.lock"),
+            ipc_socket_path: wa_dir.join("wa.sock"),
+            logs_dir: wa_dir.join("logs"),
+            log_path: wa_dir.join("logs/wa.log"),
+            crash_dir: wa_dir.join("crashes"),
+            diag_dir: wa_dir.join("diag"),
+        }
+    }
+
+    #[tokio::test]
+    async fn doctor_fixture_healthy_workspace() {
+        let temp = unique_temp_dir("doctor_healthy");
+        let layout = make_test_layout(&temp);
+        std::fs::create_dir_all(&layout.logs_dir).unwrap();
+
+        // Create a valid SQLite DB with correct schema version
+        let storage = StorageHandle::new(&layout.db_path.to_string_lossy()).await.unwrap();
+        let _ = storage.shutdown().await;
+        let config = wa_core::config::Config::default();
+
+        let checks = run_diagnostics(&[], &config, &layout);
+
+        // Should have multiple checks
+        assert!(checks.len() >= 5, "expected at least 5 checks, got {}", checks.len());
+
+        // Find specific checks by name
+        let core_check = checks.iter().find(|c| c.name == "wa-core loaded");
+        assert!(core_check.is_some());
+        assert_eq!(core_check.unwrap().status, DiagnosticStatus::Ok);
+
+        let ws_check = checks.iter().find(|c| c.name == "workspace root");
+        assert!(ws_check.is_some());
+        assert_eq!(ws_check.unwrap().status, DiagnosticStatus::Ok);
+
+        let wa_dir_check = checks.iter().find(|c| c.name == ".wa directory");
+        assert!(wa_dir_check.is_some());
+        assert_eq!(wa_dir_check.unwrap().status, DiagnosticStatus::Ok);
+
+        let db_check = checks.iter().find(|c| c.name == "database");
+        assert!(db_check.is_some());
+        assert_eq!(db_check.unwrap().status, DiagnosticStatus::Ok);
+        let db_detail = db_check.unwrap().detail.as_deref().unwrap();
+        assert!(db_detail.contains("schema v"), "DB detail should show schema version");
+        assert!(db_detail.contains("wal"), "DB detail should show WAL mode");
+
+        let daemon_check = checks.iter().find(|c| c.name == "daemon status");
+        assert!(daemon_check.is_some());
+        // No lock file → not running
+        assert_eq!(daemon_check.unwrap().status, DiagnosticStatus::Ok);
+        assert!(daemon_check.unwrap().detail.as_deref().unwrap().contains("not running"));
+
+        let logs_check = checks.iter().find(|c| c.name == "logs directory");
+        assert!(logs_check.is_some());
+        assert_eq!(logs_check.unwrap().status, DiagnosticStatus::Ok);
+
+        // Verify JSON shape
+        let json_checks: Vec<serde_json::Value> = checks.iter().map(|c| c.to_json_value()).collect();
+        for jc in &json_checks {
+            assert!(jc.get("name").is_some());
+            assert!(jc.get("status").is_some());
+            let status = jc["status"].as_str().unwrap();
+            assert!(
+                ["ok", "warning", "error"].contains(&status),
+                "invalid status: {status}"
+            );
+        }
+
+        // No errors in healthy workspace
+        let error_names: Vec<&str> = checks
+            .iter()
+            .filter(|c| c.status == DiagnosticStatus::Error)
+            .map(|c| c.name)
+            .collect();
+        assert!(error_names.is_empty(), "healthy workspace should have no errors: {error_names:?}");
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn doctor_fixture_missing_wa_dir() {
+        let temp = unique_temp_dir("doctor_no_wa");
+        let layout = make_test_layout(&temp);
+        let config = wa_core::config::Config::default();
+
+        let checks = run_diagnostics(&[], &config, &layout);
+
+        let wa_dir_check = checks.iter().find(|c| c.name == ".wa directory").unwrap();
+        assert_eq!(wa_dir_check.status, DiagnosticStatus::Warning);
+        assert!(wa_dir_check.detail.as_deref().unwrap().contains("does not exist"));
+
+        let db_check = checks.iter().find(|c| c.name == "database").unwrap();
+        assert_eq!(db_check.status, DiagnosticStatus::Warning);
+
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn doctor_fixture_stale_lock_file() {
+        let temp = unique_temp_dir("doctor_stale_lock");
+        let layout = make_test_layout(&temp);
+        std::fs::create_dir_all(&layout.wa_dir).unwrap();
+
+        // Write a lock file with a PID that definitely doesn't exist
+        std::fs::write(&layout.lock_path, "999999999").unwrap();
+
+        let config = wa_core::config::Config::default();
+
+        let checks = run_diagnostics(&[], &config, &layout);
+
+        let daemon_check = checks.iter().find(|c| c.name == "daemon status").unwrap();
+        assert_eq!(daemon_check.status, DiagnosticStatus::Warning);
+        let detail = daemon_check.detail.as_deref().unwrap();
+        assert!(
+            detail.contains("stale") || detail.contains("not running"),
+            "stale lock should be detected, got: {detail}"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn doctor_fixture_feature_flags() {
+        let temp = unique_temp_dir("doctor_features");
+        let layout = make_test_layout(&temp);
+        std::fs::create_dir_all(&layout.wa_dir).unwrap();
+
+        let config = wa_core::config::Config::default();
+
+        let checks = run_diagnostics(&[], &config, &layout);
+
+        let features_check = checks.iter().find(|c| c.name == "features").unwrap();
+        assert_eq!(features_check.status, DiagnosticStatus::Ok);
+        // Features detail should be a string (either feature list or "default")
+        let detail = features_check.detail.as_deref().unwrap();
+        assert!(!detail.is_empty());
+        // Should not contain secrets
+        assert!(!detail.contains("sk-"));
+        assert!(!detail.contains("Bearer"));
+
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn doctor_json_output_all_checks_have_valid_status() {
+        let temp = unique_temp_dir("doctor_valid_status");
+        let layout = make_test_layout(&temp);
+        std::fs::create_dir_all(&layout.wa_dir).unwrap();
+
+        let config = wa_core::config::Config::default();
+
+        let checks = run_diagnostics(&[], &config, &layout);
+
+        // Verify every check can be serialized to valid JSON
+        for check in &checks {
+            let json = check.to_json_value();
+            let status = json["status"].as_str().unwrap();
+            assert!(
+                ["ok", "warning", "error"].contains(&status),
+                "check '{}' has invalid status: '{}'",
+                check.name,
+                status
+            );
+            // Name is always present and non-empty
+            let name = json["name"].as_str().unwrap();
+            assert!(!name.is_empty(), "check name must not be empty");
+        }
+
+        // Overall JSON envelope
+        let has_errors = checks.iter().any(|c| c.status == DiagnosticStatus::Error);
+        let has_warnings = checks.iter().any(|c| c.status == DiagnosticStatus::Warning);
+        let overall = if has_errors {
+            "error"
+        } else if has_warnings {
+            "warning"
+        } else {
+            "ok"
+        };
+
+        let envelope = serde_json::json!({
+            "ok": !has_errors,
+            "status": overall,
+            "version": wa_core::VERSION,
+            "checks": checks.iter().map(|c| c.to_json_value()).collect::<Vec<_>>(),
+        });
+
+        // Envelope has required fields
+        assert!(envelope.get("ok").is_some());
+        assert!(envelope.get("status").is_some());
+        assert!(envelope.get("version").is_some());
+        assert!(envelope.get("checks").is_some());
+
+        // Full JSON roundtrip
+        let json_str = serde_json::to_string_pretty(&envelope).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(parsed["ok"], envelope["ok"]);
+        assert_eq!(parsed["status"], envelope["status"]);
+
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn doctor_check_names_are_deterministic() {
+        let temp = unique_temp_dir("doctor_deterministic");
+        let layout = make_test_layout(&temp);
+        std::fs::create_dir_all(&layout.wa_dir).unwrap();
+
+        let config = wa_core::config::Config::default();
+
+        let checks_1 = run_diagnostics(&[], &config, &layout);
+        let checks_2 = run_diagnostics(&[], &config, &layout);
+
+        // Same names in same order
+        let names_1: Vec<&str> = checks_1.iter().map(|c| c.name).collect();
+        let names_2: Vec<&str> = checks_2.iter().map(|c| c.name).collect();
+        assert_eq!(names_1, names_2, "check names must be deterministic");
+
+        // Same statuses
+        let statuses_1: Vec<&str> = checks_1.iter().map(|c| c.status.as_str()).collect();
+        let statuses_2: Vec<&str> = checks_2.iter().map(|c| c.status.as_str()).collect();
+        assert_eq!(statuses_1, statuses_2, "check statuses must be deterministic");
+
+        let _ = std::fs::remove_dir_all(&temp);
+    }
 }
