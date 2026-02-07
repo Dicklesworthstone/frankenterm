@@ -6524,6 +6524,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "toml",
  "toml_edit 0.24.0+spec-1.1.0",

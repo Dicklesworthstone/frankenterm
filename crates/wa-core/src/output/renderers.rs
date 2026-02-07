@@ -1709,11 +1709,7 @@ impl HealthSnapshotRenderer {
                 checks.push(HealthDiagnostic {
                     name: "pane activity",
                     status: HealthDiagnosticStatus::Warning,
-                    detail: format!(
-                        "{} stuck pane(s): {}",
-                        stuck.len(),
-                        ids.join(", ")
-                    ),
+                    detail: format!("{} stuck pane(s): {}", stuck.len(), ids.join(", ")),
                 });
             }
         }
@@ -1815,7 +1811,9 @@ impl AccountListRenderer {
         let mut table = Table::new(vec![
             Column::new("ACCOUNT").min_width(16),
             Column::new("NAME").min_width(12),
-            Column::new("REMAINING").align(Alignment::Right).min_width(10),
+            Column::new("REMAINING")
+                .align(Alignment::Right)
+                .min_width(10),
             Column::new("USED").align(Alignment::Right).min_width(10),
             Column::new("LIMIT").align(Alignment::Right).min_width(10),
             Column::new("REFRESHED").min_width(20),
@@ -1849,16 +1847,12 @@ impl AccountListRenderer {
         if let Some(pick_result) = pick {
             output.push('\n');
             if let Some(ref selected) = pick_result.selected {
-                let display_name = selected
-                    .name
-                    .as_deref()
-                    .unwrap_or(&selected.account_id);
+                let display_name = selected.name.as_deref().unwrap_or(&selected.account_id);
                 output.push_str(&style.bold("Pick: "));
                 output.push_str(&style.green(display_name));
                 output.push_str(&format!(
                     " ({:.1}%) - {}\n",
-                    selected.percent_remaining,
-                    pick_result.explanation.selection_reason
+                    selected.percent_remaining, pick_result.explanation.selection_reason
                 ));
             } else {
                 output.push_str(&style.yellow(&format!(
@@ -3192,10 +3186,7 @@ mod tests {
             pane_priority_overrides: vec![],
             scheduler: None,
             backpressure_tier: None,
-            last_activity_by_pane: vec![
-                (1, 1_700_000_000_000),
-                (2, 1_700_000_000_000),
-            ],
+            last_activity_by_pane: vec![(1, 1_700_000_000_000), (2, 1_700_000_000_000)],
         }
     }
 
@@ -3824,7 +3815,10 @@ mod tests {
         let ctx = RenderContext::new(OutputFormat::Json);
         let output = AccountListRenderer::render(&accounts, Some(&pick), "openai", &ctx);
         let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
-        assert!(parsed["pick_preview"].is_object(), "should have pick_preview");
+        assert!(
+            parsed["pick_preview"].is_object(),
+            "should have pick_preview"
+        );
         assert_eq!(parsed["pick_preview"]["selected_account_id"], "acct-alpha");
     }
 

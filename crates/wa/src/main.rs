@@ -10820,8 +10820,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                             #[cfg(unix)]
                             {
-                                let client =
-                                    wa_core::ipc::IpcClient::new(&layout.ipc_socket_path);
+                                let client = wa_core::ipc::IpcClient::new(&layout.ipc_socket_path);
                                 match client.status().await {
                                     Ok(response) if response.ok => {
                                         payload["watcher_running"] = serde_json::json!(true);
@@ -10829,13 +10828,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             if let Some(health) = data.get("health") {
                                                 payload["health"] = health.clone();
                                                 // Add stuck pane diagnostics
-                                                if let Ok(snapshot) =
-                                                    serde_json::from_value::<
-                                                        wa_core::crash::HealthSnapshot,
-                                                    >(
-                                                        health.clone()
-                                                    )
-                                                {
+                                                if let Ok(snapshot) = serde_json::from_value::<
+                                                    wa_core::crash::HealthSnapshot,
+                                                >(
+                                                    health.clone()
+                                                ) {
                                                     let diags = wa_core::output::HealthSnapshotRenderer::diagnostic_checks(&snapshot);
                                                     let diag_json: Vec<serde_json::Value> = diags
                                                         .iter()
@@ -10847,7 +10844,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                             })
                                                         })
                                                         .collect();
-                                                    payload["diagnostics"] = serde_json::json!(diag_json);
+                                                    payload["diagnostics"] =
+                                                        serde_json::json!(diag_json);
                                                 }
                                             }
                                             if let Some(uptime) = data.get("uptime_ms") {
@@ -10862,8 +10860,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     }
                                     Err(e) => {
                                         payload["watcher_running"] = serde_json::json!(false);
-                                        payload["watcher_error"] =
-                                            serde_json::json!(e.to_string());
+                                        payload["watcher_error"] = serde_json::json!(e.to_string());
                                     }
                                 }
                             }
@@ -10878,12 +10875,14 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                             // Fallback: try global snapshot
                             if payload.get("health").is_none() {
-                                if let Some(snapshot) =
-                                    wa_core::crash::HealthSnapshot::get_global()
+                                if let Some(snapshot) = wa_core::crash::HealthSnapshot::get_global()
                                 {
                                     payload["health"] = serde_json::to_value(&snapshot)
                                         .unwrap_or(serde_json::Value::Null);
-                                    let diags = wa_core::output::HealthSnapshotRenderer::diagnostic_checks(&snapshot);
+                                    let diags =
+                                        wa_core::output::HealthSnapshotRenderer::diagnostic_checks(
+                                            &snapshot,
+                                        );
                                     let diag_json: Vec<serde_json::Value> = diags
                                         .iter()
                                         .map(|d| {
@@ -10906,10 +10905,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     "bundle_path": crash.path.display().to_string(),
                                 });
                                 if let Some(ref report) = crash.report {
-                                    crash_info["message"] =
-                                        serde_json::json!(report.message);
-                                    crash_info["timestamp"] =
-                                        serde_json::json!(report.timestamp);
+                                    crash_info["message"] = serde_json::json!(report.message);
+                                    crash_info["timestamp"] = serde_json::json!(report.timestamp);
                                 }
                                 payload["latest_crash"] = crash_info;
                             }
@@ -16272,11 +16269,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
         }
 
         Some(Commands::Ext { command }) => {
-            handle_ext_command(
-                command,
-                &config,
-                resolved_config_path.as_deref(),
-            );
+            handle_ext_command(command, &config, resolved_config_path.as_deref());
         }
 
         Some(Commands::Record { command }) => match command {
@@ -16380,7 +16373,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 std::process::exit(1);
             }
 
-            RecordCommands::List { limit, json: as_json } => {
+            RecordCommands::List {
+                limit,
+                json: as_json,
+            } => {
                 let recordings_dir = layout.recordings_dir();
                 let mut entries = Vec::new();
 
@@ -16394,9 +16390,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 let modified = metadata
                                     .as_ref()
                                     .and_then(|m| m.modified().ok())
-                                    .and_then(|t| {
-                                        t.duration_since(std::time::UNIX_EPOCH).ok()
-                                    })
+                                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                                     .map(|d| d.as_millis() as i64)
                                     .unwrap_or(0);
 
@@ -16467,7 +16461,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 }
             }
 
-            RecordCommands::Info { file, json: as_json } => {
+            RecordCommands::Info {
+                file,
+                json: as_json,
+            } => {
                 let recording = wa_core::replay::Recording::load(&file).map_err(|e| {
                     anyhow::anyhow!("Failed to load recording '{}': {e}", file.display())
                 })?;
@@ -16476,15 +16473,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 if as_json {
                     println!(
                         "{}",
-                        serde_json::to_string_pretty(&info)
-                            .unwrap_or_else(|_| "{}".to_string())
+                        serde_json::to_string_pretty(&info).unwrap_or_else(|_| "{}".to_string())
                     );
                 } else {
                     println!("Recording: {}", file.display());
-                    println!(
-                        "Duration:  {}",
-                        format_duration_short(info.duration_ms)
-                    );
+                    println!("Duration:  {}", format_duration_short(info.duration_ms));
                     println!("Terminal:  {}x{}", info.terminal_cols, info.terminal_rows);
                     println!("Frames:    {} total", info.frame_count);
                     println!("  Output:  {}", info.output_frames);
@@ -16522,9 +16515,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     "asciinema" | "cast" => ExportFormat::Asciinema,
                     "html" => ExportFormat::Html,
                     other => {
-                        eprintln!(
-                            "Error: Unknown format '{other}'. Use 'asciinema' or 'html'."
-                        );
+                        eprintln!("Error: Unknown format '{other}'. Use 'asciinema' or 'html'.");
                         std::process::exit(1);
                     }
                 };
@@ -16541,10 +16532,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     ExportFormat::Asciinema => {
                         if let Some(ref path) = output {
                             let mut f = std::fs::File::create(path).map_err(|e| {
-                                anyhow::anyhow!(
-                                    "Failed to create '{}': {e}",
-                                    path.display()
-                                )
+                                anyhow::anyhow!("Failed to create '{}': {e}", path.display())
                             })?;
                             let count = export_asciinema(&recording, &opts, &mut f)?;
                             eprintln!(
@@ -16560,10 +16548,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     ExportFormat::Html => {
                         if let Some(ref path) = output {
                             let mut f = std::fs::File::create(path).map_err(|e| {
-                                anyhow::anyhow!(
-                                    "Failed to create '{}': {e}",
-                                    path.display()
-                                )
+                                anyhow::anyhow!("Failed to create '{}': {e}", path.display())
                             })?;
                             let count = export_html(&recording, &opts, &mut f)?;
                             eprintln!(
@@ -16588,8 +16573,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             json: as_json,
         }) => {
             use wa_core::replay::{
-                CollectorSink, HeadlessSink, PlaybackSpeed, Player, Recording, decode_frame,
-                DecodedFrame,
+                CollectorSink, DecodedFrame, HeadlessSink, PlaybackSpeed, Player, Recording,
+                decode_frame,
             };
 
             let recording = Recording::load(&file).map_err(|e| {
@@ -16631,31 +16616,26 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 if as_json {
                     println!(
                         "{}",
-                        serde_json::to_string_pretty(&events)
-                            .unwrap_or_else(|_| "[]".to_string())
+                        serde_json::to_string_pretty(&events).unwrap_or_else(|_| "[]".to_string())
                     );
                 } else if events.is_empty() {
                     println!("No events or markers in recording.");
                 } else {
-                        for ev in &events {
-                            let t = ev["time_ms"].as_u64().unwrap_or(0);
-                            let kind = ev["type"].as_str().unwrap_or("?");
-                            let detail = if kind == "marker" {
-                                ev["text"].as_str().unwrap_or("").to_string()
-                            } else {
-                                ev["data"].to_string()
-                            };
-                            println!(
-                                "[{:>8}ms] {kind}: {detail}",
-                                t
-                            );
-                        }
+                    for ev in &events {
+                        let t = ev["time_ms"].as_u64().unwrap_or(0);
+                        let kind = ev["type"].as_str().unwrap_or("?");
+                        let detail = if kind == "marker" {
+                            ev["text"].as_str().unwrap_or("").to_string()
+                        } else {
+                            ev["data"].to_string()
+                        };
+                        println!("[{:>8}ms] {kind}: {detail}", t);
                     }
+                }
             } else {
                 // Full playback
-                let playback_speed = PlaybackSpeed::new(speed as f32).map_err(|e| {
-                    anyhow::anyhow!("Invalid speed {speed}: {e}")
-                })?;
+                let playback_speed = PlaybackSpeed::new(speed as f32)
+                    .map_err(|e| anyhow::anyhow!("Invalid speed {speed}: {e}"))?;
 
                 let mut player = Player::new(recording);
                 player.set_speed(playback_speed);
@@ -16680,8 +16660,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     });
                     println!(
                         "{}",
-                        serde_json::to_string_pretty(&result)
-                            .unwrap_or_else(|_| "{}".to_string())
+                        serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
                     );
                 } else {
                     eprintln!(
@@ -16700,10 +16679,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 wa_core::Error::Runtime(format!("stdout write error: {e}"))
                             })
                         }
-                        fn show_event(
-                            &mut self,
-                            event: &serde_json::Value,
-                        ) -> wa_core::Result<()> {
+                        fn show_event(&mut self, event: &serde_json::Value) -> wa_core::Result<()> {
                             eprintln!("\n[event] {event}");
                             Ok(())
                         }
@@ -16977,7 +16953,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             pick,
             command,
         }) => {
-            use wa_core::output::{AccountListRenderer, OutputFormat, RenderContext, detect_format};
+            use wa_core::output::{
+                AccountListRenderer, OutputFormat, RenderContext, detect_format,
+            };
 
             let output_format = match format.to_lowercase().as_str() {
                 "json" => OutputFormat::Json,
@@ -17025,12 +17003,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                 // Open storage for rate-limit check
                 let db_path = layout.db_path.to_string_lossy();
-                if let Ok(storage_check) =
-                    wa_core::storage::StorageHandle::new(&db_path).await
-                {
-                    if let Ok(accounts) = storage_check
-                        .get_accounts_by_service(&ref_service)
-                        .await
+                if let Ok(storage_check) = wa_core::storage::StorageHandle::new(&db_path).await {
+                    if let Ok(accounts) = storage_check.get_accounts_by_service(&ref_service).await
                     {
                         let now_check = now_ms_i64();
                         let most_recent = accounts
@@ -17084,16 +17058,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 let now = now_ms_i64();
                 let mut count = 0usize;
                 for usage in &refresh_result.accounts {
-                    let record = wa_core::accounts::AccountRecord::from_caut(
-                        usage,
-                        caut_service,
-                        now,
-                    );
+                    let record =
+                        wa_core::accounts::AccountRecord::from_caut(usage, caut_service, now);
                     if let Err(e) = storage.upsert_account(record.clone()).await {
-                        tracing::warn!(
-                            "Failed to upsert account {}: {e}",
-                            record.account_id
-                        );
+                        tracing::warn!("Failed to upsert account {}: {e}", record.account_id);
                     }
                     count += 1;
                 }
@@ -17155,12 +17123,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 };
 
                 let ctx = RenderContext::new(output_format).verbose(cli.verbose);
-                let rendered = AccountListRenderer::render(
-                    &accounts,
-                    pick_result.as_ref(),
-                    &service,
-                    &ctx,
-                );
+                let rendered =
+                    AccountListRenderer::render(&accounts, pick_result.as_ref(), &service, &ctx);
                 print!("{rendered}");
 
                 if let Err(e) = storage.shutdown().await {
@@ -17978,9 +17942,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                 for (i, event) in scenario.events.iter().enumerate() {
                     // Wait until the scaled time for this event
-                    let target_elapsed = std::time::Duration::from_secs_f64(
-                        event.at.as_secs_f64() / speed_factor,
-                    );
+                    let target_elapsed =
+                        std::time::Duration::from_secs_f64(event.at.as_secs_f64() / speed_factor);
                     let actual_elapsed = start.elapsed();
                     if let Some(wait) = target_elapsed.checked_sub(actual_elapsed) {
                         tokio::time::sleep(wait).await;
@@ -18052,13 +18015,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     println!("{}", serde_json::to_string_pretty(&result)?);
                 } else if pass_count + fail_count > 0 {
                     println!();
-                    println!(
-                        "Results: {} passed, {} failed",
-                        pass_count, fail_count
-                    );
+                    println!("Results: {} passed, {} failed", pass_count, fail_count);
                 } else {
                     println!();
-                    println!("Simulation complete ({} events executed)", scenario.events.len());
+                    println!(
+                        "Simulation complete ({} events executed)",
+                        scenario.events.len()
+                    );
                 }
 
                 if fail_count > 0 {
@@ -18158,7 +18121,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         }
                         println!();
                         println!("Run a demo: wa demo <name>");
-                        println!("Note: Demo scenarios are not yet bundled. Use 'wa simulate run' with custom YAML.");
+                        println!(
+                            "Note: Demo scenarios are not yet bundled. Use 'wa simulate run' with custom YAML."
+                        );
                     }
                 }
                 Some(name) => {
@@ -19652,14 +19617,13 @@ fn handle_ext_command(
                 _ => detect_format(),
             };
 
-            let detail =
-                match extensions::extension_info(&name, &config.patterns, config_root) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        eprintln!("Extension '{name}' not found: {e}");
-                        std::process::exit(1);
-                    }
-                };
+            let detail = match extensions::extension_info(&name, &config.patterns, config_root) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("Extension '{name}' not found: {e}");
+                    std::process::exit(1);
+                }
+            };
 
             if matches!(fmt, OutputFormat::Json) {
                 println!(
@@ -20437,7 +20401,10 @@ fn handle_learn_command(
 
                 // Show any newly unlocked achievements
                 for achievement in engine.state().achievements.iter().skip(before_count) {
-                    println!("\n{}", TutorialEngine::format_achievement_unlock(achievement));
+                    println!(
+                        "\n{}",
+                        TutorialEngine::format_achievement_unlock(achievement)
+                    );
                 }
 
                 // Show next exercise or completion
@@ -22215,16 +22182,23 @@ async fn run_guided_setup(apply: bool, dry_run: bool, verbose: u8) -> anyhow::Re
     println!("\nRecommended configuration:\n");
     println!("  Poll interval:    {}ms", auto.poll_interval_ms);
     println!("  Min poll:         {}ms", auto.min_poll_interval_ms);
-    println!("  Concurrency:      {} captures", auto.max_concurrent_captures);
     println!(
-        "  Pattern packs:    {}",
-        auto.pattern_packs.join(", ")
+        "  Concurrency:      {} captures",
+        auto.max_concurrent_captures
     );
+    println!("  Pattern packs:    {}", auto.pattern_packs.join(", "));
     println!(
         "  Safety mode:      {}",
-        if auto.strict_safety { "strict" } else { "standard" }
+        if auto.strict_safety {
+            "strict"
+        } else {
+            "standard"
+        }
     );
-    println!("  Rate limit:       {}/min per pane", auto.rate_limit_per_pane);
+    println!(
+        "  Rate limit:       {}/min per pane",
+        auto.rate_limit_per_pane
+    );
 
     if !auto.recommendations.is_empty() {
         println!("\n  Reasons:");
@@ -24302,7 +24276,13 @@ log_level = "debug"
         assert!(result.is_some());
         let preview = result.unwrap();
         assert_eq!(preview.would_run, Some(false));
-        assert!(preview.reason.as_deref().unwrap().contains("already handled"));
+        assert!(
+            preview
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("already handled")
+        );
     }
 
     #[test]
@@ -24365,7 +24345,8 @@ log_level = "debug"
     #[test]
     fn send_dry_run_report_json_roundtrip() {
         let config = wa_core::config::Config::default();
-        let command_ctx = wa_core::dry_run::CommandContext::new("wa robot send 0 \"echo hi\" --dry-run", true);
+        let command_ctx =
+            wa_core::dry_run::CommandContext::new("wa robot send 0 \"echo hi\" --dry-run", true);
         let report = build_send_dry_run_report(
             &command_ctx,
             0,
@@ -24414,10 +24395,7 @@ log_level = "debug"
             "policy evaluation must always be present in dry-run"
         );
         let eval = report.policy_evaluation.unwrap();
-        assert!(
-            !eval.checks.is_empty(),
-            "policy checks must not be empty"
-        );
+        assert!(!eval.checks.is_empty(), "policy checks must not be empty");
     }
 
     #[test]
@@ -24584,9 +24562,7 @@ log_level = "debug"
         );
 
         assert_eq!(
-            step_action_to_dry_run_type(&StepAction::MarkEventHandled {
-                event_id: 1,
-            }),
+            step_action_to_dry_run_type(&StepAction::MarkEventHandled { event_id: 1 }),
             ActionType::MarkEventHandled
         );
     }
@@ -24656,13 +24632,8 @@ log_level = "debug"
 
     #[test]
     fn cli_robot_events_dry_run_flag() {
-        let cli = Cli::try_parse_from([
-            "wa",
-            "robot",
-            "events",
-            "--dry-run",
-        ])
-        .expect("robot events --dry-run should parse");
+        let cli = Cli::try_parse_from(["wa", "robot", "events", "--dry-run"])
+            .expect("robot events --dry-run should parse");
 
         match cli.command {
             Some(Commands::Robot { command, .. }) => match command {
@@ -24677,17 +24648,16 @@ log_level = "debug"
 
     #[test]
     fn cli_robot_events_would_handle_flag() {
-        let cli = Cli::try_parse_from([
-            "wa",
-            "robot",
-            "events",
-            "--would-handle",
-        ])
-        .expect("robot events --would-handle should parse");
+        let cli = Cli::try_parse_from(["wa", "robot", "events", "--would-handle"])
+            .expect("robot events --would-handle should parse");
 
         match cli.command {
             Some(Commands::Robot { command, .. }) => match command {
-                Some(RobotCommands::Events { would_handle, dry_run, .. }) => {
+                Some(RobotCommands::Events {
+                    would_handle,
+                    dry_run,
+                    ..
+                }) => {
                     assert!(would_handle, "--would-handle flag should be true");
                     assert!(!dry_run, "--dry-run should be false when not set");
                 }
@@ -24699,15 +24669,8 @@ log_level = "debug"
 
     #[test]
     fn cli_robot_send_dry_run_flag() {
-        let cli = Cli::try_parse_from([
-            "wa",
-            "robot",
-            "send",
-            "0",
-            "echo hello",
-            "--dry-run",
-        ])
-        .expect("robot send --dry-run should parse");
+        let cli = Cli::try_parse_from(["wa", "robot", "send", "0", "echo hello", "--dry-run"])
+            .expect("robot send --dry-run should parse");
 
         match cli.command {
             Some(Commands::Robot { command, .. }) => match command {
@@ -28143,7 +28106,12 @@ log_level = "debug"
         assert_eq!(json["name"], "database");
         assert_eq!(json["status"], "error");
         assert!(json["detail"].as_str().unwrap().contains("locked"));
-        assert!(json["recommendation"].as_str().unwrap().contains("another wa"));
+        assert!(
+            json["recommendation"]
+                .as_str()
+                .unwrap()
+                .contains("another wa")
+        );
     }
 
     #[test]
@@ -28340,14 +28308,20 @@ log_level = "debug"
         std::fs::create_dir_all(&layout.logs_dir).unwrap();
 
         // Create a valid SQLite DB with correct schema version
-        let storage = StorageHandle::new(&layout.db_path.to_string_lossy()).await.unwrap();
+        let storage = StorageHandle::new(&layout.db_path.to_string_lossy())
+            .await
+            .unwrap();
         let _ = storage.shutdown().await;
         let config = wa_core::config::Config::default();
 
         let checks = run_diagnostics(&[], &config, &layout);
 
         // Should have multiple checks
-        assert!(checks.len() >= 5, "expected at least 5 checks, got {}", checks.len());
+        assert!(
+            checks.len() >= 5,
+            "expected at least 5 checks, got {}",
+            checks.len()
+        );
 
         // Find specific checks by name
         let core_check = checks.iter().find(|c| c.name == "wa-core loaded");
@@ -28366,21 +28340,32 @@ log_level = "debug"
         assert!(db_check.is_some());
         assert_eq!(db_check.unwrap().status, DiagnosticStatus::Ok);
         let db_detail = db_check.unwrap().detail.as_deref().unwrap();
-        assert!(db_detail.contains("schema v"), "DB detail should show schema version");
+        assert!(
+            db_detail.contains("schema v"),
+            "DB detail should show schema version"
+        );
         assert!(db_detail.contains("wal"), "DB detail should show WAL mode");
 
         let daemon_check = checks.iter().find(|c| c.name == "daemon status");
         assert!(daemon_check.is_some());
         // No lock file → not running
         assert_eq!(daemon_check.unwrap().status, DiagnosticStatus::Ok);
-        assert!(daemon_check.unwrap().detail.as_deref().unwrap().contains("not running"));
+        assert!(
+            daemon_check
+                .unwrap()
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("not running")
+        );
 
         let logs_check = checks.iter().find(|c| c.name == "logs directory");
         assert!(logs_check.is_some());
         assert_eq!(logs_check.unwrap().status, DiagnosticStatus::Ok);
 
         // Verify JSON shape
-        let json_checks: Vec<serde_json::Value> = checks.iter().map(|c| c.to_json_value()).collect();
+        let json_checks: Vec<serde_json::Value> =
+            checks.iter().map(|c| c.to_json_value()).collect();
         for jc in &json_checks {
             assert!(jc.get("name").is_some());
             assert!(jc.get("status").is_some());
@@ -28397,7 +28382,10 @@ log_level = "debug"
             .filter(|c| c.status == DiagnosticStatus::Error)
             .map(|c| c.name)
             .collect();
-        assert!(error_names.is_empty(), "healthy workspace should have no errors: {error_names:?}");
+        assert!(
+            error_names.is_empty(),
+            "healthy workspace should have no errors: {error_names:?}"
+        );
 
         // Cleanup
         let _ = std::fs::remove_dir_all(&temp);
@@ -28413,7 +28401,13 @@ log_level = "debug"
 
         let wa_dir_check = checks.iter().find(|c| c.name == ".wa directory").unwrap();
         assert_eq!(wa_dir_check.status, DiagnosticStatus::Warning);
-        assert!(wa_dir_check.detail.as_deref().unwrap().contains("does not exist"));
+        assert!(
+            wa_dir_check
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("does not exist")
+        );
 
         let db_check = checks.iter().find(|c| c.name == "database").unwrap();
         assert_eq!(db_check.status, DiagnosticStatus::Warning);
@@ -28544,7 +28538,10 @@ log_level = "debug"
         // Same statuses
         let statuses_1: Vec<&str> = checks_1.iter().map(|c| c.status.as_str()).collect();
         let statuses_2: Vec<&str> = checks_2.iter().map(|c| c.status.as_str()).collect();
-        assert_eq!(statuses_1, statuses_2, "check statuses must be deterministic");
+        assert_eq!(
+            statuses_1, statuses_2,
+            "check statuses must be deterministic"
+        );
 
         let _ = std::fs::remove_dir_all(&temp);
     }

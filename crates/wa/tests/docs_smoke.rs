@@ -44,10 +44,7 @@ fn emit_env_artifact() {
 }
 
 fn artifact_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "wa_smoke_artifacts_{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("wa_smoke_artifacts_{}", std::process::id()));
     std::fs::create_dir_all(&dir).ok();
     dir
 }
@@ -104,10 +101,7 @@ fn smoke_wa_version() {
     save_artifact("version_stdout.txt", &stdout);
     emit_artifact("wa_version_stdout", &stdout);
 
-    assert!(
-        output.status.success(),
-        "wa --version should exit 0"
-    );
+    assert!(output.status.success(), "wa --version should exit 0");
     assert!(
         stdout.contains("wa") || stdout.contains("0."),
         "wa --version should contain version info"
@@ -177,10 +171,7 @@ fn smoke_wa_doctor_plain() {
     emit_artifact("wa_doctor_plain", &stdout);
 
     // Doctor should not panic; it may exit non-zero if WezTerm is missing
-    assert!(
-        !stderr.contains("panicked"),
-        "wa doctor should not panic"
-    );
+    assert!(!stderr.contains("panicked"), "wa doctor should not panic");
 }
 
 #[test]
@@ -240,10 +231,7 @@ fn smoke_wa_robot_default() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     save_artifact("robot_default_stdout.txt", &stdout);
 
-    assert!(
-        output.status.success(),
-        "wa robot (default) should exit 0"
-    );
+    assert!(output.status.success(), "wa robot (default) should exit 0");
 }
 
 #[test]
@@ -332,10 +320,7 @@ fn smoke_wa_accounts_help() {
 
 #[test]
 fn smoke_unknown_subcommand_fails() {
-    wa_cmd()
-        .arg("nonexistent-command-xyz")
-        .assert()
-        .failure();
+    wa_cmd().arg("nonexistent-command-xyz").assert().failure();
 }
 
 // =============================================================================
