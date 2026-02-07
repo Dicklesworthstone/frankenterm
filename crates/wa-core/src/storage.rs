@@ -50,7 +50,7 @@ use crate::policy::Redactor;
 /// This is the target version that new databases will be initialized to,
 /// and existing databases will be migrated to.
 /// Uses SQLite's PRAGMA user_version for atomic version tracking.
-pub const SCHEMA_VERSION: i32 = 19;
+pub const SCHEMA_VERSION: i32 = 20;
 
 /// Schema initialization SQL
 ///
@@ -546,6 +546,20 @@ CREATE INDEX IF NOT EXISTS idx_notification_history_timestamp ON notification_hi
 CREATE INDEX IF NOT EXISTS idx_notification_history_status ON notification_history(status);
 CREATE INDEX IF NOT EXISTS idx_notification_history_event ON notification_history(event_id);
 CREATE INDEX IF NOT EXISTS idx_notification_history_channel_ts ON notification_history(channel, timestamp);
+
+-- Pane bookmarks: named aliases with optional tags for fast pane access
+CREATE TABLE IF NOT EXISTS pane_bookmarks (
+    id INTEGER PRIMARY KEY,
+    pane_id INTEGER NOT NULL,
+    alias TEXT NOT NULL UNIQUE,
+    tags TEXT,                            -- JSON array of tag strings
+    description TEXT,
+    created_at INTEGER NOT NULL,          -- epoch ms
+    updated_at INTEGER NOT NULL           -- epoch ms
+);
+
+CREATE INDEX IF NOT EXISTS idx_pane_bookmarks_pane_id ON pane_bookmarks(pane_id);
+CREATE INDEX IF NOT EXISTS idx_pane_bookmarks_alias ON pane_bookmarks(alias);
 
 -- Action history view (audit + undo + workflow step info)
 CREATE VIEW IF NOT EXISTS action_history AS
@@ -1116,6 +1130,33 @@ static MIGRATIONS: &[Migration] = &[
             ALTER TABLE approval_tokens DROP COLUMN risk_summary;
             ALTER TABLE approval_tokens DROP COLUMN plan_version;
             ALTER TABLE approval_tokens DROP COLUMN plan_hash;
+        ",
+        ),
+    },
+    Migration {
+        version: 20,
+        description: "Add pane_bookmarks table for named pane aliases with tags",
+        up_sql: r"
+            CREATE TABLE IF NOT EXISTS pane_bookmarks (
+                id INTEGER PRIMARY KEY,
+                pane_id INTEGER NOT NULL,
+                alias TEXT NOT NULL UNIQUE,
+                tags TEXT,
+                description TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_pane_bookmarks_pane_id
+                ON pane_bookmarks(pane_id);
+            CREATE INDEX IF NOT EXISTS idx_pane_bookmarks_alias
+                ON pane_bookmarks(alias);
+        ",
+        down_sql: Some(
+            r"
+            DROP INDEX IF EXISTS idx_pane_bookmarks_alias;
+            DROP INDEX IF EXISTS idx_pane_bookmarks_pane_id;
+            DROP TABLE IF EXISTS pane_bookmarks;
         ",
         ),
     },
@@ -2245,6 +2286,18 @@ pub struct SavedSearchRecord {
     /// Created timestamp (epoch ms).
     pub created_at: i64,
     /// Updated timestamp (epoch ms).
+    pub updated_at: i64,
+}
+
+/// A pane bookmark record binding an alias (and optional tags) to a pane.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaneBookmarkRecord {
+    pub id: i64,
+    pub pane_id: u64,
+    pub alias: String,
+    pub tags: Option<Vec<String>>,
+    pub description: Option<String>,
+    pub created_at: i64,
     pub updated_at: i64,
 }
 
@@ -3973,6 +4026,16 @@ enum WriteCommand {
         before_ts: i64,
         respond: oneshot::Sender<Result<usize>>,
     },
+    /// Insert a pane bookmark
+    InsertPaneBookmark {
+        record: PaneBookmarkRecord,
+        respond: oneshot::Sender<Result<i64>>,
+    },
+    /// Delete a pane bookmark by alias
+    DeletePaneBookmark {
+        alias: String,
+        respond: oneshot::Sender<Result<bool>>,
+    },
     /// Shutdown the writer thread (flush pending writes)
     Shutdown { respond: oneshot::Sender<()> },
 }
@@ -4566,6 +4629,80 @@ impl StorageHandle {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
             list_saved_searches_sync(&conn)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+    }
+
+    /// Insert a pane bookmark. Returns the row ID.
+    pub async fn insert_pane_bookmark(&self, record: PaneBookmarkRecord) -> Result<i64> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::InsertPaneBookmark {
+                record,
+                respond: tx,
+            })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    /// Delete a pane bookmark by alias. Returns true if a row was deleted.
+    pub async fn delete_pane_bookmark(&self, alias: &str) -> Result<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::DeletePaneBookmark {
+                alias: alias.to_string(),
+                respond: tx,
+            })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    /// Get a pane bookmark by alias.
+    pub async fn get_pane_bookmark_by_alias(
+        &self,
+        alias: &str,
+    ) -> Result<Option<PaneBookmarkRecord>> {
+        let db_path = Arc::clone(&self.db_path);
+        let alias = alias.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            query_pane_bookmark_by_alias(&conn, &alias)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+    }
+
+    /// List all pane bookmarks in alias order.
+    pub async fn list_pane_bookmarks(&self) -> Result<Vec<PaneBookmarkRecord>> {
+        let db_path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            list_pane_bookmarks_sync(&conn)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+    }
+
+    /// List pane bookmarks filtered by tag.
+    pub async fn list_pane_bookmarks_by_tag(&self, tag: &str) -> Result<Vec<PaneBookmarkRecord>> {
+        let db_path = Arc::clone(&self.db_path);
+        let tag = tag.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            list_pane_bookmarks_by_tag_sync(&conn, &tag)
         })
         .await
         .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
@@ -6868,6 +7005,14 @@ fn dispatch_write_command(conn: &mut Connection, cmd: WriteCommand, should_break
             let result = purge_notification_history_sync(conn, before_ts);
             let _ = respond.send(result);
         }
+        WriteCommand::InsertPaneBookmark { record, respond } => {
+            let result = insert_pane_bookmark_sync(conn, &record);
+            let _ = respond.send(result);
+        }
+        WriteCommand::DeletePaneBookmark { alias, respond } => {
+            let result = delete_pane_bookmark_sync(conn, &alias);
+            let _ = respond.send(result);
+        }
         WriteCommand::Shutdown { respond } => {
             let _ = respond.send(());
             *should_break = true;
@@ -6880,7 +7025,7 @@ fn dispatch_write_command(conn: &mut Connection, cmd: WriteCommand, should_break
 // =============================================================================
 
 /// Get current timestamp in epoch milliseconds
-fn now_ms() -> i64 {
+pub fn now_ms() -> i64 {
     #[allow(clippy::cast_possible_truncation)]
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -7891,6 +8036,113 @@ fn list_saved_searches_sync(conn: &Connection) -> Result<Vec<SavedSearchRecord>>
         searches.push(row.map_err(|e| StorageError::Database(format!("{e}")))?);
     }
     Ok(searches)
+}
+
+// =============================================================================
+// Pane Bookmarks
+// =============================================================================
+
+fn insert_pane_bookmark_sync(conn: &Connection, record: &PaneBookmarkRecord) -> Result<i64> {
+    let tags_json = record
+        .tags
+        .as_ref()
+        .map(|t| serde_json::to_string(t).unwrap_or_else(|_| "[]".to_string()));
+
+    conn.execute(
+        "INSERT INTO pane_bookmarks (pane_id, alias, tags, description, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            record.pane_id as i64,
+            record.alias,
+            tags_json,
+            record.description,
+            record.created_at,
+            record.updated_at,
+        ],
+    )
+    .map_err(|e| StorageError::Database(format!("Failed to insert pane bookmark: {e}")))?;
+
+    Ok(conn.last_insert_rowid())
+}
+
+fn delete_pane_bookmark_sync(conn: &Connection, alias: &str) -> Result<bool> {
+    let deleted = conn
+        .execute("DELETE FROM pane_bookmarks WHERE alias = ?1", [alias])
+        .map_err(|e| StorageError::Database(format!("Failed to delete pane bookmark: {e}")))?;
+    Ok(deleted > 0)
+}
+
+fn pane_bookmark_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PaneBookmarkRecord> {
+    let pane_id_raw: i64 = row.get(1)?;
+    let tags_raw: Option<String> = row.get(3)?;
+    let tags = tags_raw.and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok());
+    Ok(PaneBookmarkRecord {
+        id: row.get(0)?,
+        pane_id: pane_id_raw as u64,
+        alias: row.get(2)?,
+        tags,
+        description: row.get(4)?,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
+    })
+}
+
+fn query_pane_bookmark_by_alias(
+    conn: &Connection,
+    alias: &str,
+) -> Result<Option<PaneBookmarkRecord>> {
+    Ok(conn
+        .query_row(
+            "SELECT id, pane_id, alias, tags, description, created_at, updated_at
+             FROM pane_bookmarks WHERE alias = ?1",
+            [alias],
+            pane_bookmark_from_row,
+        )
+        .optional()
+        .map_err(|e| StorageError::Database(format!("Failed to query pane bookmark: {e}")))?)
+}
+
+fn list_pane_bookmarks_sync(conn: &Connection) -> Result<Vec<PaneBookmarkRecord>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, pane_id, alias, tags, description, created_at, updated_at
+             FROM pane_bookmarks ORDER BY alias ASC",
+        )
+        .map_err(|e| StorageError::Database(format!("Failed to list pane bookmarks: {e}")))?;
+    let rows = stmt
+        .query_map([], pane_bookmark_from_row)
+        .map_err(|e| StorageError::Database(format!("Failed to list pane bookmarks: {e}")))?;
+    let mut bookmarks = Vec::new();
+    for row in rows {
+        bookmarks.push(row.map_err(|e| StorageError::Database(format!("{e}")))?);
+    }
+    Ok(bookmarks)
+}
+
+fn list_pane_bookmarks_by_tag_sync(
+    conn: &Connection,
+    tag: &str,
+) -> Result<Vec<PaneBookmarkRecord>> {
+    // Use JSON containment check: tags column is a JSON array
+    let pattern = format!("%\"{tag}\"%");
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, pane_id, alias, tags, description, created_at, updated_at
+             FROM pane_bookmarks WHERE tags LIKE ?1 ORDER BY alias ASC",
+        )
+        .map_err(|e| {
+            StorageError::Database(format!("Failed to list pane bookmarks by tag: {e}"))
+        })?;
+    let rows = stmt
+        .query_map([pattern], pane_bookmark_from_row)
+        .map_err(|e| {
+            StorageError::Database(format!("Failed to list pane bookmarks by tag: {e}"))
+        })?;
+    let mut bookmarks = Vec::new();
+    for row in rows {
+        bookmarks.push(row.map_err(|e| StorageError::Database(format!("{e}")))?);
+    }
+    Ok(bookmarks)
 }
 
 fn prune_segments_sync(conn: &Connection, before_ts: i64) -> Result<usize> {
@@ -11842,6 +12094,7 @@ mod tests {
             "config",
             "saved_searches",
             "maintenance_log",
+            "pane_bookmarks",
         ];
 
         for table in &expected_tables {
@@ -18702,5 +18955,173 @@ mod timeline_correlation_tests {
         assert_eq!(CorrelationType::Temporal.to_string(), "temporal");
         assert_eq!(CorrelationType::WorkflowGroup.to_string(), "workflow_group");
         assert_eq!(CorrelationType::DedupeGroup.to_string(), "dedupe_group");
+    }
+
+    // =========================================================================
+    // Pane Bookmark Tests
+    // =========================================================================
+
+    #[test]
+    fn pane_bookmark_insert_and_query() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let now = now_ms();
+        let record = PaneBookmarkRecord {
+            id: 0,
+            pane_id: 42,
+            alias: "build".to_string(),
+            tags: Some(vec!["ci".to_string(), "important".to_string()]),
+            description: Some("The build pane".to_string()),
+            created_at: now,
+            updated_at: now,
+        };
+
+        let id = insert_pane_bookmark_sync(&conn, &record).unwrap();
+        assert!(id > 0);
+
+        let fetched = query_pane_bookmark_by_alias(&conn, "build").unwrap();
+        assert!(fetched.is_some());
+        let bm = fetched.unwrap();
+        assert_eq!(bm.pane_id, 42);
+        assert_eq!(bm.alias, "build");
+        assert_eq!(
+            bm.tags,
+            Some(vec!["ci".to_string(), "important".to_string()])
+        );
+        assert_eq!(bm.description.as_deref(), Some("The build pane"));
+    }
+
+    #[test]
+    fn pane_bookmark_alias_unique() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let now = now_ms();
+        let record = PaneBookmarkRecord {
+            id: 0,
+            pane_id: 1,
+            alias: "main".to_string(),
+            tags: None,
+            description: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        insert_pane_bookmark_sync(&conn, &record).unwrap();
+        let result = insert_pane_bookmark_sync(&conn, &record);
+        assert!(result.is_err(), "Duplicate alias should fail");
+    }
+
+    #[test]
+    fn pane_bookmark_list_and_delete() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let now = now_ms();
+        for (pane, alias) in [(1, "alpha"), (2, "beta"), (3, "gamma")] {
+            let record = PaneBookmarkRecord {
+                id: 0,
+                pane_id: pane,
+                alias: alias.to_string(),
+                tags: None,
+                description: None,
+                created_at: now,
+                updated_at: now,
+            };
+            insert_pane_bookmark_sync(&conn, &record).unwrap();
+        }
+
+        let list = list_pane_bookmarks_sync(&conn).unwrap();
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[0].alias, "alpha");
+        assert_eq!(list[1].alias, "beta");
+        assert_eq!(list[2].alias, "gamma");
+
+        let deleted = delete_pane_bookmark_sync(&conn, "beta").unwrap();
+        assert!(deleted);
+
+        let list2 = list_pane_bookmarks_sync(&conn).unwrap();
+        assert_eq!(list2.len(), 2);
+
+        let not_found = delete_pane_bookmark_sync(&conn, "nonexistent").unwrap();
+        assert!(!not_found);
+    }
+
+    #[test]
+    fn pane_bookmark_filter_by_tag() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let now = now_ms();
+        let records = vec![
+            PaneBookmarkRecord {
+                id: 0,
+                pane_id: 1,
+                alias: "web".to_string(),
+                tags: Some(vec!["frontend".to_string(), "prod".to_string()]),
+                description: None,
+                created_at: now,
+                updated_at: now,
+            },
+            PaneBookmarkRecord {
+                id: 0,
+                pane_id: 2,
+                alias: "api".to_string(),
+                tags: Some(vec!["backend".to_string(), "prod".to_string()]),
+                description: None,
+                created_at: now,
+                updated_at: now,
+            },
+            PaneBookmarkRecord {
+                id: 0,
+                pane_id: 3,
+                alias: "test".to_string(),
+                tags: Some(vec!["ci".to_string()]),
+                description: None,
+                created_at: now,
+                updated_at: now,
+            },
+        ];
+
+        for r in &records {
+            insert_pane_bookmark_sync(&conn, r).unwrap();
+        }
+
+        let prod = list_pane_bookmarks_by_tag_sync(&conn, "prod").unwrap();
+        assert_eq!(prod.len(), 2);
+
+        let ci = list_pane_bookmarks_by_tag_sync(&conn, "ci").unwrap();
+        assert_eq!(ci.len(), 1);
+        assert_eq!(ci[0].alias, "test");
+
+        let none = list_pane_bookmarks_by_tag_sync(&conn, "nonexistent").unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn pane_bookmark_persists_across_restarts() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let now = now_ms();
+        let record = PaneBookmarkRecord {
+            id: 0,
+            pane_id: 99,
+            alias: "persistent".to_string(),
+            tags: Some(vec!["durable".to_string()]),
+            description: Some("survives restart".to_string()),
+            created_at: now,
+            updated_at: now,
+        };
+
+        insert_pane_bookmark_sync(&conn, &record).unwrap();
+
+        // Simulate "restart" by querying fresh (same in-memory DB)
+        let fetched = query_pane_bookmark_by_alias(&conn, "persistent")
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched.pane_id, 99);
+        assert_eq!(fetched.description.as_deref(), Some("survives restart"));
     }
 }

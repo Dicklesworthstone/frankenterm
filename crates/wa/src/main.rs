@@ -240,10 +240,14 @@ SEE ALSO:
     wa panes priority 3 --weight 10         Prefer pane 3 during capture scheduling
     wa panes priority 3 --weight 10 --ttl-secs 600
     wa panes priority 3 --clear
+    wa panes bookmark add 3 --alias build   Bookmark pane 3 as "build"
+    wa panes bookmark list                  List all bookmarks
+    wa panes bookmark remove build          Remove a bookmark
 
 NOTES:
   - Lower numbers indicate higher priority (consistent with config `ingest.priorities`)
-  - Priority overrides are runtime-only (stored in the watcher process)"#)]
+  - Priority overrides are runtime-only (stored in the watcher process)
+  - Bookmarks persist across restarts (stored in the DB)"#)]
     Panes {
         #[command(subcommand)]
         command: PanesCommands,
@@ -1364,6 +1368,58 @@ enum PanesCommands {
         clear: bool,
 
         /// Output raw IPC JSON response
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Manage pane bookmarks (add, list, remove aliases)
+    Bookmark {
+        #[command(subcommand)]
+        action: BookmarkAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum BookmarkAction {
+    /// Add a bookmark for a pane
+    Add {
+        /// Pane ID to bookmark
+        pane_id: u64,
+
+        /// Unique alias for this bookmark
+        #[arg(long)]
+        alias: String,
+
+        /// Optional comma-separated tags
+        #[arg(long)]
+        tags: Option<String>,
+
+        /// Optional description
+        #[arg(long)]
+        description: Option<String>,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// List all bookmarks
+    List {
+        /// Filter by tag
+        #[arg(long)]
+        tag: Option<String>,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Remove a bookmark by alias
+    Remove {
+        /// Alias of the bookmark to remove
+        alias: String,
+
+        /// Output as JSON
         #[arg(long)]
         json: bool,
     },
@@ -12014,6 +12070,134 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 {
                     eprintln!("Error: IPC is not supported on this platform");
                     std::process::exit(1);
+                }
+            }
+            PanesCommands::Bookmark { action } => {
+                let db_path = layout.db_path.to_string_lossy();
+                let storage = match wa_core::storage::StorageHandle::new(&db_path).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("Error: Failed to open storage: {e}");
+                        std::process::exit(1);
+                    }
+                };
+
+                match action {
+                    BookmarkAction::Add {
+                        pane_id,
+                        alias,
+                        tags,
+                        description,
+                        json,
+                    } => {
+                        let tags_vec = tags.map(|t| {
+                            t.split(',')
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty())
+                                .collect::<Vec<_>>()
+                        });
+                        let now = wa_core::storage::now_ms();
+                        let record = wa_core::storage::PaneBookmarkRecord {
+                            id: 0,
+                            pane_id,
+                            alias: alias.clone(),
+                            tags: tags_vec,
+                            description,
+                            created_at: now,
+                            updated_at: now,
+                        };
+                        match storage.insert_pane_bookmark(record).await {
+                            Ok(id) => {
+                                if json {
+                                    println!(
+                                        r#"{{"ok": true, "id": {}, "alias": "{}"}}"#,
+                                        id, alias
+                                    );
+                                } else {
+                                    println!("Bookmarked pane {pane_id} as \"{alias}\"");
+                                }
+                            }
+                            Err(e) => {
+                                let msg = format!("{e}");
+                                if msg.contains("UNIQUE constraint") {
+                                    eprintln!(
+                                        "Error: alias \"{alias}\" already exists. Remove it first."
+                                    );
+                                } else {
+                                    eprintln!("Error: {e}");
+                                }
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                    BookmarkAction::List { tag, json } => {
+                        let bookmarks = if let Some(ref tag) = tag {
+                            storage.list_pane_bookmarks_by_tag(tag).await
+                        } else {
+                            storage.list_pane_bookmarks().await
+                        };
+                        match bookmarks {
+                            Ok(list) => {
+                                if json {
+                                    println!("{}", serde_json::to_string_pretty(&list)?);
+                                } else if list.is_empty() {
+                                    if let Some(ref tag) = tag {
+                                        println!("No bookmarks with tag \"{tag}\"");
+                                    } else {
+                                        println!(
+                                            "No bookmarks. Add one with: wa panes bookmark add <pane_id> --alias <name>"
+                                        );
+                                    }
+                                } else {
+                                    for bm in &list {
+                                        let tags_str = bm
+                                            .tags
+                                            .as_ref()
+                                            .map(|t| t.join(", "))
+                                            .unwrap_or_default();
+                                        let desc = bm.description.as_deref().unwrap_or("");
+                                        if tags_str.is_empty() && desc.is_empty() {
+                                            println!("  {} → pane {}", bm.alias, bm.pane_id);
+                                        } else if desc.is_empty() {
+                                            println!(
+                                                "  {} → pane {} [{}]",
+                                                bm.alias, bm.pane_id, tags_str
+                                            );
+                                        } else {
+                                            println!(
+                                                "  {} → pane {} [{}] {}",
+                                                bm.alias, bm.pane_id, tags_str, desc
+                                            );
+                                        }
+                                    }
+                                    println!("\n{} bookmark(s)", list.len());
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("Error: {e}");
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                    BookmarkAction::Remove { alias, json } => {
+                        match storage.delete_pane_bookmark(&alias).await {
+                            Ok(true) => {
+                                if json {
+                                    println!(r#"{{"ok": true, "alias": "{}"}}"#, alias);
+                                } else {
+                                    println!("Removed bookmark \"{alias}\"");
+                                }
+                            }
+                            Ok(false) => {
+                                eprintln!("Error: bookmark \"{alias}\" not found");
+                                std::process::exit(1);
+                            }
+                            Err(e) => {
+                                eprintln!("Error: {e}");
+                                std::process::exit(1);
+                            }
+                        }
+                    }
                 }
             }
         },

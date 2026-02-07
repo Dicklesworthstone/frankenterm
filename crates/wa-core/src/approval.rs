@@ -754,7 +754,9 @@ mod tests {
             "wa_test_plan_hash_{suffix}_{}.db",
             std::process::id()
         ));
-        let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+        let storage = StorageHandle::new(&db_path.to_string_lossy())
+            .await
+            .unwrap();
         let pane = PaneRecord {
             pane_id: 1,
             pane_uuid: None,
@@ -828,10 +830,7 @@ mod tests {
             .consume_for_plan(&request.allow_once_code, &input, "sha256:differentplan")
             .await
             .unwrap();
-        assert!(
-            consumed.is_none(),
-            "Mismatched plan_hash must be rejected"
-        );
+        assert!(consumed.is_none(), "Mismatched plan_hash must be rejected");
 
         cleanup_storage(storage, &db_path).await;
     }
