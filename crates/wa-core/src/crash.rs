@@ -73,6 +73,11 @@ pub struct HealthSnapshot {
     /// Current backpressure tier (Green/Yellow/Red/Black).
     #[serde(default)]
     pub backpressure_tier: Option<String>,
+
+    /// Per-pane last activity timestamp (epoch ms) for stuck pane detection.
+    /// Each entry is `(pane_id, last_seen_at_epoch_ms)`.
+    #[serde(default)]
+    pub last_activity_by_pane: Vec<(u64, u64)>,
 }
 
 /// Health snapshot view of a runtime pane priority override.
@@ -1304,6 +1309,7 @@ mod tests {
             pane_priority_overrides: vec![],
             scheduler: None,
             backpressure_tier: None,
+            last_activity_by_pane: vec![(1, 1_234_567_890), (2, 1_234_567_800)],
         }
     }
 
@@ -1367,6 +1373,7 @@ mod tests {
             pane_priority_overrides: vec![],
             scheduler: None,
             backpressure_tier: None,
+            last_activity_by_pane: vec![],
         };
 
         HealthSnapshot::update_global(snapshot);

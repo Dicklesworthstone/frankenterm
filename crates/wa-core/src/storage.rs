@@ -17396,6 +17396,7 @@ mod backpressure_integration_tests {
             pane_priority_overrides: vec![],
             scheduler: None,
             backpressure_tier: None,
+            last_activity_by_pane: vec![],
         };
 
         assert!(!snapshot.warnings.is_empty());

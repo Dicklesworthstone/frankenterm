@@ -49,6 +49,7 @@ fn basic_snapshot() -> HealthSnapshot {
         pane_priority_overrides: vec![],
         scheduler: None,
         backpressure_tier: None,
+        last_activity_by_pane: vec![],
     }
 }
 

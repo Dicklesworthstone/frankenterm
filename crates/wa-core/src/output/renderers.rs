@@ -1517,6 +1517,26 @@ impl HealthSnapshotRenderer {
             output.push_str(&format!("  Backpressure:  {tier}\n"));
         }
 
+        // Stuck pane indicator
+        if !snapshot.last_activity_by_pane.is_empty() && snapshot.timestamp > 0 {
+            const STUCK_MS: u64 = 5 * 60 * 1000;
+            let stuck: Vec<u64> = snapshot
+                .last_activity_by_pane
+                .iter()
+                .filter(|(_, last)| snapshot.timestamp.saturating_sub(*last) > STUCK_MS)
+                .map(|(id, _)| *id)
+                .collect();
+            if !stuck.is_empty() {
+                let ids: Vec<String> = stuck.iter().map(|id| id.to_string()).collect();
+                output.push_str(&format!(
+                    "  {}  {} stuck pane(s): {}\n",
+                    style.yellow("Stuck:"),
+                    stuck.len(),
+                    ids.join(", ")
+                ));
+            }
+        }
+
         // Verbose: per-pane sequence numbers
         if ctx.is_verbose() && !snapshot.last_seq_by_pane.is_empty() {
             output.push_str("  Sequences:     ");
@@ -1661,6 +1681,41 @@ impl HealthSnapshotRenderer {
                 status: HealthDiagnosticStatus::Error,
                 detail: "database is NOT writable".to_string(),
             });
+        }
+
+        // Stuck pane detection: panes with no activity for > 5 minutes
+        const STUCK_THRESHOLD_MS: u64 = 5 * 60 * 1000;
+        if !snapshot.last_activity_by_pane.is_empty() && snapshot.timestamp > 0 {
+            let stuck: Vec<u64> = snapshot
+                .last_activity_by_pane
+                .iter()
+                .filter(|(_, last_seen)| {
+                    snapshot.timestamp.saturating_sub(*last_seen) > STUCK_THRESHOLD_MS
+                })
+                .map(|(pane_id, _)| *pane_id)
+                .collect();
+
+            if stuck.is_empty() {
+                checks.push(HealthDiagnostic {
+                    name: "pane activity",
+                    status: HealthDiagnosticStatus::Ok,
+                    detail: format!(
+                        "all {} pane(s) active",
+                        snapshot.last_activity_by_pane.len()
+                    ),
+                });
+            } else {
+                let ids: Vec<String> = stuck.iter().map(|id| id.to_string()).collect();
+                checks.push(HealthDiagnostic {
+                    name: "pane activity",
+                    status: HealthDiagnosticStatus::Warning,
+                    detail: format!(
+                        "{} stuck pane(s): {}",
+                        stuck.len(),
+                        ids.join(", ")
+                    ),
+                });
+            }
         }
 
         // Surface warnings as individual diagnostics
@@ -3011,6 +3066,10 @@ mod tests {
             pane_priority_overrides: vec![],
             scheduler: None,
             backpressure_tier: None,
+            last_activity_by_pane: vec![
+                (1, 1_700_000_000_000),
+                (2, 1_700_000_000_000),
+            ],
         }
     }
 
@@ -3345,5 +3404,205 @@ mod tests {
         assert_eq!(parsed["scheduler"]["max_captures_per_sec"], 10);
         assert_eq!(parsed["scheduler"]["tracked_panes"], 1);
         assert!(parsed["scheduler"]["budget_active"].as_bool().unwrap());
+    }
+
+    // ── Stuck pane detection tests (wa-nu4.3.4.2) ────────────────────────
+
+    #[test]
+    fn health_diagnostics_stuck_pane_detected() {
+        let mut snapshot = sample_health_snapshot();
+        // Pane 1 last seen 10 minutes ago (stuck), pane 2 recent
+        snapshot.timestamp = 1_700_000_600_000; // 10 min after base
+        snapshot.last_activity_by_pane = vec![
+            (1, 1_700_000_000_000), // 10 min old → stuck
+            (2, 1_700_000_590_000), // 10 sec old → ok
+        ];
+
+        let checks = HealthSnapshotRenderer::diagnostic_checks(&snapshot);
+        let activity = checks.iter().find(|c| c.name == "pane activity").unwrap();
+        assert_eq!(activity.status, HealthDiagnosticStatus::Warning);
+        assert!(activity.detail.contains("1 stuck pane"));
+        assert!(activity.detail.contains("1")); // pane id 1
+    }
+
+    #[test]
+    fn health_diagnostics_no_stuck_panes_all_active() {
+        let snapshot = sample_health_snapshot(); // both panes have same timestamp
+        let checks = HealthSnapshotRenderer::diagnostic_checks(&snapshot);
+        let activity = checks.iter().find(|c| c.name == "pane activity").unwrap();
+        assert_eq!(activity.status, HealthDiagnosticStatus::Ok);
+        assert!(activity.detail.contains("all 2 pane(s) active"));
+    }
+
+    #[test]
+    fn health_diagnostics_no_activity_data_skips_check() {
+        let mut snapshot = sample_health_snapshot();
+        snapshot.last_activity_by_pane = vec![];
+        let checks = HealthSnapshotRenderer::diagnostic_checks(&snapshot);
+        assert!(checks.iter().all(|c| c.name != "pane activity"));
+    }
+
+    #[test]
+    fn health_render_shows_stuck_pane_warning() {
+        let mut snapshot = sample_health_snapshot();
+        snapshot.timestamp = 1_700_000_600_000;
+        snapshot.last_activity_by_pane = vec![
+            (3, 1_700_000_000_000), // 10 min → stuck
+            (7, 1_700_000_000_000), // 10 min → stuck
+            (9, 1_700_000_599_000), // 1 sec → ok
+        ];
+
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = HealthSnapshotRenderer::render(&snapshot, &ctx);
+
+        assert!(output.contains("Stuck:"));
+        assert!(output.contains("2 stuck pane(s)"));
+        assert!(output.contains("3"));
+        assert!(output.contains("7"));
+    }
+
+    #[test]
+    fn health_render_no_stuck_panes_no_stuck_line() {
+        let snapshot = sample_health_snapshot();
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = HealthSnapshotRenderer::render(&snapshot, &ctx);
+        assert!(!output.contains("Stuck:"));
+    }
+
+    #[test]
+    fn health_json_includes_last_activity_by_pane() {
+        let snapshot = sample_health_snapshot();
+        let ctx = RenderContext::new(OutputFormat::Json);
+        let output = HealthSnapshotRenderer::render(&snapshot, &ctx);
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        let activity = parsed["last_activity_by_pane"].as_array().unwrap();
+        assert_eq!(activity.len(), 2);
+        assert_eq!(activity[0][0], 1); // pane_id
+        assert_eq!(activity[1][0], 2); // pane_id
+    }
+
+    // ── Schema stability tests (wa-nu4.3.4.2) ───────────────────────────
+
+    #[test]
+    fn health_json_schema_has_expected_fields() {
+        let mut snapshot = sample_health_snapshot();
+        snapshot.scheduler = Some(crate::tailer::SchedulerSnapshot {
+            budget_active: true,
+            max_captures_per_sec: 10,
+            max_bytes_per_sec: 500,
+            captures_remaining: 8,
+            bytes_remaining: 400,
+            total_rate_limited: 0,
+            total_byte_budget_exceeded: 0,
+            total_throttle_events: 0,
+            tracked_panes: 1,
+        });
+        snapshot.backpressure_tier = Some("Green".to_string());
+
+        let ctx = RenderContext::new(OutputFormat::Json);
+        let output = HealthSnapshotRenderer::render(&snapshot, &ctx);
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let obj = parsed.as_object().unwrap();
+
+        let expected = [
+            "timestamp",
+            "observed_panes",
+            "capture_queue_depth",
+            "write_queue_depth",
+            "last_seq_by_pane",
+            "warnings",
+            "ingest_lag_avg_ms",
+            "ingest_lag_max_ms",
+            "db_writable",
+            "db_last_write_at",
+            "pane_priority_overrides",
+            "scheduler",
+            "backpressure_tier",
+            "last_activity_by_pane",
+        ];
+
+        for field in &expected {
+            assert!(
+                obj.contains_key(*field),
+                "health JSON missing expected field: {field}"
+            );
+        }
+
+        // No unexpected fields (schema drift detection)
+        for key in obj.keys() {
+            assert!(
+                expected.contains(&key.as_str()),
+                "health JSON contains unexpected field: {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn health_json_roundtrip_stable() {
+        let snapshot = sample_health_snapshot();
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let deser: HealthSnapshot = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deser.timestamp, snapshot.timestamp);
+        assert_eq!(deser.observed_panes, snapshot.observed_panes);
+        assert_eq!(deser.capture_queue_depth, snapshot.capture_queue_depth);
+        assert_eq!(deser.write_queue_depth, snapshot.write_queue_depth);
+        assert_eq!(deser.last_seq_by_pane, snapshot.last_seq_by_pane);
+        assert_eq!(deser.warnings, snapshot.warnings);
+        assert_eq!(deser.db_writable, snapshot.db_writable);
+        assert_eq!(deser.last_activity_by_pane, snapshot.last_activity_by_pane);
+    }
+
+    #[test]
+    fn health_json_backward_compat_missing_new_fields() {
+        // Old JSON without last_activity_by_pane should still deserialize
+        let json = r#"{
+            "timestamp": 1000,
+            "observed_panes": 1,
+            "capture_queue_depth": 0,
+            "write_queue_depth": 0,
+            "last_seq_by_pane": [],
+            "warnings": [],
+            "ingest_lag_avg_ms": 0.0,
+            "ingest_lag_max_ms": 0,
+            "db_writable": true,
+            "db_last_write_at": null
+        }"#;
+
+        let deser: HealthSnapshot = serde_json::from_str(json).unwrap();
+        assert_eq!(deser.timestamp, 1000);
+        assert!(deser.last_activity_by_pane.is_empty());
+        assert!(deser.pane_priority_overrides.is_empty());
+        assert!(deser.scheduler.is_none());
+        assert!(deser.backpressure_tier.is_none());
+    }
+
+    #[test]
+    fn health_diagnostics_multiple_stuck_panes() {
+        let mut snapshot = sample_health_snapshot();
+        snapshot.timestamp = 1_700_001_000_000; // well after base
+        snapshot.last_activity_by_pane = vec![
+            (1, 1_700_000_000_000), // stuck
+            (2, 1_700_000_000_000), // stuck
+            (3, 1_700_000_000_000), // stuck
+        ];
+
+        let checks = HealthSnapshotRenderer::diagnostic_checks(&snapshot);
+        let activity = checks.iter().find(|c| c.name == "pane activity").unwrap();
+        assert_eq!(activity.status, HealthDiagnosticStatus::Warning);
+        assert!(activity.detail.contains("3 stuck pane(s)"));
+    }
+
+    #[test]
+    fn health_diagnostics_pane_just_under_threshold_not_stuck() {
+        let mut snapshot = sample_health_snapshot();
+        // 4 min 59 sec = under 5 min threshold
+        snapshot.timestamp = 1_700_000_299_000;
+        snapshot.last_activity_by_pane = vec![(1, 1_700_000_000_000)];
+
+        let checks = HealthSnapshotRenderer::diagnostic_checks(&snapshot);
+        let activity = checks.iter().find(|c| c.name == "pane activity").unwrap();
+        assert_eq!(activity.status, HealthDiagnosticStatus::Ok);
     }
 }

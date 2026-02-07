@@ -264,6 +264,35 @@ fn smoke_wa_export_help() {
     );
 }
 
+#[test]
+fn smoke_wa_robot_health() {
+    let output = wa_cmd()
+        .args(["robot", "health"])
+        .output()
+        .expect("wa robot health should execute");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    save_artifact("robot_health_stdout.txt", &stdout);
+    save_artifact("robot_health_stderr.txt", &stderr);
+    emit_artifact("wa_robot_health", &stdout);
+
+    assert!(
+        output.status.success(),
+        "wa robot health should exit 0, stderr: {stderr}"
+    );
+
+    // Should produce valid JSON with version field
+    let parsed = serde_json::from_str::<serde_json::Value>(&stdout);
+    assert!(parsed.is_ok(), "wa robot health should output valid JSON");
+    let val = parsed.unwrap();
+    // Robot response wraps data
+    assert!(
+        val["data"]["version"].is_string() || val["version"].is_string(),
+        "wa robot health should include version"
+    );
+}
+
 // =============================================================================
 // Predicate-based tests (using assert_cmd sugar)
 // =============================================================================

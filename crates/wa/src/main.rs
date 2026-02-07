@@ -1947,6 +1947,9 @@ enum RobotCommands {
         command: RobotReservationCommands,
     },
 
+    /// Get watcher health snapshot (queue depths, ingest lag, stuck panes, scheduler state)
+    Health,
+
     /// Submit an approval code for a pending action
     Approve {
         /// The approval code (8-character alphanumeric)
@@ -5579,6 +5582,10 @@ fn build_robot_help() -> RobotHelp {
             RobotCommandInfo {
                 name: "why",
                 description: "Explain an error code or policy denial",
+            },
+            RobotCommandInfo {
+                name: "health",
+                description: "Get watcher health snapshot (queue depths, ingest lag, stuck panes)",
             },
             RobotCommandInfo {
                 name: "approve",
@@ -10750,6 +10757,126 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             if let Err(e) = storage.shutdown().await {
                                 tracing::warn!("Failed to shutdown storage cleanly: {e}");
                             }
+                        }
+                        RobotCommands::Health => {
+                            let layout = match config.workspace_layout(Some(&workspace_root)) {
+                                Ok(l) => l,
+                                Err(e) => {
+                                    let response =
+                                        RobotResponse::<serde_json::Value>::error_with_code(
+                                            ROBOT_ERR_CONFIG,
+                                            format!("Failed to get workspace layout: {e}"),
+                                            Some("Check --workspace or WA_WORKSPACE".to_string()),
+                                            elapsed_ms(start),
+                                        );
+                                    print_robot_response(&response, format, stats)?;
+                                    return Ok(());
+                                }
+                            };
+
+                            // Try IPC first (watcher is running)
+                            let mut payload = serde_json::json!({
+                                "version": wa_core::VERSION,
+                            });
+
+                            #[cfg(unix)]
+                            {
+                                let client =
+                                    wa_core::ipc::IpcClient::new(&layout.ipc_socket_path);
+                                match client.status().await {
+                                    Ok(response) if response.ok => {
+                                        payload["watcher_running"] = serde_json::json!(true);
+                                        if let Some(ref data) = response.data {
+                                            if let Some(health) = data.get("health") {
+                                                payload["health"] = health.clone();
+                                                // Add stuck pane diagnostics
+                                                if let Ok(snapshot) =
+                                                    serde_json::from_value::<
+                                                        wa_core::crash::HealthSnapshot,
+                                                    >(
+                                                        health.clone()
+                                                    )
+                                                {
+                                                    let diags = wa_core::output::HealthSnapshotRenderer::diagnostic_checks(&snapshot);
+                                                    let diag_json: Vec<serde_json::Value> = diags
+                                                        .iter()
+                                                        .map(|d| {
+                                                            serde_json::json!({
+                                                                "name": d.name,
+                                                                "status": format!("{:?}", d.status),
+                                                                "detail": d.detail,
+                                                            })
+                                                        })
+                                                        .collect();
+                                                    payload["diagnostics"] = serde_json::json!(diag_json);
+                                                }
+                                            }
+                                            if let Some(uptime) = data.get("uptime_ms") {
+                                                payload["uptime_ms"] = uptime.clone();
+                                            }
+                                        }
+                                    }
+                                    Ok(_) => {
+                                        payload["watcher_running"] = serde_json::json!(false);
+                                        payload["watcher_error"] =
+                                            serde_json::json!("watcher returned error");
+                                    }
+                                    Err(e) => {
+                                        payload["watcher_running"] = serde_json::json!(false);
+                                        payload["watcher_error"] =
+                                            serde_json::json!(e.to_string());
+                                    }
+                                }
+                            }
+
+                            #[cfg(not(unix))]
+                            {
+                                let _ = &layout;
+                                payload["watcher_running"] = serde_json::json!(false);
+                                payload["watcher_error"] =
+                                    serde_json::json!("IPC not available on this platform");
+                            }
+
+                            // Fallback: try global snapshot
+                            if payload.get("health").is_none() {
+                                if let Some(snapshot) =
+                                    wa_core::crash::HealthSnapshot::get_global()
+                                {
+                                    payload["health"] = serde_json::to_value(&snapshot)
+                                        .unwrap_or(serde_json::Value::Null);
+                                    let diags = wa_core::output::HealthSnapshotRenderer::diagnostic_checks(&snapshot);
+                                    let diag_json: Vec<serde_json::Value> = diags
+                                        .iter()
+                                        .map(|d| {
+                                            serde_json::json!({
+                                                "name": d.name,
+                                                "status": format!("{:?}", d.status),
+                                                "detail": d.detail,
+                                            })
+                                        })
+                                        .collect();
+                                    payload["diagnostics"] = serde_json::json!(diag_json);
+                                }
+                            }
+
+                            // Latest crash bundle
+                            if let Some(crash) =
+                                wa_core::crash::latest_crash_bundle(&layout.crash_dir)
+                            {
+                                let mut crash_info = serde_json::json!({
+                                    "bundle_path": crash.path.display().to_string(),
+                                });
+                                if let Some(ref report) = crash.report {
+                                    crash_info["message"] =
+                                        serde_json::json!(report.message);
+                                    crash_info["timestamp"] =
+                                        serde_json::json!(report.timestamp);
+                                }
+                                payload["latest_crash"] = crash_info;
+                            }
+
+                            let response = RobotResponse::success(payload, elapsed_ms(start));
+                            print_robot_response(&response, format, stats)?;
                         }
                         RobotCommands::Help | RobotCommands::QuickStart => {
                             unreachable!("handled above")

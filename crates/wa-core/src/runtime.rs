@@ -503,9 +503,18 @@ impl ObservationRuntime {
                         }
 
                         if now.duration_since(last_health_snapshot) >= health_interval {
-                            let observed_panes = {
+                            let (observed_panes, last_activity_by_pane) = {
                                 let reg = registry.read().await;
-                                reg.observed_pane_ids().len()
+                                let ids = reg.observed_pane_ids();
+                                let activity: Vec<(u64, u64)> = reg
+                                    .entries()
+                                    .filter(|(_, e)| e.should_observe())
+                                    .map(|(id, e)| {
+                                        #[allow(clippy::cast_sign_loss)]
+                                        (*id, e.last_seen_at as u64)
+                                    })
+                                    .collect();
+                                (ids.len(), activity)
                             };
 
                             let last_seq_by_pane: Vec<(u64, i64)> = {
@@ -586,6 +595,7 @@ impl ObservationRuntime {
                                     if snap.budget_active { Some(snap.clone()) } else { None }
                                 },
                                 backpressure_tier: None,
+                                last_activity_by_pane,
                             };
 
                             HealthSnapshot::update_global(snapshot);
@@ -1493,9 +1503,18 @@ impl RuntimeHandle {
     ///
     /// Call this periodically (e.g., every 30s) to keep crash reports useful.
     pub async fn update_health_snapshot(&self) {
-        let observed_panes = {
+        let (observed_panes, last_activity_by_pane) = {
             let reg = self.registry.read().await;
-            reg.observed_pane_ids().len()
+            let ids = reg.observed_pane_ids();
+            let activity: Vec<(u64, u64)> = reg
+                .entries()
+                .filter(|(_, e)| e.should_observe())
+                .map(|(id, e)| {
+                    #[allow(clippy::cast_sign_loss)]
+                    (*id, e.last_seen_at as u64)
+                })
+                .collect();
+            (ids.len(), activity)
         };
 
         let last_seq_by_pane: Vec<(u64, i64)> = {
@@ -1580,6 +1599,7 @@ impl RuntimeHandle {
                 }
             },
             backpressure_tier: None,
+            last_activity_by_pane,
         };
 
         HealthSnapshot::update_global(snapshot);
@@ -1825,6 +1845,7 @@ mod tests {
             pane_priority_overrides: vec![],
             scheduler: None,
             backpressure_tier: None,
+            last_activity_by_pane: vec![],
         };
 
         // Verify metrics are correctly reflected in snapshot
@@ -1939,6 +1960,7 @@ mod tests {
             pane_priority_overrides: vec![],
             scheduler: None,
             backpressure_tier: None,
+            last_activity_by_pane: vec![],
         };
 
         assert_eq!(snapshot.capture_queue_depth, 500);
@@ -1978,6 +2000,7 @@ mod tests {
             pane_priority_overrides: vec![],
             scheduler: Some(sched),
             backpressure_tier: Some("Green".to_string()),
+            last_activity_by_pane: vec![],
         };
 
         let sched = snapshot.scheduler.as_ref().unwrap();
@@ -2017,6 +2040,7 @@ mod tests {
                 tracked_panes: 2,
             }),
             backpressure_tier: None,
+            last_activity_by_pane: vec![],
         };
 
         let json = serde_json::to_string(&snapshot).unwrap();
