@@ -728,4 +728,398 @@ mod tests {
         // Time should not decrease
         assert!(engine.state().total_time_minutes >= initial_time);
     }
+
+    // -----------------------------------------------------------------------
+    // Extended state machine tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_skip_exercise_advances_without_completing() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("learn.json");
+        let mut engine = TutorialEngine::load_or_create_at(path).unwrap();
+
+        engine
+            .handle_event(TutorialEvent::StartTrack("basics".into()))
+            .unwrap();
+        engine
+            .handle_event(TutorialEvent::SkipExercise("basics.1".into()))
+            .unwrap();
+
+        // Advances to next exercise but doesn't mark as completed
+        assert_eq!(engine.state().current_exercise, Some("basics.2".into()));
+        assert!(!engine.state().completed_exercises.contains("basics.1"));
+    }
+
+    #[test]
+    fn test_complete_last_exercise_clears_current() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("learn.json");
+        let mut engine = TutorialEngine::load_or_create_at(path).unwrap();
+
+        engine
+            .handle_event(TutorialEvent::StartTrack("basics".into()))
+            .unwrap();
+        engine
+            .handle_event(TutorialEvent::CompleteExercise("basics.1".into()))
+            .unwrap();
+        engine
+            .handle_event(TutorialEvent::CompleteExercise("basics.2".into()))
+            .unwrap();
+        engine
+            .handle_event(TutorialEvent::CompleteExercise("basics.3".into()))
+            .unwrap();
+
+        // After completing last exercise, current_exercise becomes None
+        assert!(engine.state().current_exercise.is_none());
+        assert!(engine.is_track_complete("basics"));
+    }
+
+    #[test]
+    fn test_duplicate_completion_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("learn.json");
+        let mut engine = TutorialEngine::load_or_create_at(path).unwrap();
+
+        engine
+            .handle_event(TutorialEvent::StartTrack("basics".into()))
+            .unwrap();
+        engine
+            .handle_event(TutorialEvent::CompleteExercise("basics.1".into()))
+            .unwrap();
+        // Complete same exercise again
+        engine
+            .handle_event(TutorialEvent::CompleteExercise("basics.1".into()))
+            .unwrap();
+
+        assert!(engine.state().completed_exercises.contains("basics.1"));
+        assert_eq!(engine.state().completed_exercises.len(), 1);
+    }
+
+    #[test]
+    fn test_complete_exercise_without_track() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("learn.json");
+        let mut engine = TutorialEngine::load_or_create_at(path).unwrap();
+
+        // Complete exercise without starting a track — should still record
+        engine
+            .handle_event(TutorialEvent::CompleteExercise("basics.1".into()))
+            .unwrap();
+
+        assert!(engine.state().completed_exercises.contains("basics.1"));
+    }
+
+    #[test]
+    fn test_skip_last_exercise_clears_current() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("learn.json");
+        let mut engine = TutorialEngine::load_or_create_at(path).unwrap();
+
+        engine
+            .handle_event(TutorialEvent::StartTrack("basics".into()))
+            .unwrap();
+        engine
+            .handle_event(TutorialEvent::SkipExercise("basics.1".into()))
+            .unwrap();
+        engine
+            .handle_event(TutorialEvent::SkipExercise("basics.2".into()))
+            .unwrap();
+        engine
+            .handle_event(TutorialEvent::SkipExercise("basics.3".into()))
+            .unwrap();
+
+        assert!(engine.state().current_exercise.is_none());
+        // But track is NOT complete since nothing was completed
+        assert!(!engine.is_track_complete("basics"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Achievement tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_first_event_achievement() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("learn.json");
+        let mut engine = TutorialEngine::load_or_create_at(path).unwrap();
+
+        engine
+            .handle_event(TutorialEvent::CompleteExercise("events.1".into()))
+            .unwrap();
+
+        assert!(
+            engine
+                .state()
+                .achievements
+                .iter()
+                .any(|a| a.id == "first_event")
+        );
+    }
+
+    #[test]
+    fn test_track_completion_achievement() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("learn.json");
+        let mut engine = TutorialEngine::load_or_create_at(path).unwrap();
+
+        for id in &["events.1", "events.2"] {
+            engine
+                .handle_event(TutorialEvent::CompleteExercise((*id).into()))
+                .unwrap();
+        }
+
+        assert!(
+            engine
+                .state()
+                .achievements
+                .iter()
+                .any(|a| a.id == "track_events_complete")
+        );
+    }
+
+    #[test]
+    fn test_duplicate_achievement_not_added() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("learn.json");
+        let mut engine = TutorialEngine::load_or_create_at(path).unwrap();
+
+        engine
+            .handle_event(TutorialEvent::UnlockAchievement {
+                id: "custom".into(),
+                name: "Custom".into(),
+                description: "Test".into(),
+            })
+            .unwrap();
+        engine
+            .handle_event(TutorialEvent::UnlockAchievement {
+                id: "custom".into(),
+                name: "Custom".into(),
+                description: "Test".into(),
+            })
+            .unwrap();
+
+        let count = engine
+            .state()
+            .achievements
+            .iter()
+            .filter(|a| a.id == "custom")
+            .count();
+        assert_eq!(count, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Progress and status tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_overall_progress() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("learn.json");
+        let mut engine = TutorialEngine::load_or_create_at(path).unwrap();
+
+        let (completed, total) = engine.overall_progress();
+        assert_eq!(completed, 0);
+        assert_eq!(total, 7); // 3 basics + 2 events + 2 workflows
+
+        engine
+            .handle_event(TutorialEvent::CompleteExercise("basics.1".into()))
+            .unwrap();
+        let (completed, _) = engine.overall_progress();
+        assert_eq!(completed, 1);
+    }
+
+    #[test]
+    fn test_unknown_track_progress() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("learn.json");
+        let engine = TutorialEngine::load_or_create_at(path).unwrap();
+
+        assert_eq!(engine.track_progress("nonexistent"), (0, 0));
+        assert!(!engine.is_track_complete("nonexistent"));
+    }
+
+    #[test]
+    fn test_current_exercise_returns_details() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("learn.json");
+        let mut engine = TutorialEngine::load_or_create_at(path).unwrap();
+
+        assert!(engine.current_exercise().is_none());
+
+        engine
+            .handle_event(TutorialEvent::StartTrack("basics".into()))
+            .unwrap();
+
+        let ex = engine.current_exercise().unwrap();
+        assert_eq!(ex.id, "basics.1");
+        assert_eq!(ex.title, "Check your environment");
+    }
+
+    #[test]
+    fn test_tutorial_status_from_engine() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("learn.json");
+        let mut engine = TutorialEngine::load_or_create_at(path).unwrap();
+
+        engine
+            .handle_event(TutorialEvent::StartTrack("basics".into()))
+            .unwrap();
+        engine
+            .handle_event(TutorialEvent::CompleteExercise("basics.1".into()))
+            .unwrap();
+
+        let status = TutorialStatus::from(&engine);
+        assert_eq!(status.current_track.as_deref(), Some("basics"));
+        assert_eq!(status.completed_exercises, 1);
+        assert_eq!(status.total_exercises, 7);
+        assert_eq!(status.tracks.len(), 3);
+        assert_eq!(status.tracks[0].completed, 1);
+        assert_eq!(status.tracks[0].total, 3);
+        assert!(!status.tracks[0].is_complete);
+    }
+
+    #[test]
+    fn test_tutorial_status_json_serializable() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("learn.json");
+        let engine = TutorialEngine::load_or_create_at(path).unwrap();
+
+        let status = TutorialStatus::from(&engine);
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains("completed_exercises"));
+        assert!(json.contains("total_exercises"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Persistence edge case tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_corrupt_progress_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("learn.json");
+        std::fs::write(&path, "not valid json").unwrap();
+
+        let result = TutorialEngine::load_or_create_at(path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_progress_file_created_on_save() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("subdir").join("learn.json");
+
+        let engine = TutorialEngine::load_or_create_at(path.clone()).unwrap();
+        assert!(!path.exists());
+
+        engine.save().unwrap();
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn test_get_track_returns_correct_track() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("learn.json");
+        let engine = TutorialEngine::load_or_create_at(path).unwrap();
+
+        let track = engine.get_track("events").unwrap();
+        assert_eq!(track.name, "Events");
+        assert_eq!(track.exercises.len(), 2);
+
+        assert!(engine.get_track("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_builtin_tracks_have_exercises() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("learn.json");
+        let engine = TutorialEngine::load_or_create_at(path).unwrap();
+
+        assert_eq!(engine.tracks().len(), 3);
+        for track in engine.tracks() {
+            assert!(!track.exercises.is_empty());
+            assert!(!track.name.is_empty());
+            assert!(!track.id.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_exercise_verification_fields() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("learn.json");
+        let engine = TutorialEngine::load_or_create_at(path).unwrap();
+
+        let basics = engine.get_track("basics").unwrap();
+        // basics.1 has verification
+        assert!(basics.exercises[0].verification_command.is_some());
+        assert!(basics.exercises[0].verification_pattern.is_some());
+        // basics.3 has no verification
+        assert!(basics.exercises[2].verification_command.is_none());
+    }
+
+    #[test]
+    fn test_reset_clears_achievements_too() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("learn.json");
+        let mut engine = TutorialEngine::load_or_create_at(path).unwrap();
+
+        engine
+            .handle_event(TutorialEvent::CompleteExercise("basics.2".into()))
+            .unwrap();
+        assert!(!engine.state().achievements.is_empty());
+
+        engine.handle_event(TutorialEvent::Reset).unwrap();
+        assert!(engine.state().achievements.is_empty());
+        assert!(engine.state().completed_exercises.is_empty());
+    }
+
+    #[test]
+    fn test_switch_tracks() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("learn.json");
+        let mut engine = TutorialEngine::load_or_create_at(path).unwrap();
+
+        engine
+            .handle_event(TutorialEvent::StartTrack("basics".into()))
+            .unwrap();
+        assert_eq!(engine.state().current_track.as_deref(), Some("basics"));
+
+        engine
+            .handle_event(TutorialEvent::StartTrack("events".into()))
+            .unwrap();
+        assert_eq!(engine.state().current_track.as_deref(), Some("events"));
+        assert_eq!(
+            engine.state().current_exercise.as_deref(),
+            Some("events.1")
+        );
+    }
+
+    #[test]
+    fn test_resume_track_skips_completed() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("learn.json");
+        let mut engine = TutorialEngine::load_or_create_at(path).unwrap();
+
+        engine
+            .handle_event(TutorialEvent::StartTrack("basics".into()))
+            .unwrap();
+        engine
+            .handle_event(TutorialEvent::CompleteExercise("basics.1".into()))
+            .unwrap();
+
+        // Switch to events, then back to basics
+        engine
+            .handle_event(TutorialEvent::StartTrack("events".into()))
+            .unwrap();
+        engine
+            .handle_event(TutorialEvent::StartTrack("basics".into()))
+            .unwrap();
+
+        // Should resume at basics.2 (first incomplete)
+        assert_eq!(
+            engine.state().current_exercise.as_deref(),
+            Some("basics.2")
+        );
+    }
 }
