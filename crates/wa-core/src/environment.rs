@@ -909,4 +909,621 @@ mod tests {
         assert_eq!(auto.rate_limit_per_pane, 30);
         assert_eq!(auto.pattern_packs, vec!["builtin:core"]);
     }
+
+    // -----------------------------------------------------------------------
+    // Serde roundtrip tests for all public types
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn wezterm_capabilities_serde_roundtrip() {
+        let caps = WeztermCapabilities {
+            cli_available: true,
+            json_output: true,
+            multiplexing: false,
+            osc_133: true,
+            osc_7: false,
+            image_protocol: true,
+        };
+        let json = serde_json::to_string(&caps).unwrap();
+        assert!(json.contains("\"cli_available\":true"));
+        assert!(json.contains("\"osc_133\":true"));
+        assert!(json.contains("\"multiplexing\":false"));
+    }
+
+    #[test]
+    fn wezterm_info_serde_roundtrip() {
+        let info = WeztermInfo {
+            version: Some("20230712-072601-f4abf8fd".to_string()),
+            socket_path: Some(PathBuf::from("/tmp/wezterm-sock")),
+            is_running: true,
+            capabilities: WeztermCapabilities::default(),
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains("20230712"));
+        assert!(json.contains("wezterm-sock"));
+        assert!(json.contains("\"is_running\":true"));
+    }
+
+    #[test]
+    fn shell_info_serde_roundtrip() {
+        let info = ShellInfo {
+            shell_path: Some("/usr/bin/fish".into()),
+            shell_type: Some("fish".into()),
+            version: Some("3.7.0".into()),
+            config_file: Some(PathBuf::from("/home/user/.config/fish/config.fish")),
+            osc_133_enabled: true,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains("fish"));
+        assert!(json.contains("\"osc_133_enabled\":true"));
+        assert!(json.contains("3.7.0"));
+    }
+
+    #[test]
+    fn system_info_serde_roundtrip() {
+        let info = SystemInfo {
+            os: "linux".into(),
+            arch: "aarch64".into(),
+            cpu_count: 12,
+            memory_mb: Some(32768),
+            load_average: Some(1.5),
+            detected_at_epoch_ms: 1700000000000,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains("\"aarch64\""));
+        assert!(json.contains("32768"));
+        assert!(json.contains("1.5"));
+    }
+
+    #[test]
+    fn detected_agent_serde_roundtrip() {
+        let agent = DetectedAgent {
+            agent_type: AgentType::Codex,
+            pane_id: 42,
+            confidence: 0.85,
+            indicators: vec!["title:codex".into(), "output:openai".into()],
+        };
+        let json = serde_json::to_string(&agent).unwrap();
+        assert!(json.contains("42"));
+        assert!(json.contains("0.85"));
+        assert!(json.contains("output:openai"));
+    }
+
+    #[test]
+    fn remote_host_serde_roundtrip() {
+        let host = RemoteHost {
+            hostname: "dev.example.com".into(),
+            connection_type: ConnectionType::Ssh,
+            pane_ids: vec![1, 2, 3],
+        };
+        let json = serde_json::to_string(&host).unwrap();
+        assert!(json.contains("dev.example.com"));
+        assert!(json.contains("\"ssh\""));
+        assert!(json.contains("[1,2,3]"));
+    }
+
+    #[test]
+    fn connection_type_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&ConnectionType::Ssh).unwrap(),
+            "\"ssh\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ConnectionType::Wsl).unwrap(),
+            "\"wsl\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ConnectionType::Docker).unwrap(),
+            "\"docker\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ConnectionType::Unknown).unwrap(),
+            "\"unknown\""
+        );
+    }
+
+    #[test]
+    fn config_source_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&ConfigSource::Default).unwrap(),
+            "\"default\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ConfigSource::AutoDetected).unwrap(),
+            "\"auto_detected\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ConfigSource::ConfigFile).unwrap(),
+            "\"config_file\""
+        );
+    }
+
+    #[test]
+    fn detected_environment_serde_roundtrip() {
+        let env = make_env(4, Some(8192), Some(1.0), vec![], vec![]);
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"wezterm\""));
+        assert!(json.contains("\"shell\""));
+        assert!(json.contains("\"agents\""));
+        assert!(json.contains("\"remotes\""));
+        assert!(json.contains("\"system\""));
+        assert!(json.contains("\"detected_at\""));
+    }
+
+    #[test]
+    fn config_recommendation_serde_roundtrip() {
+        let rec = ConfigRecommendation {
+            key: "ingest.poll_interval_ms".into(),
+            value: "200".into(),
+            reason: "test reason".into(),
+            source: ConfigSource::AutoDetected,
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(json.contains("ingest.poll_interval_ms"));
+        assert!(json.contains("\"auto_detected\""));
+    }
+
+    // -----------------------------------------------------------------------
+    // Shell detection edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn shell_info_from_zsh_path() {
+        let info = ShellInfo::from_shell_path(Some("/bin/zsh"));
+        assert_eq!(info.shell_type.as_deref(), Some("zsh"));
+        assert_eq!(info.shell_path.as_deref(), Some("/bin/zsh"));
+    }
+
+    #[test]
+    fn shell_info_from_fish_path() {
+        let info = ShellInfo::from_shell_path(Some("/usr/bin/fish"));
+        assert_eq!(info.shell_type.as_deref(), Some("fish"));
+    }
+
+    #[test]
+    fn shell_info_from_unknown_shell() {
+        let info = ShellInfo::from_shell_path(Some("/usr/local/bin/nushell"));
+        assert!(info.shell_type.is_none());
+        assert_eq!(info.shell_path.as_deref(), Some("/usr/local/bin/nushell"));
+    }
+
+    #[test]
+    fn shell_info_from_none_path() {
+        let info = ShellInfo::from_shell_path(None);
+        assert!(info.shell_type.is_none());
+        assert!(info.shell_path.is_none());
+        assert!(info.version.is_none());
+        assert!(info.config_file.is_none());
+        assert!(!info.osc_133_enabled);
+    }
+
+    #[test]
+    fn shell_info_from_empty_path() {
+        let info = ShellInfo::from_shell_path(Some(""));
+        assert!(info.shell_type.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Agent detection edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn detect_agents_empty_panes() {
+        let detected = detect_agents_from_panes(&[]);
+        assert!(detected.is_empty());
+    }
+
+    #[test]
+    fn detect_agents_no_matching_titles() {
+        let panes = vec![
+            pane_with_title(1, "vim"),
+            pane_with_title(2, "htop"),
+            pane_with_title(3, "zsh"),
+        ];
+        let detected = detect_agents_from_panes(&panes);
+        assert!(detected.is_empty());
+    }
+
+    #[test]
+    fn detect_agents_case_insensitive() {
+        let panes = vec![
+            pane_with_title(1, "CODEX"),
+            pane_with_title(2, "Claude Code"),
+            pane_with_title(3, "GEMINI Pro"),
+        ];
+        let detected = detect_agents_from_panes(&panes);
+        assert_eq!(detected.len(), 3);
+    }
+
+    #[test]
+    fn detect_agents_partial_match() {
+        let panes = vec![
+            pane_with_title(1, "my-codex-session"),
+            pane_with_title(2, "running claude code assistant"),
+        ];
+        let detected = detect_agents_from_panes(&panes);
+        assert_eq!(detected.len(), 2);
+        assert_eq!(detected[0].agent_type, AgentType::Codex);
+        assert_eq!(detected[1].agent_type, AgentType::ClaudeCode);
+    }
+
+    #[test]
+    fn detect_agents_openai_matches_codex() {
+        let panes = vec![pane_with_title(1, "OpenAI CLI")];
+        let detected = detect_agents_from_panes(&panes);
+        assert_eq!(detected.len(), 1);
+        assert_eq!(detected[0].agent_type, AgentType::Codex);
+        assert_eq!(detected[0].indicators, vec!["title:codex"]);
+    }
+
+    #[test]
+    fn detect_agents_empty_title_ignored() {
+        let panes = vec![pane_with_title(1, "")];
+        let detected = detect_agents_from_panes(&panes);
+        assert!(detected.is_empty());
+    }
+
+    #[test]
+    fn detect_agents_none_title_ignored() {
+        let pane = PaneInfo {
+            pane_id: 1,
+            tab_id: 1,
+            window_id: 1,
+            domain_id: None,
+            domain_name: None,
+            workspace: None,
+            size: None,
+            rows: None,
+            cols: None,
+            title: None,
+            cwd: None,
+            tty_name: None,
+            cursor_x: None,
+            cursor_y: None,
+            cursor_visibility: None,
+            left_col: None,
+            top_row: None,
+            is_active: false,
+            is_zoomed: false,
+            extra: std::collections::HashMap::new(),
+        };
+        let detected = detect_agents_from_panes(&[pane]);
+        assert!(detected.is_empty());
+    }
+
+    #[test]
+    fn detect_agents_confidence_and_pane_id() {
+        let panes = vec![pane_with_title(99, "codex")];
+        let detected = detect_agents_from_panes(&panes);
+        assert_eq!(detected.len(), 1);
+        assert_eq!(detected[0].pane_id, 99);
+        assert!((detected[0].confidence - 0.7).abs() < f32::EPSILON);
+    }
+
+    // -----------------------------------------------------------------------
+    // Remote detection edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn detect_remotes_wsl_domain() {
+        let mut pane = pane_with_title(1, "bash");
+        pane.domain_name = Some("wsl:Ubuntu-22.04".to_string());
+        let remotes = detect_remotes_from_panes(&[pane]);
+        assert_eq!(remotes.len(), 1);
+        assert_eq!(remotes[0].connection_type, ConnectionType::Wsl);
+        assert_eq!(remotes[0].hostname, "Ubuntu-22.04");
+    }
+
+    #[test]
+    fn detect_remotes_docker_domain() {
+        let mut pane = pane_with_title(1, "bash");
+        pane.domain_name = Some("docker:my-container".to_string());
+        let remotes = detect_remotes_from_panes(&[pane]);
+        assert_eq!(remotes.len(), 1);
+        assert_eq!(remotes[0].connection_type, ConnectionType::Docker);
+    }
+
+    #[test]
+    fn detect_remotes_unknown_domain() {
+        let mut pane = pane_with_title(1, "bash");
+        pane.domain_name = Some("mux:server1".to_string());
+        let remotes = detect_remotes_from_panes(&[pane]);
+        assert_eq!(remotes.len(), 1);
+        assert_eq!(remotes[0].connection_type, ConnectionType::Unknown);
+    }
+
+    #[test]
+    fn detect_remotes_local_domain_excluded() {
+        let mut pane = pane_with_title(1, "bash");
+        pane.domain_name = Some("local".to_string());
+        let remotes = detect_remotes_from_panes(&[pane]);
+        assert!(remotes.is_empty());
+    }
+
+    #[test]
+    fn detect_remotes_local_case_insensitive() {
+        let mut pane = pane_with_title(1, "bash");
+        pane.domain_name = Some("Local".to_string());
+        let remotes = detect_remotes_from_panes(&[pane]);
+        assert!(remotes.is_empty());
+    }
+
+    #[test]
+    fn detect_remotes_empty_panes() {
+        let remotes = detect_remotes_from_panes(&[]);
+        assert!(remotes.is_empty());
+    }
+
+    #[test]
+    fn detect_remotes_groups_same_host() {
+        let mut p1 = pane_with_title(1, "bash");
+        p1.domain_name = Some("ssh:server1".to_string());
+        let mut p2 = pane_with_title(2, "vim");
+        p2.domain_name = Some("ssh:server1".to_string());
+        let remotes = detect_remotes_from_panes(&[p1, p2]);
+        assert_eq!(remotes.len(), 1);
+        assert_eq!(remotes[0].pane_ids.len(), 2);
+        assert!(remotes[0].pane_ids.contains(&1));
+        assert!(remotes[0].pane_ids.contains(&2));
+    }
+
+    #[test]
+    fn detect_remotes_separates_different_hosts() {
+        let mut p1 = pane_with_title(1, "bash");
+        p1.domain_name = Some("ssh:server1".to_string());
+        let mut p2 = pane_with_title(2, "bash");
+        p2.domain_name = Some("ssh:server2".to_string());
+        let remotes = detect_remotes_from_panes(&[p1, p2]);
+        assert_eq!(remotes.len(), 2);
+    }
+
+    #[test]
+    fn detect_remotes_from_cwd_uri() {
+        // Pane without domain_name but with remote cwd
+        let mut pane = pane_with_title(1, "bash");
+        pane.domain_name = None;
+        pane.cwd = Some("file://remote-host/home/user".to_string());
+        let remotes = detect_remotes_from_panes(&[pane]);
+        // inferred_domain returns "ssh:remote-host" when cwd is remote
+        assert_eq!(remotes.len(), 1);
+        assert_eq!(remotes[0].connection_type, ConnectionType::Ssh);
+    }
+
+    // -----------------------------------------------------------------------
+    // Compound AutoConfig scenarios
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn auto_config_high_load_plus_low_memory_plus_remote() {
+        let remotes = vec![RemoteHost {
+            hostname: "staging.internal".into(),
+            connection_type: ConnectionType::Ssh,
+            pane_ids: vec![1],
+        }];
+        // 2 cores, load 6.0 (per-core 3.0) → 500ms, memory 1GB → ≥300ms, remote → ≥200ms
+        let env = make_env(2, Some(1024), Some(6.0), vec![], remotes);
+        let auto = AutoConfig::from_environment(&env);
+        // All three factors push interval up; highest wins
+        assert_eq!(auto.poll_interval_ms, 500);
+        assert!(auto.strict_safety);
+        assert!(auto.rate_limit_per_pane < 30);
+    }
+
+    #[test]
+    fn auto_config_production_plus_agents() {
+        let agents = vec![
+            DetectedAgent {
+                agent_type: AgentType::Codex,
+                pane_id: 1,
+                confidence: 0.9,
+                indicators: vec!["title:codex".into()],
+            },
+            DetectedAgent {
+                agent_type: AgentType::ClaudeCode,
+                pane_id: 2,
+                confidence: 0.8,
+                indicators: vec!["title:claude".into()],
+            },
+            DetectedAgent {
+                agent_type: AgentType::Gemini,
+                pane_id: 3,
+                confidence: 0.7,
+                indicators: vec!["title:gemini".into()],
+            },
+        ];
+        let remotes = vec![RemoteHost {
+            hostname: "production-api".into(),
+            connection_type: ConnectionType::Ssh,
+            pane_ids: vec![4],
+        }];
+        let env = make_env(8, Some(16384), Some(0.5), agents, remotes);
+        let auto = AutoConfig::from_environment(&env);
+        // Production host → strict safety, rate ≤ 10
+        assert!(auto.strict_safety);
+        assert!(auto.rate_limit_per_pane <= 10);
+        // All three agent packs plus core
+        assert!(auto.pattern_packs.contains(&"builtin:codex".to_string()));
+        assert!(
+            auto.pattern_packs
+                .contains(&"builtin:claude_code".to_string())
+        );
+        assert!(auto.pattern_packs.contains(&"builtin:gemini".to_string()));
+    }
+
+    #[test]
+    fn auto_config_boundary_load_at_exactly_1_0() {
+        // per-core load 1.0 exactly → NOT moderate (condition is > 1.0)
+        let env = make_env(4, Some(8192), Some(4.0), vec![], vec![]);
+        let auto = AutoConfig::from_environment(&env);
+        assert_eq!(auto.poll_interval_ms, 100);
+    }
+
+    #[test]
+    fn auto_config_boundary_load_just_above_1_0() {
+        // per-core load 1.01 → moderate → 200ms
+        let env = make_env(4, Some(8192), Some(4.04), vec![], vec![]);
+        let auto = AutoConfig::from_environment(&env);
+        assert_eq!(auto.poll_interval_ms, 200);
+    }
+
+    #[test]
+    fn auto_config_boundary_load_at_exactly_2_0() {
+        // per-core load 2.0 exactly → moderate (condition for high is > 2.0)
+        let env = make_env(4, Some(8192), Some(8.0), vec![], vec![]);
+        let auto = AutoConfig::from_environment(&env);
+        assert_eq!(auto.poll_interval_ms, 200);
+    }
+
+    #[test]
+    fn auto_config_boundary_load_just_above_2_0() {
+        // per-core load 2.01 → high → 500ms
+        let env = make_env(4, Some(8192), Some(8.04), vec![], vec![]);
+        let auto = AutoConfig::from_environment(&env);
+        assert_eq!(auto.poll_interval_ms, 500);
+    }
+
+    #[test]
+    fn auto_config_boundary_memory_at_2048() {
+        // 2048 MB is NOT low (condition is < 2048)
+        let env = make_env(4, Some(2048), Some(0.1), vec![], vec![]);
+        let auto = AutoConfig::from_environment(&env);
+        assert_eq!(auto.poll_interval_ms, 100);
+    }
+
+    #[test]
+    fn auto_config_boundary_memory_at_2047() {
+        // 2047 MB IS low → interval ≥ 300
+        let env = make_env(4, Some(2047), Some(0.1), vec![], vec![]);
+        let auto = AutoConfig::from_environment(&env);
+        assert!(auto.poll_interval_ms >= 300);
+    }
+
+    #[test]
+    fn auto_config_concurrent_captures_capped_at_32() {
+        // 64 cores → 128 but capped at 32
+        let env = make_env(64, Some(65536), None, vec![], vec![]);
+        let auto = AutoConfig::from_environment(&env);
+        assert_eq!(auto.max_concurrent_captures, 32);
+    }
+
+    #[test]
+    fn auto_config_concurrent_captures_min_4() {
+        // 1 core → 2 but floor is 4
+        let env = make_env(1, Some(4096), None, vec![], vec![]);
+        let auto = AutoConfig::from_environment(&env);
+        assert_eq!(auto.max_concurrent_captures, 4);
+    }
+
+    #[test]
+    fn auto_config_production_hostname_live() {
+        let remotes = vec![RemoteHost {
+            hostname: "api-live-01".into(),
+            connection_type: ConnectionType::Ssh,
+            pane_ids: vec![1],
+        }];
+        let env = make_env(8, Some(16384), Some(0.5), vec![], remotes);
+        let auto = AutoConfig::from_environment(&env);
+        assert!(auto.strict_safety);
+        assert!(auto.rate_limit_per_pane <= 10);
+    }
+
+    #[test]
+    fn auto_config_non_production_hostname_not_strict() {
+        let remotes = vec![RemoteHost {
+            hostname: "staging-01".into(),
+            connection_type: ConnectionType::Ssh,
+            pane_ids: vec![1],
+        }];
+        let env = make_env(8, Some(16384), Some(0.5), vec![], remotes);
+        let auto = AutoConfig::from_environment(&env);
+        // Remote → strict, but rate not capped to 10 (no production host)
+        assert!(auto.strict_safety);
+        assert_eq!(auto.rate_limit_per_pane, 15);
+    }
+
+    #[test]
+    fn auto_config_duplicate_agent_types_deduped() {
+        let agents = vec![
+            DetectedAgent {
+                agent_type: AgentType::Codex,
+                pane_id: 1,
+                confidence: 0.9,
+                indicators: vec!["title:codex".into()],
+            },
+            DetectedAgent {
+                agent_type: AgentType::Codex,
+                pane_id: 2,
+                confidence: 0.8,
+                indicators: vec!["title:openai".into()],
+            },
+        ];
+        let env = make_env(4, Some(8192), None, agents, vec![]);
+        let auto = AutoConfig::from_environment(&env);
+        let codex_count = auto
+            .pattern_packs
+            .iter()
+            .filter(|p| *p == "builtin:codex")
+            .count();
+        assert_eq!(codex_count, 1, "codex pack should appear exactly once");
+    }
+
+    #[test]
+    fn auto_config_recommendations_have_correct_sources() {
+        let remotes = vec![RemoteHost {
+            hostname: "web-prod-01".into(),
+            connection_type: ConnectionType::Ssh,
+            pane_ids: vec![1],
+        }];
+        let env = make_env(2, Some(1024), Some(8.0), vec![], remotes);
+        let auto = AutoConfig::from_environment(&env);
+        for rec in &auto.recommendations {
+            assert_eq!(rec.source, ConfigSource::AutoDetected);
+            assert!(!rec.key.is_empty());
+            assert!(!rec.value.is_empty());
+            assert!(!rec.reason.is_empty());
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // WeztermCapabilities defaults
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn wezterm_capabilities_default_all_false() {
+        let caps = WeztermCapabilities::default();
+        assert!(!caps.cli_available);
+        assert!(!caps.json_output);
+        assert!(!caps.multiplexing);
+        assert!(!caps.osc_133);
+        assert!(!caps.osc_7);
+        assert!(!caps.image_protocol);
+    }
+
+    // -----------------------------------------------------------------------
+    // WeztermInfo with no WezTerm
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn wezterm_info_missing_wezterm() {
+        let info = WeztermInfo {
+            version: None,
+            socket_path: None,
+            is_running: false,
+            capabilities: WeztermCapabilities::default(),
+        };
+        assert!(!info.is_running);
+        assert!(info.version.is_none());
+        assert!(info.socket_path.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // ConnectionType equality and hash
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn connection_type_equality() {
+        assert_eq!(ConnectionType::Ssh, ConnectionType::Ssh);
+        assert_ne!(ConnectionType::Ssh, ConnectionType::Wsl);
+        assert_ne!(ConnectionType::Docker, ConnectionType::Unknown);
+    }
 }
