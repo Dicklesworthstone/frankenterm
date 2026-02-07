@@ -50,7 +50,7 @@ use crate::policy::Redactor;
 /// This is the target version that new databases will be initialized to,
 /// and existing databases will be migrated to.
 /// Uses SQLite's PRAGMA user_version for atomic version tracking.
-pub const SCHEMA_VERSION: i32 = 18;
+pub const SCHEMA_VERSION: i32 = 19;
 
 /// Schema initialization SQL
 ///
@@ -377,7 +377,10 @@ CREATE TABLE IF NOT EXISTS approval_tokens (
     workspace_id TEXT NOT NULL,        -- workspace scope
     action_kind TEXT NOT NULL,         -- send_text, workflow_run, etc.
     pane_id INTEGER REFERENCES panes(pane_id) ON DELETE SET NULL,
-    action_fingerprint TEXT NOT NULL   -- normalized action fingerprint
+    action_fingerprint TEXT NOT NULL,  -- normalized action fingerprint
+    plan_hash TEXT,                    -- optional sha256 hash of bound ActionPlan
+    plan_version INTEGER,             -- optional plan schema version
+    risk_summary TEXT                  -- optional human-readable risk description
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_approval_tokens_hash ON approval_tokens(code_hash);
@@ -1093,6 +1096,26 @@ static MIGRATIONS: &[Migration] = &[
             ALTER TABLE events DROP COLUMN triage_updated_by;
             ALTER TABLE events DROP COLUMN triage_updated_at;
             ALTER TABLE events DROP COLUMN triage_state;
+        ",
+        ),
+    },
+    Migration {
+        version: 19,
+        description: "Add plan_hash binding to approval_tokens",
+        up_sql: r"
+            ALTER TABLE approval_tokens ADD COLUMN plan_hash TEXT;
+            ALTER TABLE approval_tokens ADD COLUMN plan_version INTEGER;
+            ALTER TABLE approval_tokens ADD COLUMN risk_summary TEXT;
+
+            CREATE INDEX IF NOT EXISTS idx_approval_tokens_plan_hash
+                ON approval_tokens(plan_hash) WHERE plan_hash IS NOT NULL;
+        ",
+        down_sql: Some(
+            r"
+            DROP INDEX IF EXISTS idx_approval_tokens_plan_hash;
+            ALTER TABLE approval_tokens DROP COLUMN risk_summary;
+            ALTER TABLE approval_tokens DROP COLUMN plan_version;
+            ALTER TABLE approval_tokens DROP COLUMN plan_hash;
         ",
         ),
     },
@@ -2286,6 +2309,12 @@ pub struct ApprovalTokenRecord {
     pub pane_id: Option<u64>,
     /// Normalized action fingerprint
     pub action_fingerprint: String,
+    /// Optional plan hash binding (sha256 of bound ActionPlan)
+    pub plan_hash: Option<String>,
+    /// Optional plan schema version
+    pub plan_version: Option<i32>,
+    /// Optional human-readable risk summary
+    pub risk_summary: Option<String>,
 }
 
 impl ApprovalTokenRecord {
@@ -8690,8 +8719,8 @@ fn insert_approval_token_sync(conn: &Connection, token: &ApprovalTokenRecord) ->
 
     conn.execute(
         "INSERT INTO approval_tokens (code_hash, created_at, expires_at, used_at, workspace_id,
-         action_kind, pane_id, action_fingerprint)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+         action_kind, pane_id, action_fingerprint, plan_hash, plan_version, risk_summary)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             token.code_hash.as_str(),
             token.created_at,
@@ -8701,6 +8730,9 @@ fn insert_approval_token_sync(conn: &Connection, token: &ApprovalTokenRecord) ->
             token.action_kind.as_str(),
             pane_id_i64,
             token.action_fingerprint.as_str(),
+            token.plan_hash.as_deref(),
+            token.plan_version,
+            token.risk_summary.as_deref(),
         ],
     )
     .map_err(|e| StorageError::Database(format!("Failed to insert approval token: {e}")))?;
