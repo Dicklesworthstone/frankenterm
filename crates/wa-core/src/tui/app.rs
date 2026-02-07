@@ -376,6 +376,20 @@ impl<Q: QueryClient> App<Q> {
     /// Handle key events in the search view
     fn handle_search_key(&mut self, key: KeyEvent) {
         match key.code {
+            KeyCode::Down | KeyCode::Char('j')
+                if !self.view_state.search_results.is_empty() =>
+            {
+                self.view_state.search_selected_index =
+                    (self.view_state.search_selected_index + 1)
+                        % self.view_state.search_results.len();
+            }
+            KeyCode::Up | KeyCode::Char('k') if !self.view_state.search_results.is_empty() => {
+                self.view_state.search_selected_index = self
+                    .view_state
+                    .search_selected_index
+                    .checked_sub(1)
+                    .unwrap_or(self.view_state.search_results.len() - 1);
+            }
             KeyCode::Char(c) => {
                 self.view_state.search_query.push(c);
             }
@@ -383,13 +397,35 @@ impl<Q: QueryClient> App<Q> {
                 self.view_state.search_query.pop();
             }
             KeyCode::Enter => {
-                // TODO: Execute search
-                self.view_state.clear_error();
+                self.execute_search();
             }
             KeyCode::Esc => {
                 self.view_state.search_query.clear();
+                self.view_state.search_results.clear();
+                self.view_state.search_last_query.clear();
+                self.view_state.search_selected_index = 0;
             }
             _ => {}
+        }
+    }
+
+    /// Execute FTS search using query client
+    fn execute_search(&mut self) {
+        let query = self.view_state.search_query.trim().to_string();
+        if query.is_empty() {
+            return;
+        }
+        self.view_state.search_last_query = query.clone();
+        self.view_state.search_selected_index = 0;
+        match self.query_client.search(&query, 50) {
+            Ok(results) => {
+                self.view_state.search_results = results;
+                self.view_state.clear_error();
+            }
+            Err(e) => {
+                self.view_state.search_results.clear();
+                self.view_state.set_error(format!("Search failed: {e}"));
+            }
         }
     }
 
@@ -854,5 +890,146 @@ mod tests {
         // Esc clears
         app.handle_events_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.view_state.events_pane_filter.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Search view tests (wa-nu4.3.7.4)
+    // -----------------------------------------------------------------------
+
+    struct SearchQueryClient;
+
+    impl QueryClient for SearchQueryClient {
+        fn list_panes(&self) -> Result<Vec<PaneView>, QueryError> {
+            Ok(Vec::new())
+        }
+
+        fn list_events(&self, _: &EventFilters) -> Result<Vec<EventView>, QueryError> {
+            Ok(Vec::new())
+        }
+
+        fn list_triage_items(&self) -> Result<Vec<crate::tui::query::TriageItemView>, QueryError> {
+            Ok(Vec::new())
+        }
+
+        fn search(&self, query: &str, _limit: usize) -> Result<Vec<SearchResultView>, QueryError> {
+            if query == "error" {
+                return Err(QueryError::DatabaseNotInitialized("test".to_string()));
+            }
+            if query.is_empty() {
+                return Ok(Vec::new());
+            }
+            Ok(vec![
+                SearchResultView {
+                    pane_id: 10,
+                    timestamp: 1_700_000_000_000,
+                    snippet: format!(">>matched<< text for {query}"),
+                    rank: 0.95,
+                },
+                SearchResultView {
+                    pane_id: 20,
+                    timestamp: 1_700_000_001_000,
+                    snippet: format!("another >>result<< with {query}"),
+                    rank: 0.75,
+                },
+            ])
+        }
+
+        fn health(&self) -> Result<HealthStatus, QueryError> {
+            Ok(HealthStatus {
+                watcher_running: true,
+                db_accessible: true,
+                wezterm_accessible: true,
+                wezterm_circuit: crate::circuit_breaker::CircuitBreakerStatus::default(),
+                pane_count: 0,
+                event_count: 0,
+                last_capture_ts: None,
+            })
+        }
+
+        fn is_watcher_running(&self) -> bool {
+            true
+        }
+
+        fn mark_event_muted(&self, _event_id: i64) -> Result<(), QueryError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn search_executes_on_enter() {
+        let mut app = App::new(SearchQueryClient, AppConfig::default());
+        app.refresh_data();
+
+        // Type a query
+        app.handle_search_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        app.handle_search_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        app.handle_search_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        app.handle_search_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        assert_eq!(app.view_state.search_query, "test");
+
+        // Execute search
+        app.handle_search_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.view_state.search_last_query, "test");
+        assert_eq!(app.view_state.search_results.len(), 2);
+        assert_eq!(app.view_state.search_selected_index, 0);
+    }
+
+    #[test]
+    fn search_navigation_wraps() {
+        let mut app = App::new(SearchQueryClient, AppConfig::default());
+        app.view_state.search_query = "test".to_string();
+        app.execute_search();
+        assert_eq!(app.view_state.search_results.len(), 2);
+
+        // Navigate down
+        app.handle_search_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.view_state.search_selected_index, 1);
+
+        // Wrap around
+        app.handle_search_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.view_state.search_selected_index, 0);
+
+        // Navigate up wraps
+        app.handle_search_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.view_state.search_selected_index, 1);
+    }
+
+    #[test]
+    fn search_esc_clears_all() {
+        let mut app = App::new(SearchQueryClient, AppConfig::default());
+        app.view_state.search_query = "test".to_string();
+        app.execute_search();
+        assert!(!app.view_state.search_results.is_empty());
+
+        app.handle_search_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.view_state.search_query.is_empty());
+        assert!(app.view_state.search_results.is_empty());
+        assert!(app.view_state.search_last_query.is_empty());
+    }
+
+    #[test]
+    fn search_error_sets_error_message() {
+        let mut app = App::new(SearchQueryClient, AppConfig::default());
+        app.view_state.search_query = "error".to_string();
+        app.execute_search();
+        assert!(app.view_state.search_results.is_empty());
+        assert!(app.view_state.error_message.is_some());
+    }
+
+    #[test]
+    fn search_empty_query_does_nothing() {
+        let mut app = App::new(SearchQueryClient, AppConfig::default());
+        app.view_state.search_query = "  ".to_string();
+        app.execute_search();
+        assert!(app.view_state.search_results.is_empty());
+        assert!(app.view_state.search_last_query.is_empty());
+    }
+
+    #[test]
+    fn search_backspace_removes_char() {
+        let mut app = App::new(SearchQueryClient, AppConfig::default());
+        app.view_state.search_query = "test".to_string();
+        app.handle_search_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(app.view_state.search_query, "tes");
     }
 }

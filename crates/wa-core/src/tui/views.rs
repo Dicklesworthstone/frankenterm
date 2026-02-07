@@ -11,7 +11,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Tabs, Widget},
 };
 
-use super::query::{EventView, HealthStatus, PaneView, TriageItemView};
+use super::query::{EventView, HealthStatus, PaneView, SearchResultView, TriageItemView};
 use crate::circuit_breaker::CircuitStateKind;
 
 /// Available views in the TUI
@@ -132,6 +132,12 @@ pub struct ViewState {
     pub events_pane_filter: String,
     /// Events: selected index (separate from panes)
     pub events_selected_index: usize,
+    /// Search: last executed query (for display)
+    pub search_last_query: String,
+    /// Search: results from last query
+    pub search_results: Vec<SearchResultView>,
+    /// Search: selected result index
+    pub search_selected_index: usize,
 }
 
 impl ViewState {
@@ -660,25 +666,130 @@ pub fn render_search_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // Search input
-            Constraint::Min(5),    // Results
+            Constraint::Min(5),    // Results + detail
         ])
         .split(area);
 
     // Search input
-    let search_input = Paragraph::new(state.search_query.as_str()).block(
+    let cursor_indicator = if state.search_query.is_empty() {
+        "Search (FTS5) — type query, Enter to search"
+    } else {
+        "Search (FTS5) — Enter to search, Esc to clear"
+    };
+    let search_input = Paragraph::new(format!("{}_", state.search_query)).block(
         Block::default()
-            .title("Search (FTS5)")
+            .title(cursor_indicator)
             .borders(Borders::ALL),
     );
     search_input.render(chunks[0], buf);
 
-    // Placeholder for results
-    let results = Paragraph::new(Span::styled(
-        "Type a query and press Enter to search captured output.",
-        Style::default().fg(Color::Gray),
-    ))
-    .block(Block::default().title("Results").borders(Borders::ALL));
-    results.render(chunks[1], buf);
+    if state.search_results.is_empty() {
+        let msg = if state.search_last_query.is_empty() {
+            "Type a query and press Enter to search captured output."
+        } else {
+            "No results found. Try a different query."
+        };
+        let results = Paragraph::new(Span::styled(msg, Style::default().fg(Color::Gray))).block(
+            Block::default()
+                .title(format!(
+                    "Results ({})",
+                    if state.search_last_query.is_empty() {
+                        "waiting"
+                    } else {
+                        "0 matches"
+                    }
+                ))
+                .borders(Borders::ALL),
+        );
+        results.render(chunks[1], buf);
+        return;
+    }
+
+    // Split results area into list + detail
+    let result_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(chunks[1]);
+
+    let selected = state
+        .search_selected_index
+        .min(state.search_results.len().saturating_sub(1));
+
+    // Results list
+    let list_block = Block::default()
+        .title(format!(
+            "Results ({} matches for '{}')",
+            state.search_results.len(),
+            truncate_str(&state.search_last_query, 20),
+        ))
+        .borders(Borders::ALL);
+    let list_inner = list_block.inner(result_chunks[0]);
+    list_block.render(result_chunks[0], buf);
+
+    let mut lines: Vec<Line> = Vec::with_capacity(state.search_results.len());
+    for (pos, result) in state.search_results.iter().enumerate() {
+        let snippet_preview = truncate_str(&result.snippet, 40);
+        if pos == selected {
+            lines.push(Line::styled(
+                format!(
+                    "P{:>3} | {:.2} | {}",
+                    result.pane_id, result.rank, snippet_preview,
+                ),
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("P{:>3}", result.pane_id),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::raw(format!(" | {:.2} | {}", result.rank, snippet_preview)),
+            ]));
+        }
+    }
+    Paragraph::new(lines).render(list_inner, buf);
+
+    // Detail panel for selected result
+    let detail_block = Block::default()
+        .title("Match Context")
+        .borders(Borders::ALL);
+    let detail_inner = detail_block.inner(result_chunks[1]);
+    detail_block.render(result_chunks[1], buf);
+
+    if let Some(result) = state.search_results.get(selected) {
+        let details = vec![
+            Line::from(vec![
+                Span::styled(
+                    "Pane: ",
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(result.pane_id.to_string()),
+            ]),
+            Line::from(vec![
+                Span::styled(
+                    "Rank: ",
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!("{:.4}", result.rank)),
+            ]),
+            Line::from(vec![
+                Span::styled(
+                    "Captured: ",
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(result.timestamp.to_string()),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Snippet (redacted):",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::from(result.snippet.clone()),
+        ];
+        Paragraph::new(details).render(detail_inner, buf);
+    }
 }
 
 /// Render the triage view
@@ -1111,5 +1222,76 @@ mod tests {
         let filtered = filtered_event_indices(&state);
         let clamped = state.events_selected_index.min(filtered.len().saturating_sub(1));
         assert_eq!(clamped, 1); // Clamped to last index
+    }
+
+    // -----------------------------------------------------------------------
+    // Search view rendering tests (wa-nu4.3.7.4)
+    // -----------------------------------------------------------------------
+
+    fn search_result(pane_id: u64, snippet: &str, rank: f64) -> SearchResultView {
+        SearchResultView {
+            pane_id,
+            timestamp: 1_700_000_000_000,
+            snippet: snippet.to_string(),
+            rank,
+        }
+    }
+
+    #[test]
+    fn render_search_view_empty_no_query() {
+        let state = ViewState::default();
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        render_search_view(&state, area, &mut buf);
+        // Should not panic; shows "type a query" message
+    }
+
+    #[test]
+    fn render_search_view_empty_with_prior_query() {
+        let mut state = ViewState::default();
+        state.search_last_query = "nonexistent".to_string();
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        render_search_view(&state, area, &mut buf);
+        // Shows "no results" message
+    }
+
+    #[test]
+    fn render_search_view_with_results() {
+        let mut state = ViewState::default();
+        state.search_last_query = "test".to_string();
+        state.search_results = vec![
+            search_result(10, ">>matched<< text for test", 0.95),
+            search_result(20, "another >>match<< here", 0.75),
+        ];
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        render_search_view(&state, area, &mut buf);
+        // Should render results list + detail panel
+    }
+
+    #[test]
+    fn render_search_view_with_selection() {
+        let mut state = ViewState::default();
+        state.search_last_query = "test".to_string();
+        state.search_results = vec![
+            search_result(10, "first result", 0.95),
+            search_result(20, "second result", 0.75),
+        ];
+        state.search_selected_index = 1;
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        render_search_view(&state, area, &mut buf);
+        // Detail panel shows second result
+    }
+
+    #[test]
+    fn render_search_view_query_with_cursor() {
+        let mut state = ViewState::default();
+        state.search_query = "hello".to_string();
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        render_search_view(&state, area, &mut buf);
+        // Should show "hello_" in the input area
     }
 }
