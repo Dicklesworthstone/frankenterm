@@ -477,4 +477,388 @@ mod tests {
         assert!(!text.contains(secret));
         assert!(text.contains("[REDACTED]"));
     }
+
+    // -----------------------------------------------------------------------
+    // wa-z0e.6: Recording tests — format, roundtrip, fuzz
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn frame_encodes_all_frame_types() {
+        let types = [
+            (FrameType::Output, 1u8),
+            (FrameType::Resize, 2),
+            (FrameType::Event, 3),
+            (FrameType::Marker, 4),
+            (FrameType::Input, 5),
+        ];
+        for (ft, expected_byte) in types {
+            let frame = RecordingFrame {
+                header: FrameHeader {
+                    timestamp_ms: 0,
+                    frame_type: ft,
+                    flags: 0,
+                    payload_len: 0,
+                },
+                payload: vec![],
+            };
+            let bytes = frame.encode();
+            assert_eq!(bytes.len(), 14);
+            assert_eq!(bytes[8], expected_byte, "wrong byte for {ft:?}");
+        }
+    }
+
+    #[test]
+    fn frame_encodes_empty_payload() {
+        let frame = RecordingFrame {
+            header: FrameHeader {
+                timestamp_ms: 0,
+                frame_type: FrameType::Output,
+                flags: 0,
+                payload_len: 0,
+            },
+            payload: vec![],
+        };
+        let bytes = frame.encode();
+        assert_eq!(bytes.len(), 14);
+        assert_eq!(u32::from_le_bytes(bytes[10..14].try_into().unwrap()), 0);
+    }
+
+    #[test]
+    fn frame_encodes_gap_flag() {
+        let frame = RecordingFrame {
+            header: FrameHeader {
+                timestamp_ms: 0,
+                frame_type: FrameType::Output,
+                flags: 0b0000_0001, // gap flag
+                payload_len: 0,
+            },
+            payload: vec![],
+        };
+        let bytes = frame.encode();
+        assert_eq!(bytes[9], 1);
+    }
+
+    #[test]
+    fn frame_encodes_max_timestamp() {
+        let frame = RecordingFrame {
+            header: FrameHeader {
+                timestamp_ms: u64::MAX,
+                frame_type: FrameType::Output,
+                flags: 0,
+                payload_len: 0,
+            },
+            payload: vec![],
+        };
+        let bytes = frame.encode();
+        assert_eq!(
+            u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn delta_encoding_full_variant() {
+        let data = vec![1u8, 2, 3, 4, 5];
+        let enc = DeltaEncoding::Full(data.clone());
+        if let DeltaEncoding::Full(inner) = enc {
+            assert_eq!(inner, data);
+        } else {
+            panic!("expected Full variant");
+        }
+    }
+
+    #[test]
+    fn delta_encoding_serde_roundtrip() {
+        let enc = DeltaEncoding::Full(vec![0xDE, 0xAD]);
+        let json = serde_json::to_string(&enc).unwrap();
+        let back: DeltaEncoding = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, enc);
+    }
+
+    #[test]
+    fn diff_op_serde_roundtrip() {
+        let ops = vec![
+            DiffOp::Copy {
+                offset: 0,
+                len: 10,
+            },
+            DiffOp::Insert {
+                data: vec![1, 2, 3],
+            },
+        ];
+        let json = serde_json::to_string(&ops).unwrap();
+        let back: Vec<DiffOp> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ops);
+    }
+
+    #[test]
+    fn frame_writer_writes_to_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.war");
+
+        {
+            let mut writer = FrameWriter::new(&path, 10).unwrap();
+            writer
+                .write_frame(RecordingFrame {
+                    header: FrameHeader {
+                        timestamp_ms: 0,
+                        frame_type: FrameType::Output,
+                        flags: 0,
+                        payload_len: 5,
+                    },
+                    payload: b"hello".to_vec(),
+                })
+                .unwrap();
+            writer.flush().unwrap();
+        }
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.len(), 14 + 5); // header + payload
+    }
+
+    #[test]
+    fn frame_writer_auto_flushes_at_threshold() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.war");
+
+        {
+            let mut writer = FrameWriter::new(&path, 2).unwrap();
+            // Write 2 frames (equals threshold) — should auto-flush
+            for _ in 0..2 {
+                writer
+                    .write_frame(RecordingFrame {
+                        header: FrameHeader {
+                            timestamp_ms: 0,
+                            frame_type: FrameType::Marker,
+                            flags: 0,
+                            payload_len: 1,
+                        },
+                        payload: vec![b'x'],
+                    })
+                    .unwrap();
+            }
+            // Don't call flush() — it should have happened automatically
+        }
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.len(), (14 + 1) * 2);
+    }
+
+    #[test]
+    fn frame_writer_multiple_flushes() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.war");
+
+        {
+            let mut writer = FrameWriter::new(&path, 1).unwrap();
+            for i in 0..5u8 {
+                writer
+                    .write_frame(RecordingFrame {
+                        header: FrameHeader {
+                            timestamp_ms: i as u64 * 100,
+                            frame_type: FrameType::Output,
+                            flags: 0,
+                            payload_len: 1,
+                        },
+                        payload: vec![b'A' + i],
+                    })
+                    .unwrap();
+            }
+        }
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.len(), (14 + 1) * 5);
+    }
+
+    #[test]
+    fn recorder_state_transitions() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.war");
+        let mut recorder = Recorder::new(42, &path, 10).unwrap();
+
+        assert_eq!(recorder.state, RecorderState::Idle);
+        assert!(!recorder.is_recording());
+
+        recorder.start(1000);
+        assert_eq!(recorder.state, RecorderState::Recording);
+        assert!(recorder.is_recording());
+
+        recorder.stop().unwrap();
+        assert_eq!(recorder.state, RecorderState::Stopped);
+        assert!(!recorder.is_recording());
+    }
+
+    #[test]
+    fn recorder_ignores_output_when_not_recording() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.war");
+        let mut recorder = Recorder::new(1, &path, 10).unwrap();
+
+        // Don't start — output should be silently dropped
+        recorder.record_output(0, false, b"ignored").unwrap();
+        assert_eq!(recorder.stats().frames_written, 0);
+    }
+
+    #[test]
+    fn recorder_records_output_frames() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.war");
+        let mut recorder = Recorder::new(1, &path, 100).unwrap();
+
+        recorder.start(0);
+        recorder.record_output(10, false, b"hello").unwrap();
+        recorder.record_output(20, true, b"world").unwrap();
+        recorder.stop().unwrap();
+
+        let stats = recorder.stats();
+        assert_eq!(stats.frames_written, 2);
+        assert_eq!(stats.bytes_written, 10); // "hello" + "world"
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.len() > 0);
+    }
+
+    #[test]
+    fn recorder_records_segments() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.war");
+        let mut recorder = Recorder::new(1, &path, 100).unwrap();
+
+        recorder.start(0);
+        let segment = CapturedSegment {
+            pane_id: 1,
+            seq: 0,
+            content: "output data".to_string(),
+            kind: CapturedSegmentKind::Delta,
+            captured_at: 50,
+        };
+        recorder.record_segment(&segment).unwrap();
+        recorder.stop().unwrap();
+
+        let stats = recorder.stats();
+        assert_eq!(stats.frames_written, 1);
+        assert_eq!(stats.bytes_raw, 11); // "output data"
+    }
+
+    #[test]
+    fn recorder_stats_snapshot() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.war");
+        let recorder = Recorder::new(42, &path, 10).unwrap();
+
+        let stats = recorder.stats();
+        assert_eq!(stats.pane_id, 42);
+        assert_eq!(stats.frames_written, 0);
+        assert_eq!(stats.bytes_raw, 0);
+        assert_eq!(stats.bytes_written, 0);
+        assert_eq!(stats.state, RecorderState::Idle);
+    }
+
+    #[test]
+    fn recorder_file_io_roundtrip() {
+        use crate::replay::Recording;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("roundtrip.war");
+
+        // Record some frames
+        {
+            let mut recorder = Recorder::new(1, &path, 1).unwrap();
+            recorder.start(0);
+            recorder.record_output(10, false, b"first line\n").unwrap();
+            recorder.record_output(20, false, b"second line\n").unwrap();
+            recorder.record_output(30, true, b"gap output\n").unwrap();
+            recorder.stop().unwrap();
+        }
+
+        // Load and verify via replay module
+        let bytes = std::fs::read(&path).unwrap();
+        let recording = Recording::from_bytes(&bytes).unwrap();
+        assert_eq!(recording.frames.len(), 3);
+        assert_eq!(recording.duration_ms, 30);
+        assert_eq!(recording.frames[0].payload, b"first line\n");
+        assert_eq!(recording.frames[2].header.flags & 1, 1); // gap flag
+    }
+
+    #[tokio::test]
+    async fn recording_manager_multi_pane() {
+        let dir = tempdir().unwrap();
+        let path1 = dir.path().join("pane1.war");
+        let path2 = dir.path().join("pane2.war");
+
+        let manager = RecordingManager::new(RecordingOptions {
+            flush_threshold: 1,
+            redact_output: false,
+            redact_events: false,
+        });
+
+        manager.start_recording(1, &path1, 0).await.unwrap();
+        manager.start_recording(2, &path2, 0).await.unwrap();
+
+        let seg1 = CapturedSegment {
+            pane_id: 1,
+            seq: 0,
+            content: "pane1_data".into(),
+            kind: CapturedSegmentKind::Delta,
+            captured_at: 10,
+        };
+        let seg2 = CapturedSegment {
+            pane_id: 2,
+            seq: 0,
+            content: "pane2_data".into(),
+            kind: CapturedSegmentKind::Delta,
+            captured_at: 10,
+        };
+
+        manager.record_segment(&seg1).await.unwrap();
+        manager.record_segment(&seg2).await.unwrap();
+
+        let stats1 = manager.stop_recording(1).await.unwrap().unwrap();
+        let stats2 = manager.stop_recording(2).await.unwrap().unwrap();
+
+        assert_eq!(stats1.pane_id, 1);
+        assert_eq!(stats1.frames_written, 1);
+        assert_eq!(stats2.pane_id, 2);
+        assert_eq!(stats2.frames_written, 1);
+
+        // Verify file isolation
+        let bytes1 = std::fs::read(&path1).unwrap();
+        let bytes2 = std::fs::read(&path2).unwrap();
+        assert!(String::from_utf8_lossy(&bytes1).contains("pane1_data"));
+        assert!(String::from_utf8_lossy(&bytes2).contains("pane2_data"));
+        assert!(!String::from_utf8_lossy(&bytes1).contains("pane2_data"));
+    }
+
+    #[tokio::test]
+    async fn recording_manager_duplicate_start_fails() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.war");
+
+        let manager = RecordingManager::new(RecordingOptions::default());
+        manager.start_recording(1, &path, 0).await.unwrap();
+
+        let result = manager.start_recording(1, &path, 0).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn recording_manager_stop_nonexistent_returns_none() {
+        let manager = RecordingManager::new(RecordingOptions::default());
+        let result = manager.stop_recording(999).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn recording_manager_segment_for_unknown_pane_is_noop() {
+        let manager = RecordingManager::new(RecordingOptions::default());
+        let segment = CapturedSegment {
+            pane_id: 999,
+            seq: 0,
+            content: "ghost".into(),
+            kind: CapturedSegmentKind::Delta,
+            captured_at: 0,
+        };
+        // Should not error
+        manager.record_segment(&segment).await.unwrap();
+    }
 }

@@ -1674,4 +1674,362 @@ mod tests {
         // "90" without unit is raw ms (parsed first), but "1m30" treats 30 as seconds
         assert_eq!(parse_duration_ms("1m30").unwrap(), 90_000);
     }
+
+    // -----------------------------------------------------------------------
+    // wa-z0e.6: Recording tests — format, roundtrip, playback, fuzz
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn recording_info_counts_frame_types() {
+        let data = build_recording(&[
+            (0, FrameType::Output, b"a".to_vec()),
+            (10, FrameType::Output, b"b".to_vec()),
+            (20, FrameType::Event, b"{}".to_vec()),
+            (30, FrameType::Marker, b"m".to_vec()),
+            (40, FrameType::Input, b"x".to_vec()),
+            (50, FrameType::Resize, {
+                let mut p = Vec::new();
+                p.extend_from_slice(&80u16.to_le_bytes());
+                p.extend_from_slice(&24u16.to_le_bytes());
+                p
+            }),
+        ]);
+        let rec = Recording::from_bytes(&data).unwrap();
+        let info = rec.info();
+
+        assert_eq!(info.frame_count, 6);
+        assert_eq!(info.output_frames, 2);
+        assert_eq!(info.event_frames, 1);
+        assert_eq!(info.marker_frames, 1);
+        assert_eq!(info.input_frames, 1);
+        assert_eq!(info.resize_frames, 1);
+        assert_eq!(info.duration_ms, 50);
+        assert_eq!(info.terminal_cols, 80);
+        assert_eq!(info.terminal_rows, 24);
+    }
+
+    #[test]
+    fn recording_info_empty() {
+        let rec = Recording::from_bytes(&[]).unwrap();
+        let info = rec.info();
+
+        assert_eq!(info.frame_count, 0);
+        assert_eq!(info.duration_ms, 0);
+        assert_eq!(info.total_bytes, 0);
+        // Defaults when no resize frame present
+        assert_eq!(info.terminal_cols, 80);
+        assert_eq!(info.terminal_rows, 24);
+    }
+
+    #[test]
+    fn recording_info_total_bytes() {
+        let data = build_recording(&[
+            (0, FrameType::Output, b"hello".to_vec()), // 5 bytes
+            (10, FrameType::Output, b"world!".to_vec()), // 6 bytes
+        ]);
+        let rec = Recording::from_bytes(&data).unwrap();
+        assert_eq!(rec.info().total_bytes, 11);
+    }
+
+    #[test]
+    fn recording_load_from_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.war");
+        let data = build_recording(&[
+            (0, FrameType::Output, b"file test".to_vec()),
+            (100, FrameType::Marker, b"end".to_vec()),
+        ]);
+        std::fs::write(&path, &data).unwrap();
+
+        let rec = Recording::load(&path).unwrap();
+        assert_eq!(rec.frames.len(), 2);
+        assert_eq!(rec.duration_ms, 100);
+    }
+
+    #[test]
+    fn recording_load_nonexistent_file_errors() {
+        let result = Recording::load(std::path::Path::new("/tmp/nonexistent_wa_test.war"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn fuzz_invalid_frame_type_byte() {
+        // Valid header length but invalid frame type byte (0)
+        let mut data = vec![0u8; 14];
+        data[8] = 0; // invalid frame type
+        let result = Recording::from_bytes(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn fuzz_frame_type_byte_255() {
+        let mut data = vec![0u8; 14];
+        data[8] = 255; // invalid frame type
+        let result = Recording::from_bytes(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn fuzz_valid_header_huge_payload_len() {
+        // Header says payload is u32::MAX bytes but only 14 bytes of header present
+        let mut data = vec![0u8; 14];
+        data[8] = FrameType::Output as u8;
+        data[10..14].copy_from_slice(&u32::MAX.to_le_bytes());
+        let result = Recording::from_bytes(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn fuzz_single_byte_input() {
+        // Should not panic
+        let result = Recording::from_bytes(&[0x42]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn fuzz_all_zeros() {
+        // 14 zero bytes = valid header size but frame_type 0 is invalid
+        let result = Recording::from_bytes(&[0u8; 14]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn fuzz_random_noise_does_not_panic() {
+        // Various garbage inputs that must not panic
+        let inputs: Vec<&[u8]> = vec![
+            &[],
+            &[0xFF],
+            &[0xFF; 13],
+            &[0xFF; 14],
+            &[0xFF; 100],
+            b"NOT_A_RECORDING_FORMAT",
+        ];
+        for input in inputs {
+            let _ = Recording::from_bytes(input);
+        }
+    }
+
+    #[test]
+    fn fuzz_partial_second_frame() {
+        // First frame valid, second frame truncated
+        let mut data = build_recording(&[(0, FrameType::Output, b"ok".to_vec())]);
+        // Append partial header for second frame
+        data.extend_from_slice(&[0u8; 10]);
+        let result = Recording::from_bytes(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn decode_input_frame() {
+        let frame = RecordingFrame {
+            header: FrameHeader {
+                timestamp_ms: 0,
+                frame_type: FrameType::Input,
+                flags: 0,
+                payload_len: 3,
+            },
+            payload: b"ls\n".to_vec(),
+        };
+        let decoded = decode_frame(&frame).unwrap();
+        assert!(matches!(decoded, DecodedFrame::Input(ref b) if b == b"ls\n"));
+    }
+
+    #[test]
+    fn decode_resize_too_short_payload() {
+        let frame = RecordingFrame {
+            header: FrameHeader {
+                timestamp_ms: 0,
+                frame_type: FrameType::Resize,
+                flags: 0,
+                payload_len: 2, // Too short — need 4 bytes for cols+rows
+            },
+            payload: vec![0, 0],
+        };
+        let result = decode_frame(&frame);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn decode_event_invalid_json() {
+        let frame = RecordingFrame {
+            header: FrameHeader {
+                timestamp_ms: 0,
+                frame_type: FrameType::Event,
+                flags: 0,
+                payload_len: 3,
+            },
+            payload: b"???".to_vec(),
+        };
+        let result = decode_frame(&frame);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn seek_to_exact_frame_boundary() {
+        let specs: Vec<_> = (0..5)
+            .map(|i| (i * 100, FrameType::Output, format!("f{i}").into_bytes()))
+            .collect();
+        let data = build_recording(&specs);
+        let recording = Recording::from_bytes(&data).unwrap();
+        let mut player = Player::new(recording);
+        let mut sink = CollectorSink::new();
+
+        // Seek to exactly timestamp 200 → should land after frame at 200
+        player.seek_to(200, &mut sink).unwrap();
+        assert_eq!(player.position().frame_index, 3); // frames 0,1,2 replayed
+    }
+
+    #[test]
+    fn seek_in_recording_with_mixed_frame_types() {
+        let event_payload = serde_json::to_vec(&json!({"x": 1})).unwrap();
+        let data = build_recording(&[
+            (0, FrameType::Output, b"start".to_vec()),
+            (50, FrameType::Event, event_payload),
+            (100, FrameType::Marker, b"mid".to_vec()),
+            (150, FrameType::Output, b"end".to_vec()),
+        ]);
+        let recording = Recording::from_bytes(&data).unwrap();
+        let mut player = Player::new(recording);
+        let mut sink = CollectorSink::new();
+
+        player.seek_to(120, &mut sink).unwrap();
+        // Should skip past frames 0,1,2 (timestamps 0,50,100)
+        assert_eq!(player.position().frame_index, 3);
+        // seek_to only replays Output frames silently — events/markers are skipped
+        assert_eq!(sink.output, b"start");
+        assert_eq!(sink.events.len(), 0);
+        assert!(sink.markers.is_empty());
+    }
+
+    #[test]
+    fn player_initial_state() {
+        let data = build_recording(&[(0, FrameType::Output, b"x".to_vec())]);
+        let recording = Recording::from_bytes(&data).unwrap();
+        let player = Player::new(recording);
+
+        assert_eq!(player.state(), PlayerState::Stopped);
+        assert_eq!(player.position().frame_index, 0);
+        assert_eq!(player.position().timestamp_ms, 0);
+        assert_eq!(player.total_frames(), 1);
+        assert_eq!(player.duration_ms(), 0);
+    }
+
+    #[tokio::test]
+    async fn play_empty_recording_finishes_immediately() {
+        let recording = Recording::from_bytes(&[]).unwrap();
+        let mut player = Player::new(recording);
+        let mut sink = HeadlessSink;
+
+        player.play_simple(&mut sink).await.unwrap();
+        assert_eq!(player.state(), PlayerState::Finished);
+    }
+
+    #[test]
+    fn recording_large_payload() {
+        let large = vec![b'Z'; 100_000];
+        let data = build_recording(&[(0, FrameType::Output, large.clone())]);
+        let rec = Recording::from_bytes(&data).unwrap();
+        assert_eq!(rec.frames.len(), 1);
+        assert_eq!(rec.frames[0].payload, large);
+    }
+
+    #[tokio::test]
+    async fn play_with_pause_then_resume() {
+        tokio::time::pause();
+
+        let data = build_recording(&[
+            (0, FrameType::Output, b"A".to_vec()),
+            (5000, FrameType::Output, b"B".to_vec()),
+            (10000, FrameType::Output, b"C".to_vec()),
+        ]);
+        let recording = Recording::from_bytes(&data).unwrap();
+        let mut player = Player::new(recording);
+
+        let (tx, rx) = watch::channel(PlayerControl::Play);
+        let mut sink = CollectorSink::new();
+
+        let tx2 = tx.clone();
+        tokio::spawn(async move {
+            // Pause at 1s, resume at 2s
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+            let _ = tx2.send(PlayerControl::Pause);
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+            let _ = tx2.send(PlayerControl::Play);
+        });
+
+        player.play(&mut sink, rx).await.unwrap();
+        assert_eq!(player.state(), PlayerState::Finished);
+        assert_eq!(sink.output, b"ABC");
+        drop(tx);
+    }
+
+    #[test]
+    fn recording_preserves_frame_ordering() {
+        // Non-monotonic timestamps should still be preserved
+        let data = build_recording(&[
+            (100, FrameType::Output, b"late".to_vec()),
+            (50, FrameType::Output, b"early".to_vec()),
+            (200, FrameType::Output, b"last".to_vec()),
+        ]);
+        let rec = Recording::from_bytes(&data).unwrap();
+        assert_eq!(rec.frames.len(), 3);
+        assert_eq!(rec.frames[0].header.timestamp_ms, 100);
+        assert_eq!(rec.frames[1].header.timestamp_ms, 50);
+        assert_eq!(rec.frames[2].header.timestamp_ms, 200);
+    }
+
+    #[test]
+    fn recording_flags_preserved() {
+        let frame = RecordingFrame {
+            header: FrameHeader {
+                timestamp_ms: 0,
+                frame_type: FrameType::Output,
+                flags: 0b0000_0001,
+                payload_len: 3,
+            },
+            payload: b"gap".to_vec(),
+        };
+        let data = frame.encode();
+        let rec = Recording::from_bytes(&data).unwrap();
+        assert_eq!(rec.frames[0].header.flags, 1);
+    }
+
+    #[test]
+    fn export_asciinema_skips_input_and_event_frames() {
+        let data = build_recording(&[
+            (0, FrameType::Output, b"$ ".to_vec()),
+            (100, FrameType::Input, b"ls\n".to_vec()),
+            (200, FrameType::Event, b"{}".to_vec()),
+        ]);
+        let rec = Recording::from_bytes(&data).unwrap();
+        let opts = ExportOptions {
+            redact: false,
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        let count = export_asciinema(&rec, &opts, &mut buf).unwrap();
+        // Only Output frames are exported; Input and Event are skipped
+        assert_eq!(count, 1);
+        let output = String::from_utf8(buf).unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 2); // header + 1 output event
+    }
+
+    #[tokio::test]
+    async fn play_simple_records_correct_final_position() {
+        let data = build_recording(&[
+            (0, FrameType::Output, b"a".to_vec()),
+            (100, FrameType::Output, b"b".to_vec()),
+            (500, FrameType::Output, b"c".to_vec()),
+        ]);
+        let recording = Recording::from_bytes(&data).unwrap();
+        let mut player = Player::new(recording);
+        player.set_speed(PlaybackSpeed::QUAD);
+        let mut sink = CollectorSink::new();
+
+        player.play_simple(&mut sink).await.unwrap();
+
+        assert_eq!(player.position().frame_index, 3);
+        assert_eq!(sink.output, b"abc");
+    }
 }
