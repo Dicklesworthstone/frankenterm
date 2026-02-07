@@ -833,7 +833,12 @@ mod tests {
         let files = reg.schema_files();
         assert!(!files.is_empty());
         for f in &files {
-            assert!(f.ends_with(".json"), "schema file should be .json: {f}");
+            assert!(
+                std::path::Path::new(f)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("json")),
+                "schema file should be .json: {f}"
+            );
         }
     }
 

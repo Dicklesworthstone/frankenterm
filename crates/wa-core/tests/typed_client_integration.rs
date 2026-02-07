@@ -14,7 +14,7 @@
 //!   hand-authored before Rust types stabilized). New drift triggers failures.
 //! - **Error handling tests**: Error envelope, error codes, and into_result().
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
@@ -172,14 +172,13 @@ macro_rules! deser_test {
         #[test]
         fn $test_name() {
             let envelope = wrap_envelope($fixture);
-            let resp: RobotResponse<$type> =
-                serde_json::from_value(envelope).unwrap_or_else(|e| {
-                    panic!(
-                        "Failed to deserialize into RobotResponse<{}>: {}",
-                        stringify!($type),
-                        e
-                    )
-                });
+            let resp: RobotResponse<$type> = serde_json::from_value(envelope).unwrap_or_else(|e| {
+                panic!(
+                    "Failed to deserialize into RobotResponse<{}>: {}",
+                    stringify!($type),
+                    e
+                )
+            });
             assert!(resp.ok);
             let data = resp.data.expect("data should be present");
 
@@ -606,14 +605,8 @@ macro_rules! schema_match_test {
             let schema = load_schema($schema_file);
             let envelope = wrap_envelope($fixture);
 
-            let resp: RobotResponse<$type> =
-                serde_json::from_value(envelope).unwrap_or_else(|e| {
-                    panic!(
-                        "Failed to deserialize {}: {}",
-                        stringify!($type),
-                        e
-                    )
-                });
+            let resp: RobotResponse<$type> = serde_json::from_value(envelope)
+                .unwrap_or_else(|e| panic!("Failed to deserialize {}: {}", stringify!($type), e));
 
             let data = resp.into_result().unwrap();
             let reserialized = serde_json::to_value(&data).unwrap();
@@ -905,7 +898,11 @@ fn all_schema_files_are_valid_json() {
         let schema: Value = serde_json::from_str(&content)
             .unwrap_or_else(|e| panic!("Invalid JSON in {}: {}", filename, e));
 
-        assert!(schema.get("$schema").is_some(), "{}: missing $schema", filename);
+        assert!(
+            schema.get("$schema").is_some(),
+            "{}: missing $schema",
+            filename
+        );
         assert!(schema.get("title").is_some(), "{}: missing title", filename);
         assert!(
             schema.get("description").is_some(),

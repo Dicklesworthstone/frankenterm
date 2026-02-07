@@ -279,7 +279,9 @@ fn every_endpoint_has_schema_file() {
             ep.id
         );
         assert!(
-            ep.schema_file.ends_with(".json"),
+            std::path::Path::new(&ep.schema_file)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("json")),
             "Endpoint '{}' schema_file should end with .json: {}",
             ep.id,
             ep.schema_file
@@ -372,8 +374,10 @@ fn events_schema_has_defs() {
             "events schema should have $defs"
         );
 
-        let def_names: Vec<&str> = doc.definitions.iter().map(|(n, _)| n.as_str()).collect();
-        assert!(def_names.contains(&"event"), "events missing 'event' def");
+        assert!(
+            doc.definitions.iter().any(|(n, _)| n == "event"),
+            "events missing 'event' def"
+        );
     }
 }
 
