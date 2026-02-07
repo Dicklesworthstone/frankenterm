@@ -389,6 +389,7 @@ SCENARIO_REGISTRY=(
     "backpressure_stress|Validate backpressure tiers, overflow GAP, hysteresis, and bounded execution|true|cargo,jq|Protects backpressure graceful degradation"
     "storage_stress|Validate storage/indexing stability under load (many panes, large transcripts)|true|cargo,jq|Protects storage perf at scale"
     "search_perf|Validate FTS search stays fast at 1K/10K/100K segments with perf artifacts|true|cargo,jq|Protects search performance at scale"
+    "pane_uuid_stability|Validate pane_uuid stable across rename, tab move, cwd change|true|cargo,jq|Protects pane identity stability"
 )
 
 list_scenarios() {
