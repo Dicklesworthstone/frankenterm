@@ -386,6 +386,7 @@ SCENARIO_REGISTRY=(
     "workflow_resume|Validate workflow resumes after watcher restart (no duplicate steps)|true|wezterm,jq,sqlite3|Protects workflow resume"
     "accounts_refresh|Validate accounts refresh via fake caut + pick preview + redaction|true|wezterm,jq,sqlite3|Protects accounts refresh"
     "environment_detection|Validate environment detection API (shell, agents, remotes, auto-config)|true|wezterm,jq|Protects environment detection and auto-config"
+    "backpressure_stress|Validate backpressure tiers, overflow GAP, hysteresis, and bounded execution|true|cargo,jq|Protects backpressure graceful degradation"
 )
 
 list_scenarios() {
