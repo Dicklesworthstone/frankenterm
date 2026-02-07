@@ -2423,6 +2423,12 @@ impl PatternEngine {
     pub fn rules(&self) -> &[RuleDef] {
         self.library.rules()
     }
+
+    /// Access the loaded pattern packs.
+    #[must_use]
+    pub fn packs(&self) -> &[PatternPack] {
+        self.library.packs()
+    }
 }
 
 #[cfg(test)]

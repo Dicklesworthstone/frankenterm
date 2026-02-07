@@ -923,6 +923,22 @@ SEE ALSO:
         command: RulesCommands,
     },
 
+    /// Extension management (list, install, remove, validate, info)
+    #[command(after_help = r#"EXAMPLES:
+    wa ext list                       List all extensions
+    wa ext install ./my-patterns.toml Install from local file
+    wa ext remove my-patterns         Remove an extension
+    wa ext validate ./pack.toml       Validate extension file
+    wa ext info codex                 Show extension details
+
+SEE ALSO:
+    wa rules      Pattern detection rules
+    wa config     Configuration"#)]
+    Ext {
+        #[command(subcommand)]
+        command: ExtCommands,
+    },
+
     /// Reserve a pane for exclusive use
     #[command(after_help = r#"EXAMPLES:
     wa reserve 3 --owner-id agent-1   Reserve pane 3 for agent-1
@@ -2115,6 +2131,48 @@ enum RulesCommands {
     Profile {
         #[command(subcommand)]
         command: RulesProfileCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum ExtCommands {
+    /// List all extensions (built-in and installed)
+    List {
+        /// Filter by type: all, builtin, file
+        #[arg(long, short = 't', default_value = "all")]
+        r#type: String,
+
+        /// Output format: auto, plain, or json
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+    },
+
+    /// Install an extension from a local file
+    Install {
+        /// Path to the extension file (.toml, .yaml, .json)
+        path: PathBuf,
+    },
+
+    /// Remove an installed extension
+    Remove {
+        /// Extension name or file stem
+        name: String,
+    },
+
+    /// Validate an extension file without installing
+    Validate {
+        /// Path to the extension file
+        path: PathBuf,
+    },
+
+    /// Show detailed information about an extension
+    Info {
+        /// Extension name (e.g., "codex", "my-patterns")
+        name: String,
+
+        /// Output format: auto, plain, or json
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
     },
 }
 
@@ -15836,6 +15894,14 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             );
         }
 
+        Some(Commands::Ext { command }) => {
+            handle_ext_command(
+                command,
+                &config,
+                resolved_config_path.as_deref(),
+            );
+        }
+
         Some(Commands::Reserve {
             pane_id,
             ttl,
@@ -18174,6 +18240,176 @@ fn handle_rules_profile_command(
     }
 
     Ok(())
+}
+
+/// Handle `wa ext` subcommands
+fn handle_ext_command(
+    command: ExtCommands,
+    config: &wa_core::config::Config,
+    resolved_config_path: Option<&Path>,
+) {
+    use wa_core::extensions;
+    use wa_core::output::{OutputFormat, detect_format};
+
+    let config_root = resolved_config_path.and_then(|p| p.parent());
+
+    match command {
+        ExtCommands::List { r#type, format } => {
+            let fmt = match format.to_lowercase().as_str() {
+                "json" => OutputFormat::Json,
+                "plain" => OutputFormat::Plain,
+                _ => detect_format(),
+            };
+
+            let exts = match extensions::list_extensions(&config.patterns, config_root) {
+                Ok(exts) => exts,
+                Err(e) => {
+                    eprintln!("Failed to list extensions: {e}");
+                    std::process::exit(1);
+                }
+            };
+
+            let type_filter = r#type.to_lowercase();
+            let filtered: Vec<_> = exts
+                .iter()
+                .filter(|e| match type_filter.as_str() {
+                    "builtin" => e.source == extensions::ExtensionSource::Builtin,
+                    "file" => e.source == extensions::ExtensionSource::File,
+                    _ => true,
+                })
+                .collect();
+
+            if matches!(fmt, OutputFormat::Json) {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&filtered).unwrap_or_else(|_| "[]".to_string())
+                );
+            } else {
+                if filtered.is_empty() {
+                    println!("No extensions found.");
+                    return;
+                }
+
+                println!(
+                    "{:<10} {:<25} {:<10} {:<10} {:<8} {}",
+                    "TYPE", "NAME", "VERSION", "RULES", "ACTIVE", "PATH"
+                );
+                for ext in &filtered {
+                    let source = match ext.source {
+                        extensions::ExtensionSource::Builtin => "built-in",
+                        extensions::ExtensionSource::File => "file",
+                    };
+                    let active = if ext.active { "yes" } else { "no" };
+                    let path = ext.path.as_deref().unwrap_or("-");
+                    println!(
+                        "{:<10} {:<25} {:<10} {:<10} {:<8} {}",
+                        source, ext.name, ext.version, ext.rule_count, active, path
+                    );
+                }
+            }
+        }
+
+        ExtCommands::Install { path } => {
+            match extensions::install_extension(&path, resolved_config_path) {
+                Ok(pack_id) => {
+                    println!("Installed extension: {pack_id}");
+                    println!();
+                    println!("To activate, add to wa.toml [patterns].packs:");
+                    println!("  packs = [..., \"{pack_id}\"]");
+                }
+                Err(e) => {
+                    eprintln!("Failed to install extension: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        ExtCommands::Remove { name } => {
+            match extensions::remove_extension(&name, &config.patterns, resolved_config_path) {
+                Ok(Some(pack_id)) => {
+                    println!("Removed extension: {pack_id}");
+                    println!();
+                    println!("Remember to remove from wa.toml [patterns].packs if present.");
+                }
+                Ok(None) => {
+                    eprintln!("Extension '{name}' not found.");
+                    eprintln!("Use 'wa ext list' to see installed extensions.");
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("Failed to remove extension: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        ExtCommands::Validate { path } => {
+            let result = extensions::validate_extension(&path);
+
+            if result.valid {
+                println!("Extension is valid.");
+                if let Some(name) = &result.pack_name {
+                    println!("  Name: {name}");
+                }
+                if let Some(version) = &result.version {
+                    println!("  Version: {version}");
+                }
+                println!("  Rules: {}", result.rule_count);
+            } else {
+                eprintln!("Extension validation failed:");
+                for error in &result.errors {
+                    eprintln!("  error: {error}");
+                }
+            }
+
+            for warning in &result.warnings {
+                eprintln!("  warning: {warning}");
+            }
+
+            if !result.valid {
+                std::process::exit(1);
+            }
+        }
+
+        ExtCommands::Info { name, format } => {
+            let fmt = match format.to_lowercase().as_str() {
+                "json" => OutputFormat::Json,
+                "plain" => OutputFormat::Plain,
+                _ => detect_format(),
+            };
+
+            let detail =
+                match extensions::extension_info(&name, &config.patterns, config_root) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        eprintln!("Extension '{name}' not found: {e}");
+                        std::process::exit(1);
+                    }
+                };
+
+            if matches!(fmt, OutputFormat::Json) {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&detail).unwrap_or_else(|_| "{}".to_string())
+                );
+            } else {
+                let source = match detail.source {
+                    extensions::ExtensionSource::Builtin => "built-in",
+                    extensions::ExtensionSource::File => "file",
+                };
+                println!("Name: {}", detail.name);
+                println!("Version: {}", detail.version);
+                println!("Type: {source}");
+                if let Some(path) = &detail.path {
+                    println!("Source: {path}");
+                }
+                println!("Rules: {}", detail.rules.len());
+                for rule in &detail.rules {
+                    println!("  - {} ({}, {})", rule.id, rule.severity, rule.description);
+                }
+            }
+        }
+    }
 }
 
 /// Handle `wa rules` subcommands

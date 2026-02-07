@@ -69,6 +69,7 @@ pub mod event_templates;
 pub mod events;
 pub mod explanations;
 pub mod export;
+pub mod extensions;
 pub mod incident_bundle;
 pub mod ingest;
 #[cfg(unix)]
