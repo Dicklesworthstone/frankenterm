@@ -266,7 +266,10 @@ impl MetricsCollector for RuntimeMetricsCollector {
                 let registry = runtime.registry.read().await;
                 registry.observed_pane_ids().len()
             };
-            let event_bus = runtime.event_bus.as_ref().map(event_bus_snapshot);
+            let event_bus = runtime
+                .event_bus
+                .as_ref()
+                .map(|bus| event_bus_snapshot(bus.as_ref()));
             let db_last_write_age_ms = metrics
                 .last_db_write()
                 .map(|ts| epoch_ms_u64().saturating_sub(ts));
@@ -333,6 +336,8 @@ pub struct MetricsServer {
     prefix: String,
     collector: Arc<dyn MetricsCollector>,
     shutdown_flag: Arc<AtomicBool>,
+    /// Must be set to `true` to bind on non-localhost addresses.
+    allow_public_bind: bool,
 }
 
 impl MetricsServer {
@@ -348,10 +353,31 @@ impl MetricsServer {
             prefix: prefix.into(),
             collector,
             shutdown_flag,
+            allow_public_bind: false,
         }
     }
 
+    /// Explicitly opt in to binding on a non-localhost address.
+    #[must_use]
+    pub fn with_dangerous_public_bind(mut self) -> Self {
+        self.allow_public_bind = true;
+        self
+    }
+
     pub async fn start(self) -> Result<MetricsServerHandle> {
+        if !is_localhost_bind(&self.bind) && !self.allow_public_bind {
+            return Err(crate::Error::Runtime(format!(
+                "refusing to bind metrics on public address '{}' — use --dangerous-bind-any to override",
+                self.bind
+            )));
+        }
+        if !is_localhost_bind(&self.bind) {
+            warn!(
+                bind = %self.bind,
+                "binding metrics endpoint on non-localhost address — endpoint may be remotely reachable"
+            );
+        }
+
         let listener = TcpListener::bind(&self.bind).await?;
         let local_addr = listener.local_addr()?;
         let prefix = sanitize_prefix(&self.prefix);
@@ -377,7 +403,7 @@ impl MetricsServer {
                             }
                         }
                     }
-                    _ = wait_for_shutdown(Arc::clone(&shutdown_flag)) => break,
+                    () = wait_for_shutdown(Arc::clone(&shutdown_flag)) => break,
                 }
             }
         });
@@ -485,6 +511,16 @@ fn sanitize_prefix(prefix: &str) -> String {
     sanitized
 }
 
+fn is_localhost_bind(bind: &str) -> bool {
+    if let Ok(addr) = bind.parse::<SocketAddr>() {
+        return addr.ip().is_loopback();
+    }
+
+    // Accept common hostname-style binds like "localhost:9090".
+    let host = bind.rsplit_once(':').map(|(h, _)| h).unwrap_or(bind).trim();
+    matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
+}
+
 fn format_float(value: f64) -> String {
     if value.is_finite() {
         value.to_string()
@@ -575,6 +611,45 @@ mod tests {
         assert!(response.contains("200 OK"));
         assert!(response.contains("wa_segments_persisted_total"));
 
+        shutdown_flag.store(true, Ordering::SeqCst);
+        handle.wait().await;
+    }
+
+    #[test]
+    fn localhost_bind_detection() {
+        assert!(is_localhost_bind("127.0.0.1:9090"));
+        assert!(is_localhost_bind("localhost:9090"));
+        assert!(is_localhost_bind("[::1]:9090"));
+        assert!(!is_localhost_bind("0.0.0.0:9090"));
+    }
+
+    #[tokio::test]
+    async fn metrics_server_refuses_public_bind_without_opt_in() {
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let collector = Arc::new(FixedMetricsCollector::new(MetricsSnapshot::default()));
+        let server = MetricsServer::new("0.0.0.0:0", "wa", collector, shutdown_flag);
+
+        let err = match server.start().await {
+            Ok(_) => panic!("public bind should be refused"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("refusing to bind metrics on public address")
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_server_allows_public_bind_with_opt_in() {
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let collector = Arc::new(FixedMetricsCollector::new(MetricsSnapshot::default()));
+        let server = MetricsServer::new("0.0.0.0:0", "wa", collector, Arc::clone(&shutdown_flag))
+            .with_dangerous_public_bind();
+
+        let handle = server
+            .start()
+            .await
+            .expect("public bind allowed with opt-in");
         shutdown_flag.store(true, Ordering::SeqCst);
         handle.wait().await;
     }

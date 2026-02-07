@@ -133,6 +133,10 @@ SEE ALSO:
         /// Disable single-instance lock (DANGEROUS: may corrupt data)
         #[arg(long)]
         dangerous_disable_lock: bool,
+
+        /// Allow metrics endpoint to bind on non-localhost addresses (DANGEROUS)
+        #[arg(long)]
+        dangerous_bind_any: bool,
     },
 
     /// Show version and build metadata
@@ -6420,6 +6424,7 @@ async fn run_watcher_with_backoff(
     notify_filter: Vec<String>,
     notify_via: Vec<NotifyChannel>,
     disable_lock: bool,
+    dangerous_bind_any: bool,
 ) -> anyhow::Result<()> {
     let mut crash_loop = WatcherCrashLoop::new();
 
@@ -6437,6 +6442,7 @@ async fn run_watcher_with_backoff(
             notify_filter.clone(),
             notify_via.clone(),
             disable_lock,
+            dangerous_bind_any,
         )
         .await;
 
@@ -6496,6 +6502,7 @@ async fn run_watcher(
     notify_filter: Vec<String>,
     notify_via: Vec<NotifyChannel>,
     disable_lock: bool,
+    dangerous_bind_any: bool,
 ) -> anyhow::Result<()> {
     use std::time::Duration;
     use tokio::sync::mpsc;
@@ -6896,6 +6903,11 @@ async fn run_watcher(
             Arc::new(collector),
             Arc::clone(&handle.shutdown_flag),
         );
+        let server = if dangerous_bind_any {
+            server.with_dangerous_public_bind()
+        } else {
+            server
+        };
         match server.start().await {
             Ok(handle) => {
                 tracing::info!(
@@ -6918,6 +6930,8 @@ async fn run_watcher(
     if config.metrics.enabled {
         tracing::warn!("Metrics enabled in config, but wa was built without the metrics feature");
     }
+    #[cfg(not(feature = "metrics"))]
+    let _ = dangerous_bind_any;
 
     let config_path_buf = config_path.map(Path::to_path_buf);
     let ipc_handle = if config.ipc.enabled {
@@ -7874,6 +7888,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             metrics_bind: _metrics_bind,
             metrics_prefix: _metrics_prefix,
             dangerous_disable_lock,
+            dangerous_bind_any,
         }) => {
             // Install panic hook so panics write a bounded, redacted crash bundle under
             // `layout.crash_dir` (required for crash-only diagnosability + E2E coverage).
@@ -7894,6 +7909,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 notify_filter,
                 notify_via,
                 dangerous_disable_lock,
+                dangerous_bind_any,
             )
             .await?;
         }
