@@ -4,38 +4,15 @@
   "title": "WA Robot Release Response",
   "description": "Schema for the data field when calling 'wa robot release <pane_id>'. Releases a pane reservation.",
   "type": "object",
-  "required": ["pane_id", "released"],
+  "required": ["reservation_id", "released"],
   "properties": {
-    "pane_id": {
+    "reservation_id": {
       "type": "integer",
-      "minimum": 0,
-      "description": "The pane ID whose reservation was released"
+      "description": "ID of the reservation that was released"
     },
     "released": {
       "type": "boolean",
       "description": "True if a reservation was released, false if no matching reservation existed"
-    },
-    "reservation_id": {
-      "type": "string",
-      "description": "ID of the released reservation (if released=true)"
-    },
-    "owner_kind": {
-      "type": "string",
-      "enum": ["human", "robot", "mcp", "workflow"],
-      "description": "Owner type of the released reservation"
-    },
-    "owner_id": {
-      "type": "string",
-      "description": "Owner ID of the released reservation"
-    },
-    "held_for_ms": {
-      "type": "integer",
-      "minimum": 0,
-      "description": "How long the reservation was held before release"
-    },
-    "not_found_reason": {
-      "type": "string",
-      "description": "If released=false, explains why (e.g., 'no reservation', 'not owner')"
     }
   },
   "additionalProperties": false

@@ -4,7 +4,7 @@
   "title": "WA Robot Search Response",
   "description": "Schema for the data field when calling 'wa robot search <query>'. Returns FTS search results.",
   "type": "object",
-  "required": ["query", "results", "total_matches"],
+  "required": ["query", "results", "total_hits", "limit"],
   "properties": {
     "query": {
       "type": "string",
@@ -12,15 +12,15 @@
     },
     "results": {
       "type": "array",
-      "description": "Matching segments ordered by relevance (BM25)",
+      "description": "Matching segments ordered by relevance",
       "items": {
-        "$ref": "#/$defs/search_result"
+        "$ref": "#/$defs/search_hit"
       }
     },
-    "total_matches": {
+    "total_hits": {
       "type": "integer",
       "minimum": 0,
-      "description": "Total number of matches (may exceed returned results if limited)"
+      "description": "Total number of hits (may exceed returned results if limited)"
     },
     "limit": {
       "type": "integer",
@@ -32,32 +32,20 @@
       "minimum": 0,
       "description": "If set, results were filtered to this pane_id"
     },
-    "time_filter": {
-      "type": "object",
-      "description": "If set, results were filtered to this time range",
-      "properties": {
-        "after": {
-          "type": "integer",
-          "description": "Unix timestamp (ms) - results after this time"
-        },
-        "before": {
-          "type": "integer",
-          "description": "Unix timestamp (ms) - results before this time"
-        }
-      },
-      "additionalProperties": false
+    "since_filter": {
+      "type": "integer",
+      "description": "If set, results were filtered to segments after this timestamp (epoch ms)"
     }
   },
   "additionalProperties": false,
   "$defs": {
-    "search_result": {
+    "search_hit": {
       "type": "object",
-      "description": "A single search result with snippet and metadata",
-      "required": ["segment_id", "pane_id", "captured_at", "snippet"],
+      "description": "A single search result with score and metadata",
+      "required": ["segment_id", "pane_id", "seq", "captured_at", "score"],
       "properties": {
         "segment_id": {
           "type": "integer",
-          "minimum": 0,
           "description": "Unique segment identifier"
         },
         "pane_id": {
@@ -72,16 +60,19 @@
         },
         "captured_at": {
           "type": "integer",
-          "minimum": 0,
           "description": "Unix timestamp (ms) when the segment was captured"
+        },
+        "score": {
+          "type": "number",
+          "description": "BM25 relevance score"
         },
         "snippet": {
           "type": "string",
-          "description": "Relevant portion of the segment with match highlights (FTS5 snippet)"
+          "description": "Relevant portion of the segment with match highlights"
         },
-        "bm25_score": {
-          "type": "number",
-          "description": "BM25 relevance score (lower is more relevant)"
+        "content": {
+          "type": "string",
+          "description": "Full segment content (present when snippets are disabled)"
         }
       },
       "additionalProperties": false

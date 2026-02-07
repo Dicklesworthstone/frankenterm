@@ -2,78 +2,38 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://wezterm-automata.dev/schemas/wa-robot-wait-for.json",
   "title": "WA Robot Wait-For Response",
-  "description": "Schema for the data field when calling 'wa robot wait-for <pane_id> <rule_id>'. Waits for a pattern to match.",
+  "description": "Schema for the data field when calling 'wa robot wait-for' or 'wa send --wait-for'. Waits for a pattern to match.",
   "type": "object",
-  "required": ["pane_id", "rule_id", "matched", "waited_ms"],
+  "required": ["pane_id", "pattern", "matched", "elapsed_ms", "polls"],
   "properties": {
     "pane_id": {
       "type": "integer",
       "minimum": 0,
       "description": "The pane being monitored"
     },
-    "rule_id": {
+    "pattern": {
       "type": "string",
-      "description": "The pattern rule being waited for"
+      "description": "The pattern string being waited for"
     },
     "matched": {
       "type": "boolean",
       "description": "Whether the pattern was matched before timeout"
     },
-    "timeout_ms": {
+    "elapsed_ms": {
       "type": "integer",
       "minimum": 0,
-      "description": "The timeout that was configured"
+      "description": "Actual time spent waiting (milliseconds)"
     },
-    "waited_ms": {
+    "polls": {
       "type": "integer",
       "minimum": 0,
-      "description": "Actual time spent waiting"
+      "description": "Number of polling attempts"
     },
-    "timed_out": {
+    "is_regex": {
       "type": "boolean",
-      "description": "True if the wait ended due to timeout"
-    },
-    "detection": {
-      "$ref": "#/$defs/detection",
-      "description": "Details of the detection (present when matched=true)"
+      "default": false,
+      "description": "True if the pattern is a regex, false for substring match"
     }
   },
-  "additionalProperties": false,
-  "$defs": {
-    "detection": {
-      "type": "object",
-      "description": "Pattern detection details",
-      "required": ["rule_id", "event_type", "detected_at"],
-      "properties": {
-        "rule_id": {
-          "type": "string",
-          "description": "The rule that matched"
-        },
-        "event_type": {
-          "type": "string",
-          "description": "Type of event detected"
-        },
-        "severity": {
-          "type": "string",
-          "enum": ["info", "warning", "critical"]
-        },
-        "confidence": {
-          "type": "number",
-          "minimum": 0,
-          "maximum": 1
-        },
-        "extracted": {
-          "type": "object",
-          "description": "Extracted values from the pattern",
-          "additionalProperties": true
-        },
-        "detected_at": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "Unix timestamp (ms)"
-        }
-      },
-      "additionalProperties": false
-    }
-  }
+  "additionalProperties": false
 }

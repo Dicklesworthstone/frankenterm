@@ -113,14 +113,6 @@ fn validate_required_fields_present(data: &Value, schema: &Value, schema_name: &
 fn known_drift_schemas() -> BTreeMap<&'static str, &'static str> {
     BTreeMap::from([
         (
-            "wa-robot-wait-for.json",
-            "Schema uses waited_ms/rule_id; Rust uses elapsed_ms/pattern, no rule_id",
-        ),
-        (
-            "wa-robot-search.json",
-            "Schema uses total_matches; Rust uses total_hits",
-        ),
-        (
             "wa-robot-rules-list.json",
             "Schema uses packs/total_rules; Rust uses rules[]",
         ),
@@ -137,16 +129,8 @@ fn known_drift_schemas() -> BTreeMap<&'static str, &'static str> {
             "Schema uses accounts_updated/changes; Rust uses refreshed_count/accounts",
         ),
         (
-            "wa-robot-reservations.json",
-            "Schema lacks total field; Rust includes total",
-        ),
-        (
             "wa-robot-reserve.json",
             "Schema uses flat pane_id/reservation_id; Rust uses nested reservation object",
-        ),
-        (
-            "wa-robot-release.json",
-            "Schema uses pane_id+released+more; Rust uses reservation_id+released",
         ),
         (
             "wa-robot-workflow-run.json",
@@ -685,6 +669,68 @@ schema_match_test!(
     })
 );
 
+schema_match_test!(
+    schema_wait_for,
+    WaitForData,
+    "wa-robot-wait-for.json",
+    json!({
+        "pane_id": 1,
+        "pattern": "\\$\\s*$",
+        "matched": true,
+        "elapsed_ms": 1200,
+        "polls": 24,
+        "is_regex": true
+    })
+);
+
+schema_match_test!(
+    schema_search,
+    SearchData,
+    "wa-robot-search.json",
+    json!({
+        "query": "error",
+        "results": [{
+            "segment_id": 101,
+            "pane_id": 2,
+            "seq": 5,
+            "captured_at": 1700000000000i64,
+            "score": 2.5,
+            "snippet": "...compile error..."
+        }],
+        "total_hits": 1,
+        "limit": 20
+    })
+);
+
+schema_match_test!(
+    schema_reservations,
+    ReservationsListData,
+    "wa-robot-reservations.json",
+    json!({
+        "reservations": [{
+            "id": 1,
+            "pane_id": 5,
+            "owner_kind": "agent",
+            "owner_id": "codex-1",
+            "reason": "build monitoring",
+            "created_at": 1700000000000i64,
+            "expires_at": 1700000060000i64,
+            "status": "active"
+        }],
+        "total": 1
+    })
+);
+
+schema_match_test!(
+    schema_release,
+    ReleaseData,
+    "wa-robot-release.json",
+    json!({
+        "reservation_id": 7,
+        "released": true
+    })
+);
+
 // ============================================================================
 // Drift detection — document and freeze known schema↔type mismatches
 // ============================================================================
@@ -695,7 +741,7 @@ fn drift_set_is_stable() {
     // If a schema is fixed to match the Rust types, remove it from known_drift_schemas().
     // If a new schema is added that doesn't match, this test will fail and prompt an update.
     let known = known_drift_schemas();
-    let expected_count = 12;
+    let expected_count = 8;
     assert_eq!(
         known.len(),
         expected_count,

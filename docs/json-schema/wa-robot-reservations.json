@@ -4,7 +4,7 @@
   "title": "WA Robot Reservations Response",
   "description": "Schema for the data field when calling 'wa robot reservations'. Lists pane reservations.",
   "type": "object",
-  "required": ["reservations"],
+  "required": ["reservations", "total"],
   "properties": {
     "reservations": {
       "type": "array",
@@ -13,9 +13,10 @@
         "$ref": "#/$defs/reservation"
       }
     },
-    "pane_filter": {
+    "total": {
       "type": "integer",
-      "description": "If set, only reservations for this pane_id were returned"
+      "minimum": 0,
+      "description": "Total number of reservations"
     }
   },
   "additionalProperties": false,
@@ -23,8 +24,12 @@
     "reservation": {
       "type": "object",
       "description": "A pane reservation",
-      "required": ["pane_id", "owner_kind", "owner_id", "created_at", "expires_at"],
+      "required": ["id", "pane_id", "owner_kind", "owner_id", "created_at", "expires_at", "status"],
       "properties": {
+        "id": {
+          "type": "integer",
+          "description": "Reservation identifier"
+        },
         "pane_id": {
           "type": "integer",
           "minimum": 0,
@@ -32,7 +37,6 @@
         },
         "owner_kind": {
           "type": "string",
-          "enum": ["human", "robot", "mcp", "workflow"],
           "description": "Type of actor holding the reservation"
         },
         "owner_id": {
@@ -41,21 +45,23 @@
         },
         "reason": {
           "type": "string",
-          "description": "Why the pane was reserved (e.g., issue ID)"
+          "description": "Why the pane was reserved"
         },
         "created_at": {
           "type": "integer",
-          "minimum": 0,
           "description": "Unix timestamp (ms) when reservation was created"
         },
         "expires_at": {
           "type": "integer",
-          "minimum": 0,
           "description": "Unix timestamp (ms) when reservation expires"
         },
-        "exclusive": {
-          "type": "boolean",
-          "description": "True if this is an exclusive reservation"
+        "released_at": {
+          "type": "integer",
+          "description": "Unix timestamp (ms) when reservation was released (null if active)"
+        },
+        "status": {
+          "type": "string",
+          "description": "Reservation status (e.g., 'active', 'released', 'expired')"
         }
       },
       "additionalProperties": false
