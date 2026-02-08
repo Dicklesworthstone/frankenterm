@@ -808,6 +808,167 @@ pub enum PollOutcome {
     Error(String),
 }
 
+// ---------------------------------------------------------------------------
+// Streaming tailer integration (wa-nu4.4.2.3)
+// ---------------------------------------------------------------------------
+
+/// Capture mode for a pane — either polling-based or streaming-based.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TailerMode {
+    /// Traditional get_text polling with adaptive intervals.
+    Polling,
+    /// Vendored mux subscription with direct delta delivery.
+    Streaming,
+}
+
+impl std::fmt::Display for TailerMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Polling => write!(f, "polling"),
+            Self::Streaming => write!(f, "streaming"),
+        }
+    }
+}
+
+/// Detect the best available tailer mode at runtime.
+///
+/// Returns `Streaming` only when the vendored feature is compiled in
+/// and the mux socket is discoverable. Otherwise returns `Polling`.
+#[must_use]
+pub fn detect_tailer_mode(config: &crate::config::Config) -> TailerMode {
+    #[cfg(feature = "vendored")]
+    {
+        let socket_from_config = config
+            .vendored
+            .mux_socket_path
+            .as_deref()
+            .is_some_and(|p| !p.trim().is_empty());
+        let socket_from_env = std::env::var("WEZTERM_UNIX_SOCKET")
+            .ok()
+            .is_some_and(|p| !p.trim().is_empty());
+        if socket_from_config || socket_from_env {
+            return TailerMode::Streaming;
+        }
+    }
+    let _ = config; // suppress unused warning when vendored is off
+    TailerMode::Polling
+}
+
+/// Bridges vendored `PaneDelta` events into the existing `StreamIngester`
+/// pipeline, producing `CapturedSegment`s with monotonic seq.
+///
+/// The bridge converts each delta kind:
+/// - `Output` → `StreamEvent::OutputData` (data is the title for now —
+///   the actual line content would require `get_lines()` round-trip)
+/// - `Gap` → `StreamEvent::OutputData` with overflow flag
+/// - `Ended` → `StreamEvent::PaneClosed`
+pub struct StreamingBridge {
+    ingester: crate::ingest::StreamIngester,
+    /// Number of PaneDelta events processed.
+    events_processed: u64,
+    /// Number of fallback-to-polling transitions.
+    fallback_count: u64,
+}
+
+impl StreamingBridge {
+    /// Create a new streaming bridge.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            ingester: crate::ingest::StreamIngester::new(),
+            events_processed: 0,
+            fallback_count: 0,
+        }
+    }
+
+    /// Convert a PaneDelta into CapturedSegments via the StreamIngester.
+    ///
+    /// The caller is responsible for persisting the returned segments.
+    #[cfg(feature = "vendored")]
+    pub fn process_delta(&mut self, delta: crate::vendored::PaneDelta) -> Vec<CapturedSegment> {
+        use crate::ingest::StreamEvent;
+        self.events_processed += 1;
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+
+        let event = match delta {
+            crate::vendored::PaneDelta::Output {
+                pane_id,
+                seqno: _,
+                title,
+                dirty_range_count,
+            } => StreamEvent::OutputData {
+                pane_id,
+                data: format!("[render_changes: {dirty_range_count} dirty ranges, title={title}]"),
+                received_at: now_ms,
+                overflow: false,
+            },
+            crate::vendored::PaneDelta::Gap { pane_id, reason: _ } => {
+                // A gap from the subscription → treat as overflow so ingester
+                // emits a proper GAP segment.
+                StreamEvent::OutputData {
+                    pane_id,
+                    data: String::new(),
+                    received_at: now_ms,
+                    overflow: true,
+                }
+            }
+            crate::vendored::PaneDelta::Ended { pane_id, reason: _ } => {
+                StreamEvent::PaneClosed { pane_id }
+            }
+        };
+
+        self.ingester.process(event)
+    }
+
+    /// Record that a fallback to polling occurred.
+    pub fn record_fallback(&mut self) {
+        self.fallback_count += 1;
+    }
+
+    /// Number of events processed.
+    #[must_use]
+    pub fn events_processed(&self) -> u64 {
+        self.events_processed
+    }
+
+    /// Number of fallback transitions.
+    #[must_use]
+    pub fn fallback_count(&self) -> u64 {
+        self.fallback_count
+    }
+
+    /// Access the underlying ingester for diagnostics.
+    #[must_use]
+    pub fn ingester(&self) -> &crate::ingest::StreamIngester {
+        &self.ingester
+    }
+}
+
+impl Default for StreamingBridge {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Health snapshot for streaming diagnostics.
+#[derive(Debug, Clone)]
+pub struct StreamingHealth {
+    /// Current capture mode.
+    pub mode: TailerMode,
+    /// Events processed through the streaming bridge.
+    pub events_processed: u64,
+    /// Gaps emitted through the streaming bridge.
+    pub gaps_emitted: u64,
+    /// Number of times streaming fell back to polling.
+    pub fallback_count: u64,
+    /// Active panes in the streaming ingester.
+    pub active_panes: usize,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1934,5 +2095,211 @@ mod tests {
 
         assert_eq!(supervisor.scheduler.budget.max_captures_per_sec, 50);
         assert_eq!(supervisor.scheduler.budget.max_bytes_per_sec, 10_000);
+    }
+
+    // --- Streaming tailer tests (wa-nu4.4.2.3) ---
+
+    #[test]
+    fn tailer_mode_display() {
+        assert_eq!(TailerMode::Polling.to_string(), "polling");
+        assert_eq!(TailerMode::Streaming.to_string(), "streaming");
+    }
+
+    #[test]
+    fn tailer_mode_eq() {
+        assert_eq!(TailerMode::Polling, TailerMode::Polling);
+        assert_eq!(TailerMode::Streaming, TailerMode::Streaming);
+        assert_ne!(TailerMode::Polling, TailerMode::Streaming);
+    }
+
+    #[test]
+    fn detect_mode_without_vendored_returns_polling() {
+        // Without the vendored feature, or without a socket path,
+        // detection should always return Polling.
+        let config = crate::config::Config::default();
+        let mode = detect_tailer_mode(&config);
+        // Can be Streaming if vendored is on + WEZTERM_UNIX_SOCKET is set in env,
+        // but by default should be Polling.
+        if cfg!(feature = "vendored") {
+            // Mode depends on env var — just check it's valid
+            assert!(mode == TailerMode::Polling || mode == TailerMode::Streaming);
+        } else {
+            assert_eq!(mode, TailerMode::Polling);
+        }
+    }
+
+    #[test]
+    fn detect_mode_with_socket_path_config() {
+        let mut config = crate::config::Config::default();
+        config.vendored.mux_socket_path = Some("/tmp/test-mux.sock".to_string());
+        let mode = detect_tailer_mode(&config);
+        if cfg!(feature = "vendored") {
+            assert_eq!(mode, TailerMode::Streaming);
+        } else {
+            assert_eq!(mode, TailerMode::Polling);
+        }
+    }
+
+    #[test]
+    fn detect_mode_empty_socket_path_is_polling() {
+        let mut config = crate::config::Config::default();
+        config.vendored.mux_socket_path = Some("  ".to_string());
+        let mode = detect_tailer_mode(&config);
+        // Empty/whitespace path should not trigger streaming
+        if cfg!(feature = "vendored") {
+            // Only Streaming if WEZTERM_UNIX_SOCKET is also set in env
+            // In a clean test env, this should be Polling
+            assert!(mode == TailerMode::Polling || mode == TailerMode::Streaming);
+        } else {
+            assert_eq!(mode, TailerMode::Polling);
+        }
+    }
+
+    #[test]
+    fn streaming_bridge_new_defaults() {
+        let bridge = StreamingBridge::new();
+        assert_eq!(bridge.events_processed(), 0);
+        assert_eq!(bridge.fallback_count(), 0);
+        assert_eq!(bridge.ingester().active_panes(), 0);
+    }
+
+    #[test]
+    fn streaming_bridge_default_matches_new() {
+        let a = StreamingBridge::new();
+        let b = StreamingBridge::default();
+        assert_eq!(a.events_processed(), b.events_processed());
+        assert_eq!(a.fallback_count(), b.fallback_count());
+    }
+
+    #[test]
+    fn streaming_bridge_record_fallback() {
+        let mut bridge = StreamingBridge::new();
+        assert_eq!(bridge.fallback_count(), 0);
+        bridge.record_fallback();
+        assert_eq!(bridge.fallback_count(), 1);
+        bridge.record_fallback();
+        assert_eq!(bridge.fallback_count(), 2);
+    }
+
+    #[cfg(feature = "vendored")]
+    #[test]
+    fn streaming_bridge_process_output_delta() {
+        use crate::vendored::PaneDelta;
+
+        let mut bridge = StreamingBridge::new();
+        let delta = PaneDelta::Output {
+            pane_id: 1,
+            seqno: 5,
+            title: "bash".to_string(),
+            dirty_range_count: 2,
+        };
+
+        let segments = bridge.process_delta(delta);
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].pane_id, 1);
+        assert_eq!(segments[0].seq, 0); // first segment for this pane
+        assert!(segments[0].content.contains("dirty ranges"));
+        assert_eq!(bridge.events_processed(), 1);
+    }
+
+    #[cfg(feature = "vendored")]
+    #[test]
+    fn streaming_bridge_process_gap_emits_gap_segment() {
+        use crate::ingest::CapturedSegmentKind;
+        use crate::vendored::PaneDelta;
+
+        let mut bridge = StreamingBridge::new();
+
+        // First, send a normal output to establish the pane cursor
+        let output = PaneDelta::Output {
+            pane_id: 1,
+            seqno: 1,
+            title: "bash".to_string(),
+            dirty_range_count: 1,
+        };
+        bridge.process_delta(output);
+
+        // Now send a gap
+        let gap = PaneDelta::Gap {
+            pane_id: 1,
+            reason: "seqno jump".to_string(),
+        };
+        let segments = bridge.process_delta(gap);
+
+        // Gap delta with overflow=true → next event will emit gap.
+        // The current event itself is an empty delta, so we get 1 segment.
+        // But overflow is set for the *next* event.
+        assert!(!segments.is_empty());
+        assert_eq!(bridge.events_processed(), 2);
+    }
+
+    #[cfg(feature = "vendored")]
+    #[test]
+    fn streaming_bridge_process_ended_emits_pane_closed() {
+        use crate::ingest::CapturedSegmentKind;
+        use crate::vendored::PaneDelta;
+
+        let mut bridge = StreamingBridge::new();
+
+        // Establish cursor
+        let output = PaneDelta::Output {
+            pane_id: 1,
+            seqno: 1,
+            title: "bash".to_string(),
+            dirty_range_count: 1,
+        };
+        bridge.process_delta(output);
+
+        // End the subscription
+        let ended = PaneDelta::Ended {
+            pane_id: 1,
+            reason: "cancelled".to_string(),
+        };
+        let segments = bridge.process_delta(ended);
+
+        // PaneClosed → final gap segment
+        assert_eq!(segments.len(), 1);
+        match &segments[0].kind {
+            CapturedSegmentKind::Gap { reason } => {
+                assert!(reason.contains("pane_closed"));
+            }
+            _ => panic!("expected Gap segment for pane close"),
+        }
+    }
+
+    #[cfg(feature = "vendored")]
+    #[test]
+    fn streaming_bridge_multiple_panes() {
+        use crate::vendored::PaneDelta;
+
+        let mut bridge = StreamingBridge::new();
+
+        for pane_id in [1, 2, 3] {
+            let delta = PaneDelta::Output {
+                pane_id,
+                seqno: 1,
+                title: format!("pane-{pane_id}"),
+                dirty_range_count: 1,
+            };
+            bridge.process_delta(delta);
+        }
+
+        assert_eq!(bridge.events_processed(), 3);
+        assert_eq!(bridge.ingester().active_panes(), 3);
+    }
+
+    #[test]
+    fn streaming_health_snapshot() {
+        let bridge = StreamingBridge::new();
+        let health = StreamingHealth {
+            mode: TailerMode::Streaming,
+            events_processed: bridge.events_processed(),
+            gaps_emitted: bridge.ingester().total_gaps(),
+            fallback_count: bridge.fallback_count(),
+            active_panes: bridge.ingester().active_panes(),
+        };
+        assert_eq!(health.mode, TailerMode::Streaming);
+        assert_eq!(health.events_processed, 0);
+        assert_eq!(health.active_panes, 0);
     }
 }

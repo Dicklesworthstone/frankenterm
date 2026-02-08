@@ -1981,6 +1981,295 @@ mod tests {
 }
 
 // ---------------------------------------------------------------------------
+// UnifiedClient: backend-agnostic WezTerm client (wa-nu4.4.1.3)
+// ---------------------------------------------------------------------------
+
+/// Which backend the UnifiedClient selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendKind {
+    /// WezTerm CLI subprocess (`wezterm cli ...`).
+    Cli,
+    /// Vendored direct mux socket connection.
+    Vendored,
+}
+
+impl std::fmt::Display for BackendKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cli => f.write_str("cli"),
+            Self::Vendored => f.write_str("vendored"),
+        }
+    }
+}
+
+/// Describes why a particular backend was selected.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackendSelection {
+    /// The selected backend.
+    pub kind: BackendKind,
+    /// Human-readable reason for the selection.
+    pub reason: String,
+    /// Vendored compatibility report serialized as JSON value.
+    /// This avoids a hard dependency on the `vendored` feature for the type.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compatibility: Option<serde_json::Value>,
+}
+
+/// A WezTerm client that automatically selects the best available backend.
+///
+/// When the `vendored` feature is enabled, the binary is compiled with
+/// vendored WezTerm dependencies, and the local WezTerm version is compatible,
+/// the client will use the direct mux socket backend (faster for large
+/// scrollback reads). Otherwise it falls back to the CLI subprocess backend.
+///
+/// The selection decision is captured in [`BackendSelection`] for observability
+/// (`wa doctor`, `wa status`, logging).
+pub struct UnifiedClient {
+    inner: WeztermHandle,
+    selection: BackendSelection,
+}
+
+impl UnifiedClient {
+    /// Create a `UnifiedClient` with the CLI backend.
+    #[must_use]
+    pub fn cli() -> Self {
+        Self {
+            inner: Arc::new(WeztermClient::new()),
+            selection: BackendSelection {
+                kind: BackendKind::Cli,
+                reason: "explicit CLI backend".to_string(),
+                compatibility: None,
+            },
+        }
+    }
+
+    /// Create a `UnifiedClient` wrapping an existing handle.
+    #[must_use]
+    pub fn from_handle(handle: WeztermHandle, selection: BackendSelection) -> Self {
+        Self {
+            inner: handle,
+            selection,
+        }
+    }
+
+    /// Return the backend selection metadata (for `wa doctor` / logging).
+    #[must_use]
+    pub fn selection(&self) -> &BackendSelection {
+        &self.selection
+    }
+
+    /// Return the inner handle.
+    #[must_use]
+    pub fn handle(&self) -> &WeztermHandle {
+        &self.inner
+    }
+}
+
+/// Inputs for backend selection logic, decoupled from feature-gated types.
+#[derive(Debug, Clone)]
+pub struct BackendSelectionInputs {
+    /// Whether the `vendored` feature is enabled at compile time.
+    pub vendored_feature_enabled: bool,
+    /// Whether vendored backend is allowed by compatibility checks.
+    pub allow_vendored: bool,
+    /// Human-readable compatibility message.
+    pub compat_message: String,
+    /// Serialized compatibility report (for observability).
+    pub compat_json: Option<serde_json::Value>,
+    /// Whether a mux socket was discovered.
+    pub socket_discovered: bool,
+}
+
+/// Evaluate backend selection rules and return a `BackendSelection` describing
+/// the outcome. This is a pure function over the provided inputs, suitable for
+/// unit testing without filesystem or network side effects.
+#[must_use]
+pub fn evaluate_backend_selection(inputs: &BackendSelectionInputs) -> BackendSelection {
+    if !inputs.vendored_feature_enabled {
+        return BackendSelection {
+            kind: BackendKind::Cli,
+            reason: "vendored feature not enabled at compile time".to_string(),
+            compatibility: inputs.compat_json.clone(),
+        };
+    }
+
+    if !inputs.allow_vendored {
+        return BackendSelection {
+            kind: BackendKind::Cli,
+            reason: format!("vendored backend disallowed: {}", inputs.compat_message),
+            compatibility: inputs.compat_json.clone(),
+        };
+    }
+
+    if !inputs.socket_discovered {
+        return BackendSelection {
+            kind: BackendKind::Cli,
+            reason: "mux socket not discovered; falling back to CLI".to_string(),
+            compatibility: inputs.compat_json.clone(),
+        };
+    }
+
+    BackendSelection {
+        kind: BackendKind::Vendored,
+        reason: format!("vendored backend selected: {}", inputs.compat_message),
+        compatibility: inputs.compat_json.clone(),
+    }
+}
+
+/// Build a `UnifiedClient` by probing the runtime environment.
+///
+/// 1. Check if the `vendored` feature is enabled (compile time).
+/// 2. Run vendored compatibility checks (when feature available).
+/// 3. Attempt mux socket discovery.
+/// 4. If all pass, use vendored backend; else fall back to CLI.
+pub fn build_unified_client(config: &crate::config::Config) -> UnifiedClient {
+    let vendored_enabled = cfg!(feature = "vendored");
+
+    // Build compatibility inputs depending on feature availability.
+    let (allow_vendored, compat_message, compat_json) = if vendored_enabled {
+        #[cfg(feature = "vendored")]
+        {
+            let local_version = crate::vendored::read_local_wezterm_version();
+            let report = crate::vendored::compatibility_report(local_version.as_ref());
+            let json = serde_json::to_value(&report).ok();
+            (report.allow_vendored, report.message.clone(), json)
+        }
+        #[cfg(not(feature = "vendored"))]
+        {
+            (false, "vendored module unavailable".to_string(), None)
+        }
+    } else {
+        (false, "vendored feature not enabled".to_string(), None)
+    };
+
+    // Socket discovery: check if a socket path is configured or discoverable.
+    let socket_found = config
+        .vendored
+        .mux_socket_path
+        .as_ref()
+        .is_some_and(|p| !p.trim().is_empty() && std::path::Path::new(p).exists())
+        || std::env::var_os("WEZTERM_UNIX_SOCKET")
+            .is_some_and(|p| !p.is_empty() && std::path::Path::new(&p).exists());
+
+    let inputs = BackendSelectionInputs {
+        vendored_feature_enabled: vendored_enabled,
+        allow_vendored,
+        compat_message,
+        compat_json,
+        socket_discovered: socket_found,
+    };
+
+    let selection = evaluate_backend_selection(&inputs);
+
+    tracing::info!(
+        backend = %selection.kind,
+        reason = %selection.reason,
+        "UnifiedClient backend selection"
+    );
+
+    let inner: WeztermHandle = match selection.kind {
+        BackendKind::Cli => Arc::new(WeztermClient::new()),
+        BackendKind::Vendored => {
+            // Even though selection says Vendored, we still wrap the CLI client
+            // because DirectMuxClient doesn't implement WeztermInterface (it has a
+            // different async API with &mut self). A future bead can bridge the gap
+            // with a proper adapter; for now, vendored selection is recorded for
+            // observability while we use CLI as the transport.
+            //
+            // TODO(wa-nu4.4.1.5): Implement VendoredAdapter that wraps
+            // DirectMuxClient behind WeztermInterface.
+            Arc::new(WeztermClient::new())
+        }
+    };
+
+    UnifiedClient { inner, selection }
+}
+
+impl WeztermInterface for UnifiedClient {
+    fn list_panes(&self) -> WeztermFuture<'_, Vec<PaneInfo>> {
+        self.inner.list_panes()
+    }
+
+    fn get_pane(&self, pane_id: u64) -> WeztermFuture<'_, PaneInfo> {
+        self.inner.get_pane(pane_id)
+    }
+
+    fn get_text(&self, pane_id: u64, escapes: bool) -> WeztermFuture<'_, String> {
+        self.inner.get_text(pane_id, escapes)
+    }
+
+    fn send_text(&self, pane_id: u64, text: &str) -> WeztermFuture<'_, ()> {
+        self.inner.send_text(pane_id, text)
+    }
+
+    fn send_text_no_paste(&self, pane_id: u64, text: &str) -> WeztermFuture<'_, ()> {
+        self.inner.send_text_no_paste(pane_id, text)
+    }
+
+    fn send_text_with_options(
+        &self,
+        pane_id: u64,
+        text: &str,
+        no_paste: bool,
+        no_newline: bool,
+    ) -> WeztermFuture<'_, ()> {
+        self.inner
+            .send_text_with_options(pane_id, text, no_paste, no_newline)
+    }
+
+    fn send_control(&self, pane_id: u64, control_char: &str) -> WeztermFuture<'_, ()> {
+        self.inner.send_control(pane_id, control_char)
+    }
+
+    fn send_ctrl_c(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
+        self.inner.send_ctrl_c(pane_id)
+    }
+
+    fn send_ctrl_d(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
+        self.inner.send_ctrl_d(pane_id)
+    }
+
+    fn spawn(&self, cwd: Option<&str>, domain_name: Option<&str>) -> WeztermFuture<'_, u64> {
+        self.inner.spawn(cwd, domain_name)
+    }
+
+    fn split_pane(
+        &self,
+        pane_id: u64,
+        direction: SplitDirection,
+        cwd: Option<&str>,
+        percent: Option<u8>,
+    ) -> WeztermFuture<'_, u64> {
+        self.inner.split_pane(pane_id, direction, cwd, percent)
+    }
+
+    fn activate_pane(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
+        self.inner.activate_pane(pane_id)
+    }
+
+    fn get_pane_direction(
+        &self,
+        pane_id: u64,
+        direction: MoveDirection,
+    ) -> WeztermFuture<'_, Option<u64>> {
+        self.inner.get_pane_direction(pane_id, direction)
+    }
+
+    fn kill_pane(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
+        self.inner.kill_pane(pane_id)
+    }
+
+    fn zoom_pane(&self, pane_id: u64, zoom: bool) -> WeztermFuture<'_, ()> {
+        self.inner.zoom_pane(pane_id, zoom)
+    }
+
+    fn circuit_status(&self) -> CircuitBreakerStatus {
+        self.inner.circuit_status()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // MockWezterm: in-memory pane state for testing and simulation
 // ---------------------------------------------------------------------------
 
@@ -2510,5 +2799,208 @@ mod mock_tests {
             .unwrap();
         assert_eq!(mock.pane_count().await, 1);
         assert_eq!(new_id, 0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// UnifiedClient tests (wa-nu4.4.1.3)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod unified_tests {
+    use super::*;
+
+    fn inputs(
+        feature_enabled: bool,
+        allow: bool,
+        message: &str,
+        socket: bool,
+    ) -> BackendSelectionInputs {
+        BackendSelectionInputs {
+            vendored_feature_enabled: feature_enabled,
+            allow_vendored: allow,
+            compat_message: message.to_string(),
+            compat_json: Some(serde_json::json!({
+                "status": if allow { "matched" } else { "incompatible" },
+                "message": message,
+            })),
+            socket_discovered: socket,
+        }
+    }
+
+    #[test]
+    fn select_vendored_when_all_conditions_met() {
+        let inp = inputs(true, true, "commit matches vendored build", true);
+        let sel = evaluate_backend_selection(&inp);
+        assert_eq!(sel.kind, BackendKind::Vendored);
+        assert!(sel.reason.contains("vendored backend selected"));
+        assert!(sel.compatibility.is_some());
+    }
+
+    #[test]
+    fn select_cli_when_feature_disabled() {
+        let inp = inputs(false, false, "vendored feature not enabled", true);
+        let sel = evaluate_backend_selection(&inp);
+        assert_eq!(sel.kind, BackendKind::Cli);
+        assert!(sel.reason.contains("not enabled"));
+    }
+
+    #[test]
+    fn select_cli_when_incompatible() {
+        let inp = inputs(
+            true,
+            false,
+            "local commit deadbeef does not match vendored abcdef12",
+            true,
+        );
+        let sel = evaluate_backend_selection(&inp);
+        assert_eq!(sel.kind, BackendKind::Cli);
+        assert!(sel.reason.contains("disallowed"));
+    }
+
+    #[test]
+    fn select_cli_when_socket_not_found() {
+        let inp = inputs(true, true, "commit matches vendored build", false);
+        let sel = evaluate_backend_selection(&inp);
+        assert_eq!(sel.kind, BackendKind::Cli);
+        assert!(sel.reason.contains("socket not discovered"));
+    }
+
+    #[test]
+    fn select_vendored_compatible_with_socket() {
+        let inp = inputs(
+            true,
+            true,
+            "local version unavailable; assuming compatible",
+            true,
+        );
+        let sel = evaluate_backend_selection(&inp);
+        assert_eq!(sel.kind, BackendKind::Vendored);
+    }
+
+    #[test]
+    fn backend_kind_display() {
+        assert_eq!(format!("{}", BackendKind::Cli), "cli");
+        assert_eq!(format!("{}", BackendKind::Vendored), "vendored");
+    }
+
+    #[test]
+    fn backend_kind_serde_roundtrip() {
+        let json = serde_json::to_string(&BackendKind::Vendored).unwrap();
+        assert_eq!(json, r#""vendored""#);
+        let back: BackendKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, BackendKind::Vendored);
+    }
+
+    #[test]
+    fn backend_selection_serializes() {
+        let inp = inputs(true, true, "matched", true);
+        let sel = evaluate_backend_selection(&inp);
+        let json = serde_json::to_value(&sel).expect("should serialize");
+        assert_eq!(json["kind"], "vendored");
+        assert!(
+            json["reason"]
+                .as_str()
+                .unwrap()
+                .contains("vendored backend selected")
+        );
+        assert!(json["compatibility"].is_object());
+    }
+
+    #[test]
+    fn backend_selection_without_compat_json() {
+        let inp = BackendSelectionInputs {
+            vendored_feature_enabled: false,
+            allow_vendored: false,
+            compat_message: "no vendored".to_string(),
+            compat_json: None,
+            socket_discovered: false,
+        };
+        let sel = evaluate_backend_selection(&inp);
+        assert_eq!(sel.kind, BackendKind::Cli);
+        // compatibility should be omitted in JSON (skip_serializing_if)
+        let json = serde_json::to_value(&sel).unwrap();
+        assert!(json.get("compatibility").is_none());
+    }
+
+    #[test]
+    fn unified_client_cli_delegates_to_mock() {
+        let mock = MockWezterm::new();
+        let handle: WeztermHandle = Arc::new(mock);
+        let sel = BackendSelection {
+            kind: BackendKind::Cli,
+            reason: "test".to_string(),
+            compatibility: None,
+        };
+        let unified = UnifiedClient::from_handle(handle, sel);
+        assert_eq!(unified.selection().kind, BackendKind::Cli);
+        assert_eq!(unified.selection().reason, "test");
+    }
+
+    #[tokio::test]
+    async fn unified_client_get_text_delegates() {
+        let mock = MockWezterm::new();
+        mock.add_default_pane(0).await;
+        mock.inject_output(0, "hello from unified").await.unwrap();
+
+        let handle: WeztermHandle = Arc::new(mock);
+        let sel = BackendSelection {
+            kind: BackendKind::Cli,
+            reason: "test".to_string(),
+            compatibility: None,
+        };
+        let unified = UnifiedClient::from_handle(handle, sel);
+        let text = unified.get_text(0, false).await.unwrap();
+        assert_eq!(text, "hello from unified");
+    }
+
+    #[tokio::test]
+    async fn unified_client_send_text_delegates() {
+        let mock = MockWezterm::new();
+        mock.add_default_pane(0).await;
+
+        let handle: WeztermHandle = Arc::new(mock);
+        let sel = BackendSelection {
+            kind: BackendKind::Cli,
+            reason: "test".to_string(),
+            compatibility: None,
+        };
+        let unified = UnifiedClient::from_handle(handle, sel);
+        unified.send_text(0, "cmd\n").await.unwrap();
+        let text = unified.get_text(0, false).await.unwrap();
+        assert_eq!(text, "cmd\n");
+    }
+
+    #[tokio::test]
+    async fn unified_client_list_panes_delegates() {
+        let mock = MockWezterm::new();
+        mock.add_default_pane(0).await;
+        mock.add_default_pane(1).await;
+
+        let handle: WeztermHandle = Arc::new(mock);
+        let sel = BackendSelection {
+            kind: BackendKind::Vendored,
+            reason: "test".to_string(),
+            compatibility: None,
+        };
+        let unified = UnifiedClient::from_handle(handle, sel);
+        let panes = unified.list_panes().await.unwrap();
+        assert_eq!(panes.len(), 2);
+    }
+
+    #[test]
+    fn build_unified_client_returns_cli_without_vendored_feature() {
+        let config = crate::config::Config::default();
+        let client = build_unified_client(&config);
+        if !cfg!(feature = "vendored") {
+            assert_eq!(client.selection().kind, BackendKind::Cli);
+        }
+    }
+
+    #[test]
+    fn unified_client_cli_constructor() {
+        let unified = UnifiedClient::cli();
+        assert_eq!(unified.selection().kind, BackendKind::Cli);
+        assert!(unified.selection().reason.contains("explicit CLI"));
     }
 }
