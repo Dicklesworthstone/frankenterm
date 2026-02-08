@@ -361,6 +361,7 @@ SCENARIO_REGISTRY=(
     "compaction_workflow|Validate pattern detection and workflow execution|true|wezterm,jq,sqlite3|Protects compaction workflow auto-handle"
     "unhandled_event_lifecycle|Validate unhandled event lifecycle and dedupe handling|true|wezterm,jq,sqlite3|Protects dedupe + unhandled tracking"
     "workflow_lifecycle|Validate robot workflow list/run/status/abort (dry-run)|true|wezterm,jq,sqlite3|Protects robot workflow surface"
+    "history_undo_workflow|Validate action history workflow view + undo execution lifecycle|true|jq,sqlite3|Protects rollback visualization and undo trust surface"
     "dry_run_mode|Validate dry-run previews for send/workflow (human+robot) without side effects|true|wezterm,jq,sqlite3|Protects dry-run trust surface"
     "events_unhandled_alias|Validate robot events --unhandled alias|true|wezterm,jq,sqlite3|Protects events CLI aliases"
     "events_annotations_triage|Validate event annotate/label/triage lifecycle with redaction + audit evidence|true|jq,sqlite3|Protects event mutation workflows and filters"
@@ -6583,6 +6584,232 @@ SQL
 }
 
 # ==============================================================================
+# Scenario: History + Undo Workflow Lifecycle
+# ==============================================================================
+# Validates that:
+# 1) wa history --workflow renders expected workflow action tree lines
+# 2) wa undo --list surfaces currently undoable workflow action
+# 3) wa undo <action-id> succeeds for workflow_abort and marks action undone
+# 4) workflow execution transitions to aborted and remains auditable
+# ==============================================================================
+
+run_scenario_history_undo_workflow() {
+    local scenario_dir="$1"
+    local temp_workspace
+    temp_workspace=$(mktemp -d /tmp/wa-e2e-history-undo-XXXXXX)
+    local result=0
+    local db_path=""
+    local pane_id=9301
+    local workflow_id="wf-e2e-history-undo"
+    local start_action_id=900001
+    local step_action_id=900002
+    local old_wa_data_dir="${WA_DATA_DIR:-}"
+    local old_wa_workspace="${WA_WORKSPACE:-}"
+    local old_wa_config="${WA_CONFIG:-}"
+
+    log_info "Workspace: $temp_workspace"
+
+    cleanup_history_undo_workflow() {
+        log_verbose "Cleaning up history_undo_workflow scenario"
+        if [[ -d "${temp_workspace:-}" ]]; then
+            cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp "$temp_workspace/wa.toml" "$scenario_dir/" 2>/dev/null || true
+        fi
+        if [[ -n "$old_wa_data_dir" ]]; then
+            export WA_DATA_DIR="$old_wa_data_dir"
+        else
+            unset WA_DATA_DIR
+        fi
+        if [[ -n "$old_wa_workspace" ]]; then
+            export WA_WORKSPACE="$old_wa_workspace"
+        else
+            unset WA_WORKSPACE
+        fi
+        if [[ -n "$old_wa_config" ]]; then
+            export WA_CONFIG="$old_wa_config"
+        else
+            unset WA_CONFIG
+        fi
+
+        # Keep workspace for postmortem/debug review.
+        echo "temp_workspace: $temp_workspace" >> "$scenario_dir/scenario.log"
+    }
+    trap cleanup_history_undo_workflow EXIT
+
+    export WA_DATA_DIR="$temp_workspace/.wa"
+    export WA_WORKSPACE="$temp_workspace"
+    mkdir -p "$WA_DATA_DIR"
+
+    local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
+    if [[ -f "$baseline_config" ]]; then
+        cp "$baseline_config" "$temp_workspace/wa.toml"
+        export WA_CONFIG="$temp_workspace/wa.toml"
+        log_verbose "Using baseline config: $baseline_config"
+    fi
+
+    # Step 1: Initialize DB
+    log_info "Step 1: Initializing DB..."
+    "$WA_BINARY" db migrate --yes > "$scenario_dir/db_migrate.txt" 2>&1 || true
+    "$WA_BINARY" db check -f json > "$scenario_dir/db_check.json" 2>&1 || true
+    db_path="$temp_workspace/.wa/wa.db"
+    if [[ ! -f "$db_path" ]]; then
+        log_fail "DB not created at $db_path"
+        result=1
+    fi
+
+    if [[ $result -eq 0 ]]; then
+        # Step 2: Seed deterministic workflow + action history + undo metadata
+        log_info "Step 2: Seeding workflow/action-history fixtures..."
+        local now_ms
+        now_ms=$(python3 - <<'PY'
+import time
+print(int(time.time() * 1000))
+PY
+)
+        local start_ts=$((now_ms - 3000))
+        local step_ts=$((now_ms - 2000))
+
+        sqlite3 "$db_path" <<SQL
+PRAGMA foreign_keys = ON;
+INSERT OR REPLACE INTO panes (
+    pane_id, pane_uuid, domain, window_id, tab_id, title, cwd, tty_name,
+    first_seen_at, last_seen_at, observed, ignore_reason, last_decision_at
+) VALUES (
+    $pane_id, 'e2e-history-undo-pane', 'local', 1, 1, 'e2e-history-undo', '$temp_workspace', 'tty-e2e-history-undo',
+    $now_ms, $now_ms, 1, NULL, $now_ms
+);
+
+INSERT OR REPLACE INTO workflow_executions (
+    id, workflow_name, pane_id, trigger_event_id, current_step, status, wait_condition, context,
+    result, error, started_at, updated_at, completed_at
+) VALUES (
+    '$workflow_id', 'e2e_history_undo', $pane_id, NULL, 1, 'running', NULL, NULL,
+    NULL, NULL, $start_ts, $now_ms, NULL
+);
+
+INSERT OR REPLACE INTO audit_actions (
+    id, ts, actor_kind, actor_id, correlation_id, pane_id, domain, action_kind,
+    policy_decision, decision_reason, rule_id, input_summary, verification_summary, decision_context, result
+) VALUES (
+    $start_action_id, $start_ts, 'workflow', '$workflow_id', NULL, $pane_id, 'local', 'workflow_start',
+    'allow', 'workflow started', NULL, '{"workflow_name":"e2e_history_undo"}', NULL, NULL, 'success'
+);
+
+INSERT OR REPLACE INTO action_undo (
+    audit_action_id, undoable, undo_strategy, undo_hint, undo_payload, undone_at, undone_by
+) VALUES (
+    $start_action_id, 1, 'workflow_abort', 'Abort workflow execution', '{"execution_id":"$workflow_id","pane_id":$pane_id}', NULL, NULL
+);
+
+INSERT OR REPLACE INTO audit_actions (
+    id, ts, actor_kind, actor_id, correlation_id, pane_id, domain, action_kind,
+    policy_decision, decision_reason, rule_id, input_summary, verification_summary, decision_context, result
+) VALUES (
+    $step_action_id, $step_ts, 'workflow', '$workflow_id', NULL, $pane_id, 'local', 'workflow_step',
+    'allow', 'workflow step emitted', NULL, '{"step_name":"send_probe","parent_action_id":$start_action_id}', NULL, NULL, 'success'
+);
+
+INSERT OR REPLACE INTO workflow_step_logs (
+    id, workflow_id, audit_action_id, step_index, step_name, step_id, step_kind, result_type,
+    result_data, policy_summary, verification_refs, error_code, started_at, completed_at, duration_ms
+) VALUES (
+    1, '$workflow_id', $step_action_id, 1, 'send_probe', 'step-send-probe', 'send_text', 'continue',
+    '{"sent":"echo probe"}', NULL, NULL, NULL, $step_ts, $step_ts, 0
+);
+SQL
+    fi
+
+    if [[ $result -eq 0 ]]; then
+        # Step 3: Verify workflow history rendering and undo list surface
+        log_info "Step 3: Verifying history + undo list..."
+        "$WA_BINARY" history --workflow "$workflow_id" --format plain --limit 20 \
+            > "$scenario_dir/history_workflow_plain.txt" 2> "$scenario_dir/history_workflow_plain.stderr" || true
+        "$WA_BINARY" history --workflow "$workflow_id" --export json --limit 20 \
+            > "$scenario_dir/history_workflow.json" 2> "$scenario_dir/history_workflow_json.stderr" || true
+        "$WA_BINARY" undo --list --format json --limit 20 \
+            > "$scenario_dir/undo_list.json" 2> "$scenario_dir/undo_list.stderr" || true
+
+        if grep -q "workflow_start" "$scenario_dir/history_workflow_plain.txt" \
+            && grep -q "workflow_step" "$scenario_dir/history_workflow_plain.txt"; then
+            log_pass "wa history --workflow contains expected workflow actions"
+        else
+            log_fail "wa history --workflow missing expected action tree lines"
+            result=1
+        fi
+
+        if jq -e \
+            --argjson action_id "$start_action_id" \
+            '.ok == true and (.data.actions | map(.action_id) | index($action_id) != null)' \
+            "$scenario_dir/undo_list.json" >/dev/null 2>&1; then
+            log_pass "wa undo --list exposes seeded undoable workflow action"
+        else
+            log_fail "wa undo --list did not expose expected workflow action"
+            result=1
+        fi
+    fi
+
+    if [[ $result -eq 0 ]]; then
+        # Step 4: Execute undo and validate lifecycle transition
+        log_info "Step 4: Executing undo and validating state transitions..."
+        "$WA_BINARY" undo "$start_action_id" --yes --format json \
+            > "$scenario_dir/undo_execute.json" 2> "$scenario_dir/undo_execute.stderr" || true
+        "$WA_BINARY" audit -f json -l 20 > "$scenario_dir/audit_after_undo.json" \
+            2> "$scenario_dir/audit_after_undo.stderr" || true
+
+        if jq -e \
+            '.ok == true
+             and (.data.results | length) == 1
+             and .data.results[0].outcome == "success"' \
+            "$scenario_dir/undo_execute.json" >/dev/null 2>&1; then
+            log_pass "wa undo executed successfully"
+        else
+            log_fail "wa undo execution did not return success"
+            result=1
+        fi
+
+        local workflow_status
+        workflow_status=$(sqlite3 "$db_path" \
+            "SELECT status FROM workflow_executions WHERE id = '$workflow_id' LIMIT 1;")
+        if [[ "$workflow_status" == "aborted" ]]; then
+            log_pass "Workflow status transitioned to aborted"
+        else
+            log_fail "Workflow status expected 'aborted', got '$workflow_status'"
+            result=1
+        fi
+
+        local undo_state
+        undo_state=$(sqlite3 "$db_path" \
+            "SELECT CASE WHEN undone_at IS NOT NULL AND undone_by = 'human-cli' THEN 'ok' ELSE 'bad' END FROM action_undo WHERE audit_action_id = $start_action_id;")
+        if [[ "$undo_state" == "ok" ]]; then
+            log_pass "Undo metadata marked with undone_at + undone_by"
+        else
+            log_fail "Undo metadata did not record expected undone state"
+            result=1
+        fi
+    fi
+
+    if [[ $result -eq 0 ]]; then
+        # Step 5: Capture compact scenario summary
+        log_info "Step 5: Writing scenario summary..."
+        jq -n \
+            --arg workflow_id "$workflow_id" \
+            --argjson action_id "$start_action_id" \
+            --arg status "$(sqlite3 "$db_path" "SELECT status FROM workflow_executions WHERE id = '$workflow_id' LIMIT 1;")" \
+            --slurpfile undo "$scenario_dir/undo_execute.json" \
+            '{
+              workflow_id: $workflow_id,
+              undo_action_id: $action_id,
+              workflow_status_after_undo: $status,
+              undo_outcome: ($undo[0].data.results[0].outcome // null)
+            }' > "$scenario_dir/history_undo_summary.json" 2>/dev/null || true
+    fi
+
+    trap - EXIT
+    cleanup_history_undo_workflow
+    return $result
+}
+
+# ==============================================================================
 # Scenario: Accounts Refresh (fake caut + pick preview + redaction)
 # ==============================================================================
 # Validates that:
@@ -7510,6 +7737,9 @@ run_scenario() {
                 ;;
             events_annotations_triage)
                 run_scenario_events_annotations_triage "$scenario_dir" || result=$?
+                ;;
+            history_undo_workflow)
+                run_scenario_history_undo_workflow "$scenario_dir" || result=$?
                 ;;
         policy_denial)
             run_scenario_policy_denial "$scenario_dir" || result=$?
