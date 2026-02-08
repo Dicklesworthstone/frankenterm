@@ -112,6 +112,21 @@ fn assert_no_ansi(output: &str, context: &str) {
     );
 }
 
+/// Run a wa command and parse stdout as JSON.
+fn run_wa_json(workspace: &str, args: &[&str]) -> serde_json::Value {
+    let output = wa_cmd_for(workspace)
+        .args(args)
+        .output()
+        .expect("wa command should execute");
+    assert!(
+        output.status.success(),
+        "command failed: wa {} \nstderr: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("stdout should be valid JSON")
+}
+
 // =============================================================================
 // wa status contract tests
 // =============================================================================
@@ -275,6 +290,137 @@ fn contract_events_filter_by_pane() {
             "filtered events should only contain pane 2"
         );
     }
+}
+
+#[test]
+fn contract_events_mutations_human_roundtrip() {
+    let (_dir, ws) = setup_populated_workspace();
+
+    let events = run_wa_json(&ws, &["events", "--format", "json"]);
+    let first_id = events
+        .as_array()
+        .and_then(|rows| rows.first())
+        .and_then(|row| row.get("id"))
+        .and_then(serde_json::Value::as_i64)
+        .expect("expected at least one event with id");
+
+    let annotate = run_wa_json(
+        &ws,
+        &[
+            "events",
+            "--format",
+            "json",
+            "annotate",
+            &first_id.to_string(),
+            "--note",
+            "investigating event",
+        ],
+    );
+    assert_eq!(annotate["ok"], true);
+    assert_eq!(annotate["annotations"]["note"], "investigating event");
+
+    let triage = run_wa_json(
+        &ws,
+        &[
+            "events",
+            "--format",
+            "json",
+            "triage",
+            &first_id.to_string(),
+            "--state",
+            "investigating",
+        ],
+    );
+    assert_eq!(triage["ok"], true);
+    assert_eq!(triage["annotations"]["triage_state"], "investigating");
+
+    let label = run_wa_json(
+        &ws,
+        &[
+            "events",
+            "--format",
+            "json",
+            "label",
+            &first_id.to_string(),
+            "--add",
+            "urgent",
+        ],
+    );
+    assert_eq!(label["ok"], true);
+    assert!(
+        label["annotations"]["labels"]
+            .as_array()
+            .is_some_and(|labels| labels.iter().any(|v| v == "urgent")),
+        "labels should contain urgent: {}",
+        label["annotations"]
+    );
+}
+
+#[test]
+fn contract_robot_events_mutations_roundtrip() {
+    let (_dir, ws) = setup_populated_workspace();
+
+    let baseline = run_wa_json(&ws, &["events", "--format", "json"]);
+    let first_id = baseline
+        .as_array()
+        .and_then(|rows| rows.first())
+        .and_then(|row| row.get("id"))
+        .and_then(serde_json::Value::as_i64)
+        .expect("expected at least one event with id");
+
+    let annotate = run_wa_json(
+        &ws,
+        &[
+            "robot",
+            "events",
+            "annotate",
+            &first_id.to_string(),
+            "--note",
+            "robot-note",
+        ],
+    );
+    assert_eq!(annotate["ok"], true);
+    assert_eq!(
+        annotate["data"]["annotations"]["note"],
+        serde_json::Value::String("robot-note".to_string())
+    );
+
+    let triage = run_wa_json(
+        &ws,
+        &[
+            "robot",
+            "events",
+            "triage",
+            &first_id.to_string(),
+            "--state",
+            "investigating",
+        ],
+    );
+    assert_eq!(triage["ok"], true);
+    assert_eq!(
+        triage["data"]["annotations"]["triage_state"],
+        serde_json::Value::String("investigating".to_string())
+    );
+
+    let label = run_wa_json(
+        &ws,
+        &[
+            "robot",
+            "events",
+            "label",
+            &first_id.to_string(),
+            "--add",
+            "urgent",
+        ],
+    );
+    assert_eq!(label["ok"], true);
+    assert!(
+        label["data"]["annotations"]["labels"]
+            .as_array()
+            .is_some_and(|labels| labels.iter().any(|v| v == "urgent")),
+        "robot labels should contain urgent: {}",
+        label["data"]["annotations"]
+    );
 }
 
 #[test]

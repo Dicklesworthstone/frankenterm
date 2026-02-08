@@ -648,6 +648,409 @@ fn labels_scoped_to_event() {
     });
 }
 
+// ---- Note redaction of secrets (bd-1q77) ----
+
+#[test]
+fn note_with_secret_is_redacted_on_storage() {
+    let rt = runtime();
+    rt.block_on(async {
+        let (_dir, storage, event_id) = setup_with_event().await;
+
+        // Build an OpenAI-style key at runtime (split to avoid push-protection)
+        let secret_key = [
+            "sk-",
+            "proj-",
+            "abc123456789012345678901234567890123456789ABCDE",
+        ]
+        .concat();
+        let note_text = format!("Found key: {secret_key} in logs");
+
+        storage
+            .set_event_note(event_id, Some(note_text), Some("bot".to_string()))
+            .await
+            .unwrap();
+
+        let ann = storage
+            .get_event_annotations(event_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // The secret should be redacted before persistence
+        let stored_note = ann.note.as_deref().unwrap();
+        assert!(
+            stored_note.contains("[REDACTED]"),
+            "note should contain REDACTED marker: {stored_note}"
+        );
+        let prefix = ["sk-", "proj-"].concat();
+        assert!(
+            !stored_note.contains(&prefix),
+            "API key prefix should not be in stored note: {stored_note}"
+        );
+    });
+}
+
+#[test]
+fn note_without_secrets_passes_through() {
+    let rt = runtime();
+    rt.block_on(async {
+        let (_dir, storage, event_id) = setup_with_event().await;
+
+        let note_text = "This is a clean note with no secrets".to_string();
+        storage
+            .set_event_note(event_id, Some(note_text.clone()), None)
+            .await
+            .unwrap();
+
+        let ann = storage
+            .get_event_annotations(event_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ann.note.as_deref(), Some(note_text.as_str()));
+    });
+}
+
+#[test]
+fn note_with_bearer_token_is_redacted() {
+    let rt = runtime();
+    rt.block_on(async {
+        let (_dir, storage, event_id) = setup_with_event().await;
+
+        // Must match the bearer_token regex: Authorization: Bearer <20+ chars>
+        let token = [
+            "Authorization: Bearer ",
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0",
+        ]
+        .concat();
+        let note_text = format!("Auth header: {token}");
+
+        storage
+            .set_event_note(event_id, Some(note_text), None)
+            .await
+            .unwrap();
+
+        let ann = storage
+            .get_event_annotations(event_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let stored_note = ann.note.as_deref().unwrap();
+        assert!(
+            stored_note.contains("[REDACTED]"),
+            "bearer token should be redacted: {stored_note}"
+        );
+    });
+}
+
+// ---- Empty and edge-case notes (bd-1q77) ----
+
+#[test]
+fn empty_string_note_is_stored() {
+    let rt = runtime();
+    rt.block_on(async {
+        let (_dir, storage, event_id) = setup_with_event().await;
+
+        storage
+            .set_event_note(event_id, Some(String::new()), Some("alice".to_string()))
+            .await
+            .unwrap();
+
+        let ann = storage
+            .get_event_annotations(event_id)
+            .await
+            .unwrap()
+            .unwrap();
+        // Empty string note should be stored (not treated as None)
+        assert_eq!(ann.note.as_deref(), Some(""));
+        assert!(ann.note_updated_at.is_some());
+    });
+}
+
+#[test]
+fn whitespace_only_note_is_stored() {
+    let rt = runtime();
+    rt.block_on(async {
+        let (_dir, storage, event_id) = setup_with_event().await;
+
+        storage
+            .set_event_note(event_id, Some("   \n\t  ".to_string()), None)
+            .await
+            .unwrap();
+
+        let ann = storage
+            .get_event_annotations(event_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(ann.note.is_some());
+    });
+}
+
+// ---- Triage state edge cases (bd-1q77) ----
+
+#[test]
+fn triage_state_backward_transition() {
+    let rt = runtime();
+    rt.block_on(async {
+        let (_dir, storage, event_id) = setup_with_event().await;
+
+        // Forward: new → investigating → resolved
+        storage
+            .set_event_triage_state(
+                event_id,
+                Some("resolved".to_string()),
+                Some("ops".to_string()),
+            )
+            .await
+            .unwrap();
+
+        // Backward: resolved → new (should be allowed — no state machine enforcement)
+        storage
+            .set_event_triage_state(event_id, Some("new".to_string()), Some("ops".to_string()))
+            .await
+            .unwrap();
+
+        let ann = storage
+            .get_event_annotations(event_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ann.triage_state.as_deref(), Some("new"));
+    });
+}
+
+#[test]
+fn triage_state_accepts_arbitrary_strings() {
+    let rt = runtime();
+    rt.block_on(async {
+        let (_dir, storage, event_id) = setup_with_event().await;
+
+        // Any string is accepted (no restricted state machine)
+        let updated = storage
+            .set_event_triage_state(event_id, Some("custom_state_xyz".to_string()), None)
+            .await
+            .unwrap();
+        assert!(updated);
+
+        let ann = storage
+            .get_event_annotations(event_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ann.triage_state.as_deref(), Some("custom_state_xyz"));
+    });
+}
+
+#[test]
+fn triage_state_set_same_twice_is_idempotent() {
+    let rt = runtime();
+    rt.block_on(async {
+        let (_dir, storage, event_id) = setup_with_event().await;
+
+        storage
+            .set_event_triage_state(
+                event_id,
+                Some("investigating".to_string()),
+                Some("ops".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let ann1 = storage
+            .get_event_annotations(event_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Set same state again
+        storage
+            .set_event_triage_state(
+                event_id,
+                Some("investigating".to_string()),
+                Some("ops".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let ann2 = storage
+            .get_event_annotations(event_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(ann1.triage_state, ann2.triage_state);
+        // Timestamp may change (it's an update, not a no-op)
+    });
+}
+
+#[test]
+fn triage_timestamp_updates_on_mutation() {
+    let rt = runtime();
+    rt.block_on(async {
+        let (_dir, storage, event_id) = setup_with_event().await;
+
+        storage
+            .set_event_triage_state(event_id, Some("new".to_string()), Some("alice".to_string()))
+            .await
+            .unwrap();
+
+        let ann1 = storage
+            .get_event_annotations(event_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let ts1 = ann1.triage_updated_at.unwrap();
+
+        // Small delay then update
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        storage
+            .set_event_triage_state(
+                event_id,
+                Some("investigating".to_string()),
+                Some("bob".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let ann2 = storage
+            .get_event_annotations(event_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let ts2 = ann2.triage_updated_at.unwrap();
+
+        assert!(
+            ts2 >= ts1,
+            "timestamp should not decrease: ts1={ts1} ts2={ts2}"
+        );
+        assert_eq!(ann2.triage_updated_by.as_deref(), Some("bob"));
+    });
+}
+
+// ---- Label edge cases (bd-1q77) ----
+
+#[test]
+fn many_labels_sorted_alphabetically() {
+    let rt = runtime();
+    rt.block_on(async {
+        let (_dir, storage, event_id) = setup_with_event().await;
+
+        for label in &["zebra", "alpha", "middle", "beta"] {
+            storage
+                .add_event_label(event_id, label.to_string(), None)
+                .await
+                .unwrap();
+        }
+
+        let ann = storage
+            .get_event_annotations(event_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ann.labels, vec!["alpha", "beta", "middle", "zebra"]);
+    });
+}
+
+#[test]
+fn remove_all_labels_leaves_empty_vec() {
+    let rt = runtime();
+    rt.block_on(async {
+        let (_dir, storage, event_id) = setup_with_event().await;
+
+        storage
+            .add_event_label(event_id, "a".to_string(), None)
+            .await
+            .unwrap();
+        storage
+            .add_event_label(event_id, "b".to_string(), None)
+            .await
+            .unwrap();
+
+        storage
+            .remove_event_label(event_id, "a".to_string())
+            .await
+            .unwrap();
+        storage
+            .remove_event_label(event_id, "b".to_string())
+            .await
+            .unwrap();
+
+        let ann = storage
+            .get_event_annotations(event_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(ann.labels.is_empty());
+    });
+}
+
+#[test]
+fn label_on_nonexistent_event() {
+    let rt = runtime();
+    rt.block_on(async {
+        let (_dir, path) = temp_db();
+        let storage = StorageHandle::new(&path).await.expect("create storage");
+
+        // Adding a label to a nonexistent event should fail gracefully
+        let result = storage
+            .add_event_label(99999, "orphan".to_string(), None)
+            .await;
+        // May succeed (FOREIGN KEY might be disabled) or error
+        // Either way, no panic
+        let _ = result;
+    });
+}
+
+#[test]
+fn note_timestamp_updates_on_mutation() {
+    let rt = runtime();
+    rt.block_on(async {
+        let (_dir, storage, event_id) = setup_with_event().await;
+
+        storage
+            .set_event_note(
+                event_id,
+                Some("first".to_string()),
+                Some("alice".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let ann1 = storage
+            .get_event_annotations(event_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let ts1 = ann1.note_updated_at.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        storage
+            .set_event_note(
+                event_id,
+                Some("second".to_string()),
+                Some("bob".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let ann2 = storage
+            .get_event_annotations(event_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let ts2 = ann2.note_updated_at.unwrap();
+
+        assert!(
+            ts2 >= ts1,
+            "note timestamp should not decrease: ts1={ts1} ts2={ts2}"
+        );
+        assert_eq!(ann2.note_updated_by.as_deref(), Some("bob"));
+    });
+}
+
 // ---- Schema migration v18 ----
 
 #[test]

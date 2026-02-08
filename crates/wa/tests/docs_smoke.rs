@@ -281,6 +281,61 @@ fn smoke_wa_robot_health() {
     );
 }
 
+#[test]
+fn smoke_robot_playbook_commands_emit_json_envelopes() {
+    let commands: [(&str, &[&str]); 4] = [
+        ("robot_state", &["robot", "--format", "json", "state"]),
+        (
+            "robot_search",
+            &[
+                "robot",
+                "--format",
+                "json",
+                "search",
+                "playbook-smoke",
+                "--limit",
+                "1",
+            ],
+        ),
+        (
+            "robot_events",
+            &["robot", "--format", "json", "events", "--limit", "1"],
+        ),
+        (
+            "robot_workflow_list",
+            &["robot", "--format", "json", "workflow", "list"],
+        ),
+    ];
+
+    for (label, args) in commands {
+        let output = wa_cmd()
+            .args(args)
+            .output()
+            .expect("playbook command should execute");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        save_artifact(&format!("{label}_stdout.txt"), &stdout);
+        save_artifact(&format!("{label}_stderr.txt"), &stderr);
+
+        assert!(
+            !stderr.contains("panicked"),
+            "{label} should not panic, stderr: {stderr}"
+        );
+
+        let parsed = serde_json::from_str::<serde_json::Value>(&stdout).unwrap_or_else(|e| {
+            panic!("{label} should emit valid JSON envelope, parse error: {e}, stdout: {stdout}")
+        });
+        assert!(
+            parsed
+                .get("ok")
+                .and_then(serde_json::Value::as_bool)
+                .is_some(),
+            "{label} JSON should include boolean 'ok' field: {parsed}"
+        );
+    }
+}
+
 // =============================================================================
 // Predicate-based tests (using assert_cmd sugar)
 // =============================================================================
