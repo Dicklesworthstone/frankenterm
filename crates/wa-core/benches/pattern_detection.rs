@@ -18,6 +18,18 @@ const BUDGETS: &[bench_common::BenchBudget] = &[
         name: "pattern_detection_typical",
         budget: "p50 < 1ms, p99 < 5ms (typical corpus)",
     },
+    bench_common::BenchBudget {
+        name: "lazy_init_construction",
+        budget: "< 50ms (no compilation, pack loading only)",
+    },
+    bench_common::BenchBudget {
+        name: "lazy_init_first_detect",
+        budget: "< 200ms (includes one-time compilation)",
+    },
+    bench_common::BenchBudget {
+        name: "lazy_init_warm_detect",
+        budget: "< 5ms (index already compiled)",
+    },
 ];
 
 /// Typical shell output that shouldn't match any patterns.
@@ -180,6 +192,37 @@ fn bench_throughput(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_lazy_init(c: &mut Criterion) {
+    let mut group = c.benchmark_group("pattern_lazy_init");
+
+    // Budget: construction must be fast (no compilation)
+    group.bench_function("construction_only", |b| {
+        b.iter(|| {
+            let engine = PatternEngine::new();
+            assert!(!engine.is_initialized());
+            engine
+        });
+    });
+
+    // First detect() triggers compilation — measure the one-time cost
+    group.bench_function("first_detect_cold", |b| {
+        b.iter(|| {
+            let engine = PatternEngine::new();
+            engine.detect(TYPICAL_NO_MATCH)
+        });
+    });
+
+    // Subsequent detect() should be fast (index already compiled)
+    group.bench_function("subsequent_detect_warm", |b| {
+        let engine = PatternEngine::new();
+        let _ = engine.detect("warmup");
+        assert!(engine.is_initialized());
+        b.iter(|| engine.detect(TYPICAL_NO_MATCH));
+    });
+
+    group.finish();
+}
+
 fn bench_config() -> Criterion {
     bench_common::emit_bench_artifacts("pattern_detection", BUDGETS);
     Criterion::default().configure_from_args()
@@ -191,6 +234,7 @@ criterion_group!(
     targets = bench_quick_reject,
         bench_pattern_detection,
         bench_detection_with_context,
-        bench_throughput
+        bench_throughput,
+        bench_lazy_init
 );
 criterion_main!(benches);

@@ -662,10 +662,7 @@ pub fn generate_ssh_domains_lua(hosts: &[SshHost], scrollback_lines: u64) -> Str
             // order, so the first is typically the most specific for this host).
             if let Some(ifile) = host.identity_files.first() {
                 output.push_str("    ssh_option = {\n");
-                output.push_str(&format!(
-                    "      identityfile = '{}',\n",
-                    lua_escape(ifile)
-                ));
+                output.push_str(&format!("      identityfile = '{}',\n", lua_escape(ifile)));
                 output.push_str("    },\n");
             }
             output.push_str("    multiplexing = 'WezTerm',\n");

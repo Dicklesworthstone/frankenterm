@@ -2494,6 +2494,79 @@ rules:
     }
 
     #[test]
+    fn lazy_init_from_config_defers_compilation() {
+        let config = PatternsConfig::default();
+        let engine = PatternEngine::from_config(&config).unwrap();
+        assert!(
+            !engine.is_initialized(),
+            "from_config should NOT compile eagerly"
+        );
+        let _ = engine.detect("trigger compilation");
+        assert!(
+            engine.is_initialized(),
+            "detect should trigger lazy compilation"
+        );
+    }
+
+    #[test]
+    fn lazy_init_thread_safe() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let engine = Arc::new(PatternEngine::new());
+        assert!(!engine.is_initialized());
+
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let eng = Arc::clone(&engine);
+            handles.push(thread::spawn(move || {
+                let _ = eng.detect("concurrent access");
+            }));
+        }
+        for h in handles {
+            h.join().expect("thread should not panic");
+        }
+        assert!(engine.is_initialized());
+    }
+
+    #[test]
+    fn lazy_vs_eager_produce_same_results() {
+        // Lazy path: new() then detect
+        let lazy = PatternEngine::new();
+        let lazy_results = lazy.detect("test content");
+
+        // Eager path: with_packs compiles immediately
+        let eager =
+            PatternEngine::with_packs(builtin_packs()).expect("builtin packs should compile");
+        assert!(eager.is_initialized(), "with_packs should compile eagerly");
+        let eager_results = eager.detect("test content");
+
+        assert_eq!(lazy_results.len(), eager_results.len());
+    }
+
+    #[test]
+    fn with_packs_compiles_eagerly() {
+        let engine =
+            PatternEngine::with_packs(builtin_packs()).expect("builtin packs should compile");
+        assert!(
+            engine.is_initialized(),
+            "with_packs should compile the index immediately"
+        );
+    }
+
+    #[test]
+    fn is_initialized_stays_true_after_multiple_detects() {
+        let engine = PatternEngine::new();
+        assert!(!engine.is_initialized());
+        let _ = engine.detect("first");
+        assert!(engine.is_initialized());
+        let _ = engine.detect("second");
+        assert!(engine.is_initialized());
+        let _ = engine.detect("third");
+        assert!(engine.is_initialized());
+    }
+
+    #[test]
     fn detect_returns_empty_for_now() {
         let engine = PatternEngine::new();
         let detections = engine.detect("some text");
