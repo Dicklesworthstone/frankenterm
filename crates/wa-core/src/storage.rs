@@ -8255,7 +8255,10 @@ fn upsert_action_undo_sync(conn: &Connection, record: &ActionUndoRecord) -> Resu
     Ok(())
 }
 
-fn query_action_undo_sync(conn: &Connection, audit_action_id: i64) -> Result<Option<ActionUndoRecord>> {
+fn query_action_undo_sync(
+    conn: &Connection,
+    audit_action_id: i64,
+) -> Result<Option<ActionUndoRecord>> {
     conn.query_row(
         "SELECT audit_action_id, undoable, undo_strategy, undo_hint, undo_payload, undone_at, undone_by
          FROM action_undo WHERE audit_action_id = ?1",
