@@ -656,16 +656,16 @@ pub fn generate_ssh_domains_lua(hosts: &[SshHost], scrollback_lines: u64) -> Str
             if let Some(port) = host.port {
                 output.push_str(&format!("    port = {},\n", port));
             }
-            // Emit identity files so WezTerm uses the correct SSH keys (#15)
-            if !host.identity_files.is_empty() {
-                // WezTerm ssh_domains accept ssh_option for extra SSH options
+            // Emit identity files so WezTerm uses the correct SSH keys (#15).
+            // ssh_option is a Lua table (key-value), so duplicate keys aren't
+            // possible. Use the first identity file (SSH config tries them in
+            // order, so the first is typically the most specific for this host).
+            if let Some(ifile) = host.identity_files.first() {
                 output.push_str("    ssh_option = {\n");
-                for ifile in &host.identity_files {
-                    output.push_str(&format!(
-                        "      identityfile = '{}',\n",
-                        lua_escape(ifile)
-                    ));
-                }
+                output.push_str(&format!(
+                    "      identityfile = '{}',\n",
+                    lua_escape(ifile)
+                ));
                 output.push_str("    },\n");
             }
             output.push_str("    multiplexing = 'WezTerm',\n");
@@ -1566,7 +1566,8 @@ return config
         assert!(block.contains(WA_BEGIN_MARKER));
         assert!(block.contains("config = config or {}"));
         assert!(block.contains("config.scrollback_lines = 50000"));
-        assert!(block.contains("config.ssh_domains = {"));
+        assert!(block.contains("config.ssh_domains = config.ssh_domains or {}"));
+        assert!(block.contains("local wa_ssh_domains = {"));
         assert!(block.contains("name = 'box'"));
         assert!(block.contains("remote_address = 'box.example'"));
         assert!(block.contains("username = 'alice'"));
@@ -1575,6 +1576,28 @@ return config
         assert!(block.contains(USERVAR_FORWARDING_LUA));
         // Note: STATUS_UPDATE_LUA was removed in v0.2.0 (alt-screen now via escape sequences)
         assert!(block.contains(WA_END_MARKER));
+        // Verify additive append pattern (not overwrite)
+        assert!(block.contains("table.insert(config.ssh_domains, domain)"));
+    }
+
+    #[test]
+    fn test_generate_ssh_domains_includes_identity_file() {
+        let hosts = vec![SshHost {
+            alias: "secure".to_string(),
+            hostname: Some("secure.example".to_string()),
+            user: Some("deploy".to_string()),
+            port: None,
+            identity_files: vec![
+                "~/.ssh/id_ed25519_deploy".to_string(),
+                "~/.ssh/id_rsa_backup".to_string(),
+            ],
+        }];
+        let block = generate_ssh_domains_lua(&hosts, 50_000);
+        // Should include first identity file in ssh_option
+        assert!(block.contains("ssh_option = {"));
+        assert!(block.contains("identityfile = '~/.ssh/id_ed25519_deploy'"));
+        // Should NOT include second file (Lua table keys must be unique)
+        assert!(!block.contains("id_rsa_backup"));
     }
 
     #[test]
