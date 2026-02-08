@@ -1725,6 +1725,393 @@ pub fn has_alt_screen_change(text: &str) -> bool {
         || memmem::find(bytes, b"\x1b[?47l").is_some()
 }
 
+// =============================================================================
+// Streaming Design (wa-nu4.4.2.1)
+// =============================================================================
+//
+// This section defines the types and policies for real-time output streaming
+// from vendored WezTerm's subscribe_output API. The streaming path produces
+// the same CapturedSegment type as the polling path but receives events
+// pushed from the mux server rather than pulling via CLI snapshots.
+//
+// ## Streamed Unit
+//
+// The streamed unit is a **delta string**: a UTF-8 string representing new
+// output appended to a pane. This aligns with the existing CapturedSegment
+// model where `kind: Delta` carries the incremental text and `kind: Gap`
+// carries a full snapshot when continuity is broken.
+//
+// The vendored subscribe_output API delivers chunks of bytes as they arrive
+// at the PTY. These are decoded to UTF-8 (lossy) and wrapped in StreamEvent
+// for channel delivery. The StreamIngester then maps each event through a
+// PaneCursor to assign monotonic seq numbers and detect gaps.
+//
+// ## Backpressure Strategy
+//
+// A bounded mpsc channel sits between the mux event source and the ingester.
+// When the channel fills (consumer too slow), the overflow policy determines
+// behavior:
+//
+// - **EmitGap** (default): The sender drops the event and sets a per-pane
+//   overflow flag. The next successfully delivered event for that pane will
+//   carry an `overflow: true` annotation, causing the ingester to emit an
+//   explicit GAP segment before the delta. This ensures no silent data loss.
+//
+// - **DropOldest**: The sender removes the oldest event in the channel to
+//   make room for the new one, and marks both the dropped pane and the new
+//   event's pane as having experienced overflow.
+//
+// Silent drops are never permitted. Every lost event manifests as a GAP in
+// the segment stream.
+
+/// An event from the streaming output source (vendored mux subscribe_output).
+///
+/// This is the "wire format" between the mux event loop and the ingester.
+/// Each event carries raw delta text for a single pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamEvent {
+    /// New output data from a pane.
+    OutputData {
+        /// Pane that produced the output.
+        pane_id: u64,
+        /// UTF-8 delta text (new bytes decoded from PTY).
+        data: String,
+        /// Epoch milliseconds when the data was received from the mux.
+        received_at: i64,
+        /// True if one or more events were dropped before this one due to
+        /// channel overflow. The ingester must emit a GAP before this delta.
+        overflow: bool,
+    },
+    /// Pane was closed or the subscription ended for this pane.
+    PaneClosed { pane_id: u64 },
+    /// The entire subscription was disconnected (mux server gone, reconnect needed).
+    Disconnected { reason: String },
+}
+
+/// Policy for handling channel overflow when the consumer cannot keep up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OverflowPolicy {
+    /// Drop the new event and mark the pane as having overflow.
+    /// The next delivered event triggers a GAP. This is the safest default:
+    /// the sender never blocks, and every drop is accounted for.
+    EmitGap,
+    /// Remove the oldest event in the channel to make room. Both the dropped
+    /// event's pane and the new event's pane are marked as overflow.
+    DropOldest,
+}
+
+impl Default for OverflowPolicy {
+    fn default() -> Self {
+        Self::EmitGap
+    }
+}
+
+/// Configuration for the streaming channel between mux source and ingester.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamChannelConfig {
+    /// Maximum number of events the channel can buffer before overflow
+    /// policy kicks in. Must be >= 1.
+    pub capacity: usize,
+    /// What to do when the channel is full.
+    pub overflow_policy: OverflowPolicy,
+}
+
+impl Default for StreamChannelConfig {
+    fn default() -> Self {
+        Self {
+            capacity: 4096,
+            overflow_policy: OverflowPolicy::EmitGap,
+        }
+    }
+}
+
+/// Converts streaming events into CapturedSegments with monotonic seq.
+///
+/// The ingester maintains a PaneCursor per pane (same as the polling path)
+/// and maps each StreamEvent::OutputData into a CapturedSegment. When
+/// overflow is indicated, it emits a GAP before the delta.
+///
+/// # Invariants
+///
+/// 1. **Seq monotonicity**: For any pane, each emitted CapturedSegment has
+///    a strictly increasing `seq` (no duplicates, no decreases).
+/// 2. **GAP determinism**: Every overflow or disconnect produces exactly one
+///    GAP segment per affected pane before the next delta.
+/// 3. **No silent drops**: If data is lost between source and storage, a GAP
+///    with a descriptive reason appears in the segment stream.
+pub struct StreamIngester {
+    /// Per-pane cursors (same type as polling path).
+    cursors: HashMap<u64, PaneCursor>,
+    /// Panes that have experienced overflow and need a GAP on next data.
+    overflow_pending: HashSet<u64>,
+    /// Total segments emitted (diagnostic counter).
+    segments_emitted: u64,
+    /// Total gaps emitted (diagnostic counter).
+    gaps_emitted: u64,
+}
+
+impl StreamIngester {
+    /// Create a new ingester with no pane state.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            cursors: HashMap::new(),
+            overflow_pending: HashSet::new(),
+            segments_emitted: 0,
+            gaps_emitted: 0,
+        }
+    }
+
+    /// Process a stream event and return zero or more CapturedSegments.
+    ///
+    /// Returns a Vec because overflow events produce two segments (GAP + Delta).
+    /// Normal deltas produce exactly one segment. PaneClosed and Disconnected
+    /// may produce GAP segments for affected panes.
+    pub fn process(&mut self, event: StreamEvent) -> Vec<CapturedSegment> {
+        match event {
+            StreamEvent::OutputData {
+                pane_id,
+                data,
+                received_at,
+                overflow,
+            } => self.process_output(pane_id, data, received_at, overflow),
+            StreamEvent::PaneClosed { pane_id } => self.process_pane_closed(pane_id),
+            StreamEvent::Disconnected { reason } => self.process_disconnected(&reason),
+        }
+    }
+
+    fn process_output(
+        &mut self,
+        pane_id: u64,
+        data: String,
+        received_at: i64,
+        overflow: bool,
+    ) -> Vec<CapturedSegment> {
+        let mut segments = Vec::new();
+
+        // Track overflow from the event itself or from prior pending state
+        if overflow {
+            self.overflow_pending.insert(pane_id);
+        }
+
+        let cursor = self
+            .cursors
+            .entry(pane_id)
+            .or_insert_with(|| PaneCursor::new(pane_id));
+
+        // If this pane has pending overflow, emit GAP first
+        if self.overflow_pending.remove(&pane_id) {
+            let gap = cursor.emit_gap("stream_overflow");
+            self.gaps_emitted += 1;
+            self.segments_emitted += 1;
+            segments.push(gap);
+        }
+
+        // Emit the delta segment via PaneCursor (bypasses snapshot diff,
+        // since streaming gives us actual deltas directly)
+        let seg = cursor.capture_delta(data, received_at);
+        self.segments_emitted += 1;
+        segments.push(seg);
+
+        segments
+    }
+
+    fn process_pane_closed(&mut self, pane_id: u64) -> Vec<CapturedSegment> {
+        self.overflow_pending.remove(&pane_id);
+
+        // If we have a cursor for this pane, emit a final gap marking the close
+        if let Some(mut cursor) = self.cursors.remove(&pane_id) {
+            let gap = cursor.emit_gap("pane_closed");
+            self.gaps_emitted += 1;
+            self.segments_emitted += 1;
+            vec![gap]
+        } else {
+            vec![]
+        }
+    }
+
+    fn process_disconnected(&mut self, reason: &str) -> Vec<CapturedSegment> {
+        let mut segments = Vec::new();
+        let gap_reason = format!("stream_disconnected:{reason}");
+
+        // Emit a GAP for every active pane
+        for cursor in self.cursors.values_mut() {
+            let gap = cursor.emit_gap(&gap_reason);
+            self.gaps_emitted += 1;
+            self.segments_emitted += 1;
+            segments.push(gap);
+        }
+
+        // Mark all panes as overflow-pending for when they reconnect
+        let pane_ids: Vec<u64> = self.cursors.keys().copied().collect();
+        for pid in pane_ids {
+            self.overflow_pending.insert(pid);
+        }
+
+        segments
+    }
+
+    /// Number of active pane cursors.
+    #[must_use]
+    pub fn active_panes(&self) -> usize {
+        self.cursors.len()
+    }
+
+    /// Total segments emitted since creation.
+    #[must_use]
+    pub fn total_segments(&self) -> u64 {
+        self.segments_emitted
+    }
+
+    /// Total gap segments emitted since creation.
+    #[must_use]
+    pub fn total_gaps(&self) -> u64 {
+        self.gaps_emitted
+    }
+
+    /// Check if a pane has pending overflow (next data will produce GAP first).
+    #[must_use]
+    pub fn has_pending_overflow(&self, pane_id: u64) -> bool {
+        self.overflow_pending.contains(&pane_id)
+    }
+
+    /// Get the current cursor state for a pane (for diagnostics).
+    #[must_use]
+    pub fn cursor_for(&self, pane_id: u64) -> Option<&PaneCursor> {
+        self.cursors.get(&pane_id)
+    }
+}
+
+impl Default for StreamIngester {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Simulates a bounded channel with overflow tracking for testing.
+///
+/// In production, this will be backed by `tokio::sync::mpsc` with
+/// `try_send` for non-blocking overflow detection. This sync version
+/// exists for property testing without a runtime.
+pub struct StreamChannel {
+    buffer: VecDeque<StreamEvent>,
+    capacity: usize,
+    policy: OverflowPolicy,
+    /// Per-pane overflow flag: set when an event is dropped.
+    overflow_panes: HashSet<u64>,
+    /// Total events dropped due to overflow.
+    pub events_dropped: u64,
+}
+
+impl StreamChannel {
+    /// Create a new channel with the given config.
+    #[must_use]
+    pub fn new(config: &StreamChannelConfig) -> Self {
+        Self {
+            buffer: VecDeque::with_capacity(config.capacity),
+            capacity: config.capacity.max(1),
+            policy: config.overflow_policy,
+            overflow_panes: HashSet::new(),
+            events_dropped: 0,
+        }
+    }
+
+    /// Try to send an event into the channel.
+    ///
+    /// Returns `true` if the event was buffered, `false` if it was dropped
+    /// (EmitGap policy) or if an older event was evicted (DropOldest policy).
+    pub fn send(&mut self, mut event: StreamEvent) -> bool {
+        // Tag the event with overflow if this pane had a prior drop
+        if let StreamEvent::OutputData {
+            pane_id,
+            ref mut overflow,
+            ..
+        } = event
+        {
+            if self.overflow_panes.remove(&pane_id) {
+                *overflow = true;
+            }
+        }
+
+        if self.buffer.len() < self.capacity {
+            self.buffer.push_back(event);
+            return true;
+        }
+
+        // Channel full — apply overflow policy
+        match self.policy {
+            OverflowPolicy::EmitGap => {
+                // Mark the pane as having overflow
+                if let StreamEvent::OutputData { pane_id, .. } = &event {
+                    self.overflow_panes.insert(*pane_id);
+                }
+                self.events_dropped += 1;
+                false
+            }
+            OverflowPolicy::DropOldest => {
+                // Evict oldest, mark its pane
+                if let Some(StreamEvent::OutputData { pane_id, .. }) =
+                    self.buffer.pop_front().as_ref()
+                {
+                    self.overflow_panes.insert(*pane_id);
+                }
+                // Mark new event's pane if it had prior drops
+                if let StreamEvent::OutputData {
+                    pane_id,
+                    ref mut overflow,
+                    ..
+                } = event
+                {
+                    if self.overflow_panes.remove(&pane_id) {
+                        *overflow = true;
+                    }
+                }
+                self.buffer.push_back(event);
+                self.events_dropped += 1;
+                true
+            }
+        }
+    }
+
+    /// Receive the next event from the channel.
+    pub fn recv(&mut self) -> Option<StreamEvent> {
+        let mut event = self.buffer.pop_front()?;
+
+        // Apply pending overflow flags on receive
+        if let StreamEvent::OutputData {
+            pane_id,
+            ref mut overflow,
+            ..
+        } = event
+        {
+            if self.overflow_panes.remove(&pane_id) {
+                *overflow = true;
+            }
+        }
+
+        Some(event)
+    }
+
+    /// Number of events currently buffered.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// Whether the channel is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
+
+    /// Whether the channel is at capacity.
+    #[must_use]
+    pub fn is_full(&self) -> bool {
+        self.buffer.len() >= self.capacity
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3333,5 +3720,796 @@ mod tests {
         // The next capture with content change may produce a Delta or Gap
         // depending on overlap extraction.  Either is valid.
         assert!(seg.pane_id == 1);
+    }
+
+    // =========================================================================
+    // Streaming Design Tests (wa-nu4.4.2.1)
+    // =========================================================================
+
+    // --- StreamEvent construction ---
+
+    #[test]
+    fn stream_event_output_data_fields() {
+        let event = StreamEvent::OutputData {
+            pane_id: 42,
+            data: "hello\n".to_string(),
+            received_at: 1_700_000_000_000,
+            overflow: false,
+        };
+        if let StreamEvent::OutputData {
+            pane_id,
+            data,
+            received_at,
+            overflow,
+        } = event
+        {
+            assert_eq!(pane_id, 42);
+            assert_eq!(data, "hello\n");
+            assert_eq!(received_at, 1_700_000_000_000);
+            assert!(!overflow);
+        } else {
+            panic!("expected OutputData");
+        }
+    }
+
+    #[test]
+    fn stream_event_pane_closed() {
+        let event = StreamEvent::PaneClosed { pane_id: 7 };
+        assert!(matches!(event, StreamEvent::PaneClosed { pane_id: 7 }));
+    }
+
+    #[test]
+    fn stream_event_disconnected() {
+        let event = StreamEvent::Disconnected {
+            reason: "mux gone".to_string(),
+        };
+        if let StreamEvent::Disconnected { reason } = event {
+            assert_eq!(reason, "mux gone");
+        } else {
+            panic!("expected Disconnected");
+        }
+    }
+
+    // --- OverflowPolicy defaults ---
+
+    #[test]
+    fn overflow_policy_default_is_emit_gap() {
+        assert_eq!(OverflowPolicy::default(), OverflowPolicy::EmitGap);
+    }
+
+    #[test]
+    fn stream_channel_config_default() {
+        let cfg = StreamChannelConfig::default();
+        assert_eq!(cfg.capacity, 4096);
+        assert_eq!(cfg.overflow_policy, OverflowPolicy::EmitGap);
+    }
+
+    // --- StreamIngester: basic delta ---
+
+    #[test]
+    fn ingester_single_delta_produces_one_segment() {
+        let mut ingester = StreamIngester::new();
+        let event = StreamEvent::OutputData {
+            pane_id: 1,
+            data: "line1\n".to_string(),
+            received_at: 100,
+            overflow: false,
+        };
+
+        let segs = ingester.process(event);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].pane_id, 1);
+        assert_eq!(segs[0].seq, 0);
+        assert_eq!(segs[0].content, "line1\n");
+        assert_eq!(segs[0].kind, CapturedSegmentKind::Delta);
+        assert_eq!(segs[0].captured_at, 100);
+    }
+
+    // --- Property: seq monotonicity ---
+
+    #[test]
+    fn ingester_seq_monotonicity_single_pane() {
+        let mut ingester = StreamIngester::new();
+
+        let mut last_seq: Option<u64> = None;
+        for i in 0..100 {
+            let event = StreamEvent::OutputData {
+                pane_id: 1,
+                data: format!("line {i}\n"),
+                received_at: i as i64,
+                overflow: false,
+            };
+            let segs = ingester.process(event);
+            for seg in &segs {
+                if let Some(prev) = last_seq {
+                    assert!(
+                        seg.seq > prev,
+                        "seq must be strictly increasing: prev={prev}, got={}",
+                        seg.seq
+                    );
+                }
+                last_seq = Some(seg.seq);
+            }
+        }
+        assert_eq!(last_seq, Some(99));
+    }
+
+    #[test]
+    fn ingester_seq_monotonicity_multi_pane() {
+        let mut ingester = StreamIngester::new();
+        let mut last_seq_per_pane: HashMap<u64, u64> = HashMap::new();
+
+        // Interleave events from 3 panes
+        for i in 0..60 {
+            let pane_id = (i % 3) + 1;
+            let event = StreamEvent::OutputData {
+                pane_id,
+                data: format!("data {i}\n"),
+                received_at: i as i64,
+                overflow: false,
+            };
+            let segs = ingester.process(event);
+            for seg in &segs {
+                if let Some(&prev) = last_seq_per_pane.get(&seg.pane_id) {
+                    assert!(
+                        seg.seq > prev,
+                        "pane {} seq must increase: prev={prev}, got={}",
+                        seg.pane_id,
+                        seg.seq
+                    );
+                }
+                last_seq_per_pane.insert(seg.pane_id, seg.seq);
+            }
+        }
+
+        // Each pane should have received 20 events (60/3)
+        for pane_id in 1..=3 {
+            assert_eq!(last_seq_per_pane[&pane_id], 19);
+        }
+    }
+
+    // --- Property: overflow always produces GAP ---
+
+    #[test]
+    fn ingester_overflow_emits_gap_before_delta() {
+        let mut ingester = StreamIngester::new();
+
+        // First: normal event to establish cursor
+        let normal = StreamEvent::OutputData {
+            pane_id: 1,
+            data: "first\n".to_string(),
+            received_at: 100,
+            overflow: false,
+        };
+        let segs = ingester.process(normal);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].seq, 0);
+        assert_eq!(segs[0].kind, CapturedSegmentKind::Delta);
+
+        // Second: event with overflow=true
+        let overflow = StreamEvent::OutputData {
+            pane_id: 1,
+            data: "after_drop\n".to_string(),
+            received_at: 200,
+            overflow: true,
+        };
+        let segs = ingester.process(overflow);
+        assert_eq!(segs.len(), 2, "overflow must produce GAP + Delta");
+
+        // First segment is GAP
+        assert!(
+            matches!(segs[0].kind, CapturedSegmentKind::Gap { ref reason } if reason == "stream_overflow")
+        );
+        assert_eq!(segs[0].seq, 1);
+        assert_eq!(segs[0].pane_id, 1);
+
+        // Second segment is Delta
+        assert_eq!(segs[1].kind, CapturedSegmentKind::Delta);
+        assert_eq!(segs[1].seq, 2);
+        assert_eq!(segs[1].content, "after_drop\n");
+    }
+
+    #[test]
+    fn ingester_overflow_no_double_gap() {
+        let mut ingester = StreamIngester::new();
+
+        // Normal event
+        ingester.process(StreamEvent::OutputData {
+            pane_id: 1,
+            data: "a".to_string(),
+            received_at: 100,
+            overflow: false,
+        });
+
+        // Overflow event — emits GAP + Delta
+        let segs = ingester.process(StreamEvent::OutputData {
+            pane_id: 1,
+            data: "b".to_string(),
+            received_at: 200,
+            overflow: true,
+        });
+        assert_eq!(segs.len(), 2);
+
+        // Next normal event should NOT produce another GAP
+        let segs = ingester.process(StreamEvent::OutputData {
+            pane_id: 1,
+            data: "c".to_string(),
+            received_at: 300,
+            overflow: false,
+        });
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].kind, CapturedSegmentKind::Delta);
+    }
+
+    // --- PaneClosed ---
+
+    #[test]
+    fn ingester_pane_closed_emits_gap() {
+        let mut ingester = StreamIngester::new();
+
+        // Establish cursor
+        ingester.process(StreamEvent::OutputData {
+            pane_id: 5,
+            data: "hello\n".to_string(),
+            received_at: 100,
+            overflow: false,
+        });
+        assert_eq!(ingester.active_panes(), 1);
+
+        // Close pane
+        let segs = ingester.process(StreamEvent::PaneClosed { pane_id: 5 });
+        assert_eq!(segs.len(), 1);
+        assert!(
+            matches!(&segs[0].kind, CapturedSegmentKind::Gap { reason } if reason == "pane_closed")
+        );
+        assert_eq!(segs[0].pane_id, 5);
+        assert_eq!(ingester.active_panes(), 0);
+    }
+
+    #[test]
+    fn ingester_pane_closed_unknown_pane_is_noop() {
+        let mut ingester = StreamIngester::new();
+        let segs = ingester.process(StreamEvent::PaneClosed { pane_id: 999 });
+        assert!(segs.is_empty());
+    }
+
+    // --- Disconnected ---
+
+    #[test]
+    fn ingester_disconnected_emits_gap_per_pane() {
+        let mut ingester = StreamIngester::new();
+
+        // Establish 3 panes
+        for pid in [1, 2, 3] {
+            ingester.process(StreamEvent::OutputData {
+                pane_id: pid,
+                data: "init\n".to_string(),
+                received_at: 100,
+                overflow: false,
+            });
+        }
+        assert_eq!(ingester.active_panes(), 3);
+
+        let segs = ingester.process(StreamEvent::Disconnected {
+            reason: "mux_restart".to_string(),
+        });
+        assert_eq!(segs.len(), 3);
+
+        for seg in &segs {
+            assert!(matches!(
+                &seg.kind,
+                CapturedSegmentKind::Gap { reason } if reason == "stream_disconnected:mux_restart"
+            ));
+        }
+
+        // All panes should now have pending overflow
+        for pid in [1, 2, 3] {
+            assert!(ingester.has_pending_overflow(pid));
+        }
+    }
+
+    #[test]
+    fn ingester_reconnect_after_disconnect_emits_gap() {
+        let mut ingester = StreamIngester::new();
+
+        // Establish pane
+        ingester.process(StreamEvent::OutputData {
+            pane_id: 1,
+            data: "before\n".to_string(),
+            received_at: 100,
+            overflow: false,
+        });
+
+        // Disconnect
+        ingester.process(StreamEvent::Disconnected {
+            reason: "network".to_string(),
+        });
+
+        // Reconnect with new data — should get GAP + Delta
+        let segs = ingester.process(StreamEvent::OutputData {
+            pane_id: 1,
+            data: "after\n".to_string(),
+            received_at: 300,
+            overflow: false,
+        });
+        assert_eq!(segs.len(), 2);
+        assert!(matches!(
+            &segs[0].kind,
+            CapturedSegmentKind::Gap { reason } if reason == "stream_overflow"
+        ));
+        assert_eq!(segs[1].kind, CapturedSegmentKind::Delta);
+        assert_eq!(segs[1].content, "after\n");
+    }
+
+    // --- Ingester counters ---
+
+    #[test]
+    fn ingester_counters_track_segments_and_gaps() {
+        let mut ingester = StreamIngester::new();
+        assert_eq!(ingester.total_segments(), 0);
+        assert_eq!(ingester.total_gaps(), 0);
+
+        // 1 delta
+        ingester.process(StreamEvent::OutputData {
+            pane_id: 1,
+            data: "a".to_string(),
+            received_at: 100,
+            overflow: false,
+        });
+        assert_eq!(ingester.total_segments(), 1);
+        assert_eq!(ingester.total_gaps(), 0);
+
+        // 1 overflow → GAP + Delta = 2 segments, 1 gap
+        ingester.process(StreamEvent::OutputData {
+            pane_id: 1,
+            data: "b".to_string(),
+            received_at: 200,
+            overflow: true,
+        });
+        assert_eq!(ingester.total_segments(), 3);
+        assert_eq!(ingester.total_gaps(), 1);
+
+        // Close pane → 1 gap
+        ingester.process(StreamEvent::PaneClosed { pane_id: 1 });
+        assert_eq!(ingester.total_segments(), 4);
+        assert_eq!(ingester.total_gaps(), 2);
+    }
+
+    // --- StreamChannel: bounded channel with overflow ---
+
+    #[test]
+    fn stream_channel_basic_send_recv() {
+        let cfg = StreamChannelConfig {
+            capacity: 4,
+            overflow_policy: OverflowPolicy::EmitGap,
+        };
+        let mut ch = StreamChannel::new(&cfg);
+
+        assert!(ch.is_empty());
+        assert!(!ch.is_full());
+
+        let ok = ch.send(StreamEvent::OutputData {
+            pane_id: 1,
+            data: "a".to_string(),
+            received_at: 100,
+            overflow: false,
+        });
+        assert!(ok);
+        assert_eq!(ch.len(), 1);
+
+        let event = ch.recv().expect("should have event");
+        assert!(matches!(event, StreamEvent::OutputData { pane_id: 1, .. }));
+        assert!(ch.is_empty());
+    }
+
+    #[test]
+    fn stream_channel_emit_gap_drops_on_full() {
+        let cfg = StreamChannelConfig {
+            capacity: 2,
+            overflow_policy: OverflowPolicy::EmitGap,
+        };
+        let mut ch = StreamChannel::new(&cfg);
+
+        // Fill channel
+        ch.send(StreamEvent::OutputData {
+            pane_id: 1,
+            data: "a".to_string(),
+            received_at: 100,
+            overflow: false,
+        });
+        ch.send(StreamEvent::OutputData {
+            pane_id: 1,
+            data: "b".to_string(),
+            received_at: 200,
+            overflow: false,
+        });
+        assert!(ch.is_full());
+
+        // Third send should fail (dropped)
+        let ok = ch.send(StreamEvent::OutputData {
+            pane_id: 1,
+            data: "c".to_string(),
+            received_at: 300,
+            overflow: false,
+        });
+        assert!(!ok, "should drop when full with EmitGap policy");
+        assert_eq!(ch.events_dropped, 1);
+        assert_eq!(ch.len(), 2); // still 2
+
+        // Next recv for pane 1 should have overflow=true
+        let event = ch.recv().unwrap();
+        if let StreamEvent::OutputData { overflow, .. } = event {
+            assert!(
+                overflow,
+                "recv should tag overflow on the next event for this pane"
+            );
+        }
+    }
+
+    #[test]
+    fn stream_channel_drop_oldest_evicts() {
+        let cfg = StreamChannelConfig {
+            capacity: 2,
+            overflow_policy: OverflowPolicy::DropOldest,
+        };
+        let mut ch = StreamChannel::new(&cfg);
+
+        // Fill
+        ch.send(StreamEvent::OutputData {
+            pane_id: 1,
+            data: "a".to_string(),
+            received_at: 100,
+            overflow: false,
+        });
+        ch.send(StreamEvent::OutputData {
+            pane_id: 1,
+            data: "b".to_string(),
+            received_at: 200,
+            overflow: false,
+        });
+
+        // Third: evicts "a", inserts "c"
+        let ok = ch.send(StreamEvent::OutputData {
+            pane_id: 1,
+            data: "c".to_string(),
+            received_at: 300,
+            overflow: false,
+        });
+        assert!(ok, "DropOldest should always accept");
+        assert_eq!(ch.events_dropped, 1);
+        assert_eq!(ch.len(), 2);
+
+        // First recv should be "b" (oldest remaining)
+        let event = ch.recv().unwrap();
+        if let StreamEvent::OutputData { data, .. } = event {
+            assert_eq!(data, "b");
+        }
+    }
+
+    // --- Integration: fake stream through channel + ingester ---
+
+    #[test]
+    fn integration_fake_stream_no_drops() {
+        let cfg = StreamChannelConfig {
+            capacity: 128,
+            overflow_policy: OverflowPolicy::EmitGap,
+        };
+        let mut channel = StreamChannel::new(&cfg);
+        let mut ingester = StreamIngester::new();
+
+        // Simulate a stream of 50 events for 2 panes
+        for i in 0u64..50 {
+            let pane_id = (i % 2) + 1;
+            channel.send(StreamEvent::OutputData {
+                pane_id,
+                data: format!("line {i}\n"),
+                received_at: i as i64 * 10,
+                overflow: false,
+            });
+        }
+
+        // Drain channel through ingester
+        let mut all_segments: Vec<CapturedSegment> = Vec::new();
+        while let Some(event) = channel.recv() {
+            all_segments.extend(ingester.process(event));
+        }
+
+        assert_eq!(channel.events_dropped, 0);
+        assert_eq!(all_segments.len(), 50);
+
+        // Verify seq monotonicity per pane
+        let mut seqs_per_pane: HashMap<u64, Vec<u64>> = HashMap::new();
+        for seg in &all_segments {
+            seqs_per_pane.entry(seg.pane_id).or_default().push(seg.seq);
+        }
+
+        for (pid, seqs) in &seqs_per_pane {
+            for window in seqs.windows(2) {
+                assert!(
+                    window[1] > window[0],
+                    "pane {pid}: seq not monotonic: {} -> {}",
+                    window[0],
+                    window[1]
+                );
+            }
+        }
+
+        // Each pane should have 25 segments, seqs 0..24
+        assert_eq!(seqs_per_pane[&1].len(), 25);
+        assert_eq!(seqs_per_pane[&2].len(), 25);
+        assert_eq!(*seqs_per_pane[&1].last().unwrap(), 24);
+        assert_eq!(*seqs_per_pane[&2].last().unwrap(), 24);
+    }
+
+    #[test]
+    fn integration_slow_consumer_overflow() {
+        // Tiny channel to force overflow quickly
+        let cfg = StreamChannelConfig {
+            capacity: 3,
+            overflow_policy: OverflowPolicy::EmitGap,
+        };
+        let mut channel = StreamChannel::new(&cfg);
+
+        // Send 10 events without consuming — 7 should be dropped
+        for i in 0u64..10 {
+            channel.send(StreamEvent::OutputData {
+                pane_id: 1,
+                data: format!("line {i}\n"),
+                received_at: i as i64 * 10,
+                overflow: false,
+            });
+        }
+        assert_eq!(channel.events_dropped, 7);
+        assert_eq!(channel.len(), 3);
+
+        // Drain through ingester
+        let mut ingester = StreamIngester::new();
+        let mut all_segments: Vec<CapturedSegment> = Vec::new();
+        while let Some(event) = channel.recv() {
+            all_segments.extend(ingester.process(event));
+        }
+
+        // Should have GAP(s) + Deltas — verify no silent drops
+        let gaps: Vec<_> = all_segments
+            .iter()
+            .filter(|s| matches!(s.kind, CapturedSegmentKind::Gap { .. }))
+            .collect();
+        let deltas: Vec<_> = all_segments
+            .iter()
+            .filter(|s| s.kind == CapturedSegmentKind::Delta)
+            .collect();
+
+        // At least one gap must exist (overflow occurred)
+        assert!(
+            !gaps.is_empty(),
+            "overflow must produce at least one GAP segment"
+        );
+
+        // All segments for pane 1 must have monotonic seq
+        let mut prev_seq: Option<u64> = None;
+        for seg in &all_segments {
+            assert_eq!(seg.pane_id, 1);
+            if let Some(p) = prev_seq {
+                assert!(seg.seq > p, "seq not monotonic: {p} -> {}", seg.seq);
+            }
+            prev_seq = Some(seg.seq);
+        }
+
+        // Total = gaps + deltas = all segments
+        assert_eq!(gaps.len() + deltas.len(), all_segments.len());
+    }
+
+    #[test]
+    fn integration_bounded_channel_multi_pane_overflow() {
+        let cfg = StreamChannelConfig {
+            capacity: 3,
+            overflow_policy: OverflowPolicy::EmitGap,
+        };
+        let mut channel = StreamChannel::new(&cfg);
+        let mut ingester = StreamIngester::new();
+
+        // Interleave 3 panes, 10 events each (30 total into capacity=3)
+        // Consumer only drains every 10 events (very slow)
+        for i in 0u64..30 {
+            let pane_id = (i % 3) + 1;
+            channel.send(StreamEvent::OutputData {
+                pane_id,
+                data: format!("data {i}\n"),
+                received_at: i as i64,
+                overflow: false,
+            });
+
+            // Consumer runs every 10 events (slow consumer simulation)
+            if (i + 1) % 10 == 0 {
+                while let Some(event) = channel.recv() {
+                    ingester.process(event);
+                }
+            }
+        }
+
+        // Drain remainder
+        while let Some(event) = channel.recv() {
+            ingester.process(event);
+        }
+
+        // Verify seq monotonicity for all panes
+        for pid in 1..=3 {
+            if let Some(cursor) = ingester.cursor_for(pid) {
+                assert!(cursor.next_seq > 0, "pane {pid} should have segments");
+            }
+        }
+
+        // Some drops should have occurred (30 events, capacity 3, drained every 10)
+        assert!(channel.events_dropped > 0, "should have drops");
+        assert!(
+            ingester.total_gaps() > 0,
+            "drops must manifest as GAP segments"
+        );
+    }
+
+    #[test]
+    fn integration_cancellation_reconnect() {
+        let mut ingester = StreamIngester::new();
+
+        // Phase 1: normal streaming
+        for i in 0u64..5 {
+            ingester.process(StreamEvent::OutputData {
+                pane_id: 1,
+                data: format!("phase1:{i}\n"),
+                received_at: i as i64,
+                overflow: false,
+            });
+        }
+        assert_eq!(ingester.cursor_for(1).unwrap().next_seq, 5);
+
+        // Phase 2: disconnect (simulating cancellation)
+        let disconnect_segs = ingester.process(StreamEvent::Disconnected {
+            reason: "cancelled".to_string(),
+        });
+        assert_eq!(disconnect_segs.len(), 1);
+        assert!(matches!(
+            &disconnect_segs[0].kind,
+            CapturedSegmentKind::Gap { reason } if reason.contains("cancelled")
+        ));
+
+        // Phase 3: reconnect with new data
+        let reconnect_segs = ingester.process(StreamEvent::OutputData {
+            pane_id: 1,
+            data: "phase3:0\n".to_string(),
+            received_at: 1000,
+            overflow: false,
+        });
+        // Should be GAP (from pending overflow) + Delta
+        assert_eq!(reconnect_segs.len(), 2);
+        assert!(matches!(
+            &reconnect_segs[0].kind,
+            CapturedSegmentKind::Gap { .. }
+        ));
+        assert_eq!(reconnect_segs[1].kind, CapturedSegmentKind::Delta);
+
+        // Verify overall seq monotonicity
+        let cursor = ingester.cursor_for(1).unwrap();
+        // 5 (phase1) + 1 (disconnect gap) + 1 (overflow gap) + 1 (reconnect delta) = 8
+        assert_eq!(cursor.next_seq, 8);
+    }
+
+    // --- Property: no silent drops ---
+
+    #[test]
+    fn property_every_drop_manifests_as_gap() {
+        // For various channel sizes and event counts, verify that every
+        // dropped event produces a GAP in the final segment stream.
+        for capacity in [1, 2, 5, 10] {
+            let cfg = StreamChannelConfig {
+                capacity,
+                overflow_policy: OverflowPolicy::EmitGap,
+            };
+            let mut channel = StreamChannel::new(&cfg);
+            let mut ingester = StreamIngester::new();
+            let total_events = 50;
+
+            // Send all events without consuming (worst case)
+            for i in 0u64..total_events {
+                channel.send(StreamEvent::OutputData {
+                    pane_id: 1,
+                    data: format!("{i}\n"),
+                    received_at: i as i64,
+                    overflow: false,
+                });
+            }
+
+            let dropped = channel.events_dropped;
+            assert_eq!(
+                dropped,
+                (total_events as u64).saturating_sub(capacity as u64),
+                "capacity={capacity}"
+            );
+
+            // Drain through ingester
+            let mut all_segs = Vec::new();
+            while let Some(event) = channel.recv() {
+                all_segs.extend(ingester.process(event));
+            }
+
+            if dropped > 0 {
+                let gap_count = all_segs
+                    .iter()
+                    .filter(|s| matches!(s.kind, CapturedSegmentKind::Gap { .. }))
+                    .count();
+                assert!(
+                    gap_count >= 1,
+                    "capacity={capacity}: dropped={dropped} but gap_count={gap_count}"
+                );
+            }
+
+            // Seq monotonicity
+            let mut prev: Option<u64> = None;
+            for seg in &all_segs {
+                if let Some(p) = prev {
+                    assert!(seg.seq > p);
+                }
+                prev = Some(seg.seq);
+            }
+        }
+    }
+
+    // --- StreamIngester Default trait ---
+
+    #[test]
+    fn stream_ingester_default() {
+        let ingester = StreamIngester::default();
+        assert_eq!(ingester.active_panes(), 0);
+        assert_eq!(ingester.total_segments(), 0);
+        assert_eq!(ingester.total_gaps(), 0);
+    }
+
+    // --- OverflowPolicy serialization ---
+
+    #[test]
+    fn overflow_policy_serde_roundtrip() {
+        let emit_gap = OverflowPolicy::EmitGap;
+        let json = serde_json::to_string(&emit_gap).unwrap();
+        assert_eq!(json, "\"emit_gap\"");
+        let parsed: OverflowPolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, OverflowPolicy::EmitGap);
+
+        let drop_oldest = OverflowPolicy::DropOldest;
+        let json = serde_json::to_string(&drop_oldest).unwrap();
+        assert_eq!(json, "\"drop_oldest\"");
+        let parsed: OverflowPolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, OverflowPolicy::DropOldest);
+    }
+
+    #[test]
+    fn stream_channel_config_serde_roundtrip() {
+        let cfg = StreamChannelConfig {
+            capacity: 256,
+            overflow_policy: OverflowPolicy::DropOldest,
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let parsed: StreamChannelConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.capacity, 256);
+        assert_eq!(parsed.overflow_policy, OverflowPolicy::DropOldest);
+    }
+
+    // --- Channel minimum capacity enforcement ---
+
+    #[test]
+    fn stream_channel_min_capacity_is_one() {
+        let cfg = StreamChannelConfig {
+            capacity: 0, // should be clamped to 1
+            overflow_policy: OverflowPolicy::EmitGap,
+        };
+        let mut ch = StreamChannel::new(&cfg);
+
+        // Should accept at least 1 event
+        let ok = ch.send(StreamEvent::OutputData {
+            pane_id: 1,
+            data: "a".to_string(),
+            received_at: 100,
+            overflow: false,
+        });
+        assert!(ok);
+        assert!(ch.is_full());
     }
 }

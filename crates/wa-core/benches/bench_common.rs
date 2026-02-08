@@ -63,6 +63,24 @@ pub const CI_BUDGETS: &[CiBudgetEntry] = &[
         max_median_ns: 5_000_000,
         note: "pattern w/ context: observed ~350us, ceiling 5ms",
     },
+    // Lazy init: construction without compilation (pack loading only)
+    CiBudgetEntry {
+        group_prefix: "pattern_lazy_init/construction_only",
+        max_median_ns: 50_000_000,
+        note: "lazy construction: observed ~12ms, ceiling 50ms",
+    },
+    // Lazy init: cold detect (construction + first compilation)
+    CiBudgetEntry {
+        group_prefix: "pattern_lazy_init/first_detect_cold",
+        max_median_ns: 200_000_000,
+        note: "cold first detect: observed ~25ms, ceiling 200ms",
+    },
+    // Lazy init: warm detect (already compiled)
+    CiBudgetEntry {
+        group_prefix: "pattern_lazy_init/subsequent_detect_warm",
+        max_median_ns: 5_000_000,
+        note: "warm detect: observed ~40us, ceiling 5ms",
+    },
     // Delta extraction: design < 200µs → ceiling 5ms
     CiBudgetEntry {
         group_prefix: "delta_extraction",
