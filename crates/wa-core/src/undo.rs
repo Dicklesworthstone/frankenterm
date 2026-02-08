@@ -692,6 +692,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn already_undone_action_returns_not_applicable_without_mutation() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("undo-already-undone.db");
+        let db_path = db_path.to_string_lossy().to_string();
+        let storage = Arc::new(StorageHandle::new(&db_path).await.expect("storage"));
+        let pane_id = 21_u64;
+        seed_pane(storage.as_ref(), pane_id).await;
+        let action_id = seed_action(storage.as_ref(), pane_id, "human", Some("cli"), "spawn").await;
+        let initial_undone_at = now_ms() - 1_000;
+
+        storage
+            .upsert_action_undo(ActionUndoRecord {
+                audit_action_id: action_id,
+                undoable: true,
+                undo_strategy: "pane_close".to_string(),
+                undo_hint: Some("Pane was already closed.".to_string()),
+                undo_payload: Some(serde_json::json!({ "pane_id": pane_id }).to_string()),
+                undone_at: Some(initial_undone_at),
+                undone_by: Some("first-operator".to_string()),
+            })
+            .await
+            .expect("undo metadata");
+
+        let mock = Arc::new(MockWezterm::new());
+        let executor = UndoExecutor::new(Arc::clone(&storage), mock);
+        let result = executor
+            .execute(UndoRequest::new(action_id).with_actor("second-operator"))
+            .await
+            .expect("undo result");
+
+        assert_eq!(result.outcome, UndoOutcome::NotApplicable);
+        assert!(result.message.contains("already been undone"));
+
+        let undo = storage
+            .get_action_undo(action_id)
+            .await
+            .expect("undo query")
+            .expect("undo exists");
+        assert_eq!(undo.undone_at, Some(initial_undone_at));
+        assert_eq!(undo.undone_by.as_deref(), Some("first-operator"));
+
+        storage.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
     async fn pane_close_undo_closes_existing_pane() {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let db_path = temp.path().join("undo-pane-close-success.db");
