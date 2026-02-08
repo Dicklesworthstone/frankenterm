@@ -1086,6 +1086,45 @@ impl Default for DescriptorLimits {
     }
 }
 
+/// Trigger definition for descriptor workflows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DescriptorTrigger {
+    /// Event types that trigger this workflow (e.g., "session.compaction").
+    #[serde(default)]
+    pub event_types: Vec<String>,
+    /// Agent types this trigger applies to (e.g., ["codex", "claude_code"]).
+    /// Empty means all agents.
+    #[serde(default)]
+    pub agent_types: Vec<String>,
+    /// Rule IDs that trigger this workflow (e.g., "compaction.detected").
+    #[serde(default)]
+    pub rule_ids: Vec<String>,
+}
+
+/// Failure handler for descriptor workflows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DescriptorFailureHandler {
+    /// Send a notification with a message. Supports `${failed_step}` interpolation.
+    Notify { message: String },
+    /// Write a log entry with a message. Supports `${failed_step}` interpolation.
+    Log { message: String },
+    /// Abort with a reason message. Supports `${failed_step}` interpolation.
+    Abort { message: String },
+}
+
+impl DescriptorFailureHandler {
+    /// Interpolate `${failed_step}` in the message template.
+    #[must_use]
+    pub fn interpolate_message(&self, failed_step: &str) -> String {
+        let template = match self {
+            Self::Notify { message } | Self::Log { message } | Self::Abort { message } => message,
+        };
+        template.replace("${failed_step}", failed_step)
+    }
+}
+
 /// Descriptor for a simple, data-driven workflow.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1094,7 +1133,13 @@ pub struct WorkflowDescriptor {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
+    /// Triggers that activate this workflow.
+    #[serde(default)]
+    pub triggers: Vec<DescriptorTrigger>,
     pub steps: Vec<DescriptorStep>,
+    /// Handler executed when a step fails.
+    #[serde(default)]
+    pub on_failure: Option<DescriptorFailureHandler>,
 }
 
 impl WorkflowDescriptor {
@@ -1258,6 +1303,51 @@ pub enum DescriptorStep {
         description: Option<String>,
         key: DescriptorControlKey,
     },
+    /// Send a notification message (logged, not injected into pane).
+    Notify {
+        id: String,
+        #[serde(default)]
+        description: Option<String>,
+        message: String,
+    },
+    /// Write an entry to the workflow audit log.
+    Log {
+        id: String,
+        #[serde(default)]
+        description: Option<String>,
+        message: String,
+    },
+    /// Abort the workflow immediately with a reason.
+    Abort {
+        id: String,
+        #[serde(default)]
+        description: Option<String>,
+        reason: String,
+    },
+    /// Conditional branching: evaluate a matcher and run then/else steps.
+    Conditional {
+        id: String,
+        #[serde(default)]
+        description: Option<String>,
+        /// Text to test the condition against (supports `${trigger}` interpolation).
+        test_text: String,
+        matcher: DescriptorMatcher,
+        /// Steps to execute if the condition matches.
+        then_steps: Vec<DescriptorStep>,
+        /// Steps to execute if the condition does not match.
+        #[serde(default)]
+        else_steps: Vec<DescriptorStep>,
+    },
+    /// Loop: repeat contained steps a fixed number of times.
+    Loop {
+        id: String,
+        #[serde(default)]
+        description: Option<String>,
+        /// Number of iterations.
+        count: u32,
+        /// Steps to repeat.
+        body: Vec<DescriptorStep>,
+    },
 }
 
 impl DescriptorStep {
@@ -1266,7 +1356,12 @@ impl DescriptorStep {
             Self::WaitFor { id, .. }
             | Self::Sleep { id, .. }
             | Self::SendText { id, .. }
-            | Self::SendCtrl { id, .. } => id,
+            | Self::SendCtrl { id, .. }
+            | Self::Notify { id, .. }
+            | Self::Log { id, .. }
+            | Self::Abort { id, .. }
+            | Self::Conditional { id, .. }
+            | Self::Loop { id, .. } => id,
         }
     }
 
@@ -1284,6 +1379,21 @@ impl DescriptorStep {
             Self::SendCtrl { description, .. } => description
                 .clone()
                 .unwrap_or_else(|| "Send control key".to_string()),
+            Self::Notify { description, .. } => {
+                description.clone().unwrap_or_else(|| "Notify".to_string())
+            }
+            Self::Log { description, .. } => description
+                .clone()
+                .unwrap_or_else(|| "Log message".to_string()),
+            Self::Abort { description, .. } => description
+                .clone()
+                .unwrap_or_else(|| "Abort workflow".to_string()),
+            Self::Conditional { description, .. } => description
+                .clone()
+                .unwrap_or_else(|| "Conditional branch".to_string()),
+            Self::Loop { description, .. } => {
+                description.clone().unwrap_or_else(|| "Loop".to_string())
+            }
         }
     }
 
@@ -1346,8 +1456,182 @@ impl DescriptorStep {
                 }
             }
             Self::SendCtrl { .. } => {}
+            Self::Notify { message, .. } | Self::Log { message, .. } => {
+                if message.len() > limits.max_text_len {
+                    return Err(crate::Error::Config(
+                        crate::error::ConfigError::ValidationError(format!(
+                            "Message too long ({} > max {})",
+                            message.len(),
+                            limits.max_text_len
+                        )),
+                    ));
+                }
+            }
+            Self::Abort { reason, .. } => {
+                if reason.len() > limits.max_text_len {
+                    return Err(crate::Error::Config(
+                        crate::error::ConfigError::ValidationError(format!(
+                            "Abort reason too long ({} > max {})",
+                            reason.len(),
+                            limits.max_text_len
+                        )),
+                    ));
+                }
+            }
+            Self::Conditional {
+                matcher,
+                then_steps,
+                else_steps,
+                ..
+            } => {
+                matcher.validate(limits)?;
+                for step in then_steps {
+                    step.validate(limits)?;
+                }
+                for step in else_steps {
+                    step.validate(limits)?;
+                }
+            }
+            Self::Loop { count, body, .. } => {
+                if *count > 1000 {
+                    return Err(crate::Error::Config(
+                        crate::error::ConfigError::ValidationError(format!(
+                            "Loop count too large ({count} > max 1000)"
+                        )),
+                    ));
+                }
+                if body.is_empty() {
+                    return Err(crate::Error::Config(
+                        crate::error::ConfigError::ValidationError(
+                            "Loop body must contain at least one step".to_string(),
+                        ),
+                    ));
+                }
+                for step in body {
+                    step.validate(limits)?;
+                }
+            }
         }
         Ok(())
+    }
+}
+
+/// Execute a single descriptor step, used for inline execution in conditionals and loops.
+async fn execute_descriptor_step(
+    step: &DescriptorStep,
+    default_wait_timeout_ms: u64,
+    ctx_clone: WorkflowContext,
+) -> StepResult {
+    match step {
+        DescriptorStep::WaitFor {
+            matcher,
+            timeout_ms,
+            ..
+        } => {
+            let condition = WaitCondition::text_match(matcher.to_text_match());
+            if let Some(timeout_ms) = timeout_ms {
+                StepResult::wait_for_with_timeout(condition, *timeout_ms)
+            } else {
+                StepResult::wait_for(condition)
+            }
+        }
+        DescriptorStep::Sleep { duration_ms, .. } => {
+            StepResult::wait_for_with_timeout(WaitCondition::sleep(*duration_ms), *duration_ms)
+        }
+        DescriptorStep::SendText {
+            text,
+            wait_for,
+            wait_timeout_ms,
+            ..
+        } => {
+            if let Some(wait_for) = wait_for {
+                let condition = WaitCondition::text_match(wait_for.to_text_match());
+                StepResult::send_text_and_wait(
+                    text.clone(),
+                    condition,
+                    wait_timeout_ms.unwrap_or(default_wait_timeout_ms),
+                )
+            } else {
+                StepResult::send_text(text.clone())
+            }
+        }
+        DescriptorStep::SendCtrl { key, .. } => {
+            let mut ctx_clone = ctx_clone;
+            let result = match key {
+                DescriptorControlKey::CtrlC => ctx_clone.send_ctrl_c().await,
+                DescriptorControlKey::CtrlD => ctx_clone.send_ctrl_d().await,
+                DescriptorControlKey::CtrlZ => ctx_clone.send_ctrl_z().await,
+            };
+            match result {
+                Ok(InjectionResult::Allowed { .. }) => StepResult::cont(),
+                Ok(InjectionResult::Denied { decision, .. }) => StepResult::abort(format!(
+                    "Policy denied control send: {}",
+                    decision.reason().unwrap_or("denied")
+                )),
+                Ok(InjectionResult::RequiresApproval { decision, .. }) => {
+                    StepResult::abort(format!(
+                        "Control send requires approval: {}",
+                        decision.reason().unwrap_or("requires approval")
+                    ))
+                }
+                Ok(InjectionResult::Error { error, .. }) => {
+                    StepResult::abort(format!("Control send failed: {error}"))
+                }
+                Err(err) => StepResult::abort(err),
+            }
+        }
+        DescriptorStep::Notify { message, id, .. } => {
+            tracing::info!(step_id = %id, %message, "descriptor workflow notify");
+            StepResult::cont()
+        }
+        DescriptorStep::Log { message, id, .. } => {
+            tracing::info!(step_id = %id, %message, "descriptor workflow log");
+            StepResult::cont()
+        }
+        DescriptorStep::Abort { reason, .. } => StepResult::abort(reason.clone()),
+        DescriptorStep::Conditional {
+            test_text,
+            matcher,
+            then_steps,
+            else_steps,
+            ..
+        } => {
+            let matches = match matcher {
+                DescriptorMatcher::Substring { value } => test_text.contains(value.as_str()),
+                DescriptorMatcher::Regex { pattern } => fancy_regex::Regex::new(pattern)
+                    .map(|re| re.is_match(test_text).unwrap_or(false))
+                    .unwrap_or(false),
+            };
+            let branch = if matches { then_steps } else { else_steps };
+            for branch_step in branch {
+                let result = Box::pin(execute_descriptor_step(
+                    branch_step,
+                    default_wait_timeout_ms,
+                    ctx_clone.clone(),
+                ))
+                .await;
+                if !result.is_continue() {
+                    return result;
+                }
+            }
+            StepResult::cont()
+        }
+        DescriptorStep::Loop { count, body, .. } => {
+            for _iteration in 0..*count {
+                for body_step in body {
+                    let result = Box::pin(execute_descriptor_step(
+                        body_step,
+                        default_wait_timeout_ms,
+                        ctx_clone.clone(),
+                    ))
+                    .await;
+                    if !result.is_continue() {
+                        return result;
+                    }
+                }
+            }
+            StepResult::cont()
+        }
     }
 }
 
@@ -1397,8 +1681,25 @@ impl Workflow for DescriptorWorkflow {
         self.description
     }
 
-    fn handles(&self, _detection: &crate::patterns::Detection) -> bool {
-        false
+    fn handles(&self, detection: &crate::patterns::Detection) -> bool {
+        if self.descriptor.triggers.is_empty() {
+            return false;
+        }
+        self.descriptor.triggers.iter().any(|trigger| {
+            let event_match = trigger.event_types.is_empty()
+                || trigger
+                    .event_types
+                    .iter()
+                    .any(|et| et == &detection.event_type);
+            let agent_match = trigger.agent_types.is_empty()
+                || trigger
+                    .agent_types
+                    .iter()
+                    .any(|at| at == &detection.agent_type.to_string());
+            let rule_match = trigger.rule_ids.is_empty()
+                || trigger.rule_ids.iter().any(|ri| ri == &detection.rule_id);
+            event_match && agent_match && rule_match
+        })
     }
 
     fn steps(&self) -> Vec<WorkflowStep> {
@@ -1481,9 +1782,143 @@ impl Workflow for DescriptorWorkflow {
                         Err(err) => StepResult::abort(err),
                     }
                 }
+                DescriptorStep::Notify { message, id, .. } => {
+                    tracing::info!(step_id = %id, %message, "descriptor workflow notify");
+                    StepResult::cont()
+                }
+                DescriptorStep::Log { message, id, .. } => {
+                    tracing::info!(step_id = %id, %message, "descriptor workflow log");
+                    StepResult::cont()
+                }
+                DescriptorStep::Abort { reason, .. } => StepResult::abort(reason),
+                DescriptorStep::Conditional {
+                    test_text,
+                    matcher,
+                    then_steps,
+                    else_steps,
+                    ..
+                } => {
+                    let matches = match &matcher {
+                        DescriptorMatcher::Substring { value } => {
+                            test_text.contains(value.as_str())
+                        }
+                        DescriptorMatcher::Regex { pattern } => fancy_regex::Regex::new(pattern)
+                            .map(|re| re.is_match(&test_text).unwrap_or(false))
+                            .unwrap_or(false),
+                    };
+                    let branch = if matches { &then_steps } else { &else_steps };
+                    // Execute the first step of the matching branch; the rest are
+                    // flattened into subsequent top-level steps at parse time for
+                    // simplicity. For the MVP, we execute all branch steps inline.
+                    for branch_step in branch {
+                        let result = execute_descriptor_step(
+                            branch_step,
+                            default_wait_timeout_ms,
+                            ctx_clone.clone(),
+                        )
+                        .await;
+                        if !result.is_continue() {
+                            return result;
+                        }
+                    }
+                    StepResult::cont()
+                }
+                DescriptorStep::Loop { count, body, .. } => {
+                    for _iteration in 0..count {
+                        for body_step in &body {
+                            let result = execute_descriptor_step(
+                                body_step,
+                                default_wait_timeout_ms,
+                                ctx_clone.clone(),
+                            )
+                            .await;
+                            if !result.is_continue() {
+                                return result;
+                            }
+                        }
+                    }
+                    StepResult::cont()
+                }
             }
         })
     }
+}
+
+// ============================================================================
+// Filesystem Loading (wa-fno.2)
+// ============================================================================
+
+/// Load all YAML and TOML workflow descriptors from a directory.
+///
+/// Scans `dir` for files with `.yaml`, `.yml`, or `.toml` extensions,
+/// parses each as a `WorkflowDescriptor`, wraps it in a `DescriptorWorkflow`,
+/// and returns the collection. Files that fail to parse are logged and skipped.
+///
+/// The canonical user directory is `~/.config/wa/workflows/`.
+pub fn load_workflows_from_dir(
+    dir: &std::path::Path,
+) -> Vec<(DescriptorWorkflow, std::path::PathBuf)> {
+    let mut workflows = Vec::new();
+
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::debug!(path = %dir.display(), error = %e, "cannot read workflow directory");
+            return workflows;
+        }
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "failed to read workflow file");
+                continue;
+            }
+        };
+
+        let result = match ext.as_str() {
+            "yaml" | "yml" => DescriptorWorkflow::from_yaml_str(&content),
+            "toml" => DescriptorWorkflow::from_toml_str(&content),
+            _ => continue,
+        };
+
+        match result {
+            Ok(workflow) => {
+                tracing::info!(
+                    name = workflow.name,
+                    path = %path.display(),
+                    "loaded custom workflow"
+                );
+                workflows.push((workflow, path));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "skipping invalid workflow file"
+                );
+            }
+        }
+    }
+
+    workflows
+}
+
+/// Return the default user workflow directory path (`~/.config/wa/workflows/`).
+#[must_use]
+pub fn default_workflow_dir() -> Option<std::path::PathBuf> {
+    dirs::config_dir().map(|d| d.join("wa").join("workflows"))
 }
 
 // ============================================================================
@@ -3152,6 +3587,1093 @@ impl PaneWorkflowLockGuard<'_> {
 impl Drop for PaneWorkflowLockGuard<'_> {
     fn drop(&mut self) {
         self.manager.release(self.pane_id, &self.execution_id);
+    }
+}
+
+// ============================================================================
+// Multi-Pane Coordination Primitives (wa-nu4.4.4.1)
+// ============================================================================
+
+/// Strategy for grouping panes into coordination groups.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PaneGroupStrategy {
+    /// Group by WezTerm domain (e.g., "local", "SSH:host").
+    ByDomain,
+    /// Group by inferred agent type (codex, claude_code, etc.).
+    ByAgent,
+    /// Group by project directory (cwd-based).
+    ByProject,
+    /// Explicit list of pane IDs.
+    Explicit { pane_ids: Vec<u64> },
+}
+
+/// A named group of panes selected by a grouping strategy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaneGroup {
+    /// Group name (e.g., domain name, agent type, project path).
+    pub name: String,
+    /// Pane IDs belonging to this group.
+    pub pane_ids: Vec<u64>,
+    /// Strategy used to form this group.
+    pub strategy: PaneGroupStrategy,
+}
+
+impl PaneGroup {
+    /// Create a new pane group.
+    #[must_use]
+    pub fn new(name: impl Into<String>, pane_ids: Vec<u64>, strategy: PaneGroupStrategy) -> Self {
+        Self {
+            name: name.into(),
+            pane_ids,
+            strategy,
+        }
+    }
+
+    /// Number of panes in this group.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.pane_ids.len()
+    }
+
+    /// Whether this group is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.pane_ids.is_empty()
+    }
+}
+
+/// Build pane groups from a list of pane records using the given strategy.
+///
+/// Returns groups sorted deterministically by name.
+pub fn build_pane_groups(
+    panes: &[crate::storage::PaneRecord],
+    strategy: &PaneGroupStrategy,
+) -> Vec<PaneGroup> {
+    use std::collections::BTreeMap;
+
+    match strategy {
+        PaneGroupStrategy::ByDomain => {
+            let mut groups: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+            for pane in panes {
+                groups
+                    .entry(pane.domain.clone())
+                    .or_default()
+                    .push(pane.pane_id);
+            }
+            groups
+                .into_iter()
+                .map(|(name, mut pane_ids)| {
+                    pane_ids.sort_unstable();
+                    PaneGroup::new(name, pane_ids, PaneGroupStrategy::ByDomain)
+                })
+                .collect()
+        }
+        PaneGroupStrategy::ByAgent => {
+            let mut groups: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+            for pane in panes {
+                let agent = pane
+                    .title
+                    .as_deref()
+                    .and_then(infer_agent_from_title)
+                    .unwrap_or("unknown")
+                    .to_string();
+                groups.entry(agent).or_default().push(pane.pane_id);
+            }
+            groups
+                .into_iter()
+                .map(|(name, mut pane_ids)| {
+                    pane_ids.sort_unstable();
+                    PaneGroup::new(name, pane_ids, PaneGroupStrategy::ByAgent)
+                })
+                .collect()
+        }
+        PaneGroupStrategy::ByProject => {
+            let mut groups: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+            for pane in panes {
+                let project = pane.cwd.as_deref().unwrap_or("unknown").to_string();
+                groups.entry(project).or_default().push(pane.pane_id);
+            }
+            groups
+                .into_iter()
+                .map(|(name, mut pane_ids)| {
+                    pane_ids.sort_unstable();
+                    PaneGroup::new(name, pane_ids, PaneGroupStrategy::ByProject)
+                })
+                .collect()
+        }
+        PaneGroupStrategy::Explicit { pane_ids } => {
+            let mut sorted = pane_ids.clone();
+            sorted.sort_unstable();
+            vec![PaneGroup::new("explicit", sorted, strategy.clone())]
+        }
+    }
+}
+
+/// Simple agent inference from pane title.
+fn infer_agent_from_title(title: &str) -> Option<&'static str> {
+    let lower = title.to_lowercase();
+    if lower.contains("codex") {
+        Some("codex")
+    } else if lower.contains("claude") {
+        Some("claude_code")
+    } else if lower.contains("gemini") {
+        Some("gemini")
+    } else {
+        None
+    }
+}
+
+/// Result of attempting to acquire group locks.
+#[derive(Debug, Clone)]
+pub enum GroupLockResult {
+    /// All pane locks acquired successfully.
+    Acquired {
+        /// Pane IDs that were locked.
+        locked_panes: Vec<u64>,
+    },
+    /// Some panes were already locked; acquisition was rolled back.
+    PartialFailure {
+        /// Panes that were successfully locked (then released during rollback).
+        would_have_locked: Vec<u64>,
+        /// Panes that were already locked by other workflows.
+        conflicts: Vec<GroupLockConflict>,
+    },
+}
+
+impl GroupLockResult {
+    /// Whether all locks were acquired.
+    #[must_use]
+    pub fn is_acquired(&self) -> bool {
+        matches!(self, Self::Acquired { .. })
+    }
+}
+
+/// Information about a lock conflict during group acquisition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupLockConflict {
+    /// Pane that couldn't be locked.
+    pub pane_id: u64,
+    /// Workflow currently holding the lock.
+    pub held_by_workflow: String,
+    /// Execution ID holding the lock.
+    pub held_by_execution: String,
+}
+
+impl PaneWorkflowLockManager {
+    /// Attempt to acquire locks for all panes in a group (all-or-nothing).
+    ///
+    /// If any pane is already locked, all acquired locks are rolled back
+    /// and `PartialFailure` is returned with conflict details.
+    pub fn try_acquire_group(
+        &self,
+        pane_ids: &[u64],
+        workflow_name: &str,
+        execution_id: &str,
+    ) -> GroupLockResult {
+        let mut acquired = Vec::new();
+        let mut conflicts = Vec::new();
+
+        for &pane_id in pane_ids {
+            match self.try_acquire(pane_id, workflow_name, execution_id) {
+                LockAcquisitionResult::Acquired => {
+                    acquired.push(pane_id);
+                }
+                LockAcquisitionResult::AlreadyLocked {
+                    held_by_workflow,
+                    held_by_execution,
+                    ..
+                } => {
+                    conflicts.push(GroupLockConflict {
+                        pane_id,
+                        held_by_workflow,
+                        held_by_execution,
+                    });
+                }
+            }
+        }
+
+        if conflicts.is_empty() {
+            GroupLockResult::Acquired {
+                locked_panes: acquired,
+            }
+        } else {
+            // Rollback: release all locks we acquired
+            for pane_id in &acquired {
+                self.release(*pane_id, execution_id);
+            }
+            GroupLockResult::PartialFailure {
+                would_have_locked: acquired,
+                conflicts,
+            }
+        }
+    }
+
+    /// Release locks for all panes in a group.
+    pub fn release_group(&self, pane_ids: &[u64], execution_id: &str) -> usize {
+        let mut released = 0;
+        for &pane_id in pane_ids {
+            if self.release(pane_id, execution_id) {
+                released += 1;
+            }
+        }
+        released
+    }
+}
+
+/// Precondition that a pane must satisfy before a broadcast action is executed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum BroadcastPrecondition {
+    /// Pane must have a shell prompt active (from OSC 133).
+    PromptActive,
+    /// Pane must NOT be in alternate screen mode (vim, less, etc.).
+    NotAltScreen,
+    /// Pane must NOT have a recent capture gap.
+    NoRecentGap,
+    /// Pane must NOT be reserved by another workflow.
+    NotReserved,
+}
+
+impl BroadcastPrecondition {
+    /// Check if the pane capabilities satisfy this precondition.
+    #[must_use]
+    pub fn check(&self, caps: &crate::policy::PaneCapabilities) -> bool {
+        match self {
+            Self::PromptActive => caps.prompt_active,
+            Self::NotAltScreen => !caps.alt_screen.unwrap_or(false),
+            Self::NoRecentGap => !caps.has_recent_gap,
+            Self::NotReserved => !caps.is_reserved,
+        }
+    }
+
+    /// Human-readable label for this precondition.
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::PromptActive => "prompt_active",
+            Self::NotAltScreen => "not_alt_screen",
+            Self::NoRecentGap => "no_recent_gap",
+            Self::NotReserved => "not_reserved",
+        }
+    }
+}
+
+/// Default safe broadcast preconditions.
+///
+/// These prevent "spray and pray" broadcasting:
+/// - Prompt must be active
+/// - Not in alternate screen
+/// - No recent capture gap
+/// - Not reserved by another workflow
+#[must_use]
+pub fn default_broadcast_preconditions() -> Vec<BroadcastPrecondition> {
+    vec![
+        BroadcastPrecondition::PromptActive,
+        BroadcastPrecondition::NotAltScreen,
+        BroadcastPrecondition::NoRecentGap,
+        BroadcastPrecondition::NotReserved,
+    ]
+}
+
+/// Check all preconditions against pane capabilities.
+///
+/// Returns a list of failed precondition labels.
+pub fn check_preconditions(
+    preconditions: &[BroadcastPrecondition],
+    caps: &crate::policy::PaneCapabilities,
+) -> Vec<&'static str> {
+    preconditions
+        .iter()
+        .filter(|p| !p.check(caps))
+        .map(|p| p.label())
+        .collect()
+}
+
+/// Outcome of a broadcast action on a single pane.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum PaneBroadcastOutcome {
+    /// Action was allowed and executed.
+    Allowed {
+        /// Time taken for this pane's action in milliseconds.
+        elapsed_ms: u64,
+    },
+    /// Action was denied by policy.
+    Denied {
+        /// Reason for denial.
+        reason: String,
+    },
+    /// Preconditions were not met.
+    PreconditionFailed {
+        /// List of failed precondition labels.
+        failed: Vec<String>,
+    },
+    /// Action was skipped (pane was locked by another workflow).
+    Skipped {
+        /// Reason for skipping.
+        reason: String,
+    },
+    /// Verification after action failed.
+    VerificationFailed {
+        /// What went wrong during verification.
+        reason: String,
+    },
+}
+
+/// Full broadcast result across all targeted panes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BroadcastResult {
+    /// Workflow or action name.
+    pub action: String,
+    /// Per-pane outcomes, keyed by pane ID.
+    pub outcomes: Vec<PaneBroadcastEntry>,
+    /// Total elapsed time in milliseconds.
+    pub total_elapsed_ms: u64,
+}
+
+/// A single entry in a broadcast result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaneBroadcastEntry {
+    /// Pane ID.
+    pub pane_id: u64,
+    /// Outcome for this pane.
+    pub outcome: PaneBroadcastOutcome,
+}
+
+impl BroadcastResult {
+    /// Create a new broadcast result.
+    #[must_use]
+    pub fn new(action: impl Into<String>) -> Self {
+        Self {
+            action: action.into(),
+            outcomes: Vec::new(),
+            total_elapsed_ms: 0,
+        }
+    }
+
+    /// Add a pane outcome.
+    pub fn add_outcome(&mut self, pane_id: u64, outcome: PaneBroadcastOutcome) {
+        self.outcomes.push(PaneBroadcastEntry { pane_id, outcome });
+    }
+
+    /// Count of panes where the action was allowed.
+    #[must_use]
+    pub fn allowed_count(&self) -> usize {
+        self.outcomes
+            .iter()
+            .filter(|e| matches!(e.outcome, PaneBroadcastOutcome::Allowed { .. }))
+            .count()
+    }
+
+    /// Count of panes where the action was denied.
+    #[must_use]
+    pub fn denied_count(&self) -> usize {
+        self.outcomes
+            .iter()
+            .filter(|e| matches!(e.outcome, PaneBroadcastOutcome::Denied { .. }))
+            .count()
+    }
+
+    /// Count of panes where preconditions failed.
+    #[must_use]
+    pub fn precondition_failed_count(&self) -> usize {
+        self.outcomes
+            .iter()
+            .filter(|e| matches!(e.outcome, PaneBroadcastOutcome::PreconditionFailed { .. }))
+            .count()
+    }
+
+    /// Count of panes that were skipped.
+    #[must_use]
+    pub fn skipped_count(&self) -> usize {
+        self.outcomes
+            .iter()
+            .filter(|e| matches!(e.outcome, PaneBroadcastOutcome::Skipped { .. }))
+            .count()
+    }
+
+    /// Whether all targeted panes were allowed.
+    #[must_use]
+    pub fn all_allowed(&self) -> bool {
+        !self.outcomes.is_empty() && self.allowed_count() == self.outcomes.len()
+    }
+}
+
+// ============================================================================
+// Multi-Pane Coordination Workflows (wa-nu4.4.4.2)
+// ============================================================================
+
+/// Configuration for the `coordinate_agents` family of multi-pane workflows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoordinateAgentsConfig {
+    /// Strategy for selecting which panes to target.
+    pub strategy: PaneGroupStrategy,
+    /// Preconditions each pane must meet before receiving a broadcast action.
+    #[serde(default = "default_broadcast_preconditions")]
+    pub preconditions: Vec<BroadcastPrecondition>,
+    /// Whether to abort the entire operation if group lock acquisition fails.
+    #[serde(default)]
+    pub abort_on_lock_failure: bool,
+}
+
+impl Default for CoordinateAgentsConfig {
+    fn default() -> Self {
+        Self {
+            strategy: PaneGroupStrategy::ByAgent,
+            preconditions: default_broadcast_preconditions(),
+            abort_on_lock_failure: false,
+        }
+    }
+}
+
+/// Agent-specific text to send for context refresh.
+#[must_use]
+pub fn agent_reread_prompt(agent_hint: &str) -> &'static str {
+    match agent_hint {
+        "codex" => "Read the AGENTS.md file and follow the instructions for resuming context.\n",
+        "claude_code" => "/read AGENTS.md\n",
+        "gemini" => "Please read AGENTS.md and follow any instructions for context recovery.\n",
+        _ => "cat AGENTS.md\n",
+    }
+}
+
+/// Agent-specific safe pause keystrokes.
+#[must_use]
+pub fn agent_pause_text(agent_hint: &str) -> &'static str {
+    match agent_hint {
+        // For AI coding agents, Ctrl-C is the safest interrupt
+        "codex" | "claude_code" | "gemini" => "\x03",
+        // For unknown panes, also Ctrl-C
+        _ => "\x03",
+    }
+}
+
+/// Result of a multi-pane coordination operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoordinationResult {
+    /// The operation that was performed.
+    pub operation: String,
+    /// Per-group results.
+    pub groups: Vec<GroupCoordinationEntry>,
+    /// Aggregate broadcast result across all groups.
+    pub broadcast: BroadcastResult,
+}
+
+/// Per-group result within a coordination operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupCoordinationEntry {
+    /// Group name (e.g., domain name, agent type, project path).
+    pub group_name: String,
+    /// Number of panes in this group.
+    pub pane_count: usize,
+    /// Number of panes that received the action.
+    pub acted_count: usize,
+    /// Number of panes that failed preconditions.
+    pub precondition_failed_count: usize,
+    /// Number of panes that were skipped (lock conflicts, etc.).
+    pub skipped_count: usize,
+}
+
+impl CoordinationResult {
+    /// Create a new coordination result for the given operation.
+    #[must_use]
+    pub fn new(operation: impl Into<String>) -> Self {
+        let op = operation.into();
+        Self {
+            operation: op.clone(),
+            groups: Vec::new(),
+            broadcast: BroadcastResult::new(op),
+        }
+    }
+
+    /// Total panes that were successfully acted upon.
+    #[must_use]
+    pub fn total_acted(&self) -> usize {
+        self.groups.iter().map(|g| g.acted_count).sum()
+    }
+
+    /// Total panes across all groups.
+    #[must_use]
+    pub fn total_panes(&self) -> usize {
+        self.groups.iter().map(|g| g.pane_count).sum()
+    }
+}
+
+/// Evaluate which panes in a group pass preconditions and return per-pane outcomes.
+///
+/// This is the core "filter before broadcast" logic that prevents spraying actions
+/// to panes that aren't ready. Returns a vec of (pane_id, Option<outcome>) where
+/// `None` means the pane passed all preconditions.
+#[must_use]
+pub fn evaluate_pane_preconditions<S: ::std::hash::BuildHasher>(
+    pane_ids: &[u64],
+    capabilities: &std::collections::HashMap<u64, crate::policy::PaneCapabilities, S>,
+    preconditions: &[BroadcastPrecondition],
+) -> Vec<(u64, Option<PaneBroadcastOutcome>)> {
+    pane_ids
+        .iter()
+        .map(|&pid| {
+            match capabilities.get(&pid) {
+                Some(caps) => {
+                    let failed = check_preconditions(preconditions, caps);
+                    if failed.is_empty() {
+                        (pid, None) // passed all preconditions
+                    } else {
+                        (
+                            pid,
+                            Some(PaneBroadcastOutcome::PreconditionFailed {
+                                failed: failed.iter().map(|s| (*s).to_string()).collect(),
+                            }),
+                        )
+                    }
+                }
+                None => (
+                    pid,
+                    Some(PaneBroadcastOutcome::Skipped {
+                        reason: "no capabilities available for pane".to_string(),
+                    }),
+                ),
+            }
+        })
+        .collect()
+}
+
+/// Plan a `reread_context` coordination: determine which panes would receive
+/// a context refresh prompt and which would be filtered out.
+///
+/// This is a dry-run / planning function that does not execute any actions.
+#[must_use]
+pub fn plan_reread_context<S: ::std::hash::BuildHasher>(
+    panes: &[crate::storage::PaneRecord],
+    capabilities: &std::collections::HashMap<u64, crate::policy::PaneCapabilities, S>,
+    config: &CoordinateAgentsConfig,
+) -> CoordinationResult {
+    let groups = build_pane_groups(panes, &config.strategy);
+    let mut result = CoordinationResult::new("reread_context");
+
+    for group in &groups {
+        let evals =
+            evaluate_pane_preconditions(&group.pane_ids, capabilities, &config.preconditions);
+        let mut acted = 0usize;
+        let mut precond_failed = 0usize;
+        let mut skipped = 0usize;
+
+        for (pid, outcome) in &evals {
+            match outcome {
+                None => {
+                    acted += 1;
+                    result
+                        .broadcast
+                        .add_outcome(*pid, PaneBroadcastOutcome::Allowed { elapsed_ms: 0 });
+                }
+                Some(o @ PaneBroadcastOutcome::PreconditionFailed { .. }) => {
+                    precond_failed += 1;
+                    result.broadcast.add_outcome(*pid, o.clone());
+                }
+                Some(o) => {
+                    skipped += 1;
+                    result.broadcast.add_outcome(*pid, o.clone());
+                }
+            }
+        }
+
+        result.groups.push(GroupCoordinationEntry {
+            group_name: group.name.clone(),
+            pane_count: group.pane_ids.len(),
+            acted_count: acted,
+            precondition_failed_count: precond_failed,
+            skipped_count: skipped,
+        });
+    }
+
+    result
+}
+
+/// Plan a `pause_all` coordination: determine which panes would receive
+/// a safe pause signal.
+#[must_use]
+pub fn plan_pause_all<S: ::std::hash::BuildHasher>(
+    panes: &[crate::storage::PaneRecord],
+    capabilities: &std::collections::HashMap<u64, crate::policy::PaneCapabilities, S>,
+    config: &CoordinateAgentsConfig,
+) -> CoordinationResult {
+    let groups = build_pane_groups(panes, &config.strategy);
+    let mut result = CoordinationResult::new("pause_all");
+
+    for group in &groups {
+        // For pause_all, we only require NotAltScreen — we deliberately send
+        // to panes even if a command is running (that's the point of pausing).
+        let pause_preconditions: Vec<BroadcastPrecondition> = config
+            .preconditions
+            .iter()
+            .filter(|p| matches!(p, BroadcastPrecondition::NotAltScreen))
+            .cloned()
+            .collect();
+
+        let evals =
+            evaluate_pane_preconditions(&group.pane_ids, capabilities, &pause_preconditions);
+        let mut acted = 0usize;
+        let mut precond_failed = 0usize;
+        let mut skipped = 0usize;
+
+        for (pid, outcome) in &evals {
+            match outcome {
+                None => {
+                    acted += 1;
+                    result
+                        .broadcast
+                        .add_outcome(*pid, PaneBroadcastOutcome::Allowed { elapsed_ms: 0 });
+                }
+                Some(o @ PaneBroadcastOutcome::PreconditionFailed { .. }) => {
+                    precond_failed += 1;
+                    result.broadcast.add_outcome(*pid, o.clone());
+                }
+                Some(o) => {
+                    skipped += 1;
+                    result.broadcast.add_outcome(*pid, o.clone());
+                }
+            }
+        }
+
+        result.groups.push(GroupCoordinationEntry {
+            group_name: group.name.clone(),
+            pane_count: group.pane_ids.len(),
+            acted_count: acted,
+            precondition_failed_count: precond_failed,
+            skipped_count: skipped,
+        });
+    }
+
+    result
+}
+
+/// Resolve the text to send for each pane in a `reread_context` operation.
+///
+/// Returns a map from pane_id to the prompt text, using agent-specific prompts
+/// when the agent type can be inferred from the pane title.
+#[must_use]
+pub fn resolve_reread_prompts(
+    panes: &[crate::storage::PaneRecord],
+) -> std::collections::HashMap<u64, &'static str> {
+    panes
+        .iter()
+        .map(|p| {
+            let agent = p
+                .title
+                .as_deref()
+                .and_then(infer_agent_from_title)
+                .unwrap_or("unknown");
+            (p.pane_id, agent_reread_prompt(agent))
+        })
+        .collect()
+}
+
+/// Resolve the text to send for each pane in a `pause_all` operation.
+#[must_use]
+pub fn resolve_pause_texts(
+    panes: &[crate::storage::PaneRecord],
+) -> std::collections::HashMap<u64, &'static str> {
+    panes
+        .iter()
+        .map(|p| {
+            let agent = p
+                .title
+                .as_deref()
+                .and_then(infer_agent_from_title)
+                .unwrap_or("unknown");
+            (p.pane_id, agent_pause_text(agent))
+        })
+        .collect()
+}
+
+// ============================================================================
+// Unstick Workflow: read-only code scanning (wa-nu4.4.4.4)
+// ============================================================================
+
+/// Category of code pattern scanned by the unstick workflow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnstickFindingKind {
+    /// TODO / FIXME / HACK comment.
+    TodoComment,
+    /// `unwrap()` / `expect()` / `panic!()` call.
+    PanicSite,
+    /// Suspicious error handling (e.g., `let _ = ...` on Result).
+    SuppressedError,
+}
+
+impl UnstickFindingKind {
+    /// Human-readable label for display.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::TodoComment => "TODO/FIXME",
+            Self::PanicSite => "panic site",
+            Self::SuppressedError => "suppressed error",
+        }
+    }
+}
+
+/// A single finding from the unstick scan.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnstickFinding {
+    /// Category of the finding.
+    pub kind: UnstickFindingKind,
+    /// Relative file path from the repo root.
+    pub file: String,
+    /// One-based line number.
+    pub line: u32,
+    /// Short snippet of the matched code (bounded to 200 chars).
+    pub snippet: String,
+    /// Suggested next action for the agent.
+    pub suggestion: String,
+}
+
+/// Configuration for the unstick scan.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnstickConfig {
+    /// Root directory to scan (must be absolute).
+    pub root: std::path::PathBuf,
+    /// Maximum number of findings per category.
+    #[serde(default = "default_max_findings_per_kind")]
+    pub max_findings_per_kind: usize,
+    /// Maximum total findings across all categories.
+    #[serde(default = "default_max_total_findings")]
+    pub max_total_findings: usize,
+    /// File extensions to scan (e.g., ["rs", "py", "ts"]).
+    #[serde(default = "default_scan_extensions")]
+    pub extensions: Vec<String>,
+}
+
+fn default_max_findings_per_kind() -> usize {
+    10
+}
+
+fn default_max_total_findings() -> usize {
+    25
+}
+
+fn default_scan_extensions() -> Vec<String> {
+    vec![
+        "rs".to_string(),
+        "py".to_string(),
+        "ts".to_string(),
+        "js".to_string(),
+        "go".to_string(),
+    ]
+}
+
+impl Default for UnstickConfig {
+    fn default() -> Self {
+        Self {
+            root: std::path::PathBuf::from("."),
+            max_findings_per_kind: default_max_findings_per_kind(),
+            max_total_findings: default_max_total_findings(),
+            extensions: default_scan_extensions(),
+        }
+    }
+}
+
+/// Result of an unstick scan.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnstickReport {
+    /// Findings grouped by kind.
+    pub findings: Vec<UnstickFinding>,
+    /// Total files scanned.
+    pub files_scanned: usize,
+    /// Whether the scan was truncated due to limits.
+    pub truncated: bool,
+    /// Which scanner was used ("ast-grep" or "text").
+    pub scanner: String,
+    /// Summary counts by kind.
+    pub counts: std::collections::BTreeMap<String, usize>,
+}
+
+impl UnstickReport {
+    /// Create an empty report.
+    #[must_use]
+    pub fn empty(scanner: &str) -> Self {
+        Self {
+            findings: Vec::new(),
+            files_scanned: 0,
+            truncated: false,
+            scanner: scanner.to_string(),
+            counts: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Total number of findings.
+    #[must_use]
+    pub fn total_findings(&self) -> usize {
+        self.findings.len()
+    }
+
+    /// Format as a concise human-readable summary.
+    #[must_use]
+    pub fn human_summary(&self) -> String {
+        if self.findings.is_empty() {
+            return "No actionable findings.".to_string();
+        }
+
+        let mut lines = Vec::new();
+        lines.push(format!(
+            "Found {} items across {} files (scanner: {}):",
+            self.findings.len(),
+            self.files_scanned,
+            self.scanner,
+        ));
+
+        for (kind, count) in &self.counts {
+            lines.push(format!("  {kind}: {count}"));
+        }
+
+        lines.push(String::new());
+
+        // Show top findings (up to 10)
+        for (i, f) in self.findings.iter().take(10).enumerate() {
+            lines.push(format!(
+                "  {}. [{}] {}:{} — {}",
+                i + 1,
+                f.kind.label(),
+                f.file,
+                f.line,
+                truncate_snippet(&f.snippet, 80),
+            ));
+            lines.push(format!("     → {}", f.suggestion));
+        }
+
+        if self.findings.len() > 10 {
+            lines.push(format!(
+                "  ... and {} more (use --format json for full list)",
+                self.findings.len() - 10
+            ));
+        }
+
+        if self.truncated {
+            lines.push("  (results truncated due to limits)".to_string());
+        }
+
+        lines.join("\n")
+    }
+}
+
+/// Truncate a snippet to a max length, adding "..." if needed.
+fn truncate_snippet(s: &str, max_len: usize) -> String {
+    let trimmed = s.trim();
+    if trimmed.len() <= max_len {
+        trimmed.to_string()
+    } else {
+        format!("{}...", &trimmed[..max_len.saturating_sub(3)])
+    }
+}
+
+/// Regex patterns for text-based scanning (fallback when ast-grep is not available).
+struct TextScanPatterns {
+    todo: regex::Regex,
+    panic_site: regex::Regex,
+    suppressed_error: regex::Regex,
+}
+
+impl TextScanPatterns {
+    fn new() -> Self {
+        Self {
+            todo: regex::Regex::new(r"(?i)\b(TODO|FIXME|HACK|XXX)\b").expect("valid regex"),
+            panic_site: regex::Regex::new(r"\b(unwrap|expect|panic!)\s*\(").expect("valid regex"),
+            suppressed_error: regex::Regex::new(r"let\s+_\s*=.*\?|let\s+_\s*=.*\.unwrap")
+                .expect("valid regex"),
+        }
+    }
+}
+
+/// Scan a single file for findings using text-based patterns.
+fn scan_file_text(
+    path: &std::path::Path,
+    root: &std::path::Path,
+    patterns: &TextScanPatterns,
+    max_per_kind: usize,
+    kind_counts: &mut std::collections::HashMap<UnstickFindingKind, usize>,
+) -> Vec<UnstickFinding> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    let rel_path = path
+        .strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .to_string();
+
+    let mut findings = Vec::new();
+
+    for (line_num, line) in content.lines().enumerate() {
+        let line_num = (line_num + 1) as u32;
+
+        // Check TODO/FIXME
+        if patterns.todo.is_match(line) {
+            let count = kind_counts
+                .entry(UnstickFindingKind::TodoComment)
+                .or_insert(0);
+            if *count < max_per_kind {
+                *count += 1;
+                findings.push(UnstickFinding {
+                    kind: UnstickFindingKind::TodoComment,
+                    file: rel_path.clone(),
+                    line: line_num,
+                    snippet: line.trim().chars().take(200).collect(),
+                    suggestion: "Address this TODO item or convert to a tracked issue".to_string(),
+                });
+            }
+        }
+
+        // Check panic sites
+        if patterns.panic_site.is_match(line) {
+            let count = kind_counts
+                .entry(UnstickFindingKind::PanicSite)
+                .or_insert(0);
+            if *count < max_per_kind {
+                *count += 1;
+                findings.push(UnstickFinding {
+                    kind: UnstickFindingKind::PanicSite,
+                    file: rel_path.clone(),
+                    line: line_num,
+                    snippet: line.trim().chars().take(200).collect(),
+                    suggestion: "Replace with proper error handling (? operator or match)"
+                        .to_string(),
+                });
+            }
+        }
+
+        // Check suppressed errors
+        if patterns.suppressed_error.is_match(line) {
+            let count = kind_counts
+                .entry(UnstickFindingKind::SuppressedError)
+                .or_insert(0);
+            if *count < max_per_kind {
+                *count += 1;
+                findings.push(UnstickFinding {
+                    kind: UnstickFindingKind::SuppressedError,
+                    file: rel_path.clone(),
+                    line: line_num,
+                    snippet: line.trim().chars().take(200).collect(),
+                    suggestion: "Handle this error explicitly instead of suppressing it"
+                        .to_string(),
+                });
+            }
+        }
+    }
+
+    findings
+}
+
+/// Check whether `sg` (ast-grep) is available on the system.
+#[must_use]
+pub fn is_ast_grep_available() -> bool {
+    std::process::Command::new("sg")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Run the unstick scan using text-based patterns (always available).
+///
+/// This is the fallback scanner when ast-grep is not installed.
+/// It scans files matching the configured extensions and returns
+/// a bounded set of findings.
+#[must_use]
+pub fn run_unstick_scan_text(config: &UnstickConfig) -> UnstickReport {
+    let patterns = TextScanPatterns::new();
+    let mut kind_counts: std::collections::HashMap<UnstickFindingKind, usize> =
+        std::collections::HashMap::new();
+    let mut all_findings = Vec::new();
+    let mut files_scanned = 0usize;
+    let mut truncated = false;
+
+    // Walk the directory tree using a stack-based approach (no walkdir dep)
+    let mut dir_stack: Vec<(std::path::PathBuf, usize)> = vec![(config.root.clone(), 0)];
+
+    while let Some((dir, depth)) = dir_stack.pop() {
+        if depth > 10 || all_findings.len() >= config.max_total_findings {
+            if all_findings.len() >= config.max_total_findings {
+                truncated = true;
+            }
+            break;
+        }
+
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        for entry in entries.flatten() {
+            if all_findings.len() >= config.max_total_findings {
+                truncated = true;
+                break;
+            }
+
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+
+            if path.is_dir() {
+                // Skip hidden dirs, target, node_modules, vendor
+                if !name.starts_with('.')
+                    && name != "target"
+                    && name != "node_modules"
+                    && name != "vendor"
+                {
+                    dir_stack.push((path, depth + 1));
+                }
+                continue;
+            }
+
+            if !path.is_file() {
+                continue;
+            }
+
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_string();
+
+            if !config.extensions.contains(&ext) {
+                continue;
+            }
+
+            files_scanned += 1;
+
+            let file_findings = scan_file_text(
+                &path,
+                &config.root,
+                &patterns,
+                config.max_findings_per_kind,
+                &mut kind_counts,
+            );
+
+            for f in file_findings {
+                if all_findings.len() >= config.max_total_findings {
+                    truncated = true;
+                    break;
+                }
+                all_findings.push(f);
+            }
+        }
+    }
+
+    // Build counts summary
+    let counts: std::collections::BTreeMap<String, usize> = kind_counts
+        .iter()
+        .map(|(k, v)| (k.label().to_string(), *v))
+        .collect();
+
+    UnstickReport {
+        findings: all_findings,
+        files_scanned,
+        truncated,
+        scanner: "text".to_string(),
+        counts,
     }
 }
 
@@ -9453,6 +10975,638 @@ steps:
         );
     }
 
+    // --- Custom workflow extensions (wa-fno.2) ---
+
+    #[test]
+    fn descriptor_with_triggers_parses() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: "triggered_flow"
+description: "A workflow with triggers"
+triggers:
+  - event_types: ["session.compaction"]
+    agent_types: ["codex"]
+    rule_ids: ["compaction.detected"]
+steps:
+  - type: notify
+    id: note
+    message: "Trigger activated"
+"#;
+        let descriptor = WorkflowDescriptor::from_yaml_str(yaml).unwrap();
+        assert_eq!(descriptor.triggers.len(), 1);
+        assert_eq!(
+            descriptor.triggers[0].event_types,
+            vec!["session.compaction"]
+        );
+        assert_eq!(descriptor.triggers[0].agent_types, vec!["codex"]);
+        assert_eq!(descriptor.triggers[0].rule_ids, vec!["compaction.detected"]);
+    }
+
+    #[test]
+    fn descriptor_trigger_handles_detection() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: "trigger_match"
+triggers:
+  - event_types: ["session.compaction"]
+    agent_types: ["codex"]
+steps:
+  - type: log
+    id: entry
+    message: "handled"
+"#;
+        let workflow = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
+
+        let matching = crate::patterns::Detection {
+            rule_id: "any_rule".to_string(),
+            agent_type: crate::patterns::AgentType::Codex,
+            event_type: "session.compaction".to_string(),
+            severity: crate::patterns::Severity::Info,
+            confidence: 1.0,
+            extracted: serde_json::Value::Null,
+            matched_text: String::new(),
+            span: (0, 0),
+        };
+        assert!(workflow.handles(&matching));
+
+        let non_matching = crate::patterns::Detection {
+            rule_id: "any_rule".to_string(),
+            agent_type: crate::patterns::AgentType::ClaudeCode,
+            event_type: "session.compaction".to_string(),
+            severity: crate::patterns::Severity::Info,
+            confidence: 1.0,
+            extracted: serde_json::Value::Null,
+            matched_text: String::new(),
+            span: (0, 0),
+        };
+        assert!(!workflow.handles(&non_matching));
+    }
+
+    #[test]
+    fn descriptor_no_triggers_does_not_handle() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: "no_triggers"
+steps:
+  - type: sleep
+    id: pause
+    duration_ms: 10
+"#;
+        let workflow = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
+        let detection = crate::patterns::Detection {
+            rule_id: "test".to_string(),
+            agent_type: crate::patterns::AgentType::Codex,
+            event_type: "any.event".to_string(),
+            severity: crate::patterns::Severity::Info,
+            confidence: 1.0,
+            extracted: serde_json::Value::Null,
+            matched_text: String::new(),
+            span: (0, 0),
+        };
+        assert!(!workflow.handles(&detection));
+    }
+
+    #[test]
+    fn descriptor_on_failure_parses() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: "with_failure"
+steps:
+  - type: sleep
+    id: pause
+    duration_ms: 10
+on_failure:
+  action: notify
+  message: "Failed at step: ${failed_step}"
+"#;
+        let descriptor = WorkflowDescriptor::from_yaml_str(yaml).unwrap();
+        assert!(descriptor.on_failure.is_some());
+        let handler = descriptor.on_failure.as_ref().unwrap();
+        let msg = handler.interpolate_message("pause");
+        assert_eq!(msg, "Failed at step: pause");
+    }
+
+    #[test]
+    fn descriptor_on_failure_log_variant() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: "failure_log"
+steps:
+  - type: sleep
+    id: pause
+    duration_ms: 10
+on_failure:
+  action: log
+  message: "Error in ${failed_step}"
+"#;
+        let descriptor = WorkflowDescriptor::from_yaml_str(yaml).unwrap();
+        let handler = descriptor.on_failure.as_ref().unwrap();
+        assert!(matches!(handler, DescriptorFailureHandler::Log { .. }));
+        assert_eq!(handler.interpolate_message("step_x"), "Error in step_x");
+    }
+
+    #[test]
+    fn descriptor_notify_step_parses_and_builds_steps() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: "notify_flow"
+steps:
+  - type: notify
+    id: alert
+    message: "Something happened"
+  - type: log
+    id: record
+    message: "Logged event"
+"#;
+        let workflow = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
+        let steps = workflow.steps();
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].name, "alert");
+        assert_eq!(steps[1].name, "record");
+    }
+
+    #[tokio::test]
+    async fn descriptor_notify_step_returns_continue() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: "notify_exec"
+steps:
+  - type: notify
+    id: alert
+    message: "test notification"
+"#;
+        let workflow = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("notify.db")
+            .to_string_lossy()
+            .to_string();
+        let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+        let mut ctx = WorkflowContext::new(storage, 1, PaneCapabilities::default(), "exec-notify");
+        let result = workflow.execute_step(&mut ctx, 0).await;
+        assert!(result.is_continue());
+    }
+
+    #[tokio::test]
+    async fn descriptor_log_step_returns_continue() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: "log_exec"
+steps:
+  - type: log
+    id: entry
+    message: "audit trail entry"
+"#;
+        let workflow = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("log.db").to_string_lossy().to_string();
+        let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+        let mut ctx = WorkflowContext::new(storage, 1, PaneCapabilities::default(), "exec-log");
+        let result = workflow.execute_step(&mut ctx, 0).await;
+        assert!(result.is_continue());
+    }
+
+    #[tokio::test]
+    async fn descriptor_abort_step_returns_abort() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: "abort_exec"
+steps:
+  - type: abort
+    id: bail
+    reason: "cannot proceed"
+"#;
+        let workflow = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("abort.db")
+            .to_string_lossy()
+            .to_string();
+        let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+        let mut ctx = WorkflowContext::new(storage, 1, PaneCapabilities::default(), "exec-abort");
+        let result = workflow.execute_step(&mut ctx, 0).await;
+        match result {
+            StepResult::Abort { reason } => assert_eq!(reason, "cannot proceed"),
+            other => panic!("Expected Abort, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn descriptor_conditional_then_branch() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: "cond_then"
+steps:
+  - type: conditional
+    id: check
+    test_text: "error detected in output"
+    matcher:
+      kind: substring
+      value: "error"
+    then_steps:
+      - type: notify
+        id: alert
+        message: "error found"
+    else_steps:
+      - type: log
+        id: ok
+        message: "all clear"
+"#;
+        let workflow = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("cond.db")
+            .to_string_lossy()
+            .to_string();
+        let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+        let mut ctx = WorkflowContext::new(storage, 1, PaneCapabilities::default(), "exec-cond");
+        // test_text contains "error" so then_steps should run (notify returns Continue)
+        let result = workflow.execute_step(&mut ctx, 0).await;
+        assert!(result.is_continue());
+    }
+
+    #[tokio::test]
+    async fn descriptor_conditional_else_branch() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: "cond_else"
+steps:
+  - type: conditional
+    id: check
+    test_text: "all systems nominal"
+    matcher:
+      kind: substring
+      value: "error"
+    then_steps:
+      - type: abort
+        id: bail
+        reason: "error found"
+    else_steps:
+      - type: notify
+        id: ok
+        message: "all clear"
+"#;
+        let workflow = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("cond_else.db")
+            .to_string_lossy()
+            .to_string();
+        let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+        let mut ctx =
+            WorkflowContext::new(storage, 1, PaneCapabilities::default(), "exec-cond-else");
+        // test_text does NOT contain "error" so else branch runs (notify returns Continue)
+        let result = workflow.execute_step(&mut ctx, 0).await;
+        assert!(result.is_continue());
+    }
+
+    #[tokio::test]
+    async fn descriptor_conditional_then_with_abort() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: "cond_abort"
+steps:
+  - type: conditional
+    id: check
+    test_text: "FATAL error occurred"
+    matcher:
+      kind: regex
+      pattern: "FATAL"
+    then_steps:
+      - type: abort
+        id: bail
+        reason: "fatal error"
+    else_steps: []
+"#;
+        let workflow = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("cond_abort.db")
+            .to_string_lossy()
+            .to_string();
+        let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+        let mut ctx =
+            WorkflowContext::new(storage, 1, PaneCapabilities::default(), "exec-cond-abort");
+        let result = workflow.execute_step(&mut ctx, 0).await;
+        match result {
+            StepResult::Abort { reason } => assert_eq!(reason, "fatal error"),
+            other => panic!("Expected Abort, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn descriptor_loop_repeats_steps() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: "loop_test"
+steps:
+  - type: loop
+    id: repeat
+    count: 3
+    body:
+      - type: log
+        id: tick
+        message: "iteration"
+"#;
+        let workflow = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("loop.db")
+            .to_string_lossy()
+            .to_string();
+        let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+        let mut ctx = WorkflowContext::new(storage, 1, PaneCapabilities::default(), "exec-loop");
+        // All body steps are log (Continue), so loop completes with Continue
+        let result = workflow.execute_step(&mut ctx, 0).await;
+        assert!(result.is_continue());
+    }
+
+    #[tokio::test]
+    async fn descriptor_loop_aborts_on_abort_step() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: "loop_abort"
+steps:
+  - type: loop
+    id: repeat
+    count: 10
+    body:
+      - type: abort
+        id: bail
+        reason: "stop early"
+"#;
+        let workflow = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("loop_abort.db")
+            .to_string_lossy()
+            .to_string();
+        let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+        let mut ctx =
+            WorkflowContext::new(storage, 1, PaneCapabilities::default(), "exec-loop-abort");
+        let result = workflow.execute_step(&mut ctx, 0).await;
+        match result {
+            StepResult::Abort { reason } => assert_eq!(reason, "stop early"),
+            other => panic!("Expected Abort, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn descriptor_rejects_loop_count_too_large() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: "big_loop"
+steps:
+  - type: loop
+    id: big
+    count: 1001
+    body:
+      - type: sleep
+        id: pause
+        duration_ms: 1
+"#;
+        let err = WorkflowDescriptor::from_yaml_str(yaml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("Loop count too large"));
+    }
+
+    #[test]
+    fn descriptor_rejects_empty_loop_body() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: "empty_loop"
+steps:
+  - type: loop
+    id: empty
+    count: 5
+    body: []
+"#;
+        let err = WorkflowDescriptor::from_yaml_str(yaml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("Loop body must contain at least one step"));
+    }
+
+    #[test]
+    fn descriptor_conditional_validates_nested_steps() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: "cond_validate"
+steps:
+  - type: conditional
+    id: check
+    test_text: "test"
+    matcher:
+      kind: regex
+      pattern: "(["
+    then_steps: []
+    else_steps: []
+"#;
+        let err = WorkflowDescriptor::from_yaml_str(yaml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("Invalid regex pattern"));
+    }
+
+    #[test]
+    fn descriptor_toml_with_triggers_and_on_failure() {
+        let toml = r#"
+workflow_schema_version = 1
+name = "toml_full"
+
+[[triggers]]
+event_types = ["restart.prompt"]
+agent_types = ["custom-agent"]
+
+[[steps]]
+type = "send_text"
+id = "restart"
+text = "/restart\n"
+
+[on_failure]
+action = "notify"
+message = "Failed at ${failed_step}"
+"#;
+        let descriptor = WorkflowDescriptor::from_toml_str(toml).unwrap();
+        assert_eq!(descriptor.triggers.len(), 1);
+        assert!(descriptor.on_failure.is_some());
+        let handler = descriptor.on_failure.as_ref().unwrap();
+        assert_eq!(handler.interpolate_message("restart"), "Failed at restart");
+    }
+
+    #[test]
+    fn load_workflows_from_dir_loads_yaml_and_toml() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let yaml_content = r#"
+workflow_schema_version: 1
+name: "yaml_wf"
+steps:
+  - type: sleep
+    id: pause
+    duration_ms: 10
+"#;
+        std::fs::write(dir.path().join("wf1.yaml"), yaml_content).unwrap();
+
+        let toml_content = r#"
+workflow_schema_version = 1
+name = "toml_wf"
+
+[[steps]]
+type = "sleep"
+id = "pause"
+duration_ms = 10
+"#;
+        std::fs::write(dir.path().join("wf2.toml"), toml_content).unwrap();
+
+        // Should skip non-workflow files
+        std::fs::write(dir.path().join("readme.txt"), "ignore me").unwrap();
+
+        let loaded = load_workflows_from_dir(dir.path());
+        assert_eq!(loaded.len(), 2);
+        let names: Vec<&str> = loaded.iter().map(|(wf, _)| wf.name).collect();
+        assert!(names.contains(&"yaml_wf"));
+        assert!(names.contains(&"toml_wf"));
+    }
+
+    #[test]
+    fn load_workflows_from_dir_skips_invalid_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Valid
+        let yaml = r#"
+workflow_schema_version: 1
+name: "valid"
+steps:
+  - type: sleep
+    id: pause
+    duration_ms: 10
+"#;
+        std::fs::write(dir.path().join("valid.yaml"), yaml).unwrap();
+
+        // Invalid YAML
+        std::fs::write(dir.path().join("broken.yaml"), "not: valid: yaml: {{").unwrap();
+
+        let loaded = load_workflows_from_dir(dir.path());
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].0.name, "valid");
+    }
+
+    #[test]
+    fn load_workflows_from_nonexistent_dir_returns_empty() {
+        let loaded =
+            load_workflows_from_dir(std::path::Path::new("/nonexistent/path/wa/workflows"));
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn default_workflow_dir_returns_some() {
+        // On most systems, config_dir() is available
+        let dir = default_workflow_dir();
+        if let Some(d) = &dir {
+            assert!(d.ends_with("wa/workflows"));
+        }
+    }
+
+    #[test]
+    fn descriptor_failure_handler_abort_variant() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: "fail_abort"
+steps:
+  - type: sleep
+    id: pause
+    duration_ms: 10
+on_failure:
+  action: abort
+  message: "Critical failure in ${failed_step}"
+"#;
+        let descriptor = WorkflowDescriptor::from_yaml_str(yaml).unwrap();
+        let handler = descriptor.on_failure.as_ref().unwrap();
+        assert!(matches!(handler, DescriptorFailureHandler::Abort { .. }));
+        assert_eq!(
+            handler.interpolate_message("pause"),
+            "Critical failure in pause"
+        );
+    }
+
+    #[test]
+    fn descriptor_multiple_triggers_any_match() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: "multi_trigger"
+triggers:
+  - event_types: ["session.compaction"]
+  - rule_ids: ["usage.warning"]
+steps:
+  - type: sleep
+    id: pause
+    duration_ms: 10
+"#;
+        let workflow = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
+
+        // First trigger matches on event_type
+        let det1 = crate::patterns::Detection {
+            rule_id: "other_rule".to_string(),
+            agent_type: crate::patterns::AgentType::Codex,
+            event_type: "session.compaction".to_string(),
+            severity: crate::patterns::Severity::Info,
+            confidence: 1.0,
+            extracted: serde_json::Value::Null,
+            matched_text: String::new(),
+            span: (0, 0),
+        };
+        assert!(workflow.handles(&det1));
+
+        // Second trigger matches on rule_id
+        let det2 = crate::patterns::Detection {
+            rule_id: "usage.warning".to_string(),
+            agent_type: crate::patterns::AgentType::ClaudeCode,
+            event_type: "other.event".to_string(),
+            severity: crate::patterns::Severity::Info,
+            confidence: 1.0,
+            extracted: serde_json::Value::Null,
+            matched_text: String::new(),
+            span: (0, 0),
+        };
+        assert!(workflow.handles(&det2));
+
+        // Neither trigger matches
+        let det3 = crate::patterns::Detection {
+            rule_id: "unrelated".to_string(),
+            agent_type: crate::patterns::AgentType::Gemini,
+            event_type: "unrelated.event".to_string(),
+            severity: crate::patterns::Severity::Info,
+            confidence: 1.0,
+            extracted: serde_json::Value::Null,
+            matched_text: String::new(),
+            span: (0, 0),
+        };
+        assert!(!workflow.handles(&det3));
+    }
+
+    #[test]
+    fn descriptor_yml_extension_loads() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let yaml = r#"
+workflow_schema_version: 1
+name: "yml_ext"
+steps:
+  - type: sleep
+    id: pause
+    duration_ms: 10
+"#;
+        std::fs::write(dir.path().join("test.yml"), yaml).unwrap();
+        let loaded = load_workflows_from_dir(dir.path());
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].0.name, "yml_ext");
+    }
+
     #[tokio::test]
     async fn pane_idle_uses_heuristics_when_no_osc133() {
         let source = MockPaneSource::new(vec!["user@host:~$ ".to_string()]);
@@ -10098,6 +12252,1121 @@ steps:
         assert_eq!(parsed.workflow_name, info.workflow_name);
         assert_eq!(parsed.execution_id, info.execution_id);
         assert_eq!(parsed.locked_at_ms, info.locked_at_ms);
+    }
+
+    // ========================================================================
+    // Coordination Primitives Tests (wa-nu4.4.4.1)
+    // ========================================================================
+
+    #[test]
+    fn pane_group_by_domain() {
+        let panes = vec![
+            crate::storage::PaneRecord {
+                pane_id: 1,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: None,
+                cwd: None,
+                tty_name: None,
+                first_seen_at: 0,
+                last_seen_at: 0,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            },
+            crate::storage::PaneRecord {
+                pane_id: 2,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: None,
+                cwd: None,
+                tty_name: None,
+                first_seen_at: 0,
+                last_seen_at: 0,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            },
+            crate::storage::PaneRecord {
+                pane_id: 3,
+                pane_uuid: None,
+                domain: "SSH:host1".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: None,
+                cwd: None,
+                tty_name: None,
+                first_seen_at: 0,
+                last_seen_at: 0,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            },
+        ];
+
+        let groups = build_pane_groups(&panes, &PaneGroupStrategy::ByDomain);
+        assert_eq!(groups.len(), 2);
+        // BTreeMap sorts by key, so "SSH:host1" comes before "local"
+        assert_eq!(groups[0].name, "SSH:host1");
+        assert_eq!(groups[0].pane_ids, vec![3]);
+        assert_eq!(groups[1].name, "local");
+        assert_eq!(groups[1].pane_ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn pane_group_by_agent() {
+        let panes = vec![
+            crate::storage::PaneRecord {
+                pane_id: 1,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: Some("codex session".to_string()),
+                cwd: None,
+                tty_name: None,
+                first_seen_at: 0,
+                last_seen_at: 0,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            },
+            crate::storage::PaneRecord {
+                pane_id: 2,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: Some("claude code".to_string()),
+                cwd: None,
+                tty_name: None,
+                first_seen_at: 0,
+                last_seen_at: 0,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            },
+            crate::storage::PaneRecord {
+                pane_id: 3,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: Some("bash shell".to_string()),
+                cwd: None,
+                tty_name: None,
+                first_seen_at: 0,
+                last_seen_at: 0,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            },
+        ];
+
+        let groups = build_pane_groups(&panes, &PaneGroupStrategy::ByAgent);
+        assert_eq!(groups.len(), 3);
+        let names: Vec<&str> = groups.iter().map(|g| g.name.as_str()).collect();
+        assert!(names.contains(&"codex"));
+        assert!(names.contains(&"claude_code"));
+        assert!(names.contains(&"unknown"));
+    }
+
+    #[test]
+    fn pane_group_by_project() {
+        let panes = vec![
+            crate::storage::PaneRecord {
+                pane_id: 1,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: None,
+                cwd: Some("/home/user/project-a".to_string()),
+                tty_name: None,
+                first_seen_at: 0,
+                last_seen_at: 0,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            },
+            crate::storage::PaneRecord {
+                pane_id: 2,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: None,
+                cwd: Some("/home/user/project-a".to_string()),
+                tty_name: None,
+                first_seen_at: 0,
+                last_seen_at: 0,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            },
+            crate::storage::PaneRecord {
+                pane_id: 3,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: None,
+                cwd: Some("/home/user/project-b".to_string()),
+                tty_name: None,
+                first_seen_at: 0,
+                last_seen_at: 0,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            },
+        ];
+
+        let groups = build_pane_groups(&panes, &PaneGroupStrategy::ByProject);
+        assert_eq!(groups.len(), 2);
+        let proj_a = groups
+            .iter()
+            .find(|g| g.name.contains("project-a"))
+            .unwrap();
+        assert_eq!(proj_a.pane_ids, vec![1, 2]);
+        let proj_b = groups
+            .iter()
+            .find(|g| g.name.contains("project-b"))
+            .unwrap();
+        assert_eq!(proj_b.pane_ids, vec![3]);
+    }
+
+    #[test]
+    fn pane_group_explicit() {
+        let groups = build_pane_groups(
+            &[],
+            &PaneGroupStrategy::Explicit {
+                pane_ids: vec![5, 3, 1],
+            },
+        );
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name, "explicit");
+        assert_eq!(groups[0].pane_ids, vec![1, 3, 5]); // sorted
+    }
+
+    #[test]
+    fn pane_group_len_and_is_empty() {
+        let group = PaneGroup::new("test", vec![1, 2, 3], PaneGroupStrategy::ByDomain);
+        assert_eq!(group.len(), 3);
+        assert!(!group.is_empty());
+
+        let empty = PaneGroup::new("empty", vec![], PaneGroupStrategy::ByDomain);
+        assert_eq!(empty.len(), 0);
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn group_lock_all_succeed() {
+        let manager = PaneWorkflowLockManager::new();
+        let result = manager.try_acquire_group(&[1, 2, 3], "swarm_wf", "exec-001");
+        assert!(result.is_acquired());
+        match &result {
+            GroupLockResult::Acquired { locked_panes } => {
+                assert_eq!(locked_panes.len(), 3);
+            }
+            _ => panic!("Expected Acquired"),
+        }
+
+        // All should be locked
+        assert!(manager.is_locked(1).is_some());
+        assert!(manager.is_locked(2).is_some());
+        assert!(manager.is_locked(3).is_some());
+    }
+
+    #[test]
+    fn group_lock_partial_failure_rolls_back() {
+        let manager = PaneWorkflowLockManager::new();
+
+        // Pre-lock pane 2
+        manager.try_acquire(2, "other_wf", "exec-other");
+
+        // Group lock should fail and roll back
+        let result = manager.try_acquire_group(&[1, 2, 3], "swarm_wf", "exec-001");
+        assert!(!result.is_acquired());
+
+        match &result {
+            GroupLockResult::PartialFailure {
+                would_have_locked,
+                conflicts,
+            } => {
+                // Pane 1 would have been locked but was rolled back
+                assert!(would_have_locked.contains(&1));
+                assert_eq!(conflicts.len(), 1);
+                assert_eq!(conflicts[0].pane_id, 2);
+                assert_eq!(conflicts[0].held_by_workflow, "other_wf");
+            }
+            _ => panic!("Expected PartialFailure"),
+        }
+
+        // Pane 1 should NOT be locked (rollback)
+        assert!(manager.is_locked(1).is_none());
+        // Pane 2 still locked by original holder
+        assert!(manager.is_locked(2).is_some());
+        // Pane 3 should NOT be locked (never reached or rolled back)
+        assert!(manager.is_locked(3).is_none());
+    }
+
+    #[test]
+    fn group_lock_release_all() {
+        let manager = PaneWorkflowLockManager::new();
+        manager.try_acquire_group(&[1, 2, 3], "swarm_wf", "exec-001");
+
+        let released = manager.release_group(&[1, 2, 3], "exec-001");
+        assert_eq!(released, 3);
+
+        assert!(manager.is_locked(1).is_none());
+        assert!(manager.is_locked(2).is_none());
+        assert!(manager.is_locked(3).is_none());
+    }
+
+    #[test]
+    fn broadcast_precondition_prompt_active() {
+        let passing = PaneCapabilities {
+            prompt_active: true,
+            ..Default::default()
+        };
+        let failing = PaneCapabilities {
+            prompt_active: false,
+            ..Default::default()
+        };
+        assert!(BroadcastPrecondition::PromptActive.check(&passing));
+        assert!(!BroadcastPrecondition::PromptActive.check(&failing));
+    }
+
+    #[test]
+    fn broadcast_precondition_not_alt_screen() {
+        let normal = PaneCapabilities {
+            alt_screen: Some(false),
+            ..Default::default()
+        };
+        let alt = PaneCapabilities {
+            alt_screen: Some(true),
+            ..Default::default()
+        };
+        let unknown = PaneCapabilities {
+            alt_screen: None,
+            ..Default::default()
+        };
+        assert!(BroadcastPrecondition::NotAltScreen.check(&normal));
+        assert!(!BroadcastPrecondition::NotAltScreen.check(&alt));
+        assert!(BroadcastPrecondition::NotAltScreen.check(&unknown));
+    }
+
+    #[test]
+    fn broadcast_precondition_no_gap_and_not_reserved() {
+        let safe = PaneCapabilities {
+            has_recent_gap: false,
+            is_reserved: false,
+            ..Default::default()
+        };
+        assert!(BroadcastPrecondition::NoRecentGap.check(&safe));
+        assert!(BroadcastPrecondition::NotReserved.check(&safe));
+
+        let risky = PaneCapabilities {
+            has_recent_gap: true,
+            is_reserved: true,
+            ..Default::default()
+        };
+        assert!(!BroadcastPrecondition::NoRecentGap.check(&risky));
+        assert!(!BroadcastPrecondition::NotReserved.check(&risky));
+    }
+
+    #[test]
+    fn check_preconditions_returns_failed_labels() {
+        let preconditions = default_broadcast_preconditions();
+        let caps = PaneCapabilities {
+            prompt_active: false,
+            alt_screen: Some(true),
+            has_recent_gap: false,
+            is_reserved: false,
+            ..Default::default()
+        };
+        let failures = check_preconditions(&preconditions, &caps);
+        assert!(failures.contains(&"prompt_active"));
+        assert!(failures.contains(&"not_alt_screen"));
+        assert!(!failures.contains(&"no_recent_gap"));
+    }
+
+    #[test]
+    fn check_preconditions_all_pass() {
+        let preconditions = default_broadcast_preconditions();
+        let caps = PaneCapabilities {
+            prompt_active: true,
+            alt_screen: Some(false),
+            has_recent_gap: false,
+            is_reserved: false,
+            ..Default::default()
+        };
+        let failures = check_preconditions(&preconditions, &caps);
+        assert!(failures.is_empty());
+    }
+
+    #[test]
+    fn broadcast_result_tracking() {
+        let mut result = BroadcastResult::new("test_action");
+        result.add_outcome(1, PaneBroadcastOutcome::Allowed { elapsed_ms: 100 });
+        result.add_outcome(
+            2,
+            PaneBroadcastOutcome::Denied {
+                reason: "policy denied".to_string(),
+            },
+        );
+        result.add_outcome(
+            3,
+            PaneBroadcastOutcome::PreconditionFailed {
+                failed: vec!["prompt_active".to_string()],
+            },
+        );
+        result.add_outcome(
+            4,
+            PaneBroadcastOutcome::Skipped {
+                reason: "locked".to_string(),
+            },
+        );
+
+        assert_eq!(result.allowed_count(), 1);
+        assert_eq!(result.denied_count(), 1);
+        assert_eq!(result.precondition_failed_count(), 1);
+        assert_eq!(result.skipped_count(), 1);
+        assert!(!result.all_allowed());
+    }
+
+    #[test]
+    fn broadcast_result_all_allowed() {
+        let mut result = BroadcastResult::new("multi_pane_restart");
+        result.add_outcome(1, PaneBroadcastOutcome::Allowed { elapsed_ms: 50 });
+        result.add_outcome(2, PaneBroadcastOutcome::Allowed { elapsed_ms: 75 });
+
+        assert!(result.all_allowed());
+        assert_eq!(result.allowed_count(), 2);
+    }
+
+    #[test]
+    fn broadcast_result_serialization() {
+        let mut result = BroadcastResult::new("test");
+        result.add_outcome(1, PaneBroadcastOutcome::Allowed { elapsed_ms: 100 });
+        result.total_elapsed_ms = 150;
+
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["action"], "test");
+        assert_eq!(json["total_elapsed_ms"], 150);
+        assert_eq!(json["outcomes"][0]["pane_id"], 1);
+        assert_eq!(json["outcomes"][0]["outcome"]["status"], "allowed");
+    }
+
+    #[test]
+    fn pane_group_strategy_serialization() {
+        let strategy = PaneGroupStrategy::Explicit {
+            pane_ids: vec![1, 2, 3],
+        };
+        let json = serde_json::to_value(&strategy).unwrap();
+        assert_eq!(json["type"], "explicit");
+        assert_eq!(json["pane_ids"], serde_json::json!([1, 2, 3]));
+
+        let by_domain = PaneGroupStrategy::ByDomain;
+        let json = serde_json::to_value(&by_domain).unwrap();
+        assert_eq!(json["type"], "by_domain");
+    }
+
+    #[test]
+    fn infer_agent_from_title_works() {
+        assert_eq!(infer_agent_from_title("Codex CLI session"), Some("codex"));
+        assert_eq!(
+            infer_agent_from_title("Claude Code - project"),
+            Some("claude_code")
+        );
+        assert_eq!(infer_agent_from_title("Gemini workspace"), Some("gemini"));
+        assert_eq!(infer_agent_from_title("bash shell"), None);
+    }
+
+    #[test]
+    fn default_broadcast_preconditions_has_all_four() {
+        let preconditions = default_broadcast_preconditions();
+        assert_eq!(preconditions.len(), 4);
+        let labels: Vec<&str> = preconditions.iter().map(|p| p.label()).collect();
+        assert!(labels.contains(&"prompt_active"));
+        assert!(labels.contains(&"not_alt_screen"));
+        assert!(labels.contains(&"no_recent_gap"));
+        assert!(labels.contains(&"not_reserved"));
+    }
+
+    // ========================================================================
+    // Multi-Pane Coordination Workflow Tests (wa-nu4.4.4.2)
+    // ========================================================================
+
+    fn make_test_pane(
+        pane_id: u64,
+        domain: &str,
+        title: Option<&str>,
+        cwd: Option<&str>,
+    ) -> crate::storage::PaneRecord {
+        crate::storage::PaneRecord {
+            pane_id,
+            pane_uuid: None,
+            domain: domain.to_string(),
+            window_id: None,
+            tab_id: None,
+            title: title.map(str::to_string),
+            cwd: cwd.map(str::to_string),
+            tty_name: None,
+            first_seen_at: 0,
+            last_seen_at: 0,
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        }
+    }
+
+    fn make_ready_caps() -> crate::policy::PaneCapabilities {
+        crate::policy::PaneCapabilities {
+            prompt_active: true,
+            command_running: false,
+            alt_screen: Some(false),
+            has_recent_gap: false,
+            is_reserved: false,
+            reserved_by: None,
+        }
+    }
+
+    fn make_busy_caps() -> crate::policy::PaneCapabilities {
+        crate::policy::PaneCapabilities {
+            prompt_active: false,
+            command_running: true,
+            alt_screen: Some(false),
+            has_recent_gap: false,
+            is_reserved: false,
+            reserved_by: None,
+        }
+    }
+
+    fn make_alt_screen_caps() -> crate::policy::PaneCapabilities {
+        crate::policy::PaneCapabilities {
+            prompt_active: false,
+            command_running: false,
+            alt_screen: Some(true),
+            has_recent_gap: false,
+            is_reserved: false,
+            reserved_by: None,
+        }
+    }
+
+    #[test]
+    fn coordinate_agents_config_defaults() {
+        let config = CoordinateAgentsConfig::default();
+        assert_eq!(config.strategy, PaneGroupStrategy::ByAgent);
+        assert_eq!(config.preconditions.len(), 4);
+        assert!(!config.abort_on_lock_failure);
+    }
+
+    #[test]
+    fn coordinate_agents_config_serialization() {
+        let config = CoordinateAgentsConfig {
+            strategy: PaneGroupStrategy::Explicit {
+                pane_ids: vec![1, 2],
+            },
+            preconditions: vec![BroadcastPrecondition::PromptActive],
+            abort_on_lock_failure: true,
+        };
+        let json = serde_json::to_value(&config).expect("serialize");
+        assert_eq!(json["abort_on_lock_failure"], true);
+        let rt: CoordinateAgentsConfig = serde_json::from_value(json).expect("deserialize");
+        assert!(rt.abort_on_lock_failure);
+        assert_eq!(rt.preconditions.len(), 1);
+    }
+
+    #[test]
+    fn agent_reread_prompt_for_known_agents() {
+        assert!(agent_reread_prompt("codex").contains("AGENTS.md"));
+        assert!(agent_reread_prompt("claude_code").contains("AGENTS.md"));
+        assert!(agent_reread_prompt("gemini").contains("AGENTS.md"));
+        assert!(agent_reread_prompt("unknown").contains("AGENTS.md"));
+    }
+
+    #[test]
+    fn agent_pause_text_is_ctrl_c() {
+        for agent in &["codex", "claude_code", "gemini", "unknown"] {
+            assert_eq!(agent_pause_text(agent), "\x03");
+        }
+    }
+
+    #[test]
+    fn evaluate_preconditions_all_pass() {
+        let mut caps = std::collections::HashMap::new();
+        caps.insert(1, make_ready_caps());
+        caps.insert(2, make_ready_caps());
+
+        let results =
+            evaluate_pane_preconditions(&[1, 2], &caps, &default_broadcast_preconditions());
+
+        assert_eq!(results.len(), 2);
+        assert!(results[0].1.is_none()); // pane 1 passed
+        assert!(results[1].1.is_none()); // pane 2 passed
+    }
+
+    #[test]
+    fn evaluate_preconditions_filters_busy_pane() {
+        let mut caps = std::collections::HashMap::new();
+        caps.insert(1, make_ready_caps());
+        caps.insert(2, make_busy_caps()); // command running, no prompt
+
+        let results =
+            evaluate_pane_preconditions(&[1, 2], &caps, &default_broadcast_preconditions());
+
+        assert!(results[0].1.is_none()); // pane 1 passed
+        match &results[1].1 {
+            Some(PaneBroadcastOutcome::PreconditionFailed { failed }) => {
+                assert!(failed.contains(&"prompt_active".to_string()));
+            }
+            other => panic!("Expected PreconditionFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn evaluate_preconditions_missing_caps_skips() {
+        let caps = std::collections::HashMap::new(); // no caps at all
+
+        let results = evaluate_pane_preconditions(&[1], &caps, &default_broadcast_preconditions());
+
+        match &results[0].1 {
+            Some(PaneBroadcastOutcome::Skipped { reason }) => {
+                assert!(reason.contains("no capabilities"));
+            }
+            other => panic!("Expected Skipped, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_reread_context_filters_and_groups() {
+        let panes = vec![
+            make_test_pane(1, "local", Some("codex session"), None),
+            make_test_pane(2, "local", Some("claude code"), None),
+            make_test_pane(3, "local", Some("vim editor"), None), // will be in alt-screen
+        ];
+
+        let mut caps = std::collections::HashMap::new();
+        caps.insert(1, make_ready_caps());
+        caps.insert(2, make_ready_caps());
+        caps.insert(3, make_alt_screen_caps());
+
+        let config = CoordinateAgentsConfig {
+            strategy: PaneGroupStrategy::ByAgent,
+            preconditions: default_broadcast_preconditions(),
+            abort_on_lock_failure: false,
+        };
+
+        let result = plan_reread_context(&panes, &caps, &config);
+
+        assert_eq!(result.operation, "reread_context");
+        assert_eq!(result.total_panes(), 3);
+        assert_eq!(result.total_acted(), 2); // panes 1 and 2
+        assert_eq!(result.broadcast.allowed_count(), 2);
+        assert_eq!(result.broadcast.precondition_failed_count(), 1); // pane 3
+    }
+
+    #[test]
+    fn plan_reread_context_empty_panes() {
+        let panes: Vec<crate::storage::PaneRecord> = vec![];
+        let caps = std::collections::HashMap::new();
+        let config = CoordinateAgentsConfig::default();
+
+        let result = plan_reread_context(&panes, &caps, &config);
+
+        assert_eq!(result.total_panes(), 0);
+        assert_eq!(result.total_acted(), 0);
+        assert!(result.groups.is_empty());
+    }
+
+    #[test]
+    fn plan_pause_all_relaxed_preconditions() {
+        // pause_all should only filter by NotAltScreen, not by PromptActive
+        let panes = vec![
+            make_test_pane(1, "local", Some("codex session"), None),
+            make_test_pane(2, "local", Some("claude code"), None),
+            make_test_pane(3, "local", Some("vim editor"), None),
+        ];
+
+        let mut caps = std::collections::HashMap::new();
+        caps.insert(1, make_busy_caps()); // command running — should still get paused
+        caps.insert(2, make_ready_caps());
+        caps.insert(3, make_alt_screen_caps()); // alt-screen — should be filtered out
+
+        let config = CoordinateAgentsConfig::default();
+        let result = plan_pause_all(&panes, &caps, &config);
+
+        assert_eq!(result.operation, "pause_all");
+        // panes 1 and 2 should be acted on, pane 3 filtered by alt-screen
+        assert_eq!(result.broadcast.allowed_count(), 2);
+        assert_eq!(result.broadcast.precondition_failed_count(), 1);
+    }
+
+    #[test]
+    fn plan_pause_all_explicit_strategy() {
+        let panes = vec![
+            make_test_pane(1, "local", None, None),
+            make_test_pane(2, "local", None, None),
+        ];
+
+        let mut caps = std::collections::HashMap::new();
+        caps.insert(1, make_ready_caps());
+        caps.insert(2, make_ready_caps());
+
+        let config = CoordinateAgentsConfig {
+            strategy: PaneGroupStrategy::Explicit {
+                pane_ids: vec![1, 2],
+            },
+            preconditions: default_broadcast_preconditions(),
+            abort_on_lock_failure: false,
+        };
+
+        let result = plan_pause_all(&panes, &caps, &config);
+        assert_eq!(result.groups.len(), 1);
+        assert_eq!(result.groups[0].group_name, "explicit");
+        assert_eq!(result.broadcast.allowed_count(), 2);
+    }
+
+    #[test]
+    fn resolve_reread_prompts_agent_specific() {
+        let panes = vec![
+            make_test_pane(1, "local", Some("codex session"), None),
+            make_test_pane(2, "local", Some("claude code"), None),
+            make_test_pane(3, "local", Some("bash shell"), None),
+        ];
+
+        let prompts = resolve_reread_prompts(&panes);
+        assert_eq!(prompts.len(), 3);
+        assert!(prompts[&1].contains("AGENTS.md"));
+        assert!(prompts[&2].contains("AGENTS.md"));
+        assert!(prompts[&3].contains("AGENTS.md"));
+        // Codex gets the plain-text version, Claude gets /read
+        assert!(prompts[&1].starts_with("Read"));
+        assert!(prompts[&2].starts_with("/read"));
+    }
+
+    #[test]
+    fn resolve_pause_texts_all_ctrl_c() {
+        let panes = vec![
+            make_test_pane(1, "local", Some("codex session"), None),
+            make_test_pane(2, "local", Some("unknown"), None),
+        ];
+
+        let texts = resolve_pause_texts(&panes);
+        assert_eq!(texts[&1], "\x03");
+        assert_eq!(texts[&2], "\x03");
+    }
+
+    #[test]
+    fn coordination_result_new_and_accessors() {
+        let mut result = CoordinationResult::new("test_op");
+        assert_eq!(result.operation, "test_op");
+        assert_eq!(result.total_panes(), 0);
+        assert_eq!(result.total_acted(), 0);
+
+        result.groups.push(GroupCoordinationEntry {
+            group_name: "g1".to_string(),
+            pane_count: 3,
+            acted_count: 2,
+            precondition_failed_count: 1,
+            skipped_count: 0,
+        });
+        result.groups.push(GroupCoordinationEntry {
+            group_name: "g2".to_string(),
+            pane_count: 2,
+            acted_count: 1,
+            precondition_failed_count: 0,
+            skipped_count: 1,
+        });
+
+        assert_eq!(result.total_panes(), 5);
+        assert_eq!(result.total_acted(), 3);
+    }
+
+    #[test]
+    fn coordination_result_serialization() {
+        let mut result = CoordinationResult::new("reread_context");
+        result.groups.push(GroupCoordinationEntry {
+            group_name: "codex".to_string(),
+            pane_count: 2,
+            acted_count: 2,
+            precondition_failed_count: 0,
+            skipped_count: 0,
+        });
+        result
+            .broadcast
+            .add_outcome(1, PaneBroadcastOutcome::Allowed { elapsed_ms: 5 });
+        result
+            .broadcast
+            .add_outcome(2, PaneBroadcastOutcome::Allowed { elapsed_ms: 3 });
+
+        let json = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(json["operation"], "reread_context");
+        assert_eq!(json["groups"][0]["group_name"], "codex");
+        assert_eq!(json["broadcast"]["outcomes"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn plan_reread_context_by_domain_groups_correctly() {
+        let panes = vec![
+            make_test_pane(1, "local", Some("codex"), None),
+            make_test_pane(2, "local", Some("claude"), None),
+            make_test_pane(3, "SSH:remote", Some("codex"), None),
+        ];
+
+        let mut caps = std::collections::HashMap::new();
+        caps.insert(1, make_ready_caps());
+        caps.insert(2, make_ready_caps());
+        caps.insert(3, make_ready_caps());
+
+        let config = CoordinateAgentsConfig {
+            strategy: PaneGroupStrategy::ByDomain,
+            preconditions: default_broadcast_preconditions(),
+            abort_on_lock_failure: false,
+        };
+
+        let result = plan_reread_context(&panes, &caps, &config);
+        assert_eq!(result.groups.len(), 2); // "SSH:remote" and "local"
+        assert_eq!(result.broadcast.allowed_count(), 3);
+    }
+
+    #[test]
+    fn group_coordination_entry_fields() {
+        let entry = GroupCoordinationEntry {
+            group_name: "test".to_string(),
+            pane_count: 5,
+            acted_count: 3,
+            precondition_failed_count: 1,
+            skipped_count: 1,
+        };
+        let json = serde_json::to_value(&entry).expect("serialize");
+        assert_eq!(json["pane_count"], 5);
+        assert_eq!(json["acted_count"], 3);
+        assert_eq!(json["precondition_failed_count"], 1);
+        assert_eq!(json["skipped_count"], 1);
+    }
+
+    // ========================================================================
+    // Unstick Workflow Tests (wa-nu4.4.4.4)
+    // ========================================================================
+
+    #[test]
+    fn unstick_finding_kind_labels() {
+        assert_eq!(UnstickFindingKind::TodoComment.label(), "TODO/FIXME");
+        assert_eq!(UnstickFindingKind::PanicSite.label(), "panic site");
+        assert_eq!(
+            UnstickFindingKind::SuppressedError.label(),
+            "suppressed error"
+        );
+    }
+
+    #[test]
+    fn unstick_finding_kind_serialization() {
+        let json = serde_json::to_value(UnstickFindingKind::TodoComment).expect("serialize");
+        assert_eq!(json, "todo_comment");
+
+        let json = serde_json::to_value(UnstickFindingKind::PanicSite).expect("serialize");
+        assert_eq!(json, "panic_site");
+
+        let rt: UnstickFindingKind =
+            serde_json::from_str("\"suppressed_error\"").expect("deserialize");
+        assert_eq!(rt, UnstickFindingKind::SuppressedError);
+    }
+
+    #[test]
+    fn unstick_config_defaults() {
+        let config = UnstickConfig::default();
+        assert_eq!(config.max_findings_per_kind, 10);
+        assert_eq!(config.max_total_findings, 25);
+        assert!(config.extensions.contains(&"rs".to_string()));
+        assert!(config.extensions.contains(&"py".to_string()));
+    }
+
+    #[test]
+    fn unstick_report_empty() {
+        let report = UnstickReport::empty("text");
+        assert_eq!(report.total_findings(), 0);
+        assert_eq!(report.scanner, "text");
+        assert!(!report.truncated);
+        assert_eq!(report.human_summary(), "No actionable findings.");
+    }
+
+    #[test]
+    fn unstick_report_with_findings() {
+        let mut report = UnstickReport::empty("text");
+        report.findings.push(UnstickFinding {
+            kind: UnstickFindingKind::TodoComment,
+            file: "src/main.rs".to_string(),
+            line: 42,
+            snippet: "// TODO: fix this".to_string(),
+            suggestion: "Address this TODO".to_string(),
+        });
+        report.findings.push(UnstickFinding {
+            kind: UnstickFindingKind::PanicSite,
+            file: "src/lib.rs".to_string(),
+            line: 100,
+            snippet: "value.unwrap()".to_string(),
+            suggestion: "Use ? operator".to_string(),
+        });
+        report.files_scanned = 5;
+        report.counts.insert("TODO/FIXME".to_string(), 1);
+        report.counts.insert("panic site".to_string(), 1);
+
+        assert_eq!(report.total_findings(), 2);
+        let summary = report.human_summary();
+        assert!(summary.contains("Found 2 items"));
+        assert!(summary.contains("src/main.rs:42"));
+        assert!(summary.contains("src/lib.rs:100"));
+    }
+
+    #[test]
+    fn unstick_report_serialization() {
+        let mut report = UnstickReport::empty("text");
+        report.findings.push(UnstickFinding {
+            kind: UnstickFindingKind::TodoComment,
+            file: "test.rs".to_string(),
+            line: 1,
+            snippet: "// TODO".to_string(),
+            suggestion: "fix it".to_string(),
+        });
+        report.files_scanned = 1;
+
+        let json = serde_json::to_value(&report).expect("serialize");
+        assert_eq!(json["scanner"], "text");
+        assert_eq!(json["files_scanned"], 1);
+        assert_eq!(json["findings"][0]["kind"], "todo_comment");
+        assert_eq!(json["findings"][0]["file"], "test.rs");
+        assert_eq!(json["findings"][0]["line"], 1);
+    }
+
+    #[test]
+    fn truncate_snippet_short_passthrough() {
+        assert_eq!(truncate_snippet("short", 80), "short");
+        assert_eq!(truncate_snippet("  padded  ", 80), "padded");
+    }
+
+    #[test]
+    fn truncate_snippet_long_truncated() {
+        let long = "a".repeat(100);
+        let result = truncate_snippet(&long, 20);
+        assert!(result.len() <= 20);
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn scan_file_text_finds_todo() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let file_path = dir.path().join("test.rs");
+        std::fs::write(&file_path, "fn main() {\n    // TODO: fix this\n}\n").expect("write file");
+
+        let patterns = TextScanPatterns::new();
+        let mut kind_counts = std::collections::HashMap::new();
+
+        let findings = scan_file_text(&file_path, dir.path(), &patterns, 10, &mut kind_counts);
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].kind, UnstickFindingKind::TodoComment);
+        assert_eq!(findings[0].file, "test.rs");
+        assert_eq!(findings[0].line, 2);
+        assert!(findings[0].snippet.contains("TODO"));
+    }
+
+    #[test]
+    fn scan_file_text_finds_unwrap() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let file_path = dir.path().join("test.rs");
+        std::fs::write(&file_path, "let x = foo.unwrap();\n").expect("write file");
+
+        let patterns = TextScanPatterns::new();
+        let mut kind_counts = std::collections::HashMap::new();
+
+        let findings = scan_file_text(&file_path, dir.path(), &patterns, 10, &mut kind_counts);
+
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.kind == UnstickFindingKind::PanicSite)
+        );
+    }
+
+    #[test]
+    fn scan_file_text_finds_suppressed_error() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let file_path = dir.path().join("test.rs");
+        std::fs::write(&file_path, "let _ = some_fallible_call()?;\n").expect("write file");
+
+        let patterns = TextScanPatterns::new();
+        let mut kind_counts = std::collections::HashMap::new();
+
+        let findings = scan_file_text(&file_path, dir.path(), &patterns, 10, &mut kind_counts);
+
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.kind == UnstickFindingKind::SuppressedError)
+        );
+    }
+
+    #[test]
+    fn scan_file_text_respects_max_per_kind() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let file_path = dir.path().join("test.rs");
+        let content = (0..20)
+            .map(|i| format!("// TODO: item {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&file_path, content).expect("write file");
+
+        let patterns = TextScanPatterns::new();
+        let mut kind_counts = std::collections::HashMap::new();
+
+        let findings = scan_file_text(&file_path, dir.path(), &patterns, 3, &mut kind_counts);
+
+        assert_eq!(findings.len(), 3); // capped at max_per_kind
+    }
+
+    #[test]
+    fn run_unstick_scan_text_on_fixture_dir() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+
+        // Create a small fixture tree
+        std::fs::write(
+            dir.path().join("main.rs"),
+            "fn main() {\n    // TODO: implement\n    let x = foo.unwrap();\n}\n",
+        )
+        .expect("write");
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "pub fn bar() {\n    // FIXME: clean up\n}\n",
+        )
+        .expect("write");
+        // Non-matching extension should be skipped
+        std::fs::write(
+            dir.path().join("notes.txt"),
+            "TODO: this should be skipped\n",
+        )
+        .expect("write");
+
+        let config = UnstickConfig {
+            root: dir.path().to_path_buf(),
+            max_findings_per_kind: 10,
+            max_total_findings: 25,
+            extensions: vec!["rs".to_string()],
+        };
+
+        let report = run_unstick_scan_text(&config);
+
+        assert_eq!(report.scanner, "text");
+        assert_eq!(report.files_scanned, 2);
+        assert!(!report.truncated);
+        // Should find: 2 TODOs + 1 unwrap = 3 findings minimum
+        assert!(report.total_findings() >= 3);
+        // .txt file should not contribute findings
+        assert!(report.findings.iter().all(|f| f.file.ends_with(".rs")));
+    }
+
+    #[test]
+    fn run_unstick_scan_text_skips_hidden_and_target() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+
+        // Create dirs that should be skipped
+        let hidden = dir.path().join(".hidden");
+        std::fs::create_dir(&hidden).expect("mkdir");
+        std::fs::write(hidden.join("secret.rs"), "// TODO: hidden").expect("write");
+
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).expect("mkdir");
+        std::fs::write(target.join("built.rs"), "// TODO: target").expect("write");
+
+        // Create a file that should be scanned
+        std::fs::write(dir.path().join("src.rs"), "// TODO: visible").expect("write");
+
+        let config = UnstickConfig {
+            root: dir.path().to_path_buf(),
+            ..UnstickConfig::default()
+        };
+
+        let report = run_unstick_scan_text(&config);
+
+        assert_eq!(report.files_scanned, 1);
+        assert_eq!(report.total_findings(), 1);
+        assert_eq!(report.findings[0].file, "src.rs");
+    }
+
+    #[test]
+    fn run_unstick_scan_text_truncates_at_max_total() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+
+        // Create many TODO lines
+        let content = (0..50)
+            .map(|i| format!("// TODO: item {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(dir.path().join("big.rs"), content).expect("write");
+
+        let config = UnstickConfig {
+            root: dir.path().to_path_buf(),
+            max_findings_per_kind: 100, // high per-kind limit
+            max_total_findings: 5,      // low total limit
+            extensions: vec!["rs".to_string()],
+        };
+
+        let report = run_unstick_scan_text(&config);
+
+        assert!(report.total_findings() <= 5);
+        assert!(report.truncated);
+    }
+
+    #[test]
+    fn run_unstick_scan_text_empty_dir() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+
+        let config = UnstickConfig {
+            root: dir.path().to_path_buf(),
+            ..UnstickConfig::default()
+        };
+
+        let report = run_unstick_scan_text(&config);
+        assert_eq!(report.total_findings(), 0);
+        assert_eq!(report.files_scanned, 0);
+        assert!(!report.truncated);
+    }
+
+    #[test]
+    fn run_unstick_scan_text_nonexistent_dir() {
+        let config = UnstickConfig {
+            root: std::path::PathBuf::from("/nonexistent/path/does/not/exist"),
+            ..UnstickConfig::default()
+        };
+
+        let report = run_unstick_scan_text(&config);
+        assert_eq!(report.total_findings(), 0);
+        assert_eq!(report.files_scanned, 0);
+    }
+
+    #[test]
+    fn unstick_human_summary_with_many_findings() {
+        let mut report = UnstickReport::empty("text");
+        for i in 0..15 {
+            report.findings.push(UnstickFinding {
+                kind: UnstickFindingKind::TodoComment,
+                file: format!("file{i}.rs"),
+                line: i as u32 + 1,
+                snippet: format!("// TODO: item {i}"),
+                suggestion: "fix it".to_string(),
+            });
+        }
+        report.files_scanned = 15;
+        report.counts.insert("TODO/FIXME".to_string(), 15);
+
+        let summary = report.human_summary();
+        assert!(summary.contains("Found 15 items"));
+        assert!(summary.contains("... and 5 more"));
     }
 
     // ========================================================================
