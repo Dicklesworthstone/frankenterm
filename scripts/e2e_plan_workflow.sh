@@ -43,6 +43,8 @@ TESTS_SKIPPED=0
 
 # Binary path
 WA_BIN=""
+TEST_WORKSPACE=""
+TEST_PANE_ID=""
 
 # Logging functions
 log_test() {
@@ -89,6 +91,47 @@ is_valid_json() {
     echo "$1" | jq . >/dev/null 2>&1
 }
 
+ensure_test_pane() {
+    # Reuse an existing pane ID if still present.
+    if [[ -n "$TEST_PANE_ID" ]]; then
+        if wezterm cli list 2>/dev/null | grep -qE "^${TEST_PANE_ID}[[:space:]]"; then
+            return 0
+        fi
+        TEST_PANE_ID=""
+    fi
+
+    # Prefer an already-available pane to avoid blocking on spawn.
+    local existing_pane
+    existing_pane=$(timeout 5 wezterm cli list 2>/dev/null | awk 'NR==1 {print $1}' || true)
+    if [[ -n "$existing_pane" && "$existing_pane" =~ ^[0-9]+$ ]]; then
+        TEST_PANE_ID="$existing_pane"
+        e2e_add_file "pane_existing.txt" "pane_id=$TEST_PANE_ID"
+        log_pass "using existing pane: $TEST_PANE_ID"
+        return 0
+    fi
+
+    local marker="PLAN_WORKFLOW_E2E_$(date +%s%N)"
+    local dummy_script="$PROJECT_ROOT/fixtures/e2e/dummy_print.sh"
+    if [[ ! -x "$dummy_script" ]]; then
+        log_skip "dummy script missing: $dummy_script"
+        return 1
+    fi
+
+    local spawn_output
+    spawn_output=$(timeout 10 wezterm cli spawn --cwd "$TEST_WORKSPACE" -- bash "$dummy_script" "$marker" 20 2>&1 || true)
+    TEST_PANE_ID=$(echo "$spawn_output" | grep -oE '^[0-9]+$' | head -1 || true)
+
+    if [[ -z "$TEST_PANE_ID" ]]; then
+        e2e_add_file "pane_spawn_error.txt" "$spawn_output"
+        log_skip "unable to spawn deterministic test pane (likely headless/no mux server)"
+        return 1
+    fi
+
+    e2e_add_file "pane_spawn.txt" "pane_id=$TEST_PANE_ID marker=$marker"
+    log_pass "spawned deterministic test pane: $TEST_PANE_ID"
+    return 0
+}
+
 # ==============================================================================
 # Prerequisites
 # ==============================================================================
@@ -129,6 +172,39 @@ check_prerequisites() {
     else
         log_fail "jq not found"
         exit 1
+    fi
+
+    # Check sqlite3 for workflow/action-plan assertions
+    if command -v sqlite3 &>/dev/null; then
+        log_pass "sqlite3 available"
+    else
+        log_fail "sqlite3 not found"
+        exit 1
+    fi
+
+    # Check wezterm for deterministic pane provisioning
+    if command -v wezterm &>/dev/null; then
+        log_pass "wezterm available"
+    else
+        log_fail "wezterm not found"
+        exit 1
+    fi
+
+    # Create isolated workspace so this test never mutates the caller workspace
+    TEST_WORKSPACE=$(mktemp -d /tmp/wa-e2e-plan-workflow-XXXXXX)
+    export WA_WORKSPACE="$TEST_WORKSPACE"
+    export WA_DATA_DIR="$TEST_WORKSPACE/.wa"
+    mkdir -p "$WA_DATA_DIR"
+    log_pass "isolated workspace initialized: $TEST_WORKSPACE"
+
+    # Copy baseline config when present
+    local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
+    if [[ -f "$baseline_config" ]]; then
+        cp "$baseline_config" "$TEST_WORKSPACE/wa.toml"
+        export WA_CONFIG="$TEST_WORKSPACE/wa.toml"
+        log_pass "baseline config applied"
+    else
+        log_skip "baseline config not found; using defaults"
     fi
 }
 
@@ -188,33 +264,16 @@ test_workflow_list() {
 test_plan_preview() {
     log_test "Testing Plan Preview (Dry-Run)"
 
-    # First, check if pane 0 exists
-    local state_output
-    state_output=$(run_wa_timeout 5 robot state)
-
-    if ! is_valid_json "$state_output"; then
-        log_skip "plan preview: cannot determine pane state"
-        e2e_add_file "state_raw.txt" "$state_output"
+    if ! ensure_test_pane; then
+        log_skip "plan preview: could not provision test pane"
         return
     fi
 
-    e2e_add_json "state_before.json" "$state_output"
-
-    local pane_count
-    pane_count=$(echo "$state_output" | jq -r '. as $root | if .ok then (.data | length) else 0 end')
-
-    if [[ "$pane_count" -eq 0 ]]; then
-        log_skip "plan preview: no panes available for testing"
-        return
-    fi
-
-    local first_pane_id
-    first_pane_id=$(echo "$state_output" | jq -r '.data[0].pane_id')
-    echo "[INFO] Using pane $first_pane_id for plan preview test"
+    echo "[INFO] Using pane $TEST_PANE_ID for plan preview test"
 
     # Run dry-run workflow
     local dry_run_output
-    dry_run_output=$(run_wa_timeout 10 robot workflow run handle_compaction "$first_pane_id" --dry-run)
+    dry_run_output=$(run_wa_timeout 15 robot workflow run handle_compaction "$TEST_PANE_ID" --dry-run --format json)
 
     if ! is_valid_json "$dry_run_output"; then
         log_fail "plan preview: dry-run output not valid JSON"
@@ -293,6 +352,121 @@ test_plan_preview() {
     else
         log_skip "plan preview: no target resolution in response"
     fi
+}
+
+# ==============================================================================
+# Test: Workflow Execution + Persisted Plan/Step Logs
+# ==============================================================================
+
+test_workflow_execution_logs() {
+    log_test "Testing Workflow Execution + Persisted Plan/Step Logs"
+
+    if ! ensure_test_pane; then
+        log_skip "workflow execution logs: could not provision test pane"
+        return
+    fi
+
+    local db_path="$WA_DATA_DIR/wa.db"
+    local before_count=0
+    if [[ -f "$db_path" ]]; then
+        before_count=$(sqlite3 "$db_path" "SELECT COUNT(*) FROM workflow_executions;" 2>/dev/null || echo "0")
+    fi
+    e2e_add_file "workflow_executions_before.txt" "$before_count"
+
+    local run_output
+    run_output=$(run_wa_timeout 20 robot workflow run handle_compaction "$TEST_PANE_ID" --format json)
+    e2e_add_file "workflow_run_raw.txt" "$run_output"
+
+    if is_valid_json "$run_output"; then
+        e2e_add_json "workflow_run.json" "$run_output"
+        log_pass "workflow run: valid JSON envelope"
+    else
+        log_fail "workflow run: invalid JSON output"
+        return
+    fi
+
+    local after_count
+    after_count=$(sqlite3 "$db_path" "SELECT COUNT(*) FROM workflow_executions;" 2>/dev/null || echo "0")
+    e2e_add_file "workflow_executions_after.txt" "$after_count"
+    if [[ "$after_count" -gt "$before_count" ]]; then
+        log_pass "workflow execution persisted to DB ($before_count -> $after_count)"
+    else
+        log_fail "workflow execution not persisted to DB ($before_count -> $after_count)"
+        return
+    fi
+
+    local execution_id
+    execution_id=$(sqlite3 "$db_path" "SELECT id FROM workflow_executions ORDER BY started_at DESC LIMIT 1;" 2>/dev/null || true)
+    if [[ -z "$execution_id" ]]; then
+        log_fail "unable to resolve latest workflow execution id from DB"
+        return
+    fi
+    e2e_add_file "workflow_execution_id.txt" "$execution_id"
+    log_pass "resolved latest execution id: $execution_id"
+
+    local status_output
+    status_output=$(run_wa_timeout 15 robot workflow status "$execution_id" --verbose --format json)
+    if ! is_valid_json "$status_output"; then
+        log_fail "workflow status: invalid JSON"
+        e2e_add_file "workflow_status_verbose_raw.txt" "$status_output"
+        return
+    fi
+    e2e_add_json "workflow_status_verbose.json" "$status_output"
+
+    if echo "$status_output" | jq -e '.ok == true' >/dev/null 2>&1; then
+        log_pass "workflow status: ok=true for persisted execution"
+    else
+        log_fail "workflow status: expected ok=true"
+        return
+    fi
+
+    if echo "$status_output" | jq -e '.data.action_plan.plan_id | type == "string"' >/dev/null 2>&1 \
+        && echo "$status_output" | jq -e '.data.action_plan.plan_hash | type == "string"' >/dev/null 2>&1; then
+        log_pass "workflow status: action_plan metadata persisted"
+    else
+        log_fail "workflow status: missing action_plan metadata"
+        return
+    fi
+
+    local step_log_count
+    step_log_count=$(echo "$status_output" | jq -r '.data.step_logs | length // 0')
+    e2e_add_file "workflow_step_log_count.txt" "$step_log_count"
+    if [[ "$step_log_count" -gt 0 ]]; then
+        log_pass "workflow status: step logs captured ($step_log_count)"
+    else
+        log_fail "workflow status: no step logs captured"
+        return
+    fi
+
+    local status_value
+    status_value=$(echo "$status_output" | jq -r '.data.status // "unknown"')
+    local boundary_evidence
+    boundary_evidence=$(echo "$status_output" | jq -r '
+      (.data.current_step != null) or
+      ((.data.step_logs // []) | any(.error_code != null)) or
+      ((.data.step_logs // []) | any((.result_type // "") != "Done"))
+    ')
+    if [[ "$status_value" == "completed" ]]; then
+        log_pass "workflow completed; status and step logs are queryable"
+    elif [[ "$boundary_evidence" == "true" ]]; then
+        log_pass "workflow failure surfaced with step-boundary evidence"
+    else
+        log_fail "workflow failure missing step-boundary evidence"
+        return
+    fi
+
+    local summary
+    summary=$(cat <<EOF
+execution_id: $execution_id
+workflow_name: handle_compaction
+status: $status_value
+step_logs: $step_log_count
+plan_id: $(echo "$status_output" | jq -r '.data.action_plan.plan_id')
+plan_hash: $(echo "$status_output" | jq -r '.data.action_plan.plan_hash')
+EOF
+)
+    e2e_add_file "workflow_execution_summary.txt" "$summary"
+    log_pass "workflow execution summary artifact written"
 }
 
 # ==============================================================================
@@ -380,6 +554,11 @@ test_workflow_schemas() {
 
     local schema_dir="$PROJECT_ROOT/docs/json-schema"
 
+    if ! command -v jsonschema >/dev/null 2>&1; then
+        log_skip "jsonschema not installed; skipping schema validation checks"
+        return
+    fi
+
     # Check workflow-list schema
     local list_schema="$schema_dir/wa-robot-workflow-list.json"
     if [[ -f "$list_schema" ]]; then
@@ -453,6 +632,7 @@ main() {
     check_prerequisites
     test_workflow_list
     test_plan_preview
+    test_workflow_execution_logs
     test_workflow_status
     test_events_workflow
     test_workflow_schemas

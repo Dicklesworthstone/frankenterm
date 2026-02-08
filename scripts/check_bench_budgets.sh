@@ -41,6 +41,9 @@ declare -A BUDGETS=(
     ["pattern_detection/"]=5000000            # observed ~300-400us, ceiling 5ms
     ["pattern_detection_context"]=5000000     # observed ~350us, ceiling 5ms
     ["pattern_throughput"]=200000000          # observed ~20ms at 64KB, ceiling 200ms
+    ["pattern_lazy_init/construction_only"]=50000000  # observed ~12ms, ceiling 50ms
+    ["pattern_lazy_init/first_detect_cold"]=200000000 # observed ~25ms, ceiling 200ms
+    ["pattern_lazy_init/subsequent_detect_warm"]=5000000 # observed ~40us, ceiling 5ms
 
     # Delta extraction
     ["delta_extraction"]=5000000              # ceiling 5ms

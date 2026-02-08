@@ -363,6 +363,7 @@ SCENARIO_REGISTRY=(
     "workflow_lifecycle|Validate robot workflow list/run/status/abort (dry-run)|true|wezterm,jq,sqlite3|Protects robot workflow surface"
     "dry_run_mode|Validate dry-run previews for send/workflow (human+robot) without side effects|true|wezterm,jq,sqlite3|Protects dry-run trust surface"
     "events_unhandled_alias|Validate robot events --unhandled alias|true|wezterm,jq,sqlite3|Protects events CLI aliases"
+    "events_annotations_triage|Validate event annotate/label/triage lifecycle with redaction + audit evidence|true|jq,sqlite3|Protects event mutation workflows and filters"
     "usage_limit_safe_pause|Validate usage-limit safe pause workflow (fallback plan persisted)|true|wezterm,jq,sqlite3|Protects usage-limit fallback workflow"
     "notification_webhook|Validate webhook notifications (delivery, retry, throttle, recovery)|true|wezterm,jq,sqlite3,python3,curl|Protects webhook notification pipeline"
     "watch_notify_only|Validate notify-only mode (no auto-handle, filters, throttling)|true|wezterm,jq,sqlite3,python3,curl|Protects notify-only monitoring mode"
@@ -6293,6 +6294,295 @@ run_scenario_events_unhandled_alias() {
 }
 
 # ==============================================================================
+# Scenario: Event Annotations + Label + Triage
+# ==============================================================================
+# Validates end-to-end mutation lifecycle for event annotations:
+# 1) Create deterministic fixture events in an isolated workspace
+# 2) Annotate note (with secret-like token) and verify redaction
+# 3) Add label + set triage state
+# 4) Verify robot filters by label + triage_state
+# 5) Verify audit records exist, are ordered, and remain redacted
+# ==============================================================================
+
+run_scenario_events_annotations_triage() {
+    local scenario_dir="$1"
+    local temp_workspace
+    temp_workspace=$(mktemp -d /tmp/wa-e2e-events-annotations-XXXXXX)
+    local result=0
+    local db_path=""
+    local pane_id=9101
+    local target_event_id=""
+    local noise_event_id=""
+    local note_secret="investigating sk-test-should-redact-events-1234567890abcdef"
+    local old_wa_data_dir="${WA_DATA_DIR:-}"
+    local old_wa_workspace="${WA_WORKSPACE:-}"
+    local old_wa_config="${WA_CONFIG:-}"
+
+    log_info "Workspace: $temp_workspace"
+
+    cleanup_events_annotations_triage() {
+        log_verbose "Cleaning up events_annotations_triage scenario"
+        if [[ -d "${temp_workspace:-}" ]]; then
+            cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp "$temp_workspace/wa.toml" "$scenario_dir/" 2>/dev/null || true
+        fi
+        if [[ -n "$old_wa_data_dir" ]]; then
+            export WA_DATA_DIR="$old_wa_data_dir"
+        else
+            unset WA_DATA_DIR
+        fi
+        if [[ -n "$old_wa_workspace" ]]; then
+            export WA_WORKSPACE="$old_wa_workspace"
+        else
+            unset WA_WORKSPACE
+        fi
+        if [[ -n "$old_wa_config" ]]; then
+            export WA_CONFIG="$old_wa_config"
+        else
+            unset WA_CONFIG
+        fi
+
+        # Intentionally keep the temp workspace for postmortem/debug review.
+        echo "temp_workspace: $temp_workspace" >> "$scenario_dir/scenario.log"
+    }
+    trap cleanup_events_annotations_triage EXIT
+
+    # Setup environment for isolated wa instance
+    export WA_DATA_DIR="$temp_workspace/.wa"
+    export WA_WORKSPACE="$temp_workspace"
+    mkdir -p "$WA_DATA_DIR"
+
+    local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
+    if [[ -f "$baseline_config" ]]; then
+        cp "$baseline_config" "$temp_workspace/wa.toml"
+        export WA_CONFIG="$temp_workspace/wa.toml"
+        log_verbose "Using baseline config: $baseline_config"
+    fi
+
+    # Step 1: Initialize DB
+    log_info "Step 1: Initializing DB..."
+    "$WA_BINARY" db migrate --yes > "$scenario_dir/db_migrate.txt" 2>&1 || true
+    "$WA_BINARY" db check -f json > "$scenario_dir/db_check.json" 2>&1 || true
+    db_path="$temp_workspace/.wa/wa.db"
+    if [[ ! -f "$db_path" ]]; then
+        log_fail "DB not created at $db_path"
+        result=1
+    fi
+
+    if [[ $result -eq 0 ]]; then
+        # Step 2: Seed deterministic fixture pane + events
+        log_info "Step 2: Seeding fixture events..."
+        local now_ms
+        now_ms=$(python3 - <<'PY'
+import time
+print(int(time.time() * 1000))
+PY
+)
+        local target_detected_at=$((now_ms - 3000))
+        local noise_detected_at=$((now_ms - 2000))
+
+        sqlite3 "$db_path" <<SQL
+PRAGMA foreign_keys = ON;
+INSERT OR REPLACE INTO panes (
+    pane_id, pane_uuid, domain, window_id, tab_id, title, cwd, tty_name,
+    first_seen_at, last_seen_at, observed, ignore_reason, last_decision_at
+) VALUES (
+    $pane_id, 'e2e-events-annotations-pane', 'local', 1, 1, 'e2e-events-pane', '$temp_workspace', 'tty-e2e-events',
+    $now_ms, $now_ms, 1, NULL, $now_ms
+);
+
+INSERT INTO events (
+    pane_id, rule_id, agent_type, event_type, severity, confidence,
+    extracted, matched_text, segment_id, detected_at, handled_at,
+    handled_by_workflow_id, handled_status, dedupe_key
+) VALUES (
+    $pane_id, 'e2e.events.annotation.target', 'codex', 'usage_warning', 'warning', 0.7,
+    NULL, 'target mutation event', NULL, $target_detected_at, NULL,
+    NULL, NULL, 'e2e-events-target'
+);
+
+INSERT INTO events (
+    pane_id, rule_id, agent_type, event_type, severity, confidence,
+    extracted, matched_text, segment_id, detected_at, handled_at,
+    handled_by_workflow_id, handled_status, dedupe_key
+) VALUES (
+    $pane_id, 'e2e.events.annotation.noise', 'codex', 'usage_warning', 'warning', 0.6,
+    NULL, 'noise event', NULL, $noise_detected_at, NULL,
+    NULL, NULL, 'e2e-events-noise'
+);
+SQL
+
+        target_event_id=$(sqlite3 "$db_path" \
+            "SELECT id FROM events WHERE rule_id='e2e.events.annotation.target' LIMIT 1;")
+        noise_event_id=$(sqlite3 "$db_path" \
+            "SELECT id FROM events WHERE rule_id='e2e.events.annotation.noise' LIMIT 1;")
+        echo "target_event_id: $target_event_id" >> "$scenario_dir/scenario.log"
+        echo "noise_event_id: $noise_event_id" >> "$scenario_dir/scenario.log"
+
+        if [[ -z "$target_event_id" || -z "$noise_event_id" ]]; then
+            log_fail "Failed to seed deterministic event ids"
+            result=1
+        fi
+    fi
+
+    if [[ $result -eq 0 ]]; then
+        # Step 3: Annotate target event with secret-like note (must redact)
+        log_info "Step 3: Annotating event note with redaction check..."
+        "$WA_BINARY" events --format json annotate "$target_event_id" \
+            --note "$note_secret" --by "e2e-user" \
+            > "$scenario_dir/annotate.json" 2> "$scenario_dir/annotate.stderr" || true
+
+        if jq -e '.ok == true' "$scenario_dir/annotate.json" >/dev/null 2>&1; then
+            log_pass "events annotate mutation succeeded"
+        else
+            log_fail "events annotate mutation failed"
+            result=1
+        fi
+
+        if grep -q "$note_secret" "$scenario_dir/annotate.json" 2>/dev/null; then
+            log_fail "Annotation response leaked raw secret-like note"
+            result=1
+        elif jq -e '.annotations.note // "" | contains("[REDACTED]")' \
+            "$scenario_dir/annotate.json" >/dev/null 2>&1; then
+            log_pass "Annotation note redacted in mutation response"
+        else
+            log_fail "Annotation response missing redaction marker"
+            result=1
+        fi
+    fi
+
+    if [[ $result -eq 0 ]]; then
+        # Step 4: Add label + triage state
+        log_info "Step 4: Applying label + triage mutations..."
+        "$WA_BINARY" events --format json label "$target_event_id" --add urgent --by "e2e-user" \
+            > "$scenario_dir/label_add.json" 2> "$scenario_dir/label_add.stderr" || true
+        if jq -e '.ok == true and (.annotations.labels | index("urgent") != null)' \
+            "$scenario_dir/label_add.json" >/dev/null 2>&1; then
+            log_pass "Label mutation applied"
+        else
+            log_fail "Label mutation failed"
+            result=1
+        fi
+
+        "$WA_BINARY" events --format json triage "$target_event_id" \
+            --state investigating --by "e2e-user" \
+            > "$scenario_dir/triage_set.json" 2> "$scenario_dir/triage_set.stderr" || true
+        if jq -e '.ok == true and .annotations.triage_state == "investigating"' \
+            "$scenario_dir/triage_set.json" >/dev/null 2>&1; then
+            log_pass "Triage state mutation applied"
+        else
+            log_fail "Triage state mutation failed"
+            result=1
+        fi
+    fi
+
+    if [[ $result -eq 0 ]]; then
+        # Step 5: Verify label/state filters via robot CLI
+        log_info "Step 5: Validating robot filters by label + triage state..."
+        "$WA_BINARY" robot events --label urgent --triage-state investigating --limit 10 \
+            > "$scenario_dir/robot_events_filtered.json" \
+            2> "$scenario_dir/robot_events_filtered.stderr" || true
+
+        if jq -e \
+            --arg target_id "$target_event_id" \
+            '.ok == true
+            and .data.label_filter == "urgent"
+            and .data.triage_state_filter == "investigating"
+            and (.data.events | length) == 1
+            and ((.data.events[0].id | tostring) == $target_id)' \
+            "$scenario_dir/robot_events_filtered.json" >/dev/null 2>&1; then
+            log_pass "Robot label/state filters returned deterministic target event"
+        else
+            log_fail "Robot label/state filters did not return expected event"
+            result=1
+        fi
+
+        "$WA_BINARY" events --format json > "$scenario_dir/events_after_mutation.json" \
+            2> "$scenario_dir/events_after_mutation.stderr" || true
+        if grep -q "$note_secret" "$scenario_dir/events_after_mutation.json" 2>/dev/null; then
+            log_fail "Event list output leaked raw secret-like note"
+            result=1
+        else
+            log_pass "Event list output did not leak raw note"
+        fi
+    fi
+
+    if [[ $result -eq 0 ]]; then
+        # Step 6: Capture and verify audit evidence
+        log_info "Step 6: Validating audit records for mutation lifecycle..."
+        "$WA_BINARY" audit -f json -l 50 > "$scenario_dir/audit.json" \
+            2> "$scenario_dir/audit.stderr" || true
+
+        if ! jq \
+            '[ (if type=="array" then . else (.records // .items // .data // []) end)[]
+             | select((.action_kind // "") | startswith("event.")) ]' \
+            "$scenario_dir/audit.json" > "$scenario_dir/audit_event_mutations.json" 2>/dev/null; then
+            echo "[]" > "$scenario_dir/audit_event_mutations.json"
+        fi
+
+        if jq -e 'length >= 3' "$scenario_dir/audit_event_mutations.json" >/dev/null 2>&1; then
+            log_pass "Audit contains event mutation records"
+        else
+            log_fail "Missing event mutation audit records"
+            result=1
+        fi
+
+        if jq -e \
+            'map(.action_kind) as $k
+             | ($k | index("event.annotate") != null)
+             and ($k | index("event.triage") != null)
+             and ($k | index("event.label.add") != null)' \
+            "$scenario_dir/audit_event_mutations.json" >/dev/null 2>&1; then
+            log_pass "Audit includes annotate/triage/label actions"
+        else
+            log_fail "Audit missing one or more expected event action kinds"
+            result=1
+        fi
+
+        if jq -e '([.[].ts] == ([.[].ts] | sort | reverse))' \
+            "$scenario_dir/audit_event_mutations.json" >/dev/null 2>&1; then
+            log_pass "Event mutation audit timestamps are in deterministic order"
+        else
+            log_fail "Event mutation audit timestamps are not in deterministic order"
+            result=1
+        fi
+
+        if jq -e \
+            'map(select(.action_kind == "event.annotate"))
+             | length >= 1
+             and all(.[]; (.input_summary // "") | contains("<redacted>"))' \
+            "$scenario_dir/audit_event_mutations.json" >/dev/null 2>&1; then
+            log_pass "Audit annotation summaries remain redacted"
+        else
+            log_fail "Audit annotation summaries missing redaction marker"
+            result=1
+        fi
+
+        if grep -q "$note_secret" "$scenario_dir/audit.json" 2>/dev/null; then
+            log_fail "Audit output leaked raw secret-like note"
+            result=1
+        else
+            log_pass "Audit output does not leak raw secret-like note"
+        fi
+
+        jq -n \
+            --slurpfile annotate "$scenario_dir/annotate.json" \
+            --slurpfile triage "$scenario_dir/triage_set.json" \
+            --slurpfile audit "$scenario_dir/audit_event_mutations.json" \
+            '{
+              annotate_note_updated_at: ($annotate[0].annotations.note_updated_at // null),
+              triage_updated_at: ($triage[0].annotations.triage_updated_at // null),
+              audit_event_timestamps: (($audit[0] // []) | map(.ts))
+            }' > "$scenario_dir/mutation_timestamps.json" 2>/dev/null || true
+    fi
+
+    trap - EXIT
+    cleanup_events_annotations_triage
+
+    return $result
+}
+
+# ==============================================================================
 # Scenario: Accounts Refresh (fake caut + pick preview + redaction)
 # ==============================================================================
 # Validates that:
@@ -7217,6 +7507,9 @@ run_scenario() {
                 ;;
             events_unhandled_alias)
                 run_scenario_events_unhandled_alias "$scenario_dir" || result=$?
+                ;;
+            events_annotations_triage)
+                run_scenario_events_annotations_triage "$scenario_dir" || result=$?
                 ;;
         policy_denial)
             run_scenario_policy_denial "$scenario_dir" || result=$?

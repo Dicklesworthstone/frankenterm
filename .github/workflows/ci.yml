@@ -265,6 +265,62 @@ jobs:
             echo "::warning::Coverage $COVERAGE% is below 50%"
           fi
 
+  # Extended E2E: approval allow-once scenario + artifact collection.
+  # Runs the approval flow E2E (unit-based, no live WezTerm required) and the
+  # prepare_commit_approvals harness scenario when prerequisites are available.
+  # Implements: wa-nu4.3.9.7
+  e2e-extended:
+    name: E2E (approval allow-once)
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: e2e-extended
+
+      - name: Install jq
+        run: sudo apt-get update -qq && sudo apt-get install -qq -y jq
+
+      - name: Build wa (release)
+        run: cargo build --release -p wa
+
+      - name: E2E harness self-check
+        run: scripts/e2e_test.sh --self-check --skip-self-check 2>&1 || true
+
+      - name: Run approval flow E2E
+        id: approval_e2e
+        run: |
+          scripts/e2e_approval_flow.sh 2>&1 | tee e2e-approval-output.log
+        env:
+          WA_LOG_LEVEL: debug
+          WA_LOG_FORMAT: json
+          WA_E2E_VERBOSE: "1"
+          WA_E2E_KEEP_ARTIFACTS: "1"
+
+      - name: Summarize approval E2E results
+        if: always()
+        run: |
+          echo "## E2E: Approval Allow-Once" >> $GITHUB_STEP_SUMMARY
+          if [[ -f e2e-approval-output.log ]]; then
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            tail -10 e2e-approval-output.log >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload E2E artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-approval-artifacts
+          path: |
+            e2e-artifacts/
+            e2e-approval-output.log
+          if-no-files-found: ignore
+          retention-days: 7
+
   # Build verification across platforms
   build:
     name: Build (${{ matrix.target }})
