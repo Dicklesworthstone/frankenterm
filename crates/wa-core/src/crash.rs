@@ -1290,6 +1290,225 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
     (year, m, d)
 }
 
+// ---------------------------------------------------------------------------
+// Crash loop detection + backoff
+// ---------------------------------------------------------------------------
+
+/// Configuration for crash loop detection and backoff.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CrashLoopConfig {
+    /// Window in seconds to count recent crashes (default: 300 = 5 min).
+    pub window_secs: u64,
+    /// Number of crashes within window to trigger "loop" state (default: 3).
+    pub crash_threshold: u32,
+    /// Initial backoff delay in milliseconds (default: 1000).
+    pub initial_delay_ms: u64,
+    /// Maximum backoff delay in milliseconds (default: 60000 = 1 min).
+    pub max_delay_ms: u64,
+    /// Backoff multiplier (default: 2.0).
+    pub backoff_factor: f64,
+}
+
+impl Default for CrashLoopConfig {
+    fn default() -> Self {
+        Self {
+            window_secs: 300,
+            crash_threshold: 3,
+            initial_delay_ms: 1_000,
+            max_delay_ms: 60_000,
+            backoff_factor: 2.0,
+        }
+    }
+}
+
+/// Tracks crash history and computes exponential backoff delays.
+///
+/// Used to detect rapid repeated crashes (crash loops) and apply capped
+/// exponential backoff before allowing restart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CrashLoopDetector {
+    config: CrashLoopConfig,
+    /// Timestamps of recent crashes (epoch seconds), oldest first.
+    crash_timestamps: Vec<u64>,
+    /// Number of consecutive crashes without a successful run.
+    consecutive_crashes: u32,
+}
+
+impl CrashLoopDetector {
+    /// Create a new detector with the given configuration.
+    #[must_use]
+    pub fn new(config: CrashLoopConfig) -> Self {
+        Self {
+            config,
+            crash_timestamps: Vec::new(),
+            consecutive_crashes: 0,
+        }
+    }
+
+    /// Record a crash event at the given timestamp (epoch seconds).
+    pub fn record_crash(&mut self, timestamp: u64) {
+        self.crash_timestamps.push(timestamp);
+        self.consecutive_crashes += 1;
+        // Prune timestamps older than the window
+        self.prune_old(timestamp);
+    }
+
+    /// Record a successful run, resetting the consecutive crash counter.
+    pub fn record_success(&mut self) {
+        self.consecutive_crashes = 0;
+    }
+
+    /// Whether the system is in a crash loop (enough crashes within the window).
+    #[must_use]
+    pub fn is_crash_loop(&self) -> bool {
+        if self.crash_timestamps.is_empty() {
+            return false;
+        }
+        let now = *self.crash_timestamps.last().unwrap();
+        self.crashes_in_window(now) >= self.config.crash_threshold
+    }
+
+    /// Number of consecutive crashes without a successful run.
+    #[must_use]
+    pub fn consecutive_crashes(&self) -> u32 {
+        self.consecutive_crashes
+    }
+
+    /// Compute the next backoff delay in milliseconds based on consecutive crashes.
+    ///
+    /// Returns 0 if there are no consecutive crashes. Otherwise computes
+    /// `initial_delay_ms * backoff_factor^(consecutive - 1)`, capped at `max_delay_ms`.
+    #[must_use]
+    pub fn next_delay_ms(&self) -> u64 {
+        if self.consecutive_crashes == 0 {
+            return 0;
+        }
+        let exponent = (self.consecutive_crashes - 1) as f64;
+        let delay = self.config.initial_delay_ms as f64 * self.config.backoff_factor.powf(exponent);
+        let capped = delay.min(self.config.max_delay_ms as f64) as u64;
+        capped.min(self.config.max_delay_ms)
+    }
+
+    /// Count crashes within the detection window relative to `now`.
+    #[must_use]
+    pub fn crashes_in_window(&self, now: u64) -> u32 {
+        let cutoff = now.saturating_sub(self.config.window_secs);
+        self.crash_timestamps
+            .iter()
+            .filter(|&&ts| ts >= cutoff)
+            .count() as u32
+    }
+
+    /// Prune crash timestamps older than the window.
+    fn prune_old(&mut self, now: u64) {
+        let cutoff = now.saturating_sub(self.config.window_secs);
+        self.crash_timestamps.retain(|&ts| ts >= cutoff);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Capture checkpoint
+// ---------------------------------------------------------------------------
+
+/// Format version for checkpoint serialization.
+const CHECKPOINT_FORMAT_VERSION: u32 = 1;
+
+/// Per-pane capture state saved in a checkpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PaneCaptureState {
+    /// Pane identifier.
+    pub pane_id: u64,
+    /// Last persisted sequence number for this pane.
+    pub last_seq: i64,
+    /// Byte offset of the last captured cursor position.
+    pub cursor_offset: u64,
+    /// Epoch seconds when this pane was last captured.
+    pub last_capture_at: u64,
+}
+
+/// Checkpoint for resuming capture after restart without duplicate segments.
+///
+/// The checkpoint is versioned so future changes can be detected and handled.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaptureCheckpoint {
+    /// Format version (always [`CHECKPOINT_FORMAT_VERSION`]).
+    pub version: u32,
+    /// Epoch seconds when the checkpoint was created.
+    pub created_at: u64,
+    /// Per-pane capture states.
+    pub panes: Vec<PaneCaptureState>,
+    /// wa version that created the checkpoint.
+    pub wa_version: String,
+}
+
+impl CaptureCheckpoint {
+    /// Create a new checkpoint with the given pane states.
+    #[must_use]
+    pub fn new(panes: Vec<PaneCaptureState>) -> Self {
+        Self {
+            version: CHECKPOINT_FORMAT_VERSION,
+            created_at: epoch_secs(),
+            panes,
+            wa_version: crate::VERSION.to_string(),
+        }
+    }
+
+    /// Create a checkpoint with an explicit timestamp (for deterministic tests).
+    #[must_use]
+    pub fn with_timestamp(panes: Vec<PaneCaptureState>, created_at: u64) -> Self {
+        Self {
+            version: CHECKPOINT_FORMAT_VERSION,
+            created_at,
+            panes,
+            wa_version: crate::VERSION.to_string(),
+        }
+    }
+
+    /// Save the checkpoint to a JSON file atomically (write-to-tmp then rename).
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
+        let tmp_path = path.with_extension("tmp");
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&tmp_path, json.as_bytes())?;
+        fs::rename(&tmp_path, path)?;
+        Ok(())
+    }
+
+    /// Load a checkpoint from a JSON file.
+    pub fn load(path: &Path) -> std::io::Result<Self> {
+        let data = fs::read_to_string(path)?;
+        let checkpoint: Self = serde_json::from_str(&data).map_err(std::io::Error::other)?;
+        if checkpoint.version != CHECKPOINT_FORMAT_VERSION {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported checkpoint version {} (expected {})",
+                    checkpoint.version, CHECKPOINT_FORMAT_VERSION
+                ),
+            ));
+        }
+        Ok(checkpoint)
+    }
+
+    /// Look up the capture state for a specific pane.
+    #[must_use]
+    pub fn pane_state(&self, pane_id: u64) -> Option<&PaneCaptureState> {
+        self.panes.iter().find(|p| p.pane_id == pane_id)
+    }
+
+    /// Whether a segment should be skipped (already captured before the checkpoint).
+    ///
+    /// Returns `true` if the pane has a recorded state and `seq` is at or before
+    /// the last persisted sequence number.
+    #[must_use]
+    pub fn should_skip_segment(&self, pane_id: u64, seq: i64) -> bool {
+        self.pane_state(pane_id)
+            .is_some_and(|state| seq <= state.last_seq)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2057,5 +2276,575 @@ mod tests {
     fn incident_kind_display() {
         assert_eq!(format!("{}", IncidentKind::Crash), "crash");
         assert_eq!(format!("{}", IncidentKind::Manual), "manual");
+    }
+
+    // -----------------------------------------------------------------------
+    // Crash loop detection + backoff tests (bd-24cz TDD)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn crash_loop_config_defaults() {
+        let config = CrashLoopConfig::default();
+        assert_eq!(config.window_secs, 300);
+        assert_eq!(config.crash_threshold, 3);
+        assert_eq!(config.initial_delay_ms, 1_000);
+        assert_eq!(config.max_delay_ms, 60_000);
+        assert!((config.backoff_factor - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn crash_loop_config_serialization() {
+        let config = CrashLoopConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: CrashLoopConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.window_secs, config.window_secs);
+        assert_eq!(parsed.crash_threshold, config.crash_threshold);
+        assert_eq!(parsed.initial_delay_ms, config.initial_delay_ms);
+        assert_eq!(parsed.max_delay_ms, config.max_delay_ms);
+    }
+
+    #[test]
+    fn detector_new_has_zero_crashes() {
+        let det = CrashLoopDetector::new(CrashLoopConfig::default());
+        assert_eq!(det.consecutive_crashes(), 0);
+        assert!(!det.is_crash_loop());
+        assert_eq!(det.next_delay_ms(), 0);
+    }
+
+    #[test]
+    fn detector_single_crash_not_loop() {
+        let mut det = CrashLoopDetector::new(CrashLoopConfig::default());
+        det.record_crash(1000);
+        assert_eq!(det.consecutive_crashes(), 1);
+        assert!(!det.is_crash_loop());
+    }
+
+    #[test]
+    fn detector_backoff_growth_exponential() {
+        let config = CrashLoopConfig {
+            initial_delay_ms: 1_000,
+            backoff_factor: 2.0,
+            max_delay_ms: 60_000,
+            ..CrashLoopConfig::default()
+        };
+        let mut det = CrashLoopDetector::new(config);
+
+        // 1st crash: delay = 1000 * 2^0 = 1000
+        det.record_crash(1000);
+        assert_eq!(det.next_delay_ms(), 1_000);
+
+        // 2nd crash: delay = 1000 * 2^1 = 2000
+        det.record_crash(1001);
+        assert_eq!(det.next_delay_ms(), 2_000);
+
+        // 3rd crash: delay = 1000 * 2^2 = 4000
+        det.record_crash(1002);
+        assert_eq!(det.next_delay_ms(), 4_000);
+
+        // 4th crash: delay = 1000 * 2^3 = 8000
+        det.record_crash(1003);
+        assert_eq!(det.next_delay_ms(), 8_000);
+
+        // 5th crash: delay = 1000 * 2^4 = 16000
+        det.record_crash(1004);
+        assert_eq!(det.next_delay_ms(), 16_000);
+    }
+
+    #[test]
+    fn detector_backoff_capped_at_max() {
+        let config = CrashLoopConfig {
+            initial_delay_ms: 1_000,
+            backoff_factor: 2.0,
+            max_delay_ms: 5_000,
+            ..CrashLoopConfig::default()
+        };
+        let mut det = CrashLoopDetector::new(config);
+
+        // Record many crashes
+        for i in 0..20 {
+            det.record_crash(1000 + i);
+        }
+        // Should be capped at 5000
+        assert_eq!(det.next_delay_ms(), 5_000);
+    }
+
+    #[test]
+    fn detector_reset_after_success() {
+        let mut det = CrashLoopDetector::new(CrashLoopConfig::default());
+
+        det.record_crash(1000);
+        det.record_crash(1001);
+        det.record_crash(1002);
+        assert_eq!(det.consecutive_crashes(), 3);
+        assert!(det.is_crash_loop());
+
+        det.record_success();
+        assert_eq!(det.consecutive_crashes(), 0);
+        assert_eq!(det.next_delay_ms(), 0);
+    }
+
+    #[test]
+    fn detector_crash_loop_threshold() {
+        let config = CrashLoopConfig {
+            crash_threshold: 3,
+            window_secs: 60,
+            ..CrashLoopConfig::default()
+        };
+        let mut det = CrashLoopDetector::new(config);
+
+        det.record_crash(1000);
+        assert!(!det.is_crash_loop());
+
+        det.record_crash(1010);
+        assert!(!det.is_crash_loop());
+
+        det.record_crash(1020);
+        assert!(det.is_crash_loop());
+    }
+
+    #[test]
+    fn detector_crashes_outside_window_not_counted() {
+        let config = CrashLoopConfig {
+            crash_threshold: 3,
+            window_secs: 60,
+            ..CrashLoopConfig::default()
+        };
+        let mut det = CrashLoopDetector::new(config);
+
+        // Two crashes at time 100 and 110 (within window)
+        det.record_crash(100);
+        det.record_crash(110);
+
+        // Third crash much later (time 500) — the first two are outside the window
+        det.record_crash(500);
+
+        // Only 1 crash in the last 60s window (at 500)
+        assert_eq!(det.crashes_in_window(500), 1);
+        assert!(!det.is_crash_loop());
+    }
+
+    #[test]
+    fn detector_rapid_crash_loop_detected() {
+        let config = CrashLoopConfig {
+            crash_threshold: 5,
+            window_secs: 10,
+            ..CrashLoopConfig::default()
+        };
+        let mut det = CrashLoopDetector::new(config);
+
+        // Five crashes within 10 seconds
+        for i in 0..5 {
+            det.record_crash(1000 + i);
+        }
+        assert!(det.is_crash_loop());
+        assert_eq!(det.crashes_in_window(1004), 5);
+    }
+
+    #[test]
+    fn detector_success_resets_but_preserves_timestamps() {
+        let config = CrashLoopConfig {
+            crash_threshold: 3,
+            window_secs: 300,
+            ..CrashLoopConfig::default()
+        };
+        let mut det = CrashLoopDetector::new(config);
+
+        det.record_crash(1000);
+        det.record_crash(1001);
+        det.record_success();
+
+        // Consecutive counter is reset but timestamps remain
+        assert_eq!(det.consecutive_crashes(), 0);
+        assert_eq!(det.crashes_in_window(1001), 2);
+
+        // One more crash triggers loop (3 total in window)
+        det.record_crash(1002);
+        assert!(det.is_crash_loop());
+        // But consecutive is only 1 since last success
+        assert_eq!(det.consecutive_crashes(), 1);
+    }
+
+    #[test]
+    fn detector_serialization_round_trip() {
+        let mut det = CrashLoopDetector::new(CrashLoopConfig::default());
+        det.record_crash(1000);
+        det.record_crash(1001);
+
+        let json = serde_json::to_string(&det).unwrap();
+        let parsed: CrashLoopDetector = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.consecutive_crashes(), 2);
+        assert_eq!(parsed.crash_timestamps.len(), 2);
+    }
+
+    #[test]
+    fn detector_backoff_with_custom_factor() {
+        let config = CrashLoopConfig {
+            initial_delay_ms: 500,
+            backoff_factor: 3.0,
+            max_delay_ms: 100_000,
+            ..CrashLoopConfig::default()
+        };
+        let mut det = CrashLoopDetector::new(config);
+
+        det.record_crash(1000);
+        assert_eq!(det.next_delay_ms(), 500); // 500 * 3^0
+
+        det.record_crash(1001);
+        assert_eq!(det.next_delay_ms(), 1_500); // 500 * 3^1
+
+        det.record_crash(1002);
+        assert_eq!(det.next_delay_ms(), 4_500); // 500 * 3^2
+    }
+
+    #[test]
+    fn detector_crashes_in_window_empty() {
+        let det = CrashLoopDetector::new(CrashLoopConfig::default());
+        assert_eq!(det.crashes_in_window(1000), 0);
+    }
+
+    #[test]
+    fn detector_prune_removes_old_timestamps() {
+        let config = CrashLoopConfig {
+            window_secs: 10,
+            ..CrashLoopConfig::default()
+        };
+        let mut det = CrashLoopDetector::new(config);
+
+        det.record_crash(100);
+        det.record_crash(105);
+        det.record_crash(200); // >10s after first two
+
+        // After recording crash at 200, timestamps at 100 and 105 are pruned
+        assert_eq!(det.crash_timestamps.len(), 1);
+        assert_eq!(det.crash_timestamps[0], 200);
+    }
+
+    // -----------------------------------------------------------------------
+    // Capture checkpoint tests (bd-24cz TDD)
+    // -----------------------------------------------------------------------
+
+    fn sample_pane_states() -> Vec<PaneCaptureState> {
+        vec![
+            PaneCaptureState {
+                pane_id: 1,
+                last_seq: 100,
+                cursor_offset: 4096,
+                last_capture_at: 1_700_000_000,
+            },
+            PaneCaptureState {
+                pane_id: 2,
+                last_seq: 200,
+                cursor_offset: 8192,
+                last_capture_at: 1_700_000_001,
+            },
+            PaneCaptureState {
+                pane_id: 5,
+                last_seq: 50,
+                cursor_offset: 1024,
+                last_capture_at: 1_700_000_002,
+            },
+        ]
+    }
+
+    #[test]
+    fn checkpoint_new_sets_version() {
+        let cp = CaptureCheckpoint::with_timestamp(vec![], 1000);
+        assert_eq!(cp.version, CHECKPOINT_FORMAT_VERSION);
+        assert_eq!(cp.created_at, 1000);
+        assert_eq!(cp.wa_version, crate::VERSION);
+        assert!(cp.panes.is_empty());
+    }
+
+    #[test]
+    fn checkpoint_with_panes() {
+        let panes = sample_pane_states();
+        let cp = CaptureCheckpoint::with_timestamp(panes.clone(), 2000);
+        assert_eq!(cp.panes.len(), 3);
+        assert_eq!(cp.panes[0].pane_id, 1);
+        assert_eq!(cp.panes[1].pane_id, 2);
+        assert_eq!(cp.panes[2].pane_id, 5);
+    }
+
+    #[test]
+    fn checkpoint_save_load_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("checkpoint.json");
+
+        let panes = sample_pane_states();
+        let cp = CaptureCheckpoint::with_timestamp(panes, 1_700_000_000);
+        cp.save(&path).unwrap();
+
+        let loaded = CaptureCheckpoint::load(&path).unwrap();
+        assert_eq!(loaded.version, CHECKPOINT_FORMAT_VERSION);
+        assert_eq!(loaded.created_at, 1_700_000_000);
+        assert_eq!(loaded.panes.len(), 3);
+        assert_eq!(loaded.panes[0], cp.panes[0]);
+        assert_eq!(loaded.panes[1], cp.panes[1]);
+        assert_eq!(loaded.panes[2], cp.panes[2]);
+    }
+
+    #[test]
+    fn checkpoint_save_creates_parent_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("deep")
+            .join("nested")
+            .join("checkpoint.json");
+
+        let cp = CaptureCheckpoint::with_timestamp(vec![], 1000);
+        cp.save(&path).unwrap();
+
+        assert!(path.exists());
+        let loaded = CaptureCheckpoint::load(&path).unwrap();
+        assert_eq!(loaded.version, CHECKPOINT_FORMAT_VERSION);
+    }
+
+    #[test]
+    fn checkpoint_load_rejects_wrong_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("checkpoint.json");
+
+        // Write a checkpoint with a different version
+        let json = serde_json::json!({
+            "version": 99,
+            "created_at": 1000,
+            "panes": [],
+            "wa_version": "0.0.0"
+        });
+        fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+
+        let result = CaptureCheckpoint::load(&path);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("unsupported checkpoint version"));
+    }
+
+    #[test]
+    fn checkpoint_load_nonexistent_file() {
+        let result = CaptureCheckpoint::load(Path::new("/nonexistent/checkpoint.json"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn checkpoint_load_invalid_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("checkpoint.json");
+        fs::write(&path, "not valid json").unwrap();
+
+        let result = CaptureCheckpoint::load(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn checkpoint_pane_state_lookup() {
+        let panes = sample_pane_states();
+        let cp = CaptureCheckpoint::with_timestamp(panes, 1000);
+
+        let state = cp.pane_state(1).unwrap();
+        assert_eq!(state.last_seq, 100);
+        assert_eq!(state.cursor_offset, 4096);
+
+        let state = cp.pane_state(5).unwrap();
+        assert_eq!(state.last_seq, 50);
+
+        assert!(cp.pane_state(99).is_none());
+    }
+
+    #[test]
+    fn checkpoint_should_skip_segment_at_or_before() {
+        let panes = sample_pane_states();
+        let cp = CaptureCheckpoint::with_timestamp(panes, 1000);
+
+        // Pane 1: last_seq = 100
+        assert!(cp.should_skip_segment(1, 50)); // before last_seq
+        assert!(cp.should_skip_segment(1, 100)); // at last_seq
+        assert!(!cp.should_skip_segment(1, 101)); // after last_seq
+    }
+
+    #[test]
+    fn checkpoint_should_skip_unknown_pane() {
+        let panes = sample_pane_states();
+        let cp = CaptureCheckpoint::with_timestamp(panes, 1000);
+
+        // Unknown pane should never skip
+        assert!(!cp.should_skip_segment(99, 1));
+        assert!(!cp.should_skip_segment(99, 1000));
+    }
+
+    #[test]
+    fn checkpoint_empty_panes_skip_nothing() {
+        let cp = CaptureCheckpoint::with_timestamp(vec![], 1000);
+        assert!(!cp.should_skip_segment(1, 1));
+        assert!(!cp.should_skip_segment(1, 0));
+    }
+
+    #[test]
+    fn checkpoint_serialization_json_structure() {
+        let panes = vec![PaneCaptureState {
+            pane_id: 42,
+            last_seq: 999,
+            cursor_offset: 65536,
+            last_capture_at: 1_700_000_000,
+        }];
+        let cp = CaptureCheckpoint::with_timestamp(panes, 1_700_000_000);
+
+        let json = serde_json::to_value(&cp).unwrap();
+        assert_eq!(json["version"], CHECKPOINT_FORMAT_VERSION);
+        assert_eq!(json["created_at"], 1_700_000_000_u64);
+        assert_eq!(json["panes"][0]["pane_id"], 42);
+        assert_eq!(json["panes"][0]["last_seq"], 999);
+        assert_eq!(json["panes"][0]["cursor_offset"], 65536);
+    }
+
+    #[test]
+    fn checkpoint_overwrite_save() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("checkpoint.json");
+
+        // Save first checkpoint
+        let cp1 = CaptureCheckpoint::with_timestamp(
+            vec![PaneCaptureState {
+                pane_id: 1,
+                last_seq: 10,
+                cursor_offset: 0,
+                last_capture_at: 100,
+            }],
+            100,
+        );
+        cp1.save(&path).unwrap();
+
+        // Overwrite with second checkpoint
+        let cp2 = CaptureCheckpoint::with_timestamp(
+            vec![PaneCaptureState {
+                pane_id: 1,
+                last_seq: 50,
+                cursor_offset: 4096,
+                last_capture_at: 200,
+            }],
+            200,
+        );
+        cp2.save(&path).unwrap();
+
+        // Load should get the latest
+        let loaded = CaptureCheckpoint::load(&path).unwrap();
+        assert_eq!(loaded.created_at, 200);
+        assert_eq!(loaded.panes[0].last_seq, 50);
+    }
+
+    #[test]
+    fn checkpoint_resume_without_duplicates() {
+        // Simulate: save checkpoint with pane 1 at seq 100, pane 2 at seq 200
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("checkpoint.json");
+
+        let cp = CaptureCheckpoint::with_timestamp(sample_pane_states(), 1000);
+        cp.save(&path).unwrap();
+
+        // On restart, load checkpoint
+        let loaded = CaptureCheckpoint::load(&path).unwrap();
+
+        // Simulate incoming segments: should skip old ones, accept new ones
+        let segments = vec![
+            (1u64, 99i64, "old-duplicate"),
+            (1, 100, "exactly-at-checkpoint"),
+            (1, 101, "new-segment"),
+            (2, 200, "exactly-at-checkpoint-pane2"),
+            (2, 201, "new-segment-pane2"),
+            (3, 1, "unknown-pane-always-accept"),
+        ];
+
+        let mut accepted = Vec::new();
+        let mut skipped = Vec::new();
+        for (pane_id, seq, label) in &segments {
+            if loaded.should_skip_segment(*pane_id, *seq) {
+                skipped.push(*label);
+            } else {
+                accepted.push(*label);
+            }
+        }
+
+        assert_eq!(
+            skipped,
+            vec![
+                "old-duplicate",
+                "exactly-at-checkpoint",
+                "exactly-at-checkpoint-pane2"
+            ]
+        );
+        assert_eq!(
+            accepted,
+            vec![
+                "new-segment",
+                "new-segment-pane2",
+                "unknown-pane-always-accept"
+            ]
+        );
+    }
+
+    #[test]
+    fn pane_capture_state_equality() {
+        let a = PaneCaptureState {
+            pane_id: 1,
+            last_seq: 100,
+            cursor_offset: 4096,
+            last_capture_at: 1000,
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
+
+        let c = PaneCaptureState {
+            pane_id: 1,
+            last_seq: 101,
+            cursor_offset: 4096,
+            last_capture_at: 1000,
+        };
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn detector_and_checkpoint_combined_recovery_flow() {
+        // Simulate: crash loop detected, save checkpoint, restart, resume
+        let tmp = tempfile::tempdir().unwrap();
+        let cp_path = tmp.path().join("checkpoint.json");
+
+        let mut det = CrashLoopDetector::new(CrashLoopConfig {
+            crash_threshold: 3,
+            window_secs: 60,
+            ..CrashLoopConfig::default()
+        });
+
+        // Three rapid crashes
+        det.record_crash(1000);
+        det.record_crash(1001);
+        det.record_crash(1002);
+        assert!(det.is_crash_loop());
+
+        // Save checkpoint before restart
+        let cp = CaptureCheckpoint::with_timestamp(
+            vec![PaneCaptureState {
+                pane_id: 1,
+                last_seq: 50,
+                cursor_offset: 2048,
+                last_capture_at: 1002,
+            }],
+            1002,
+        );
+        cp.save(&cp_path).unwrap();
+
+        // Wait for backoff delay
+        let delay = det.next_delay_ms();
+        assert!(delay > 0);
+
+        // On restart, load checkpoint and resume
+        let loaded = CaptureCheckpoint::load(&cp_path).unwrap();
+        assert!(loaded.should_skip_segment(1, 50)); // skip old
+        assert!(!loaded.should_skip_segment(1, 51)); // accept new
+
+        // Record success after restart
+        det.record_success();
+        assert_eq!(det.consecutive_crashes(), 0);
+        assert_eq!(det.next_delay_ms(), 0);
     }
 }
