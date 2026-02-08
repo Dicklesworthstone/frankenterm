@@ -184,6 +184,8 @@ SEE ALSO:
     wa search "error"                 Find lines containing "error"
     wa search "error" --pane 3        Search in specific pane
     wa search "error OR warning"      FTS5 boolean query
+    wa search "error" --bookmark build
+                                     Search in pane aliased as "build"
     wa search "error" -f json         Machine-readable output
     wa search fts verify              Verify FTS index health
     wa search fts rebuild             Rebuild FTS index
@@ -215,6 +217,14 @@ SEE ALSO:
         /// Filter by pane ID
         #[arg(long, short = 'p')]
         pane: Option<u64>,
+
+        /// Filter by bookmark alias
+        #[arg(long)]
+        bookmark: Option<String>,
+
+        /// Filter by bookmark tag
+        #[arg(long = "bookmark-tag")]
+        bookmark_tag: Option<String>,
 
         /// Only return results since this timestamp (epoch ms or ISO8601)
         #[arg(long, short = 's')]
@@ -348,6 +358,7 @@ SEE ALSO:
     wa status                         System and pane overview
     wa status -f json                 Machine-readable status
     wa status --pane-id 3             Status for specific pane
+    wa status --bookmark build        Status for pane aliased as "build"
     wa status --health                Health check only
 
 SEE ALSO:
@@ -373,6 +384,14 @@ SEE ALSO:
         /// Filter by pane ID
         #[arg(long, short = 'p')]
         pane_id: Option<u64>,
+
+        /// Filter by bookmark alias
+        #[arg(long)]
+        bookmark: Option<String>,
+
+        /// Filter by bookmark tag
+        #[arg(long = "bookmark-tag")]
+        bookmark_tag: Option<String>,
     },
 
     /// Show recent detection events
@@ -4153,6 +4172,44 @@ fn format_search_lints_plain(lints: &[wa_core::storage::SearchLint]) -> String {
         }
     }
     output
+}
+
+async fn resolve_bookmark_pane_ids(
+    storage: &wa_core::storage::StorageHandle,
+    bookmark_alias: Option<&str>,
+    bookmark_tag: Option<&str>,
+) -> std::result::Result<Option<HashSet<u64>>, String> {
+    if bookmark_alias.is_none() && bookmark_tag.is_none() {
+        return Ok(None);
+    }
+
+    let mut pane_ids = if let Some(alias) = bookmark_alias {
+        let resolved = storage
+            .get_pane_bookmark_by_alias(alias)
+            .await
+            .map_err(|e| format!("Failed to resolve bookmark alias \"{alias}\": {e}"))?;
+        let mut alias_ids = HashSet::new();
+        if let Some(record) = resolved {
+            alias_ids.insert(record.pane_id);
+        }
+        Some(alias_ids)
+    } else {
+        None
+    };
+
+    if let Some(tag) = bookmark_tag {
+        let records = storage
+            .list_pane_bookmarks_by_tag(tag)
+            .await
+            .map_err(|e| format!("Failed to resolve bookmark tag \"{tag}\": {e}"))?;
+        let tag_ids: HashSet<u64> = records.into_iter().map(|record| record.pane_id).collect();
+        pane_ids = Some(match pane_ids {
+            Some(existing_ids) => existing_ids.intersection(&tag_ids).copied().collect(),
+            None => tag_ids,
+        });
+    }
+
+    Ok(pane_ids)
 }
 
 fn format_saved_searches_plain(searches: &[wa_core::storage::SavedSearchRecord]) -> String {
@@ -11000,6 +11057,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             format,
             limit,
             pane,
+            bookmark,
+            bookmark_tag,
             since,
         }) => {
             use wa_core::output::{
@@ -11888,12 +11947,42 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         }
                     };
 
+                    let mut bookmark_pane_ids = match resolve_bookmark_pane_ids(
+                        &storage,
+                        bookmark.as_deref(),
+                        bookmark_tag.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(ids) => ids,
+                        Err(err) => {
+                            if output_format.is_json() {
+                                println!(
+                                    r#"{{"ok": false, "error": "{}", "version": "{}"}}"#,
+                                    err,
+                                    wa_core::VERSION
+                                );
+                            } else {
+                                eprintln!("Error: {err}");
+                            }
+                            std::process::exit(1);
+                        }
+                    };
+
+                    if let Some(filter_pane_id) = pane
+                        && let Some(ref mut pane_ids) = bookmark_pane_ids
+                    {
+                        pane_ids.retain(|pane_id| *pane_id == filter_pane_id);
+                    }
+
                     let redacted_query = redact_for_output(&query);
                     tracing::info!(
-                        "Searching for '{}' (limit={}, pane={:?})",
+                        "Searching for '{}' (limit={}, pane={:?}, bookmark={:?}, bookmark_tag={:?})",
                         redacted_query,
                         limit,
-                        pane
+                        pane,
+                        bookmark,
+                        bookmark_tag
                     );
 
                     let lints = wa_core::storage::lint_fts_query(&query);
@@ -11919,10 +12008,21 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         eprint!("{}", format_search_lints_plain(&lints));
                     }
 
-                    // Build search options
-                    let options = wa_core::storage::SearchOptions {
+                    let mut pane_candidates = bookmark_pane_ids.map(|pane_ids| {
+                        let mut ids: Vec<u64> = pane_ids.into_iter().collect();
+                        ids.sort_unstable();
+                        ids
+                    });
+                    if pane_candidates.is_none()
+                        && let Some(filter_pane_id) = pane
+                    {
+                        pane_candidates = Some(vec![filter_pane_id]);
+                    }
+
+                    // Build base search options
+                    let base_options = wa_core::storage::SearchOptions {
                         limit: Some(limit),
-                        pane_id: pane,
+                        pane_id: None,
                         since,
                         until: None,
                         include_snippets: Some(true),
@@ -11931,8 +12031,54 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         highlight_suffix: Some("<<".to_string()),
                     };
 
-                    // Perform search
-                    match storage.search_with_results(&query, options).await {
+                    let search_results = if let Some(candidate_panes) = pane_candidates {
+                        if candidate_panes.is_empty() {
+                            Ok(Vec::new())
+                        } else if candidate_panes.len() == 1 {
+                            let mut options = base_options.clone();
+                            options.pane_id = Some(candidate_panes[0]);
+                            storage.search_with_results(&query, options).await
+                        } else {
+                            let mut combined = Vec::new();
+                            for candidate_pane in candidate_panes {
+                                let mut options = base_options.clone();
+                                options.pane_id = Some(candidate_pane);
+                                let mut pane_results = match storage
+                                    .search_with_results(&query, options)
+                                    .await
+                                {
+                                    Ok(results) => results,
+                                    Err(e) => {
+                                        if output_format.is_json() {
+                                            println!(
+                                                r#"{{"ok": false, "error": "Search failed: {}", "version": "{}"}}"#,
+                                                e,
+                                                wa_core::VERSION
+                                            );
+                                        } else {
+                                            eprintln!("Error: Search failed: {e}");
+                                        }
+                                        std::process::exit(1);
+                                    }
+                                };
+                                combined.append(&mut pane_results);
+                            }
+                            combined.sort_by(|left, right| {
+                                left.score
+                                    .total_cmp(&right.score)
+                                    .then_with(|| {
+                                        left.segment.captured_at.cmp(&right.segment.captured_at)
+                                    })
+                                    .then_with(|| left.segment.id.cmp(&right.segment.id))
+                            });
+                            combined.truncate(limit);
+                            Ok(combined)
+                        }
+                    } else {
+                        storage.search_with_results(&query, base_options).await
+                    };
+
+                    match search_results {
                         Ok(results) => {
                             let ctx = RenderContext::new(output_format)
                                 .verbose(cli.verbose)
@@ -12880,6 +13026,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             domain,
             agent,
             pane_id,
+            bookmark,
+            bookmark_tag,
         }) => {
             let watcher_status = {
                 #[cfg(unix)]
@@ -12979,6 +13127,56 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     })
                     .or_else(wa_core::crash::HealthSnapshot::get_global);
 
+                let bookmark_pane_ids = if bookmark.is_some() || bookmark_tag.is_some() {
+                    let db_path = layout.db_path.to_string_lossy();
+                    let storage = match wa_core::storage::StorageHandle::new(&db_path).await {
+                        Ok(storage) => storage,
+                        Err(e) => {
+                            if output_format.is_json() {
+                                println!(
+                                    r#"{{"ok": false, "error": "Failed to open storage: {}", "version": "{}"}}"#,
+                                    e,
+                                    wa_core::VERSION
+                                );
+                            } else {
+                                eprintln!("Error: Failed to open storage: {e}");
+                                eprintln!("Is the database initialized? Run 'wa watch' first.");
+                            }
+                            std::process::exit(1);
+                        }
+                    };
+
+                    let resolved = match resolve_bookmark_pane_ids(
+                        &storage,
+                        bookmark.as_deref(),
+                        bookmark_tag.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(ids) => ids,
+                        Err(err) => {
+                            if output_format.is_json() {
+                                println!(
+                                    r#"{{"ok": false, "error": "{}", "version": "{}"}}"#,
+                                    err,
+                                    wa_core::VERSION
+                                );
+                            } else {
+                                eprintln!("Error: {err}");
+                            }
+                            std::process::exit(1);
+                        }
+                    };
+
+                    if let Err(e) = storage.shutdown().await {
+                        tracing::warn!("Failed to shutdown storage cleanly: {e}");
+                    }
+
+                    resolved
+                } else {
+                    None
+                };
+
                 let wezterm = wa_core::wezterm::default_wezterm_handle();
                 match wezterm.list_panes().await {
                     Ok(panes) => {
@@ -13007,6 +13205,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                                 if let Some(ref domain_filter) = domain {
                                     if !glob_match(domain_filter, &pane_domain) {
+                                        return None;
+                                    }
+                                }
+
+                                if let Some(ref bookmark_filters) = bookmark_pane_ids {
+                                    if !bookmark_filters.contains(&p.pane_id) {
                                         return None;
                                     }
                                 }
@@ -27494,6 +27698,59 @@ log_level = "debug"
                 assert_eq!(verbose, 2, "-vv should set verbose=2");
             }
             _ => panic!("expected Workflow::Status"),
+        }
+    }
+
+    #[test]
+    fn cli_search_parses_bookmark_filters() {
+        let cli = Cli::try_parse_from([
+            "wa",
+            "search",
+            "error",
+            "--bookmark",
+            "build",
+            "--bookmark-tag",
+            "prod",
+        ])
+        .expect("search bookmark filters should parse");
+
+        match cli.command {
+            Some(Commands::Search {
+                query,
+                bookmark,
+                bookmark_tag,
+                ..
+            }) => {
+                assert_eq!(query.as_deref(), Some("error"));
+                assert_eq!(bookmark.as_deref(), Some("build"));
+                assert_eq!(bookmark_tag.as_deref(), Some("prod"));
+            }
+            _ => panic!("expected Search command"),
+        }
+    }
+
+    #[test]
+    fn cli_status_parses_bookmark_filters() {
+        let cli = Cli::try_parse_from([
+            "wa",
+            "status",
+            "--bookmark",
+            "build",
+            "--bookmark-tag",
+            "prod",
+        ])
+        .expect("status bookmark filters should parse");
+
+        match cli.command {
+            Some(Commands::Status {
+                bookmark,
+                bookmark_tag,
+                ..
+            }) => {
+                assert_eq!(bookmark.as_deref(), Some("build"));
+                assert_eq!(bookmark_tag.as_deref(), Some("prod"));
+            }
+            _ => panic!("expected Status command"),
         }
     }
 
