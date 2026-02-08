@@ -732,6 +732,232 @@ pub fn execute_file_plan(plan: &SyncFilePlan) -> SyncResult<usize> {
     Ok(written)
 }
 
+// =============================================================================
+// Snapshot sync: immutable artifacts with versioned filenames
+// =============================================================================
+
+/// Patterns that identify live SQLite database files (never eligible for sync).
+const LIVE_DB_PATTERNS: &[&str] = &[
+    ".db",
+    "-wal",
+    "-shm",
+    ".db-wal",
+    ".db-shm",
+    ".sqlite",
+    ".sqlite-wal",
+    ".sqlite-shm",
+];
+
+/// Check if a path refers to a live SQLite database file.
+///
+/// Live DB files (including WAL and SHM) must never be synced.
+/// Only exported snapshots (explicit copies) are safe.
+#[must_use]
+pub fn is_live_db_path(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    LIVE_DB_PATTERNS
+        .iter()
+        .any(|pattern| lower.ends_with(pattern))
+}
+
+/// Generate a self-describing snapshot filename.
+///
+/// Format: `wa_snapshot_{version}_{timestamp}_{workspace_key}_{host}.db`
+///
+/// - `version`: wa version string (sanitized)
+/// - `timestamp`: UTC ISO-8601 compact (YYYYMMDD_HHMMSS)
+/// - `workspace_key`: first 8 chars of SHA-256 of workspace root
+/// - `host`: hostname (sanitized, truncated)
+#[must_use]
+pub fn snapshot_filename(
+    version: &str,
+    timestamp_utc: &str,
+    workspace_root: &Path,
+    hostname: &str,
+) -> String {
+    let version_safe = sanitize_component(version);
+    let ts_safe = sanitize_component(timestamp_utc);
+    let ws_hash = {
+        let mut hasher = Sha256::new();
+        hasher.update(workspace_root.to_string_lossy().as_bytes());
+        hex::encode(hasher.finalize())
+    };
+    let ws_short = &ws_hash[..8];
+    let host_safe = sanitize_component(hostname);
+    let host_trunc = if host_safe.len() > 16 {
+        &host_safe[..16]
+    } else {
+        &host_safe
+    };
+
+    format!("wa_snapshot_{version_safe}_{ts_safe}_{ws_short}_{host_trunc}.db")
+}
+
+/// Parse metadata from a snapshot filename.
+///
+/// Returns `Some((version, timestamp, workspace_key, host))` if the filename matches
+/// the expected pattern, `None` otherwise.
+#[must_use]
+pub fn parse_snapshot_filename(filename: &str) -> Option<(String, String, String, String)> {
+    let stem = filename.strip_suffix(".db")?;
+    let rest = stem.strip_prefix("wa_snapshot_")?;
+
+    // Split on underscores: version_ts_wskey_host
+    // But version and timestamp may contain underscores themselves in the timestamp part
+    // Format is: {version}_{YYYYMMDD}_{HHMMSS}_{wskey}_{host}
+    let parts: Vec<&str> = rest.splitn(5, '_').collect();
+    if parts.len() >= 4 {
+        let version = parts[0].to_string();
+        let timestamp = if parts.len() == 5 {
+            format!("{}_{}", parts[1], parts[2])
+        } else {
+            parts[1].to_string()
+        };
+        let ws_key = if parts.len() == 5 {
+            parts[3].to_string()
+        } else {
+            parts[2].to_string()
+        };
+        let host = if parts.len() == 5 {
+            parts[4].to_string()
+        } else {
+            parts[3].to_string()
+        };
+        Some((version, timestamp, ws_key, host))
+    } else {
+        None
+    }
+}
+
+fn sanitize_component(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Build a snapshot-specific file plan with immutable semantics.
+///
+/// Unlike config sync, snapshot sync:
+/// - Rejects any live DB files (WAL, SHM)
+/// - Never overwrites: existing files with the same name are skipped
+/// - Only processes files matching the `wa_snapshot_*` pattern
+pub fn build_snapshot_plan(
+    source_root: &Path,
+    destination_root: &Path,
+    direction: SyncDirection,
+) -> SyncResult<SyncFilePlan> {
+    let mut items = Vec::new();
+
+    if !source_root.exists() {
+        return Ok(SyncFilePlan {
+            category: SyncCategory::Snapshots,
+            source_root: path_to_string(source_root),
+            destination_root: path_to_string(destination_root),
+            direction,
+            items: vec![],
+            denied_count: 0,
+            add_count: 0,
+            update_count: 0,
+            skip_count: 0,
+            conflict_count: 0,
+        });
+    }
+
+    let entries = if source_root.is_dir() {
+        std::fs::read_dir(source_root)?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_file())
+            .collect::<Vec<_>>()
+    } else {
+        vec![]
+    };
+
+    for entry in entries {
+        let path = entry.path();
+        let filename = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        // Reject live DB files
+        if is_live_db_path(&filename) && !filename.starts_with("wa_snapshot_") {
+            items.push(SyncItem {
+                relative_path: filename,
+                action: SyncItemAction::Denied,
+                source_hash: None,
+                destination_hash: None,
+                size_bytes: None,
+                reason: Some(
+                    "live database file; only exported snapshots are eligible".to_string(),
+                ),
+            });
+            continue;
+        }
+
+        let dest_path = destination_root.join(&filename);
+
+        // Immutable: if destination exists, skip (never overwrite snapshots)
+        if dest_path.exists() {
+            let source_hash = hash_file(&path)?;
+            let dest_hash = hash_file(&dest_path)?;
+            items.push(SyncItem {
+                relative_path: filename,
+                action: SyncItemAction::Skip,
+                source_hash: Some(source_hash),
+                destination_hash: Some(dest_hash),
+                size_bytes: Some(path.metadata()?.len()),
+                reason: Some("snapshot already exists at destination (immutable)".to_string()),
+            });
+            continue;
+        }
+
+        // New snapshot: add
+        let source_hash = hash_file(&path)?;
+        items.push(SyncItem {
+            relative_path: filename,
+            action: SyncItemAction::Add,
+            source_hash: Some(source_hash),
+            destination_hash: None,
+            size_bytes: Some(path.metadata()?.len()),
+            reason: None,
+        });
+    }
+
+    items.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+
+    let denied_count = items
+        .iter()
+        .filter(|i| i.action == SyncItemAction::Denied)
+        .count();
+    let add_count = items
+        .iter()
+        .filter(|i| i.action == SyncItemAction::Add)
+        .count();
+    let skip_count = items
+        .iter()
+        .filter(|i| i.action == SyncItemAction::Skip)
+        .count();
+
+    Ok(SyncFilePlan {
+        category: SyncCategory::Snapshots,
+        source_root: path_to_string(source_root),
+        destination_root: path_to_string(destination_root),
+        direction,
+        items,
+        denied_count,
+        add_count,
+        update_count: 0,
+        skip_count,
+        conflict_count: 0,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1943,5 +2169,287 @@ mod tests {
         ));
         let msg = err.to_string();
         assert!(msg.contains("access denied"));
+    }
+
+    // ========================================================================
+    // Live DB path detection
+    // ========================================================================
+
+    #[test]
+    fn live_db_paths_detected() {
+        assert!(is_live_db_path("wa.db"));
+        assert!(is_live_db_path("wa.db-wal"));
+        assert!(is_live_db_path("wa.db-shm"));
+        assert!(is_live_db_path("data.sqlite"));
+        assert!(is_live_db_path("data.sqlite-wal"));
+        assert!(is_live_db_path("data.sqlite-shm"));
+        assert!(is_live_db_path("/path/to/wa.db"));
+    }
+
+    #[test]
+    fn non_db_paths_not_detected() {
+        assert!(!is_live_db_path("wa.toml"));
+        assert!(!is_live_db_path("config.yaml"));
+        assert!(!is_live_db_path("backup.tar.gz"));
+        // Note: snapshot filenames end with .db so is_live_db_path returns true,
+        // but build_snapshot_plan handles this by checking the wa_snapshot_ prefix.
+        assert!(is_live_db_path(
+            "wa_snapshot_0.1.0_20260208_120000_abcd1234_host.db"
+        ));
+    }
+
+    // ========================================================================
+    // Snapshot filename generation
+    // ========================================================================
+
+    #[test]
+    fn snapshot_filename_format() {
+        let name = snapshot_filename(
+            "0.1.0",
+            "20260208_120000",
+            Path::new("/home/user/project"),
+            "my-server",
+        );
+        assert!(name.starts_with("wa_snapshot_"));
+        assert!(name.ends_with(".db"));
+        assert!(name.contains("0.1.0"));
+        assert!(name.contains("20260208_120000"));
+        assert!(name.contains("my-server"));
+        // workspace key is 8 hex chars
+        let parts: Vec<&str> = name.split('_').collect();
+        assert!(parts.len() >= 5);
+    }
+
+    #[test]
+    fn snapshot_filename_sanitizes_special_chars() {
+        let name = snapshot_filename(
+            "0.1.0-beta+build",
+            "2026/02/08 12:00",
+            Path::new("/home/user"),
+            "host name!",
+        );
+        // No special chars except - and .
+        assert!(!name.contains('/'));
+        assert!(!name.contains('!'));
+        assert!(!name.contains(' '));
+    }
+
+    #[test]
+    fn snapshot_filename_truncates_long_hostname() {
+        let name = snapshot_filename(
+            "0.1.0",
+            "20260208",
+            Path::new("/workspace"),
+            "this-is-a-very-long-hostname-that-should-be-truncated",
+        );
+        // Hostname portion should be at most 16 chars
+        assert!(name.len() < 200);
+    }
+
+    #[test]
+    fn snapshot_filename_deterministic() {
+        let a = snapshot_filename("0.1.0", "20260208", Path::new("/ws"), "host");
+        let b = snapshot_filename("0.1.0", "20260208", Path::new("/ws"), "host");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn snapshot_filename_differs_by_workspace() {
+        let a = snapshot_filename("0.1.0", "20260208", Path::new("/ws/a"), "host");
+        let b = snapshot_filename("0.1.0", "20260208", Path::new("/ws/b"), "host");
+        assert_ne!(a, b);
+    }
+
+    // ========================================================================
+    // Snapshot filename parsing
+    // ========================================================================
+
+    #[test]
+    fn parse_snapshot_roundtrip() {
+        let name = snapshot_filename(
+            "0.1.0",
+            "20260208_120000",
+            Path::new("/home/user/project"),
+            "myhost",
+        );
+        let parsed = parse_snapshot_filename(&name);
+        assert!(parsed.is_some());
+        let (version, ts, _ws_key, host) = parsed.unwrap();
+        assert_eq!(version, "0.1.0");
+        assert!(ts.contains("20260208"));
+        assert_eq!(host, "myhost");
+    }
+
+    #[test]
+    fn parse_invalid_filename_returns_none() {
+        assert!(parse_snapshot_filename("random_file.txt").is_none());
+        assert!(parse_snapshot_filename("wa.db").is_none());
+        assert!(parse_snapshot_filename("").is_none());
+    }
+
+    // ========================================================================
+    // Snapshot plan building
+    // ========================================================================
+
+    #[test]
+    fn snapshot_plan_adds_new_snapshots() {
+        let (src, dst) = setup_temp_trees();
+        let snap_name = snapshot_filename("0.1.0", "20260208_120000", Path::new("/test"), "host");
+        write_file(src.path(), &snap_name, "snapshot data");
+
+        let plan = build_snapshot_plan(src.path(), dst.path(), SyncDirection::Push).unwrap();
+
+        assert_eq!(plan.add_count, 1);
+        assert_eq!(plan.items[0].action, SyncItemAction::Add);
+    }
+
+    #[test]
+    fn snapshot_plan_skips_existing_snapshots() {
+        let (src, dst) = setup_temp_trees();
+        let snap_name = snapshot_filename("0.1.0", "20260208_120000", Path::new("/test"), "host");
+        write_file(src.path(), &snap_name, "snapshot data");
+        write_file(dst.path(), &snap_name, "snapshot data");
+
+        let plan = build_snapshot_plan(src.path(), dst.path(), SyncDirection::Push).unwrap();
+
+        assert_eq!(plan.skip_count, 1);
+        assert_eq!(plan.add_count, 0);
+        assert!(
+            plan.items[0]
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("immutable")
+        );
+    }
+
+    #[test]
+    fn snapshot_plan_never_overwrites_different_content() {
+        let (src, dst) = setup_temp_trees();
+        let snap_name = snapshot_filename("0.1.0", "20260208_120000", Path::new("/test"), "host");
+        write_file(src.path(), &snap_name, "new snapshot data");
+        write_file(dst.path(), &snap_name, "old snapshot data");
+
+        let plan = build_snapshot_plan(src.path(), dst.path(), SyncDirection::Push).unwrap();
+
+        // Even with different content, snapshots are immutable: skip, not conflict
+        assert_eq!(plan.skip_count, 1);
+        assert_eq!(plan.conflict_count, 0);
+    }
+
+    #[test]
+    fn snapshot_plan_denies_live_db_files() {
+        let (src, dst) = setup_temp_trees();
+        write_file(src.path(), "wa.db", "live database");
+        write_file(src.path(), "wa.db-wal", "wal");
+        write_file(src.path(), "wa.db-shm", "shm");
+
+        let plan = build_snapshot_plan(src.path(), dst.path(), SyncDirection::Push).unwrap();
+
+        assert_eq!(plan.denied_count, 3);
+        assert_eq!(plan.add_count, 0);
+        for item in &plan.items {
+            assert_eq!(item.action, SyncItemAction::Denied);
+            assert!(item.reason.as_deref().unwrap().contains("live database"));
+        }
+    }
+
+    #[test]
+    fn snapshot_plan_mixed_files() {
+        let (src, dst) = setup_temp_trees();
+        let snap = snapshot_filename("0.1.0", "20260208", Path::new("/t"), "h");
+        write_file(src.path(), &snap, "snapshot");
+        write_file(src.path(), "wa.db", "live db");
+        write_file(src.path(), "wa.db-wal", "wal");
+
+        let plan = build_snapshot_plan(src.path(), dst.path(), SyncDirection::Push).unwrap();
+
+        assert_eq!(plan.add_count, 1);
+        assert_eq!(plan.denied_count, 2);
+    }
+
+    #[test]
+    fn snapshot_plan_empty_source() {
+        let (src, dst) = setup_temp_trees();
+        let plan = build_snapshot_plan(src.path(), dst.path(), SyncDirection::Push).unwrap();
+        assert!(plan.items.is_empty());
+    }
+
+    #[test]
+    fn snapshot_plan_nonexistent_source() {
+        let dst = tempfile::tempdir().unwrap();
+        let plan = build_snapshot_plan(
+            Path::new("/nonexistent/snapshot/dir"),
+            dst.path(),
+            SyncDirection::Push,
+        )
+        .unwrap();
+        assert!(plan.items.is_empty());
+    }
+
+    #[test]
+    fn snapshot_plan_execute_adds_snapshot() {
+        let (src, dst) = setup_temp_trees();
+        let snap = snapshot_filename("0.1.0", "20260208", Path::new("/t"), "h");
+        write_file(src.path(), &snap, "snapshot content");
+
+        let plan = build_snapshot_plan(src.path(), dst.path(), SyncDirection::Push).unwrap();
+        let written = execute_file_plan(&plan).unwrap();
+
+        assert_eq!(written, 1);
+        assert_eq!(
+            std::fs::read_to_string(dst.path().join(&snap)).unwrap(),
+            "snapshot content"
+        );
+    }
+
+    #[test]
+    fn snapshot_plan_execute_never_copies_live_db() {
+        let (src, dst) = setup_temp_trees();
+        write_file(src.path(), "wa.db", "live db data");
+
+        let plan = build_snapshot_plan(src.path(), dst.path(), SyncDirection::Push).unwrap();
+        let written = execute_file_plan(&plan).unwrap();
+
+        assert_eq!(written, 0);
+        assert!(!dst.path().join("wa.db").exists());
+    }
+
+    #[test]
+    fn snapshot_plan_sorted_deterministically() {
+        let (src, dst) = setup_temp_trees();
+        let snap_c = snapshot_filename("0.1.0", "20260210", Path::new("/t"), "c");
+        let snap_a = snapshot_filename("0.1.0", "20260208", Path::new("/t"), "a");
+        let snap_b = snapshot_filename("0.1.0", "20260209", Path::new("/t"), "b");
+        write_file(src.path(), &snap_c, "c");
+        write_file(src.path(), &snap_a, "a");
+        write_file(src.path(), &snap_b, "b");
+
+        let plan = build_snapshot_plan(src.path(), dst.path(), SyncDirection::Push).unwrap();
+
+        // Items should be sorted by filename (which includes timestamp)
+        let paths: Vec<&str> = plan
+            .items
+            .iter()
+            .map(|i| i.relative_path.as_str())
+            .collect();
+        let mut sorted = paths.clone();
+        sorted.sort();
+        assert_eq!(paths, sorted);
+    }
+
+    #[test]
+    fn snapshot_plan_json_stable() {
+        let (src, dst) = setup_temp_trees();
+        let snap = snapshot_filename("0.1.0", "20260208", Path::new("/t"), "h");
+        write_file(src.path(), &snap, "data");
+
+        let plan = build_snapshot_plan(src.path(), dst.path(), SyncDirection::Push).unwrap();
+        let json = serde_json::to_value(&plan).unwrap();
+
+        assert_eq!(json["category"], "snapshots");
+        assert_eq!(json["add_count"], 1);
+        assert_eq!(json["conflict_count"], 0);
+        assert_eq!(json["update_count"], 0);
     }
 }

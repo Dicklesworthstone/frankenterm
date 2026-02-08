@@ -1495,7 +1495,7 @@ impl AgentSessionRecord {
 // =============================================================================
 
 /// Type of correlation between events
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CorrelationType {
     /// Usage limit event followed by new session (failover)
     Failover,
@@ -4042,6 +4042,13 @@ enum WriteCommand {
         record: ActionUndoRecord,
         respond: oneshot::Sender<Result<()>>,
     },
+    /// Mark an undo record as executed by setting undone_at/undone_by.
+    MarkActionUndone {
+        audit_action_id: i64,
+        undone_at: i64,
+        undone_by: String,
+        respond: oneshot::Sender<Result<bool>>,
+    },
     /// Upsert an agent session record
     UpsertSession {
         session: AgentSessionRecord,
@@ -4687,6 +4694,41 @@ impl StorageHandle {
         let redactor = Redactor::new();
         record.redact_fields(&redactor);
         self.upsert_action_undo(record).await
+    }
+
+    /// Fetch undo metadata for a specific audit action ID.
+    pub async fn get_action_undo(&self, audit_action_id: i64) -> Result<Option<ActionUndoRecord>> {
+        let db_path = Arc::clone(&self.db_path);
+
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+
+            query_action_undo_sync(&conn, audit_action_id)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+    }
+
+    /// Mark an undo record as executed.
+    ///
+    /// Returns `true` when the row was updated and `false` when the target
+    /// action was already undone, non-undoable, or missing undo metadata.
+    pub async fn mark_action_undone(&self, audit_action_id: i64, undone_by: &str) -> Result<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::MarkActionUndone {
+                audit_action_id,
+                undone_at: now_ms(),
+                undone_by: undone_by.to_string(),
+                respond: tx,
+            })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
     }
 
     /// Purge audit actions older than a cutoff timestamp
@@ -6839,6 +6881,8 @@ pub struct AuditStreamPage {
 /// Query options for action history view
 #[derive(Debug, Clone, Default)]
 pub struct ActionHistoryQuery {
+    /// Filter by audit action ID
+    pub audit_action_id: Option<i64>,
     /// Maximum number of results (default: 100)
     pub limit: Option<usize>,
     /// Filter by pane ID
@@ -7149,6 +7193,15 @@ fn dispatch_write_command(conn: &mut Connection, cmd: WriteCommand, should_break
         }
         WriteCommand::UpsertActionUndo { record, respond } => {
             let result = upsert_action_undo_sync(conn, &record);
+            let _ = respond.send(result);
+        }
+        WriteCommand::MarkActionUndone {
+            audit_action_id,
+            undone_at,
+            undone_by,
+            respond,
+        } => {
+            let result = mark_action_undone_sync(conn, audit_action_id, undone_at, &undone_by);
             let _ = respond.send(result);
         }
         WriteCommand::PurgeAuditActions { before_ts, respond } => {
@@ -8200,6 +8253,47 @@ fn upsert_action_undo_sync(conn: &Connection, record: &ActionUndoRecord) -> Resu
     .map_err(|e| StorageError::Database(format!("Failed to upsert action_undo: {e}")))?;
 
     Ok(())
+}
+
+fn query_action_undo_sync(conn: &Connection, audit_action_id: i64) -> Result<Option<ActionUndoRecord>> {
+    conn.query_row(
+        "SELECT audit_action_id, undoable, undo_strategy, undo_hint, undo_payload, undone_at, undone_by
+         FROM action_undo WHERE audit_action_id = ?1",
+        params![audit_action_id],
+        |row| {
+            Ok(ActionUndoRecord {
+                audit_action_id: row.get(0)?,
+                undoable: {
+                    let value: i64 = row.get(1)?;
+                    value != 0
+                },
+                undo_strategy: row.get(2)?,
+                undo_hint: row.get(3)?,
+                undo_payload: row.get(4)?,
+                undone_at: row.get(5)?,
+                undone_by: row.get(6)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|e| StorageError::Database(format!("Failed to query action_undo: {e}")).into())
+}
+
+fn mark_action_undone_sync(
+    conn: &Connection,
+    audit_action_id: i64,
+    undone_at: i64,
+    undone_by: &str,
+) -> Result<bool> {
+    let changed = conn
+        .execute(
+            "UPDATE action_undo
+             SET undone_at = ?1, undone_by = ?2
+             WHERE audit_action_id = ?3 AND undoable = 1 AND undone_at IS NULL",
+            params![undone_at, undone_by, audit_action_id],
+        )
+        .map_err(|e| StorageError::Database(format!("Failed to mark action as undone: {e}")))?;
+    Ok(changed > 0)
 }
 
 /// Purge audit actions before a cutoff timestamp (synchronous)
@@ -11103,12 +11197,14 @@ fn detect_correlations(events: &[TimelineEvent]) -> Vec<Correlation> {
     let mut correlations = Vec::new();
     let mut correlation_counter = 0u64;
 
-    // Temporal correlation: events within 5 seconds of each other
-    const TEMPORAL_WINDOW_MS: i64 = 5_000;
+    // Temporal correlation: events within 10 seconds of each other
+    const TEMPORAL_WINDOW_MS: i64 = 10_000;
     // Cascade correlation window: 30 seconds
     const CASCADE_WINDOW_MS: i64 = 30_000;
-    // Failover correlation window: 60 seconds
-    const FAILOVER_WINDOW_MS: i64 = 60_000;
+    // Failover correlation window: 5 minutes
+    const FAILOVER_WINDOW_MS: i64 = 300_000;
+    // DedupeGroup window: same rule_id across different panes within 30 seconds
+    const DEDUPE_GROUP_WINDOW_MS: i64 = 30_000;
 
     fn rule_prefix(rule_id: &str) -> Option<&str> {
         let prefix = rule_id.split('.').next()?;
@@ -11178,7 +11274,7 @@ fn detect_correlations(events: &[TimelineEvent]) -> Vec<Correlation> {
                 event_ids: cluster,
                 correlation_type: CorrelationType::Temporal,
                 confidence: 0.6,
-                description: "Events occurred within 5 seconds across different panes".to_string(),
+                description: "Events occurred within 10 seconds across different panes".to_string(),
             });
         }
 
@@ -11247,6 +11343,60 @@ fn detect_correlations(events: &[TimelineEvent]) -> Vec<Correlation> {
                 description: "Error followed by recovery event in another pane".to_string(),
             });
             break;
+        }
+    }
+
+    // DedupeGroup correlation: same rule_id firing across different panes within window
+    {
+        let mut rule_groups: std::collections::HashMap<&str, Vec<&TimelineEvent>> =
+            std::collections::HashMap::new();
+        for event in events {
+            rule_groups
+                .entry(event.rule_id.as_str())
+                .or_default()
+                .push(event);
+        }
+        for (rule_id, group) in &rule_groups {
+            if group.len() < 2 {
+                continue;
+            }
+            // Check if events span multiple panes and are within the window
+            let pane_ids: std::collections::HashSet<u64> =
+                group.iter().map(|e| e.pane_info.pane_id).collect();
+            if pane_ids.len() < 2 {
+                continue;
+            }
+            // Find clusters within the dedupe window
+            let mut sorted = group.clone();
+            sorted.sort_by_key(|e| e.timestamp);
+            let mut cluster_start = 0;
+            while cluster_start < sorted.len() {
+                let base_ts = sorted[cluster_start].timestamp;
+                let mut cluster_ids = vec![sorted[cluster_start].id];
+                let mut cluster_panes =
+                    std::collections::HashSet::from([sorted[cluster_start].pane_info.pane_id]);
+                let mut j = cluster_start + 1;
+                while j < sorted.len() && sorted[j].timestamp - base_ts <= DEDUPE_GROUP_WINDOW_MS {
+                    cluster_ids.push(sorted[j].id);
+                    cluster_panes.insert(sorted[j].pane_info.pane_id);
+                    j += 1;
+                }
+                if cluster_ids.len() >= 2 && cluster_panes.len() >= 2 {
+                    correlation_counter += 1;
+                    correlations.push(Correlation {
+                        id: format!("corr-dedupe-{correlation_counter}"),
+                        event_ids: cluster_ids,
+                        correlation_type: CorrelationType::DedupeGroup,
+                        confidence: 0.7,
+                        description: format!(
+                            "Same rule '{}' fired across {} panes",
+                            rule_id,
+                            cluster_panes.len()
+                        ),
+                    });
+                }
+                cluster_start = j;
+            }
         }
     }
 
@@ -11517,6 +11667,10 @@ fn query_action_history(
     );
     let mut params: Vec<SqlValue> = Vec::new();
 
+    if let Some(audit_action_id) = query.audit_action_id {
+        sql.push_str(" AND id = ?");
+        params.push(SqlValue::Integer(audit_action_id));
+    }
     if let Some(pane_id) = query.pane_id {
         let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
         sql.push_str(" AND pane_id = ?");
@@ -19265,7 +19419,7 @@ mod timeline_correlation_tests {
     fn temporal_correlation_detects_close_events() {
         let events = vec![
             create_test_event(1, 1000, 1, "rule_a", "error"),
-            create_test_event(2, 2000, 2, "rule_b", "error"), // Different pane, within 5s
+            create_test_event(2, 2000, 2, "rule_b", "error"), // Different pane, within 10s
             create_test_event(3, 3000, 1, "rule_c", "warning"),
         ];
 
@@ -19311,7 +19465,7 @@ mod timeline_correlation_tests {
     fn temporal_correlation_respects_window() {
         let events = vec![
             create_test_event(1, 1000, 1, "rule_a", "error"),
-            create_test_event(2, 10000, 2, "rule_b", "error"), // 9 seconds apart, outside window
+            create_test_event(2, 15000, 2, "rule_b", "error"), // 14 seconds apart, outside 10s window
         ];
 
         let correlations = detect_correlations(&events);
@@ -19323,7 +19477,10 @@ mod timeline_correlation_tests {
             .filter(|c| c.event_ids.contains(&1) && c.event_ids.contains(&2))
             .count();
 
-        assert_eq!(temporal, 0, "Events outside window should not correlate");
+        assert_eq!(
+            temporal, 0,
+            "Events outside 10s window should not correlate"
+        );
     }
 
     #[test]
@@ -19366,7 +19523,7 @@ mod timeline_correlation_tests {
     fn failover_correlation_detects_limit_then_session() {
         let events = vec![
             create_test_event(1, 1000, 1, "usage_limit", "usage_limit"),
-            create_test_event(2, 30000, 2, "session_start", "session_start"), // Different pane, within 60s
+            create_test_event(2, 30000, 2, "session_start", "session_start"), // Different pane, within 5min
         ];
 
         let correlations = detect_correlations(&events);
@@ -19401,10 +19558,10 @@ mod timeline_correlation_tests {
     }
 
     #[test]
-    fn failover_correlation_respects_60s_window() {
+    fn failover_correlation_respects_5min_window() {
         let events = vec![
             create_test_event(1, 1000, 1, "usage_limit", "usage_limit"),
-            create_test_event(2, 100000, 2, "session_start", "session_start"), // >60s apart
+            create_test_event(2, 400000, 2, "session_start", "session_start"), // >5min apart
         ];
 
         let correlations = detect_correlations(&events);
@@ -19414,7 +19571,7 @@ mod timeline_correlation_tests {
             .filter(|c| c.correlation_type == CorrelationType::Failover)
             .count();
 
-        assert_eq!(failover, 0, "Events >60s apart should not be failover");
+        assert_eq!(failover, 0, "Events >5min apart should not be failover");
     }
 
     #[test]
@@ -19498,6 +19655,320 @@ mod timeline_correlation_tests {
         assert_eq!(CorrelationType::Temporal.to_string(), "temporal");
         assert_eq!(CorrelationType::WorkflowGroup.to_string(), "workflow_group");
         assert_eq!(CorrelationType::DedupeGroup.to_string(), "dedupe_group");
+    }
+
+    #[test]
+    fn dedupe_group_detects_same_rule_across_panes() {
+        let events = vec![
+            create_test_event(1, 1000, 1, "claude_code.usage.reached", "error"),
+            create_test_event(2, 5000, 2, "claude_code.usage.reached", "error"),
+            create_test_event(3, 8000, 3, "claude_code.usage.reached", "error"),
+        ];
+
+        let correlations = detect_correlations(&events);
+
+        let dedupe = correlations
+            .iter()
+            .filter(|c| c.correlation_type == CorrelationType::DedupeGroup)
+            .collect::<Vec<_>>();
+
+        assert_eq!(dedupe.len(), 1, "Should detect one dedupe group");
+        assert_eq!(
+            dedupe[0].event_ids.len(),
+            3,
+            "All three events should be grouped"
+        );
+        assert!(
+            (dedupe[0].confidence - 0.7).abs() < 0.01,
+            "DedupeGroup confidence should be 0.7"
+        );
+    }
+
+    #[test]
+    fn dedupe_group_ignores_same_pane_only() {
+        let events = vec![
+            create_test_event(1, 1000, 1, "rule_a", "error"),
+            create_test_event(2, 5000, 1, "rule_a", "error"), // Same pane
+        ];
+
+        let correlations = detect_correlations(&events);
+
+        let dedupe = correlations
+            .iter()
+            .filter(|c| c.correlation_type == CorrelationType::DedupeGroup)
+            .count();
+
+        assert_eq!(
+            dedupe, 0,
+            "Same-pane-only events should not form dedupe group"
+        );
+    }
+
+    #[test]
+    fn dedupe_group_respects_window() {
+        let events = vec![
+            create_test_event(1, 1000, 1, "rule_a", "error"),
+            create_test_event(2, 50000, 2, "rule_a", "error"), // 49s apart, outside 30s window
+        ];
+
+        let correlations = detect_correlations(&events);
+
+        let dedupe = correlations
+            .iter()
+            .filter(|c| c.correlation_type == CorrelationType::DedupeGroup)
+            .count();
+
+        assert_eq!(
+            dedupe, 0,
+            "Events outside 30s window should not form dedupe group"
+        );
+    }
+
+    #[test]
+    fn dedupe_group_different_rules_not_grouped() {
+        let events = vec![
+            create_test_event(1, 1000, 1, "rule_a", "error"),
+            create_test_event(2, 2000, 2, "rule_b", "error"),
+        ];
+
+        let correlations = detect_correlations(&events);
+
+        let dedupe = correlations
+            .iter()
+            .filter(|c| c.correlation_type == CorrelationType::DedupeGroup)
+            .count();
+
+        assert_eq!(dedupe, 0, "Different rule_ids should not form dedupe group");
+    }
+
+    #[test]
+    fn temporal_window_10s_boundary() {
+        // Exactly at boundary: 10s apart should still correlate
+        let events = vec![
+            create_test_event(1, 1000, 1, "rule_a", "error"),
+            create_test_event(2, 11000, 2, "rule_b", "error"), // Exactly 10s
+        ];
+
+        let correlations = detect_correlations(&events);
+
+        let temporal = correlations
+            .iter()
+            .filter(|c| c.correlation_type == CorrelationType::Temporal)
+            .filter(|c| c.event_ids.contains(&1) && c.event_ids.contains(&2))
+            .count();
+
+        assert_eq!(temporal, 1, "Events exactly 10s apart should correlate");
+    }
+
+    #[test]
+    fn temporal_window_just_outside() {
+        // 10.001s apart should not correlate
+        let events = vec![
+            create_test_event(1, 1000, 1, "rule_a", "error"),
+            create_test_event(2, 11002, 2, "rule_b", "error"), // >10s
+        ];
+
+        let correlations = detect_correlations(&events);
+
+        let temporal = correlations
+            .iter()
+            .filter(|c| c.correlation_type == CorrelationType::Temporal)
+            .filter(|c| c.event_ids.contains(&1) && c.event_ids.contains(&2))
+            .count();
+
+        assert_eq!(
+            temporal, 0,
+            "Events >10s apart should not temporally correlate"
+        );
+    }
+
+    #[test]
+    fn failover_within_5min_window_detected() {
+        // 4 minutes apart (240s) — within 5min window
+        let events = vec![
+            create_test_event(1, 1000, 1, "usage_limit", "usage.reached"),
+            create_test_event(2, 241000, 2, "session_start", "session.start"),
+        ];
+
+        let correlations = detect_correlations(&events);
+
+        let failover = correlations
+            .iter()
+            .filter(|c| c.correlation_type == CorrelationType::Failover)
+            .count();
+
+        assert_eq!(failover, 1, "Events 4min apart should detect failover");
+    }
+
+    #[test]
+    fn cascade_error_then_recovery_detected() {
+        let mut event1 = create_test_event(1, 1000, 1, "rule_a", "error");
+        event1.severity = "error".to_string();
+
+        let event2 = create_test_event(2, 15000, 2, "session.resume", "session.resume");
+
+        let correlations = detect_correlations(&[event1, event2]);
+
+        let cascade = correlations
+            .iter()
+            .filter(|c| c.correlation_type == CorrelationType::Cascade)
+            .collect::<Vec<_>>();
+
+        assert_eq!(cascade.len(), 1, "Should detect cascade correlation");
+        assert!(
+            (cascade[0].confidence - 0.75).abs() < 0.01,
+            "Cascade confidence should be 0.75"
+        );
+    }
+
+    #[test]
+    fn cascade_ignores_non_error_severity() {
+        let event1 = create_test_event(1, 1000, 1, "rule_a", "info");
+        let event2 = create_test_event(2, 5000, 2, "session.resume", "session.resume");
+
+        let correlations = detect_correlations(&[event1, event2]);
+
+        let cascade = correlations
+            .iter()
+            .filter(|c| c.correlation_type == CorrelationType::Cascade)
+            .count();
+
+        assert_eq!(cascade, 0, "Non-error severity should not trigger cascade");
+    }
+
+    #[test]
+    fn cascade_respects_30s_window() {
+        let mut event1 = create_test_event(1, 1000, 1, "rule_a", "error");
+        event1.severity = "error".to_string();
+
+        let event2 = create_test_event(2, 40000, 2, "session.resume", "session.resume");
+
+        let correlations = detect_correlations(&[event1, event2]);
+
+        let cascade = correlations
+            .iter()
+            .filter(|c| c.correlation_type == CorrelationType::Cascade)
+            .count();
+
+        assert_eq!(cascade, 0, "Events >30s apart should not cascade");
+    }
+
+    #[test]
+    fn failover_agent_type_mismatch_no_correlation() {
+        let mut event1 = create_test_event(1, 1000, 1, "usage_limit", "usage.reached");
+        event1.pane_info.agent_type = Some("claude_code".to_string());
+
+        let mut event2 = create_test_event(2, 30000, 2, "session_start", "session.start");
+        event2.pane_info.agent_type = Some("codex".to_string());
+
+        let correlations = detect_correlations(&[event1, event2]);
+
+        let failover = correlations
+            .iter()
+            .filter(|c| c.correlation_type == CorrelationType::Failover)
+            .count();
+
+        assert_eq!(
+            failover, 0,
+            "Different agent types should not create failover correlation"
+        );
+    }
+
+    #[test]
+    fn failover_same_agent_type_correlates() {
+        let mut event1 = create_test_event(1, 1000, 1, "usage_limit", "usage.reached");
+        event1.pane_info.agent_type = Some("claude_code".to_string());
+
+        let mut event2 = create_test_event(2, 30000, 2, "session_start", "session.start");
+        event2.pane_info.agent_type = Some("claude_code".to_string());
+
+        let correlations = detect_correlations(&[event1, event2]);
+
+        let failover = correlations
+            .iter()
+            .filter(|c| c.correlation_type == CorrelationType::Failover)
+            .count();
+
+        assert_eq!(
+            failover, 1,
+            "Same agent type should create failover correlation"
+        );
+    }
+
+    #[test]
+    fn correlation_serde_roundtrip() {
+        let corr = Correlation {
+            id: "corr-test-1".to_string(),
+            event_ids: vec![1, 2, 3],
+            correlation_type: CorrelationType::DedupeGroup,
+            confidence: 0.7,
+            description: "Test correlation".to_string(),
+        };
+
+        let json = serde_json::to_string(&corr).unwrap();
+        let deserialized: Correlation = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.id, corr.id);
+        assert_eq!(deserialized.event_ids, corr.event_ids);
+        assert_eq!(deserialized.correlation_type, CorrelationType::DedupeGroup);
+        assert!((deserialized.confidence - 0.7).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn multiple_correlation_types_coexist() {
+        // Two events: close in time, same workflow, same rule in different panes
+        let mut event1 = create_test_event(1, 1000, 1, "rule_x", "error");
+        event1.severity = "error".to_string();
+        event1.handled = Some(HandledInfo {
+            handled_at: 2000,
+            workflow_id: Some("wf-99".to_string()),
+            status: "handled".to_string(),
+        });
+
+        let mut event2 = create_test_event(2, 3000, 2, "rule_x", "session.resume");
+        event2.handled = Some(HandledInfo {
+            handled_at: 4000,
+            workflow_id: Some("wf-99".to_string()),
+            status: "handled".to_string(),
+        });
+
+        let correlations = detect_correlations(&[event1, event2]);
+
+        let types: std::collections::HashSet<_> =
+            correlations.iter().map(|c| c.correlation_type).collect();
+
+        // Should have at least temporal + workflow + dedupe (and possibly cascade)
+        assert!(
+            types.contains(&CorrelationType::Temporal),
+            "Should detect temporal correlation"
+        );
+        assert!(
+            types.contains(&CorrelationType::WorkflowGroup),
+            "Should detect workflow group"
+        );
+        assert!(
+            types.contains(&CorrelationType::DedupeGroup),
+            "Should detect dedupe group (same rule_id across panes)"
+        );
+    }
+
+    #[test]
+    fn many_events_performance_no_panic() {
+        // Verify detect_correlations handles a larger event set without panicking
+        let events: Vec<TimelineEvent> = (0..100)
+            .map(|i| create_test_event(i, i * 500, (i % 5) as u64 + 1, "rule_perf", "warning"))
+            .collect();
+
+        let correlations = detect_correlations(&events);
+
+        // Should produce some correlations without panicking
+        assert!(
+            !correlations.is_empty(),
+            "100 events across 5 panes should produce correlations"
+        );
+        // All IDs should be unique
+        let ids: std::collections::HashSet<_> = correlations.iter().map(|c| &c.id).collect();
+        assert_eq!(ids.len(), correlations.len());
     }
 
     // =========================================================================
@@ -19885,5 +20356,814 @@ mod timeline_correlation_tests {
 
         let by_tag = list_pane_bookmarks_by_tag_sync(&conn, "anything").unwrap();
         assert!(by_tag.is_empty());
+    }
+}
+
+// =============================================================================
+// Timeline Integration Tests (wa-6sk.5)
+// =============================================================================
+
+#[cfg(test)]
+mod timeline_integration_tests {
+    use super::*;
+
+    fn make_pane(pane_id: u64, now: i64) -> PaneRecord {
+        PaneRecord {
+            pane_id,
+            pane_uuid: Some(format!("uuid-{pane_id}")),
+            domain: "local".to_string(),
+            window_id: None,
+            tab_id: None,
+            title: Some(format!("pane-{pane_id}")),
+            cwd: Some("/tmp/test".to_string()),
+            tty_name: None,
+            first_seen_at: now,
+            last_seen_at: now,
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        }
+    }
+
+    fn make_event(
+        pane_id: u64,
+        rule_id: &str,
+        event_type: &str,
+        severity: &str,
+        detected_at: i64,
+    ) -> StoredEvent {
+        StoredEvent {
+            id: 0,
+            pane_id,
+            rule_id: rule_id.to_string(),
+            agent_type: "claude_code".to_string(),
+            event_type: event_type.to_string(),
+            severity: severity.to_string(),
+            confidence: 0.9,
+            extracted: None,
+            matched_text: None,
+            segment_id: None,
+            detected_at,
+            dedupe_key: None,
+            handled_at: None,
+            handled_by_workflow_id: None,
+            handled_status: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn timeline_empty_db_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("wa.db");
+        let handle = StorageHandle::new(&db_path.to_string_lossy())
+            .await
+            .unwrap();
+
+        let query = TimelineQuery::new();
+        let timeline = handle.get_timeline(query).await.unwrap();
+
+        assert!(timeline.events.is_empty());
+        assert!(timeline.correlations.is_empty());
+        assert_eq!(timeline.total_count, 0);
+        assert!(!timeline.has_more);
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn timeline_single_event_no_correlations() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("wa.db");
+        let handle = StorageHandle::new(&db_path.to_string_lossy())
+            .await
+            .unwrap();
+
+        let now = 1_700_000_000_000i64;
+        handle.upsert_pane(make_pane(1, now)).await.unwrap();
+        handle
+            .record_event(make_event(1, "rule_a", "error", "error", now))
+            .await
+            .unwrap();
+
+        let query = TimelineQuery {
+            include_correlations: true,
+            ..TimelineQuery::new()
+        };
+        let timeline = handle.get_timeline(query).await.unwrap();
+
+        assert_eq!(timeline.events.len(), 1);
+        assert!(timeline.correlations.is_empty());
+        assert_eq!(timeline.total_count, 1);
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn timeline_temporal_correlation_across_panes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("wa.db");
+        let handle = StorageHandle::new(&db_path.to_string_lossy())
+            .await
+            .unwrap();
+
+        let now = 1_700_000_000_000i64;
+        handle.upsert_pane(make_pane(1, now)).await.unwrap();
+        handle.upsert_pane(make_pane(2, now)).await.unwrap();
+
+        // Two events within 10s across different panes
+        handle
+            .record_event(make_event(1, "rule_a", "error", "error", now))
+            .await
+            .unwrap();
+        handle
+            .record_event(make_event(2, "rule_b", "warning", "warning", now + 3000))
+            .await
+            .unwrap();
+
+        let query = TimelineQuery {
+            include_correlations: true,
+            ..TimelineQuery::new()
+        };
+        let timeline = handle.get_timeline(query).await.unwrap();
+
+        assert_eq!(timeline.events.len(), 2);
+        let temporal = timeline
+            .correlations
+            .iter()
+            .filter(|c| c.correlation_type == CorrelationType::Temporal)
+            .count();
+        assert!(temporal > 0, "Should detect temporal correlation");
+
+        // Events should have correlation refs attached
+        let event_with_refs = timeline
+            .events
+            .iter()
+            .filter(|e| !e.correlations.is_empty())
+            .count();
+        assert!(event_with_refs > 0, "Events should have correlation refs");
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn timeline_failover_correlation_integration() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("wa.db");
+        let handle = StorageHandle::new(&db_path.to_string_lossy())
+            .await
+            .unwrap();
+
+        let now = 1_700_000_000_000i64;
+        handle.upsert_pane(make_pane(1, now)).await.unwrap();
+        handle.upsert_pane(make_pane(2, now)).await.unwrap();
+
+        // Usage limit in pane 1, session start in pane 2 within 5 minutes
+        handle
+            .record_event(make_event(
+                1,
+                "usage_limit",
+                "usage.reached",
+                "warning",
+                now,
+            ))
+            .await
+            .unwrap();
+        handle
+            .record_event(make_event(
+                2,
+                "session_start",
+                "session.start",
+                "info",
+                now + 120_000,
+            ))
+            .await
+            .unwrap();
+
+        let query = TimelineQuery {
+            include_correlations: true,
+            ..TimelineQuery::new()
+        };
+        let timeline = handle.get_timeline(query).await.unwrap();
+
+        let failover = timeline
+            .correlations
+            .iter()
+            .filter(|c| c.correlation_type == CorrelationType::Failover)
+            .count();
+        assert_eq!(failover, 1, "Should detect failover correlation");
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn timeline_pagination_offset_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("wa.db");
+        let handle = StorageHandle::new(&db_path.to_string_lossy())
+            .await
+            .unwrap();
+
+        let now = 1_700_000_000_000i64;
+        handle.upsert_pane(make_pane(1, now)).await.unwrap();
+
+        // Insert 10 events
+        for i in 0..10 {
+            handle
+                .record_event(make_event(
+                    1,
+                    &format!("rule_{i}"),
+                    "info",
+                    "info",
+                    now + i * 1000,
+                ))
+                .await
+                .unwrap();
+        }
+
+        // Page 1: first 3
+        let query = TimelineQuery {
+            limit: 3,
+            offset: 0,
+            include_correlations: false,
+            ..TimelineQuery::new()
+        };
+        let page1 = handle.get_timeline(query).await.unwrap();
+        assert_eq!(page1.events.len(), 3);
+        assert_eq!(page1.total_count, 10);
+        assert!(page1.has_more);
+
+        // Page 2: next 3
+        let query = TimelineQuery {
+            limit: 3,
+            offset: 3,
+            include_correlations: false,
+            ..TimelineQuery::new()
+        };
+        let page2 = handle.get_timeline(query).await.unwrap();
+        assert_eq!(page2.events.len(), 3);
+        assert!(page2.has_more);
+
+        // Page 4: last 1
+        let query = TimelineQuery {
+            limit: 3,
+            offset: 9,
+            include_correlations: false,
+            ..TimelineQuery::new()
+        };
+        let page4 = handle.get_timeline(query).await.unwrap();
+        assert_eq!(page4.events.len(), 1);
+        assert!(!page4.has_more);
+
+        // Beyond range
+        let query = TimelineQuery {
+            limit: 3,
+            offset: 15,
+            include_correlations: false,
+            ..TimelineQuery::new()
+        };
+        let beyond = handle.get_timeline(query).await.unwrap();
+        assert!(beyond.events.is_empty());
+        assert!(!beyond.has_more);
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn timeline_filter_by_severity() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("wa.db");
+        let handle = StorageHandle::new(&db_path.to_string_lossy())
+            .await
+            .unwrap();
+
+        let now = 1_700_000_000_000i64;
+        handle.upsert_pane(make_pane(1, now)).await.unwrap();
+
+        handle
+            .record_event(make_event(1, "rule_a", "error", "error", now))
+            .await
+            .unwrap();
+        handle
+            .record_event(make_event(1, "rule_b", "warning", "warning", now + 1000))
+            .await
+            .unwrap();
+        handle
+            .record_event(make_event(1, "rule_c", "info", "info", now + 2000))
+            .await
+            .unwrap();
+
+        let query = TimelineQuery {
+            severities: Some(vec!["error".to_string()]),
+            include_correlations: false,
+            ..TimelineQuery::new()
+        };
+        let timeline = handle.get_timeline(query).await.unwrap();
+        assert_eq!(timeline.events.len(), 1);
+        assert_eq!(timeline.events[0].severity, "error");
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn timeline_filter_by_pane_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("wa.db");
+        let handle = StorageHandle::new(&db_path.to_string_lossy())
+            .await
+            .unwrap();
+
+        let now = 1_700_000_000_000i64;
+        handle.upsert_pane(make_pane(1, now)).await.unwrap();
+        handle.upsert_pane(make_pane(2, now)).await.unwrap();
+
+        handle
+            .record_event(make_event(1, "rule_a", "error", "error", now))
+            .await
+            .unwrap();
+        handle
+            .record_event(make_event(2, "rule_b", "error", "error", now + 1000))
+            .await
+            .unwrap();
+
+        let query = TimelineQuery {
+            pane_ids: Some(vec![1]),
+            include_correlations: false,
+            ..TimelineQuery::new()
+        };
+        let timeline = handle.get_timeline(query).await.unwrap();
+        assert_eq!(timeline.events.len(), 1);
+        assert_eq!(timeline.events[0].pane_info.pane_id, 1);
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn timeline_filter_by_time_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("wa.db");
+        let handle = StorageHandle::new(&db_path.to_string_lossy())
+            .await
+            .unwrap();
+
+        let now = 1_700_000_000_000i64;
+        handle.upsert_pane(make_pane(1, now)).await.unwrap();
+
+        for i in 0..5 {
+            handle
+                .record_event(make_event(
+                    1,
+                    &format!("rule_{i}"),
+                    "info",
+                    "info",
+                    now + i * 60_000,
+                ))
+                .await
+                .unwrap();
+        }
+
+        // Only events in first 2 minutes
+        let query = TimelineQuery {
+            start: Some(now),
+            end: Some(now + 120_000),
+            include_correlations: false,
+            ..TimelineQuery::new()
+        };
+        let timeline = handle.get_timeline(query).await.unwrap();
+        assert_eq!(timeline.events.len(), 3); // t=0, t=60s, t=120s
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn timeline_unhandled_only_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("wa.db");
+        let handle = StorageHandle::new(&db_path.to_string_lossy())
+            .await
+            .unwrap();
+
+        let now = 1_700_000_000_000i64;
+        handle.upsert_pane(make_pane(1, now)).await.unwrap();
+
+        // Insert event then mark it as handled via the proper API
+        let event_id = handle
+            .record_event(make_event(1, "rule_a", "error", "error", now))
+            .await
+            .unwrap();
+        handle
+            .mark_event_handled(event_id, Some("wf-1".to_string()), "handled")
+            .await
+            .unwrap();
+
+        handle
+            .record_event(make_event(1, "rule_b", "warning", "warning", now + 5000))
+            .await
+            .unwrap();
+
+        let query = TimelineQuery {
+            unhandled_only: true,
+            include_correlations: false,
+            ..TimelineQuery::new()
+        };
+        let timeline = handle.get_timeline(query).await.unwrap();
+        assert_eq!(timeline.events.len(), 1);
+        assert!(timeline.events[0].handled.is_none());
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn timeline_events_same_timestamp_handled_gracefully() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("wa.db");
+        let handle = StorageHandle::new(&db_path.to_string_lossy())
+            .await
+            .unwrap();
+
+        let now = 1_700_000_000_000i64;
+        handle.upsert_pane(make_pane(1, now)).await.unwrap();
+        handle.upsert_pane(make_pane(2, now)).await.unwrap();
+
+        // Three events at the exact same timestamp
+        for i in 0..3 {
+            handle
+                .record_event(make_event(
+                    (i % 2) as u64 + 1,
+                    &format!("rule_{i}"),
+                    "error",
+                    "error",
+                    now,
+                ))
+                .await
+                .unwrap();
+        }
+
+        let query = TimelineQuery {
+            include_correlations: true,
+            ..TimelineQuery::new()
+        };
+        let timeline = handle.get_timeline(query).await.unwrap();
+
+        assert_eq!(timeline.events.len(), 3);
+        // Should detect temporal correlation (same timestamp, different panes)
+        let temporal = timeline
+            .correlations
+            .iter()
+            .filter(|c| c.correlation_type == CorrelationType::Temporal)
+            .count();
+        assert!(
+            temporal > 0,
+            "Same-timestamp cross-pane events should correlate"
+        );
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn timeline_correlation_refs_attached_to_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("wa.db");
+        let handle = StorageHandle::new(&db_path.to_string_lossy())
+            .await
+            .unwrap();
+
+        let now = 1_700_000_000_000i64;
+        handle.upsert_pane(make_pane(1, now)).await.unwrap();
+        handle.upsert_pane(make_pane(2, now)).await.unwrap();
+
+        // Two events that should correlate temporally
+        handle
+            .record_event(make_event(1, "rule_a", "error", "error", now))
+            .await
+            .unwrap();
+        handle
+            .record_event(make_event(2, "rule_b", "warning", "warning", now + 2000))
+            .await
+            .unwrap();
+
+        let query = TimelineQuery {
+            include_correlations: true,
+            ..TimelineQuery::new()
+        };
+        let timeline = handle.get_timeline(query).await.unwrap();
+
+        // At least one event should have correlation refs
+        let has_refs = timeline.events.iter().any(|e| !e.correlations.is_empty());
+        assert!(
+            has_refs,
+            "Correlated events should have CorrelationRef attached"
+        );
+
+        // Verify ref IDs match top-level correlation IDs
+        for event in &timeline.events {
+            for cref in &event.correlations {
+                assert!(
+                    timeline.correlations.iter().any(|c| c.id == cref.id),
+                    "Event correlation ref ID should match a top-level correlation"
+                );
+            }
+        }
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn timeline_correlations_disabled_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("wa.db");
+        let handle = StorageHandle::new(&db_path.to_string_lossy())
+            .await
+            .unwrap();
+
+        let now = 1_700_000_000_000i64;
+        handle.upsert_pane(make_pane(1, now)).await.unwrap();
+        handle.upsert_pane(make_pane(2, now)).await.unwrap();
+
+        // Events that would normally correlate
+        handle
+            .record_event(make_event(1, "rule_a", "error", "error", now))
+            .await
+            .unwrap();
+        handle
+            .record_event(make_event(2, "rule_b", "error", "error", now + 1000))
+            .await
+            .unwrap();
+
+        let query = TimelineQuery {
+            include_correlations: false,
+            ..TimelineQuery::new()
+        };
+        let timeline = handle.get_timeline(query).await.unwrap();
+
+        assert_eq!(timeline.events.len(), 2);
+        assert!(
+            timeline.correlations.is_empty(),
+            "Correlations should be empty when disabled"
+        );
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn timeline_query_performance_many_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("wa.db");
+        let handle = StorageHandle::new(&db_path.to_string_lossy())
+            .await
+            .unwrap();
+
+        let now = 1_700_000_000_000i64;
+        // Create 5 panes
+        for p in 1..=5 {
+            handle.upsert_pane(make_pane(p, now)).await.unwrap();
+        }
+
+        // Insert 200 events across panes
+        for i in 0..200 {
+            let pane = (i % 5) as u64 + 1;
+            handle
+                .record_event(make_event(
+                    pane,
+                    &format!("rule_{}", i % 10),
+                    "detection",
+                    if i % 3 == 0 { "error" } else { "warning" },
+                    now + i * 500,
+                ))
+                .await
+                .unwrap();
+        }
+
+        // Time the query
+        let start = std::time::Instant::now();
+        let query = TimelineQuery {
+            include_correlations: true,
+            limit: 100,
+            ..TimelineQuery::new()
+        };
+        let timeline = handle.get_timeline(query).await.unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(timeline.events.len(), 100);
+        assert_eq!(timeline.total_count, 200);
+        assert!(timeline.has_more);
+        assert!(
+            !timeline.correlations.is_empty(),
+            "Should find correlations among 200 events"
+        );
+        // Performance budget: query should complete in <500ms (generous for CI)
+        assert!(
+            elapsed.as_millis() < 500,
+            "Timeline query took {}ms, expected <500ms",
+            elapsed.as_millis()
+        );
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn timeline_workflow_group_integration() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("wa.db");
+        let handle = StorageHandle::new(&db_path.to_string_lossy())
+            .await
+            .unwrap();
+
+        let now = 1_700_000_000_000i64;
+        handle.upsert_pane(make_pane(1, now)).await.unwrap();
+        handle.upsert_pane(make_pane(2, now)).await.unwrap();
+
+        // Two events handled by same workflow (must use mark_event_handled API)
+        let eid1 = handle
+            .record_event(make_event(1, "rule_a", "error", "error", now))
+            .await
+            .unwrap();
+        handle
+            .mark_event_handled(eid1, Some("wf-test-1".to_string()), "handled")
+            .await
+            .unwrap();
+
+        let eid2 = handle
+            .record_event(make_event(2, "rule_b", "error", "error", now + 5000))
+            .await
+            .unwrap();
+        handle
+            .mark_event_handled(eid2, Some("wf-test-1".to_string()), "handled")
+            .await
+            .unwrap();
+
+        let query = TimelineQuery {
+            include_correlations: true,
+            ..TimelineQuery::new()
+        };
+        let timeline = handle.get_timeline(query).await.unwrap();
+
+        let workflow = timeline
+            .correlations
+            .iter()
+            .filter(|c| c.correlation_type == CorrelationType::WorkflowGroup)
+            .collect::<Vec<_>>();
+        assert_eq!(workflow.len(), 1, "Should detect workflow group");
+        assert_eq!(workflow[0].event_ids.len(), 2);
+        assert!(
+            (workflow[0].confidence - 0.95).abs() < 0.01,
+            "Workflow confidence should be 0.95"
+        );
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn timeline_serde_roundtrip() {
+        let timeline = Timeline {
+            start: 1000,
+            end: 5000,
+            events: vec![TimelineEvent {
+                id: 1,
+                timestamp: 1000,
+                pane_info: PaneInfo {
+                    pane_id: 1,
+                    pane_uuid: Some("uuid-1".to_string()),
+                    agent_type: Some("claude_code".to_string()),
+                    domain: "local".to_string(),
+                    cwd: Some("/tmp".to_string()),
+                    title: Some("test".to_string()),
+                },
+                rule_id: "rule_a".to_string(),
+                event_type: "error".to_string(),
+                severity: "error".to_string(),
+                confidence: 0.9,
+                handled: None,
+                correlations: vec![CorrelationRef {
+                    id: "corr-1".to_string(),
+                    correlation_type: CorrelationType::Temporal,
+                }],
+                summary: Some("Test event".to_string()),
+            }],
+            correlations: vec![Correlation {
+                id: "corr-1".to_string(),
+                event_ids: vec![1, 2],
+                correlation_type: CorrelationType::Temporal,
+                confidence: 0.6,
+                description: "Test correlation".to_string(),
+            }],
+            total_count: 1,
+            has_more: false,
+        };
+
+        let json = serde_json::to_string(&timeline).unwrap();
+        let deserialized: Timeline = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.events.len(), 1);
+        assert_eq!(deserialized.correlations.len(), 1);
+        assert_eq!(deserialized.total_count, 1);
+        assert!(!deserialized.has_more);
+        assert_eq!(deserialized.events[0].correlations.len(), 1);
+        assert_eq!(
+            deserialized.correlations[0].correlation_type,
+            CorrelationType::Temporal
+        );
+    }
+
+    #[tokio::test]
+    async fn timeline_dedupe_group_integration() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("wa.db");
+        let handle = StorageHandle::new(&db_path.to_string_lossy())
+            .await
+            .unwrap();
+
+        let now = 1_700_000_000_000i64;
+        handle.upsert_pane(make_pane(1, now)).await.unwrap();
+        handle.upsert_pane(make_pane(2, now)).await.unwrap();
+        handle.upsert_pane(make_pane(3, now)).await.unwrap();
+
+        // Same rule firing across 3 panes within 30s
+        handle
+            .record_event(make_event(
+                1,
+                "claude_code.usage.reached",
+                "usage",
+                "warning",
+                now,
+            ))
+            .await
+            .unwrap();
+        handle
+            .record_event(make_event(
+                2,
+                "claude_code.usage.reached",
+                "usage",
+                "warning",
+                now + 10_000,
+            ))
+            .await
+            .unwrap();
+        handle
+            .record_event(make_event(
+                3,
+                "claude_code.usage.reached",
+                "usage",
+                "warning",
+                now + 20_000,
+            ))
+            .await
+            .unwrap();
+
+        let query = TimelineQuery {
+            include_correlations: true,
+            ..TimelineQuery::new()
+        };
+        let timeline = handle.get_timeline(query).await.unwrap();
+
+        let dedupe = timeline
+            .correlations
+            .iter()
+            .filter(|c| c.correlation_type == CorrelationType::DedupeGroup)
+            .collect::<Vec<_>>();
+        assert_eq!(dedupe.len(), 1, "Should detect dedupe group across 3 panes");
+        assert_eq!(dedupe[0].event_ids.len(), 3);
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn timeline_events_ordered_chronologically() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("wa.db");
+        let handle = StorageHandle::new(&db_path.to_string_lossy())
+            .await
+            .unwrap();
+
+        let now = 1_700_000_000_000i64;
+        handle.upsert_pane(make_pane(1, now)).await.unwrap();
+
+        // Insert events out of order
+        handle
+            .record_event(make_event(1, "rule_c", "info", "info", now + 5000))
+            .await
+            .unwrap();
+        handle
+            .record_event(make_event(1, "rule_a", "info", "info", now))
+            .await
+            .unwrap();
+        handle
+            .record_event(make_event(1, "rule_b", "info", "info", now + 2000))
+            .await
+            .unwrap();
+
+        let query = TimelineQuery {
+            include_correlations: false,
+            ..TimelineQuery::new()
+        };
+        let timeline = handle.get_timeline(query).await.unwrap();
+
+        assert_eq!(timeline.events.len(), 3);
+        assert!(
+            timeline.events[0].timestamp <= timeline.events[1].timestamp
+                && timeline.events[1].timestamp <= timeline.events[2].timestamp,
+            "Events should be in chronological order"
+        );
+
+        handle.shutdown().await.unwrap();
     }
 }
