@@ -830,6 +830,339 @@ fn contract_approve_invalid_code() {
 // Unknown/invalid command contract tests
 // =============================================================================
 
+// =============================================================================
+// wa history contract tests
+// =============================================================================
+
+#[test]
+fn contract_history_plain_no_ansi_and_redacted_summary() {
+    let (_dir, ws) = setup_populated_workspace();
+    let output = wa_cmd_for(&ws)
+        .args(["history", "--format", "plain", "--limit", "20"])
+        .output()
+        .expect("wa history should execute");
+
+    assert!(
+        output.status.success(),
+        "wa history should exit 0, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_no_ansi(&stdout, "wa history (plain)");
+    assert!(
+        stdout.contains("Action history"),
+        "wa history plain should include heading: {stdout}"
+    );
+    assert!(
+        stdout.contains("SUMMARY"),
+        "wa history plain should include table headers: {stdout}"
+    );
+    assert!(
+        stdout.contains("[REDACTED]"),
+        "wa history plain should preserve redacted summaries: {stdout}"
+    );
+}
+
+#[test]
+fn contract_history_json_filters_undoable_and_orders_newest_first() {
+    let (dir, ws) = setup_populated_workspace();
+    let db_path = dir.path().join(".wa").join("wa.db");
+    let conn = rusqlite::Connection::open(&db_path).expect("open DB");
+
+    conn.execute(
+        "INSERT INTO audit_actions (ts, actor_kind, action_kind, policy_decision, result, pane_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![1_700_000_120_000i64, "human", "spawn", "allow", "success", 1i64],
+    )
+    .expect("insert audit undoable older");
+    let older_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO action_undo (audit_action_id, undoable, undo_strategy, undo_hint, undo_payload, undone_at, undone_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![
+            older_id,
+            1i64,
+            "pane_close",
+            "Close pane",
+            r#"{"pane_id":1}"#,
+            rusqlite::types::Null,
+            rusqlite::types::Null,
+        ],
+    )
+    .expect("insert undo older");
+
+    conn.execute(
+        "INSERT INTO audit_actions (ts, actor_kind, action_kind, policy_decision, result, pane_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![1_700_000_130_000i64, "workflow", "workflow_start", "allow", "success", 1i64],
+    )
+    .expect("insert audit undoable newer");
+    let newer_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO action_undo (audit_action_id, undoable, undo_strategy, undo_hint, undo_payload, undone_at, undone_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![
+            newer_id,
+            1i64,
+            "workflow_abort",
+            "Abort workflow",
+            r#"{"execution_id":"wf-123"}"#,
+            rusqlite::types::Null,
+            rusqlite::types::Null,
+        ],
+    )
+    .expect("insert undo newer");
+
+    conn.execute(
+        "INSERT INTO audit_actions (ts, actor_kind, action_kind, policy_decision, result, pane_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![1_700_000_140_000i64, "human", "send_text", "allow", "success", 1i64],
+    )
+    .expect("insert audit non-undoable");
+    let non_undoable_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO action_undo (audit_action_id, undoable, undo_strategy, undo_hint, undo_payload, undone_at, undone_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![
+            non_undoable_id,
+            0i64,
+            "manual",
+            "Manual only",
+            rusqlite::types::Null,
+            rusqlite::types::Null,
+            rusqlite::types::Null,
+        ],
+    )
+    .expect("insert undo non-undoable");
+    drop(conn);
+
+    let payload = run_wa_json(
+        &ws,
+        &["history", "--format", "json", "--undoable", "--limit", "20"],
+    );
+    let rows = payload.as_array().expect("history JSON should be an array");
+
+    let ids: Vec<i64> = rows.iter().filter_map(|row| row["id"].as_i64()).collect();
+    assert_eq!(
+        ids,
+        vec![newer_id, older_id],
+        "history undoable filter should return only undoable rows in deterministic order"
+    );
+
+    for row in rows {
+        assert_eq!(row["undoable"].as_bool(), Some(true));
+        assert!(
+            row.get("undo_strategy").is_some(),
+            "undoable row should carry undo_strategy"
+        );
+    }
+}
+
+// =============================================================================
+// wa undo contract tests
+// =============================================================================
+
+#[test]
+fn contract_undo_list_json_returns_only_currently_undoable_actions() {
+    let (dir, ws) = setup_populated_workspace();
+    let db_path = dir.path().join(".wa").join("wa.db");
+    let conn = rusqlite::Connection::open(&db_path).expect("open DB");
+
+    conn.execute(
+        "INSERT INTO audit_actions (ts, actor_kind, action_kind, policy_decision, result, pane_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![1_700_000_100_000i64, "human", "spawn", "allow", "success", 1i64],
+    )
+    .expect("insert audit undoable");
+    let undoable_id = conn.last_insert_rowid();
+
+    conn.execute(
+        "INSERT INTO action_undo (audit_action_id, undoable, undo_strategy, undo_hint, undo_payload, undone_at, undone_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![
+            undoable_id,
+            1i64,
+            "pane_close",
+            "Close spawned pane",
+            r#"{"pane_id":1}"#,
+            rusqlite::types::Null,
+            rusqlite::types::Null,
+        ],
+    )
+    .expect("insert action_undo undoable");
+
+    conn.execute(
+        "INSERT INTO audit_actions (ts, actor_kind, action_kind, policy_decision, result, pane_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![1_700_000_101_000i64, "human", "spawn", "allow", "success", 1i64],
+    )
+    .expect("insert audit undone");
+    let undone_id = conn.last_insert_rowid();
+
+    conn.execute(
+        "INSERT INTO action_undo (audit_action_id, undoable, undo_strategy, undo_hint, undo_payload, undone_at, undone_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![
+            undone_id,
+            1i64,
+            "pane_close",
+            "Already undone",
+            r#"{"pane_id":1}"#,
+            1_700_000_200_000i64,
+            "tester",
+        ],
+    )
+    .expect("insert action_undo undone");
+
+    conn.execute(
+        "INSERT INTO audit_actions (ts, actor_kind, action_kind, policy_decision, result, pane_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![1_700_000_102_000i64, "human", "send_text", "allow", "success", 1i64],
+    )
+    .expect("insert audit non-undoable");
+    let non_undoable_id = conn.last_insert_rowid();
+
+    conn.execute(
+        "INSERT INTO action_undo (audit_action_id, undoable, undo_strategy, undo_hint, undo_payload, undone_at, undone_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![
+            non_undoable_id,
+            0i64,
+            "manual",
+            "Manual only",
+            rusqlite::types::Null,
+            rusqlite::types::Null,
+            rusqlite::types::Null,
+        ],
+    )
+    .expect("insert action_undo non-undoable");
+    drop(conn);
+
+    let payload = run_wa_json(
+        &ws,
+        &["undo", "--list", "--format", "json", "--limit", "20"],
+    );
+    assert_eq!(payload["ok"], true);
+
+    let actions = payload["data"]["actions"]
+        .as_array()
+        .expect("actions should be an array");
+    let ids: Vec<i64> = actions
+        .iter()
+        .filter_map(|row| row["action_id"].as_i64())
+        .collect();
+
+    assert!(
+        ids.contains(&undoable_id),
+        "undoable pending action should be listed"
+    );
+    assert!(
+        !ids.contains(&undone_id),
+        "already-undone action should not be listed"
+    );
+    assert!(
+        !ids.contains(&non_undoable_id),
+        "non-undoable action should not be listed"
+    );
+}
+
+#[test]
+fn contract_undo_single_json_not_applicable_for_manual_strategy() {
+    let (dir, ws) = setup_populated_workspace();
+    let db_path = dir.path().join(".wa").join("wa.db");
+    let conn = rusqlite::Connection::open(&db_path).expect("open DB");
+
+    conn.execute(
+        "INSERT INTO audit_actions (ts, actor_kind, action_kind, policy_decision, result, pane_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![1_700_000_150_000i64, "human", "send_text", "allow", "success", 1i64],
+    )
+    .expect("insert audit manual");
+    let action_id = conn.last_insert_rowid();
+
+    conn.execute(
+        "INSERT INTO action_undo (audit_action_id, undoable, undo_strategy, undo_hint, undo_payload, undone_at, undone_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![
+            action_id,
+            0i64,
+            "manual",
+            "Reverse this command manually.",
+            rusqlite::types::Null,
+            rusqlite::types::Null,
+            rusqlite::types::Null,
+        ],
+    )
+    .expect("insert action_undo manual");
+    drop(conn);
+
+    let payload = run_wa_json(
+        &ws,
+        &["undo", &action_id.to_string(), "--yes", "--format", "json"],
+    );
+    assert_eq!(payload["ok"], true);
+
+    let results = payload["data"]["results"]
+        .as_array()
+        .expect("results should be an array");
+    assert_eq!(results.len(), 1, "expected exactly one undo result");
+    assert_eq!(results[0]["action_id"].as_i64(), Some(action_id));
+    assert_eq!(results[0]["outcome"].as_str(), Some("not_applicable"));
+    assert_eq!(results[0]["strategy"].as_str(), Some("manual"));
+    assert_eq!(
+        results[0]["guidance"].as_str(),
+        Some("Reverse this command manually.")
+    );
+}
+
+#[test]
+fn contract_undo_single_json_already_undone_is_idempotent_noop() {
+    let (dir, ws) = setup_populated_workspace();
+    let db_path = dir.path().join(".wa").join("wa.db");
+    let conn = rusqlite::Connection::open(&db_path).expect("open DB");
+
+    conn.execute(
+        "INSERT INTO audit_actions (ts, actor_kind, action_kind, policy_decision, result, pane_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![1_700_000_170_000i64, "human", "spawn", "allow", "success", 1i64],
+    )
+    .expect("insert audit already-undone");
+    let action_id = conn.last_insert_rowid();
+    let already_undone_at = 1_700_000_171_000i64;
+
+    conn.execute(
+        "INSERT INTO action_undo (audit_action_id, undoable, undo_strategy, undo_hint, undo_payload, undone_at, undone_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![
+            action_id,
+            1i64,
+            "pane_close",
+            "Pane already closed previously.",
+            r#"{"pane_id":1}"#,
+            already_undone_at,
+            "previous-operator",
+        ],
+    )
+    .expect("insert action_undo already-undone");
+    drop(conn);
+
+    let payload = run_wa_json(
+        &ws,
+        &["undo", &action_id.to_string(), "--yes", "--format", "json"],
+    );
+    assert_eq!(payload["ok"], true);
+
+    let results = payload["data"]["results"]
+        .as_array()
+        .expect("results should be an array");
+    assert_eq!(results.len(), 1, "expected exactly one undo result");
+    assert_eq!(results[0]["action_id"].as_i64(), Some(action_id));
+    assert_eq!(results[0]["outcome"].as_str(), Some("not_applicable"));
+    assert!(
+        results[0]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("already been undone"),
+        "expected idempotent already-undone message"
+    );
+
+    let conn = rusqlite::Connection::open(&db_path).expect("re-open DB");
+    let record: (Option<i64>, Option<String>) = conn
+        .query_row(
+            "SELECT undone_at, undone_by FROM action_undo WHERE audit_action_id = ?1",
+            rusqlite::params![action_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("query action_undo");
+    assert_eq!(record.0, Some(already_undone_at));
+    assert_eq!(record.1.as_deref(), Some("previous-operator"));
+}
+
 #[test]
 fn contract_unknown_subcommand_fails() {
     let (_dir, ws) = setup_workspace();
@@ -870,6 +1203,8 @@ fn contract_no_ansi_in_plain_mode() {
         vec!["events", "--format", "plain"],
         vec!["accounts", "--format", "plain"],
         vec!["audit", "--format", "plain"],
+        vec!["history", "--format", "plain"],
+        vec!["undo", "--list", "--format", "plain"],
         vec!["rules", "list", "--format", "plain"],
         vec!["doctor"],
     ];
@@ -897,6 +1232,8 @@ fn contract_json_mode_always_parseable() {
         vec!["events", "--format", "json"],
         vec!["accounts", "--format", "json"],
         vec!["audit", "--format", "json"],
+        vec!["history", "--format", "json"],
+        vec!["undo", "--list", "--format", "json"],
         vec!["rules", "list", "--format", "json"],
     ];
 
