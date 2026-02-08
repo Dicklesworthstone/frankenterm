@@ -2548,4 +2548,418 @@ mod tests {
         );
         assert_eq!(parse_agent_type("nope"), None);
     }
+
+    // ========================================================================
+    // E2E: noise control pipeline (wa-upg.8.6)
+    // ========================================================================
+
+    /// E2E: repeated identical events are deduplicated, then cooldown-throttled.
+    #[test]
+    fn e2e_repeated_events_dedup_then_cooldown() {
+        // Short dedup window (1ms) so we can test cooldown after dedup expires.
+        // Longer cooldown (300s) to ensure throttling kicks in.
+        let mut gate = NotificationGate::from_config(
+            EventFilter::allow_all(),
+            Duration::from_millis(1),
+            Duration::from_secs(300),
+        );
+        let d = make_detection(
+            "codex.usage_reached",
+            crate::patterns::Severity::Warning,
+            crate::patterns::AgentType::Codex,
+        );
+
+        // First event: Send
+        let r1 = gate.should_notify(&d, 1, None);
+        assert_eq!(
+            r1,
+            NotifyDecision::Send {
+                suppressed_since_last: 0
+            }
+        );
+
+        // Immediate repeat: Deduplicated (within 1ms dedup window)
+        let r2 = gate.should_notify(&d, 1, None);
+        assert!(
+            matches!(r2, NotifyDecision::Deduplicated { .. }),
+            "expected Deduplicated, got {r2:?}"
+        );
+
+        // Wait for dedup to expire
+        std::thread::sleep(Duration::from_millis(5));
+
+        // After dedup expires but within cooldown: Throttled
+        let r3 = gate.should_notify(&d, 1, None);
+        assert!(
+            matches!(r3, NotifyDecision::Throttled { .. }),
+            "expected Throttled, got {r3:?}"
+        );
+    }
+
+    /// E2E: suppressed count escalates correctly across repeated events.
+    #[test]
+    fn e2e_suppressed_count_escalates() {
+        let mut dedup = EventDeduplicator::with_config(Duration::from_secs(300), 100);
+
+        // First occurrence: New
+        assert_eq!(dedup.check("event_a"), DedupeVerdict::New);
+
+        // Repeat 10 times: count escalates
+        for i in 1..=10 {
+            assert_eq!(
+                dedup.check("event_a"),
+                DedupeVerdict::Duplicate {
+                    suppressed_count: i
+                }
+            );
+        }
+
+        // Suppressed count reflects total duplicates
+        assert_eq!(dedup.suppressed_count("event_a"), 10);
+    }
+
+    /// E2E: cooldown tracks suppressed count and reports it on send.
+    #[test]
+    fn e2e_cooldown_suppressed_count_reported_on_send() {
+        let mut cooldown = NotificationCooldown::with_config(Duration::from_millis(10), 100);
+
+        // First: Send (0 suppressed)
+        assert_eq!(
+            cooldown.check("key_a"),
+            CooldownVerdict::Send {
+                suppressed_since_last: 0
+            }
+        );
+
+        // Suppress 3 events within cooldown
+        for _ in 0..3 {
+            let v = cooldown.check("key_a");
+            assert!(matches!(v, CooldownVerdict::Suppress { .. }));
+        }
+
+        // Wait for cooldown to expire
+        std::thread::sleep(Duration::from_millis(15));
+
+        // Next check: Send with suppressed count = 3
+        assert_eq!(
+            cooldown.check("key_a"),
+            CooldownVerdict::Send {
+                suppressed_since_last: 3
+            }
+        );
+    }
+
+    /// E2E: filter excludes events before dedup/cooldown are touched.
+    #[test]
+    fn e2e_filter_short_circuits_before_dedup() {
+        let filter = EventFilter::from_config(&[], &["codex.*".to_string()], None, &[]);
+        let mut gate = NotificationGate::from_config(
+            filter,
+            Duration::from_secs(300),
+            Duration::from_secs(30),
+        );
+
+        let d = make_detection(
+            "codex.usage_reached",
+            crate::patterns::Severity::Warning,
+            crate::patterns::AgentType::Codex,
+        );
+
+        // All attempts are filtered, never reaching dedup
+        for _ in 0..5 {
+            assert_eq!(gate.should_notify(&d, 1, None), NotifyDecision::Filtered);
+        }
+
+        // A different (non-excluded) event still sends fine
+        let d2 = make_detection(
+            "gemini.session_start",
+            crate::patterns::Severity::Info,
+            crate::patterns::AgentType::Gemini,
+        );
+        assert!(matches!(
+            gate.should_notify(&d2, 1, None),
+            NotifyDecision::Send { .. }
+        ));
+    }
+
+    /// E2E: events from different panes are independent in the gate.
+    #[test]
+    fn e2e_multi_pane_independence() {
+        let mut gate = NotificationGate::from_config(
+            EventFilter::allow_all(),
+            Duration::from_secs(300),
+            Duration::from_secs(300),
+        );
+        let d = make_detection(
+            "codex.compaction",
+            crate::patterns::Severity::Info,
+            crate::patterns::AgentType::Codex,
+        );
+
+        // Pane 1, 2, 3 all send independently
+        for pane_id in 1..=3 {
+            let result = gate.should_notify(&d, pane_id, None);
+            assert!(
+                matches!(result, NotifyDecision::Send { .. }),
+                "pane {pane_id} should send, got {result:?}"
+            );
+        }
+
+        // Repeating on pane 1 is deduplicated
+        let result = gate.should_notify(&d, 1, None);
+        assert!(matches!(result, NotifyDecision::Deduplicated { .. }));
+
+        // But pane 4 is still new
+        let result = gate.should_notify(&d, 4, None);
+        assert!(matches!(result, NotifyDecision::Send { .. }));
+    }
+
+    /// E2E: mute lifecycle with storage (add, check, list, remove).
+    #[tokio::test]
+    async fn e2e_mute_lifecycle_with_storage() {
+        use crate::storage::{EventMuteRecord, StorageHandle};
+
+        let db_path = std::env::temp_dir().join(format!("wa_e2e_mute_{}.db", std::process::id()));
+        let db_str = db_path.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{db_str}-wal"));
+        let _ = std::fs::remove_file(format!("{db_str}-shm"));
+
+        let storage = StorageHandle::new(&db_str).await.expect("open test db");
+        let now = crate::storage::now_ms();
+
+        // Generate an identity key for our test event
+        let d = make_detection(
+            "codex.usage_reached",
+            crate::patterns::Severity::Warning,
+            crate::patterns::AgentType::Codex,
+        );
+        let identity_key = event_identity_key(&d, 1, None);
+
+        // Initially not muted
+        assert!(
+            !storage.is_event_muted(&identity_key, now).await.unwrap(),
+            "should not be muted initially"
+        );
+
+        // Add mute with no expiry (permanent)
+        storage
+            .add_event_mute(EventMuteRecord {
+                identity_key: identity_key.clone(),
+                scope: "workspace".to_string(),
+                created_at: now,
+                expires_at: None,
+                created_by: Some("test".to_string()),
+                reason: Some("noisy test event".to_string()),
+            })
+            .await
+            .unwrap();
+
+        // Now muted
+        assert!(
+            storage.is_event_muted(&identity_key, now).await.unwrap(),
+            "should be muted after add"
+        );
+
+        // Appears in active mutes list
+        let mutes = storage.list_active_mutes(now).await.unwrap();
+        assert!(
+            mutes.iter().any(|m| m.identity_key == identity_key),
+            "mute should appear in active list"
+        );
+
+        // Remove mute
+        storage.remove_event_mute(&identity_key).await.unwrap();
+
+        // No longer muted
+        assert!(
+            !storage.is_event_muted(&identity_key, now).await.unwrap(),
+            "should not be muted after remove"
+        );
+
+        // Clean up
+        storage.shutdown().await.expect("shutdown");
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{db_str}-wal"));
+        let _ = std::fs::remove_file(format!("{db_str}-shm"));
+    }
+
+    /// E2E: mute with expiry automatically expires.
+    #[tokio::test]
+    async fn e2e_mute_expiry() {
+        use crate::storage::{EventMuteRecord, StorageHandle};
+
+        let db_path =
+            std::env::temp_dir().join(format!("wa_e2e_mute_expiry_{}.db", std::process::id()));
+        let db_str = db_path.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{db_str}-wal"));
+        let _ = std::fs::remove_file(format!("{db_str}-shm"));
+
+        let storage = StorageHandle::new(&db_str).await.expect("open test db");
+        let now = crate::storage::now_ms();
+
+        let identity_key = "evt:test_expiry_key".to_string();
+
+        // Add mute that already expired (expires_at in the past)
+        storage
+            .add_event_mute(EventMuteRecord {
+                identity_key: identity_key.clone(),
+                scope: "workspace".to_string(),
+                created_at: now - 60_000,
+                expires_at: Some(now - 1000), // expired 1 second ago
+                created_by: None,
+                reason: None,
+            })
+            .await
+            .unwrap();
+
+        // Should not be active since it's expired
+        assert!(
+            !storage.is_event_muted(&identity_key, now).await.unwrap(),
+            "expired mute should not be active"
+        );
+
+        // Should not appear in active mutes list
+        let mutes = storage.list_active_mutes(now).await.unwrap();
+        assert!(
+            !mutes.iter().any(|m| m.identity_key == identity_key),
+            "expired mute should not appear in active list"
+        );
+
+        // Add a mute that expires in the future
+        let future_key = "evt:test_future_key".to_string();
+        storage
+            .add_event_mute(EventMuteRecord {
+                identity_key: future_key.clone(),
+                scope: "workspace".to_string(),
+                created_at: now,
+                expires_at: Some(now + 3_600_000), // 1 hour from now
+                created_by: None,
+                reason: Some("temporary mute".to_string()),
+            })
+            .await
+            .unwrap();
+
+        // Should be active
+        assert!(
+            storage.is_event_muted(&future_key, now).await.unwrap(),
+            "future mute should be active"
+        );
+
+        // Clean up
+        storage.shutdown().await.expect("shutdown");
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{db_str}-wal"));
+        let _ = std::fs::remove_file(format!("{db_str}-shm"));
+    }
+
+    /// E2E: full noise control pipeline - dedup → cooldown → mute check.
+    #[tokio::test]
+    async fn e2e_full_pipeline_dedup_cooldown_mute() {
+        use crate::storage::{EventMuteRecord, StorageHandle};
+
+        let db_path =
+            std::env::temp_dir().join(format!("wa_e2e_full_pipeline_{}.db", std::process::id()));
+        let db_str = db_path.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{db_str}-wal"));
+        let _ = std::fs::remove_file(format!("{db_str}-shm"));
+
+        let storage = StorageHandle::new(&db_str).await.expect("open test db");
+        let now = crate::storage::now_ms();
+
+        let d = make_detection(
+            "codex.compaction",
+            crate::patterns::Severity::Warning,
+            crate::patterns::AgentType::Codex,
+        );
+        let identity_key = event_identity_key(&d, 1, None);
+
+        // Step 1: gate allows first event
+        let mut gate = NotificationGate::from_config(
+            EventFilter::allow_all(),
+            Duration::from_secs(300),
+            Duration::from_secs(300),
+        );
+        let r1 = gate.should_notify(&d, 1, None);
+        assert!(matches!(r1, NotifyDecision::Send { .. }));
+
+        // Step 2: gate deduplicates second event
+        let r2 = gate.should_notify(&d, 1, None);
+        assert!(matches!(r2, NotifyDecision::Deduplicated { .. }));
+
+        // Step 3: mute the event via storage
+        storage
+            .add_event_mute(EventMuteRecord {
+                identity_key: identity_key.clone(),
+                scope: "workspace".to_string(),
+                created_at: now,
+                expires_at: None,
+                created_by: Some("operator".to_string()),
+                reason: Some("too noisy".to_string()),
+            })
+            .await
+            .unwrap();
+
+        // Step 4: verify mute is active
+        assert!(storage.is_event_muted(&identity_key, now).await.unwrap());
+
+        // Step 5: muted event is visible in muted list
+        let mutes = storage.list_active_mutes(now).await.unwrap();
+        let our_mute = mutes.iter().find(|m| m.identity_key == identity_key);
+        assert!(our_mute.is_some(), "muted event should be in list");
+        assert_eq!(our_mute.unwrap().reason.as_deref(), Some("too noisy"));
+
+        // Step 6: after unmuting, is_event_muted returns false
+        storage.remove_event_mute(&identity_key).await.unwrap();
+        assert!(!storage.is_event_muted(&identity_key, now).await.unwrap());
+
+        // Clean up
+        storage.shutdown().await.expect("shutdown");
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{db_str}-wal"));
+        let _ = std::fs::remove_file(format!("{db_str}-shm"));
+    }
+
+    /// E2E: dedup and cooldown JSON artifacts are deterministic.
+    #[test]
+    fn e2e_noise_control_json_stability() {
+        let d = make_detection(
+            "codex.compaction",
+            crate::patterns::Severity::Warning,
+            crate::patterns::AgentType::Codex,
+        );
+
+        let mut gate = NotificationGate::from_config(
+            EventFilter::allow_all(),
+            Duration::from_secs(300),
+            Duration::from_secs(300),
+        );
+
+        // Collect decisions
+        let decisions: Vec<NotifyDecision> =
+            (0..5).map(|_| gate.should_notify(&d, 1, None)).collect();
+
+        // First is Send, rest are Deduplicated
+        assert!(matches!(decisions[0], NotifyDecision::Send { .. }));
+        for decision in &decisions[1..] {
+            assert!(matches!(decision, NotifyDecision::Deduplicated { .. }));
+        }
+
+        // Suppressed counts are monotonically increasing
+        let counts: Vec<u64> = decisions[1..]
+            .iter()
+            .map(|d| match d {
+                NotifyDecision::Deduplicated { suppressed_count } => *suppressed_count,
+                _ => panic!("expected Deduplicated"),
+            })
+            .collect();
+        for window in counts.windows(2) {
+            assert!(
+                window[1] > window[0],
+                "suppressed counts should increase monotonically: {counts:?}"
+            );
+        }
+    }
 }

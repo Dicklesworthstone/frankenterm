@@ -491,4 +491,489 @@ mod tests {
         ));
         assert_eq!(sent.lock().unwrap().len(), 1);
     }
+
+    // ========================================================================
+    // Redaction tests (bd-wolc)
+    // ========================================================================
+
+    #[test]
+    fn payload_redacts_openai_key_in_summary() {
+        let detection = test_detection();
+        let rendered = RenderedEvent {
+            summary: "Token: sk-abc123456789012345678901234567890123456789012345678901".to_string(),
+            description: "No secrets here".to_string(),
+            suggestions: vec![],
+            severity: Severity::Warning,
+        };
+        let payload = NotificationPayload::from_detection(&detection, 1, &rendered, 0);
+        assert!(
+            !payload.summary.contains("sk-abc"),
+            "OpenAI key should be redacted from summary"
+        );
+        assert!(
+            payload.summary.contains("[REDACTED]"),
+            "should contain redaction marker"
+        );
+    }
+
+    #[test]
+    fn payload_redacts_github_token_in_description() {
+        let detection = test_detection();
+        let rendered = RenderedEvent {
+            summary: "Alert".to_string(),
+            description: "GH token: ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789".to_string(),
+            suggestions: vec![],
+            severity: Severity::Warning,
+        };
+        let payload = NotificationPayload::from_detection(&detection, 1, &rendered, 0);
+        assert!(
+            !payload.description.contains("ghp_"),
+            "GitHub token should be redacted from description"
+        );
+    }
+
+    #[test]
+    fn payload_redacts_quick_fix_command() {
+        let detection = test_detection();
+        let rendered = RenderedEvent {
+            summary: "Set API key".to_string(),
+            description: "Configure key".to_string(),
+            suggestions: vec![crate::event_templates::Suggestion {
+                text: "Set key".to_string(),
+                command: Some(
+                    "export KEY=sk-abc123456789012345678901234567890123456789012345678901"
+                        .to_string(),
+                ),
+                doc_link: None,
+            }],
+            severity: Severity::Warning,
+        };
+        let payload = NotificationPayload::from_detection(&detection, 1, &rendered, 0);
+        let fix = payload.quick_fix.expect("should have quick_fix");
+        assert!(
+            !fix.contains("sk-abc"),
+            "quick_fix should not contain raw secret"
+        );
+    }
+
+    #[test]
+    fn payload_with_no_secrets_passes_through() {
+        let detection = test_detection();
+        let rendered = RenderedEvent {
+            summary: "Agent usage limit reached".to_string(),
+            description: "The codex agent hit its rate limit.".to_string(),
+            suggestions: vec![],
+            severity: Severity::Warning,
+        };
+        let payload = NotificationPayload::from_detection(&detection, 5, &rendered, 3);
+        assert_eq!(payload.summary, "Agent usage limit reached");
+        assert_eq!(payload.description, "The codex agent hit its rate limit.");
+        assert_eq!(payload.suppressed_since_last, 3);
+    }
+
+    #[test]
+    fn payload_redacts_database_url_password() {
+        let detection = test_detection();
+        let rendered = RenderedEvent {
+            summary: "DB: postgres://admin:hunter2@db.example.com:5432/prod".to_string(),
+            description: "Connection failed".to_string(),
+            suggestions: vec![],
+            severity: Severity::Critical,
+        };
+        let payload = NotificationPayload::from_detection(&detection, 1, &rendered, 0);
+        assert!(
+            !payload.summary.contains("hunter2"),
+            "DB password should be redacted"
+        );
+    }
+
+    #[test]
+    fn payload_json_serialization_does_not_leak_secrets() {
+        let payload =
+            NotificationPayload::from_detection(&test_detection(), 3, &test_rendered(), 0);
+        let json = serde_json::to_string(&payload).expect("serialize");
+        assert!(
+            !json.contains("sk-abc"),
+            "JSON should not contain raw API key"
+        );
+    }
+
+    #[test]
+    fn payload_preserves_metadata_fields() {
+        let detection = Detection {
+            rule_id: "custom.agent:session_end".to_string(),
+            agent_type: AgentType::Gemini,
+            event_type: "session_end".to_string(),
+            severity: Severity::Info,
+            confidence: 0.85,
+            extracted: serde_json::json!({"count": 42}),
+            matched_text: "Session ended".to_string(),
+            span: (0, 13),
+        };
+        let rendered = RenderedEvent {
+            summary: "Session ended".to_string(),
+            description: "Agent session concluded".to_string(),
+            suggestions: vec![],
+            severity: Severity::Info,
+        };
+        let payload = NotificationPayload::from_detection(&detection, 99, &rendered, 7);
+        assert_eq!(payload.event_type, "custom.agent:session_end");
+        assert_eq!(payload.pane_id, 99);
+        assert_eq!(payload.severity, "info");
+        assert_eq!(payload.agent_type, "gemini");
+        assert!((payload.confidence - 0.85).abs() < f64::EPSILON);
+        assert_eq!(payload.suppressed_since_last, 7);
+        assert!(payload.quick_fix.is_none());
+    }
+
+    // ========================================================================
+    // Rate limiting (RateLimitedSender)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn rate_limited_sender_allows_first_send() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let inner = MockSender::new("inner", Arc::clone(&sent));
+        let limited = RateLimitedSender::new(inner, Duration::from_secs(60));
+
+        let payload =
+            NotificationPayload::from_detection(&test_detection(), 1, &test_rendered(), 0);
+        let delivery = limited.send(&payload).await;
+
+        assert!(delivery.success);
+        assert!(!delivery.rate_limited);
+        assert_eq!(sent.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rate_limited_sender_blocks_rapid_second_send() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let inner = MockSender::new("inner", Arc::clone(&sent));
+        let limited = RateLimitedSender::new(inner, Duration::from_secs(60));
+
+        let payload =
+            NotificationPayload::from_detection(&test_detection(), 1, &test_rendered(), 0);
+
+        // First send succeeds
+        let d1 = limited.send(&payload).await;
+        assert!(d1.success);
+
+        // Immediate second send is rate limited
+        let d2 = limited.send(&payload).await;
+        assert!(!d2.success);
+        assert!(d2.rate_limited);
+        assert_eq!(
+            d2.error.as_deref(),
+            Some("rate_limited"),
+            "should report rate_limited error"
+        );
+
+        // Only 1 delivery reached the inner sender
+        assert_eq!(sent.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rate_limited_sender_allows_after_interval() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let inner = MockSender::new("inner", Arc::clone(&sent));
+        let limited = RateLimitedSender::new(inner, Duration::from_millis(10));
+
+        let payload =
+            NotificationPayload::from_detection(&test_detection(), 1, &test_rendered(), 0);
+
+        let d1 = limited.send(&payload).await;
+        assert!(d1.success);
+
+        // Wait for rate limit to expire
+        std::thread::sleep(Duration::from_millis(15));
+
+        let d2 = limited.send(&payload).await;
+        assert!(d2.success, "should allow send after interval");
+        assert!(!d2.rate_limited);
+        assert_eq!(sent.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn rate_limited_sender_exposes_inner() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let inner = MockSender::new("test_inner", Arc::clone(&sent));
+        let limited = RateLimitedSender::new(inner, Duration::from_secs(60));
+        assert_eq!(limited.inner().name, "test_inner");
+    }
+
+    #[test]
+    fn rate_limited_sender_name_delegates() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let inner = MockSender::new("delegate_name", Arc::clone(&sent));
+        let limited = RateLimitedSender::new(inner, Duration::from_secs(60));
+        assert_eq!(limited.name(), "delegate_name");
+    }
+
+    // ========================================================================
+    // Pipeline: multi-sender fan-out
+    // ========================================================================
+
+    #[tokio::test]
+    async fn pipeline_fans_out_to_multiple_senders() {
+        let filter = EventFilter::allow_all();
+        let gate =
+            NotificationGate::from_config(filter, Duration::from_secs(60), Duration::from_secs(60));
+
+        let sent_a = Arc::new(Mutex::new(Vec::new()));
+        let sent_b = Arc::new(Mutex::new(Vec::new()));
+        let sender_a = MockSender::new("a", Arc::clone(&sent_a));
+        let sender_b = MockSender::new("b", Arc::clone(&sent_b));
+        let mut pipeline =
+            NotificationPipeline::new(gate, vec![Box::new(sender_a), Box::new(sender_b)]);
+
+        let outcome = pipeline
+            .handle_detection(&test_detection(), 1, None, None)
+            .await;
+
+        assert!(matches!(outcome.decision, NotifyDecision::Send { .. }));
+        assert_eq!(
+            outcome.deliveries.len(),
+            2,
+            "should deliver to both senders"
+        );
+        assert_eq!(sent_a.lock().unwrap().len(), 1);
+        assert_eq!(sent_b.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn pipeline_sender_count() {
+        let filter = EventFilter::allow_all();
+        let gate =
+            NotificationGate::from_config(filter, Duration::from_secs(60), Duration::from_secs(60));
+
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let s1 = MockSender::new("s1", Arc::clone(&sent));
+        let s2 = MockSender::new("s2", Arc::clone(&sent));
+        let pipeline = NotificationPipeline::new(gate, vec![Box::new(s1), Box::new(s2)]);
+
+        assert_eq!(pipeline.sender_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn pipeline_empty_senders_still_returns_outcome() {
+        let filter = EventFilter::allow_all();
+        let gate =
+            NotificationGate::from_config(filter, Duration::from_secs(60), Duration::from_secs(60));
+        let mut pipeline = NotificationPipeline::new(gate, vec![]);
+
+        let outcome = pipeline
+            .handle_detection(&test_detection(), 1, None, None)
+            .await;
+
+        assert!(matches!(outcome.decision, NotifyDecision::Send { .. }));
+        assert!(
+            outcome.deliveries.is_empty(),
+            "no senders means no deliveries"
+        );
+    }
+
+    // ========================================================================
+    // Pipeline: mute store integration
+    // ========================================================================
+
+    #[tokio::test]
+    async fn pipeline_with_mute_store_blocks_muted_events() {
+        use crate::events::event_identity_key;
+        use crate::storage::{EventMuteRecord, StorageHandle};
+
+        let db_path =
+            std::env::temp_dir().join(format!("wa_notif_test_mute_{}.db", std::process::id()));
+        let db_str = db_path.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{db_str}-wal"));
+        let _ = std::fs::remove_file(format!("{db_str}-shm"));
+
+        let storage = StorageHandle::new(&db_str).await.expect("open test db");
+
+        // Mute the event
+        let detection = test_detection();
+        let identity_key = event_identity_key(&detection, 7, None);
+        let now_ms = crate::storage::now_ms();
+        storage
+            .add_event_mute(EventMuteRecord {
+                identity_key,
+                scope: "workspace".to_string(),
+                created_at: now_ms,
+                expires_at: None,
+                created_by: Some("test".to_string()),
+                reason: Some("too noisy".to_string()),
+            })
+            .await
+            .unwrap();
+
+        let filter = EventFilter::allow_all();
+        let gate =
+            NotificationGate::from_config(filter, Duration::from_secs(60), Duration::from_secs(60));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sender = MockSender::new("mock", Arc::clone(&sent));
+        let storage_arc = Arc::new(tokio::sync::Mutex::new(storage));
+        let mut pipeline =
+            NotificationPipeline::with_mute_store(gate, vec![Box::new(sender)], storage_arc);
+
+        let outcome = pipeline.handle_detection(&detection, 7, None, None).await;
+
+        assert!(
+            matches!(outcome.decision, NotifyDecision::Filtered),
+            "muted event should be filtered"
+        );
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "muted event should not be sent"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{db_str}-wal"));
+        let _ = std::fs::remove_file(format!("{db_str}-shm"));
+    }
+
+    // ========================================================================
+    // Failure handling mock
+    // ========================================================================
+
+    /// Mock sender that simulates failures.
+    struct FailingSender;
+
+    impl NotificationSender for FailingSender {
+        fn name(&self) -> &'static str {
+            "failing"
+        }
+
+        fn send<'a>(&'a self, _payload: &'a NotificationPayload) -> NotificationFuture<'a> {
+            Box::pin(async {
+                NotificationDelivery {
+                    sender: "failing".to_string(),
+                    success: false,
+                    rate_limited: false,
+                    error: Some("connection refused".to_string()),
+                    records: Vec::new(),
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn pipeline_handles_sender_failure_gracefully() {
+        let filter = EventFilter::allow_all();
+        let gate =
+            NotificationGate::from_config(filter, Duration::from_secs(60), Duration::from_secs(60));
+        let mut pipeline = NotificationPipeline::new(gate, vec![Box::new(FailingSender)]);
+
+        let outcome = pipeline
+            .handle_detection(&test_detection(), 1, None, None)
+            .await;
+
+        assert!(matches!(outcome.decision, NotifyDecision::Send { .. }));
+        assert_eq!(outcome.deliveries.len(), 1);
+        assert!(!outcome.deliveries[0].success);
+        assert_eq!(
+            outcome.deliveries[0].error.as_deref(),
+            Some("connection refused")
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_partial_failure_still_delivers_to_healthy_senders() {
+        let filter = EventFilter::allow_all();
+        let gate =
+            NotificationGate::from_config(filter, Duration::from_secs(60), Duration::from_secs(60));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let good_sender = MockSender::new("good", Arc::clone(&sent));
+        let mut pipeline =
+            NotificationPipeline::new(gate, vec![Box::new(FailingSender), Box::new(good_sender)]);
+
+        let outcome = pipeline
+            .handle_detection(&test_detection(), 1, None, None)
+            .await;
+
+        assert_eq!(outcome.deliveries.len(), 2);
+        // First delivery fails
+        assert!(!outcome.deliveries[0].success);
+        // Second delivery succeeds
+        assert!(outcome.deliveries[1].success);
+        // Good sender received the payload
+        assert_eq!(sent.lock().unwrap().len(), 1);
+    }
+
+    // ========================================================================
+    // Failure sender doesn't leak secrets
+    // ========================================================================
+
+    #[tokio::test]
+    async fn failed_delivery_error_does_not_contain_payload() {
+        let filter = EventFilter::allow_all();
+        let gate =
+            NotificationGate::from_config(filter, Duration::from_secs(60), Duration::from_secs(60));
+        let mut pipeline = NotificationPipeline::new(gate, vec![Box::new(FailingSender)]);
+
+        let outcome = pipeline
+            .handle_detection(&test_detection(), 1, None, None)
+            .await;
+
+        // Error message should not contain the event payload or secrets
+        let err = outcome.deliveries[0].error.as_deref().unwrap_or("");
+        assert!(!err.contains("sk-abc"), "error should not leak secrets");
+    }
+
+    // ========================================================================
+    // Helper function tests
+    // ========================================================================
+
+    #[test]
+    fn severity_str_maps_all_variants() {
+        let mut d = test_detection();
+        d.severity = Severity::Info;
+        assert_eq!(severity_str(&d), "info");
+        d.severity = Severity::Warning;
+        assert_eq!(severity_str(&d), "warning");
+        d.severity = Severity::Critical;
+        assert_eq!(severity_str(&d), "critical");
+    }
+
+    #[test]
+    fn now_iso8601_produces_valid_timestamp() {
+        let ts = now_iso8601();
+        // Should contain 'T' separator (ISO 8601 format)
+        assert!(ts.contains('T'), "should be ISO 8601 format: {ts}");
+    }
+
+    // ========================================================================
+    // NotificationDeliveryRecord / NotificationDelivery
+    // ========================================================================
+
+    #[test]
+    fn delivery_record_serializes() {
+        let record = NotificationDeliveryRecord {
+            target: "slack-webhook".to_string(),
+            accepted: true,
+            status_code: 200,
+            error: None,
+        };
+        let json = serde_json::to_string(&record).expect("serialize");
+        assert!(json.contains("slack-webhook"));
+        assert!(json.contains("200"));
+    }
+
+    #[test]
+    fn delivery_with_error_serializes() {
+        let delivery = NotificationDelivery {
+            sender: "webhook".to_string(),
+            success: false,
+            rate_limited: false,
+            error: Some("timeout".to_string()),
+            records: vec![NotificationDeliveryRecord {
+                target: "https://hooks.example.com".to_string(),
+                accepted: false,
+                status_code: 0,
+                error: Some("connection reset".to_string()),
+            }],
+        };
+        let json = serde_json::to_string(&delivery).expect("serialize");
+        assert!(json.contains("timeout"));
+        assert!(json.contains("connection reset"));
+    }
 }
