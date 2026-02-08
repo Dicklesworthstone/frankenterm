@@ -28,6 +28,7 @@ Registry lives in `scripts/e2e_test.sh` (SCENARIO_REGISTRY). Current entries:
 - unhandled_event_lifecycle
 - workflow_lifecycle
 - events_unhandled_alias
+- events_annotations_triage
 - usage_limit_safe_pause
 - notification_webhook
 - watch_notify_only
@@ -112,6 +113,9 @@ Registry lives in `scripts/e2e_test.sh` (SCENARIO_REGISTRY). Current entries:
 
 #### Triage (wa-upg.9)
 - [x] E2E: triage ordering and suggested actions with multiple issues. Scenario(s): triage_multi_issue
+
+#### Event annotations + triage state (bd-2sua)
+- [x] E2E: event annotate/label/triage lifecycle with redaction and audit evidence. Scenario(s): events_annotations_triage
 
 #### Notifications (wa-psm)
 - [x] E2E: events trigger notifications (webhook mock server). Scenario(s): notification_webhook

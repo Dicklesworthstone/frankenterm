@@ -351,6 +351,7 @@ wa mcp serve
 ```
 
 MCP mirrors robot mode. See `docs/mcp-api-spec.md` for the tool list and `docs/json-schema/` for response schemas.
+For multi-agent operating procedures, see `docs/swarm-playbook.md`.
 
 ### Configuration
 

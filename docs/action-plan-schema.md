@@ -3,7 +3,7 @@
 **Bead:** wa-upg.2.1
 **Author:** GrayGorge
 **Date:** 2026-01-27
-**Status:** Draft
+**Status:** Living spec (updated through wa-upg.2.7)
 
 ## Overview
 
@@ -209,6 +209,32 @@ When introducing a new StepAction, Precondition, or Verification strategy:
 7. **Document behavior** here so future contributors understand when to use the new step.
 
 If a step needs *conditional branching*, prefer representing it as multiple explicit steps plus a verification/abort strategy. Avoid implicit branching inside actions; it breaks determinism and preview accuracy.
+
+### Contributor Checklist (File-by-File)
+
+Use this checklist when adding a new `StepAction`/`Precondition`/`VerificationStrategy` variant so implementation stays deterministic and auditable:
+
+1. **Schema + serde tags**
+   - Edit `crates/wa-core/src/plan.rs`.
+   - Add the new enum variant with stable `snake_case` serde tags and deterministic field ordering.
+2. **Canonicalization + hashing**
+   - Update canonical string helpers in `crates/wa-core/src/plan.rs` (`canonical_*` helpers).
+   - Ensure no volatile values (timestamps, random IDs, non-deterministic map iteration) influence hashes.
+3. **Execution wiring**
+   - Wire execution semantics in `crates/wa-core/src/workflows.rs` (plan generation + runtime handling).
+   - Ensure precondition and verification behavior is explicit (no hidden branching).
+4. **Policy + redaction**
+   - If the action can mutate panes or carry user text, verify policy gating and redaction paths in `crates/wa-core/src/policy.rs`, `crates/wa-core/src/approval.rs`, and storage/audit logging paths.
+5. **Surface parity**
+   - Verify dry-run/human CLI (`crates/wa/src/main.rs`), robot output, and MCP output expose the new variant consistently.
+   - Update docs/schemas if output contracts change.
+6. **Tests (required before merge)**
+   - Add/extend tests in `crates/wa-core/src/plan.rs` for serialization and canonical hash stability.
+   - Add/extend execution tests in `crates/wa-core/src/workflows.rs` or `crates/wa-core/tests/`.
+   - Run:
+     - `cargo test -p wa-core plan`
+     - `cargo test -p wa-core workflows`
+     - `cargo check --all-targets`
 
 ## Rust Type Definitions
 
