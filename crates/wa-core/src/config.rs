@@ -570,7 +570,8 @@ pub struct StorageConfig {
     /// Database file path (relative to workspace .wa dir if not absolute)
     pub db_path: String,
 
-    /// Retention period in days (0 = no retention, keep forever)
+    /// Retention period in days (0 = no retention, keep forever).
+    /// This is the global fallback; tier-specific overrides take precedence.
     pub retention_days: u32,
 
     /// Size-based retention in megabytes (0 = no size limit)
@@ -584,6 +585,10 @@ pub struct StorageConfig {
 
     /// Read pool size (concurrent read connections)
     pub read_pool_size: u32,
+
+    /// Tiered retention rules (evaluated in order; first match wins).
+    /// When empty, all events use `retention_days` as a flat policy.
+    pub retention_tiers: Vec<RetentionTier>,
 }
 
 impl Default for StorageConfig {
@@ -595,8 +600,106 @@ impl Default for StorageConfig {
             checkpoint_interval_secs: 60,
             writer_queue_size: 10000,
             read_pool_size: 4,
+            retention_tiers: default_retention_tiers(),
         }
     }
+}
+
+/// A single retention tier rule. Tiers are evaluated in order; the first
+/// matching tier determines the retention period for an event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetentionTier {
+    /// Human-readable tier name (e.g. "critical", "info-handled")
+    pub name: String,
+
+    /// Retention period in days for matching events (0 = keep forever)
+    pub retention_days: u32,
+
+    /// Match events with any of these severities. Empty = match any severity.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub severities: Vec<String>,
+
+    /// Match events with any of these event_type prefixes. Empty = match any type.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub event_types: Vec<String>,
+
+    /// If Some(true), match only handled events; Some(false) = only unhandled; None = both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handled: Option<bool>,
+}
+
+/// Default retention tiers: critical kept longest, info shortest.
+fn default_retention_tiers() -> Vec<RetentionTier> {
+    vec![
+        RetentionTier {
+            name: "critical".to_string(),
+            retention_days: 90,
+            severities: vec!["critical".to_string()],
+            event_types: vec![],
+            handled: None,
+        },
+        RetentionTier {
+            name: "warning".to_string(),
+            retention_days: 30,
+            severities: vec!["warning".to_string()],
+            event_types: vec![],
+            handled: None,
+        },
+        RetentionTier {
+            name: "info".to_string(),
+            retention_days: 7,
+            severities: vec!["info".to_string()],
+            event_types: vec![],
+            handled: None,
+        },
+    ]
+}
+
+impl StorageConfig {
+    /// Resolve the retention period (in days) for an event based on tier rules.
+    ///
+    /// Tiers are evaluated in order; the first match wins. If no tier matches,
+    /// falls back to the global `retention_days`. Returns 0 for "keep forever".
+    pub fn resolve_retention_days(&self, severity: &str, event_type: &str, handled: bool) -> u32 {
+        for tier in &self.retention_tiers {
+            if tier_matches(tier, severity, event_type, handled) {
+                return tier.retention_days;
+            }
+        }
+        self.retention_days
+    }
+}
+
+/// Check whether a single tier matches the given event attributes.
+fn tier_matches(tier: &RetentionTier, severity: &str, event_type: &str, handled: bool) -> bool {
+    // Severity filter
+    if !tier.severities.is_empty()
+        && !tier
+            .severities
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case(severity))
+    {
+        return false;
+    }
+
+    // Event type prefix filter
+    if !tier.event_types.is_empty()
+        && !tier
+            .event_types
+            .iter()
+            .any(|prefix| event_type.starts_with(prefix.as_str()))
+    {
+        return false;
+    }
+
+    // Handled filter
+    if let Some(want_handled) = tier.handled {
+        if want_handled != handled {
+            return false;
+        }
+    }
+
+    true
 }
 
 // =============================================================================
@@ -2498,6 +2601,14 @@ impl Config {
             });
         }
 
+        if self.storage.retention_tiers != new_config.storage.retention_tiers {
+            changes.push(HotReloadChange {
+                name: "storage.retention_tiers".to_string(),
+                old_value: format!("{:?}", self.storage.retention_tiers),
+                new_value: format!("{:?}", new_config.storage.retention_tiers),
+            });
+        }
+
         if self.storage.checkpoint_interval_secs != new_config.storage.checkpoint_interval_secs {
             changes.push(HotReloadChange {
                 name: "storage.checkpoint_interval_secs".to_string(),
@@ -4276,5 +4387,234 @@ log_level = "debug"
         let config = Config::default();
         let toml = config.to_toml().expect("Failed to serialize");
         assert!(toml.contains("[notifications]"));
+    }
+
+    // =========================================================================
+    // Retention Tiers Tests
+    // =========================================================================
+
+    #[test]
+    fn default_retention_tiers_exist() {
+        let config = StorageConfig::default();
+        assert_eq!(config.retention_tiers.len(), 3);
+        assert_eq!(config.retention_tiers[0].name, "critical");
+        assert_eq!(config.retention_tiers[0].retention_days, 90);
+        assert_eq!(config.retention_tiers[1].name, "warning");
+        assert_eq!(config.retention_tiers[1].retention_days, 30);
+        assert_eq!(config.retention_tiers[2].name, "info");
+        assert_eq!(config.retention_tiers[2].retention_days, 7);
+    }
+
+    #[test]
+    fn resolve_retention_days_matches_severity() {
+        let config = StorageConfig::default();
+        assert_eq!(
+            config.resolve_retention_days("critical", "error.crash", false),
+            90
+        );
+        assert_eq!(
+            config.resolve_retention_days("warning", "usage.limit", true),
+            30
+        );
+        assert_eq!(config.resolve_retention_days("info", "detection", false), 7);
+    }
+
+    #[test]
+    fn resolve_retention_days_falls_back_to_global() {
+        let config = StorageConfig {
+            retention_tiers: vec![],
+            retention_days: 60,
+            ..StorageConfig::default()
+        };
+        assert_eq!(
+            config.resolve_retention_days("critical", "error", false),
+            60
+        );
+        assert_eq!(config.resolve_retention_days("info", "detection", true), 60);
+    }
+
+    #[test]
+    fn resolve_retention_days_unknown_severity_falls_back() {
+        let config = StorageConfig::default();
+        // "debug" is not in any tier → global fallback
+        assert_eq!(
+            config.resolve_retention_days("debug", "something", false),
+            config.retention_days
+        );
+    }
+
+    #[test]
+    fn retention_tier_event_type_prefix_match() {
+        let config = StorageConfig {
+            retention_tiers: vec![RetentionTier {
+                name: "errors".to_string(),
+                retention_days: 120,
+                severities: vec![],
+                event_types: vec!["error.".to_string()],
+                handled: None,
+            }],
+            retention_days: 30,
+            ..StorageConfig::default()
+        };
+        assert_eq!(
+            config.resolve_retention_days("info", "error.crash", false),
+            120
+        );
+        assert_eq!(
+            config.resolve_retention_days("critical", "error.oom", true),
+            120
+        );
+        assert_eq!(
+            config.resolve_retention_days("info", "detection.pattern", false),
+            30
+        );
+    }
+
+    #[test]
+    fn retention_tier_handled_filter() {
+        let config = StorageConfig {
+            retention_tiers: vec![
+                RetentionTier {
+                    name: "unhandled-critical".to_string(),
+                    retention_days: 180,
+                    severities: vec!["critical".to_string()],
+                    event_types: vec![],
+                    handled: Some(false),
+                },
+                RetentionTier {
+                    name: "handled-critical".to_string(),
+                    retention_days: 30,
+                    severities: vec!["critical".to_string()],
+                    event_types: vec![],
+                    handled: Some(true),
+                },
+            ],
+            retention_days: 14,
+            ..StorageConfig::default()
+        };
+        assert_eq!(
+            config.resolve_retention_days("critical", "error", false),
+            180
+        );
+        assert_eq!(config.resolve_retention_days("critical", "error", true), 30);
+        assert_eq!(
+            config.resolve_retention_days("info", "detection", false),
+            14
+        );
+    }
+
+    #[test]
+    fn retention_tier_first_match_wins() {
+        let config = StorageConfig {
+            retention_tiers: vec![
+                RetentionTier {
+                    name: "catch-all".to_string(),
+                    retention_days: 1,
+                    severities: vec![],
+                    event_types: vec![],
+                    handled: None,
+                },
+                RetentionTier {
+                    name: "critical".to_string(),
+                    retention_days: 365,
+                    severities: vec!["critical".to_string()],
+                    event_types: vec![],
+                    handled: None,
+                },
+            ],
+            retention_days: 30,
+            ..StorageConfig::default()
+        };
+        // Catch-all tier matches everything first
+        assert_eq!(config.resolve_retention_days("critical", "error", false), 1);
+        assert_eq!(config.resolve_retention_days("info", "detection", false), 1);
+    }
+
+    #[test]
+    fn retention_tier_severity_case_insensitive() {
+        let config = StorageConfig {
+            retention_tiers: vec![RetentionTier {
+                name: "crit".to_string(),
+                retention_days: 90,
+                severities: vec!["Critical".to_string()],
+                event_types: vec![],
+                handled: None,
+            }],
+            retention_days: 7,
+            ..StorageConfig::default()
+        };
+        assert_eq!(
+            config.resolve_retention_days("critical", "error", false),
+            90
+        );
+        assert_eq!(
+            config.resolve_retention_days("CRITICAL", "error", false),
+            90
+        );
+    }
+
+    #[test]
+    fn retention_tiers_toml_roundtrip() {
+        let config = Config::default();
+        let toml = config.to_toml().expect("serialize");
+        let parsed = Config::from_toml(&toml).expect("parse");
+        assert_eq!(
+            config.storage.retention_tiers.len(),
+            parsed.storage.retention_tiers.len()
+        );
+        for (a, b) in config
+            .storage
+            .retention_tiers
+            .iter()
+            .zip(parsed.storage.retention_tiers.iter())
+        {
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.retention_days, b.retention_days);
+            assert_eq!(a.severities, b.severities);
+        }
+    }
+
+    #[test]
+    fn retention_tiers_hot_reload_detects_change() {
+        let config_a = Config::default();
+        let mut config_b = Config::default();
+        config_b.storage.retention_tiers[0].retention_days = 999;
+
+        let result = config_a.diff_for_hot_reload(&config_b);
+        assert!(
+            result
+                .changes
+                .iter()
+                .any(|c| c.name == "storage.retention_tiers")
+        );
+    }
+
+    #[test]
+    fn retention_tiers_hot_reload_no_change() {
+        let config = Config::default();
+        let result = config.diff_for_hot_reload(&config);
+        assert!(
+            !result
+                .changes
+                .iter()
+                .any(|c| c.name == "storage.retention_tiers")
+        );
+    }
+
+    #[test]
+    fn retention_tiers_empty_config_uses_global() {
+        let toml_str = "
+[storage]
+retention_days = 45
+retention_tiers = []
+";
+        let config = Config::from_toml(toml_str).expect("parse");
+        assert!(config.storage.retention_tiers.is_empty());
+        assert_eq!(
+            config
+                .storage
+                .resolve_retention_days("critical", "error", false),
+            45
+        );
     }
 }
