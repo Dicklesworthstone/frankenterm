@@ -5,6 +5,7 @@ use std::path::Path;
 #[cfg(feature = "distributed")]
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[cfg(feature = "distributed")]
@@ -797,6 +798,265 @@ pub fn build_tls_server_name(bind_addr: &str) -> Result<ServerName<'static>, Dis
         .map_err(|_| DistributedTlsError::Config("invalid server name".to_string()))
 }
 
+// =============================================================================
+// Distributed Mode Readiness Checklist (wa-nu4.4.3.6)
+// =============================================================================
+//
+// Distributed mode introduces network and security risks. This checklist
+// provides a programmatic go/no-go evaluation for enabling distributed mode.
+//
+// ## Feature Gating Decision
+//
+// Distributed mode is OFF by default and requires explicit opt-in via:
+//   - Compile time: `--features distributed`
+//   - Runtime: `[distributed] enabled = true` in wa.toml
+//
+// This dual gate ensures operators consciously enable both the code path
+// and the runtime behavior. The default binary ships without distributed
+// networking capabilities.
+//
+// ## Rollout Steps
+//
+// 1. Build with `cargo build --features distributed`
+// 2. Run `wa doctor` to verify security posture
+// 3. Configure `[distributed]` in wa.toml (see distributed-security-spec.md)
+// 4. Start with loopback bind first, verify locally
+// 5. Switch to non-loopback with TLS, verify E2E
+// 6. Enable agent-id allowlisting for production
+
+/// A single item in the distributed mode readiness checklist.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReadinessItem {
+    /// Machine-readable identifier (e.g., "security.auth_configured").
+    pub id: String,
+    /// Human-readable category.
+    pub category: String,
+    /// Description of what this item checks.
+    pub description: String,
+    /// Whether this item passes.
+    pub pass: bool,
+    /// Details explaining the pass/fail status.
+    pub detail: String,
+    /// Whether this item is required (blocking) or advisory.
+    pub required: bool,
+}
+
+/// Aggregate result of the distributed mode readiness evaluation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadinessReport {
+    /// Overall go/no-go decision.
+    pub ready: bool,
+    /// Feature compiled in.
+    pub feature_compiled: bool,
+    /// Runtime enabled.
+    pub runtime_enabled: bool,
+    /// Individual checklist items.
+    pub items: Vec<ReadinessItem>,
+    /// Count of passing required items.
+    pub required_pass: usize,
+    /// Count of total required items.
+    pub required_total: usize,
+    /// Count of passing advisory items.
+    pub advisory_pass: usize,
+    /// Count of total advisory items.
+    pub advisory_total: usize,
+}
+
+/// Evaluate the distributed mode readiness checklist against a config.
+///
+/// Returns a report with pass/fail for each item and an overall go/no-go.
+/// The checklist covers:
+/// - Security baseline (auth, TLS, bind defaults)
+/// - Observability (logging configured)
+/// - Configuration validity (no conflicting settings)
+/// - Wire protocol readiness (feature compiled)
+#[must_use]
+pub fn evaluate_readiness(config: &DistributedConfig) -> ReadinessReport {
+    let feature_compiled = cfg!(feature = "distributed");
+    let mut items = Vec::new();
+
+    // --- Security baseline ---
+
+    items.push(ReadinessItem {
+        id: "security.feature_compiled".to_string(),
+        category: "Security".to_string(),
+        description: "Distributed feature compiled into binary".to_string(),
+        pass: feature_compiled,
+        detail: if feature_compiled {
+            "Binary built with --features distributed".to_string()
+        } else {
+            "Rebuild with --features distributed to enable".to_string()
+        },
+        required: true,
+    });
+
+    items.push(ReadinessItem {
+        id: "security.runtime_enabled".to_string(),
+        category: "Security".to_string(),
+        description: "Distributed mode enabled in config".to_string(),
+        pass: config.enabled,
+        detail: if config.enabled {
+            "distributed.enabled = true".to_string()
+        } else {
+            "Set distributed.enabled = true in wa.toml".to_string()
+        },
+        required: true,
+    });
+
+    let auth_configured = if config.auth_mode.requires_token() {
+        config.token.is_some() || config.token_env.is_some() || config.token_path.is_some()
+    } else {
+        true // mTLS-only does not require a token credential
+    };
+    items.push(ReadinessItem {
+        id: "security.auth_configured".to_string(),
+        category: "Security".to_string(),
+        description: "Authentication credentials configured".to_string(),
+        pass: auth_configured,
+        detail: if auth_configured {
+            format!("Auth mode {:?} with credentials present", config.auth_mode)
+        } else {
+            "Set token, token_env, or token_path in [distributed]".to_string()
+        },
+        required: true,
+    });
+
+    let is_loopback = config.bind_addr.starts_with("127.")
+        || config.bind_addr.starts_with("localhost")
+        || config.bind_addr.starts_with("[::1]");
+    let tls_required_and_missing =
+        !is_loopback && config.require_tls_for_non_loopback && !config.tls.enabled;
+    items.push(ReadinessItem {
+        id: "security.tls_for_remote".to_string(),
+        category: "Security".to_string(),
+        description: "TLS enabled for non-loopback bind".to_string(),
+        pass: is_loopback || config.tls.enabled || config.allow_insecure,
+        detail: if is_loopback {
+            "Loopback bind — TLS optional".to_string()
+        } else if config.tls.enabled {
+            "TLS enabled for remote bind".to_string()
+        } else if config.allow_insecure {
+            "WARNING: allow_insecure=true bypasses TLS requirement".to_string()
+        } else if tls_required_and_missing {
+            "Non-loopback bind requires TLS — enable distributed.tls".to_string()
+        } else {
+            "TLS status undetermined".to_string()
+        },
+        required: true,
+    });
+
+    let no_insecure = !config.allow_insecure;
+    items.push(ReadinessItem {
+        id: "security.no_insecure_override".to_string(),
+        category: "Security".to_string(),
+        description: "Insecure mode not enabled".to_string(),
+        pass: no_insecure,
+        detail: if no_insecure {
+            "allow_insecure = false (safe)".to_string()
+        } else {
+            "WARNING: allow_insecure = true — plaintext traffic allowed".to_string()
+        },
+        required: false, // advisory — may be intentional for dev
+    });
+
+    let has_allowlist = !config.allow_agent_ids.is_empty();
+    items.push(ReadinessItem {
+        id: "security.agent_allowlist".to_string(),
+        category: "Security".to_string(),
+        description: "Agent ID allowlist configured".to_string(),
+        pass: has_allowlist,
+        detail: if has_allowlist {
+            format!("{} agent ID(s) in allowlist", config.allow_agent_ids.len())
+        } else {
+            "No agent ID allowlist — any authenticated agent can connect".to_string()
+        },
+        required: false, // advisory — recommended for production
+    });
+
+    // --- Configuration validity ---
+
+    let bind_valid = !config.bind_addr.is_empty();
+    items.push(ReadinessItem {
+        id: "config.bind_addr_set".to_string(),
+        category: "Configuration".to_string(),
+        description: "Bind address is set".to_string(),
+        pass: bind_valid,
+        detail: if bind_valid {
+            format!("bind_addr = {}", config.bind_addr)
+        } else {
+            "bind_addr is empty — set to host:port".to_string()
+        },
+        required: true,
+    });
+
+    let tls_paths_ok = if config.tls.enabled {
+        config.tls.cert_path.is_some() && config.tls.key_path.is_some()
+    } else {
+        true // TLS disabled — paths not needed
+    };
+    items.push(ReadinessItem {
+        id: "config.tls_paths".to_string(),
+        category: "Configuration".to_string(),
+        description: "TLS certificate and key paths configured".to_string(),
+        pass: tls_paths_ok,
+        detail: if !config.tls.enabled {
+            "TLS disabled — paths not required".to_string()
+        } else if tls_paths_ok {
+            "cert_path and key_path set".to_string()
+        } else {
+            "TLS enabled but cert_path or key_path missing".to_string()
+        },
+        required: true,
+    });
+
+    // --- Observability ---
+
+    // Observability is checked at a basic level here (config-based).
+    // Full observability (tracing spans, metrics) is verified by E2E tests.
+    items.push(ReadinessItem {
+        id: "observability.logging_assumed".to_string(),
+        category: "Observability".to_string(),
+        description: "Structured logging available for distributed events".to_string(),
+        pass: true, // Always true — wa has structured logging baseline
+        detail: "wa emits tracing spans for all distributed operations".to_string(),
+        required: true,
+    });
+
+    // --- Wire protocol ---
+
+    items.push(ReadinessItem {
+        id: "wire.feature_gate".to_string(),
+        category: "Wire Protocol".to_string(),
+        description: "Wire protocol code compiled in".to_string(),
+        pass: feature_compiled,
+        detail: if feature_compiled {
+            "Distributed feature gate active".to_string()
+        } else {
+            "Wire protocol unavailable — rebuild with --features distributed".to_string()
+        },
+        required: true,
+    });
+
+    // --- Compute aggregate ---
+
+    let required_pass = items.iter().filter(|i| i.required && i.pass).count();
+    let required_total = items.iter().filter(|i| i.required).count();
+    let advisory_pass = items.iter().filter(|i| !i.required && i.pass).count();
+    let advisory_total = items.iter().filter(|i| !i.required).count();
+    let ready = required_pass == required_total;
+
+    ReadinessReport {
+        ready,
+        feature_compiled,
+        runtime_enabled: config.enabled,
+        items,
+        required_pass,
+        required_total,
+        advisory_pass,
+        advisory_total,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1426,5 +1686,400 @@ mod tests {
             prop_assert!(!message.contains(expected.as_str()));
             prop_assert!(!message.contains(presented.as_str()));
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Readiness checklist tests (wa-nu4.4.3.6)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn readiness_default_config_not_ready() {
+        let config = DistributedConfig::default();
+        let report = evaluate_readiness(&config);
+        // Default config has enabled=false, so not ready
+        assert!(!report.ready);
+        assert!(!report.runtime_enabled);
+        // feature_compiled depends on build flags; runtime_enabled is always false for default
+        let runtime = report
+            .items
+            .iter()
+            .find(|i| i.id == "security.runtime_enabled")
+            .unwrap();
+        assert!(!runtime.pass);
+    }
+
+    #[test]
+    fn readiness_enabled_loopback_with_token_is_ready() {
+        let mut config = DistributedConfig::default();
+        config.enabled = true;
+        config.auth_mode = DistributedAuthMode::Token;
+        config.token = Some("test-secret".to_string());
+        // bind_addr defaults to 127.0.0.1:4141 (loopback)
+        // TLS not required for loopback
+
+        let report = evaluate_readiness(&config);
+
+        // Whether ready depends on feature_compiled (cfg), but all config-based items should pass
+        let runtime = report
+            .items
+            .iter()
+            .find(|i| i.id == "security.runtime_enabled")
+            .unwrap();
+        assert!(runtime.pass);
+        let auth = report
+            .items
+            .iter()
+            .find(|i| i.id == "security.auth_configured")
+            .unwrap();
+        assert!(auth.pass);
+        let tls_remote = report
+            .items
+            .iter()
+            .find(|i| i.id == "security.tls_for_remote")
+            .unwrap();
+        assert!(tls_remote.pass, "loopback should not require TLS");
+        let bind = report
+            .items
+            .iter()
+            .find(|i| i.id == "config.bind_addr_set")
+            .unwrap();
+        assert!(bind.pass);
+        let tls_paths = report
+            .items
+            .iter()
+            .find(|i| i.id == "config.tls_paths")
+            .unwrap();
+        assert!(tls_paths.pass, "TLS disabled — paths not needed");
+    }
+
+    #[test]
+    fn readiness_missing_auth_credentials_fails() {
+        let mut config = DistributedConfig::default();
+        config.enabled = true;
+        config.auth_mode = DistributedAuthMode::Token;
+        // No token, token_env, or token_path set
+
+        let report = evaluate_readiness(&config);
+        let auth = report
+            .items
+            .iter()
+            .find(|i| i.id == "security.auth_configured")
+            .unwrap();
+        assert!(!auth.pass);
+        assert!(auth.required);
+    }
+
+    #[test]
+    fn readiness_mtls_only_passes_auth_without_token() {
+        let mut config = DistributedConfig::default();
+        config.enabled = true;
+        config.auth_mode = DistributedAuthMode::Mtls;
+        // No token set — mTLS-only doesn't need one
+
+        let report = evaluate_readiness(&config);
+        let auth = report
+            .items
+            .iter()
+            .find(|i| i.id == "security.auth_configured")
+            .unwrap();
+        assert!(auth.pass, "mTLS-only should not require token credentials");
+    }
+
+    #[test]
+    fn readiness_no_agent_allowlist_is_advisory_warning() {
+        let mut config = DistributedConfig::default();
+        config.enabled = true;
+        config.auth_mode = DistributedAuthMode::Token;
+        config.token = Some("secret".to_string());
+        // No allow_agent_ids set
+
+        let report = evaluate_readiness(&config);
+        let advisory = report
+            .items
+            .iter()
+            .find(|i| i.id == "security.agent_allowlist")
+            .unwrap();
+        assert!(!advisory.pass);
+        assert!(!advisory.required);
+    }
+
+    #[test]
+    fn readiness_agent_allowlist_passes_when_set() {
+        let mut config = DistributedConfig::default();
+        config.enabled = true;
+        config.auth_mode = DistributedAuthMode::Token;
+        config.token = Some("secret".to_string());
+        config.allow_agent_ids = vec!["agent-1".to_string(), "agent-2".to_string()];
+
+        let report = evaluate_readiness(&config);
+        let advisory = report
+            .items
+            .iter()
+            .find(|i| i.id == "security.agent_allowlist")
+            .unwrap();
+        assert!(advisory.pass);
+    }
+
+    #[test]
+    fn readiness_non_loopback_without_tls_fails() {
+        let mut config = DistributedConfig::default();
+        config.enabled = true;
+        config.auth_mode = DistributedAuthMode::Token;
+        config.token = Some("test-secret".to_string());
+        config.bind_addr = "0.0.0.0:4141".to_string();
+        // TLS disabled, not loopback, allow_insecure=false
+
+        let report = evaluate_readiness(&config);
+        let tls = report
+            .items
+            .iter()
+            .find(|i| i.id == "security.tls_for_remote")
+            .unwrap();
+        assert!(!tls.pass, "non-loopback without TLS should fail");
+        assert!(tls.required);
+    }
+
+    #[test]
+    fn readiness_non_loopback_with_tls_passes() {
+        let mut config = DistributedConfig::default();
+        config.enabled = true;
+        config.auth_mode = DistributedAuthMode::Token;
+        config.token = Some("test-secret".to_string());
+        config.bind_addr = "10.0.0.1:4141".to_string();
+        config.tls.enabled = true;
+        config.tls.cert_path = Some("/etc/certs/server.pem".to_string());
+        config.tls.key_path = Some("/etc/certs/server.key".to_string());
+
+        let report = evaluate_readiness(&config);
+        let tls = report
+            .items
+            .iter()
+            .find(|i| i.id == "security.tls_for_remote")
+            .unwrap();
+        assert!(tls.pass);
+        let paths = report
+            .items
+            .iter()
+            .find(|i| i.id == "config.tls_paths")
+            .unwrap();
+        assert!(paths.pass);
+    }
+
+    #[test]
+    fn readiness_allow_insecure_bypasses_tls_with_advisory_warning() {
+        let mut config = DistributedConfig::default();
+        config.enabled = true;
+        config.auth_mode = DistributedAuthMode::Token;
+        config.token = Some("test-secret".to_string());
+        config.bind_addr = "0.0.0.0:4141".to_string();
+        config.allow_insecure = true; // bypass TLS requirement
+
+        let report = evaluate_readiness(&config);
+        let tls = report
+            .items
+            .iter()
+            .find(|i| i.id == "security.tls_for_remote")
+            .unwrap();
+        assert!(tls.pass, "allow_insecure bypasses TLS requirement");
+        // Advisory should warn
+        let advisory = report
+            .items
+            .iter()
+            .find(|i| i.id == "security.no_insecure_override")
+            .unwrap();
+        assert!(!advisory.pass);
+        assert!(!advisory.required);
+    }
+
+    #[test]
+    fn readiness_tls_enabled_without_paths_fails() {
+        let mut config = DistributedConfig::default();
+        config.enabled = true;
+        config.auth_mode = DistributedAuthMode::Token;
+        config.token = Some("test-secret".to_string());
+        config.tls.enabled = true;
+        // No cert_path or key_path
+
+        let report = evaluate_readiness(&config);
+        let paths = report
+            .items
+            .iter()
+            .find(|i| i.id == "config.tls_paths")
+            .unwrap();
+        assert!(!paths.pass);
+        assert!(paths.required);
+    }
+
+    #[test]
+    fn readiness_empty_bind_addr_fails() {
+        let mut config = DistributedConfig::default();
+        config.enabled = true;
+        config.bind_addr = String::new();
+
+        let report = evaluate_readiness(&config);
+        let bind = report
+            .items
+            .iter()
+            .find(|i| i.id == "config.bind_addr_set")
+            .unwrap();
+        assert!(!bind.pass);
+        assert!(bind.required);
+    }
+
+    #[test]
+    fn readiness_report_counts_correct() {
+        let mut config = DistributedConfig::default();
+        config.enabled = true;
+        config.auth_mode = DistributedAuthMode::Token;
+        config.token = Some("test-secret".to_string());
+
+        let report = evaluate_readiness(&config);
+        let manual_required_pass = report.items.iter().filter(|i| i.required && i.pass).count();
+        let manual_required_total = report.items.iter().filter(|i| i.required).count();
+        let manual_advisory_pass = report
+            .items
+            .iter()
+            .filter(|i| !i.required && i.pass)
+            .count();
+        let manual_advisory_total = report.items.iter().filter(|i| !i.required).count();
+
+        assert_eq!(report.required_pass, manual_required_pass);
+        assert_eq!(report.required_total, manual_required_total);
+        assert_eq!(report.advisory_pass, manual_advisory_pass);
+        assert_eq!(report.advisory_total, manual_advisory_total);
+        assert_eq!(report.ready, manual_required_pass == manual_required_total);
+    }
+
+    #[test]
+    fn readiness_report_serde_roundtrip() {
+        let mut config = DistributedConfig::default();
+        config.enabled = true;
+        config.auth_mode = DistributedAuthMode::Token;
+        config.token = Some("test-secret".to_string());
+
+        let report = evaluate_readiness(&config);
+        let json = serde_json::to_string(&report).expect("serialize report");
+        let deserialized: ReadinessReport =
+            serde_json::from_str(&json).expect("deserialize report");
+
+        assert_eq!(deserialized.ready, report.ready);
+        assert_eq!(deserialized.feature_compiled, report.feature_compiled);
+        assert_eq!(deserialized.runtime_enabled, report.runtime_enabled);
+        assert_eq!(deserialized.items.len(), report.items.len());
+        assert_eq!(deserialized.required_pass, report.required_pass);
+        assert_eq!(deserialized.required_total, report.required_total);
+    }
+
+    #[test]
+    fn readiness_item_serde_roundtrip() {
+        let item = ReadinessItem {
+            id: "test.item".to_string(),
+            category: "Test".to_string(),
+            description: "A test item".to_string(),
+            pass: true,
+            detail: "looks good".to_string(),
+            required: true,
+        };
+        let json = serde_json::to_string(&item).expect("serialize");
+        let deserialized: ReadinessItem = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(deserialized, item);
+    }
+
+    #[test]
+    fn readiness_token_env_satisfies_auth() {
+        let mut config = DistributedConfig::default();
+        config.enabled = true;
+        config.auth_mode = DistributedAuthMode::Token;
+        config.token_env = Some("WA_DIST_TOKEN".to_string());
+
+        let report = evaluate_readiness(&config);
+        let auth = report
+            .items
+            .iter()
+            .find(|i| i.id == "security.auth_configured")
+            .unwrap();
+        assert!(auth.pass);
+    }
+
+    #[test]
+    fn readiness_token_path_satisfies_auth() {
+        let mut config = DistributedConfig::default();
+        config.enabled = true;
+        config.auth_mode = DistributedAuthMode::Token;
+        config.token_path = Some("/run/secrets/wa-token".to_string());
+
+        let report = evaluate_readiness(&config);
+        let auth = report
+            .items
+            .iter()
+            .find(|i| i.id == "security.auth_configured")
+            .unwrap();
+        assert!(auth.pass);
+    }
+
+    #[test]
+    fn readiness_ipv6_loopback_recognized() {
+        let mut config = DistributedConfig::default();
+        config.enabled = true;
+        config.auth_mode = DistributedAuthMode::Token;
+        config.token = Some("secret".to_string());
+        config.bind_addr = "[::1]:4141".to_string();
+
+        let report = evaluate_readiness(&config);
+        let tls = report
+            .items
+            .iter()
+            .find(|i| i.id == "security.tls_for_remote")
+            .unwrap();
+        assert!(tls.pass, "IPv6 loopback should not require TLS");
+    }
+
+    #[test]
+    fn readiness_localhost_recognized_as_loopback() {
+        let mut config = DistributedConfig::default();
+        config.enabled = true;
+        config.auth_mode = DistributedAuthMode::Token;
+        config.token = Some("secret".to_string());
+        config.bind_addr = "localhost:4141".to_string();
+
+        let report = evaluate_readiness(&config);
+        let tls = report
+            .items
+            .iter()
+            .find(|i| i.id == "security.tls_for_remote")
+            .unwrap();
+        assert!(tls.pass, "localhost should not require TLS");
+    }
+
+    #[test]
+    fn readiness_all_items_have_unique_ids() {
+        let config = DistributedConfig::default();
+        let report = evaluate_readiness(&config);
+        let mut ids: Vec<&str> = report.items.iter().map(|i| i.id.as_str()).collect();
+        let original_len = ids.len();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), original_len, "readiness item IDs must be unique");
+    }
+
+    #[test]
+    fn readiness_report_json_fields_stable() {
+        let mut config = DistributedConfig::default();
+        config.enabled = true;
+        config.auth_mode = DistributedAuthMode::Token;
+        config.token = Some("secret".to_string());
+
+        let report = evaluate_readiness(&config);
+        let json = serde_json::to_value(&report).expect("serialize");
+
+        assert!(json.get("ready").is_some());
+        assert!(json.get("feature_compiled").is_some());
+        assert!(json.get("runtime_enabled").is_some());
+        assert!(json.get("items").is_some());
+        assert!(json.get("required_pass").is_some());
+        assert!(json.get("required_total").is_some());
+        assert!(json.get("advisory_pass").is_some());
+        assert!(json.get("advisory_total").is_some());
+        assert!(json["items"].is_array());
     }
 }
