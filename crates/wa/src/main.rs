@@ -717,6 +717,41 @@ SEE ALSO:
         until: Option<String>,
     },
 
+    /// Undo supported actions with confirmation
+    #[command(after_help = r#"EXAMPLES:
+    wa undo --list
+    wa undo 1234
+    wa undo --all-in-workflow wf-abc123 --yes
+    wa undo 1234 --format json --yes
+
+SEE ALSO:
+    wa history     Review undoable actions and workflow context
+    wa workflow    Workflow status and controls"#)]
+    Undo {
+        /// Action ID to undo
+        action_id: Option<i64>,
+
+        /// List currently undoable actions
+        #[arg(long)]
+        list: bool,
+
+        /// Undo all currently undoable actions in a workflow execution
+        #[arg(long)]
+        all_in_workflow: Option<String>,
+
+        /// Skip confirmation prompt
+        #[arg(long)]
+        yes: bool,
+
+        /// Output format: auto, plain, or json
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+
+        /// Maximum number of actions returned by --list
+        #[arg(long, short = 'l', default_value = "50")]
+        limit: usize,
+    },
+
     /// Notification utilities (test channels)
     #[command(after_help = r#"EXAMPLES:
     wa notify test --channel desktop
@@ -15792,6 +15827,269 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 Err(e) => {
                     fail(&format!("Failed to query action history: {e}"));
                 }
+            }
+        }
+
+        Some(Commands::Undo {
+            action_id,
+            list,
+            all_in_workflow,
+            yes,
+            format,
+            limit,
+        }) => {
+            use wa_core::output::{OutputFormat, detect_format};
+            use wa_core::undo::{UndoExecutionResult, UndoExecutor, UndoOutcome, UndoRequest};
+
+            let output_format = match format.to_lowercase().as_str() {
+                "json" => OutputFormat::Json,
+                "plain" => OutputFormat::Plain,
+                "auto" => detect_format(),
+                other => {
+                    eprintln!("Error: Unknown format '{other}'. Valid values: auto, plain, json");
+                    std::process::exit(1);
+                }
+            };
+            let wants_json_error = output_format.is_json();
+
+            let fail = |message: &str| -> ! {
+                if wants_json_error {
+                    println!(
+                        r#"{{"ok": false, "error": "{}", "version": "{}"}}"#,
+                        message,
+                        wa_core::VERSION
+                    );
+                } else {
+                    eprintln!("Error: {message}");
+                }
+                std::process::exit(1);
+            };
+
+            let mode_count = usize::from(list)
+                + usize::from(action_id.is_some())
+                + usize::from(all_in_workflow.is_some());
+            if mode_count != 1 {
+                fail("Specify exactly one mode: --list, <action-id>, or --all-in-workflow <id>");
+            }
+
+            let layout = match config.workspace_layout(Some(&workspace_root)) {
+                Ok(value) => value,
+                Err(err) => fail(&format!("Failed to get workspace layout: {err}")),
+            };
+            let db_path = layout.db_path.to_string_lossy();
+            let storage = match wa_core::storage::StorageHandle::new(&db_path).await {
+                Ok(value) => Arc::new(value),
+                Err(err) => fail(&format!("Failed to open storage: {err}")),
+            };
+
+            let query_undoable = |workflow_filter: Option<&str>, fetch_limit: usize| {
+                wa_core::storage::ActionHistoryQuery {
+                    limit: Some(fetch_limit),
+                    undoable: Some(true),
+                    actor_kind: workflow_filter.map(|_| "workflow".to_string()),
+                    actor_id: workflow_filter.map(str::to_string),
+                    ..Default::default()
+                }
+            };
+
+            if list {
+                let fetch_limit = limit.saturating_mul(4).max(limit);
+                let mut actions = match storage
+                    .get_action_history(query_undoable(None, fetch_limit))
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(err) => fail(&format!("Failed to query undoable actions: {err}")),
+                };
+                actions.retain(|row| row.undone_at.is_none());
+                if actions.len() > limit {
+                    actions.truncate(limit);
+                }
+
+                if output_format.is_json() {
+                    let items = actions
+                        .iter()
+                        .map(|row| {
+                            serde_json::json!({
+                                "action_id": row.id,
+                                "ts": row.ts,
+                                "action_kind": row.action_kind,
+                                "pane_id": row.pane_id,
+                                "workflow_id": row.actor_id,
+                                "strategy": row.undo_strategy,
+                                "hint": row.undo_hint,
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "ok": true,
+                            "data": {
+                                "actions": items,
+                                "count": items.len(),
+                            },
+                            "version": wa_core::VERSION,
+                        }))
+                        .unwrap_or_else(|_| "{}".to_string())
+                    );
+                } else if actions.is_empty() {
+                    println!("No undoable actions found.");
+                } else {
+                    println!(
+                        "{:<8} {:<14} {:<16} {:<8} {}",
+                        "ID", "STRATEGY", "ACTION", "PANE", "WORKFLOW"
+                    );
+                    for row in &actions {
+                        println!(
+                            "{:<8} {:<14} {:<16} {:<8} {}",
+                            row.id,
+                            row.undo_strategy.as_deref().unwrap_or("-"),
+                            row.action_kind,
+                            row.pane_id
+                                .map_or_else(|| "-".to_string(), |value| value.to_string()),
+                            row.actor_id.as_deref().unwrap_or("-")
+                        );
+                    }
+                    println!("\n{} undoable action(s).", actions.len());
+                }
+
+                if let Err(err) = storage.shutdown().await {
+                    tracing::warn!("Failed to shutdown storage cleanly: {err}");
+                }
+                return Ok(());
+            }
+
+            let mut target_action_ids: Vec<i64> = if let Some(workflow_id) = &all_in_workflow {
+                let fetch_limit = limit.saturating_mul(8).max(limit);
+                let mut actions = match storage
+                    .get_action_history(query_undoable(Some(workflow_id), fetch_limit))
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(err) => fail(&format!("Failed to query workflow undo actions: {err}")),
+                };
+                actions.retain(|row| row.undone_at.is_none());
+                actions.into_iter().map(|row| row.id).collect()
+            } else {
+                vec![action_id.expect("validated mode requires action_id")]
+            };
+
+            if target_action_ids.is_empty() {
+                fail("No undoable actions found for the requested workflow");
+            }
+
+            if !yes {
+                if !std::io::stdin().is_terminal() {
+                    fail("Confirmation required in non-interactive mode. Re-run with --yes.");
+                }
+
+                if let Some(workflow_id) = &all_in_workflow {
+                    println!(
+                        "About to undo {} action(s) in workflow {}.",
+                        target_action_ids.len(),
+                        workflow_id
+                    );
+                } else {
+                    let id = target_action_ids[0];
+                    let action = storage
+                        .get_action_history(wa_core::storage::ActionHistoryQuery {
+                            audit_action_id: Some(id),
+                            limit: Some(1),
+                            ..Default::default()
+                        })
+                        .await
+                        .ok()
+                        .and_then(|mut rows| rows.pop());
+                    if let Some(action) = action {
+                        println!(
+                            "About to undo action {} (strategy={}, kind={}, pane={}).",
+                            action.id,
+                            action.undo_strategy.as_deref().unwrap_or("-"),
+                            action.action_kind,
+                            action
+                                .pane_id
+                                .map_or_else(|| "-".to_string(), |value| value.to_string())
+                        );
+                    } else {
+                        println!("About to undo action {}.", id);
+                    }
+                }
+
+                if !prompt_confirm("Proceed with undo? [y/N]: ")? {
+                    println!("Aborted.");
+                    if let Err(err) = storage.shutdown().await {
+                        tracing::warn!("Failed to shutdown storage cleanly: {err}");
+                    }
+                    return Ok(());
+                }
+            }
+
+            let executor = UndoExecutor::new(
+                Arc::clone(&storage),
+                wa_core::wezterm::default_wezterm_handle(),
+            );
+            let reason = if let Some(workflow_id) = &all_in_workflow {
+                format!("wa undo --all-in-workflow {workflow_id}")
+            } else {
+                format!("wa undo {}", target_action_ids[0])
+            };
+
+            // Deterministic order: newest id first by default query order.
+            target_action_ids.sort_unstable_by(|lhs, rhs| rhs.cmp(lhs));
+
+            let mut results: Vec<UndoExecutionResult> = Vec::with_capacity(target_action_ids.len());
+            for action_id in target_action_ids {
+                let request = UndoRequest::new(action_id)
+                    .with_actor("human-cli")
+                    .with_reason(reason.clone());
+                match executor.execute(request).await {
+                    Ok(result) => results.push(result),
+                    Err(err) => results.push(UndoExecutionResult {
+                        action_id,
+                        strategy: "unknown".to_string(),
+                        outcome: UndoOutcome::Failed,
+                        message: format!("Undo execution failed: {err}"),
+                        guidance: Some(
+                            "Inspect action history and workflow status for remediation."
+                                .to_string(),
+                        ),
+                        target_workflow_id: None,
+                        target_pane_id: None,
+                        undone_at: None,
+                    }),
+                }
+            }
+
+            if output_format.is_json() {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "ok": true,
+                        "data": {
+                            "results": results,
+                            "count": results.len(),
+                        },
+                        "version": wa_core::VERSION,
+                    }))
+                    .unwrap_or_else(|_| "{}".to_string())
+                );
+            } else {
+                for result in &results {
+                    let outcome = match result.outcome {
+                        UndoOutcome::Success => "success",
+                        UndoOutcome::NotApplicable => "not_applicable",
+                        UndoOutcome::Failed => "failed",
+                    };
+                    println!("#{} [{outcome}] {}", result.action_id, result.message);
+                    if let Some(guidance) = &result.guidance {
+                        println!("  hint: {guidance}");
+                    }
+                }
+            }
+
+            if let Err(err) = storage.shutdown().await {
+                tracing::warn!("Failed to shutdown storage cleanly: {err}");
             }
         }
 
