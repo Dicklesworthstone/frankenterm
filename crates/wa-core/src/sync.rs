@@ -521,10 +521,22 @@ pub fn build_file_plan(
     }
     // If source doesn't exist, plan is empty (no items)
 
-    let denied_count = items.iter().filter(|i| i.action == SyncItemAction::Denied).count();
-    let add_count = items.iter().filter(|i| i.action == SyncItemAction::Add).count();
-    let update_count = items.iter().filter(|i| i.action == SyncItemAction::Update).count();
-    let skip_count = items.iter().filter(|i| i.action == SyncItemAction::Skip).count();
+    let denied_count = items
+        .iter()
+        .filter(|i| i.action == SyncItemAction::Denied)
+        .count();
+    let add_count = items
+        .iter()
+        .filter(|i| i.action == SyncItemAction::Add)
+        .count();
+    let update_count = items
+        .iter()
+        .filter(|i| i.action == SyncItemAction::Update)
+        .count();
+    let skip_count = items
+        .iter()
+        .filter(|i| i.action == SyncItemAction::Skip)
+        .count();
     let conflict_count = items
         .iter()
         .filter(|i| i.action == SyncItemAction::Conflict)
@@ -564,7 +576,15 @@ fn walk_dir(
         let path = entry.path();
 
         if path.is_dir() {
-            walk_dir(base, &path, dest_root, deny_paths, allow_paths, allow_overwrite, items)?;
+            walk_dir(
+                base,
+                &path,
+                dest_root,
+                deny_paths,
+                allow_paths,
+                allow_overwrite,
+                items,
+            )?;
         } else if path.is_file() {
             let relative = path
                 .strip_prefix(base)
@@ -697,11 +717,12 @@ pub fn execute_file_plan(plan: &SyncFilePlan) -> SyncResult<usize> {
                 } else {
                     source_root.join(&item.relative_path)
                 };
-                let dest = if dest_root.is_file() || (plan.items.len() == 1 && source_root.is_file()) {
-                    dest_root.to_path_buf()
-                } else {
-                    dest_root.join(&item.relative_path)
-                };
+                let dest =
+                    if dest_root.is_file() || (plan.items.len() == 1 && source_root.is_file()) {
+                        dest_root.to_path_buf()
+                    } else {
+                        dest_root.join(&item.relative_path)
+                    };
 
                 if let Some(parent) = dest.parent() {
                     std::fs::create_dir_all(parent)?;
@@ -1402,5 +1423,530 @@ mod tests {
 
         let err = build_sync_plan(&config, &layout, plan_options(SyncDirection::Push)).unwrap_err();
         assert!(matches!(err, SyncError::AmbiguousTarget { .. }));
+    }
+
+    // ========================================================================
+    // Path deny/allow rules
+    // ========================================================================
+
+    #[test]
+    fn deny_env_files() {
+        assert!(is_path_denied(".env", &[]));
+        assert!(is_path_denied(".env.local", &[]));
+        assert!(is_path_denied(".env.production", &[]));
+        assert!(is_path_denied("subdir/.env", &[]));
+    }
+
+    #[test]
+    fn deny_credential_files() {
+        assert!(is_path_denied("tokens.json", &[]));
+        assert!(is_path_denied("credentials.json", &[]));
+        assert!(is_path_denied("subdir/tokens.json", &[]));
+    }
+
+    #[test]
+    fn deny_ssh_and_crypto_keys() {
+        assert!(is_path_denied(".ssh/id_rsa", &[]));
+        assert!(is_path_denied("id_ed25519", &[]));
+        assert!(is_path_denied(".gnupg/pubring.kbx", &[]));
+        assert!(is_path_denied("cert.pem", &[]));
+        assert!(is_path_denied("private.key", &[]));
+        assert!(is_path_denied("server.p12", &[]));
+        assert!(is_path_denied("client.pfx", &[]));
+    }
+
+    #[test]
+    fn deny_extra_patterns() {
+        let extra = vec!["custom_secret.txt".to_string()];
+        assert!(is_path_denied("custom_secret.txt", &extra));
+        assert!(!is_path_denied("safe_file.txt", &extra));
+    }
+
+    #[test]
+    fn allow_normal_config_files() {
+        assert!(!is_path_denied("wa.toml", &[]));
+        assert!(!is_path_denied("profiles/default.toml", &[]));
+        assert!(!is_path_denied("rules/codex.yaml", &[]));
+    }
+
+    #[test]
+    fn allow_list_empty_allows_all() {
+        assert!(is_path_allowed("anything.txt", &[]));
+    }
+
+    #[test]
+    fn allow_list_filters() {
+        let allow = vec!["config/".to_string()];
+        assert!(is_path_allowed("config/wa.toml", &allow));
+        assert!(!is_path_allowed("secrets/token.json", &allow));
+    }
+
+    #[test]
+    fn allow_glob_style_prefix() {
+        let allow = vec!["config/**".to_string()];
+        assert!(is_path_allowed("config/profiles/default.toml", &allow));
+        assert!(!is_path_allowed("other/file.txt", &allow));
+    }
+
+    // ========================================================================
+    // File plan building (temp dirs)
+    // ========================================================================
+
+    fn setup_temp_trees() -> (tempfile::TempDir, tempfile::TempDir) {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        (src, dst)
+    }
+
+    fn write_file(dir: &Path, rel_path: &str, content: &str) {
+        let path = dir.join(rel_path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn file_plan_new_file_is_add() {
+        let (src, dst) = setup_temp_trees();
+        write_file(src.path(), "wa.toml", "# config");
+
+        let plan = build_file_plan(
+            src.path(),
+            dst.path(),
+            SyncCategory::Config,
+            SyncDirection::Push,
+            &[],
+            &[],
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(plan.add_count, 1);
+        assert_eq!(plan.items[0].action, SyncItemAction::Add);
+        assert!(plan.items[0].source_hash.is_some());
+        assert!(plan.items[0].destination_hash.is_none());
+    }
+
+    #[test]
+    fn file_plan_same_content_is_skip() {
+        let (src, dst) = setup_temp_trees();
+        write_file(src.path(), "wa.toml", "# same content");
+        write_file(dst.path(), "wa.toml", "# same content");
+
+        let plan = build_file_plan(
+            src.path(),
+            dst.path(),
+            SyncCategory::Config,
+            SyncDirection::Push,
+            &[],
+            &[],
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(plan.skip_count, 1);
+        assert_eq!(plan.items[0].action, SyncItemAction::Skip);
+    }
+
+    #[test]
+    fn file_plan_different_content_without_overwrite_is_conflict() {
+        let (src, dst) = setup_temp_trees();
+        write_file(src.path(), "wa.toml", "# source version");
+        write_file(dst.path(), "wa.toml", "# dest version");
+
+        let plan = build_file_plan(
+            src.path(),
+            dst.path(),
+            SyncCategory::Config,
+            SyncDirection::Push,
+            &[],
+            &[],
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(plan.conflict_count, 1);
+        assert_eq!(plan.items[0].action, SyncItemAction::Conflict);
+        assert!(
+            plan.items[0]
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("--allow-overwrite")
+        );
+    }
+
+    #[test]
+    fn file_plan_different_content_with_overwrite_is_update() {
+        let (src, dst) = setup_temp_trees();
+        write_file(src.path(), "wa.toml", "# source version");
+        write_file(dst.path(), "wa.toml", "# dest version");
+
+        let plan = build_file_plan(
+            src.path(),
+            dst.path(),
+            SyncCategory::Config,
+            SyncDirection::Push,
+            &[],
+            &[],
+            true, // allow_overwrite
+        )
+        .unwrap();
+
+        assert_eq!(plan.update_count, 1);
+        assert_eq!(plan.items[0].action, SyncItemAction::Update);
+    }
+
+    #[test]
+    fn file_plan_denied_files_are_excluded() {
+        let (src, dst) = setup_temp_trees();
+        write_file(src.path(), "wa.toml", "# config");
+        write_file(src.path(), ".env", "SECRET=value");
+        write_file(src.path(), "tokens.json", "{}");
+
+        let plan = build_file_plan(
+            src.path(),
+            dst.path(),
+            SyncCategory::Config,
+            SyncDirection::Push,
+            &[],
+            &[],
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(plan.denied_count, 2);
+        assert_eq!(plan.add_count, 1);
+        let denied: Vec<_> = plan
+            .items
+            .iter()
+            .filter(|i| i.action == SyncItemAction::Denied)
+            .collect();
+        assert_eq!(denied.len(), 2);
+    }
+
+    #[test]
+    fn file_plan_sorted_deterministically() {
+        let (src, dst) = setup_temp_trees();
+        write_file(src.path(), "z_file.toml", "z");
+        write_file(src.path(), "a_file.toml", "a");
+        write_file(src.path(), "m_file.toml", "m");
+
+        let plan = build_file_plan(
+            src.path(),
+            dst.path(),
+            SyncCategory::Config,
+            SyncDirection::Push,
+            &[],
+            &[],
+            false,
+        )
+        .unwrap();
+
+        let paths: Vec<&str> = plan
+            .items
+            .iter()
+            .map(|i| i.relative_path.as_str())
+            .collect();
+        assert_eq!(paths, vec!["a_file.toml", "m_file.toml", "z_file.toml"]);
+    }
+
+    #[test]
+    fn file_plan_nested_directories() {
+        let (src, dst) = setup_temp_trees();
+        write_file(src.path(), "profiles/default.toml", "default");
+        write_file(src.path(), "profiles/work.toml", "work");
+        write_file(src.path(), "rules/codex.yaml", "rules");
+
+        let plan = build_file_plan(
+            src.path(),
+            dst.path(),
+            SyncCategory::Config,
+            SyncDirection::Push,
+            &[],
+            &[],
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(plan.add_count, 3);
+        assert!(
+            plan.items
+                .iter()
+                .any(|i| i.relative_path == "profiles/default.toml")
+        );
+        assert!(
+            plan.items
+                .iter()
+                .any(|i| i.relative_path == "rules/codex.yaml")
+        );
+    }
+
+    #[test]
+    fn file_plan_single_file_mode() {
+        let (src, dst) = setup_temp_trees();
+        let binary = src.path().join("wa");
+        std::fs::write(&binary, b"binary content").unwrap();
+
+        let plan = build_file_plan(
+            &binary,
+            &dst.path().join("wa"),
+            SyncCategory::Binary,
+            SyncDirection::Push,
+            &[],
+            &[],
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(plan.add_count, 1);
+        assert_eq!(plan.items[0].relative_path, "wa");
+    }
+
+    #[test]
+    fn file_plan_empty_source_dir() {
+        let (src, dst) = setup_temp_trees();
+
+        let plan = build_file_plan(
+            src.path(),
+            dst.path(),
+            SyncCategory::Config,
+            SyncDirection::Push,
+            &[],
+            &[],
+            false,
+        )
+        .unwrap();
+
+        assert!(plan.items.is_empty());
+        assert_eq!(plan.add_count, 0);
+    }
+
+    #[test]
+    fn file_plan_nonexistent_source_is_empty() {
+        let dst = tempfile::tempdir().unwrap();
+        let plan = build_file_plan(
+            Path::new("/nonexistent/path/that/does/not/exist"),
+            dst.path(),
+            SyncCategory::Config,
+            SyncDirection::Push,
+            &[],
+            &[],
+            false,
+        )
+        .unwrap();
+
+        assert!(plan.items.is_empty());
+    }
+
+    // ========================================================================
+    // Sync execution
+    // ========================================================================
+
+    #[test]
+    fn execute_adds_new_files() {
+        let (src, dst) = setup_temp_trees();
+        write_file(src.path(), "wa.toml", "# config");
+        write_file(src.path(), "profiles/default.toml", "default");
+
+        let plan = build_file_plan(
+            src.path(),
+            dst.path(),
+            SyncCategory::Config,
+            SyncDirection::Push,
+            &[],
+            &[],
+            false,
+        )
+        .unwrap();
+
+        let written = execute_file_plan(&plan).unwrap();
+        assert_eq!(written, 2);
+        assert!(dst.path().join("wa.toml").exists());
+        assert!(dst.path().join("profiles/default.toml").exists());
+        assert_eq!(
+            std::fs::read_to_string(dst.path().join("wa.toml")).unwrap(),
+            "# config"
+        );
+    }
+
+    #[test]
+    fn execute_skips_unchanged_files() {
+        let (src, dst) = setup_temp_trees();
+        write_file(src.path(), "wa.toml", "# same");
+        write_file(dst.path(), "wa.toml", "# same");
+
+        let plan = build_file_plan(
+            src.path(),
+            dst.path(),
+            SyncCategory::Config,
+            SyncDirection::Push,
+            &[],
+            &[],
+            false,
+        )
+        .unwrap();
+
+        let written = execute_file_plan(&plan).unwrap();
+        assert_eq!(written, 0);
+    }
+
+    #[test]
+    fn execute_refuses_unresolved_conflicts() {
+        let (src, dst) = setup_temp_trees();
+        write_file(src.path(), "wa.toml", "# source");
+        write_file(dst.path(), "wa.toml", "# dest");
+
+        let plan = build_file_plan(
+            src.path(),
+            dst.path(),
+            SyncCategory::Config,
+            SyncDirection::Push,
+            &[],
+            &[],
+            false, // no overwrite
+        )
+        .unwrap();
+
+        let err = execute_file_plan(&plan).unwrap_err();
+        assert!(matches!(err, SyncError::UnresolvedConflicts { count: 1 }));
+    }
+
+    #[test]
+    fn execute_updates_with_overwrite() {
+        let (src, dst) = setup_temp_trees();
+        write_file(src.path(), "wa.toml", "# new version");
+        write_file(dst.path(), "wa.toml", "# old version");
+
+        let plan = build_file_plan(
+            src.path(),
+            dst.path(),
+            SyncCategory::Config,
+            SyncDirection::Push,
+            &[],
+            &[],
+            true, // allow overwrite
+        )
+        .unwrap();
+
+        let written = execute_file_plan(&plan).unwrap();
+        assert_eq!(written, 1);
+        assert_eq!(
+            std::fs::read_to_string(dst.path().join("wa.toml")).unwrap(),
+            "# new version"
+        );
+    }
+
+    #[test]
+    fn execute_never_writes_denied_files() {
+        let (src, dst) = setup_temp_trees();
+        write_file(src.path(), ".env", "SECRET=hunter2");
+        write_file(src.path(), "wa.toml", "# config");
+
+        let plan = build_file_plan(
+            src.path(),
+            dst.path(),
+            SyncCategory::Config,
+            SyncDirection::Push,
+            &[],
+            &[],
+            false,
+        )
+        .unwrap();
+
+        let written = execute_file_plan(&plan).unwrap();
+        assert_eq!(written, 1);
+        assert!(
+            !dst.path().join(".env").exists(),
+            "denied file must not be synced"
+        );
+        assert!(dst.path().join("wa.toml").exists());
+    }
+
+    #[test]
+    fn dry_run_plan_does_not_modify_destination() {
+        let (src, dst) = setup_temp_trees();
+        write_file(src.path(), "wa.toml", "# config");
+
+        // Build plan (plan never modifies files)
+        let plan = build_file_plan(
+            src.path(),
+            dst.path(),
+            SyncCategory::Config,
+            SyncDirection::Push,
+            &[],
+            &[],
+            false,
+        )
+        .unwrap();
+
+        // Verify destination is still empty (plan is read-only)
+        assert!(!dst.path().join("wa.toml").exists());
+        assert_eq!(plan.add_count, 1);
+    }
+
+    // ========================================================================
+    // JSON serialization: file plan
+    // ========================================================================
+
+    #[test]
+    fn file_plan_json_stable() {
+        let (src, dst) = setup_temp_trees();
+        write_file(src.path(), "wa.toml", "# config");
+
+        let plan = build_file_plan(
+            src.path(),
+            dst.path(),
+            SyncCategory::Config,
+            SyncDirection::Push,
+            &[],
+            &[],
+            false,
+        )
+        .unwrap();
+
+        let json = serde_json::to_value(&plan).unwrap();
+        assert_eq!(json["category"], "config");
+        assert_eq!(json["add_count"], 1);
+        assert_eq!(json["denied_count"], 0);
+        assert!(json["items"].is_array());
+        assert_eq!(json["items"][0]["action"], "add");
+    }
+
+    #[test]
+    fn sync_item_action_serializes_snake_case() {
+        let item = SyncItem {
+            relative_path: "test.txt".to_string(),
+            action: SyncItemAction::Denied,
+            source_hash: None,
+            destination_hash: None,
+            size_bytes: None,
+            reason: Some("denied".to_string()),
+        };
+        let json = serde_json::to_value(&item).unwrap();
+        assert_eq!(json["action"], "denied");
+    }
+
+    // ========================================================================
+    // Error display: new variants
+    // ========================================================================
+
+    #[test]
+    fn error_unresolved_conflicts_message() {
+        let err = SyncError::UnresolvedConflicts { count: 3 };
+        let msg = err.to_string();
+        assert!(msg.contains("3"));
+        assert!(msg.contains("conflict"));
+    }
+
+    #[test]
+    fn error_io_message() {
+        let err = SyncError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "access denied",
+        ));
+        let msg = err.to_string();
+        assert!(msg.contains("access denied"));
     }
 }
