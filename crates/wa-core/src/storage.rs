@@ -2650,6 +2650,194 @@ impl DbRepairReport {
     }
 }
 
+/// Per-table row count for the stats report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TableStats {
+    pub name: String,
+    pub row_count: u64,
+}
+
+/// Per-pane storage summary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaneStats {
+    pub pane_id: u64,
+    pub title: Option<String>,
+    pub segment_count: u64,
+    pub segment_bytes: u64,
+    pub event_count: u64,
+}
+
+/// Event type distribution entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventTypeStats {
+    pub event_type: String,
+    pub count: u64,
+}
+
+/// Full database statistics report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbStatsReport {
+    pub db_path: String,
+    pub db_size_bytes: Option<u64>,
+    pub tables: Vec<TableStats>,
+    pub top_panes: Vec<PaneStats>,
+    pub event_types: Vec<EventTypeStats>,
+    pub suggestions: Vec<String>,
+}
+
+/// Collect storage statistics for `db_path`.
+///
+/// Returns row counts per table, top panes by data volume, event type
+/// distribution, and cleanup suggestions referencing dry-run commands.
+pub fn database_stats(db_path: &Path, retention_days: u32) -> DbStatsReport {
+    let path_str = db_path.display().to_string();
+    let db_size_bytes = std::fs::metadata(db_path).ok().map(|m| m.len());
+
+    let conn = match Connection::open(db_path) {
+        Ok(c) => c,
+        Err(_) => {
+            return DbStatsReport {
+                db_path: path_str,
+                db_size_bytes,
+                tables: vec![],
+                top_panes: vec![],
+                event_types: vec![],
+                suggestions: vec!["Database could not be opened.".to_string()],
+            };
+        }
+    };
+
+    // Table row counts
+    let table_names = [
+        "panes",
+        "output_segments",
+        "events",
+        "audit_actions",
+        "usage_metrics",
+        "notification_history",
+        "workflow_executions",
+        "maintenance_log",
+    ];
+    let mut tables = Vec::new();
+    for name in &table_names {
+        let count: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {name}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap_or(0);
+        tables.push(TableStats {
+            name: (*name).to_string(),
+            row_count: count as u64,
+        });
+    }
+
+    // Top panes by segment volume (count + total content_len)
+    let top_panes = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT s.pane_id, p.title,
+                        COUNT(*) as seg_count,
+                        COALESCE(SUM(s.content_len), 0) as seg_bytes,
+                        (SELECT COUNT(*) FROM events e WHERE e.pane_id = s.pane_id) as evt_count
+                 FROM output_segments s
+                 LEFT JOIN panes p ON p.pane_id = s.pane_id
+                 GROUP BY s.pane_id
+                 ORDER BY seg_bytes DESC
+                 LIMIT 10",
+            )
+            .ok();
+        match stmt.as_mut() {
+            Some(s) => s
+                .query_map([], |row| {
+                    Ok(PaneStats {
+                        pane_id: row.get::<_, i64>(0)? as u64,
+                        title: row.get(1)?,
+                        segment_count: row.get::<_, i64>(2)? as u64,
+                        segment_bytes: row.get::<_, i64>(3)? as u64,
+                        event_count: row.get::<_, i64>(4)? as u64,
+                    })
+                })
+                .ok()
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default(),
+            None => vec![],
+        }
+    };
+
+    // Event type distribution
+    let event_types = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT event_type, COUNT(*) as cnt
+                 FROM events
+                 GROUP BY event_type
+                 ORDER BY cnt DESC",
+            )
+            .ok();
+        match stmt.as_mut() {
+            Some(s) => s
+                .query_map([], |row| {
+                    Ok(EventTypeStats {
+                        event_type: row.get(0)?,
+                        count: row.get::<_, i64>(1)? as u64,
+                    })
+                })
+                .ok()
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default(),
+            None => vec![],
+        }
+    };
+
+    // Cleanup suggestions
+    let mut suggestions = Vec::new();
+
+    let total_events: u64 = tables
+        .iter()
+        .find(|t| t.name == "events")
+        .map_or(0, |t| t.row_count);
+    let total_segments: u64 = tables
+        .iter()
+        .find(|t| t.name == "output_segments")
+        .map_or(0, |t| t.row_count);
+
+    if total_events > 10_000 {
+        suggestions.push(format!(
+            "{total_events} events stored. Preview cleanup: wa cleanup --dry-run"
+        ));
+    }
+    if total_segments > 50_000 {
+        suggestions.push(format!(
+            "{total_segments} segments stored. Preview cleanup: wa cleanup --dry-run"
+        ));
+    }
+    if let Some(size) = db_size_bytes {
+        if size > 100 * 1024 * 1024 {
+            suggestions.push(format!(
+                "Database is {:.1} MB. Consider: wa db repair --dry-run (includes VACUUM)",
+                size as f64 / 1_048_576.0
+            ));
+        }
+    }
+    if retention_days > 0 {
+        suggestions.push(format!(
+            "Retention policy: {retention_days} days. Configure in wa.toml [storage] retention_days"
+        ));
+    }
+    if suggestions.is_empty() {
+        suggestions.push("Database looks healthy. No cleanup actions needed.".to_string());
+    }
+
+    DbStatsReport {
+        db_path: path_str,
+        db_size_bytes,
+        tables,
+        top_panes,
+        event_types,
+        suggestions,
+    }
+}
+
 /// Run health checks on the database at `db_path`.
 ///
 /// Checks performed:
@@ -4026,6 +4214,21 @@ enum WriteCommand {
         before_ts: i64,
         respond: oneshot::Sender<Result<usize>>,
     },
+    /// Delete events older than a cutoff (flat, no tier filters)
+    DeleteEventsBefore {
+        before_ts: i64,
+        batch_size: usize,
+        respond: oneshot::Sender<Result<usize>>,
+    },
+    /// Delete events matching tier criteria older than a cutoff
+    DeleteEventsByTier {
+        before_ts: i64,
+        severities: Vec<String>,
+        event_types: Vec<String>,
+        handled: Option<bool>,
+        batch_size: usize,
+        respond: oneshot::Sender<Result<usize>>,
+    },
     /// Insert a pane bookmark
     InsertPaneBookmark {
         record: PaneBookmarkRecord,
@@ -4910,6 +5113,138 @@ impl StorageHandle {
         self.write_tx
             .send(WriteCommand::PurgeNotificationHistory {
                 before_ts,
+                respond: tx,
+            })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    // =========================================================================
+    // Cleanup engine: count + delete helpers
+    // =========================================================================
+
+    /// Count output_segments older than a cutoff (read-path).
+    pub async fn count_segments_before(&self, before_ts: i64) -> Result<usize> {
+        let db_path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            count_segments_before_sync(&conn, before_ts)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Spawn blocking failed: {e}")))?
+    }
+
+    /// Count events older than a cutoff (flat, no tier filters; read-path).
+    pub async fn count_events_before(&self, before_ts: i64) -> Result<usize> {
+        let db_path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            count_events_before_sync(&conn, before_ts)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Spawn blocking failed: {e}")))?
+    }
+
+    /// Count events matching tier criteria older than a cutoff (read-path).
+    pub async fn count_events_by_tier(
+        &self,
+        before_ts: i64,
+        severities: &[String],
+        event_types: &[String],
+        handled: Option<bool>,
+    ) -> Result<usize> {
+        let db_path = Arc::clone(&self.db_path);
+        let severities = severities.to_vec();
+        let event_types = event_types.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            count_events_by_tier_sync(&conn, before_ts, &severities, &event_types, handled)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Spawn blocking failed: {e}")))?
+    }
+
+    /// Count audit_actions older than a cutoff (read-path).
+    pub async fn count_audit_actions_before(&self, before_ts: i64) -> Result<usize> {
+        let db_path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            count_audit_actions_before_sync(&conn, before_ts)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Spawn blocking failed: {e}")))?
+    }
+
+    /// Count usage_metrics older than a cutoff (read-path).
+    pub async fn count_usage_metrics_before(&self, before_ts: i64) -> Result<usize> {
+        let db_path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            count_usage_metrics_before_sync(&conn, before_ts)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Spawn blocking failed: {e}")))?
+    }
+
+    /// Count notification_history older than a cutoff (read-path).
+    pub async fn count_notification_history_before(&self, before_ts: i64) -> Result<usize> {
+        let db_path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            count_notification_history_before_sync(&conn, before_ts)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Spawn blocking failed: {e}")))?
+    }
+
+    /// Delete events older than a cutoff (flat, no tier; write-path).
+    pub async fn delete_events_before(&self, before_ts: i64, batch_size: usize) -> Result<usize> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::DeleteEventsBefore {
+                before_ts,
+                batch_size,
+                respond: tx,
+            })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    /// Delete events matching tier criteria older than a cutoff (write-path).
+    pub async fn delete_events_by_tier(
+        &self,
+        before_ts: i64,
+        severities: &[String],
+        event_types: &[String],
+        handled: Option<bool>,
+        batch_size: usize,
+    ) -> Result<usize> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::DeleteEventsByTier {
+                before_ts,
+                severities: severities.to_vec(),
+                event_types: event_types.to_vec(),
+                handled,
+                batch_size,
                 respond: tx,
             })
             .await
@@ -7005,6 +7340,32 @@ fn dispatch_write_command(conn: &mut Connection, cmd: WriteCommand, should_break
             let result = purge_notification_history_sync(conn, before_ts);
             let _ = respond.send(result);
         }
+        WriteCommand::DeleteEventsBefore {
+            before_ts,
+            batch_size,
+            respond,
+        } => {
+            let result = delete_events_before_sync(conn, before_ts, batch_size);
+            let _ = respond.send(result);
+        }
+        WriteCommand::DeleteEventsByTier {
+            before_ts,
+            severities,
+            event_types,
+            handled,
+            batch_size,
+            respond,
+        } => {
+            let result = delete_events_by_tier_sync(
+                conn,
+                before_ts,
+                &severities,
+                &event_types,
+                handled,
+                batch_size,
+            );
+            let _ = respond.send(result);
+        }
         WriteCommand::InsertPaneBookmark { record, respond } => {
             let result = insert_pane_bookmark_sync(conn, &record);
             let _ = respond.send(result);
@@ -8516,6 +8877,188 @@ fn purge_notification_history_sync(conn: &Connection, before_ts: i64) -> Result<
             StorageError::Database(format!("Failed to purge notification history: {e}"))
         })?;
     Ok(deleted)
+}
+
+// =============================================================================
+// Cleanup engine: count + delete sync helpers
+// =============================================================================
+
+fn count_segments_before_sync(conn: &Connection, before_ts: i64) -> Result<usize> {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM output_segments WHERE captured_at < ?1",
+            params![before_ts],
+            |row| row.get(0),
+        )
+        .map_err(|e| StorageError::Database(format!("Failed to count segments: {e}")))?;
+    Ok(count as usize)
+}
+
+fn count_events_before_sync(conn: &Connection, before_ts: i64) -> Result<usize> {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE detected_at < ?1",
+            params![before_ts],
+            |row| row.get(0),
+        )
+        .map_err(|e| StorageError::Database(format!("Failed to count events: {e}")))?;
+    Ok(count as usize)
+}
+
+fn count_events_by_tier_sync(
+    conn: &Connection,
+    before_ts: i64,
+    severities: &[String],
+    event_types: &[String],
+    handled: Option<bool>,
+) -> Result<usize> {
+    let (sql, param_values) = build_tier_query(
+        "SELECT COUNT(*) FROM events",
+        before_ts,
+        severities,
+        event_types,
+        handled,
+    );
+    let params_dyn: Vec<&dyn rusqlite::ToSql> = param_values
+        .iter()
+        .map(|v| v as &dyn rusqlite::ToSql)
+        .collect();
+    let count: i64 = conn
+        .query_row(&sql, params_dyn.as_slice(), |row| row.get(0))
+        .map_err(|e| StorageError::Database(format!("Failed to count events by tier: {e}")))?;
+    Ok(count as usize)
+}
+
+fn count_audit_actions_before_sync(conn: &Connection, before_ts: i64) -> Result<usize> {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM audit_actions WHERE ts < ?1",
+            params![before_ts],
+            |row| row.get(0),
+        )
+        .map_err(|e| StorageError::Database(format!("Failed to count audit actions: {e}")))?;
+    Ok(count as usize)
+}
+
+fn count_usage_metrics_before_sync(conn: &Connection, before_ts: i64) -> Result<usize> {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM usage_metrics WHERE timestamp < ?1",
+            params![before_ts],
+            |row| row.get(0),
+        )
+        .map_err(|e| StorageError::Database(format!("Failed to count usage metrics: {e}")))?;
+    Ok(count as usize)
+}
+
+fn count_notification_history_before_sync(conn: &Connection, before_ts: i64) -> Result<usize> {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM notification_history WHERE timestamp < ?1",
+            params![before_ts],
+            |row| row.get(0),
+        )
+        .map_err(|e| {
+            StorageError::Database(format!("Failed to count notification history: {e}"))
+        })?;
+    Ok(count as usize)
+}
+
+fn delete_events_before_sync(
+    conn: &Connection,
+    before_ts: i64,
+    batch_size: usize,
+) -> Result<usize> {
+    let mut total_deleted = 0usize;
+    loop {
+        let deleted = conn
+            .execute(
+                "DELETE FROM events WHERE id IN (\
+                 SELECT id FROM events WHERE detected_at < ?1 LIMIT ?2)",
+                params![before_ts, batch_size as i64],
+            )
+            .map_err(|e| StorageError::Database(format!("Failed to delete events: {e}")))?;
+        total_deleted += deleted;
+        if deleted < batch_size {
+            break;
+        }
+    }
+    Ok(total_deleted)
+}
+
+fn delete_events_by_tier_sync(
+    conn: &Connection,
+    before_ts: i64,
+    severities: &[String],
+    event_types: &[String],
+    handled: Option<bool>,
+    batch_size: usize,
+) -> Result<usize> {
+    let (inner_query, param_values) = build_tier_query(
+        "SELECT id FROM events",
+        before_ts,
+        severities,
+        event_types,
+        handled,
+    );
+    let delete_sql = format!("DELETE FROM events WHERE id IN ({inner_query} LIMIT {batch_size})");
+
+    let mut total_deleted = 0usize;
+    loop {
+        let params_dyn: Vec<&dyn rusqlite::ToSql> = param_values
+            .iter()
+            .map(|v| v as &dyn rusqlite::ToSql)
+            .collect();
+        let deleted = conn
+            .execute(&delete_sql, params_dyn.as_slice())
+            .map_err(|e| StorageError::Database(format!("Failed to delete events by tier: {e}")))?;
+        total_deleted += deleted;
+        if deleted < batch_size {
+            break;
+        }
+    }
+    Ok(total_deleted)
+}
+
+/// Build a tier-filtered query clause with positional parameters.
+fn build_tier_query(
+    select_prefix: &str,
+    before_ts: i64,
+    severities: &[String],
+    event_types: &[String],
+    handled: Option<bool>,
+) -> (String, Vec<SqlValue>) {
+    let mut sql = format!("{select_prefix} WHERE detected_at < ?");
+    let mut params: Vec<SqlValue> = vec![SqlValue::Integer(before_ts)];
+
+    if !severities.is_empty() {
+        let placeholders: Vec<String> = severities.iter().map(|_| "?".to_string()).collect();
+        sql.push_str(&format!(" AND severity IN ({})", placeholders.join(",")));
+        for s in severities {
+            params.push(SqlValue::Text(s.clone()));
+        }
+    }
+
+    if !event_types.is_empty() {
+        let conditions: Vec<String> = event_types
+            .iter()
+            .map(|_| "event_type LIKE ?".to_string())
+            .collect();
+        sql.push_str(&format!(" AND ({})", conditions.join(" OR ")));
+        for et in event_types {
+            params.push(SqlValue::Text(format!("{et}%")));
+        }
+    }
+
+    if let Some(want_handled) = handled {
+        if want_handled {
+            sql.push_str(" AND handled_at IS NOT NULL");
+        } else {
+            sql.push_str(" AND handled_at IS NULL");
+        }
+    }
+
+    (sql, params)
 }
 
 fn query_notification_history_sync(
