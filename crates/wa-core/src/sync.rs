@@ -251,7 +251,7 @@ fn include_category(include: &[SyncCategory], category: SyncCategory) -> bool {
     if include.is_empty() {
         return true;
     }
-    include.iter().any(|value| *value == category)
+    include.contains(&category)
 }
 
 /// Build a sync plan (plan-only; does not mutate any files).
@@ -431,15 +431,10 @@ pub fn is_path_denied(relative_path: &str, extra_deny: &[String]) -> bool {
         }
     }
 
-    // Also check filename against common secret suffixes
-    if let Some(filename) = path.file_name() {
-        let filename = filename.to_string_lossy();
-        let lower = filename.to_lowercase();
-        if lower.ends_with(".key")
-            || lower.ends_with(".pem")
-            || lower.ends_with(".p12")
-            || lower.ends_with(".pfx")
-        {
+    // Also check filename against common secret file extensions
+    if let Some(ext) = path.extension() {
+        let ext = ext.to_string_lossy().to_lowercase();
+        if matches!(ext.as_str(), "key" | "pem" | "p12" | "pfx") {
             return true;
         }
     }
@@ -601,7 +596,7 @@ fn walk_dir(
             )
             .map_err(|e| match e {
                 SyncError::Io(io_err) => io_err,
-                _ => std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+                _ => std::io::Error::other(e.to_string()),
             })?;
             items.push(item);
         }
