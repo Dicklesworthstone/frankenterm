@@ -53,6 +53,7 @@ pub mod caut;
 #[cfg(test)]
 pub mod chaos;
 pub mod circuit_breaker;
+pub mod cleanup;
 pub mod config;
 pub mod config_profiles;
 pub mod crash;
@@ -124,6 +125,8 @@ pub mod tui;
 
 #[cfg(feature = "web")]
 pub mod web;
+
+pub mod ui_query;
 
 pub mod distributed;
 pub mod simulation;

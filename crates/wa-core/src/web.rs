@@ -1,10 +1,12 @@
 //! Web server scaffolding for wa (feature-gated: web).
 //!
 //! Provides a minimal `wa web` HTTP server with /health and read-only
-//! data endpoints (/panes, /events, /search) backed by [`StorageHandle`].
+//! data endpoints (/panes, /events, /search, /bookmarks, /ruleset-profile, /saved-searches)
+//! backed by shared query helpers.
 
 use crate::policy::Redactor;
 use crate::storage::{EventQuery, PaneRecord, SearchOptions, SearchResult, StorageHandle};
+use crate::ui_query;
 use crate::{Error, Result, VERSION};
 use asupersync::net::TcpListener;
 use fastapi::ResponseBody;
@@ -458,11 +460,40 @@ struct EventView {
     extracted: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     matched_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    annotations: Option<EventAnnotationsView>,
     detected_at: i64,
 }
 
+#[derive(Serialize)]
+struct EventAnnotationsView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    triage_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
+    labels: Vec<String>,
+}
+
+impl EventAnnotationsView {
+    fn from_stored(annotations: crate::storage::EventAnnotations, redactor: &Redactor) -> Self {
+        Self {
+            triage_state: annotations.triage_state.map(|v| redactor.redact(&v)),
+            note: annotations.note.map(|v| redactor.redact(&v)),
+            labels: annotations
+                .labels
+                .into_iter()
+                .map(|label| redactor.redact(&label))
+                .collect(),
+        }
+    }
+}
+
 impl EventView {
-    fn from_stored(e: crate::storage::StoredEvent, redactor: &Redactor) -> Self {
+    fn from_stored(
+        e: crate::storage::StoredEvent,
+        redactor: &Redactor,
+        annotations: Option<EventAnnotationsView>,
+    ) -> Self {
         Self {
             id: e.id,
             pane_id: e.pane_id,
@@ -472,6 +503,7 @@ impl EventView {
             confidence: e.confidence,
             extracted: e.extracted,
             matched_text: e.matched_text.map(|t| redactor.redact(&t)),
+            annotations,
             detected_at: e.detected_at,
         }
     }
@@ -504,10 +536,20 @@ fn handle_events(
         match storage.get_events(query).await {
             Ok(events) => {
                 let total = events.len();
-                let views: Vec<EventView> = events
-                    .into_iter()
-                    .map(|e| EventView::from_stored(e, &redactor))
-                    .collect();
+                let mut views: Vec<EventView> = Vec::with_capacity(total);
+                for event in events {
+                    let annotations = match storage.get_event_annotations(event.id).await {
+                        Ok(Some(annotations)) => {
+                            Some(EventAnnotationsView::from_stored(annotations, &redactor))
+                        }
+                        Ok(None) => None,
+                        Err(err) => {
+                            warn!(target: "wa.web", error = %err, event_id = event.id, "failed to load event annotations");
+                            None
+                        }
+                    };
+                    views.push(EventView::from_stored(event, &redactor, annotations));
+                }
                 json_ok(EventsResponse {
                     events: views,
                     total,
@@ -612,6 +654,229 @@ fn handle_search(
 }
 
 // =============================================================================
+// /bookmarks
+// =============================================================================
+
+#[derive(Serialize)]
+struct BookmarksResponse {
+    bookmarks: Vec<BookmarkView>,
+    total: usize,
+}
+
+#[derive(Serialize)]
+struct BookmarkView {
+    pane_id: u64,
+    alias: String,
+    tags: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+impl BookmarkView {
+    fn from_query(bookmark: ui_query::PaneBookmarkView, redactor: &Redactor) -> Self {
+        Self {
+            pane_id: bookmark.pane_id,
+            alias: redactor.redact(&bookmark.alias),
+            tags: bookmark
+                .tags
+                .iter()
+                .map(|tag| redactor.redact(tag))
+                .collect(),
+            description: bookmark.description.map(|desc| redactor.redact(&desc)),
+            created_at: bookmark.created_at,
+            updated_at: bookmark.updated_at,
+        }
+    }
+}
+
+fn handle_bookmarks(
+    req: &Request,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>> {
+    let result = require_storage(req);
+    Box::pin(async move {
+        let (storage, redactor) = match result {
+            Ok(s) => s,
+            Err(resp) => return resp,
+        };
+        match ui_query::list_pane_bookmarks(&storage).await {
+            Ok(bookmarks) => {
+                let total = bookmarks.len();
+                let views: Vec<BookmarkView> = bookmarks
+                    .into_iter()
+                    .map(|bookmark| BookmarkView::from_query(bookmark, &redactor))
+                    .collect();
+                json_ok(BookmarksResponse {
+                    bookmarks: views,
+                    total,
+                })
+            }
+            Err(e) => json_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_error",
+                format!("Failed to query bookmarks: {e}"),
+            ),
+        }
+    })
+}
+
+// =============================================================================
+// /ruleset-profile
+// =============================================================================
+
+#[derive(Serialize)]
+struct RulesetProfileResponse {
+    active_profile: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    active_last_applied_at: Option<u64>,
+    profiles: Vec<RulesetProfileView>,
+    total: usize,
+}
+
+#[derive(Serialize)]
+struct RulesetProfileView {
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_applied_at: Option<u64>,
+    implicit: bool,
+}
+
+impl RulesetProfileView {
+    fn from_summary(summary: crate::rulesets::RulesetProfileSummary, redactor: &Redactor) -> Self {
+        Self {
+            name: summary.name,
+            description: summary.description.map(|d| redactor.redact(&d)),
+            path: summary.path.map(|p| redactor.redact(&p)),
+            last_applied_at: summary.last_applied_at,
+            implicit: summary.implicit,
+        }
+    }
+}
+
+fn handle_ruleset_profile(
+    req: &Request,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>> {
+    let redactor = req
+        .get_extension::<AppState>()
+        .map(|s| Arc::clone(&s.redactor))
+        .unwrap_or_else(|| Arc::new(Redactor::new()));
+    Box::pin(async move {
+        let config_path = crate::config::resolve_config_path(None);
+        match ui_query::resolve_ruleset_profile_state(config_path.as_deref()) {
+            Ok(state) => {
+                let total = state.profiles.len();
+                let profiles = state
+                    .profiles
+                    .into_iter()
+                    .map(|profile| RulesetProfileView::from_summary(profile, &redactor))
+                    .collect();
+                json_ok(RulesetProfileResponse {
+                    active_profile: state.active_profile,
+                    active_last_applied_at: state.active_last_applied_at,
+                    profiles,
+                    total,
+                })
+            }
+            Err(e) => json_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "ruleset_profile_error",
+                format!("Failed to resolve ruleset profile state: {e}"),
+            ),
+        }
+    })
+}
+
+// =============================================================================
+// /saved-searches
+// =============================================================================
+
+#[derive(Serialize)]
+struct SavedSearchesResponse {
+    saved_searches: Vec<SavedSearchView>,
+    total: usize,
+}
+
+#[derive(Serialize)]
+struct SavedSearchView {
+    id: String,
+    name: String,
+    query: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pane_id: Option<u64>,
+    limit: i64,
+    since_mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    since_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    schedule_interval_ms: Option<i64>,
+    enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_run_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_result_count: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_error: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+impl SavedSearchView {
+    fn from_query(saved: ui_query::SavedSearchView, redactor: &Redactor) -> Self {
+        Self {
+            id: saved.id,
+            name: redactor.redact(&saved.name),
+            query: redactor.redact(&saved.query),
+            pane_id: saved.pane_id,
+            limit: saved.limit,
+            since_mode: saved.since_mode,
+            since_ms: saved.since_ms,
+            schedule_interval_ms: saved.schedule_interval_ms,
+            enabled: saved.enabled,
+            last_run_at: saved.last_run_at,
+            last_result_count: saved.last_result_count,
+            last_error: saved.last_error.map(|e| redactor.redact(&e)),
+            created_at: saved.created_at,
+            updated_at: saved.updated_at,
+        }
+    }
+}
+
+fn handle_saved_searches(
+    req: &Request,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>> {
+    let result = require_storage(req);
+    Box::pin(async move {
+        let (storage, redactor) = match result {
+            Ok(s) => s,
+            Err(resp) => return resp,
+        };
+        match ui_query::list_saved_searches(&storage).await {
+            Ok(saved_searches) => {
+                let total = saved_searches.len();
+                let views = saved_searches
+                    .into_iter()
+                    .map(|saved| SavedSearchView::from_query(saved, &redactor))
+                    .collect();
+                json_ok(SavedSearchesResponse {
+                    saved_searches: views,
+                    total,
+                })
+            }
+            Err(e) => json_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_error",
+                format!("Failed to query saved searches: {e}"),
+            ),
+        }
+    })
+}
+
+// =============================================================================
 // App builder
 // =============================================================================
 
@@ -644,6 +909,21 @@ fn build_app(storage: Option<StorageHandle>) -> App {
             "/search",
             Method::Get,
             |_ctx: &RequestContext, req: &mut Request| handle_search(req),
+        )
+        .route(
+            "/bookmarks",
+            Method::Get,
+            |_ctx: &RequestContext, req: &mut Request| handle_bookmarks(req),
+        )
+        .route(
+            "/ruleset-profile",
+            Method::Get,
+            |_ctx: &RequestContext, req: &mut Request| handle_ruleset_profile(req),
+        )
+        .route(
+            "/saved-searches",
+            Method::Get,
+            |_ctx: &RequestContext, req: &mut Request| handle_saved_searches(req),
         )
         .build()
 }

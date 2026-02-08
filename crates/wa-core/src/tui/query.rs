@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use crate::circuit_breaker::CircuitBreakerStatus;
 use crate::config::WorkspaceLayout;
 use crate::storage::{EventMuteRecord, StorageHandle};
+pub use crate::ui_query::{PaneBookmarkView, RulesetProfileState, SavedSearchView};
 use crate::wezterm::{PaneInfo, WeztermHandle, default_wezterm_handle};
 
 /// Errors that can occur during query operations
@@ -106,6 +107,9 @@ pub struct EventView {
     pub message: String,
     pub timestamp: i64,
     pub handled: bool,
+    pub triage_state: Option<String>,
+    pub labels: Vec<String>,
+    pub note: Option<String>,
 }
 
 /// Action associated with a triage item
@@ -242,6 +246,21 @@ pub trait QueryClient: Send + Sync {
     fn list_action_history(&self, _limit: usize) -> Result<Vec<HistoryEntryView>, QueryError> {
         Ok(Vec::new())
     }
+
+    /// List pane bookmarks for panes/dashboard surfaces.
+    fn list_pane_bookmarks(&self) -> Result<Vec<PaneBookmarkView>, QueryError> {
+        Ok(Vec::new())
+    }
+
+    /// List saved searches for search/dashboard surfaces.
+    fn list_saved_searches(&self) -> Result<Vec<SavedSearchView>, QueryError> {
+        Ok(Vec::new())
+    }
+
+    /// Resolve ruleset profile status for profile-aware UI.
+    fn ruleset_profile_state(&self) -> Result<RulesetProfileState, QueryError> {
+        Ok(RulesetProfileState::default())
+    }
 }
 
 /// Production implementation of QueryClient
@@ -252,6 +271,7 @@ pub trait QueryClient: Send + Sync {
 /// runs in a separate thread from the main async context.
 pub struct ProductionQueryClient {
     workspace_layout: WorkspaceLayout,
+    config_path: Option<PathBuf>,
     wezterm: WeztermHandle,
     #[allow(dead_code)]
     storage: Option<StorageHandle>,
@@ -275,6 +295,7 @@ impl ProductionQueryClient {
 
         Self {
             workspace_layout,
+            config_path: crate::config::resolve_config_path(None),
             wezterm: default_wezterm_handle(),
             storage: None,
             runtime,
@@ -296,6 +317,7 @@ impl ProductionQueryClient {
 
         Self {
             workspace_layout,
+            config_path: crate::config::resolve_config_path(None),
             wezterm: default_wezterm_handle(),
             storage: Some(storage),
             runtime,
@@ -314,6 +336,7 @@ impl ProductionQueryClient {
 
         Self {
             workspace_layout,
+            config_path: crate::config::resolve_config_path(None),
             wezterm,
             storage: None,
             runtime,
@@ -336,6 +359,7 @@ impl ProductionQueryClient {
 
         Self {
             workspace_layout,
+            config_path: crate::config::resolve_config_path(None),
             wezterm,
             storage: Some(storage),
             runtime,
@@ -406,17 +430,34 @@ impl QueryClient for ProductionQueryClient {
             until: None,
         };
 
-        // Use the dedicated runtime to run async code from sync context.
-        let events = self.runtime.block_on(async {
-            storage
+        let rows = self.runtime.block_on(async {
+            let events = storage
                 .get_events(query)
                 .await
-                .map_err(|e| QueryError::StorageError(e.to_string()))
+                .map_err(|e| QueryError::StorageError(e.to_string()))?;
+
+            let mut rows = Vec::with_capacity(events.len());
+            for event in events {
+                let annotations = match storage.get_event_annotations(event.id).await {
+                    Ok(Some(annotations)) => annotations,
+                    Ok(None) => crate::storage::EventAnnotations::default(),
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            event_id = event.id,
+                            "Failed to load event annotations for TUI",
+                        );
+                        crate::storage::EventAnnotations::default()
+                    }
+                };
+                rows.push((event, annotations));
+            }
+            Ok::<_, QueryError>(rows)
         })?;
 
-        Ok(events
+        Ok(rows
             .into_iter()
-            .map(|e| EventView {
+            .map(|(e, annotations)| EventView {
                 id: e.id,
                 rule_id: e.rule_id,
                 pane_id: e.pane_id,
@@ -426,6 +467,9 @@ impl QueryClient for ProductionQueryClient {
                     .unwrap_or_else(|| "Pattern matched".to_string()),
                 timestamp: e.detected_at,
                 handled: e.handled_at.is_some(),
+                triage_state: annotations.triage_state,
+                labels: annotations.labels,
+                note: annotations.note,
             })
             .collect())
     }
@@ -527,7 +571,7 @@ impl QueryClient for ProductionQueryClient {
                 pane_id: None,
                 workflow_id: None,
             });
-            items.sort_by(|a, b| severity_rank(&b.severity).cmp(&severity_rank(&a.severity)));
+            items.sort_by_key(|item| std::cmp::Reverse(severity_rank(&item.severity)));
             return Ok(items);
         };
 
@@ -764,8 +808,8 @@ impl QueryClient for ProductionQueryClient {
                 let summary = row
                     .input_summary
                     .clone()
-                    .or(row.verification_summary.clone())
-                    .or(row.decision_reason.clone())
+                    .or_else(|| row.verification_summary.clone())
+                    .or_else(|| row.decision_reason.clone())
                     .unwrap_or_default();
 
                 HistoryEntryView {
@@ -786,6 +830,35 @@ impl QueryClient for ProductionQueryClient {
                 }
             })
             .collect())
+    }
+
+    fn list_pane_bookmarks(&self) -> Result<Vec<PaneBookmarkView>, QueryError> {
+        let Some(storage) = &self.storage else {
+            return Ok(Vec::new());
+        };
+        let storage = storage.clone();
+        self.runtime.block_on(async {
+            crate::ui_query::list_pane_bookmarks(&storage)
+                .await
+                .map_err(|e| QueryError::StorageError(e.to_string()))
+        })
+    }
+
+    fn list_saved_searches(&self) -> Result<Vec<SavedSearchView>, QueryError> {
+        let Some(storage) = &self.storage else {
+            return Ok(Vec::new());
+        };
+        let storage = storage.clone();
+        self.runtime.block_on(async {
+            crate::ui_query::list_saved_searches(&storage)
+                .await
+                .map_err(|e| QueryError::StorageError(e.to_string()))
+        })
+    }
+
+    fn ruleset_profile_state(&self) -> Result<RulesetProfileState, QueryError> {
+        crate::ui_query::resolve_ruleset_profile_state(self.config_path.as_deref())
+            .map_err(|e| QueryError::QueryFailed(e.to_string()))
     }
 }
 

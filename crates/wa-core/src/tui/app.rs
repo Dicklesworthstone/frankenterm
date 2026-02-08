@@ -178,7 +178,7 @@ impl<Q: QueryClient> App<Q> {
                 self.current_view = View::Help;
                 return;
             }
-            KeyCode::Char('r') => {
+            KeyCode::Char('r') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.refresh_data();
                 return;
             }
@@ -260,6 +260,10 @@ impl<Q: QueryClient> App<Q> {
                 self.view_state.panes_unhandled_only = !self.view_state.panes_unhandled_only;
                 self.view_state.selected_index = 0;
             }
+            KeyCode::Char('b') => {
+                self.view_state.panes_bookmarked_only = !self.view_state.panes_bookmarked_only;
+                self.view_state.selected_index = 0;
+            }
             KeyCode::Char('a') => {
                 self.view_state.panes_agent_filter =
                     Self::next_agent_filter(self.view_state.panes_agent_filter.as_deref());
@@ -277,6 +281,28 @@ impl<Q: QueryClient> App<Q> {
             KeyCode::Esc => {
                 self.view_state.panes_filter_query.clear();
                 self.view_state.selected_index = 0;
+            }
+            KeyCode::Char('p') => {
+                if let Some(profile_state) = &self.view_state.ruleset_profile_state
+                    && !profile_state.profiles.is_empty()
+                {
+                    self.view_state.selected_ruleset_profile_index =
+                        (self.view_state.selected_ruleset_profile_index + 1)
+                            % profile_state.profiles.len();
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(profile_state) = &self.view_state.ruleset_profile_state
+                    && let Some(selected) = profile_state.profiles.get(
+                        self.view_state
+                            .selected_ruleset_profile_index
+                            .min(profile_state.profiles.len().saturating_sub(1)),
+                    )
+                    && selected.name != profile_state.active_profile
+                {
+                    self.pending_command =
+                        Some(format!("wa rules profile apply {}", selected.name));
+                }
             }
             KeyCode::Char(c) if !c.is_control() => {
                 self.view_state.panes_filter_query.push(c);
@@ -391,6 +417,54 @@ impl<Q: QueryClient> App<Q> {
     /// Handle key events in the search view
     fn handle_search_key(&mut self, key: KeyEvent) {
         match key.code {
+            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if !self.view_state.saved_searches.is_empty() {
+                    self.view_state.saved_search_selected_index =
+                        (self.view_state.saved_search_selected_index + 1)
+                            % self.view_state.saved_searches.len();
+                }
+            }
+            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if !self.view_state.saved_searches.is_empty() {
+                    self.view_state.saved_search_selected_index = self
+                        .view_state
+                        .saved_search_selected_index
+                        .checked_sub(1)
+                        .unwrap_or(self.view_state.saved_searches.len() - 1);
+                }
+            }
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(saved) = self
+                    .view_state
+                    .saved_searches
+                    .get(self.view_state.saved_search_selected_index)
+                {
+                    self.pending_command = Some(format!("wa search saved run {}", saved.name));
+                } else {
+                    self.view_state.set_error("No saved search selected");
+                }
+            }
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(saved) = self
+                    .view_state
+                    .saved_searches
+                    .get(self.view_state.saved_search_selected_index)
+                {
+                    if saved.enabled {
+                        self.pending_command =
+                            Some(format!("wa search saved disable {}", saved.name));
+                    } else if saved.schedule_interval_ms.is_some() {
+                        self.pending_command =
+                            Some(format!("wa search saved enable {}", saved.name));
+                    } else {
+                        self.view_state.set_error(
+                            "Saved search has no schedule; set one via `wa search saved schedule`",
+                        );
+                    }
+                } else {
+                    self.view_state.set_error("No saved search selected");
+                }
+            }
             KeyCode::Down | KeyCode::Char('j') if !self.view_state.search_results.is_empty() => {
                 self.view_state.search_selected_index = (self.view_state.search_selected_index + 1)
                     % self.view_state.search_results.len();
@@ -467,7 +541,7 @@ impl<Q: QueryClient> App<Q> {
         if query.is_empty() {
             return;
         }
-        self.view_state.search_last_query = query.clone();
+        self.view_state.search_last_query.clone_from(&query);
         self.view_state.search_selected_index = 0;
         match self.query_client.search(&query, 50) {
             Ok(results) => {
@@ -545,6 +619,65 @@ impl<Q: QueryClient> App<Q> {
             Err(e) => {
                 self.view_state
                     .set_error(format!("Failed to list action history: {e}"));
+            }
+        }
+
+        // Refresh saved searches
+        match self.query_client.list_saved_searches() {
+            Ok(saved_searches) => {
+                self.view_state.saved_searches = saved_searches;
+                if self.view_state.saved_search_selected_index
+                    >= self.view_state.saved_searches.len()
+                {
+                    self.view_state.saved_search_selected_index = 0;
+                }
+            }
+            Err(QueryError::DatabaseNotInitialized(_)) => {
+                self.view_state.saved_searches.clear();
+                self.view_state.saved_search_selected_index = 0;
+            }
+            Err(e) => {
+                self.view_state
+                    .set_error(format!("Failed to list saved searches: {e}"));
+            }
+        }
+
+        // Refresh pane bookmarks
+        match self.query_client.list_pane_bookmarks() {
+            Ok(bookmarks) => {
+                self.view_state.pane_bookmarks = bookmarks;
+            }
+            Err(QueryError::DatabaseNotInitialized(_)) => {
+                self.view_state.pane_bookmarks.clear();
+            }
+            Err(e) => {
+                self.view_state
+                    .set_error(format!("Failed to list pane bookmarks: {e}"));
+            }
+        }
+
+        // Refresh ruleset profile state
+        match self.query_client.ruleset_profile_state() {
+            Ok(profile_state) => {
+                let active_index = profile_state
+                    .profiles
+                    .iter()
+                    .position(|p| p.name == profile_state.active_profile)
+                    .unwrap_or(0);
+                if self.view_state.selected_ruleset_profile_index >= profile_state.profiles.len() {
+                    self.view_state.selected_ruleset_profile_index = active_index;
+                }
+                if self.view_state.selected_ruleset_profile_index == 0
+                    && !profile_state.profiles.is_empty()
+                    && self.view_state.ruleset_profile_state.is_none()
+                {
+                    self.view_state.selected_ruleset_profile_index = active_index;
+                }
+                self.view_state.ruleset_profile_state = Some(profile_state);
+            }
+            Err(e) => {
+                self.view_state
+                    .set_error(format!("Failed to resolve ruleset profiles: {e}"));
             }
         }
 
@@ -759,6 +892,61 @@ mod tests {
         fn list_active_workflows(&self) -> Result<Vec<WorkflowProgressView>, QueryError> {
             Ok(Vec::new())
         }
+
+        fn list_saved_searches(
+            &self,
+        ) -> Result<Vec<crate::tui::query::SavedSearchView>, QueryError> {
+            Ok(vec![
+                crate::tui::query::SavedSearchView {
+                    id: "ss-1".to_string(),
+                    name: "errors".to_string(),
+                    query: "error".to_string(),
+                    pane_id: None,
+                    limit: 50,
+                    since_mode: "last_run".to_string(),
+                    since_ms: None,
+                    schedule_interval_ms: Some(60_000),
+                    enabled: false,
+                    last_run_at: None,
+                    last_result_count: None,
+                    last_error: None,
+                    created_at: 1_700_000_000_000,
+                    updated_at: 1_700_000_000_000,
+                },
+                crate::tui::query::SavedSearchView {
+                    id: "ss-2".to_string(),
+                    name: "warnings".to_string(),
+                    query: "warning".to_string(),
+                    pane_id: Some(2),
+                    limit: 25,
+                    since_mode: "last_run".to_string(),
+                    since_ms: None,
+                    schedule_interval_ms: Some(120_000),
+                    enabled: true,
+                    last_run_at: Some(1_700_000_001_000),
+                    last_result_count: Some(7),
+                    last_error: None,
+                    created_at: 1_700_000_000_000,
+                    updated_at: 1_700_000_001_000,
+                },
+                crate::tui::query::SavedSearchView {
+                    id: "ss-3".to_string(),
+                    name: "manual".to_string(),
+                    query: "panic".to_string(),
+                    pane_id: None,
+                    limit: 10,
+                    since_mode: "fixed".to_string(),
+                    since_ms: Some(1_700_000_000_000),
+                    schedule_interval_ms: None,
+                    enabled: false,
+                    last_run_at: None,
+                    last_result_count: None,
+                    last_error: Some("invalid query".to_string()),
+                    created_at: 1_700_000_000_000,
+                    updated_at: 1_700_000_002_000,
+                },
+            ])
+        }
     }
 
     #[test]
@@ -882,6 +1070,9 @@ mod tests {
                     message: "usage limit hit".to_string(),
                     timestamp: 1_700_000_000_000,
                     handled: false,
+                    triage_state: None,
+                    labels: Vec::new(),
+                    note: None,
                 },
                 EventView {
                     id: 2,
@@ -891,6 +1082,9 @@ mod tests {
                     message: "agent error".to_string(),
                     timestamp: 1_700_000_001_000,
                     handled: true,
+                    triage_state: None,
+                    labels: Vec::new(),
+                    note: None,
                 },
                 EventView {
                     id: 3,
@@ -900,6 +1094,9 @@ mod tests {
                     message: "pane idle".to_string(),
                     timestamp: 1_700_000_002_000,
                     handled: false,
+                    triage_state: None,
+                    labels: Vec::new(),
+                    note: None,
                 },
             ])
         }
@@ -1137,6 +1334,49 @@ mod tests {
         app.view_state.search_query = "test".to_string();
         app.handle_search_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
         assert_eq!(app.view_state.search_query, "tes");
+    }
+
+    #[test]
+    fn search_saved_shortcuts_cycle_and_queue_actions() {
+        let mut app = App::new(SearchQueryClient, AppConfig::default());
+        app.refresh_data();
+        assert_eq!(app.view_state.saved_searches.len(), 3);
+        assert_eq!(app.view_state.saved_search_selected_index, 0);
+
+        app.handle_search_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        assert_eq!(app.view_state.saved_search_selected_index, 1);
+
+        app.handle_search_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert_eq!(app.view_state.saved_search_selected_index, 0);
+
+        app.handle_search_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        assert_eq!(
+            app.pending_command.as_deref(),
+            Some("wa search saved run errors")
+        );
+
+        app.handle_search_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        assert_eq!(
+            app.pending_command.as_deref(),
+            Some("wa search saved enable errors")
+        );
+
+        app.view_state.saved_search_selected_index = 1;
+        app.handle_search_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        assert_eq!(
+            app.pending_command.as_deref(),
+            Some("wa search saved disable warnings")
+        );
+
+        app.view_state.saved_search_selected_index = 2;
+        app.handle_search_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        assert!(
+            app.view_state
+                .error_message
+                .as_deref()
+                .is_some_and(|msg| msg.contains("no schedule")),
+            "manual-only saved search should surface a schedule guidance error"
+        );
     }
 
     #[test]
@@ -1516,6 +1756,9 @@ mod tests {
                 message: "auth.prompt: Please authenticate".to_string(),
                 timestamp: 1_700_000_000_000,
                 handled: false,
+                triage_state: Some("new".to_string()),
+                labels: vec!["auth".to_string()],
+                note: Some("Waiting for operator follow-up".to_string()),
             },
             EventView {
                 id: 2,
@@ -1525,6 +1768,9 @@ mod tests {
                 message: "secret_detected: API key found in output".to_string(),
                 timestamp: 1_700_000_001_000,
                 handled: true,
+                triage_state: Some("mitigated".to_string()),
+                labels: vec!["security".to_string(), "urgent".to_string()],
+                note: Some("Credential rotated".to_string()),
             },
             EventView {
                 id: 3,
@@ -1534,6 +1780,9 @@ mod tests {
                 message: "error.compilation: cargo build failed".to_string(),
                 timestamp: 1_700_000_002_000,
                 handled: false,
+                triage_state: Some("investigating".to_string()),
+                labels: vec!["build".to_string()],
+                note: None,
             },
         ]
     }

@@ -2831,6 +2831,13 @@ enum DbCommands {
         #[arg(long, short = 'f', default_value = "auto")]
         format: String,
     },
+
+    /// Show database size, record counts, and cleanup suggestions
+    Stats {
+        /// Output format (auto, plain, json)
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -13720,6 +13727,64 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         active_mutes.len(),
                     );
                     print!("{output}");
+
+                    if cli.verbose > 0 && !output_format.is_json() {
+                        let display_events = if limit > 0 && events.len() > limit {
+                            &events[..limit]
+                        } else {
+                            &events[..]
+                        };
+                        let clip = |s: &str, max: usize| -> String {
+                            let mut out: String = s.chars().take(max).collect();
+                            if s.chars().count() > max {
+                                out.push_str("...");
+                            }
+                            out
+                        };
+                        let mut lines: Vec<String> = Vec::new();
+                        for event in display_events {
+                            match storage.get_event_annotations(event.id).await {
+                                Ok(Some(annotations)) => {
+                                    if annotations.triage_state.is_none()
+                                        && annotations.note.is_none()
+                                        && annotations.labels.is_empty()
+                                    {
+                                        continue;
+                                    }
+                                    let triage =
+                                        annotations.triage_state.unwrap_or_else(|| "-".to_string());
+                                    let labels = if annotations.labels.is_empty() {
+                                        "-".to_string()
+                                    } else {
+                                        annotations.labels.join(",")
+                                    };
+                                    let note = annotations.note.unwrap_or_else(|| "-".to_string());
+                                    lines.push(format!(
+                                        "  {:>5}  {:12}  {:18}  {}",
+                                        event.id,
+                                        clip(&triage, 12),
+                                        clip(&labels, 18),
+                                        clip(&note, 48),
+                                    ));
+                                }
+                                Ok(None) => {}
+                                Err(err) => {
+                                    tracing::warn!(
+                                        error = %err,
+                                        event_id = event.id,
+                                        "Failed to load event annotations"
+                                    );
+                                }
+                            }
+                        }
+                        if !lines.is_empty() {
+                            println!("Annotations (verbose):");
+                            println!("  event  triage        labels              note");
+                            for line in lines {
+                                println!("{line}");
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     die(&format!("Failed to query events: {e}"), None);
@@ -16457,7 +16522,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
         }
 
         Some(Commands::Db { command }) => {
-            handle_db_command(command, &layout).await?;
+            handle_db_command(command, &layout, config.storage.retention_days).await?;
         }
 
         Some(Commands::Backup { command }) => {
@@ -20924,6 +20989,7 @@ fn handle_learn_command(
 async fn handle_db_command(
     command: DbCommands,
     layout: &wa_core::config::WorkspaceLayout,
+    retention_days: u32,
 ) -> anyhow::Result<()> {
     use wa_core::storage::{
         MigrationDirection, SCHEMA_VERSION, migrate_database_to_version, migration_plan_for_path,
@@ -21138,6 +21204,78 @@ async fn handle_db_command(
                 } else {
                     eprintln!("Some repairs failed. Check output above.");
                     std::process::exit(1);
+                }
+            }
+        }
+
+        DbCommands::Stats { format } => {
+            use wa_core::output::{OutputFormat, detect_format};
+            use wa_core::storage::database_stats;
+
+            let output_format = match format.to_lowercase().as_str() {
+                "json" => OutputFormat::Json,
+                "plain" => OutputFormat::Plain,
+                _ => detect_format(),
+            };
+
+            let report = database_stats(db_path, retention_days);
+
+            if output_format == OutputFormat::Json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report)
+                        .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
+                );
+            } else {
+                println!("Database: {}", report.db_path);
+                if let Some(size) = report.db_size_bytes {
+                    let size_display = if size > 1_048_576 {
+                        format!("{:.1} MB", size as f64 / 1_048_576.0)
+                    } else if size > 1024 {
+                        format!("{:.1} KB", size as f64 / 1024.0)
+                    } else {
+                        format!("{size} bytes")
+                    };
+                    println!("Size: {size_display}");
+                }
+
+                println!();
+                println!("Table row counts:");
+                for table in &report.tables {
+                    println!("  {:<25} {:>10}", table.name, table.row_count);
+                }
+
+                if !report.top_panes.is_empty() {
+                    println!();
+                    println!("Top panes by data volume:");
+                    for pane in &report.top_panes {
+                        let title = pane.title.as_deref().unwrap_or("(untitled)");
+                        let seg_display = if pane.segment_bytes > 1_048_576 {
+                            format!("{:.1} MB", pane.segment_bytes as f64 / 1_048_576.0)
+                        } else if pane.segment_bytes > 1024 {
+                            format!("{:.1} KB", pane.segment_bytes as f64 / 1024.0)
+                        } else {
+                            format!("{} B", pane.segment_bytes)
+                        };
+                        println!(
+                            "  pane {} ({title}): {seg_display}, {} segments, {} events",
+                            pane.pane_id, pane.segment_count, pane.event_count
+                        );
+                    }
+                }
+
+                if !report.event_types.is_empty() {
+                    println!();
+                    println!("Event type distribution:");
+                    for et in &report.event_types {
+                        println!("  {:<35} {:>8}", et.event_type, et.count);
+                    }
+                }
+
+                println!();
+                println!("Suggestions:");
+                for suggestion in &report.suggestions {
+                    println!("  - {suggestion}");
                 }
             }
         }

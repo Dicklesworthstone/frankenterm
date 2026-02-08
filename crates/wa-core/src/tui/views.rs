@@ -10,10 +10,11 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Tabs, Widget},
 };
+use std::collections::{HashMap, HashSet};
 
 use super::query::{
-    EventView, HealthStatus, HistoryEntryView, PaneView, SearchResultView, TriageItemView,
-    WorkflowProgressView,
+    EventView, HealthStatus, HistoryEntryView, PaneBookmarkView, PaneView, RulesetProfileState,
+    SavedSearchView, SearchResultView, TriageItemView, WorkflowProgressView,
 };
 use crate::circuit_breaker::CircuitStateKind;
 
@@ -156,10 +157,22 @@ pub struct ViewState {
     pub search_results: Vec<SearchResultView>,
     /// Search: selected result index
     pub search_selected_index: usize,
+    /// Saved searches for search view.
+    pub saved_searches: Vec<SavedSearchView>,
+    /// Selected saved search index.
+    pub saved_search_selected_index: usize,
     /// Active workflows for progress display
     pub workflows: Vec<WorkflowProgressView>,
     /// Expanded workflow index in triage view (None = collapsed)
     pub triage_expanded: Option<usize>,
+    /// Bookmark records for panes.
+    pub pane_bookmarks: Vec<PaneBookmarkView>,
+    /// Optional ruleset profile state.
+    pub ruleset_profile_state: Option<RulesetProfileState>,
+    /// Selected profile index in the profile selector.
+    pub selected_ruleset_profile_index: usize,
+    /// Only show panes that have at least one bookmark.
+    pub panes_bookmarked_only: bool,
 }
 
 impl ViewState {
@@ -178,6 +191,7 @@ impl ViewState {
 #[must_use]
 pub fn filtered_pane_indices(state: &ViewState) -> Vec<usize> {
     let query = state.panes_filter_query.trim().to_ascii_lowercase();
+    let bookmarked_panes: HashSet<u64> = state.pane_bookmarks.iter().map(|b| b.pane_id).collect();
     state
         .panes
         .iter()
@@ -204,6 +218,10 @@ pub fn filtered_pane_indices(state: &ViewState) -> Vec<usize> {
                 } else if !domain.contains(&filter) {
                     return false;
                 }
+            }
+
+            if state.panes_bookmarked_only && !bookmarked_panes.contains(&pane.pane_id) {
+                return false;
             }
 
             if query.is_empty() {
@@ -526,6 +544,14 @@ pub fn render_panes_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
         .constraints([Constraint::Percentage(67), Constraint::Percentage(33)])
         .split(area);
 
+    let mut bookmarks_by_pane: HashMap<u64, Vec<&PaneBookmarkView>> = HashMap::new();
+    for bookmark in &state.pane_bookmarks {
+        bookmarks_by_pane
+            .entry(bookmark.pane_id)
+            .or_default()
+            .push(bookmark);
+    }
+
     let filtered_indices = filtered_pane_indices(state);
     let selected_filtered_index = state
         .selected_index
@@ -549,15 +575,42 @@ pub fn render_panes_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
         .constraints([Constraint::Length(3), Constraint::Min(1)])
         .split(list_inner);
 
+    let active_profile_name = state
+        .ruleset_profile_state
+        .as_ref()
+        .map(|s| s.active_profile.as_str())
+        .unwrap_or("default");
+    let selected_profile_name = state
+        .ruleset_profile_state
+        .as_ref()
+        .and_then(|s| {
+            s.profiles
+                .get(
+                    state
+                        .selected_ruleset_profile_index
+                        .min(s.profiles.len().saturating_sub(1)),
+                )
+                .map(|p| p.name.as_str())
+        })
+        .unwrap_or("default");
+    let profile_count = state
+        .ruleset_profile_state
+        .as_ref()
+        .map_or(0, |s| s.profiles.len());
+
     let filter_summary = format!(
-        "filter='{}'  unhandled_only={}  agent={}  domain={}",
+        "filter='{}' unhandled={} bookmarked={} agent={} domain={} profile={} active={} ({})",
         state.panes_filter_query,
         state.panes_unhandled_only,
+        state.panes_bookmarked_only,
         state.panes_agent_filter.as_deref().unwrap_or("all"),
-        state.panes_domain_filter.as_deref().unwrap_or("all")
+        state.panes_domain_filter.as_deref().unwrap_or("all"),
+        selected_profile_name,
+        active_profile_name,
+        profile_count
     );
     Paragraph::new(vec![
-        Line::from("id  agent    state          unhandled  title"),
+        Line::from("id  bm      agent    state          unhandled  title"),
         Line::from(Span::styled(
             filter_summary,
             Style::default().fg(Color::Gray),
@@ -575,6 +628,16 @@ pub fn render_panes_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
         let mut lines: Vec<Line> = Vec::with_capacity(filtered_indices.len());
         for (pos, pane_index) in filtered_indices.iter().enumerate() {
             let pane = &state.panes[*pane_index];
+            let bookmark_summary = bookmarks_by_pane.get(&pane.pane_id).map_or_else(
+                || "-".to_string(),
+                |bookmarks| {
+                    if bookmarks.len() == 1 {
+                        truncate_str(&bookmarks[0].alias, 6)
+                    } else {
+                        format!("{}*", bookmarks.len())
+                    }
+                },
+            );
             let style = if pos == selected_filtered_index {
                 Style::default()
                     .bg(Color::DarkGray)
@@ -589,12 +652,13 @@ pub fn render_panes_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
             let agent = pane.agent_type.as_deref().unwrap_or("unknown");
             lines.push(Line::styled(
                 format!(
-                    "{:>3} {:8} {:12} {:>9}  {}",
+                    "{:>3} {:6} {:8} {:12} {:>9}  {}",
                     pane.pane_id,
+                    bookmark_summary,
                     truncate_str(agent, 8),
                     truncate_str(&pane.pane_state, 12),
                     pane.unhandled_event_count,
-                    truncate_str(&pane.title, 30)
+                    truncate_str(&pane.title, 24)
                 ),
                 style,
             ));
@@ -607,13 +671,34 @@ pub fn render_panes_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
     detail_block.render(chunks[1], buf);
 
     if let Some(pane) = selected_pane {
+        let pane_bookmarks = bookmarks_by_pane
+            .get(&pane.pane_id)
+            .cloned()
+            .unwrap_or_default();
         let last_activity = pane
             .last_activity_ts
             .map_or_else(|| "unknown".to_string(), |ts| ts.to_string());
-        let next_action = if pane.unhandled_event_count > 0 {
+        let next_action = if selected_profile_name != active_profile_name {
+            format!("Apply selected profile: wa rules profile apply {selected_profile_name}")
+        } else if pane.unhandled_event_count > 0 {
             format!("Run: wa workflow list --pane {}", pane.pane_id)
         } else {
             format!("Inspect: wa get-text {} --tail 120", pane.pane_id)
+        };
+        let bookmark_summary = if pane_bookmarks.is_empty() {
+            "none".to_string()
+        } else {
+            pane_bookmarks
+                .iter()
+                .map(|b| {
+                    if b.tags.is_empty() {
+                        b.alias.clone()
+                    } else {
+                        format!("{} [{}]", b.alias, b.tags.join(","))
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
         };
         let details = vec![
             Line::from(format!("Pane ID: {}", pane.pane_id)),
@@ -627,12 +712,23 @@ pub fn render_panes_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
             Line::from(format!("CWD: {}", pane.cwd.as_deref().unwrap_or("unknown"))),
             Line::from(format!("Last Activity: {}", last_activity)),
             Line::from(format!("Unhandled Events: {}", pane.unhandled_event_count)),
+            Line::from(format!(
+                "Bookmarks: {}",
+                truncate_str(&bookmark_summary, 80)
+            )),
+            Line::from(format!("Ruleset Active: {}", active_profile_name)),
+            Line::from(format!("Ruleset Selected: {}", selected_profile_name)),
             Line::from(""),
             Line::from(Span::styled(
                 "Next best action:",
                 Style::default().add_modifier(Modifier::BOLD),
             )),
             Line::from(next_action),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Keys: p=cycle profile, Enter=apply selected profile, b=bookmarked only",
+                Style::default().fg(Color::Gray),
+            )),
         ];
         Paragraph::new(details).render(detail_inner, buf);
     } else {
@@ -754,6 +850,13 @@ pub fn render_events_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
         } else {
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
         };
+        let triage = event.triage_state.as_deref().unwrap_or("unset");
+        let labels = if event.labels.is_empty() {
+            "none".to_string()
+        } else {
+            event.labels.join(",")
+        };
+        let note = event.note.as_deref().unwrap_or("none");
 
         let mut details = vec![
             Line::from(vec![
@@ -772,6 +875,9 @@ pub fn render_events_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
                 Span::raw("Status: "),
                 Span::styled(handled_label, handled_style),
             ]),
+            Line::from(format!("Triage: {triage}")),
+            Line::from(format!("Labels: {}", truncate_str(&labels, 60))),
+            Line::from(format!("Note: {}", truncate_str(note, 60))),
             Line::from(""),
             Line::from(Span::styled(
                 "Rule:",
@@ -1065,6 +1171,7 @@ pub fn render_search_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // Search input
+            Constraint::Length(8), // Saved searches
             Constraint::Min(5),    // Results + detail
         ])
         .split(area);
@@ -1082,9 +1189,68 @@ pub fn render_search_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
     );
     search_input.render(chunks[0], buf);
 
+    // Saved searches list
+    let saved_block = Block::default()
+        .title(format!("Saved Searches ({})", state.saved_searches.len()))
+        .borders(Borders::ALL);
+    let saved_inner = saved_block.inner(chunks[1]);
+    saved_block.render(chunks[1], buf);
+    if state.saved_searches.is_empty() {
+        Paragraph::new(Span::styled(
+            "No saved searches yet. Use `wa search save <name> <query>`.",
+            Style::default().fg(Color::Gray),
+        ))
+        .render(saved_inner, buf);
+    } else {
+        let selected_saved = state
+            .saved_search_selected_index
+            .min(state.saved_searches.len().saturating_sub(1));
+        let mut saved_lines = vec![Line::from(
+            "name           ena sched(ms) pane last_run      err query",
+        )];
+        for (idx, saved) in state.saved_searches.iter().enumerate() {
+            let enabled = if saved.enabled { "on" } else { "off" };
+            let schedule = saved
+                .schedule_interval_ms
+                .map_or_else(|| "-".to_string(), |v| v.to_string());
+            let pane = saved
+                .pane_id
+                .map_or_else(|| "-".to_string(), |id| id.to_string());
+            let last_run = saved
+                .last_run_at
+                .map_or_else(|| "-".to_string(), |ts| ts.to_string());
+            let err = if saved.last_error.is_some() {
+                "yes"
+            } else {
+                "no"
+            };
+            let line = format!(
+                "{:14} {:3} {:9} {:4} {:12} {:3} {}",
+                truncate_str(&saved.name, 14),
+                enabled,
+                truncate_str(&schedule, 9),
+                truncate_str(&pane, 4),
+                truncate_str(&last_run, 12),
+                err,
+                truncate_str(&saved.query, 32),
+            );
+            if idx == selected_saved {
+                saved_lines.push(Line::styled(
+                    line,
+                    Style::default()
+                        .bg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                saved_lines.push(Line::raw(line));
+            }
+        }
+        Paragraph::new(saved_lines).render(saved_inner, buf);
+    }
+
     if state.search_results.is_empty() {
         let msg = if state.search_last_query.is_empty() {
-            "Type a query and press Enter to search captured output."
+            "Type a query + Enter, or Ctrl+N/Ctrl+P to pick a saved search then Ctrl+R to run."
         } else {
             "No results found. Try a different query."
         };
@@ -1100,7 +1266,7 @@ pub fn render_search_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
                 ))
                 .borders(Borders::ALL),
         );
-        results.render(chunks[1], buf);
+        results.render(chunks[2], buf);
         return;
     }
 
@@ -1108,7 +1274,7 @@ pub fn render_search_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
     let result_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-        .split(chunks[1]);
+        .split(chunks[2]);
 
     let selected = state
         .search_selected_index
@@ -1177,6 +1343,12 @@ pub fn render_search_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
                 Style::default().add_modifier(Modifier::BOLD),
             )),
             Line::from(result.snippet.clone()),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Saved search keys:",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::from("Ctrl+N next, Ctrl+P prev, Ctrl+R run, Ctrl+E toggle enable"),
         ];
         Paragraph::new(details).render(detail_inner, buf);
     }
@@ -1185,11 +1357,10 @@ pub fn render_search_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
 /// Render an ASCII progress bar: `[████░░░░] 2/5`
 fn render_progress_bar(current: usize, total: usize, width: usize) -> Vec<Span<'static>> {
     let bar_width = width.saturating_sub(2); // account for [ ]
-    let filled = if total == 0 {
-        0
-    } else {
-        (current * bar_width) / total
-    };
+    let filled = current
+        .checked_mul(bar_width)
+        .and_then(|value| value.checked_div(total))
+        .unwrap_or(0);
     let empty = bar_width.saturating_sub(filled);
 
     let filled_char = "\u{2588}"; // █
@@ -1424,9 +1595,11 @@ pub fn render_help_view(area: Rect, buf: &mut Buffer) {
         Line::from("  1-9        Run action by number (triage)"),
         Line::from("  m          Mute selected event (triage)"),
         Line::from("  [Panes] type text to filter, Backspace to edit, Esc to clear"),
-        Line::from("  [Panes] u=unhandled-only, a=agent filter, d=domain filter"),
+        Line::from("  [Panes] u=unhandled-only, b=bookmarked-only, a=agent, d=domain"),
+        Line::from("  [Panes] p=cycle ruleset profile, Enter=apply selected profile"),
         Line::from("  [Events] type digits to filter by pane/rule, u=unhandled-only"),
         Line::from("  [History] type text to filter, u=undoable-only"),
+        Line::from("  [Search] Ctrl+N/Ctrl+P select saved, Ctrl+R run, Ctrl+E toggle"),
         Line::from("  [Triage] e=expand/collapse workflow progress"),
         Line::from(""),
         Line::from(Span::styled(
@@ -1582,6 +1755,9 @@ mod tests {
             message: format!("matched text for {rule}"),
             timestamp: 1_700_000_000_000 + id,
             handled,
+            triage_state: None,
+            labels: Vec::new(),
+            note: None,
         }
     }
 
