@@ -254,7 +254,7 @@ impl UndoExecutor {
                 action.id,
                 undo.undo_strategy.clone(),
                 "Undo payload did not contain a workflow execution ID".to_string(),
-                undo.undo_hint.clone().or(action.undo_hint.clone()),
+                undo.undo_hint.clone().or_else(|| action.undo_hint.clone()),
                 None,
                 action.pane_id,
             ));
@@ -288,7 +288,7 @@ impl UndoExecutor {
                     action.id,
                     undo.undo_strategy.clone(),
                     message,
-                    undo.undo_hint.clone().or(action.undo_hint.clone()),
+                    undo.undo_hint.clone().or_else(|| action.undo_hint.clone()),
                     Some(result.execution_id),
                     Some(result.pane_id),
                 ))
@@ -297,7 +297,7 @@ impl UndoExecutor {
                 action.id,
                 undo.undo_strategy.clone(),
                 format!("Failed to abort workflow {execution_id}: {err}"),
-                undo.undo_hint.clone().or(action.undo_hint.clone()),
+                undo.undo_hint.clone().or_else(|| action.undo_hint.clone()),
                 Some(execution_id),
                 action.pane_id,
             )),
@@ -316,7 +316,7 @@ impl UndoExecutor {
                 action.id,
                 undo.undo_strategy.clone(),
                 "Undo payload did not contain a pane ID".to_string(),
-                undo.undo_hint.clone().or(action.undo_hint.clone()),
+                undo.undo_hint.clone().or_else(|| action.undo_hint.clone()),
                 action.actor_id.clone(),
                 None,
             ));
@@ -329,7 +329,7 @@ impl UndoExecutor {
                     action.id,
                     undo.undo_strategy.clone(),
                     format!("Pane {pane_id} no longer exists"),
-                    undo.undo_hint.clone().or(action.undo_hint.clone()),
+                    undo.undo_hint.clone().or_else(|| action.undo_hint.clone()),
                     action.actor_id.clone(),
                     Some(pane_id),
                 ));
@@ -339,7 +339,7 @@ impl UndoExecutor {
                     action.id,
                     undo.undo_strategy.clone(),
                     format!("Failed to validate pane {pane_id}: {err}"),
-                    undo.undo_hint.clone().or(action.undo_hint.clone()),
+                    undo.undo_hint.clone().or_else(|| action.undo_hint.clone()),
                     action.actor_id.clone(),
                     Some(pane_id),
                 ));
@@ -347,7 +347,7 @@ impl UndoExecutor {
         }
 
         match self.wezterm.kill_pane(pane_id).await {
-            Ok(_) => {
+            Ok(()) => {
                 let undone_at = self.mark_undone(action.id, &request.actor).await?;
                 Ok(UndoExecutionResult::success(
                     action.id,
@@ -363,7 +363,7 @@ impl UndoExecutor {
                     action.id,
                     undo.undo_strategy.clone(),
                     format!("Pane {pane_id} was already closed"),
-                    undo.undo_hint.clone().or(action.undo_hint.clone()),
+                    undo.undo_hint.clone().or_else(|| action.undo_hint.clone()),
                     action.actor_id.clone(),
                     Some(pane_id),
                 ))
@@ -372,7 +372,7 @@ impl UndoExecutor {
                 action.id,
                 undo.undo_strategy.clone(),
                 format!("Failed to close pane {pane_id}: {err}"),
-                undo.undo_hint.clone().or(action.undo_hint.clone()),
+                undo.undo_hint.clone().or_else(|| action.undo_hint.clone()),
                 action.actor_id.clone(),
                 Some(pane_id),
             )),
