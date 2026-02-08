@@ -330,10 +330,11 @@ wezterm.on('mux-startup', function()
   -- Initialize mux-level state
 end)
 
--- Called periodically and on status changes
-wezterm.on('update-status', function(window, pane)
-  -- Update status bar, check conditions
-end)
+-- DEPRECATED in wa v0.2.0: update-status hook removed for performance.
+-- Use CLI polling + user-var signaling instead. Shown here for reference only.
+-- wezterm.on('update-status', function(window, pane)
+--   -- Update status bar, check conditions
+-- end)
 
 -- Called when bell rings in any pane
 wezterm.on('bell', function(window, pane)

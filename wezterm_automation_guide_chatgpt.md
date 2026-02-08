@@ -260,8 +260,10 @@ local domain_info = {
 }
 
 -- DYNAMIC OVERRIDES ON DOMAIN CHANGE: apply colors and status when active pane's domain changes
+-- NOTE: update-status was removed in wa v0.2.0. This example is HISTORICAL.
+-- Prefer CLI polling + user-var signaling instead.
 local last_domain = {}
-wezterm.on('update-status', function(window, pane)
+wezterm.on('update-status', function(window, pane)  -- DEPRECATED: see note above
   local domain = pane:get_domain_name()
   local winid = tostring(window:window_id())
   if last_domain[winid] ~= domain then
@@ -639,7 +641,7 @@ Problem / Symptom	Likely Cause	Solution / Fix
 Cannot connect to remote domain (WezTerm says “Timed out” or “Connection failed”)	SSH to server failed, or wezterm-mux-server not running on remote, or version mismatch.	Verify you can ssh user@host from terminal. Ensure the remote service is active (systemctl --user status wezterm-mux-server). Check for version mismatches and update if needed. Also ensure your local config’s ssh_domains entries are correct (hostnames, usernames).
 Remote sessions don’t persist (get closed when Mac closes)	The mux server likely isn’t running persistently. Perhaps linger not enabled or service not started.	SSH into remote after a disconnect, run systemctl --user status wezterm-mux-server. If it’s not running, enable linger (loginctl enable-linger). If it crashed, check logs. Make sure you used multiplexing = "WezTerm" in config; if you used plain SSH mode, sessions won’t persist.
 Too many tabs opening on each launch	The gui-startup logic might be creating new tabs every time instead of reusing.	Check the condition that determines if a remote already had tabs. In our config, we used #tabs <= 1. If you accidentally removed that or always spawn tabs, you’ll duplicate. Also ensure you don’t have multiple gui-startup handlers stacking via config reloads. Only one should run.
-Colors or domain-specific config not applying	Possibly the pane:get_domain_name() in update-status isn’t matching your domain (maybe domain name typo).	Print/debug the domain name from the event to see what it is. It should match one of the keys in domain_colors. Also ensure update-status event is used (for WezTerm 2024+, update-status is the correct event; older versions used update-right-status).
+Colors or domain-specific config not applying	Possibly the pane:get_domain_name() isn't matching your domain (maybe domain name typo).	Print/debug the domain name to see what it is. It should match one of the keys in domain_colors. Note: wa v0.2.0+ removed the Lua update-status hook; use CLI polling and user-var signaling instead.
 Keybindings conflicts	Leader key or others not working as expected.	Make sure no other app (or macOS itself) is intercepting the combo. On macOS, Ctrl+Arrow might be tied to Mission Control; you may need to adjust those OS shortcuts. Also note WezTerm doesn’t allow duplicate key assignments – ensure your config isn’t merging multiple tables causing duplicates. Use wezterm show-keys to see active bindings.
 Automation tool (wa) isn’t catching events	The pattern might not match exactly due to formatting differences, or wa might not be polling frequently enough.	Test your regex patterns against sample output to ensure they match (taking into account punctuation, etc.). Increase polling frequency or use a manual trigger (you can always force a read with wa logs pane_id). Also confirm wa has correct pane IDs – they can change if you close and reopen tabs. wa should refresh the list if needed.
 Unable to send Ctrl+C or special keys	wezterm cli send-text by itself doesn’t send special keycodes.	Use --no-paste and the literal control character if possible. In bash, ^C is 0x03. You could echo that via printf "\x03". On Linux/macOS, you might also use wezterm cli send-text --pane-id X $'\x03' --no-paste (using shell ANSI C quoting). If that fails, consider sending the escape sequence for SIGINT – in some contexts \x03 should work. Alternatively, as a last resort, ssh into the remote and kill -INT <pid> of the process. But that’s heavier.

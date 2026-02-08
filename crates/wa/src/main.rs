@@ -22726,19 +22726,24 @@ async fn run_guided_setup(apply: bool, dry_run: bool, verbose: u8) -> anyhow::Re
     Ok(())
 }
 
-const REMOTE_MUX_SERVICE_UNIT: &str = r"[Unit]
+/// Generate a systemd unit for the WezTerm mux server using the resolved binary path.
+fn remote_mux_service_unit(mux_path: &str) -> String {
+    format!(
+        r"[Unit]
 Description=WezTerm Mux Server
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/wezterm-mux-server --daemonize=false
+ExecStart={mux_path} --daemonize=false
 Restart=on-failure
 RestartSec=2
 
 [Install]
 WantedBy=default.target
-";
+"
+    )
+}
 
 struct RemoteCommandOutput {
     status: std::process::ExitStatus,
@@ -22940,8 +22945,21 @@ where
             options.verbose,
             false,
         )?;
-        if !version_output.stdout.trim().is_empty() {
-            println!("  Version: {}", version_output.stdout.trim());
+        let remote_version = version_output.stdout.trim().to_string();
+        if !remote_version.is_empty() {
+            println!("  Remote version: {remote_version}");
+            // Compare with local version to warn about mismatches
+            if let Ok(local_out) = std::process::Command::new("wezterm").arg("--version").output() {
+                let local_version = String::from_utf8_lossy(&local_out.stdout).trim().to_string();
+                if !local_version.is_empty() {
+                    if local_version != remote_version {
+                        println!("  ⚠ Version mismatch: local={local_version}, remote={remote_version}");
+                        println!("    WezTerm multiplexing works best with matching versions.");
+                    } else {
+                        println!("  ✓ Local and remote versions match");
+                    }
+                }
+            }
         }
     }
 
@@ -22949,6 +22967,18 @@ where
         match pkg_manager.as_deref() {
             Some(path) if path.contains("apt-get") => {
                 if apply_changes {
+                    // Set up WezTerm apt repository (not in default distro repos)
+                    run_remote_step(
+                        "Add WezTerm apt repo",
+                        host,
+                        "curl -fsSL https://apt.fury.io/wez/gpg.key | sudo gpg --yes --dearmor -o /usr/share/keyrings/wezterm-fury.gpg && \
+                         echo 'deb [signed-by=/usr/share/keyrings/wezterm-fury.gpg] https://apt.fury.io/wez/ * *' | sudo tee /etc/apt/sources.list.d/wezterm.list >/dev/null",
+                        timeout,
+                        runner,
+                        &redactor,
+                        options.verbose,
+                        true,
+                    )?;
                     run_remote_step(
                         "Install WezTerm (apt)",
                         host,
@@ -22960,12 +22990,22 @@ where
                         true,
                     )?;
                 } else {
+                    println!("• Would add WezTerm apt repository (apt.fury.io/wez)");
                     println!("• Would install WezTerm via apt");
-                    println!("  cmd: sudo apt-get update && sudo apt-get install -y wezterm");
                 }
             }
             Some(path) if path.contains("dnf") => {
                 if apply_changes {
+                    run_remote_step(
+                        "Add WezTerm COPR repo",
+                        host,
+                        "sudo dnf copr enable -y wezfurlong/wezterm-nightly 2>/dev/null || true",
+                        timeout,
+                        runner,
+                        &redactor,
+                        options.verbose,
+                        true,
+                    )?;
                     run_remote_step(
                         "Install WezTerm (dnf)",
                         host,
@@ -22977,8 +23017,8 @@ where
                         true,
                     )?;
                 } else {
+                    println!("• Would add WezTerm COPR repo");
                     println!("• Would install WezTerm via dnf");
-                    println!("  cmd: sudo dnf install -y wezterm");
                 }
             }
             Some(path) if path.contains("yum") => {
@@ -23021,7 +23061,20 @@ where
         }
     }
 
-    // Step 4: Install mux-server user service unit
+    // Step 4: Resolve mux-server path and install user service unit
+    let mux_path_output = run_remote_step(
+        "Locate wezterm-mux-server",
+        host,
+        "command -v wezterm-mux-server || which wezterm-mux-server 2>/dev/null || echo /usr/bin/wezterm-mux-server",
+        timeout,
+        runner,
+        &redactor,
+        options.verbose,
+        false,
+    )?;
+    let mux_server_path = mux_path_output.stdout.trim().lines().next().unwrap_or("/usr/bin/wezterm-mux-server").trim().to_string();
+    let mux_unit = remote_mux_service_unit(&mux_server_path);
+
     let service_path = "~/.config/systemd/user/wezterm-mux-server.service";
     let check_service_cmd = format!("cat {service_path} 2>/dev/null || true");
     let service_output = run_remote_step(
@@ -23035,13 +23088,13 @@ where
         false,
     )?;
     let existing_service = service_output.stdout.trim();
-    let expected_service = REMOTE_MUX_SERVICE_UNIT.trim();
+    let expected_service = mux_unit.trim();
     if existing_service == expected_service {
         println!("✓ mux service unit already up to date");
     } else if existing_service.is_empty() {
         if apply_changes {
             let install_cmd = format!(
-                "mkdir -p ~/.config/systemd/user && cat > {service_path} <<'EOF'\n{REMOTE_MUX_SERVICE_UNIT}EOF"
+                "mkdir -p ~/.config/systemd/user && cat > {service_path} <<'EOF'\n{mux_unit}EOF"
             );
             run_remote_step(
                 "Install mux service unit",

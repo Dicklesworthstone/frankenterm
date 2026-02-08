@@ -292,7 +292,9 @@ local domain_info = {
 
 local last_domain = {}
 
-wezterm.on('update-status', function(window, pane)
+-- DEPRECATED in wa v0.2.0: shown for historical reference only.
+-- Prefer CLI polling + user-var signaling instead.
+wezterm.on('update-status', function(window, pane)  -- DEPRECATED
   local domain = pane:get_domain_name()
   local win_id = tostring(window:window_id())
 
@@ -485,7 +487,7 @@ Both should show the same version (e.g., `20240101-123456-abcdef`).
 |:--------|:------|:----|
 | "Connection failed" on startup | Remote unreachable or mux-server not running | Check SSH connectivity; verify systemd service is active |
 | Wrong number of tabs on remote | Previous session state persisted | Restart mux-server: `ssh host 'systemctl --user restart wezterm-mux-server'` |
-| Colors not applying | `update-status` event not recognizing domain | Check `pane:get_domain_name()` returns expected value |
+| Colors not applying | Domain name not matching config table | Check `pane:get_domain_name()` returns expected value. Note: wa v0.2.0+ removed `update-status` hook; use CLI polling instead |
 | Version mismatch errors | Local and remote WezTerm versions differ | Update WezTerm on both ends to same version |
 | Mux-server dies on disconnect | Lingering not enabled | Run `sudo loginctl enable-linger $USER` on remote |
 | Can't create new tabs in domain | Mux-server crashed | Check logs; restart service |

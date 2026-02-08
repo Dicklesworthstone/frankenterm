@@ -635,13 +635,14 @@ pub fn generate_ssh_domains_lua(hosts: &[SshHost], scrollback_lines: u64) -> Str
     output.push_str("-- wa: generated ssh_domains config\n");
     output.push_str("config = config or {}\n");
     output.push_str(&format!("config.scrollback_lines = {scrollback_lines}\n\n"));
+    // Preserve any existing ssh_domains defined outside the WA block
+    output.push_str("config.ssh_domains = config.ssh_domains or {}\n");
     if hosts.is_empty() {
         output.push_str(
             "-- No SSH hosts found; add entries manually or re-run wa setup --list-hosts\n",
         );
-        output.push_str("config.ssh_domains = {}\n");
     } else {
-        output.push_str("config.ssh_domains = {\n");
+        output.push_str("local wa_ssh_domains = {\n");
 
         for host in hosts {
             let name = lua_escape(&host.alias);
@@ -655,11 +656,27 @@ pub fn generate_ssh_domains_lua(hosts: &[SshHost], scrollback_lines: u64) -> Str
             if let Some(port) = host.port {
                 output.push_str(&format!("    port = {},\n", port));
             }
+            // Emit identity files so WezTerm uses the correct SSH keys (#15)
+            if !host.identity_files.is_empty() {
+                // WezTerm ssh_domains accept ssh_option for extra SSH options
+                output.push_str("    ssh_option = {\n");
+                for ifile in &host.identity_files {
+                    output.push_str(&format!(
+                        "      identityfile = '{}',\n",
+                        lua_escape(ifile)
+                    ));
+                }
+                output.push_str("    },\n");
+            }
             output.push_str("    multiplexing = 'WezTerm',\n");
             output.push_str("  },\n");
         }
 
         output.push_str("}\n");
+        // Append WA-managed domains instead of overwriting (#16)
+        output.push_str("for _, domain in ipairs(wa_ssh_domains) do\n");
+        output.push_str("  table.insert(config.ssh_domains, domain)\n");
+        output.push_str("end\n");
     }
     output.push('\n');
     output.push_str(USERVAR_FORWARDING_LUA);
