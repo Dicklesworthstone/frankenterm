@@ -158,6 +158,14 @@ pub const BUILTIN_ACHIEVEMENTS: &[AchievementDefinition] = &[
         rarity: Rarity::Uncommon,
         secret: false,
     },
+    AchievementDefinition {
+        id: "track_robot_complete",
+        name: "Robot Operator",
+        description: "Completed all Robot Mode exercises",
+        icon: '\u{1F916}', // robot face
+        rarity: Rarity::Uncommon,
+        secret: false,
+    },
     // --- Cross-track milestones (Uncommon/Rare) ---
     AchievementDefinition {
         id: "explorer",
@@ -384,24 +392,40 @@ impl TutorialEngine {
             Track {
                 id: "basics".into(),
                 name: "Basics".into(),
-                description: "What is wa? Start watching. View status.".into(),
+                description: "What is wa? Check WezTerm. Start watching. View status. See events."
+                    .into(),
                 estimated_minutes: 5,
                 exercises: vec![
                     Exercise {
                         id: "basics.1".into(),
-                        title: "Check your environment".into(),
-                        description: "Verify wa can connect to WezTerm".into(),
+                        title: "What is wa?".into(),
+                        description:
+                            "Get the 30-second mental model: wa is a terminal hypervisor for AI agent swarms."
+                                .into(),
                         instructions: vec![
-                            "Run: wa doctor".into(),
-                            "Check that WezTerm is detected".into(),
+                            "Read this flow: WezTerm panes -> ingest -> storage/events -> workflows + robot/MCP.".into(),
+                            "Goal: understand wa observes output, detects state transitions, then safely automates responses.".into(),
                         ],
-                        verification_command: Some("wa doctor --json".into()),
-                        verification_pattern: Some("wezterm.*ok".into()),
+                        verification_command: None,
+                        verification_pattern: None,
                         requirements: vec![],
                         can_simulate: true,
                     },
                     Exercise {
                         id: "basics.2".into(),
+                        title: "Check WezTerm".into(),
+                        description: "Verify wa can see your WezTerm environment".into(),
+                        instructions: vec![
+                            "Run: wa doctor".into(),
+                            "Confirm WezTerm is detected (or use sandbox mode if unavailable).".into(),
+                        ],
+                        verification_command: Some("wa doctor --json".into()),
+                        verification_pattern: Some("wezterm".into()),
+                        requirements: vec![],
+                        can_simulate: true,
+                    },
+                    Exercise {
+                        id: "basics.3".into(),
                         title: "Start the watcher".into(),
                         description: "Launch the wa daemon to observe terminal activity".into(),
                         instructions: vec![
@@ -409,18 +433,38 @@ impl TutorialEngine {
                             "The watcher starts in the background".into(),
                         ],
                         verification_command: Some("wa status --json".into()),
-                        verification_pattern: Some("running.*true".into()),
+                        verification_pattern: Some("\"running\"\\s*:\\s*true".into()),
                         requirements: vec![Requirement::WeztermRunning],
-                        can_simulate: false,
+                        can_simulate: true,
                     },
                     Exercise {
-                        id: "basics.3".into(),
+                        id: "basics.4".into(),
                         title: "View pane status".into(),
                         description: "See what panes wa is observing".into(),
-                        instructions: vec!["Run: wa list".into(), "Run: wa status".into()],
+                        instructions: vec![
+                            "Run: wa status".into(),
+                            "Run: wa list".into(),
+                            "Check that pane metadata and watcher state make sense.".into(),
+                        ],
                         verification_command: None,
                         verification_pattern: None,
                         requirements: vec![Requirement::WatcherRunning],
+                        can_simulate: true,
+                    },
+                    Exercise {
+                        id: "basics.5".into(),
+                        title: "Your first event".into(),
+                        description:
+                            "Inspect detections and understand what wa records when patterns match."
+                                .into(),
+                        instructions: vec![
+                            "Run: wa events".into(),
+                            "If there are no events yet, continue in sandbox/simulation mode.".into(),
+                            "Identify one event type and what it means.".into(),
+                        ],
+                        verification_command: None,
+                        verification_pattern: None,
+                        requirements: vec![Requirement::DbHasData],
                         can_simulate: true,
                     },
                 ],
@@ -433,11 +477,39 @@ impl TutorialEngine {
                 exercises: vec![
                     Exercise {
                         id: "events.1".into(),
-                        title: "View detected events".into(),
-                        description: "See what patterns wa has detected".into(),
+                        title: "What are events?".into(),
+                        description:
+                            "Events are meaningful terminal occurrences wa detects via pattern rules."
+                                .into(),
                         instructions: vec![
-                            "Run: wa robot events".into(),
-                            "Look for pattern matches".into(),
+                            "Review: events represent things like usage limits, compaction, and errors.".into(),
+                            "Goal: understand events are structured detections, not raw log lines.".into(),
+                        ],
+                        verification_command: None,
+                        verification_pattern: None,
+                        requirements: vec![],
+                        can_simulate: true,
+                    },
+                    Exercise {
+                        id: "events.2".into(),
+                        title: "Pattern packs".into(),
+                        description: "Explore built-in rule packs and what they cover".into(),
+                        instructions: vec![
+                            "Run: wa rules list".into(),
+                            "Identify at least one core pack and an example rule it contains.".into(),
+                        ],
+                        verification_command: None,
+                        verification_pattern: None,
+                        requirements: vec![],
+                        can_simulate: true,
+                    },
+                    Exercise {
+                        id: "events.3".into(),
+                        title: "View recent events".into(),
+                        description: "Inspect recent detections and event fields".into(),
+                        instructions: vec![
+                            "Run: wa events --limit 5".into(),
+                            "Inspect fields like rule/event type, pane, and timestamp.".into(),
                         ],
                         verification_command: None,
                         verification_pattern: None,
@@ -445,12 +517,40 @@ impl TutorialEngine {
                         can_simulate: true,
                     },
                     Exercise {
-                        id: "events.2".into(),
-                        title: "Search pane output".into(),
-                        description: "Use FTS5 to search captured output".into(),
+                        id: "events.4".into(),
+                        title: "Search events and output".into(),
+                        description: "Use FTS queries to find relevant event context".into(),
                         instructions: vec![
-                            "Run: wa search \"error\"".into(),
-                            "Try different search terms".into(),
+                            "Run: wa query \"compaction\"".into(),
+                            "Try at least one alternate search term and compare results.".into(),
+                        ],
+                        verification_command: None,
+                        verification_pattern: None,
+                        requirements: vec![Requirement::DbHasData],
+                        can_simulate: true,
+                    },
+                    Exercise {
+                        id: "events.5".into(),
+                        title: "Test a pattern".into(),
+                        description: "Run rule evaluation against sample text".into(),
+                        instructions: vec![
+                            "Run: wa rules test \"Session limit reached\"".into(),
+                            "Observe which rule matches and why.".into(),
+                        ],
+                        verification_command: None,
+                        verification_pattern: None,
+                        requirements: vec![],
+                        can_simulate: true,
+                    },
+                    Exercise {
+                        id: "events.6".into(),
+                        title: "Trigger a detection (simulated)".into(),
+                        description:
+                            "Simulate a detection path and confirm it appears in the events feed."
+                                .into(),
+                        instructions: vec![
+                            "In sandbox mode, simulate a usage-limit style event.".into(),
+                            "Run: wa events and confirm the simulated detection is visible.".into(),
                         ],
                         verification_command: None,
                         verification_pattern: None,
@@ -467,26 +567,199 @@ impl TutorialEngine {
                 exercises: vec![
                     Exercise {
                         id: "workflows.1".into(),
-                        title: "List workflows".into(),
-                        description: "See available workflow definitions".into(),
-                        instructions: vec!["Run: wa workflow list".into()],
+                        title: "What are workflows?".into(),
+                        description:
+                            "Workflows are automated multi-step responses to detected events."
+                                .into(),
+                        instructions: vec![
+                            "Review this flow: Event -> Workflow -> Steps -> Verification.".into(),
+                            "Goal: understand workflows orchestrate safe, deterministic actions."
+                                .into(),
+                        ],
+                        verification_command: None,
+                        verification_pattern: None,
+                        requirements: vec![],
+                        can_simulate: true,
+                    },
+                    Exercise {
+                        id: "workflows.2".into(),
+                        title: "Built-in workflows".into(),
+                        description: "List available built-in workflows and what they do".into(),
+                        instructions: vec![
+                            "Run: wa workflow list".into(),
+                            "Identify at least one workflow (for example handle_compaction).".into(),
+                        ],
                         verification_command: None,
                         verification_pattern: None,
                         requirements: vec![Requirement::WaConfigured],
                         can_simulate: true,
                     },
                     Exercise {
-                        id: "workflows.2".into(),
-                        title: "Run a workflow manually".into(),
-                        description: "Trigger a workflow on demand".into(),
+                        id: "workflows.3".into(),
+                        title: "Policy gates".into(),
+                        description:
+                            "Understand allow/deny/require-approval decisions before actions run."
+                                .into(),
                         instructions: vec![
-                            "Run: wa workflow run <name>".into(),
-                            "Check the output".into(),
+                            "Review why wa may require approval for risky actions.".into(),
+                            "Goal: understand safety checks are intentional guardrails.".into(),
+                        ],
+                        verification_command: None,
+                        verification_pattern: None,
+                        requirements: vec![],
+                        can_simulate: true,
+                    },
+                    Exercise {
+                        id: "workflows.4".into(),
+                        title: "Run a workflow (dry-run)".into(),
+                        description: "Preview a workflow step plan without executing side effects"
+                            .into(),
+                        instructions: vec![
+                            "Run: wa workflow run handle_compaction --dry-run".into(),
+                            "Inspect the generated steps and verification expectations.".into(),
                         ],
                         verification_command: None,
                         verification_pattern: None,
                         requirements: vec![Requirement::WaConfigured, Requirement::WatcherRunning],
-                        can_simulate: false,
+                        can_simulate: true,
+                    },
+                    Exercise {
+                        id: "workflows.5".into(),
+                        title: "Workflow step logs".into(),
+                        description: "Inspect workflow execution states, timing, and outcomes".into(),
+                        instructions: vec![
+                            "Run: wa workflow status <execution_id> -v".into(),
+                            "Read step-level status and timing output.".into(),
+                        ],
+                        verification_command: None,
+                        verification_pattern: None,
+                        requirements: vec![Requirement::DbHasData],
+                        can_simulate: true,
+                    },
+                    Exercise {
+                        id: "workflows.6".into(),
+                        title: "Watch a workflow execute (simulated)".into(),
+                        description:
+                            "Observe a simulated event-driven workflow execution from trigger to completion."
+                                .into(),
+                        instructions: vec![
+                            "In sandbox mode, simulate an event that triggers a workflow.".into(),
+                            "Confirm you can follow step progression to completion.".into(),
+                        ],
+                        verification_command: None,
+                        verification_pattern: None,
+                        requirements: vec![Requirement::DbHasData],
+                        can_simulate: true,
+                    },
+                    Exercise {
+                        id: "workflows.7".into(),
+                        title: "Approval flow".into(),
+                        description: "Practice the require-approval path and continuation".into(),
+                        instructions: vec![
+                            "Run: wa approve <token> in sandbox/tutorial context.".into(),
+                            "Confirm the workflow can continue after approval.".into(),
+                        ],
+                        verification_command: None,
+                        verification_pattern: None,
+                        requirements: vec![Requirement::WaConfigured],
+                        can_simulate: true,
+                    },
+                ],
+            },
+            Track {
+                id: "robot".into(),
+                name: "Robot Mode".into(),
+                description: "Building machine-readable integrations for agents.".into(),
+                estimated_minutes: 10,
+                exercises: vec![
+                    Exercise {
+                        id: "robot.1".into(),
+                        title: "What is Robot Mode?".into(),
+                        description:
+                            "Robot mode provides stable machine-readable output for agent integrations."
+                                .into(),
+                        instructions: vec![
+                            "Review: Robot mode uses a stable success/data/error envelope for automation."
+                                .into(),
+                            "Goal: understand Robot mode is designed for agent-to-agent tooling.".into(),
+                        ],
+                        verification_command: None,
+                        verification_pattern: None,
+                        requirements: vec![],
+                        can_simulate: true,
+                    },
+                    Exercise {
+                        id: "robot.2".into(),
+                        title: "JSON envelope".into(),
+                        description: "Inspect Robot mode state output and envelope structure".into(),
+                        instructions: vec![
+                            "Run: wa robot state".into(),
+                            "Identify the envelope fields (ok/data/error/hint).".into(),
+                        ],
+                        verification_command: None,
+                        verification_pattern: None,
+                        requirements: vec![Requirement::WeztermRunning],
+                        can_simulate: true,
+                    },
+                    Exercise {
+                        id: "robot.3".into(),
+                        title: "Error codes".into(),
+                        description:
+                            "Trigger and inspect a structured Robot mode error response.".into(),
+                        instructions: vec![
+                            "Run a command with an invalid pane id to observe structured errors."
+                                .into(),
+                            "Note the error code and hint fields.".into(),
+                        ],
+                        verification_command: None,
+                        verification_pattern: None,
+                        requirements: vec![],
+                        can_simulate: true,
+                    },
+                    Exercise {
+                        id: "robot.4".into(),
+                        title: "Quick-start for agents".into(),
+                        description:
+                            "Use quick-start output to bootstrap an automated agent session.".into(),
+                        instructions: vec![
+                            "Run: wa robot quick-start".into(),
+                            "Confirm the output contains concise machine-friendly startup context."
+                                .into(),
+                        ],
+                        verification_command: None,
+                        verification_pattern: None,
+                        requirements: vec![],
+                        can_simulate: true,
+                    },
+                    Exercise {
+                        id: "robot.5".into(),
+                        title: "Poll for unhandled events".into(),
+                        description:
+                            "Practice the agent loop pattern: poll events -> process -> mark handled."
+                                .into(),
+                        instructions: vec![
+                            "Run: wa robot events --unhandled".into(),
+                            "Interpret the returned envelope and event list.".into(),
+                        ],
+                        verification_command: None,
+                        verification_pattern: None,
+                        requirements: vec![Requirement::DbHasData],
+                        can_simulate: true,
+                    },
+                    Exercise {
+                        id: "robot.6".into(),
+                        title: "Safe send (simulated)".into(),
+                        description:
+                            "Exercise policy-gated send behavior in sandbox/simulation mode.".into(),
+                        instructions: vec![
+                            "In sandbox mode, run a Robot send command and inspect policy decision output."
+                                .into(),
+                            "Confirm unsafe sends are gated instead of silently executed.".into(),
+                        ],
+                        verification_command: None,
+                        verification_pattern: None,
+                        requirements: vec![Requirement::WaConfigured],
+                        can_simulate: true,
                     },
                 ],
             },
@@ -606,7 +879,7 @@ impl TutorialEngine {
         }
 
         // First watch achievement
-        if self.state.completed_exercises.contains("basics.2") && !has("first_watch") {
+        if self.state.completed_exercises.contains("basics.3") && !has("first_watch") {
             to_add.push((
                 "first_watch".into(),
                 "First Watch".into(),
@@ -615,7 +888,10 @@ impl TutorialEngine {
         }
 
         // First event achievement
-        if self.state.completed_exercises.contains("events.1") && !has("first_event") {
+        if (self.state.completed_exercises.contains("basics.5")
+            || self.state.completed_exercises.contains("events.3"))
+            && !has("first_event")
+        {
             to_add.push((
                 "first_event".into(),
                 "Event Spotter".into(),
@@ -624,7 +900,7 @@ impl TutorialEngine {
         }
 
         // Searcher — FTS5 search exercise
-        if self.state.completed_exercises.contains("events.2") && !has("searcher") {
+        if self.state.completed_exercises.contains("events.4") && !has("searcher") {
             to_add.push((
                 "searcher".into(),
                 "Data Detective".into(),
@@ -633,7 +909,7 @@ impl TutorialEngine {
         }
 
         // Workflow runner — listed workflows
-        if self.state.completed_exercises.contains("workflows.1") && !has("workflow_runner") {
+        if self.state.completed_exercises.contains("workflows.2") && !has("workflow_runner") {
             to_add.push((
                 "workflow_runner".into(),
                 "Workflow Runner".into(),
@@ -1169,12 +1445,12 @@ mod tests {
         let path = dir.path().join("learn.json");
         let mut engine = TutorialEngine::load_or_create_at(path).unwrap();
 
-        assert_eq!(engine.track_progress("basics"), (0, 3));
+        assert_eq!(engine.track_progress("basics"), (0, 5));
 
         engine
             .handle_event(TutorialEvent::CompleteExercise("basics.1".into()))
             .unwrap();
-        assert_eq!(engine.track_progress("basics"), (1, 3));
+        assert_eq!(engine.track_progress("basics"), (1, 5));
 
         engine
             .handle_event(TutorialEvent::CompleteExercise("basics.2".into()))
@@ -1182,7 +1458,13 @@ mod tests {
         engine
             .handle_event(TutorialEvent::CompleteExercise("basics.3".into()))
             .unwrap();
-        assert_eq!(engine.track_progress("basics"), (3, 3));
+        engine
+            .handle_event(TutorialEvent::CompleteExercise("basics.4".into()))
+            .unwrap();
+        engine
+            .handle_event(TutorialEvent::CompleteExercise("basics.5".into()))
+            .unwrap();
+        assert_eq!(engine.track_progress("basics"), (5, 5));
         assert!(engine.is_track_complete("basics"));
     }
 
@@ -1193,7 +1475,7 @@ mod tests {
         let mut engine = TutorialEngine::load_or_create_at(path).unwrap();
 
         engine
-            .handle_event(TutorialEvent::CompleteExercise("basics.2".into()))
+            .handle_event(TutorialEvent::CompleteExercise("basics.3".into()))
             .unwrap();
 
         // Should have unlocked "first_watch" achievement
@@ -1283,6 +1565,12 @@ mod tests {
         engine
             .handle_event(TutorialEvent::CompleteExercise("basics.3".into()))
             .unwrap();
+        engine
+            .handle_event(TutorialEvent::CompleteExercise("basics.4".into()))
+            .unwrap();
+        engine
+            .handle_event(TutorialEvent::CompleteExercise("basics.5".into()))
+            .unwrap();
 
         // After completing last exercise, current_exercise becomes None
         assert!(engine.state().current_exercise.is_none());
@@ -1342,6 +1630,12 @@ mod tests {
         engine
             .handle_event(TutorialEvent::SkipExercise("basics.3".into()))
             .unwrap();
+        engine
+            .handle_event(TutorialEvent::SkipExercise("basics.4".into()))
+            .unwrap();
+        engine
+            .handle_event(TutorialEvent::SkipExercise("basics.5".into()))
+            .unwrap();
 
         assert!(engine.state().current_exercise.is_none());
         // But track is NOT complete since nothing was completed
@@ -1359,7 +1653,7 @@ mod tests {
         let mut engine = TutorialEngine::load_or_create_at(path).unwrap();
 
         engine
-            .handle_event(TutorialEvent::CompleteExercise("events.1".into()))
+            .handle_event(TutorialEvent::CompleteExercise("events.3".into()))
             .unwrap();
 
         assert!(
@@ -1377,7 +1671,9 @@ mod tests {
         let path = dir.path().join("learn.json");
         let mut engine = TutorialEngine::load_or_create_at(path).unwrap();
 
-        for id in &["events.1", "events.2"] {
+        for id in &[
+            "events.1", "events.2", "events.3", "events.4", "events.5", "events.6",
+        ] {
             engine
                 .handle_event(TutorialEvent::CompleteExercise((*id).into()))
                 .unwrap();
@@ -1389,6 +1685,29 @@ mod tests {
                 .achievements
                 .iter()
                 .any(|a| a.id == "track_events_complete")
+        );
+    }
+
+    #[test]
+    fn test_robot_track_completion_achievement() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("learn.json");
+        let mut engine = TutorialEngine::load_or_create_at(path).unwrap();
+
+        for id in &[
+            "robot.1", "robot.2", "robot.3", "robot.4", "robot.5", "robot.6",
+        ] {
+            engine
+                .handle_event(TutorialEvent::CompleteExercise((*id).into()))
+                .unwrap();
+        }
+
+        assert!(
+            engine
+                .state()
+                .achievements
+                .iter()
+                .any(|a| a.id == "track_robot_complete")
         );
     }
 
@@ -1434,7 +1753,7 @@ mod tests {
 
         let (completed, total) = engine.overall_progress();
         assert_eq!(completed, 0);
-        assert_eq!(total, 7); // 3 basics + 2 events + 2 workflows
+        assert_eq!(total, 24); // 5 basics + 6 events + 7 workflows + 6 robot
 
         engine
             .handle_event(TutorialEvent::CompleteExercise("basics.1".into()))
@@ -1467,7 +1786,7 @@ mod tests {
 
         let ex = engine.current_exercise().unwrap();
         assert_eq!(ex.id, "basics.1");
-        assert_eq!(ex.title, "Check your environment");
+        assert_eq!(ex.title, "What is wa?");
     }
 
     #[test]
@@ -1486,10 +1805,10 @@ mod tests {
         let status = TutorialStatus::from(&engine);
         assert_eq!(status.current_track.as_deref(), Some("basics"));
         assert_eq!(status.completed_exercises, 1);
-        assert_eq!(status.total_exercises, 7);
-        assert_eq!(status.tracks.len(), 3);
+        assert_eq!(status.total_exercises, 24);
+        assert_eq!(status.tracks.len(), 4);
         assert_eq!(status.tracks[0].completed, 1);
-        assert_eq!(status.tracks[0].total, 3);
+        assert_eq!(status.tracks[0].total, 5);
         assert!(!status.tracks[0].is_complete);
     }
 
@@ -1539,7 +1858,7 @@ mod tests {
 
         let track = engine.get_track("events").unwrap();
         assert_eq!(track.name, "Events");
-        assert_eq!(track.exercises.len(), 2);
+        assert_eq!(track.exercises.len(), 6);
 
         assert!(engine.get_track("nonexistent").is_none());
     }
@@ -1550,7 +1869,7 @@ mod tests {
         let path = dir.path().join("learn.json");
         let engine = TutorialEngine::load_or_create_at(path).unwrap();
 
-        assert_eq!(engine.tracks().len(), 3);
+        assert_eq!(engine.tracks().len(), 4);
         for track in engine.tracks() {
             assert!(!track.exercises.is_empty());
             assert!(!track.name.is_empty());
@@ -1565,11 +1884,14 @@ mod tests {
         let engine = TutorialEngine::load_or_create_at(path).unwrap();
 
         let basics = engine.get_track("basics").unwrap();
-        // basics.1 has verification
-        assert!(basics.exercises[0].verification_command.is_some());
-        assert!(basics.exercises[0].verification_pattern.is_some());
-        // basics.3 has no verification
-        assert!(basics.exercises[2].verification_command.is_none());
+        // basics.1 is informational and has no verification
+        assert!(basics.exercises[0].verification_command.is_none());
+        assert!(basics.exercises[0].verification_pattern.is_none());
+        // basics.2 and basics.3 have verification commands
+        assert!(basics.exercises[1].verification_command.is_some());
+        assert!(basics.exercises[2].verification_command.is_some());
+        // basics.4 has no verification
+        assert!(basics.exercises[3].verification_command.is_none());
     }
 
     #[test]
@@ -1579,7 +1901,7 @@ mod tests {
         let mut engine = TutorialEngine::load_or_create_at(path).unwrap();
 
         engine
-            .handle_event(TutorialEvent::CompleteExercise("basics.2".into()))
+            .handle_event(TutorialEvent::CompleteExercise("basics.3".into()))
             .unwrap();
         assert!(!engine.state().achievements.is_empty());
 
@@ -1713,7 +2035,7 @@ mod tests {
         let mut engine = TutorialEngine::load_or_create_at(path).unwrap();
 
         engine
-            .handle_event(TutorialEvent::CompleteExercise("events.2".into()))
+            .handle_event(TutorialEvent::CompleteExercise("events.4".into()))
             .unwrap();
 
         assert!(
@@ -1732,7 +2054,7 @@ mod tests {
         let mut engine = TutorialEngine::load_or_create_at(path).unwrap();
 
         engine
-            .handle_event(TutorialEvent::CompleteExercise("workflows.1".into()))
+            .handle_event(TutorialEvent::CompleteExercise("workflows.2".into()))
             .unwrap();
 
         assert!(
@@ -1777,6 +2099,16 @@ mod tests {
             .handle_event(TutorialEvent::CompleteExercise("workflows.1".into()))
             .unwrap();
         assert!(
+            !engine
+                .state()
+                .achievements
+                .iter()
+                .any(|a| a.id == "explorer")
+        );
+        engine
+            .handle_event(TutorialEvent::CompleteExercise("robot.1".into()))
+            .unwrap();
+        assert!(
             engine
                 .state()
                 .achievements
@@ -1797,10 +2129,27 @@ mod tests {
             "basics.1",
             "basics.2",
             "basics.3",
+            "basics.4",
+            "basics.5",
             "events.1",
             "events.2",
+            "events.3",
+            "events.4",
+            "events.5",
+            "events.6",
             "workflows.1",
             "workflows.2",
+            "workflows.3",
+            "workflows.4",
+            "workflows.5",
+            "workflows.6",
+            "workflows.7",
+            "robot.1",
+            "robot.2",
+            "robot.3",
+            "robot.4",
+            "robot.5",
+            "robot.6",
         ];
         for ex in &all_exercises {
             engine
@@ -1841,6 +2190,12 @@ mod tests {
         engine
             .handle_event(TutorialEvent::CompleteExercise("basics.3".into()))
             .unwrap();
+        engine
+            .handle_event(TutorialEvent::CompleteExercise("basics.4".into()))
+            .unwrap();
+        engine
+            .handle_event(TutorialEvent::CompleteExercise("basics.5".into()))
+            .unwrap();
 
         assert!(
             engine
@@ -1874,7 +2229,7 @@ mod tests {
         let mut engine = TutorialEngine::load_or_create_at(path).unwrap();
 
         engine
-            .handle_event(TutorialEvent::CompleteExercise("basics.2".into()))
+            .handle_event(TutorialEvent::CompleteExercise("basics.3".into()))
             .unwrap();
 
         let collection = engine.achievement_collection();
@@ -1910,7 +2265,7 @@ mod tests {
         let mut engine = TutorialEngine::load_or_create_at(path).unwrap();
 
         engine
-            .handle_event(TutorialEvent::CompleteExercise("events.1".into()))
+            .handle_event(TutorialEvent::CompleteExercise("events.3".into()))
             .unwrap();
 
         let collection = engine.achievement_collection();
@@ -1928,7 +2283,7 @@ mod tests {
         let mut engine = TutorialEngine::load_or_create_at(path).unwrap();
 
         engine
-            .handle_event(TutorialEvent::CompleteExercise("basics.2".into()))
+            .handle_event(TutorialEvent::CompleteExercise("basics.3".into()))
             .unwrap();
 
         let achievement = engine
@@ -1964,7 +2319,7 @@ mod tests {
         let mut engine = TutorialEngine::load_or_create_at(path).unwrap();
 
         engine
-            .handle_event(TutorialEvent::CompleteExercise("basics.2".into()))
+            .handle_event(TutorialEvent::CompleteExercise("basics.3".into()))
             .unwrap();
 
         let list = engine.format_achievement_list();
@@ -1991,9 +2346,9 @@ mod tests {
         let path = dir.path().join("learn.json");
         let mut engine = TutorialEngine::load_or_create_at(path).unwrap();
 
-        // Completing basics.2 should unlock both first_step and first_watch
+        // Completing basics.3 should unlock both first_step and first_watch
         engine
-            .handle_event(TutorialEvent::CompleteExercise("basics.2".into()))
+            .handle_event(TutorialEvent::CompleteExercise("basics.3".into()))
             .unwrap();
 
         let ids: Vec<&str> = engine
@@ -2015,7 +2370,7 @@ mod tests {
         {
             let mut engine = TutorialEngine::load_or_create_at(path.clone()).unwrap();
             engine
-                .handle_event(TutorialEvent::CompleteExercise("events.1".into()))
+                .handle_event(TutorialEvent::CompleteExercise("events.3".into()))
                 .unwrap();
             engine.save().unwrap();
         }
@@ -2331,36 +2686,58 @@ mod tests {
 
         // basics.1 should have no requirements (can always run)
         let basics = engine.get_track("basics").unwrap();
+        assert_eq!(basics.exercises.len(), 5);
+        assert!(basics.exercises.iter().all(|e| e.can_simulate));
         assert!(basics.exercises[0].requirements.is_empty());
         assert!(basics.exercises[0].can_simulate);
 
-        // basics.2 requires WezTerm
+        // basics.3 requires WezTerm
         assert!(
-            basics.exercises[1]
+            basics.exercises[2]
                 .requirements
                 .contains(&Requirement::WeztermRunning)
         );
-        assert!(!basics.exercises[1].can_simulate);
+        assert!(basics.exercises[2].can_simulate);
 
-        // events.1 requires data
+        // events.3 requires data
         let events = engine.get_track("events").unwrap();
+        assert_eq!(events.exercises.len(), 6);
+        assert!(events.exercises.iter().all(|e| e.can_simulate));
         assert!(
-            events.exercises[0]
+            events.exercises[2]
                 .requirements
                 .contains(&Requirement::DbHasData)
         );
 
-        // workflows.2 requires WaConfigured + WatcherRunning
+        // workflows.4 requires WaConfigured + WatcherRunning
         let workflows = engine.get_track("workflows").unwrap();
+        assert_eq!(workflows.exercises.len(), 7);
+        assert!(workflows.exercises.iter().all(|e| e.can_simulate));
         assert!(
-            workflows.exercises[1]
+            workflows.exercises[3]
                 .requirements
                 .contains(&Requirement::WaConfigured)
         );
         assert!(
-            workflows.exercises[1]
+            workflows.exercises[3]
                 .requirements
                 .contains(&Requirement::WatcherRunning)
+        );
+
+        // robot.5 requires DbHasData and all Robot exercises support simulation
+        let robot = engine.get_track("robot").unwrap();
+        assert_eq!(robot.exercises.len(), 6);
+        assert!(robot.exercises.iter().all(|e| e.can_simulate));
+        assert!(
+            robot.exercises[4]
+                .requirements
+                .contains(&Requirement::DbHasData)
+        );
+        // robot.6 requires WaConfigured
+        assert!(
+            robot.exercises[5]
+                .requirements
+                .contains(&Requirement::WaConfigured)
         );
     }
 }
