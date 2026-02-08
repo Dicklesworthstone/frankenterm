@@ -582,22 +582,64 @@ pub fn build_server_with_db(config: &Config, db_path: Option<PathBuf>) -> Result
 
     if let Some(ref db_path) = db_path {
         builder = builder
-            .tool(WaSearchTool::new(Arc::clone(db_path)))
-            .tool(WaEventsTool::new(Arc::clone(db_path)))
-            .tool(WaEventsAnnotateTool::new(Arc::clone(db_path)))
-            .tool(WaEventsTriageTool::new(Arc::clone(db_path)))
-            .tool(WaEventsLabelTool::new(Arc::clone(db_path)))
-            .tool(WaReservationsTool::new(Arc::clone(db_path)))
-            .tool(WaReserveTool::new(Arc::clone(&config), Arc::clone(db_path)))
-            .tool(WaReleaseTool::new(Arc::clone(&config), Arc::clone(db_path)))
-            .tool(WaSendTool::new(Arc::clone(&config), Arc::clone(db_path)))
-            .tool(WaWorkflowRunTool::new(
-                Arc::clone(&config),
+            .tool(AuditedToolHandler::new(
+                WaSearchTool::new(Arc::clone(db_path)),
+                "wa.search",
                 Arc::clone(db_path),
             ))
-            .tool(WaAccountsTool::new(Arc::clone(db_path)))
-            .tool(WaAccountsRefreshTool::new(
-                Arc::clone(&config),
+            .tool(AuditedToolHandler::new(
+                WaEventsTool::new(Arc::clone(db_path)),
+                "wa.events",
+                Arc::clone(db_path),
+            ))
+            .tool(AuditedToolHandler::new(
+                WaEventsAnnotateTool::new(Arc::clone(db_path)),
+                "wa.events_annotate",
+                Arc::clone(db_path),
+            ))
+            .tool(AuditedToolHandler::new(
+                WaEventsTriageTool::new(Arc::clone(db_path)),
+                "wa.events_triage",
+                Arc::clone(db_path),
+            ))
+            .tool(AuditedToolHandler::new(
+                WaEventsLabelTool::new(Arc::clone(db_path)),
+                "wa.events_label",
+                Arc::clone(db_path),
+            ))
+            .tool(AuditedToolHandler::new(
+                WaReservationsTool::new(Arc::clone(db_path)),
+                "wa.reservations",
+                Arc::clone(db_path),
+            ))
+            .tool(AuditedToolHandler::new(
+                WaReserveTool::new(Arc::clone(&config), Arc::clone(db_path)),
+                "wa.reserve",
+                Arc::clone(db_path),
+            ))
+            .tool(AuditedToolHandler::new(
+                WaReleaseTool::new(Arc::clone(&config), Arc::clone(db_path)),
+                "wa.release",
+                Arc::clone(db_path),
+            ))
+            .tool(AuditedToolHandler::new(
+                WaSendTool::new(Arc::clone(&config), Arc::clone(db_path)),
+                "wa.send",
+                Arc::clone(db_path),
+            ))
+            .tool(AuditedToolHandler::new(
+                WaWorkflowRunTool::new(Arc::clone(&config), Arc::clone(db_path)),
+                "wa.workflow_run",
+                Arc::clone(db_path),
+            ))
+            .tool(AuditedToolHandler::new(
+                WaAccountsTool::new(Arc::clone(db_path)),
+                "wa.accounts",
+                Arc::clone(db_path),
+            ))
+            .tool(AuditedToolHandler::new(
+                WaAccountsRefreshTool::new(Arc::clone(&config), Arc::clone(db_path)),
+                "wa.accounts_refresh",
                 Arc::clone(db_path),
             ))
             .resource(WaEventsResource::new(Arc::clone(db_path)))
@@ -3991,6 +4033,171 @@ fn now_ms() -> u64 {
         .map_or(0, |dur| u64::try_from(dur.as_millis()).unwrap_or(u64::MAX))
 }
 
+// ── MCP audit recording (wa-nu4.3.1.6) ──────────────────────────────────
+
+/// Wrapper that records an audit entry for every tool call.
+///
+/// Wraps any `ToolHandler` and intercepts `call()` to record:
+/// - tool name and redacted argument keys
+/// - success/failure outcome
+/// - error code (if any)
+/// - elapsed time
+struct AuditedToolHandler<T: ToolHandler> {
+    inner: T,
+    tool_name: String,
+    db_path: Arc<PathBuf>,
+}
+
+impl<T: ToolHandler> AuditedToolHandler<T> {
+    fn new(inner: T, tool_name: impl Into<String>, db_path: Arc<PathBuf>) -> Self {
+        Self {
+            inner,
+            tool_name: tool_name.into(),
+            db_path,
+        }
+    }
+}
+
+impl<T: ToolHandler> ToolHandler for AuditedToolHandler<T> {
+    fn definition(&self) -> Tool {
+        self.inner.definition()
+    }
+
+    fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        let start = Instant::now();
+        let raw_args = arguments.clone();
+        let result = self.inner.call(ctx, arguments);
+
+        // Extract ok/error_code from the envelope in the result
+        let (ok, error_code) = match &result {
+            Ok(contents) => {
+                let parsed = contents.first().and_then(|c| match c {
+                    Content::Text { text } => serde_json::from_str::<serde_json::Value>(text).ok(),
+                    _ => None,
+                });
+                let is_ok = parsed
+                    .as_ref()
+                    .and_then(|v| v.get("ok")?.as_bool())
+                    .unwrap_or(true);
+                let code = if !is_ok {
+                    parsed.and_then(|v| v.get("error_code")?.as_str().map(String::from))
+                } else {
+                    None
+                };
+                (is_ok, code)
+            }
+            Err(_) => (false, Some("MCP_INTERNAL".to_string())),
+        };
+
+        record_mcp_audit_sync(
+            &self.db_path,
+            &self.tool_name,
+            &raw_args,
+            ok,
+            error_code.as_deref(),
+            elapsed_ms(start),
+        );
+
+        result
+    }
+}
+
+/// Build a redacted summary of MCP tool arguments (keys only, no values).
+fn redact_mcp_args(tool_name: &str, args: &serde_json::Value) -> String {
+    let keys = args
+        .as_object()
+        .map(|m| m.keys().map(|k| k.as_str()).collect::<Vec<_>>().join(","))
+        .unwrap_or_default();
+    if keys.is_empty() {
+        format!("mcp:{tool_name}")
+    } else {
+        format!("mcp:{tool_name} keys=[{keys}]")
+    }
+}
+
+/// Record an MCP tool call audit entry.
+///
+/// This is fire-and-forget: failures are logged but never propagated to the caller.
+async fn record_mcp_audit(
+    storage: &StorageHandle,
+    tool_name: &str,
+    input_summary: String,
+    decision: &str,
+    result: &str,
+    error_code: Option<&str>,
+    elapsed_ms: u64,
+) {
+    let ts = i64::try_from(now_ms()).unwrap_or(0);
+    let audit = crate::storage::AuditActionRecord {
+        id: 0,
+        ts,
+        actor_kind: "mcp".to_string(),
+        actor_id: None,
+        correlation_id: None,
+        pane_id: None,
+        domain: None,
+        action_kind: format!("mcp.{tool_name}"),
+        policy_decision: decision.to_string(),
+        decision_reason: error_code.map(|c| format!("error_code={c}")),
+        rule_id: None,
+        input_summary: Some(format!("{input_summary} elapsed_ms={elapsed_ms}")),
+        verification_summary: None,
+        decision_context: None,
+        result: result.to_string(),
+    };
+    if let Err(e) = storage.record_audit_action_redacted(audit).await {
+        tracing::warn!(tool = tool_name, error = %e, "Failed to record MCP audit entry");
+    }
+}
+
+/// Record an MCP audit entry for tools that have a db_path available.
+///
+/// Opens a StorageHandle, records the audit, and closes it.
+/// Fire-and-forget: errors are logged, never propagated.
+fn record_mcp_audit_sync(
+    db_path: &PathBuf,
+    tool_name: &str,
+    args: &serde_json::Value,
+    ok: bool,
+    error_code: Option<&str>,
+    elapsed_ms: u64,
+) {
+    let summary = redact_mcp_args(tool_name, args);
+    let db_path_str = db_path.to_string_lossy().to_string();
+    let tool_name = tool_name.to_string();
+    let error_code = error_code.map(|s| s.to_string());
+    let decision = if ok { "allow" } else { "deny" };
+    let result = if ok { "success" } else { "error" };
+
+    // Spawn a background task to record audit — non-blocking, fire-and-forget
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(tool = %tool_name, error = %e, "Failed to create runtime for MCP audit");
+                return;
+            }
+        };
+        rt.block_on(async {
+            if let Ok(storage) = StorageHandle::new(&db_path_str).await {
+                record_mcp_audit(
+                    &storage,
+                    &tool_name,
+                    summary,
+                    decision,
+                    result,
+                    error_code.as_deref(),
+                    elapsed_ms,
+                )
+                .await;
+            }
+        });
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4057,5 +4264,368 @@ mod tests {
             ])
         );
         assert_eq!(templates, uri_set(["wa://rules/{agent_type}".to_string()]));
+    }
+
+    // ── Error code stability tests (wa-nu4.3.1.3) ────────────────────────
+
+    #[test]
+    fn error_codes_have_stable_prefix() {
+        let codes = [
+            MCP_ERR_INVALID_ARGS,
+            MCP_ERR_CONFIG,
+            MCP_ERR_WEZTERM,
+            MCP_ERR_STORAGE,
+            MCP_ERR_POLICY,
+            MCP_ERR_PANE_NOT_FOUND,
+            MCP_ERR_WORKFLOW,
+            MCP_ERR_TIMEOUT,
+            MCP_ERR_NOT_IMPLEMENTED,
+            MCP_ERR_FTS_QUERY,
+            MCP_ERR_RESERVATION_CONFLICT,
+            MCP_ERR_CAUT,
+        ];
+        for code in &codes {
+            assert!(
+                code.starts_with("WA-MCP-"),
+                "Error code {code} must start with WA-MCP-"
+            );
+        }
+        // All codes should be unique
+        let unique: BTreeSet<&str> = codes.iter().copied().collect();
+        assert_eq!(unique.len(), codes.len(), "Error codes must be unique");
+    }
+
+    #[test]
+    fn error_codes_are_numeric_suffixed() {
+        let codes = [
+            MCP_ERR_INVALID_ARGS,
+            MCP_ERR_CONFIG,
+            MCP_ERR_WEZTERM,
+            MCP_ERR_STORAGE,
+            MCP_ERR_POLICY,
+            MCP_ERR_PANE_NOT_FOUND,
+            MCP_ERR_WORKFLOW,
+            MCP_ERR_TIMEOUT,
+            MCP_ERR_NOT_IMPLEMENTED,
+            MCP_ERR_FTS_QUERY,
+            MCP_ERR_RESERVATION_CONFLICT,
+            MCP_ERR_CAUT,
+        ];
+        for code in &codes {
+            let suffix = &code["WA-MCP-".len()..];
+            assert!(
+                suffix.chars().all(|c| c.is_ascii_digit()),
+                "Error code suffix '{suffix}' must be numeric for {code}"
+            );
+        }
+    }
+
+    // ── Envelope schema tests (wa-nu4.3.1.3) ─────────────────────────────
+
+    #[test]
+    fn envelope_success_has_required_fields() {
+        let envelope = McpEnvelope::success("test_data".to_string(), 42);
+        let json = serde_json::to_value(&envelope).unwrap();
+        assert_eq!(json["ok"], true);
+        assert!(json["data"].is_string());
+        assert_eq!(json["elapsed_ms"], 42);
+        assert!(json["version"].is_string());
+        assert!(json["now"].is_number());
+        assert!(json["mcp_version"].is_string());
+        // Error fields should be absent (skip_serializing_if = Option::is_none)
+        assert!(json.get("error").is_none());
+        assert!(json.get("error_code").is_none());
+        assert!(json.get("hint").is_none());
+    }
+
+    #[test]
+    fn envelope_error_has_required_fields() {
+        let envelope = McpEnvelope::<()>::error(
+            MCP_ERR_STORAGE,
+            "db error",
+            Some("Try again".to_string()),
+            99,
+        );
+        let json = serde_json::to_value(&envelope).unwrap();
+        assert_eq!(json["ok"], false);
+        assert!(json.get("data").is_none());
+        assert_eq!(json["error"], "db error");
+        assert_eq!(json["error_code"], "WA-MCP-0005");
+        assert_eq!(json["hint"], "Try again");
+        assert_eq!(json["elapsed_ms"], 99);
+        assert!(json["version"].is_string());
+    }
+
+    #[test]
+    fn envelope_error_without_hint() {
+        let envelope = McpEnvelope::<()>::error(MCP_ERR_TIMEOUT, "timeout", None, 5000);
+        let json = serde_json::to_value(&envelope).unwrap();
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["error_code"], "WA-MCP-0009");
+        assert!(json.get("hint").is_none());
+    }
+
+    #[test]
+    fn envelope_version_matches_crate() {
+        let envelope = McpEnvelope::success((), 0);
+        assert_eq!(envelope.version, crate::VERSION);
+    }
+
+    #[test]
+    fn mcp_version_is_set() {
+        assert!(!MCP_VERSION.is_empty());
+        assert!(
+            MCP_VERSION.starts_with('v')
+                || MCP_VERSION.starts_with("0.")
+                || MCP_VERSION.starts_with("1."),
+            "MCP_VERSION '{MCP_VERSION}' should be versioned"
+        );
+    }
+
+    // ── map_mcp_error coverage (wa-nu4.3.1.3) ────────────────────────────
+
+    #[test]
+    fn map_mcp_error_storage() {
+        let err = crate::Error::Storage(crate::StorageError::Database("test".to_string()));
+        let (code, _hint) = map_mcp_error(&err);
+        assert_eq!(code, MCP_ERR_STORAGE);
+    }
+
+    #[test]
+    fn map_mcp_error_config() {
+        let err = crate::Error::Config(crate::error::ConfigError::ParseError(
+            "bad config".to_string(),
+        ));
+        let (code, _hint) = map_mcp_error(&err);
+        assert_eq!(code, MCP_ERR_CONFIG);
+    }
+
+    // ── Tool definition validation (wa-nu4.3.1.3) ────────────────────────
+
+    #[test]
+    fn all_spec_tools_registered_with_db() {
+        let server = build_server_with_db(&Config::default(), Some(PathBuf::from("wa-test.db")))
+            .expect("build mcp server");
+        let tool_defs = server.tools();
+        let tool_names: BTreeSet<String> = tool_defs.into_iter().map(|t| t.name).collect();
+
+        // All tools from wa-nu4.3.1.1 spec must be present
+        let required = [
+            "wa.state",
+            "wa.get_text",
+            "wa.send",
+            "wa.wait_for",
+            "wa.search",
+            "wa.events",
+            "wa.workflow_run",
+            "wa.accounts",
+            "wa.accounts_refresh",
+            "wa.rules_list",
+            "wa.rules_test",
+            "wa.reservations",
+            "wa.reserve",
+            "wa.release",
+        ];
+        for name in &required {
+            assert!(
+                tool_names.contains(*name),
+                "Required tool '{name}' not registered. Found: {tool_names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_storage_tools_registered_without_db() {
+        let server = build_server_with_db(&Config::default(), None).expect("build mcp server");
+        let tool_defs = server.tools();
+        let tool_names: BTreeSet<String> = tool_defs.into_iter().map(|t| t.name).collect();
+
+        // Non-storage tools must be present even without DB
+        let always_present = [
+            "wa.state",
+            "wa.get_text",
+            "wa.wait_for",
+            "wa.rules_list",
+            "wa.rules_test",
+        ];
+        for name in &always_present {
+            assert!(
+                tool_names.contains(*name),
+                "Non-storage tool '{name}' must be registered without DB. Found: {tool_names:?}"
+            );
+        }
+
+        // Storage-dependent tools must NOT be present without DB
+        let storage_only = [
+            "wa.search",
+            "wa.events",
+            "wa.workflow_run",
+            "wa.accounts",
+            "wa.accounts_refresh",
+            "wa.reservations",
+            "wa.reserve",
+            "wa.release",
+        ];
+        for name in &storage_only {
+            assert!(
+                !tool_names.contains(*name),
+                "Storage tool '{name}' should not be registered without DB"
+            );
+        }
+    }
+
+    #[test]
+    fn all_tool_definitions_have_descriptions() {
+        let server = build_server_with_db(&Config::default(), Some(PathBuf::from("wa-test.db")))
+            .expect("build mcp server");
+        let tool_defs = server.tools();
+        for tool in &tool_defs {
+            assert!(
+                tool.description.as_ref().is_some_and(|d| !d.is_empty()),
+                "Tool '{}' must have a non-empty description",
+                tool.name
+            );
+        }
+    }
+
+    #[test]
+    fn all_tool_definitions_have_input_schemas() {
+        let server = build_server_with_db(&Config::default(), Some(PathBuf::from("wa-test.db")))
+            .expect("build mcp server");
+        let tool_defs = server.tools();
+        for tool in &tool_defs {
+            let schema = &tool.input_schema;
+            assert!(
+                schema.get("type").is_some(),
+                "Tool '{}' input schema must have a 'type' field",
+                tool.name
+            );
+        }
+    }
+
+    #[test]
+    fn all_tool_definitions_have_version() {
+        let server = build_server_with_db(&Config::default(), Some(PathBuf::from("wa-test.db")))
+            .expect("build mcp server");
+        let tool_defs = server.tools();
+        for tool in &tool_defs {
+            assert!(
+                tool.version.as_ref().is_some_and(|v| !v.is_empty()),
+                "Tool '{}' must have a version",
+                tool.name
+            );
+        }
+    }
+
+    #[test]
+    fn tool_count_with_db() {
+        let server = build_server_with_db(&Config::default(), Some(PathBuf::from("wa-test.db")))
+            .expect("build mcp server");
+        let count = server.tools().len();
+        // 5 non-storage + 12 storage-dependent = 17 total
+        assert!(
+            count >= 17,
+            "Expected at least 17 tools with DB, got {count}"
+        );
+    }
+
+    // ── MCP audit tests (wa-nu4.3.1.6) ──────────────────────────────────
+
+    #[test]
+    fn redact_mcp_args_with_keys() {
+        let args = serde_json::json!({"pane_id": 42, "text": "secret stuff", "escape": true});
+        let redacted = redact_mcp_args("wa.send", &args);
+        assert!(redacted.starts_with("mcp:wa.send"));
+        assert!(redacted.contains("keys=["));
+        // Keys present, values absent
+        assert!(redacted.contains("pane_id"));
+        assert!(redacted.contains("text"));
+        assert!(redacted.contains("escape"));
+        assert!(!redacted.contains("secret stuff"));
+        assert!(!redacted.contains("42"));
+    }
+
+    #[test]
+    fn redact_mcp_args_empty_object() {
+        let args = serde_json::json!({});
+        let redacted = redact_mcp_args("wa.state", &args);
+        assert_eq!(redacted, "mcp:wa.state");
+    }
+
+    #[test]
+    fn redact_mcp_args_non_object() {
+        let args = serde_json::json!("just a string");
+        let redacted = redact_mcp_args("wa.get_text", &args);
+        assert_eq!(redacted, "mcp:wa.get_text");
+    }
+
+    #[test]
+    fn redact_mcp_args_nested_values_not_leaked() {
+        let args = serde_json::json!({
+            "api_key": "sk-secret-123",
+            "config": {"nested": "value"},
+            "token": "bearer-abc"
+        });
+        let redacted = redact_mcp_args("wa.accounts_refresh", &args);
+        assert!(!redacted.contains("sk-secret-123"));
+        assert!(!redacted.contains("bearer-abc"));
+        assert!(!redacted.contains("nested"));
+        // Keys only
+        assert!(redacted.contains("api_key"));
+        assert!(redacted.contains("config"));
+        assert!(redacted.contains("token"));
+    }
+
+    #[test]
+    fn audited_handler_delegates_definition() {
+        let inner = WaRulesListTool;
+        let inner_def = inner.definition();
+        let wrapped = AuditedToolHandler::new(
+            inner,
+            "wa.rules_list",
+            Arc::new(PathBuf::from("/tmp/test.db")),
+        );
+        let wrapped_def = wrapped.definition();
+        assert_eq!(inner_def.name, wrapped_def.name);
+        assert_eq!(inner_def.description, wrapped_def.description);
+    }
+
+    #[test]
+    fn audited_handler_preserves_tool_name() {
+        let handler = AuditedToolHandler::new(
+            WaRulesTestTool,
+            "wa.rules_test",
+            Arc::new(PathBuf::from("/tmp/test.db")),
+        );
+        assert_eq!(handler.tool_name, "wa.rules_test");
+    }
+
+    #[test]
+    fn all_storage_tools_wrapped_with_audit() {
+        // Verify tool names still match after wrapping
+        let server = build_server_with_db(&Config::default(), Some(PathBuf::from("wa-test.db")))
+            .expect("build mcp server");
+        let tool_names: BTreeSet<String> = server.tools().into_iter().map(|t| t.name).collect();
+
+        let audited_tools = [
+            "wa.search",
+            "wa.events",
+            "wa.events_annotate",
+            "wa.events_triage",
+            "wa.events_label",
+            "wa.reservations",
+            "wa.reserve",
+            "wa.release",
+            "wa.send",
+            "wa.workflow_run",
+            "wa.accounts",
+            "wa.accounts_refresh",
+        ];
+        for name in &audited_tools {
+            assert!(
+                tool_names.contains(*name),
+                "Audited tool '{name}' must still be registered after wrapping"
+            );
+        }
     }
 }

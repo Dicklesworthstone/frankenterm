@@ -40,6 +40,6 @@ pub use renderers::{
     EventListRenderer, HealthDiagnostic, HealthDiagnosticStatus, HealthSnapshotRenderer,
     PaneTableRenderer, Render, RenderContext, RuleDetail, RuleDetailRenderer, RuleListItem,
     RuleTestMatch, RulesListRenderer, RulesTestRenderer, SearchResultRenderer,
-    WorkflowResultRenderer,
+    SearchSuggestRenderer, TimelineRenderer, WorkflowResultRenderer,
 };
 pub use table::{Alignment, Column, Table};

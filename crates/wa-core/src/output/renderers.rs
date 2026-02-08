@@ -9,7 +9,8 @@ use super::format::{OutputFormat, Style};
 use super::table::{Alignment, Column, Table};
 use crate::event_templates;
 use crate::storage::{
-    ActionHistoryRecord, AuditActionRecord, PaneRecord, SearchResult, StoredEvent,
+    ActionHistoryRecord, AuditActionRecord, CorrelationType, PaneRecord, SearchResult,
+    SearchSuggestion, StoredEvent, Timeline,
 };
 
 /// Rendering context with shared settings
@@ -520,6 +521,58 @@ impl SearchResultRenderer {
                 "... and {} more results (use --limit to see more)\n",
                 results.len() - ctx.limit
             )));
+        }
+
+        output
+    }
+}
+
+// =============================================================================
+// Search Suggest Renderer
+// =============================================================================
+
+pub struct SearchSuggestRenderer;
+
+impl SearchSuggestRenderer {
+    /// Render search query suggestions.
+    #[must_use]
+    pub fn render(suggestions: &[SearchSuggestion], partial: &str, ctx: &RenderContext) -> String {
+        if ctx.format.is_json() {
+            return serde_json::to_string_pretty(suggestions).unwrap_or_else(|_| "[]".to_string());
+        }
+
+        let style = Style::from_format(ctx.format);
+
+        if suggestions.is_empty() {
+            return format!(
+                "{}\n",
+                style.dim(&format!(
+                    "No suggestions{}",
+                    if partial.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" for \"{partial}\"")
+                    }
+                ))
+            );
+        }
+
+        let mut output = String::new();
+        let heading = if partial.is_empty() {
+            "Search suggestions:".to_string()
+        } else {
+            format!("Suggestions for \"{partial}\":")
+        };
+        output.push_str(&style.bold(&heading));
+        output.push('\n');
+
+        for suggestion in suggestions {
+            let desc = suggestion.description.as_deref().unwrap_or("");
+            output.push_str(&format!(
+                "  {} {}\n",
+                style.bold(&suggestion.text),
+                style.dim(&format!("— {desc}"))
+            ));
         }
 
         output
@@ -2063,6 +2116,187 @@ impl AnalyticsExportRenderer {
     pub fn render_json(metrics: &[crate::storage::UsageMetricRecord]) -> String {
         serde_json::to_string_pretty(metrics).unwrap_or_else(|_| "[]".to_string())
     }
+}
+
+// =============================================================================
+// Timeline Renderer (wa-6sk.3)
+// =============================================================================
+
+/// Renderer for event timeline with cross-pane correlations
+pub struct TimelineRenderer;
+
+impl TimelineRenderer {
+    /// Render a timeline with ASCII visualization
+    #[must_use]
+    pub fn render(timeline: &Timeline, ctx: &RenderContext) -> String {
+        if ctx.format.is_json() {
+            return serde_json::to_string_pretty(timeline).unwrap_or_else(|_| "{}".to_string());
+        }
+
+        let style = Style::from_format(ctx.format);
+
+        if timeline.events.is_empty() {
+            return style.dim("No events in timeline\n");
+        }
+
+        let mut output = String::new();
+
+        // Header: time range and summary
+        let pane_ids: std::collections::HashSet<u64> = timeline
+            .events
+            .iter()
+            .map(|e| e.pane_info.pane_id)
+            .collect();
+        let header = format!(
+            "Timeline: {} - {} ({} panes, {} events)\n\n",
+            format_timestamp(timeline.start),
+            format_timestamp(timeline.end),
+            pane_ids.len(),
+            timeline.total_count,
+        );
+        output.push_str(&style.bold(&header));
+
+        // Build correlation lookup: event_id -> list of correlation labels
+        let mut corr_labels: std::collections::HashMap<i64, Vec<String>> =
+            std::collections::HashMap::new();
+        for corr in &timeline.correlations {
+            let label = match corr.correlation_type {
+                CorrelationType::Failover => "failover",
+                CorrelationType::Cascade => "cascade",
+                CorrelationType::Temporal => "temporal",
+                CorrelationType::WorkflowGroup => "workflow-group",
+                CorrelationType::DedupeGroup => "dedupe-group",
+            };
+            for &eid in &corr.event_ids {
+                corr_labels.entry(eid).or_default().push(label.to_string());
+            }
+        }
+
+        // Render each event as a timeline entry
+        let events = &timeline.events;
+        for (i, event) in events.iter().enumerate() {
+            let ts = format_time_hms(event.timestamp);
+            let connector = if i == 0 {
+                "\u{2500}\u{252c}\u{2500}" // ─┬─
+            } else if i == events.len() - 1 {
+                "\u{2500}\u{2534}\u{2500}" // ─┴─
+            } else {
+                "\u{2500}\u{253c}\u{2500}" // ─┼─
+            };
+
+            // Pane label
+            let agent_label = event.pane_info.agent_type.as_deref().unwrap_or("unknown");
+            let pane_label = format!("Pane {} ({})", event.pane_info.pane_id, agent_label,);
+
+            // Event line
+            let mut line = format!(
+                "{} {} {}: {}",
+                style.dim(&ts),
+                connector,
+                style.cyan(&pane_label),
+                event.event_type,
+            );
+
+            // Handled indicator
+            if let Some(ref handled) = event.handled {
+                let handled_ts = format_time_hms(handled.handled_at);
+                line.push_str(&format!(
+                    " {}",
+                    style.green(&format!("\u{2500}\u{2500}\u{2192} handled ({handled_ts})")),
+                ));
+            }
+
+            // Correlation markers
+            if let Some(labels) = corr_labels.get(&event.id) {
+                let unique: std::collections::HashSet<&str> =
+                    labels.iter().map(|s| s.as_str()).collect();
+                let mut sorted: Vec<&str> = unique.into_iter().collect();
+                sorted.sort_unstable();
+                for label in sorted {
+                    line.push_str(&format!(
+                        " {}",
+                        style.yellow(&format!("[CORRELATED: {label}]")),
+                    ));
+                }
+            }
+
+            output.push_str(&line);
+            output.push('\n');
+
+            // Verbose: show workflow info on a sub-line
+            if ctx.is_verbose() {
+                if let Some(ref handled) = event.handled {
+                    if let Some(ref wf_id) = handled.workflow_id {
+                        output.push_str(&format!(
+                            "          {}\n",
+                            style.dim(&format!(
+                                "\u{251c}\u{2500}\u{2500}\u{2192} workflow: {} ({})",
+                                wf_id, handled.status
+                            )),
+                        ));
+                    }
+                }
+            }
+
+            // Debug: show full event details
+            if ctx.is_debug() {
+                output.push_str(&format!(
+                    "          {} id={} rule={} sev={} conf={:.2}\n",
+                    style.dim("\u{2502}"),
+                    event.id,
+                    event.rule_id,
+                    event.severity,
+                    event.confidence,
+                ));
+                if let Some(ref summary) = event.summary {
+                    output.push_str(&format!(
+                        "          {} {}\n",
+                        style.dim("\u{2502}"),
+                        style.dim(summary),
+                    ));
+                }
+                for cref in &event.correlations {
+                    output.push_str(&format!(
+                        "          {} corr: {} ({:?})\n",
+                        style.dim("\u{2502}"),
+                        cref.id,
+                        cref.correlation_type,
+                    ));
+                }
+            }
+
+            // Vertical connector between events
+            if i < events.len() - 1 {
+                output.push_str(&format!("          {}\n", style.dim("\u{2502}"),));
+            }
+        }
+
+        // Pagination hint
+        if timeline.has_more {
+            output.push_str(&style.dim(&format!(
+                "\n... {} more events (use --limit to see more)\n",
+                timeline.total_count as usize - events.len(),
+            )));
+        }
+
+        // Legend
+        output.push('\n');
+        output.push_str(&style.dim(
+            "Legend: \u{2500}\u{2500}\u{2192} workflow action  [CORRELATED] cross-pane relationship\n",
+        ));
+
+        output
+    }
+}
+
+/// Format epoch-ms as HH:MM:SS for timeline display
+fn format_time_hms(epoch_ms: i64) -> String {
+    let secs_since_epoch = u64::try_from(epoch_ms / 1000).unwrap_or(0);
+    let secs_in_day = secs_since_epoch % 86400;
+    let hours = secs_in_day / 3600;
+    let minutes = (secs_in_day % 3600) / 60;
+    let seconds = secs_in_day % 60;
+    format!("{hours:02}:{minutes:02}:{seconds:02}")
 }
 
 /// Format a large number with comma separators
@@ -3854,5 +4088,350 @@ mod tests {
         assert_eq!(super::format_token_count(175_000), "175K");
         assert_eq!(super::format_token_count(1_500_000), "1.5M");
         assert_eq!(super::format_token_count(0), "0");
+    }
+
+    // ── Timeline renderer tests (wa-6sk.3) ────────────────────────────────
+
+    use crate::storage::{Correlation, CorrelationRef, HandledInfo, PaneInfo, TimelineEvent};
+
+    fn sample_pane_info(pane_id: u64, agent_type: &str) -> PaneInfo {
+        PaneInfo {
+            pane_id,
+            pane_uuid: None,
+            agent_type: Some(agent_type.to_string()),
+            domain: "local".to_string(),
+            cwd: Some("/home/user".to_string()),
+            title: None,
+        }
+    }
+
+    fn sample_timeline_event(id: i64, pane_id: u64, ts: i64) -> TimelineEvent {
+        TimelineEvent {
+            id,
+            timestamp: ts,
+            pane_info: sample_pane_info(pane_id, "codex"),
+            rule_id: format!("rule.{id}"),
+            event_type: "session.started".to_string(),
+            severity: "info".to_string(),
+            confidence: 0.9,
+            handled: None,
+            correlations: vec![],
+            summary: None,
+        }
+    }
+
+    fn sample_timeline(events: Vec<TimelineEvent>, correlations: Vec<Correlation>) -> Timeline {
+        let start = events.iter().map(|e| e.timestamp).min().unwrap_or(0);
+        let end = events.iter().map(|e| e.timestamp).max().unwrap_or(0);
+        let total = events.len() as u64;
+        Timeline {
+            start,
+            end,
+            events,
+            correlations,
+            total_count: total,
+            has_more: false,
+        }
+    }
+
+    #[test]
+    fn timeline_empty_renders_message() {
+        let tl = sample_timeline(vec![], vec![]);
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = TimelineRenderer::render(&tl, &ctx);
+        assert!(output.contains("No events"), "{output}");
+    }
+
+    #[test]
+    fn timeline_single_event_renders() {
+        let events = vec![sample_timeline_event(1, 3, 1_738_000_000_000)];
+        let tl = sample_timeline(events, vec![]);
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = TimelineRenderer::render(&tl, &ctx);
+        assert!(output.contains("Pane 3"), "{output}");
+        assert!(output.contains("session.started"), "{output}");
+        assert!(output.contains("Timeline:"), "{output}");
+        assert!(output.contains("1 panes"), "{output}");
+        assert!(output.contains("1 events"), "{output}");
+    }
+
+    #[test]
+    fn timeline_multiple_events_connector_chars() {
+        let events = vec![
+            sample_timeline_event(1, 1, 1_738_000_000_000),
+            sample_timeline_event(2, 2, 1_738_000_010_000),
+            sample_timeline_event(3, 3, 1_738_000_020_000),
+        ];
+        let tl = sample_timeline(events, vec![]);
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = TimelineRenderer::render(&tl, &ctx);
+        // First event: ─┬─, middle: ─┼─, last: ─┴─
+        assert!(
+            output.contains("\u{2500}\u{252c}\u{2500}"),
+            "missing top connector: {output}"
+        );
+        assert!(
+            output.contains("\u{2500}\u{253c}\u{2500}"),
+            "missing mid connector: {output}"
+        );
+        assert!(
+            output.contains("\u{2500}\u{2534}\u{2500}"),
+            "missing bot connector: {output}"
+        );
+    }
+
+    #[test]
+    fn timeline_handled_shows_arrow() {
+        let mut event = sample_timeline_event(1, 1, 1_738_000_000_000);
+        event.handled = Some(HandledInfo {
+            handled_at: 1_738_000_008_000,
+            workflow_id: Some("wf-abc".to_string()),
+            status: "handled".to_string(),
+        });
+        let tl = sample_timeline(vec![event], vec![]);
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = TimelineRenderer::render(&tl, &ctx);
+        assert!(output.contains("handled"), "{output}");
+        assert!(output.contains("\u{2192}"), "missing arrow: {output}");
+    }
+
+    #[test]
+    fn timeline_verbose_shows_workflow() {
+        let mut event = sample_timeline_event(1, 1, 1_738_000_000_000);
+        event.handled = Some(HandledInfo {
+            handled_at: 1_738_000_008_000,
+            workflow_id: Some("wf-xyz".to_string()),
+            status: "in_progress".to_string(),
+        });
+        let tl = sample_timeline(vec![event], vec![]);
+        let ctx = RenderContext::new(OutputFormat::Plain).verbose(1);
+        let output = TimelineRenderer::render(&tl, &ctx);
+        assert!(output.contains("workflow: wf-xyz"), "{output}");
+        assert!(output.contains("in_progress"), "{output}");
+    }
+
+    #[test]
+    fn timeline_debug_shows_details() {
+        let mut event = sample_timeline_event(1, 1, 1_738_000_000_000);
+        event.summary = Some("Test summary text".to_string());
+        let tl = sample_timeline(vec![event], vec![]);
+        let ctx = RenderContext::new(OutputFormat::Plain).verbose(2);
+        let output = TimelineRenderer::render(&tl, &ctx);
+        assert!(output.contains("id=1"), "{output}");
+        assert!(output.contains("rule=rule.1"), "{output}");
+        assert!(output.contains("sev=info"), "{output}");
+        assert!(output.contains("Test summary text"), "{output}");
+    }
+
+    #[test]
+    fn timeline_correlation_markers() {
+        let mut e1 = sample_timeline_event(1, 1, 1_738_000_000_000);
+        let mut e2 = sample_timeline_event(2, 7, 1_738_000_045_000);
+        let corr = Correlation {
+            id: "corr-fail-1".to_string(),
+            event_ids: vec![1, 2],
+            correlation_type: CorrelationType::Failover,
+            confidence: 0.85,
+            description: "Agent failover detected".to_string(),
+        };
+        e1.correlations = vec![CorrelationRef {
+            id: "corr-fail-1".to_string(),
+            correlation_type: CorrelationType::Failover,
+        }];
+        e2.correlations = vec![CorrelationRef {
+            id: "corr-fail-1".to_string(),
+            correlation_type: CorrelationType::Failover,
+        }];
+        let tl = sample_timeline(vec![e1, e2], vec![corr]);
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = TimelineRenderer::render(&tl, &ctx);
+        assert!(output.contains("[CORRELATED: failover]"), "{output}");
+    }
+
+    #[test]
+    fn timeline_json_output() {
+        let events = vec![sample_timeline_event(1, 1, 1_738_000_000_000)];
+        let tl = sample_timeline(events, vec![]);
+        let ctx = RenderContext::new(OutputFormat::Json);
+        let output = TimelineRenderer::render(&tl, &ctx);
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert!(parsed.get("events").is_some(), "{output}");
+        assert!(parsed.get("correlations").is_some(), "{output}");
+        assert!(parsed.get("total_count").is_some(), "{output}");
+    }
+
+    #[test]
+    fn timeline_plain_no_ansi() {
+        let events = vec![sample_timeline_event(1, 1, 1_738_000_000_000)];
+        let tl = sample_timeline(events, vec![]);
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = TimelineRenderer::render(&tl, &ctx);
+        assert!(
+            !output.contains("\x1b["),
+            "found ANSI codes in plain output: {output}"
+        );
+    }
+
+    #[test]
+    fn timeline_has_more_shows_hint() {
+        let events = vec![sample_timeline_event(1, 1, 1_738_000_000_000)];
+        let mut tl = sample_timeline(events, vec![]);
+        tl.total_count = 50;
+        tl.has_more = true;
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = TimelineRenderer::render(&tl, &ctx);
+        assert!(output.contains("49 more events"), "{output}");
+    }
+
+    #[test]
+    fn timeline_legend_present() {
+        let events = vec![sample_timeline_event(1, 1, 1_738_000_000_000)];
+        let tl = sample_timeline(events, vec![]);
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = TimelineRenderer::render(&tl, &ctx);
+        assert!(output.contains("Legend:"), "{output}");
+    }
+
+    #[test]
+    fn timeline_multiple_pane_count() {
+        let events = vec![
+            sample_timeline_event(1, 1, 1_738_000_000_000),
+            sample_timeline_event(2, 3, 1_738_000_010_000),
+            sample_timeline_event(3, 5, 1_738_000_020_000),
+            sample_timeline_event(4, 1, 1_738_000_030_000),
+        ];
+        let tl = sample_timeline(events, vec![]);
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = TimelineRenderer::render(&tl, &ctx);
+        assert!(output.contains("3 panes"), "{output}");
+        assert!(output.contains("4 events"), "{output}");
+    }
+
+    #[test]
+    fn timeline_debug_shows_correlation_refs() {
+        let mut e1 = sample_timeline_event(1, 1, 1_738_000_000_000);
+        e1.correlations = vec![CorrelationRef {
+            id: "corr-t-1".to_string(),
+            correlation_type: CorrelationType::Temporal,
+        }];
+        let corr = Correlation {
+            id: "corr-t-1".to_string(),
+            event_ids: vec![1],
+            correlation_type: CorrelationType::Temporal,
+            confidence: 0.8,
+            description: "Temporal cluster".to_string(),
+        };
+        let tl = sample_timeline(vec![e1], vec![corr]);
+        let ctx = RenderContext::new(OutputFormat::Plain).verbose(2);
+        let output = TimelineRenderer::render(&tl, &ctx);
+        assert!(output.contains("corr: corr-t-1"), "{output}");
+        assert!(output.contains("Temporal"), "{output}");
+    }
+
+    #[test]
+    fn format_time_hms_basic() {
+        // 1738000000 seconds since epoch = HH:MM:SS (mod 86400)
+        let result = super::format_time_hms(1_738_000_000_000);
+        assert_eq!(result.len(), 8, "HH:MM:SS should be 8 chars: {result}");
+        assert!(result.contains(':'), "should contain colon: {result}");
+    }
+
+    #[test]
+    fn timeline_dedupe_group_label() {
+        let mut e1 = sample_timeline_event(1, 1, 1_738_000_000_000);
+        let mut e2 = sample_timeline_event(2, 2, 1_738_000_005_000);
+        let corr = Correlation {
+            id: "corr-dedupe-1".to_string(),
+            event_ids: vec![1, 2],
+            correlation_type: CorrelationType::DedupeGroup,
+            confidence: 0.7,
+            description: "Same rule fired across 2 panes".to_string(),
+        };
+        e1.correlations = vec![CorrelationRef {
+            id: "corr-dedupe-1".to_string(),
+            correlation_type: CorrelationType::DedupeGroup,
+        }];
+        e2.correlations = vec![CorrelationRef {
+            id: "corr-dedupe-1".to_string(),
+            correlation_type: CorrelationType::DedupeGroup,
+        }];
+        let tl = sample_timeline(vec![e1, e2], vec![corr]);
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = TimelineRenderer::render(&tl, &ctx);
+        assert!(output.contains("[CORRELATED: dedupe-group]"), "{output}");
+    }
+
+    // ── SearchSuggestRenderer tests (bd-282k) ─────────────────────────
+
+    fn sample_suggestions() -> Vec<SearchSuggestion> {
+        vec![
+            SearchSuggestion {
+                text: "error".to_string(),
+                description: Some("Common errors".to_string()),
+            },
+            SearchSuggestion {
+                text: "warning".to_string(),
+                description: Some("Warnings in output".to_string()),
+            },
+            SearchSuggestion {
+                text: "panic".to_string(),
+                description: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn suggest_renderer_empty_no_partial() {
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = SearchSuggestRenderer::render(&[], "", &ctx);
+        assert!(output.contains("No suggestions"), "{output}");
+        assert!(!output.contains("for \""), "{output}");
+    }
+
+    #[test]
+    fn suggest_renderer_empty_with_partial() {
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = SearchSuggestRenderer::render(&[], "xyz", &ctx);
+        assert!(output.contains("No suggestions for \"xyz\""), "{output}");
+    }
+
+    #[test]
+    fn suggest_renderer_plain_output() {
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let suggestions = sample_suggestions();
+        let output = SearchSuggestRenderer::render(&suggestions, "err", &ctx);
+        assert!(output.contains("error"), "{output}");
+        assert!(output.contains("Common errors"), "{output}");
+        assert!(output.contains("warning"), "{output}");
+        assert!(output.contains("panic"), "{output}");
+        assert_no_ansi(&output, "SearchSuggestRenderer");
+    }
+
+    #[test]
+    fn suggest_renderer_json_output() {
+        let ctx = RenderContext::new(OutputFormat::Json);
+        let suggestions = sample_suggestions();
+        let output = SearchSuggestRenderer::render(&suggestions, "", &ctx);
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0]["text"], "error");
+        assert_eq!(parsed[1]["text"], "warning");
+        assert_eq!(parsed[2]["description"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn suggest_renderer_heading_includes_partial() {
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let suggestions = sample_suggestions();
+        let output = SearchSuggestRenderer::render(&suggestions, "err", &ctx);
+        assert!(output.contains("Suggestions for \"err\""), "{output}");
+    }
+
+    #[test]
+    fn suggest_renderer_heading_no_partial() {
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let suggestions = sample_suggestions();
+        let output = SearchSuggestRenderer::render(&suggestions, "", &ctx);
+        assert!(output.contains("Search suggestions:"), "{output}");
     }
 }

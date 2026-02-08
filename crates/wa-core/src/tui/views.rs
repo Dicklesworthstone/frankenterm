@@ -173,6 +173,8 @@ pub struct ViewState {
     pub selected_ruleset_profile_index: usize,
     /// Only show panes that have at least one bookmark.
     pub panes_bookmarked_only: bool,
+    /// Search: inline suggestions based on current query input.
+    pub search_suggestions: Vec<crate::storage::SearchSuggestion>,
 }
 
 impl ViewState {
@@ -1167,13 +1169,24 @@ pub fn render_history_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
 
 /// Render the search view
 pub fn render_search_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
+    let show_suggestions = !state.search_suggestions.is_empty() && state.search_results.is_empty();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // Search input
-            Constraint::Length(8), // Saved searches
-            Constraint::Min(5),    // Results + detail
-        ])
+        .constraints(if show_suggestions {
+            vec![
+                Constraint::Length(3), // Search input
+                Constraint::Length(5), // Suggestions
+                Constraint::Length(8), // Saved searches
+                Constraint::Min(5),    // Results + detail
+            ]
+        } else {
+            vec![
+                Constraint::Length(3), // Search input
+                Constraint::Length(0), // No suggestions
+                Constraint::Length(8), // Saved searches
+                Constraint::Min(5),    // Results + detail
+            ]
+        })
         .split(area);
 
     // Search input
@@ -1189,12 +1202,31 @@ pub fn render_search_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
     );
     search_input.render(chunks[0], buf);
 
+    // Inline suggestions (shown while typing, before executing a search)
+    if show_suggestions {
+        let mut suggestion_lines: Vec<Line> = Vec::new();
+        for s in state.search_suggestions.iter().take(4) {
+            let desc = s.description.as_deref().unwrap_or("");
+            suggestion_lines.push(Line::from(vec![
+                Span::styled(
+                    format!(" {} ", s.text),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!(" {desc}"), Style::default().fg(Color::Gray)),
+            ]));
+        }
+        let suggestions_block = Block::default().title("Suggestions").borders(Borders::ALL);
+        Paragraph::new(suggestion_lines)
+            .block(suggestions_block)
+            .render(chunks[1], buf);
+    }
+
     // Saved searches list
     let saved_block = Block::default()
         .title(format!("Saved Searches ({})", state.saved_searches.len()))
         .borders(Borders::ALL);
-    let saved_inner = saved_block.inner(chunks[1]);
-    saved_block.render(chunks[1], buf);
+    let saved_inner = saved_block.inner(chunks[2]);
+    saved_block.render(chunks[2], buf);
     if state.saved_searches.is_empty() {
         Paragraph::new(Span::styled(
             "No saved searches yet. Use `wa search save <name> <query>`.",
@@ -1266,7 +1298,7 @@ pub fn render_search_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
                 ))
                 .borders(Borders::ALL),
         );
-        results.render(chunks[2], buf);
+        results.render(chunks[3], buf);
         return;
     }
 
@@ -1274,7 +1306,7 @@ pub fn render_search_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
     let result_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-        .split(chunks[2]);
+        .split(chunks[3]);
 
     let selected = state
         .search_selected_index
@@ -2059,6 +2091,42 @@ mod tests {
         let mut buf = Buffer::empty(area);
         render_search_view(&state, area, &mut buf);
         // Should show "hello_" in the input area
+    }
+
+    #[test]
+    fn render_search_view_shows_suggestions() {
+        let mut state = ViewState::default();
+        state.search_query = "err".to_string();
+        state.search_suggestions = vec![crate::storage::SearchSuggestion {
+            text: "error".to_string(),
+            description: Some("Common errors".to_string()),
+        }];
+        let area = Rect::new(0, 0, 120, 40);
+        let mut buf = Buffer::empty(area);
+        render_search_view(&state, area, &mut buf);
+        // Should not panic with suggestions rendered
+    }
+
+    #[test]
+    fn render_search_view_hides_suggestions_with_results() {
+        let mut state = ViewState::default();
+        state.search_query = "err".to_string();
+        state.search_suggestions = vec![crate::storage::SearchSuggestion {
+            text: "error".to_string(),
+            description: Some("Common errors".to_string()),
+        }];
+        // Add a result — suggestions should be hidden
+        state.search_results = vec![crate::tui::query::SearchResultView {
+            pane_id: 1,
+            timestamp: "2026-01-01".to_string(),
+            snippet: "some error text".to_string(),
+            rank: 1.0,
+        }];
+        state.search_last_query = "err".to_string();
+        let area = Rect::new(0, 0, 120, 40);
+        let mut buf = Buffer::empty(area);
+        render_search_view(&state, area, &mut buf);
+        // Should not panic; suggestions hidden when results present
     }
 
     // -----------------------------------------------------------------------

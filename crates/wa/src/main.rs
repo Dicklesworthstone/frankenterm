@@ -229,6 +229,10 @@ SEE ALSO:
         /// Only return results since this timestamp (epoch ms or ISO8601)
         #[arg(long, short = 's')]
         since: Option<i64>,
+
+        /// Return query completion suggestions instead of running the search
+        #[arg(long)]
+        suggest: bool,
     },
 
     /// List panes and their status
@@ -1292,6 +1296,40 @@ SEE ALSO:
     Simulate {
         #[command(subcommand)]
         command: SimulateCommands,
+    },
+
+    /// Display a unified event timeline with cross-pane correlations
+    #[command(after_help = r#"EXAMPLES:
+    wa timeline                       Recent events (last 30m)
+    wa timeline --last 2h             Events from the last 2 hours
+    wa timeline --pane 3              Filter to pane 3
+    wa timeline --type session.started  Filter by event type
+    wa timeline -f json               Machine-readable output
+    wa timeline -vv                   Show full correlation reasoning
+
+SEE ALSO:
+    wa events     List detection events
+    wa status     Pane and system overview"#)]
+    Timeline {
+        /// Time range to display (e.g., "30m", "2h", "1d")
+        #[arg(long, default_value = "30m")]
+        last: String,
+
+        /// Filter to specific pane ID(s) (comma-separated)
+        #[arg(long, short = 'p', value_delimiter = ',')]
+        pane: Vec<u64>,
+
+        /// Filter to specific event type(s) (comma-separated)
+        #[arg(long, short = 't', value_delimiter = ',')]
+        r#type: Vec<String>,
+
+        /// Output format: auto, plain, or json
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+
+        /// Maximum events to display
+        #[arg(long, short = 'l', default_value = "100")]
+        limit: usize,
     },
 
     /// Interactive demo mode for presentations
@@ -8287,7 +8325,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     };
                                 }
 
-                                let injection = match decision {
+                                let mut injection = match decision {
                                     PolicyDecision::Allow { .. } => {
                                         let send_result = wezterm.send_text(pane_id, &text).await;
                                         match send_result {
@@ -8333,10 +8371,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     Some(wa_core::policy::build_send_text_audit_summary(
                                         &text, None, None,
                                     ));
-                                if let Err(e) =
-                                    storage.record_audit_action_redacted(audit_record).await
-                                {
-                                    tracing::warn!(pane_id, "Failed to record audit: {e}");
+                                match storage.record_audit_action_redacted(audit_record).await {
+                                    Ok(audit_id) => {
+                                        injection.set_audit_action_id(audit_id);
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(pane_id, "Failed to record audit: {e}");
+                                    }
                                 }
 
                                 let mut wait_for_data = None;
@@ -11067,9 +11108,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             bookmark,
             bookmark_tag,
             since,
+            suggest,
         }) => {
             use wa_core::output::{
-                OutputFormat, RenderContext, SearchResultRenderer, detect_format,
+                OutputFormat, RenderContext, SearchResultRenderer, SearchSuggestRenderer,
+                detect_format,
             };
 
             let output_format = match format.to_lowercase().as_str() {
@@ -11937,6 +11980,17 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         }
                     }
                 },
+                None if suggest => {
+                    let partial = query.as_deref().unwrap_or("");
+                    let suggestions = wa_core::storage::search_query_suggestions(partial, limit);
+                    let ctx = RenderContext::new(output_format)
+                        .limit(limit)
+                        .verbose(cli.verbose);
+                    println!(
+                        "{}",
+                        SearchSuggestRenderer::render(&suggestions, partial, &ctx)
+                    );
+                }
                 None => {
                     let query = match query {
                         Some(q) => q,
@@ -13788,6 +13842,107 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 }
                 Err(e) => {
                     die(&format!("Failed to query events: {e}"), None);
+                }
+            }
+        }
+
+        Some(Commands::Timeline {
+            last,
+            pane,
+            r#type,
+            format,
+            limit,
+        }) => {
+            use wa_core::output::{OutputFormat, RenderContext, TimelineRenderer, detect_format};
+            use wa_core::storage::TimelineQuery;
+
+            let output_format = match format.to_lowercase().as_str() {
+                "json" => OutputFormat::Json,
+                "plain" => OutputFormat::Plain,
+                _ => detect_format(),
+            };
+
+            let die = |msg: &str, hint: Option<&str>| -> ! {
+                if output_format.is_json() {
+                    let mut payload = serde_json::json!({
+                        "ok": false,
+                        "error": msg,
+                        "version": wa_core::VERSION,
+                    });
+                    if let Some(h) = hint {
+                        payload["hint"] = serde_json::Value::String(h.to_string());
+                    }
+                    println!(
+                        "{}",
+                        serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string())
+                    );
+                } else {
+                    eprintln!("Error: {msg}");
+                    if let Some(h) = hint {
+                        eprintln!("{h}");
+                    }
+                }
+                std::process::exit(1);
+            };
+
+            // Parse --last duration
+            let duration_ms = match parse_duration_to_ms(&last) {
+                Some(ms) => ms,
+                None => {
+                    die(
+                        &format!("Invalid duration '{last}'. Use e.g. 30s, 5m, 1h, 7d, 2w."),
+                        Some("Example: wa timeline --last 2h"),
+                    );
+                }
+            };
+
+            let now = now_ms_i64();
+            let start = now - duration_ms;
+
+            // Build timeline query
+            let mut query = TimelineQuery::new()
+                .with_range(start, now)
+                .with_pagination(limit, 0);
+
+            if !pane.is_empty() {
+                query = query.with_panes(pane);
+            }
+
+            if !r#type.is_empty() {
+                query.event_types = Some(r#type);
+            }
+
+            // Open storage
+            let layout = match config.workspace_layout(Some(&workspace_root)) {
+                Ok(l) => l,
+                Err(e) => {
+                    die(
+                        &format!("Failed to get workspace layout: {e}"),
+                        Some("Check --workspace or WA_WORKSPACE"),
+                    );
+                }
+            };
+
+            let db_path = layout.db_path.to_string_lossy();
+            let storage = match wa_core::storage::StorageHandle::new(&db_path).await {
+                Ok(s) => s,
+                Err(e) => {
+                    die(
+                        &format!("Failed to open storage: {e}"),
+                        Some("Is the database initialized? Run 'wa watch' first."),
+                    );
+                }
+            };
+
+            // Fetch timeline
+            match storage.get_timeline(query).await {
+                Ok(timeline) => {
+                    let ctx = RenderContext::new(output_format).verbose(cli.verbose);
+                    let rendered = TimelineRenderer::render(&timeline, &ctx);
+                    print!("{rendered}");
+                }
+                Err(e) => {
+                    die(&format!("Failed to query timeline: {e}"), None);
                 }
             }
         }
@@ -23087,11 +23242,18 @@ where
         if !remote_version.is_empty() {
             println!("  Remote version: {remote_version}");
             // Compare with local version to warn about mismatches
-            if let Ok(local_out) = std::process::Command::new("wezterm").arg("--version").output() {
-                let local_version = String::from_utf8_lossy(&local_out.stdout).trim().to_string();
+            if let Ok(local_out) = std::process::Command::new("wezterm")
+                .arg("--version")
+                .output()
+            {
+                let local_version = String::from_utf8_lossy(&local_out.stdout)
+                    .trim()
+                    .to_string();
                 if !local_version.is_empty() {
                     if local_version != remote_version {
-                        println!("  ⚠ Version mismatch: local={local_version}, remote={remote_version}");
+                        println!(
+                            "  ⚠ Version mismatch: local={local_version}, remote={remote_version}"
+                        );
                         println!("    WezTerm multiplexing works best with matching versions.");
                     } else {
                         println!("  ✓ Local and remote versions match");
@@ -23210,7 +23372,14 @@ where
         options.verbose,
         false,
     )?;
-    let mux_server_path = mux_path_output.stdout.trim().lines().next().unwrap_or("/usr/bin/wezterm-mux-server").trim().to_string();
+    let mux_server_path = mux_path_output
+        .stdout
+        .trim()
+        .lines()
+        .next()
+        .unwrap_or("/usr/bin/wezterm-mux-server")
+        .trim()
+        .to_string();
     let mux_unit = remote_mux_service_unit(&mux_server_path);
 
     let service_path = "~/.config/systemd/user/wezterm-mux-server.service";

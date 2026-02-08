@@ -478,11 +478,14 @@ impl<Q: QueryClient> App<Q> {
             }
             KeyCode::Char(c) => {
                 self.view_state.search_query.push(c);
+                self.refresh_search_suggestions();
             }
             KeyCode::Backspace => {
                 self.view_state.search_query.pop();
+                self.refresh_search_suggestions();
             }
             KeyCode::Enter => {
+                self.view_state.search_suggestions.clear();
                 self.execute_search();
             }
             KeyCode::Esc => {
@@ -490,6 +493,7 @@ impl<Q: QueryClient> App<Q> {
                 self.view_state.search_results.clear();
                 self.view_state.search_last_query.clear();
                 self.view_state.search_selected_index = 0;
+                self.view_state.search_suggestions.clear();
             }
             _ => {}
         }
@@ -553,6 +557,11 @@ impl<Q: QueryClient> App<Q> {
                 self.view_state.set_error(format!("Search failed: {e}"));
             }
         }
+    }
+
+    fn refresh_search_suggestions(&mut self) {
+        self.view_state.search_suggestions =
+            crate::storage::search_query_suggestions(&self.view_state.search_query, 5);
     }
 
     /// Refresh data from the query client
