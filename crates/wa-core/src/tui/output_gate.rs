@@ -443,4 +443,169 @@ pub(crate) mod tests {
 
         set_phase(GatePhase::Inactive);
     }
+
+    // ====================================================================
+    // FTUI-08.4: Output gate resilience / concurrency stress
+    // ====================================================================
+
+    // -- Gate G1: rapid phase cycling stress --
+
+    #[test]
+    fn gate_rapid_phase_cycling_1000_rounds() {
+        let _lock = lock_gate();
+        set_phase(GatePhase::Inactive);
+
+        for _ in 0..1000 {
+            // Simulate full lifecycle: Inactive → Active → Suspended → Active → Inactive
+            set_phase(GatePhase::Active);
+            assert!(is_output_suppressed());
+
+            set_phase(GatePhase::Suspended);
+            assert!(!is_output_suppressed());
+
+            set_phase(GatePhase::Active);
+            assert!(is_output_suppressed());
+
+            set_phase(GatePhase::Inactive);
+            assert!(!is_output_suppressed());
+        }
+    }
+
+    // -- Gate G2: concurrent reads during phase transitions --
+
+    #[test]
+    fn gate_concurrent_reads_during_transitions() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AOrdering};
+
+        let _lock = lock_gate();
+        set_phase(GatePhase::Inactive);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = Arc::clone(&stop);
+        let reader_ready = Arc::new(AtomicBool::new(false));
+        let reader_ready_clone = Arc::clone(&reader_ready);
+        let read_count = Arc::new(AtomicU64::new(0));
+        let read_count_clone = Arc::clone(&read_count);
+
+        // Spawn reader thread that continuously checks the gate
+        let reader = std::thread::spawn(move || {
+            reader_ready_clone.store(true, AOrdering::Release);
+            while !stop_clone.load(AOrdering::Relaxed) {
+                // is_output_suppressed must never panic
+                let _suppressed = is_output_suppressed();
+                // phase() must always return a valid GatePhase
+                let p = phase();
+                assert!(
+                    matches!(
+                        p,
+                        GatePhase::Inactive | GatePhase::Active | GatePhase::Suspended
+                    ),
+                    "invalid gate phase: {p:?}"
+                );
+                read_count_clone.fetch_add(1, AOrdering::Relaxed);
+            }
+        });
+
+        // Wait for reader thread to be ready
+        while !reader_ready.load(AOrdering::Acquire) {
+            std::thread::yield_now();
+        }
+
+        // Writer: rapidly cycle through phases, yielding periodically
+        for i in 0..500u32 {
+            set_phase(GatePhase::Active);
+            set_phase(GatePhase::Suspended);
+            set_phase(GatePhase::Inactive);
+            if i % 50 == 0 {
+                std::thread::yield_now();
+            }
+        }
+
+        stop.store(true, AOrdering::Relaxed);
+        reader.join().expect("reader thread panicked");
+        let reads = read_count.load(AOrdering::Relaxed);
+        // Verify reader did work (may be 0 on very fast single-core, so warn only)
+        assert!(reads > 0, "reader thread should have performed reads");
+
+        // Gate must be back to Inactive
+        assert_eq!(phase(), GatePhase::Inactive);
+    }
+
+    // -- Gate G3: writer suppression invariant under cycling --
+
+    #[test]
+    fn gate_writer_suppression_invariant_under_cycling() {
+        use std::io::Write;
+        let _lock = lock_gate();
+
+        for _ in 0..200 {
+            set_phase(GatePhase::Active);
+            let writer = TuiAwareWriter;
+            let mut inner = writer.make();
+            // Must silently discard during Active
+            let n = inner.write(b"suppressed").unwrap();
+            assert_eq!(n, 10);
+            assert!(matches!(inner, TuiAwareWriterInner::Suppressed));
+
+            set_phase(GatePhase::Suspended);
+            let mut inner2 = writer.make();
+            // Must pass through during Suspended
+            assert!(matches!(inner2, TuiAwareWriterInner::Stderr(_)));
+            let _ = inner2.write(b"ok");
+
+            set_phase(GatePhase::Inactive);
+            let mut inner3 = writer.make();
+            // Must pass through during Inactive
+            assert!(matches!(inner3, TuiAwareWriterInner::Stderr(_)));
+            let _ = inner3.write(b"ok");
+        }
+    }
+
+    // -- Gate G4: gated_write functions across rapid transitions --
+
+    #[test]
+    fn gate_gated_write_across_transitions() {
+        let _lock = lock_gate();
+
+        for i in 0..100u32 {
+            set_phase(GatePhase::Inactive);
+            gated_write_stdout(format_args!("inactive-stdout-{i}\n"));
+            gated_write_stderr(format_args!("inactive-stderr-{i}\n"));
+
+            set_phase(GatePhase::Suspended);
+            gated_write_stdout(format_args!("suspended-stdout-{i}\n"));
+            gated_write_stderr(format_args!("suspended-stderr-{i}\n"));
+
+            // Active: skip gated_write calls (would debug_assert)
+            set_phase(GatePhase::Active);
+            // Verify suppression without calling gated_write
+            assert!(is_output_suppressed());
+
+            set_phase(GatePhase::Inactive);
+        }
+    }
+
+    // -- Gate G5: phase idempotency --
+
+    #[test]
+    fn gate_phase_idempotent_set() {
+        let _lock = lock_gate();
+
+        // Setting the same phase repeatedly must be idempotent
+        for _ in 0..100 {
+            set_phase(GatePhase::Active);
+            assert!(is_output_suppressed());
+        }
+        for _ in 0..100 {
+            set_phase(GatePhase::Inactive);
+            assert!(!is_output_suppressed());
+        }
+        for _ in 0..100 {
+            set_phase(GatePhase::Suspended);
+            assert!(!is_output_suppressed());
+        }
+
+        set_phase(GatePhase::Inactive);
+    }
 }

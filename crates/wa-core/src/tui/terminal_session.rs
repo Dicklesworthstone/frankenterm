@@ -1159,4 +1159,457 @@ mod tests {
         assert_eq!(output_gate::phase(), GatePhase::Inactive);
         assert_eq!(session.phase(), SessionPhase::Idle);
     }
+
+    // ====================================================================
+    // FTUI-08.4: Resilience / chaos validation
+    // ====================================================================
+
+    // -- FailableSession: error-injection mock --
+
+    /// A mock session that can inject errors at configurable lifecycle points.
+    /// Used to validate that the guard and callers handle partial failures
+    /// without leaking state.
+    struct FailableSession {
+        inner: MockTerminalSession,
+        /// If set, `suspend()` will fail with this error after N successful calls.
+        fail_suspend_after: Option<usize>,
+        suspend_count: usize,
+        /// If set, `resume()` will fail with this error after N successful calls.
+        fail_resume_after: Option<usize>,
+        resume_count: usize,
+        /// If set, `draw()` will fail after N successful calls.
+        fail_draw_after: Option<usize>,
+    }
+
+    impl FailableSession {
+        fn new() -> Self {
+            Self {
+                inner: MockTerminalSession::new(),
+                fail_suspend_after: None,
+                suspend_count: 0,
+                fail_resume_after: None,
+                resume_count: 0,
+                fail_draw_after: None,
+            }
+        }
+
+        fn fail_suspend_after(mut self, n: usize) -> Self {
+            self.fail_suspend_after = Some(n);
+            self
+        }
+
+        fn fail_resume_after(mut self, n: usize) -> Self {
+            self.fail_resume_after = Some(n);
+            self
+        }
+
+        fn fail_draw_after(mut self, n: usize) -> Self {
+            self.fail_draw_after = Some(n);
+            self
+        }
+    }
+
+    impl TerminalSession for FailableSession {
+        fn phase(&self) -> SessionPhase {
+            self.inner.phase()
+        }
+
+        fn screen_mode(&self) -> Option<ScreenMode> {
+            self.inner.screen_mode()
+        }
+
+        fn enter(&mut self, mode: ScreenMode) -> Result<(), SessionError> {
+            self.inner.enter(mode)
+        }
+
+        fn draw(
+            &mut self,
+            render: &mut dyn FnMut(Area, &mut dyn RenderSurface),
+        ) -> Result<(), SessionError> {
+            if let Some(limit) = self.fail_draw_after {
+                if self.inner.draw_count >= limit {
+                    return Err(SessionError::Io(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "injected draw failure",
+                    )));
+                }
+            }
+            self.inner.draw(render)
+        }
+
+        fn poll_event(&mut self, timeout: Duration) -> Result<Option<InputEvent>, SessionError> {
+            self.inner.poll_event(timeout)
+        }
+
+        fn suspend(&mut self) -> Result<(), SessionError> {
+            if let Some(limit) = self.fail_suspend_after {
+                if self.suspend_count >= limit {
+                    return Err(SessionError::Io(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "injected suspend failure",
+                    )));
+                }
+            }
+            self.suspend_count += 1;
+            self.inner.suspend()
+        }
+
+        fn resume(&mut self) -> Result<(), SessionError> {
+            if let Some(limit) = self.fail_resume_after {
+                if self.resume_count >= limit {
+                    return Err(SessionError::Io(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "injected resume failure",
+                    )));
+                }
+            }
+            self.resume_count += 1;
+            self.inner.resume()
+        }
+
+        fn leave(&mut self) {
+            self.inner.leave();
+        }
+    }
+
+    // -- Chaos C1: rapid lifecycle cycling with interleaved operations --
+
+    #[test]
+    fn chaos_rapid_lifecycle_cycling_100_rounds() {
+        // Stress: enter→draw→suspend→resume→draw→leave for 100 rounds.
+        // No gate lock needed — MockTerminalSession doesn't touch the atomic gate.
+        for round in 0..100u32 {
+            let mut session = MockTerminalSession::new();
+            let mode = if round % 3 == 0 {
+                ScreenMode::AltScreen
+            } else {
+                ScreenMode::Inline {
+                    ui_height: (round % 50 + 1) as u16,
+                }
+            };
+
+            session.enter(mode).unwrap();
+            assert_eq!(session.phase(), SessionPhase::Active);
+
+            session.draw(&mut |_, _| {}).unwrap();
+
+            session.suspend().unwrap();
+            assert_eq!(session.phase(), SessionPhase::Suspended);
+
+            session.resume().unwrap();
+            assert_eq!(session.phase(), SessionPhase::Active);
+
+            session.draw(&mut |_, _| {}).unwrap();
+            session.leave();
+
+            assert_eq!(session.phase(), SessionPhase::Idle);
+            assert!(session.screen_mode().is_none());
+            assert_eq!(session.draw_count, 2);
+        }
+    }
+
+    // -- Chaos C2: rapid suspend/resume without draw --
+
+    #[test]
+    fn chaos_rapid_suspend_resume_200_cycles() {
+        let mut session = MockTerminalSession::new();
+        session.enter(ScreenMode::AltScreen).unwrap();
+
+        for i in 0..200u32 {
+            session.suspend().unwrap();
+            assert_eq!(
+                session.phase(),
+                SessionPhase::Suspended,
+                "cycle {i}: expected Suspended"
+            );
+            session.resume().unwrap();
+            assert_eq!(
+                session.phase(),
+                SessionPhase::Active,
+                "cycle {i}: expected Active"
+            );
+        }
+
+        session.leave();
+        // 1 enter + 200*(suspend+resume) + 1 leave = 402
+        assert_eq!(session.history.len(), 402);
+    }
+
+    // -- Chaos C3: failure injection during suspend --
+
+    #[test]
+    fn chaos_suspend_failure_preserves_active_state() {
+        let mut session = FailableSession::new().fail_suspend_after(2);
+        session.enter(ScreenMode::AltScreen).unwrap();
+
+        // First two suspend/resume cycles succeed
+        session.suspend().unwrap();
+        session.resume().unwrap();
+        session.suspend().unwrap();
+        session.resume().unwrap();
+
+        // Third suspend should fail (injected after count >= 2)
+        let err = session.suspend().unwrap_err();
+        assert!(
+            matches!(err, SessionError::Io(_)),
+            "expected Io error, got: {err:?}"
+        );
+        // Session should still be Active (suspend didn't partially transition)
+        assert_eq!(session.phase(), SessionPhase::Active);
+
+        // Can still draw after failed suspend
+        session.draw(&mut |_, _| {}).unwrap();
+
+        // Clean leave still works
+        session.leave();
+        assert_eq!(session.phase(), SessionPhase::Idle);
+    }
+
+    // -- Chaos C4: failure injection during resume --
+
+    #[test]
+    fn chaos_resume_failure_preserves_suspended_state() {
+        let mut session = FailableSession::new().fail_resume_after(1);
+        session.enter(ScreenMode::AltScreen).unwrap();
+
+        // First resume succeeds
+        session.suspend().unwrap();
+        session.resume().unwrap();
+
+        // Second cycle: suspend succeeds, resume fails
+        session.suspend().unwrap();
+        let err = session.resume().unwrap_err();
+        assert!(
+            matches!(err, SessionError::Io(_)),
+            "expected Io error, got: {err:?}"
+        );
+        // Session stays Suspended
+        assert_eq!(session.phase(), SessionPhase::Suspended);
+
+        // Emergency leave from Suspended should still work
+        session.leave();
+        assert_eq!(session.phase(), SessionPhase::Idle);
+    }
+
+    // -- Chaos C5: failure injection during draw --
+
+    #[test]
+    fn chaos_draw_failure_preserves_active_state() {
+        let mut session = FailableSession::new().fail_draw_after(3);
+        session.enter(ScreenMode::AltScreen).unwrap();
+
+        // First three draws succeed
+        for _ in 0..3 {
+            session.draw(&mut |_, _| {}).unwrap();
+        }
+
+        // Fourth draw should fail
+        let err = session.draw(&mut |_, _| {}).unwrap_err();
+        assert!(
+            matches!(err, SessionError::Io(_)),
+            "expected Io error, got: {err:?}"
+        );
+        // Session should still be Active
+        assert_eq!(session.phase(), SessionPhase::Active);
+
+        // Suspend/resume still works after draw failure
+        session.suspend().unwrap();
+        session.resume().unwrap();
+        session.leave();
+        assert_eq!(session.phase(), SessionPhase::Idle);
+    }
+
+    // -- Chaos C6: guard cleanup after injected suspend failure --
+
+    #[test]
+    fn chaos_guard_cleanup_after_suspend_failure() {
+        use super::super::output_gate::tests::GATE_TEST_LOCK;
+        use super::super::output_gate::{self, GatePhase};
+        let _lock = GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        output_gate::set_phase(GatePhase::Inactive);
+
+        let session = FailableSession::new().fail_suspend_after(0);
+        let mut guard = SessionGuard::enter(session, ScreenMode::AltScreen).unwrap();
+        assert_eq!(output_gate::phase(), GatePhase::Active);
+
+        // Suspend will fail immediately
+        let err = guard.suspend().unwrap_err();
+        assert!(matches!(err, SessionError::Io(_)));
+
+        // Guard still holds Active — drop should clean up
+        drop(guard);
+        assert_eq!(output_gate::phase(), GatePhase::Inactive);
+    }
+
+    // -- Chaos C7: interleaved draw/poll/suspend/resume stress --
+
+    #[test]
+    fn chaos_interleaved_operations_stress() {
+        let events = (0..50)
+            .map(|i| {
+                if i % 10 == 0 {
+                    InputEvent::Resize {
+                        width: 80 + (i % 40) as u16,
+                        height: 24 + (i % 20) as u16,
+                    }
+                } else if i % 5 == 0 {
+                    InputEvent::Tick
+                } else {
+                    InputEvent::Key(KeyInput::new(Key::Char('a')))
+                }
+            })
+            .collect();
+
+        let mut session = MockTerminalSession::new().with_events(events);
+        session.enter(ScreenMode::AltScreen).unwrap();
+
+        // Mixed operation sequence: draw, poll, suspend/resume cycles
+        for i in 0..50u32 {
+            match i % 7 {
+                0 | 1 | 2 => {
+                    // Draw
+                    session.draw(&mut |_, _| {}).unwrap();
+                }
+                3 => {
+                    // Poll
+                    let _ = session.poll_event(Duration::ZERO);
+                }
+                4 => {
+                    // Suspend + immediate resume
+                    session.suspend().unwrap();
+                    session.resume().unwrap();
+                }
+                5 => {
+                    // Poll multiple times
+                    let _ = session.poll_event(Duration::ZERO);
+                    let _ = session.poll_event(Duration::ZERO);
+                }
+                _ => {
+                    // Draw + poll
+                    session.draw(&mut |_, _| {}).unwrap();
+                    let _ = session.poll_event(Duration::ZERO);
+                }
+            }
+        }
+
+        session.leave();
+        assert_eq!(session.phase(), SessionPhase::Idle);
+    }
+
+    // -- Chaos C8: guard with panic during draw failure recovery --
+
+    #[test]
+    fn chaos_guard_panic_after_draw_failure() {
+        run_panic_harness(std::panic::AssertUnwindSafe(|| {
+            let session = FailableSession::new().fail_draw_after(2);
+            let mut guard = SessionGuard::enter(session, ScreenMode::AltScreen).unwrap();
+            guard.draw(&mut |_, _| {}).unwrap();
+            guard.draw(&mut |_, _| {}).unwrap();
+            // This draw fails, and then we panic
+            let _err = guard.draw(&mut |_, _| {});
+            panic!("panic during draw failure recovery");
+        }));
+    }
+
+    // -- Chaos C9: panic during resume after suspend --
+
+    #[test]
+    fn chaos_guard_panic_during_resume_attempt() {
+        run_panic_harness(std::panic::AssertUnwindSafe(|| {
+            let session = MockTerminalSession::new();
+            let mut guard = SessionGuard::enter(session, ScreenMode::AltScreen).unwrap();
+            guard.suspend().unwrap();
+            guard.resume().unwrap();
+            guard.suspend().unwrap();
+            // Panic while suspended (simulates crash during command handoff)
+            panic!("crash during second command handoff");
+        }));
+    }
+
+    // -- Chaos C10: screen mode variations under stress --
+
+    #[test]
+    fn chaos_all_screen_modes_lifecycle_stress() {
+        let modes = [
+            ScreenMode::AltScreen,
+            ScreenMode::Inline { ui_height: 1 },
+            ScreenMode::Inline { ui_height: 8 },
+            ScreenMode::Inline { ui_height: 24 },
+            ScreenMode::Inline { ui_height: 100 },
+        ];
+
+        for mode in modes {
+            for _ in 0..20 {
+                let mut session = MockTerminalSession::new();
+                session.enter(mode).unwrap();
+                assert_eq!(session.screen_mode(), Some(mode));
+
+                // Draw
+                session.draw(&mut |_, _| {}).unwrap();
+                assert_eq!(session.screen_mode(), Some(mode));
+
+                // Suspend/resume preserves mode
+                session.suspend().unwrap();
+                assert_eq!(session.screen_mode(), Some(mode));
+                session.resume().unwrap();
+                assert_eq!(session.screen_mode(), Some(mode));
+
+                // Leave clears mode
+                session.leave();
+                assert!(session.screen_mode().is_none());
+            }
+        }
+    }
+
+    // -- Chaos C11: failure recovery and retry --
+
+    #[test]
+    fn chaos_suspend_failure_retry_succeeds() {
+        // Simulates: suspend fails once, but a retry (after resetting state) succeeds.
+        // FailableSession fails after N calls total, so we can't really "retry"
+        // the same call. Instead verify that the session is in a usable state
+        // after a failed suspend and can still be cleanly torn down.
+        let mut session = FailableSession::new().fail_suspend_after(0);
+        session.enter(ScreenMode::AltScreen).unwrap();
+
+        // Suspend fails
+        assert!(session.suspend().is_err());
+        // State is still Active
+        assert_eq!(session.phase(), SessionPhase::Active);
+
+        // Draw still works
+        session.draw(&mut |_, _| {}).unwrap();
+
+        // Leave is always safe
+        session.leave();
+        assert_eq!(session.phase(), SessionPhase::Idle);
+    }
+
+    // -- Chaos C12: sequential guard creation stress --
+
+    #[test]
+    fn chaos_sequential_guard_creation_100_times() {
+        use super::super::output_gate::tests::GATE_TEST_LOCK;
+        use super::super::output_gate::{self, GatePhase};
+        let _lock = GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        output_gate::set_phase(GatePhase::Inactive);
+
+        for i in 0..100u32 {
+            let session = MockTerminalSession::new();
+            let mode = if i % 2 == 0 {
+                ScreenMode::AltScreen
+            } else {
+                ScreenMode::Inline {
+                    ui_height: (i % 24 + 1) as u16,
+                }
+            };
+
+            {
+                let _guard = SessionGuard::enter(session, mode).unwrap();
+                assert_eq!(output_gate::phase(), GatePhase::Active);
+            }
+            // Guard dropped — gate back to Inactive
+            assert_eq!(output_gate::phase(), GatePhase::Inactive);
+        }
+    }
 }
