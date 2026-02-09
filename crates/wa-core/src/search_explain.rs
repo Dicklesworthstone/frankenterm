@@ -106,17 +106,67 @@ pub struct GapInfo {
 ///
 /// Queries the database for panes, indexing stats, gaps, retention cleanup events,
 /// and segment time range, then assembles the context for `explain_search`.
-///
-/// NOTE: Requires storage methods that are not yet implemented (get_gaps,
-/// get_retention_cleanup_count, get_segment_time_range). Stubbed with todo!().
 pub async fn build_explain_context(
-    _storage: &crate::storage::StorageHandle,
-    _query: &str,
-    _pane_filter: Option<u64>,
+    storage: &crate::storage::StorageHandle,
+    query: &str,
+    pane_filter: Option<u64>,
 ) -> crate::Result<SearchExplainContext> {
-    // TODO: Requires storage methods not yet implemented:
-    //   get_gaps, get_retention_cleanup_count, get_segment_time_range
-    todo!("build_explain_context: storage methods not yet implemented")
+    let pane_records = storage.get_panes().await?;
+    let indexing_stats_raw = storage.get_pane_indexing_stats().await?;
+    let gaps_raw = storage.get_gaps().await?;
+    let retention_cleanup_count = storage.get_retention_cleanup_count().await?;
+    let (earliest_segment_at, latest_segment_at) = storage.get_segment_time_range().await?;
+
+    let panes = pane_records
+        .iter()
+        .map(|p| PaneExplainInfo {
+            pane_id: p.pane_id,
+            observed: p.observed,
+            ignore_reason: p.ignore_reason.clone(),
+            domain: p.domain.clone(),
+            last_seen_at: p.last_seen_at,
+        })
+        .collect();
+
+    let indexing_stats = indexing_stats_raw
+        .iter()
+        .map(|s| PaneIndexingInfo {
+            pane_id: s.pane_id,
+            segment_count: s.segment_count,
+            total_bytes: s.total_bytes,
+            last_segment_at: s.last_segment_at,
+            fts_row_count: s.fts_row_count,
+            fts_consistent: s.fts_consistent,
+        })
+        .collect();
+
+    let gaps = gaps_raw
+        .iter()
+        .map(|g| GapInfo {
+            pane_id: g.pane_id,
+            seq_before: g.seq_before,
+            seq_after: g.seq_after,
+            reason: g.reason.clone(),
+            detected_at: g.detected_at,
+        })
+        .collect();
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+
+    Ok(SearchExplainContext {
+        query: query.to_string(),
+        pane_filter,
+        panes,
+        indexing_stats,
+        gaps,
+        retention_cleanup_count,
+        earliest_segment_at,
+        latest_segment_at,
+        now_ms,
+    })
 }
 
 /// Analyze the search context and produce a ranked explanation.
