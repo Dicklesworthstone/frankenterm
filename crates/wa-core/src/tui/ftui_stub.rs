@@ -28,7 +28,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::query::QueryClient;
-use super::view_adapters::{HealthModel, PaneRow, SearchRow, adapt_event, adapt_health, adapt_pane, adapt_search};
+use super::view_adapters::{
+    HealthModel, PaneRow, SearchRow, TriageRow, WorkflowRow,
+    adapt_event, adapt_health, adapt_pane, adapt_search, adapt_triage, adapt_workflow,
+};
 
 // ---------------------------------------------------------------------------
 // View enum — shared navigation target
@@ -253,6 +256,13 @@ pub struct WaModel {
     panes: Vec<PaneRow>,
     panes_selected: usize,
     panes_domain_filter: Option<String>,
+    // Triage view state.
+    triage_items: Vec<TriageRow>,
+    triage_selected: usize,
+    triage_expanded: Option<usize>,
+    workflows: Vec<WorkflowRow>,
+    // Queued action command from triage (consumed by the event loop).
+    triage_queued_action: Option<String>,
     // Search view state.
     search_query: String,
     search_last_query: String,
@@ -273,6 +283,11 @@ impl WaModel {
             panes: Vec::new(),
             panes_selected: 0,
             panes_domain_filter: None,
+            triage_items: Vec::new(),
+            triage_selected: 0,
+            triage_expanded: None,
+            workflows: Vec::new(),
+            triage_queued_action: None,
             search_query: String::new(),
             search_last_query: String::new(),
             search_results: Vec::new(),
@@ -289,6 +304,7 @@ impl WaModel {
         match self.view_state.current_view {
             View::Panes => self.handle_panes_key(key),
             View::Events => self.handle_events_key(key),
+            View::Triage => self.handle_triage_key(key),
             View::Search => self.handle_search_key(key),
             _ => ftui::Cmd::None,
         }
@@ -343,6 +359,86 @@ impl WaModel {
         }
     }
 
+    /// Handle keys specific to the Triage view.
+    ///
+    /// j/k/Down/Up: navigate items.  Enter/a: run primary action.
+    /// 1-9: run numbered action.  m: mute selected event.
+    /// e: toggle workflow expand/collapse.
+    fn handle_triage_key(&mut self, key: &ftui::KeyEvent) -> ftui::Cmd<WaMsg> {
+        use ftui::KeyCode;
+
+        let count = self.triage_items.len();
+
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => {
+                if count > 0 {
+                    self.triage_selected = (self.triage_selected + 1) % count;
+                }
+                ftui::Cmd::None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if count > 0 {
+                    self.triage_selected =
+                        self.triage_selected.checked_sub(1).unwrap_or(count - 1);
+                }
+                ftui::Cmd::None
+            }
+            KeyCode::Enter | KeyCode::Char('a') => {
+                // Queue primary action (index 0) for the selected triage item.
+                self.queue_triage_action(0);
+                ftui::Cmd::None
+            }
+            KeyCode::Char('m') => {
+                // Mute the selected triage item's event (if it has an event_id).
+                self.mute_selected_triage_event();
+                ftui::Cmd::None
+            }
+            KeyCode::Char('e') => {
+                // Toggle workflow progress expand/collapse.
+                if !self.workflows.is_empty() {
+                    if self.triage_expanded.is_some() {
+                        self.triage_expanded = None;
+                    } else {
+                        self.triage_expanded = Some(0);
+                    }
+                }
+                ftui::Cmd::None
+            }
+            KeyCode::Char(c) if c.is_ascii_digit() => {
+                let idx = c.to_digit(10).unwrap_or(0);
+                if idx > 0 {
+                    self.queue_triage_action(idx as usize - 1);
+                }
+                ftui::Cmd::None
+            }
+            _ => ftui::Cmd::None,
+        }
+    }
+
+    /// Queue a triage action command for later execution.
+    fn queue_triage_action(&mut self, action_idx: usize) {
+        if let Some(item) = self.triage_items.get(self.triage_selected) {
+            if let Some(cmd) = item.action_commands.get(action_idx) {
+                self.triage_queued_action = Some(cmd.clone());
+            }
+        }
+    }
+
+    /// Mute the event associated with the selected triage item.
+    fn mute_selected_triage_event(&mut self) {
+        let event_id_str = self
+            .triage_items
+            .get(self.triage_selected)
+            .map(|item| item.event_id.clone())
+            .unwrap_or_default();
+        if let Ok(event_id) = event_id_str.parse::<i64>() {
+            if let Err(e) = self.query.mark_event_muted(event_id) {
+                self.view_state.error_message =
+                    Some(format!("Mute failed: {e}"));
+            }
+        }
+    }
+
     /// Handle keys specific to the Search view.
     ///
     /// Text input: chars append to query, Backspace removes, Enter executes,
@@ -364,7 +460,7 @@ impl WaModel {
                 if query.is_empty() {
                     return ftui::Cmd::None;
                 }
-                self.search_last_query = query.clone();
+                self.search_last_query.clone_from(&query);
                 match self.query.search(&query, 50) {
                     Ok(results) => {
                         self.search_results =
@@ -517,10 +613,25 @@ impl WaModel {
             Err(_) => { /* health query already reports errors */ }
         }
 
-        // Triage item count
+        // Triage items (used for both count on Home and Triage view)
         match self.query.list_triage_items() {
             Ok(items) => {
                 self.triage_count = items.len();
+                self.triage_items = items.iter().map(adapt_triage).collect();
+                if self.triage_items.is_empty() {
+                    self.triage_selected = 0;
+                } else {
+                    self.triage_selected =
+                        self.triage_selected.min(self.triage_items.len() - 1);
+                }
+            }
+            Err(_) => { /* non-fatal */ }
+        }
+
+        // Active workflows (for Triage view progress panel)
+        match self.query.list_active_workflows() {
+            Ok(wfs) => {
+                self.workflows = wfs.iter().map(adapt_workflow).collect();
             }
             Err(_) => { /* non-fatal */ }
         }
@@ -566,6 +677,7 @@ impl WaModel {
 
         let in_search = self.view_state.current_view == View::Search;
         let in_events = self.view_state.current_view == View::Events;
+        let in_triage = self.view_state.current_view == View::Triage;
 
         match key.code {
             // Tab/BackTab navigation is always global (even in Search).
@@ -589,8 +701,8 @@ impl WaModel {
                 self.refresh_data();
                 Some(ftui::Cmd::None)
             }
-            // In Events view, digits go to pane filter instead of view switching.
-            KeyCode::Char(ch @ '1'..='7') if !in_search && !in_events => {
+            // In Events/Triage views, digits go to view-specific handlers.
+            KeyCode::Char(ch @ '1'..='7') if !in_search && !in_events && !in_triage => {
                 if let Some(view) = View::from_shortcut(ch) {
                     self.view_state.current_view = view;
                 }
@@ -713,7 +825,17 @@ impl ftui::Model for WaModel {
                     clamped_sel,
                 );
             }
-            _ => render_view_placeholder(
+            View::Triage => render_triage_view(
+                frame,
+                content_y,
+                width,
+                content_h,
+                &self.triage_items,
+                self.triage_selected,
+                &self.workflows,
+                self.triage_expanded,
+            ),
+            View::History => render_view_placeholder(
                 frame,
                 content_y,
                 width,
@@ -1199,6 +1321,7 @@ fn render_panes_view(
 ///   Row 0:    Search input bar with cursor/prompt
 ///   Row 1:    Separator / status
 ///   Rows 2+:  Two-panel (results list left 55%, detail right 45%) or empty message
+#[allow(clippy::too_many_arguments)]
 fn render_search_view(
     frame: &mut ftui::Frame,
     y: u16,
@@ -1643,6 +1766,284 @@ fn render_events_view(
     }
 }
 
+/// Render the Triage view.
+///
+/// Vertical layout:
+///   Block 1 (50% or fill): Triage item list with severity indicators and selection.
+///   Block 2 (25%, optional): Active workflow progress panel (when workflows exist).
+///   Block 3 (6 rows fixed): Details + action affordances for the selected item.
+#[allow(clippy::too_many_arguments)]
+fn render_triage_view(
+    frame: &mut ftui::Frame,
+    y: u16,
+    width: u16,
+    height: u16,
+    triage_items: &[TriageRow],
+    selected: usize,
+    workflows: &[WorkflowRow],
+    expanded: Option<usize>,
+) {
+    if height == 0 {
+        return;
+    }
+
+    let max_row = y.saturating_add(height);
+    let blank_line = " ".repeat(width as usize);
+
+    // Calculate layout: triage list, optional workflow panel, detail panel (6 rows).
+    let has_workflows = !workflows.is_empty();
+    let detail_height: u16 = 6;
+    let workflow_height: u16 = if has_workflows {
+        (height / 4).max(4)
+    } else {
+        0
+    };
+    let list_height = height
+        .saturating_sub(detail_height)
+        .saturating_sub(workflow_height);
+
+    // -- Triage list section --
+    let mut row = y;
+    let list_end = y.saturating_add(list_height);
+
+    // Header
+    let header = if triage_items.is_empty() && !has_workflows {
+        "  Triage (prioritized) — all clear".to_string()
+    } else {
+        format!("  Triage (prioritized) — {} items", triage_items.len())
+    };
+    write_styled(frame, 0, row, &header, CellStyle::new().bold());
+    let hlen = header.len() as u16;
+    if hlen < width {
+        let fill = " ".repeat((width - hlen) as usize);
+        write_styled(frame, hlen, row, &fill, CellStyle::new());
+    }
+    row += 1;
+
+    // Empty state
+    if triage_items.is_empty() && !has_workflows {
+        if row < list_end {
+            let msg = "  All clear. No items need attention.";
+            write_styled(frame, 0, row, msg, CellStyle::new().dim());
+            let mlen = msg.len() as u16;
+            if mlen < width {
+                let fill = " ".repeat((width - mlen) as usize);
+                write_styled(frame, mlen, row, &fill, CellStyle::new());
+            }
+            row += 1;
+        }
+    } else {
+        // Column header
+        if row < list_end {
+            let col_header = format!(
+                "  {:8}  {:8}  {}",
+                "severity", "section", "title"
+            );
+            write_styled(frame, 0, row, &col_header, CellStyle::new().dim());
+            let clen = col_header.len() as u16;
+            if clen < width {
+                let fill = " ".repeat((width - clen) as usize);
+                write_styled(frame, clen, row, &fill, CellStyle::new());
+            }
+            row += 1;
+        }
+
+        // Triage item rows
+        let clamped_sel = selected.min(triage_items.len().saturating_sub(1));
+        for (pos, item) in triage_items.iter().enumerate() {
+            if row >= list_end {
+                break;
+            }
+            let line = format!(
+                "  [{:7}] {:8} | {}",
+                truncate_str(&item.severity_label, 7),
+                truncate_str(&item.section, 8),
+                truncate_str(&item.title, 80),
+            );
+            let style = if pos == clamped_sel {
+                CellStyle::new().bold().reverse()
+            } else {
+                CellStyle::new()
+            };
+            write_styled(frame, 0, row, &line, style);
+            let llen = line.len() as u16;
+            if llen < width {
+                let fill = " ".repeat((width - llen) as usize);
+                write_styled(frame, llen, row, &fill, style);
+            }
+            row += 1;
+        }
+    }
+
+    // Fill remaining list area
+    while row < list_end {
+        write_styled(frame, 0, row, &blank_line, CellStyle::new());
+        row += 1;
+    }
+
+    // -- Workflow progress panel (optional) --
+    if has_workflows {
+        let wf_end = row.saturating_add(workflow_height);
+
+        // Workflow header
+        let wf_header = format!("  Active Workflows ({})", workflows.len());
+        write_styled(frame, 0, row, &wf_header, CellStyle::new().bold());
+        let whlen = wf_header.len() as u16;
+        if whlen < width {
+            let fill = " ".repeat((width - whlen) as usize);
+            write_styled(frame, whlen, row, &fill, CellStyle::new());
+        }
+        row += 1;
+
+        for (i, wf) in workflows.iter().enumerate() {
+            if row >= wf_end {
+                break;
+            }
+            let is_expanded = expanded == Some(i);
+            let marker = if is_expanded { "v" } else { ">" };
+            let line = format!(
+                "  {} {:20} P{:>3} {:8} {}",
+                marker,
+                truncate_str(&wf.name, 20),
+                wf.pane_id,
+                truncate_str(&wf.status_label, 8),
+                wf.progress_label,
+            );
+            write_styled(frame, 0, row, &line, CellStyle::new());
+            let llen = line.len() as u16;
+            if llen < width {
+                let fill = " ".repeat((width - llen) as usize);
+                write_styled(frame, llen, row, &fill, CellStyle::new());
+            }
+            row += 1;
+
+            // Expanded detail
+            if is_expanded {
+                if row < wf_end {
+                    let id_line = format!("    ID: {}", wf.id);
+                    write_styled(frame, 0, row, &id_line, CellStyle::new().dim());
+                    let ilen = id_line.len() as u16;
+                    if ilen < width {
+                        let fill = " ".repeat((width - ilen) as usize);
+                        write_styled(frame, ilen, row, &fill, CellStyle::new());
+                    }
+                    row += 1;
+                }
+                if row < wf_end {
+                    let step_line = format!(
+                        "    Step {} | started {}",
+                        wf.progress_label, wf.started_at,
+                    );
+                    write_styled(frame, 0, row, &step_line, CellStyle::new().dim());
+                    let slen = step_line.len() as u16;
+                    if slen < width {
+                        let fill = " ".repeat((width - slen) as usize);
+                        write_styled(frame, slen, row, &fill, CellStyle::new());
+                    }
+                    row += 1;
+                }
+                if let Some(ref error) = wf.error {
+                    if row < wf_end {
+                        let err_line = format!(
+                            "    ERROR: {}",
+                            truncate_str(error, 60),
+                        );
+                        write_styled(frame, 0, row, &err_line, CellStyle::new().bold());
+                        let elen = err_line.len() as u16;
+                        if elen < width {
+                            let fill = " ".repeat((width - elen) as usize);
+                            write_styled(frame, elen, row, &fill, CellStyle::new());
+                        }
+                        row += 1;
+                    }
+                }
+            }
+        }
+
+        // Fill remaining workflow area
+        while row < wf_end {
+            write_styled(frame, 0, row, &blank_line, CellStyle::new());
+            row += 1;
+        }
+    }
+
+    // -- Details + Actions panel --
+    let detail_header = "  Details / Actions (Enter or 1-9 to run, m to mute, e to expand)";
+    if row < max_row {
+        write_styled(frame, 0, row, detail_header, CellStyle::new().bold());
+        let dhlen = detail_header.len() as u16;
+        if dhlen < width {
+            let fill = " ".repeat((width - dhlen) as usize);
+            write_styled(frame, dhlen, row, &fill, CellStyle::new());
+        }
+        row += 1;
+    }
+
+    let clamped_sel = selected.min(triage_items.len().saturating_sub(1));
+    if let Some(item) = triage_items.get(clamped_sel) {
+        // Detail text
+        if !item.detail.is_empty() && row < max_row {
+            let detail_line = format!("  {}", truncate_str(&item.detail, width.saturating_sub(4) as usize));
+            write_styled(frame, 0, row, &detail_line, CellStyle::new());
+            let dlen = detail_line.len() as u16;
+            if dlen < width {
+                let fill = " ".repeat((width - dlen) as usize);
+                write_styled(frame, dlen, row, &fill, CellStyle::new());
+            }
+            row += 1;
+        }
+
+        // Actions
+        if !item.action_labels.is_empty() && row < max_row {
+            let actions_header = "  Actions:";
+            write_styled(frame, 0, row, actions_header, CellStyle::new().bold());
+            let ahlen = actions_header.len() as u16;
+            if ahlen < width {
+                let fill = " ".repeat((width - ahlen) as usize);
+                write_styled(frame, ahlen, row, &fill, CellStyle::new());
+            }
+            row += 1;
+
+            for (idx, label) in item.action_labels.iter().enumerate() {
+                if row >= max_row {
+                    break;
+                }
+                let cmd_display = item
+                    .action_commands
+                    .get(idx)
+                    .map(|c| truncate_str(c, 40))
+                    .unwrap_or_default();
+                let action_line = format!("    {}. {} ({})", idx + 1, label, cmd_display);
+                write_styled(frame, 0, row, &action_line, CellStyle::new());
+                let alen = action_line.len() as u16;
+                if alen < width {
+                    let fill = " ".repeat((width - alen) as usize);
+                    write_styled(frame, alen, row, &fill, CellStyle::new());
+                }
+                row += 1;
+            }
+        }
+
+        // Cross-reference IDs
+        if row < max_row && (!item.event_id.is_empty() || !item.pane_id.is_empty()) {
+            let ref_line = format!("  event={} pane={} wf={}", item.event_id, item.pane_id, item.workflow_id);
+            write_styled(frame, 0, row, &ref_line, CellStyle::new().dim());
+            let rlen = ref_line.len() as u16;
+            if rlen < width {
+                let fill = " ".repeat((width - rlen) as usize);
+                write_styled(frame, rlen, row, &fill, CellStyle::new());
+            }
+            row += 1;
+        }
+    }
+
+    // Fill remaining rows
+    while row < max_row {
+        write_styled(frame, 0, row, &blank_line, CellStyle::new());
+        row += 1;
+    }
+}
+
 /// Truncate a string for display.
 fn truncate_str(s: &str, max: usize) -> String {
     if s.len() <= max {
@@ -1814,6 +2215,8 @@ mod tests {
         pane_count: usize,
         unhandled_per_pane: u32,
         triage_count: usize,
+        triage_items_detailed: Vec<TriageItemView>,
+        workflows_data: Vec<WorkflowProgressView>,
         search_results: Vec<SearchResultView>,
         events: Vec<EventView>,
     }
@@ -1825,6 +2228,8 @@ mod tests {
                 pane_count: 3,
                 unhandled_per_pane: 2,
                 triage_count: 1,
+                triage_items_detailed: Vec::new(),
+                workflows_data: Vec::new(),
                 search_results: Vec::new(),
                 events: vec![],
             }
@@ -1836,6 +2241,8 @@ mod tests {
                 pane_count: 0,
                 unhandled_per_pane: 0,
                 triage_count: 0,
+                triage_items_detailed: Vec::new(),
+                workflows_data: Vec::new(),
                 search_results: Vec::new(),
                 events: vec![],
             }
@@ -1847,6 +2254,8 @@ mod tests {
                 pane_count: 3,
                 unhandled_per_pane: 2,
                 triage_count: 1,
+                triage_items_detailed: Vec::new(),
+                workflows_data: Vec::new(),
                 search_results: Vec::new(),
                 events: vec![
                     EventView {
@@ -1893,6 +2302,73 @@ mod tests {
             self.search_results = results;
             self
         }
+
+        fn with_triage() -> Self {
+            use crate::tui::query::TriageAction;
+            Self {
+                healthy: true,
+                pane_count: 3,
+                unhandled_per_pane: 2,
+                triage_count: 0, // overridden by triage_items_detailed
+                triage_items_detailed: vec![
+                    TriageItemView {
+                        section: "events".to_string(),
+                        severity: "error".to_string(),
+                        title: "Fatal crash in pane 7".to_string(),
+                        detail: "Process exited with signal 11 (SIGSEGV)".to_string(),
+                        actions: vec![
+                            TriageAction {
+                                label: "Restart".to_string(),
+                                command: "wa pane restart 7".to_string(),
+                            },
+                            TriageAction {
+                                label: "Investigate".to_string(),
+                                command: "wa events show --pane 7".to_string(),
+                            },
+                        ],
+                        event_id: Some(101),
+                        pane_id: Some(7),
+                        workflow_id: None,
+                    },
+                    TriageItemView {
+                        section: "health".to_string(),
+                        severity: "warning".to_string(),
+                        title: "Rate limit approaching on pane 42".to_string(),
+                        detail: "80% of rate limit consumed".to_string(),
+                        actions: vec![TriageAction {
+                            label: "Throttle".to_string(),
+                            command: "wa rules throttle 42".to_string(),
+                        }],
+                        event_id: Some(102),
+                        pane_id: Some(42),
+                        workflow_id: Some("wf-abc".to_string()),
+                    },
+                    TriageItemView {
+                        section: "workflow".to_string(),
+                        severity: "info".to_string(),
+                        title: "Workflow deploy-prod completed".to_string(),
+                        detail: "All 5 steps finished successfully".to_string(),
+                        actions: vec![],
+                        event_id: None,
+                        pane_id: None,
+                        workflow_id: Some("wf-xyz".to_string()),
+                    },
+                ],
+                workflows_data: vec![WorkflowProgressView {
+                    id: "wf-abc".to_string(),
+                    workflow_name: "rate-limit-handler".to_string(),
+                    pane_id: 42,
+                    current_step: 2,
+                    total_steps: 4,
+                    status: "running".to_string(),
+                    error: None,
+                    started_at: 1_700_000_000_000,
+                    updated_at: 1_700_000_060_000,
+                }],
+                search_results: Vec::new(),
+                events: vec![],
+            }
+        }
     }
 
     impl QueryClient for MockQuery {
@@ -1917,6 +2393,9 @@ mod tests {
         }
 
         fn list_triage_items(&self) -> Result<Vec<TriageItemView>, QueryError> {
+            if !self.triage_items_detailed.is_empty() {
+                return Ok(self.triage_items_detailed.clone());
+            }
             Ok((0..self.triage_count)
                 .map(|_| TriageItemView {
                     section: "test".to_string(),
@@ -1956,7 +2435,7 @@ mod tests {
         }
 
         fn list_active_workflows(&self) -> Result<Vec<WorkflowProgressView>, QueryError> {
-            Ok(Vec::new())
+            Ok(self.workflows_data.clone())
         }
     }
 
@@ -2924,5 +3403,370 @@ mod tests {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = ftui::Frame::new(80, 24, &mut pool);
         render_events_view(&mut frame, 0, 80, 0, &events_state, &[], 0);
+    }
+
+    // -- Triage view tests --
+
+    #[test]
+    fn refresh_data_populates_triage_items() {
+        let mut model = make_model(MockQuery::with_triage());
+        model.refresh_data();
+
+        assert_eq!(model.triage_items.len(), 3);
+        assert_eq!(model.triage_items[0].severity_label, "error");
+        assert_eq!(model.triage_items[1].severity_label, "warning");
+        assert_eq!(model.triage_items[2].severity_label, "info");
+    }
+
+    #[test]
+    fn refresh_data_populates_workflows() {
+        let mut model = make_model(MockQuery::with_triage());
+        model.refresh_data();
+
+        assert_eq!(model.workflows.len(), 1);
+        assert_eq!(model.workflows[0].name, "rate-limit-handler");
+        assert_eq!(model.workflows[0].status_label, "running");
+    }
+
+    #[test]
+    fn triage_navigation_down_wraps() {
+        let mut model = make_model(MockQuery::with_triage());
+        model.refresh_data();
+        model.view_state.current_view = View::Triage;
+
+        // Navigate past last item should wrap to 0
+        model.triage_selected = 2; // last item (index 2)
+        let key = ftui::KeyEvent {
+            code: ftui::KeyCode::Down,
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
+        model.handle_triage_key(&key);
+        assert_eq!(model.triage_selected, 0);
+    }
+
+    #[test]
+    fn triage_navigation_up_wraps() {
+        let mut model = make_model(MockQuery::with_triage());
+        model.refresh_data();
+        model.view_state.current_view = View::Triage;
+
+        model.triage_selected = 0;
+        let key = ftui::KeyEvent {
+            code: ftui::KeyCode::Up,
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
+        model.handle_triage_key(&key);
+        assert_eq!(model.triage_selected, 2);
+    }
+
+    #[test]
+    fn triage_j_k_navigation() {
+        let mut model = make_model(MockQuery::with_triage());
+        model.refresh_data();
+        model.view_state.current_view = View::Triage;
+
+        let key_j = ftui::KeyEvent {
+            code: ftui::KeyCode::Char('j'),
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
+        let key_k = ftui::KeyEvent {
+            code: ftui::KeyCode::Char('k'),
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
+
+        assert_eq!(model.triage_selected, 0);
+        model.handle_triage_key(&key_j);
+        assert_eq!(model.triage_selected, 1);
+        model.handle_triage_key(&key_k);
+        assert_eq!(model.triage_selected, 0);
+    }
+
+    #[test]
+    fn triage_enter_queues_primary_action() {
+        let mut model = make_model(MockQuery::with_triage());
+        model.refresh_data();
+        model.view_state.current_view = View::Triage;
+
+        let key = ftui::KeyEvent {
+            code: ftui::KeyCode::Enter,
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
+        model.handle_triage_key(&key);
+        assert_eq!(
+            model.triage_queued_action.as_deref(),
+            Some("wa pane restart 7"),
+        );
+    }
+
+    #[test]
+    fn triage_digit_queues_numbered_action() {
+        let mut model = make_model(MockQuery::with_triage());
+        model.refresh_data();
+        model.view_state.current_view = View::Triage;
+
+        // Digit '2' should queue action at index 1 ("Investigate")
+        let key = ftui::KeyEvent {
+            code: ftui::KeyCode::Char('2'),
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
+        model.handle_triage_key(&key);
+        assert_eq!(
+            model.triage_queued_action.as_deref(),
+            Some("wa events show --pane 7"),
+        );
+    }
+
+    #[test]
+    fn triage_digit_out_of_range_no_action() {
+        let mut model = make_model(MockQuery::with_triage());
+        model.refresh_data();
+        model.view_state.current_view = View::Triage;
+
+        // Digit '9' — no action at index 8
+        let key = ftui::KeyEvent {
+            code: ftui::KeyCode::Char('9'),
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
+        model.handle_triage_key(&key);
+        assert!(model.triage_queued_action.is_none());
+    }
+
+    #[test]
+    fn triage_mute_calls_mark_event_muted() {
+        let mut model = make_model(MockQuery::with_triage());
+        model.refresh_data();
+        model.view_state.current_view = View::Triage;
+
+        let key = ftui::KeyEvent {
+            code: ftui::KeyCode::Char('m'),
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
+        // Should not error (MockQuery.mark_event_muted returns Ok)
+        model.handle_triage_key(&key);
+        assert!(model.view_state.error_message.is_none());
+    }
+
+    #[test]
+    fn triage_e_toggles_workflow_expand() {
+        let mut model = make_model(MockQuery::with_triage());
+        model.refresh_data();
+        model.view_state.current_view = View::Triage;
+
+        assert!(model.triage_expanded.is_none());
+
+        let key = ftui::KeyEvent {
+            code: ftui::KeyCode::Char('e'),
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
+        model.handle_triage_key(&key);
+        assert_eq!(model.triage_expanded, Some(0));
+
+        model.handle_triage_key(&key);
+        assert!(model.triage_expanded.is_none());
+    }
+
+    #[test]
+    fn triage_e_no_op_without_workflows() {
+        let mut model = make_model(MockQuery::healthy());
+        model.refresh_data();
+        model.view_state.current_view = View::Triage;
+
+        let key = ftui::KeyEvent {
+            code: ftui::KeyCode::Char('e'),
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
+        model.handle_triage_key(&key);
+        assert!(model.triage_expanded.is_none());
+    }
+
+    #[test]
+    fn triage_digits_not_consumed_globally() {
+        let mut model = make_model(MockQuery::with_triage());
+        model.refresh_data();
+        model.view_state.current_view = View::Triage;
+
+        // Digit '2' in Triage should NOT switch views
+        let key = ftui::KeyEvent {
+            code: ftui::KeyCode::Char('2'),
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
+        let result = model.handle_global_key(&key);
+        assert!(result.is_none(), "Digit should not be consumed globally in Triage view");
+        assert_eq!(model.view_state.current_view, View::Triage);
+    }
+
+    #[test]
+    fn render_triage_shows_header_and_items() {
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(100, 24, &mut pool);
+
+        let mut model = make_model(MockQuery::with_triage());
+        model.refresh_data();
+
+        render_triage_view(
+            &mut frame, 0, 100, 22,
+            &model.triage_items, model.triage_selected,
+            &model.workflows, model.triage_expanded,
+        );
+
+        let row0 = read_row(&frame, 0);
+        assert!(row0.contains("Triage"), "Header should contain 'Triage'");
+        assert!(row0.contains("3 items"), "Header should show item count");
+    }
+
+    #[test]
+    fn render_triage_shows_severity_and_title() {
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(100, 24, &mut pool);
+
+        let mut model = make_model(MockQuery::with_triage());
+        model.refresh_data();
+
+        render_triage_view(
+            &mut frame, 0, 100, 22,
+            &model.triage_items, model.triage_selected,
+            &model.workflows, model.triage_expanded,
+        );
+
+        // Item rows start after header + column header
+        let mut found_error = false;
+        let mut found_warning = false;
+        for r in 2..12 {
+            let text = read_row(&frame, r);
+            if text.contains("error") && text.contains("Fatal crash") {
+                found_error = true;
+            }
+            if text.contains("warning") && text.contains("Rate limit") {
+                found_warning = true;
+            }
+        }
+        assert!(found_error, "Error severity item not found");
+        assert!(found_warning, "Warning severity item not found");
+    }
+
+    #[test]
+    fn render_triage_shows_workflow_panel() {
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(100, 24, &mut pool);
+
+        let mut model = make_model(MockQuery::with_triage());
+        model.refresh_data();
+
+        render_triage_view(
+            &mut frame, 0, 100, 22,
+            &model.triage_items, model.triage_selected,
+            &model.workflows, model.triage_expanded,
+        );
+
+        let mut found_wf = false;
+        for r in 0..22 {
+            let text = read_row(&frame, r);
+            if text.contains("Active Workflows") {
+                found_wf = true;
+                break;
+            }
+        }
+        assert!(found_wf, "Workflow panel header not found");
+    }
+
+    #[test]
+    fn render_triage_shows_detail_actions() {
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(100, 24, &mut pool);
+
+        let mut model = make_model(MockQuery::with_triage());
+        model.refresh_data();
+
+        render_triage_view(
+            &mut frame, 0, 100, 22,
+            &model.triage_items, model.triage_selected,
+            &model.workflows, model.triage_expanded,
+        );
+
+        let mut found_actions = false;
+        let mut found_restart = false;
+        for r in 0..22 {
+            let text = read_row(&frame, r);
+            if text.contains("Actions") {
+                found_actions = true;
+            }
+            if text.contains("Restart") && text.contains("wa pane restart") {
+                found_restart = true;
+            }
+        }
+        assert!(found_actions, "Actions header not found");
+        assert!(found_restart, "Restart action not found");
+    }
+
+    #[test]
+    fn render_triage_empty_shows_all_clear() {
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(100, 24, &mut pool);
+
+        render_triage_view(&mut frame, 0, 100, 22, &[], 0, &[], None);
+
+        let mut found_clear = false;
+        for r in 0..22 {
+            let text = read_row(&frame, r);
+            if text.contains("All clear") {
+                found_clear = true;
+                break;
+            }
+        }
+        assert!(found_clear, "All clear message not found");
+    }
+
+    #[test]
+    fn render_triage_zero_height_no_panic() {
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(80, 24, &mut pool);
+        render_triage_view(&mut frame, 0, 80, 0, &[], 0, &[], None);
+    }
+
+    #[test]
+    fn render_triage_no_workflows_hides_panel() {
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(100, 24, &mut pool);
+
+        let mut model = make_model(MockQuery::with_triage());
+        model.refresh_data();
+
+        // Remove workflows to test without them
+        let empty_wf: Vec<WorkflowRow> = vec![];
+        render_triage_view(
+            &mut frame, 0, 100, 22,
+            &model.triage_items, model.triage_selected,
+            &empty_wf, None,
+        );
+
+        let mut found_wf = false;
+        for r in 0..22 {
+            let text = read_row(&frame, r);
+            if text.contains("Active Workflows") {
+                found_wf = true;
+                break;
+            }
+        }
+        assert!(!found_wf, "Workflow panel should not appear without workflows");
+    }
+
+    #[test]
+    fn triage_selection_clamps_after_refresh() {
+        let mut model = make_model(MockQuery::with_triage());
+        model.refresh_data();
+        model.triage_selected = 10; // Past end
+        model.refresh_data();
+        assert_eq!(model.triage_selected, 2); // Clamped to last item
     }
 }
