@@ -398,6 +398,7 @@ SCENARIO_REGISTRY=(
     "flake_guard|Repeat-run representative test suites to detect timing flakiness|false|cargo,jq|Catches timing regressions early"
     "reliability_hardening|Validate circuit breaker, retry, degradation, chaos, watchdog|true|cargo,jq|Protects resilience and fault tolerance"
     "perf_regression|Perf regression smoke: patterns, delta, cache, benchmarks with budget validation|true|cargo,jq|Protects performance budgets"
+    "timeline_correlation|Validate timeline cross-pane correlation (aggregation, failover, temporal)|true|cargo,jq,sqlite3|Protects event correlation determinism"
 )
 
 list_scenarios() {
@@ -7806,6 +7807,10 @@ run_scenario() {
             ;;
         environment_detection)
             run_scenario_environment_detection "$scenario_dir" || result=$?
+            ;;
+        timeline_correlation)
+            "$SCRIPT_DIR/e2e_timeline_correlation.sh" ${VERBOSE:+--verbose} || result=$?
+            cp -r "$SCRIPT_DIR/../evidence/e2e/"*timeline* "$scenario_dir/" 2>/dev/null || true
             ;;
         *)
             log_fail "Unknown scenario: $name"
