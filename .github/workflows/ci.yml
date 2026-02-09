@@ -207,6 +207,34 @@ jobs:
       - name: Run FTUI guardrail checks
         run: scripts/check_ftui_guardrails.sh
 
+  # FTUI migration test suite: grouped snapshot, E2E, and unit test execution
+  # with minimum count enforcement and diagnostic artifact collection.
+  # Implements: wa-36xw (FTUI-07.4)
+  ftui-tests:
+    name: FTUI Tests
+    needs: [lint]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ftui-tests
+
+      - name: Run FTUI test suite
+        run: scripts/check_ftui_tests.sh
+
+      - name: Upload FTUI test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ftui-test-artifacts
+          path: |
+            target/ftui-test-artifacts/
+          if-no-files-found: ignore
+          retention-days: 14
+
   # Performance budget enforcement: run Criterion benchmarks and check against
   # coarse thresholds (10x design budgets) to catch gross regressions.
   benchmarks:
@@ -345,7 +373,7 @@ jobs:
   # Build verification across platforms
   build:
     name: Build (${{ matrix.target }})
-    needs: [lint, test, feature-matrix]
+    needs: [lint, test, feature-matrix, ftui-tests]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:

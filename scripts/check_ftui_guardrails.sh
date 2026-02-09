@@ -127,6 +127,34 @@ done
 echo ""
 
 # ---------------------------------------------------------------------------
+# 5. Test presence: snapshot and E2E tests must exist in ftui_stub.rs
+# Implements: wa-36xw (FTUI-07.4)
+# ---------------------------------------------------------------------------
+echo "--- Check 5: FTUI test presence ---"
+
+FTUI_STUB="crates/wa-core/src/tui/ftui_stub.rs"
+if [ -f "$FTUI_STUB" ]; then
+    SNAPSHOT_FNS=$(grep -c 'fn snapshot_' "$FTUI_STUB" || true)
+    E2E_FNS=$(grep -c 'fn e2e_' "$FTUI_STUB" || true)
+
+    if [ "$SNAPSHOT_FNS" -ge 20 ]; then
+        pass "Snapshot tests present ($SNAPSHOT_FNS functions)"
+    else
+        fail "Snapshot tests missing or below 20 (found $SNAPSHOT_FNS)"
+    fi
+
+    if [ "$E2E_FNS" -ge 10 ]; then
+        pass "E2E tests present ($E2E_FNS functions)"
+    else
+        fail "E2E tests missing or below 10 (found $E2E_FNS)"
+    fi
+else
+    fail "ftui_stub.rs not found"
+fi
+
+echo ""
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo "=== Summary ==="
