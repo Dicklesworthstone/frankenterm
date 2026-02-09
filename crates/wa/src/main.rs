@@ -13494,9 +13494,21 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     }
                                 }
 
-                                // Agent filter would go here when agent inference is implemented
-                                if agent.is_some() {
-                                    // TODO: Filter by inferred agent type once available
+                                if let Some(ref agent_filter) = agent {
+                                    let title_lower = pane_title.to_lowercase();
+                                    let filter_lower = agent_filter.to_lowercase();
+                                    let matches = match filter_lower.as_str() {
+                                        "codex" => {
+                                            title_lower.contains("codex")
+                                                || title_lower.contains("openai")
+                                        }
+                                        "claude_code" | "claude" => title_lower.contains("claude"),
+                                        "gemini" => title_lower.contains("gemini"),
+                                        _ => title_lower.contains(&filter_lower),
+                                    };
+                                    if !matches {
+                                        return None;
+                                    }
                                 }
 
                                 let ignore_reason =
