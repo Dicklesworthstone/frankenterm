@@ -1,0 +1,11 @@
+[
+  {
+    "rule_id": "gemini.auth.oauth_required",
+    "agent_type": "gemini",
+    "event_type": "auth.oauth_required",
+    "severity": "warning",
+    "confidence": 0.6,
+    "extracted": {},
+    "matched_text": "authorize this app"
+  }
+]

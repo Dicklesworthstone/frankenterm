@@ -365,5 +365,29 @@
     "text": "pane exited",
     "expected_rule_ids": [],
     "negative_for": "wezterm.pane.exited"
+  },
+  {
+    "name": "claude_code_auth_login_required_positive",
+    "text": "To sign in, open this URL in your browser: https://console.anthropic.com/login",
+    "expected_rule_ids": ["claude_code.auth.login_required"],
+    "expected_extracted": {}
+  },
+  {
+    "name": "claude_code_auth_login_required_negative",
+    "text": "Sign in successful. Welcome to Claude Code.",
+    "expected_rule_ids": [],
+    "negative_for": "claude_code.auth.login_required"
+  },
+  {
+    "name": "gemini_auth_oauth_required_positive",
+    "text": "Go to the following link in your browser to authorize this app: https://accounts.google.com/o/oauth2/auth?client_id=xxx",
+    "expected_rule_ids": ["gemini.auth.oauth_required"],
+    "expected_extracted": {}
+  },
+  {
+    "name": "gemini_auth_oauth_required_negative",
+    "text": "Authorization successful. You are now signed in with Google.",
+    "expected_rule_ids": [],
+    "negative_for": "gemini.auth.oauth_required"
   }
 ]

@@ -1,0 +1,1 @@
+To sign in, open this URL in your browser: https://console.anthropic.com/login

@@ -1,0 +1,1 @@
+Authorization complete. You are now authenticated with Google.

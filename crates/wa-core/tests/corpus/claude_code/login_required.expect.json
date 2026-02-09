@@ -1,0 +1,11 @@
+[
+  {
+    "rule_id": "claude_code.auth.login_required",
+    "agent_type": "claude_code",
+    "event_type": "auth.login_required",
+    "severity": "warning",
+    "confidence": 0.6,
+    "extracted": {},
+    "matched_text": "To sign in"
+  }
+]
