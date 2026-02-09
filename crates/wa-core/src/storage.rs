@@ -18400,6 +18400,11 @@ mod backpressure_integration_tests {
             scheduler: None,
             backpressure_tier: None,
             last_activity_by_pane: vec![],
+            restart_count: 0,
+            last_crash_at: None,
+            consecutive_crashes: 0,
+            current_backoff_ms: 0,
+            in_crash_loop: false,
         };
 
         assert!(!snapshot.warnings.is_empty());

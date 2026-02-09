@@ -1590,6 +1590,22 @@ impl HealthSnapshotRenderer {
             }
         }
 
+        // Restart diagnostics
+        if snapshot.restart_count > 0 || snapshot.in_crash_loop {
+            let label = if snapshot.in_crash_loop {
+                style.red("CRASH LOOP")
+            } else {
+                format!("{} restart(s)", snapshot.restart_count)
+            };
+            output.push_str(&format!("  Restarts:      {label}\n"));
+            if snapshot.consecutive_crashes > 0 {
+                output.push_str(&format!(
+                    "    consecutive: {}, backoff: {}ms\n",
+                    snapshot.consecutive_crashes, snapshot.current_backoff_ms
+                ));
+            }
+        }
+
         // Verbose: per-pane sequence numbers
         if ctx.is_verbose() && !snapshot.last_seq_by_pane.is_empty() {
             output.push_str("  Sequences:     ");
@@ -1765,6 +1781,24 @@ impl HealthSnapshotRenderer {
                     detail: format!("{} stuck pane(s): {}", stuck.len(), ids.join(", ")),
                 });
             }
+        }
+
+        // Crash loop detection
+        if snapshot.in_crash_loop {
+            checks.push(HealthDiagnostic {
+                name: "crash loop",
+                status: HealthDiagnosticStatus::Error,
+                detail: format!(
+                    "{} consecutive crashes, backoff {}ms",
+                    snapshot.consecutive_crashes, snapshot.current_backoff_ms
+                ),
+            });
+        } else if snapshot.restart_count > 0 {
+            checks.push(HealthDiagnostic {
+                name: "crash loop",
+                status: HealthDiagnosticStatus::Info,
+                detail: format!("{} restart(s), no crash loop", snapshot.restart_count),
+            });
         }
 
         // Surface warnings as individual diagnostics
@@ -3421,6 +3455,11 @@ mod tests {
             scheduler: None,
             backpressure_tier: None,
             last_activity_by_pane: vec![(1, 1_700_000_000_000), (2, 1_700_000_000_000)],
+            restart_count: 0,
+            last_crash_at: None,
+            consecutive_crashes: 0,
+            current_backoff_ms: 0,
+            in_crash_loop: false,
         }
     }
 

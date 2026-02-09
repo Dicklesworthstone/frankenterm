@@ -78,6 +78,26 @@ pub struct HealthSnapshot {
     /// Each entry is `(pane_id, last_seen_at_epoch_ms)`.
     #[serde(default)]
     pub last_activity_by_pane: Vec<(u64, u64)>,
+
+    /// Total number of watcher restarts since process start.
+    #[serde(default)]
+    pub restart_count: u32,
+
+    /// Timestamp of the most recent crash (epoch ms), if any.
+    #[serde(default)]
+    pub last_crash_at: Option<u64>,
+
+    /// Number of consecutive crashes without a stable run.
+    #[serde(default)]
+    pub consecutive_crashes: u32,
+
+    /// Current backoff delay in milliseconds (0 if healthy).
+    #[serde(default)]
+    pub current_backoff_ms: u64,
+
+    /// Whether the watcher is currently in a detected crash loop.
+    #[serde(default)]
+    pub in_crash_loop: bool,
 }
 
 /// Health snapshot view of a runtime pane priority override.
@@ -1417,11 +1437,50 @@ impl CrashLoopDetector {
             .count() as u32
     }
 
+    /// Total number of recorded restarts (crash timestamps in history).
+    #[must_use]
+    pub fn total_restarts(&self) -> u32 {
+        self.crash_timestamps.len() as u32
+    }
+
+    /// Timestamp of the most recent crash, if any.
+    #[must_use]
+    pub fn last_crash_timestamp(&self) -> Option<u64> {
+        self.crash_timestamps.last().copied()
+    }
+
+    /// Produce diagnostics fields for inclusion in [`HealthSnapshot`].
+    #[must_use]
+    pub fn diagnostics(&self) -> CrashLoopDiagnostics {
+        CrashLoopDiagnostics {
+            restart_count: self.total_restarts(),
+            last_crash_at: self.last_crash_timestamp(),
+            consecutive_crashes: self.consecutive_crashes,
+            current_backoff_ms: self.next_delay_ms(),
+            in_crash_loop: self.is_crash_loop(),
+        }
+    }
+
     /// Prune crash timestamps older than the window.
     fn prune_old(&mut self, now: u64) {
         let cutoff = now.saturating_sub(self.config.window_secs);
         self.crash_timestamps.retain(|&ts| ts >= cutoff);
     }
+}
+
+/// Diagnostic summary from a [`CrashLoopDetector`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CrashLoopDiagnostics {
+    /// Total number of watcher restarts in the detection window.
+    pub restart_count: u32,
+    /// Timestamp of the most recent crash (epoch seconds).
+    pub last_crash_at: Option<u64>,
+    /// Number of consecutive crashes without a successful run.
+    pub consecutive_crashes: u32,
+    /// Current backoff delay in milliseconds.
+    pub current_backoff_ms: u64,
+    /// Whether the detector considers the system in a crash loop.
+    pub in_crash_loop: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1547,6 +1606,11 @@ mod tests {
             scheduler: None,
             backpressure_tier: None,
             last_activity_by_pane: vec![(1, 1_234_567_890), (2, 1_234_567_800)],
+            restart_count: 0,
+            last_crash_at: None,
+            consecutive_crashes: 0,
+            current_backoff_ms: 0,
+            in_crash_loop: false,
         }
     }
 
@@ -1611,6 +1675,11 @@ mod tests {
             scheduler: None,
             backpressure_tier: None,
             last_activity_by_pane: vec![],
+            restart_count: 0,
+            last_crash_at: None,
+            consecutive_crashes: 0,
+            current_backoff_ms: 0,
+            in_crash_loop: false,
         };
 
         HealthSnapshot::update_global(snapshot);
@@ -2536,6 +2605,53 @@ mod tests {
         // After recording crash at 200, timestamps at 100 and 105 are pruned
         assert_eq!(det.crash_timestamps.len(), 1);
         assert_eq!(det.crash_timestamps[0], 200);
+    }
+
+    #[test]
+    fn diagnostics_reflects_detector_state() {
+        let config = CrashLoopConfig {
+            crash_threshold: 3,
+            window_secs: 300,
+            initial_delay_ms: 1000,
+            backoff_factor: 2.0,
+            max_delay_ms: 60_000,
+        };
+        let mut det = CrashLoopDetector::new(config);
+
+        // Fresh detector — all zeros / defaults
+        let diag = det.diagnostics();
+        assert_eq!(diag.restart_count, 0);
+        assert_eq!(diag.last_crash_at, None);
+        assert_eq!(diag.consecutive_crashes, 0);
+        assert_eq!(diag.current_backoff_ms, 0);
+        assert!(!diag.in_crash_loop);
+
+        // Record two crashes (below threshold)
+        det.record_crash(1000);
+        det.record_crash(1001);
+        let diag = det.diagnostics();
+        assert_eq!(diag.restart_count, 2);
+        assert_eq!(diag.last_crash_at, Some(1001));
+        assert_eq!(diag.consecutive_crashes, 2);
+        assert_eq!(diag.current_backoff_ms, 2000); // 1000 * 2^1
+        assert!(!diag.in_crash_loop);
+
+        // Third crash triggers crash loop detection
+        det.record_crash(1002);
+        let diag = det.diagnostics();
+        assert_eq!(diag.restart_count, 3);
+        assert_eq!(diag.consecutive_crashes, 3);
+        assert!(diag.in_crash_loop);
+        assert_eq!(diag.current_backoff_ms, 4000); // 1000 * 2^2
+
+        // Record a stable run — resets consecutive count but window still
+        // contains 3 crashes, so is_crash_loop() remains true (window-based).
+        det.record_success();
+        let diag = det.diagnostics();
+        assert_eq!(diag.restart_count, 3); // total unchanged
+        assert_eq!(diag.consecutive_crashes, 0);
+        assert!(diag.in_crash_loop); // window-based: 3 crashes still in 300s window
+        assert_eq!(diag.current_backoff_ms, 0); // consecutive=0 → no backoff
     }
 
     // -----------------------------------------------------------------------

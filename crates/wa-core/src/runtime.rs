@@ -596,6 +596,11 @@ impl ObservationRuntime {
                                 },
                                 backpressure_tier: None,
                                 last_activity_by_pane,
+                                restart_count: 0,
+                                last_crash_at: None,
+                                consecutive_crashes: 0,
+                                current_backoff_ms: 0,
+                                in_crash_loop: false,
                             };
 
                             HealthSnapshot::update_global(snapshot);
@@ -1600,6 +1605,11 @@ impl RuntimeHandle {
             },
             backpressure_tier: None,
             last_activity_by_pane,
+            restart_count: 0,
+            last_crash_at: None,
+            consecutive_crashes: 0,
+            current_backoff_ms: 0,
+            in_crash_loop: false,
         };
 
         HealthSnapshot::update_global(snapshot);
@@ -1846,6 +1856,11 @@ mod tests {
             scheduler: None,
             backpressure_tier: None,
             last_activity_by_pane: vec![],
+            restart_count: 0,
+            last_crash_at: None,
+            consecutive_crashes: 0,
+            current_backoff_ms: 0,
+            in_crash_loop: false,
         };
 
         // Verify metrics are correctly reflected in snapshot
@@ -1961,6 +1976,11 @@ mod tests {
             scheduler: None,
             backpressure_tier: None,
             last_activity_by_pane: vec![],
+            restart_count: 0,
+            last_crash_at: None,
+            consecutive_crashes: 0,
+            current_backoff_ms: 0,
+            in_crash_loop: false,
         };
 
         assert_eq!(snapshot.capture_queue_depth, 500);
@@ -2001,6 +2021,11 @@ mod tests {
             scheduler: Some(sched),
             backpressure_tier: Some("Green".to_string()),
             last_activity_by_pane: vec![],
+            restart_count: 0,
+            last_crash_at: None,
+            consecutive_crashes: 0,
+            current_backoff_ms: 0,
+            in_crash_loop: false,
         };
 
         let sched = snapshot.scheduler.as_ref().unwrap();
@@ -2041,6 +2066,11 @@ mod tests {
             }),
             backpressure_tier: None,
             last_activity_by_pane: vec![],
+            restart_count: 0,
+            last_crash_at: None,
+            consecutive_crashes: 0,
+            current_backoff_ms: 0,
+            in_crash_loop: false,
         };
 
         let json = serde_json::to_string(&snapshot).unwrap();
