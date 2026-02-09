@@ -704,7 +704,7 @@ mod tests {
     fn guard_toggles_output_gate_on_enter_and_drop() {
         use super::super::output_gate::tests::GATE_TEST_LOCK;
         use super::super::output_gate::{self, GatePhase};
-        let _lock = GATE_TEST_LOCK.lock().unwrap();
+        let _lock = GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         output_gate::set_phase(GatePhase::Inactive);
 
         {
@@ -722,7 +722,7 @@ mod tests {
     fn guard_into_inner_clears_gate() {
         use super::super::output_gate::tests::GATE_TEST_LOCK;
         use super::super::output_gate::{self, GatePhase};
-        let _lock = GATE_TEST_LOCK.lock().unwrap();
+        let _lock = GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         output_gate::set_phase(GatePhase::Inactive);
 
         let session = MockTerminalSession::new();
@@ -823,7 +823,7 @@ mod tests {
     fn guard_drop_cleans_up_after_caught_panic() {
         use super::super::output_gate::tests::GATE_TEST_LOCK;
         use super::super::output_gate::{self, GatePhase};
-        let _lock = GATE_TEST_LOCK.lock().unwrap();
+        let _lock = GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         output_gate::set_phase(GatePhase::Inactive);
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -843,7 +843,7 @@ mod tests {
     fn guard_drop_cleans_up_after_panic_in_suspended_state() {
         use super::super::output_gate::tests::GATE_TEST_LOCK;
         use super::super::output_gate::{self, GatePhase};
-        let _lock = GATE_TEST_LOCK.lock().unwrap();
+        let _lock = GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         output_gate::set_phase(GatePhase::Inactive);
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -879,7 +879,7 @@ mod tests {
     fn teardown_idempotency_drop_after_into_inner() {
         use super::super::output_gate::tests::GATE_TEST_LOCK;
         use super::super::output_gate::{self, GatePhase};
-        let _lock = GATE_TEST_LOCK.lock().unwrap();
+        let _lock = GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         output_gate::set_phase(GatePhase::Inactive);
 
         let session = MockTerminalSession::new();
@@ -898,7 +898,7 @@ mod tests {
     fn lifecycle_stress_repeated_enter_leave_cycles() {
         use super::super::output_gate::tests::GATE_TEST_LOCK;
         use super::super::output_gate::{self, GatePhase};
-        let _lock = GATE_TEST_LOCK.lock().unwrap();
+        let _lock = GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         output_gate::set_phase(GatePhase::Inactive);
 
         // Rapid start/stop cycles must not leak mode state.
@@ -943,7 +943,7 @@ mod tests {
     fn guard_drop_after_panic_in_draw_callback() {
         use super::super::output_gate::tests::GATE_TEST_LOCK;
         use super::super::output_gate::{self, GatePhase};
-        let _lock = GATE_TEST_LOCK.lock().unwrap();
+        let _lock = GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         output_gate::set_phase(GatePhase::Inactive);
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -957,5 +957,206 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(output_gate::phase(), GatePhase::Inactive);
+    }
+
+    // -- FTUI-03.4.a: teardown harness and restoration assertions --
+    //
+    // Systematic harness that exercises all abort scenarios and validates
+    // the full set of restoration invariants:
+    //   1. SessionPhase returns to Idle
+    //   2. ScreenMode returns to None
+    //   3. Output gate returns to Inactive
+    //   4. MockSession history shows leave was called
+
+    /// Assert that all restoration invariants hold after teardown.
+    fn assert_restoration_invariants(gate_phase: super::super::output_gate::GatePhase) {
+        use super::super::output_gate::GatePhase;
+        assert_eq!(
+            gate_phase,
+            GatePhase::Inactive,
+            "output gate must be Inactive after teardown"
+        );
+        assert!(
+            !super::super::output_gate::is_output_suppressed(),
+            "output must not be suppressed after teardown"
+        );
+    }
+
+    /// Run a closure that is expected to panic, then verify all restoration
+    /// invariants. Returns the caught panic for optional further inspection.
+    fn run_panic_harness(
+        f: impl FnOnce() + std::panic::UnwindSafe,
+    ) -> Box<dyn std::any::Any + Send> {
+        use super::super::output_gate::tests::GATE_TEST_LOCK;
+        use super::super::output_gate::{self, GatePhase};
+        let _lock = GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        output_gate::set_phase(GatePhase::Inactive);
+
+        let result = std::panic::catch_unwind(f);
+        assert!(result.is_err(), "closure should have panicked");
+
+        assert_restoration_invariants(output_gate::phase());
+        result.unwrap_err()
+    }
+
+    #[test]
+    fn harness_panic_during_active_alt_screen() {
+        run_panic_harness(std::panic::AssertUnwindSafe(|| {
+            let session = MockTerminalSession::new();
+            let _guard = SessionGuard::enter(session, ScreenMode::AltScreen).unwrap();
+            panic!("abort during active alt-screen");
+        }));
+    }
+
+    #[test]
+    fn harness_panic_during_active_inline() {
+        run_panic_harness(std::panic::AssertUnwindSafe(|| {
+            let session = MockTerminalSession::new();
+            let _guard =
+                SessionGuard::enter(session, ScreenMode::Inline { ui_height: 12 }).unwrap();
+            panic!("abort during active inline mode");
+        }));
+    }
+
+    #[test]
+    fn harness_panic_during_suspended_phase() {
+        run_panic_harness(std::panic::AssertUnwindSafe(|| {
+            let session = MockTerminalSession::new();
+            let mut guard = SessionGuard::enter(session, ScreenMode::AltScreen).unwrap();
+            guard.suspend().unwrap();
+            panic!("abort during suspended command handoff");
+        }));
+    }
+
+    #[test]
+    fn harness_panic_during_draw() {
+        run_panic_harness(std::panic::AssertUnwindSafe(|| {
+            let session = MockTerminalSession::new();
+            let mut guard = SessionGuard::enter(session, ScreenMode::default()).unwrap();
+            guard.draw(&mut |_, _| {}).unwrap();
+            guard.draw(&mut |_, _| {}).unwrap();
+            panic!("abort mid-render cycle");
+        }));
+    }
+
+    #[test]
+    fn harness_panic_during_poll() {
+        run_panic_harness(std::panic::AssertUnwindSafe(|| {
+            let session = MockTerminalSession::new();
+            let mut guard = SessionGuard::enter(session, ScreenMode::default()).unwrap();
+            let _ = guard.poll_event(Duration::ZERO);
+            panic!("abort during event poll");
+        }));
+    }
+
+    #[test]
+    fn harness_panic_after_multiple_suspend_resume_cycles() {
+        run_panic_harness(std::panic::AssertUnwindSafe(|| {
+            let session = MockTerminalSession::new();
+            let mut guard = SessionGuard::enter(session, ScreenMode::AltScreen).unwrap();
+            for _ in 0..5 {
+                guard.suspend().unwrap();
+                guard.resume().unwrap();
+            }
+            panic!("abort after rapid suspend/resume cycling");
+        }));
+    }
+
+    #[test]
+    fn harness_into_inner_then_drop_no_double_cleanup() {
+        use super::super::output_gate::tests::GATE_TEST_LOCK;
+        use super::super::output_gate::{self, GatePhase};
+        let _lock = GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        output_gate::set_phase(GatePhase::Inactive);
+
+        let session = MockTerminalSession::new();
+        let guard = SessionGuard::enter(session, ScreenMode::AltScreen).unwrap();
+        let session = guard.into_inner();
+
+        assert_restoration_invariants(output_gate::phase());
+        assert_eq!(session.phase(), SessionPhase::Idle);
+        assert!(session.screen_mode().is_none());
+        // Only one leave in history (not double)
+        assert_eq!(session.history.iter().filter(|h| **h == "leave").count(), 1);
+    }
+
+    #[test]
+    fn harness_leave_restores_all_screen_modes() {
+        // Verify that leave() clears screen mode for each mode variant.
+        for mode in [
+            ScreenMode::AltScreen,
+            ScreenMode::Inline { ui_height: 1 },
+            ScreenMode::Inline { ui_height: 24 },
+            ScreenMode::Inline { ui_height: 100 },
+        ] {
+            let mut session = MockTerminalSession::new();
+            session.enter(mode).unwrap();
+            assert_eq!(session.screen_mode(), Some(mode));
+            session.leave();
+            assert!(
+                session.screen_mode().is_none(),
+                "screen_mode not cleared for {mode:?}"
+            );
+            assert_eq!(session.phase(), SessionPhase::Idle);
+        }
+    }
+
+    #[test]
+    fn harness_panic_message_preserved_in_catch() {
+        let payload = run_panic_harness(std::panic::AssertUnwindSafe(|| {
+            let session = MockTerminalSession::new();
+            let _guard = SessionGuard::enter(session, ScreenMode::default()).unwrap();
+            panic!("specific panic message for forensics");
+        }));
+
+        // Verify the panic payload is accessible for crash bundle generation.
+        let msg = payload
+            .downcast_ref::<&str>()
+            .expect("panic payload should be &str");
+        assert_eq!(*msg, "specific panic message for forensics");
+    }
+
+    #[test]
+    fn harness_sequential_panics_no_state_leak() {
+        // Multiple sequential panics must each leave clean state.
+        for i in 0..10 {
+            run_panic_harness(std::panic::AssertUnwindSafe(move || {
+                let session = MockTerminalSession::new();
+                let mode = if i % 2 == 0 {
+                    ScreenMode::AltScreen
+                } else {
+                    ScreenMode::Inline { ui_height: 8 }
+                };
+                let _guard = SessionGuard::enter(session, mode).unwrap();
+                panic!("sequential panic #{i}");
+            }));
+        }
+    }
+
+    #[test]
+    fn harness_gate_phase_correct_at_each_lifecycle_point() {
+        use super::super::output_gate::tests::GATE_TEST_LOCK;
+        use super::super::output_gate::{self, GatePhase};
+        let _lock = GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        output_gate::set_phase(GatePhase::Inactive);
+
+        // Track gate phase at each lifecycle point.
+        let session = MockTerminalSession::new();
+        assert_eq!(output_gate::phase(), GatePhase::Inactive);
+
+        let mut guard = SessionGuard::enter(session, ScreenMode::AltScreen).unwrap();
+        assert_eq!(output_gate::phase(), GatePhase::Active);
+
+        guard.draw(&mut |_, _| {}).unwrap();
+        assert_eq!(output_gate::phase(), GatePhase::Active);
+
+        // Note: MockTerminalSession does NOT toggle gate on suspend/resume
+        // (only CrosstermSession does). Gate remains Active through mock
+        // suspend/resume. The gate is managed by the caller (command_handoff.rs)
+        // or the real session implementation.
+
+        let session = guard.into_inner();
+        assert_eq!(output_gate::phase(), GatePhase::Inactive);
+        assert_eq!(session.phase(), SessionPhase::Idle);
     }
 }

@@ -9,6 +9,31 @@
 //! the TUI is currently active.  Other parts of the codebase (logging, crash
 //! handler, debug output) check this gate before writing to stderr.
 //!
+//! # Output routing contract (FTUI-03.2.a)
+//!
+//! All in-process output MUST obey the output gate phase:
+//!
+//! | Phase | Allowed writes | Mechanism |
+//! |-------|---------------|-----------|
+//! | **Inactive** | Any | Normal stdout/stderr |
+//! | **Active** | Rendering pipeline only | `TuiAwareWriter` discards; use `gated_write!` |
+//! | **Suspended** | Command handoff output | `gated_write!` asserts not Active |
+//!
+//! ## Sanctioned output paths
+//!
+//! 1. **Structured logging** — routes through `TuiAwareWriter` via tracing.
+//!    Suppressed during Active, passes through during Inactive/Suspended.
+//! 2. **Command handoff** — `gated_write!`/`gated_writeln!` with debug
+//!    assertions that the gate is not Active.
+//! 3. **Crash/panic handler** — checks `is_output_suppressed()` before
+//!    writing; may force-write if terminal restoration is needed.
+//!
+//! ## Prohibited
+//!
+//! Raw `println!`/`eprintln!`/`print!`/`eprint!` in any code path that
+//! can execute while the TUI is Active.  Use `tracing::error!` for errors
+//! or `gated_writeln!` for operator-facing messages during command handoff.
+//!
 //! # Integration points
 //!
 //! - [`SessionGuard`](super::terminal_session::SessionGuard) toggles the
@@ -150,6 +175,81 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TuiAwareWriter {
 }
 
 // -------------------------------------------------------------------------
+// Gated write helpers (FTUI-03.2.a)
+// -------------------------------------------------------------------------
+
+/// Write to stdout only when the output gate allows it.
+///
+/// In debug builds, panics if called while the gate is
+/// [`GatePhase::Active`] — this catches accidental writes that would
+/// corrupt the TUI.  In release builds, silently discards the write
+/// to avoid crashing in production.
+///
+/// # Usage
+///
+/// ```ignore
+/// use wa_core::tui::output_gate::gated_write_stdout;
+/// gated_write_stdout(format_args!("Running: {}\n", command));
+/// ```
+pub fn gated_write_stdout(args: std::fmt::Arguments<'_>) {
+    if is_output_suppressed() {
+        debug_assert!(
+            false,
+            "gated_write_stdout called while output gate is Active — this would corrupt the TUI"
+        );
+        return;
+    }
+    use std::io::Write;
+    let _ = std::io::stdout().write_fmt(args);
+}
+
+/// Write to stderr only when the output gate allows it.
+///
+/// Same semantics as [`gated_write_stdout`] but targets stderr.
+pub fn gated_write_stderr(args: std::fmt::Arguments<'_>) {
+    if is_output_suppressed() {
+        debug_assert!(
+            false,
+            "gated_write_stderr called while output gate is Active — this would corrupt the TUI"
+        );
+        return;
+    }
+    use std::io::Write;
+    let _ = std::io::stderr().write_fmt(args);
+}
+
+/// Gate-aware replacement for `println!`.
+///
+/// Writes to stdout with a trailing newline when the output gate is not
+/// Active.  Debug-asserts if called during Active phase.
+///
+/// Sanctioned for use in command handoff paths (Suspended phase) and
+/// pre/post-TUI paths (Inactive phase).
+#[macro_export]
+macro_rules! gated_println {
+    () => {
+        $crate::tui::output_gate::gated_write_stdout(format_args!("\n"))
+    };
+    ($($arg:tt)*) => {
+        $crate::tui::output_gate::gated_write_stdout(format_args!("{}\n", format_args!($($arg)*)))
+    };
+}
+
+/// Gate-aware replacement for `eprintln!`.
+///
+/// Writes to stderr with a trailing newline when the output gate is not
+/// Active.  Debug-asserts if called during Active phase.
+#[macro_export]
+macro_rules! gated_eprintln {
+    () => {
+        $crate::tui::output_gate::gated_write_stderr(format_args!("\n"))
+    };
+    ($($arg:tt)*) => {
+        $crate::tui::output_gate::gated_write_stderr(format_args!("{}\n", format_args!($($arg)*)))
+    };
+}
+
+// -------------------------------------------------------------------------
 // Tests
 // -------------------------------------------------------------------------
 
@@ -161,9 +261,18 @@ pub(crate) mod tests {
     // must run under a serial lock to avoid races with parallel test
     // threads.  We use a Mutex to serialize all gate-mutation tests.
     // `pub(crate)` so terminal_session tests can share it.
+    //
+    // `#[should_panic]` tests poison the mutex — `lock_gate()` recovers
+    // from `PoisonError` so subsequent tests are not affected.
     use std::sync::Mutex;
     #[allow(clippy::redundant_pub_crate)]
     pub(crate) static GATE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Lock the gate test mutex, recovering from poison (caused by
+    /// `#[should_panic]` tests that panic while holding the lock).
+    fn lock_gate() -> std::sync::MutexGuard<'static, ()> {
+        GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn gate_phase_roundtrip() {
@@ -177,7 +286,7 @@ pub(crate) mod tests {
 
     #[test]
     fn active_suppresses_output() {
-        let _lock = GATE_TEST_LOCK.lock().unwrap();
+        let _lock = lock_gate();
         set_phase(GatePhase::Active);
         assert!(is_output_suppressed());
         set_phase(GatePhase::Inactive);
@@ -185,7 +294,7 @@ pub(crate) mod tests {
 
     #[test]
     fn suspended_does_not_suppress() {
-        let _lock = GATE_TEST_LOCK.lock().unwrap();
+        let _lock = lock_gate();
         set_phase(GatePhase::Suspended);
         assert!(!is_output_suppressed());
         set_phase(GatePhase::Inactive);
@@ -193,7 +302,7 @@ pub(crate) mod tests {
 
     #[test]
     fn full_lifecycle() {
-        let _lock = GATE_TEST_LOCK.lock().unwrap();
+        let _lock = lock_gate();
 
         set_phase(GatePhase::Inactive);
         assert!(!is_output_suppressed());
@@ -218,7 +327,7 @@ pub(crate) mod tests {
     #[test]
     fn tui_aware_writer_suppresses_when_active() {
         use std::io::Write;
-        let _lock = GATE_TEST_LOCK.lock().unwrap();
+        let _lock = lock_gate();
 
         set_phase(GatePhase::Active);
         let writer = TuiAwareWriter;
@@ -232,7 +341,7 @@ pub(crate) mod tests {
     #[test]
     fn tui_aware_writer_passes_through_when_inactive() {
         use std::io::Write;
-        let _lock = GATE_TEST_LOCK.lock().unwrap();
+        let _lock = lock_gate();
 
         set_phase(GatePhase::Inactive);
         let writer = TuiAwareWriter;
@@ -240,6 +349,98 @@ pub(crate) mod tests {
         // Write should succeed (forwarded to stderr)
         let result = inner.write(b"test");
         assert!(result.is_ok());
+        set_phase(GatePhase::Inactive);
+    }
+
+    // -- gated write tests (FTUI-03.2.a) --
+
+    #[test]
+    fn gated_write_stdout_passes_when_inactive() {
+        let _lock = lock_gate();
+        set_phase(GatePhase::Inactive);
+        // Should not panic — gate is Inactive.
+        gated_write_stdout(format_args!("test inactive\n"));
+        set_phase(GatePhase::Inactive);
+    }
+
+    #[test]
+    fn gated_write_stdout_passes_when_suspended() {
+        let _lock = lock_gate();
+        set_phase(GatePhase::Suspended);
+        // Should not panic — gate is Suspended (command handoff).
+        gated_write_stdout(format_args!("test suspended\n"));
+        set_phase(GatePhase::Inactive);
+    }
+
+    #[test]
+    fn gated_write_stdout_suppressed_when_active() {
+        let _lock = lock_gate();
+        set_phase(GatePhase::Active);
+        // In release builds, this silently discards.
+        // In debug builds, the debug_assert would fire — but we test release
+        // semantics here by checking it doesn't panic in non-debug.
+        #[cfg(not(debug_assertions))]
+        gated_write_stdout(format_args!("should be suppressed\n"));
+        set_phase(GatePhase::Inactive);
+    }
+
+    #[test]
+    fn gated_write_stderr_passes_when_inactive() {
+        let _lock = lock_gate();
+        set_phase(GatePhase::Inactive);
+        gated_write_stderr(format_args!("test stderr inactive\n"));
+        set_phase(GatePhase::Inactive);
+    }
+
+    #[test]
+    fn gated_write_stderr_passes_when_suspended() {
+        let _lock = lock_gate();
+        set_phase(GatePhase::Suspended);
+        gated_write_stderr(format_args!("test stderr suspended\n"));
+        set_phase(GatePhase::Inactive);
+    }
+
+    #[test]
+    fn gated_write_stderr_suppressed_when_active() {
+        let _lock = lock_gate();
+        set_phase(GatePhase::Active);
+        #[cfg(not(debug_assertions))]
+        gated_write_stderr(format_args!("should be suppressed\n"));
+        set_phase(GatePhase::Inactive);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "output gate is Active")]
+    fn gated_write_stdout_panics_in_debug_when_active() {
+        let _lock = lock_gate();
+        set_phase(GatePhase::Active);
+        gated_write_stdout(format_args!("boom"));
+        // Cleanup won't run due to panic, but the GATE is process-global
+        // and the test harness will continue on the next test.
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "output gate is Active")]
+    fn gated_write_stderr_panics_in_debug_when_active() {
+        let _lock = lock_gate();
+        set_phase(GatePhase::Active);
+        gated_write_stderr(format_args!("boom"));
+    }
+
+    #[test]
+    fn gated_macros_compile_and_run() {
+        let _lock = lock_gate();
+        set_phase(GatePhase::Inactive);
+
+        // Verify that the gated_println! and gated_eprintln! macros
+        // compile and execute without error in Inactive phase.
+        crate::gated_println!("macro test: {}", 42);
+        crate::gated_eprintln!("macro test stderr: {}", 42);
+        crate::gated_println!();
+        crate::gated_eprintln!();
+
         set_phase(GatePhase::Inactive);
     }
 }

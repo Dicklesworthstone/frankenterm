@@ -805,14 +805,15 @@ impl<Q: QueryClient> App<Q> {
         // Leave alternate screen to show command output
         disable_raw_mode()?;
         execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-        println!("Running: {command}\n");
+        // Gate-aware writes: asserts not Active in debug builds (FTUI-03.2.a).
+        crate::gated_println!("Running: {command}\n");
 
         let status = std::process::Command::new(program).args(parts).status();
         match status {
-            Ok(status) => println!("Exit status: {status}"),
-            Err(err) => println!("Command failed: {err}"),
+            Ok(status) => crate::gated_println!("Exit status: {status}"),
+            Err(err) => crate::gated_println!("Command failed: {err}"),
         }
-        println!("\nPress Enter to return to the TUI...");
+        crate::gated_println!("\nPress Enter to return to the TUI...");
         let mut input = String::new();
         let _ = io::stdin().read_line(&mut input);
 

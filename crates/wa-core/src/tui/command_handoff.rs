@@ -107,9 +107,7 @@ pub fn execute<S: TerminalSession>(
     }
 
     // 2. Suspend
-    session
-        .suspend()
-        .map_err(HandoffError::SuspendFailed)?;
+    session.suspend().map_err(HandoffError::SuspendFailed)?;
 
     // 3. Execute (session is now Suspended — output gate allows writes)
     let result = execute_inner(command);
@@ -134,11 +132,12 @@ fn execute_inner(command: &str) -> CommandResult {
     let program = parts.next().unwrap(); // Caller verified non-empty
 
     // Print the command so the operator sees what's running.
-    println!("Running: {command}\n");
+    // Gate-aware: asserts not Active in debug builds (FTUI-03.2.a).
+    crate::gated_println!("Running: {command}\n");
 
     match std::process::Command::new(program).args(parts).status() {
         Ok(status) => {
-            println!("\nExit status: {status}");
+            crate::gated_println!("\nExit status: {status}");
             CommandResult {
                 command: command.to_string(),
                 status: Some(status),
@@ -146,7 +145,7 @@ fn execute_inner(command: &str) -> CommandResult {
             }
         }
         Err(err) => {
-            println!("\nCommand failed to launch: {err}");
+            crate::gated_println!("\nCommand failed to launch: {err}");
             CommandResult {
                 command: command.to_string(),
                 status: None,
@@ -159,9 +158,11 @@ fn execute_inner(command: &str) -> CommandResult {
 /// Block until the operator presses Enter.
 fn wait_for_enter(result: &CommandResult) {
     if result.success() {
-        println!("\nPress Enter to return to the TUI...");
+        crate::gated_println!("\nPress Enter to return to the TUI...");
     } else {
-        println!("\nCommand completed with errors. Press Enter to return to the TUI...");
+        crate::gated_println!(
+            "\nCommand completed with errors. Press Enter to return to the TUI..."
+        );
     }
 
     let mut buf = String::new();
@@ -232,5 +233,200 @@ mod tests {
     fn handoff_error_display() {
         let err = HandoffError::EmptyCommand;
         assert_eq!(err.to_string(), "empty command");
+    }
+
+    // -- FTUI-06.2.a: state-machine traces and failure-path catalog --
+
+    // Trace T1: nominal path (Active → Suspended → cmd → Suspended → Active)
+    #[test]
+    fn trace_nominal_suspend_resume() {
+        let mut session = MockTerminalSession::new();
+        session.enter(ScreenMode::AltScreen).unwrap();
+        assert_eq!(session.phase(), SessionPhase::Active);
+
+        session.suspend().unwrap();
+        assert_eq!(session.phase(), SessionPhase::Suspended);
+
+        // Simulate command execution (just phase verification)
+        assert_eq!(session.phase(), SessionPhase::Suspended);
+
+        session.resume().unwrap();
+        assert_eq!(session.phase(), SessionPhase::Active);
+
+        assert_eq!(session.history, vec!["enter", "suspend", "resume"]);
+    }
+
+    // Trace T2: nominal + leave (Active → Suspended → Active → Idle)
+    #[test]
+    fn trace_nominal_full_lifecycle() {
+        let mut session = MockTerminalSession::new();
+        session.enter(ScreenMode::AltScreen).unwrap();
+        session.suspend().unwrap();
+        session.resume().unwrap();
+        session.leave();
+        assert_eq!(session.phase(), SessionPhase::Idle);
+        assert!(session.screen_mode().is_none());
+        assert_eq!(session.history, vec!["enter", "suspend", "resume", "leave"]);
+    }
+
+    // Trace T3: multiple handoffs in sequence
+    #[test]
+    fn trace_multiple_handoffs_sequential() {
+        let mut session = MockTerminalSession::new();
+        session.enter(ScreenMode::AltScreen).unwrap();
+
+        for i in 0..5 {
+            session.suspend().unwrap();
+            assert_eq!(
+                session.phase(),
+                SessionPhase::Suspended,
+                "handoff #{i}: not Suspended after suspend"
+            );
+            session.resume().unwrap();
+            assert_eq!(
+                session.phase(),
+                SessionPhase::Active,
+                "handoff #{i}: not Active after resume"
+            );
+        }
+
+        session.leave();
+        // 1 enter + 5*(suspend + resume) + 1 leave = 12 events
+        assert_eq!(session.history.len(), 12);
+    }
+
+    // Trace F1: suspend fails (session not Active)
+    #[test]
+    fn trace_fail_suspend_from_idle() {
+        let mut session = MockTerminalSession::new();
+        let err = execute(&mut session, "echo hello").unwrap_err();
+        assert!(matches!(err, HandoffError::SuspendFailed(_)));
+        assert_eq!(session.phase(), SessionPhase::Idle);
+    }
+
+    // Trace F2: suspend fails (already Suspended)
+    #[test]
+    fn trace_fail_double_suspend() {
+        let mut session = MockTerminalSession::new();
+        session.enter(ScreenMode::default()).unwrap();
+        session.suspend().unwrap();
+        let err = session.suspend().unwrap_err();
+        assert!(matches!(err, SessionError::InvalidPhase { .. }));
+        // Session stays Suspended — not corrupted
+        assert_eq!(session.phase(), SessionPhase::Suspended);
+    }
+
+    // Trace F3: resume fails (already Active)
+    #[test]
+    fn trace_fail_double_resume() {
+        let mut session = MockTerminalSession::new();
+        session.enter(ScreenMode::default()).unwrap();
+        let err = session.resume().unwrap_err();
+        assert!(matches!(err, SessionError::InvalidPhase { .. }));
+        // Session stays Active — not corrupted
+        assert_eq!(session.phase(), SessionPhase::Active);
+    }
+
+    // Trace F4: leave from Suspended (emergency cleanup)
+    #[test]
+    fn trace_leave_from_suspended_emergency() {
+        let mut session = MockTerminalSession::new();
+        session.enter(ScreenMode::AltScreen).unwrap();
+        session.suspend().unwrap();
+        // If resume fails, caller may leave() as emergency cleanup
+        session.leave();
+        assert_eq!(session.phase(), SessionPhase::Idle);
+        assert!(session.screen_mode().is_none());
+    }
+
+    // Trace F5: empty command before any phase transition
+    #[test]
+    fn trace_fail_empty_command_preserves_phase() {
+        let mut session = MockTerminalSession::new();
+        session.enter(ScreenMode::default()).unwrap();
+        let err = execute(&mut session, "").unwrap_err();
+        assert!(matches!(err, HandoffError::EmptyCommand));
+        // Session still Active — no suspension happened
+        assert_eq!(session.phase(), SessionPhase::Active);
+        assert_eq!(session.history, vec!["enter"]);
+    }
+
+    // Invariant I1: screen mode preserved across handoff
+    #[test]
+    fn invariant_screen_mode_preserved_across_handoff() {
+        for mode in [
+            ScreenMode::AltScreen,
+            ScreenMode::Inline { ui_height: 8 },
+            ScreenMode::Inline { ui_height: 24 },
+        ] {
+            let mut session = MockTerminalSession::new();
+            session.enter(mode).unwrap();
+            assert_eq!(session.screen_mode(), Some(mode));
+
+            session.suspend().unwrap();
+            assert_eq!(
+                session.screen_mode(),
+                Some(mode),
+                "mode lost during suspend for {mode:?}"
+            );
+
+            session.resume().unwrap();
+            assert_eq!(
+                session.screen_mode(),
+                Some(mode),
+                "mode lost during resume for {mode:?}"
+            );
+        }
+    }
+
+    // Invariant I2: draw only allowed in Active phase
+    #[test]
+    fn invariant_no_draw_during_suspended() {
+        let mut session = MockTerminalSession::new();
+        session.enter(ScreenMode::default()).unwrap();
+        session.suspend().unwrap();
+        let err = session.draw(&mut |_, _| {}).unwrap_err();
+        assert!(matches!(err, SessionError::InvalidPhase { .. }));
+    }
+
+    // Invariant I3: poll only allowed in Active phase
+    #[test]
+    fn invariant_no_poll_during_suspended() {
+        let mut session = MockTerminalSession::new();
+        session.enter(ScreenMode::default()).unwrap();
+        session.suspend().unwrap();
+        let err = session.poll_event(std::time::Duration::ZERO).unwrap_err();
+        assert!(matches!(err, SessionError::InvalidPhase { .. }));
+    }
+
+    // Invariant I4: CommandResult fields for launch failure
+    #[test]
+    fn invariant_command_result_launch_failure() {
+        let result = CommandResult {
+            command: "nonexistent_binary".to_string(),
+            status: None,
+            launch_error: Some("No such file or directory".to_string()),
+        };
+        assert!(!result.success());
+        assert!(result.status.is_none());
+        assert!(result.launch_error.is_some());
+    }
+
+    // Invariant I5: HandoffError variants are all distinct
+    #[test]
+    fn invariant_handoff_error_variants() {
+        let e1 = HandoffError::EmptyCommand;
+        let e2 = HandoffError::SuspendFailed(SessionError::InvalidPhase {
+            expected: &[SessionPhase::Active],
+            actual: SessionPhase::Idle,
+        });
+        let e3 = HandoffError::ResumeFailed(SessionError::InvalidPhase {
+            expected: &[SessionPhase::Suspended],
+            actual: SessionPhase::Active,
+        });
+        // Each variant produces a distinct error message
+        assert!(e1.to_string().contains("empty"));
+        assert!(e2.to_string().contains("suspend"));
+        assert!(e3.to_string().contains("resume"));
     }
 }

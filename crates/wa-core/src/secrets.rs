@@ -768,9 +768,11 @@ mod tests {
         let mut report = make_report();
 
         // Create a segment with many secrets
-        let content = (0..10)
-            .map(|i| format!("password=secret_value_{i:02}xx\n"))
-            .collect::<String>();
+        let content: String = (0..10).fold(String::new(), |mut acc, i| {
+            use std::fmt::Write;
+            let _ = writeln!(acc, "password=secret_value_{i:02}xx");
+            acc
+        });
         let segment = make_segment(1, 1, &content);
 
         engine.scan_segment(&segment, &options, &mut report);

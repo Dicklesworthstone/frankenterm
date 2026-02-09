@@ -18673,7 +18673,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             let storage = match wa_core::storage::StorageHandle::new(&db_path).await {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("Failed to open storage: {e}");
+                    // Route through tracing, not raw eprintln (FTUI-03.2.a).
+                    tracing::error!(%e, "Failed to open storage for TUI");
                     return Err(e.into());
                 }
             };
@@ -18695,7 +18696,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("TUI thread panicked: {e}"))?;
 
             if let Err(e) = result {
-                eprintln!("TUI error: {e}");
+                // Route through tracing, not raw eprintln (FTUI-03.2.a).
+                tracing::error!(%e, "TUI runtime error");
                 return Err(e.into());
             }
         }
@@ -18709,7 +18711,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             let storage = match wa_core::storage::StorageHandle::new(&db_path).await {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("Failed to open storage: {e}");
+                    // Route through tracing, not raw eprintln (FTUI-03.2.a).
+                    tracing::error!(%e, "Failed to open storage for TUI");
                     return Err(e.into());
                 }
             };
@@ -18728,7 +18731,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("TUI thread panicked: {e}"))?;
 
             if let Err(e) = result {
-                eprintln!("TUI error: {e}");
+                // Route through tracing, not raw eprintln (FTUI-03.2.a).
+                tracing::error!(%e, "TUI runtime error");
                 return Err(e.into());
             }
         }

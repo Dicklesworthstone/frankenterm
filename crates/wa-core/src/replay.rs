@@ -234,10 +234,21 @@ impl OutputSink for HeadlessSink {
 }
 
 /// Sink that writes terminal output to stdout.
+///
+/// # One-writer rule
+///
+/// This sink writes directly to stdout/stderr and must NOT be used while
+/// the TUI rendering pipeline is active (`GatePhase::Active`).  A
+/// `debug_assert!` fires if the output gate is suppressed.
 pub struct TerminalSink;
 
 impl OutputSink for TerminalSink {
     fn write_output(&mut self, bytes: &[u8]) -> Result<()> {
+        #[cfg(any(feature = "tui", feature = "ftui"))]
+        debug_assert!(
+            !crate::tui::output_gate::is_output_suppressed(),
+            "TerminalSink::write_output called while TUI output gate is active"
+        );
         use std::io::Write;
         std::io::stdout().write_all(bytes)?;
         std::io::stdout().flush()?;
@@ -245,11 +256,21 @@ impl OutputSink for TerminalSink {
     }
 
     fn show_event(&mut self, event: &serde_json::Value) -> Result<()> {
+        #[cfg(any(feature = "tui", feature = "ftui"))]
+        debug_assert!(
+            !crate::tui::output_gate::is_output_suppressed(),
+            "TerminalSink::show_event called while TUI output gate is active"
+        );
         eprintln!("[event] {event}");
         Ok(())
     }
 
     fn show_marker(&mut self, text: &str) -> Result<()> {
+        #[cfg(any(feature = "tui", feature = "ftui"))]
+        debug_assert!(
+            !crate::tui::output_gate::is_output_suppressed(),
+            "TerminalSink::show_marker called while TUI output gate is active"
+        );
         eprintln!("[marker] {text}");
         Ok(())
     }

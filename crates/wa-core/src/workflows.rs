@@ -12472,7 +12472,7 @@ steps:
             GroupLockResult::Acquired { locked_panes } => {
                 assert_eq!(locked_panes.len(), 3);
             }
-            _ => panic!("Expected Acquired"),
+            GroupLockResult::PartialFailure { .. } => panic!("Expected Acquired"),
         }
 
         // All should be locked
@@ -12503,7 +12503,7 @@ steps:
                 assert_eq!(conflicts[0].pane_id, 2);
                 assert_eq!(conflicts[0].held_by_workflow, "other_wf");
             }
-            _ => panic!("Expected PartialFailure"),
+            GroupLockResult::Acquired { .. } => panic!("Expected PartialFailure"),
         }
 
         // Pane 1 should NOT be locked (rollback)
@@ -13267,7 +13267,11 @@ steps:
         // Should find: 2 TODOs + 1 unwrap = 3 findings minimum
         assert!(report.total_findings() >= 3);
         // .txt file should not contribute findings
-        assert!(report.findings.iter().all(|f| f.file.ends_with(".rs")));
+        assert!(report.findings.iter().all(|f| {
+            std::path::Path::new(&f.file)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"))
+        }));
     }
 
     #[test]

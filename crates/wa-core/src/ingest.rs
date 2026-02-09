@@ -4274,10 +4274,10 @@ mod tests {
             .iter()
             .filter(|s| matches!(s.kind, CapturedSegmentKind::Gap { .. }))
             .collect();
-        let deltas: Vec<_> = all_segments
+        let delta_count = all_segments
             .iter()
             .filter(|s| s.kind == CapturedSegmentKind::Delta)
-            .collect();
+            .count();
 
         // At least one gap must exist (overflow occurred)
         assert!(
@@ -4296,7 +4296,7 @@ mod tests {
         }
 
         // Total = gaps + deltas = all segments
-        assert_eq!(gaps.len() + deltas.len(), all_segments.len());
+        assert_eq!(gaps.len() + delta_count, all_segments.len());
     }
 
     #[test]
@@ -4421,7 +4421,7 @@ mod tests {
             let dropped = channel.events_dropped;
             assert_eq!(
                 dropped,
-                (total_events as u64).saturating_sub(capacity as u64),
+                total_events.saturating_sub(capacity as u64),
                 "capacity={capacity}"
             );
 
