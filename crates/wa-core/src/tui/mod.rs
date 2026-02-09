@@ -62,6 +62,11 @@ pub mod view_adapters;
 // DELETION: Remove when ftui TerminalWriter owns output routing (FTUI-09.3).
 pub mod output_gate;
 
+// Canonical keybinding table and input dispatcher.
+// Single source of truth for key→action mapping, shared between backends.
+// DELETION: Remove legacy parity tests when `tui` feature is dropped (FTUI-09.3).
+pub mod keymap;
+
 // Terminal session ownership abstraction — lifecycle, command handoff, teardown.
 // DELETION: Remove when ftui Program runtime fully owns the lifecycle (FTUI-09.3).
 pub mod terminal_session;
