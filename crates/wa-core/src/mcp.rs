@@ -1262,12 +1262,6 @@ impl ToolHandler for WaStateTool {
             }
         };
 
-        if params.agent.is_some() {
-            tracing::info!(
-                "MCP wa.state agent filter is not yet implemented; returning unfiltered results"
-            );
-        }
-
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1288,6 +1282,19 @@ impl ToolHandler for WaStateTool {
                     })
                     .filter(|pane| match params.domain.as_ref() {
                         Some(domain) => pane.inferred_domain() == *domain,
+                        None => true,
+                    })
+                    .filter(|pane| match params.agent.as_ref() {
+                        Some(agent) => {
+                            let title = pane.title.as_deref().unwrap_or("").to_lowercase();
+                            let filter = agent.to_lowercase();
+                            match filter.as_str() {
+                                "codex" => title.contains("codex") || title.contains("openai"),
+                                "claude_code" | "claude" => title.contains("claude"),
+                                "gemini" => title.contains("gemini"),
+                                _ => title.contains(&filter),
+                            }
+                        }
                         None => true,
                     })
                     .map(|pane| McpPaneState::from_pane_info(pane, &self.filter))
