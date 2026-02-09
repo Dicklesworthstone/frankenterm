@@ -1591,7 +1591,7 @@ dependencies = [
  "crossterm 0.28.1",
  "parking_lot",
  "regex",
- "rich_rust 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "rich_rust 0.1.1 (git+https://github.com/Dicklesworthstone/rich_rust?branch=master)",
  "unicode-width",
 ]
 
@@ -5161,8 +5161,7 @@ dependencies = [
 [[package]]
 name = "rich_rust"
 version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a7c2ecb6193f75fc8143648beb454f8b1d3a4fbd2fe13813a504760867d91b1"
+source = "git+https://github.com/Dicklesworthstone/rich_rust?branch=master#232a35595682328d0c5d110d64fc5e93771d431e"
 dependencies = [
  "bitflags 2.10.0",
  "crossterm 0.29.0",
@@ -5171,6 +5170,7 @@ dependencies = [
  "num-rational",
  "once_cell",
  "regex",
+ "smallvec",
  "time",
  "unicode-width",
 ]
@@ -7770,3 +7770,18 @@ checksum = "410e9ecef634c709e3831c2cfdb8d9c32164fae1c67496d5b68fff728eec37fe"
 dependencies = [
  "zune-core 0.5.1",
 ]
+
+[[patch.unused]]
+name = "asupersync"
+version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/asupersync#673cf66d7d316a53f3d7fb08a15999a97221c865"
+
+[[patch.unused]]
+name = "asupersync"
+version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/asupersync#673cf66d7d316a53f3d7fb08a15999a97221c865"
+
+[[patch.unused]]
+name = "asupersync"
+version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/asupersync#673cf66d7d316a53f3d7fb08a15999a97221c865"

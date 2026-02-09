@@ -4,6 +4,9 @@ target-*/
 **/*.rs.bk
 Cargo.lock.bak
 
+# Local Cargo overrides (use .cargo/config.toml.example as template)
+.cargo/config.toml
+
 # IDE and editor files
 .idea/
 .vscode/
