@@ -561,6 +561,12 @@ impl PatternLibrary {
     fn pack_id_for_rule_id(&self, rule_id: &str) -> Option<&str> {
         self.rule_to_pack.get(rule_id).map(String::as_str)
     }
+
+    /// Return the pack name that provides a given rule ID, if any.
+    #[must_use]
+    pub fn pack_for_rule(&self, rule_id: &str) -> Option<&str> {
+        self.pack_id_for_rule_id(rule_id)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2428,6 +2434,12 @@ impl PatternEngine {
     #[must_use]
     pub fn packs(&self) -> &[PatternPack] {
         self.library.packs()
+    }
+
+    /// Return the pack name that provides a given rule ID, if any.
+    #[must_use]
+    pub fn pack_for_rule(&self, rule_id: &str) -> Option<&str> {
+        self.library.pack_for_rule(rule_id)
     }
 }
 

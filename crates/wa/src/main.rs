@@ -10264,13 +10264,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         .rules()
                                         .iter()
                                         .filter(|rule| {
-                                            // Filter by pack if specified
                                             if let Some(ref pack_filter) = pack {
-                                                // Rules don't store pack directly, but we can derive from id prefix
-                                                // For now, show all rules (pack filtering would need library access)
-                                                let _ = pack_filter;
+                                                let rule_pack =
+                                                    engine.pack_for_rule(&rule.id).unwrap_or("");
+                                                if rule_pack != pack_filter.as_str() {
+                                                    return false;
+                                                }
                                             }
-                                            // Filter by agent type if specified
                                             if let Some(ref agent) = agent_filter {
                                                 if rule.agent_type != *agent {
                                                     return false;
@@ -10303,13 +10303,20 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     print_robot_response(&response, format, stats)?;
                                 }
                                 RobotRulesCommands::Test { text, trace, pack } => {
-                                    let _ = pack; // Pack filtering not implemented yet
-
                                     // Run detection on the provided text
                                     let detections = engine.detect(&text);
 
                                     let matches: Vec<RobotRuleMatchItem> = detections
                                         .iter()
+                                        .filter(|d| {
+                                            if let Some(ref pack_filter) = pack {
+                                                let rule_pack =
+                                                    engine.pack_for_rule(&d.rule_id).unwrap_or("");
+                                                rule_pack == pack_filter.as_str()
+                                            } else {
+                                                true
+                                            }
+                                        })
                                         .map(|d| RobotRuleMatchItem {
                                             rule_id: d.rule_id.clone(),
                                             agent_type: format!("{}", d.agent_type),
@@ -10385,14 +10392,24 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     skip_regex_check,
                                     strict,
                                 } => {
-                                    let _ = pack; // Pack filtering not yet implemented
-
-                                    let rules = engine.rules();
+                                    let all_rules = engine.rules();
+                                    let rules: Vec<&wa_core::patterns::RuleDef> = all_rules
+                                        .iter()
+                                        .filter(|r| {
+                                            if let Some(ref pack_filter) = pack {
+                                                let rule_pack =
+                                                    engine.pack_for_rule(&r.id).unwrap_or("");
+                                                rule_pack == pack_filter.as_str()
+                                            } else {
+                                                true
+                                            }
+                                        })
+                                        .collect();
                                     let mut errors: Vec<RobotLintIssue> = Vec::new();
                                     let mut warnings: Vec<RobotLintIssue> = Vec::new();
 
                                     // 1. Validate rule ID naming conventions
-                                    for rule in rules {
+                                    for rule in &rules {
                                         let has_valid_prefix =
                                             RULE_ID_PREFIXES.iter().any(|p| rule.id.starts_with(p));
                                         if !has_valid_prefix {
