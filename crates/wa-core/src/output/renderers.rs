@@ -3910,6 +3910,11 @@ mod tests {
             "scheduler",
             "backpressure_tier",
             "last_activity_by_pane",
+            "restart_count",
+            "last_crash_at",
+            "consecutive_crashes",
+            "current_backoff_ms",
+            "in_crash_loop",
         ];
 
         for field in &expected {
