@@ -1,0 +1,33 @@
+# Local development overrides — copy this to config.toml and adjust paths.
+#
+# These [patch] entries redirect git dependencies to local checkouts,
+# so you can iterate on sibling repos without pushing first.
+# config.toml is gitignored; this example is committed for reference.
+
+[patch."https://github.com/Dicklesworthstone/asupersync"]
+asupersync = { path = "../asupersync" }
+
+[patch."https://github.com/Dicklesworthstone/rich_rust"]
+rich_rust = { path = "../rich_rust" }
+
+[patch."https://github.com/Dicklesworthstone/frankentui"]
+ftui = { path = "../frankentui/crates/ftui" }
+
+[patch."https://github.com/Dicklesworthstone/fastmcp_rust"]
+fastmcp-rust = { path = "../fastmcp_rust/crates/fastmcp" }
+fastmcp-core = { path = "../fastmcp_rust/crates/fastmcp-core" }
+fastmcp-transport = { path = "../fastmcp_rust/crates/fastmcp-transport" }
+fastmcp-protocol = { path = "../fastmcp_rust/crates/fastmcp-protocol" }
+fastmcp-server = { path = "../fastmcp_rust/crates/fastmcp-server" }
+fastmcp-client = { path = "../fastmcp_rust/crates/fastmcp-client" }
+fastmcp-derive = { path = "../fastmcp_rust/crates/fastmcp-macros" }
+fastmcp-console = { path = "../fastmcp_rust/crates/fastmcp-console" }
+
+[patch."https://github.com/Dicklesworthstone/fastapi_rust"]
+fastapi-rust = { path = "../fastapi_rust/crates/fastapi" }
+fastapi-core = { path = "../fastapi_rust/crates/fastapi-core" }
+fastapi-http = { path = "../fastapi_rust/crates/fastapi-http" }
+fastapi-router = { path = "../fastapi_rust/crates/fastapi-router" }
+fastapi-macros = { path = "../fastapi_rust/crates/fastapi-macros" }
+fastapi-openapi = { path = "../fastapi_rust/crates/fastapi-openapi" }
+fastapi-output = { path = "../fastapi_rust/crates/fastapi-output" }
