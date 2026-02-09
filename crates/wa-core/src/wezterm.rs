@@ -390,6 +390,13 @@ const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_RETRY_ATTEMPTS: u32 = 3;
 /// Default delay between retries (ms)
 const DEFAULT_RETRY_DELAY_MS: u64 = 200;
+/// Environment variable to override the wezterm binary path.
+const WEZTERM_CLI_ENV: &str = "WA_WEZTERM_CLI";
+
+/// Resolve the wezterm binary path, respecting `WA_WEZTERM_CLI` env var.
+fn wezterm_binary() -> String {
+    std::env::var(WEZTERM_CLI_ENV).unwrap_or_else(|_| "wezterm".to_string())
+}
 
 /// WezTerm CLI client for interacting with WezTerm instances
 ///
@@ -895,7 +902,7 @@ impl WeztermClient {
             }
         }
 
-        let mut cmd = Command::new("wezterm");
+        let mut cmd = Command::new(wezterm_binary());
         cmd.args(args);
 
         // Add socket path if specified

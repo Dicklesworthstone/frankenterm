@@ -23781,7 +23781,7 @@ where
         if !remote_version.is_empty() {
             println!("  Remote version: {remote_version}");
             // Compare with local version to warn about mismatches
-            if let Ok(local_out) = std::process::Command::new("wezterm")
+            if let Ok(local_out) = std::process::Command::new(wezterm_binary())
                 .arg("--version")
                 .output()
             {
@@ -24326,6 +24326,11 @@ fn distributed_security_check(config: &wa_core::config::Config) -> DiagnosticChe
     }
 }
 
+/// Resolve the wezterm binary, respecting `WA_WEZTERM_CLI` env var.
+fn wezterm_binary() -> String {
+    std::env::var("WA_WEZTERM_CLI").unwrap_or_else(|_| "wezterm".to_string())
+}
+
 /// Run a command with a timeout, returning an error if the process doesn't complete in time.
 fn run_cmd_with_timeout(
     cmd: &mut std::process::Command,
@@ -24564,7 +24569,7 @@ fn run_diagnostics(
     #[cfg(feature = "vendored")]
     let mut local_wezterm_version: Option<wa_core::vendored::WeztermVersion> = None;
     match run_cmd_with_timeout(
-        std::process::Command::new("wezterm").arg("--version"),
+        std::process::Command::new(wezterm_binary()).arg("--version"),
         wezterm_timeout,
     ) {
         Ok(output) if output.status.success() => {
@@ -24700,7 +24705,7 @@ fn run_diagnostics(
 
     // Check 5: WezTerm running and responding
     match run_cmd_with_timeout(
-        std::process::Command::new("wezterm").args(["cli", "list", "--format", "json"]),
+        std::process::Command::new(wezterm_binary()).args(["cli", "list", "--format", "json"]),
         wezterm_timeout,
     ) {
         Ok(output) if output.status.success() => {
@@ -24781,15 +24786,16 @@ fn run_diagnostics(
         }
 
         // Check browser profiles for each service
-        let data_dir = layout
-            .wa_dir
-            .join("browser_profiles");
+        let data_dir = layout.wa_dir.join("browser_profiles");
         for service in &["openai", "anthropic", "google"] {
             let service_dir = data_dir.join(service);
             if service_dir.exists() {
                 // Count account profiles
                 let profile_count = std::fs::read_dir(&service_dir)
-                    .map(|rd| rd.filter(|e| e.as_ref().is_ok_and(|e| e.path().is_dir())).count())
+                    .map(|rd| {
+                        rd.filter(|e| e.as_ref().is_ok_and(|e| e.path().is_dir()))
+                            .count()
+                    })
                     .unwrap_or(0);
 
                 if profile_count > 0 {
@@ -24800,8 +24806,14 @@ fn run_diagnostics(
                             let meta_path = entry.path().join(".wa_profile.json");
                             if meta_path.exists() {
                                 if let Ok(content) = std::fs::read_to_string(&meta_path) {
-                                    if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&content) {
-                                        if meta.get("bootstrapped_at").and_then(|v| v.as_str()).is_some() {
+                                    if let Ok(meta) =
+                                        serde_json::from_str::<serde_json::Value>(&content)
+                                    {
+                                        if meta
+                                            .get("bootstrapped_at")
+                                            .and_then(|v| v.as_str())
+                                            .is_some()
+                                        {
                                             bootstrapped += 1;
                                         }
                                     }
