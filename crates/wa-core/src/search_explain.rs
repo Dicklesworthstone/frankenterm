@@ -106,66 +106,17 @@ pub struct GapInfo {
 ///
 /// Queries the database for panes, indexing stats, gaps, retention cleanup events,
 /// and segment time range, then assembles the context for `explain_search`.
+///
+/// NOTE: Requires storage methods that are not yet implemented (get_gaps,
+/// get_retention_cleanup_count, get_segment_time_range). Stubbed with todo!().
 pub async fn build_explain_context(
-    storage: &crate::storage::StorageHandle,
-    query: &str,
-    pane_filter: Option<u64>,
+    _storage: &crate::storage::StorageHandle,
+    _query: &str,
+    _pane_filter: Option<u64>,
 ) -> crate::Result<SearchExplainContext> {
-    let panes = storage.get_panes().await?;
-    let indexing_stats = storage.get_pane_indexing_stats().await?;
-    let gaps = storage.get_gaps().await?;
-    let retention_cleanup_count = storage.get_retention_cleanup_count().await?;
-    let (earliest_segment_at, latest_segment_at) = storage.get_segment_time_range().await?;
-
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as i64);
-
-    let pane_infos: Vec<PaneExplainInfo> = panes
-        .iter()
-        .map(|p| PaneExplainInfo {
-            pane_id: p.pane_id,
-            observed: p.observed,
-            ignore_reason: p.ignore_reason.clone(),
-            domain: p.domain.clone(),
-            last_seen_at: p.last_seen_at,
-        })
-        .collect();
-
-    let indexing_infos: Vec<PaneIndexingInfo> = indexing_stats
-        .iter()
-        .map(|s| PaneIndexingInfo {
-            pane_id: s.pane_id,
-            segment_count: s.segment_count,
-            total_bytes: s.total_bytes,
-            last_segment_at: s.last_segment_at,
-            fts_row_count: s.fts_row_count,
-            fts_consistent: s.fts_consistent,
-        })
-        .collect();
-
-    let gap_infos: Vec<GapInfo> = gaps
-        .iter()
-        .map(|g| GapInfo {
-            pane_id: g.pane_id,
-            seq_before: g.seq_before,
-            seq_after: g.seq_after,
-            reason: g.reason.clone(),
-            detected_at: g.detected_at,
-        })
-        .collect();
-
-    Ok(SearchExplainContext {
-        query: query.to_string(),
-        pane_filter,
-        panes: pane_infos,
-        indexing_stats: indexing_infos,
-        gaps: gap_infos,
-        retention_cleanup_count,
-        earliest_segment_at,
-        latest_segment_at,
-        now_ms,
-    })
+    // TODO: Requires storage methods not yet implemented:
+    //   get_gaps, get_retention_cleanup_count, get_segment_time_range
+    todo!("build_explain_context: storage methods not yet implemented")
 }
 
 /// Analyze the search context and produce a ranked explanation.
@@ -182,7 +133,11 @@ pub fn explain_search(ctx: &SearchExplainContext) -> SearchExplainResult {
     check_narrow_time_range(ctx, &mut reasons);
 
     // Sort by confidence descending
-    reasons.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
+    reasons.sort_by(|a, b| {
+        b.confidence
+            .partial_cmp(&a.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     let total_panes = ctx.panes.len();
     let observed_panes = ctx.panes.iter().filter(|p| p.observed).count();
@@ -224,10 +179,7 @@ fn check_pane_excluded(ctx: &SearchExplainContext, reasons: &mut Vec<SearchExpla
     if let Some(pane_id) = ctx.pane_filter {
         if let Some(pane) = ctx.panes.iter().find(|p| p.pane_id == pane_id) {
             if !pane.observed {
-                let reason_text = pane
-                    .ignore_reason
-                    .as_deref()
-                    .unwrap_or("unknown");
+                let reason_text = pane.ignore_reason.as_deref().unwrap_or("unknown");
                 reasons.push(SearchExplainReason {
                     code: "PANE_EXCLUDED",
                     summary: format!(
@@ -338,12 +290,17 @@ fn check_gaps(ctx: &SearchExplainContext, reasons: &mut Vec<SearchExplainReason>
     }
 
     // Group gaps by pane
-    let mut pane_gaps: std::collections::HashMap<u64, Vec<&GapInfo>> = std::collections::HashMap::new();
+    let mut pane_gaps: std::collections::HashMap<u64, Vec<&GapInfo>> =
+        std::collections::HashMap::new();
     for gap in &ctx.gaps {
         pane_gaps.entry(gap.pane_id).or_default().push(gap);
     }
 
-    let total_gap_segments: u64 = ctx.gaps.iter().map(|g| g.seq_after.saturating_sub(g.seq_before)).sum();
+    let total_gap_segments: u64 = ctx
+        .gaps
+        .iter()
+        .map(|g| g.seq_after.saturating_sub(g.seq_before))
+        .sum();
 
     let mut evidence = vec![
         SearchExplainEvidence {
@@ -407,7 +364,7 @@ fn check_retention_cleanup(ctx: &SearchExplainContext, reasons: &mut Vec<SearchE
                 key: "earliest_segment_at".to_string(),
                 value: ctx
                     .earliest_segment_at
-                    .map_or("none".to_string(), |t| t.to_string()),
+                    .map_or_else(|| "none".to_string(), |t| t.to_string()),
             },
         ],
         suggestions: vec![
@@ -461,13 +418,13 @@ fn check_narrow_time_range(ctx: &SearchExplainContext, reasons: &mut Vec<SearchE
         if range_ms < one_minute_ms && range_ms > 0 {
             reasons.push(SearchExplainReason {
                 code: "NARROW_TIME_RANGE",
-                summary: "Captured data spans less than 1 minute. The watcher may have just started.".to_string(),
-                evidence: vec![
-                    SearchExplainEvidence {
-                        key: "data_range_ms".to_string(),
-                        value: range_ms.to_string(),
-                    },
-                ],
+                summary:
+                    "Captured data spans less than 1 minute. The watcher may have just started."
+                        .to_string(),
+                evidence: vec![SearchExplainEvidence {
+                    key: "data_range_ms".to_string(),
+                    value: range_ms.to_string(),
+                }],
                 suggestions: vec![
                     "Wait for more data to be captured.".to_string(),
                     "The watcher needs time to accumulate output.".to_string(),
@@ -599,10 +556,12 @@ mod tests {
             ..empty_context()
         };
         let result = explain_search(&ctx);
-        assert!(result
-            .reasons
-            .iter()
-            .any(|r| r.code == "FTS_INDEX_INCONSISTENT"));
+        assert!(
+            result
+                .reasons
+                .iter()
+                .any(|r| r.code == "FTS_INDEX_INCONSISTENT")
+        );
     }
 
     #[test]
@@ -653,10 +612,7 @@ mod tests {
             ..empty_context()
         };
         let result = explain_search(&ctx);
-        assert!(result
-            .reasons
-            .iter()
-            .any(|r| r.code == "RETENTION_CLEANUP"));
+        assert!(result.reasons.iter().any(|r| r.code == "RETENTION_CLEANUP"));
     }
 
     #[test]
@@ -703,10 +659,7 @@ mod tests {
             ..empty_context()
         };
         let result = explain_search(&ctx);
-        assert!(result
-            .reasons
-            .iter()
-            .any(|r| r.code == "NARROW_TIME_RANGE"));
+        assert!(result.reasons.iter().any(|r| r.code == "NARROW_TIME_RANGE"));
     }
 
     #[test]

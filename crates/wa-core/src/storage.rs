@@ -6363,6 +6363,78 @@ impl StorageHandle {
         .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
+    /// Get all output gaps (for search explain diagnostics)
+    pub async fn get_gaps(&self) -> Result<Vec<Gap>> {
+        let db_path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || -> Result<Vec<Gap>> {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, pane_id, seq_before, seq_after, reason, detected_at \
+                     FROM output_gaps ORDER BY detected_at DESC",
+                )
+                .map_err(|e| StorageError::Database(format!("Prepare gaps query: {e}")))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(Gap {
+                        id: row.get(0)?,
+                        pane_id: row.get::<_, i64>(1)? as u64,
+                        seq_before: row.get::<_, i64>(2)? as u64,
+                        seq_after: row.get::<_, i64>(3)? as u64,
+                        reason: row.get(4)?,
+                        detected_at: row.get(5)?,
+                    })
+                })
+                .map_err(|e| StorageError::Database(format!("Query gaps: {e}")))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| StorageError::Database(format!("Collect gaps: {e}")).into())
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+    }
+
+    /// Count retention cleanup events (for search explain diagnostics)
+    pub async fn get_retention_cleanup_count(&self) -> Result<u64> {
+        let db_path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || -> Result<u64> {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM maintenance_log WHERE event_type = 'retention_cleanup'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| StorageError::Database(format!("Count retention cleanups: {e}")))?;
+            Ok(count as u64)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+    }
+
+    /// Get the min/max captured_at timestamps across all segments (for search explain diagnostics)
+    pub async fn get_segment_time_range(&self) -> Result<(Option<i64>, Option<i64>)> {
+        let db_path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || -> Result<(Option<i64>, Option<i64>)> {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            let (earliest, latest): (Option<i64>, Option<i64>) = conn
+                .query_row(
+                    "SELECT MIN(captured_at), MAX(captured_at) FROM output_segments",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(|e| StorageError::Database(format!("Query segment time range: {e}")))?;
+            Ok((earliest, latest))
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+    }
+
     /// Export workflow executions with optional pane/time/limit filters
     pub async fn export_workflows(&self, query: ExportQuery) -> Result<Vec<WorkflowRecord>> {
         let db_path = Arc::clone(&self.db_path);

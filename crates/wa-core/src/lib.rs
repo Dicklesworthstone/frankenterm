@@ -96,6 +96,7 @@ pub mod robot_types;
 pub mod rulesets;
 pub mod runtime;
 pub mod screen_state;
+pub mod search_explain;
 pub mod secrets;
 pub mod session_correlation;
 pub mod setup;
