@@ -162,8 +162,12 @@ pub struct SessionGuard<S: TerminalSession> {
 
 impl<S: TerminalSession> SessionGuard<S> {
     /// Enter the session and return a guard that will leave on drop.
+    ///
+    /// Sets the output gate to [`Active`](super::output_gate::GatePhase::Active),
+    /// signaling that direct stderr/stdout writes are unsafe.
     pub fn enter(mut session: S) -> Result<Self, SessionError> {
         session.enter()?;
+        super::output_gate::set_phase(super::output_gate::GatePhase::Active);
         Ok(Self {
             session: Some(session),
         })
@@ -174,7 +178,9 @@ impl<S: TerminalSession> SessionGuard<S> {
     /// # Panics
     /// Panics if called after `into_inner()`.
     pub fn session(&self) -> &S {
-        self.session.as_ref().expect("session consumed by into_inner")
+        self.session
+            .as_ref()
+            .expect("session consumed by into_inner")
     }
 
     /// Access the underlying session mutably.
@@ -182,15 +188,19 @@ impl<S: TerminalSession> SessionGuard<S> {
     /// # Panics
     /// Panics if called after `into_inner()`.
     pub fn session_mut(&mut self) -> &mut S {
-        self.session.as_mut().expect("session consumed by into_inner")
+        self.session
+            .as_mut()
+            .expect("session consumed by into_inner")
     }
 
     /// Consume the guard, calling `leave()` and returning the session.
     ///
     /// The drop-based leave is suppressed; leave is called exactly once.
+    /// Clears the output gate to [`Inactive`](super::output_gate::GatePhase::Inactive).
     pub fn into_inner(mut self) -> S {
         let mut session = self.session.take().expect("session consumed by into_inner");
         session.leave();
+        super::output_gate::set_phase(super::output_gate::GatePhase::Inactive);
         session
     }
 }
@@ -200,19 +210,26 @@ impl<S: TerminalSession> Drop for SessionGuard<S> {
         if let Some(session) = &mut self.session {
             session.leave();
         }
+        // Always clear the gate on drop, even if session was already taken
+        // via into_inner() (idempotent).
+        super::output_gate::set_phase(super::output_gate::GatePhase::Inactive);
     }
 }
 
 impl<S: TerminalSession> std::ops::Deref for SessionGuard<S> {
     type Target = S;
     fn deref(&self) -> &S {
-        self.session.as_ref().expect("session consumed by into_inner")
+        self.session
+            .as_ref()
+            .expect("session consumed by into_inner")
     }
 }
 
 impl<S: TerminalSession> std::ops::DerefMut for SessionGuard<S> {
     fn deref_mut(&mut self) -> &mut S {
-        self.session.as_mut().expect("session consumed by into_inner")
+        self.session
+            .as_mut()
+            .expect("session consumed by into_inner")
     }
 }
 
@@ -361,6 +378,7 @@ impl TerminalSession for CrosstermSession {
             )?;
         }
         self.phase = SessionPhase::Suspended;
+        super::output_gate::set_phase(super::output_gate::GatePhase::Suspended);
         Ok(())
     }
 
@@ -380,6 +398,7 @@ impl TerminalSession for CrosstermSession {
         }
         crossterm::terminal::enable_raw_mode()?;
         self.phase = SessionPhase::Active;
+        super::output_gate::set_phase(super::output_gate::GatePhase::Active);
         Ok(())
     }
 
@@ -398,6 +417,7 @@ impl TerminalSession for CrosstermSession {
         }
         self.terminal = None;
         self.phase = SessionPhase::Idle;
+        super::output_gate::set_phase(super::output_gate::GatePhase::Inactive);
     }
 }
 
@@ -524,8 +544,8 @@ impl TerminalSession for MockTerminalSession {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::ftui_compat::{Key, KeyInput};
+    use super::*;
 
     #[test]
     fn mock_lifecycle_enter_leave() {
@@ -552,9 +572,7 @@ mod tests {
     #[test]
     fn mock_draw_requires_active() {
         let mut session = MockTerminalSession::new();
-        let err = session
-            .draw(&mut |_, _| {})
-            .unwrap_err();
+        let err = session.draw(&mut |_, _| {}).unwrap_err();
         assert!(matches!(err, SessionError::InvalidPhase { .. }));
     }
 
@@ -571,10 +589,7 @@ mod tests {
 
         session.resume().unwrap();
         assert_eq!(session.phase(), SessionPhase::Active);
-        assert_eq!(
-            session.history,
-            vec!["enter", "suspend", "resume"]
-        );
+        assert_eq!(session.history, vec!["enter", "suspend", "resume"]);
     }
 
     #[test]
@@ -597,7 +612,9 @@ mod tests {
 
         assert_eq!(
             session.history,
-            vec!["enter", "draw", "draw", "suspend", "resume", "draw", "leave"]
+            vec![
+                "enter", "draw", "draw", "suspend", "resume", "draw", "leave"
+            ]
         );
         assert_eq!(session.draw_count, 3);
     }
@@ -647,6 +664,43 @@ mod tests {
         let session = guard.into_inner();
         assert_eq!(session.phase(), SessionPhase::Idle);
         assert_eq!(session.history, vec!["enter", "leave"]);
+    }
+
+    // -- output gate integration tests --
+    // These share the process-global gate atomic, so they must serialize
+    // with the output_gate tests via the same lock.
+
+    #[test]
+    fn guard_toggles_output_gate_on_enter_and_drop() {
+        use super::super::output_gate::tests::GATE_TEST_LOCK;
+        use super::super::output_gate::{self, GatePhase};
+        let _lock = GATE_TEST_LOCK.lock().unwrap();
+        output_gate::set_phase(GatePhase::Inactive);
+
+        {
+            let session = MockTerminalSession::new();
+            let _guard = SessionGuard::enter(session).unwrap();
+            assert_eq!(output_gate::phase(), GatePhase::Active);
+            assert!(output_gate::is_output_suppressed());
+        }
+        // Guard dropped → gate inactive
+        assert_eq!(output_gate::phase(), GatePhase::Inactive);
+        assert!(!output_gate::is_output_suppressed());
+    }
+
+    #[test]
+    fn guard_into_inner_clears_gate() {
+        use super::super::output_gate::tests::GATE_TEST_LOCK;
+        use super::super::output_gate::{self, GatePhase};
+        let _lock = GATE_TEST_LOCK.lock().unwrap();
+        output_gate::set_phase(GatePhase::Inactive);
+
+        let session = MockTerminalSession::new();
+        let guard = SessionGuard::enter(session).unwrap();
+        assert!(output_gate::is_output_suppressed());
+
+        let _session = guard.into_inner();
+        assert!(!output_gate::is_output_suppressed());
     }
 
     #[test]

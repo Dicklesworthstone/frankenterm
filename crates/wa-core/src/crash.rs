@@ -208,11 +208,21 @@ pub fn install_panic_hook(config: &CrashConfig) {
             .location()
             .map(|loc| format!("{}:{}:{}", loc.file(), loc.line(), loc.column()));
 
-        // Always print to stderr (the original hook behavior)
-        if let Some(ref loc) = location {
-            eprintln!("wa: panic at {loc}: {message}");
-        } else {
-            eprintln!("wa: panic: {message}");
+        // Print to stderr only when the TUI rendering pipeline is not active.
+        // When the TUI owns the terminal, stray eprintln! corrupts the UI.
+        // The crash bundle (written to disk below) preserves the information
+        // regardless of whether stderr output is suppressed.
+        #[cfg(any(feature = "tui", feature = "ftui"))]
+        let stderr_ok = !crate::tui::output_gate::is_output_suppressed();
+        #[cfg(not(any(feature = "tui", feature = "ftui")))]
+        let stderr_ok = true;
+
+        if stderr_ok {
+            if let Some(ref loc) = location {
+                eprintln!("wa: panic at {loc}: {message}");
+            } else {
+                eprintln!("wa: panic: {message}");
+            }
         }
 
         // Write crash bundle if crash_dir is configured
@@ -238,8 +248,16 @@ pub fn install_panic_hook(config: &CrashConfig) {
             let health = HealthSnapshot::get_global();
 
             match write_crash_bundle(dir, &report, health.as_ref()) {
-                Ok(path) => eprintln!("wa: crash bundle written to {}", path.display()),
-                Err(e) => eprintln!("wa: failed to write crash bundle: {e}"),
+                Ok(path) => {
+                    if stderr_ok {
+                        eprintln!("wa: crash bundle written to {}", path.display());
+                    }
+                }
+                Err(e) => {
+                    if stderr_ok {
+                        eprintln!("wa: failed to write crash bundle: {e}");
+                    }
+                }
             }
         }
     }));

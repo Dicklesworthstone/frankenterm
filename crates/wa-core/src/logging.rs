@@ -165,12 +165,28 @@ pub fn init_logging(config: &LogConfig) -> Result<(), LogError> {
         None
     };
 
+    // Build the stderr writer.  When the TUI module is compiled, use a
+    // TUI-aware writer that suppresses output while the rendering pipeline
+    // owns the terminal (one-writer rule).  Without a TUI feature the plain
+    // stderr writer is used — zero overhead.
+    #[cfg(any(feature = "tui", feature = "ftui"))]
+    let stderr_writer = crate::tui::output_gate::TuiAwareWriter;
+
     // Configure and install subscriber based on format
     match config.format {
         LogFormat::Pretty => {
             let subscriber = tracing_subscriber::registry().with(env_filter).with(
                 fmt::layer()
-                    .with_writer(std::io::stderr)
+                    .with_writer({
+                        #[cfg(any(feature = "tui", feature = "ftui"))]
+                        {
+                            stderr_writer
+                        }
+                        #[cfg(not(any(feature = "tui", feature = "ftui")))]
+                        {
+                            std::io::stderr
+                        }
+                    })
                     .with_target(true)
                     .with_thread_ids(false)
                     .with_thread_names(false)
@@ -196,7 +212,16 @@ pub fn init_logging(config: &LogConfig) -> Result<(), LogError> {
                 fmt::layer()
                     .json()
                     .with_timer(SystemTime)
-                    .with_writer(std::io::stderr)
+                    .with_writer({
+                        #[cfg(any(feature = "tui", feature = "ftui"))]
+                        {
+                            stderr_writer
+                        }
+                        #[cfg(not(any(feature = "tui", feature = "ftui")))]
+                        {
+                            std::io::stderr
+                        }
+                    })
                     .with_target(true)
                     .with_current_span(true)
                     .with_span_list(false)

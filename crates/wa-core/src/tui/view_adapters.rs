@@ -55,11 +55,7 @@ pub struct PaneRow {
 /// Adapt a PaneView from QueryClient into a render-ready PaneRow.
 #[must_use]
 pub fn adapt_pane(pane: &PaneView) -> PaneRow {
-    let agent_label = pane
-        .agent_type
-        .as_deref()
-        .unwrap_or("unknown")
-        .to_string();
+    let agent_label = pane.agent_type.as_deref().unwrap_or("unknown").to_string();
 
     let agent_style = match pane.agent_type.as_deref() {
         Some("codex") => StyleSpec::new().fg(ColorSpec::Green),
@@ -321,10 +317,7 @@ pub struct HealthModel {
 #[must_use]
 pub fn adapt_health(health: &HealthStatus) -> HealthModel {
     let (watcher_label, watcher_style) = if health.watcher_running {
-        (
-            "running".to_string(),
-            StyleSpec::new().fg(ColorSpec::Green),
-        )
+        ("running".to_string(), StyleSpec::new().fg(ColorSpec::Green))
     } else {
         (
             "stopped".to_string(),
@@ -351,11 +344,11 @@ pub fn adapt_health(health: &HealthStatus) -> HealthModel {
     };
 
     let (circuit_label, circuit_style) = match health.wezterm_circuit.state {
-        CircuitStateKind::Closed => (
-            "closed".to_string(),
-            StyleSpec::new().fg(ColorSpec::Green),
+        CircuitStateKind::Closed => ("closed".to_string(), StyleSpec::new().fg(ColorSpec::Green)),
+        CircuitStateKind::Open => (
+            "OPEN".to_string(),
+            StyleSpec::new().fg(ColorSpec::Red).bold(),
         ),
-        CircuitStateKind::Open => ("OPEN".to_string(), StyleSpec::new().fg(ColorSpec::Red).bold()),
         CircuitStateKind::HalfOpen => (
             "half-open".to_string(),
             StyleSpec::new().fg(ColorSpec::Yellow),

@@ -57,6 +57,11 @@ pub mod ftui_compat;
 // See docs/adr/0008-query-facade-contract.md for the data boundary.
 pub mod view_adapters;
 
+// One-writer output gate — tracks whether the TUI owns the terminal.
+// Thread-safe atomic gate consulted by logging, crash handlers, debug output.
+// DELETION: Remove when ftui TerminalWriter owns output routing (FTUI-09.3).
+pub mod output_gate;
+
 // Terminal session ownership abstraction — lifecycle, command handoff, teardown.
 // DELETION: Remove when ftui Program runtime fully owns the lifecycle (FTUI-09.3).
 pub mod terminal_session;
