@@ -1,3 +1,5 @@
+#![allow(dead_code)] // Shared utility module; not all benchmarks use all functions.
+
 use serde::Serialize;
 use std::env;
 use std::fs::OpenOptions;

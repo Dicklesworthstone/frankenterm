@@ -39,9 +39,9 @@ This document defines the evidence-based criteria for deciding whether the ratat
 
 | # | Criterion | Evidence Artifact | Status |
 |---|-----------|------------------|--------|
-| P1 | Pre/post migration baselines captured | wa-290k evidence | In progress (PinkMountain) |
+| P1 | Pre/post migration baselines captured | `evidence/ftui-08.1/perf-baselines.md` | Verified |
 | P2 | No S1/S2 performance regressions | wa-avl6 hot path optimization | Blocked on P1 |
-| P3 | Rendering latency within 60fps budget (<16ms p95) | Baseline comparison | Blocked on P1 |
+| P3 | Rendering latency within 60fps budget (<16ms p95) | Worst case: 86µs (0.52% of budget) | Verified |
 
 ### 2.4  Compatibility
 
@@ -88,18 +88,17 @@ This document defines the evidence-based criteria for deciding whether the ratat
 |----------|--------|----------|
 | Functional (F1-F7) | All met | None |
 | Infrastructure (I1-I7) | All met | None |
-| Performance (P1-P3) | Blocked | wa-290k in progress |
+| Performance (P1-P3) | Partial | P1+P3 met; P2 blocked on wa-avl6 |
 | Compatibility (C1-C5) | Partial | PTY E2E + macOS/tmux certification needed |
 | Resilience (R1-R4) | All met | None |
 | Documentation (D1-D5) | All met | None |
 
-**Current verdict: NO-GO** (Performance baselines and compatibility certification incomplete)
+**Current verdict: CONDITIONAL GO** (Performance baselines captured; P2 regression analysis + compatibility certification remaining)
 
 ### Remaining Work for GO
 
-1. Complete wa-290k (performance baselines) — assigned to PinkMountain
-2. Complete wa-avl6 (hot path optimization) — blocked by wa-290k
-3. Certify at least 2 more P0+P1 environments (WezTerm macOS, tmux Linux)
+1. Complete wa-avl6 (hot path optimization / regression analysis) — P2
+2. Certify at least 2 more P0+P1 environments (WezTerm macOS, tmux Linux)
 4. Run Stage 1 canary for >= 2 weeks
 5. Run Stage 2 beta for >= 4 weeks
 
