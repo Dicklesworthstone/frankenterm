@@ -367,19 +367,18 @@ pub fn reduce(state: &mut UiState, action: UiAction) -> Vec<Effect> {
             vec![]
         }
         UiAction::CycleAgentFilter => {
-            state.panes_agent_filter = cycle_agent_filter(&state.panes_agent_filter);
+            state.panes_agent_filter = cycle_agent_filter(state.panes_agent_filter.as_deref());
             state.panes.selected = 0;
             vec![]
         }
         UiAction::CycleDomainFilter => {
-            state.panes_domain_filter = cycle_domain_filter(&state.panes_domain_filter);
+            state.panes_domain_filter = cycle_domain_filter(state.panes_domain_filter.as_deref());
             state.panes.selected = 0;
             vec![]
         }
         UiAction::CycleProfile => {
             if state.profiles_count > 0 {
-                state.panes_profile_index =
-                    (state.panes_profile_index + 1) % state.profiles_count;
+                state.panes_profile_index = (state.panes_profile_index + 1) % state.profiles_count;
             }
             vec![]
         }
@@ -457,7 +456,7 @@ pub fn reduce(state: &mut UiState, action: UiAction) -> Vec<Effect> {
                 return vec![];
             }
             let query = state.search_query.clone();
-            state.search_last_query = query.clone();
+            state.search_last_query.clone_from(&query);
             vec![Effect::ExecuteSearch(query)]
         }
         UiAction::SearchCompleted {
@@ -552,9 +551,7 @@ fn select_next_for_view(state: &mut UiState) {
         View::Events => state.events.select_next(state.events_filtered_count),
         View::Triage => state.triage.select_next(state.triage_count),
         View::History => state.history.select_next(state.history_filtered_count),
-        View::Search => state
-            .search_results
-            .select_next(state.search_results_count),
+        View::Search => state.search_results.select_next(state.search_results_count),
         View::Home | View::Help => {}
     }
 }
@@ -566,30 +563,28 @@ fn select_prev_for_view(state: &mut UiState) {
         View::Events => state.events.select_prev(state.events_filtered_count),
         View::Triage => state.triage.select_prev(state.triage_count),
         View::History => state.history.select_prev(state.history_filtered_count),
-        View::Search => state
-            .search_results
-            .select_prev(state.search_results_count),
+        View::Search => state.search_results.select_prev(state.search_results_count),
         View::Home | View::Help => {}
     }
 }
 
 /// Cycle agent filter: None → codex → claude → gemini → unknown → None.
-fn cycle_agent_filter(current: &Option<String>) -> Option<String> {
-    match current.as_deref() {
+fn cycle_agent_filter(current: Option<&str>) -> Option<String> {
+    match current {
         None => Some("codex".to_string()),
         Some("codex") => Some("claude".to_string()),
         Some("claude") => Some("gemini".to_string()),
         Some("gemini") => Some("unknown".to_string()),
-        Some("unknown") | Some(_) => None,
+        Some("unknown" | _) => None,
     }
 }
 
 /// Cycle domain filter: None → local → ssh → None.
-fn cycle_domain_filter(current: &Option<String>) -> Option<String> {
-    match current.as_deref() {
+fn cycle_domain_filter(current: Option<&str>) -> Option<String> {
+    match current {
         None => Some("local".to_string()),
         Some("local") => Some("ssh".to_string()),
-        Some("ssh") | Some(_) => None,
+        Some("ssh" | _) => None,
     }
 }
 

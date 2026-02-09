@@ -18664,7 +18664,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             wa_core::web::run_web_server(config).await?;
         }
 
-        #[cfg(feature = "tui")]
+        #[cfg(all(feature = "tui", not(feature = "rollout")))]
         Some(Commands::Tui { debug, refresh }) => {
             use std::time::Duration;
             use wa_core::tui::{AppConfig, ProductionQueryClient, run_tui};
@@ -18702,7 +18702,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             }
         }
 
-        #[cfg(all(feature = "ftui", not(feature = "tui")))]
+        #[cfg(all(feature = "ftui", not(feature = "tui"), not(feature = "rollout")))]
         Some(Commands::Tui { debug, refresh }) => {
             use std::time::Duration;
             use wa_core::tui::{AppConfig, ProductionQueryClient, run_tui};
@@ -18733,6 +18733,44 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             if let Err(e) = result {
                 // Route through tracing, not raw eprintln (FTUI-03.2.a).
                 tracing::error!(%e, "TUI runtime error");
+                return Err(e.into());
+            }
+        }
+
+        // Rollout mode: both backends compiled, runtime selection via WA_TUI_BACKEND.
+        // See docs/ftui-rollout-strategy.md for stage details. (FTUI-09.2)
+        #[cfg(feature = "rollout")]
+        Some(Commands::Tui { debug, refresh }) => {
+            use std::time::Duration;
+            use wa_core::tui::{AppConfig, ProductionQueryClient, run_tui, select_backend};
+
+            let backend = select_backend();
+            tracing::info!(%backend, "TUI rollout mode — backend selected");
+
+            let db_path = layout.db_path.to_string_lossy();
+            let storage = match wa_core::storage::StorageHandle::new(&db_path).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(%e, "Failed to open storage for TUI");
+                    return Err(e.into());
+                }
+            };
+
+            let tui_config = AppConfig {
+                refresh_interval: Duration::from_secs(refresh),
+                debug,
+            };
+
+            let layout_clone = layout.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let query_client = ProductionQueryClient::with_storage(layout_clone, storage);
+                run_tui(query_client, tui_config)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("TUI thread panicked: {e}"))?;
+
+            if let Err(e) = result {
+                tracing::error!(%e, %backend, "TUI runtime error (rollout mode)");
                 return Err(e.into());
             }
         }

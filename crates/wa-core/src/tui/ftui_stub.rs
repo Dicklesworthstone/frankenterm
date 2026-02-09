@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use super::query::QueryClient;
 use super::view_adapters::{
-    HealthModel, HistoryRow, PaneRow, SearchRow, TriageRow, WorkflowRow, adapt_event, adapt_health,
+    HealthModel, PaneRow, SearchRow, TriageRow, WorkflowRow, adapt_event, adapt_health,
     adapt_history, adapt_pane, adapt_search, adapt_triage, adapt_workflow,
 };
 
@@ -461,6 +461,7 @@ impl HistoryViewState {
 // ---------------------------------------------------------------------------
 
 /// TUI application configuration.
+#[allow(dead_code)] // `debug` will be consumed when debug overlay is migrated (FTUI-06)
 pub struct AppConfig {
     pub refresh_interval: Duration,
     pub debug: bool,
@@ -501,7 +502,8 @@ impl From<ftui::Event> for WaMsg {
 /// the aggregated view state.  The runtime drives the init → update → view
 /// cycle.
 pub struct WaModel {
-    view_state: ViewState,
+    /// View state (public for benchmarking; use `view_state.current_view` to switch views).
+    pub view_state: ViewState,
     config: AppConfig,
     last_refresh: Instant,
     // QueryClient stored as trait object for type erasure (the generic Q
@@ -532,7 +534,10 @@ pub struct WaModel {
 }
 
 impl WaModel {
-    fn new(query: Arc<dyn QueryClient + Send + Sync>, config: AppConfig) -> Self {
+    /// Create a new model with the given query client and configuration.
+    ///
+    /// Public for benchmarking; normal usage goes through [`run_tui`].
+    pub fn new(query: Arc<dyn QueryClient + Send + Sync>, config: AppConfig) -> Self {
         Self {
             view_state: ViewState::default(),
             config,
@@ -1076,7 +1081,9 @@ impl WaModel {
     }
 
     /// Refresh dashboard data from the QueryClient.
-    fn refresh_data(&mut self) {
+    ///
+    /// Public for benchmarking.
+    pub fn refresh_data(&mut self) {
         // Health status
         match self.query.health() {
             Ok(health) => {
@@ -1420,6 +1427,7 @@ fn render_tab_bar(frame: &mut ftui::Frame, row: u16, width: u16, active: View) {
 /// Render a placeholder for the view content area.
 ///
 /// Individual view rendering will be migrated in FTUI-05.2 through FTUI-05.7.
+#[allow(dead_code)] // Will be used when remaining views are migrated (FTUI-05.2+)
 fn render_view_placeholder(frame: &mut ftui::Frame, y: u16, width: u16, height: u16, view: View) {
     if height == 0 {
         return;
@@ -3039,6 +3047,7 @@ fn write_styled(frame: &mut ftui::Frame, col: u16, row: u16, text: &str, style: 
 // ---------------------------------------------------------------------------
 
 /// FrankenTUI application shell.
+#[allow(dead_code)] // Public API surface matches ratatui backend; used via run_tui()
 pub struct App<Q: QueryClient> {
     _query: Q,
     _config: AppConfig,

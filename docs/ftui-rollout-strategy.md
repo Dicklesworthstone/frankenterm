@@ -70,19 +70,22 @@ wa tui
 
 ## 2  Feature Flag Implementation
 
-### Runtime Backend Selection
+### Runtime Backend Selection (implemented)
 
-The `WA_TUI_BACKEND` environment variable controls which backend is used at runtime. This requires both backends compiled into the binary during Stages 1-2.
+The `WA_TUI_BACKEND` environment variable controls which backend is used at
+runtime.  Build with `--features rollout` to compile both backends into a single
+binary.
+
+**Implementation:** `crates/wa-core/src/tui/rollout.rs`
 
 ```rust
-// In wa/src/main.rs (TUI launch path)
-fn select_tui_backend() -> TuiBackend {
-    match std::env::var("WA_TUI_BACKEND").as_deref() {
-        Ok("ftui") => TuiBackend::Ftui,
-        Ok("ratatui") => TuiBackend::Ratatui,
-        _ => TuiBackend::default_for_stage(),
-    }
-}
+// select_backend() reads WA_TUI_BACKEND and returns the active backend.
+// Recognized values: "ftui", "frankentui", "ratatui", "legacy".
+// Unrecognized or unset → stage default (currently Ratatui for Stage 1).
+pub fn select_backend() -> TuiBackend { ... }
+
+// run_tui() dispatches to the selected backend's run_tui().
+pub fn run_tui<Q: QueryClient + Send + Sync + 'static>(...) { ... }
 ```
 
 ### Compile-Time Feature Matrix by Stage
@@ -90,8 +93,8 @@ fn select_tui_backend() -> TuiBackend {
 | Stage | Cargo features | Binary size impact |
 |-------|---------------|-------------------|
 | 0 (Dev) | `tui` OR `ftui` (exclusive) | Single backend |
-| 1 (Canary) | `tui,ftui` (both compiled, mutual exclusion removed) | ~15-20% increase |
-| 2 (Beta) | `tui,ftui` (both compiled) | Same as Stage 1 |
+| 1 (Canary) | `rollout` (compiles both via `tui` + `ftui`) | ~15-20% increase |
+| 2 (Beta) | `rollout` (both compiled, default swapped to ftui) | Same as Stage 1 |
 | 3 (GA) | `ftui` only | Returns to single backend |
 
 ### Stage Transition Checklist

@@ -27,7 +27,7 @@ echo "=== FTUI Migration Guardrails ==="
 echo ""
 
 # ---------------------------------------------------------------------------
-# 1. Feature exclusion: tui + ftui must not compile together
+# 1. Feature exclusion: tui + ftui must not compile together (unless rollout)
 # ---------------------------------------------------------------------------
 echo "--- Check 1: Mutual exclusion (tui + ftui) ---"
 
@@ -35,6 +35,12 @@ if cargo check -p wa-core --features tui,ftui >/dev/null 2>&1; then
     fail "tui + ftui compiled successfully — compile_error! guard is missing or broken"
 else
     pass "tui + ftui correctly fails to compile"
+fi
+
+if cargo check -p wa-core --features rollout >/dev/null 2>&1; then
+    pass "rollout (tui + ftui) compiles with runtime dispatch"
+else
+    fail "rollout feature does not compile"
 fi
 
 echo ""
@@ -132,7 +138,7 @@ echo ""
 # ---------------------------------------------------------------------------
 echo "--- Check 4: Clippy for both features ---"
 
-for feature in tui ftui; do
+for feature in tui ftui rollout; do
     if cargo clippy -p wa-core --features "$feature" -- -D warnings >/dev/null 2>&1; then
         pass "clippy --features $feature passes"
     else

@@ -18,11 +18,20 @@
 | **Full legacy** | `tui,mcp,web,metrics` | Legacy binary with all optional frontends | `cargo check -p wa --features tui,mcp,web,metrics` |
 | **Full ftui** | `ftui,mcp,web,metrics` | ftui binary with all optional frontends | `cargo check -p wa --features ftui,mcp,web,metrics` |
 
+### Rollout Mode (Stages 1-2)
+
+| Mode | Features | Purpose | CI Gate |
+|------|----------|---------|---------|
+| **Rollout** | `rollout` | Both backends compiled; runtime selection via `WA_TUI_BACKEND` | `cargo check -p wa-core --features rollout` |
+
+The `rollout` feature implies `tui` + `ftui` and bypasses the mutual-exclusion
+guard.  Backend selection happens at runtime via `tui::select_backend()`.
+
 ### Disallowed Combinations
 
 | Combination | Enforcement | Error Message |
 |-------------|-------------|---------------|
-| `tui` + `ftui` | `compile_error!` in `wa-core/src/lib.rs:130` | "Features `tui` and `ftui` are mutually exclusive. Use `--features tui` for the legacy ratatui backend or `--features ftui` for the FrankenTUI backend, not both." |
+| `tui` + `ftui` (without `rollout`) | `compile_error!` in `wa-core/src/lib.rs` | "Features `tui` and `ftui` are mutually exclusive... Use `--features rollout` for runtime backend selection during migration." |
 
 ### Orthogonal Features
 
@@ -125,26 +134,26 @@ Each check logs:
 
 ### Current: `tui` + `ftui`
 
-The `compile_error!` at `wa-core/src/lib.rs:129-134` fires when both features
-are active.  This is the only disallowed combination.
+The `compile_error!` at `wa-core/src/lib.rs` fires when both features are active
+**without** the `rollout` feature.  This is the only disallowed combination.
 
-**Why not a runtime check?**  Both backends export `App`, `AppConfig`, `View`,
-`ViewState`, and `run_tui` from `tui/mod.rs`.  Name collisions make dual-active
-compilation impossible even without the explicit `compile_error!`.  The
-`compile_error!` provides a clear, actionable message instead of a wall of
-"duplicate definition" errors.
+**Name collision handling:**  Both backends export `App`, `AppConfig`, `View`,
+`ViewState`, and `run_tui` from `tui/mod.rs`.  Under `rollout`, these conflicting
+re-exports are suppressed via `#[cfg(not(feature = "rollout"))]` guards, and the
+`tui::rollout` dispatch module provides unified exports instead.
 
 ### Future: Removing `tui`
 
 When FTUI-09.3 (decommission) is reached:
 
-1. Remove `tui` feature from `wa-core/Cargo.toml` and `wa/Cargo.toml`
-2. Remove `compile_error!` guard
+1. Remove `tui` and `rollout` features from `wa-core/Cargo.toml` and `wa/Cargo.toml`
+2. Remove `compile_error!` guard and `rollout.rs` dispatch module
 3. Remove all `#[cfg(feature = "tui")]` blocks
 4. Rename `ftui` to `tui` (or make ftui the default)
-5. Update CI matrix to drop legacy checks
+5. Update CI matrix to drop legacy and rollout checks
 
-Until then, both features must compile independently and CI must verify both.
+Until then, all three modes (`tui`, `ftui`, `rollout`) must compile independently
+and CI must verify all.
 
 ## 5  Test Mode Matrix
 

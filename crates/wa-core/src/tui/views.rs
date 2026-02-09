@@ -41,7 +41,7 @@ pub enum View {
 impl View {
     /// Get the display name for this view
     #[must_use]
-    pub const fn name(&self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             Self::Home => "Home",
             Self::Panes => "Panes",
@@ -69,7 +69,7 @@ impl View {
 
     /// Get the index of this view in the tab order
     #[must_use]
-    pub fn index(&self) -> usize {
+    pub fn index(self) -> usize {
         match self {
             Self::Home => 0,
             Self::Panes => 1,
@@ -83,7 +83,7 @@ impl View {
 
     /// Get the next view (wraps around)
     #[must_use]
-    pub fn next(&self) -> Self {
+    pub fn next(self) -> Self {
         match self {
             Self::Home => Self::Panes,
             Self::Panes => Self::Events,
@@ -97,7 +97,7 @@ impl View {
 
     /// Get the previous view (wraps around)
     #[must_use]
-    pub fn prev(&self) -> Self {
+    pub fn prev(self) -> Self {
         match self {
             Self::Home => Self::Help,
             Self::Panes => Self::Home,

@@ -35,16 +35,20 @@
 //!
 //! # Backend Selection
 //!
-//! The rendering backend is selected at compile time via feature flags:
+//! The rendering backend is selected via feature flags:
 //! - `tui`: Legacy ratatui/crossterm backend (current production)
 //! - `ftui`: FrankenTUI backend (migration target, see docs/adr/)
+//! - `rollout`: Both backends compiled; runtime selection via `WA_TUI_BACKEND`
 //!
-//! These features are mutually exclusive (enforced by compile_error! in lib.rs).
+//! `tui` and `ftui` are mutually exclusive unless `rollout` is active.
 //! The QueryClient trait and data types are shared between both backends.
 
 // QueryClient trait and data types — framework-agnostic, always compiled.
 mod query;
-pub use query::{ProductionQueryClient, QueryClient, QueryError};
+pub use query::{
+    EventFilters, EventView, HealthStatus, PaneView, ProductionQueryClient, QueryClient,
+    QueryError, SearchResultView, TriageAction, TriageItemView, WorkflowProgressView,
+};
 
 // Compatibility adapter for incremental migration between backends.
 // Framework-agnostic types with cfg-gated conversions for each backend.
@@ -87,17 +91,27 @@ mod app;
 #[cfg(feature = "tui")]
 mod views;
 
-#[cfg(feature = "tui")]
+// Single-backend re-exports (suppressed when rollout is active to avoid
+// name collisions — rollout.rs provides the dispatch layer instead).
+#[cfg(all(feature = "tui", not(feature = "rollout")))]
 pub use app::{App, AppConfig, run_tui};
-#[cfg(feature = "tui")]
+#[cfg(all(feature = "tui", not(feature = "rollout")))]
 pub use views::{View, ViewState};
 
 // FrankenTUI backend (migration target — FTUI-03 through FTUI-06)
 #[cfg(feature = "ftui")]
 mod ftui_stub;
 
-#[cfg(feature = "ftui")]
-pub use ftui_stub::{App, AppConfig, View, ViewState, run_tui};
+#[cfg(all(feature = "ftui", not(feature = "rollout")))]
+pub use ftui_stub::{App, AppConfig, View, ViewState, WaModel, WaMsg, run_tui};
+
+// Rollout dispatch: runtime backend selection via WA_TUI_BACKEND env var.
+// Compiles both backends and delegates at runtime based on operator preference.
+// DELETION: Remove when the `tui` feature is dropped (FTUI-09.3).
+#[cfg(feature = "rollout")]
+mod rollout;
+#[cfg(feature = "rollout")]
+pub use rollout::{AppConfig, TuiBackend, View, ViewState, run_tui, select_backend};
 
 // -------------------------------------------------------------------------
 // FTUI-09.3.a: Compile-time guardrails against ratatui reintroduction
@@ -128,6 +142,7 @@ mod import_guardrail_tests {
         "mod.rs",              // Conditional module imports
         "app.rs",              // Legacy ratatui backend (only compiled under `tui`)
         "views.rs",            // Legacy ratatui backend (only compiled under `tui`)
+        "rollout.rs",          // Runtime dispatch — references both backends (FTUI-09.2)
     ];
 
     /// Migration-complete modules that MUST NOT contain bare ratatui/crossterm.

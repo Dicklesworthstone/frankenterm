@@ -110,6 +110,11 @@ harness = false
 name = "backpressure_performance"
 harness = false
 
+[[bench]]
+name = "tui_rendering"
+harness = false
+required-features = ["ftui"]
+
 [features]
 default = []
 # Public feature flags (stable surface)
@@ -119,6 +124,7 @@ mcp = ["mcp-server"]
 web = ["dep:fastapi", "dep:fastapi-core", "dep:asupersync"]
 tui = ["dep:ratatui", "dep:crossterm"]
 ftui = ["dep:ftui"]
+rollout = ["tui", "ftui"]
 metrics = []
 native-wezterm = []
 distributed = [

@@ -60,6 +60,7 @@ pub enum TuiError {
     Query(#[from] QueryError),
 
     #[error("Terminal setup failed: {0}")]
+    #[allow(dead_code)] // Reserved for terminal setup error paths
     TerminalSetup(String),
 }
 
