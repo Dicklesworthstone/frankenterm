@@ -162,6 +162,7 @@ pub(crate) mod tests {
     // threads.  We use a Mutex to serialize all gate-mutation tests.
     // `pub(crate)` so terminal_session tests can share it.
     use std::sync::Mutex;
+    #[allow(clippy::redundant_pub_crate)]
     pub(crate) static GATE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
