@@ -235,6 +235,24 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  # FTUI docs-smoke and contract-drift: validate migration docs stay in sync
+  # with code (View enum, adapter API, feature matrix, parity contract).
+  # Implements: wa-107q (FTUI-07.5)
+  ftui-docs:
+    name: FTUI Docs Smoke
+    needs: [lint]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ftui-docs
+
+      - name: Run docs-smoke and contract-drift checks
+        run: scripts/check_ftui_docs.sh
+
   # Performance budget enforcement: run Criterion benchmarks and check against
   # coarse thresholds (10x design budgets) to catch gross regressions.
   benchmarks:
