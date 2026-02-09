@@ -7316,4 +7316,228 @@ mod tests {
         );
         assert!(dump.contains("=== Frame 2 ==="), "Should have 3 frames");
     }
+
+    // -- FTUI-08.4: Resilience / chaos validation --
+    //
+    // Scenarios that exercise the system under adversarial conditions:
+    // concurrent resize + input, rapid view switching under different data states,
+    // extreme terminal dimensions, and failure injection.
+
+    #[test]
+    fn chaos_resize_during_key_storm() {
+        // Scenario: Interleave resize and key input — simulates a user resizing
+        // the terminal while actively navigating.
+        use ftui::Model as _;
+        let mut model = make_model(MockQuery::with_events());
+        model.refresh_data();
+
+        let sizes: &[(u16, u16)] = &[(80, 24), (40, 10), (120, 50), (30, 5), (80, 24)];
+        let keys: &[ftui::KeyCode] = &[
+            ftui::KeyCode::Tab,
+            ftui::KeyCode::Char('j'),
+            ftui::KeyCode::Char('k'),
+            ftui::KeyCode::Tab,
+            ftui::KeyCode::Char('3'),
+        ];
+
+        for round in 0..3 {
+            for (i, (&(w, h), &code)) in sizes.iter().zip(keys.iter()).enumerate() {
+                // Resize
+                let mut pool = ftui::GraphemePool::new();
+                let mut frame = ftui::Frame::new(w, h, &mut pool);
+                model.view(&mut frame);
+
+                // Key press
+                let msg = WaMsg::TermEvent(ftui::Event::Key(ftui::KeyEvent {
+                    code,
+                    kind: ftui::KeyEventKind::Press,
+                    modifiers: ftui::Modifiers::empty(),
+                }));
+                let _cmd = model.update(msg);
+
+                // Render at new size
+                let mut pool2 = ftui::GraphemePool::new();
+                let mut frame2 = ftui::Frame::new(w, h, &mut pool2);
+                model.view(&mut frame2);
+
+                if h >= 3 && w >= 20 {
+                    let text = frame_to_text(&frame2);
+                    assert!(
+                        !text.is_empty(),
+                        "Empty frame at round={round} step={i} size={w}x{h}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn chaos_extreme_dimensions() {
+        // Scenario: Render at extreme terminal sizes (1x1, 1000x1, 1x1000, etc.)
+        use ftui::Model as _;
+        let mut model = make_model(MockQuery::healthy());
+        model.refresh_data();
+
+        let extremes: &[(u16, u16)] = &[
+            (1, 1),
+            (1, 100),
+            (100, 1),
+            (2, 2),
+            (3, 3),
+            (255, 255),
+            (1, 2),
+            (2, 1),
+            (500, 1),
+        ];
+
+        for &view in View::all() {
+            model.view_state.current_view = view;
+            for &(w, h) in extremes {
+                let mut pool = ftui::GraphemePool::new();
+                let mut frame = ftui::Frame::new(w, h, &mut pool);
+                // Must not panic regardless of size
+                model.view(&mut frame);
+            }
+        }
+    }
+
+    #[test]
+    fn chaos_rapid_view_switch_with_filter_state() {
+        // Scenario: Switch views while filter state is active — ensure no
+        // cross-view state corruption.
+        let mut s = E2eSession::new(MockQuery::with_events());
+
+        // Enter Events view and set a filter (direct view assignment avoids
+        // digit keys being consumed by the filter input handler)
+        s.model.view_state.current_view = View::Events;
+        s.press(ftui::KeyCode::Char('0'));
+        s.press(ftui::KeyCode::Char('9'));
+        s.capture();
+        assert_eq!(s.model.view_state.events.pane_filter.text(), "09");
+
+        // Switch to History (which also has a filter)
+        s.model.view_state.current_view = View::History;
+        s.press(ftui::KeyCode::Char('x'));
+        s.capture();
+        assert_eq!(s.model.view_state.history.filter_input.text(), "x");
+
+        // Switch back to Events — filter should be preserved
+        s.model.view_state.current_view = View::Events;
+        assert_eq!(
+            s.model.view_state.events.pane_filter.text(),
+            "09",
+            "Events pane filter lost after view switch"
+        );
+
+        // Switch back to History — filter should be preserved
+        s.model.view_state.current_view = View::History;
+        assert_eq!(
+            s.model.view_state.history.filter_input.text(),
+            "x",
+            "History filter lost after view switch"
+        );
+    }
+
+    #[test]
+    fn chaos_100_rapid_tab_cycles_with_data() {
+        // Scenario: 100 Tab presses with real data — stress the view routing
+        let mut s = E2eSession::new(MockQuery::with_events());
+
+        for i in 0..100 {
+            s.press(ftui::KeyCode::Tab);
+            // Capture every 10th frame to exercise rendering
+            if i % 10 == 0 {
+                s.capture();
+                assert!(!s.last_frame().is_empty(), "Empty frame at cycle {i}");
+            }
+        }
+
+        // 100 tabs through 7 views = 100 mod 7 = position 2
+        // Views: Home(0), Panes(1), Events(2), Triage(3), History(4), Search(5), Help(6)
+        // 100 % 7 = 2 → Events
+        s.assert_view(View::Events);
+    }
+
+    #[test]
+    fn chaos_refresh_during_every_view() {
+        // Scenario: Force data refresh while on each view — must not crash
+        // or lose view position.
+        let mut s = E2eSession::new(MockQuery::with_history());
+
+        for &view in View::all() {
+            s.model.view_state.current_view = view;
+            s.capture();
+            s.model.refresh_data();
+            s.capture();
+            assert_eq!(
+                s.model.view_state.current_view, view,
+                "View changed during refresh on {view:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn chaos_degraded_then_healthy_transition() {
+        // Scenario: System starts degraded, then data becomes healthy.
+        // Simulates recovery from a monitoring gap.
+        use ftui::Model as _;
+        let mut model = make_model(MockQuery::degraded());
+        model.refresh_data();
+
+        // Render all views in degraded state
+        for &view in View::all() {
+            model.view_state.current_view = view;
+            let mut pool = ftui::GraphemePool::new();
+            let mut frame = ftui::Frame::new(80, 24, &mut pool);
+            model.view(&mut frame);
+        }
+
+        // Transition to healthy by replacing query client
+        model.query = std::sync::Arc::new(MockQuery::with_events());
+        model.refresh_data();
+
+        // Render all views in healthy state
+        for &view in View::all() {
+            model.view_state.current_view = view;
+            let mut pool = ftui::GraphemePool::new();
+            let mut frame = ftui::Frame::new(80, 24, &mut pool);
+            model.view(&mut frame);
+            let text = frame_to_text(&frame);
+            assert!(!text.is_empty(), "Empty frame after recovery for {view:?}");
+        }
+    }
+
+    #[test]
+    fn chaos_backspace_storm_on_empty_filter() {
+        // Scenario: Rapid backspace presses on empty filter — must not underflow
+        let mut s = E2eSession::new(MockQuery::with_history());
+        s.model.view_state.current_view = View::History;
+
+        // 50 backspace presses on empty filter
+        for _ in 0..50 {
+            s.press(ftui::KeyCode::Backspace);
+        }
+        assert!(s.model.view_state.history.filter_input.is_empty());
+        s.capture();
+        assert!(!s.last_frame().is_empty());
+    }
+
+    #[test]
+    fn chaos_alternating_filter_clear_cycles() {
+        // Scenario: Rapidly type then clear filter, 20 cycles
+        let mut s = E2eSession::new(MockQuery::with_history());
+        s.model.view_state.current_view = View::History;
+
+        for _ in 0..20 {
+            // Type 5 chars
+            for c in "hello".chars() {
+                s.char(c);
+            }
+            assert_eq!(s.model.view_state.history.filter_input.text(), "hello");
+            // Clear with Escape
+            s.press(ftui::KeyCode::Escape);
+            assert!(s.model.view_state.history.filter_input.is_empty());
+        }
+        s.capture();
+    }
 }
