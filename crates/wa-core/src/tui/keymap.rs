@@ -34,6 +34,7 @@ pub enum Scope {
     Triage,
     History,
     Search,
+    Timeline,
 }
 
 // ---------------------------------------------------------------------------
@@ -89,6 +90,12 @@ pub enum Action {
     SearchRunSaved,
     SearchToggleSaved,
     SearchExecute,
+
+    // -- timeline --
+    TimelineZoomIn,
+    TimelineZoomOut,
+    TimelineScrollLeft,
+    TimelineScrollRight,
 }
 
 // ---------------------------------------------------------------------------
@@ -172,73 +179,352 @@ struct Binding {
 /// (first match wins), but in practice there should be no duplicates.
 static KEYMAP: &[Binding] = &[
     // ---- Global ----
-    Binding { pattern: key(Key::Char('q')),  scope: Scope::Global, action: Action::Quit },
-    Binding { pattern: key(Key::Char('?')),  scope: Scope::Global, action: Action::ShowHelp },
-    Binding { pattern: key(Key::Char('r')),  scope: Scope::Global, action: Action::Refresh },
-    Binding { pattern: key(Key::Tab),        scope: Scope::Global, action: Action::NextTab },
-    Binding { pattern: key(Key::BackTab),    scope: Scope::Global, action: Action::PrevTab },
-    Binding { pattern: key(Key::Char('1')),  scope: Scope::Global, action: Action::GoToView(1) },
-    Binding { pattern: key(Key::Char('2')),  scope: Scope::Global, action: Action::GoToView(2) },
-    Binding { pattern: key(Key::Char('3')),  scope: Scope::Global, action: Action::GoToView(3) },
-    Binding { pattern: key(Key::Char('4')),  scope: Scope::Global, action: Action::GoToView(4) },
-    Binding { pattern: key(Key::Char('5')),  scope: Scope::Global, action: Action::GoToView(5) },
-    Binding { pattern: key(Key::Char('6')),  scope: Scope::Global, action: Action::GoToView(6) },
-    Binding { pattern: key(Key::Char('7')),  scope: Scope::Global, action: Action::GoToView(7) },
-
+    Binding {
+        pattern: key(Key::Char('q')),
+        scope: Scope::Global,
+        action: Action::Quit,
+    },
+    Binding {
+        pattern: key(Key::Char('?')),
+        scope: Scope::Global,
+        action: Action::ShowHelp,
+    },
+    Binding {
+        pattern: key(Key::Char('r')),
+        scope: Scope::Global,
+        action: Action::Refresh,
+    },
+    Binding {
+        pattern: key(Key::Tab),
+        scope: Scope::Global,
+        action: Action::NextTab,
+    },
+    Binding {
+        pattern: key(Key::BackTab),
+        scope: Scope::Global,
+        action: Action::PrevTab,
+    },
+    Binding {
+        pattern: key(Key::Char('1')),
+        scope: Scope::Global,
+        action: Action::GoToView(1),
+    },
+    Binding {
+        pattern: key(Key::Char('2')),
+        scope: Scope::Global,
+        action: Action::GoToView(2),
+    },
+    Binding {
+        pattern: key(Key::Char('3')),
+        scope: Scope::Global,
+        action: Action::GoToView(3),
+    },
+    Binding {
+        pattern: key(Key::Char('4')),
+        scope: Scope::Global,
+        action: Action::GoToView(4),
+    },
+    Binding {
+        pattern: key(Key::Char('5')),
+        scope: Scope::Global,
+        action: Action::GoToView(5),
+    },
+    Binding {
+        pattern: key(Key::Char('6')),
+        scope: Scope::Global,
+        action: Action::GoToView(6),
+    },
+    Binding {
+        pattern: key(Key::Char('7')),
+        scope: Scope::Global,
+        action: Action::GoToView(7),
+    },
+    Binding {
+        pattern: key(Key::Char('8')),
+        scope: Scope::Global,
+        action: Action::GoToView(8),
+    },
     // ---- Panes ----
-    Binding { pattern: key(Key::Down),       scope: Scope::Panes, action: Action::ListNext },
-    Binding { pattern: key(Key::Char('j')),  scope: Scope::Panes, action: Action::ListNext },
-    Binding { pattern: key(Key::Up),         scope: Scope::Panes, action: Action::ListPrev },
-    Binding { pattern: key(Key::Char('k')),  scope: Scope::Panes, action: Action::ListPrev },
-    Binding { pattern: key(Key::Char('u')),  scope: Scope::Panes, action: Action::ToggleUnhandledOnly },
-    Binding { pattern: key(Key::Char('b')),  scope: Scope::Panes, action: Action::ToggleBookmarkedOnly },
-    Binding { pattern: key(Key::Char('a')),  scope: Scope::Panes, action: Action::CycleAgentFilter },
-    Binding { pattern: key(Key::Char('d')),  scope: Scope::Panes, action: Action::CycleDomainFilter },
-    Binding { pattern: key(Key::Char('p')),  scope: Scope::Panes, action: Action::CycleRulesetProfile },
-    Binding { pattern: key(Key::Enter),      scope: Scope::Panes, action: Action::ApplyRulesetProfile },
-    Binding { pattern: key(Key::Backspace),  scope: Scope::Panes, action: Action::FilterDeleteChar },
-    Binding { pattern: key(Key::Esc),        scope: Scope::Panes, action: Action::FilterClear },
-
+    Binding {
+        pattern: key(Key::Down),
+        scope: Scope::Panes,
+        action: Action::ListNext,
+    },
+    Binding {
+        pattern: key(Key::Char('j')),
+        scope: Scope::Panes,
+        action: Action::ListNext,
+    },
+    Binding {
+        pattern: key(Key::Up),
+        scope: Scope::Panes,
+        action: Action::ListPrev,
+    },
+    Binding {
+        pattern: key(Key::Char('k')),
+        scope: Scope::Panes,
+        action: Action::ListPrev,
+    },
+    Binding {
+        pattern: key(Key::Char('u')),
+        scope: Scope::Panes,
+        action: Action::ToggleUnhandledOnly,
+    },
+    Binding {
+        pattern: key(Key::Char('b')),
+        scope: Scope::Panes,
+        action: Action::ToggleBookmarkedOnly,
+    },
+    Binding {
+        pattern: key(Key::Char('a')),
+        scope: Scope::Panes,
+        action: Action::CycleAgentFilter,
+    },
+    Binding {
+        pattern: key(Key::Char('d')),
+        scope: Scope::Panes,
+        action: Action::CycleDomainFilter,
+    },
+    Binding {
+        pattern: key(Key::Char('p')),
+        scope: Scope::Panes,
+        action: Action::CycleRulesetProfile,
+    },
+    Binding {
+        pattern: key(Key::Enter),
+        scope: Scope::Panes,
+        action: Action::ApplyRulesetProfile,
+    },
+    Binding {
+        pattern: key(Key::Backspace),
+        scope: Scope::Panes,
+        action: Action::FilterDeleteChar,
+    },
+    Binding {
+        pattern: key(Key::Esc),
+        scope: Scope::Panes,
+        action: Action::FilterClear,
+    },
     // ---- Events ----
-    Binding { pattern: key(Key::Down),       scope: Scope::Events, action: Action::ListNext },
-    Binding { pattern: key(Key::Char('j')),  scope: Scope::Events, action: Action::ListNext },
-    Binding { pattern: key(Key::Up),         scope: Scope::Events, action: Action::ListPrev },
-    Binding { pattern: key(Key::Char('k')),  scope: Scope::Events, action: Action::ListPrev },
-    Binding { pattern: key(Key::Char('u')),  scope: Scope::Events, action: Action::ToggleUnhandledOnly },
-    Binding { pattern: key(Key::Backspace),  scope: Scope::Events, action: Action::FilterDeleteChar },
-    Binding { pattern: key(Key::Esc),        scope: Scope::Events, action: Action::FilterClear },
-
+    Binding {
+        pattern: key(Key::Down),
+        scope: Scope::Events,
+        action: Action::ListNext,
+    },
+    Binding {
+        pattern: key(Key::Char('j')),
+        scope: Scope::Events,
+        action: Action::ListNext,
+    },
+    Binding {
+        pattern: key(Key::Up),
+        scope: Scope::Events,
+        action: Action::ListPrev,
+    },
+    Binding {
+        pattern: key(Key::Char('k')),
+        scope: Scope::Events,
+        action: Action::ListPrev,
+    },
+    Binding {
+        pattern: key(Key::Char('u')),
+        scope: Scope::Events,
+        action: Action::ToggleUnhandledOnly,
+    },
+    Binding {
+        pattern: key(Key::Backspace),
+        scope: Scope::Events,
+        action: Action::FilterDeleteChar,
+    },
+    Binding {
+        pattern: key(Key::Esc),
+        scope: Scope::Events,
+        action: Action::FilterClear,
+    },
     // ---- Triage ----
-    Binding { pattern: key(Key::Down),       scope: Scope::Triage, action: Action::ListNext },
-    Binding { pattern: key(Key::Char('j')),  scope: Scope::Triage, action: Action::ListNext },
-    Binding { pattern: key(Key::Up),         scope: Scope::Triage, action: Action::ListPrev },
-    Binding { pattern: key(Key::Char('k')),  scope: Scope::Triage, action: Action::ListPrev },
-    Binding { pattern: key(Key::Enter),      scope: Scope::Triage, action: Action::TriagePrimaryAction },
-    Binding { pattern: key(Key::Char('a')),  scope: Scope::Triage, action: Action::TriagePrimaryAction },
-    Binding { pattern: key(Key::Char('m')),  scope: Scope::Triage, action: Action::TriageMute },
-    Binding { pattern: key(Key::Char('e')),  scope: Scope::Triage, action: Action::TriageToggleExpand },
-
+    Binding {
+        pattern: key(Key::Down),
+        scope: Scope::Triage,
+        action: Action::ListNext,
+    },
+    Binding {
+        pattern: key(Key::Char('j')),
+        scope: Scope::Triage,
+        action: Action::ListNext,
+    },
+    Binding {
+        pattern: key(Key::Up),
+        scope: Scope::Triage,
+        action: Action::ListPrev,
+    },
+    Binding {
+        pattern: key(Key::Char('k')),
+        scope: Scope::Triage,
+        action: Action::ListPrev,
+    },
+    Binding {
+        pattern: key(Key::Enter),
+        scope: Scope::Triage,
+        action: Action::TriagePrimaryAction,
+    },
+    Binding {
+        pattern: key(Key::Char('a')),
+        scope: Scope::Triage,
+        action: Action::TriagePrimaryAction,
+    },
+    Binding {
+        pattern: key(Key::Char('m')),
+        scope: Scope::Triage,
+        action: Action::TriageMute,
+    },
+    Binding {
+        pattern: key(Key::Char('e')),
+        scope: Scope::Triage,
+        action: Action::TriageToggleExpand,
+    },
     // ---- History ----
-    Binding { pattern: key(Key::Down),       scope: Scope::History, action: Action::ListNext },
-    Binding { pattern: key(Key::Char('j')),  scope: Scope::History, action: Action::ListNext },
-    Binding { pattern: key(Key::Up),         scope: Scope::History, action: Action::ListPrev },
-    Binding { pattern: key(Key::Char('k')),  scope: Scope::History, action: Action::ListPrev },
-    Binding { pattern: key(Key::Char('u')),  scope: Scope::History, action: Action::ToggleUndoableOnly },
-    Binding { pattern: key(Key::Backspace),  scope: Scope::History, action: Action::FilterDeleteChar },
-    Binding { pattern: key(Key::Esc),        scope: Scope::History, action: Action::FilterClear },
-
+    Binding {
+        pattern: key(Key::Down),
+        scope: Scope::History,
+        action: Action::ListNext,
+    },
+    Binding {
+        pattern: key(Key::Char('j')),
+        scope: Scope::History,
+        action: Action::ListNext,
+    },
+    Binding {
+        pattern: key(Key::Up),
+        scope: Scope::History,
+        action: Action::ListPrev,
+    },
+    Binding {
+        pattern: key(Key::Char('k')),
+        scope: Scope::History,
+        action: Action::ListPrev,
+    },
+    Binding {
+        pattern: key(Key::Char('u')),
+        scope: Scope::History,
+        action: Action::ToggleUndoableOnly,
+    },
+    Binding {
+        pattern: key(Key::Backspace),
+        scope: Scope::History,
+        action: Action::FilterDeleteChar,
+    },
+    Binding {
+        pattern: key(Key::Esc),
+        scope: Scope::History,
+        action: Action::FilterClear,
+    },
     // ---- Search ----
-    Binding { pattern: ctrl(Key::Char('n')), scope: Scope::Search, action: Action::SearchNextSaved },
-    Binding { pattern: ctrl(Key::Char('p')), scope: Scope::Search, action: Action::SearchPrevSaved },
-    Binding { pattern: ctrl(Key::Char('r')), scope: Scope::Search, action: Action::SearchRunSaved },
-    Binding { pattern: ctrl(Key::Char('e')), scope: Scope::Search, action: Action::SearchToggleSaved },
-    Binding { pattern: key(Key::Down),       scope: Scope::Search, action: Action::ListNext },
-    Binding { pattern: key(Key::Char('j')),  scope: Scope::Search, action: Action::ListNext },
-    Binding { pattern: key(Key::Up),         scope: Scope::Search, action: Action::ListPrev },
-    Binding { pattern: key(Key::Char('k')),  scope: Scope::Search, action: Action::ListPrev },
-    Binding { pattern: key(Key::Backspace),  scope: Scope::Search, action: Action::FilterDeleteChar },
-    Binding { pattern: key(Key::Enter),      scope: Scope::Search, action: Action::SearchExecute },
-    Binding { pattern: key(Key::Esc),        scope: Scope::Search, action: Action::FilterClear },
+    Binding {
+        pattern: ctrl(Key::Char('n')),
+        scope: Scope::Search,
+        action: Action::SearchNextSaved,
+    },
+    Binding {
+        pattern: ctrl(Key::Char('p')),
+        scope: Scope::Search,
+        action: Action::SearchPrevSaved,
+    },
+    Binding {
+        pattern: ctrl(Key::Char('r')),
+        scope: Scope::Search,
+        action: Action::SearchRunSaved,
+    },
+    Binding {
+        pattern: ctrl(Key::Char('e')),
+        scope: Scope::Search,
+        action: Action::SearchToggleSaved,
+    },
+    Binding {
+        pattern: key(Key::Down),
+        scope: Scope::Search,
+        action: Action::ListNext,
+    },
+    Binding {
+        pattern: key(Key::Char('j')),
+        scope: Scope::Search,
+        action: Action::ListNext,
+    },
+    Binding {
+        pattern: key(Key::Up),
+        scope: Scope::Search,
+        action: Action::ListPrev,
+    },
+    Binding {
+        pattern: key(Key::Char('k')),
+        scope: Scope::Search,
+        action: Action::ListPrev,
+    },
+    Binding {
+        pattern: key(Key::Backspace),
+        scope: Scope::Search,
+        action: Action::FilterDeleteChar,
+    },
+    Binding {
+        pattern: key(Key::Enter),
+        scope: Scope::Search,
+        action: Action::SearchExecute,
+    },
+    Binding {
+        pattern: key(Key::Esc),
+        scope: Scope::Search,
+        action: Action::FilterClear,
+    },
+    // ---- Timeline ----
+    Binding {
+        pattern: key(Key::Down),
+        scope: Scope::Timeline,
+        action: Action::ListNext,
+    },
+    Binding {
+        pattern: key(Key::Char('j')),
+        scope: Scope::Timeline,
+        action: Action::ListNext,
+    },
+    Binding {
+        pattern: key(Key::Up),
+        scope: Scope::Timeline,
+        action: Action::ListPrev,
+    },
+    Binding {
+        pattern: key(Key::Char('k')),
+        scope: Scope::Timeline,
+        action: Action::ListPrev,
+    },
+    Binding {
+        pattern: key(Key::Right),
+        scope: Scope::Timeline,
+        action: Action::TimelineScrollRight,
+    },
+    Binding {
+        pattern: key(Key::Char('l')),
+        scope: Scope::Timeline,
+        action: Action::TimelineScrollRight,
+    },
+    Binding {
+        pattern: key(Key::Left),
+        scope: Scope::Timeline,
+        action: Action::TimelineScrollLeft,
+    },
+    Binding {
+        pattern: key(Key::Char('h')),
+        scope: Scope::Timeline,
+        action: Action::TimelineScrollLeft,
+    },
+    Binding {
+        pattern: key(Key::Char('+')),
+        scope: Scope::Timeline,
+        action: Action::TimelineZoomIn,
+    },
+    Binding {
+        pattern: key(Key::Char('-')),
+        scope: Scope::Timeline,
+        action: Action::TimelineZoomOut,
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -255,6 +541,7 @@ fn view_scope(view_name: &str) -> Option<Scope> {
         "Triage" => Some(Scope::Triage),
         "History" => Some(Scope::History),
         "Search" => Some(Scope::Search),
+        "Timeline" => Some(Scope::Timeline),
         _ => None,
     }
 }
@@ -320,6 +607,7 @@ pub fn resolve(input: &KeyInput, view_name: &str) -> Option<Action> {
                             }
                         }
                     }
+                    Scope::Timeline => {}
                     Scope::Global => unreachable!(),
                 }
             }
@@ -360,6 +648,10 @@ pub fn action_label(action: &Action) -> &'static str {
         Action::SearchRunSaved => "Run saved search",
         Action::SearchToggleSaved => "Toggle saved search",
         Action::SearchExecute => "Execute search",
+        Action::TimelineZoomIn => "Zoom in timeline",
+        Action::TimelineZoomOut => "Zoom out timeline",
+        Action::TimelineScrollLeft => "Scroll timeline left",
+        Action::TimelineScrollRight => "Scroll timeline right",
     }
 }
 
@@ -409,10 +701,7 @@ mod tests {
 
     #[test]
     fn parity_global_refresh() {
-        assert_eq!(
-            resolve(&ki(Key::Char('r')), "Home"),
-            Some(Action::Refresh)
-        );
+        assert_eq!(resolve(&ki(Key::Char('r')), "Home"), Some(Action::Refresh));
     }
 
     #[test]
@@ -499,10 +788,7 @@ mod tests {
             resolve(&ki(Key::Backspace), "Panes"),
             Some(Action::FilterDeleteChar)
         );
-        assert_eq!(
-            resolve(&ki(Key::Esc), "Panes"),
-            Some(Action::FilterClear)
-        );
+        assert_eq!(resolve(&ki(Key::Esc), "Panes"), Some(Action::FilterClear));
         assert_eq!(
             resolve(&ki(Key::Char('x')), "Panes"),
             Some(Action::FilterAppendChar('x'))
@@ -518,14 +804,14 @@ mod tests {
             // Global GoToView(5) wins over events digit filter
             Some(Action::GoToView(5))
         );
-        // But 0, 8, 9 are not global
+        // But 0, 9 are not global (8 is now GoToView(8))
         assert_eq!(
             resolve(&ki(Key::Char('0')), "Events"),
             Some(Action::EventsFilterDigit('0'))
         );
         assert_eq!(
             resolve(&ki(Key::Char('8')), "Events"),
-            Some(Action::EventsFilterDigit('8'))
+            Some(Action::GoToView(8))
         );
     }
 
@@ -559,10 +845,10 @@ mod tests {
 
     #[test]
     fn parity_triage_numbered_actions() {
-        // 1-7 are global (GoToView), 8-9 are triage-specific
+        // 1-8 are global (GoToView), 9 is triage-specific
         assert_eq!(
             resolve(&ki(Key::Char('8')), "Triage"),
-            Some(Action::TriageNumberedAction(8))
+            Some(Action::GoToView(8))
         );
         assert_eq!(
             resolve(&ki(Key::Char('9')), "Triage"),
@@ -584,10 +870,7 @@ mod tests {
 
     #[test]
     fn parity_history_esc_clears() {
-        assert_eq!(
-            resolve(&ki(Key::Esc), "History"),
-            Some(Action::FilterClear)
-        );
+        assert_eq!(resolve(&ki(Key::Esc), "History"), Some(Action::FilterClear));
     }
 
     #[test]
@@ -657,10 +940,7 @@ mod tests {
         let mut seen = HashSet::new();
         for b in KEYMAP {
             let key = format!("{:?}|{:?}", b.scope, b.pattern);
-            assert!(
-                seen.insert(key.clone()),
-                "Duplicate keymap entry: {key}"
-            );
+            assert!(seen.insert(key.clone()), "Duplicate keymap entry: {key}");
         }
     }
 
@@ -675,6 +955,6 @@ mod tests {
     #[test]
     fn bindings_for_scope_returns_correct_count() {
         let globals = bindings_for_scope(Scope::Global);
-        assert_eq!(globals.len(), 12); // q ? r Tab BackTab 1-7
+        assert_eq!(globals.len(), 13); // q ? r Tab BackTab 1-8
     }
 }

@@ -26,7 +26,7 @@ use super::query::{EventFilters, QueryClient, QueryError};
 use super::views::{
     View, ViewState, filtered_event_indices, filtered_history_indices, filtered_pane_indices,
     render_events_view, render_help_view, render_history_view, render_home_view, render_panes_view,
-    render_search_view, render_tabs, render_triage_view,
+    render_search_view, render_tabs, render_timeline_placeholder, render_triage_view,
 };
 
 /// Application configuration
@@ -224,6 +224,10 @@ impl<Q: QueryClient> App<Q> {
                 self.current_view = View::Help;
                 return;
             }
+            KeyCode::Char('8') => {
+                self.current_view = View::Timeline;
+                return;
+            }
             _ => {}
         }
 
@@ -234,7 +238,7 @@ impl<Q: QueryClient> App<Q> {
             View::History => self.handle_history_key(key),
             View::Triage => self.handle_triage_key(key),
             View::Search => self.handle_search_key(key),
-            View::Home | View::Help => {}
+            View::Home | View::Help | View::Timeline => {}
         }
     }
 
@@ -747,6 +751,7 @@ impl<Q: QueryClient> App<Q> {
             View::Triage => render_triage_view(&self.view_state, chunks[1], buf),
             View::Search => render_search_view(&self.view_state, chunks[1], buf),
             View::Help => render_help_view(chunks[1], buf),
+            View::Timeline => render_timeline_placeholder(chunks[1], buf),
         }
     }
 
@@ -1495,6 +1500,8 @@ mod tests {
         app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.current_view, View::Help);
         app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.current_view, View::Timeline);
+        app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.current_view, View::Home); // Wraps
     }
 
@@ -1503,16 +1510,16 @@ mod tests {
         let mut app = App::new(TestQueryClient, AppConfig::default());
         assert_eq!(app.current_view, View::Home);
         app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT));
-        assert_eq!(app.current_view, View::Help);
+        assert_eq!(app.current_view, View::Timeline);
         app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT));
-        assert_eq!(app.current_view, View::Search);
+        assert_eq!(app.current_view, View::Help);
     }
 
     #[test]
     fn global_backtab_cycles_backward() {
         let mut app = App::new(TestQueryClient, AppConfig::default());
         app.handle_key_event(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
-        assert_eq!(app.current_view, View::Help);
+        assert_eq!(app.current_view, View::Timeline);
     }
 
     #[test]

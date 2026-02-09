@@ -29,8 +29,9 @@ use std::time::{Duration, Instant};
 
 use super::query::QueryClient;
 use super::view_adapters::{
-    HealthModel, PaneRow, SearchRow, TriageRow, WorkflowRow, adapt_event, adapt_health,
-    adapt_history, adapt_pane, adapt_search, adapt_triage, adapt_workflow,
+    HealthModel, PaneRow, SearchRow, TimelineRow, TriageRow, WorkflowRow, adapt_event,
+    adapt_health, adapt_history, adapt_pane, adapt_search, adapt_timeline_event, adapt_triage,
+    adapt_workflow,
 };
 
 // ---------------------------------------------------------------------------
@@ -48,6 +49,8 @@ pub enum View {
     History,
     Search,
     Help,
+    /// Unified event timeline with cross-pane correlations (wa-6sk.4).
+    Timeline,
 }
 
 impl View {
@@ -61,6 +64,7 @@ impl View {
             Self::History => "History",
             Self::Search => "Search",
             Self::Help => "Help",
+            Self::Timeline => "Timeline",
         }
     }
 
@@ -74,10 +78,11 @@ impl View {
             Self::History,
             Self::Search,
             Self::Help,
+            Self::Timeline,
         ]
     }
 
-    /// Shortcut key for direct navigation (1-7).
+    /// Shortcut key for direct navigation (1-8).
     #[must_use]
     pub const fn shortcut(&self) -> char {
         match self {
@@ -88,6 +93,7 @@ impl View {
             Self::History => '5',
             Self::Search => '6',
             Self::Help => '7',
+            Self::Timeline => '8',
         }
     }
 
@@ -101,7 +107,8 @@ impl View {
             Self::Triage => Self::History,
             Self::History => Self::Search,
             Self::Search => Self::Help,
-            Self::Help => Self::Home,
+            Self::Help => Self::Timeline,
+            Self::Timeline => Self::Home,
         }
     }
 
@@ -109,17 +116,18 @@ impl View {
     #[must_use]
     pub const fn prev(&self) -> Self {
         match self {
-            Self::Home => Self::Help,
+            Self::Home => Self::Timeline,
             Self::Panes => Self::Home,
             Self::Events => Self::Panes,
             Self::Triage => Self::Events,
             Self::History => Self::Triage,
             Self::Search => Self::History,
             Self::Help => Self::Search,
+            Self::Timeline => Self::Help,
         }
     }
 
-    /// Resolve a '1'-'7' character to a view.
+    /// Resolve a '1'-'8' character to a view.
     fn from_shortcut(ch: char) -> Option<Self> {
         match ch {
             '1' => Some(Self::Home),
@@ -129,6 +137,7 @@ impl View {
             '5' => Some(Self::History),
             '6' => Some(Self::Search),
             '7' => Some(Self::Help),
+            '8' => Some(Self::Timeline),
             _ => None,
         }
     }
@@ -531,6 +540,10 @@ pub struct WaModel {
     search_last_query: String,
     search_results: Vec<SearchRow>,
     search_selected: usize,
+    // Timeline view state (wa-6sk.4).
+    timeline_rows: Vec<TimelineRow>,
+    timeline_selected: usize,
+    timeline_zoom: u8,
 }
 
 impl WaModel {
@@ -559,6 +572,9 @@ impl WaModel {
             search_last_query: String::new(),
             search_results: Vec::new(),
             search_selected: 0,
+            timeline_rows: Vec::new(),
+            timeline_selected: 0,
+            timeline_zoom: 0,
         }
     }
 
@@ -574,6 +590,7 @@ impl WaModel {
             View::Triage => self.handle_triage_key(key),
             View::History => self.handle_history_key(key),
             View::Search => self.handle_search_key(key),
+            View::Timeline => self.handle_timeline_key(key),
             _ => ftui::Cmd::None,
         }
     }
@@ -968,6 +985,39 @@ impl WaModel {
         }
     }
 
+    /// Handle keys specific to the Timeline view.
+    fn handle_timeline_key(&mut self, key: &ftui::KeyEvent) -> ftui::Cmd<WaMsg> {
+        use ftui::KeyCode;
+
+        let count = self.timeline_rows.len();
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => {
+                if count > 0 {
+                    self.timeline_selected = (self.timeline_selected + 1) % count;
+                }
+                ftui::Cmd::None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if count > 0 {
+                    self.timeline_selected =
+                        self.timeline_selected.checked_sub(1).unwrap_or(count - 1);
+                }
+                ftui::Cmd::None
+            }
+            KeyCode::Char('+') => {
+                if self.timeline_zoom < 5 {
+                    self.timeline_zoom += 1;
+                }
+                ftui::Cmd::None
+            }
+            KeyCode::Char('-') => {
+                self.timeline_zoom = self.timeline_zoom.saturating_sub(1);
+                ftui::Cmd::None
+            }
+            _ => ftui::Cmd::None,
+        }
+    }
+
     /// Handle keys specific to the Events view.
     ///
     /// j/k/Down/Up navigate, u toggles unhandled filter, Backspace removes
@@ -1165,6 +1215,28 @@ impl WaModel {
                         self.view_state.history.selected_index.min(filtered_len - 1);
                 } else {
                     self.view_state.history.selected_index = 0;
+                }
+            }
+            Err(_) => { /* non-fatal */ }
+        }
+
+        // Timeline data (wa-6sk.4): last 30m, zoom-aware limit.
+        let timeline_limit = match self.timeline_zoom {
+            0 => 50,
+            1 => 100,
+            2 => 200,
+            _ => 500,
+        };
+        // 30 minutes in milliseconds
+        let last_ms = 30 * 60 * 1000;
+        match self.query.get_timeline(last_ms, timeline_limit) {
+            Ok(timeline) => {
+                self.timeline_rows = timeline.events.iter().map(adapt_timeline_event).collect();
+                if self.timeline_rows.is_empty() {
+                    self.timeline_selected = 0;
+                } else {
+                    self.timeline_selected =
+                        self.timeline_selected.min(self.timeline_rows.len() - 1);
                 }
             }
             Err(_) => { /* non-fatal */ }
@@ -1367,6 +1439,15 @@ impl ftui::Model for WaModel {
                     self.view_state.focus,
                 );
             }
+            View::Timeline => render_timeline_view(
+                frame,
+                content_y,
+                width,
+                content_h,
+                &self.timeline_rows,
+                self.timeline_selected,
+                self.timeline_zoom,
+            ),
         }
 
         // -- Footer / status bar --
@@ -2077,7 +2158,7 @@ fn render_help_view(frame: &mut ftui::Frame, y: u16, width: u16, height: u16) {
         ("    r          Refresh current view", false),
         ("    Tab        Next view", false),
         ("    Shift+Tab  Previous view", false),
-        ("    1-7        Jump to view by number", false),
+        ("    1-8        Jump to view by number", false),
         ("", false),
         ("  List Navigation:", true),
         ("    j / Down   Move selection down", false),
@@ -2102,6 +2183,7 @@ fn render_help_view(frame: &mut ftui::Frame, y: u16, width: u16, height: u16) {
         ("    5. History Audit action timeline", false),
         ("    6. Search  Full-text search", false),
         ("    7. Help    This screen", false),
+        ("    8. Timeline Cross-pane event timeline", false),
     ];
 
     for &(line, bold) in help_lines {
@@ -2844,6 +2926,195 @@ fn truncate_str(s: &str, max: usize) -> String {
     }
 }
 
+/// Render the Timeline view — cross-pane event timeline with correlation markers.
+///
+/// Two-panel layout:
+///   Left 60%:  Timeline list with severity, pane, type, and correlation indicators.
+///   Right 40%: Detail panel for the selected event.
+fn render_timeline_view(
+    frame: &mut ftui::Frame,
+    y: u16,
+    width: u16,
+    height: u16,
+    rows: &[TimelineRow],
+    selected: usize,
+    zoom: u8,
+) {
+    if height == 0 {
+        return;
+    }
+
+    let max_row = y.saturating_add(height);
+    let list_width = (width * 3 / 5).max(20); // 60%
+    let detail_x = list_width;
+    let detail_width = width.saturating_sub(list_width);
+
+    let mut row = y;
+
+    // -- Header: count + zoom level --
+    let zoom_label = match zoom {
+        0 => "30m",
+        1 => "1h",
+        2 => "2h",
+        _ => "6h+",
+    };
+    let header = format!(
+        "  Timeline ({} events)  zoom={}  +/-=zoom j/k=nav",
+        rows.len(),
+        zoom_label,
+    );
+    write_styled(frame, 0, row, &header, CellStyle::new().bold());
+    let hlen = header.len() as u16;
+    if hlen < list_width {
+        let fill = " ".repeat((list_width - hlen) as usize);
+        write_styled(frame, hlen, row, &fill, CellStyle::new());
+    }
+    row += 1;
+
+    // -- Column headers --
+    if row < max_row {
+        let col_header = format!(
+            "  {:>8}  {:6}  {:8}  {:12}  {}",
+            "time", "pane", "severity", "type", "corr"
+        );
+        write_styled(frame, 0, row, &col_header, CellStyle::new().dim());
+        let clen = col_header.len() as u16;
+        if clen < list_width {
+            let fill = " ".repeat((list_width - clen) as usize);
+            write_styled(frame, clen, row, &fill, CellStyle::new());
+        }
+        row += 1;
+    }
+
+    // -- Timeline rows --
+    if rows.is_empty() && row < max_row {
+        let msg = "  No timeline events in the current window.";
+        write_styled(frame, 0, row, msg, CellStyle::new().dim());
+        let msg_len = msg.len() as u16;
+        if msg_len < list_width {
+            let fill = " ".repeat((list_width - msg_len) as usize);
+            write_styled(frame, msg_len, row, &fill, CellStyle::new());
+        }
+        row += 1;
+    } else {
+        for (pos, trow) in rows.iter().enumerate() {
+            if row >= max_row {
+                break;
+            }
+            let corr_marker = if trow.correlation_label.is_empty() {
+                " "
+            } else {
+                "*"
+            };
+            let line = format!(
+                "  {:>8}  {:6}  {:8}  {:12}  {}",
+                truncate_str(&trow.timestamp, 8),
+                truncate_str(&trow.pane_label, 6),
+                truncate_str(&trow.severity_label, 8),
+                truncate_str(&trow.event_type, 12),
+                corr_marker,
+            );
+            let style = if pos == selected {
+                CellStyle::new().bold().reverse()
+            } else if trow.severity_label == "error" {
+                CellStyle::new().bold()
+            } else {
+                CellStyle::new()
+            };
+            write_styled(frame, 0, row, &line, style);
+            let llen = line.len() as u16;
+            if llen < list_width {
+                let fill = " ".repeat((list_width - llen) as usize);
+                write_styled(frame, llen, row, &fill, style);
+            }
+            row += 1;
+        }
+    }
+
+    // Fill remaining list area
+    let blank_list = " ".repeat(list_width as usize);
+    while row < max_row {
+        write_styled(frame, 0, row, &blank_list, CellStyle::new());
+        row += 1;
+    }
+
+    // -- Detail panel (right side) --
+    let mut drow = y;
+
+    // Detail header
+    write_styled(
+        frame,
+        detail_x,
+        drow,
+        " Event Details",
+        CellStyle::new().bold(),
+    );
+    let dhlen = 14u16;
+    if dhlen < detail_width {
+        let fill = " ".repeat((detail_width - dhlen) as usize);
+        write_styled(frame, detail_x + dhlen, drow, &fill, CellStyle::new());
+    }
+    drow += 1;
+
+    if let Some(trow) = rows.get(selected) {
+        let detail_lines: Vec<String> = vec![
+            format!(" ID:       {}", truncate_str(&trow.id, 30)),
+            format!(" Time:     {}", trow.timestamp),
+            format!(" Pane:     {}", trow.pane_label),
+            format!(" Agent:    {}", trow.agent_label),
+            format!(" Type:     {}", trow.event_type),
+            format!(" Severity: {}", trow.severity_label),
+            format!(" Handled:  {}", trow.handled_label),
+            if trow.correlation_label.is_empty() {
+                " Corr:     none".to_string()
+            } else {
+                format!(" Corr:     {}", truncate_str(&trow.correlation_label, 30))
+            },
+            String::new(),
+            format!(
+                " {}",
+                truncate_str(&trow.summary, detail_width.saturating_sub(2) as usize)
+            ),
+            String::new(),
+            " Keys: j/k=nav +/-=zoom".to_string(),
+        ];
+
+        for line in &detail_lines {
+            if drow >= max_row {
+                break;
+            }
+            write_styled(frame, detail_x, drow, line, CellStyle::new());
+            let llen = line.len() as u16;
+            if llen < detail_width {
+                let fill = " ".repeat((detail_width - llen) as usize);
+                write_styled(frame, detail_x + llen, drow, &fill, CellStyle::new());
+            }
+            drow += 1;
+        }
+    } else if drow < max_row {
+        write_styled(
+            frame,
+            detail_x,
+            drow,
+            " No event selected.",
+            CellStyle::new().dim(),
+        );
+        let msg_len = 20u16;
+        if msg_len < detail_width {
+            let fill = " ".repeat((detail_width - msg_len) as usize);
+            write_styled(frame, detail_x + msg_len, drow, &fill, CellStyle::new());
+        }
+        drow += 1;
+    }
+
+    // Fill remaining detail area
+    let blank_detail = " ".repeat(detail_width as usize);
+    while drow < max_row {
+        write_styled(frame, detail_x, drow, &blank_detail, CellStyle::new());
+        drow += 1;
+    }
+}
+
 /// Render the status footer.
 fn render_footer(frame: &mut ftui::Frame, row: u16, width: u16, view: View, error: Option<&str>) {
     let left = if let Some(err) = error {
@@ -3389,7 +3660,7 @@ mod tests {
 
     // -- Helpers --
 
-    fn make_model(query: impl QueryClient + Send + Sync + 'static) -> WaModel {
+    fn make_model(query: impl QueryClient + 'static) -> WaModel {
         let query: Arc<dyn QueryClient + Send + Sync> = Arc::new(query);
         WaModel::new(
             query,
@@ -3421,19 +3692,21 @@ mod tests {
     // -- View navigation tests --
 
     #[test]
-    fn view_all_returns_seven_views() {
-        assert_eq!(View::all().len(), 7);
+    fn view_all_returns_eight_views() {
+        assert_eq!(View::all().len(), 8);
     }
 
     #[test]
     fn view_next_wraps() {
-        assert_eq!(View::Help.next(), View::Home);
+        assert_eq!(View::Help.next(), View::Timeline);
+        assert_eq!(View::Timeline.next(), View::Home);
         assert_eq!(View::Home.next(), View::Panes);
     }
 
     #[test]
     fn view_prev_wraps() {
-        assert_eq!(View::Home.prev(), View::Help);
+        assert_eq!(View::Home.prev(), View::Timeline);
+        assert_eq!(View::Timeline.prev(), View::Help);
         assert_eq!(View::Panes.prev(), View::Home);
     }
 
@@ -3449,7 +3722,7 @@ mod tests {
     #[test]
     fn view_from_shortcut_invalid() {
         assert_eq!(View::from_shortcut('0'), None);
-        assert_eq!(View::from_shortcut('8'), None);
+        assert_eq!(View::from_shortcut('9'), None);
         assert_eq!(View::from_shortcut('a'), None);
     }
 
@@ -4067,13 +4340,13 @@ mod tests {
             &rows,
             0,
         );
-        let row1 = read_row(&frame, 1);
-        assert!(row1.contains("2 matches"));
-        let row2 = read_row(&frame, 2);
-        assert!(row2.contains("Pane"));
-        assert!(row2.contains("Rank"));
-        let row3 = read_row(&frame, 3);
-        assert!(row3.contains("P 10"));
+        let header_row = read_row(&frame, 1);
+        assert!(header_row.contains("2 matches"));
+        let column_row = read_row(&frame, 2);
+        assert!(column_row.contains("Pane"));
+        assert!(column_row.contains("Rank"));
+        let data_row = read_row(&frame, 3);
+        assert!(data_row.contains("P 10"));
         let mut found = false;
         for r in 0..22 {
             if read_row(&frame, r).contains("Match Context") {
@@ -6810,6 +7083,7 @@ mod tests {
         }
 
         /// Assert last frame does NOT contain text.
+        #[allow(dead_code)]
         fn assert_not_contains(&self, text: &str) {
             let last = self.last_frame();
             assert!(
@@ -7548,5 +7822,213 @@ mod tests {
             assert!(s.model.view_state.history.filter_input.is_empty());
         }
         s.capture();
+    }
+
+    // -----------------------------------------------------------------------
+    // Timeline view tests (wa-6sk.4)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn render_timeline_empty_no_panic() {
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(80, 24, &mut pool);
+        render_timeline_view(&mut frame, 2, 80, 20, &[], 0, 0);
+    }
+
+    #[test]
+    fn render_timeline_zero_height_no_panic() {
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(80, 24, &mut pool);
+        render_timeline_view(&mut frame, 2, 80, 0, &[], 0, 0);
+    }
+
+    #[test]
+    fn render_timeline_with_rows_no_panic() {
+        let rows = vec![
+            TimelineRow {
+                id: "evt-1".to_string(),
+                timestamp: "12:34:56".to_string(),
+                pane_label: "P0".to_string(),
+                agent_label: "codex".to_string(),
+                event_type: "error_burst".to_string(),
+                severity_label: "error".to_string(),
+                handled_label: "unhandled".to_string(),
+                correlation_label: "failover".to_string(),
+                summary: "Test error event".to_string(),
+                severity_style: StyleSpec::new(),
+                agent_style: StyleSpec::new(),
+                handled_style: StyleSpec::new(),
+                correlation_style: StyleSpec::new(),
+            },
+            TimelineRow {
+                id: "evt-2".to_string(),
+                timestamp: "12:34:57".to_string(),
+                pane_label: "P1".to_string(),
+                agent_label: "claude".to_string(),
+                event_type: "idle_timeout".to_string(),
+                severity_label: "warning".to_string(),
+                handled_label: "handled".to_string(),
+                correlation_label: String::new(),
+                summary: "Warning event".to_string(),
+                severity_style: StyleSpec::new(),
+                agent_style: StyleSpec::new(),
+                handled_style: StyleSpec::new(),
+                correlation_style: StyleSpec::new(),
+            },
+        ];
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(80, 24, &mut pool);
+        render_timeline_view(&mut frame, 2, 80, 20, &rows, 0, 0);
+    }
+
+    #[test]
+    fn render_timeline_selected_second_row() {
+        let rows = vec![
+            TimelineRow {
+                id: "1".to_string(),
+                timestamp: "00:00".to_string(),
+                pane_label: "P0".to_string(),
+                agent_label: "a".to_string(),
+                event_type: "t".to_string(),
+                severity_label: "info".to_string(),
+                handled_label: "h".to_string(),
+                correlation_label: String::new(),
+                summary: "first".to_string(),
+                severity_style: StyleSpec::new(),
+                agent_style: StyleSpec::new(),
+                handled_style: StyleSpec::new(),
+                correlation_style: StyleSpec::new(),
+            },
+            TimelineRow {
+                id: "2".to_string(),
+                timestamp: "00:01".to_string(),
+                pane_label: "P1".to_string(),
+                agent_label: "b".to_string(),
+                event_type: "t".to_string(),
+                severity_label: "error".to_string(),
+                handled_label: "u".to_string(),
+                correlation_label: "cascade".to_string(),
+                summary: "second".to_string(),
+                severity_style: StyleSpec::new(),
+                agent_style: StyleSpec::new(),
+                handled_style: StyleSpec::new(),
+                correlation_style: StyleSpec::new(),
+            },
+        ];
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(100, 24, &mut pool);
+        // selected=1 should render detail panel for second event
+        render_timeline_view(&mut frame, 1, 100, 22, &rows, 1, 2);
+    }
+
+    #[test]
+    fn timeline_key_nav_down_up() {
+        let mut model = make_model(MockQuery::healthy());
+        model.timeline_rows = vec![
+            TimelineRow {
+                id: "1".to_string(),
+                timestamp: "t".to_string(),
+                pane_label: "P0".to_string(),
+                agent_label: "a".to_string(),
+                event_type: "e".to_string(),
+                severity_label: "info".to_string(),
+                handled_label: "h".to_string(),
+                correlation_label: String::new(),
+                summary: String::new(),
+                severity_style: StyleSpec::new(),
+                agent_style: StyleSpec::new(),
+                handled_style: StyleSpec::new(),
+                correlation_style: StyleSpec::new(),
+            },
+            TimelineRow {
+                id: "2".to_string(),
+                timestamp: "t".to_string(),
+                pane_label: "P1".to_string(),
+                agent_label: "b".to_string(),
+                event_type: "e".to_string(),
+                severity_label: "error".to_string(),
+                handled_label: "u".to_string(),
+                correlation_label: String::new(),
+                summary: String::new(),
+                severity_style: StyleSpec::new(),
+                agent_style: StyleSpec::new(),
+                handled_style: StyleSpec::new(),
+                correlation_style: StyleSpec::new(),
+            },
+        ];
+        model.view_state.current_view = super::state::View::Timeline;
+        assert_eq!(model.timeline_selected, 0);
+
+        // Press Down
+        let down = ftui::KeyEvent {
+            code: ftui::KeyCode::Down,
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
+        model.handle_timeline_key(&down);
+        assert_eq!(model.timeline_selected, 1);
+
+        // Press Up
+        let up = ftui::KeyEvent {
+            code: ftui::KeyCode::Up,
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
+        model.handle_timeline_key(&up);
+        assert_eq!(model.timeline_selected, 0);
+    }
+
+    #[test]
+    fn timeline_key_zoom_in_out() {
+        let mut model = make_model(MockQuery::healthy());
+        model.view_state.current_view = super::state::View::Timeline;
+        assert_eq!(model.timeline_zoom, 0);
+
+        let plus = ftui::KeyEvent {
+            code: ftui::KeyCode::Char('+'),
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
+        model.handle_timeline_key(&plus);
+        assert_eq!(model.timeline_zoom, 1);
+        model.handle_timeline_key(&plus);
+        assert_eq!(model.timeline_zoom, 2);
+
+        let minus = ftui::KeyEvent {
+            code: ftui::KeyCode::Char('-'),
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
+        model.handle_timeline_key(&minus);
+        assert_eq!(model.timeline_zoom, 1);
+        model.handle_timeline_key(&minus);
+        assert_eq!(model.timeline_zoom, 0);
+        // Doesn't go below 0
+        model.handle_timeline_key(&minus);
+        assert_eq!(model.timeline_zoom, 0);
+    }
+
+    #[test]
+    fn timeline_zoom_capped_at_5() {
+        let mut model = make_model(MockQuery::healthy());
+        let plus = ftui::KeyEvent {
+            code: ftui::KeyCode::Char('+'),
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
+        for _ in 0..10 {
+            model.handle_timeline_key(&plus);
+        }
+        assert_eq!(model.timeline_zoom, 5);
+    }
+
+    #[test]
+    fn view_shortcut_8_maps_to_timeline() {
+        assert_eq!(View::from_shortcut('8'), Some(View::Timeline));
+    }
+
+    #[test]
+    fn view_timeline_name() {
+        assert_eq!(View::Timeline.name(), "Timeline");
     }
 }

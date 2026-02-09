@@ -261,6 +261,22 @@ pub trait QueryClient: Send + Sync {
     fn ruleset_profile_state(&self) -> Result<RulesetProfileState, QueryError> {
         Ok(RulesetProfileState::default())
     }
+
+    /// Query the unified timeline of events across panes.
+    fn get_timeline(
+        &self,
+        _last_ms: i64,
+        _limit: usize,
+    ) -> Result<crate::storage::Timeline, QueryError> {
+        Ok(crate::storage::Timeline {
+            start: 0,
+            end: 0,
+            events: Vec::new(),
+            correlations: Vec::new(),
+            total_count: 0,
+            has_more: false,
+        })
+    }
 }
 
 /// Production implementation of QueryClient
@@ -859,6 +875,34 @@ impl QueryClient for ProductionQueryClient {
     fn ruleset_profile_state(&self) -> Result<RulesetProfileState, QueryError> {
         crate::ui_query::resolve_ruleset_profile_state(self.config_path.as_deref())
             .map_err(|e| QueryError::QueryFailed(e.to_string()))
+    }
+
+    fn get_timeline(
+        &self,
+        last_ms: i64,
+        limit: usize,
+    ) -> Result<crate::storage::Timeline, QueryError> {
+        let storage = match &self.storage {
+            Some(s) => s.clone(),
+            None => {
+                return Ok(crate::storage::Timeline {
+                    start: 0,
+                    end: 0,
+                    events: Vec::new(),
+                    correlations: Vec::new(),
+                    total_count: 0,
+                    has_more: false,
+                });
+            }
+        };
+        let now = epoch_ms();
+        let start = now - last_ms;
+        let query = crate::storage::TimelineQuery::new()
+            .with_range(start, now)
+            .with_pagination(limit, 0);
+        self.runtime
+            .block_on(storage.get_timeline(query))
+            .map_err(|e| QueryError::StorageError(e.to_string()))
     }
 }
 

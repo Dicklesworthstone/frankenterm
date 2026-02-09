@@ -52,6 +52,8 @@ pub enum View {
     History,
     Search,
     Help,
+    /// Unified event timeline with cross-pane correlations (wa-6sk.4).
+    Timeline,
 }
 
 impl View {
@@ -63,6 +65,7 @@ impl View {
         Self::History,
         Self::Search,
         Self::Help,
+        Self::Timeline,
     ];
 
     #[must_use]
@@ -75,6 +78,7 @@ impl View {
             Self::History => "History",
             Self::Search => "Search",
             Self::Help => "Help",
+            Self::Timeline => "Timeline",
         }
     }
 
@@ -87,20 +91,22 @@ impl View {
             Self::Triage => Self::History,
             Self::History => Self::Search,
             Self::Search => Self::Help,
-            Self::Help => Self::Home,
+            Self::Help => Self::Timeline,
+            Self::Timeline => Self::Home,
         }
     }
 
     #[must_use]
     pub fn prev(self) -> Self {
         match self {
-            Self::Home => Self::Help,
+            Self::Home => Self::Timeline,
             Self::Panes => Self::Home,
             Self::Events => Self::Panes,
             Self::Triage => Self::Events,
             Self::History => Self::Triage,
             Self::Search => Self::History,
             Self::Help => Self::Search,
+            Self::Timeline => Self::Help,
         }
     }
 
@@ -150,6 +156,12 @@ pub struct UiState {
     pub search_results: ListState,
     pub saved_search_index: usize,
 
+    pub timeline: ListState,
+    /// Zoom level for timeline view (0 = widest, higher = more detail).
+    pub timeline_zoom: u8,
+    /// Horizontal scroll offset in the timeline (number of events scrolled past).
+    pub timeline_scroll: usize,
+
     // -- data item counts (for clamping) --
     pub panes_count: usize,
     pub panes_filtered_count: usize,
@@ -161,6 +173,7 @@ pub struct UiState {
     pub search_results_count: usize,
     pub saved_searches_count: usize,
     pub profiles_count: usize,
+    pub timeline_count: usize,
 }
 
 /// Selection state for a list view.
@@ -259,6 +272,12 @@ pub enum UiAction {
     CycleSavedSearchNext,
     CycleSavedSearchPrev,
 
+    // -- timeline --
+    TimelineZoomIn,
+    TimelineZoomOut,
+    TimelineScrollLeft,
+    TimelineScrollRight,
+
     // -- data lifecycle --
     /// Data snapshot arrived (counts for clamping).
     DataRefreshed {
@@ -271,6 +290,7 @@ pub enum UiAction {
         history_filtered_count: usize,
         saved_searches_count: usize,
         profiles_count: usize,
+        timeline_count: usize,
     },
     DataError(String),
     ClearError,
@@ -435,6 +455,29 @@ pub fn reduce(state: &mut UiState, action: UiAction) -> Vec<Effect> {
             vec![]
         }
 
+        // -- timeline --
+        UiAction::TimelineZoomIn => {
+            if state.timeline_zoom < 5 {
+                state.timeline_zoom += 1;
+            }
+            vec![]
+        }
+        UiAction::TimelineZoomOut => {
+            state.timeline_zoom = state.timeline_zoom.saturating_sub(1);
+            vec![]
+        }
+        UiAction::TimelineScrollLeft => {
+            state.timeline_scroll = state.timeline_scroll.saturating_sub(1);
+            vec![]
+        }
+        UiAction::TimelineScrollRight => {
+            if state.timeline_count > 0 {
+                state.timeline_scroll =
+                    (state.timeline_scroll + 1).min(state.timeline_count.saturating_sub(1));
+            }
+            vec![]
+        }
+
         // -- search --
         UiAction::PushSearchChar(c) => {
             state.search_query.push(c);
@@ -498,6 +541,7 @@ pub fn reduce(state: &mut UiState, action: UiAction) -> Vec<Effect> {
             history_filtered_count,
             saved_searches_count,
             profiles_count,
+            timeline_count,
         } => {
             state.panes_count = panes_count;
             state.panes_filtered_count = panes_filtered_count;
@@ -508,12 +552,14 @@ pub fn reduce(state: &mut UiState, action: UiAction) -> Vec<Effect> {
             state.history_filtered_count = history_filtered_count;
             state.saved_searches_count = saved_searches_count;
             state.profiles_count = profiles_count;
+            state.timeline_count = timeline_count;
 
             // Clamp all selection indices to new bounds.
             state.panes.clamp(panes_filtered_count);
             state.events.clamp(events_filtered_count);
             state.triage.clamp(triage_count);
             state.history.clamp(history_filtered_count);
+            state.timeline.clamp(timeline_count);
             // triage_expanded must also be valid.
             if let Some(idx) = state.triage_expanded {
                 if idx >= triage_count {
@@ -552,6 +598,7 @@ fn select_next_for_view(state: &mut UiState) {
         View::Triage => state.triage.select_next(state.triage_count),
         View::History => state.history.select_next(state.history_filtered_count),
         View::Search => state.search_results.select_next(state.search_results_count),
+        View::Timeline => state.timeline.select_next(state.timeline_count),
         View::Home | View::Help => {}
     }
 }
@@ -564,6 +611,7 @@ fn select_prev_for_view(state: &mut UiState) {
         View::Triage => state.triage.select_prev(state.triage_count),
         View::History => state.history.select_prev(state.history_filtered_count),
         View::Search => state.search_results.select_prev(state.search_results_count),
+        View::Timeline => state.timeline.select_prev(state.timeline_count),
         View::Home | View::Help => {}
     }
 }
@@ -598,21 +646,24 @@ mod tests {
 
     #[test]
     fn view_navigation_next_wraps() {
-        assert_eq!(View::Help.next(), View::Home);
+        assert_eq!(View::Timeline.next(), View::Home);
         assert_eq!(View::Home.next(), View::Panes);
+        assert_eq!(View::Help.next(), View::Timeline);
     }
 
     #[test]
     fn view_navigation_prev_wraps() {
-        assert_eq!(View::Home.prev(), View::Help);
+        assert_eq!(View::Home.prev(), View::Timeline);
         assert_eq!(View::Panes.prev(), View::Home);
+        assert_eq!(View::Timeline.prev(), View::Help);
     }
 
     #[test]
     fn view_from_index() {
         assert_eq!(View::from_index(0), Some(View::Home));
         assert_eq!(View::from_index(6), Some(View::Help));
-        assert_eq!(View::from_index(7), None);
+        assert_eq!(View::from_index(7), Some(View::Timeline));
+        assert_eq!(View::from_index(8), None);
     }
 
     #[test]
@@ -785,6 +836,7 @@ mod tests {
                 history_filtered_count: 0,
                 saved_searches_count: 0,
                 profiles_count: 0,
+                timeline_count: 0,
             },
         );
         assert_eq!(state.panes.selected, 4); // Clamped to 5-1
@@ -893,9 +945,9 @@ mod tests {
         let mut state = UiState::default();
         assert_eq!(state.active_view, View::Home);
         reduce(&mut state, UiAction::PrevView);
-        assert_eq!(state.active_view, View::Help);
+        assert_eq!(state.active_view, View::Timeline);
         reduce(&mut state, UiAction::PrevView);
-        assert_eq!(state.active_view, View::Search);
+        assert_eq!(state.active_view, View::Help);
     }
 
     #[test]
@@ -1227,6 +1279,7 @@ mod tests {
                 history_filtered_count: 0,
                 saved_searches_count: 0,
                 profiles_count: 0,
+                timeline_count: 0,
             },
         );
         assert_eq!(state.triage_expanded, Some(1)); // Still valid
@@ -1271,5 +1324,104 @@ mod tests {
         assert_eq!(state1.panes_filter, state2.panes_filter);
         assert_eq!(state1.panes_unhandled_only, state2.panes_unhandled_only);
         assert_eq!(effects1, effects2);
+    }
+
+    // -- Timeline reducer tests (wa-6sk.4) --
+
+    #[test]
+    fn timeline_zoom_in_increments() {
+        let mut state = UiState::default();
+        assert_eq!(state.timeline_zoom, 0);
+        reduce(&mut state, UiAction::TimelineZoomIn);
+        assert_eq!(state.timeline_zoom, 1);
+        reduce(&mut state, UiAction::TimelineZoomIn);
+        assert_eq!(state.timeline_zoom, 2);
+    }
+
+    #[test]
+    fn timeline_zoom_in_capped_at_5() {
+        let mut state = UiState::default();
+        state.timeline_zoom = 5;
+        reduce(&mut state, UiAction::TimelineZoomIn);
+        assert_eq!(state.timeline_zoom, 5);
+    }
+
+    #[test]
+    fn timeline_zoom_out_decrements() {
+        let mut state = UiState::default();
+        state.timeline_zoom = 3;
+        reduce(&mut state, UiAction::TimelineZoomOut);
+        assert_eq!(state.timeline_zoom, 2);
+    }
+
+    #[test]
+    fn timeline_zoom_out_floors_at_0() {
+        let mut state = UiState::default();
+        assert_eq!(state.timeline_zoom, 0);
+        reduce(&mut state, UiAction::TimelineZoomOut);
+        assert_eq!(state.timeline_zoom, 0);
+    }
+
+    #[test]
+    fn timeline_scroll_right_increments() {
+        let mut state = UiState::default();
+        state.timeline_count = 10;
+        reduce(&mut state, UiAction::TimelineScrollRight);
+        assert_eq!(state.timeline_scroll, 1);
+    }
+
+    #[test]
+    fn timeline_scroll_right_clamped() {
+        let mut state = UiState::default();
+        state.timeline_count = 3;
+        state.timeline_scroll = 2;
+        reduce(&mut state, UiAction::TimelineScrollRight);
+        assert_eq!(state.timeline_scroll, 2); // clamped to count-1
+    }
+
+    #[test]
+    fn timeline_scroll_right_empty() {
+        let mut state = UiState::default();
+        state.timeline_count = 0;
+        reduce(&mut state, UiAction::TimelineScrollRight);
+        assert_eq!(state.timeline_scroll, 0);
+    }
+
+    #[test]
+    fn timeline_scroll_left_decrements() {
+        let mut state = UiState::default();
+        state.timeline_scroll = 5;
+        reduce(&mut state, UiAction::TimelineScrollLeft);
+        assert_eq!(state.timeline_scroll, 4);
+    }
+
+    #[test]
+    fn timeline_scroll_left_floors_at_0() {
+        let mut state = UiState::default();
+        assert_eq!(state.timeline_scroll, 0);
+        reduce(&mut state, UiAction::TimelineScrollLeft);
+        assert_eq!(state.timeline_scroll, 0);
+    }
+
+    #[test]
+    fn timeline_data_refreshed_clamps_selection() {
+        let mut state = UiState::default();
+        state.timeline.selected = 10;
+        reduce(
+            &mut state,
+            UiAction::DataRefreshed {
+                panes_count: 0,
+                panes_filtered_count: 0,
+                events_count: 0,
+                events_filtered_count: 0,
+                triage_count: 0,
+                history_count: 0,
+                history_filtered_count: 0,
+                saved_searches_count: 0,
+                profiles_count: 0,
+                timeline_count: 3,
+            },
+        );
+        assert_eq!(state.timeline_count, 3);
     }
 }

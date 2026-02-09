@@ -36,6 +36,8 @@ pub enum View {
     Search,
     /// Help screen
     Help,
+    /// Unified event timeline with cross-pane correlations (wa-6sk.4)
+    Timeline,
 }
 
 impl View {
@@ -50,6 +52,7 @@ impl View {
             Self::History => "History",
             Self::Search => "Search",
             Self::Help => "Help",
+            Self::Timeline => "Timeline",
         }
     }
 
@@ -64,6 +67,7 @@ impl View {
             Self::History,
             Self::Search,
             Self::Help,
+            Self::Timeline,
         ]
     }
 
@@ -78,6 +82,7 @@ impl View {
             Self::History => 4,
             Self::Search => 5,
             Self::Help => 6,
+            Self::Timeline => 7,
         }
     }
 
@@ -91,7 +96,8 @@ impl View {
             Self::Triage => Self::History,
             Self::History => Self::Search,
             Self::Search => Self::Help,
-            Self::Help => Self::Home,
+            Self::Help => Self::Timeline,
+            Self::Timeline => Self::Home,
         }
     }
 
@@ -99,13 +105,14 @@ impl View {
     #[must_use]
     pub fn prev(self) -> Self {
         match self {
-            Self::Home => Self::Help,
+            Self::Home => Self::Timeline,
             Self::Panes => Self::Home,
             Self::Events => Self::Panes,
             Self::Triage => Self::Events,
             Self::History => Self::Triage,
             Self::Search => Self::History,
             Self::Help => Self::Search,
+            Self::Timeline => Self::Help,
         }
     }
 }
@@ -1645,11 +1652,33 @@ pub fn render_help_view(area: Rect, buf: &mut Buffer) {
         Line::from("  5. History Audit action timeline"),
         Line::from("  6. Search  Full-text search"),
         Line::from("  7. Help    This screen"),
+        Line::from("  8. Timeline Cross-pane event timeline"),
     ];
 
     let help =
         Paragraph::new(help_text).block(Block::default().title("Help").borders(Borders::ALL));
     help.render(area, buf);
+}
+
+/// Render a placeholder for the Timeline view in the ratatui backend.
+///
+/// Full timeline rendering is implemented in the ftui backend; this stub
+/// provides basic UI so the ratatui backend compiles and displays a message.
+pub fn render_timeline_placeholder(area: Rect, buf: &mut Buffer) {
+    let text = vec![
+        Line::from(Span::styled(
+            "Timeline",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from("  Cross-pane event timeline with correlation markers."),
+        Line::from("  Full rendering available in the ftui backend."),
+        Line::from(""),
+        Line::from("  Keys: j/k=nav  +/-=zoom  8=jump here"),
+    ];
+    let block =
+        Paragraph::new(text).block(Block::default().title("Timeline").borders(Borders::ALL));
+    block.render(area, buf);
 }
 
 /// Truncate a string to max length, adding ellipsis if needed
@@ -1673,8 +1702,10 @@ mod tests {
     #[test]
     fn view_navigation_wraps() {
         assert_eq!(View::Home.next(), View::Panes);
-        assert_eq!(View::Help.next(), View::Home);
-        assert_eq!(View::Home.prev(), View::Help);
+        assert_eq!(View::Help.next(), View::Timeline);
+        assert_eq!(View::Timeline.next(), View::Home);
+        assert_eq!(View::Home.prev(), View::Timeline);
+        assert_eq!(View::Timeline.prev(), View::Help);
         assert_eq!(View::Panes.prev(), View::Home);
         assert_eq!(View::Triage.prev(), View::Events);
     }
@@ -2410,8 +2441,8 @@ mod tests {
     }
 
     #[test]
-    fn view_all_returns_seven_views() {
-        assert_eq!(View::all().len(), 7);
+    fn view_all_returns_eight_views() {
+        assert_eq!(View::all().len(), 8);
     }
 
     #[test]

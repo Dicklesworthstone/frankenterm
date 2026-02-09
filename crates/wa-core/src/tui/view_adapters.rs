@@ -32,6 +32,7 @@ use super::query::{
     WorkflowProgressView,
 };
 use crate::circuit_breaker::CircuitStateKind;
+use crate::storage::{CorrelationRef, TimelineEvent};
 
 // ---------------------------------------------------------------------------
 // Pane adapter
@@ -348,6 +349,101 @@ pub fn adapt_workflow(wf: &WorkflowProgressView) -> WorkflowRow {
 }
 
 // ---------------------------------------------------------------------------
+// Timeline adapter
+// ---------------------------------------------------------------------------
+
+/// Render-ready timeline event row for the Timeline view.
+#[derive(Debug, Clone)]
+pub struct TimelineRow {
+    pub id: String,
+    pub timestamp: String,
+    pub pane_label: String,
+    pub agent_label: String,
+    pub event_type: String,
+    pub severity_label: String,
+    pub handled_label: String,
+    pub correlation_label: String,
+    pub summary: String,
+    pub severity_style: StyleSpec,
+    pub agent_style: StyleSpec,
+    pub handled_style: StyleSpec,
+    pub correlation_style: StyleSpec,
+}
+
+/// Adapt a TimelineEvent from storage into a render-ready TimelineRow.
+#[must_use]
+pub fn adapt_timeline_event(event: &TimelineEvent) -> TimelineRow {
+    let severity_style = severity_to_style(&event.severity);
+    let agent_label = event
+        .pane_info
+        .agent_type
+        .as_deref()
+        .unwrap_or("unknown")
+        .to_string();
+
+    let agent_style = match event.pane_info.agent_type.as_deref() {
+        Some("codex") => StyleSpec::new().fg(ColorSpec::Green),
+        Some("claude") => StyleSpec::new().fg(ColorSpec::Magenta),
+        Some("gemini") => StyleSpec::new().fg(ColorSpec::Blue),
+        _ => StyleSpec::new().fg(ColorSpec::DarkGray),
+    };
+
+    let handled_label = if event.handled.is_some() {
+        "handled".to_string()
+    } else {
+        "OPEN".to_string()
+    };
+    let handled_style = if event.handled.is_some() {
+        StyleSpec::new().fg(ColorSpec::DarkGray)
+    } else {
+        StyleSpec::new().fg(ColorSpec::Yellow).bold()
+    };
+
+    let correlation_label = format_correlations(&event.correlations);
+    let correlation_style = if event.correlations.is_empty() {
+        StyleSpec::new()
+    } else {
+        StyleSpec::new().fg(ColorSpec::Cyan)
+    };
+
+    let summary = event
+        .summary
+        .as_deref()
+        .map(|s| truncate(s, 60))
+        .unwrap_or_default();
+
+    let pane_label = format!("P{}", event.pane_info.pane_id);
+
+    TimelineRow {
+        id: event.id.to_string(),
+        timestamp: format_epoch_ms(event.timestamp),
+        pane_label,
+        agent_label,
+        event_type: event.event_type.clone(),
+        severity_label: event.severity.clone(),
+        handled_label,
+        correlation_label,
+        summary,
+        severity_style,
+        agent_style,
+        handled_style,
+        correlation_style,
+    }
+}
+
+/// Format correlation references into a compact label.
+fn format_correlations(correlations: &[CorrelationRef]) -> String {
+    if correlations.is_empty() {
+        return String::new();
+    }
+    correlations
+        .iter()
+        .map(|c| c.correlation_type.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+// ---------------------------------------------------------------------------
 // Health adapter
 // ---------------------------------------------------------------------------
 
@@ -561,7 +657,7 @@ mod tests {
             pane_id: 42,
             timestamp: 1_700_000_000_000,
             snippet: ">>error<< in authentication module".to_string(),
-            rank: 3.14,
+            rank: 3.15,
         }
     }
 
@@ -2386,5 +2482,137 @@ mod tests {
         let triage2 = adapt_triage(&sample_triage());
         assert_eq!(triage1.title, triage2.title);
         assert_eq!(triage1.action_labels, triage2.action_labels);
+    }
+
+    // -- Timeline adapter tests (wa-6sk.4) --
+
+    fn sample_timeline_event() -> TimelineEvent {
+        use crate::storage::{CorrelationType, HandledInfo, PaneInfo};
+        TimelineEvent {
+            id: 42,
+            timestamp: 1_700_000_060_000,
+            pane_info: PaneInfo {
+                pane_id: 3,
+                pane_uuid: None,
+                agent_type: Some("codex".to_string()),
+                domain: "local".to_string(),
+                cwd: Some("/data/projects/foo".to_string()),
+                title: Some("codex session".to_string()),
+            },
+            rule_id: "error_burst_detected".to_string(),
+            event_type: "error_burst".to_string(),
+            severity: "error".to_string(),
+            confidence: 0.95,
+            handled: Some(HandledInfo {
+                handled_at: 1_700_000_062_000,
+                workflow_id: Some("wf-1".to_string()),
+                status: "resolved".to_string(),
+            }),
+            correlations: vec![
+                CorrelationRef {
+                    id: "corr-1".to_string(),
+                    correlation_type: CorrelationType::Failover,
+                },
+                CorrelationRef {
+                    id: "corr-2".to_string(),
+                    correlation_type: CorrelationType::Cascade,
+                },
+            ],
+            summary: Some("Error burst detected in pane 3".to_string()),
+        }
+    }
+
+    #[test]
+    fn adapt_timeline_event_formats_id() {
+        let row = adapt_timeline_event(&sample_timeline_event());
+        assert_eq!(row.id, "42");
+    }
+
+    #[test]
+    fn adapt_timeline_event_formats_pane_label() {
+        let row = adapt_timeline_event(&sample_timeline_event());
+        assert_eq!(row.pane_label, "P3");
+    }
+
+    #[test]
+    fn adapt_timeline_event_formats_agent() {
+        let row = adapt_timeline_event(&sample_timeline_event());
+        assert_eq!(row.agent_label, "codex");
+    }
+
+    #[test]
+    fn adapt_timeline_event_handled_label() {
+        let row = adapt_timeline_event(&sample_timeline_event());
+        assert_eq!(row.handled_label, "handled");
+    }
+
+    #[test]
+    fn adapt_timeline_event_unhandled_label() {
+        let mut event = sample_timeline_event();
+        event.handled = None;
+        let row = adapt_timeline_event(&event);
+        assert_eq!(row.handled_label, "OPEN");
+    }
+
+    #[test]
+    fn adapt_timeline_event_correlation_label() {
+        let row = adapt_timeline_event(&sample_timeline_event());
+        assert!(row.correlation_label.contains("failover"));
+        assert!(row.correlation_label.contains("cascade"));
+    }
+
+    #[test]
+    fn adapt_timeline_event_no_correlations() {
+        let mut event = sample_timeline_event();
+        event.correlations.clear();
+        let row = adapt_timeline_event(&event);
+        assert!(row.correlation_label.is_empty());
+    }
+
+    #[test]
+    fn adapt_timeline_event_severity_error_bold() {
+        let row = adapt_timeline_event(&sample_timeline_event());
+        assert!(row.severity_style.bold);
+    }
+
+    #[test]
+    fn adapt_timeline_event_unknown_agent() {
+        let mut event = sample_timeline_event();
+        event.pane_info.agent_type = None;
+        let row = adapt_timeline_event(&event);
+        assert_eq!(row.agent_label, "unknown");
+    }
+
+    #[test]
+    fn adapt_timeline_event_deterministic() {
+        let row1 = adapt_timeline_event(&sample_timeline_event());
+        let row2 = adapt_timeline_event(&sample_timeline_event());
+        assert_eq!(row1.id, row2.id);
+        assert_eq!(row1.pane_label, row2.pane_label);
+        assert_eq!(row1.severity_label, row2.severity_label);
+        assert_eq!(row1.correlation_label, row2.correlation_label);
+    }
+
+    #[test]
+    fn format_correlations_empty() {
+        assert!(format_correlations(&[]).is_empty());
+    }
+
+    #[test]
+    fn format_correlations_multiple() {
+        use crate::storage::CorrelationType;
+        let refs = vec![
+            CorrelationRef {
+                id: "a".to_string(),
+                correlation_type: CorrelationType::Failover,
+            },
+            CorrelationRef {
+                id: "b".to_string(),
+                correlation_type: CorrelationType::Temporal,
+            },
+        ];
+        let label = format_correlations(&refs);
+        assert!(label.contains("failover"));
+        assert!(label.contains("temporal"));
     }
 }
