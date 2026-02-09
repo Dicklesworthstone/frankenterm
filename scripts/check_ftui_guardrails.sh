@@ -65,23 +65,40 @@ echo ""
 # ---------------------------------------------------------------------------
 echo "--- Check 3: Import isolation ---"
 
-# Files that are exclusively ftui (must not import ratatui or crossterm
-# outside of cfg(feature = "tui") blocks).
+# Migration-complete modules that MUST NOT reference ratatui or crossterm
+# outside of cfg(feature = "tui") blocks.
 #
-# EXCEPTION LIST: These files are allowed to contain ratatui/crossterm
-# imports because they are part of the compatibility layer:
-#   - tui/ftui_compat.rs (the adapter itself, with cfg-gated impls)
-#   - tui/terminal_session.rs (CrosstermSession is cfg-gated)
-#   - tui/mod.rs (conditional module imports)
-#   - tui/app.rs (legacy ratatui backend, only compiled under tui feature)
-#   - tui/views.rs (legacy ratatui backend, only compiled under tui feature)
+# ALLOWLIST (files permitted to contain ratatui/crossterm):
+#   - tui/ftui_compat.rs   — compatibility adapter with cfg-gated conversions
+#   - tui/terminal_session.rs — CrosstermSession impl is cfg-gated
+#   - tui/mod.rs           — conditional module imports
+#   - tui/app.rs           — legacy ratatui backend (compiled only under tui)
+#   - tui/views.rs         — legacy ratatui backend (compiled only under tui)
 #
-# This check targets modules that should be framework-agnostic:
+# To add an exception: add the file path to the allowlist above AND file a
+# bead explaining why the exception is needed and when it expires.
+#
+# DEVELOPER GUIDANCE: If this check fails for your module:
+#   1. Replace `ratatui::` types with equivalents from `tui::ftui_compat`
+#   2. Replace `crossterm::` types with `tui::ftui_compat::InputEvent` etc.
+#   3. Use `ftui::` directly for FrankenTUI-native code
+#   4. If a conversion is genuinely needed, add it to ftui_compat.rs with
+#      a `#[cfg(feature = "tui")]` gate
 
 FTUI_AGNOSTIC_FILES=(
     "crates/wa-core/src/tui/query.rs"
     "crates/wa-core/src/tui/ftui_stub.rs"
+    "crates/wa-core/src/tui/view_adapters.rs"
+    "crates/wa-core/src/tui/keymap.rs"
+    "crates/wa-core/src/tui/state.rs"
+    "crates/wa-core/src/tui/command_handoff.rs"
+    "crates/wa-core/src/tui/output_gate.rs"
 )
+
+# Forbidden patterns: bare (non-cfg-gated) references to ratatui or crossterm.
+# Matches `use ratatui`, `use crossterm`, `ratatui::`, `crossterm::` but
+# excludes lines that are inside cfg attributes or doc comments.
+FORBIDDEN_PATTERNS='(use ratatui|use crossterm|ratatui::|crossterm::)'
 
 for file in "${FTUI_AGNOSTIC_FILES[@]}"; do
     if [ ! -f "$file" ]; then
@@ -89,25 +106,24 @@ for file in "${FTUI_AGNOSTIC_FILES[@]}"; do
         continue
     fi
 
-    # Check for bare ratatui/crossterm imports (not inside cfg blocks)
-    # We grep for use statements and direct type references
-    if grep -n 'use ratatui' "$file" | grep -v '#\[cfg' >/dev/null 2>&1; then
-        fail "$file contains bare ratatui import (not cfg-gated)"
-    elif grep -n 'use crossterm' "$file" | grep -v '#\[cfg' >/dev/null 2>&1; then
-        fail "$file contains bare crossterm import (not cfg-gated)"
+    basename=$(basename "$file")
+
+    # Check for forbidden patterns, excluding cfg-gated lines and comments
+    violations=$(grep -nE "$FORBIDDEN_PATTERNS" "$file" \
+        | grep -v '#\[cfg' \
+        | grep -v '^ *///' \
+        | grep -v '^ *//' \
+        || true)
+
+    if [ -n "$violations" ]; then
+        fail "$basename contains bare ratatui/crossterm reference (not cfg-gated):"
+        echo "$violations" | while read -r line; do
+            echo "    $line"
+        done
     else
-        pass "$file is framework-agnostic (no bare ratatui/crossterm imports)"
+        pass "$basename is framework-agnostic"
     fi
 done
-
-# Check that view_adapters.rs (if present) is also agnostic
-if [ -f "crates/wa-core/src/tui/view_adapters.rs" ]; then
-    if grep -n 'use ratatui' "crates/wa-core/src/tui/view_adapters.rs" | grep -v '#\[cfg' >/dev/null 2>&1; then
-        fail "view_adapters.rs contains bare ratatui import"
-    else
-        pass "view_adapters.rs is framework-agnostic"
-    fi
-fi
 
 echo ""
 
