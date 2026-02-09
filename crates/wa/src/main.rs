@@ -1261,8 +1261,8 @@ SEE ALSO:
         port: u16,
     },
 
-    /// Launch the interactive TUI (requires --features tui)
-    #[cfg(feature = "tui")]
+    /// Launch the interactive TUI (requires --features tui or --features ftui)
+    #[cfg(any(feature = "tui", feature = "ftui"))]
     #[command(after_help = r#"EXAMPLES:
     wa tui                            Launch interactive dashboard
     wa tui --debug                    Enable debug overlay
@@ -18686,6 +18686,39 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             // Spawn TUI in a blocking thread to completely isolate it from
             // the main async runtime. The ProductionQueryClient creates its
             // own dedicated runtime for async operations.
+            let layout_clone = layout.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let query_client = ProductionQueryClient::with_storage(layout_clone, storage);
+                run_tui(query_client, tui_config)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("TUI thread panicked: {e}"))?;
+
+            if let Err(e) = result {
+                eprintln!("TUI error: {e}");
+                return Err(e.into());
+            }
+        }
+
+        #[cfg(all(feature = "ftui", not(feature = "tui")))]
+        Some(Commands::Tui { debug, refresh }) => {
+            use std::time::Duration;
+            use wa_core::tui::{AppConfig, ProductionQueryClient, run_tui};
+
+            let db_path = layout.db_path.to_string_lossy();
+            let storage = match wa_core::storage::StorageHandle::new(&db_path).await {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Failed to open storage: {e}");
+                    return Err(e.into());
+                }
+            };
+
+            let tui_config = AppConfig {
+                refresh_interval: Duration::from_secs(refresh),
+                debug,
+            };
+
             let layout_clone = layout.clone();
             let result = tokio::task::spawn_blocking(move || {
                 let query_client = ProductionQueryClient::with_storage(layout_clone, storage);

@@ -197,6 +197,11 @@ fs2 = "0.4.3"
 ratatui = "0.30.0"
 crossterm = "0.29.0"
 
+# FrankenTUI (optional, migration target for TUI — see docs/adr/0001-adopt-frankentui-for-tui-migration.md)
+# Path dep during development; will switch to git pin per FTUI-02.2 sync policy.
+# Pinned rev for reference: 65b8538 (2026-02-08)
+ftui = { path = "../frankentui/crates/ftui", default-features = false, features = ["runtime"] }
+
 # Benchmarking
 criterion = { version = "0.7.0", features = ["async_tokio"] }
 

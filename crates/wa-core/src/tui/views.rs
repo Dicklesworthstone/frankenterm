@@ -2118,7 +2118,7 @@ mod tests {
         // Add a result — suggestions should be hidden
         state.search_results = vec![crate::tui::query::SearchResultView {
             pane_id: 1,
-            timestamp: "2026-01-01".to_string(),
+            timestamp: 1_735_689_600_000,
             snippet: "some error text".to_string(),
             rank: 1.0,
         }];

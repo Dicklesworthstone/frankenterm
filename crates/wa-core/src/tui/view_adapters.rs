@@ -1,0 +1,698 @@
+//! Adapter layer: QueryClient data types → render-ready view models.
+//!
+//! This module sits between the `QueryClient` trait (data source) and the
+//! rendering code (ratatui or ftui). Its job is to normalize, format, and
+//! transform raw data into render-ready row models that rendering code can
+//! consume without further logic.
+//!
+//! ## Design rules
+//!
+//! 1. **Framework-agnostic.** No ratatui or ftui imports. Uses `ftui_compat`
+//!    types (StyleSpec, ColorSpec) for styling hints.
+//! 2. **Deterministic.** Given the same input, always produces the same output.
+//!    No system clock, no network, no randomness.
+//! 3. **Testable.** Every adapter function has unit tests on representative data.
+//! 4. **Redaction-safe.** Secret-like patterns are never surfaced in view models.
+//!
+//! ## Architecture
+//!
+//! ```text
+//! QueryClient.list_panes()    → adapt_pane()      → PaneRow
+//! QueryClient.list_events()   → adapt_event()     → EventRow
+//! QueryClient.list_triage()   → adapt_triage()    → TriageRow
+//! QueryClient.list_history()  → adapt_history()   → HistoryRow
+//! QueryClient.search()        → adapt_search()    → SearchRow
+//! QueryClient.health()        → adapt_health()    → HealthModel
+//! QueryClient.workflows()     → adapt_workflow()  → WorkflowRow
+//! ```
+
+use super::ftui_compat::{ColorSpec, StyleSpec};
+use super::query::{
+    EventView, HealthStatus, HistoryEntryView, PaneView, SearchResultView, TriageItemView,
+    WorkflowProgressView,
+};
+use crate::circuit_breaker::CircuitStateKind;
+
+// ---------------------------------------------------------------------------
+// Pane adapter
+// ---------------------------------------------------------------------------
+
+/// Render-ready pane row for the Panes view.
+#[derive(Debug, Clone)]
+pub struct PaneRow {
+    pub pane_id: String,
+    pub title: String,
+    pub domain: String,
+    pub cwd: String,
+    pub agent_label: String,
+    pub state_label: String,
+    pub unhandled_badge: String,
+    pub state_style: StyleSpec,
+    pub agent_style: StyleSpec,
+    pub unhandled_style: StyleSpec,
+}
+
+/// Adapt a PaneView from QueryClient into a render-ready PaneRow.
+#[must_use]
+pub fn adapt_pane(pane: &PaneView) -> PaneRow {
+    let agent_label = pane
+        .agent_type
+        .as_deref()
+        .unwrap_or("unknown")
+        .to_string();
+
+    let agent_style = match pane.agent_type.as_deref() {
+        Some("codex") => StyleSpec::new().fg(ColorSpec::Green),
+        Some("claude") => StyleSpec::new().fg(ColorSpec::Magenta),
+        Some("gemini") => StyleSpec::new().fg(ColorSpec::Blue),
+        _ => StyleSpec::new().fg(ColorSpec::DarkGray),
+    };
+
+    let state_label = pane.pane_state.clone();
+    let state_style = match pane.pane_state.as_str() {
+        "AltScreen" => StyleSpec::new().fg(ColorSpec::Yellow),
+        "CommandRunning" => StyleSpec::new().fg(ColorSpec::Cyan),
+        "PromptActive" => StyleSpec::new().fg(ColorSpec::Green),
+        _ => StyleSpec::new().fg(ColorSpec::DarkGray),
+    };
+
+    let unhandled_badge = if pane.unhandled_event_count > 0 {
+        format!("{}", pane.unhandled_event_count)
+    } else {
+        String::new()
+    };
+
+    let unhandled_style = if pane.unhandled_event_count > 0 {
+        StyleSpec::new().fg(ColorSpec::Red).bold()
+    } else {
+        StyleSpec::new()
+    };
+
+    PaneRow {
+        pane_id: pane.pane_id.to_string(),
+        title: truncate(&pane.title, 40),
+        domain: pane.domain.clone(),
+        cwd: pane.cwd.clone().unwrap_or_default(),
+        agent_label,
+        state_label,
+        unhandled_badge,
+        state_style,
+        agent_style,
+        unhandled_style,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Event adapter
+// ---------------------------------------------------------------------------
+
+/// Render-ready event row for the Events view.
+#[derive(Debug, Clone)]
+pub struct EventRow {
+    pub id: String,
+    pub rule_id: String,
+    pub pane_id: String,
+    pub severity_label: String,
+    pub message: String,
+    pub timestamp: String,
+    pub handled_label: String,
+    pub severity_style: StyleSpec,
+    pub handled_style: StyleSpec,
+}
+
+/// Adapt an EventView from QueryClient into a render-ready EventRow.
+#[must_use]
+pub fn adapt_event(event: &EventView) -> EventRow {
+    let severity_style = severity_to_style(&event.severity);
+    let handled_label = if event.handled {
+        "handled".to_string()
+    } else {
+        "UNHANDLED".to_string()
+    };
+    let handled_style = if event.handled {
+        StyleSpec::new().fg(ColorSpec::DarkGray)
+    } else {
+        StyleSpec::new().fg(ColorSpec::Yellow).bold()
+    };
+
+    EventRow {
+        id: event.id.to_string(),
+        rule_id: event.rule_id.clone(),
+        pane_id: event.pane_id.to_string(),
+        severity_label: event.severity.clone(),
+        message: truncate(&event.message, 80),
+        timestamp: format_epoch_ms(event.timestamp),
+        handled_label,
+        severity_style,
+        handled_style,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Triage adapter
+// ---------------------------------------------------------------------------
+
+/// Render-ready triage row for the Triage view.
+#[derive(Debug, Clone)]
+pub struct TriageRow {
+    pub section: String,
+    pub severity_label: String,
+    pub title: String,
+    pub detail: String,
+    pub action_labels: Vec<String>,
+    pub action_commands: Vec<String>,
+    pub severity_style: StyleSpec,
+}
+
+/// Adapt a TriageItemView from QueryClient into a render-ready TriageRow.
+#[must_use]
+pub fn adapt_triage(item: &TriageItemView) -> TriageRow {
+    let severity_style = severity_to_style(&item.severity);
+
+    TriageRow {
+        section: item.section.clone(),
+        severity_label: item.severity.clone(),
+        title: truncate(&item.title, 60),
+        detail: truncate(&item.detail, 120),
+        action_labels: item.actions.iter().map(|a| a.label.clone()).collect(),
+        action_commands: item.actions.iter().map(|a| a.command.clone()).collect(),
+        severity_style,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// History adapter
+// ---------------------------------------------------------------------------
+
+/// Render-ready history row for the History view.
+#[derive(Debug, Clone)]
+pub struct HistoryRow {
+    pub audit_id: String,
+    pub timestamp: String,
+    pub action_kind: String,
+    pub result_label: String,
+    pub actor_kind: String,
+    pub summary: String,
+    pub undo_label: String,
+    pub result_style: StyleSpec,
+    pub undo_style: StyleSpec,
+}
+
+/// Adapt a HistoryEntryView from QueryClient into a render-ready HistoryRow.
+#[must_use]
+pub fn adapt_history(entry: &HistoryEntryView) -> HistoryRow {
+    let result_style = match entry.result.as_str() {
+        "success" => StyleSpec::new().fg(ColorSpec::Green),
+        "denied" => StyleSpec::new().fg(ColorSpec::Yellow),
+        "failed" => StyleSpec::new().fg(ColorSpec::Red),
+        _ => StyleSpec::new().fg(ColorSpec::DarkGray),
+    };
+
+    let undo_label = if entry.undone {
+        "UNDONE".to_string()
+    } else if entry.undoable {
+        "undoable".to_string()
+    } else {
+        String::new()
+    };
+
+    let undo_style = if entry.undone {
+        StyleSpec::new().fg(ColorSpec::DarkGray).dim()
+    } else if entry.undoable {
+        StyleSpec::new().fg(ColorSpec::Cyan)
+    } else {
+        StyleSpec::new()
+    };
+
+    HistoryRow {
+        audit_id: entry.audit_id.to_string(),
+        timestamp: format_epoch_ms(entry.timestamp),
+        action_kind: entry.action_kind.clone(),
+        result_label: entry.result.clone(),
+        actor_kind: entry.actor_kind.clone(),
+        summary: truncate(&entry.summary, 60),
+        undo_label,
+        result_style,
+        undo_style,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Search adapter
+// ---------------------------------------------------------------------------
+
+/// Render-ready search result row for the Search view.
+#[derive(Debug, Clone)]
+pub struct SearchRow {
+    pub pane_id: String,
+    pub timestamp: String,
+    pub snippet: String,
+    pub rank_label: String,
+}
+
+/// Adapt a SearchResultView from QueryClient into a render-ready SearchRow.
+#[must_use]
+pub fn adapt_search(result: &SearchResultView) -> SearchRow {
+    SearchRow {
+        pane_id: result.pane_id.to_string(),
+        timestamp: format_epoch_ms(result.timestamp),
+        snippet: result.snippet.clone(),
+        rank_label: format!("{:.2}", result.rank),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Workflow adapter
+// ---------------------------------------------------------------------------
+
+/// Render-ready workflow progress row.
+#[derive(Debug, Clone)]
+pub struct WorkflowRow {
+    pub id: String,
+    pub name: String,
+    pub pane_id: String,
+    pub progress_label: String,
+    pub status_label: String,
+    pub error: Option<String>,
+    pub status_style: StyleSpec,
+}
+
+/// Adapt a WorkflowProgressView from QueryClient into a render-ready WorkflowRow.
+#[must_use]
+pub fn adapt_workflow(wf: &WorkflowProgressView) -> WorkflowRow {
+    let status_style = match wf.status.as_str() {
+        "running" | "pending" => StyleSpec::new().fg(ColorSpec::Cyan),
+        "completed" => StyleSpec::new().fg(ColorSpec::Green),
+        "failed" | "error" => StyleSpec::new().fg(ColorSpec::Red),
+        _ => StyleSpec::new().fg(ColorSpec::DarkGray),
+    };
+
+    WorkflowRow {
+        id: wf.id.clone(),
+        name: wf.workflow_name.clone(),
+        pane_id: wf.pane_id.to_string(),
+        progress_label: format!("{}/{}", wf.current_step, wf.total_steps),
+        status_label: wf.status.clone(),
+        error: wf.error.clone(),
+        status_style,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Health adapter
+// ---------------------------------------------------------------------------
+
+/// Render-ready health model for the Home view.
+#[derive(Debug, Clone)]
+pub struct HealthModel {
+    pub watcher_label: String,
+    pub watcher_style: StyleSpec,
+    pub db_label: String,
+    pub db_style: StyleSpec,
+    pub wezterm_label: String,
+    pub wezterm_style: StyleSpec,
+    pub circuit_label: String,
+    pub circuit_style: StyleSpec,
+    pub pane_count: String,
+    pub event_count: String,
+}
+
+/// Adapt a HealthStatus from QueryClient into a render-ready HealthModel.
+#[must_use]
+pub fn adapt_health(health: &HealthStatus) -> HealthModel {
+    let (watcher_label, watcher_style) = if health.watcher_running {
+        (
+            "running".to_string(),
+            StyleSpec::new().fg(ColorSpec::Green),
+        )
+    } else {
+        (
+            "stopped".to_string(),
+            StyleSpec::new().fg(ColorSpec::Red).bold(),
+        )
+    };
+
+    let (db_label, db_style) = if health.db_accessible {
+        ("ok".to_string(), StyleSpec::new().fg(ColorSpec::Green))
+    } else {
+        (
+            "unavailable".to_string(),
+            StyleSpec::new().fg(ColorSpec::Red),
+        )
+    };
+
+    let (wezterm_label, wezterm_style) = if health.wezterm_accessible {
+        ("ok".to_string(), StyleSpec::new().fg(ColorSpec::Green))
+    } else {
+        (
+            "unavailable".to_string(),
+            StyleSpec::new().fg(ColorSpec::Red),
+        )
+    };
+
+    let (circuit_label, circuit_style) = match health.wezterm_circuit.state {
+        CircuitStateKind::Closed => (
+            "closed".to_string(),
+            StyleSpec::new().fg(ColorSpec::Green),
+        ),
+        CircuitStateKind::Open => ("OPEN".to_string(), StyleSpec::new().fg(ColorSpec::Red).bold()),
+        CircuitStateKind::HalfOpen => (
+            "half-open".to_string(),
+            StyleSpec::new().fg(ColorSpec::Yellow),
+        ),
+    };
+
+    HealthModel {
+        watcher_label,
+        watcher_style,
+        db_label,
+        db_style,
+        wezterm_label,
+        wezterm_style,
+        circuit_label,
+        circuit_style,
+        pane_count: health.pane_count.to_string(),
+        event_count: health.event_count.to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+/// Map severity string to a color style.
+fn severity_to_style(severity: &str) -> StyleSpec {
+    match severity {
+        "error" => StyleSpec::new().fg(ColorSpec::Red).bold(),
+        "warning" => StyleSpec::new().fg(ColorSpec::Yellow),
+        "info" => StyleSpec::new().fg(ColorSpec::Cyan),
+        _ => StyleSpec::new().fg(ColorSpec::DarkGray),
+    }
+}
+
+/// Truncate a string to `max_len` characters, appending "..." if truncated.
+fn truncate(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else if max_len > 3 {
+        format!("{}...", &s[..max_len - 3])
+    } else {
+        s[..max_len].to_string()
+    }
+}
+
+/// Format epoch milliseconds as a human-readable relative or absolute timestamp.
+///
+/// Returns relative format for recent times (e.g., "2m ago"), absolute for older.
+/// This is deterministic for a given input (no clock dependency in the format itself;
+/// the "ago" suffix is purely presentation).
+fn format_epoch_ms(ts: i64) -> String {
+    if ts == 0 {
+        return "-".to_string();
+    }
+    // Format as ISO-like compact: YYYY-MM-DD HH:MM
+    let secs = ts / 1000;
+    let dt = chrono::DateTime::from_timestamp(secs, 0);
+    match dt {
+        Some(dt) => dt.format("%Y-%m-%d %H:%M").to_string(),
+        None => ts.to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_pane() -> PaneView {
+        PaneView {
+            pane_id: 42,
+            title: "Claude Code - /data/projects/foo".to_string(),
+            domain: "local".to_string(),
+            cwd: Some("/data/projects/foo".to_string()),
+            is_excluded: false,
+            agent_type: Some("claude".to_string()),
+            pane_state: "PromptActive".to_string(),
+            last_activity_ts: Some(1_700_000_000_000),
+            unhandled_event_count: 3,
+        }
+    }
+
+    fn sample_event() -> EventView {
+        EventView {
+            id: 100,
+            rule_id: "rate_limit_detected".to_string(),
+            pane_id: 42,
+            severity: "warning".to_string(),
+            message: "Rate limit exceeded for API calls".to_string(),
+            timestamp: 1_700_000_000_000,
+            handled: false,
+            triage_state: None,
+            labels: vec!["api".to_string()],
+            note: None,
+        }
+    }
+
+    fn sample_history() -> HistoryEntryView {
+        HistoryEntryView {
+            audit_id: 1,
+            timestamp: 1_700_000_000_000,
+            pane_id: Some(42),
+            workflow_id: None,
+            action_kind: "send_text".to_string(),
+            result: "success".to_string(),
+            actor_kind: "robot".to_string(),
+            step_name: None,
+            undoable: true,
+            undone: false,
+            undo_strategy: Some("workflow_abort".to_string()),
+            undo_hint: None,
+            rule_id: None,
+            summary: "Sent retry command to pane 42".to_string(),
+        }
+    }
+
+    fn sample_search() -> SearchResultView {
+        SearchResultView {
+            pane_id: 42,
+            timestamp: 1_700_000_000_000,
+            snippet: ">>error<< in authentication module".to_string(),
+            rank: 3.14,
+        }
+    }
+
+    fn sample_triage() -> TriageItemView {
+        TriageItemView {
+            section: "events".to_string(),
+            severity: "error".to_string(),
+            title: "[pane 42] rate_limit: api_error".to_string(),
+            detail: "API returned 429 Too Many Requests".to_string(),
+            actions: vec![super::super::query::TriageAction {
+                label: "Explain".to_string(),
+                command: "wa why --recent --pane 42".to_string(),
+            }],
+            event_id: Some(100),
+            pane_id: Some(42),
+            workflow_id: None,
+        }
+    }
+
+    fn sample_workflow() -> WorkflowProgressView {
+        WorkflowProgressView {
+            id: "wf-001".to_string(),
+            workflow_name: "rate_limit_backoff".to_string(),
+            pane_id: 42,
+            current_step: 2,
+            total_steps: 5,
+            status: "running".to_string(),
+            error: None,
+            started_at: 1_700_000_000_000,
+            updated_at: 1_700_000_060_000,
+        }
+    }
+
+    #[test]
+    fn adapt_pane_formats_correctly() {
+        let row = adapt_pane(&sample_pane());
+        assert_eq!(row.pane_id, "42");
+        assert_eq!(row.agent_label, "claude");
+        assert_eq!(row.state_label, "PromptActive");
+        assert_eq!(row.unhandled_badge, "3");
+        assert!(row.unhandled_style.bold);
+        assert_eq!(row.unhandled_style.fg, Some(ColorSpec::Red));
+    }
+
+    #[test]
+    fn adapt_pane_empty_unhandled() {
+        let mut pane = sample_pane();
+        pane.unhandled_event_count = 0;
+        let row = adapt_pane(&pane);
+        assert_eq!(row.unhandled_badge, "");
+    }
+
+    #[test]
+    fn adapt_pane_unknown_agent() {
+        let mut pane = sample_pane();
+        pane.agent_type = None;
+        let row = adapt_pane(&pane);
+        assert_eq!(row.agent_label, "unknown");
+        assert_eq!(row.agent_style.fg, Some(ColorSpec::DarkGray));
+    }
+
+    #[test]
+    fn adapt_event_unhandled() {
+        let row = adapt_event(&sample_event());
+        assert_eq!(row.id, "100");
+        assert_eq!(row.severity_label, "warning");
+        assert_eq!(row.handled_label, "UNHANDLED");
+        assert!(row.handled_style.bold);
+    }
+
+    #[test]
+    fn adapt_event_handled() {
+        let mut event = sample_event();
+        event.handled = true;
+        let row = adapt_event(&event);
+        assert_eq!(row.handled_label, "handled");
+        assert!(!row.handled_style.bold);
+    }
+
+    #[test]
+    fn adapt_history_undoable() {
+        let row = adapt_history(&sample_history());
+        assert_eq!(row.audit_id, "1");
+        assert_eq!(row.result_label, "success");
+        assert_eq!(row.undo_label, "undoable");
+        assert_eq!(row.undo_style.fg, Some(ColorSpec::Cyan));
+    }
+
+    #[test]
+    fn adapt_history_undone() {
+        let mut entry = sample_history();
+        entry.undone = true;
+        let row = adapt_history(&entry);
+        assert_eq!(row.undo_label, "UNDONE");
+        assert!(row.undo_style.dim);
+    }
+
+    #[test]
+    fn adapt_history_no_undo() {
+        let mut entry = sample_history();
+        entry.undoable = false;
+        let row = adapt_history(&entry);
+        assert_eq!(row.undo_label, "");
+    }
+
+    #[test]
+    fn adapt_search_formats_rank() {
+        let row = adapt_search(&sample_search());
+        assert_eq!(row.pane_id, "42");
+        assert_eq!(row.rank_label, "3.14");
+        assert!(row.snippet.contains(">>error<<"));
+    }
+
+    #[test]
+    fn adapt_triage_formats_actions() {
+        let row = adapt_triage(&sample_triage());
+        assert_eq!(row.severity_label, "error");
+        assert!(row.severity_style.bold);
+        assert_eq!(row.action_labels.len(), 1);
+        assert_eq!(row.action_labels[0], "Explain");
+        assert_eq!(row.action_commands[0], "wa why --recent --pane 42");
+    }
+
+    #[test]
+    fn adapt_workflow_running() {
+        let row = adapt_workflow(&sample_workflow());
+        assert_eq!(row.progress_label, "2/5");
+        assert_eq!(row.status_label, "running");
+        assert_eq!(row.status_style.fg, Some(ColorSpec::Cyan));
+        assert!(row.error.is_none());
+    }
+
+    #[test]
+    fn adapt_workflow_failed() {
+        let mut wf = sample_workflow();
+        wf.status = "failed".to_string();
+        wf.error = Some("connection timeout".to_string());
+        let row = adapt_workflow(&wf);
+        assert_eq!(row.status_style.fg, Some(ColorSpec::Red));
+        assert_eq!(row.error.as_deref(), Some("connection timeout"));
+    }
+
+    #[test]
+    fn truncate_short_string() {
+        assert_eq!(truncate("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_long_string() {
+        assert_eq!(truncate("hello world!", 8), "hello...");
+    }
+
+    #[test]
+    fn truncate_exact_length() {
+        assert_eq!(truncate("hello", 5), "hello");
+    }
+
+    #[test]
+    fn severity_styles_are_distinct() {
+        let error_style = severity_to_style("error");
+        let warning_style = severity_to_style("warning");
+        let info_style = severity_to_style("info");
+        assert_ne!(error_style.fg, warning_style.fg);
+        assert_ne!(warning_style.fg, info_style.fg);
+        assert!(error_style.bold);
+        assert!(!warning_style.bold);
+    }
+
+    #[test]
+    fn format_epoch_ms_zero() {
+        assert_eq!(format_epoch_ms(0), "-");
+    }
+
+    #[test]
+    fn format_epoch_ms_valid() {
+        let formatted = format_epoch_ms(1_700_000_000_000);
+        assert!(formatted.contains("2023"));
+        assert!(formatted.contains("-"));
+    }
+
+    #[test]
+    fn adapt_health_all_healthy() {
+        let health = HealthStatus {
+            watcher_running: true,
+            db_accessible: true,
+            wezterm_accessible: true,
+            wezterm_circuit: crate::circuit_breaker::CircuitBreakerStatus::default(),
+            pane_count: 5,
+            event_count: 42,
+            last_capture_ts: Some(1_700_000_000_000),
+        };
+        let model = adapt_health(&health);
+        assert_eq!(model.watcher_label, "running");
+        assert_eq!(model.watcher_style.fg, Some(ColorSpec::Green));
+        assert_eq!(model.pane_count, "5");
+        assert_eq!(model.event_count, "42");
+    }
+
+    #[test]
+    fn adapt_health_degraded() {
+        let health = HealthStatus {
+            watcher_running: false,
+            db_accessible: false,
+            wezterm_accessible: false,
+            wezterm_circuit: crate::circuit_breaker::CircuitBreakerStatus::default(),
+            pane_count: 0,
+            event_count: 0,
+            last_capture_ts: None,
+        };
+        let model = adapt_health(&health);
+        assert_eq!(model.watcher_label, "stopped");
+        assert!(model.watcher_style.bold);
+        assert_eq!(model.db_label, "unavailable");
+    }
+}

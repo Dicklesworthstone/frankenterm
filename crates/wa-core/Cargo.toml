@@ -59,6 +59,9 @@ wezterm-term = { workspace = true, optional = true }
 ratatui = { workspace = true, optional = true }
 crossterm = { workspace = true, optional = true }
 
+# FrankenTUI (optional, migration target — see docs/adr/)
+ftui = { workspace = true, optional = true }
+
 # MCP server (optional, behind feature)
 fastmcp = { workspace = true, optional = true }
 # Web server (optional, behind feature)
@@ -115,6 +118,7 @@ browser = ["browser-automation"]
 mcp = ["mcp-server"]
 web = ["dep:fastapi", "dep:fastapi-core", "dep:asupersync"]
 tui = ["dep:ratatui", "dep:crossterm"]
+ftui = ["dep:ftui"]
 metrics = []
 native-wezterm = []
 distributed = [

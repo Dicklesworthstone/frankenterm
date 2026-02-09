@@ -122,7 +122,18 @@ pub mod native_events;
 #[cfg(feature = "browser")]
 pub mod browser;
 
-#[cfg(feature = "tui")]
+// tui and ftui are mutually exclusive feature flags.
+// The legacy `tui` feature uses ratatui/crossterm; the new `ftui` feature uses FrankenTUI.
+// Both compile the `tui` module but with different rendering backends.
+// See docs/adr/0004-phased-rollout-and-rollback.md for migration details.
+#[cfg(all(feature = "tui", feature = "ftui"))]
+compile_error!(
+    "Features `tui` and `ftui` are mutually exclusive. \
+     Use `--features tui` for the legacy ratatui backend or \
+     `--features ftui` for the FrankenTUI backend, not both."
+);
+
+#[cfg(any(feature = "tui", feature = "ftui"))]
 pub mod tui;
 
 #[cfg(feature = "web")]
