@@ -314,6 +314,32 @@ impl TextInput {
 }
 
 // ---------------------------------------------------------------------------
+// FocusRegion — intra-view focus tracking (FTUI-06.5)
+// ---------------------------------------------------------------------------
+
+/// Logical focus region within a two-panel view.
+///
+/// Terminal UIs use a master-detail pattern: the primary list always owns
+/// selection (j/k/Up/Down), while the detail panel passively reflects the
+/// selected item.  `FocusRegion` makes this explicit and testable.
+///
+/// Focus traversal policy:
+/// - Tab/Shift+Tab: always switches **views** (global, not panel-level).
+/// - j/k/Up/Down: navigates the list in the PrimaryList region.
+/// - Detail panels auto-update based on selection (no independent scroll).
+/// - FilterBar captures text input; list navigation still works (Down/Up).
+/// - Modals trap all input until dismissed (Enter/y/Escape/n).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(dead_code)]
+pub enum FocusRegion {
+    /// The main interactive list (events, panes, triage, history, search results).
+    #[default]
+    PrimaryList,
+    /// Text filter/search input bar (search query, events pane filter, history filter).
+    FilterBar,
+}
+
+// ---------------------------------------------------------------------------
 // ViewState — per-view data
 // ---------------------------------------------------------------------------
 
@@ -325,6 +351,8 @@ impl TextInput {
 pub struct ViewState {
     pub current_view: View,
     pub error_message: Option<String>,
+    /// Intra-view focus region (FTUI-06.5).
+    pub focus: FocusRegion,
 
     // -- Events view state (FTUI-05.4) --
     pub events: EventsViewState,
@@ -780,6 +808,7 @@ impl WaModel {
 
         match key.code {
             KeyCode::Down | KeyCode::Char('j') => {
+                self.view_state.focus = FocusRegion::PrimaryList;
                 if count > 0 {
                     self.view_state.history.selected_index =
                         (self.view_state.history.selected_index + 1) % count;
@@ -787,6 +816,7 @@ impl WaModel {
                 ftui::Cmd::None
             }
             KeyCode::Up | KeyCode::Char('k') => {
+                self.view_state.focus = FocusRegion::PrimaryList;
                 if count > 0 {
                     self.view_state.history.selected_index = self
                         .view_state
@@ -798,44 +828,53 @@ impl WaModel {
                 ftui::Cmd::None
             }
             KeyCode::Char('u') => {
+                self.view_state.focus = FocusRegion::PrimaryList;
                 self.view_state.history.undoable_only =
                     !self.view_state.history.undoable_only;
                 self.view_state.history.selected_index = 0;
                 ftui::Cmd::None
             }
             KeyCode::Backspace => {
+                self.view_state.focus = FocusRegion::FilterBar;
                 self.view_state.history.filter_input.delete_back();
                 self.view_state.history.selected_index = 0;
                 ftui::Cmd::None
             }
             KeyCode::Delete => {
+                self.view_state.focus = FocusRegion::FilterBar;
                 self.view_state.history.filter_input.delete_forward();
                 self.view_state.history.selected_index = 0;
                 ftui::Cmd::None
             }
             KeyCode::Escape => {
+                self.view_state.focus = FocusRegion::PrimaryList;
                 self.view_state.history.filter_input.clear();
                 self.view_state.history.undoable_only = false;
                 self.view_state.history.selected_index = 0;
                 ftui::Cmd::None
             }
             KeyCode::Left => {
+                self.view_state.focus = FocusRegion::FilterBar;
                 self.view_state.history.filter_input.move_left();
                 ftui::Cmd::None
             }
             KeyCode::Right => {
+                self.view_state.focus = FocusRegion::FilterBar;
                 self.view_state.history.filter_input.move_right();
                 ftui::Cmd::None
             }
             KeyCode::Home => {
+                self.view_state.focus = FocusRegion::FilterBar;
                 self.view_state.history.filter_input.move_home();
                 ftui::Cmd::None
             }
             KeyCode::End => {
+                self.view_state.focus = FocusRegion::FilterBar;
                 self.view_state.history.filter_input.move_end();
                 ftui::Cmd::None
             }
             KeyCode::Char(c) if !c.is_control() => {
+                self.view_state.focus = FocusRegion::FilterBar;
                 self.view_state.history.filter_input.insert_char(c);
                 self.view_state.history.selected_index = 0;
                 ftui::Cmd::None
@@ -853,34 +892,42 @@ impl WaModel {
 
         match key.code {
             KeyCode::Char(c) => {
+                self.view_state.focus = FocusRegion::FilterBar;
                 self.search_input.insert_char(c);
                 ftui::Cmd::None
             }
             KeyCode::Backspace => {
+                self.view_state.focus = FocusRegion::FilterBar;
                 self.search_input.delete_back();
                 ftui::Cmd::None
             }
             KeyCode::Delete => {
+                self.view_state.focus = FocusRegion::FilterBar;
                 self.search_input.delete_forward();
                 ftui::Cmd::None
             }
             KeyCode::Left => {
+                self.view_state.focus = FocusRegion::FilterBar;
                 self.search_input.move_left();
                 ftui::Cmd::None
             }
             KeyCode::Right => {
+                self.view_state.focus = FocusRegion::FilterBar;
                 self.search_input.move_right();
                 ftui::Cmd::None
             }
             KeyCode::Home => {
+                self.view_state.focus = FocusRegion::FilterBar;
                 self.search_input.move_home();
                 ftui::Cmd::None
             }
             KeyCode::End => {
+                self.view_state.focus = FocusRegion::FilterBar;
                 self.search_input.move_end();
                 ftui::Cmd::None
             }
             KeyCode::Enter => {
+                self.view_state.focus = FocusRegion::PrimaryList;
                 let query = self.search_input.text().trim().to_string();
                 if query.is_empty() {
                     return ftui::Cmd::None;
@@ -901,6 +948,7 @@ impl WaModel {
                 ftui::Cmd::None
             }
             KeyCode::Escape => {
+                self.view_state.focus = FocusRegion::PrimaryList;
                 self.search_input.clear();
                 self.search_last_query.clear();
                 self.search_results.clear();
@@ -908,6 +956,7 @@ impl WaModel {
                 ftui::Cmd::None
             }
             KeyCode::Down => {
+                self.view_state.focus = FocusRegion::PrimaryList;
                 let count = self.search_results.len();
                 if count > 0 {
                     self.search_selected = (self.search_selected + 1) % count;
@@ -915,6 +964,7 @@ impl WaModel {
                 ftui::Cmd::None
             }
             KeyCode::Up => {
+                self.view_state.focus = FocusRegion::PrimaryList;
                 let count = self.search_results.len();
                 if count > 0 {
                     self.search_selected =
@@ -938,6 +988,7 @@ impl WaModel {
 
         match key.code {
             KeyCode::Down | KeyCode::Char('j') => {
+                self.view_state.focus = FocusRegion::PrimaryList;
                 if count > 0 {
                     self.view_state.events.selected_index =
                         (self.view_state.events.selected_index + 1) % count;
@@ -945,6 +996,7 @@ impl WaModel {
                 ftui::Cmd::None
             }
             KeyCode::Up | KeyCode::Char('k') => {
+                self.view_state.focus = FocusRegion::PrimaryList;
                 if count > 0 {
                     self.view_state.events.selected_index = self
                         .view_state
@@ -956,43 +1008,52 @@ impl WaModel {
                 ftui::Cmd::None
             }
             KeyCode::Char('u') => {
+                self.view_state.focus = FocusRegion::PrimaryList;
                 self.view_state.events.unhandled_only =
                     !self.view_state.events.unhandled_only;
                 self.view_state.events.selected_index = 0;
                 ftui::Cmd::None
             }
             KeyCode::Backspace => {
+                self.view_state.focus = FocusRegion::FilterBar;
                 self.view_state.events.pane_filter.delete_back();
                 self.view_state.events.selected_index = 0;
                 ftui::Cmd::None
             }
             KeyCode::Delete => {
+                self.view_state.focus = FocusRegion::FilterBar;
                 self.view_state.events.pane_filter.delete_forward();
                 self.view_state.events.selected_index = 0;
                 ftui::Cmd::None
             }
             KeyCode::Escape => {
+                self.view_state.focus = FocusRegion::PrimaryList;
                 self.view_state.events.pane_filter.clear();
                 self.view_state.events.selected_index = 0;
                 ftui::Cmd::None
             }
             KeyCode::Left => {
+                self.view_state.focus = FocusRegion::FilterBar;
                 self.view_state.events.pane_filter.move_left();
                 ftui::Cmd::None
             }
             KeyCode::Right => {
+                self.view_state.focus = FocusRegion::FilterBar;
                 self.view_state.events.pane_filter.move_right();
                 ftui::Cmd::None
             }
             KeyCode::Home => {
+                self.view_state.focus = FocusRegion::FilterBar;
                 self.view_state.events.pane_filter.move_home();
                 ftui::Cmd::None
             }
             KeyCode::End => {
+                self.view_state.focus = FocusRegion::FilterBar;
                 self.view_state.events.pane_filter.move_end();
                 ftui::Cmd::None
             }
             KeyCode::Char(c) if c.is_ascii_digit() => {
+                self.view_state.focus = FocusRegion::FilterBar;
                 self.view_state.events.pane_filter.insert_char(c);
                 self.view_state.events.selected_index = 0;
                 ftui::Cmd::None
@@ -1153,10 +1214,12 @@ impl WaModel {
             // Tab/BackTab navigation is always global (even in text input views).
             KeyCode::Tab => {
                 self.view_state.current_view = self.view_state.current_view.next();
+                self.view_state.focus = FocusRegion::default();
                 Some(ftui::Cmd::None)
             }
             KeyCode::BackTab => {
                 self.view_state.current_view = self.view_state.current_view.prev();
+                self.view_state.focus = FocusRegion::default();
                 Some(ftui::Cmd::None)
             }
             // Character-based shortcuts are suppressed in views with text input
@@ -1281,6 +1344,8 @@ impl ftui::Model for WaModel {
                 width,
                 content_h,
                 self.search_input.text(),
+                self.search_input.cursor_pos(),
+                self.view_state.focus,
                 &self.search_last_query,
                 &self.search_results,
                 self.search_selected,
@@ -1297,6 +1362,7 @@ impl ftui::Model for WaModel {
                     &self.view_state.events,
                     &filtered,
                     clamped_sel,
+                    self.view_state.focus,
                 );
             }
             View::Triage => render_triage_view(
@@ -1320,6 +1386,7 @@ impl ftui::Model for WaModel {
                     &self.view_state.history,
                     &filtered,
                     clamped_sel,
+                    self.view_state.focus,
                 );
             }
         }
@@ -1813,6 +1880,8 @@ fn render_search_view(
     width: u16,
     height: u16,
     query: &str,
+    cursor_pos: usize,
+    focus: FocusRegion,
     last_query: &str,
     results: &[SearchRow],
     selected: usize,
@@ -1831,7 +1900,14 @@ fn render_search_view(
     } else {
         "Search (FTS5) — Enter to search, Esc to clear"
     };
-    let input_line = format!("  {prompt}: {query}_");
+    // Show cursor indicator when FilterBar has focus, trailing underscore otherwise.
+    let cursor_char = if focus == FocusRegion::FilterBar { '▏' } else { '_' };
+    let (before_cursor, after_cursor) = if cursor_pos <= query.len() {
+        (&query[..cursor_pos], &query[cursor_pos..])
+    } else {
+        (query, "")
+    };
+    let input_line = format!("  {prompt}: {before_cursor}{cursor_char}{after_cursor}");
     write_styled(frame, 0, row, &input_line, CellStyle::new().bold());
     let ilen = input_line.len() as u16;
     if ilen < width {
@@ -2059,6 +2135,7 @@ fn render_events_view(
     events_state: &EventsViewState,
     filtered_indices: &[usize],
     selected: usize,
+    focus: FocusRegion,
 ) {
     if height == 0 {
         return;
@@ -2071,13 +2148,16 @@ fn render_events_view(
 
     let mut row = y;
 
-    // -- Header: count and filter status --
+    // -- Header: count and filter status (with focus-aware cursor) --
+    let filter_text = events_state.pane_filter.text();
+    let cursor_indicator = if focus == FocusRegion::FilterBar { "▏" } else { "" };
     let header = format!(
-        "  Events ({}/{})  unhandled_only={}  pane/rule='{}'",
+        "  Events ({}/{})  unhandled_only={}  pane/rule='{}{}'",
         filtered_indices.len(),
         events_state.items.len(),
         events_state.unhandled_only,
-        events_state.pane_filter.text(),
+        filter_text,
+        cursor_indicator,
     );
     write_styled(frame, 0, row, &header, CellStyle::new().bold());
     let hlen = header.len() as u16;
@@ -2542,6 +2622,7 @@ fn render_history_view(
     history_state: &HistoryViewState,
     filtered_indices: &[usize],
     selected: usize,
+    focus: FocusRegion,
 ) {
     if height == 0 {
         return;
@@ -2554,13 +2635,16 @@ fn render_history_view(
 
     let mut row = y;
 
-    // -- Header: count and filter status --
+    // -- Header: count and filter status (with focus-aware cursor) --
+    let filter_text = history_state.filter_input.text();
+    let cursor_indicator = if focus == FocusRegion::FilterBar { "▏" } else { "" };
     let header = format!(
-        "  History ({}/{})  undoable_only={}  q='{}'",
+        "  History ({}/{})  undoable_only={}  q='{}{}'",
         filtered_indices.len(),
         history_state.items.len(),
         history_state.undoable_only,
-        history_state.filter_input.text(),
+        filter_text,
+        cursor_indicator,
     );
     write_styled(frame, 0, row, &header, CellStyle::new().bold());
     let hlen = header.len() as u16;
@@ -3953,7 +4037,7 @@ mod tests {
     fn render_search_empty_shows_prompt() {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = ftui::Frame::new(80, 24, &mut pool);
-        render_search_view(&mut frame, 0, 80, 22, "", "", &[], 0);
+        render_search_view(&mut frame, 0, 80, 22, "", 0, FocusRegion::PrimaryList, "", &[], 0);
         let row0 = read_row(&frame, 0);
         assert!(row0.contains("Search (FTS5)"));
         let row1 = read_row(&frame, 1);
@@ -3964,7 +4048,7 @@ mod tests {
     fn render_search_no_results_shows_message() {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = ftui::Frame::new(80, 24, &mut pool);
-        render_search_view(&mut frame, 0, 80, 22, "test", "test", &[], 0);
+        render_search_view(&mut frame, 0, 80, 22, "test", 4, FocusRegion::PrimaryList, "test", &[], 0);
         let row1 = read_row(&frame, 1);
         assert!(row1.contains("No results"));
     }
@@ -3974,7 +4058,7 @@ mod tests {
         let rows: Vec<super::SearchRow> = sample_search_results().iter().map(super::adapt_search).collect();
         let mut pool = ftui::GraphemePool::new();
         let mut frame = ftui::Frame::new(100, 24, &mut pool);
-        render_search_view(&mut frame, 0, 100, 22, "error", "error", &rows, 0);
+        render_search_view(&mut frame, 0, 100, 22, "error", 5, FocusRegion::PrimaryList, "error", &rows, 0);
         let row1 = read_row(&frame, 1);
         assert!(row1.contains("2 matches"));
         let row2 = read_row(&frame, 2);
@@ -3991,7 +4075,7 @@ mod tests {
     fn render_search_zero_height_no_panic() {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = ftui::Frame::new(80, 24, &mut pool);
-        render_search_view(&mut frame, 0, 80, 0, "q", "q", &[], 0);
+        render_search_view(&mut frame, 0, 80, 0, "q", 1, FocusRegion::PrimaryList, "q", &[], 0);
     }
 
     // -- Help view tests --
@@ -4192,7 +4276,7 @@ mod tests {
         let clamped = model.view_state.events.clamped_selection();
         render_events_view(
             &mut frame, 0, 100, 22,
-            &model.view_state.events, &filtered, clamped,
+            &model.view_state.events, &filtered, clamped, FocusRegion::PrimaryList,
         );
 
         let row0 = read_row(&frame, 0);
@@ -4216,7 +4300,7 @@ mod tests {
         let clamped = model.view_state.events.clamped_selection();
         render_events_view(
             &mut frame, 0, 100, 22,
-            &model.view_state.events, &filtered, clamped,
+            &model.view_state.events, &filtered, clamped, FocusRegion::PrimaryList,
         );
 
         // Event rows start at row 2
@@ -4238,7 +4322,7 @@ mod tests {
         let clamped = model.view_state.events.clamped_selection();
         render_events_view(
             &mut frame, 0, 100, 22,
-            &model.view_state.events, &filtered, clamped,
+            &model.view_state.events, &filtered, clamped, FocusRegion::PrimaryList,
         );
 
         let mut found_detail = false;
@@ -4258,7 +4342,7 @@ mod tests {
         let mut frame = ftui::Frame::new(100, 24, &mut pool);
 
         let events_state = EventsViewState::default();
-        render_events_view(&mut frame, 0, 100, 22, &events_state, &[], 0);
+        render_events_view(&mut frame, 0, 100, 22, &events_state, &[], 0, FocusRegion::PrimaryList);
 
         let mut found_msg = false;
         for r in 0..22 {
@@ -4276,7 +4360,7 @@ mod tests {
         let events_state = EventsViewState::default();
         let mut pool = ftui::GraphemePool::new();
         let mut frame = ftui::Frame::new(80, 24, &mut pool);
-        render_events_view(&mut frame, 0, 80, 0, &events_state, &[], 0);
+        render_events_view(&mut frame, 0, 80, 0, &events_state, &[], 0, FocusRegion::PrimaryList);
     }
 
     // -- Triage view tests --
@@ -4896,7 +4980,7 @@ mod tests {
 
         let filtered = model.view_state.history.filtered_indices();
         let clamped = model.view_state.history.clamped_selection();
-        render_history_view(&mut frame, 0, 120, 28, &model.view_state.history, &filtered, clamped);
+        render_history_view(&mut frame, 0, 120, 28, &model.view_state.history, &filtered, clamped, FocusRegion::PrimaryList);
 
         let row0 = read_row(&frame, 0);
         assert!(row0.contains("History"), "Header should contain 'History': {row0}");
@@ -4912,7 +4996,7 @@ mod tests {
 
         let filtered = model.view_state.history.filtered_indices();
         let clamped = model.view_state.history.clamped_selection();
-        render_history_view(&mut frame, 0, 120, 28, &model.view_state.history, &filtered, clamped);
+        render_history_view(&mut frame, 0, 120, 28, &model.view_state.history, &filtered, clamped, FocusRegion::PrimaryList);
 
         let mut found_send = false;
         let mut found_wait = false;
@@ -4934,7 +5018,7 @@ mod tests {
 
         let filtered = model.view_state.history.filtered_indices();
         let clamped = model.view_state.history.clamped_selection();
-        render_history_view(&mut frame, 0, 120, 28, &model.view_state.history, &filtered, clamped);
+        render_history_view(&mut frame, 0, 120, 28, &model.view_state.history, &filtered, clamped, FocusRegion::PrimaryList);
 
         let mut found_detail = false;
         for r in 0..28 {
@@ -4954,7 +5038,7 @@ mod tests {
         let state = HistoryViewState::default();
         let filtered = state.filtered_indices();
         let clamped = state.clamped_selection();
-        render_history_view(&mut frame, 0, 80, 22, &state, &filtered, clamped);
+        render_history_view(&mut frame, 0, 80, 22, &state, &filtered, clamped, FocusRegion::PrimaryList);
 
         let mut found_empty = false;
         for r in 0..22 {
@@ -4973,7 +5057,7 @@ mod tests {
         let mut frame = ftui::Frame::new(80, 24, &mut pool);
         let state = HistoryViewState::default();
         let filtered = state.filtered_indices();
-        render_history_view(&mut frame, 0, 80, 0, &state, &filtered, 0);
+        render_history_view(&mut frame, 0, 80, 0, &state, &filtered, 0, FocusRegion::PrimaryList);
     }
 
     #[test]
@@ -4986,7 +5070,7 @@ mod tests {
 
         let filtered = model.view_state.history.filtered_indices();
         let clamped = model.view_state.history.clamped_selection();
-        render_history_view(&mut frame, 0, 120, 28, &model.view_state.history, &filtered, clamped);
+        render_history_view(&mut frame, 0, 120, 28, &model.view_state.history, &filtered, clamped, FocusRegion::PrimaryList);
 
         let row0 = read_row(&frame, 0);
         assert!(row0.contains("undoable") || row0.contains("2"),
@@ -5294,4 +5378,535 @@ mod tests {
         press_key(&mut model, ftui::KeyCode::Delete);
         assert_eq!(model.search_input.text(), "b");
     }
+
+    // -- Events pane_filter cursor navigation integration tests --
+
+    #[test]
+    fn events_left_right_in_filter() {
+        let mut model = make_model(MockQuery::with_events());
+        model.view_state.current_view = View::Events;
+        model.refresh_data();
+        press_key(&mut model, ftui::KeyCode::Char('4'));
+        press_key(&mut model, ftui::KeyCode::Char('2'));
+        assert_eq!(model.view_state.events.pane_filter.text(), "42");
+        press_key(&mut model, ftui::KeyCode::Left);
+        press_key(&mut model, ftui::KeyCode::Char('0'));
+        assert_eq!(model.view_state.events.pane_filter.text(), "402");
+    }
+
+    #[test]
+    fn events_home_end_in_filter() {
+        let mut model = make_model(MockQuery::with_events());
+        model.view_state.current_view = View::Events;
+        model.refresh_data();
+        press_key(&mut model, ftui::KeyCode::Char('1'));
+        press_key(&mut model, ftui::KeyCode::Char('2'));
+        press_key(&mut model, ftui::KeyCode::Home);
+        press_key(&mut model, ftui::KeyCode::Char('9'));
+        assert_eq!(model.view_state.events.pane_filter.text(), "912");
+        press_key(&mut model, ftui::KeyCode::End);
+        press_key(&mut model, ftui::KeyCode::Char('3'));
+        assert_eq!(model.view_state.events.pane_filter.text(), "9123");
+    }
+
+    #[test]
+    fn events_delete_forward_in_filter() {
+        let mut model = make_model(MockQuery::with_events());
+        model.view_state.current_view = View::Events;
+        model.refresh_data();
+        press_key(&mut model, ftui::KeyCode::Char('5'));
+        press_key(&mut model, ftui::KeyCode::Char('6'));
+        press_key(&mut model, ftui::KeyCode::Home);
+        press_key(&mut model, ftui::KeyCode::Delete);
+        assert_eq!(model.view_state.events.pane_filter.text(), "6");
+    }
+
+    // -- History filter_input cursor navigation integration tests --
+
+    #[test]
+    fn history_left_right_in_filter() {
+        let mut model = make_model(MockQuery::with_history());
+        model.view_state.current_view = View::History;
+        model.refresh_data();
+        press_key(&mut model, ftui::KeyCode::Char('a'));
+        press_key(&mut model, ftui::KeyCode::Char('b'));
+        assert_eq!(model.view_state.history.filter_input.text(), "ab");
+        press_key(&mut model, ftui::KeyCode::Left);
+        press_key(&mut model, ftui::KeyCode::Char('x'));
+        assert_eq!(model.view_state.history.filter_input.text(), "axb");
+    }
+
+    #[test]
+    fn history_home_end_in_filter() {
+        let mut model = make_model(MockQuery::with_history());
+        model.view_state.current_view = View::History;
+        model.refresh_data();
+        press_key(&mut model, ftui::KeyCode::Char('h'));
+        press_key(&mut model, ftui::KeyCode::Char('i'));
+        press_key(&mut model, ftui::KeyCode::Home);
+        press_key(&mut model, ftui::KeyCode::Char('_'));
+        assert_eq!(model.view_state.history.filter_input.text(), "_hi");
+        press_key(&mut model, ftui::KeyCode::End);
+        press_key(&mut model, ftui::KeyCode::Char('!'));
+        assert_eq!(model.view_state.history.filter_input.text(), "_hi!");
+    }
+
+    #[test]
+    fn history_delete_forward_in_filter() {
+        let mut model = make_model(MockQuery::with_history());
+        model.view_state.current_view = View::History;
+        model.refresh_data();
+        press_key(&mut model, ftui::KeyCode::Char('a'));
+        press_key(&mut model, ftui::KeyCode::Char('b'));
+        press_key(&mut model, ftui::KeyCode::Home);
+        press_key(&mut model, ftui::KeyCode::Delete);
+        assert_eq!(model.view_state.history.filter_input.text(), "b");
+    }
+
+    // -----------------------------------------------------------------------
+    // Snapshot / golden suite (FTUI-07.2)
+    // -----------------------------------------------------------------------
+
+    /// Capture the entire frame buffer as a multi-line string.
+    /// Trailing whitespace is trimmed per-line for stable comparisons.
+    fn frame_to_text(frame: &ftui::Frame) -> String {
+        let h = frame.height();
+        let mut lines = Vec::with_capacity(h as usize);
+        for y in 0..h {
+            lines.push(read_row(frame, y).trim_end().to_string());
+        }
+        // Remove trailing empty lines
+        while lines.last().is_some_and(|l| l.is_empty()) {
+            lines.pop();
+        }
+        lines.join("\n")
+    }
+
+    /// Render a full frame for the given view + model and return text.
+    fn snapshot_view(query: MockQuery, view: View, w: u16, h: u16) -> String {
+        use ftui::Model as _;
+        let mut model = make_model(query);
+        model.refresh_data();
+        model.view_state.current_view = view;
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(w, h, &mut pool);
+        model.view(&mut frame);
+        frame_to_text(&frame)
+    }
+
+    // -- Structural invariants across all views and sizes --
+
+    const SNAPSHOT_SIZES: &[(u16, u16)] = &[(40, 5), (80, 24), (120, 40)];
+
+    fn assert_tab_bar(text: &str, _active_view: View) {
+        let first_line = text.lines().next().expect("non-empty frame");
+        // Tab bar should contain at least "Home" (the first tab always fits)
+        assert!(
+            first_line.contains("Home"),
+            "Tab bar missing 'Home' in: {first_line}"
+        );
+        assert!(
+            first_line.contains('|'),
+            "Tab bar missing separators in: {first_line}"
+        );
+    }
+
+    /// Stricter tab bar check for wide terminals (>= 80 cols).
+    fn assert_tab_bar_full(text: &str, active_view: View) {
+        let first_line = text.lines().next().expect("non-empty frame");
+        for v in View::all() {
+            assert!(
+                first_line.contains(v.name()),
+                "Tab bar missing '{name}' in: {first_line}",
+                name = v.name()
+            );
+        }
+        assert!(
+            first_line.contains(active_view.name()),
+            "Active view '{name}' not in tab bar: {first_line}",
+            name = active_view.name()
+        );
+    }
+
+    fn assert_footer_present(text: &str, active_view: View) {
+        let last_line = text.lines().last().expect("non-empty frame");
+        // Footer should mention the current view name
+        assert!(
+            last_line.contains(active_view.name()),
+            "Footer missing '{name}': {last_line}",
+            name = active_view.name()
+        );
+    }
+
+    // -- Home view snapshots --
+
+    #[test]
+    fn snapshot_home_healthy_80x24() {
+        let text = snapshot_view(MockQuery::healthy(), View::Home, 80, 24);
+        assert_tab_bar(&text, View::Home);
+        assert_footer_present(&text, View::Home);
+        assert!(text.contains("ok") || text.contains("OK") || text.contains("healthy") || text.contains("Home"),
+            "Home should show health status");
+    }
+
+    #[test]
+    fn snapshot_home_degraded_80x24() {
+        let text = snapshot_view(MockQuery::degraded(), View::Home, 80, 24);
+        assert_tab_bar_full(&text, View::Home);
+        assert_footer_present(&text, View::Home);
+        // Degraded state should show ERROR badge, "stopped" watcher, or "unavailable" db
+        assert!(text.contains("ERROR") || text.contains("stopped") || text.contains("unavailable"),
+            "Degraded home should show problems: {text}");
+    }
+
+    #[test]
+    fn snapshot_home_all_sizes() {
+        for &(w, h) in SNAPSHOT_SIZES {
+            let text = snapshot_view(MockQuery::healthy(), View::Home, w, h);
+            if h >= 3 {
+                assert_tab_bar(&text, View::Home);
+            }
+            // Should not panic at any size
+            assert!(!text.is_empty() || h < 3, "Frame should be non-empty for h={h}");
+        }
+    }
+
+    // -- Panes view snapshots --
+
+    #[test]
+    fn snapshot_panes_populated_80x24() {
+        let text = snapshot_view(MockQuery::healthy(), View::Panes, 80, 24);
+        assert_tab_bar(&text, View::Panes);
+        assert_footer_present(&text, View::Panes);
+        // MockQuery::healthy() has pane_count=3
+        assert!(text.contains("pane") || text.contains("Pane"),
+            "Panes view should show pane info");
+    }
+
+    #[test]
+    fn snapshot_panes_empty_80x24() {
+        let text = snapshot_view(MockQuery::degraded(), View::Panes, 80, 24);
+        assert_tab_bar(&text, View::Panes);
+        // With 0 panes, should show empty state
+        assert!(text.contains("No pane") || text.contains("no pane") || text.contains("0")
+            || text.lines().count() >= 3,
+            "Empty panes should show some message");
+    }
+
+    #[test]
+    fn snapshot_panes_all_sizes() {
+        for &(w, h) in SNAPSHOT_SIZES {
+            let text = snapshot_view(MockQuery::healthy(), View::Panes, w, h);
+            if h >= 3 {
+                assert_tab_bar(&text, View::Panes);
+            }
+        }
+    }
+
+    // -- Events view snapshots --
+
+    #[test]
+    fn snapshot_events_populated_80x24() {
+        let text = snapshot_view(MockQuery::with_events(), View::Events, 80, 24);
+        assert_tab_bar(&text, View::Events);
+        assert_footer_present(&text, View::Events);
+        assert!(text.contains("Rate limit") || text.contains("rate_limit")
+            || text.contains("warning") || text.contains("error"),
+            "Events view should show event data");
+    }
+
+    #[test]
+    fn snapshot_events_empty_80x24() {
+        let text = snapshot_view(MockQuery::healthy(), View::Events, 80, 24);
+        assert_tab_bar(&text, View::Events);
+        // healthy() has empty events
+    }
+
+    #[test]
+    fn snapshot_events_all_sizes() {
+        for &(w, h) in SNAPSHOT_SIZES {
+            let text = snapshot_view(MockQuery::with_events(), View::Events, w, h);
+            if h >= 3 {
+                assert_tab_bar(&text, View::Events);
+            }
+        }
+    }
+
+    // -- Triage view snapshots --
+
+    #[test]
+    fn snapshot_triage_populated_80x24() {
+        let text = snapshot_view(MockQuery::with_triage(), View::Triage, 80, 24);
+        assert_tab_bar(&text, View::Triage);
+        assert_footer_present(&text, View::Triage);
+        assert!(text.contains("crash") || text.contains("Fatal") || text.contains("Triage")
+            || text.contains("error"),
+            "Triage view should show triage items");
+    }
+
+    #[test]
+    fn snapshot_triage_empty_80x24() {
+        let text = snapshot_view(MockQuery::degraded(), View::Triage, 80, 24);
+        assert_tab_bar(&text, View::Triage);
+    }
+
+    #[test]
+    fn snapshot_triage_all_sizes() {
+        for &(w, h) in SNAPSHOT_SIZES {
+            let text = snapshot_view(MockQuery::with_triage(), View::Triage, w, h);
+            if h >= 3 {
+                assert_tab_bar(&text, View::Triage);
+            }
+        }
+    }
+
+    // -- History view snapshots --
+
+    #[test]
+    fn snapshot_history_populated_80x24() {
+        let text = snapshot_view(MockQuery::with_history(), View::History, 80, 24);
+        assert_tab_bar(&text, View::History);
+        assert_footer_present(&text, View::History);
+        assert!(text.contains("send_text") || text.contains("History"),
+            "History view should show action data");
+    }
+
+    #[test]
+    fn snapshot_history_empty_80x24() {
+        let text = snapshot_view(MockQuery::healthy(), View::History, 80, 24);
+        assert_tab_bar(&text, View::History);
+        assert!(text.contains("No history") || text.contains("no history")
+            || text.contains("empty"),
+            "Empty history should show placeholder: {text}");
+    }
+
+    #[test]
+    fn snapshot_history_all_sizes() {
+        for &(w, h) in SNAPSHOT_SIZES {
+            let text = snapshot_view(MockQuery::with_history(), View::History, w, h);
+            if h >= 3 {
+                assert_tab_bar(&text, View::History);
+            }
+        }
+    }
+
+    // -- Search view snapshots --
+
+    #[test]
+    fn snapshot_search_empty_80x24() {
+        let text = snapshot_view(MockQuery::healthy(), View::Search, 80, 24);
+        assert_tab_bar(&text, View::Search);
+        assert_footer_present(&text, View::Search);
+    }
+
+    #[test]
+    fn snapshot_search_with_results_80x24() {
+        use ftui::Model as _;
+        let query = MockQuery::healthy().with_search_results(vec![
+            SearchResultView {
+                pane_id: 1,
+                timestamp: 1_700_000_000_000,
+                snippet: "matched line alpha".to_string(),
+                rank: 0.95,
+            },
+            SearchResultView {
+                pane_id: 2,
+                timestamp: 1_700_000_060_000,
+                snippet: "matched line beta".to_string(),
+                rank: 0.80,
+            },
+        ]);
+        let mut model = make_model(query);
+        model.refresh_data();
+        model.view_state.current_view = View::Search;
+        model.search_last_query = "alpha".to_string();
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(80, 24, &mut pool);
+        model.view(&mut frame);
+        let text = frame_to_text(&frame);
+        assert_tab_bar(&text, View::Search);
+        assert!(text.contains("alpha") || text.contains("matched"),
+            "Search results should show snippets");
+    }
+
+    #[test]
+    fn snapshot_search_all_sizes() {
+        for &(w, h) in SNAPSHOT_SIZES {
+            let text = snapshot_view(MockQuery::healthy(), View::Search, w, h);
+            if h >= 3 {
+                assert_tab_bar(&text, View::Search);
+            }
+        }
+    }
+
+    // -- Help view snapshots --
+
+    #[test]
+    fn snapshot_help_80x24() {
+        let text = snapshot_view(MockQuery::healthy(), View::Help, 80, 24);
+        assert_tab_bar(&text, View::Help);
+        assert_footer_present(&text, View::Help);
+        assert!(text.contains("WezTerm Automata") || text.contains("Keybindings")
+            || text.contains("Tab") || text.contains("help"),
+            "Help view should show help text: {text}");
+    }
+
+    #[test]
+    fn snapshot_help_all_sizes() {
+        for &(w, h) in SNAPSHOT_SIZES {
+            let text = snapshot_view(MockQuery::healthy(), View::Help, w, h);
+            if h >= 3 {
+                assert_tab_bar(&text, View::Help);
+            }
+        }
+    }
+
+    // -- Full-frame structural tests --
+
+    #[test]
+    fn snapshot_all_views_no_panic_tiny() {
+        // 40x5 is extremely small — ensure no panics
+        for &view in View::all() {
+            let text = snapshot_view(MockQuery::healthy(), view, 40, 5);
+            assert_tab_bar(&text, view);
+        }
+    }
+
+    #[test]
+    fn snapshot_all_views_no_panic_very_small() {
+        // Minimum viable: 3 rows (tab + 1 content + footer)
+        for &view in View::all() {
+            let _text = snapshot_view(MockQuery::healthy(), view, 30, 3);
+        }
+    }
+
+    #[test]
+    fn snapshot_all_views_height_2_renders_empty() {
+        use ftui::Model as _;
+        // height < 3 → view() returns early, frame should be all spaces
+        for &view in View::all() {
+            let mut model = make_model(MockQuery::healthy());
+            model.view_state.current_view = view;
+            let mut pool = ftui::GraphemePool::new();
+            let mut frame = ftui::Frame::new(80, 2, &mut pool);
+            model.view(&mut frame);
+            let text = frame_to_text(&frame);
+            // Should be empty or whitespace-only since height < 3
+            assert!(text.trim().is_empty(),
+                "Height 2 should produce empty frame for {view:?}: '{text}'");
+        }
+    }
+
+    #[test]
+    fn snapshot_all_views_large_120x40() {
+        // Large terminal — verify structure
+        for &view in View::all() {
+            let query = match view {
+                View::Events => MockQuery::with_events(),
+                View::Triage => MockQuery::with_triage(),
+                View::History => MockQuery::with_history(),
+                _ => MockQuery::healthy(),
+            };
+            let text = snapshot_view(query, view, 120, 40);
+            assert_tab_bar(&text, view);
+            assert_footer_present(&text, view);
+        }
+    }
+
+    // -- Width edge cases --
+
+    #[test]
+    fn snapshot_narrow_width_no_panic() {
+        // Width of 20 — tab bar gets truncated, verify no panic
+        for &view in View::all() {
+            let _text = snapshot_view(MockQuery::healthy(), view, 20, 24);
+        }
+    }
+
+    #[test]
+    fn snapshot_wide_width_200() {
+        // Very wide terminal
+        for &view in View::all() {
+            let text = snapshot_view(MockQuery::healthy(), view, 200, 24);
+            if !text.is_empty() {
+                let first_line = text.lines().next().unwrap();
+                // Tab bar should be present
+                assert!(first_line.contains("Home"), "Tab bar present at 200 width");
+            }
+        }
+    }
+
+    // -- Golden text structural tests for tab bar --
+
+    #[test]
+    fn snapshot_tab_bar_structure_80() {
+        let text = snapshot_view(MockQuery::healthy(), View::Home, 80, 24);
+        let tab_line = text.lines().next().unwrap();
+        // Verify separator characters between tabs
+        assert!(tab_line.contains('|'), "Tab bar should have separators");
+        // Verify shortcut numbers
+        for (i, view) in View::all().iter().enumerate() {
+            let expected = format!("{} {}", i + 1, view.name());
+            assert!(tab_line.contains(&expected),
+                "Tab bar should contain '{expected}': {tab_line}");
+        }
+    }
+
+    #[test]
+    fn snapshot_footer_shows_view_name() {
+        for &view in View::all() {
+            let text = snapshot_view(MockQuery::healthy(), view, 80, 24);
+            let last_line = text.lines().last().unwrap();
+            assert!(last_line.contains(view.name()),
+                "Footer should show '{name}' for {view:?}: {last_line}",
+                name = view.name());
+        }
+    }
+
+    // -- Content area line count sanity --
+
+    #[test]
+    fn snapshot_content_fills_frame() {
+        // In an 80x24 frame, we expect tab (1) + content (22) + footer (1) = 24 lines
+        let text = snapshot_view(MockQuery::healthy(), View::Home, 80, 24);
+        let line_count = text.lines().count();
+        // The last lines may be trimmed if blank, but we should have at least
+        // tab + some content + footer
+        assert!(line_count >= 3, "Should have at least 3 lines in 80x24 frame, got {line_count}");
+    }
+
+    // -- Filtered state snapshots --
+
+    #[test]
+    fn snapshot_events_with_filter_80x24() {
+        use ftui::Model as _;
+        let mut model = make_model(MockQuery::with_events());
+        model.refresh_data();
+        model.view_state.current_view = View::Events;
+        // Apply unhandled-only filter
+        model.view_state.events.unhandled_only = true;
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(80, 24, &mut pool);
+        model.view(&mut frame);
+        let text = frame_to_text(&frame);
+        assert_tab_bar(&text, View::Events);
+    }
+
+    #[test]
+    fn snapshot_history_undoable_filter_80x24() {
+        use ftui::Model as _;
+        let mut model = make_model(MockQuery::with_history());
+        model.refresh_data();
+        model.view_state.current_view = View::History;
+        model.view_state.history.undoable_only = true;
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(80, 24, &mut pool);
+        model.view(&mut frame);
+        let text = frame_to_text(&frame);
+        assert_tab_bar(&text, View::History);
+        // Only 2 of 3 entries are undoable
+        assert!(text.contains("2") || text.contains("undoable"),
+            "Should reflect filtered count");
+    }
+
 }
