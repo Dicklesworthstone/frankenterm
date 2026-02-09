@@ -7,7 +7,7 @@ edition = "2024"
 [dependencies]
 libfuzzer-sys = "0.4.10"
 wa-core = { path = "../crates/wa-core" }
-toml = "0.8.23"
+toml = "0.9.11"
 serde = { version = "1.0.228", features = ["derive"] }
 rusqlite = { version = "0.38.0", features = ["bundled", "backup", "functions"] }
 

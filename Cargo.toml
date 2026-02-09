@@ -153,31 +153,31 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 tokio = { version = "1.49.0", features = ["full"] }
 thiserror = "2.0.18"
-anyhow = "1.0.100"
+anyhow = "1.0.101"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "json"] }
 reqwest = { version = "0.12.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # CLI
-clap = { version = "4.5.54", features = ["derive", "env"] }
+clap = { version = "4.5.57", features = ["derive", "env"] }
 
 # Database
 rusqlite = { version = "0.38.0", features = ["bundled", "backup", "functions"] }
 
 # Pattern matching
 aho-corasick = "1.1.4"
-memchr = "2.7.6"
-fancy-regex = "0.14"
-regex = "1.12.2"
-bloomfilter = "1.0"
+memchr = "2.8.0"
+fancy-regex = "0.17"
+regex = "1.12.3"
+bloomfilter = "3.0"
 
 # Crypto / randomness
-rand = "0.9.2"
+rand = "0.10.0"
 sha2 = "0.10.9"
-x509-parser = "0.18.0"
+x509-parser = "0.18.1"
 
 # Config
-toml = "0.8.23"
+toml = "0.9.11"
 toml_edit = "0.24.0"
 serde_yaml = "0.9.34"
 
@@ -202,7 +202,7 @@ crossterm = "0.29.0"
 ftui = { git = "https://github.com/Dicklesworthstone/frankentui", default-features = false, features = ["runtime"] }
 
 # Benchmarking
-criterion = { version = "0.7.0", features = ["async_tokio"] }
+criterion = { version = "0.8.2", features = ["async_tokio"] }
 
 # FastMCP (optional MCP server dependencies)
 asupersync = { git = "https://github.com/Dicklesworthstone/asupersync" }
@@ -212,7 +212,7 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 notify = "8"
 glob = "0.3"
 console = "0.15"
-getrandom = "0.3"
+getrandom = "0.4"
 trybuild = { version = "1", default-features = false }
 rustls = "0.23"
 tokio-rustls = "0.26"

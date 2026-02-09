@@ -77,9 +77,9 @@ x509-parser = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
-proptest = "1.8.0"
+proptest = "1.10.0"
 tempfile = "3.23.0"
-criterion = { version = "0.7.0", features = ["async_tokio"] }
+criterion = { version = "0.8.2", features = ["async_tokio"] }
 
 # Benchmarks
 [[bench]]
