@@ -53,7 +53,7 @@ pub struct GapNotice {
 }
 
 /// A detection event from the pattern engine.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DetectionNotice {
     pub rule_id: String,
     pub agent_type: AgentType,
@@ -79,7 +79,7 @@ pub struct PanesMeta {
 // ---------------------------------------------------------------------------
 
 /// All possible wire message payloads.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WirePayload {
     PaneMeta(PaneMeta),
@@ -90,7 +90,7 @@ pub enum WirePayload {
 }
 
 /// Versioned envelope wrapping every wire message.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WireEnvelope {
     /// Protocol version for compat checking.
     pub version: u32,
@@ -353,6 +353,129 @@ impl AgentStreamer {
             self.messages_sent += 1;
             WireEnvelope::new(self.seq, &self.sender_id, p)
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Aggregator: accepts and processes incoming agent streams
+// ---------------------------------------------------------------------------
+
+use std::collections::HashMap;
+
+/// Per-agent tracking state within the aggregator.
+#[derive(Debug)]
+struct AgentSession {
+    /// Last sequence number received from this agent (for ordering/dedup).
+    last_seq: u64,
+    /// Total messages received from this agent.
+    messages_received: u64,
+    /// Total duplicates skipped.
+    duplicates_skipped: u64,
+    /// Timestamp of last message.
+    last_seen_ms: i64,
+}
+
+/// Result of processing an incoming wire message.
+#[derive(Debug, Clone, PartialEq)]
+pub enum IngestResult {
+    /// Message accepted and payload extracted.
+    Accepted(WirePayload),
+    /// Duplicate message (already seen this seq from this sender).
+    Duplicate { sender: String, seq: u64 },
+}
+
+/// Aggregator that processes incoming wire messages from agents.
+///
+/// Provides per-agent dedup, ordering validation, and metrics.
+/// Transport-agnostic: the caller feeds raw JSON bytes, the aggregator
+/// returns processed payloads ready for the event bus / storage.
+pub struct Aggregator {
+    agents: HashMap<String, AgentSession>,
+    total_accepted: u64,
+    total_rejected: u64,
+    max_agents: usize,
+}
+
+impl Aggregator {
+    /// Create a new aggregator with a maximum number of tracked agents.
+    pub fn new(max_agents: usize) -> Self {
+        Self {
+            agents: HashMap::new(),
+            total_accepted: 0,
+            total_rejected: 0,
+            max_agents,
+        }
+    }
+
+    /// Process a raw JSON wire message. Returns the payload if accepted.
+    pub fn ingest(&mut self, bytes: &[u8]) -> Result<IngestResult, WireProtocolError> {
+        let envelope = WireEnvelope::from_json(bytes)?;
+        self.ingest_envelope(envelope)
+    }
+
+    /// Process a decoded envelope. Returns the payload if accepted.
+    pub fn ingest_envelope(
+        &mut self,
+        envelope: WireEnvelope,
+    ) -> Result<IngestResult, WireProtocolError> {
+        let is_new = !self.agents.contains_key(&envelope.sender);
+        if is_new && self.agents.len() >= self.max_agents {
+            tracing::warn!(
+                "aggregator: max agents ({}) reached, allowing new agent '{}'",
+                self.max_agents,
+                envelope.sender
+            );
+        }
+
+        let session = self
+            .agents
+            .entry(envelope.sender.clone())
+            .or_insert(AgentSession {
+                last_seq: 0,
+                messages_received: 0,
+                duplicates_skipped: 0,
+                last_seen_ms: 0,
+            });
+
+        // Dedup: skip if we've already seen this or a later seq from this sender.
+        if envelope.seq <= session.last_seq {
+            session.duplicates_skipped += 1;
+            return Ok(IngestResult::Duplicate {
+                sender: envelope.sender,
+                seq: envelope.seq,
+            });
+        }
+
+        session.last_seq = envelope.seq;
+        session.messages_received += 1;
+        session.last_seen_ms = envelope.sent_at_ms;
+        self.total_accepted += 1;
+
+        Ok(IngestResult::Accepted(envelope.payload))
+    }
+
+    /// Number of unique agents currently tracked.
+    #[must_use]
+    pub fn agent_count(&self) -> usize {
+        self.agents.len()
+    }
+
+    /// Total accepted messages across all agents.
+    #[must_use]
+    pub fn total_accepted(&self) -> u64 {
+        self.total_accepted
+    }
+
+    /// Total rejected messages (parse errors, etc.).
+    #[must_use]
+    pub fn total_rejected(&self) -> u64 {
+        self.total_rejected
+    }
+
+    /// Get the last sequence number received from a given agent.
+    #[must_use]
+    pub fn agent_last_seq(&self, sender: &str) -> Option<u64> {
+        self.agents.get(sender).map(|s| s.last_seq)
     }
 }
 
@@ -940,5 +1063,128 @@ mod tests {
         // Next reconnect starts from attempt 0
         let delay = streamer.mark_reconnecting();
         assert_eq!(delay, 500); // back to initial
+    }
+
+    // --- Aggregator tests ---
+
+    #[test]
+    fn aggregator_accepts_valid_message() {
+        let mut agg = Aggregator::new(10);
+        let envelope = WireEnvelope::new(1, "agent-1", WirePayload::Gap(sample_gap()));
+        let bytes = envelope.to_json().unwrap();
+        let result = agg.ingest(&bytes).unwrap();
+        assert!(matches!(result, IngestResult::Accepted(WirePayload::Gap(_))));
+        assert_eq!(agg.total_accepted(), 1);
+        assert_eq!(agg.agent_count(), 1);
+    }
+
+    #[test]
+    fn aggregator_dedup_by_seq() {
+        let mut agg = Aggregator::new(10);
+        let e1 = WireEnvelope::new(1, "agent-1", WirePayload::Gap(sample_gap()));
+        let e2 = WireEnvelope::new(1, "agent-1", WirePayload::Gap(sample_gap())); // same seq
+        let e3 = WireEnvelope::new(2, "agent-1", WirePayload::Gap(sample_gap())); // new seq
+
+        assert!(matches!(
+            agg.ingest_envelope(e1).unwrap(),
+            IngestResult::Accepted(_)
+        ));
+        assert!(matches!(
+            agg.ingest_envelope(e2).unwrap(),
+            IngestResult::Duplicate { .. }
+        ));
+        assert!(matches!(
+            agg.ingest_envelope(e3).unwrap(),
+            IngestResult::Accepted(_)
+        ));
+        assert_eq!(agg.total_accepted(), 2);
+    }
+
+    #[test]
+    fn aggregator_tracks_multiple_agents() {
+        let mut agg = Aggregator::new(10);
+        let e1 = WireEnvelope::new(1, "agent-a", WirePayload::Gap(sample_gap()));
+        let e2 = WireEnvelope::new(1, "agent-b", WirePayload::Gap(sample_gap()));
+        let e3 = WireEnvelope::new(2, "agent-a", WirePayload::Gap(sample_gap()));
+
+        agg.ingest_envelope(e1).unwrap();
+        agg.ingest_envelope(e2).unwrap();
+        agg.ingest_envelope(e3).unwrap();
+
+        assert_eq!(agg.agent_count(), 2);
+        assert_eq!(agg.agent_last_seq("agent-a"), Some(2));
+        assert_eq!(agg.agent_last_seq("agent-b"), Some(1));
+        assert_eq!(agg.agent_last_seq("unknown"), None);
+    }
+
+    #[test]
+    fn aggregator_rejects_malformed_input() {
+        let mut agg = Aggregator::new(10);
+        let result = agg.ingest(b"not json");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn aggregator_rejects_oversized_input() {
+        let mut agg = Aggregator::new(10);
+        let huge = vec![b'{'; MAX_MESSAGE_SIZE + 1];
+        let result = agg.ingest(&huge);
+        assert!(matches!(
+            result,
+            Err(WireProtocolError::MessageTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn aggregator_end_to_end_with_streamer() {
+        let mut streamer = AgentStreamer::new("remote-agent");
+        let mut agg = Aggregator::new(10);
+
+        // Simulate: streamer produces events, aggregator consumes them
+        let events = vec![
+            Event::PaneDiscovered {
+                pane_id: 1,
+                domain: "SSH:prod".into(),
+                title: "codex".into(),
+            },
+            Event::SegmentCaptured {
+                pane_id: 1,
+                seq: 1,
+                content_len: 50,
+            },
+            Event::GapDetected {
+                pane_id: 1,
+                reason: "restart".into(),
+            },
+        ];
+
+        for event in &events {
+            if let Some(envelope) = streamer.event_to_envelope(event) {
+                let bytes = envelope.to_json().unwrap();
+                let result = agg.ingest(&bytes).unwrap();
+                assert!(matches!(result, IngestResult::Accepted(_)));
+            }
+        }
+
+        assert_eq!(agg.total_accepted(), 3);
+        assert_eq!(agg.agent_last_seq("remote-agent"), Some(3));
+    }
+
+    #[test]
+    fn aggregator_old_seq_skipped() {
+        let mut agg = Aggregator::new(10);
+        // Receive seq 5 first
+        let e1 = WireEnvelope::new(5, "agent", WirePayload::Gap(sample_gap()));
+        agg.ingest_envelope(e1).unwrap();
+
+        // Then receive seq 3 (out-of-order/old) - should be skipped
+        let e2 = WireEnvelope::new(3, "agent", WirePayload::Gap(sample_gap()));
+        let result = agg.ingest_envelope(e2).unwrap();
+        assert!(matches!(result, IngestResult::Duplicate { .. }));
+
+        // seq 6 accepted
+        let e3 = WireEnvelope::new(6, "agent", WirePayload::Gap(sample_gap()));
+        let result = agg.ingest_envelope(e3).unwrap();
+        assert!(matches!(result, IngestResult::Accepted(_)));
     }
 }

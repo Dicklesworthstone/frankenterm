@@ -147,6 +147,7 @@ pub mod ui_query;
 
 pub mod distributed;
 pub mod simulation;
+pub mod wire_protocol;
 
 #[cfg(feature = "sync")]
 pub mod sync;
