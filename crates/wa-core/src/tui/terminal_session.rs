@@ -31,7 +31,7 @@
 
 use std::time::Duration;
 
-use super::ftui_compat::{Area, InputEvent, RenderSurface};
+use super::ftui_compat::{Area, InputEvent, RenderSurface, ScreenMode};
 
 // ---------------------------------------------------------------------------
 // Session phase
@@ -90,11 +90,20 @@ pub trait TerminalSession {
     /// Current lifecycle phase.
     fn phase(&self) -> SessionPhase;
 
-    /// Acquire the terminal: enable raw mode, enter alternate screen.
+    /// The screen mode this session was entered with.
+    ///
+    /// Returns `None` if the session has not been entered yet (phase is `Idle`).
+    fn screen_mode(&self) -> Option<ScreenMode>;
+
+    /// Acquire the terminal with the specified screen mode.
+    ///
+    /// The `mode` determines whether to enter alternate screen (`AltScreen`)
+    /// or stay inline (`Inline` / `InlineAuto`). The chosen mode affects
+    /// scrollback behavior, cleanup semantics, and subprocess output routing.
     ///
     /// # Errors
     /// Returns `SessionError::InvalidPhase` if not in `Idle` phase.
-    fn enter(&mut self) -> Result<(), SessionError>;
+    fn enter(&mut self, mode: ScreenMode) -> Result<(), SessionError>;
 
     /// Render a frame by invoking the callback with the current surface.
     ///
@@ -161,12 +170,13 @@ pub struct SessionGuard<S: TerminalSession> {
 }
 
 impl<S: TerminalSession> SessionGuard<S> {
-    /// Enter the session and return a guard that will leave on drop.
+    /// Enter the session with the specified screen mode and return a guard
+    /// that will leave on drop.
     ///
     /// Sets the output gate to [`Active`](super::output_gate::GatePhase::Active),
     /// signaling that direct stderr/stdout writes are unsafe.
-    pub fn enter(mut session: S) -> Result<Self, SessionError> {
-        session.enter()?;
+    pub fn enter(mut session: S, mode: ScreenMode) -> Result<Self, SessionError> {
+        session.enter(mode)?;
         super::output_gate::set_phase(super::output_gate::GatePhase::Active);
         Ok(Self {
             session: Some(session),
@@ -247,6 +257,7 @@ impl<S: TerminalSession> std::ops::DerefMut for SessionGuard<S> {
 #[cfg(feature = "tui")]
 pub struct CrosstermSession {
     phase: SessionPhase,
+    mode: Option<ScreenMode>,
     terminal: Option<ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>>,
 }
 
@@ -255,6 +266,7 @@ impl CrosstermSession {
     pub fn new() -> Self {
         Self {
             phase: SessionPhase::Idle,
+            mode: None,
             terminal: None,
         }
     }
@@ -273,7 +285,11 @@ impl TerminalSession for CrosstermSession {
         self.phase
     }
 
-    fn enter(&mut self) -> Result<(), SessionError> {
+    fn screen_mode(&self) -> Option<ScreenMode> {
+        self.mode
+    }
+
+    fn enter(&mut self, mode: ScreenMode) -> Result<(), SessionError> {
         if self.phase != SessionPhase::Idle {
             return Err(SessionError::InvalidPhase {
                 expected: &[SessionPhase::Idle],
@@ -283,6 +299,11 @@ impl TerminalSession for CrosstermSession {
 
         crossterm::terminal::enable_raw_mode()?;
 
+        // The ratatui/crossterm backend only supports AltScreen natively.
+        // Inline modes are a ftui-only feature; under the `tui` backend we
+        // always enter alternate screen regardless of the requested mode.
+        // This is acceptable during the migration period — once the `tui`
+        // feature is dropped, the ftui runtime handles mode selection.
         if let Err(err) =
             crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)
         {
@@ -294,6 +315,7 @@ impl TerminalSession for CrosstermSession {
         match ratatui::Terminal::new(backend) {
             Ok(terminal) => {
                 self.terminal = Some(terminal);
+                self.mode = Some(mode);
                 self.phase = SessionPhase::Active;
                 Ok(())
             }
@@ -416,6 +438,7 @@ impl TerminalSession for CrosstermSession {
             let _ = terminal.show_cursor();
         }
         self.terminal = None;
+        self.mode = None;
         self.phase = SessionPhase::Idle;
         super::output_gate::set_phase(super::output_gate::GatePhase::Inactive);
     }
@@ -432,6 +455,7 @@ impl TerminalSession for CrosstermSession {
 #[derive(Debug, Default)]
 pub struct MockTerminalSession {
     phase: SessionPhase,
+    mode: Option<ScreenMode>,
     /// Lifecycle transitions recorded in order.
     pub history: Vec<&'static str>,
     /// Number of draw calls.
@@ -464,13 +488,18 @@ impl TerminalSession for MockTerminalSession {
         self.phase
     }
 
-    fn enter(&mut self) -> Result<(), SessionError> {
+    fn screen_mode(&self) -> Option<ScreenMode> {
+        self.mode
+    }
+
+    fn enter(&mut self, mode: ScreenMode) -> Result<(), SessionError> {
         if self.phase != SessionPhase::Idle {
             return Err(SessionError::InvalidPhase {
                 expected: &[SessionPhase::Idle],
                 actual: self.phase,
             });
         }
+        self.mode = Some(mode);
         self.phase = SessionPhase::Active;
         self.history.push("enter");
         Ok(())
@@ -533,6 +562,7 @@ impl TerminalSession for MockTerminalSession {
     fn leave(&mut self) {
         if self.phase != SessionPhase::Idle {
             self.history.push("leave");
+            self.mode = None;
             self.phase = SessionPhase::Idle;
         }
     }
@@ -552,7 +582,7 @@ mod tests {
         let mut session = MockTerminalSession::new();
         assert_eq!(session.phase(), SessionPhase::Idle);
 
-        session.enter().unwrap();
+        session.enter(ScreenMode::default()).unwrap();
         assert_eq!(session.phase(), SessionPhase::Active);
         assert_eq!(session.history, vec!["enter"]);
 
@@ -564,8 +594,8 @@ mod tests {
     #[test]
     fn mock_double_enter_fails() {
         let mut session = MockTerminalSession::new();
-        session.enter().unwrap();
-        let err = session.enter().unwrap_err();
+        session.enter(ScreenMode::default()).unwrap();
+        let err = session.enter(ScreenMode::default()).unwrap_err();
         assert!(matches!(err, SessionError::InvalidPhase { .. }));
     }
 
@@ -579,7 +609,7 @@ mod tests {
     #[test]
     fn mock_suspend_resume_lifecycle() {
         let mut session = MockTerminalSession::new();
-        session.enter().unwrap();
+        session.enter(ScreenMode::default()).unwrap();
         session.suspend().unwrap();
         assert_eq!(session.phase(), SessionPhase::Suspended);
 
@@ -595,7 +625,7 @@ mod tests {
     #[test]
     fn mock_command_handoff_pattern() {
         let mut session = MockTerminalSession::new();
-        session.enter().unwrap();
+        session.enter(ScreenMode::default()).unwrap();
 
         // Draw a few frames
         session.draw(&mut |_, _| {}).unwrap();
@@ -626,7 +656,7 @@ mod tests {
             InputEvent::Key(KeyInput::new(Key::Enter)),
         ];
         let mut session = MockTerminalSession::new().with_events(events);
-        session.enter().unwrap();
+        session.enter(ScreenMode::default()).unwrap();
 
         let ev1 = session.poll_event(Duration::ZERO).unwrap();
         assert!(matches!(ev1, Some(InputEvent::Key(ref k)) if k.is_char('q')));
@@ -641,7 +671,7 @@ mod tests {
     #[test]
     fn mock_leave_is_idempotent() {
         let mut session = MockTerminalSession::new();
-        session.enter().unwrap();
+        session.enter(ScreenMode::default()).unwrap();
         session.leave();
         session.leave(); // Second leave is no-op
         assert_eq!(session.history, vec!["enter", "leave"]);
@@ -650,7 +680,7 @@ mod tests {
     #[test]
     fn mock_leave_from_suspended() {
         let mut session = MockTerminalSession::new();
-        session.enter().unwrap();
+        session.enter(ScreenMode::default()).unwrap();
         session.suspend().unwrap();
         session.leave(); // Can leave from suspended
         assert_eq!(session.phase(), SessionPhase::Idle);
@@ -659,7 +689,7 @@ mod tests {
     #[test]
     fn session_guard_into_inner_calls_leave() {
         let session = MockTerminalSession::new();
-        let guard = SessionGuard::enter(session).unwrap();
+        let guard = SessionGuard::enter(session, ScreenMode::default()).unwrap();
         assert_eq!(guard.phase(), SessionPhase::Active);
         let session = guard.into_inner();
         assert_eq!(session.phase(), SessionPhase::Idle);
@@ -679,7 +709,7 @@ mod tests {
 
         {
             let session = MockTerminalSession::new();
-            let _guard = SessionGuard::enter(session).unwrap();
+            let _guard = SessionGuard::enter(session, ScreenMode::default()).unwrap();
             assert_eq!(output_gate::phase(), GatePhase::Active);
             assert!(output_gate::is_output_suppressed());
         }
@@ -696,7 +726,7 @@ mod tests {
         output_gate::set_phase(GatePhase::Inactive);
 
         let session = MockTerminalSession::new();
-        let guard = SessionGuard::enter(session).unwrap();
+        let guard = SessionGuard::enter(session, ScreenMode::default()).unwrap();
         assert!(output_gate::is_output_suppressed());
 
         let _session = guard.into_inner();
@@ -706,7 +736,7 @@ mod tests {
     #[test]
     fn session_guard_deref() {
         let session = MockTerminalSession::new();
-        let mut guard = SessionGuard::enter(session).unwrap();
+        let mut guard = SessionGuard::enter(session, ScreenMode::default()).unwrap();
         assert_eq!(guard.phase(), SessionPhase::Active);
         guard.suspend().unwrap();
         assert_eq!(guard.phase(), SessionPhase::Suspended);
@@ -715,7 +745,7 @@ mod tests {
     #[test]
     fn resume_from_wrong_phase_fails() {
         let mut session = MockTerminalSession::new();
-        session.enter().unwrap();
+        session.enter(ScreenMode::default()).unwrap();
         let err = session.resume().unwrap_err();
         assert!(matches!(err, SessionError::InvalidPhase { .. }));
     }
@@ -725,5 +755,207 @@ mod tests {
         let mut session = MockTerminalSession::new();
         let err = session.suspend().unwrap_err();
         assert!(matches!(err, SessionError::InvalidPhase { .. }));
+    }
+
+    // -- screen mode tests --
+
+    #[test]
+    fn screen_mode_none_before_enter() {
+        let session = MockTerminalSession::new();
+        assert!(session.screen_mode().is_none());
+    }
+
+    #[test]
+    fn screen_mode_tracks_alt_screen() {
+        let mut session = MockTerminalSession::new();
+        session.enter(ScreenMode::AltScreen).unwrap();
+        assert_eq!(session.screen_mode(), Some(ScreenMode::AltScreen));
+    }
+
+    #[test]
+    fn screen_mode_tracks_inline() {
+        let mut session = MockTerminalSession::new();
+        session.enter(ScreenMode::Inline { ui_height: 12 }).unwrap();
+        assert_eq!(
+            session.screen_mode(),
+            Some(ScreenMode::Inline { ui_height: 12 })
+        );
+    }
+
+    #[test]
+    fn screen_mode_cleared_on_leave() {
+        let mut session = MockTerminalSession::new();
+        session.enter(ScreenMode::AltScreen).unwrap();
+        assert!(session.screen_mode().is_some());
+        session.leave();
+        assert!(session.screen_mode().is_none());
+    }
+
+    #[test]
+    fn screen_mode_preserved_across_suspend_resume() {
+        let mut session = MockTerminalSession::new();
+        session.enter(ScreenMode::Inline { ui_height: 8 }).unwrap();
+        session.suspend().unwrap();
+        assert_eq!(
+            session.screen_mode(),
+            Some(ScreenMode::Inline { ui_height: 8 })
+        );
+        session.resume().unwrap();
+        assert_eq!(
+            session.screen_mode(),
+            Some(ScreenMode::Inline { ui_height: 8 })
+        );
+    }
+
+    #[test]
+    fn guard_preserves_screen_mode() {
+        let session = MockTerminalSession::new();
+        let guard = SessionGuard::enter(session, ScreenMode::Inline { ui_height: 15 }).unwrap();
+        assert_eq!(
+            guard.screen_mode(),
+            Some(ScreenMode::Inline { ui_height: 15 })
+        );
+    }
+
+    // -- FTUI-03.4: panic-safe cleanup and lifecycle stress validation --
+
+    #[test]
+    fn guard_drop_cleans_up_after_caught_panic() {
+        use super::super::output_gate::tests::GATE_TEST_LOCK;
+        use super::super::output_gate::{self, GatePhase};
+        let _lock = GATE_TEST_LOCK.lock().unwrap();
+        output_gate::set_phase(GatePhase::Inactive);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let session = MockTerminalSession::new();
+            let _guard = SessionGuard::enter(session, ScreenMode::default()).unwrap();
+            assert_eq!(output_gate::phase(), GatePhase::Active);
+            panic!("simulated panic during TUI operation");
+        }));
+
+        assert!(result.is_err(), "panic should have been caught");
+        // Guard's Drop must have run, clearing the gate back to Inactive.
+        assert_eq!(output_gate::phase(), GatePhase::Inactive);
+        assert!(!output_gate::is_output_suppressed());
+    }
+
+    #[test]
+    fn guard_drop_cleans_up_after_panic_in_suspended_state() {
+        use super::super::output_gate::tests::GATE_TEST_LOCK;
+        use super::super::output_gate::{self, GatePhase};
+        let _lock = GATE_TEST_LOCK.lock().unwrap();
+        output_gate::set_phase(GatePhase::Inactive);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let session = MockTerminalSession::new();
+            let mut guard = SessionGuard::enter(session, ScreenMode::default()).unwrap();
+            guard.suspend().unwrap();
+            // Gate should be Suspended (CrosstermSession toggles it, mock doesn't)
+            panic!("simulated panic during command handoff");
+        }));
+
+        assert!(result.is_err());
+        // Guard's Drop restores the gate to Inactive regardless of session phase.
+        assert_eq!(output_gate::phase(), GatePhase::Inactive);
+    }
+
+    #[test]
+    fn teardown_idempotency_leave_after_leave() {
+        let mut session = MockTerminalSession::new();
+        session.enter(ScreenMode::default()).unwrap();
+
+        // Multiple leave() calls must not panic or corrupt state.
+        session.leave();
+        session.leave();
+        session.leave();
+
+        assert_eq!(session.phase(), SessionPhase::Idle);
+        assert!(session.screen_mode().is_none());
+        // Only one "leave" recorded (subsequent calls are no-ops).
+        assert_eq!(session.history, vec!["enter", "leave"]);
+    }
+
+    #[test]
+    fn teardown_idempotency_drop_after_into_inner() {
+        use super::super::output_gate::tests::GATE_TEST_LOCK;
+        use super::super::output_gate::{self, GatePhase};
+        let _lock = GATE_TEST_LOCK.lock().unwrap();
+        output_gate::set_phase(GatePhase::Inactive);
+
+        let session = MockTerminalSession::new();
+        let guard = SessionGuard::enter(session, ScreenMode::default()).unwrap();
+
+        // into_inner() calls leave() and clears gate...
+        let session = guard.into_inner();
+        assert_eq!(output_gate::phase(), GatePhase::Inactive);
+        assert_eq!(session.phase(), SessionPhase::Idle);
+        // ...and the guard's Drop runs but finds session already taken (no double leave).
+        drop(session);
+        assert_eq!(output_gate::phase(), GatePhase::Inactive);
+    }
+
+    #[test]
+    fn lifecycle_stress_repeated_enter_leave_cycles() {
+        use super::super::output_gate::tests::GATE_TEST_LOCK;
+        use super::super::output_gate::{self, GatePhase};
+        let _lock = GATE_TEST_LOCK.lock().unwrap();
+        output_gate::set_phase(GatePhase::Inactive);
+
+        // Rapid start/stop cycles must not leak mode state.
+        for i in 0..50 {
+            let session = MockTerminalSession::new();
+            let mode = if i % 2 == 0 {
+                ScreenMode::AltScreen
+            } else {
+                ScreenMode::Inline { ui_height: 10 }
+            };
+            let guard = SessionGuard::enter(session, mode).unwrap();
+            assert_eq!(output_gate::phase(), GatePhase::Active);
+            assert_eq!(guard.screen_mode(), Some(mode));
+            let session = guard.into_inner();
+            assert_eq!(output_gate::phase(), GatePhase::Inactive);
+            assert!(session.screen_mode().is_none());
+        }
+    }
+
+    #[test]
+    fn lifecycle_stress_suspend_resume_cycles() {
+        let mut session = MockTerminalSession::new();
+        session.enter(ScreenMode::default()).unwrap();
+
+        // Repeated suspend/resume must not corrupt phase or mode state.
+        for _ in 0..20 {
+            session.suspend().unwrap();
+            assert_eq!(session.phase(), SessionPhase::Suspended);
+            assert!(session.screen_mode().is_some()); // Mode preserved
+
+            session.resume().unwrap();
+            assert_eq!(session.phase(), SessionPhase::Active);
+            assert!(session.screen_mode().is_some()); // Mode preserved
+        }
+
+        session.leave();
+        assert_eq!(session.phase(), SessionPhase::Idle);
+        assert!(session.screen_mode().is_none());
+    }
+
+    #[test]
+    fn guard_drop_after_panic_in_draw_callback() {
+        use super::super::output_gate::tests::GATE_TEST_LOCK;
+        use super::super::output_gate::{self, GatePhase};
+        let _lock = GATE_TEST_LOCK.lock().unwrap();
+        output_gate::set_phase(GatePhase::Inactive);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let session = MockTerminalSession::new();
+            let mut guard = SessionGuard::enter(session, ScreenMode::default()).unwrap();
+            // The mock draw doesn't actually call the callback, but this tests
+            // the guard cleanup even if draw were to trigger a panic.
+            guard.draw(&mut |_, _| {}).unwrap();
+            panic!("simulated panic after draw");
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(output_gate::phase(), GatePhase::Inactive);
     }
 }

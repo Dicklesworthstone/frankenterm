@@ -29,8 +29,8 @@ use std::time::{Duration, Instant};
 
 use super::query::QueryClient;
 use super::view_adapters::{
-    HealthModel, PaneRow, SearchRow, TriageRow, WorkflowRow,
-    adapt_event, adapt_health, adapt_pane, adapt_search, adapt_triage, adapt_workflow,
+    HealthModel, HistoryRow, PaneRow, SearchRow, TriageRow, WorkflowRow,
+    adapt_event, adapt_health, adapt_history, adapt_pane, adapt_search, adapt_triage, adapt_workflow,
 };
 
 // ---------------------------------------------------------------------------
@@ -135,6 +135,74 @@ impl View {
 }
 
 // ---------------------------------------------------------------------------
+// Modal state — reusable overlay for confirmations, errors, and info
+// ---------------------------------------------------------------------------
+
+/// The kind of modal being displayed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // Info variant used as migration progresses
+pub enum ModalKind {
+    /// Confirmation dialog — requires user to accept or cancel.
+    Confirm,
+    /// Error display — dismissible with Escape or Enter.
+    Error,
+    /// Informational message — dismissible with Escape or Enter.
+    Info,
+}
+
+/// Action to execute when a Confirm modal is accepted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfirmAction {
+    /// Execute a shell command (triage action, profile apply, etc.).
+    ExecuteCommand(String),
+    /// Mute an event by its string ID.
+    MuteEvent(String),
+}
+
+/// State for an active modal overlay.
+#[derive(Debug, Clone)]
+pub struct ModalState {
+    pub kind: ModalKind,
+    pub title: String,
+    pub body: String,
+    /// Action to run on confirm (only relevant for `ModalKind::Confirm`).
+    pub on_confirm: Option<ConfirmAction>,
+}
+
+#[allow(dead_code)] // Constructors used as migration progresses (FTUI-06.3+)
+impl ModalState {
+    /// Create a confirmation modal.
+    fn confirm(title: impl Into<String>, body: impl Into<String>, action: ConfirmAction) -> Self {
+        Self {
+            kind: ModalKind::Confirm,
+            title: title.into(),
+            body: body.into(),
+            on_confirm: Some(action),
+        }
+    }
+
+    /// Create an error modal.
+    fn error(title: impl Into<String>, body: impl Into<String>) -> Self {
+        Self {
+            kind: ModalKind::Error,
+            title: title.into(),
+            body: body.into(),
+            on_confirm: None,
+        }
+    }
+
+    /// Create an informational modal.
+    fn info(title: impl Into<String>, body: impl Into<String>) -> Self {
+        Self {
+            kind: ModalKind::Info,
+            title: title.into(),
+            body: body.into(),
+            on_confirm: None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ViewState — per-view data
 // ---------------------------------------------------------------------------
 
@@ -149,6 +217,9 @@ pub struct ViewState {
 
     // -- Events view state (FTUI-05.4) --
     pub events: EventsViewState,
+
+    // -- History view state (FTUI-05.6) --
+    pub history: HistoryViewState,
 }
 
 /// Events view state.
@@ -184,6 +255,60 @@ impl EventsViewState {
                     }
                 }
                 true
+            })
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    /// Clamped selected index within filtered results.
+    pub fn clamped_selection(&self) -> usize {
+        let filtered = self.filtered_indices();
+        self.selected_index
+            .min(filtered.len().saturating_sub(1))
+    }
+}
+
+/// History view state.
+#[derive(Debug, Default)]
+pub struct HistoryViewState {
+    /// Raw history entries from last data refresh.
+    pub items: Vec<super::query::HistoryEntryView>,
+    /// Adapted render-ready rows (parallel to `items`).
+    pub rows: Vec<super::view_adapters::HistoryRow>,
+    /// Show only undoable actions.
+    pub undoable_only: bool,
+    /// Free-text filter (matches pane, workflow, action, audit ID).
+    pub filter_query: String,
+    /// Currently selected index within filtered results.
+    pub selected_index: usize,
+}
+
+impl HistoryViewState {
+    /// Return indices of history entries matching the current filters.
+    pub fn filtered_indices(&self) -> Vec<usize> {
+        let query = self.filter_query.trim().to_ascii_lowercase();
+        self.items
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                if self.undoable_only && !entry.undoable {
+                    return false;
+                }
+                if query.is_empty() {
+                    return true;
+                }
+                let pane = entry
+                    .pane_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_default();
+                let workflow = entry.workflow_id.as_deref().unwrap_or("");
+                let audit = entry.audit_id.to_string();
+                let haystack = format!(
+                    "{pane} {workflow} {} {} {} {audit}",
+                    entry.action_kind, entry.result, entry.actor_kind
+                )
+                .to_ascii_lowercase();
+                haystack.contains(&query)
             })
             .map(|(idx, _)| idx)
             .collect()
@@ -263,6 +388,8 @@ pub struct WaModel {
     workflows: Vec<WorkflowRow>,
     // Queued action command from triage (consumed by the event loop).
     triage_queued_action: Option<String>,
+    // Modal overlay state (FTUI-06.3).
+    active_modal: Option<ModalState>,
     // Search view state.
     search_query: String,
     search_last_query: String,
@@ -288,6 +415,7 @@ impl WaModel {
             triage_expanded: None,
             workflows: Vec::new(),
             triage_queued_action: None,
+            active_modal: None,
             search_query: String::new(),
             search_last_query: String::new(),
             search_results: Vec::new(),
@@ -305,6 +433,7 @@ impl WaModel {
             View::Panes => self.handle_panes_key(key),
             View::Events => self.handle_events_key(key),
             View::Triage => self.handle_triage_key(key),
+            View::History => self.handle_history_key(key),
             View::Search => self.handle_search_key(key),
             _ => ftui::Cmd::None,
         }
@@ -415,27 +544,171 @@ impl WaModel {
         }
     }
 
-    /// Queue a triage action command for later execution.
+    /// Show a confirmation modal for a triage action.
     fn queue_triage_action(&mut self, action_idx: usize) {
         if let Some(item) = self.triage_items.get(self.triage_selected) {
             if let Some(cmd) = item.action_commands.get(action_idx) {
-                self.triage_queued_action = Some(cmd.clone());
+                let label = item
+                    .action_labels
+                    .get(action_idx)
+                    .cloned()
+                    .unwrap_or_else(|| cmd.clone());
+                self.show_modal(ModalState::confirm(
+                    "Confirm Action",
+                    format!("Run \"{label}\"?\n\n  {cmd}"),
+                    ConfirmAction::ExecuteCommand(cmd.clone()),
+                ));
             }
         }
     }
 
-    /// Mute the event associated with the selected triage item.
+    /// Show a confirmation modal for muting an event.
     fn mute_selected_triage_event(&mut self) {
         let event_id_str = self
             .triage_items
             .get(self.triage_selected)
             .map(|item| item.event_id.clone())
             .unwrap_or_default();
-        if let Ok(event_id) = event_id_str.parse::<i64>() {
-            if let Err(e) = self.query.mark_event_muted(event_id) {
-                self.view_state.error_message =
-                    Some(format!("Mute failed: {e}"));
+        if event_id_str.is_empty() {
+            return;
+        }
+        let title_str = self
+            .triage_items
+            .get(self.triage_selected)
+            .map(|item| item.title.clone())
+            .unwrap_or_default();
+        self.show_modal(ModalState::confirm(
+            "Confirm Mute",
+            format!("Mute event {event_id_str}?\n\n  {title_str}"),
+            ConfirmAction::MuteEvent(event_id_str),
+        ));
+    }
+
+    /// Show a modal overlay.
+    fn show_modal(&mut self, modal: ModalState) {
+        self.active_modal = Some(modal);
+    }
+
+    /// Dismiss the active modal without executing.
+    fn dismiss_modal(&mut self) {
+        self.active_modal = None;
+    }
+
+    /// Handle keys when a modal is active.
+    ///
+    /// Returns `Some(cmd)` if the key was consumed by the modal,
+    /// `None` if no modal is active (caller should proceed with normal handling).
+    fn handle_modal_key(&mut self, key: &ftui::KeyEvent) -> Option<ftui::Cmd<WaMsg>> {
+        if key.kind != ftui::KeyEventKind::Press {
+            return self.active_modal.as_ref().map(|_| ftui::Cmd::None);
+        }
+
+        let modal = self.active_modal.as_ref()?;
+        let kind = modal.kind.clone();
+
+        match key.code {
+            ftui::KeyCode::Escape | ftui::KeyCode::Char('n') => {
+                self.dismiss_modal();
+                Some(ftui::Cmd::None)
             }
+            ftui::KeyCode::Enter | ftui::KeyCode::Char('y') => {
+                if kind == ModalKind::Confirm {
+                    // Execute the confirm action.
+                    let action = self
+                        .active_modal
+                        .as_ref()
+                        .and_then(|m| m.on_confirm.clone());
+                    self.dismiss_modal();
+                    if let Some(action) = action {
+                        self.execute_confirm_action(action);
+                    }
+                } else {
+                    // Error/Info — just dismiss.
+                    self.dismiss_modal();
+                }
+                Some(ftui::Cmd::None)
+            }
+            _ => {
+                // Modal is active but key not recognized — absorb it.
+                Some(ftui::Cmd::None)
+            }
+        }
+    }
+
+    /// Execute a confirmed action.
+    fn execute_confirm_action(&mut self, action: ConfirmAction) {
+        match action {
+            ConfirmAction::ExecuteCommand(cmd) => {
+                self.triage_queued_action = Some(cmd);
+            }
+            ConfirmAction::MuteEvent(event_id_str) => {
+                if let Ok(event_id) = event_id_str.parse::<i64>() {
+                    if let Err(e) = self.query.mark_event_muted(event_id) {
+                        self.show_modal(ModalState::error(
+                            "Mute Failed",
+                            format!("Could not mute event {event_id}: {e}"),
+                        ));
+                    } else {
+                        self.refresh_data();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Handle keys specific to the History view.
+    ///
+    /// j/k/Down/Up: navigate entries.  u: toggle undoable filter.
+    /// Backspace: remove filter char.  Esc: clear all filters.
+    /// Printable chars: append to free-text filter.
+    fn handle_history_key(&mut self, key: &ftui::KeyEvent) -> ftui::Cmd<WaMsg> {
+        use ftui::KeyCode;
+
+        let filtered = self.view_state.history.filtered_indices();
+        let count = filtered.len();
+
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => {
+                if count > 0 {
+                    self.view_state.history.selected_index =
+                        (self.view_state.history.selected_index + 1) % count;
+                }
+                ftui::Cmd::None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if count > 0 {
+                    self.view_state.history.selected_index = self
+                        .view_state
+                        .history
+                        .selected_index
+                        .checked_sub(1)
+                        .unwrap_or(count - 1);
+                }
+                ftui::Cmd::None
+            }
+            KeyCode::Char('u') => {
+                self.view_state.history.undoable_only =
+                    !self.view_state.history.undoable_only;
+                self.view_state.history.selected_index = 0;
+                ftui::Cmd::None
+            }
+            KeyCode::Backspace => {
+                self.view_state.history.filter_query.pop();
+                self.view_state.history.selected_index = 0;
+                ftui::Cmd::None
+            }
+            KeyCode::Escape => {
+                self.view_state.history.filter_query.clear();
+                self.view_state.history.undoable_only = false;
+                self.view_state.history.selected_index = 0;
+                ftui::Cmd::None
+            }
+            KeyCode::Char(c) if !c.is_control() => {
+                self.view_state.history.filter_query.push(c);
+                self.view_state.history.selected_index = 0;
+                ftui::Cmd::None
+            }
+            _ => ftui::Cmd::None,
         }
     }
 
@@ -663,6 +936,27 @@ impl WaModel {
             }
             Err(_) => { /* non-fatal */ }
         }
+
+        // History data
+        match self.query.list_action_history(500) {
+            Ok(entries) => {
+                self.view_state.history.rows =
+                    entries.iter().map(adapt_history).collect();
+                self.view_state.history.items = entries;
+                let filtered_len =
+                    self.view_state.history.filtered_indices().len();
+                if filtered_len > 0 {
+                    self.view_state.history.selected_index = self
+                        .view_state
+                        .history
+                        .selected_index
+                        .min(filtered_len - 1);
+                } else {
+                    self.view_state.history.selected_index = 0;
+                }
+            }
+            Err(_) => { /* non-fatal */ }
+        }
     }
 
     /// Handle a key event at the global level.  Returns `Some(Cmd)` if the
@@ -678,9 +972,12 @@ impl WaModel {
         let in_search = self.view_state.current_view == View::Search;
         let in_events = self.view_state.current_view == View::Events;
         let in_triage = self.view_state.current_view == View::Triage;
+        let in_history = self.view_state.current_view == View::History;
+        // Views with text input suppress character shortcuts.
+        let has_text_input = in_search || in_history;
 
         match key.code {
-            // Tab/BackTab navigation is always global (even in Search).
+            // Tab/BackTab navigation is always global (even in text input views).
             KeyCode::Tab => {
                 self.view_state.current_view = self.view_state.current_view.next();
                 Some(ftui::Cmd::None)
@@ -689,20 +986,20 @@ impl WaModel {
                 self.view_state.current_view = self.view_state.current_view.prev();
                 Some(ftui::Cmd::None)
             }
-            // Character-based shortcuts are suppressed in Search view so that
-            // keystrokes flow to the search query input instead.
-            KeyCode::Char('q') if !in_search => Some(ftui::Cmd::Quit),
-            KeyCode::Char('?') if !in_search => {
+            // Character-based shortcuts are suppressed in views with text input
+            // so that keystrokes flow to the query/filter input instead.
+            KeyCode::Char('q') if !has_text_input => Some(ftui::Cmd::Quit),
+            KeyCode::Char('?') if !has_text_input => {
                 self.view_state.current_view = View::Help;
                 Some(ftui::Cmd::None)
             }
-            KeyCode::Char('r') if !in_search => {
+            KeyCode::Char('r') if !has_text_input => {
                 self.view_state.error_message = None;
                 self.refresh_data();
                 Some(ftui::Cmd::None)
             }
-            // In Events/Triage views, digits go to view-specific handlers.
-            KeyCode::Char(ch @ '1'..='7') if !in_search && !in_events && !in_triage => {
+            // In Events/Triage/History views, digits go to view-specific handlers.
+            KeyCode::Char(ch @ '1'..='7') if !has_text_input && !in_events && !in_triage => {
                 if let Some(view) = View::from_shortcut(ch) {
                     self.view_state.current_view = view;
                 }
@@ -726,6 +1023,10 @@ impl ftui::Model for WaModel {
     fn update(&mut self, msg: WaMsg) -> ftui::Cmd<WaMsg> {
         match msg {
             WaMsg::TermEvent(ftui::Event::Key(ref key)) => {
+                // Modal intercept — when a modal is active, it absorbs all keys.
+                if let Some(cmd) = self.handle_modal_key(key) {
+                    return cmd;
+                }
                 if let Some(cmd) = self.handle_global_key(key) {
                     return cmd;
                 }
@@ -835,13 +1136,19 @@ impl ftui::Model for WaModel {
                 &self.workflows,
                 self.triage_expanded,
             ),
-            View::History => render_view_placeholder(
-                frame,
-                content_y,
-                width,
-                content_h,
-                self.view_state.current_view,
-            ),
+            View::History => {
+                let filtered = self.view_state.history.filtered_indices();
+                let clamped_sel = self.view_state.history.clamped_selection();
+                render_history_view(
+                    frame,
+                    content_y,
+                    width,
+                    content_h,
+                    &self.view_state.history,
+                    &filtered,
+                    clamped_sel,
+                );
+            }
         }
 
         // -- Footer / status bar --
@@ -852,6 +1159,11 @@ impl ftui::Model for WaModel {
             self.view_state.current_view,
             self.view_state.error_message.as_deref(),
         );
+
+        // -- Modal overlay (drawn last so it's on top) --
+        if let Some(ref modal) = self.active_modal {
+            render_modal_overlay(frame, width, height, modal);
+        }
     }
 }
 
@@ -1321,7 +1633,7 @@ fn render_panes_view(
 ///   Row 0:    Search input bar with cursor/prompt
 ///   Row 1:    Separator / status
 ///   Rows 2+:  Two-panel (results list left 55%, detail right 45%) or empty message
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::similar_names)]
 fn render_search_view(
     frame: &mut ftui::Frame,
     y: u16,
@@ -1772,7 +2084,7 @@ fn render_events_view(
 ///   Block 1 (50% or fill): Triage item list with severity indicators and selection.
 ///   Block 2 (25%, optional): Active workflow progress panel (when workflows exist).
 ///   Block 3 (6 rows fixed): Details + action affordances for the selected item.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::similar_names)]
 fn render_triage_view(
     frame: &mut ftui::Frame,
     y: u16,
@@ -2044,6 +2356,222 @@ fn render_triage_view(
     }
 }
 
+/// Render the History view.
+///
+/// Two-panel layout:
+///   Left 60%: History entry list with filter header, column headers, and selection.
+///   Right 40%: Detail panel for the selected history entry with provenance.
+fn render_history_view(
+    frame: &mut ftui::Frame,
+    y: u16,
+    width: u16,
+    height: u16,
+    history_state: &HistoryViewState,
+    filtered_indices: &[usize],
+    selected: usize,
+) {
+    if height == 0 {
+        return;
+    }
+
+    let max_row = y.saturating_add(height);
+    let list_width = (width * 3 / 5).max(20); // 60%
+    let detail_x = list_width;
+    let detail_width = width.saturating_sub(list_width);
+
+    let mut row = y;
+
+    // -- Header: count and filter status --
+    let header = format!(
+        "  History ({}/{})  undoable_only={}  q='{}'",
+        filtered_indices.len(),
+        history_state.items.len(),
+        history_state.undoable_only,
+        history_state.filter_query,
+    );
+    write_styled(frame, 0, row, &header, CellStyle::new().bold());
+    let hlen = header.len() as u16;
+    if hlen < list_width {
+        let fill = " ".repeat((list_width - hlen) as usize);
+        write_styled(frame, hlen, row, &fill, CellStyle::new());
+    }
+    row += 1;
+
+    // -- Column headers --
+    if row < max_row {
+        let col_header = format!(
+            "  {:>6}  {:18}  {:8}  {:>8}  {}",
+            "audit", "action", "result", "undo", "actor"
+        );
+        write_styled(frame, 0, row, &col_header, CellStyle::new().dim());
+        let clen = col_header.len() as u16;
+        if clen < list_width {
+            let fill = " ".repeat((list_width - clen) as usize);
+            write_styled(frame, clen, row, &fill, CellStyle::new());
+        }
+        row += 1;
+    }
+
+    // -- History rows --
+    if filtered_indices.is_empty() && row < max_row {
+        let msg = if history_state.items.is_empty() {
+            "  No history entries yet."
+        } else {
+            "  No entries match the current filters."
+        };
+        write_styled(frame, 0, row, msg, CellStyle::new().dim());
+        let msg_len = msg.len() as u16;
+        if msg_len < list_width {
+            let fill = " ".repeat((list_width - msg_len) as usize);
+            write_styled(frame, msg_len, row, &fill, CellStyle::new());
+        }
+        row += 1;
+    } else {
+        for (pos, &entry_idx) in filtered_indices.iter().enumerate() {
+            if row >= max_row {
+                break;
+            }
+            let hrow = &history_state.rows[entry_idx];
+            let line = format!(
+                "  #{:>5}  {:18}  {:8}  {:>8}  {}",
+                truncate_str(&hrow.audit_id, 5),
+                truncate_str(&hrow.action_kind, 18),
+                truncate_str(&hrow.result_label, 8),
+                truncate_str(&hrow.undo_label, 8),
+                truncate_str(&hrow.actor_kind, 10),
+            );
+            let style = if pos == selected {
+                CellStyle::new().bold().reverse()
+            } else if !hrow.undo_label.is_empty() {
+                CellStyle::new().bold()
+            } else {
+                CellStyle::new()
+            };
+            write_styled(frame, 0, row, &line, style);
+            let llen = line.len() as u16;
+            if llen < list_width {
+                let fill = " ".repeat((list_width - llen) as usize);
+                write_styled(frame, llen, row, &fill, style);
+            }
+            row += 1;
+        }
+    }
+
+    // Fill remaining list area
+    let blank_list = " ".repeat(list_width as usize);
+    while row < max_row {
+        write_styled(frame, 0, row, &blank_list, CellStyle::new());
+        row += 1;
+    }
+
+    // -- Detail panel (right side) --
+    let selected_entry = filtered_indices
+        .get(selected)
+        .and_then(|&idx| history_state.items.get(idx));
+    let selected_row = filtered_indices
+        .get(selected)
+        .and_then(|&idx| history_state.rows.get(idx));
+
+    let mut drow = y;
+
+    // Detail header
+    write_styled(
+        frame,
+        detail_x,
+        drow,
+        " History Details",
+        CellStyle::new().bold(),
+    );
+    let dhlen = 16u16;
+    if dhlen < detail_width {
+        let fill = " ".repeat((detail_width - dhlen) as usize);
+        write_styled(frame, detail_x + dhlen, drow, &fill, CellStyle::new());
+    }
+    drow += 1;
+
+    if let (Some(entry), Some(hrow)) = (selected_entry, selected_row) {
+        let undo_status = if entry.undone {
+            "undone"
+        } else if entry.undoable {
+            "undoable"
+        } else {
+            "not-undoable"
+        };
+
+        let mut detail_lines: Vec<String> = vec![
+            format!(" Audit ID: #{}", entry.audit_id),
+            format!(" Action:   {}", hrow.action_kind),
+            format!(" Result:   {}", hrow.result_label),
+            format!(" Actor:    {}", hrow.actor_kind),
+            format!(" Undo:     {}", undo_status),
+            format!(" Time:     {}", hrow.timestamp),
+        ];
+
+        // Provenance fields
+        if !hrow.pane_id.is_empty() {
+            detail_lines.push(format!(" Pane:     {}", hrow.pane_id));
+        }
+        if !hrow.workflow_id.is_empty() {
+            detail_lines.push(format!(" Workflow: {}", hrow.workflow_id));
+        }
+        if !hrow.step_name.is_empty() {
+            detail_lines.push(format!(" Step:     {}", hrow.step_name));
+        }
+        if !hrow.undo_strategy.is_empty() {
+            detail_lines.push(format!(" Strategy: {}", hrow.undo_strategy));
+        }
+        if !hrow.undo_hint.is_empty() {
+            detail_lines.push(format!(
+                " Hint:     {}",
+                truncate_str(&hrow.undo_hint, 40)
+            ));
+        }
+        if !hrow.summary.is_empty() {
+            detail_lines.push(format!(
+                " Summary:  {}",
+                truncate_str(&hrow.summary, 40)
+            ));
+        }
+
+        detail_lines.push(String::new());
+        detail_lines.push(" Keys: j/k=nav u=undoable filter Esc=clear".to_string());
+
+        for line in &detail_lines {
+            if drow >= max_row {
+                break;
+            }
+            write_styled(frame, detail_x, drow, line, CellStyle::new());
+            let llen = line.len() as u16;
+            if llen < detail_width {
+                let fill = " ".repeat((detail_width - llen) as usize);
+                write_styled(frame, detail_x + llen, drow, &fill, CellStyle::new());
+            }
+            drow += 1;
+        }
+    } else if drow < max_row {
+        write_styled(
+            frame,
+            detail_x,
+            drow,
+            " No entry selected.",
+            CellStyle::new().dim(),
+        );
+        let msg_len = 20u16;
+        if msg_len < detail_width {
+            let fill = " ".repeat((detail_width - msg_len) as usize);
+            write_styled(frame, detail_x + msg_len, drow, &fill, CellStyle::new());
+        }
+        drow += 1;
+    }
+
+    // Fill remaining detail area
+    let blank_detail = " ".repeat(detail_width as usize);
+    while drow < max_row {
+        write_styled(frame, detail_x, drow, &blank_detail, CellStyle::new());
+        drow += 1;
+    }
+}
+
 /// Truncate a string for display.
 fn truncate_str(s: &str, max: usize) -> String {
     if s.len() <= max {
@@ -2084,6 +2612,107 @@ fn render_footer(frame: &mut ftui::Frame, row: u16, width: u16, view: View, erro
 
     if left_len + mid + right_len <= width {
         write_styled(frame, left_len + mid, row, right, style);
+    }
+}
+
+/// Render a modal overlay centered on the screen.
+///
+/// The modal is a bordered box with title, body text, and action hints.
+/// It overwrites the underlying content (no transparency in cell-based rendering).
+fn render_modal_overlay(frame: &mut ftui::Frame, width: u16, height: u16, modal: &ModalState) {
+    // Modal size: 50 chars wide (or width-4, whichever is smaller), height depends on content.
+    let modal_w = 50u16.min(width.saturating_sub(4));
+    if modal_w < 10 || height < 7 {
+        return; // Terminal too small for a modal.
+    }
+
+    let body_lines: Vec<&str> = modal.body.lines().collect();
+    // Title(1) + border top/bottom(2) + body lines + hint line(1) + padding(1)
+    let modal_h = (5 + body_lines.len() as u16).min(height.saturating_sub(2));
+    let inner_h = modal_h.saturating_sub(4); // rows for body + hint
+
+    // Center the modal.
+    let x0 = (width.saturating_sub(modal_w)) / 2;
+    let y0 = (height.saturating_sub(modal_h)) / 2;
+
+    let inner_w = modal_w.saturating_sub(2); // inside the border columns
+
+    // -- Top border --
+    let top = format!("\u{250c}{}\u{2510}", "\u{2500}".repeat(inner_w as usize));
+    write_styled(frame, x0, y0, &top, CellStyle::new().bold());
+
+    let mut row = y0 + 1;
+    let max_row = y0 + modal_h.saturating_sub(1);
+
+    // -- Title row --
+    if row < max_row {
+        let title = truncate_str(&modal.title, inner_w as usize);
+        let pad = inner_w.saturating_sub(title.len() as u16);
+        let line = format!(
+            "\u{2502}{title}{}\u{2502}",
+            " ".repeat(pad as usize),
+        );
+        write_styled(frame, x0, row, &line, CellStyle::new().bold());
+        row += 1;
+    }
+
+    // -- Separator --
+    if row < max_row {
+        let sep = format!("\u{251c}{}\u{2524}", "\u{2500}".repeat(inner_w as usize));
+        write_styled(frame, x0, row, &sep, CellStyle::new());
+        row += 1;
+    }
+
+    // -- Body lines --
+    let body_rows = inner_h.saturating_sub(1); // reserve 1 for hint
+    for (i, line_text) in body_lines.iter().enumerate() {
+        if row >= max_row || i as u16 >= body_rows {
+            break;
+        }
+        let text = truncate_str(line_text, inner_w as usize);
+        let pad = inner_w.saturating_sub(text.len() as u16);
+        let line = format!(
+            "\u{2502}{text}{}\u{2502}",
+            " ".repeat(pad as usize),
+        );
+        write_styled(frame, x0, row, &line, CellStyle::new());
+        row += 1;
+    }
+
+    // Fill remaining body area with blank rows.
+    while row < max_row.saturating_sub(1) {
+        let blank = format!(
+            "\u{2502}{}\u{2502}",
+            " ".repeat(inner_w as usize),
+        );
+        write_styled(frame, x0, row, &blank, CellStyle::new());
+        row += 1;
+    }
+
+    // -- Hint / action row --
+    if row < max_row {
+        let hint = match modal.kind {
+            ModalKind::Confirm => " Enter/y: confirm  Esc/n: cancel",
+            ModalKind::Error => " Enter/Esc: dismiss",
+            ModalKind::Info => " Enter/Esc: dismiss",
+        };
+        let hint_text = truncate_str(hint, inner_w as usize);
+        let pad = inner_w.saturating_sub(hint_text.len() as u16);
+        let line = format!(
+            "\u{2502}{hint_text}{}\u{2502}",
+            " ".repeat(pad as usize),
+        );
+        write_styled(frame, x0, row, &line, CellStyle::new().dim());
+        row += 1;
+    }
+
+    // -- Bottom border --
+    if row <= y0 + modal_h {
+        let bottom = format!(
+            "\u{2514}{}\u{2518}",
+            "\u{2500}".repeat(inner_w as usize),
+        );
+        write_styled(frame, x0, row, &bottom, CellStyle::new().bold());
     }
 }
 
@@ -2204,7 +2833,7 @@ mod tests {
     use super::*;
     use crate::circuit_breaker::CircuitBreakerStatus;
     use crate::tui::query::{
-        EventFilters, EventView, HealthStatus, PaneView, QueryError,
+        EventFilters, EventView, HealthStatus, HistoryEntryView, PaneView, QueryError,
         SearchResultView, TriageItemView, WorkflowProgressView,
     };
 
@@ -2219,6 +2848,7 @@ mod tests {
         workflows_data: Vec<WorkflowProgressView>,
         search_results: Vec<SearchResultView>,
         events: Vec<EventView>,
+        history_entries: Vec<HistoryEntryView>,
     }
 
     impl MockQuery {
@@ -2232,6 +2862,7 @@ mod tests {
                 workflows_data: Vec::new(),
                 search_results: Vec::new(),
                 events: vec![],
+                history_entries: vec![],
             }
         }
 
@@ -2245,6 +2876,7 @@ mod tests {
                 workflows_data: Vec::new(),
                 search_results: Vec::new(),
                 events: vec![],
+                history_entries: vec![],
             }
         }
 
@@ -2257,6 +2889,7 @@ mod tests {
                 triage_items_detailed: Vec::new(),
                 workflows_data: Vec::new(),
                 search_results: Vec::new(),
+                history_entries: vec![],
                 events: vec![
                     EventView {
                         id: 1,
@@ -2367,6 +3000,70 @@ mod tests {
                 }],
                 search_results: Vec::new(),
                 events: vec![],
+                history_entries: vec![],
+            }
+        }
+
+        fn with_history() -> Self {
+            Self {
+                healthy: true,
+                pane_count: 2,
+                unhandled_per_pane: 0,
+                triage_count: 0,
+                triage_items_detailed: vec![],
+                workflows_data: vec![],
+                search_results: vec![],
+                events: vec![],
+                history_entries: vec![
+                    HistoryEntryView {
+                        audit_id: 1001,
+                        timestamp: 1_700_000_000_000,
+                        pane_id: Some(3),
+                        workflow_id: Some("wf-deploy".to_string()),
+                        action_kind: "send_text".to_string(),
+                        result: "ok".to_string(),
+                        actor_kind: "robot".to_string(),
+                        step_name: Some("deploy-step-1".to_string()),
+                        undoable: true,
+                        undone: false,
+                        undo_strategy: Some("ctrl_c".to_string()),
+                        undo_hint: Some("Send Ctrl-C to cancel".to_string()),
+                        rule_id: Some("rule-deploy".to_string()),
+                        summary: ("Sent deploy command".to_string()),
+                    },
+                    HistoryEntryView {
+                        audit_id: 1002,
+                        timestamp: 1_700_000_060_000,
+                        pane_id: Some(3),
+                        workflow_id: Some("wf-deploy".to_string()),
+                        action_kind: "wait_for".to_string(),
+                        result: "timeout".to_string(),
+                        actor_kind: "robot".to_string(),
+                        step_name: Some("deploy-step-2".to_string()),
+                        undoable: false,
+                        undone: false,
+                        undo_strategy: None,
+                        undo_hint: None,
+                        rule_id: Some("rule-deploy".to_string()),
+                        summary: ("Wait for prompt timed out".to_string()),
+                    },
+                    HistoryEntryView {
+                        audit_id: 1003,
+                        timestamp: 1_700_000_120_000,
+                        pane_id: Some(7),
+                        workflow_id: None,
+                        action_kind: "send_text".to_string(),
+                        result: "ok".to_string(),
+                        actor_kind: "operator".to_string(),
+                        step_name: None,
+                        undoable: true,
+                        undone: false,
+                        undo_strategy: Some("ctrl_c".to_string()),
+                        undo_hint: Some("Send Ctrl-C".to_string()),
+                        rule_id: None,
+                        summary: ("Manual command sent".to_string()),
+                    },
+                ],
             }
         }
     }
@@ -2436,6 +3133,10 @@ mod tests {
 
         fn list_active_workflows(&self) -> Result<Vec<WorkflowProgressView>, QueryError> {
             Ok(self.workflows_data.clone())
+        }
+
+        fn list_action_history(&self, _limit: usize) -> Result<Vec<HistoryEntryView>, QueryError> {
+            Ok(self.history_entries.clone())
         }
     }
 
@@ -3497,6 +4198,17 @@ mod tests {
             modifiers: ftui::Modifiers::empty(),
         };
         model.handle_triage_key(&key);
+        // Action now shows confirmation modal first.
+        assert!(model.active_modal.is_some());
+        assert_eq!(model.active_modal.as_ref().unwrap().kind, ModalKind::Confirm);
+        // Confirm the modal.
+        let confirm = ftui::KeyEvent {
+            code: ftui::KeyCode::Enter,
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
+        model.handle_modal_key(&confirm);
+        assert!(model.active_modal.is_none());
         assert_eq!(
             model.triage_queued_action.as_deref(),
             Some("wa pane restart 7"),
@@ -3509,13 +4221,22 @@ mod tests {
         model.refresh_data();
         model.view_state.current_view = View::Triage;
 
-        // Digit '2' should queue action at index 1 ("Investigate")
+        // Digit '2' should show confirm modal for action at index 1 ("Investigate")
         let key = ftui::KeyEvent {
             code: ftui::KeyCode::Char('2'),
             kind: ftui::KeyEventKind::Press,
             modifiers: ftui::Modifiers::empty(),
         };
         model.handle_triage_key(&key);
+        assert!(model.active_modal.is_some());
+        // Confirm with 'y'.
+        let confirm = ftui::KeyEvent {
+            code: ftui::KeyCode::Char('y'),
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
+        model.handle_modal_key(&confirm);
+        assert!(model.active_modal.is_none());
         assert_eq!(
             model.triage_queued_action.as_deref(),
             Some("wa events show --pane 7"),
@@ -3549,8 +4270,19 @@ mod tests {
             kind: ftui::KeyEventKind::Press,
             modifiers: ftui::Modifiers::empty(),
         };
-        // Should not error (MockQuery.mark_event_muted returns Ok)
+        // Mute now shows confirm modal.
         model.handle_triage_key(&key);
+        assert!(model.active_modal.is_some());
+        assert_eq!(model.active_modal.as_ref().unwrap().kind, ModalKind::Confirm);
+        // Confirm the mute.
+        let confirm = ftui::KeyEvent {
+            code: ftui::KeyCode::Enter,
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
+        model.handle_modal_key(&confirm);
+        assert!(model.active_modal.is_none());
+        // Should not error (MockQuery.mark_event_muted returns Ok)
         assert!(model.view_state.error_message.is_none());
     }
 
@@ -3768,5 +4500,475 @@ mod tests {
         model.triage_selected = 10; // Past end
         model.refresh_data();
         assert_eq!(model.triage_selected, 2); // Clamped to last item
+    }
+
+    // -- History view tests (FTUI-05.6) --
+
+    #[test]
+    fn refresh_data_populates_history_entries() {
+        let mut model = make_model(MockQuery::with_history());
+        model.refresh_data();
+        assert_eq!(model.view_state.history.items.len(), 3);
+        assert_eq!(model.view_state.history.rows.len(), 3);
+    }
+
+    #[test]
+    fn history_navigation_down_wraps() {
+        let mut model = make_model(MockQuery::with_history());
+        model.refresh_data();
+        model.view_state.current_view = View::History;
+
+        for _ in 0..3 {
+            let key = ftui::KeyEvent {
+                code: ftui::KeyCode::Char('j'),
+                kind: ftui::KeyEventKind::Press,
+                modifiers: ftui::Modifiers::empty(),
+            };
+            model.handle_view_key(&key);
+        }
+        assert_eq!(model.view_state.history.selected_index, 0);
+    }
+
+    #[test]
+    fn history_navigation_up_wraps() {
+        let mut model = make_model(MockQuery::with_history());
+        model.refresh_data();
+        model.view_state.current_view = View::History;
+
+        let key = ftui::KeyEvent {
+            code: ftui::KeyCode::Char('k'),
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
+        model.handle_view_key(&key);
+        assert_eq!(model.view_state.history.selected_index, 2);
+    }
+
+    #[test]
+    fn history_arrow_keys_navigate() {
+        let mut model = make_model(MockQuery::with_history());
+        model.refresh_data();
+        model.view_state.current_view = View::History;
+
+        let down = ftui::KeyEvent {
+            code: ftui::KeyCode::Down,
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
+        model.handle_view_key(&down);
+        assert_eq!(model.view_state.history.selected_index, 1);
+
+        let up = ftui::KeyEvent {
+            code: ftui::KeyCode::Up,
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
+        model.handle_view_key(&up);
+        assert_eq!(model.view_state.history.selected_index, 0);
+    }
+
+    #[test]
+    fn history_undoable_toggle() {
+        let mut model = make_model(MockQuery::with_history());
+        model.refresh_data();
+        model.view_state.current_view = View::History;
+
+        assert!(!model.view_state.history.undoable_only);
+        assert_eq!(model.view_state.history.filtered_indices().len(), 3);
+
+        let key = ftui::KeyEvent {
+            code: ftui::KeyCode::Char('u'),
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
+        model.handle_view_key(&key);
+        assert!(model.view_state.history.undoable_only);
+        assert_eq!(model.view_state.history.filtered_indices().len(), 2);
+
+        model.handle_view_key(&key);
+        assert!(!model.view_state.history.undoable_only);
+        assert_eq!(model.view_state.history.filtered_indices().len(), 3);
+    }
+
+    #[test]
+    fn history_text_filter() {
+        let mut model = make_model(MockQuery::with_history());
+        model.refresh_data();
+        model.view_state.current_view = View::History;
+
+        for ch in "wait_for".chars() {
+            let key = ftui::KeyEvent {
+                code: ftui::KeyCode::Char(ch),
+                kind: ftui::KeyEventKind::Press,
+                modifiers: ftui::Modifiers::empty(),
+            };
+            model.handle_view_key(&key);
+        }
+        assert_eq!(model.view_state.history.filter_query, "wait_for");
+        assert_eq!(model.view_state.history.filtered_indices().len(), 1);
+        assert_eq!(model.view_state.history.filtered_indices()[0], 1);
+    }
+
+    #[test]
+    fn history_backspace_removes_char() {
+        let mut model = make_model(MockQuery::with_history());
+        model.refresh_data();
+        model.view_state.current_view = View::History;
+
+        for ch in "abc".chars() {
+            let key = ftui::KeyEvent {
+                code: ftui::KeyCode::Char(ch),
+                kind: ftui::KeyEventKind::Press,
+                modifiers: ftui::Modifiers::empty(),
+            };
+            model.handle_view_key(&key);
+        }
+        assert_eq!(model.view_state.history.filter_query, "abc");
+
+        let bs = ftui::KeyEvent {
+            code: ftui::KeyCode::Backspace,
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
+        model.handle_view_key(&bs);
+        assert_eq!(model.view_state.history.filter_query, "ab");
+    }
+
+    #[test]
+    fn history_escape_clears_all() {
+        let mut model = make_model(MockQuery::with_history());
+        model.refresh_data();
+        model.view_state.current_view = View::History;
+
+        model.view_state.history.filter_query = "test".to_string();
+        model.view_state.history.undoable_only = true;
+        model.view_state.history.selected_index = 1;
+
+        let esc = ftui::KeyEvent {
+            code: ftui::KeyCode::Escape,
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
+        model.handle_view_key(&esc);
+        assert!(model.view_state.history.filter_query.is_empty());
+        assert!(!model.view_state.history.undoable_only);
+        assert_eq!(model.view_state.history.selected_index, 0);
+    }
+
+    #[test]
+    fn history_q_does_not_quit() {
+        let mut model = make_model(MockQuery::with_history());
+        model.refresh_data();
+        model.view_state.current_view = View::History;
+
+        let key = ftui::KeyEvent {
+            code: ftui::KeyCode::Char('q'),
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
+        let cmd = model.handle_view_key(&key);
+        assert!(!matches!(cmd, ftui::Cmd::Quit));
+        assert_eq!(model.view_state.history.filter_query, "q");
+    }
+
+    #[test]
+    fn history_digits_filter_not_switch() {
+        let mut model = make_model(MockQuery::with_history());
+        model.refresh_data();
+        model.view_state.current_view = View::History;
+
+        let key = ftui::KeyEvent {
+            code: ftui::KeyCode::Char('3'),
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
+        model.handle_view_key(&key);
+        assert_eq!(model.view_state.current_view, View::History);
+        assert_eq!(model.view_state.history.filter_query, "3");
+    }
+
+    #[test]
+    fn history_selection_clamps_after_refresh() {
+        let mut model = make_model(MockQuery::with_history());
+        model.refresh_data();
+        model.view_state.history.selected_index = 100;
+        model.refresh_data();
+        assert_eq!(model.view_state.history.selected_index, 2);
+    }
+
+    #[test]
+    fn history_filtered_indices_combined() {
+        let mut model = make_model(MockQuery::with_history());
+        model.refresh_data();
+
+        model.view_state.history.filter_query = "send_text".to_string();
+        model.view_state.history.undoable_only = true;
+        let filtered = model.view_state.history.filtered_indices();
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered, vec![0, 2]);
+    }
+
+    #[test]
+    fn history_clamped_selection_empty() {
+        let state = HistoryViewState::default();
+        assert_eq!(state.clamped_selection(), 0);
+    }
+
+    #[test]
+    fn render_history_shows_header() {
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(120, 30, &mut pool);
+        let mut model = make_model(MockQuery::with_history());
+        model.refresh_data();
+
+        let filtered = model.view_state.history.filtered_indices();
+        let clamped = model.view_state.history.clamped_selection();
+        render_history_view(&mut frame, 0, 120, 28, &model.view_state.history, &filtered, clamped);
+
+        let row0 = read_row(&frame, 0);
+        assert!(row0.contains("History"), "Header should contain 'History': {row0}");
+        assert!(row0.contains("3"), "Header should show entry count: {row0}");
+    }
+
+    #[test]
+    fn render_history_shows_entries() {
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(120, 30, &mut pool);
+        let mut model = make_model(MockQuery::with_history());
+        model.refresh_data();
+
+        let filtered = model.view_state.history.filtered_indices();
+        let clamped = model.view_state.history.clamped_selection();
+        render_history_view(&mut frame, 0, 120, 28, &model.view_state.history, &filtered, clamped);
+
+        let mut found_send = false;
+        let mut found_wait = false;
+        for r in 0..28 {
+            let text = read_row(&frame, r);
+            if text.contains("send_text") { found_send = true; }
+            if text.contains("wait_for") { found_wait = true; }
+        }
+        assert!(found_send, "Should show send_text action");
+        assert!(found_wait, "Should show wait_for action");
+    }
+
+    #[test]
+    fn render_history_shows_detail_panel() {
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(120, 30, &mut pool);
+        let mut model = make_model(MockQuery::with_history());
+        model.refresh_data();
+
+        let filtered = model.view_state.history.filtered_indices();
+        let clamped = model.view_state.history.clamped_selection();
+        render_history_view(&mut frame, 0, 120, 28, &model.view_state.history, &filtered, clamped);
+
+        let mut found_detail = false;
+        for r in 0..28 {
+            let text = read_row(&frame, r);
+            if text.contains("Detail") || text.contains("Pane") || text.contains("Workflow") {
+                found_detail = true;
+                break;
+            }
+        }
+        assert!(found_detail, "Detail panel should be visible");
+    }
+
+    #[test]
+    fn render_history_empty_shows_message() {
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(80, 24, &mut pool);
+        let state = HistoryViewState::default();
+        let filtered = state.filtered_indices();
+        let clamped = state.clamped_selection();
+        render_history_view(&mut frame, 0, 80, 22, &state, &filtered, clamped);
+
+        let mut found_empty = false;
+        for r in 0..22 {
+            let text = read_row(&frame, r);
+            if text.contains("No history") {
+                found_empty = true;
+                break;
+            }
+        }
+        assert!(found_empty, "Should show 'No history' message");
+    }
+
+    #[test]
+    fn render_history_zero_height_no_panic() {
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(80, 24, &mut pool);
+        let state = HistoryViewState::default();
+        let filtered = state.filtered_indices();
+        render_history_view(&mut frame, 0, 80, 0, &state, &filtered, 0);
+    }
+
+    #[test]
+    fn render_history_undoable_filter_shown() {
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(120, 30, &mut pool);
+        let mut model = make_model(MockQuery::with_history());
+        model.refresh_data();
+        model.view_state.history.undoable_only = true;
+
+        let filtered = model.view_state.history.filtered_indices();
+        let clamped = model.view_state.history.clamped_selection();
+        render_history_view(&mut frame, 0, 120, 28, &model.view_state.history, &filtered, clamped);
+
+        let row0 = read_row(&frame, 0);
+        assert!(row0.contains("undoable") || row0.contains("2"),
+            "Header should reflect undoable filter: {row0}");
+    }
+
+    // -- Modal interaction tests (FTUI-06.3) --
+
+    #[test]
+    fn modal_confirm_enter_executes_action() {
+        let mut model = make_model(MockQuery::with_triage());
+        model.refresh_data();
+        model.show_modal(ModalState::confirm("Test", "Run action?", ConfirmAction::ExecuteCommand("wa test cmd".to_string())));
+        assert!(model.active_modal.is_some());
+        let key = ftui::KeyEvent { code: ftui::KeyCode::Enter, kind: ftui::KeyEventKind::Press, modifiers: ftui::Modifiers::empty() };
+        model.handle_modal_key(&key);
+        assert!(model.active_modal.is_none());
+        assert_eq!(model.triage_queued_action.as_deref(), Some("wa test cmd"));
+    }
+
+    #[test]
+    fn modal_confirm_y_executes_action() {
+        let mut model = make_model(MockQuery::with_triage());
+        model.show_modal(ModalState::confirm("Test", "Run?", ConfirmAction::ExecuteCommand("wa test".to_string())));
+        let key = ftui::KeyEvent { code: ftui::KeyCode::Char('y'), kind: ftui::KeyEventKind::Press, modifiers: ftui::Modifiers::empty() };
+        model.handle_modal_key(&key);
+        assert!(model.active_modal.is_none());
+        assert_eq!(model.triage_queued_action.as_deref(), Some("wa test"));
+    }
+
+    #[test]
+    fn modal_escape_dismisses_without_action() {
+        let mut model = make_model(MockQuery::with_triage());
+        model.show_modal(ModalState::confirm("Test", "Run?", ConfirmAction::ExecuteCommand("wa dangerous".to_string())));
+        let key = ftui::KeyEvent { code: ftui::KeyCode::Escape, kind: ftui::KeyEventKind::Press, modifiers: ftui::Modifiers::empty() };
+        model.handle_modal_key(&key);
+        assert!(model.active_modal.is_none());
+        assert!(model.triage_queued_action.is_none());
+    }
+
+    #[test]
+    fn modal_n_dismisses_without_action() {
+        let mut model = make_model(MockQuery::with_triage());
+        model.show_modal(ModalState::confirm("Test", "Run?", ConfirmAction::ExecuteCommand("wa dangerous".to_string())));
+        let key = ftui::KeyEvent { code: ftui::KeyCode::Char('n'), kind: ftui::KeyEventKind::Press, modifiers: ftui::Modifiers::empty() };
+        model.handle_modal_key(&key);
+        assert!(model.active_modal.is_none());
+        assert!(model.triage_queued_action.is_none());
+    }
+
+    #[test]
+    fn modal_absorbs_unrelated_keys() {
+        let mut model = make_model(MockQuery::with_triage());
+        model.show_modal(ModalState::confirm("Test", "Run?", ConfirmAction::ExecuteCommand("cmd".to_string())));
+        let key = ftui::KeyEvent { code: ftui::KeyCode::Char('q'), kind: ftui::KeyEventKind::Press, modifiers: ftui::Modifiers::empty() };
+        let result = model.handle_modal_key(&key);
+        assert!(result.is_some());
+        assert!(model.active_modal.is_some());
+    }
+
+    #[test]
+    fn modal_blocks_global_keys_in_update() {
+        let mut model = make_model(MockQuery::with_triage());
+        model.show_modal(ModalState::confirm("Test", "Proceed?", ConfirmAction::ExecuteCommand("cmd".to_string())));
+        let before = model.view_state.current_view;
+        let cmd = ftui::Model::update(&mut model, WaMsg::TermEvent(ftui::Event::Key(ftui::KeyEvent { code: ftui::KeyCode::Tab, kind: ftui::KeyEventKind::Press, modifiers: ftui::Modifiers::empty() })));
+        assert!(matches!(cmd, ftui::Cmd::None));
+        assert_eq!(model.view_state.current_view, before);
+        assert!(model.active_modal.is_some());
+    }
+
+    #[test]
+    fn modal_error_dismissed_with_enter() {
+        let mut model = make_model(MockQuery::healthy());
+        model.show_modal(ModalState::error("Error", "Something went wrong"));
+        let key = ftui::KeyEvent { code: ftui::KeyCode::Enter, kind: ftui::KeyEventKind::Press, modifiers: ftui::Modifiers::empty() };
+        model.handle_modal_key(&key);
+        assert!(model.active_modal.is_none());
+    }
+
+    #[test]
+    fn modal_error_dismissed_with_escape() {
+        let mut model = make_model(MockQuery::healthy());
+        model.show_modal(ModalState::error("Error", "Something went wrong"));
+        let key = ftui::KeyEvent { code: ftui::KeyCode::Escape, kind: ftui::KeyEventKind::Press, modifiers: ftui::Modifiers::empty() };
+        model.handle_modal_key(&key);
+        assert!(model.active_modal.is_none());
+    }
+
+    #[test]
+    fn modal_info_dismissed_with_enter() {
+        let mut model = make_model(MockQuery::healthy());
+        model.show_modal(ModalState::info("Info", "Operation complete."));
+        let key = ftui::KeyEvent { code: ftui::KeyCode::Enter, kind: ftui::KeyEventKind::Press, modifiers: ftui::Modifiers::empty() };
+        model.handle_modal_key(&key);
+        assert!(model.active_modal.is_none());
+    }
+
+    #[test]
+    fn modal_no_active_returns_none() {
+        let mut model = make_model(MockQuery::healthy());
+        assert!(model.active_modal.is_none());
+        let key = ftui::KeyEvent { code: ftui::KeyCode::Enter, kind: ftui::KeyEventKind::Press, modifiers: ftui::Modifiers::empty() };
+        let result = model.handle_modal_key(&key);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn modal_mute_confirm_executes_mute() {
+        let mut model = make_model(MockQuery::with_triage());
+        model.refresh_data();
+        model.show_modal(ModalState::confirm("Confirm Mute", "Mute event 42?", ConfirmAction::MuteEvent("42".to_string())));
+        let key = ftui::KeyEvent { code: ftui::KeyCode::Enter, kind: ftui::KeyEventKind::Press, modifiers: ftui::Modifiers::empty() };
+        model.handle_modal_key(&key);
+        assert!(model.active_modal.is_none());
+        assert!(model.view_state.error_message.is_none());
+    }
+
+    #[test]
+    fn render_modal_overlay_zero_height_no_panic() {
+        // ftui::Frame requires height > 0; test with height=1 for minimal terminal
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(80, 1, &mut pool);
+        let modal = ModalState::confirm("Test", "Body", ConfirmAction::ExecuteCommand("cmd".to_string()));
+        render_modal_overlay(&mut frame, 80, 1, &modal);
+    }
+
+    #[test]
+    fn render_modal_overlay_small_terminal_no_panic() {
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(10, 7, &mut pool);
+        let modal = ModalState::error("Error", "Something went wrong.");
+        render_modal_overlay(&mut frame, 10, 7, &modal);
+    }
+
+    #[test]
+    fn render_modal_confirm_shows_hint() {
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(80, 24, &mut pool);
+        let modal = ModalState::confirm("Confirm", "Do it?", ConfirmAction::ExecuteCommand("cmd".to_string()));
+        render_modal_overlay(&mut frame, 80, 24, &modal);
+        let text: String = (0..24).map(|r| read_row(&frame, r)).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("confirm"), "Should show confirm hint: {text}");
+        assert!(text.contains("cancel"), "Should show cancel hint: {text}");
+        assert!(text.contains("Confirm"), "Should show title: {text}");
+    }
+
+    #[test]
+    fn render_modal_error_shows_dismiss_hint() {
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(80, 24, &mut pool);
+        let modal = ModalState::error("Oops", "An error occurred.");
+        render_modal_overlay(&mut frame, 80, 24, &modal);
+        let text: String = (0..24).map(|r| read_row(&frame, r)).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("dismiss"), "Should show dismiss hint: {text}");
+        assert!(text.contains("Oops"), "Should show title: {text}");
     }
 }

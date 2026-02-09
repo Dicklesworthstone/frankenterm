@@ -112,8 +112,12 @@ pub struct EventRow {
     pub message: String,
     pub timestamp: String,
     pub handled_label: String,
+    pub triage_label: String,
+    pub labels_label: String,
+    pub note_preview: String,
     pub severity_style: StyleSpec,
     pub handled_style: StyleSpec,
+    pub triage_style: StyleSpec,
 }
 
 /// Adapt an EventView from QueryClient into a render-ready EventRow.
@@ -131,16 +135,45 @@ pub fn adapt_event(event: &EventView) -> EventRow {
         StyleSpec::new().fg(ColorSpec::Yellow).bold()
     };
 
+    let triage_label = event
+        .triage_state
+        .as_deref()
+        .unwrap_or("")
+        .to_string();
+    let triage_style = match event.triage_state.as_deref() {
+        Some("escalated") => StyleSpec::new().fg(ColorSpec::Red).bold(),
+        Some("deferred") => StyleSpec::new().fg(ColorSpec::Yellow),
+        Some("acknowledged") => StyleSpec::new().fg(ColorSpec::Green),
+        Some(_) => StyleSpec::new().fg(ColorSpec::DarkGray),
+        None => StyleSpec::new(),
+    };
+
+    let labels_label = if event.labels.is_empty() {
+        String::new()
+    } else {
+        event.labels.join(", ")
+    };
+
+    let note_preview = event
+        .note
+        .as_deref()
+        .map(|n| truncate(n, 40))
+        .unwrap_or_default();
+
     EventRow {
         id: event.id.to_string(),
         rule_id: event.rule_id.clone(),
         pane_id: event.pane_id.to_string(),
         severity_label: event.severity.clone(),
-        message: truncate(&event.message, 80),
+        message: redact_secrets(&truncate(&event.message, 80)),
         timestamp: format_epoch_ms(event.timestamp),
         handled_label,
+        triage_label,
+        labels_label,
+        note_preview,
         severity_style,
         handled_style,
+        triage_style,
     }
 }
 
@@ -158,6 +191,10 @@ pub struct TriageRow {
     pub action_labels: Vec<String>,
     pub action_commands: Vec<String>,
     pub severity_style: StyleSpec,
+    // Cross-reference IDs for provenance tracing.
+    pub event_id: String,
+    pub pane_id: String,
+    pub workflow_id: String,
 }
 
 /// Adapt a TriageItemView from QueryClient into a render-ready TriageRow.
@@ -169,10 +206,19 @@ pub fn adapt_triage(item: &TriageItemView) -> TriageRow {
         section: item.section.clone(),
         severity_label: item.severity.clone(),
         title: truncate(&item.title, 60),
-        detail: truncate(&item.detail, 120),
+        detail: redact_secrets(&truncate(&item.detail, 120)),
         action_labels: item.actions.iter().map(|a| a.label.clone()).collect(),
         action_commands: item.actions.iter().map(|a| a.command.clone()).collect(),
         severity_style,
+        event_id: item
+            .event_id
+            .map(|id| id.to_string())
+            .unwrap_or_default(),
+        pane_id: item
+            .pane_id
+            .map(|id| id.to_string())
+            .unwrap_or_default(),
+        workflow_id: item.workflow_id.clone().unwrap_or_default(),
     }
 }
 
@@ -192,6 +238,13 @@ pub struct HistoryRow {
     pub undo_label: String,
     pub result_style: StyleSpec,
     pub undo_style: StyleSpec,
+    // Provenance fields for cross-referencing and operator interpretation.
+    pub pane_id: String,
+    pub workflow_id: String,
+    pub step_name: String,
+    pub rule_id: String,
+    pub undo_strategy: String,
+    pub undo_hint: String,
 }
 
 /// Adapt a HistoryEntryView from QueryClient into a render-ready HistoryRow.
@@ -226,10 +279,19 @@ pub fn adapt_history(entry: &HistoryEntryView) -> HistoryRow {
         action_kind: entry.action_kind.clone(),
         result_label: entry.result.clone(),
         actor_kind: entry.actor_kind.clone(),
-        summary: truncate(&entry.summary, 60),
+        summary: redact_secrets(&truncate(&entry.summary, 60)),
         undo_label,
         result_style,
         undo_style,
+        pane_id: entry
+            .pane_id
+            .map(|id| id.to_string())
+            .unwrap_or_default(),
+        workflow_id: entry.workflow_id.clone().unwrap_or_default(),
+        step_name: entry.step_name.clone().unwrap_or_default(),
+        rule_id: entry.rule_id.clone().unwrap_or_default(),
+        undo_strategy: entry.undo_strategy.clone().unwrap_or_default(),
+        undo_hint: entry.undo_hint.clone().unwrap_or_default(),
     }
 }
 
@@ -252,7 +314,7 @@ pub fn adapt_search(result: &SearchResultView) -> SearchRow {
     SearchRow {
         pane_id: result.pane_id.to_string(),
         timestamp: format_epoch_ms(result.timestamp),
-        snippet: result.snippet.clone(),
+        snippet: redact_secrets(&result.snippet),
         rank_label: format!("{:.2}", result.rank),
     }
 }
@@ -271,6 +333,8 @@ pub struct WorkflowRow {
     pub status_label: String,
     pub error: Option<String>,
     pub status_style: StyleSpec,
+    pub started_at: String,
+    pub updated_at: String,
 }
 
 /// Adapt a WorkflowProgressView from QueryClient into a render-ready WorkflowRow.
@@ -291,6 +355,8 @@ pub fn adapt_workflow(wf: &WorkflowProgressView) -> WorkflowRow {
         status_label: wf.status.clone(),
         error: wf.error.clone(),
         status_style,
+        started_at: format_epoch_ms(wf.started_at),
+        updated_at: format_epoch_ms(wf.updated_at),
     }
 }
 
@@ -394,6 +460,41 @@ fn truncate(s: &str, max_len: usize) -> String {
     }
 }
 
+/// Redact secret-like patterns from display strings.
+///
+/// Masks patterns that commonly appear as secrets in terminal output:
+/// - API keys / tokens (Bearer, sk-, key-, ghp_, AKIA, etc.)
+/// - Password-like assignments (`password=...`, `secret=...`, `token=...`)
+/// - AWS-style access keys
+///
+/// This is a best-effort defense-in-depth measure. The primary redaction
+/// boundary is at the storage/capture layer; this provides a second pass
+/// before values reach the render surface.
+fn redact_secrets(s: &str) -> String {
+    use regex::Regex;
+    use std::sync::LazyLock;
+
+    static SECRET_RE: LazyLock<Regex> = LazyLock::new(|| {
+        // Order: longer patterns first to avoid partial matches.
+        Regex::new(concat!(
+            r"(?i)",
+            r"(?:",
+            // Bearer token: "Bearer <token>"
+            r"Bearer\s+\S{8,}",
+            r"|",
+            // Common key prefixes followed by 8+ non-whitespace chars
+            r"(?:sk-|sk_live_|sk_test_|ghp_|gho_|github_pat_|AKIA)[A-Za-z0-9_\-]{8,}",
+            r"|",
+            // password=/secret=/token=/api_key= assignments (value after =)
+            r"(?:password|secret|token|api_key|apikey|access_key|private_key)\s*=\s*\S{4,}",
+            r")",
+        ))
+        .expect("redact_secrets regex is valid")
+    });
+
+    SECRET_RE.replace_all(s, "[REDACTED]").into_owned()
+}
+
 /// Format epoch milliseconds as a human-readable relative or absolute timestamp.
 ///
 /// Returns relative format for recent times (e.g., "2m ago"), absolute for older.
@@ -443,9 +544,9 @@ mod tests {
             message: "Rate limit exceeded for API calls".to_string(),
             timestamp: 1_700_000_000_000,
             handled: false,
-            triage_state: None,
-            labels: vec!["api".to_string()],
-            note: None,
+            triage_state: Some("escalated".to_string()),
+            labels: vec!["api".to_string(), "rate-limit".to_string()],
+            note: Some("Investigate throttling config".to_string()),
         }
     }
 
@@ -554,6 +655,60 @@ mod tests {
     }
 
     #[test]
+    fn adapt_event_triage_state_escalated() {
+        let row = adapt_event(&sample_event());
+        assert_eq!(row.triage_label, "escalated");
+        assert_eq!(row.triage_style.fg, Some(ColorSpec::Red));
+        assert!(row.triage_style.bold);
+    }
+
+    #[test]
+    fn adapt_event_triage_state_acknowledged() {
+        let mut event = sample_event();
+        event.triage_state = Some("acknowledged".to_string());
+        let row = adapt_event(&event);
+        assert_eq!(row.triage_label, "acknowledged");
+        assert_eq!(row.triage_style.fg, Some(ColorSpec::Green));
+    }
+
+    #[test]
+    fn adapt_event_triage_state_none() {
+        let mut event = sample_event();
+        event.triage_state = None;
+        let row = adapt_event(&event);
+        assert_eq!(row.triage_label, "");
+        assert_eq!(row.triage_style.fg, None);
+    }
+
+    #[test]
+    fn adapt_event_labels_mapped() {
+        let row = adapt_event(&sample_event());
+        assert_eq!(row.labels_label, "api, rate-limit");
+    }
+
+    #[test]
+    fn adapt_event_empty_labels() {
+        let mut event = sample_event();
+        event.labels = vec![];
+        let row = adapt_event(&event);
+        assert_eq!(row.labels_label, "");
+    }
+
+    #[test]
+    fn adapt_event_note_preview() {
+        let row = adapt_event(&sample_event());
+        assert_eq!(row.note_preview, "Investigate throttling config");
+    }
+
+    #[test]
+    fn adapt_event_no_note() {
+        let mut event = sample_event();
+        event.note = None;
+        let row = adapt_event(&event);
+        assert_eq!(row.note_preview, "");
+    }
+
+    #[test]
     fn adapt_history_undoable() {
         let row = adapt_history(&sample_history());
         assert_eq!(row.audit_id, "1");
@@ -580,6 +735,41 @@ mod tests {
     }
 
     #[test]
+    fn adapt_history_provenance_fields() {
+        let row = adapt_history(&sample_history());
+        assert_eq!(row.pane_id, "42");
+        assert_eq!(row.workflow_id, "");
+        assert_eq!(row.step_name, "");
+        assert_eq!(row.rule_id, "");
+        assert_eq!(row.undo_strategy, "workflow_abort");
+        assert_eq!(row.undo_hint, "");
+    }
+
+    #[test]
+    fn adapt_history_full_provenance() {
+        let mut entry = sample_history();
+        entry.workflow_id = Some("wf-010".to_string());
+        entry.step_name = Some("verify_rollback".to_string());
+        entry.rule_id = Some("rate_limit_detected".to_string());
+        entry.undo_hint = Some("Abort workflow wf-010".to_string());
+        let row = adapt_history(&entry);
+        assert_eq!(row.pane_id, "42");
+        assert_eq!(row.workflow_id, "wf-010");
+        assert_eq!(row.step_name, "verify_rollback");
+        assert_eq!(row.rule_id, "rate_limit_detected");
+        assert_eq!(row.undo_strategy, "workflow_abort");
+        assert_eq!(row.undo_hint, "Abort workflow wf-010");
+    }
+
+    #[test]
+    fn adapt_history_no_pane() {
+        let mut entry = sample_history();
+        entry.pane_id = None;
+        let row = adapt_history(&entry);
+        assert_eq!(row.pane_id, "");
+    }
+
+    #[test]
     fn adapt_search_formats_rank() {
         let row = adapt_search(&sample_search());
         assert_eq!(row.pane_id, "42");
@@ -595,6 +785,26 @@ mod tests {
         assert_eq!(row.action_labels.len(), 1);
         assert_eq!(row.action_labels[0], "Explain");
         assert_eq!(row.action_commands[0], "wa why --recent --pane 42");
+    }
+
+    #[test]
+    fn adapt_triage_cross_references() {
+        let row = adapt_triage(&sample_triage());
+        assert_eq!(row.event_id, "100");
+        assert_eq!(row.pane_id, "42");
+        assert_eq!(row.workflow_id, "");
+    }
+
+    #[test]
+    fn adapt_triage_workflow_cross_reference() {
+        let mut item = sample_triage();
+        item.event_id = None;
+        item.pane_id = Some(5);
+        item.workflow_id = Some("wf-007".to_string());
+        let row = adapt_triage(&item);
+        assert_eq!(row.event_id, "");
+        assert_eq!(row.pane_id, "5");
+        assert_eq!(row.workflow_id, "wf-007");
     }
 
     #[test]
@@ -614,6 +824,15 @@ mod tests {
         let row = adapt_workflow(&wf);
         assert_eq!(row.status_style.fg, Some(ColorSpec::Red));
         assert_eq!(row.error.as_deref(), Some("connection timeout"));
+    }
+
+    #[test]
+    fn adapt_workflow_timing_fields() {
+        let row = adapt_workflow(&sample_workflow());
+        assert!(row.started_at.contains("2023"));
+        assert!(row.updated_at.contains("2023"));
+        // updated_at should differ from started_at (60s apart in sample)
+        assert_ne!(row.started_at, row.updated_at);
     }
 
     #[test]
@@ -687,5 +906,90 @@ mod tests {
         assert_eq!(model.watcher_label, "stopped");
         assert!(model.watcher_style.bold);
         assert_eq!(model.db_label, "unavailable");
+    }
+
+    // ----- Redaction tests -----
+
+    #[test]
+    fn redact_bearer_token() {
+        let input = "Auth: Bearer sk-abc123456789def";
+        let result = redact_secrets(input);
+        assert!(result.contains("[REDACTED]"));
+        assert!(!result.contains("sk-abc123456789def"));
+    }
+
+    #[test]
+    fn redact_github_pat() {
+        let input = "Using token ghp_aBcDeFgHiJkLmNoPqRsT";
+        let result = redact_secrets(input);
+        assert!(result.contains("[REDACTED]"));
+        assert!(!result.contains("ghp_aBcDeFgHiJkLmNoPqRsT"));
+    }
+
+    #[test]
+    fn redact_password_assignment() {
+        let input = "Config: password=MyS3cretP@ss";
+        let result = redact_secrets(input);
+        assert!(result.contains("[REDACTED]"));
+        assert!(!result.contains("MyS3cretP@ss"));
+    }
+
+    #[test]
+    fn redact_api_key_assignment() {
+        let input = "export api_key=abcd1234efgh5678";
+        let result = redact_secrets(input);
+        assert!(result.contains("[REDACTED]"));
+        assert!(!result.contains("abcd1234efgh5678"));
+    }
+
+    #[test]
+    fn redact_aws_access_key() {
+        let input = "AWS key: AKIAIOSFODNN7EXAMPLE";
+        let result = redact_secrets(input);
+        assert!(result.contains("[REDACTED]"));
+        assert!(!result.contains("AKIAIOSFODNN7EXAMPLE"));
+    }
+
+    #[test]
+    fn redact_preserves_normal_text() {
+        let input = "Rate limit exceeded for API calls on pane 42";
+        let result = redact_secrets(input);
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn redact_event_message_integration() {
+        let mut event = sample_event();
+        event.message = "Error: Bearer sk-live_abcdef123456 expired".to_string();
+        let row = adapt_event(&event);
+        assert!(row.message.contains("[REDACTED]"));
+        assert!(!row.message.contains("sk-live_abcdef123456"));
+    }
+
+    #[test]
+    fn redact_search_snippet_integration() {
+        let mut result = sample_search();
+        result.snippet = "Found token=xyzSecret12345 in output".to_string();
+        let row = adapt_search(&result);
+        assert!(row.snippet.contains("[REDACTED]"));
+        assert!(!row.snippet.contains("xyzSecret12345"));
+    }
+
+    #[test]
+    fn redact_history_summary_integration() {
+        let mut entry = sample_history();
+        entry.summary = "Sent password=hunter2 to pane".to_string();
+        let row = adapt_history(&entry);
+        assert!(row.summary.contains("[REDACTED]"));
+        assert!(!row.summary.contains("hunter2"));
+    }
+
+    #[test]
+    fn redact_triage_detail_integration() {
+        let mut item = sample_triage();
+        item.detail = "Leaked secret=topSecretValue99 in logs".to_string();
+        let row = adapt_triage(&item);
+        assert!(row.detail.contains("[REDACTED]"));
+        assert!(!row.detail.contains("topSecretValue99"));
     }
 }

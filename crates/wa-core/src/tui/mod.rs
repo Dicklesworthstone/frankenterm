@@ -76,6 +76,11 @@ pub mod terminal_session;
 // DELETION: Remove when ftui's native subprocess model replaces this (FTUI-09.3).
 pub mod command_handoff;
 
+// Deterministic UI state reducer — pure function mapping (state, action) → (state, effects).
+// Framework-agnostic, shared between ratatui and ftui backends.
+// Replaces the ad-hoc state mutation in app.rs during migration.
+pub mod state;
+
 // Legacy ratatui backend
 #[cfg(feature = "tui")]
 mod app;

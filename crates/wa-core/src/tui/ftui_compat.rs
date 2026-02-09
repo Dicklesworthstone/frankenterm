@@ -483,6 +483,119 @@ impl<'a> RatatuiSurface<'a> {
 }
 
 // ---------------------------------------------------------------------------
+// ScreenMode — framework-agnostic screen mode policy
+// ---------------------------------------------------------------------------
+
+/// Terminal screen mode for the TUI session.
+///
+/// Determines whether the UI takes over the full screen (alternate screen)
+/// or renders inline within scrollback. The mode also governs scrollback
+/// preservation, subprocess output visibility, and cleanup behavior.
+///
+/// # Mode policy (FTUI-03.3)
+///
+/// | Context               | Mode         | Rationale                              |
+/// |-----------------------|--------------|----------------------------------------|
+/// | Interactive TUI       | `AltScreen`  | Full-screen UI, clean layout, Esc exit |
+/// | Agent harness / daemon| `Inline`     | Scrollback preserved for log tailing   |
+/// | Command handoff       | N/A (suspend)| Session suspends, mode doesn't change  |
+///
+/// # Scrollback safety
+///
+/// - `AltScreen`: scrollback is invisible while active; restored on leave.
+///   Content written to stdout during alt-screen is lost.
+/// - `Inline`: scrollback is preserved. UI occupies a fixed region at the
+///   bottom (or top) and logs scroll above it. On exit, the UI region is
+///   erased but log content remains visible.
+/// - `InlineAuto`: like `Inline`, but the UI height adapts to content within
+///   the configured min/max bounds.
+///
+/// # Deletion criterion
+/// Remove when views use `ftui::ScreenMode` directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreenMode {
+    /// Full-screen alternate screen. Standard TUI mode.
+    ///
+    /// - Scrollback hidden while active, restored on exit.
+    /// - Best for: interactive dashboards, multi-view navigation.
+    AltScreen,
+
+    /// Inline mode with fixed UI height.
+    ///
+    /// - Scrollback preserved; UI pinned at terminal bottom.
+    /// - Best for: agent harness, daemon monitoring, status panels.
+    Inline {
+        /// Height of the UI region in terminal rows.
+        ui_height: u16,
+    },
+
+    /// Inline mode with auto-sizing UI region.
+    ///
+    /// - UI height adapts to rendered content within bounds.
+    /// - Best for: variable-height status displays.
+    InlineAuto {
+        /// Minimum UI height in rows.
+        min_height: u16,
+        /// Maximum UI height in rows.
+        max_height: u16,
+    },
+}
+
+impl Default for ScreenMode {
+    fn default() -> Self {
+        Self::AltScreen
+    }
+}
+
+impl ScreenMode {
+    /// Returns `true` if this mode preserves terminal scrollback.
+    #[must_use]
+    pub const fn preserves_scrollback(&self) -> bool {
+        !matches!(self, Self::AltScreen)
+    }
+
+    /// Returns `true` if this mode uses the alternate screen buffer.
+    #[must_use]
+    pub const fn is_alt_screen(&self) -> bool {
+        matches!(self, Self::AltScreen)
+    }
+}
+
+#[cfg(feature = "ftui")]
+impl From<ScreenMode> for ftui::ScreenMode {
+    fn from(m: ScreenMode) -> Self {
+        match m {
+            ScreenMode::AltScreen => Self::AltScreen,
+            ScreenMode::Inline { ui_height } => Self::Inline { ui_height },
+            ScreenMode::InlineAuto {
+                min_height,
+                max_height,
+            } => Self::InlineAuto {
+                min_height,
+                max_height,
+            },
+        }
+    }
+}
+
+#[cfg(feature = "ftui")]
+impl From<ftui::ScreenMode> for ScreenMode {
+    fn from(m: ftui::ScreenMode) -> Self {
+        match m {
+            ftui::ScreenMode::AltScreen => Self::AltScreen,
+            ftui::ScreenMode::Inline { ui_height } => Self::Inline { ui_height },
+            ftui::ScreenMode::InlineAuto {
+                min_height,
+                max_height,
+            } => Self::InlineAuto {
+                min_height,
+                max_height,
+            },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Migration markers
 // ---------------------------------------------------------------------------
 
@@ -593,6 +706,30 @@ mod tests {
 
         let t = InputEvent::Tick;
         assert!(matches!(t, InputEvent::Tick));
+    }
+
+    #[test]
+    fn screen_mode_default_is_alt_screen() {
+        assert_eq!(ScreenMode::default(), ScreenMode::AltScreen);
+    }
+
+    #[test]
+    fn screen_mode_scrollback_preservation() {
+        assert!(!ScreenMode::AltScreen.preserves_scrollback());
+        assert!(ScreenMode::Inline { ui_height: 10 }.preserves_scrollback());
+        assert!(
+            ScreenMode::InlineAuto {
+                min_height: 5,
+                max_height: 20
+            }
+            .preserves_scrollback()
+        );
+    }
+
+    #[test]
+    fn screen_mode_is_alt_screen() {
+        assert!(ScreenMode::AltScreen.is_alt_screen());
+        assert!(!ScreenMode::Inline { ui_height: 10 }.is_alt_screen());
     }
 
     #[cfg(feature = "tui")]
