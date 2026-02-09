@@ -2461,6 +2461,20 @@ mod tests {
     }
 
     #[test]
+    fn pack_for_rule_returns_pack_name() {
+        let engine = PatternEngine::new();
+        // Force initialization so rules are loaded
+        let _ = engine.detect("warmup");
+        // Built-in rules should have a pack name
+        if let Some(first_rule) = engine.rules().first() {
+            let pack = engine.pack_for_rule(&first_rule.id);
+            assert!(pack.is_some(), "built-in rule should have a pack");
+        }
+        // Non-existent rule should return None
+        assert!(engine.pack_for_rule("nonexistent.rule.id").is_none());
+    }
+
+    #[test]
     fn from_config_applies_pack_overrides() {
         let dir = tempfile::tempdir().unwrap();
         let pack_path = dir.path().join("test_pack.yaml");
