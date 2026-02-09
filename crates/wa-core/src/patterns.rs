@@ -382,18 +382,36 @@ pub struct RuleDef {
 
 impl RuleDef {
     fn validate(&self) -> Result<()> {
+        self.validate_inner(false)
+    }
+
+    fn validate_user_pack(&self) -> Result<()> {
+        self.validate_inner(true)
+    }
+
+    fn validate_inner(&self, allow_custom_prefix: bool) -> Result<()> {
         if self.id.trim().is_empty() {
             return Err(PatternError::InvalidRule("rule id cannot be empty".to_string()).into());
         }
 
-        if !ALLOWED_RULE_PREFIXES
-            .iter()
-            .any(|prefix| self.id.starts_with(prefix))
+        if !allow_custom_prefix
+            && !ALLOWED_RULE_PREFIXES
+                .iter()
+                .any(|prefix| self.id.starts_with(prefix))
         {
             return Err(PatternError::InvalidRule(format!(
                 "rule id '{}' must start with one of: {}",
                 self.id,
                 ALLOWED_RULE_PREFIXES.join(", ")
+            ))
+            .into());
+        }
+
+        // Even user packs need a dotted namespace (e.g., "myorg.some_rule")
+        if allow_custom_prefix && !self.id.contains('.') {
+            return Err(PatternError::InvalidRule(format!(
+                "rule id '{}' must contain a dot-separated namespace (e.g., 'myorg.my_rule')",
+                self.id
             ))
             .into());
         }
@@ -503,6 +521,31 @@ impl PatternPack {
 
         Ok(())
     }
+
+    fn validate_as_user_pack(&self) -> Result<()> {
+        if self.name.trim().is_empty() {
+            return Err(PatternError::InvalidRule("pack name cannot be empty".to_string()).into());
+        }
+        if self.version.trim().is_empty() {
+            return Err(
+                PatternError::InvalidRule("pack version cannot be empty".to_string()).into(),
+            );
+        }
+
+        let mut seen = HashSet::new();
+        for rule in &self.rules {
+            rule.validate_user_pack()?;
+            if !seen.insert(rule.id.as_str()) {
+                return Err(PatternError::InvalidRule(format!(
+                    "pack '{}' contains duplicate rule id '{}'",
+                    self.name, rule.id
+                ))
+                .into());
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Loaded and merged pattern packs with override semantics
@@ -520,6 +563,35 @@ impl PatternLibrary {
         }
 
         // Track the effective source pack for each rule id. Later packs override earlier packs.
+        let mut rule_to_pack: HashMap<String, String> = HashMap::new();
+        for pack in &packs {
+            for rule in &pack.rules {
+                rule_to_pack.insert(rule.id.clone(), pack.name.clone());
+            }
+        }
+
+        let merged_rules = merge_rules(&packs);
+
+        Ok(Self {
+            packs,
+            merged_rules,
+            rule_to_pack,
+        })
+    }
+
+    /// Build a library where user packs use relaxed validation (custom prefixes allowed).
+    pub fn new_with_user_packs(
+        packs: Vec<PatternPack>,
+        user_pack_names: &HashSet<String>,
+    ) -> Result<Self> {
+        for pack in &packs {
+            if user_pack_names.contains(&pack.name) {
+                pack.validate_as_user_pack()?;
+            } else {
+                pack.validate()?;
+            }
+        }
+
         let mut rule_to_pack: HashMap<String, String> = HashMap::new();
         for pack in &packs {
             for rule in &pack.rules {
@@ -724,15 +796,44 @@ fn builtin_pack_by_name(name: &str) -> Option<PatternPack> {
     }
 }
 
-fn load_packs_from_config(
-    config: &PatternsConfig,
-    root: Option<&Path>,
-) -> Result<Vec<PatternPack>> {
+struct LoadedPacks {
+    packs: Vec<PatternPack>,
+    user_pack_names: HashSet<String>,
+}
+
+fn load_packs_from_config(config: &PatternsConfig, root: Option<&Path>) -> Result<LoadedPacks> {
     let mut packs = Vec::with_capacity(config.packs.len());
     for pack_id in &config.packs {
         packs.push(load_pack_from_id(pack_id, root)?);
     }
-    Ok(packs)
+
+    let mut user_pack_names = HashSet::new();
+
+    // Discover user packs from config dir (e.g. ~/.config/wa/patterns/)
+    if config.user_packs_enabled {
+        if let Some(user_dir) = config.resolved_user_packs_dir() {
+            let discovered = discover_packs_from_dir(&user_dir)?;
+            for pack in discovered {
+                user_pack_names.insert(pack.name.clone());
+                packs.push(pack);
+            }
+        }
+    }
+
+    // Discover workspace-local packs from .wa/patterns/
+    if let Some(root_path) = root {
+        let ws_dir = root_path.join(".wa").join("patterns");
+        let discovered = discover_packs_from_dir(&ws_dir)?;
+        for pack in discovered {
+            user_pack_names.insert(pack.name.clone());
+            packs.push(pack);
+        }
+    }
+
+    Ok(LoadedPacks {
+        packs,
+        user_pack_names,
+    })
 }
 
 fn load_pack_from_id(pack_id: &str, root: Option<&Path>) -> Result<PatternPack> {
@@ -783,6 +884,51 @@ fn load_pack_from_file(path: &str, root: Option<&Path>) -> Result<PatternPack> {
     };
 
     Ok(pack)
+}
+
+fn is_pack_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| matches!(e.to_lowercase().as_str(), "toml" | "yaml" | "yml" | "json"))
+        .unwrap_or(false)
+}
+
+fn discover_packs_from_dir(dir: &Path) -> Result<Vec<PatternPack>> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut packs = Vec::new();
+
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| PatternError::InvalidRule(format!("cannot read {}: {e}", dir.display())))?;
+
+    let mut sorted: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+    sorted.sort_by_key(|e| e.file_name());
+
+    for entry in sorted {
+        let path = entry.path();
+        if path.is_file() && is_pack_file(&path) {
+            match load_pack_from_file(path.to_str().unwrap_or_default(), None) {
+                Ok(pack) => packs.push(pack),
+                Err(e) => {
+                    tracing::warn!("Skipping invalid user pack {}: {e}", path.display());
+                }
+            }
+        } else if path.is_dir() {
+            let rules_file = path.join("rules.toml");
+            if rules_file.is_file() {
+                match load_pack_from_file(rules_file.to_str().unwrap_or_default(), None) {
+                    Ok(pack) => packs.push(pack),
+                    Err(e) => {
+                        tracing::warn!("Skipping invalid user pack {}: {e}", rules_file.display());
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(packs)
 }
 
 fn apply_pack_overrides(
@@ -1141,6 +1287,26 @@ fn builtin_claude_code_pack() -> PatternPack {
                 preview_command: None,
                 learn_more_url: None,
             },
+            // Auth login required (browser auth flow)
+            RuleDef {
+                id: "claude_code.auth.login_required".to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: "auth.login_required".to_string(),
+                severity: Severity::Warning,
+                anchors: vec![
+                    "To sign in".to_string(),
+                    "login required".to_string(),
+                    "please authenticate".to_string(),
+                    "auth required".to_string(),
+                ],
+                regex: None,
+                description: "Claude Code login/authentication required via browser".to_string(),
+                remediation: Some("Complete authentication in the browser window".to_string()),
+                workflow: Some("handle_auth_required".to_string()),
+                manual_fix: Some("Open the provided URL in a browser and complete the login flow".to_string()),
+                preview_command: None,
+                learn_more_url: None,
+            },
             // Tool use indicator
             RuleDef {
                 id: "claude_code.tool_use".to_string(),
@@ -1465,6 +1631,25 @@ fn builtin_gemini_pack() -> PatternPack {
                 preview_command: None,
                 learn_more_url: None,
             },
+            // OAuth required (browser auth flow)
+            RuleDef {
+                id: "gemini.auth.oauth_required".to_string(),
+                agent_type: AgentType::Gemini,
+                event_type: "auth.oauth_required".to_string(),
+                severity: Severity::Warning,
+                anchors: vec![
+                    "authorize this app".to_string(),
+                    "complete authentication".to_string(),
+                    "sign in with Google".to_string(),
+                ],
+                regex: None,
+                description: "Gemini CLI OAuth authentication required via browser".to_string(),
+                remediation: Some("Complete Google OAuth in the browser window".to_string()),
+                workflow: Some("handle_auth_required".to_string()),
+                manual_fix: Some("Open the provided Google OAuth URL in a browser and complete sign-in".to_string()),
+                preview_command: None,
+                learn_more_url: None,
+            },
         ],
     )
 }
@@ -1558,9 +1743,9 @@ impl PatternEngine {
 
     /// Create a new pattern engine using a PatternsConfig and optional root for file packs.
     pub fn from_config_with_root(config: &PatternsConfig, root: Option<&Path>) -> Result<Self> {
-        let packs = load_packs_from_config(config, root)?;
-        let packs = apply_pack_overrides(packs, &config.pack_overrides)?;
-        let library = PatternLibrary::new(packs)?;
+        let loaded = load_packs_from_config(config, root)?;
+        let packs = apply_pack_overrides(loaded.packs, &config.pack_overrides)?;
+        let library = PatternLibrary::new_with_user_packs(packs, &loaded.user_pack_names)?;
         Ok(Self {
             library,
             index: OnceLock::new(),
@@ -4023,5 +4208,261 @@ rules:
             cap_excerpt.contains("[REDACTED]"),
             "expected redaction marker in capture"
         );
+    }
+
+    // ========== User Pattern Pack Tests ==========
+
+    #[test]
+    fn user_pack_toml_loads_from_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack_path = dir.path().join("my-rules.toml");
+        fs::write(
+            &pack_path,
+            r#"
+name = "user:my-rules"
+version = "1.0.0"
+
+[[rules]]
+id = "myorg.custom_alert"
+agent_type = "codex"
+event_type = "custom.alert"
+severity = "warning"
+anchors = ["[MY-ORG] Alert:"]
+description = "Custom org alert"
+"#,
+        )
+        .unwrap();
+
+        let pack = load_pack_from_file(pack_path.to_str().unwrap(), Some(dir.path())).unwrap();
+        assert_eq!(pack.rules.len(), 1);
+        assert_eq!(pack.rules[0].id, "myorg.custom_alert");
+    }
+
+    #[test]
+    fn user_pack_validates_with_custom_prefix() {
+        let pack = PatternPack::new(
+            "user:test",
+            "1.0.0",
+            vec![RuleDef {
+                id: "myorg.custom_rule".to_string(),
+                agent_type: AgentType::Codex,
+                event_type: "custom.event".to_string(),
+                severity: Severity::Warning,
+                anchors: vec!["custom anchor".to_string()],
+                regex: None,
+                description: "Custom rule".to_string(),
+                remediation: None,
+                workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            }],
+        );
+        assert!(pack.validate().is_err());
+        assert!(pack.validate_as_user_pack().is_ok());
+    }
+
+    #[test]
+    fn user_pack_rejects_rule_without_dot() {
+        let pack = PatternPack::new(
+            "user:bad",
+            "1.0.0",
+            vec![RuleDef {
+                id: "noruleid".to_string(),
+                agent_type: AgentType::Codex,
+                event_type: "custom.event".to_string(),
+                severity: Severity::Warning,
+                anchors: vec!["anchor".to_string()],
+                regex: None,
+                description: "Bad rule".to_string(),
+                remediation: None,
+                workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            }],
+        );
+        assert!(pack.validate_as_user_pack().is_err());
+    }
+
+    #[test]
+    fn discover_packs_finds_toml_files() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("alerts.toml"),
+            r#"
+name = "user:alerts"
+version = "1.0.0"
+[[rules]]
+id = "myorg.alert"
+agent_type = "codex"
+event_type = "custom.alert"
+severity = "warning"
+anchors = ["[ALERT]"]
+description = "Alert rule"
+"#,
+        )
+        .unwrap();
+
+        let sub = dir.path().join("monitoring");
+        fs::create_dir(&sub).unwrap();
+        fs::write(
+            sub.join("rules.toml"),
+            r#"
+name = "user:monitoring"
+version = "2.0.0"
+[[rules]]
+id = "monitor.health_check"
+agent_type = "codex"
+event_type = "health.check"
+severity = "info"
+anchors = ["Health check"]
+description = "Health check rule"
+"#,
+        )
+        .unwrap();
+
+        fs::write(dir.path().join("readme.txt"), "not a pack").unwrap();
+
+        let packs = discover_packs_from_dir(dir.path()).unwrap();
+        assert_eq!(packs.len(), 2);
+        let names: Vec<&str> = packs.iter().map(|p| p.name.as_str()).collect();
+        assert!(names.contains(&"user:alerts"));
+        assert!(names.contains(&"user:monitoring"));
+    }
+
+    #[test]
+    fn discover_packs_nonexistent_dir_returns_empty() {
+        let packs = discover_packs_from_dir(Path::new("/nonexistent/path")).unwrap();
+        assert!(packs.is_empty());
+    }
+
+    #[test]
+    fn discover_packs_skips_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("broken.toml"), "this is not valid TOML{{{").unwrap();
+        let packs = discover_packs_from_dir(dir.path()).unwrap();
+        assert!(packs.is_empty());
+    }
+
+    #[test]
+    fn user_pack_rules_detected_by_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("custom.toml"),
+            r#"
+name = "user:custom"
+version = "1.0.0"
+[[rules]]
+id = "myorg.deploy_alert"
+agent_type = "codex"
+event_type = "deploy.alert"
+severity = "critical"
+anchors = ["[DEPLOY-ALERT]"]
+description = "Deployment alert"
+"#,
+        )
+        .unwrap();
+
+        let config = PatternsConfig {
+            user_packs_enabled: true,
+            user_packs_dir: Some(dir.path().to_str().unwrap().to_string()),
+            ..PatternsConfig::default()
+        };
+        let engine = PatternEngine::from_config(&config).unwrap();
+        let detections = engine.detect("[DEPLOY-ALERT] Production deployment failed");
+        assert_eq!(detections.len(), 1);
+        assert_eq!(detections[0].rule_id, "myorg.deploy_alert");
+    }
+
+    #[test]
+    fn user_packs_disabled_skips_discovery() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("custom.toml"),
+            r#"
+name = "user:custom"
+version = "1.0.0"
+[[rules]]
+id = "myorg.deploy_alert"
+agent_type = "codex"
+event_type = "deploy.alert"
+severity = "critical"
+anchors = ["[DEPLOY-ALERT]"]
+description = "Deployment alert"
+"#,
+        )
+        .unwrap();
+
+        let config = PatternsConfig {
+            user_packs_enabled: false,
+            user_packs_dir: Some(dir.path().to_str().unwrap().to_string()),
+            ..PatternsConfig::default()
+        };
+        let engine = PatternEngine::from_config(&config).unwrap();
+        let detections = engine.detect("[DEPLOY-ALERT] Production deployment failed");
+        assert!(detections.is_empty());
+    }
+
+    #[test]
+    fn user_pack_overrides_builtin_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("override.toml"),
+            r#"
+name = "user:override"
+version = "1.0.0"
+[[rules]]
+id = "codex.usage.reached"
+agent_type = "codex"
+event_type = "usage.reached"
+severity = "info"
+anchors = ["custom usage reached"]
+description = "Overridden usage reached"
+"#,
+        )
+        .unwrap();
+
+        let config = PatternsConfig {
+            user_packs_enabled: true,
+            user_packs_dir: Some(dir.path().to_str().unwrap().to_string()),
+            ..PatternsConfig::default()
+        };
+        let engine = PatternEngine::from_config(&config).unwrap();
+        let detections = engine.detect("custom usage reached alert");
+        assert_eq!(detections.len(), 1);
+        assert_eq!(detections[0].rule_id, "codex.usage.reached");
+    }
+
+    #[test]
+    fn workspace_local_packs_loaded() {
+        let root = tempfile::tempdir().unwrap();
+        let ws_dir = root.path().join(".wa").join("patterns");
+        fs::create_dir_all(&ws_dir).unwrap();
+        fs::write(
+            ws_dir.join("local.toml"),
+            r#"
+name = "user:local"
+version = "1.0.0"
+[[rules]]
+id = "project.lint_warning"
+agent_type = "codex"
+event_type = "lint.warning"
+severity = "info"
+anchors = ["[LINT-WARN]"]
+description = "Project lint warning"
+"#,
+        )
+        .unwrap();
+
+        let config = PatternsConfig {
+            user_packs_enabled: false,
+            user_packs_dir: None,
+            ..PatternsConfig::default()
+        };
+        let engine = PatternEngine::from_config_with_root(&config, Some(root.path())).unwrap();
+        let detections = engine.detect("[LINT-WARN] unused variable");
+        assert_eq!(detections.len(), 1);
+        assert_eq!(detections[0].rule_id, "project.lint_warning");
     }
 }

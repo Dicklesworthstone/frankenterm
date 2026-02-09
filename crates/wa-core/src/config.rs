@@ -1103,6 +1103,12 @@ pub struct PatternsConfig {
 
     /// Enable quick-reject optimization (memchr-based pre-filtering)
     pub quick_reject_enabled: bool,
+
+    /// Enable auto-discovery of user pattern packs from config directory.
+    pub user_packs_enabled: bool,
+
+    /// Override user patterns directory (default: ~/.config/wa/patterns/).
+    pub user_packs_dir: Option<String>,
 }
 
 impl Default for PatternsConfig {
@@ -1117,7 +1123,19 @@ impl Default for PatternsConfig {
             ],
             pack_overrides: HashMap::new(),
             quick_reject_enabled: true,
+            user_packs_enabled: true,
+            user_packs_dir: None,
         }
+    }
+}
+
+impl PatternsConfig {
+    /// Resolve the user patterns directory.
+    pub fn resolved_user_packs_dir(&self) -> Option<PathBuf> {
+        if let Some(ref explicit) = self.user_packs_dir {
+            return Some(expand_tilde(explicit));
+        }
+        dirs_config_path().map(|d| d.join("patterns"))
     }
 }
 
