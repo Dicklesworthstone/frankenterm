@@ -891,6 +891,352 @@ mod tests {
         assert!(state.triage_expanded.is_none());
     }
 
+    // -- FTUI-07.1 gap-fill tests --
+
+    #[test]
+    fn reduce_prev_view() {
+        let mut state = UiState::default();
+        assert_eq!(state.active_view, View::Home);
+        reduce(&mut state, UiAction::PrevView);
+        assert_eq!(state.active_view, View::Help);
+        reduce(&mut state, UiAction::PrevView);
+        assert_eq!(state.active_view, View::Search);
+    }
+
+    #[test]
+    fn list_state_select_prev_empty() {
+        let mut ls = ListState { selected: 0 };
+        ls.select_prev(0);
+        assert_eq!(ls.selected, 0);
+    }
+
+    #[test]
+    fn reduce_select_prev_per_view() {
+        let mut state = UiState {
+            active_view: View::Panes,
+            panes_filtered_count: 5,
+            panes: ListState { selected: 2 },
+            ..Default::default()
+        };
+        reduce(&mut state, UiAction::SelectPrev);
+        assert_eq!(state.panes.selected, 1);
+    }
+
+    #[test]
+    fn reduce_select_dispatches_triage() {
+        let mut state = UiState {
+            active_view: View::Triage,
+            triage_count: 4,
+            ..Default::default()
+        };
+        reduce(&mut state, UiAction::SelectNext);
+        assert_eq!(state.triage.selected, 1);
+        reduce(&mut state, UiAction::SelectPrev);
+        assert_eq!(state.triage.selected, 0);
+    }
+
+    #[test]
+    fn reduce_select_dispatches_history() {
+        let mut state = UiState {
+            active_view: View::History,
+            history_filtered_count: 3,
+            ..Default::default()
+        };
+        reduce(&mut state, UiAction::SelectNext);
+        assert_eq!(state.history.selected, 1);
+        reduce(&mut state, UiAction::SelectPrev);
+        assert_eq!(state.history.selected, 0);
+    }
+
+    #[test]
+    fn reduce_select_dispatches_search() {
+        let mut state = UiState {
+            active_view: View::Search,
+            search_results_count: 5,
+            ..Default::default()
+        };
+        reduce(&mut state, UiAction::SelectNext);
+        assert_eq!(state.search_results.selected, 1);
+    }
+
+    #[test]
+    fn reduce_select_noop_home_help() {
+        let mut state = UiState {
+            active_view: View::Home,
+            ..Default::default()
+        };
+        reduce(&mut state, UiAction::SelectNext);
+        // Home has no list — nothing should change
+        assert_eq!(state.panes.selected, 0);
+
+        state.active_view = View::Help;
+        reduce(&mut state, UiAction::SelectNext);
+        assert_eq!(state.panes.selected, 0);
+    }
+
+    #[test]
+    fn reduce_cycle_profile() {
+        let mut state = UiState {
+            profiles_count: 3,
+            ..Default::default()
+        };
+        assert_eq!(state.panes_profile_index, 0);
+        reduce(&mut state, UiAction::CycleProfile);
+        assert_eq!(state.panes_profile_index, 1);
+        reduce(&mut state, UiAction::CycleProfile);
+        assert_eq!(state.panes_profile_index, 2);
+        reduce(&mut state, UiAction::CycleProfile);
+        assert_eq!(state.panes_profile_index, 0); // Wraps
+    }
+
+    #[test]
+    fn reduce_cycle_profile_zero_noop() {
+        let mut state = UiState::default();
+        assert_eq!(state.profiles_count, 0);
+        reduce(&mut state, UiAction::CycleProfile);
+        assert_eq!(state.panes_profile_index, 0);
+    }
+
+    // -- events filter tests --
+
+    #[test]
+    fn reduce_events_push_filter_char() {
+        let mut state = UiState::default();
+        reduce(&mut state, UiAction::PushEventsFilterChar('4'));
+        reduce(&mut state, UiAction::PushEventsFilterChar('2'));
+        assert_eq!(state.events_pane_filter, "42");
+    }
+
+    #[test]
+    fn reduce_events_pop_filter_char() {
+        let mut state = UiState {
+            events_pane_filter: "42".to_string(),
+            ..Default::default()
+        };
+        reduce(&mut state, UiAction::PopEventsFilterChar);
+        assert_eq!(state.events_pane_filter, "4");
+        reduce(&mut state, UiAction::PopEventsFilterChar);
+        assert!(state.events_pane_filter.is_empty());
+        reduce(&mut state, UiAction::PopEventsFilterChar);
+        assert!(state.events_pane_filter.is_empty()); // No panic on empty
+    }
+
+    #[test]
+    fn reduce_events_clear_filter() {
+        let mut state = UiState {
+            events_pane_filter: "abc".to_string(),
+            events: ListState { selected: 5 },
+            ..Default::default()
+        };
+        reduce(&mut state, UiAction::ClearEventsFilter);
+        assert!(state.events_pane_filter.is_empty());
+        assert_eq!(state.events.selected, 0);
+    }
+
+    #[test]
+    fn reduce_events_toggle_unhandled() {
+        let mut state = UiState {
+            events: ListState { selected: 3 },
+            ..Default::default()
+        };
+        assert!(!state.events_unhandled_only);
+        reduce(&mut state, UiAction::ToggleEventsUnhandled);
+        assert!(state.events_unhandled_only);
+        assert_eq!(state.events.selected, 0);
+        reduce(&mut state, UiAction::ToggleEventsUnhandled);
+        assert!(!state.events_unhandled_only);
+    }
+
+    // -- history filter tests --
+
+    #[test]
+    fn reduce_history_push_filter_char() {
+        let mut state = UiState::default();
+        reduce(&mut state, UiAction::PushHistoryFilterChar('s'));
+        reduce(&mut state, UiAction::PushHistoryFilterChar('e'));
+        assert_eq!(state.history_filter, "se");
+        assert_eq!(state.history.selected, 0);
+    }
+
+    #[test]
+    fn reduce_history_push_resets_selection() {
+        let mut state = UiState {
+            history: ListState { selected: 5 },
+            ..Default::default()
+        };
+        reduce(&mut state, UiAction::PushHistoryFilterChar('x'));
+        assert_eq!(state.history.selected, 0);
+    }
+
+    #[test]
+    fn reduce_history_pop_filter_char() {
+        let mut state = UiState {
+            history_filter: "abc".to_string(),
+            ..Default::default()
+        };
+        reduce(&mut state, UiAction::PopHistoryFilterChar);
+        assert_eq!(state.history_filter, "ab");
+    }
+
+    #[test]
+    fn reduce_history_clear_filter() {
+        let mut state = UiState {
+            history_filter: "test".to_string(),
+            history: ListState { selected: 3 },
+            ..Default::default()
+        };
+        reduce(&mut state, UiAction::ClearHistoryFilter);
+        assert!(state.history_filter.is_empty());
+        assert_eq!(state.history.selected, 0);
+    }
+
+    #[test]
+    fn reduce_history_toggle_undoable() {
+        let mut state = UiState {
+            history: ListState { selected: 2 },
+            ..Default::default()
+        };
+        assert!(!state.history_undoable_only);
+        reduce(&mut state, UiAction::ToggleHistoryUndoable);
+        assert!(state.history_undoable_only);
+        assert_eq!(state.history.selected, 0);
+        reduce(&mut state, UiAction::ToggleHistoryUndoable);
+        assert!(!state.history_undoable_only);
+    }
+
+    // -- saved search cycle tests --
+
+    #[test]
+    fn reduce_cycle_saved_search_next() {
+        let mut state = UiState {
+            saved_searches_count: 3,
+            ..Default::default()
+        };
+        reduce(&mut state, UiAction::CycleSavedSearchNext);
+        assert_eq!(state.saved_search_index, 1);
+        reduce(&mut state, UiAction::CycleSavedSearchNext);
+        assert_eq!(state.saved_search_index, 2);
+        reduce(&mut state, UiAction::CycleSavedSearchNext);
+        assert_eq!(state.saved_search_index, 0); // Wraps
+    }
+
+    #[test]
+    fn reduce_cycle_saved_search_prev() {
+        let mut state = UiState {
+            saved_searches_count: 3,
+            ..Default::default()
+        };
+        reduce(&mut state, UiAction::CycleSavedSearchPrev);
+        assert_eq!(state.saved_search_index, 2); // Wraps to end
+        reduce(&mut state, UiAction::CycleSavedSearchPrev);
+        assert_eq!(state.saved_search_index, 1);
+        reduce(&mut state, UiAction::CycleSavedSearchPrev);
+        assert_eq!(state.saved_search_index, 0);
+    }
+
+    #[test]
+    fn reduce_cycle_saved_search_empty_noop() {
+        let mut state = UiState::default();
+        assert_eq!(state.saved_searches_count, 0);
+        reduce(&mut state, UiAction::CycleSavedSearchNext);
+        assert_eq!(state.saved_search_index, 0);
+        reduce(&mut state, UiAction::CycleSavedSearchPrev);
+        assert_eq!(state.saved_search_index, 0);
+    }
+
+    // -- clear error test --
+
+    #[test]
+    fn reduce_clear_error() {
+        let mut state = UiState {
+            error: Some("something failed".to_string()),
+            ..Default::default()
+        };
+        reduce(&mut state, UiAction::ClearError);
+        assert!(state.error.is_none());
+    }
+
+    #[test]
+    fn reduce_clear_error_when_none() {
+        let mut state = UiState::default();
+        reduce(&mut state, UiAction::ClearError);
+        assert!(state.error.is_none());
+    }
+
+    // -- panes toggle tests --
+
+    #[test]
+    fn reduce_toggle_unhandled_only() {
+        let mut state = UiState {
+            panes: ListState { selected: 3 },
+            ..Default::default()
+        };
+        reduce(&mut state, UiAction::ToggleUnhandledOnly);
+        assert!(state.panes_unhandled_only);
+        assert_eq!(state.panes.selected, 0);
+        reduce(&mut state, UiAction::ToggleUnhandledOnly);
+        assert!(!state.panes_unhandled_only);
+    }
+
+    #[test]
+    fn reduce_toggle_bookmarked_only() {
+        let mut state = UiState {
+            panes: ListState { selected: 2 },
+            ..Default::default()
+        };
+        reduce(&mut state, UiAction::ToggleBookmarkedOnly);
+        assert!(state.panes_bookmarked_only);
+        assert_eq!(state.panes.selected, 0);
+    }
+
+    #[test]
+    fn reduce_pop_panes_filter() {
+        let mut state = UiState {
+            panes_filter: "abc".to_string(),
+            ..Default::default()
+        };
+        let effects = reduce(&mut state, UiAction::PopPanesFilterChar);
+        assert_eq!(state.panes_filter, "ab");
+        assert_eq!(effects, vec![Effect::RefreshData]);
+    }
+
+    // -- search backspace test --
+
+    #[test]
+    fn reduce_pop_search_char() {
+        let mut state = UiState {
+            search_query: "hello".to_string(),
+            ..Default::default()
+        };
+        reduce(&mut state, UiAction::PopSearchChar);
+        assert_eq!(state.search_query, "hell");
+    }
+
+    // -- DataRefreshed clears triage_expanded within range --
+
+    #[test]
+    fn reduce_data_refreshed_preserves_triage_expanded_in_range() {
+        let mut state = UiState {
+            triage_expanded: Some(1),
+            ..Default::default()
+        };
+        reduce(
+            &mut state,
+            UiAction::DataRefreshed {
+                panes_count: 0,
+                panes_filtered_count: 0,
+                events_count: 0,
+                events_filtered_count: 0,
+                triage_count: 5,
+                history_count: 0,
+                history_filtered_count: 0,
+                saved_searches_count: 0,
+                profiles_count: 0,
+            },
+        );
+        assert_eq!(state.triage_expanded, Some(1)); // Still valid
+    }
+
     #[test]
     fn determinism_identical_inputs_produce_identical_outputs() {
         // Run the same sequence twice and verify state matches.

@@ -732,6 +732,123 @@ mod tests {
         assert!(!ScreenMode::Inline { ui_height: 10 }.is_alt_screen());
     }
 
+    // -- FTUI-07.1 gap-fill tests --
+
+    #[test]
+    fn area_non_empty() {
+        let a = Area::new(5, 10, 80, 24);
+        assert!(!a.is_empty());
+        assert_eq!(a.x, 5);
+        assert_eq!(a.y, 10);
+    }
+
+    #[test]
+    fn area_zero_width_is_empty() {
+        let a = Area::new(0, 0, 0, 24);
+        assert!(a.is_empty());
+    }
+
+    #[test]
+    fn area_split_top_zero() {
+        let area = Area::new(0, 0, 80, 24);
+        let (top, bot) = area.split_top(0);
+        assert!(top.is_empty());
+        assert_eq!(bot, area);
+    }
+
+    #[test]
+    fn style_spec_reversed_builder() {
+        let s = StyleSpec::new().fg(ColorSpec::Red).reversed();
+        assert!(s.reversed);
+        assert!(!s.bold);
+        assert_eq!(s.fg, Some(ColorSpec::Red));
+    }
+
+    #[test]
+    fn style_spec_default_all_false() {
+        let s = StyleSpec::default();
+        assert!(s.fg.is_none());
+        assert!(s.bg.is_none());
+        assert!(!s.bold);
+        assert!(!s.dim);
+        assert!(!s.italic);
+        assert!(!s.underline);
+        assert!(!s.reversed);
+    }
+
+    #[test]
+    fn style_spec_bg_only() {
+        let s = StyleSpec::new().bg(ColorSpec::Cyan);
+        assert!(s.fg.is_none());
+        assert_eq!(s.bg, Some(ColorSpec::Cyan));
+    }
+
+    #[test]
+    fn color_spec_rgb_equality() {
+        assert_eq!(ColorSpec::Rgb(255, 0, 128), ColorSpec::Rgb(255, 0, 128));
+        assert_ne!(ColorSpec::Rgb(255, 0, 128), ColorSpec::Rgb(0, 0, 128));
+    }
+
+    #[test]
+    fn key_input_new_no_modifiers() {
+        let ki = KeyInput::new(Key::Enter);
+        assert!(!ki.ctrl);
+        assert!(!ki.alt);
+        assert!(!ki.shift);
+        assert_eq!(ki.key, Key::Enter);
+    }
+
+    #[test]
+    fn key_input_is_char_non_char_key() {
+        let ki = KeyInput::new(Key::Esc);
+        assert!(!ki.is_char('q'));
+    }
+
+    #[test]
+    fn key_input_all_modifiers() {
+        let ki = KeyInput {
+            key: Key::Char('a'),
+            ctrl: true,
+            alt: true,
+            shift: true,
+        };
+        assert!(ki.ctrl);
+        assert!(ki.alt);
+        assert!(ki.shift);
+        assert!(ki.is_char('a'));
+    }
+
+    #[test]
+    fn input_event_resize_fields() {
+        let ev = InputEvent::Resize {
+            width: 120,
+            height: 40,
+        };
+        if let InputEvent::Resize { width, height } = ev {
+            assert_eq!(width, 120);
+            assert_eq!(height, 40);
+        } else {
+            panic!("Expected Resize variant");
+        }
+    }
+
+    #[test]
+    fn key_enum_f_key() {
+        let ki = KeyInput::new(Key::F(5));
+        assert_eq!(ki.key, Key::F(5));
+        assert!(!ki.is_char('5'));
+    }
+
+    #[test]
+    fn screen_mode_inline_auto_is_not_alt() {
+        let mode = ScreenMode::InlineAuto {
+            min_height: 5,
+            max_height: 20,
+        };
+        assert!(!mode.is_alt_screen());
+        assert!(mode.preserves_scrollback());
+    }
+
     #[cfg(feature = "tui")]
     mod ratatui_compat {
         use super::*;

@@ -203,6 +203,117 @@ impl ModalState {
 }
 
 // ---------------------------------------------------------------------------
+// TextInput — reusable text editing widget (FTUI-06.4)
+// ---------------------------------------------------------------------------
+
+/// Reusable text input with cursor position tracking.
+///
+/// Provides deterministic editing semantics: insert at cursor, delete left/right,
+/// cursor movement, and clear.  Used by search, events filter, and history filter.
+#[derive(Debug, Clone, Default)]
+pub struct TextInput {
+    text: String,
+    cursor: usize,
+}
+
+#[allow(dead_code)] // Methods used as integration progresses (FTUI-06.4+)
+impl TextInput {
+    /// Create a new empty text input.
+    fn new() -> Self {
+        Self {
+            text: String::new(),
+            cursor: 0,
+        }
+    }
+
+    /// The current text content.
+    fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// The cursor position (byte offset, always on a char boundary).
+    fn cursor_pos(&self) -> usize {
+        self.cursor
+    }
+
+    /// Whether the input is empty.
+    fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    /// Insert a character at the cursor position and advance cursor.
+    fn insert_char(&mut self, c: char) {
+        self.text.insert(self.cursor, c);
+        self.cursor += c.len_utf8();
+    }
+
+    /// Delete the character before the cursor (backspace).
+    fn delete_back(&mut self) {
+        if self.cursor > 0 {
+            // Find previous char boundary.
+            let prev = self.text[..self.cursor]
+                .char_indices()
+                .next_back()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            self.text.remove(prev);
+            self.cursor = prev;
+        }
+    }
+
+    /// Delete the character at the cursor (forward delete).
+    fn delete_forward(&mut self) {
+        if self.cursor < self.text.len() {
+            self.text.remove(self.cursor);
+        }
+    }
+
+    /// Clear all text and reset cursor.
+    fn clear(&mut self) {
+        self.text.clear();
+        self.cursor = 0;
+    }
+
+    /// Move cursor one character left.
+    fn move_left(&mut self) {
+        if self.cursor > 0 {
+            self.cursor = self.text[..self.cursor]
+                .char_indices()
+                .next_back()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+        }
+    }
+
+    /// Move cursor one character right.
+    fn move_right(&mut self) {
+        if self.cursor < self.text.len() {
+            self.cursor = self.text[self.cursor..]
+                .char_indices()
+                .nth(1)
+                .map(|(i, _)| self.cursor + i)
+                .unwrap_or(self.text.len());
+        }
+    }
+
+    /// Move cursor to start of text.
+    fn move_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    /// Move cursor to end of text.
+    fn move_end(&mut self) {
+        self.cursor = self.text.len();
+    }
+
+    /// Set text content, placing cursor at end.
+    fn set_text(&mut self, text: String) {
+        self.cursor = text.len();
+        self.text = text;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ViewState — per-view data
 // ---------------------------------------------------------------------------
 
@@ -232,7 +343,7 @@ pub struct EventsViewState {
     /// Show only unhandled events.
     pub unhandled_only: bool,
     /// Pane/rule text filter (digits for pane, text for rule).
-    pub pane_filter: String,
+    pub pane_filter: TextInput,
     /// Currently selected index within the filtered list.
     pub selected_index: usize,
 }
@@ -240,7 +351,7 @@ pub struct EventsViewState {
 impl EventsViewState {
     /// Return indices of events matching the current filters.
     pub fn filtered_indices(&self) -> Vec<usize> {
-        let query = self.pane_filter.trim();
+        let query = self.pane_filter.text().trim();
         self.items
             .iter()
             .enumerate()
@@ -278,7 +389,7 @@ pub struct HistoryViewState {
     /// Show only undoable actions.
     pub undoable_only: bool,
     /// Free-text filter (matches pane, workflow, action, audit ID).
-    pub filter_query: String,
+    pub filter_input: TextInput,
     /// Currently selected index within filtered results.
     pub selected_index: usize,
 }
@@ -286,7 +397,7 @@ pub struct HistoryViewState {
 impl HistoryViewState {
     /// Return indices of history entries matching the current filters.
     pub fn filtered_indices(&self) -> Vec<usize> {
-        let query = self.filter_query.trim().to_ascii_lowercase();
+        let query = self.filter_input.text().trim().to_ascii_lowercase();
         self.items
             .iter()
             .enumerate()
@@ -390,8 +501,8 @@ pub struct WaModel {
     triage_queued_action: Option<String>,
     // Modal overlay state (FTUI-06.3).
     active_modal: Option<ModalState>,
-    // Search view state.
-    search_query: String,
+    // Search view state (FTUI-06.4: uses TextInput for cursor-aware editing).
+    search_input: TextInput,
     search_last_query: String,
     search_results: Vec<SearchRow>,
     search_selected: usize,
@@ -416,7 +527,7 @@ impl WaModel {
             workflows: Vec::new(),
             triage_queued_action: None,
             active_modal: None,
-            search_query: String::new(),
+            search_input: TextInput::new(),
             search_last_query: String::new(),
             search_results: Vec::new(),
             search_selected: 0,
@@ -693,18 +804,39 @@ impl WaModel {
                 ftui::Cmd::None
             }
             KeyCode::Backspace => {
-                self.view_state.history.filter_query.pop();
+                self.view_state.history.filter_input.delete_back();
+                self.view_state.history.selected_index = 0;
+                ftui::Cmd::None
+            }
+            KeyCode::Delete => {
+                self.view_state.history.filter_input.delete_forward();
                 self.view_state.history.selected_index = 0;
                 ftui::Cmd::None
             }
             KeyCode::Escape => {
-                self.view_state.history.filter_query.clear();
+                self.view_state.history.filter_input.clear();
                 self.view_state.history.undoable_only = false;
                 self.view_state.history.selected_index = 0;
                 ftui::Cmd::None
             }
+            KeyCode::Left => {
+                self.view_state.history.filter_input.move_left();
+                ftui::Cmd::None
+            }
+            KeyCode::Right => {
+                self.view_state.history.filter_input.move_right();
+                ftui::Cmd::None
+            }
+            KeyCode::Home => {
+                self.view_state.history.filter_input.move_home();
+                ftui::Cmd::None
+            }
+            KeyCode::End => {
+                self.view_state.history.filter_input.move_end();
+                ftui::Cmd::None
+            }
             KeyCode::Char(c) if !c.is_control() => {
-                self.view_state.history.filter_query.push(c);
+                self.view_state.history.filter_input.insert_char(c);
                 self.view_state.history.selected_index = 0;
                 ftui::Cmd::None
             }
@@ -721,15 +853,35 @@ impl WaModel {
 
         match key.code {
             KeyCode::Char(c) => {
-                self.search_query.push(c);
+                self.search_input.insert_char(c);
                 ftui::Cmd::None
             }
             KeyCode::Backspace => {
-                self.search_query.pop();
+                self.search_input.delete_back();
+                ftui::Cmd::None
+            }
+            KeyCode::Delete => {
+                self.search_input.delete_forward();
+                ftui::Cmd::None
+            }
+            KeyCode::Left => {
+                self.search_input.move_left();
+                ftui::Cmd::None
+            }
+            KeyCode::Right => {
+                self.search_input.move_right();
+                ftui::Cmd::None
+            }
+            KeyCode::Home => {
+                self.search_input.move_home();
+                ftui::Cmd::None
+            }
+            KeyCode::End => {
+                self.search_input.move_end();
                 ftui::Cmd::None
             }
             KeyCode::Enter => {
-                let query = self.search_query.trim().to_string();
+                let query = self.search_input.text().trim().to_string();
                 if query.is_empty() {
                     return ftui::Cmd::None;
                 }
@@ -749,7 +901,7 @@ impl WaModel {
                 ftui::Cmd::None
             }
             KeyCode::Escape => {
-                self.search_query.clear();
+                self.search_input.clear();
                 self.search_last_query.clear();
                 self.search_results.clear();
                 self.search_selected = 0;
@@ -810,7 +962,12 @@ impl WaModel {
                 ftui::Cmd::None
             }
             KeyCode::Backspace => {
-                self.view_state.events.pane_filter.pop();
+                self.view_state.events.pane_filter.delete_back();
+                self.view_state.events.selected_index = 0;
+                ftui::Cmd::None
+            }
+            KeyCode::Delete => {
+                self.view_state.events.pane_filter.delete_forward();
                 self.view_state.events.selected_index = 0;
                 ftui::Cmd::None
             }
@@ -819,8 +976,24 @@ impl WaModel {
                 self.view_state.events.selected_index = 0;
                 ftui::Cmd::None
             }
+            KeyCode::Left => {
+                self.view_state.events.pane_filter.move_left();
+                ftui::Cmd::None
+            }
+            KeyCode::Right => {
+                self.view_state.events.pane_filter.move_right();
+                ftui::Cmd::None
+            }
+            KeyCode::Home => {
+                self.view_state.events.pane_filter.move_home();
+                ftui::Cmd::None
+            }
+            KeyCode::End => {
+                self.view_state.events.pane_filter.move_end();
+                ftui::Cmd::None
+            }
             KeyCode::Char(c) if c.is_ascii_digit() => {
-                self.view_state.events.pane_filter.push(c);
+                self.view_state.events.pane_filter.insert_char(c);
                 self.view_state.events.selected_index = 0;
                 ftui::Cmd::None
             }
@@ -1107,7 +1280,7 @@ impl ftui::Model for WaModel {
                 content_y,
                 width,
                 content_h,
-                &self.search_query,
+                self.search_input.text(),
                 &self.search_last_query,
                 &self.search_results,
                 self.search_selected,
@@ -1904,7 +2077,7 @@ fn render_events_view(
         filtered_indices.len(),
         events_state.items.len(),
         events_state.unhandled_only,
-        events_state.pane_filter,
+        events_state.pane_filter.text(),
     );
     write_styled(frame, 0, row, &header, CellStyle::new().bold());
     let hlen = header.len() as u16;
@@ -2387,7 +2560,7 @@ fn render_history_view(
         filtered_indices.len(),
         history_state.items.len(),
         history_state.undoable_only,
-        history_state.filter_query,
+        history_state.filter_input.text(),
     );
     write_styled(frame, 0, row, &header, CellStyle::new().bold());
     let hlen = header.len() as u16;
@@ -3689,7 +3862,7 @@ mod tests {
         model.view_state.current_view = View::Search;
         press_key(&mut model, ftui::KeyCode::Char('h'));
         press_key(&mut model, ftui::KeyCode::Char('i'));
-        assert_eq!(model.search_query, "hi");
+        assert_eq!(model.search_input.text(), "hi");
     }
 
     #[test]
@@ -3699,7 +3872,7 @@ mod tests {
         press_key(&mut model, ftui::KeyCode::Char('a'));
         press_key(&mut model, ftui::KeyCode::Char('b'));
         press_key(&mut model, ftui::KeyCode::Backspace);
-        assert_eq!(model.search_query, "a");
+        assert_eq!(model.search_input.text(), "a");
     }
 
     #[test]
@@ -3707,7 +3880,7 @@ mod tests {
         let mock = MockQuery::healthy().with_search_results(sample_search_results());
         let mut model = make_model(mock);
         model.view_state.current_view = View::Search;
-        model.search_query = "error".into();
+        model.search_input.set_text("error".into());
         press_key(&mut model, ftui::KeyCode::Enter);
         assert_eq!(model.search_last_query, "error");
         assert_eq!(model.search_results.len(), 2);
@@ -3718,7 +3891,7 @@ mod tests {
     fn search_enter_empty_query_noop() {
         let mut model = make_model(MockQuery::healthy());
         model.view_state.current_view = View::Search;
-        model.search_query = "  ".into();
+        model.search_input.set_text("  ".into());
         press_key(&mut model, ftui::KeyCode::Enter);
         assert!(model.search_results.is_empty());
         assert!(model.search_last_query.is_empty());
@@ -3729,11 +3902,11 @@ mod tests {
         let mock = MockQuery::healthy().with_search_results(sample_search_results());
         let mut model = make_model(mock);
         model.view_state.current_view = View::Search;
-        model.search_query = "error".into();
+        model.search_input.set_text("error".into());
         press_key(&mut model, ftui::KeyCode::Enter);
         assert!(!model.search_results.is_empty());
         press_key(&mut model, ftui::KeyCode::Escape);
-        assert!(model.search_query.is_empty());
+        assert!(model.search_input.text().is_empty());
         assert!(model.search_last_query.is_empty());
         assert!(model.search_results.is_empty());
         assert_eq!(model.search_selected, 0);
@@ -3744,7 +3917,7 @@ mod tests {
         let mock = MockQuery::healthy().with_search_results(sample_search_results());
         let mut model = make_model(mock);
         model.view_state.current_view = View::Search;
-        model.search_query = "error".into();
+        model.search_input.set_text("error".into());
         press_key(&mut model, ftui::KeyCode::Enter);
         assert_eq!(model.search_selected, 0);
         press_key(&mut model, ftui::KeyCode::Down);
@@ -3763,7 +3936,7 @@ mod tests {
         let result = model.handle_global_key(&key);
         assert!(result.is_none());
         model.handle_view_key(&key);
-        assert_eq!(model.search_query, "q");
+        assert_eq!(model.search_input.text(), "q");
     }
 
     #[test]
@@ -3889,7 +4062,7 @@ mod tests {
     fn events_filtering_pane_filter() {
         let mut model = make_model(MockQuery::with_events());
         model.refresh_data();
-        model.view_state.events.pane_filter = "42".to_string();
+        model.view_state.events.pane_filter.set_text("42".to_string());
         let indices = model.view_state.events.filtered_indices();
         assert_eq!(indices.len(), 2); // events 0 and 2 are pane 42
     }
@@ -3899,7 +4072,7 @@ mod tests {
         let mut model = make_model(MockQuery::with_events());
         model.refresh_data();
         model.view_state.events.unhandled_only = true;
-        model.view_state.events.pane_filter = "7".to_string();
+        model.view_state.events.pane_filter.set_text("7".to_string());
         let indices = model.view_state.events.filtered_indices();
         assert_eq!(indices.len(), 0); // pane 7 event is handled
     }
@@ -3962,9 +4135,9 @@ mod tests {
         model.refresh_data();
 
         press_key(&mut model, ftui::KeyCode::Char('4'));
-        assert_eq!(model.view_state.events.pane_filter, "4");
+        assert_eq!(model.view_state.events.pane_filter.text(), "4");
         press_key(&mut model, ftui::KeyCode::Char('2'));
-        assert_eq!(model.view_state.events.pane_filter, "42");
+        assert_eq!(model.view_state.events.pane_filter.text(), "42");
     }
 
     #[test]
@@ -3972,10 +4145,10 @@ mod tests {
         let mut model = make_model(MockQuery::with_events());
         model.view_state.current_view = View::Events;
         model.refresh_data();
-        model.view_state.events.pane_filter = "42".to_string();
+        model.view_state.events.pane_filter.set_text("42".to_string());
 
         press_key(&mut model, ftui::KeyCode::Backspace);
-        assert_eq!(model.view_state.events.pane_filter, "4");
+        assert_eq!(model.view_state.events.pane_filter.text(), "4");
     }
 
     #[test]
@@ -3983,7 +4156,7 @@ mod tests {
         let mut model = make_model(MockQuery::with_events());
         model.view_state.current_view = View::Events;
         model.refresh_data();
-        model.view_state.events.pane_filter = "42".to_string();
+        model.view_state.events.pane_filter.set_text("42".to_string());
         model.view_state.events.selected_index = 1;
 
         press_key(&mut model, ftui::KeyCode::Escape);
@@ -4604,7 +4777,7 @@ mod tests {
             };
             model.handle_view_key(&key);
         }
-        assert_eq!(model.view_state.history.filter_query, "wait_for");
+        assert_eq!(model.view_state.history.filter_input.text(), "wait_for");
         assert_eq!(model.view_state.history.filtered_indices().len(), 1);
         assert_eq!(model.view_state.history.filtered_indices()[0], 1);
     }
@@ -4623,7 +4796,7 @@ mod tests {
             };
             model.handle_view_key(&key);
         }
-        assert_eq!(model.view_state.history.filter_query, "abc");
+        assert_eq!(model.view_state.history.filter_input.text(), "abc");
 
         let bs = ftui::KeyEvent {
             code: ftui::KeyCode::Backspace,
@@ -4631,7 +4804,7 @@ mod tests {
             modifiers: ftui::Modifiers::empty(),
         };
         model.handle_view_key(&bs);
-        assert_eq!(model.view_state.history.filter_query, "ab");
+        assert_eq!(model.view_state.history.filter_input.text(), "ab");
     }
 
     #[test]
@@ -4640,7 +4813,7 @@ mod tests {
         model.refresh_data();
         model.view_state.current_view = View::History;
 
-        model.view_state.history.filter_query = "test".to_string();
+        model.view_state.history.filter_input.set_text("test".to_string());
         model.view_state.history.undoable_only = true;
         model.view_state.history.selected_index = 1;
 
@@ -4650,7 +4823,7 @@ mod tests {
             modifiers: ftui::Modifiers::empty(),
         };
         model.handle_view_key(&esc);
-        assert!(model.view_state.history.filter_query.is_empty());
+        assert!(model.view_state.history.filter_input.text().is_empty());
         assert!(!model.view_state.history.undoable_only);
         assert_eq!(model.view_state.history.selected_index, 0);
     }
@@ -4668,7 +4841,7 @@ mod tests {
         };
         let cmd = model.handle_view_key(&key);
         assert!(!matches!(cmd, ftui::Cmd::Quit));
-        assert_eq!(model.view_state.history.filter_query, "q");
+        assert_eq!(model.view_state.history.filter_input.text(), "q");
     }
 
     #[test]
@@ -4684,7 +4857,7 @@ mod tests {
         };
         model.handle_view_key(&key);
         assert_eq!(model.view_state.current_view, View::History);
-        assert_eq!(model.view_state.history.filter_query, "3");
+        assert_eq!(model.view_state.history.filter_input.text(), "3");
     }
 
     #[test]
@@ -4701,7 +4874,7 @@ mod tests {
         let mut model = make_model(MockQuery::with_history());
         model.refresh_data();
 
-        model.view_state.history.filter_query = "send_text".to_string();
+        model.view_state.history.filter_input.set_text("send_text".to_string());
         model.view_state.history.undoable_only = true;
         let filtered = model.view_state.history.filtered_indices();
         assert_eq!(filtered.len(), 2);
@@ -4970,5 +5143,155 @@ mod tests {
         let text: String = (0..24).map(|r| read_row(&frame, r)).collect::<Vec<_>>().join("\n");
         assert!(text.contains("dismiss"), "Should show dismiss hint: {text}");
         assert!(text.contains("Oops"), "Should show title: {text}");
+    }
+
+    // -- TextInput unit tests (FTUI-06.4) --
+
+    #[test]
+    fn text_input_insert_and_cursor() {
+        let mut ti = TextInput::new();
+        ti.insert_char('a');
+        ti.insert_char('b');
+        ti.insert_char('c');
+        assert_eq!(ti.text(), "abc");
+        assert_eq!(ti.cursor_pos(), 3);
+    }
+
+    #[test]
+    fn text_input_delete_back() {
+        let mut ti = TextInput::new();
+        ti.insert_char('a');
+        ti.insert_char('b');
+        ti.delete_back();
+        assert_eq!(ti.text(), "a");
+        assert_eq!(ti.cursor_pos(), 1);
+    }
+
+    #[test]
+    fn text_input_delete_back_empty() {
+        let mut ti = TextInput::new();
+        ti.delete_back();
+        assert_eq!(ti.text(), "");
+        assert_eq!(ti.cursor_pos(), 0);
+    }
+
+    #[test]
+    fn text_input_delete_forward() {
+        let mut ti = TextInput::new();
+        ti.insert_char('a');
+        ti.insert_char('b');
+        ti.move_left();
+        ti.delete_forward();
+        assert_eq!(ti.text(), "a");
+        assert_eq!(ti.cursor_pos(), 1);
+    }
+
+    #[test]
+    fn text_input_cursor_movement() {
+        let mut ti = TextInput::new();
+        ti.insert_char('a');
+        ti.insert_char('b');
+        ti.insert_char('c');
+        assert_eq!(ti.cursor_pos(), 3);
+        ti.move_left();
+        assert_eq!(ti.cursor_pos(), 2);
+        ti.move_left();
+        assert_eq!(ti.cursor_pos(), 1);
+        ti.move_right();
+        assert_eq!(ti.cursor_pos(), 2);
+    }
+
+    #[test]
+    fn text_input_home_end() {
+        let mut ti = TextInput::new();
+        ti.insert_char('x');
+        ti.insert_char('y');
+        ti.insert_char('z');
+        ti.move_home();
+        assert_eq!(ti.cursor_pos(), 0);
+        ti.move_end();
+        assert_eq!(ti.cursor_pos(), 3);
+    }
+
+    #[test]
+    fn text_input_insert_at_cursor() {
+        let mut ti = TextInput::new();
+        ti.insert_char('a');
+        ti.insert_char('c');
+        ti.move_left();
+        ti.insert_char('b');
+        assert_eq!(ti.text(), "abc");
+        assert_eq!(ti.cursor_pos(), 2);
+    }
+
+    #[test]
+    fn text_input_clear() {
+        let mut ti = TextInput::new();
+        ti.insert_char('x');
+        ti.insert_char('y');
+        ti.clear();
+        assert_eq!(ti.text(), "");
+        assert_eq!(ti.cursor_pos(), 0);
+    }
+
+    #[test]
+    fn text_input_cursor_clamp_at_bounds() {
+        let mut ti = TextInput::new();
+        ti.move_left();
+        assert_eq!(ti.cursor_pos(), 0);
+        ti.insert_char('a');
+        ti.move_right();
+        assert_eq!(ti.cursor_pos(), 1);
+        ti.move_right();
+        assert_eq!(ti.cursor_pos(), 1);
+    }
+
+    #[test]
+    fn text_input_set_text_clamps_cursor() {
+        let mut ti = TextInput::new();
+        ti.insert_char('a');
+        ti.insert_char('b');
+        ti.insert_char('c');
+        assert_eq!(ti.cursor_pos(), 3);
+        ti.set_text("x".into());
+        assert_eq!(ti.text(), "x");
+        assert_eq!(ti.cursor_pos(), 1);
+    }
+
+    #[test]
+    fn search_left_right_in_query() {
+        let mut model = make_model(MockQuery::healthy().with_search_results(vec![]));
+        model.view_state.current_view = View::Search;
+        press_key(&mut model, ftui::KeyCode::Char('a'));
+        press_key(&mut model, ftui::KeyCode::Char('b'));
+        assert_eq!(model.search_input.text(), "ab");
+        press_key(&mut model, ftui::KeyCode::Left);
+        press_key(&mut model, ftui::KeyCode::Char('x'));
+        assert_eq!(model.search_input.text(), "axb");
+    }
+
+    #[test]
+    fn search_home_end_in_query() {
+        let mut model = make_model(MockQuery::healthy().with_search_results(vec![]));
+        model.view_state.current_view = View::Search;
+        press_key(&mut model, ftui::KeyCode::Char('h'));
+        press_key(&mut model, ftui::KeyCode::Char('i'));
+        press_key(&mut model, ftui::KeyCode::Home);
+        press_key(&mut model, ftui::KeyCode::Char('_'));
+        assert_eq!(model.search_input.text(), "_hi");
+        press_key(&mut model, ftui::KeyCode::End);
+        press_key(&mut model, ftui::KeyCode::Char('!'));
+        assert_eq!(model.search_input.text(), "_hi!");
+    }
+
+    #[test]
+    fn search_delete_forward_in_query() {
+        let mut model = make_model(MockQuery::healthy().with_search_results(vec![]));
+        model.view_state.current_view = View::Search;
+        press_key(&mut model, ftui::KeyCode::Char('a'));
+        press_key(&mut model, ftui::KeyCode::Char('b'));
+        press_key(&mut model, ftui::KeyCode::Home);
+        press_key(&mut model, ftui::KeyCode::Delete);
+        assert_eq!(model.search_input.text(), "b");
     }
 }
