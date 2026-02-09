@@ -2051,6 +2051,16 @@ enum RobotCommands {
         snippets: bool,
     },
 
+    /// Explain why search results may be missing or incomplete
+    SearchExplain {
+        /// FTS query to explain
+        query: String,
+
+        /// Filter diagnosis to a specific pane ID
+        #[arg(long)]
+        pane: Option<u64>,
+    },
+
     /// Get recent events
     Events {
         /// Maximum number of events to return
@@ -3724,6 +3734,19 @@ struct RobotSearchHit {
     snippet: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
+}
+
+/// Robot search-explain response data
+#[derive(serde::Serialize)]
+struct RobotSearchExplainData {
+    query: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pane_filter: Option<u64>,
+    total_panes: usize,
+    observed_panes: usize,
+    ignored_panes: usize,
+    total_segments: u64,
+    reasons: Vec<wa_core::search_explain::SearchExplainReason>,
 }
 
 /// Robot events response data
@@ -5796,6 +5819,10 @@ fn build_robot_help() -> RobotHelp {
                 description: "Search captured output",
             },
             RobotCommandInfo {
+                name: "search-explain",
+                description: "Explain why search results may be missing or incomplete",
+            },
+            RobotCommandInfo {
                 name: "events",
                 description: "Fetch recent events (optional workflow preview)",
             },
@@ -5928,6 +5955,15 @@ fn build_robot_quick_start() -> RobotQuickStartData {
                 examples: vec![
                     "wa robot search \"compilation failed\"",
                     "wa robot search \"error\" --pane 0 --limit 10",
+                ],
+            },
+            QuickStartCommand {
+                name: "search-explain",
+                args: "\"<query>\" [--pane ID]",
+                summary: "Explain why search results may be missing or incomplete",
+                examples: vec![
+                    "wa robot search-explain \"compilation failed\"",
+                    "wa robot search-explain \"error\" --pane 3",
                 ],
             },
             QuickStartCommand {
@@ -8742,6 +8778,73 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             code,
                                             format!("{e}"),
                                             hint,
+                                            elapsed_ms(start),
+                                        );
+                                    print_robot_response(&response, format, stats)?;
+                                }
+                            }
+                        }
+                        RobotCommands::SearchExplain { query, pane } => {
+                            let layout = match config.workspace_layout(Some(&workspace_root)) {
+                                Ok(l) => l,
+                                Err(e) => {
+                                    let response =
+                                        RobotResponse::<RobotSearchExplainData>::error_with_code(
+                                            ROBOT_ERR_CONFIG,
+                                            format!("Failed to get workspace layout: {e}"),
+                                            Some("Check --workspace or WA_WORKSPACE".to_string()),
+                                            elapsed_ms(start),
+                                        );
+                                    print_robot_response(&response, format, stats)?;
+                                    return Ok(());
+                                }
+                            };
+
+                            let db_path = layout.db_path.to_string_lossy();
+                            let storage = match wa_core::storage::StorageHandle::new(&db_path).await
+                            {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    let response =
+                                        RobotResponse::<RobotSearchExplainData>::error_with_code(
+                                            ROBOT_ERR_STORAGE,
+                                            format!("Failed to open storage: {e}"),
+                                            Some(
+                                                "Is the database initialized? Run 'wa watch' first."
+                                                    .to_string(),
+                                            ),
+                                            elapsed_ms(start),
+                                        );
+                                    print_robot_response(&response, format, stats)?;
+                                    return Ok(());
+                                }
+                            };
+
+                            match wa_core::search_explain::build_explain_context(
+                                &storage, &query, pane,
+                            )
+                            .await
+                            {
+                                Ok(ctx) => {
+                                    let result = wa_core::search_explain::explain_search(&ctx);
+                                    let data = RobotSearchExplainData {
+                                        query,
+                                        pane_filter: pane,
+                                        total_panes: result.total_panes,
+                                        observed_panes: result.observed_panes,
+                                        ignored_panes: result.ignored_panes,
+                                        total_segments: result.total_segments,
+                                        reasons: result.reasons,
+                                    };
+                                    let response = RobotResponse::success(data, elapsed_ms(start));
+                                    print_robot_response(&response, format, stats)?;
+                                }
+                                Err(e) => {
+                                    let response =
+                                        RobotResponse::<RobotSearchExplainData>::error_with_code(
+                                            ROBOT_ERR_STORAGE,
+                                            format!("Search explain failed: {e}"),
+                                            None,
                                             elapsed_ms(start),
                                         );
                                     print_robot_response(&response, format, stats)?;
@@ -24163,6 +24266,33 @@ fn distributed_security_check(config: &wa_core::config::Config) -> DiagnosticChe
     }
 }
 
+/// Run a command with a timeout, returning an error if the process doesn't complete in time.
+fn run_cmd_with_timeout(
+    cmd: &mut std::process::Command,
+    timeout: std::time::Duration,
+) -> std::io::Result<std::process::Output> {
+    let mut child = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait()? {
+            Some(_) => return child.wait_with_output(),
+            None if start.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "process timed out",
+                ));
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    }
+}
+
 /// Run all diagnostic checks and return results
 fn run_diagnostics(
     permission_warnings: &[wa_core::config::PermissionWarning],
@@ -24370,12 +24500,13 @@ fn run_diagnostics(
     checks.push(distributed_security_check(config));
 
     // Check 2: WezTerm CLI available
+    let wezterm_timeout = std::time::Duration::from_secs(5);
     #[cfg(feature = "vendored")]
     let mut local_wezterm_version: Option<wa_core::vendored::WeztermVersion> = None;
-    match std::process::Command::new("wezterm")
-        .arg("--version")
-        .output()
-    {
+    match run_cmd_with_timeout(
+        std::process::Command::new("wezterm").arg("--version"),
+        wezterm_timeout,
+    ) {
         Ok(output) if output.status.success() => {
             let version = String::from_utf8_lossy(&output.stdout);
             let version = version.trim();
@@ -24390,6 +24521,13 @@ fn run_diagnostics(
                 "WezTerm CLI",
                 "wezterm command failed",
                 "Ensure WezTerm is installed and in PATH",
+            ));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+            checks.push(DiagnosticCheck::error(
+                "WezTerm CLI",
+                "wezterm --version timed out",
+                "WezTerm may be unresponsive; try restarting it",
             ));
         }
         Err(_) => {
@@ -24501,10 +24639,10 @@ fn run_diagnostics(
     }
 
     // Check 5: WezTerm running and responding
-    match std::process::Command::new("wezterm")
-        .args(["cli", "list", "--format", "json"])
-        .output()
-    {
+    match run_cmd_with_timeout(
+        std::process::Command::new("wezterm").args(["cli", "list", "--format", "json"]),
+        wezterm_timeout,
+    ) {
         Ok(output) if output.status.success() => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             match serde_json::from_str::<Vec<serde_json::Value>>(&stdout) {
@@ -24529,6 +24667,13 @@ fn run_diagnostics(
                 "WezTerm connection",
                 format!("CLI failed: {}", stderr.trim()),
                 "Ensure WezTerm GUI is running",
+            ));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+            checks.push(DiagnosticCheck::error(
+                "WezTerm connection",
+                "wezterm cli list timed out",
+                "WezTerm mux server may not be running; start the WezTerm GUI",
             ));
         }
         Err(e) => {
@@ -29572,15 +29717,17 @@ log_level = "debug"
             );
         }
 
-        // No errors in healthy workspace
+        // No errors in healthy workspace (except WezTerm checks which depend on runtime)
+        let wezterm_check_names = ["WezTerm CLI", "WezTerm connection"];
         let error_names: Vec<&str> = checks
             .iter()
             .filter(|c| c.status == DiagnosticStatus::Error)
+            .filter(|c| !wezterm_check_names.contains(&c.name))
             .map(|c| c.name)
             .collect();
         assert!(
             error_names.is_empty(),
-            "healthy workspace should have no errors: {error_names:?}"
+            "healthy workspace should have no non-WezTerm errors: {error_names:?}"
         );
 
         // Cleanup
