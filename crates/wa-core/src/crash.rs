@@ -2866,3 +2866,390 @@ mod tests {
         assert_eq!(det.next_delay_ms(), 0);
     }
 }
+
+// ---------------------------------------------------------------------------
+// E2E crash loop recovery tests (bd-1gf6)
+// ---------------------------------------------------------------------------
+//
+// These tests simulate realistic multi-crash scenarios end-to-end:
+// - crash loop detection with escalating backoff
+// - checkpoint persistence across simulated restarts
+// - duplicate segment rejection after recovery
+// - restart history tracking with artifact generation
+//
+// Unlike the unit tests above, these exercise the full detector + checkpoint
+// pipeline in multi-step sequences that mirror production crash/restart cycles.
+
+#[cfg(test)]
+mod e2e_crash_recovery {
+    use super::*;
+
+    /// Simulate a full watcher lifecycle: start, run for N "ticks", crash.
+    /// Returns the pane states at the time of crash (for checkpointing).
+    fn simulate_watcher_run(
+        start_time: u64,
+        pane_ids: &[u64],
+        base_seq: i64,
+        ticks: i64,
+    ) -> Vec<PaneCaptureState> {
+        pane_ids
+            .iter()
+            .map(|&pane_id| PaneCaptureState {
+                pane_id,
+                last_seq: base_seq + ticks,
+                cursor_offset: (base_seq + ticks) as u64 * 512,
+                last_capture_at: start_time + ticks as u64,
+            })
+            .collect()
+    }
+
+    // -- E2E Scenario 1: Escalating backoff across multiple crashes --
+
+    #[test]
+    fn e2e_crash_loop_backoff_escalation() {
+        let mut det = CrashLoopDetector::new(CrashLoopConfig {
+            crash_threshold: 3,
+            window_secs: 300,
+            initial_delay_ms: 1_000,
+            max_delay_ms: 60_000,
+            backoff_factor: 2.0,
+        });
+
+        // Collect (crash_number, delay_ms, in_loop) for each crash
+        let mut history: Vec<(u32, u64, bool)> = Vec::new();
+
+        // Simulate 7 rapid crashes within the 5-minute window
+        for i in 0..7u64 {
+            det.record_crash(1000 + i);
+            let delay = det.next_delay_ms();
+            let in_loop = det.is_crash_loop();
+            history.push((det.consecutive_crashes(), delay, in_loop));
+        }
+
+        // Verify escalating backoff: 1s, 2s, 4s, 8s, 16s, 32s, 60s
+        assert_eq!(history[0], (1, 1_000, false)); // 1st crash: 1s, not loop
+        assert_eq!(history[1], (2, 2_000, false)); // 2nd: 2s, not loop
+        assert_eq!(history[2], (3, 4_000, true)); // 3rd: 4s, LOOP DETECTED
+        assert_eq!(history[3], (4, 8_000, true)); // 4th: 8s
+        assert_eq!(history[4], (5, 16_000, true)); // 5th: 16s
+        assert_eq!(history[5], (6, 32_000, true)); // 6th: 32s
+        assert_eq!(history[6], (7, 60_000, true)); // 7th: capped at 60s
+
+        // After successful run, backoff resets
+        det.record_success();
+        assert_eq!(det.consecutive_crashes(), 0);
+        assert_eq!(det.next_delay_ms(), 0);
+        // But crash timestamps remain in window
+        assert!(det.crashes_in_window(1010) >= 7);
+    }
+
+    // -- E2E Scenario 2: Stable run resets crash history --
+
+    #[test]
+    fn e2e_stable_run_clears_crash_history() {
+        let mut det = CrashLoopDetector::new(CrashLoopConfig {
+            crash_threshold: 3,
+            window_secs: 60, // 1-minute window
+            ..CrashLoopConfig::default()
+        });
+
+        // Two crashes in quick succession
+        det.record_crash(100);
+        det.record_crash(101);
+        assert_eq!(det.consecutive_crashes(), 2);
+        assert!(!det.is_crash_loop());
+
+        // Record success (simulates watcher ran stably for >5 min)
+        det.record_success();
+        assert_eq!(det.consecutive_crashes(), 0);
+
+        // Now crash again — but old timestamps have aged out of window
+        det.record_crash(200); // 200 - 100 = 100s > 60s window
+        assert_eq!(det.consecutive_crashes(), 1);
+        assert_eq!(det.crashes_in_window(200), 1); // old crashes pruned
+        assert!(!det.is_crash_loop());
+    }
+
+    // -- E2E Scenario 3: Checkpoint prevents duplicate segments --
+
+    #[test]
+    fn e2e_checkpoint_dedup_across_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cp_path = tmp.path().join("wa_checkpoint.json");
+
+        // === First run: capture segments 1-50 on panes 1, 2, 3 ===
+        let panes = simulate_watcher_run(1000, &[1, 2, 3], 0, 50);
+        assert_eq!(panes[0].last_seq, 50);
+        assert_eq!(panes[1].last_seq, 50);
+        assert_eq!(panes[2].last_seq, 50);
+
+        // Crash! Save checkpoint.
+        let cp = CaptureCheckpoint::with_timestamp(panes, 1050);
+        cp.save(&cp_path).unwrap();
+
+        // === Second run: load checkpoint and verify dedup ===
+        let loaded = CaptureCheckpoint::load(&cp_path).unwrap();
+
+        // Segments at or before seq 50 should be skipped (dedup)
+        for pane_id in [1, 2, 3] {
+            assert!(
+                loaded.should_skip_segment(pane_id, 1),
+                "pane {pane_id}: should skip seq 1 (already captured)"
+            );
+            assert!(
+                loaded.should_skip_segment(pane_id, 50),
+                "pane {pane_id}: should skip seq 50 (boundary)"
+            );
+            assert!(
+                !loaded.should_skip_segment(pane_id, 51),
+                "pane {pane_id}: should NOT skip seq 51 (new)"
+            );
+        }
+
+        // Unknown pane should not skip anything
+        assert!(
+            !loaded.should_skip_segment(99, 1),
+            "unknown pane should not skip"
+        );
+    }
+
+    // -- E2E Scenario 4: Multi-restart with checkpoint updates --
+
+    #[test]
+    fn e2e_multi_restart_checkpoint_progression() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cp_path = tmp.path().join("wa_checkpoint.json");
+        let mut det = CrashLoopDetector::new(CrashLoopConfig::default());
+
+        // === Run 1: capture seq 1-20 ===
+        let panes_r1 = simulate_watcher_run(1000, &[1, 2], 0, 20);
+        det.record_crash(1020);
+        CaptureCheckpoint::with_timestamp(panes_r1.clone(), 1020)
+            .save(&cp_path)
+            .unwrap();
+
+        let cp1 = CaptureCheckpoint::load(&cp_path).unwrap();
+        assert_eq!(cp1.pane_state(1).unwrap().last_seq, 20);
+
+        // === Run 2: resume from seq 20, capture to 45 ===
+        let panes_r2 = simulate_watcher_run(1025, &[1, 2], 20, 25);
+        det.record_crash(1050);
+        CaptureCheckpoint::with_timestamp(panes_r2, 1050)
+            .save(&cp_path)
+            .unwrap();
+
+        let cp2 = CaptureCheckpoint::load(&cp_path).unwrap();
+        assert_eq!(cp2.pane_state(1).unwrap().last_seq, 45);
+        // Verify dedup: seq 20 from run 1 should be skipped
+        assert!(cp2.should_skip_segment(1, 20));
+        assert!(cp2.should_skip_segment(1, 45));
+        assert!(!cp2.should_skip_segment(1, 46));
+
+        // === Run 3: resume from seq 45, capture to 100, SUCCESS ===
+        det.record_success();
+        assert_eq!(det.consecutive_crashes(), 0);
+
+        let panes_r3 = simulate_watcher_run(1055, &[1, 2], 45, 55);
+        CaptureCheckpoint::with_timestamp(panes_r3, 1110)
+            .save(&cp_path)
+            .unwrap();
+
+        let cp3 = CaptureCheckpoint::load(&cp_path).unwrap();
+        assert_eq!(cp3.pane_state(1).unwrap().last_seq, 100);
+        assert!(cp3.should_skip_segment(1, 100));
+        assert!(!cp3.should_skip_segment(1, 101));
+
+        // Total backoff pattern: 2 consecutive crashes → delays of 1s, 2s
+        // then success resets
+        assert_eq!(det.next_delay_ms(), 0);
+    }
+
+    // -- E2E Scenario 5: Crash bundle + detector + checkpoint integration --
+
+    #[test]
+    fn e2e_full_recovery_with_crash_bundle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let crash_dir = tmp.path().join("crash");
+        let cp_path = tmp.path().join("wa_checkpoint.json");
+
+        let mut det = CrashLoopDetector::new(CrashLoopConfig {
+            crash_threshold: 3,
+            window_secs: 300,
+            initial_delay_ms: 500,
+            max_delay_ms: 30_000,
+            backoff_factor: 2.0,
+        });
+
+        // Simulate 4 crash/restart cycles, collecting artifacts
+        let mut artifacts: Vec<serde_json::Value> = Vec::new();
+
+        for cycle in 0..4u64 {
+            let start_ts = 1000 + cycle * 10;
+            let crash_ts = start_ts + 5;
+
+            // Capture some data
+            let panes = simulate_watcher_run(start_ts, &[1], cycle as i64 * 10, 5);
+
+            // Crash
+            det.record_crash(crash_ts);
+
+            // Save checkpoint
+            CaptureCheckpoint::with_timestamp(panes, crash_ts)
+                .save(&cp_path)
+                .unwrap();
+
+            // Write crash bundle
+            let bundle_dir = crash_dir.join(format!("wa_crash_{crash_ts}"));
+            std::fs::create_dir_all(&bundle_dir).unwrap();
+
+            let report = CrashReport {
+                message: format!("simulated panic in cycle {cycle}"),
+                location: Some("e2e_test:0:0".to_string()),
+                backtrace: None,
+                timestamp: crash_ts,
+                pid: std::process::id(),
+                thread_name: Some("test".to_string()),
+            };
+            let report_json = serde_json::to_string_pretty(&report).unwrap();
+            std::fs::write(bundle_dir.join("crash_report.json"), &report_json).unwrap();
+
+            // Collect artifact data
+            artifacts.push(serde_json::json!({
+                "cycle": cycle,
+                "crash_ts": crash_ts,
+                "consecutive_crashes": det.consecutive_crashes(),
+                "backoff_ms": det.next_delay_ms(),
+                "in_crash_loop": det.is_crash_loop(),
+                "checkpoint_seq": CaptureCheckpoint::load(&cp_path)
+                    .unwrap().pane_state(1).unwrap().last_seq,
+            }));
+        }
+
+        // Verify escalating backoff across cycles
+        assert_eq!(artifacts[0]["backoff_ms"], 500);
+        assert_eq!(artifacts[1]["backoff_ms"], 1_000);
+        assert_eq!(artifacts[2]["backoff_ms"], 2_000);
+        assert_eq!(artifacts[3]["backoff_ms"], 4_000);
+
+        // Crash loop detected at cycle 2 (3rd crash)
+        assert_eq!(artifacts[0]["in_crash_loop"], false);
+        assert_eq!(artifacts[1]["in_crash_loop"], false);
+        assert_eq!(artifacts[2]["in_crash_loop"], true);
+        assert_eq!(artifacts[3]["in_crash_loop"], true);
+
+        // Checkpoint progresses: seq 5, 15, 25, 35
+        assert_eq!(artifacts[0]["checkpoint_seq"], 5);
+        assert_eq!(artifacts[1]["checkpoint_seq"], 15);
+        assert_eq!(artifacts[2]["checkpoint_seq"], 25);
+        assert_eq!(artifacts[3]["checkpoint_seq"], 35);
+
+        // Verify crash bundles on disk
+        let bundles: Vec<_> = std::fs::read_dir(&crash_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(bundles.len(), 4, "expected 4 crash bundles");
+
+        // Write E2E artifact report
+        let report = serde_json::json!({
+            "test": "e2e_full_recovery_with_crash_bundle",
+            "cycles": artifacts,
+            "crash_bundles": bundles.len(),
+            "final_checkpoint_seq": 35,
+            "final_backoff_ms": 4_000,
+            "crash_loop_detected_at_cycle": 2,
+        });
+        let artifact_path = tmp.path().join("e2e_crash_recovery_report.json");
+        std::fs::write(
+            &artifact_path,
+            serde_json::to_string_pretty(&report).unwrap(),
+        )
+        .unwrap();
+
+        // Verify the artifact is valid JSON
+        let loaded: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&artifact_path).unwrap()).unwrap();
+        assert_eq!(loaded["crash_bundles"], 4);
+    }
+
+    // -- E2E Scenario 6: New pane discovered after restart --
+
+    #[test]
+    fn e2e_new_pane_after_restart_not_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cp_path = tmp.path().join("wa_checkpoint.json");
+
+        // Run 1: observe panes 1, 2
+        let panes = simulate_watcher_run(1000, &[1, 2], 0, 30);
+        CaptureCheckpoint::with_timestamp(panes, 1030)
+            .save(&cp_path)
+            .unwrap();
+
+        // Run 2: pane 3 is new (not in checkpoint)
+        let loaded = CaptureCheckpoint::load(&cp_path).unwrap();
+
+        // Existing panes: skip old segments
+        assert!(loaded.should_skip_segment(1, 30));
+        assert!(loaded.should_skip_segment(2, 30));
+        assert!(!loaded.should_skip_segment(1, 31));
+
+        // New pane 3: should NOT skip anything
+        assert!(!loaded.should_skip_segment(3, 1));
+        assert!(!loaded.should_skip_segment(3, 100));
+    }
+
+    // -- E2E Scenario 7: Checkpoint corruption recovery --
+
+    #[test]
+    fn e2e_corrupt_checkpoint_starts_fresh() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cp_path = tmp.path().join("wa_checkpoint.json");
+
+        // Write a valid checkpoint
+        let panes = simulate_watcher_run(1000, &[1], 0, 50);
+        CaptureCheckpoint::with_timestamp(panes, 1050)
+            .save(&cp_path)
+            .unwrap();
+
+        // Corrupt it
+        std::fs::write(&cp_path, "{ invalid json !!!").unwrap();
+
+        // Loading should fail gracefully
+        let result = CaptureCheckpoint::load(&cp_path);
+        assert!(result.is_err());
+
+        // Missing file should also fail gracefully
+        let missing = tmp.path().join("nonexistent.json");
+        assert!(CaptureCheckpoint::load(&missing).is_err());
+    }
+
+    // -- E2E Scenario 8: Backoff cap prevents unbounded delay --
+
+    #[test]
+    fn e2e_backoff_cap_under_sustained_crashes() {
+        let mut det = CrashLoopDetector::new(CrashLoopConfig {
+            crash_threshold: 3,
+            window_secs: 3600, // 1-hour window
+            initial_delay_ms: 100,
+            max_delay_ms: 5_000,
+            backoff_factor: 2.0,
+        });
+
+        // Simulate 20 consecutive crashes
+        let mut max_delay = 0u64;
+        for i in 0..20u64 {
+            det.record_crash(1000 + i);
+            let delay = det.next_delay_ms();
+            max_delay = max_delay.max(delay);
+        }
+
+        // Delay should never exceed configured max
+        assert!(
+            max_delay <= 5_000,
+            "max delay {max_delay}ms exceeded cap of 5000ms"
+        );
+
+        // Should be exactly at cap after enough crashes
+        assert_eq!(det.next_delay_ms(), 5_000);
+    }
+}
