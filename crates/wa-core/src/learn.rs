@@ -166,6 +166,14 @@ pub const BUILTIN_ACHIEVEMENTS: &[AchievementDefinition] = &[
         rarity: Rarity::Uncommon,
         secret: false,
     },
+    AchievementDefinition {
+        id: "track_advanced_complete",
+        name: "wa Master",
+        description: "Completed all Advanced exercises",
+        icon: '\u{1F9D9}', // mage
+        rarity: Rarity::Uncommon,
+        secret: false,
+    },
     // --- Cross-track milestones (Uncommon/Rare) ---
     AchievementDefinition {
         id: "explorer",
@@ -759,6 +767,156 @@ impl TutorialEngine {
                         verification_command: None,
                         verification_pattern: None,
                         requirements: vec![Requirement::WaConfigured],
+                        can_simulate: true,
+                    },
+                ],
+            },
+            Track {
+                id: "advanced".into(),
+                name: "Advanced".into(),
+                description:
+                    "Custom patterns, multi-agent coordination, and power-user techniques."
+                        .into(),
+                estimated_minutes: 20,
+                exercises: vec![
+                    Exercise {
+                        id: "advanced.1".into(),
+                        title: "Custom pattern basics".into(),
+                        description:
+                            "Pattern packs define detection rules. User packs extend built-in packs with org-specific patterns."
+                                .into(),
+                        instructions: vec![
+                            "Review: pattern packs contain rules with anchors (fast string match) and optional regex (extraction).".into(),
+                            "User packs live in ~/.config/wa/patterns/ or .wa/patterns/ and follow the same format.".into(),
+                            "Goal: understand the pack format (name, version, rules[]) and rule fields (id, anchors, regex, severity).".into(),
+                        ],
+                        verification_command: None,
+                        verification_pattern: None,
+                        requirements: vec![],
+                        can_simulate: true,
+                    },
+                    Exercise {
+                        id: "advanced.2".into(),
+                        title: "Create a pattern rule".into(),
+                        description:
+                            "Write a custom pattern rule in TOML and save it as a user pack."
+                                .into(),
+                        instructions: vec![
+                            "Create ~/.config/wa/patterns/my-rules.toml with a rule definition.".into(),
+                            "Example rule: id=\"myorg.deploy_alert\", anchors=[\"[DEPLOY]\"], severity=\"warning\".".into(),
+                            "Run: wa rules list -- your custom rule should appear.".into(),
+                        ],
+                        verification_command: Some("wa rules list".into()),
+                        verification_pattern: Some("myorg\\.".into()),
+                        requirements: vec![Requirement::WaConfigured],
+                        can_simulate: true,
+                    },
+                    Exercise {
+                        id: "advanced.3".into(),
+                        title: "Test custom pattern".into(),
+                        description: "Verify your custom rule matches expected text.".into(),
+                        instructions: vec![
+                            "Run: wa rules test \"[DEPLOY] Production deployment started\"".into(),
+                            "Confirm your custom rule is listed in the matches.".into(),
+                        ],
+                        verification_command: None,
+                        verification_pattern: None,
+                        requirements: vec![Requirement::WaConfigured],
+                        can_simulate: true,
+                    },
+                    Exercise {
+                        id: "advanced.4".into(),
+                        title: "Multi-pane overview".into(),
+                        description:
+                            "wa monitors all WezTerm panes simultaneously, correlating events across agents."
+                                .into(),
+                        instructions: vec![
+                            "Review: each pane has an independent capture stream and event history.".into(),
+                            "Run: wa status -- observe per-pane health and detection counts.".into(),
+                            "Goal: understand how wa tracks multiple agents in parallel.".into(),
+                        ],
+                        verification_command: None,
+                        verification_pattern: None,
+                        requirements: vec![],
+                        can_simulate: true,
+                    },
+                    Exercise {
+                        id: "advanced.5".into(),
+                        title: "Event correlation".into(),
+                        description:
+                            "Events across panes can be correlated by timestamp to understand cross-agent interactions."
+                                .into(),
+                        instructions: vec![
+                            "Run: wa timeline -- view interleaved events from all panes.".into(),
+                            "Note how events from different agents are ordered chronologically.".into(),
+                            "Goal: use timeline to diagnose cascading failures across agents.".into(),
+                        ],
+                        verification_command: None,
+                        verification_pattern: None,
+                        requirements: vec![Requirement::DbHasData],
+                        can_simulate: true,
+                    },
+                    Exercise {
+                        id: "advanced.6".into(),
+                        title: "FTS power queries".into(),
+                        description:
+                            "Use advanced full-text search with boolean operators to find specific output."
+                                .into(),
+                        instructions: vec![
+                            "Run: wa query \"error AND codex NOT timeout\"".into(),
+                            "Try prefix matching: wa query \"deploy*\"".into(),
+                            "Goal: master FTS5 boolean syntax for precise searches.".into(),
+                        ],
+                        verification_command: None,
+                        verification_pattern: None,
+                        requirements: vec![Requirement::DbHasData],
+                        can_simulate: true,
+                    },
+                    Exercise {
+                        id: "advanced.7".into(),
+                        title: "Export and analysis".into(),
+                        description:
+                            "Export captured data for offline analysis or integration with other tools."
+                                .into(),
+                        instructions: vec![
+                            "Run: wa export --format jsonl".into(),
+                            "Each line is a self-contained JSON record suitable for jq, pandas, or log aggregators.".into(),
+                            "Goal: integrate wa data into your existing observability pipeline.".into(),
+                        ],
+                        verification_command: None,
+                        verification_pattern: None,
+                        requirements: vec![Requirement::DbHasData],
+                        can_simulate: true,
+                    },
+                    Exercise {
+                        id: "advanced.8".into(),
+                        title: "Explainability with wa why".into(),
+                        description:
+                            "Ask wa to explain its decisions: why a detection fired, why a workflow ran."
+                                .into(),
+                        instructions: vec![
+                            "Run: wa why <event-id> -- to trace a detection back to its rule and workflow.".into(),
+                            "Review the explain output: matched rule, anchors hit, regex groups, workflow steps.".into(),
+                            "Goal: debug unexpected detections or missing matches.".into(),
+                        ],
+                        verification_command: None,
+                        verification_pattern: None,
+                        requirements: vec![Requirement::DbHasData],
+                        can_simulate: true,
+                    },
+                    Exercise {
+                        id: "advanced.9".into(),
+                        title: "Track completion".into(),
+                        description:
+                            "Review everything you have learned across all five tracks.".into(),
+                        instructions: vec![
+                            "Run: wa learn --status -- review your progress across all tracks.".into(),
+                            "Run: wa learn --achievements -- see your achievement collection.".into(),
+                            "You have mastered wa: watching, detection, workflows, robot mode, and advanced techniques.".into(),
+                        ],
+                        verification_command: None,
+                        verification_pattern: None,
+                        requirements: vec![],
                         can_simulate: true,
                     },
                 ],
@@ -1753,7 +1911,7 @@ mod tests {
 
         let (completed, total) = engine.overall_progress();
         assert_eq!(completed, 0);
-        assert_eq!(total, 24); // 5 basics + 6 events + 7 workflows + 6 robot
+        assert_eq!(total, 33); // 5 basics + 6 events + 7 workflows + 6 robot + 9 advanced
 
         engine
             .handle_event(TutorialEvent::CompleteExercise("basics.1".into()))
@@ -1805,8 +1963,8 @@ mod tests {
         let status = TutorialStatus::from(&engine);
         assert_eq!(status.current_track.as_deref(), Some("basics"));
         assert_eq!(status.completed_exercises, 1);
-        assert_eq!(status.total_exercises, 24);
-        assert_eq!(status.tracks.len(), 4);
+        assert_eq!(status.total_exercises, 33);
+        assert_eq!(status.tracks.len(), 5);
         assert_eq!(status.tracks[0].completed, 1);
         assert_eq!(status.tracks[0].total, 5);
         assert!(!status.tracks[0].is_complete);
@@ -1869,7 +2027,7 @@ mod tests {
         let path = dir.path().join("learn.json");
         let engine = TutorialEngine::load_or_create_at(path).unwrap();
 
-        assert_eq!(engine.tracks().len(), 4);
+        assert_eq!(engine.tracks().len(), 5);
         for track in engine.tracks() {
             assert!(!track.exercises.is_empty());
             assert!(!track.name.is_empty());
@@ -2109,6 +2267,16 @@ mod tests {
             .handle_event(TutorialEvent::CompleteExercise("robot.1".into()))
             .unwrap();
         assert!(
+            !engine
+                .state()
+                .achievements
+                .iter()
+                .any(|a| a.id == "explorer")
+        );
+        engine
+            .handle_event(TutorialEvent::CompleteExercise("advanced.1".into()))
+            .unwrap();
+        assert!(
             engine
                 .state()
                 .achievements
@@ -2150,6 +2318,15 @@ mod tests {
             "robot.4",
             "robot.5",
             "robot.6",
+            "advanced.1",
+            "advanced.2",
+            "advanced.3",
+            "advanced.4",
+            "advanced.5",
+            "advanced.6",
+            "advanced.7",
+            "advanced.8",
+            "advanced.9",
         ];
         for ex in &all_exercises {
             engine
@@ -2738,6 +2915,132 @@ mod tests {
             robot.exercises[5]
                 .requirements
                 .contains(&Requirement::WaConfigured)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Track 5 (Advanced) tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_advanced_track_exists_with_9_exercises() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("learn.json");
+        let engine = TutorialEngine::load_or_create_at(path).unwrap();
+
+        let track = engine.get_track("advanced").unwrap();
+        assert_eq!(track.name, "Advanced");
+        assert_eq!(track.exercises.len(), 9);
+        assert_eq!(track.estimated_minutes, 20);
+    }
+
+    #[test]
+    fn test_advanced_track_exercise_ids_sequential() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("learn.json");
+        let engine = TutorialEngine::load_or_create_at(path).unwrap();
+
+        let track = engine.get_track("advanced").unwrap();
+        for (i, ex) in track.exercises.iter().enumerate() {
+            assert_eq!(ex.id, format!("advanced.{}", i + 1));
+        }
+    }
+
+    #[test]
+    fn test_advanced_track_completion_achievement() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("learn.json");
+        let mut engine = TutorialEngine::load_or_create_at(path).unwrap();
+
+        for i in 1..=9 {
+            engine
+                .handle_event(TutorialEvent::CompleteExercise(
+                    format!("advanced.{i}").into(),
+                ))
+                .unwrap();
+        }
+
+        assert!(
+            engine
+                .state()
+                .achievements
+                .iter()
+                .any(|a| a.id == "track_advanced_complete")
+        );
+    }
+
+    #[test]
+    fn test_advanced_track_all_exercises_simulatable() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("learn.json");
+        let engine = TutorialEngine::load_or_create_at(path).unwrap();
+
+        let track = engine.get_track("advanced").unwrap();
+        for ex in &track.exercises {
+            assert!(ex.can_simulate, "exercise {} must be simulatable", ex.id);
+        }
+    }
+
+    #[test]
+    fn test_advanced_track_requirements() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("learn.json");
+        let engine = TutorialEngine::load_or_create_at(path).unwrap();
+
+        let track = engine.get_track("advanced").unwrap();
+        // advanced.1 (conceptual) has no requirements
+        assert!(track.exercises[0].requirements.is_empty());
+        // advanced.2 (create pattern) requires WaConfigured
+        assert!(
+            track.exercises[1]
+                .requirements
+                .contains(&Requirement::WaConfigured)
+        );
+        // advanced.5 (event correlation) requires DbHasData
+        assert!(
+            track.exercises[4]
+                .requirements
+                .contains(&Requirement::DbHasData)
+        );
+        // advanced.9 (track completion) has no requirements
+        assert!(track.exercises[8].requirements.is_empty());
+    }
+
+    #[test]
+    fn test_advanced_track_has_verification() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("learn.json");
+        let engine = TutorialEngine::load_or_create_at(path).unwrap();
+
+        let track = engine.get_track("advanced").unwrap();
+        // advanced.2 (create pattern) has verification
+        assert!(track.exercises[1].verification_command.is_some());
+        assert!(track.exercises[1].verification_pattern.is_some());
+        // advanced.1 (conceptual) has none
+        assert!(track.exercises[0].verification_command.is_none());
+    }
+
+    #[test]
+    fn test_advanced_partial_does_not_unlock_completion() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("learn.json");
+        let mut engine = TutorialEngine::load_or_create_at(path).unwrap();
+
+        // Complete only 8 of 9
+        for i in 1..=8 {
+            engine
+                .handle_event(TutorialEvent::CompleteExercise(
+                    format!("advanced.{i}").into(),
+                ))
+                .unwrap();
+        }
+
+        assert!(
+            !engine
+                .state()
+                .achievements
+                .iter()
+                .any(|a| a.id == "track_advanced_complete")
         );
     }
 }
