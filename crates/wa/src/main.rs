@@ -73,7 +73,7 @@ struct Cli {
     workspace: Option<String>,
 
     #[command(subcommand)]
-    command: Option<Commands>,
+    command: Option<Box<Commands>>,
 }
 
 #[derive(Subcommand)]
@@ -7983,6 +7983,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
         workspace,
         command,
     } = cli;
+    // Unbox the command to keep downstream match patterns unchanged.
+    // The Box avoids stack overflow for the 56-variant Commands enum in debug/test builds.
+    let command = command.map(|b| *b);
 
     let mut overrides = wa_core::config::ConfigOverrides::default();
     if verbose > 0 {
@@ -25775,7 +25778,7 @@ log_level = "debug"
         let cli = Cli::try_parse_from(["wa", "robot", "events", "--dry-run"])
             .expect("robot events --dry-run should parse");
 
-        match cli.command {
+        match cli.command.map(|b| *b) {
             Some(Commands::Robot { command, .. }) => match command {
                 Some(RobotCommands::Events { dry_run, .. }) => {
                     assert!(dry_run, "--dry-run flag should be true");
@@ -25791,7 +25794,7 @@ log_level = "debug"
         let cli = Cli::try_parse_from(["wa", "robot", "events", "--would-handle"])
             .expect("robot events --would-handle should parse");
 
-        match cli.command {
+        match cli.command.map(|b| *b) {
             Some(Commands::Robot { command, .. }) => match command {
                 Some(RobotCommands::Events {
                     would_handle,
@@ -25812,7 +25815,7 @@ log_level = "debug"
         let cli = Cli::try_parse_from(["wa", "robot", "send", "0", "echo hello", "--dry-run"])
             .expect("robot send --dry-run should parse");
 
-        match cli.command {
+        match cli.command.map(|b| *b) {
             Some(Commands::Robot { command, .. }) => match command {
                 Some(RobotCommands::Send { dry_run, .. }) => {
                     assert!(dry_run, "--dry-run flag should be true");
@@ -28049,7 +28052,7 @@ log_level = "debug"
     fn cli_workflow_run_parses_name_and_pane() {
         let cli = Cli::try_parse_from(["wa", "robot", "workflow", "run", "handle_compaction", "3"])
             .expect("workflow run should parse");
-        match cli.command {
+        match cli.command.map(|b| *b) {
             Some(Commands::Robot { command, .. }) => match command {
                 Some(RobotCommands::Workflow {
                     command: RobotWorkflowCommands::Run { name, pane_id, .. },
@@ -28081,7 +28084,7 @@ log_level = "debug"
             "--dry-run",
         ])
         .expect("workflow run --dry-run should parse");
-        match cli.command {
+        match cli.command.map(|b| *b) {
             Some(Commands::Robot { command, .. }) => match command {
                 Some(RobotCommands::Workflow {
                     command: RobotWorkflowCommands::Run { dry_run, .. },
@@ -28098,7 +28101,7 @@ log_level = "debug"
     fn cli_workflow_list_parses() {
         let cli = Cli::try_parse_from(["wa", "robot", "workflow", "list"])
             .expect("workflow list should parse");
-        match cli.command {
+        match cli.command.map(|b| *b) {
             Some(Commands::Robot { command, .. }) => match command {
                 Some(RobotCommands::Workflow {
                     command: RobotWorkflowCommands::List,
@@ -28113,7 +28116,7 @@ log_level = "debug"
     fn cli_workflow_status_by_execution_id() {
         let cli = Cli::try_parse_from(["wa", "robot", "workflow", "status", "wf-abc123"])
             .expect("workflow status should parse");
-        match cli.command {
+        match cli.command.map(|b| *b) {
             Some(Commands::Robot { command, .. }) => match command {
                 Some(RobotCommands::Workflow {
                     command:
@@ -28138,7 +28141,7 @@ log_level = "debug"
     fn cli_workflow_status_by_pane() {
         let cli = Cli::try_parse_from(["wa", "robot", "workflow", "status", "--pane", "7"])
             .expect("workflow status --pane should parse");
-        match cli.command {
+        match cli.command.map(|b| *b) {
             Some(Commands::Robot { command, .. }) => match command {
                 Some(RobotCommands::Workflow {
                     command:
@@ -28159,7 +28162,7 @@ log_level = "debug"
     fn cli_workflow_status_active_flag() {
         let cli = Cli::try_parse_from(["wa", "robot", "workflow", "status", "--active"])
             .expect("workflow status --active should parse");
-        match cli.command {
+        match cli.command.map(|b| *b) {
             Some(Commands::Robot { command, .. }) => match command {
                 Some(RobotCommands::Workflow {
                     command: RobotWorkflowCommands::Status { active, .. },
@@ -28176,7 +28179,7 @@ log_level = "debug"
     fn cli_workflow_abort_parses_execution_id() {
         let cli = Cli::try_parse_from(["wa", "robot", "workflow", "abort", "wf-xyz789"])
             .expect("workflow abort should parse");
-        match cli.command {
+        match cli.command.map(|b| *b) {
             Some(Commands::Robot { command, .. }) => match command {
                 Some(RobotCommands::Workflow {
                     command:
@@ -28209,7 +28212,7 @@ log_level = "debug"
             "--force",
         ])
         .expect("workflow abort with reason and force should parse");
-        match cli.command {
+        match cli.command.map(|b| *b) {
             Some(Commands::Robot { command, .. }) => match command {
                 Some(RobotCommands::Workflow {
                     command:
@@ -28242,7 +28245,7 @@ log_level = "debug"
     fn cli_events_unhandled_flag() {
         let cli = Cli::try_parse_from(["wa", "robot", "events", "--unhandled"])
             .expect("events --unhandled should parse");
-        match cli.command {
+        match cli.command.map(|b| *b) {
             Some(Commands::Robot { command, .. }) => match command {
                 Some(RobotCommands::Events { unhandled, .. }) => {
                     assert!(unhandled, "--unhandled flag should be true");
@@ -28257,7 +28260,7 @@ log_level = "debug"
     fn cli_events_unhandled_only_alias() {
         let cli = Cli::try_parse_from(["wa", "robot", "events", "--unhandled-only"])
             .expect("events --unhandled-only should parse");
-        match cli.command {
+        match cli.command.map(|b| *b) {
             Some(Commands::Robot { command, .. }) => match command {
                 Some(RobotCommands::Events { unhandled, .. }) => {
                     assert!(
@@ -28275,7 +28278,7 @@ log_level = "debug"
     fn cli_notify_test_parses() {
         let cli = Cli::try_parse_from(["wa", "notify", "test", "--channel", "desktop"])
             .expect("notify test should parse");
-        match cli.command {
+        match cli.command.map(|b| *b) {
             Some(Commands::Notify { command }) => match command {
                 NotifyCommands::Test { channel, format } => {
                     assert_eq!(channel, "desktop");
@@ -28328,7 +28331,7 @@ log_level = "debug"
     fn human_workflow_list_parses() {
         let cli =
             Cli::try_parse_from(["wa", "workflow", "list"]).expect("workflow list should parse");
-        match cli.command {
+        match cli.command.map(|b| *b) {
             Some(Commands::Workflow {
                 command: WorkflowCommands::List,
             }) => {}
@@ -28341,7 +28344,7 @@ log_level = "debug"
         let cli =
             Cli::try_parse_from(["wa", "workflow", "run", "handle_compaction", "--pane", "5"])
                 .expect("workflow run should parse");
-        match cli.command {
+        match cli.command.map(|b| *b) {
             Some(Commands::Workflow {
                 command:
                     WorkflowCommands::Run {
@@ -28370,7 +28373,7 @@ log_level = "debug"
             "--dry-run",
         ])
         .expect("workflow run --dry-run should parse");
-        match cli.command {
+        match cli.command.map(|b| *b) {
             Some(Commands::Workflow {
                 command: WorkflowCommands::Run { dry_run, .. },
             }) => {
@@ -28391,7 +28394,7 @@ log_level = "debug"
         let cli =
             Cli::try_parse_from(["wa", "workflow", "status", "human-handle_compaction-123456"])
                 .expect("workflow status should parse");
-        match cli.command {
+        match cli.command.map(|b| *b) {
             Some(Commands::Workflow {
                 command:
                     WorkflowCommands::Status {
@@ -28410,7 +28413,7 @@ log_level = "debug"
     fn human_workflow_status_verbose_flag() {
         let cli = Cli::try_parse_from(["wa", "workflow", "status", "wf-abc", "-v"])
             .expect("workflow status -v should parse");
-        match cli.command {
+        match cli.command.map(|b| *b) {
             Some(Commands::Workflow {
                 command: WorkflowCommands::Status { verbose, .. },
             }) => {
@@ -28424,7 +28427,7 @@ log_level = "debug"
     fn human_workflow_status_double_verbose() {
         let cli = Cli::try_parse_from(["wa", "workflow", "status", "wf-abc", "-vv"])
             .expect("workflow status -vv should parse");
-        match cli.command {
+        match cli.command.map(|b| *b) {
             Some(Commands::Workflow {
                 command: WorkflowCommands::Status { verbose, .. },
             }) => {
@@ -28447,7 +28450,7 @@ log_level = "debug"
         ])
         .expect("search bookmark filters should parse");
 
-        match cli.command {
+        match cli.command.map(|b| *b) {
             Some(Commands::Search {
                 query,
                 bookmark,
@@ -28474,7 +28477,7 @@ log_level = "debug"
         ])
         .expect("status bookmark filters should parse");
 
-        match cli.command {
+        match cli.command.map(|b| *b) {
             Some(Commands::Status {
                 bookmark,
                 bookmark_tag,
@@ -28510,7 +28513,7 @@ log_level = "debug"
         ])
         .expect("history should parse");
 
-        match cli.command {
+        match cli.command.map(|b| *b) {
             Some(Commands::History {
                 pane_id,
                 limit,
@@ -28551,7 +28554,7 @@ log_level = "debug"
     fn human_prepare_send_parses() {
         let cli = Cli::try_parse_from(["wa", "prepare", "send", "--pane", "7", "echo hi"])
             .expect("prepare send should parse");
-        match cli.command {
+        match cli.command.map(|b| *b) {
             Some(Commands::Prepare {
                 command: PrepareCommands::Send { pane_id, text, .. },
             }) => {
@@ -28577,7 +28580,7 @@ log_level = "debug"
             "4",
         ])
         .expect("prepare workflow run should parse");
-        match cli.command {
+        match cli.command.map(|b| *b) {
             Some(Commands::Prepare {
                 command:
                     PrepareCommands::Workflow {
@@ -28598,7 +28601,7 @@ log_level = "debug"
     fn human_commit_parses() {
         let cli = Cli::try_parse_from(["wa", "commit", "plan:abcd", "--text", "ls"])
             .expect("commit should parse");
-        match cli.command {
+        match cli.command.map(|b| *b) {
             Some(Commands::Commit { plan_id, text, .. }) => {
                 assert_eq!(plan_id, "plan:abcd");
                 assert_eq!(text.as_deref(), Some("ls"));
@@ -29105,7 +29108,7 @@ log_level = "debug"
     fn cli_analytics_default_parses() {
         let cli =
             Cli::try_parse_from(["wa", "analytics"]).expect("analytics should parse with defaults");
-        match cli.command {
+        match cli.command.map(|b| *b) {
             Some(Commands::Analytics {
                 command,
                 period,
@@ -29123,7 +29126,7 @@ log_level = "debug"
     fn cli_analytics_daily_parses() {
         let cli = Cli::try_parse_from(["wa", "analytics", "daily"])
             .expect("analytics daily should parse");
-        match cli.command {
+        match cli.command.map(|b| *b) {
             Some(Commands::Analytics { command, .. }) => {
                 assert!(matches!(command, Some(AnalyticsCommands::Daily)));
             }
@@ -29135,7 +29138,7 @@ log_level = "debug"
     fn cli_analytics_by_agent_parses() {
         let cli = Cli::try_parse_from(["wa", "analytics", "by-agent"])
             .expect("analytics by-agent should parse");
-        match cli.command {
+        match cli.command.map(|b| *b) {
             Some(Commands::Analytics { command, .. }) => {
                 assert!(matches!(command, Some(AnalyticsCommands::ByAgent)));
             }
@@ -29155,7 +29158,7 @@ log_level = "debug"
             "usage.csv",
         ])
         .expect("analytics export should parse");
-        match cli.command {
+        match cli.command.map(|b| *b) {
             Some(Commands::Analytics { command, .. }) => match command {
                 Some(AnalyticsCommands::Export { format, output }) => {
                     assert_eq!(format, "csv");
@@ -29171,7 +29174,7 @@ log_level = "debug"
     fn cli_analytics_period_flag() {
         let cli = Cli::try_parse_from(["wa", "analytics", "--period", "30d"])
             .expect("analytics with period should parse");
-        match cli.command {
+        match cli.command.map(|b| *b) {
             Some(Commands::Analytics { period, .. }) => {
                 assert_eq!(period, "30d");
             }
