@@ -5464,6 +5464,203 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Focus traversal tests (FTUI-06.5)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn focus_default_is_primary_list() {
+        let model = make_model(MockQuery::healthy());
+        assert_eq!(model.view_state.focus, FocusRegion::PrimaryList);
+    }
+
+    #[test]
+    fn focus_tab_resets_to_primary_list() {
+        let mut model = make_model(MockQuery::healthy());
+        model.view_state.focus = FocusRegion::FilterBar;
+        let tab = ftui::KeyEvent {
+            code: ftui::KeyCode::Tab,
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
+        ftui::Model::update(&mut model, WaMsg::TermEvent(ftui::Event::Key(tab)));
+        assert_eq!(model.view_state.focus, FocusRegion::PrimaryList);
+    }
+
+    #[test]
+    fn focus_backtab_resets_to_primary_list() {
+        let mut model = make_model(MockQuery::healthy());
+        model.view_state.focus = FocusRegion::FilterBar;
+        let backtab = ftui::KeyEvent {
+            code: ftui::KeyCode::BackTab,
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
+        ftui::Model::update(&mut model, WaMsg::TermEvent(ftui::Event::Key(backtab)));
+        assert_eq!(model.view_state.focus, FocusRegion::PrimaryList);
+    }
+
+    #[test]
+    fn focus_search_typing_sets_filter_bar() {
+        let mut model = make_model(MockQuery::healthy().with_search_results(vec![]));
+        model.view_state.current_view = View::Search;
+        press_key(&mut model, ftui::KeyCode::Char('a'));
+        assert_eq!(model.view_state.focus, FocusRegion::FilterBar);
+    }
+
+    #[test]
+    fn focus_search_down_sets_primary_list() {
+        let mut model = make_model(MockQuery::healthy().with_search_results(vec![]));
+        model.view_state.current_view = View::Search;
+        press_key(&mut model, ftui::KeyCode::Char('a'));
+        assert_eq!(model.view_state.focus, FocusRegion::FilterBar);
+        press_key(&mut model, ftui::KeyCode::Down);
+        assert_eq!(model.view_state.focus, FocusRegion::PrimaryList);
+    }
+
+    #[test]
+    fn focus_search_escape_sets_primary_list() {
+        let mut model = make_model(MockQuery::healthy().with_search_results(vec![]));
+        model.view_state.current_view = View::Search;
+        press_key(&mut model, ftui::KeyCode::Char('a'));
+        assert_eq!(model.view_state.focus, FocusRegion::FilterBar);
+        press_key(&mut model, ftui::KeyCode::Escape);
+        assert_eq!(model.view_state.focus, FocusRegion::PrimaryList);
+    }
+
+    #[test]
+    fn focus_search_enter_sets_primary_list() {
+        let mut model = make_model(MockQuery::healthy().with_search_results(vec![]));
+        model.view_state.current_view = View::Search;
+        press_key(&mut model, ftui::KeyCode::Char('t'));
+        assert_eq!(model.view_state.focus, FocusRegion::FilterBar);
+        press_key(&mut model, ftui::KeyCode::Enter);
+        assert_eq!(model.view_state.focus, FocusRegion::PrimaryList);
+    }
+
+    #[test]
+    fn focus_events_digit_sets_filter_bar() {
+        let mut model = make_model(MockQuery::with_events());
+        model.view_state.current_view = View::Events;
+        model.refresh_data();
+        press_key(&mut model, ftui::KeyCode::Char('4'));
+        assert_eq!(model.view_state.focus, FocusRegion::FilterBar);
+    }
+
+    #[test]
+    fn focus_events_j_sets_primary_list() {
+        let mut model = make_model(MockQuery::with_events());
+        model.view_state.current_view = View::Events;
+        model.refresh_data();
+        press_key(&mut model, ftui::KeyCode::Char('4'));
+        assert_eq!(model.view_state.focus, FocusRegion::FilterBar);
+        press_key(&mut model, ftui::KeyCode::Char('j'));
+        assert_eq!(model.view_state.focus, FocusRegion::PrimaryList);
+    }
+
+    #[test]
+    fn focus_events_escape_sets_primary_list() {
+        let mut model = make_model(MockQuery::with_events());
+        model.view_state.current_view = View::Events;
+        model.refresh_data();
+        press_key(&mut model, ftui::KeyCode::Char('4'));
+        assert_eq!(model.view_state.focus, FocusRegion::FilterBar);
+        press_key(&mut model, ftui::KeyCode::Escape);
+        assert_eq!(model.view_state.focus, FocusRegion::PrimaryList);
+    }
+
+    #[test]
+    fn focus_history_typing_sets_filter_bar() {
+        let mut model = make_model(MockQuery::with_history());
+        model.view_state.current_view = View::History;
+        model.refresh_data();
+        press_key(&mut model, ftui::KeyCode::Char('a'));
+        assert_eq!(model.view_state.focus, FocusRegion::FilterBar);
+    }
+
+    #[test]
+    fn focus_history_j_sets_primary_list() {
+        let mut model = make_model(MockQuery::with_history());
+        model.view_state.current_view = View::History;
+        model.refresh_data();
+        press_key(&mut model, ftui::KeyCode::Char('a'));
+        assert_eq!(model.view_state.focus, FocusRegion::FilterBar);
+        press_key(&mut model, ftui::KeyCode::Char('j'));
+        assert_eq!(model.view_state.focus, FocusRegion::PrimaryList);
+    }
+
+    #[test]
+    fn focus_history_escape_sets_primary_list() {
+        let mut model = make_model(MockQuery::with_history());
+        model.view_state.current_view = View::History;
+        model.refresh_data();
+        press_key(&mut model, ftui::KeyCode::Char('a'));
+        assert_eq!(model.view_state.focus, FocusRegion::FilterBar);
+        press_key(&mut model, ftui::KeyCode::Escape);
+        assert_eq!(model.view_state.focus, FocusRegion::PrimaryList);
+    }
+
+    #[test]
+    fn focus_modal_traps_input() {
+        let mut model = make_model(MockQuery::with_triage());
+        model.view_state.current_view = View::Triage;
+        model.refresh_data();
+        // Trigger action modal
+        press_key(&mut model, ftui::KeyCode::Enter);
+        assert!(model.active_modal.is_some());
+        // Tab should NOT change views while modal is active
+        let view_before = model.view_state.current_view;
+        let tab = ftui::KeyEvent {
+            code: ftui::KeyCode::Tab,
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
+        ftui::Model::update(&mut model, WaMsg::TermEvent(ftui::Event::Key(tab)));
+        assert_eq!(model.view_state.current_view, view_before);
+        assert!(model.active_modal.is_some());
+    }
+
+    #[test]
+    fn focus_traversal_full_cycle() {
+        // Tab through all 7 views and verify focus resets each time
+        let mut model = make_model(MockQuery::healthy());
+        model.view_state.focus = FocusRegion::FilterBar;
+        for _ in 0..7 {
+            let tab = ftui::KeyEvent {
+                code: ftui::KeyCode::Tab,
+                kind: ftui::KeyEventKind::Press,
+                modifiers: ftui::Modifiers::empty(),
+            };
+            ftui::Model::update(&mut model, WaMsg::TermEvent(ftui::Event::Key(tab)));
+            assert_eq!(model.view_state.focus, FocusRegion::PrimaryList,
+                "Focus should reset to PrimaryList on view switch");
+        }
+        // Should have cycled back to original view
+        assert_eq!(model.view_state.current_view, View::Home);
+    }
+
+    #[test]
+    fn focus_events_u_toggle_sets_primary_list() {
+        let mut model = make_model(MockQuery::with_events());
+        model.view_state.current_view = View::Events;
+        model.refresh_data();
+        press_key(&mut model, ftui::KeyCode::Char('4'));
+        assert_eq!(model.view_state.focus, FocusRegion::FilterBar);
+        press_key(&mut model, ftui::KeyCode::Char('u'));
+        assert_eq!(model.view_state.focus, FocusRegion::PrimaryList);
+    }
+
+    #[test]
+    fn focus_history_u_toggle_sets_primary_list() {
+        let mut model = make_model(MockQuery::with_history());
+        model.view_state.current_view = View::History;
+        model.refresh_data();
+        press_key(&mut model, ftui::KeyCode::Char('a'));
+        assert_eq!(model.view_state.focus, FocusRegion::FilterBar);
+        press_key(&mut model, ftui::KeyCode::Char('u'));
+        assert_eq!(model.view_state.focus, FocusRegion::PrimaryList);
+    }
+
+    // -----------------------------------------------------------------------
     // Snapshot / golden suite (FTUI-07.2)
     // -----------------------------------------------------------------------
 
@@ -5908,5 +6105,573 @@ mod tests {
         assert!(text.contains("2") || text.contains("undoable"),
             "Should reflect filtered count");
     }
+
+
+    // -----------------------------------------------------------------------
+    // PTY E2E scenario pack (FTUI-07.3)
+    //
+    // Headless multi-step user journeys through the full model pipeline.
+    // Each test simulates a realistic terminal session: key sequences,
+    // view transitions, filtering, and data interactions — capturing
+    // frame output at each step for regression detection.
+    // -----------------------------------------------------------------------
+
+    /// Multi-step session helper: inject keys and capture frames.
+    struct E2eSession {
+        model: WaModel,
+        frames: Vec<String>,
+    }
+
+    impl E2eSession {
+        fn new(query: MockQuery) -> Self {
+            let mut model = make_model(query);
+            model.refresh_data();
+            Self { model, frames: Vec::new() }
+        }
+
+        /// Press a key through the full update() pipeline and capture the frame.
+        fn press(&mut self, code: ftui::KeyCode) -> usize {
+            use ftui::Model as _;
+            let key = ftui::KeyEvent {
+                code,
+                kind: ftui::KeyEventKind::Press,
+                modifiers: ftui::Modifiers::empty(),
+            };
+            self.model.update(WaMsg::TermEvent(ftui::Event::Key(key)));
+            self.capture_idx()
+        }
+
+        /// Press a char key.
+        fn char(&mut self, ch: char) -> usize {
+            self.press(ftui::KeyCode::Char(ch))
+        }
+
+        /// Capture the current frame as text. Returns snapshot index.
+        fn capture(&mut self) -> usize {
+            self.capture_idx()
+        }
+
+        fn capture_idx(&mut self) -> usize {
+            use ftui::Model as _;
+            let mut pool = ftui::GraphemePool::new();
+            let mut frame = ftui::Frame::new(80, 24, &mut pool);
+            self.model.view(&mut frame);
+            self.frames.push(frame_to_text(&frame));
+            self.frames.len() - 1
+        }
+
+        /// Get a snapshot by index.
+        fn frame_at(&self, idx: usize) -> &str {
+            &self.frames[idx]
+        }
+
+        /// Get the last captured frame.
+        fn last_frame(&self) -> &str {
+            self.frames.last().map_or("", |s| s.as_str())
+        }
+
+        /// Dump all frames for diagnostics.
+        fn diagnostic_dump(&self) -> String {
+            let mut out = String::new();
+            for (i, f) in self.frames.iter().enumerate() {
+                out.push_str(&format!("=== Frame {} ===\n{}\n\n", i, f));
+            }
+            out
+        }
+
+        /// Assert the current view matches expected.
+        fn assert_view(&self, expected: View) {
+            assert_eq!(
+                self.model.view_state.current_view, expected,
+                "Expected view {:?}, dump:\n{}", expected, self.diagnostic_dump()
+            );
+        }
+
+        /// Assert last frame contains text.
+        fn assert_contains(&self, text: &str) {
+            let last = self.last_frame();
+            assert!(
+                last.contains(text),
+                "Expected '{}' in frame:\n{}\nFull dump:\n{}",
+                text, last, self.diagnostic_dump()
+            );
+        }
+
+        /// Assert last frame does NOT contain text.
+        fn assert_not_contains(&self, text: &str) {
+            let last = self.last_frame();
+            assert!(
+                !last.contains(text),
+                "Did not expect '{}' in frame:\n{}",
+                text, last
+            );
+        }
+    }
+
+    // -- Lifecycle scenarios --
+
+    #[test]
+    fn e2e_full_view_tour() {
+        // Scenario: User tours all views via Tab key
+        let mut s = E2eSession::new(MockQuery::healthy());
+        s.capture();
+        s.assert_view(View::Home);
+
+        // Tab through all views
+        let expected = [
+            View::Panes, View::Events, View::Triage,
+            View::History, View::Search, View::Help,
+            View::Home, // wraps
+        ];
+        for &view in &expected {
+            s.press(ftui::KeyCode::Tab);
+            s.assert_view(view);
+        }
+    }
+
+    #[test]
+    fn e2e_direct_navigation_1_through_7() {
+        // Scenario: User jumps to each view via number keys from Home
+        // Note: digit keys are consumed by filters in Events/Triage/History/Search,
+        // so we return to Home between each navigation.
+        let mut s = E2eSession::new(MockQuery::healthy());
+        let views = [
+            ('1', View::Home), ('2', View::Panes), ('3', View::Events),
+            ('4', View::Triage), ('5', View::History), ('6', View::Search),
+            ('7', View::Help),
+        ];
+        for (key, view) in views {
+            // Return to Home first (where digits always navigate)
+            s.model.view_state.current_view = View::Home;
+            s.char(key);
+            s.assert_view(view);
+        }
+    }
+
+    #[test]
+    fn e2e_quit_from_home() {
+        // Scenario: User presses 'q' to quit from Home view
+        let mut s = E2eSession::new(MockQuery::healthy());
+        s.capture();
+        s.assert_view(View::Home);
+        let key = ftui::KeyEvent {
+            code: ftui::KeyCode::Char('q'),
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
+        let result = s.model.handle_global_key(&key);
+        // 'q' on Home should signal quit (or be handled globally)
+        assert!(result.is_some(), "q should be handled globally");
+    }
+
+    // -- Events view interaction --
+
+    #[test]
+    fn e2e_events_browse_and_filter() {
+        // Scenario: Navigate to Events, browse items, toggle unhandled filter
+        let mut s = E2eSession::new(MockQuery::with_events());
+        s.char('3'); // Switch to Events
+        s.capture();
+        s.assert_view(View::Events);
+
+        // Navigate down through events
+        s.press(ftui::KeyCode::Char('j'));
+        let after_down = s.capture();
+        // Selection should have changed (different highlight)
+
+        s.press(ftui::KeyCode::Char('j'));
+        s.press(ftui::KeyCode::Char('k')); // Back up
+        s.capture();
+
+        // Toggle unhandled-only filter
+        s.press(ftui::KeyCode::Char('u'));
+        let filtered = s.capture();
+        // Should show filtered count (unhandled events only)
+        assert_ne!(
+            s.frame_at(after_down), s.frame_at(filtered),
+            "Filter should change display"
+        );
+    }
+
+    // -- History view lifecycle --
+
+    #[test]
+    fn e2e_history_filter_navigate_clear() {
+        // Scenario: Open History, type filter, navigate filtered results, clear
+        let mut s = E2eSession::new(MockQuery::with_history());
+        s.char('5'); // Switch to History
+        s.capture();
+        s.assert_view(View::History);
+        s.assert_contains("History");
+
+        // Type "send" to filter
+        for ch in "send".chars() {
+            s.char(ch);
+        }
+        s.capture();
+        assert_eq!(s.model.view_state.history.filter_input.text(), "send");
+
+        // Navigate in filtered results
+        s.press(ftui::KeyCode::Down);
+        s.capture();
+
+        // Clear with Escape
+        s.press(ftui::KeyCode::Escape);
+        s.capture();
+        assert!(s.model.view_state.history.filter_input.text().is_empty());
+        assert!(!s.model.view_state.history.undoable_only);
+    }
+
+    #[test]
+    fn e2e_history_undoable_then_text_filter() {
+        // Scenario: Toggle undoable, then add text filter — combined filtering
+        let mut s = E2eSession::new(MockQuery::with_history());
+        s.char('5');
+        s.capture();
+
+        // Toggle undoable
+        s.press(ftui::KeyCode::Char('u'));
+        s.capture();
+        assert!(s.model.view_state.history.undoable_only);
+        let undoable_count = s.model.view_state.history.filtered_indices().len();
+        assert_eq!(undoable_count, 2, "2 of 3 entries are undoable");
+
+        // Further filter by text
+        for ch in "send".chars() {
+            s.char(ch);
+        }
+        s.capture();
+        // "send_text" entries that are also undoable
+        let combined = s.model.view_state.history.filtered_indices().len();
+        assert!(combined <= undoable_count);
+    }
+
+    // -- Triage view interaction --
+
+    #[test]
+    fn e2e_triage_browse_and_expand() {
+        // Scenario: Open Triage, navigate items, expand detail
+        let mut s = E2eSession::new(MockQuery::with_triage());
+        s.char('4'); // Switch to Triage
+        s.capture();
+        s.assert_view(View::Triage);
+
+        // Navigate down
+        s.press(ftui::KeyCode::Char('j'));
+        s.capture();
+
+        // Press Enter to expand (if supported)
+        s.press(ftui::KeyCode::Enter);
+        s.capture();
+    }
+
+    // -- Search view lifecycle --
+
+    #[test]
+    fn e2e_search_type_query_and_browse() {
+        // Scenario: Open Search, type query, see results appear
+        let query = MockQuery::healthy().with_search_results(vec![
+            SearchResultView {
+                pane_id: 1,
+                timestamp: 1_700_000_000_000,
+                snippet: "matched line alpha".to_string(),
+                rank: 0.95,
+            },
+            SearchResultView {
+                pane_id: 2,
+                timestamp: 1_700_000_060_000,
+                snippet: "matched line beta".to_string(),
+                rank: 0.80,
+            },
+        ]);
+        let mut s = E2eSession::new(query);
+        s.char('6'); // Switch to Search
+        s.capture();
+        s.assert_view(View::Search);
+
+        // Type search query
+        for ch in "alpha".chars() {
+            s.char(ch);
+        }
+        s.capture();
+        assert_eq!(s.model.search_input.text(), "alpha");
+
+        // Navigate results (if any)
+        s.press(ftui::KeyCode::Down);
+        s.capture();
+    }
+
+    // -- Panes view lifecycle --
+
+    #[test]
+    fn e2e_panes_navigate_and_return() {
+        // Scenario: Navigate to Panes, browse, return to Home
+        let mut s = E2eSession::new(MockQuery::healthy());
+        s.char('2'); // Panes
+        s.capture();
+        s.assert_view(View::Panes);
+
+        // Navigate pane list
+        s.press(ftui::KeyCode::Down);
+        s.press(ftui::KeyCode::Down);
+        s.capture();
+
+        // Return to Home
+        s.char('1');
+        s.assert_view(View::Home);
+        s.capture();
+        s.assert_contains("WezTerm Automata");
+    }
+
+    // -- Resize stress --
+
+    #[test]
+    fn e2e_resize_stress_no_panic() {
+        // Scenario: Render at various sizes rapidly, simulating terminal resize
+        use ftui::Model as _;
+        let mut model = make_model(MockQuery::with_events());
+        model.refresh_data();
+
+        let sizes: &[(u16, u16)] = &[
+            (80, 24), (40, 10), (120, 50), (20, 3), (200, 80),
+            (80, 24), (60, 15), (30, 5), (100, 30), (80, 24),
+        ];
+
+        for &(w, h) in sizes {
+            for &view in View::all() {
+                model.view_state.current_view = view;
+                let mut pool = ftui::GraphemePool::new();
+                let mut frame = ftui::Frame::new(w, h, &mut pool);
+                model.view(&mut frame);
+                // Just verify no panic and non-empty for valid sizes
+                if h >= 3 && w >= 20 {
+                    let text = frame_to_text(&frame);
+                    assert!(!text.is_empty(), "Frame empty at {w}x{h} for {view:?}");
+                }
+            }
+        }
+    }
+
+    // -- Key storm stress --
+
+    #[test]
+    fn e2e_key_storm_no_panic() {
+        // Scenario: Rapid random key presses across all views
+        let mut s = E2eSession::new(MockQuery::with_history());
+
+        let key_storm: &[ftui::KeyCode] = &[
+            ftui::KeyCode::Tab, ftui::KeyCode::Char('j'), ftui::KeyCode::Char('k'),
+            ftui::KeyCode::Down, ftui::KeyCode::Up,
+            ftui::KeyCode::Char('3'), // Events
+            ftui::KeyCode::Char('j'), ftui::KeyCode::Char('j'),
+            ftui::KeyCode::Char('u'), // toggle unhandled
+            ftui::KeyCode::Tab,
+            ftui::KeyCode::Char('5'), // History
+            ftui::KeyCode::Char('a'), ftui::KeyCode::Char('b'), ftui::KeyCode::Char('c'),
+            ftui::KeyCode::Backspace, ftui::KeyCode::Backspace,
+            ftui::KeyCode::Char('u'), // toggle undoable
+            ftui::KeyCode::Escape,
+            ftui::KeyCode::Tab, ftui::KeyCode::Tab, ftui::KeyCode::Tab,
+            ftui::KeyCode::Char('7'), // Help
+            ftui::KeyCode::Char('1'), // Home
+        ];
+
+        for &code in key_storm {
+            s.press(code);
+        }
+
+        // Should end on Home after pressing '1'
+        s.assert_view(View::Home);
+        // Verify no crash and frame is renderable
+        s.capture();
+    }
+
+    // -- Data refresh during interaction --
+
+    #[test]
+    fn e2e_refresh_preserves_view() {
+        // Scenario: User is browsing, data refresh happens, view should persist
+        let mut s = E2eSession::new(MockQuery::with_events());
+        s.char('3'); // Events
+        s.capture();
+        s.assert_view(View::Events);
+
+        // Navigate down
+        s.press(ftui::KeyCode::Char('j'));
+
+        // Simulate data refresh
+        s.model.refresh_data();
+        s.capture();
+
+        // View should still be Events
+        s.assert_view(View::Events);
+    }
+
+    #[test]
+    fn e2e_refresh_during_filter() {
+        // Scenario: User has active filter, data refresh should preserve filter state
+        let mut s = E2eSession::new(MockQuery::with_history());
+        s.char('5'); // History
+        for ch in "send".chars() {
+            s.char(ch);
+        }
+        let before_refresh = s.model.view_state.history.filter_input.text().to_string();
+
+        s.model.refresh_data();
+        s.capture();
+
+        assert_eq!(s.model.view_state.history.filter_input.text(), before_refresh);
+        s.assert_view(View::History);
+    }
+
+    // -- Degraded data scenarios --
+
+    #[test]
+    fn e2e_degraded_system_all_views_accessible() {
+        // Scenario: System is unhealthy; all views should still render without panic
+        let mut s = E2eSession::new(MockQuery::degraded());
+        for &view in View::all() {
+            s.model.view_state.current_view = view;
+            s.capture();
+        }
+        // Verify Home shows error state
+        s.model.view_state.current_view = View::Home;
+        s.capture();
+        s.assert_contains("ERROR");
+    }
+
+    // -- Full workflow: navigate, filter, navigate, switch, return --
+
+    #[test]
+    fn e2e_cross_view_workflow() {
+        // Scenario: Complex multi-view workflow navigating via Tab.
+        // Digit keys are consumed by view-specific handlers in Events/History/Search.
+        let query = MockQuery::healthy()
+            .with_search_results(vec![
+                SearchResultView { pane_id: 1, timestamp: 1_700_000_000_000, snippet: "error log".to_string(), rank: 0.9 },
+            ]);
+        let mut s = E2eSession::new(query);
+
+        // 1. Home
+        s.capture();
+        s.assert_view(View::Home);
+        s.assert_contains("WezTerm Automata");
+
+        // 2. Events (from Home, digit '3' works)
+        s.char('3');
+        s.assert_view(View::Events);
+        s.press(ftui::KeyCode::Char('j'));
+        s.capture();
+
+        // 3. History (Tab from Events through Triage)
+        s.press(ftui::KeyCode::Tab); // Events -> Triage
+        s.press(ftui::KeyCode::Tab); // Triage -> History
+        s.assert_view(View::History);
+        s.char('t'); s.char('e'); s.char('s'); s.char('t');
+        s.capture();
+        assert_eq!(s.model.view_state.history.filter_input.text(), "test");
+        s.press(ftui::KeyCode::Escape);
+        assert!(s.model.view_state.history.filter_input.text().is_empty());
+
+        // 4. Panes (Tab from History through Search/Help/Home, then '2')
+        s.press(ftui::KeyCode::Tab); // History -> Search
+        s.press(ftui::KeyCode::Tab); // Search -> Help
+        s.press(ftui::KeyCode::Tab); // Help -> Home
+        s.char('2'); // Home -> Panes
+        s.assert_view(View::Panes);
+        s.press(ftui::KeyCode::Down);
+        s.capture();
+
+        // 5. Search (Tab from Panes through Events/Triage/History)
+        s.press(ftui::KeyCode::Tab); // Panes -> Events
+        s.press(ftui::KeyCode::Tab); // Events -> Triage
+        s.press(ftui::KeyCode::Tab); // Triage -> History
+        s.press(ftui::KeyCode::Tab); // History -> Search
+        s.assert_view(View::Search);
+        for ch in "error".chars() {
+            s.char(ch);
+        }
+        s.capture();
+        assert_eq!(s.model.search_input.text(), "error");
+
+        // 6. Back to Home (Tab through Help)
+        s.press(ftui::KeyCode::Tab); // Search -> Help
+        s.press(ftui::KeyCode::Tab); // Help -> Home
+        s.assert_view(View::Home);
+        s.capture();
+    }
+
+    // -- Edge case: rapid view switching --
+
+    #[test]
+    fn e2e_rapid_view_switch_stress() {
+        // Scenario: Rapidly switch between all views via Tab 100 times
+        // Tab always works globally, unlike digits which are consumed in some views.
+        let mut s = E2eSession::new(MockQuery::healthy());
+        for _ in 0..100 {
+            s.press(ftui::KeyCode::Tab);
+        }
+        // 100 tabs from Home: 100 % 7 = 2 -> should be on Events (Home+2)
+        // Home->Panes->Events->Triage->History->Search->Help->Home...
+        // 100 mod 7 = 2 (0-indexed from Home): Panes(1), Events(2)
+        s.assert_view(View::Events);
+        s.capture();
+    }
+
+    // -- Edge case: empty data states --
+
+    #[test]
+    fn e2e_empty_states_all_views() {
+        // Scenario: All data sources return empty — verify graceful rendering
+        let mut s = E2eSession::new(MockQuery::degraded());
+        for &view in View::all() {
+            s.model.view_state.current_view = view;
+            s.capture();
+            // Should not crash, frame should be non-empty
+            assert!(!s.last_frame().is_empty(), "Empty frame for {:?}", view);
+        }
+    }
+
+    // -- Input stress: long filter strings --
+
+    #[test]
+    fn e2e_long_filter_input() {
+        // Scenario: Type a very long filter string in History view
+        // Avoid: 'j' (nav down), 'k' (nav up), 'u' (toggle undoable)
+        let mut s = E2eSession::new(MockQuery::with_history());
+        s.model.view_state.current_view = View::History;
+        s.capture();
+
+        let safe_chars = "abcdefghilmnopqrstvwxyz";
+        for i in 0..200 {
+            let ch = safe_chars.as_bytes()[i % safe_chars.len()] as char;
+            s.char(ch);
+        }
+        s.capture();
+        assert_eq!(s.model.view_state.history.filter_input.text().len(), 200);
+
+        // Clear it all with Escape
+        s.press(ftui::KeyCode::Escape);
+        assert!(s.model.view_state.history.filter_input.text().is_empty());
+    }
+
+    // -- Artifact diagnostic test (demonstrates dump format) --
+
+    #[test]
+    fn e2e_diagnostic_dump_format() {
+        // Verify the diagnostic dump is useful for debugging
+        let mut s = E2eSession::new(MockQuery::healthy());
+        s.capture();
+        s.char('3'); // Events
+        s.capture();
+        s.char('5'); // History
+        s.capture();
+
+        let dump = s.diagnostic_dump();
+        assert!(dump.contains("=== Frame 0 ==="), "Dump should have frame markers");
+        assert!(dump.contains("=== Frame 1 ==="), "Dump should show multiple frames");
+        assert!(dump.contains("=== Frame 2 ==="), "Should have 3 frames");
+    }
+
 
 }
