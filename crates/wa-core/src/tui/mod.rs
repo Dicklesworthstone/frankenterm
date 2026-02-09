@@ -71,6 +71,11 @@ pub mod keymap;
 // DELETION: Remove when ftui Program runtime fully owns the lifecycle (FTUI-09.3).
 pub mod terminal_session;
 
+// Command execution handoff — suspend TUI, run shell command, resume.
+// Deterministic state machine with output gate integration.
+// DELETION: Remove when ftui's native subprocess model replaces this (FTUI-09.3).
+pub mod command_handoff;
+
 // Legacy ratatui backend
 #[cfg(feature = "tui")]
 mod app;
