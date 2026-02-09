@@ -12552,8 +12552,60 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
         Some(Commands::Show { pane_id, output }) => {
             tracing::info!("Showing pane {} (output={})", pane_id, output);
-            // TODO: Implement show
-            println!("Show not yet implemented");
+            let wezterm = wa_core::wezterm::default_wezterm_handle();
+            match wezterm.get_pane(pane_id).await {
+                Ok(pane) => {
+                    println!("Pane {}", pane.pane_id);
+                    println!(
+                        "  Tab: {}  Window: {}  Domain: {}",
+                        pane.tab_id,
+                        pane.window_id,
+                        pane.effective_domain()
+                    );
+                    if let Some(title) = &pane.title {
+                        println!("  Title: {title}");
+                    }
+                    if let Some(ws) = &pane.workspace {
+                        println!("  Workspace: {ws}");
+                    }
+                    let cwd_info = pane.parsed_cwd();
+                    if !cwd_info.path.is_empty() {
+                        println!("  CWD: {}", cwd_info.path);
+                    }
+                    println!(
+                        "  Size: {}x{}",
+                        pane.effective_cols(),
+                        pane.effective_rows()
+                    );
+                    if let (Some(x), Some(y)) = (pane.cursor_x, pane.cursor_y) {
+                        println!("  Cursor: ({x}, {y})");
+                    }
+                    if pane.is_active {
+                        println!("  Active: yes");
+                    }
+                    if pane.is_zoomed {
+                        println!("  Zoomed: yes");
+                    }
+                    if let Some(tty) = &pane.tty_name {
+                        println!("  TTY: {tty}");
+                    }
+                    if output {
+                        match wezterm.get_text(pane_id, false).await {
+                            Ok(text) => {
+                                println!("\n--- Output ---");
+                                print!("{text}");
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to get pane output: {e}");
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
 
         Some(Commands::Send {
@@ -12876,8 +12928,16 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
         Some(Commands::GetText { pane_id, escapes }) => {
             tracing::info!("Getting text from pane {} (escapes={})", pane_id, escapes);
-            // TODO: Implement get-text
-            println!("Get-text not yet implemented");
+            let wezterm = wa_core::wezterm::default_wezterm_handle();
+            match wezterm.get_text(pane_id, escapes).await {
+                Ok(text) => {
+                    print!("{text}");
+                }
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
 
         Some(Commands::Workflow { command }) => {
@@ -24682,6 +24742,112 @@ fn run_diagnostics(
                 format!("CLI error: {e}"),
                 "Ensure WezTerm is installed and running",
             ));
+        }
+    }
+
+    // Browser automation checks (when browser feature is enabled)
+    #[cfg(feature = "browser")]
+    {
+        // Profile directory check only — no browser launch needed
+
+        // Check: Playwright available
+        match std::process::Command::new("npx")
+            .args(["playwright", "--version"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                let version = String::from_utf8_lossy(&output.stdout);
+                checks.push(DiagnosticCheck::ok_with_detail(
+                    "Playwright",
+                    format!("v{}", version.trim()),
+                ));
+            }
+            Ok(_) => {
+                checks.push(DiagnosticCheck::warning(
+                    "Playwright",
+                    "npx playwright returned non-zero",
+                    "Install Playwright: npx playwright install chromium",
+                ));
+            }
+            Err(_) => {
+                checks.push(DiagnosticCheck::warning(
+                    "Playwright",
+                    "npx not found or playwright not installed",
+                    "Install Node.js and Playwright: npm install -D playwright && npx playwright install chromium",
+                ));
+            }
+        }
+
+        // Check browser profiles for each service
+        let data_dir = layout
+            .wa_dir
+            .join("browser_profiles");
+        for service in &["openai", "anthropic", "google"] {
+            let service_dir = data_dir.join(service);
+            if service_dir.exists() {
+                // Count account profiles
+                let profile_count = std::fs::read_dir(&service_dir)
+                    .map(|rd| rd.filter(|e| e.as_ref().is_ok_and(|e| e.path().is_dir())).count())
+                    .unwrap_or(0);
+
+                if profile_count > 0 {
+                    // Check if any profile has been bootstrapped
+                    let mut bootstrapped = 0u32;
+                    if let Ok(entries) = std::fs::read_dir(&service_dir) {
+                        for entry in entries.flatten() {
+                            let meta_path = entry.path().join(".wa_profile.json");
+                            if meta_path.exists() {
+                                if let Ok(content) = std::fs::read_to_string(&meta_path) {
+                                    if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&content) {
+                                        if meta.get("bootstrapped_at").and_then(|v| v.as_str()).is_some() {
+                                            bootstrapped += 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let check_name: &'static str = match *service {
+                        "openai" => "Browser: OpenAI",
+                        "anthropic" => "Browser: Anthropic",
+                        "google" => "Browser: Google",
+                        _ => "Browser: unknown",
+                    };
+
+                    if bootstrapped > 0 {
+                        checks.push(DiagnosticCheck::ok_with_detail(
+                            check_name,
+                            format!(
+                                "{} profile(s), {} bootstrapped → Automated",
+                                profile_count, bootstrapped
+                            ),
+                        ));
+                    } else {
+                        checks.push(DiagnosticCheck::warning(
+                            check_name,
+                            format!(
+                                "{} profile(s), none bootstrapped → NeedsHuman",
+                                profile_count
+                            ),
+                            "Run interactive bootstrap to authenticate",
+                        ));
+                    }
+                } else {
+                    let check_name: &'static str = match *service {
+                        "openai" => "Browser: OpenAI",
+                        "anthropic" => "Browser: Anthropic",
+                        "google" => "Browser: Google",
+                        _ => "Browser: unknown",
+                    };
+                    checks.push(DiagnosticCheck::ok_with_detail(
+                        check_name,
+                        "no profiles (not yet configured)",
+                    ));
+                }
+            }
         }
     }
 
