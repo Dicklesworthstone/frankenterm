@@ -135,11 +135,7 @@ pub fn adapt_event(event: &EventView) -> EventRow {
         StyleSpec::new().fg(ColorSpec::Yellow).bold()
     };
 
-    let triage_label = event
-        .triage_state
-        .as_deref()
-        .unwrap_or("")
-        .to_string();
+    let triage_label = event.triage_state.as_deref().unwrap_or("").to_string();
     let triage_style = match event.triage_state.as_deref() {
         Some("escalated") => StyleSpec::new().fg(ColorSpec::Red).bold(),
         Some("deferred") => StyleSpec::new().fg(ColorSpec::Yellow),
@@ -210,14 +206,8 @@ pub fn adapt_triage(item: &TriageItemView) -> TriageRow {
         action_labels: item.actions.iter().map(|a| a.label.clone()).collect(),
         action_commands: item.actions.iter().map(|a| a.command.clone()).collect(),
         severity_style,
-        event_id: item
-            .event_id
-            .map(|id| id.to_string())
-            .unwrap_or_default(),
-        pane_id: item
-            .pane_id
-            .map(|id| id.to_string())
-            .unwrap_or_default(),
+        event_id: item.event_id.map(|id| id.to_string()).unwrap_or_default(),
+        pane_id: item.pane_id.map(|id| id.to_string()).unwrap_or_default(),
         workflow_id: item.workflow_id.clone().unwrap_or_default(),
     }
 }
@@ -283,10 +273,7 @@ pub fn adapt_history(entry: &HistoryEntryView) -> HistoryRow {
         undo_label,
         result_style,
         undo_style,
-        pane_id: entry
-            .pane_id
-            .map(|id| id.to_string())
-            .unwrap_or_default(),
+        pane_id: entry.pane_id.map(|id| id.to_string()).unwrap_or_default(),
         workflow_id: entry.workflow_id.clone().unwrap_or_default(),
         step_name: entry.step_name.clone().unwrap_or_default(),
         rule_id: entry.rule_id.clone().unwrap_or_default(),
@@ -991,5 +978,1413 @@ mod tests {
         let row = adapt_triage(&item);
         assert!(row.detail.contains("[REDACTED]"));
         assert!(!row.detail.contains("topSecretValue99"));
+    }
+
+    // =====================================================================
+    // Adapter Fixture Pack (wa-2i6m / FTUI-04.2.a)
+    //
+    // Systematic corpus covering normal, missing, redacted, and malformed
+    // input variants for all adapter domains. Each test validates every
+    // output field for deterministic, actionable diagnostics on failure.
+    // =====================================================================
+
+    /// Macro for field-level adapter validation with actionable diffs.
+    ///
+    /// On failure, reports: domain, fixture variant, field name, expected, actual.
+    macro_rules! assert_field {
+        ($domain:expr, $variant:expr, $field:expr, $actual:expr, $expected:expr) => {
+            assert_eq!(
+                $actual, $expected,
+                "\n  Adapter fixture mismatch!\n  domain:   {}\n  variant:  {}\n  field:    {}\n  expected: {:?}\n  actual:   {:?}",
+                $domain, $variant, $field, $expected, $actual,
+            );
+        };
+    }
+
+    // --- Pane fixtures ---
+
+    /// Missing optional fields: no cwd, no agent, zero unhandled.
+    fn pane_missing() -> PaneView {
+        PaneView {
+            pane_id: 0,
+            title: String::new(),
+            domain: String::new(),
+            cwd: None,
+            is_excluded: false,
+            agent_type: None,
+            pane_state: String::new(),
+            last_activity_ts: None,
+            unhandled_event_count: 0,
+        }
+    }
+
+    /// Malformed: overlong title, unknown state, max pane_id, unicode domain.
+    fn pane_malformed() -> PaneView {
+        PaneView {
+            pane_id: u64::MAX,
+            title: "x".repeat(200),
+            domain: "\u{1F4BB} remote\u{0000}".to_string(),
+            cwd: Some("/a/".repeat(100)),
+            is_excluded: true,
+            agent_type: Some("unknown_agent_v99".to_string()),
+            pane_state: "BogusState".to_string(),
+            last_activity_ts: Some(-1),
+            unhandled_event_count: u32::MAX,
+        }
+    }
+
+    #[test]
+    fn fixture_pane_normal_all_fields() {
+        let row = adapt_pane(&sample_pane());
+        assert_field!("pane", "normal", "pane_id", row.pane_id, "42");
+        assert_field!(
+            "pane",
+            "normal",
+            "title",
+            row.title,
+            "Claude Code - /data/projects/foo"
+        );
+        assert_field!("pane", "normal", "domain", row.domain, "local");
+        assert_field!("pane", "normal", "cwd", row.cwd, "/data/projects/foo");
+        assert_field!("pane", "normal", "agent_label", row.agent_label, "claude");
+        assert_field!(
+            "pane",
+            "normal",
+            "state_label",
+            row.state_label,
+            "PromptActive"
+        );
+        assert_field!(
+            "pane",
+            "normal",
+            "unhandled_badge",
+            row.unhandled_badge,
+            "3"
+        );
+        assert_field!(
+            "pane",
+            "normal",
+            "state_style.fg",
+            row.state_style.fg,
+            Some(ColorSpec::Green)
+        );
+        assert_field!(
+            "pane",
+            "normal",
+            "agent_style.fg",
+            row.agent_style.fg,
+            Some(ColorSpec::Magenta)
+        );
+        assert_field!(
+            "pane",
+            "normal",
+            "unhandled_style.fg",
+            row.unhandled_style.fg,
+            Some(ColorSpec::Red)
+        );
+        assert_field!(
+            "pane",
+            "normal",
+            "unhandled_style.bold",
+            row.unhandled_style.bold,
+            true
+        );
+    }
+
+    #[test]
+    fn fixture_pane_missing_all_fields() {
+        let row = adapt_pane(&pane_missing());
+        assert_field!("pane", "missing", "pane_id", row.pane_id, "0");
+        assert_field!("pane", "missing", "title", row.title, "");
+        assert_field!("pane", "missing", "domain", row.domain, "");
+        assert_field!("pane", "missing", "cwd", row.cwd, "");
+        assert_field!("pane", "missing", "agent_label", row.agent_label, "unknown");
+        assert_field!("pane", "missing", "state_label", row.state_label, "");
+        assert_field!(
+            "pane",
+            "missing",
+            "unhandled_badge",
+            row.unhandled_badge,
+            ""
+        );
+        assert_field!(
+            "pane",
+            "missing",
+            "agent_style.fg",
+            row.agent_style.fg,
+            Some(ColorSpec::DarkGray)
+        );
+        assert_field!(
+            "pane",
+            "missing",
+            "state_style.fg",
+            row.state_style.fg,
+            Some(ColorSpec::DarkGray)
+        );
+        assert_field!(
+            "pane",
+            "missing",
+            "unhandled_style.bold",
+            row.unhandled_style.bold,
+            false
+        );
+    }
+
+    #[test]
+    fn fixture_pane_malformed_all_fields() {
+        let row = adapt_pane(&pane_malformed());
+        assert_field!(
+            "pane",
+            "malformed",
+            "pane_id",
+            row.pane_id,
+            u64::MAX.to_string()
+        );
+        // Title is truncated to 40 chars
+        assert!(
+            row.title.len() <= 40,
+            "title should be truncated to 40, got {}",
+            row.title.len()
+        );
+        assert!(
+            row.title.ends_with("..."),
+            "truncated title should end with ..."
+        );
+        // Unknown agent type → label is the raw string, style is DarkGray
+        assert_field!(
+            "pane",
+            "malformed",
+            "agent_label",
+            row.agent_label,
+            "unknown_agent_v99"
+        );
+        assert_field!(
+            "pane",
+            "malformed",
+            "agent_style.fg",
+            row.agent_style.fg,
+            Some(ColorSpec::DarkGray)
+        );
+        // Unknown state → DarkGray
+        assert_field!(
+            "pane",
+            "malformed",
+            "state_label",
+            row.state_label,
+            "BogusState"
+        );
+        assert_field!(
+            "pane",
+            "malformed",
+            "state_style.fg",
+            row.state_style.fg,
+            Some(ColorSpec::DarkGray)
+        );
+        // Max unhandled count → formatted as string
+        assert_field!(
+            "pane",
+            "malformed",
+            "unhandled_badge",
+            row.unhandled_badge,
+            u32::MAX.to_string()
+        );
+    }
+
+    #[test]
+    fn fixture_pane_agent_variants() {
+        for (agent, expected_fg) in [
+            (Some("codex"), Some(ColorSpec::Green)),
+            (Some("claude"), Some(ColorSpec::Magenta)),
+            (Some("gemini"), Some(ColorSpec::Blue)),
+            (Some("grok"), Some(ColorSpec::DarkGray)),
+            (None, Some(ColorSpec::DarkGray)),
+        ] {
+            let mut pane = sample_pane();
+            pane.agent_type = agent.map(String::from);
+            let row = adapt_pane(&pane);
+            assert_field!(
+                "pane",
+                format!("agent={:?}", agent),
+                "agent_style.fg",
+                row.agent_style.fg,
+                expected_fg
+            );
+        }
+    }
+
+    #[test]
+    fn fixture_pane_state_variants() {
+        for (state, expected_fg) in [
+            ("AltScreen", Some(ColorSpec::Yellow)),
+            ("CommandRunning", Some(ColorSpec::Cyan)),
+            ("PromptActive", Some(ColorSpec::Green)),
+            ("SomethingElse", Some(ColorSpec::DarkGray)),
+            ("", Some(ColorSpec::DarkGray)),
+        ] {
+            let mut pane = sample_pane();
+            pane.pane_state = state.to_string();
+            let row = adapt_pane(&pane);
+            assert_field!(
+                "pane",
+                format!("state={}", state),
+                "state_style.fg",
+                row.state_style.fg,
+                expected_fg
+            );
+        }
+    }
+
+    // --- Event fixtures ---
+
+    fn event_missing() -> EventView {
+        EventView {
+            id: 0,
+            rule_id: String::new(),
+            pane_id: 0,
+            severity: String::new(),
+            message: String::new(),
+            timestamp: 0,
+            handled: true,
+            triage_state: None,
+            labels: vec![],
+            note: None,
+        }
+    }
+
+    fn event_malformed() -> EventView {
+        EventView {
+            id: i64::MAX,
+            rule_id: "x".repeat(200),
+            pane_id: u64::MAX,
+            severity: "BOGUS_SEVERITY".to_string(),
+            message: "m".repeat(200),
+            timestamp: -999,
+            handled: false,
+            triage_state: Some("unknown_triage_state".to_string()),
+            labels: vec!["a".repeat(100), "\u{0000}null".to_string()],
+            note: Some("n".repeat(200)),
+        }
+    }
+
+    fn event_redacted() -> EventView {
+        EventView {
+            id: 50,
+            rule_id: "secret_leak".to_string(),
+            pane_id: 7,
+            severity: "error".to_string(),
+            message: "Leaked Bearer sk-live_abc123456789 in output".to_string(),
+            timestamp: 1_700_000_000_000,
+            handled: false,
+            triage_state: Some("escalated".to_string()),
+            labels: vec!["security".to_string()],
+            note: Some("Contains password=hunter2 in details".to_string()),
+        }
+    }
+
+    #[test]
+    fn fixture_event_normal_all_fields() {
+        let row = adapt_event(&sample_event());
+        assert_field!("event", "normal", "id", row.id, "100");
+        assert_field!(
+            "event",
+            "normal",
+            "rule_id",
+            row.rule_id,
+            "rate_limit_detected"
+        );
+        assert_field!("event", "normal", "pane_id", row.pane_id, "42");
+        assert_field!(
+            "event",
+            "normal",
+            "severity_label",
+            row.severity_label,
+            "warning"
+        );
+        assert_field!(
+            "event",
+            "normal",
+            "handled_label",
+            row.handled_label,
+            "UNHANDLED"
+        );
+        assert_field!(
+            "event",
+            "normal",
+            "triage_label",
+            row.triage_label,
+            "escalated"
+        );
+        assert_field!(
+            "event",
+            "normal",
+            "labels_label",
+            row.labels_label,
+            "api, rate-limit"
+        );
+        assert_field!(
+            "event",
+            "normal",
+            "note_preview",
+            row.note_preview,
+            "Investigate throttling config"
+        );
+        assert_field!(
+            "event",
+            "normal",
+            "severity_style.fg",
+            row.severity_style.fg,
+            Some(ColorSpec::Yellow)
+        );
+        assert_field!(
+            "event",
+            "normal",
+            "handled_style.bold",
+            row.handled_style.bold,
+            true
+        );
+        assert_field!(
+            "event",
+            "normal",
+            "triage_style.fg",
+            row.triage_style.fg,
+            Some(ColorSpec::Red)
+        );
+    }
+
+    #[test]
+    fn fixture_event_missing_all_fields() {
+        let row = adapt_event(&event_missing());
+        assert_field!("event", "missing", "id", row.id, "0");
+        assert_field!("event", "missing", "rule_id", row.rule_id, "");
+        assert_field!("event", "missing", "pane_id", row.pane_id, "0");
+        assert_field!("event", "missing", "severity_label", row.severity_label, "");
+        assert_field!("event", "missing", "message", row.message, "");
+        assert_field!("event", "missing", "timestamp", row.timestamp, "-");
+        assert_field!(
+            "event",
+            "missing",
+            "handled_label",
+            row.handled_label,
+            "handled"
+        );
+        assert_field!("event", "missing", "triage_label", row.triage_label, "");
+        assert_field!("event", "missing", "labels_label", row.labels_label, "");
+        assert_field!("event", "missing", "note_preview", row.note_preview, "");
+        assert_field!(
+            "event",
+            "missing",
+            "severity_style.fg",
+            row.severity_style.fg,
+            Some(ColorSpec::DarkGray)
+        );
+        assert_field!(
+            "event",
+            "missing",
+            "triage_style.fg",
+            row.triage_style.fg,
+            None::<ColorSpec>
+        );
+    }
+
+    #[test]
+    fn fixture_event_malformed_all_fields() {
+        let row = adapt_event(&event_malformed());
+        assert_field!("event", "malformed", "id", row.id, i64::MAX.to_string());
+        assert_field!(
+            "event",
+            "malformed",
+            "pane_id",
+            row.pane_id,
+            u64::MAX.to_string()
+        );
+        // Message truncated to 80 chars
+        assert!(
+            row.message.len() <= 80,
+            "message should be truncated to 80, got {}",
+            row.message.len()
+        );
+        // Negative timestamp → falls through to raw number display
+        assert!(!row.timestamp.is_empty());
+        // Unknown severity → DarkGray
+        assert_field!(
+            "event",
+            "malformed",
+            "severity_style.fg",
+            row.severity_style.fg,
+            Some(ColorSpec::DarkGray)
+        );
+        // Unknown triage state → DarkGray
+        assert_field!(
+            "event",
+            "malformed",
+            "triage_style.fg",
+            row.triage_style.fg,
+            Some(ColorSpec::DarkGray)
+        );
+        // Note truncated to 40 chars
+        assert!(
+            row.note_preview.len() <= 40,
+            "note should be truncated to 40, got {}",
+            row.note_preview.len()
+        );
+    }
+
+    #[test]
+    fn fixture_event_redacted_secrets_stripped() {
+        let row = adapt_event(&event_redacted());
+        assert!(
+            row.message.contains("[REDACTED]"),
+            "message should have redacted token"
+        );
+        assert!(
+            !row.message.contains("sk-live_abc123456789"),
+            "raw token must not appear"
+        );
+        // Note is truncated but would contain redacted if long enough
+        // The event ID and non-secret fields are preserved
+        assert_field!("event", "redacted", "id", row.id, "50");
+        assert_field!("event", "redacted", "rule_id", row.rule_id, "secret_leak");
+    }
+
+    #[test]
+    fn fixture_event_severity_variants() {
+        for (severity, expected_fg, expected_bold) in [
+            ("error", Some(ColorSpec::Red), true),
+            ("warning", Some(ColorSpec::Yellow), false),
+            ("info", Some(ColorSpec::Cyan), false),
+            ("debug", Some(ColorSpec::DarkGray), false),
+            ("", Some(ColorSpec::DarkGray), false),
+        ] {
+            let mut event = sample_event();
+            event.severity = severity.to_string();
+            let row = adapt_event(&event);
+            assert_field!(
+                "event",
+                format!("severity={}", severity),
+                "severity_style.fg",
+                row.severity_style.fg,
+                expected_fg
+            );
+            assert_field!(
+                "event",
+                format!("severity={}", severity),
+                "severity_style.bold",
+                row.severity_style.bold,
+                expected_bold
+            );
+        }
+    }
+
+    #[test]
+    fn fixture_event_triage_state_variants() {
+        for (triage, expected_fg, expected_bold) in [
+            (Some("escalated"), Some(ColorSpec::Red), true),
+            (Some("deferred"), Some(ColorSpec::Yellow), false),
+            (Some("acknowledged"), Some(ColorSpec::Green), false),
+            (Some("custom"), Some(ColorSpec::DarkGray), false),
+            (None, None, false),
+        ] {
+            let mut event = sample_event();
+            event.triage_state = triage.map(String::from);
+            let row = adapt_event(&event);
+            assert_field!(
+                "event",
+                format!("triage={:?}", triage),
+                "triage_style.fg",
+                row.triage_style.fg,
+                expected_fg
+            );
+            assert_field!(
+                "event",
+                format!("triage={:?}", triage),
+                "triage_style.bold",
+                row.triage_style.bold,
+                expected_bold
+            );
+        }
+    }
+
+    // --- Triage fixtures ---
+
+    fn triage_missing() -> TriageItemView {
+        TriageItemView {
+            section: String::new(),
+            severity: String::new(),
+            title: String::new(),
+            detail: String::new(),
+            actions: vec![],
+            event_id: None,
+            pane_id: None,
+            workflow_id: None,
+        }
+    }
+
+    fn triage_malformed() -> TriageItemView {
+        TriageItemView {
+            section: "\u{0000}".to_string(),
+            severity: "BOGUS".to_string(),
+            title: "t".repeat(200),
+            detail: "d".repeat(300),
+            actions: vec![
+                super::super::query::TriageAction {
+                    label: String::new(),
+                    command: String::new(),
+                },
+                super::super::query::TriageAction {
+                    label: "x".repeat(100),
+                    command: "y".repeat(100),
+                },
+            ],
+            event_id: Some(i64::MAX),
+            pane_id: Some(u64::MAX),
+            workflow_id: Some(String::new()),
+        }
+    }
+
+    fn triage_redacted() -> TriageItemView {
+        TriageItemView {
+            section: "events".to_string(),
+            severity: "error".to_string(),
+            title: "Secret leak detected".to_string(),
+            detail: "Found token=xyzAbcDef12345 in pane output".to_string(),
+            actions: vec![super::super::query::TriageAction {
+                label: "Investigate".to_string(),
+                command: "wa why --pane 42".to_string(),
+            }],
+            event_id: Some(200),
+            pane_id: Some(42),
+            workflow_id: None,
+        }
+    }
+
+    #[test]
+    fn fixture_triage_normal_all_fields() {
+        let row = adapt_triage(&sample_triage());
+        assert_field!("triage", "normal", "section", row.section, "events");
+        assert_field!(
+            "triage",
+            "normal",
+            "severity_label",
+            row.severity_label,
+            "error"
+        );
+        assert_field!(
+            "triage",
+            "normal",
+            "title",
+            row.title,
+            "[pane 42] rate_limit: api_error"
+        );
+        assert_field!(
+            "triage",
+            "normal",
+            "detail",
+            row.detail,
+            "API returned 429 Too Many Requests"
+        );
+        assert_field!(
+            "triage",
+            "normal",
+            "action_labels.len",
+            row.action_labels.len(),
+            1
+        );
+        assert_field!(
+            "triage",
+            "normal",
+            "action_labels[0]",
+            row.action_labels[0],
+            "Explain"
+        );
+        assert_field!(
+            "triage",
+            "normal",
+            "action_commands[0]",
+            row.action_commands[0],
+            "wa why --recent --pane 42"
+        );
+        assert_field!("triage", "normal", "event_id", row.event_id, "100");
+        assert_field!("triage", "normal", "pane_id", row.pane_id, "42");
+        assert_field!("triage", "normal", "workflow_id", row.workflow_id, "");
+        assert_field!(
+            "triage",
+            "normal",
+            "severity_style.bold",
+            row.severity_style.bold,
+            true
+        );
+    }
+
+    #[test]
+    fn fixture_triage_missing_all_fields() {
+        let row = adapt_triage(&triage_missing());
+        assert_field!("triage", "missing", "section", row.section, "");
+        assert_field!(
+            "triage",
+            "missing",
+            "severity_label",
+            row.severity_label,
+            ""
+        );
+        assert_field!("triage", "missing", "title", row.title, "");
+        assert_field!("triage", "missing", "detail", row.detail, "");
+        assert_field!(
+            "triage",
+            "missing",
+            "action_labels.len",
+            row.action_labels.len(),
+            0
+        );
+        assert_field!("triage", "missing", "event_id", row.event_id, "");
+        assert_field!("triage", "missing", "pane_id", row.pane_id, "");
+        assert_field!("triage", "missing", "workflow_id", row.workflow_id, "");
+    }
+
+    #[test]
+    fn fixture_triage_malformed_all_fields() {
+        let row = adapt_triage(&triage_malformed());
+        // Title truncated to 60
+        assert!(
+            row.title.len() <= 60,
+            "title should be truncated to 60, got {}",
+            row.title.len()
+        );
+        // Detail truncated to 120
+        assert!(
+            row.detail.len() <= 120,
+            "detail should be truncated to 120, got {}",
+            row.detail.len()
+        );
+        // Actions preserved including empty ones
+        assert_field!(
+            "triage",
+            "malformed",
+            "action_labels.len",
+            row.action_labels.len(),
+            2
+        );
+        assert_field!(
+            "triage",
+            "malformed",
+            "action_labels[0]",
+            row.action_labels[0],
+            ""
+        );
+        // Cross-ref IDs formatted from max values
+        assert_field!(
+            "triage",
+            "malformed",
+            "event_id",
+            row.event_id,
+            i64::MAX.to_string()
+        );
+        assert_field!(
+            "triage",
+            "malformed",
+            "pane_id",
+            row.pane_id,
+            u64::MAX.to_string()
+        );
+        assert_field!("triage", "malformed", "workflow_id", row.workflow_id, "");
+    }
+
+    #[test]
+    fn fixture_triage_redacted_secrets_stripped() {
+        let row = adapt_triage(&triage_redacted());
+        assert!(
+            row.detail.contains("[REDACTED]"),
+            "detail should have redacted token"
+        );
+        assert!(
+            !row.detail.contains("xyzAbcDef12345"),
+            "raw token must not appear"
+        );
+        // Non-secret fields preserved
+        assert_field!(
+            "triage",
+            "redacted",
+            "title",
+            row.title,
+            "Secret leak detected"
+        );
+    }
+
+    // --- History fixtures ---
+
+    fn history_missing() -> HistoryEntryView {
+        HistoryEntryView {
+            audit_id: 0,
+            timestamp: 0,
+            pane_id: None,
+            workflow_id: None,
+            action_kind: String::new(),
+            result: String::new(),
+            actor_kind: String::new(),
+            step_name: None,
+            undoable: false,
+            undone: false,
+            undo_strategy: None,
+            undo_hint: None,
+            rule_id: None,
+            summary: String::new(),
+        }
+    }
+
+    fn history_malformed() -> HistoryEntryView {
+        HistoryEntryView {
+            audit_id: i64::MAX,
+            timestamp: -1,
+            pane_id: Some(u64::MAX),
+            workflow_id: Some("w".repeat(200)),
+            action_kind: "a".repeat(100),
+            result: "BOGUS_RESULT".to_string(),
+            actor_kind: "\u{0000}null".to_string(),
+            step_name: Some("s".repeat(200)),
+            undoable: true,
+            undone: true, // Both undoable and undone — undone wins
+            undo_strategy: Some("u".repeat(200)),
+            undo_hint: Some("h".repeat(200)),
+            rule_id: Some("r".repeat(200)),
+            summary: "s".repeat(200),
+        }
+    }
+
+    fn history_redacted() -> HistoryEntryView {
+        HistoryEntryView {
+            audit_id: 99,
+            timestamp: 1_700_000_000_000,
+            pane_id: Some(7),
+            workflow_id: None,
+            action_kind: "send_text".to_string(),
+            result: "success".to_string(),
+            actor_kind: "robot".to_string(),
+            step_name: None,
+            undoable: true,
+            undone: false,
+            undo_strategy: Some("ctrl_c".to_string()),
+            undo_hint: None,
+            rule_id: None,
+            summary: "Sent api_key=secretABC12345 to pane 7".to_string(),
+        }
+    }
+
+    #[test]
+    fn fixture_history_normal_all_fields() {
+        let row = adapt_history(&sample_history());
+        assert_field!("history", "normal", "audit_id", row.audit_id, "1");
+        assert_field!(
+            "history",
+            "normal",
+            "action_kind",
+            row.action_kind,
+            "send_text"
+        );
+        assert_field!(
+            "history",
+            "normal",
+            "result_label",
+            row.result_label,
+            "success"
+        );
+        assert_field!("history", "normal", "actor_kind", row.actor_kind, "robot");
+        assert_field!(
+            "history",
+            "normal",
+            "undo_label",
+            row.undo_label,
+            "undoable"
+        );
+        assert_field!("history", "normal", "pane_id", row.pane_id, "42");
+        assert_field!("history", "normal", "workflow_id", row.workflow_id, "");
+        assert_field!("history", "normal", "step_name", row.step_name, "");
+        assert_field!("history", "normal", "rule_id", row.rule_id, "");
+        assert_field!(
+            "history",
+            "normal",
+            "undo_strategy",
+            row.undo_strategy,
+            "workflow_abort"
+        );
+        assert_field!("history", "normal", "undo_hint", row.undo_hint, "");
+        assert_field!(
+            "history",
+            "normal",
+            "result_style.fg",
+            row.result_style.fg,
+            Some(ColorSpec::Green)
+        );
+        assert_field!(
+            "history",
+            "normal",
+            "undo_style.fg",
+            row.undo_style.fg,
+            Some(ColorSpec::Cyan)
+        );
+    }
+
+    #[test]
+    fn fixture_history_missing_all_fields() {
+        let row = adapt_history(&history_missing());
+        assert_field!("history", "missing", "audit_id", row.audit_id, "0");
+        assert_field!("history", "missing", "timestamp", row.timestamp, "-");
+        assert_field!("history", "missing", "action_kind", row.action_kind, "");
+        assert_field!("history", "missing", "result_label", row.result_label, "");
+        assert_field!("history", "missing", "actor_kind", row.actor_kind, "");
+        assert_field!("history", "missing", "summary", row.summary, "");
+        assert_field!("history", "missing", "undo_label", row.undo_label, "");
+        assert_field!("history", "missing", "pane_id", row.pane_id, "");
+        assert_field!("history", "missing", "workflow_id", row.workflow_id, "");
+        assert_field!("history", "missing", "step_name", row.step_name, "");
+        assert_field!("history", "missing", "rule_id", row.rule_id, "");
+        assert_field!("history", "missing", "undo_strategy", row.undo_strategy, "");
+        assert_field!("history", "missing", "undo_hint", row.undo_hint, "");
+        // Unknown result → DarkGray
+        assert_field!(
+            "history",
+            "missing",
+            "result_style.fg",
+            row.result_style.fg,
+            Some(ColorSpec::DarkGray)
+        );
+    }
+
+    #[test]
+    fn fixture_history_malformed_all_fields() {
+        let row = adapt_history(&history_malformed());
+        assert_field!(
+            "history",
+            "malformed",
+            "audit_id",
+            row.audit_id,
+            i64::MAX.to_string()
+        );
+        // Summary truncated to 60
+        assert!(
+            row.summary.len() <= 60,
+            "summary should be truncated to 60, got {}",
+            row.summary.len()
+        );
+        // undone=true takes priority over undoable=true
+        assert_field!(
+            "history",
+            "malformed",
+            "undo_label",
+            row.undo_label,
+            "UNDONE"
+        );
+        assert_field!(
+            "history",
+            "malformed",
+            "undo_style.dim",
+            row.undo_style.dim,
+            true
+        );
+        // Unknown result → DarkGray
+        assert_field!(
+            "history",
+            "malformed",
+            "result_style.fg",
+            row.result_style.fg,
+            Some(ColorSpec::DarkGray)
+        );
+    }
+
+    #[test]
+    fn fixture_history_redacted_secrets_stripped() {
+        let row = adapt_history(&history_redacted());
+        assert!(
+            row.summary.contains("[REDACTED]"),
+            "summary should have redacted token"
+        );
+        assert!(
+            !row.summary.contains("secretABC12345"),
+            "raw token must not appear"
+        );
+        assert_field!("history", "redacted", "audit_id", row.audit_id, "99");
+    }
+
+    #[test]
+    fn fixture_history_result_style_variants() {
+        for (result, expected_fg) in [
+            ("success", Some(ColorSpec::Green)),
+            ("denied", Some(ColorSpec::Yellow)),
+            ("failed", Some(ColorSpec::Red)),
+            ("timeout", Some(ColorSpec::DarkGray)),
+            ("", Some(ColorSpec::DarkGray)),
+        ] {
+            let mut entry = sample_history();
+            entry.result = result.to_string();
+            let row = adapt_history(&entry);
+            assert_field!(
+                "history",
+                format!("result={}", result),
+                "result_style.fg",
+                row.result_style.fg,
+                expected_fg
+            );
+        }
+    }
+
+    #[test]
+    fn fixture_history_undo_state_matrix() {
+        // (undoable, undone) → expected undo_label
+        for (undoable, undone, expected_label) in [
+            (false, false, ""),
+            (true, false, "undoable"),
+            (false, true, "UNDONE"),
+            (true, true, "UNDONE"), // undone takes priority
+        ] {
+            let mut entry = sample_history();
+            entry.undoable = undoable;
+            entry.undone = undone;
+            let row = adapt_history(&entry);
+            assert_field!(
+                "history",
+                format!("undoable={},undone={}", undoable, undone),
+                "undo_label",
+                row.undo_label,
+                expected_label
+            );
+        }
+    }
+
+    // --- Search fixtures ---
+
+    fn search_missing() -> SearchResultView {
+        SearchResultView {
+            pane_id: 0,
+            timestamp: 0,
+            snippet: String::new(),
+            rank: 0.0,
+        }
+    }
+
+    fn search_malformed() -> SearchResultView {
+        SearchResultView {
+            pane_id: u64::MAX,
+            timestamp: -1,
+            snippet: "x".repeat(1000),
+            rank: f64::NEG_INFINITY,
+        }
+    }
+
+    fn search_redacted() -> SearchResultView {
+        SearchResultView {
+            pane_id: 42,
+            timestamp: 1_700_000_000_000,
+            snippet: "Output: password=superSecret99 detected".to_string(),
+            rank: 2.5,
+        }
+    }
+
+    #[test]
+    fn fixture_search_normal_all_fields() {
+        let row = adapt_search(&sample_search());
+        assert_field!("search", "normal", "pane_id", row.pane_id, "42");
+        assert!(row.timestamp.contains("2023"));
+        assert!(row.snippet.contains(">>error<<"));
+        assert_field!("search", "normal", "rank_label", row.rank_label, "3.14");
+    }
+
+    #[test]
+    fn fixture_search_missing_all_fields() {
+        let row = adapt_search(&search_missing());
+        assert_field!("search", "missing", "pane_id", row.pane_id, "0");
+        assert_field!("search", "missing", "timestamp", row.timestamp, "-");
+        assert_field!("search", "missing", "snippet", row.snippet, "");
+        assert_field!("search", "missing", "rank_label", row.rank_label, "0.00");
+    }
+
+    #[test]
+    fn fixture_search_malformed_all_fields() {
+        let row = adapt_search(&search_malformed());
+        assert_field!(
+            "search",
+            "malformed",
+            "pane_id",
+            row.pane_id,
+            u64::MAX.to_string()
+        );
+        // Very long snippet is NOT truncated by adapt_search (only redacted)
+        assert!(row.snippet.len() == 1000);
+        // NEG_INFINITY formats as "-inf"
+        assert_field!("search", "malformed", "rank_label", row.rank_label, "-inf");
+    }
+
+    #[test]
+    fn fixture_search_redacted_secrets_stripped() {
+        let row = adapt_search(&search_redacted());
+        assert!(
+            row.snippet.contains("[REDACTED]"),
+            "snippet should have redacted token"
+        );
+        assert!(
+            !row.snippet.contains("superSecret99"),
+            "raw token must not appear"
+        );
+    }
+
+    // --- Workflow fixtures ---
+
+    fn workflow_missing() -> WorkflowProgressView {
+        WorkflowProgressView {
+            id: String::new(),
+            workflow_name: String::new(),
+            pane_id: 0,
+            current_step: 0,
+            total_steps: 0,
+            status: String::new(),
+            error: None,
+            started_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    fn workflow_malformed() -> WorkflowProgressView {
+        WorkflowProgressView {
+            id: "w".repeat(200),
+            workflow_name: "\u{0000}".to_string(),
+            pane_id: u64::MAX,
+            current_step: usize::MAX,
+            total_steps: 0,
+            status: "BOGUS_STATUS".to_string(),
+            error: Some("e".repeat(500)),
+            started_at: -1,
+            updated_at: i64::MAX,
+        }
+    }
+
+    #[test]
+    fn fixture_workflow_normal_all_fields() {
+        let row = adapt_workflow(&sample_workflow());
+        assert_field!("workflow", "normal", "id", row.id, "wf-001");
+        assert_field!("workflow", "normal", "name", row.name, "rate_limit_backoff");
+        assert_field!("workflow", "normal", "pane_id", row.pane_id, "42");
+        assert_field!(
+            "workflow",
+            "normal",
+            "progress_label",
+            row.progress_label,
+            "2/5"
+        );
+        assert_field!(
+            "workflow",
+            "normal",
+            "status_label",
+            row.status_label,
+            "running"
+        );
+        assert!(row.error.is_none());
+        assert_field!(
+            "workflow",
+            "normal",
+            "status_style.fg",
+            row.status_style.fg,
+            Some(ColorSpec::Cyan)
+        );
+    }
+
+    #[test]
+    fn fixture_workflow_missing_all_fields() {
+        let row = adapt_workflow(&workflow_missing());
+        assert_field!("workflow", "missing", "id", row.id, "");
+        assert_field!("workflow", "missing", "name", row.name, "");
+        assert_field!("workflow", "missing", "pane_id", row.pane_id, "0");
+        assert_field!(
+            "workflow",
+            "missing",
+            "progress_label",
+            row.progress_label,
+            "0/0"
+        );
+        assert_field!("workflow", "missing", "status_label", row.status_label, "");
+        assert!(row.error.is_none());
+        assert_field!("workflow", "missing", "started_at", row.started_at, "-");
+        assert_field!("workflow", "missing", "updated_at", row.updated_at, "-");
+        assert_field!(
+            "workflow",
+            "missing",
+            "status_style.fg",
+            row.status_style.fg,
+            Some(ColorSpec::DarkGray)
+        );
+    }
+
+    #[test]
+    fn fixture_workflow_malformed_all_fields() {
+        let row = adapt_workflow(&workflow_malformed());
+        assert_field!(
+            "workflow",
+            "malformed",
+            "progress_label",
+            row.progress_label,
+            format!("{}/0", usize::MAX)
+        );
+        assert!(row.error.is_some());
+        assert_field!(
+            "workflow",
+            "malformed",
+            "status_style.fg",
+            row.status_style.fg,
+            Some(ColorSpec::DarkGray)
+        );
+    }
+
+    #[test]
+    fn fixture_workflow_status_variants() {
+        for (status, expected_fg) in [
+            ("running", Some(ColorSpec::Cyan)),
+            ("pending", Some(ColorSpec::Cyan)),
+            ("completed", Some(ColorSpec::Green)),
+            ("failed", Some(ColorSpec::Red)),
+            ("error", Some(ColorSpec::Red)),
+            ("unknown", Some(ColorSpec::DarkGray)),
+            ("", Some(ColorSpec::DarkGray)),
+        ] {
+            let mut wf = sample_workflow();
+            wf.status = status.to_string();
+            let row = adapt_workflow(&wf);
+            assert_field!(
+                "workflow",
+                format!("status={}", status),
+                "status_style.fg",
+                row.status_style.fg,
+                expected_fg
+            );
+        }
+    }
+
+    // --- Health fixtures ---
+
+    fn health_all_down() -> HealthStatus {
+        HealthStatus {
+            watcher_running: false,
+            db_accessible: false,
+            wezterm_accessible: false,
+            wezterm_circuit: crate::circuit_breaker::CircuitBreakerStatus {
+                state: CircuitStateKind::Open,
+                consecutive_failures: 10,
+                ..Default::default()
+            },
+            pane_count: 0,
+            event_count: 0,
+            last_capture_ts: None,
+        }
+    }
+
+    fn health_half_open() -> HealthStatus {
+        HealthStatus {
+            watcher_running: true,
+            db_accessible: true,
+            wezterm_accessible: false,
+            wezterm_circuit: crate::circuit_breaker::CircuitBreakerStatus {
+                state: CircuitStateKind::HalfOpen,
+                consecutive_failures: 3,
+                ..Default::default()
+            },
+            pane_count: 2,
+            event_count: 10,
+            last_capture_ts: Some(1_700_000_000_000),
+        }
+    }
+
+    #[test]
+    fn fixture_health_all_down_fields() {
+        let model = adapt_health(&health_all_down());
+        assert_field!(
+            "health",
+            "all_down",
+            "watcher_label",
+            model.watcher_label,
+            "stopped"
+        );
+        assert_field!(
+            "health",
+            "all_down",
+            "watcher_style.bold",
+            model.watcher_style.bold,
+            true
+        );
+        assert_field!(
+            "health",
+            "all_down",
+            "watcher_style.fg",
+            model.watcher_style.fg,
+            Some(ColorSpec::Red)
+        );
+        assert_field!(
+            "health",
+            "all_down",
+            "db_label",
+            model.db_label,
+            "unavailable"
+        );
+        assert_field!(
+            "health",
+            "all_down",
+            "db_style.fg",
+            model.db_style.fg,
+            Some(ColorSpec::Red)
+        );
+        assert_field!(
+            "health",
+            "all_down",
+            "wezterm_label",
+            model.wezterm_label,
+            "unavailable"
+        );
+        assert_field!(
+            "health",
+            "all_down",
+            "circuit_label",
+            model.circuit_label,
+            "OPEN"
+        );
+        assert_field!(
+            "health",
+            "all_down",
+            "circuit_style.bold",
+            model.circuit_style.bold,
+            true
+        );
+        assert_field!(
+            "health",
+            "all_down",
+            "circuit_style.fg",
+            model.circuit_style.fg,
+            Some(ColorSpec::Red)
+        );
+        assert_field!("health", "all_down", "pane_count", model.pane_count, "0");
+        assert_field!("health", "all_down", "event_count", model.event_count, "0");
+    }
+
+    #[test]
+    fn fixture_health_half_open_fields() {
+        let model = adapt_health(&health_half_open());
+        assert_field!(
+            "health",
+            "half_open",
+            "watcher_label",
+            model.watcher_label,
+            "running"
+        );
+        assert_field!(
+            "health",
+            "half_open",
+            "watcher_style.fg",
+            model.watcher_style.fg,
+            Some(ColorSpec::Green)
+        );
+        assert_field!("health", "half_open", "db_label", model.db_label, "ok");
+        assert_field!(
+            "health",
+            "half_open",
+            "wezterm_label",
+            model.wezterm_label,
+            "unavailable"
+        );
+        assert_field!(
+            "health",
+            "half_open",
+            "circuit_label",
+            model.circuit_label,
+            "half-open"
+        );
+        assert_field!(
+            "health",
+            "half_open",
+            "circuit_style.fg",
+            model.circuit_style.fg,
+            Some(ColorSpec::Yellow)
+        );
+        assert_field!("health", "half_open", "pane_count", model.pane_count, "2");
+        assert_field!(
+            "health",
+            "half_open",
+            "event_count",
+            model.event_count,
+            "10"
+        );
+    }
+
+    // --- Cross-domain batch validation ---
+
+    /// Verify all adapters handle the full fixture corpus without panic.
+    #[test]
+    fn fixture_all_adapters_no_panic() {
+        // Pane variants
+        let _ = adapt_pane(&sample_pane());
+        let _ = adapt_pane(&pane_missing());
+        let _ = adapt_pane(&pane_malformed());
+
+        // Event variants
+        let _ = adapt_event(&sample_event());
+        let _ = adapt_event(&event_missing());
+        let _ = adapt_event(&event_malformed());
+        let _ = adapt_event(&event_redacted());
+
+        // Triage variants
+        let _ = adapt_triage(&sample_triage());
+        let _ = adapt_triage(&triage_missing());
+        let _ = adapt_triage(&triage_malformed());
+        let _ = adapt_triage(&triage_redacted());
+
+        // History variants
+        let _ = adapt_history(&sample_history());
+        let _ = adapt_history(&history_missing());
+        let _ = adapt_history(&history_malformed());
+        let _ = adapt_history(&history_redacted());
+
+        // Search variants
+        let _ = adapt_search(&sample_search());
+        let _ = adapt_search(&search_missing());
+        let _ = adapt_search(&search_malformed());
+        let _ = adapt_search(&search_redacted());
+
+        // Workflow variants
+        let _ = adapt_workflow(&sample_workflow());
+        let _ = adapt_workflow(&workflow_missing());
+        let _ = adapt_workflow(&workflow_malformed());
+
+        // Health variants
+        let health_ok = HealthStatus {
+            watcher_running: true,
+            db_accessible: true,
+            wezterm_accessible: true,
+            wezterm_circuit: crate::circuit_breaker::CircuitBreakerStatus::default(),
+            pane_count: 5,
+            event_count: 42,
+            last_capture_ts: Some(1_700_000_000_000),
+        };
+        let _ = adapt_health(&health_ok);
+        let _ = adapt_health(&health_all_down());
+        let _ = adapt_health(&health_half_open());
+    }
+
+    /// Verify stable ordering: adapting the same input twice yields identical output.
+    #[test]
+    fn fixture_deterministic_output() {
+        let pane1 = adapt_pane(&sample_pane());
+        let pane2 = adapt_pane(&sample_pane());
+        assert_eq!(pane1.pane_id, pane2.pane_id);
+        assert_eq!(pane1.title, pane2.title);
+        assert_eq!(pane1.agent_label, pane2.agent_label);
+
+        let event1 = adapt_event(&sample_event());
+        let event2 = adapt_event(&sample_event());
+        assert_eq!(event1.id, event2.id);
+        assert_eq!(event1.message, event2.message);
+        assert_eq!(event1.timestamp, event2.timestamp);
+
+        let history1 = adapt_history(&sample_history());
+        let history2 = adapt_history(&sample_history());
+        assert_eq!(history1.audit_id, history2.audit_id);
+        assert_eq!(history1.summary, history2.summary);
+        assert_eq!(history1.undo_label, history2.undo_label);
+
+        let triage1 = adapt_triage(&sample_triage());
+        let triage2 = adapt_triage(&sample_triage());
+        assert_eq!(triage1.title, triage2.title);
+        assert_eq!(triage1.action_labels, triage2.action_labels);
     }
 }

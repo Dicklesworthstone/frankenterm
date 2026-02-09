@@ -29,8 +29,8 @@ use std::time::{Duration, Instant};
 
 use super::query::QueryClient;
 use super::view_adapters::{
-    HealthModel, HistoryRow, PaneRow, SearchRow, TriageRow, WorkflowRow,
-    adapt_event, adapt_health, adapt_history, adapt_pane, adapt_search, adapt_triage, adapt_workflow,
+    HealthModel, HistoryRow, PaneRow, SearchRow, TriageRow, WorkflowRow, adapt_event, adapt_health,
+    adapt_history, adapt_pane, adapt_search, adapt_triage, adapt_workflow,
 };
 
 // ---------------------------------------------------------------------------
@@ -402,8 +402,7 @@ impl EventsViewState {
     /// Clamped selected index within filtered results.
     pub fn clamped_selection(&self) -> usize {
         let filtered = self.filtered_indices();
-        self.selected_index
-            .min(filtered.len().saturating_sub(1))
+        self.selected_index.min(filtered.len().saturating_sub(1))
     }
 }
 
@@ -436,10 +435,7 @@ impl HistoryViewState {
                 if query.is_empty() {
                     return true;
                 }
-                let pane = entry
-                    .pane_id
-                    .map(|id| id.to_string())
-                    .unwrap_or_default();
+                let pane = entry.pane_id.map(|id| id.to_string()).unwrap_or_default();
                 let workflow = entry.workflow_id.as_deref().unwrap_or("");
                 let audit = entry.audit_id.to_string();
                 let haystack = format!(
@@ -456,8 +452,7 @@ impl HistoryViewState {
     /// Clamped selected index within filtered results.
     pub fn clamped_selection(&self) -> usize {
         let filtered = self.filtered_indices();
-        self.selected_index
-            .min(filtered.len().saturating_sub(1))
+        self.selected_index.min(filtered.len().saturating_sub(1))
     }
 }
 
@@ -594,8 +589,7 @@ impl WaModel {
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 if count > 0 {
-                    self.panes_selected =
-                        self.panes_selected.checked_sub(1).unwrap_or(count - 1);
+                    self.panes_selected = self.panes_selected.checked_sub(1).unwrap_or(count - 1);
                 }
                 ftui::Cmd::None
             }
@@ -607,9 +601,7 @@ impl WaModel {
                     Some(current) => {
                         let idx = domains.iter().position(|d| d == current);
                         match idx {
-                            Some(i) if i + 1 < domains.len() => {
-                                Some(domains[i + 1].clone())
-                            }
+                            Some(i) if i + 1 < domains.len() => Some(domains[i + 1].clone()),
                             _ => None,
                         }
                     }
@@ -646,8 +638,7 @@ impl WaModel {
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 if count > 0 {
-                    self.triage_selected =
-                        self.triage_selected.checked_sub(1).unwrap_or(count - 1);
+                    self.triage_selected = self.triage_selected.checked_sub(1).unwrap_or(count - 1);
                 }
                 ftui::Cmd::None
             }
@@ -829,8 +820,7 @@ impl WaModel {
             }
             KeyCode::Char('u') => {
                 self.view_state.focus = FocusRegion::PrimaryList;
-                self.view_state.history.undoable_only =
-                    !self.view_state.history.undoable_only;
+                self.view_state.history.undoable_only = !self.view_state.history.undoable_only;
                 self.view_state.history.selected_index = 0;
                 ftui::Cmd::None
             }
@@ -935,13 +925,11 @@ impl WaModel {
                 self.search_last_query.clone_from(&query);
                 match self.query.search(&query, 50) {
                     Ok(results) => {
-                        self.search_results =
-                            results.iter().map(adapt_search).collect();
+                        self.search_results = results.iter().map(adapt_search).collect();
                         self.search_selected = 0;
                     }
                     Err(e) => {
-                        self.view_state.error_message =
-                            Some(format!("Search failed: {e}"));
+                        self.view_state.error_message = Some(format!("Search failed: {e}"));
                         self.search_results.clear();
                     }
                 }
@@ -967,8 +955,7 @@ impl WaModel {
                 self.view_state.focus = FocusRegion::PrimaryList;
                 let count = self.search_results.len();
                 if count > 0 {
-                    self.search_selected =
-                        self.search_selected.checked_sub(1).unwrap_or(count - 1);
+                    self.search_selected = self.search_selected.checked_sub(1).unwrap_or(count - 1);
                 }
                 ftui::Cmd::None
             }
@@ -1009,8 +996,7 @@ impl WaModel {
             }
             KeyCode::Char('u') => {
                 self.view_state.focus = FocusRegion::PrimaryList;
-                self.view_state.events.unhandled_only =
-                    !self.view_state.events.unhandled_only;
+                self.view_state.events.unhandled_only = !self.view_state.events.unhandled_only;
                 self.view_state.events.selected_index = 0;
                 ftui::Cmd::None
             }
@@ -1097,18 +1083,14 @@ impl WaModel {
                 self.health = Some(adapt_health(&health));
             }
             Err(e) => {
-                self.view_state.error_message =
-                    Some(format!("Health query failed: {e}"));
+                self.view_state.error_message = Some(format!("Health query failed: {e}"));
             }
         }
 
         // Pane data (also used for unhandled count)
         match self.query.list_panes() {
             Ok(panes) => {
-                self.unhandled_count = panes
-                    .iter()
-                    .map(|p| p.unhandled_event_count as usize)
-                    .sum();
+                self.unhandled_count = panes.iter().map(|p| p.unhandled_event_count as usize).sum();
                 self.panes = panes.iter().map(adapt_pane).collect();
                 // Clamp selection
                 if !self.panes.is_empty() {
@@ -1128,8 +1110,7 @@ impl WaModel {
                 if self.triage_items.is_empty() {
                     self.triage_selected = 0;
                 } else {
-                    self.triage_selected =
-                        self.triage_selected.min(self.triage_items.len() - 1);
+                    self.triage_selected = self.triage_selected.min(self.triage_items.len() - 1);
                 }
             }
             Err(_) => { /* non-fatal */ }
@@ -1152,18 +1133,13 @@ impl WaModel {
             limit: 500,
         }) {
             Ok(events) => {
-                self.view_state.events.rows =
-                    events.iter().map(adapt_event).collect();
+                self.view_state.events.rows = events.iter().map(adapt_event).collect();
                 self.view_state.events.items = events;
                 // Clamp selection within filtered results
-                let filtered_len =
-                    self.view_state.events.filtered_indices().len();
+                let filtered_len = self.view_state.events.filtered_indices().len();
                 if filtered_len > 0 {
-                    self.view_state.events.selected_index = self
-                        .view_state
-                        .events
-                        .selected_index
-                        .min(filtered_len - 1);
+                    self.view_state.events.selected_index =
+                        self.view_state.events.selected_index.min(filtered_len - 1);
                 } else {
                     self.view_state.events.selected_index = 0;
                 }
@@ -1174,17 +1150,12 @@ impl WaModel {
         // History data
         match self.query.list_action_history(500) {
             Ok(entries) => {
-                self.view_state.history.rows =
-                    entries.iter().map(adapt_history).collect();
+                self.view_state.history.rows = entries.iter().map(adapt_history).collect();
                 self.view_state.history.items = entries;
-                let filtered_len =
-                    self.view_state.history.filtered_indices().len();
+                let filtered_len = self.view_state.history.filtered_indices().len();
                 if filtered_len > 0 {
-                    self.view_state.history.selected_index = self
-                        .view_state
-                        .history
-                        .selected_index
-                        .min(filtered_len - 1);
+                    self.view_state.history.selected_index =
+                        self.view_state.history.selected_index.min(filtered_len - 1);
                 } else {
                     self.view_state.history.selected_index = 0;
                 }
@@ -1539,10 +1510,22 @@ fn render_home_view(
     // -- System status section --
     if let Some(h) = health {
         let status_lines: &[(&str, &str, bool)] = &[
-            ("  Watcher:        ", &h.watcher_label, h.watcher_label == "running"),
+            (
+                "  Watcher:        ",
+                &h.watcher_label,
+                h.watcher_label == "running",
+            ),
             ("  Database:       ", &h.db_label, h.db_label == "ok"),
-            ("  WezTerm CLI:    ", &h.wezterm_label, h.wezterm_label == "ok"),
-            ("  Circuit Breaker:", &h.circuit_label, h.circuit_label == "closed"),
+            (
+                "  WezTerm CLI:    ",
+                &h.wezterm_label,
+                h.wezterm_label == "ok",
+            ),
+            (
+                "  Circuit Breaker:",
+                &h.circuit_label,
+                h.circuit_label == "closed",
+            ),
         ];
 
         for &(label, value, ok) in status_lines {
@@ -1566,7 +1549,13 @@ fn render_home_view(
             row += 1;
         }
     } else if row < max_row {
-        write_styled(frame, 0, row, "  Loading health data...", CellStyle::new().dim());
+        write_styled(
+            frame,
+            0,
+            row,
+            "  Loading health data...",
+            CellStyle::new().dim(),
+        );
         let used = 24u16;
         if used < width {
             let fill = " ".repeat((width - used) as usize);
@@ -1901,7 +1890,11 @@ fn render_search_view(
         "Search (FTS5) — Enter to search, Esc to clear"
     };
     // Show cursor indicator when FilterBar has focus, trailing underscore otherwise.
-    let cursor_char = if focus == FocusRegion::FilterBar { '▏' } else { '_' };
+    let cursor_char = if focus == FocusRegion::FilterBar {
+        '▏'
+    } else {
+        '_'
+    };
     let (before_cursor, after_cursor) = if cursor_pos <= query.len() {
         (&query[..cursor_pos], &query[cursor_pos..])
     } else {
@@ -2006,7 +1999,13 @@ fn render_search_view(
     let mut drow = results_start_row;
 
     // Detail header
-    write_styled(frame, detail_x, drow, " Match Context", CellStyle::new().bold());
+    write_styled(
+        frame,
+        detail_x,
+        drow,
+        " Match Context",
+        CellStyle::new().bold(),
+    );
     let dhlen = 14u16;
     if dhlen < detail_width {
         let fill = " ".repeat((detail_width - dhlen) as usize);
@@ -2150,7 +2149,11 @@ fn render_events_view(
 
     // -- Header: count and filter status (with focus-aware cursor) --
     let filter_text = events_state.pane_filter.text();
-    let cursor_indicator = if focus == FocusRegion::FilterBar { "▏" } else { "" };
+    let cursor_indicator = if focus == FocusRegion::FilterBar {
+        "▏"
+    } else {
+        ""
+    };
     let header = format!(
         "  Events ({}/{})  unhandled_only={}  pane/rule='{}{}'",
         filtered_indices.len(),
@@ -2169,10 +2172,7 @@ fn render_events_view(
 
     // -- Column headers --
     if row < max_row {
-        let col_header = format!(
-            "  {:8}  {:>4}  {:28}  {}",
-            "sev", "pane", "rule", "status"
-        );
+        let col_header = format!("  {:8}  {:>4}  {:28}  {}", "sev", "pane", "rule", "status");
         write_styled(frame, 0, row, &col_header, CellStyle::new().dim());
         let clen = col_header.len() as u16;
         if clen < list_width {
@@ -2400,10 +2400,7 @@ fn render_triage_view(
     } else {
         // Column header
         if row < list_end {
-            let col_header = format!(
-                "  {:8}  {:8}  {}",
-                "severity", "section", "title"
-            );
+            let col_header = format!("  {:8}  {:8}  {}", "severity", "section", "title");
             write_styled(frame, 0, row, &col_header, CellStyle::new().dim());
             let clen = col_header.len() as u16;
             if clen < width {
@@ -2495,10 +2492,8 @@ fn render_triage_view(
                     row += 1;
                 }
                 if row < wf_end {
-                    let step_line = format!(
-                        "    Step {} | started {}",
-                        wf.progress_label, wf.started_at,
-                    );
+                    let step_line =
+                        format!("    Step {} | started {}", wf.progress_label, wf.started_at,);
                     write_styled(frame, 0, row, &step_line, CellStyle::new().dim());
                     let slen = step_line.len() as u16;
                     if slen < width {
@@ -2509,10 +2504,7 @@ fn render_triage_view(
                 }
                 if let Some(ref error) = wf.error {
                     if row < wf_end {
-                        let err_line = format!(
-                            "    ERROR: {}",
-                            truncate_str(error, 60),
-                        );
+                        let err_line = format!("    ERROR: {}", truncate_str(error, 60),);
                         write_styled(frame, 0, row, &err_line, CellStyle::new().bold());
                         let elen = err_line.len() as u16;
                         if elen < width {
@@ -2548,7 +2540,10 @@ fn render_triage_view(
     if let Some(item) = triage_items.get(clamped_sel) {
         // Detail text
         if !item.detail.is_empty() && row < max_row {
-            let detail_line = format!("  {}", truncate_str(&item.detail, width.saturating_sub(4) as usize));
+            let detail_line = format!(
+                "  {}",
+                truncate_str(&item.detail, width.saturating_sub(4) as usize)
+            );
             write_styled(frame, 0, row, &detail_line, CellStyle::new());
             let dlen = detail_line.len() as u16;
             if dlen < width {
@@ -2591,7 +2586,10 @@ fn render_triage_view(
 
         // Cross-reference IDs
         if row < max_row && (!item.event_id.is_empty() || !item.pane_id.is_empty()) {
-            let ref_line = format!("  event={} pane={} wf={}", item.event_id, item.pane_id, item.workflow_id);
+            let ref_line = format!(
+                "  event={} pane={} wf={}",
+                item.event_id, item.pane_id, item.workflow_id
+            );
             write_styled(frame, 0, row, &ref_line, CellStyle::new().dim());
             let rlen = ref_line.len() as u16;
             if rlen < width {
@@ -2637,7 +2635,11 @@ fn render_history_view(
 
     // -- Header: count and filter status (with focus-aware cursor) --
     let filter_text = history_state.filter_input.text();
-    let cursor_indicator = if focus == FocusRegion::FilterBar { "▏" } else { "" };
+    let cursor_indicator = if focus == FocusRegion::FilterBar {
+        "▏"
+    } else {
+        ""
+    };
     let header = format!(
         "  History ({}/{})  undoable_only={}  q='{}{}'",
         filtered_indices.len(),
@@ -2778,16 +2780,10 @@ fn render_history_view(
             detail_lines.push(format!(" Strategy: {}", hrow.undo_strategy));
         }
         if !hrow.undo_hint.is_empty() {
-            detail_lines.push(format!(
-                " Hint:     {}",
-                truncate_str(&hrow.undo_hint, 40)
-            ));
+            detail_lines.push(format!(" Hint:     {}", truncate_str(&hrow.undo_hint, 40)));
         }
         if !hrow.summary.is_empty() {
-            detail_lines.push(format!(
-                " Summary:  {}",
-                truncate_str(&hrow.summary, 40)
-            ));
+            detail_lines.push(format!(" Summary:  {}", truncate_str(&hrow.summary, 40)));
         }
 
         detail_lines.push(String::new());
@@ -2905,10 +2901,7 @@ fn render_modal_overlay(frame: &mut ftui::Frame, width: u16, height: u16, modal:
     if row < max_row {
         let title = truncate_str(&modal.title, inner_w as usize);
         let pad = inner_w.saturating_sub(title.len() as u16);
-        let line = format!(
-            "\u{2502}{title}{}\u{2502}",
-            " ".repeat(pad as usize),
-        );
+        let line = format!("\u{2502}{title}{}\u{2502}", " ".repeat(pad as usize),);
         write_styled(frame, x0, row, &line, CellStyle::new().bold());
         row += 1;
     }
@@ -2928,20 +2921,14 @@ fn render_modal_overlay(frame: &mut ftui::Frame, width: u16, height: u16, modal:
         }
         let text = truncate_str(line_text, inner_w as usize);
         let pad = inner_w.saturating_sub(text.len() as u16);
-        let line = format!(
-            "\u{2502}{text}{}\u{2502}",
-            " ".repeat(pad as usize),
-        );
+        let line = format!("\u{2502}{text}{}\u{2502}", " ".repeat(pad as usize),);
         write_styled(frame, x0, row, &line, CellStyle::new());
         row += 1;
     }
 
     // Fill remaining body area with blank rows.
     while row < max_row.saturating_sub(1) {
-        let blank = format!(
-            "\u{2502}{}\u{2502}",
-            " ".repeat(inner_w as usize),
-        );
+        let blank = format!("\u{2502}{}\u{2502}", " ".repeat(inner_w as usize),);
         write_styled(frame, x0, row, &blank, CellStyle::new());
         row += 1;
     }
@@ -2955,20 +2942,14 @@ fn render_modal_overlay(frame: &mut ftui::Frame, width: u16, height: u16, modal:
         };
         let hint_text = truncate_str(hint, inner_w as usize);
         let pad = inner_w.saturating_sub(hint_text.len() as u16);
-        let line = format!(
-            "\u{2502}{hint_text}{}\u{2502}",
-            " ".repeat(pad as usize),
-        );
+        let line = format!("\u{2502}{hint_text}{}\u{2502}", " ".repeat(pad as usize),);
         write_styled(frame, x0, row, &line, CellStyle::new().dim());
         row += 1;
     }
 
     // -- Bottom border --
     if row <= y0 + modal_h {
-        let bottom = format!(
-            "\u{2514}{}\u{2518}",
-            "\u{2500}".repeat(inner_w as usize),
-        );
+        let bottom = format!("\u{2514}{}\u{2518}", "\u{2500}".repeat(inner_w as usize),);
         write_styled(frame, x0, row, &bottom, CellStyle::new().bold());
     }
 }
@@ -3813,16 +3794,7 @@ mod tests {
         model.refresh_data();
 
         let filtered = model.filtered_pane_indices();
-        render_panes_view(
-            &mut frame,
-            0,
-            100,
-            22,
-            &model.panes,
-            &filtered,
-            0,
-            None,
-        );
+        render_panes_view(&mut frame, 0, 100, 22, &model.panes, &filtered, 0, None);
 
         let row0 = read_row(&frame, 0);
         assert!(row0.contains("Panes (3/3)"));
@@ -3843,16 +3815,7 @@ mod tests {
         model.refresh_data();
 
         let filtered = model.filtered_pane_indices();
-        render_panes_view(
-            &mut frame,
-            0,
-            100,
-            22,
-            &model.panes,
-            &filtered,
-            0,
-            None,
-        );
+        render_panes_view(&mut frame, 0, 100, 22, &model.panes, &filtered, 0, None);
 
         // Pane rows start at row 2
         let row2 = read_row(&frame, 2);
@@ -3869,16 +3832,7 @@ mod tests {
         model.refresh_data();
 
         let filtered = model.filtered_pane_indices();
-        render_panes_view(
-            &mut frame,
-            0,
-            100,
-            22,
-            &model.panes,
-            &filtered,
-            0,
-            None,
-        );
+        render_panes_view(&mut frame, 0, 100, 22, &model.panes, &filtered, 0, None);
 
         // Detail panel is in the right 1/3 — check rows for "Pane Details"
         let mut found_detail = false;
@@ -3919,24 +3873,25 @@ mod tests {
         model.refresh_data();
 
         let filtered = model.filtered_pane_indices();
-        render_panes_view(
-            &mut frame,
-            0,
-            40,
-            1,
-            &model.panes,
-            &filtered,
-            0,
-            None,
-        );
+        render_panes_view(&mut frame, 0, 40, 1, &model.panes, &filtered, 0, None);
     }
 
     // -- Search view tests --
 
     fn sample_search_results() -> Vec<SearchResultView> {
         vec![
-            SearchResultView { pane_id: 10, timestamp: 1_700_000_000_000, snippet: "error: connection refused".into(), rank: 0.95 },
-            SearchResultView { pane_id: 20, timestamp: 1_700_000_001_000, snippet: "error: timeout exceeded".into(), rank: 0.88 },
+            SearchResultView {
+                pane_id: 10,
+                timestamp: 1_700_000_000_000,
+                snippet: "error: connection refused".into(),
+                rank: 0.95,
+            },
+            SearchResultView {
+                pane_id: 20,
+                timestamp: 1_700_000_001_000,
+                snippet: "error: timeout exceeded".into(),
+                rank: 0.88,
+            },
         ]
     }
 
@@ -4016,7 +3971,11 @@ mod tests {
     fn search_global_q_does_not_quit() {
         let mut model = make_model(MockQuery::healthy());
         model.view_state.current_view = View::Search;
-        let key = ftui::KeyEvent { code: ftui::KeyCode::Char('q'), kind: ftui::KeyEventKind::Press, modifiers: ftui::Modifiers::empty() };
+        let key = ftui::KeyEvent {
+            code: ftui::KeyCode::Char('q'),
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
         let result = model.handle_global_key(&key);
         assert!(result.is_none());
         model.handle_view_key(&key);
@@ -4027,7 +3986,11 @@ mod tests {
     fn search_tab_still_navigates_views() {
         let mut model = make_model(MockQuery::healthy());
         model.view_state.current_view = View::Search;
-        let key = ftui::KeyEvent { code: ftui::KeyCode::Tab, kind: ftui::KeyEventKind::Press, modifiers: ftui::Modifiers::empty() };
+        let key = ftui::KeyEvent {
+            code: ftui::KeyCode::Tab,
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
         let result = model.handle_global_key(&key);
         assert!(result.is_some());
         assert_eq!(model.view_state.current_view, View::Help);
@@ -4037,7 +4000,18 @@ mod tests {
     fn render_search_empty_shows_prompt() {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = ftui::Frame::new(80, 24, &mut pool);
-        render_search_view(&mut frame, 0, 80, 22, "", 0, FocusRegion::PrimaryList, "", &[], 0);
+        render_search_view(
+            &mut frame,
+            0,
+            80,
+            22,
+            "",
+            0,
+            FocusRegion::PrimaryList,
+            "",
+            &[],
+            0,
+        );
         let row0 = read_row(&frame, 0);
         assert!(row0.contains("Search (FTS5)"));
         let row1 = read_row(&frame, 1);
@@ -4048,17 +4022,42 @@ mod tests {
     fn render_search_no_results_shows_message() {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = ftui::Frame::new(80, 24, &mut pool);
-        render_search_view(&mut frame, 0, 80, 22, "test", 4, FocusRegion::PrimaryList, "test", &[], 0);
+        render_search_view(
+            &mut frame,
+            0,
+            80,
+            22,
+            "test",
+            4,
+            FocusRegion::PrimaryList,
+            "test",
+            &[],
+            0,
+        );
         let row1 = read_row(&frame, 1);
         assert!(row1.contains("No results"));
     }
 
     #[test]
     fn render_search_with_results_shows_list_and_detail() {
-        let rows: Vec<super::SearchRow> = sample_search_results().iter().map(super::adapt_search).collect();
+        let rows: Vec<super::SearchRow> = sample_search_results()
+            .iter()
+            .map(super::adapt_search)
+            .collect();
         let mut pool = ftui::GraphemePool::new();
         let mut frame = ftui::Frame::new(100, 24, &mut pool);
-        render_search_view(&mut frame, 0, 100, 22, "error", 5, FocusRegion::PrimaryList, "error", &rows, 0);
+        render_search_view(
+            &mut frame,
+            0,
+            100,
+            22,
+            "error",
+            5,
+            FocusRegion::PrimaryList,
+            "error",
+            &rows,
+            0,
+        );
         let row1 = read_row(&frame, 1);
         assert!(row1.contains("2 matches"));
         let row2 = read_row(&frame, 2);
@@ -4067,7 +4066,12 @@ mod tests {
         let row3 = read_row(&frame, 3);
         assert!(row3.contains("P 10"));
         let mut found = false;
-        for r in 0..22 { if read_row(&frame, r).contains("Match Context") { found = true; break; } }
+        for r in 0..22 {
+            if read_row(&frame, r).contains("Match Context") {
+                found = true;
+                break;
+            }
+        }
         assert!(found, "Detail panel header not found");
     }
 
@@ -4075,7 +4079,18 @@ mod tests {
     fn render_search_zero_height_no_panic() {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = ftui::Frame::new(80, 24, &mut pool);
-        render_search_view(&mut frame, 0, 80, 0, "q", 1, FocusRegion::PrimaryList, "q", &[], 0);
+        render_search_view(
+            &mut frame,
+            0,
+            80,
+            0,
+            "q",
+            1,
+            FocusRegion::PrimaryList,
+            "q",
+            &[],
+            0,
+        );
     }
 
     // -- Help view tests --
@@ -4087,12 +4102,20 @@ mod tests {
         render_help_view(&mut frame, 0, 80, 38);
         let row0 = read_row(&frame, 0);
         assert!(row0.contains("WezTerm Automata TUI"));
-        let mut g = false; let mut v = false; let mut s = false;
+        let mut g = false;
+        let mut v = false;
+        let mut s = false;
         for r in 0..38 {
             let t = read_row(&frame, r);
-            if t.contains("Global Keybindings") { g = true; }
-            if t.contains("Views:") { v = true; }
-            if t.contains("Search:") { s = true; }
+            if t.contains("Global Keybindings") {
+                g = true;
+            }
+            if t.contains("Views:") {
+                v = true;
+            }
+            if t.contains("Search:") {
+                s = true;
+            }
         }
         assert!(g, "Global keybindings section not found");
         assert!(v, "Views section not found");
@@ -4146,7 +4169,11 @@ mod tests {
     fn events_filtering_pane_filter() {
         let mut model = make_model(MockQuery::with_events());
         model.refresh_data();
-        model.view_state.events.pane_filter.set_text("42".to_string());
+        model
+            .view_state
+            .events
+            .pane_filter
+            .set_text("42".to_string());
         let indices = model.view_state.events.filtered_indices();
         assert_eq!(indices.len(), 2); // events 0 and 2 are pane 42
     }
@@ -4156,7 +4183,11 @@ mod tests {
         let mut model = make_model(MockQuery::with_events());
         model.refresh_data();
         model.view_state.events.unhandled_only = true;
-        model.view_state.events.pane_filter.set_text("7".to_string());
+        model
+            .view_state
+            .events
+            .pane_filter
+            .set_text("7".to_string());
         let indices = model.view_state.events.filtered_indices();
         assert_eq!(indices.len(), 0); // pane 7 event is handled
     }
@@ -4229,7 +4260,11 @@ mod tests {
         let mut model = make_model(MockQuery::with_events());
         model.view_state.current_view = View::Events;
         model.refresh_data();
-        model.view_state.events.pane_filter.set_text("42".to_string());
+        model
+            .view_state
+            .events
+            .pane_filter
+            .set_text("42".to_string());
 
         press_key(&mut model, ftui::KeyCode::Backspace);
         assert_eq!(model.view_state.events.pane_filter.text(), "4");
@@ -4240,7 +4275,11 @@ mod tests {
         let mut model = make_model(MockQuery::with_events());
         model.view_state.current_view = View::Events;
         model.refresh_data();
-        model.view_state.events.pane_filter.set_text("42".to_string());
+        model
+            .view_state
+            .events
+            .pane_filter
+            .set_text("42".to_string());
         model.view_state.events.selected_index = 1;
 
         press_key(&mut model, ftui::KeyCode::Escape);
@@ -4261,7 +4300,10 @@ mod tests {
             modifiers: ftui::Modifiers::empty(),
         };
         let result = model.handle_global_key(&key);
-        assert!(result.is_none(), "digit should not be consumed globally in Events view");
+        assert!(
+            result.is_none(),
+            "digit should not be consumed globally in Events view"
+        );
     }
 
     #[test]
@@ -4275,8 +4317,14 @@ mod tests {
         let filtered = model.view_state.events.filtered_indices();
         let clamped = model.view_state.events.clamped_selection();
         render_events_view(
-            &mut frame, 0, 100, 22,
-            &model.view_state.events, &filtered, clamped, FocusRegion::PrimaryList,
+            &mut frame,
+            0,
+            100,
+            22,
+            &model.view_state.events,
+            &filtered,
+            clamped,
+            FocusRegion::PrimaryList,
         );
 
         let row0 = read_row(&frame, 0);
@@ -4299,8 +4347,14 @@ mod tests {
         let filtered = model.view_state.events.filtered_indices();
         let clamped = model.view_state.events.clamped_selection();
         render_events_view(
-            &mut frame, 0, 100, 22,
-            &model.view_state.events, &filtered, clamped, FocusRegion::PrimaryList,
+            &mut frame,
+            0,
+            100,
+            22,
+            &model.view_state.events,
+            &filtered,
+            clamped,
+            FocusRegion::PrimaryList,
         );
 
         // Event rows start at row 2
@@ -4321,8 +4375,14 @@ mod tests {
         let filtered = model.view_state.events.filtered_indices();
         let clamped = model.view_state.events.clamped_selection();
         render_events_view(
-            &mut frame, 0, 100, 22,
-            &model.view_state.events, &filtered, clamped, FocusRegion::PrimaryList,
+            &mut frame,
+            0,
+            100,
+            22,
+            &model.view_state.events,
+            &filtered,
+            clamped,
+            FocusRegion::PrimaryList,
         );
 
         let mut found_detail = false;
@@ -4342,7 +4402,16 @@ mod tests {
         let mut frame = ftui::Frame::new(100, 24, &mut pool);
 
         let events_state = EventsViewState::default();
-        render_events_view(&mut frame, 0, 100, 22, &events_state, &[], 0, FocusRegion::PrimaryList);
+        render_events_view(
+            &mut frame,
+            0,
+            100,
+            22,
+            &events_state,
+            &[],
+            0,
+            FocusRegion::PrimaryList,
+        );
 
         let mut found_msg = false;
         for r in 0..22 {
@@ -4360,7 +4429,16 @@ mod tests {
         let events_state = EventsViewState::default();
         let mut pool = ftui::GraphemePool::new();
         let mut frame = ftui::Frame::new(80, 24, &mut pool);
-        render_events_view(&mut frame, 0, 80, 0, &events_state, &[], 0, FocusRegion::PrimaryList);
+        render_events_view(
+            &mut frame,
+            0,
+            80,
+            0,
+            &events_state,
+            &[],
+            0,
+            FocusRegion::PrimaryList,
+        );
     }
 
     // -- Triage view tests --
@@ -4457,7 +4535,10 @@ mod tests {
         model.handle_triage_key(&key);
         // Action now shows confirmation modal first.
         assert!(model.active_modal.is_some());
-        assert_eq!(model.active_modal.as_ref().unwrap().kind, ModalKind::Confirm);
+        assert_eq!(
+            model.active_modal.as_ref().unwrap().kind,
+            ModalKind::Confirm
+        );
         // Confirm the modal.
         let confirm = ftui::KeyEvent {
             code: ftui::KeyCode::Enter,
@@ -4530,7 +4611,10 @@ mod tests {
         // Mute now shows confirm modal.
         model.handle_triage_key(&key);
         assert!(model.active_modal.is_some());
-        assert_eq!(model.active_modal.as_ref().unwrap().kind, ModalKind::Confirm);
+        assert_eq!(
+            model.active_modal.as_ref().unwrap().kind,
+            ModalKind::Confirm
+        );
         // Confirm the mute.
         let confirm = ftui::KeyEvent {
             code: ftui::KeyCode::Enter,
@@ -4591,7 +4675,10 @@ mod tests {
             modifiers: ftui::Modifiers::empty(),
         };
         let result = model.handle_global_key(&key);
-        assert!(result.is_none(), "Digit should not be consumed globally in Triage view");
+        assert!(
+            result.is_none(),
+            "Digit should not be consumed globally in Triage view"
+        );
         assert_eq!(model.view_state.current_view, View::Triage);
     }
 
@@ -4604,9 +4691,14 @@ mod tests {
         model.refresh_data();
 
         render_triage_view(
-            &mut frame, 0, 100, 22,
-            &model.triage_items, model.triage_selected,
-            &model.workflows, model.triage_expanded,
+            &mut frame,
+            0,
+            100,
+            22,
+            &model.triage_items,
+            model.triage_selected,
+            &model.workflows,
+            model.triage_expanded,
         );
 
         let row0 = read_row(&frame, 0);
@@ -4623,9 +4715,14 @@ mod tests {
         model.refresh_data();
 
         render_triage_view(
-            &mut frame, 0, 100, 22,
-            &model.triage_items, model.triage_selected,
-            &model.workflows, model.triage_expanded,
+            &mut frame,
+            0,
+            100,
+            22,
+            &model.triage_items,
+            model.triage_selected,
+            &model.workflows,
+            model.triage_expanded,
         );
 
         // Item rows start after header + column header
@@ -4653,9 +4750,14 @@ mod tests {
         model.refresh_data();
 
         render_triage_view(
-            &mut frame, 0, 100, 22,
-            &model.triage_items, model.triage_selected,
-            &model.workflows, model.triage_expanded,
+            &mut frame,
+            0,
+            100,
+            22,
+            &model.triage_items,
+            model.triage_selected,
+            &model.workflows,
+            model.triage_expanded,
         );
 
         let mut found_wf = false;
@@ -4678,9 +4780,14 @@ mod tests {
         model.refresh_data();
 
         render_triage_view(
-            &mut frame, 0, 100, 22,
-            &model.triage_items, model.triage_selected,
-            &model.workflows, model.triage_expanded,
+            &mut frame,
+            0,
+            100,
+            22,
+            &model.triage_items,
+            model.triage_selected,
+            &model.workflows,
+            model.triage_expanded,
         );
 
         let mut found_actions = false;
@@ -4734,9 +4841,14 @@ mod tests {
         // Remove workflows to test without them
         let empty_wf: Vec<WorkflowRow> = vec![];
         render_triage_view(
-            &mut frame, 0, 100, 22,
-            &model.triage_items, model.triage_selected,
-            &empty_wf, None,
+            &mut frame,
+            0,
+            100,
+            22,
+            &model.triage_items,
+            model.triage_selected,
+            &empty_wf,
+            None,
         );
 
         let mut found_wf = false;
@@ -4747,7 +4859,10 @@ mod tests {
                 break;
             }
         }
-        assert!(!found_wf, "Workflow panel should not appear without workflows");
+        assert!(
+            !found_wf,
+            "Workflow panel should not appear without workflows"
+        );
     }
 
     #[test]
@@ -4897,7 +5012,11 @@ mod tests {
         model.refresh_data();
         model.view_state.current_view = View::History;
 
-        model.view_state.history.filter_input.set_text("test".to_string());
+        model
+            .view_state
+            .history
+            .filter_input
+            .set_text("test".to_string());
         model.view_state.history.undoable_only = true;
         model.view_state.history.selected_index = 1;
 
@@ -4958,7 +5077,11 @@ mod tests {
         let mut model = make_model(MockQuery::with_history());
         model.refresh_data();
 
-        model.view_state.history.filter_input.set_text("send_text".to_string());
+        model
+            .view_state
+            .history
+            .filter_input
+            .set_text("send_text".to_string());
         model.view_state.history.undoable_only = true;
         let filtered = model.view_state.history.filtered_indices();
         assert_eq!(filtered.len(), 2);
@@ -4980,10 +5103,22 @@ mod tests {
 
         let filtered = model.view_state.history.filtered_indices();
         let clamped = model.view_state.history.clamped_selection();
-        render_history_view(&mut frame, 0, 120, 28, &model.view_state.history, &filtered, clamped, FocusRegion::PrimaryList);
+        render_history_view(
+            &mut frame,
+            0,
+            120,
+            28,
+            &model.view_state.history,
+            &filtered,
+            clamped,
+            FocusRegion::PrimaryList,
+        );
 
         let row0 = read_row(&frame, 0);
-        assert!(row0.contains("History"), "Header should contain 'History': {row0}");
+        assert!(
+            row0.contains("History"),
+            "Header should contain 'History': {row0}"
+        );
         assert!(row0.contains("3"), "Header should show entry count: {row0}");
     }
 
@@ -4996,14 +5131,27 @@ mod tests {
 
         let filtered = model.view_state.history.filtered_indices();
         let clamped = model.view_state.history.clamped_selection();
-        render_history_view(&mut frame, 0, 120, 28, &model.view_state.history, &filtered, clamped, FocusRegion::PrimaryList);
+        render_history_view(
+            &mut frame,
+            0,
+            120,
+            28,
+            &model.view_state.history,
+            &filtered,
+            clamped,
+            FocusRegion::PrimaryList,
+        );
 
         let mut found_send = false;
         let mut found_wait = false;
         for r in 0..28 {
             let text = read_row(&frame, r);
-            if text.contains("send_text") { found_send = true; }
-            if text.contains("wait_for") { found_wait = true; }
+            if text.contains("send_text") {
+                found_send = true;
+            }
+            if text.contains("wait_for") {
+                found_wait = true;
+            }
         }
         assert!(found_send, "Should show send_text action");
         assert!(found_wait, "Should show wait_for action");
@@ -5018,7 +5166,16 @@ mod tests {
 
         let filtered = model.view_state.history.filtered_indices();
         let clamped = model.view_state.history.clamped_selection();
-        render_history_view(&mut frame, 0, 120, 28, &model.view_state.history, &filtered, clamped, FocusRegion::PrimaryList);
+        render_history_view(
+            &mut frame,
+            0,
+            120,
+            28,
+            &model.view_state.history,
+            &filtered,
+            clamped,
+            FocusRegion::PrimaryList,
+        );
 
         let mut found_detail = false;
         for r in 0..28 {
@@ -5038,7 +5195,16 @@ mod tests {
         let state = HistoryViewState::default();
         let filtered = state.filtered_indices();
         let clamped = state.clamped_selection();
-        render_history_view(&mut frame, 0, 80, 22, &state, &filtered, clamped, FocusRegion::PrimaryList);
+        render_history_view(
+            &mut frame,
+            0,
+            80,
+            22,
+            &state,
+            &filtered,
+            clamped,
+            FocusRegion::PrimaryList,
+        );
 
         let mut found_empty = false;
         for r in 0..22 {
@@ -5057,7 +5223,16 @@ mod tests {
         let mut frame = ftui::Frame::new(80, 24, &mut pool);
         let state = HistoryViewState::default();
         let filtered = state.filtered_indices();
-        render_history_view(&mut frame, 0, 80, 0, &state, &filtered, 0, FocusRegion::PrimaryList);
+        render_history_view(
+            &mut frame,
+            0,
+            80,
+            0,
+            &state,
+            &filtered,
+            0,
+            FocusRegion::PrimaryList,
+        );
     }
 
     #[test]
@@ -5070,11 +5245,22 @@ mod tests {
 
         let filtered = model.view_state.history.filtered_indices();
         let clamped = model.view_state.history.clamped_selection();
-        render_history_view(&mut frame, 0, 120, 28, &model.view_state.history, &filtered, clamped, FocusRegion::PrimaryList);
+        render_history_view(
+            &mut frame,
+            0,
+            120,
+            28,
+            &model.view_state.history,
+            &filtered,
+            clamped,
+            FocusRegion::PrimaryList,
+        );
 
         let row0 = read_row(&frame, 0);
-        assert!(row0.contains("undoable") || row0.contains("2"),
-            "Header should reflect undoable filter: {row0}");
+        assert!(
+            row0.contains("undoable") || row0.contains("2"),
+            "Header should reflect undoable filter: {row0}"
+        );
     }
 
     // -- Modal interaction tests (FTUI-06.3) --
@@ -5083,9 +5269,17 @@ mod tests {
     fn modal_confirm_enter_executes_action() {
         let mut model = make_model(MockQuery::with_triage());
         model.refresh_data();
-        model.show_modal(ModalState::confirm("Test", "Run action?", ConfirmAction::ExecuteCommand("wa test cmd".to_string())));
+        model.show_modal(ModalState::confirm(
+            "Test",
+            "Run action?",
+            ConfirmAction::ExecuteCommand("wa test cmd".to_string()),
+        ));
         assert!(model.active_modal.is_some());
-        let key = ftui::KeyEvent { code: ftui::KeyCode::Enter, kind: ftui::KeyEventKind::Press, modifiers: ftui::Modifiers::empty() };
+        let key = ftui::KeyEvent {
+            code: ftui::KeyCode::Enter,
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
         model.handle_modal_key(&key);
         assert!(model.active_modal.is_none());
         assert_eq!(model.triage_queued_action.as_deref(), Some("wa test cmd"));
@@ -5094,8 +5288,16 @@ mod tests {
     #[test]
     fn modal_confirm_y_executes_action() {
         let mut model = make_model(MockQuery::with_triage());
-        model.show_modal(ModalState::confirm("Test", "Run?", ConfirmAction::ExecuteCommand("wa test".to_string())));
-        let key = ftui::KeyEvent { code: ftui::KeyCode::Char('y'), kind: ftui::KeyEventKind::Press, modifiers: ftui::Modifiers::empty() };
+        model.show_modal(ModalState::confirm(
+            "Test",
+            "Run?",
+            ConfirmAction::ExecuteCommand("wa test".to_string()),
+        ));
+        let key = ftui::KeyEvent {
+            code: ftui::KeyCode::Char('y'),
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
         model.handle_modal_key(&key);
         assert!(model.active_modal.is_none());
         assert_eq!(model.triage_queued_action.as_deref(), Some("wa test"));
@@ -5104,8 +5306,16 @@ mod tests {
     #[test]
     fn modal_escape_dismisses_without_action() {
         let mut model = make_model(MockQuery::with_triage());
-        model.show_modal(ModalState::confirm("Test", "Run?", ConfirmAction::ExecuteCommand("wa dangerous".to_string())));
-        let key = ftui::KeyEvent { code: ftui::KeyCode::Escape, kind: ftui::KeyEventKind::Press, modifiers: ftui::Modifiers::empty() };
+        model.show_modal(ModalState::confirm(
+            "Test",
+            "Run?",
+            ConfirmAction::ExecuteCommand("wa dangerous".to_string()),
+        ));
+        let key = ftui::KeyEvent {
+            code: ftui::KeyCode::Escape,
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
         model.handle_modal_key(&key);
         assert!(model.active_modal.is_none());
         assert!(model.triage_queued_action.is_none());
@@ -5114,8 +5324,16 @@ mod tests {
     #[test]
     fn modal_n_dismisses_without_action() {
         let mut model = make_model(MockQuery::with_triage());
-        model.show_modal(ModalState::confirm("Test", "Run?", ConfirmAction::ExecuteCommand("wa dangerous".to_string())));
-        let key = ftui::KeyEvent { code: ftui::KeyCode::Char('n'), kind: ftui::KeyEventKind::Press, modifiers: ftui::Modifiers::empty() };
+        model.show_modal(ModalState::confirm(
+            "Test",
+            "Run?",
+            ConfirmAction::ExecuteCommand("wa dangerous".to_string()),
+        ));
+        let key = ftui::KeyEvent {
+            code: ftui::KeyCode::Char('n'),
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
         model.handle_modal_key(&key);
         assert!(model.active_modal.is_none());
         assert!(model.triage_queued_action.is_none());
@@ -5124,8 +5342,16 @@ mod tests {
     #[test]
     fn modal_absorbs_unrelated_keys() {
         let mut model = make_model(MockQuery::with_triage());
-        model.show_modal(ModalState::confirm("Test", "Run?", ConfirmAction::ExecuteCommand("cmd".to_string())));
-        let key = ftui::KeyEvent { code: ftui::KeyCode::Char('q'), kind: ftui::KeyEventKind::Press, modifiers: ftui::Modifiers::empty() };
+        model.show_modal(ModalState::confirm(
+            "Test",
+            "Run?",
+            ConfirmAction::ExecuteCommand("cmd".to_string()),
+        ));
+        let key = ftui::KeyEvent {
+            code: ftui::KeyCode::Char('q'),
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
         let result = model.handle_modal_key(&key);
         assert!(result.is_some());
         assert!(model.active_modal.is_some());
@@ -5134,9 +5360,20 @@ mod tests {
     #[test]
     fn modal_blocks_global_keys_in_update() {
         let mut model = make_model(MockQuery::with_triage());
-        model.show_modal(ModalState::confirm("Test", "Proceed?", ConfirmAction::ExecuteCommand("cmd".to_string())));
+        model.show_modal(ModalState::confirm(
+            "Test",
+            "Proceed?",
+            ConfirmAction::ExecuteCommand("cmd".to_string()),
+        ));
         let before = model.view_state.current_view;
-        let cmd = ftui::Model::update(&mut model, WaMsg::TermEvent(ftui::Event::Key(ftui::KeyEvent { code: ftui::KeyCode::Tab, kind: ftui::KeyEventKind::Press, modifiers: ftui::Modifiers::empty() })));
+        let cmd = ftui::Model::update(
+            &mut model,
+            WaMsg::TermEvent(ftui::Event::Key(ftui::KeyEvent {
+                code: ftui::KeyCode::Tab,
+                kind: ftui::KeyEventKind::Press,
+                modifiers: ftui::Modifiers::empty(),
+            })),
+        );
         assert!(matches!(cmd, ftui::Cmd::None));
         assert_eq!(model.view_state.current_view, before);
         assert!(model.active_modal.is_some());
@@ -5146,7 +5383,11 @@ mod tests {
     fn modal_error_dismissed_with_enter() {
         let mut model = make_model(MockQuery::healthy());
         model.show_modal(ModalState::error("Error", "Something went wrong"));
-        let key = ftui::KeyEvent { code: ftui::KeyCode::Enter, kind: ftui::KeyEventKind::Press, modifiers: ftui::Modifiers::empty() };
+        let key = ftui::KeyEvent {
+            code: ftui::KeyCode::Enter,
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
         model.handle_modal_key(&key);
         assert!(model.active_modal.is_none());
     }
@@ -5155,7 +5396,11 @@ mod tests {
     fn modal_error_dismissed_with_escape() {
         let mut model = make_model(MockQuery::healthy());
         model.show_modal(ModalState::error("Error", "Something went wrong"));
-        let key = ftui::KeyEvent { code: ftui::KeyCode::Escape, kind: ftui::KeyEventKind::Press, modifiers: ftui::Modifiers::empty() };
+        let key = ftui::KeyEvent {
+            code: ftui::KeyCode::Escape,
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
         model.handle_modal_key(&key);
         assert!(model.active_modal.is_none());
     }
@@ -5164,7 +5409,11 @@ mod tests {
     fn modal_info_dismissed_with_enter() {
         let mut model = make_model(MockQuery::healthy());
         model.show_modal(ModalState::info("Info", "Operation complete."));
-        let key = ftui::KeyEvent { code: ftui::KeyCode::Enter, kind: ftui::KeyEventKind::Press, modifiers: ftui::Modifiers::empty() };
+        let key = ftui::KeyEvent {
+            code: ftui::KeyCode::Enter,
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
         model.handle_modal_key(&key);
         assert!(model.active_modal.is_none());
     }
@@ -5173,7 +5422,11 @@ mod tests {
     fn modal_no_active_returns_none() {
         let mut model = make_model(MockQuery::healthy());
         assert!(model.active_modal.is_none());
-        let key = ftui::KeyEvent { code: ftui::KeyCode::Enter, kind: ftui::KeyEventKind::Press, modifiers: ftui::Modifiers::empty() };
+        let key = ftui::KeyEvent {
+            code: ftui::KeyCode::Enter,
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
         let result = model.handle_modal_key(&key);
         assert!(result.is_none());
     }
@@ -5182,8 +5435,16 @@ mod tests {
     fn modal_mute_confirm_executes_mute() {
         let mut model = make_model(MockQuery::with_triage());
         model.refresh_data();
-        model.show_modal(ModalState::confirm("Confirm Mute", "Mute event 42?", ConfirmAction::MuteEvent("42".to_string())));
-        let key = ftui::KeyEvent { code: ftui::KeyCode::Enter, kind: ftui::KeyEventKind::Press, modifiers: ftui::Modifiers::empty() };
+        model.show_modal(ModalState::confirm(
+            "Confirm Mute",
+            "Mute event 42?",
+            ConfirmAction::MuteEvent("42".to_string()),
+        ));
+        let key = ftui::KeyEvent {
+            code: ftui::KeyCode::Enter,
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
         model.handle_modal_key(&key);
         assert!(model.active_modal.is_none());
         assert!(model.view_state.error_message.is_none());
@@ -5194,7 +5455,11 @@ mod tests {
         // ftui::Frame requires height > 0; test with height=1 for minimal terminal
         let mut pool = ftui::GraphemePool::new();
         let mut frame = ftui::Frame::new(80, 1, &mut pool);
-        let modal = ModalState::confirm("Test", "Body", ConfirmAction::ExecuteCommand("cmd".to_string()));
+        let modal = ModalState::confirm(
+            "Test",
+            "Body",
+            ConfirmAction::ExecuteCommand("cmd".to_string()),
+        );
         render_modal_overlay(&mut frame, 80, 1, &modal);
     }
 
@@ -5210,9 +5475,16 @@ mod tests {
     fn render_modal_confirm_shows_hint() {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = ftui::Frame::new(80, 24, &mut pool);
-        let modal = ModalState::confirm("Confirm", "Do it?", ConfirmAction::ExecuteCommand("cmd".to_string()));
+        let modal = ModalState::confirm(
+            "Confirm",
+            "Do it?",
+            ConfirmAction::ExecuteCommand("cmd".to_string()),
+        );
         render_modal_overlay(&mut frame, 80, 24, &modal);
-        let text: String = (0..24).map(|r| read_row(&frame, r)).collect::<Vec<_>>().join("\n");
+        let text: String = (0..24)
+            .map(|r| read_row(&frame, r))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(text.contains("confirm"), "Should show confirm hint: {text}");
         assert!(text.contains("cancel"), "Should show cancel hint: {text}");
         assert!(text.contains("Confirm"), "Should show title: {text}");
@@ -5224,7 +5496,10 @@ mod tests {
         let mut frame = ftui::Frame::new(80, 24, &mut pool);
         let modal = ModalState::error("Oops", "An error occurred.");
         render_modal_overlay(&mut frame, 80, 24, &modal);
-        let text: String = (0..24).map(|r| read_row(&frame, r)).collect::<Vec<_>>().join("\n");
+        let text: String = (0..24)
+            .map(|r| read_row(&frame, r))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(text.contains("dismiss"), "Should show dismiss hint: {text}");
         assert!(text.contains("Oops"), "Should show title: {text}");
     }
@@ -5340,6 +5615,280 @@ mod tests {
         ti.set_text("x".into());
         assert_eq!(ti.text(), "x");
         assert_eq!(ti.cursor_pos(), 1);
+    }
+
+    // -- FTUI-06.4.a: text-input editing edge-case matrix --
+    //
+    // Systematic coverage of cursor/editing edge cases that the basic
+    // tests above do not exercise.
+
+    /// Helper: assert text content and cursor position together.
+    fn assert_ti(ti: &TextInput, text: &str, cursor: usize, label: &str) {
+        assert_eq!(
+            ti.text(),
+            text,
+            "{label}: text mismatch (expected {text:?})"
+        );
+        assert_eq!(
+            ti.cursor_pos(),
+            cursor,
+            "{label}: cursor mismatch (expected {cursor})"
+        );
+    }
+
+    // -- Multi-byte / Unicode edge cases --
+
+    #[test]
+    fn edge_multibyte_insert_and_delete() {
+        let mut ti = TextInput::new();
+        ti.insert_char('é'); // 2-byte UTF-8
+        assert_ti(&ti, "é", 2, "after inserting é");
+        ti.insert_char('ñ'); // 2-byte UTF-8
+        assert_ti(&ti, "éñ", 4, "after inserting ñ");
+        ti.delete_back();
+        assert_ti(&ti, "é", 2, "after deleting ñ");
+        ti.delete_back();
+        assert_ti(&ti, "", 0, "after deleting é");
+    }
+
+    #[test]
+    fn edge_multibyte_cursor_movement() {
+        let mut ti = TextInput::new();
+        ti.insert_char('a');
+        ti.insert_char('é');
+        ti.insert_char('b');
+        // "aéb" — bytes: a(1) é(2) b(1) = 4 bytes
+        assert_ti(&ti, "aéb", 4, "initial");
+        ti.move_left();
+        assert_ti(&ti, "aéb", 3, "left once (past b)");
+        ti.move_left();
+        assert_ti(&ti, "aéb", 1, "left twice (past é, 2 bytes)");
+        ti.move_right();
+        assert_ti(&ti, "aéb", 3, "right once (past é)");
+    }
+
+    #[test]
+    fn edge_emoji_insert_and_navigate() {
+        let mut ti = TextInput::new();
+        ti.insert_char('🦀'); // 4-byte UTF-8
+        ti.insert_char('x');
+        assert_ti(&ti, "🦀x", 5, "crab+x");
+        ti.move_left();
+        assert_ti(&ti, "🦀x", 4, "left past x");
+        ti.move_left();
+        assert_ti(&ti, "🦀x", 0, "left past crab");
+        ti.delete_forward();
+        assert_ti(&ti, "x", 0, "deleted crab forward");
+    }
+
+    #[test]
+    fn edge_cjk_characters() {
+        let mut ti = TextInput::new();
+        ti.insert_char('漢'); // 3-byte UTF-8
+        ti.insert_char('字'); // 3-byte UTF-8
+        assert_ti(&ti, "漢字", 6, "two CJK chars");
+        ti.move_left();
+        assert_ti(&ti, "漢字", 3, "left past 字");
+        ti.insert_char('a');
+        assert_ti(&ti, "漢a字", 4, "inserted ASCII between CJK");
+    }
+
+    // -- Deletion edge cases --
+
+    #[test]
+    fn edge_delete_forward_at_end_is_noop() {
+        let mut ti = TextInput::new();
+        ti.insert_char('a');
+        ti.delete_forward();
+        assert_ti(&ti, "a", 1, "delete_forward at end");
+    }
+
+    #[test]
+    fn edge_delete_back_at_start_is_noop() {
+        let mut ti = TextInput::new();
+        ti.insert_char('a');
+        ti.move_home();
+        ti.delete_back();
+        assert_ti(&ti, "a", 0, "delete_back at start");
+    }
+
+    #[test]
+    fn edge_delete_all_chars_one_by_one() {
+        let mut ti = TextInput::new();
+        for c in "hello".chars() {
+            ti.insert_char(c);
+        }
+        for _ in 0..5 {
+            ti.delete_back();
+        }
+        assert_ti(&ti, "", 0, "after deleting all chars");
+        // Extra delete on empty should be safe
+        ti.delete_back();
+        assert_ti(&ti, "", 0, "extra delete on empty");
+    }
+
+    #[test]
+    fn edge_delete_forward_from_middle() {
+        let mut ti = TextInput::new();
+        for c in "abcde".chars() {
+            ti.insert_char(c);
+        }
+        ti.move_home();
+        ti.move_right(); // cursor at 1 (after 'a')
+        ti.delete_forward(); // deletes 'b'
+        assert_ti(&ti, "acde", 1, "delete forward from middle");
+        ti.delete_forward(); // deletes 'c'
+        assert_ti(&ti, "ade", 1, "delete forward again");
+    }
+
+    // -- Cursor boundary edge cases --
+
+    #[test]
+    fn edge_rapid_left_right_at_boundaries() {
+        let mut ti = TextInput::new();
+        ti.insert_char('x');
+        // Rapid left past boundary
+        for _ in 0..10 {
+            ti.move_left();
+        }
+        assert_ti(&ti, "x", 0, "clamped at 0 after many lefts");
+        // Rapid right past boundary
+        for _ in 0..10 {
+            ti.move_right();
+        }
+        assert_ti(&ti, "x", 1, "clamped at len after many rights");
+    }
+
+    #[test]
+    fn edge_home_on_empty() {
+        let mut ti = TextInput::new();
+        ti.move_home();
+        assert_ti(&ti, "", 0, "home on empty");
+    }
+
+    #[test]
+    fn edge_end_on_empty() {
+        let mut ti = TextInput::new();
+        ti.move_end();
+        assert_ti(&ti, "", 0, "end on empty");
+    }
+
+    // -- Sequence combination edge cases --
+
+    #[test]
+    fn edge_home_then_insert() {
+        let mut ti = TextInput::new();
+        for c in "world".chars() {
+            ti.insert_char(c);
+        }
+        ti.move_home();
+        for c in "hello ".chars() {
+            ti.insert_char(c);
+        }
+        assert_ti(&ti, "hello world", 6, "insert at home");
+    }
+
+    #[test]
+    fn edge_home_then_delete_forward_all() {
+        let mut ti = TextInput::new();
+        for c in "abc".chars() {
+            ti.insert_char(c);
+        }
+        ti.move_home();
+        ti.delete_forward();
+        ti.delete_forward();
+        ti.delete_forward();
+        assert_ti(&ti, "", 0, "delete forward all from home");
+        ti.delete_forward(); // Extra should be safe
+        assert_ti(&ti, "", 0, "extra delete_forward on empty");
+    }
+
+    #[test]
+    fn edge_interleaved_insert_delete() {
+        let mut ti = TextInput::new();
+        ti.insert_char('a');
+        ti.insert_char('b');
+        ti.delete_back(); // remove b
+        ti.insert_char('c');
+        ti.insert_char('d');
+        ti.move_left(); // before d
+        ti.delete_back(); // remove c
+        assert_ti(&ti, "ad", 1, "interleaved insert/delete");
+    }
+
+    #[test]
+    fn edge_clear_then_rebuild() {
+        let mut ti = TextInput::new();
+        for c in "hello".chars() {
+            ti.insert_char(c);
+        }
+        ti.clear();
+        assert_ti(&ti, "", 0, "after clear");
+        for c in "world".chars() {
+            ti.insert_char(c);
+        }
+        assert_ti(&ti, "world", 5, "rebuilt after clear");
+    }
+
+    #[test]
+    fn edge_set_text_then_edit() {
+        let mut ti = TextInput::new();
+        ti.set_text("abc".into());
+        assert_ti(&ti, "abc", 3, "after set_text");
+        ti.move_left();
+        ti.insert_char('x');
+        assert_ti(&ti, "abxc", 3, "insert after set_text");
+    }
+
+    // -- Stress / long input --
+
+    #[test]
+    fn edge_long_input_200_chars() {
+        let mut ti = TextInput::new();
+        for _ in 0..200 {
+            ti.insert_char('x');
+        }
+        assert_eq!(ti.text().len(), 200);
+        assert_eq!(ti.cursor_pos(), 200);
+        ti.move_home();
+        assert_eq!(ti.cursor_pos(), 0);
+        ti.move_end();
+        assert_eq!(ti.cursor_pos(), 200);
+    }
+
+    #[test]
+    fn edge_navigate_entire_string() {
+        let mut ti = TextInput::new();
+        for c in "abcdef".chars() {
+            ti.insert_char(c);
+        }
+        // Walk all the way left
+        for i in (0..6).rev() {
+            ti.move_left();
+            assert_eq!(ti.cursor_pos(), i, "left walk at {i}");
+        }
+        // Walk all the way right
+        for i in 1..=6 {
+            ti.move_right();
+            assert_eq!(ti.cursor_pos(), i, "right walk at {i}");
+        }
+    }
+
+    #[test]
+    fn edge_single_char_full_lifecycle() {
+        let mut ti = TextInput::new();
+        ti.insert_char('z');
+        assert_ti(&ti, "z", 1, "insert");
+        ti.move_left();
+        assert_ti(&ti, "z", 0, "left");
+        ti.move_right();
+        assert_ti(&ti, "z", 1, "right");
+        ti.move_home();
+        assert_ti(&ti, "z", 0, "home");
+        ti.move_end();
+        assert_ti(&ti, "z", 1, "end");
+        ti.delete_back();
+        assert_ti(&ti, "", 0, "delete");
     }
 
     #[test]
@@ -5631,8 +6180,11 @@ mod tests {
                 modifiers: ftui::Modifiers::empty(),
             };
             ftui::Model::update(&mut model, WaMsg::TermEvent(ftui::Event::Key(tab)));
-            assert_eq!(model.view_state.focus, FocusRegion::PrimaryList,
-                "Focus should reset to PrimaryList on view switch");
+            assert_eq!(
+                model.view_state.focus,
+                FocusRegion::PrimaryList,
+                "Focus should reset to PrimaryList on view switch"
+            );
         }
         // Should have cycled back to original view
         assert_eq!(model.view_state.current_view, View::Home);
@@ -5742,8 +6294,13 @@ mod tests {
         let text = snapshot_view(MockQuery::healthy(), View::Home, 80, 24);
         assert_tab_bar(&text, View::Home);
         assert_footer_present(&text, View::Home);
-        assert!(text.contains("ok") || text.contains("OK") || text.contains("healthy") || text.contains("Home"),
-            "Home should show health status");
+        assert!(
+            text.contains("ok")
+                || text.contains("OK")
+                || text.contains("healthy")
+                || text.contains("Home"),
+            "Home should show health status"
+        );
     }
 
     #[test]
@@ -5752,8 +6309,10 @@ mod tests {
         assert_tab_bar_full(&text, View::Home);
         assert_footer_present(&text, View::Home);
         // Degraded state should show ERROR badge, "stopped" watcher, or "unavailable" db
-        assert!(text.contains("ERROR") || text.contains("stopped") || text.contains("unavailable"),
-            "Degraded home should show problems: {text}");
+        assert!(
+            text.contains("ERROR") || text.contains("stopped") || text.contains("unavailable"),
+            "Degraded home should show problems: {text}"
+        );
     }
 
     #[test]
@@ -5764,7 +6323,10 @@ mod tests {
                 assert_tab_bar(&text, View::Home);
             }
             // Should not panic at any size
-            assert!(!text.is_empty() || h < 3, "Frame should be non-empty for h={h}");
+            assert!(
+                !text.is_empty() || h < 3,
+                "Frame should be non-empty for h={h}"
+            );
         }
     }
 
@@ -5776,8 +6338,10 @@ mod tests {
         assert_tab_bar(&text, View::Panes);
         assert_footer_present(&text, View::Panes);
         // MockQuery::healthy() has pane_count=3
-        assert!(text.contains("pane") || text.contains("Pane"),
-            "Panes view should show pane info");
+        assert!(
+            text.contains("pane") || text.contains("Pane"),
+            "Panes view should show pane info"
+        );
     }
 
     #[test]
@@ -5785,9 +6349,13 @@ mod tests {
         let text = snapshot_view(MockQuery::degraded(), View::Panes, 80, 24);
         assert_tab_bar(&text, View::Panes);
         // With 0 panes, should show empty state
-        assert!(text.contains("No pane") || text.contains("no pane") || text.contains("0")
-            || text.lines().count() >= 3,
-            "Empty panes should show some message");
+        assert!(
+            text.contains("No pane")
+                || text.contains("no pane")
+                || text.contains("0")
+                || text.lines().count() >= 3,
+            "Empty panes should show some message"
+        );
     }
 
     #[test]
@@ -5807,9 +6375,13 @@ mod tests {
         let text = snapshot_view(MockQuery::with_events(), View::Events, 80, 24);
         assert_tab_bar(&text, View::Events);
         assert_footer_present(&text, View::Events);
-        assert!(text.contains("Rate limit") || text.contains("rate_limit")
-            || text.contains("warning") || text.contains("error"),
-            "Events view should show event data");
+        assert!(
+            text.contains("Rate limit")
+                || text.contains("rate_limit")
+                || text.contains("warning")
+                || text.contains("error"),
+            "Events view should show event data"
+        );
     }
 
     #[test]
@@ -5836,9 +6408,13 @@ mod tests {
         let text = snapshot_view(MockQuery::with_triage(), View::Triage, 80, 24);
         assert_tab_bar(&text, View::Triage);
         assert_footer_present(&text, View::Triage);
-        assert!(text.contains("crash") || text.contains("Fatal") || text.contains("Triage")
-            || text.contains("error"),
-            "Triage view should show triage items");
+        assert!(
+            text.contains("crash")
+                || text.contains("Fatal")
+                || text.contains("Triage")
+                || text.contains("error"),
+            "Triage view should show triage items"
+        );
     }
 
     #[test]
@@ -5864,17 +6440,20 @@ mod tests {
         let text = snapshot_view(MockQuery::with_history(), View::History, 80, 24);
         assert_tab_bar(&text, View::History);
         assert_footer_present(&text, View::History);
-        assert!(text.contains("send_text") || text.contains("History"),
-            "History view should show action data");
+        assert!(
+            text.contains("send_text") || text.contains("History"),
+            "History view should show action data"
+        );
     }
 
     #[test]
     fn snapshot_history_empty_80x24() {
         let text = snapshot_view(MockQuery::healthy(), View::History, 80, 24);
         assert_tab_bar(&text, View::History);
-        assert!(text.contains("No history") || text.contains("no history")
-            || text.contains("empty"),
-            "Empty history should show placeholder: {text}");
+        assert!(
+            text.contains("No history") || text.contains("no history") || text.contains("empty"),
+            "Empty history should show placeholder: {text}"
+        );
     }
 
     #[test]
@@ -5922,8 +6501,10 @@ mod tests {
         model.view(&mut frame);
         let text = frame_to_text(&frame);
         assert_tab_bar(&text, View::Search);
-        assert!(text.contains("alpha") || text.contains("matched"),
-            "Search results should show snippets");
+        assert!(
+            text.contains("alpha") || text.contains("matched"),
+            "Search results should show snippets"
+        );
     }
 
     #[test]
@@ -5943,9 +6524,13 @@ mod tests {
         let text = snapshot_view(MockQuery::healthy(), View::Help, 80, 24);
         assert_tab_bar(&text, View::Help);
         assert_footer_present(&text, View::Help);
-        assert!(text.contains("WezTerm Automata") || text.contains("Keybindings")
-            || text.contains("Tab") || text.contains("help"),
-            "Help view should show help text: {text}");
+        assert!(
+            text.contains("WezTerm Automata")
+                || text.contains("Keybindings")
+                || text.contains("Tab")
+                || text.contains("help"),
+            "Help view should show help text: {text}"
+        );
     }
 
     #[test]
@@ -5989,8 +6574,10 @@ mod tests {
             model.view(&mut frame);
             let text = frame_to_text(&frame);
             // Should be empty or whitespace-only since height < 3
-            assert!(text.trim().is_empty(),
-                "Height 2 should produce empty frame for {view:?}: '{text}'");
+            assert!(
+                text.trim().is_empty(),
+                "Height 2 should produce empty frame for {view:?}: '{text}'"
+            );
         }
     }
 
@@ -6044,8 +6631,10 @@ mod tests {
         // Verify shortcut numbers
         for (i, view) in View::all().iter().enumerate() {
             let expected = format!("{} {}", i + 1, view.name());
-            assert!(tab_line.contains(&expected),
-                "Tab bar should contain '{expected}': {tab_line}");
+            assert!(
+                tab_line.contains(&expected),
+                "Tab bar should contain '{expected}': {tab_line}"
+            );
         }
     }
 
@@ -6054,9 +6643,11 @@ mod tests {
         for &view in View::all() {
             let text = snapshot_view(MockQuery::healthy(), view, 80, 24);
             let last_line = text.lines().last().unwrap();
-            assert!(last_line.contains(view.name()),
+            assert!(
+                last_line.contains(view.name()),
                 "Footer should show '{name}' for {view:?}: {last_line}",
-                name = view.name());
+                name = view.name()
+            );
         }
     }
 
@@ -6069,7 +6660,10 @@ mod tests {
         let line_count = text.lines().count();
         // The last lines may be trimmed if blank, but we should have at least
         // tab + some content + footer
-        assert!(line_count >= 3, "Should have at least 3 lines in 80x24 frame, got {line_count}");
+        assert!(
+            line_count >= 3,
+            "Should have at least 3 lines in 80x24 frame, got {line_count}"
+        );
     }
 
     // -- Filtered state snapshots --
@@ -6102,10 +6696,11 @@ mod tests {
         let text = frame_to_text(&frame);
         assert_tab_bar(&text, View::History);
         // Only 2 of 3 entries are undoable
-        assert!(text.contains("2") || text.contains("undoable"),
-            "Should reflect filtered count");
+        assert!(
+            text.contains("2") || text.contains("undoable"),
+            "Should reflect filtered count"
+        );
     }
-
 
     // -----------------------------------------------------------------------
     // PTY E2E scenario pack (FTUI-07.3)
@@ -6126,7 +6721,10 @@ mod tests {
         fn new(query: MockQuery) -> Self {
             let mut model = make_model(query);
             model.refresh_data();
-            Self { model, frames: Vec::new() }
+            Self {
+                model,
+                frames: Vec::new(),
+            }
         }
 
         /// Press a key through the full update() pipeline and capture the frame.
@@ -6182,8 +6780,11 @@ mod tests {
         /// Assert the current view matches expected.
         fn assert_view(&self, expected: View) {
             assert_eq!(
-                self.model.view_state.current_view, expected,
-                "Expected view {:?}, dump:\n{}", expected, self.diagnostic_dump()
+                self.model.view_state.current_view,
+                expected,
+                "Expected view {:?}, dump:\n{}",
+                expected,
+                self.diagnostic_dump()
             );
         }
 
@@ -6193,7 +6794,9 @@ mod tests {
             assert!(
                 last.contains(text),
                 "Expected '{}' in frame:\n{}\nFull dump:\n{}",
-                text, last, self.diagnostic_dump()
+                text,
+                last,
+                self.diagnostic_dump()
             );
         }
 
@@ -6203,7 +6806,8 @@ mod tests {
             assert!(
                 !last.contains(text),
                 "Did not expect '{}' in frame:\n{}",
-                text, last
+                text,
+                last
             );
         }
     }
@@ -6219,8 +6823,12 @@ mod tests {
 
         // Tab through all views
         let expected = [
-            View::Panes, View::Events, View::Triage,
-            View::History, View::Search, View::Help,
+            View::Panes,
+            View::Events,
+            View::Triage,
+            View::History,
+            View::Search,
+            View::Help,
             View::Home, // wraps
         ];
         for &view in &expected {
@@ -6236,8 +6844,12 @@ mod tests {
         // so we return to Home between each navigation.
         let mut s = E2eSession::new(MockQuery::healthy());
         let views = [
-            ('1', View::Home), ('2', View::Panes), ('3', View::Events),
-            ('4', View::Triage), ('5', View::History), ('6', View::Search),
+            ('1', View::Home),
+            ('2', View::Panes),
+            ('3', View::Events),
+            ('4', View::Triage),
+            ('5', View::History),
+            ('6', View::Search),
             ('7', View::Help),
         ];
         for (key, view) in views {
@@ -6288,7 +6900,8 @@ mod tests {
         let filtered = s.capture();
         // Should show filtered count (unhandled events only)
         assert_ne!(
-            s.frame_at(after_down), s.frame_at(filtered),
+            s.frame_at(after_down),
+            s.frame_at(filtered),
             "Filter should change display"
         );
     }
@@ -6433,8 +7046,16 @@ mod tests {
         model.refresh_data();
 
         let sizes: &[(u16, u16)] = &[
-            (80, 24), (40, 10), (120, 50), (20, 3), (200, 80),
-            (80, 24), (60, 15), (30, 5), (100, 30), (80, 24),
+            (80, 24),
+            (40, 10),
+            (120, 50),
+            (20, 3),
+            (200, 80),
+            (80, 24),
+            (60, 15),
+            (30, 5),
+            (100, 30),
+            (80, 24),
         ];
 
         for &(w, h) in sizes {
@@ -6460,18 +7081,27 @@ mod tests {
         let mut s = E2eSession::new(MockQuery::with_history());
 
         let key_storm: &[ftui::KeyCode] = &[
-            ftui::KeyCode::Tab, ftui::KeyCode::Char('j'), ftui::KeyCode::Char('k'),
-            ftui::KeyCode::Down, ftui::KeyCode::Up,
+            ftui::KeyCode::Tab,
+            ftui::KeyCode::Char('j'),
+            ftui::KeyCode::Char('k'),
+            ftui::KeyCode::Down,
+            ftui::KeyCode::Up,
             ftui::KeyCode::Char('3'), // Events
-            ftui::KeyCode::Char('j'), ftui::KeyCode::Char('j'),
+            ftui::KeyCode::Char('j'),
+            ftui::KeyCode::Char('j'),
             ftui::KeyCode::Char('u'), // toggle unhandled
             ftui::KeyCode::Tab,
             ftui::KeyCode::Char('5'), // History
-            ftui::KeyCode::Char('a'), ftui::KeyCode::Char('b'), ftui::KeyCode::Char('c'),
-            ftui::KeyCode::Backspace, ftui::KeyCode::Backspace,
+            ftui::KeyCode::Char('a'),
+            ftui::KeyCode::Char('b'),
+            ftui::KeyCode::Char('c'),
+            ftui::KeyCode::Backspace,
+            ftui::KeyCode::Backspace,
             ftui::KeyCode::Char('u'), // toggle undoable
             ftui::KeyCode::Escape,
-            ftui::KeyCode::Tab, ftui::KeyCode::Tab, ftui::KeyCode::Tab,
+            ftui::KeyCode::Tab,
+            ftui::KeyCode::Tab,
+            ftui::KeyCode::Tab,
             ftui::KeyCode::Char('7'), // Help
             ftui::KeyCode::Char('1'), // Home
         ];
@@ -6520,7 +7150,10 @@ mod tests {
         s.model.refresh_data();
         s.capture();
 
-        assert_eq!(s.model.view_state.history.filter_input.text(), before_refresh);
+        assert_eq!(
+            s.model.view_state.history.filter_input.text(),
+            before_refresh
+        );
         s.assert_view(View::History);
     }
 
@@ -6546,10 +7179,12 @@ mod tests {
     fn e2e_cross_view_workflow() {
         // Scenario: Complex multi-view workflow navigating via Tab.
         // Digit keys are consumed by view-specific handlers in Events/History/Search.
-        let query = MockQuery::healthy()
-            .with_search_results(vec![
-                SearchResultView { pane_id: 1, timestamp: 1_700_000_000_000, snippet: "error log".to_string(), rank: 0.9 },
-            ]);
+        let query = MockQuery::healthy().with_search_results(vec![SearchResultView {
+            pane_id: 1,
+            timestamp: 1_700_000_000_000,
+            snippet: "error log".to_string(),
+            rank: 0.9,
+        }]);
         let mut s = E2eSession::new(query);
 
         // 1. Home
@@ -6567,7 +7202,10 @@ mod tests {
         s.press(ftui::KeyCode::Tab); // Events -> Triage
         s.press(ftui::KeyCode::Tab); // Triage -> History
         s.assert_view(View::History);
-        s.char('t'); s.char('e'); s.char('s'); s.char('t');
+        s.char('t');
+        s.char('e');
+        s.char('s');
+        s.char('t');
         s.capture();
         assert_eq!(s.model.view_state.history.filter_input.text(), "test");
         s.press(ftui::KeyCode::Escape);
@@ -6668,10 +7306,14 @@ mod tests {
         s.capture();
 
         let dump = s.diagnostic_dump();
-        assert!(dump.contains("=== Frame 0 ==="), "Dump should have frame markers");
-        assert!(dump.contains("=== Frame 1 ==="), "Dump should show multiple frames");
+        assert!(
+            dump.contains("=== Frame 0 ==="),
+            "Dump should have frame markers"
+        );
+        assert!(
+            dump.contains("=== Frame 1 ==="),
+            "Dump should show multiple frames"
+        );
         assert!(dump.contains("=== Frame 2 ==="), "Should have 3 frames");
     }
-
-
 }
