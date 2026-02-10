@@ -39,7 +39,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, StorageError};
 
+pub mod anthropic_auth;
 pub mod bootstrap;
+pub mod google_auth;
 pub mod openai_device;
 
 // =============================================================================

@@ -1301,25 +1301,29 @@ impl TutorialEngine {
         let name_padded = format!(
             "\u{2502}{}{}\u{2502}",
             name_line,
-            " ".repeat(inner_width - name_line.len())
+            " ".repeat(inner_width.saturating_sub(name_line.len()))
         );
         let desc_line = format!(" \"{}\"", achievement.description);
-        // Truncate long descriptions
+        // Truncate long descriptions (char-boundary safe to avoid panic on multi-byte UTF-8)
         let desc_truncated = if desc_line.len() > inner_width - 1 {
-            format!("{}...", &desc_line[..inner_width - 4])
+            let mut end = inner_width - 4;
+            while end > 0 && !desc_line.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}...", &desc_line[..end])
         } else {
             desc_line.clone()
         };
         let desc_padded = format!(
             "\u{2502}{}{}\u{2502}",
             desc_truncated,
-            " ".repeat(inner_width - desc_truncated.len())
+            " ".repeat(inner_width.saturating_sub(desc_truncated.len()))
         );
         let rarity_line = format!(" [{}]", rarity);
         let rarity_padded = format!(
             "\u{2502}{}{}\u{2502}",
             rarity_line,
-            " ".repeat(inner_width - rarity_line.len())
+            " ".repeat(inner_width.saturating_sub(rarity_line.len()))
         );
 
         format!(
