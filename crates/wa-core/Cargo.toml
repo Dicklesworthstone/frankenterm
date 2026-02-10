@@ -49,7 +49,7 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 fs2.workspace = true
 base64 = "0.22.1"
 
-# Vendored WezTerm crates (optional)
+# FrankenTerm crates (optional, in-tree ex-WezTerm)
 codec = { workspace = true, optional = true }
 config = { workspace = true, optional = true }
 mux = { workspace = true, optional = true }
@@ -118,7 +118,8 @@ required-features = ["ftui"]
 [features]
 default = []
 # Public feature flags (stable surface)
-vendored = ["vendored-wezterm"]
+frankenterm = ["frankenterm-deps"]
+vendored = ["frankenterm"]  # backward compat alias
 browser = ["browser-automation"]
 mcp = ["mcp-server"]
 web = ["dep:fastapi", "dep:fastapi-core", "dep:asupersync"]
@@ -136,6 +137,7 @@ distributed = [
 sync = ["dep:asupersync"]
 
 # Optional heavy integrations - feature-gated (internal)
-vendored-wezterm = ["dep:codec", "dep:config", "dep:mux", "dep:wezterm-term"]
+frankenterm-deps = ["dep:codec", "dep:config", "dep:mux", "dep:wezterm-term"]
+vendored-wezterm = ["frankenterm-deps"]  # backward compat alias
 browser-automation = []
 mcp-server = ["dep:fastmcp"]

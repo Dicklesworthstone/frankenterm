@@ -39,7 +39,8 @@ fastmcp = { workspace = true, optional = true }
 
 [features]
 default = []
-vendored = ["wa-core/vendored"]
+frankenterm = ["wa-core/frankenterm"]
+vendored = ["frankenterm"]  # backward compat alias
 browser = ["wa-core/browser"]
 mcp = ["wa-core/mcp", "dep:fastmcp"]
 web = ["wa-core/web"]
