@@ -178,7 +178,7 @@ Enforced via `compile_error!` in `lib.rs`.
 
 ## Boundary Rules for ftui Code
 
-1. **All ftui imports live in `crates/wa-core/src/tui/`** (Ring 3).
+1. **All ftui imports live in `crates/frankenterm-core/src/tui/`** (Ring 3).
    No ftui types appear in Ring 0, 1, or 2.
 
 2. **`ui_query` stays framework-agnostic.** The shared query types (`PaneView`,
@@ -197,8 +197,8 @@ Enforced via `compile_error!` in `lib.rs`.
 
 ## References
 
-- wa-core lib.rs module declarations: `crates/wa-core/src/lib.rs`
-- Feature definitions: `crates/wa-core/Cargo.toml:110-131`
+- frankenterm-core lib.rs module declarations: `crates/frankenterm-core/src/lib.rs`
+- Feature definitions: `crates/frankenterm-core/Cargo.toml:110-131`
 - ADR-0001: FrankenTUI adoption decision
 - ADR-0002: One-writer terminal ownership
 - ADR-0003: Migration scope and constraints

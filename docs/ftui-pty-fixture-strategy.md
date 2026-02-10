@@ -308,13 +308,13 @@ enum ScenarioStep {
 
 ```bash
 # Run all PTY E2E tests
-cargo test -p wa-core --features ftui -- pty_e2e
+cargo test -p frankenterm-core --features ftui -- pty_e2e
 
 # Run a specific scenario
-cargo test -p wa-core --features ftui -- pty_e2e::startup_and_quit
+cargo test -p frankenterm-core --features ftui -- pty_e2e::startup_and_quit
 
 # Run with increased timeouts (CI)
-WA_PTY_TIMEOUT_FACTOR=2 cargo test -p wa-core --features ftui -- pty_e2e
+WA_PTY_TIMEOUT_FACTOR=2 cargo test -p frankenterm-core --features ftui -- pty_e2e
 ```
 
 ### 7.2  Timeout Scaling
@@ -364,8 +364,8 @@ PTY tests run slower and cover the terminal integration boundary.
 
 ## References
 
-- `crates/wa-core/src/tui/ftui_stub.rs:6432-7045` — existing headless E2E tests
-- `crates/wa-core/src/tui/ftui_stub.rs:6441-6539` — E2eSession helper
+- `crates/frankenterm-core/src/tui/ftui_stub.rs:6432-7045` — existing headless E2E tests
+- `crates/frankenterm-core/src/tui/ftui_stub.rs:6441-6539` — E2eSession helper
 - `docs/ftui-command-handoff-traces.md` — handoff state machine (wa-bjvg)
 - `docs/ftui-teardown-harness.md` — teardown invariants (wa-3fed)
 - `docs/ftui-subprocess-forwarding-contract.md` — PTY capture contract (wa-3gsu)

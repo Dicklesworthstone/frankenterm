@@ -11,4 +11,4 @@ publish = false
 bstr.workspace = true
 log.workspace = true
 mlua.workspace = true
-wezterm-dynamic.workspace = true
+frankenterm-dynamic.workspace = true

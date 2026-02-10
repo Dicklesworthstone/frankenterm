@@ -229,7 +229,7 @@ Gap reasons are stable strings for downstream filtering.
 
 ### Diagnostic Output
 
-`wa status --health` (or `wa doctor`) includes:
+`ft status --health` (or `ft doctor`) includes:
 
 ```
 Backpressure: YELLOW (12s)

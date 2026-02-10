@@ -129,7 +129,7 @@ scenario_storage_core_tests() {
     exit_code=0
 
     # Run ALL storage tests (200+ tests)
-    cargo test -p wa-core 'storage::' \
+    cargo test -p frankenterm-core 'storage::' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -172,7 +172,7 @@ scenario_fts_search_tests() {
     exit_code=0
 
     # Run FTS search tests
-    cargo test -p wa-core 'storage::fts_search' \
+    cargo test -p frankenterm-core 'storage::fts_search' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -217,7 +217,7 @@ scenario_fts_sync_tests() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p wa-core 'storage::fts_sync_tests' \
+    cargo test -p frankenterm-core 'storage::fts_sync_tests' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -263,7 +263,7 @@ scenario_concurrent_writers() {
     exit_code=0
 
     # Run the concurrent writer deadlock test specifically
-    cargo test -p wa-core 'storage_concurrent_writers_dont_deadlock' \
+    cargo test -p frankenterm-core 'storage_concurrent_writers_dont_deadlock' \
         -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -277,7 +277,7 @@ scenario_concurrent_writers() {
 
     # Run the event bus subscriber lag test
     exit_code=0
-    cargo test -p wa-core 'event_bus_detects_subscriber_lag' \
+    cargo test -p frankenterm-core 'event_bus_detects_subscriber_lag' \
         -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -289,7 +289,7 @@ scenario_concurrent_writers() {
 
     # Run capture channel drain test
     exit_code=0
-    cargo test -p wa-core 'capture_channel_drains_when_consumer_resumes' \
+    cargo test -p frankenterm-core 'capture_channel_drains_when_consumer_resumes' \
         -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -313,7 +313,7 @@ scenario_db_health_repair() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p wa-core 'storage::db_check_repair_tests' \
+    cargo test -p frankenterm-core 'storage::db_check_repair_tests' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -359,7 +359,7 @@ scenario_ingest_pipeline() {
     exit_code=0
 
     # Run ingest tests covering multi-pane discovery, UUID stability, GAP handling
-    cargo test -p wa-core 'ingest::tests' \
+    cargo test -p frankenterm-core 'ingest::tests' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -407,7 +407,7 @@ scenario_benchmark_budgets() {
     exit_code=0
 
     # Run benchmarks as tests (--test flag) for quick validation
-    timeout 120 cargo test -p wa-core --bench storage_regression \
+    timeout 120 cargo test -p frankenterm-core --bench storage_regression \
         -- --test --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -426,7 +426,7 @@ scenario_benchmark_budgets() {
 
     # Run sizing benchmark in test mode
     exit_code=0
-    timeout 120 cargo test -p wa-core --bench sizing_benchmark \
+    timeout 120 cargo test -p frankenterm-core --bench sizing_benchmark \
         -- --test --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -440,7 +440,7 @@ scenario_benchmark_budgets() {
 
     # Run FTS query benchmark in test mode
     exit_code=0
-    timeout 120 cargo test -p wa-core --bench fts_query \
+    timeout 120 cargo test -p frankenterm-core --bench fts_query \
         -- --test --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -469,7 +469,7 @@ scenario_bounded_execution() {
     start_time=$(date +%s)
     exit_code=0
 
-    timeout 180 cargo test -p wa-core 'storage::' \
+    timeout 180 cargo test -p frankenterm-core 'storage::' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 

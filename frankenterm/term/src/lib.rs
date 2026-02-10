@@ -17,12 +17,12 @@
 //! The entrypoint to the crate is the [Terminal](terminal/struct.Terminal.html)
 //! struct.
 use anyhow::Error;
+use frankenterm_dynamic::{FromDynamic, ToDynamic};
+use frankenterm_surface::SequenceNo;
 #[cfg(feature = "use_serde")]
 use serde::{Deserialize, Serialize};
 use std::ops::{Deref, DerefMut, Range};
 use std::str;
-use wezterm_dynamic::{FromDynamic, ToDynamic};
-use wezterm_surface::SequenceNo;
 
 pub mod config;
 pub use config::TerminalConfiguration;
@@ -30,8 +30,8 @@ pub use config::TerminalConfiguration;
 pub mod input;
 pub use crate::input::*;
 
-pub use wezterm_cell::*;
-pub use wezterm_surface::line::*;
+pub use frankenterm_cell::*;
+pub use frankenterm_surface::line::*;
 
 pub mod screen;
 pub use crate::screen::*;
@@ -108,8 +108,8 @@ pub enum Position {
 pub struct CursorPosition {
     pub x: usize,
     pub y: VisibleRowIndex,
-    pub shape: wezterm_surface::CursorShape,
-    pub visibility: wezterm_surface::CursorVisibility,
+    pub shape: frankenterm_surface::CursorShape,
+    pub visibility: frankenterm_surface::CursorVisibility,
     pub seqno: SequenceNo,
 }
 

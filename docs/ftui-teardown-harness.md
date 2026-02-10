@@ -59,7 +59,7 @@ This prevents panic-during-panic (double fault) which would abort the process.
 
 ## 3  Teardown Harness Test Matrix
 
-Located in `crates/wa-core/src/tui/terminal_session.rs`, `tests` module.
+Located in `crates/frankenterm-core/src/tui/terminal_session.rs`, `tests` module.
 
 ### 3.1  Phase-Specific Abort Tests
 
@@ -101,7 +101,7 @@ for post-mortem analysis without rerunning interactively.
 
 ### 4.1  Crash Bundle (existing — crash.rs)
 
-Written to `.wa/crash/wa_crash_YYYYMMDD_HHMMSS/`:
+Written to `.ft/crash/wa_crash_YYYYMMDD_HHMMSS/`:
 
 | File | Content | Redacted |
 |------|---------|----------|
@@ -155,9 +155,9 @@ Crash-related regressions are caught by:
 
 | Check | How | Where |
 |-------|-----|-------|
-| Teardown harness tests | `cargo test -p wa-core terminal_session` | CI unit tests |
-| Output gate tests | `cargo test -p wa-core output_gate` | CI unit tests |
-| Crash bundle tests | `cargo test -p wa-core crash` | CI unit tests |
+| Teardown harness tests | `cargo test -p frankenterm-core terminal_session` | CI unit tests |
+| Output gate tests | `cargo test -p frankenterm-core output_gate` | CI unit tests |
+| Crash bundle tests | `cargo test -p frankenterm-core crash` | CI unit tests |
 | PTY E2E crash scenarios | FTUI-07.3 scenario pack | CI E2E tests |
 | Debug assertions | `debug_assert!` in TerminalSink | Debug builds only |
 
@@ -177,8 +177,8 @@ terminal state recovery.
 
 ## References
 
-- `crates/wa-core/src/tui/terminal_session.rs` — SessionGuard, MockTerminalSession, teardown tests
-- `crates/wa-core/src/tui/output_gate.rs` — GatePhase, is_output_suppressed
-- `crates/wa-core/src/crash.rs` — panic hook, crash bundle, checkpoint
+- `crates/frankenterm-core/src/tui/terminal_session.rs` — SessionGuard, MockTerminalSession, teardown tests
+- `crates/frankenterm-core/src/tui/output_gate.rs` — GatePhase, is_output_suppressed
+- `crates/frankenterm-core/src/crash.rs` — panic hook, crash bundle, checkpoint
 - `docs/ftui-output-sink-routing.md` — output sink routing contract (wa-1uqi)
 - `docs/ftui-subprocess-forwarding-contract.md` — subprocess forwarding (wa-3gsu)

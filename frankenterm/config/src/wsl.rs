@@ -1,8 +1,8 @@
 use crate::config::validate_domain_name;
 use crate::*;
+use frankenterm_dynamic::{FromDynamic, ToDynamic};
 use luahelper::impl_lua_conversion_dynamic;
 use std::collections::HashMap;
-use wezterm_dynamic::{FromDynamic, ToDynamic};
 
 #[derive(Default, Debug, Clone, FromDynamic, ToDynamic)]
 pub struct WslDomain {

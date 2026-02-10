@@ -13,7 +13,7 @@ produces visible glitches.
 
 ## 2  Output Gate Contract
 
-### Gate Module: `wa-core/src/tui/output_gate.rs`
+### Gate Module: `frankenterm-core/src/tui/output_gate.rs`
 
 The gate tracks three phases via a global `AtomicU8`:
 
@@ -64,8 +64,8 @@ The TUI is either not started, or these run before/after TUI lifecycle.
 | Location | Code Path | Why Safe |
 |----------|-----------|----------|
 | `main.rs` ~80+ println/eprintln | CLI command output (status, list, search, events, schedule, etc.) | Commands run instead of TUI, not alongside it |
-| `main.rs:8065-8067` | `wa version` output | One-shot command |
-| `main.rs:20890-20901` | `wa config show` output | One-shot command |
+| `main.rs:8065-8067` | `ft version` output | One-shot command |
+| `main.rs:20890-20901` | `ft config show` output | One-shot command |
 | `main.rs:3398-3429` | Robot mode JSON/TOON output | Machine output, not TUI-concurrent |
 | `main.rs:22963-23514` | Setup/confirmation prompts | Interactive setup, TUI not active |
 | `output/format.rs:34-60` | `stdout().is_terminal()` | Read-only, no writes |
@@ -106,7 +106,7 @@ When subprocess output routing (wa-3gsu) is implemented:
    output when suppressed and flushes when gate transitions to Inactive/Suspended
 2. Route export/audit stdout writes through the same sink
 3. Add compile-time lint (custom clippy or grep-based CI check) to detect
-   new `println!` / `eprintln!` calls in wa-core outside of test modules
+   new `println!` / `eprintln!` calls in frankenterm-core outside of test modules
 
 ### Phase 3: ftui TerminalWriter takeover (FTUI-09.3)
 
@@ -121,8 +121,8 @@ When ftui's `TerminalWriter` fully owns output routing:
 ### Compile-Time Check (CI)
 
 ```bash
-# Detect new println!/eprintln! in wa-core/src/ (excluding tests and output_gate)
-rg '(println!|eprintln!|print!|eprint!)' crates/wa-core/src/ \
+# Detect new println!/eprintln! in frankenterm-core/src/ (excluding tests and output_gate)
+rg '(println!|eprintln!|print!|eprint!)' crates/frankenterm-core/src/ \
   --type rust \
   -g '!**/tests/**' \
   -g '!**/output_gate.rs' \
@@ -167,15 +167,15 @@ fn terminal_sink_debug_asserts_when_gate_active() {
 
 | Rule | Scope | Enforcement |
 |------|-------|-------------|
-| No direct stdout/stderr writes during `GatePhase::Active` | All wa-core modules | `TuiAwareWriter` for logging, `is_output_suppressed()` for ad-hoc |
+| No direct stdout/stderr writes during `GatePhase::Active` | All frankenterm-core modules | `TuiAwareWriter` for logging, `is_output_suppressed()` for ad-hoc |
 | CLI command output is safe (TUI not co-active) | main.rs command handlers | Structural: commands and TUI are mutually exclusive |
-| New println!/eprintln! in wa-core must be annotated | All new code | CI grep check + code review |
+| New println!/eprintln! in frankenterm-core must be annotated | All new code | CI grep check + code review |
 | TerminalSink must assert gate is not Active | replay.rs | debug_assert! guard |
 
 ## References
 
-- `crates/wa-core/src/tui/output_gate.rs` — gate implementation
-- `crates/wa-core/src/logging.rs:172-222` — TuiAwareWriter integration
-- `crates/wa-core/src/crash.rs:215-258` — panic hook gate check
+- `crates/frankenterm-core/src/tui/output_gate.rs` — gate implementation
+- `crates/frankenterm-core/src/logging.rs:172-222` — TuiAwareWriter integration
+- `crates/frankenterm-core/src/crash.rs:215-258` — panic hook gate check
 - ADR-0010: One-Writer Rule Adaptation
 - wa-3gsu (FTUI-03.2.b): Subprocess output through PTY capture (blocked by this)

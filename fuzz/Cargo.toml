@@ -1,12 +1,12 @@
 [package]
-name = "wa-fuzz"
+name = "frankenterm-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
 
 [dependencies]
 libfuzzer-sys = "0.4.10"
-wa-core = { path = "../crates/wa-core" }
+frankenterm-core = { path = "../crates/frankenterm-core" }
 toml = "0.8.23"
 serde = { version = "1.0.228", features = ["derive"] }
 rusqlite = { version = "0.38.0", features = ["bundled", "backup", "functions"] }

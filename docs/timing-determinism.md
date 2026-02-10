@@ -92,7 +92,7 @@ match result {
 | `poll_max` | 1 s | Maximum poll interval |
 | `max_polls` | 10,000 | Safety limit |
 
-The CLI equivalent is `wa send --wait-for`:
+The CLI equivalent is `ft send --wait-for`:
 
 ```bash
 wa send 3 "ls -la" --wait-for "\\$" --timeout-secs 30
@@ -278,7 +278,7 @@ The E2E harness (`scripts/e2e_test.sh`) enforces timing discipline:
   performance tracking
 - **No real AI:** Scenarios use scripted output so results are
   deterministic
-- **Pattern detection:** All waits use `wa robot wait-for` or equivalent,
+- **Pattern detection:** All waits use `ft robot wait-for` or equivalent,
   not `sleep`
 
 ```bash

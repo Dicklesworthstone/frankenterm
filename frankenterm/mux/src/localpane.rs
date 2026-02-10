@@ -11,6 +11,12 @@ use async_trait::async_trait;
 use config::keyassignment::ScrollbackEraseMode;
 use config::{configuration, ExitBehavior, ExitBehaviorMessaging};
 use fancy_regex::Regex;
+use frankenterm_dynamic::Value;
+use frankenterm_term::color::ColorPalette;
+use frankenterm_term::{
+    Alert, AlertHandler, Clipboard, DownloadHandler, KeyCode, KeyModifiers, MouseEvent, Progress,
+    SemanticZone, StableRowIndex, Terminal, TerminalConfiguration, TerminalSize,
+};
 use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 use portable_pty::{Child, ChildKiller, ExitStatus, MasterPty, PtySize};
 use procinfo::LocalProcessInfo;
@@ -28,12 +34,6 @@ use termwiz::escape::{Action, DeviceControlMode};
 use termwiz::input::KeyboardEncoding;
 use termwiz::surface::{Line, SequenceNo};
 use url::Url;
-use wezterm_dynamic::Value;
-use wezterm_term::color::ColorPalette;
-use wezterm_term::{
-    Alert, AlertHandler, Clipboard, DownloadHandler, KeyCode, KeyModifiers, MouseEvent, Progress,
-    SemanticZone, StableRowIndex, Terminal, TerminalConfiguration, TerminalSize,
-};
 
 const PROC_INFO_CACHE_TTL: Duration = Duration::from_millis(300);
 
@@ -845,7 +845,7 @@ pub(crate) fn emit_output_for_pane(pane_id: PaneId, message: &str) {
     .detach();
 }
 
-impl wezterm_term::DeviceControlHandler for LocalPaneDCSHandler {
+impl frankenterm_term::DeviceControlHandler for LocalPaneDCSHandler {
     fn handle_device_control(&mut self, control: termwiz::escape::DeviceControlMode) {
         match control {
             DeviceControlMode::Enter(mode) => {

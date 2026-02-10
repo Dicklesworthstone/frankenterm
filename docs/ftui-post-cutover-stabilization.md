@@ -46,7 +46,7 @@ Run 2 bug-bash sessions during the stabilization window:
 
 ### Bug-Bash Procedure
 
-1. **Setup**: Each participant runs `wa tui` in their daily terminal environment
+1. **Setup**: Each participant runs `ft tui` in their daily terminal environment
 2. **Checklist execution**: Work through the compatibility runbook manual checks (9 items)
 3. **Exploratory testing**: 30 minutes of unscripted usage focusing on their workflows
 4. **Report**: File issues with `ftui-stabilization` label, include:
@@ -117,7 +117,7 @@ The stabilization window is considered successful when:
 - [ ] S2 backlog < 3 items, all with documented workarounds
 - [ ] S3 backlog < 5 items
 - [ ] Bug-bash sessions completed with findings triaged
-- [ ] No `WA_TUI_BACKEND=ratatui` override requests from operators
+- [ ] No `FT_TUI_BACKEND=ratatui` override requests from operators
 - [ ] Decommission plan (FTUI-09.3) ready for execution
 
 ## 6  Documentation Updates

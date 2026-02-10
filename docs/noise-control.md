@@ -133,7 +133,7 @@ wa mute remove evt:abc123
 - **Scope:** Workspace-wide by default
 - **Duration:** Indefinite unless `--for` is specified
 - **Storage:** Muted events are stored with status `muted`
-- **Reversibility:** `wa mute remove` restores normal notification
+- **Reversibility:** `ft mute remove` restores normal notification
   behavior immediately
 - **Ordering:** Mute decisions are applied before dedupe and cooldown
 
@@ -160,7 +160,7 @@ Event arrives
 
 Check each layer in order:
 
-1. **Is the event muted?** Run `wa mute list` to see active mutes
+1. **Is the event muted?** Run `ft mute list` to see active mutes
 2. **Is it being deduped?** The same event identity key within 5 minutes
    is suppressed by default. Check event timestamps.
 3. **Is it in cooldown?** A notification for the same key within 30
@@ -188,7 +188,7 @@ it didn't:
 
 Muted events are stored normally — they appear in event listings and
 search results. Their status is `muted` rather than `unhandled`. Use
-`wa events list` to see all events including muted ones.
+`ft events list` to see all events including muted ones.
 
 ## Configuration Summary
 

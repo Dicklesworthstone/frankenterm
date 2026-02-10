@@ -30,24 +30,24 @@ require_cmd() {
   fi
 }
 
-find_wa_binary() {
-  if [[ -n "${WA_BINARY:-}" ]] && [[ -x "${WA_BINARY:-}" ]]; then
+find_ft_binary() {
+  if [[ -n "${FT_BINARY:-}" ]] && [[ -x "${FT_BINARY:-}" ]]; then
     return 0
   fi
   if [[ -x "$PROJECT_ROOT/target/debug/wa" ]]; then
-    WA_BINARY="$PROJECT_ROOT/target/debug/wa"
+    FT_BINARY="$PROJECT_ROOT/target/debug/wa"
     return 0
   fi
-  if [[ -x "$PROJECT_ROOT/target/release/wa" ]]; then
-    WA_BINARY="$PROJECT_ROOT/target/release/wa"
+  if [[ -x "$PROJECT_ROOT/target/release/ft" ]]; then
+    FT_BINARY="$PROJECT_ROOT/target/release/ft"
     return 0
   fi
 
   # Best-effort build (kept quiet; artifacts capture stdout/stderr per scenario).
-  cargo build -p wa >/dev/null
-  WA_BINARY="$PROJECT_ROOT/target/debug/wa"
-  if [[ ! -x "$WA_BINARY" ]]; then
-    echo "Could not find wa binary at $WA_BINARY" >&2
+  cargo build -p frankenterm >/dev/null
+  FT_BINARY="$PROJECT_ROOT/target/debug/wa"
+  if [[ ! -x "$FT_BINARY" ]]; then
+    echo "Could not find wa binary at $FT_BINARY" >&2
     return 1
   fi
 }
@@ -103,22 +103,22 @@ trap cleanup_best_effort EXIT
 
 scenario_create_list_run() {
   echo "marker=$MARKER"
-  "$WA_BINARY" search save "$SAVED_NAME" "$MARKER" --limit 50 -f json | tee /dev/stdout | jq -e '.ok == true' >/dev/null
-  "$WA_BINARY" search saved list -f json | tee /dev/stdout | jq -e '.ok == true and (.saved_searches[]? | select(.name == "'"$SAVED_NAME"'" ))' >/dev/null
-  "$WA_BINARY" search saved run "$SAVED_NAME" -f json | tee /dev/stdout | jq -e '.ok == true' >/dev/null
+  "$FT_BINARY" search save "$SAVED_NAME" "$MARKER" --limit 50 -f json | tee /dev/stdout | jq -e '.ok == true' >/dev/null
+  "$FT_BINARY" search saved list -f json | tee /dev/stdout | jq -e '.ok == true and (.saved_searches[]? | select(.name == "'"$SAVED_NAME"'" ))' >/dev/null
+  "$FT_BINARY" search saved run "$SAVED_NAME" -f json | tee /dev/stdout | jq -e '.ok == true' >/dev/null
 }
 
 scenario_scheduled_alert_emits_event() {
-  "$WA_BINARY" search saved schedule "$SAVED_NAME" 1000 -f json | tee /dev/stdout | jq -e '.ok == true' >/dev/null
+  "$FT_BINARY" search saved schedule "$SAVED_NAME" 1000 -f json | tee /dev/stdout | jq -e '.ok == true' >/dev/null
 
   # Wait for a saved_search.alert event to appear.
   wait_for_json_condition \
     "saved_search.alert event recorded" \
     30 \
-    "\"$WA_BINARY\" events -f json --limit 200 | jq -e '.ok == true and (.events[]? | select(.event_type == \"saved_search.alert\" and .rule_id == \"wezterm.saved_search.alert\"))'"
+    "\"$FT_BINARY\" events -f json --limit 200 | jq -e '.ok == true and (.events[]? | select(.event_type == \"saved_search.alert\" and .rule_id == \"wezterm.saved_search.alert\"))'"
 
   # Capture the event payload and assert redaction of the injected sk- token.
-  "$WA_BINARY" events -f json --limit 200 > /tmp/wa_saved_search_events.json
+  "$FT_BINARY" events -f json --limit 200 > /tmp/wa_saved_search_events.json
   e2e_add_file "events.json" "$(cat /tmp/wa_saved_search_events.json)"
   jq -e '
     .events[]
@@ -130,10 +130,10 @@ scenario_scheduled_alert_emits_event() {
 
 scenario_disable_prevents_future_alerts() {
   local before
-  before=$("$WA_BINARY" events -f json --limit 500 | jq '[.events[]? | select(.event_type == "saved_search.alert" and .rule_id == "wezterm.saved_search.alert")] | length')
+  before=$("$FT_BINARY" events -f json --limit 500 | jq '[.events[]? | select(.event_type == "saved_search.alert" and .rule_id == "wezterm.saved_search.alert")] | length')
   echo "alerts_before=$before"
 
-  "$WA_BINARY" search saved disable "$SAVED_NAME" -f json | tee /dev/stdout | jq -e '.ok == true' >/dev/null
+  "$FT_BINARY" search saved disable "$SAVED_NAME" -f json | tee /dev/stdout | jq -e '.ok == true' >/dev/null
 
   # Generate more matching output in a second pane; search is unscoped, so new data would normally trigger.
   local secret="sk-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -146,11 +146,11 @@ scenario_disable_prevents_future_alerts() {
   if [[ -n "$PANE_B" ]]; then
     wait_for_json_condition \
       "pane $PANE_B observed by watcher" 10 \
-      "$WA_BINARY status -f json 2>/dev/null | jq -e '.observed_panes[]? | select(.pane_id == $PANE_B)' >/dev/null 2>&1"
+      "$FT_BINARY status -f json 2>/dev/null | jq -e '.observed_panes[]? | select(.pane_id == $PANE_B)' >/dev/null 2>&1"
   fi
 
   local after
-  after=$("$WA_BINARY" events -f json --limit 500 | jq '[.events[]? | select(.event_type == "saved_search.alert" and .rule_id == "wezterm.saved_search.alert")] | length')
+  after=$("$FT_BINARY" events -f json --limit 500 | jq '[.events[]? | select(.event_type == "saved_search.alert" and .rule_id == "wezterm.saved_search.alert")] | length')
   echo "alerts_after=$after"
 
   if [[ "$after" != "$before" ]]; then
@@ -163,13 +163,13 @@ main() {
   require_cmd wezterm
   require_cmd jq
   require_cmd sqlite3 || true
-  find_wa_binary
+  find_ft_binary
 
   MARKER="E2E_SAVED_SEARCH_$(date +%s%N)"
   TEMP_WORKSPACE="$(mktemp -d /tmp/wa-e2e-saved-searches.XXXXXX)"
 
   export WA_DATA_DIR="$TEMP_WORKSPACE/.wa"
-  export WA_WORKSPACE="$TEMP_WORKSPACE"
+  export FT_WORKSPACE="$TEMP_WORKSPACE"
   mkdir -p "$WA_DATA_DIR"
 
   e2e_init_artifacts "saved-searches" >/dev/null
@@ -188,14 +188,14 @@ main() {
   e2e_add_file "pane_a.txt" "$PANE_A"
 
   # Start watcher (scheduler runs inside watcher).
-  "$WA_BINARY" watch --foreground >"$E2E_RUN_DIR/wa_watch.log" 2>&1 &
+  "$FT_BINARY" watch --foreground >"$E2E_RUN_DIR/wa_watch.log" 2>&1 &
   WA_PID=$!
 
   # Wait for pane observation.
   wait_for_json_condition \
     "pane observed by watcher" \
     30 \
-    "\"$WA_BINARY\" robot state -f json | jq -e '.data[]? | select(.pane_id == $PANE_A)'"
+    "\"$FT_BINARY\" robot state -f json | jq -e '.data[]? | select(.pane_id == $PANE_A)'"
 
   # Run scenarios in deterministic order.
   e2e_capture_scenario "create_list_run" scenario_create_list_run

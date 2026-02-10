@@ -1,5 +1,5 @@
 [package]
-name = "wezterm-bidi"
+name = "frankenterm-bidi"
 version = "0.2.3"
 edition = "2021"
 repository = "https://github.com/wezterm/wezterm"
@@ -14,7 +14,7 @@ publish = false
 
 [dependencies]
 log.workspace = true
-wezterm-dynamic.workspace = true
+frankenterm-dynamic.workspace = true
 
 [dev-dependencies]
 k9.workspace = true

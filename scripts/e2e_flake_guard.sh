@@ -149,7 +149,7 @@ run_repeated_suite() {
         start_time=$(date +%s)
         exit_code=0
 
-        timeout 120 cargo test -p wa-core "$filter" \
+        timeout 120 cargo test -p frankenterm-core "$filter" \
             --no-fail-fast -- --nocapture \
             >"$iter_output" 2>&1 || exit_code=$?
 

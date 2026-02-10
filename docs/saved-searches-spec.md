@@ -15,7 +15,7 @@ reusing the existing FTS search pipeline and redaction rules.
 
 1. **Read-only by default**: Saved searches never mutate state.
 2. **Deterministic**: Stable schema, canonical field ordering, and repeatable results.
-3. **Single search engine**: Saved searches must call the same core search APIs as `wa search`.
+3. **Single search engine**: Saved searches must call the same core search APIs as `ft search`.
 4. **Redaction-first**: Any preview or alert payload must be redacted before persistence.
 5. **Scheduling is simple**: Fixed-interval scheduling only (no cron in v1).
 
@@ -27,7 +27,7 @@ reusing the existing FTS search pipeline and redaction rules.
 | --- | --- | --- |
 | `id` | TEXT (PK) | UUID or stable hash; opaque identifier |
 | `name` | TEXT (unique) | Human-friendly name |
-| `query` | TEXT | FTS query string (same as `wa search`) |
+| `query` | TEXT | FTS query string (same as `ft search`) |
 | `pane_id` | INTEGER NULL | Optional scope to a pane |
 | `limit` | INTEGER | Max rows returned (default 50) |
 | `since_mode` | TEXT | `last_run` (default) or `fixed` |
@@ -117,14 +117,14 @@ stable ordering. Suggested JSON shape:
 
 Rules:
 - `preview` should be truncated to a small number of hits (default 5).
-- `snippet` must pass through the same redactor as `wa search` output.
+- `snippet` must pass through the same redactor as `ft search` output.
 - All fields are optional-friendly for forward compatibility.
 
 ## CLI/TUI/Web Implications (Non-binding)
 
-- `wa search save <name> <query>` should create a row in `saved_searches`.
-- `wa search run <name>` should execute once and update `last_run_at`/`last_result_count`.
-- `wa search schedule <name> --interval 60s` should set `schedule_interval_ms` and enable.
+- `ft search save <name> <query>` should create a row in `saved_searches`.
+- `ft search run <name>` should execute once and update `last_run_at`/`last_result_count`.
+- `ft search schedule <name> --interval 60s` should set `schedule_interval_ms` and enable.
 - UI surfaces should show `last_run_at`, `last_result_count`, and `last_error`.
 
 ## Edge Cases
@@ -139,4 +139,4 @@ Rules:
 - Schema is documented and stable.
 - Scheduling rules are explicit and deterministic.
 - Alert payload includes redacted previews and is safe for downstream channels.
-- Implementation can reuse existing `wa search` core logic without duplication.
+- Implementation can reuse existing `ft search` core logic without duplication.

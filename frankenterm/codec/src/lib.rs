@@ -13,6 +13,8 @@
 
 use anyhow::{bail, Context as _, Error};
 use config::keyassignment::{PaneDirection, ScrollbackEraseMode};
+use frankenterm_term::color::ColorPalette;
+use frankenterm_term::{Alert, ClipboardSelection, StableRowIndex, TerminalSize};
 use mux::client::{ClientId, ClientInfo};
 use mux::pane::PaneId;
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
@@ -33,8 +35,6 @@ use termwiz::hyperlink::Hyperlink;
 use termwiz::image::{ImageData, TextureCoordinate};
 use termwiz::surface::{Line, SequenceNo};
 use thiserror::Error;
-use wezterm_term::color::ColorPalette;
-use wezterm_term::{Alert, ClipboardSelection, StableRowIndex, TerminalSize};
 
 #[derive(Error, Debug)]
 #[error("Corrupt Response: {0}")]
@@ -759,7 +759,7 @@ impl From<std::time::SystemTime> for InputSerial {
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
 pub struct SendMouseEvent {
     pub pane_id: PaneId,
-    pub event: wezterm_term::input::MouseEvent,
+    pub event: frankenterm_term::input::MouseEvent,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]

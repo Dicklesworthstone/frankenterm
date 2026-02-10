@@ -217,4 +217,4 @@ This template operationalizes the high-level parity contract in ADR-0006:
 - ADR-0006: Parity Contract (source of truth for what must match)
 - ADR-0010: One-Writer Rule Adaptation (terminal ownership evidence)
 - `docs/test-logging-contract.md` (log level and artifact conventions)
-- `crates/wa-core/src/tui/ftui_stub.rs` (primary test location)
+- `crates/frankenterm-core/src/tui/ftui_stub.rs` (primary test location)

@@ -1,0 +1,40 @@
+[package]
+authors = ["Wez Furlong"]
+name = "frankenterm-surface"
+version = "0.1.0"
+edition = "2018"
+repository = "https://github.com/wezterm/wezterm"
+description = "Surface and Line types for terminals"
+license = "MIT"
+documentation = "https://docs.rs/frankenterm-surface"
+keywords = ["terminal", "surface", "line"]
+publish = false
+
+[dependencies]
+bitflags = "2.0"
+fancy-regex.workspace = true
+finl_unicode.workspace = true
+fixedbitset.workspace = true
+ordered-float.workspace = true
+serde = {workspace=true, optional=true}
+siphasher.workspace = true
+unicode-segmentation.workspace = true
+frankenterm-bidi.workspace = true
+frankenterm-blob-leases = {workspace=true, optional=true}
+frankenterm-cell = {workspace = true}
+frankenterm-char-props.workspace = true
+frankenterm-color-types = {workspace = true}
+frankenterm-dynamic = {workspace = true}
+frankenterm-escape-parser = {workspace = true}
+frankenterm-input-types.workspace = true
+
+[features]
+default = []
+std = ["fancy-regex/std", "frankenterm-cell/std", "frankenterm-dynamic/std", "frankenterm-escape-parser/std", "fixedbitset/std", "fancy-regex/perf", "fancy-regex/unicode"]
+appdata = ["std"]
+use_serde = ["serde"] #, "frankenterm-color-types/use_serde", "frankenterm-blob-leases/serde", "bitflags/serde", "frankenterm-input-types/serde", "frankenterm-escape-parser/use_serde", "frankenterm-cell/use_serde"]
+use_image = ["frankenterm-cell/use_image"] # "image", "dep:image", "frankenterm-escape-parser/use_image", "frankenterm-escape-parser/kitty-shm", "frankenterm-cell/use_image"]
+
+[dev-dependencies]
+k9.workspace = true
+

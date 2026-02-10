@@ -77,7 +77,7 @@ wa search '"api key" OR "access token"'
 ```
 
 Invalid syntax is caught by the query linter before execution. Use
-`wa search fts verify` to check index health if queries return
+`ft search fts verify` to check index health if queries return
 unexpected results.
 
 ## Monitoring Storage Health
@@ -184,7 +184,7 @@ VACUUM is the most expensive operation — it rewrites the entire database
 file. Use it only when:
 - The database has grown significantly from deletions (retention cleanup)
 - You need to reduce the on-disk footprint
-- `wa db repair` includes it as part of a full repair
+- `ft db repair` includes it as part of a full repair
 
 VACUUM blocks all access while running. For large databases, schedule it
 during maintenance windows.
@@ -217,10 +217,10 @@ you observe frequent backpressure under heavy capture:
 
 FTS5 queries are fast for typical workloads. If search feels slow:
 
-1. **Check index health:** `wa search fts verify`
-2. **Rebuild if needed:** `wa search fts rebuild`
+1. **Check index health:** `ft search fts verify`
+2. **Rebuild if needed:** `ft search fts rebuild`
 3. **Check WAL size:** A large WAL can slow reads. Force a checkpoint
-   with `wa db repair` or wait for the automatic 10,000-frame trigger.
+   with `ft db repair` or wait for the automatic 10,000-frame trigger.
 4. **Check database size:** Very large databases benefit from retention
    cleanup to remove old segments.
 
@@ -253,11 +253,11 @@ auditing.
 
 When filing a bug report about storage performance:
 
-1. Run `wa db check -f json` and include the output
-2. Run `wa search fts verify` and include the output
+1. Run `ft db check -f json` and include the output
+2. Run `ft search fts verify` and include the output
 3. Note the database file size (`ls -lh` on the `.db` file)
 4. Note the WAL file size (`ls -lh` on the `.db-wal` file)
-5. Generate a diagnostic bundle: `wa diag bundle`
+5. Generate a diagnostic bundle: `ft diag bundle`
 
 The diagnostic bundle captures database metadata, row counts, WAL
 status, and recent events automatically.
@@ -286,11 +286,11 @@ see `WA-2001` (database locked):
 
 1. Check for external tools accessing the same database file
 2. Ensure only one wa instance is running per database
-3. Use `wa robot why WA-2001` for recovery guidance
+3. Use `ft robot why WA-2001` for recovery guidance
 
 ### FTS returns stale results
 
-Run `wa search fts verify`. If inconsistent panes are reported, rebuild:
+Run `ft search fts verify`. If inconsistent panes are reported, rebuild:
 
 ```bash
 wa search fts rebuild
@@ -299,7 +299,7 @@ wa search fts rebuild
 ### Database grows unexpectedly
 
 Check the maintenance log for retention cleanup events. If cleanup is
-not running, verify retention configuration. Run `wa db repair` to
+not running, verify retention configuration. Run `ft db repair` to
 VACUUM and reclaim space from deleted rows.
 
 ### WAL file is very large
@@ -309,4 +309,4 @@ A large WAL indicates the checkpoint is not keeping up. Possible causes:
 - Very high write throughput exceeding checkpoint capacity
 - Checkpoint disabled or failing silently
 
-Force a checkpoint: `wa db repair --yes`
+Force a checkpoint: `ft db repair --yes`

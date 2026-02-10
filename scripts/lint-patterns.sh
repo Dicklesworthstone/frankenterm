@@ -12,9 +12,9 @@
 #   ./scripts/lint-patterns.sh --help      # Show help
 #
 # Allowed files for Regex::new:
-#   - crates/wa-core/src/patterns.rs  (pattern detection engine)
-#   - crates/wa-core/src/policy.rs    (command safety, secret detection)
-#   - crates/wa-core/src/config.rs    (configuration parsing)
+#   - crates/frankenterm-core/src/patterns.rs  (pattern detection engine)
+#   - crates/frankenterm-core/src/policy.rs    (command safety, secret detection)
+#   - crates/frankenterm-core/src/config.rs    (configuration parsing)
 
 set -euo pipefail
 
@@ -26,9 +26,9 @@ NC='\033[0m' # No Color
 
 # Allowed files for Regex::new usage
 ALLOWED_REGEX_FILES=(
-    "crates/wa-core/src/patterns.rs"
-    "crates/wa-core/src/policy.rs"
-    "crates/wa-core/src/config.rs"
+    "crates/frankenterm-core/src/patterns.rs"
+    "crates/frankenterm-core/src/policy.rs"
+    "crates/frankenterm-core/src/config.rs"
 )
 
 # Test fixtures are allowed to use regex for testing purposes
@@ -82,7 +82,7 @@ run_self_test() {
 
     # Test 2: allowed files should not be checked (via script filtering)
     echo "Test 2: Verifying allowlist filtering works..."
-    if is_allowed_regex_file "crates/wa-core/src/patterns.rs"; then
+    if is_allowed_regex_file "crates/frankenterm-core/src/patterns.rs"; then
         echo -e "  ${GREEN}PASS${NC}: patterns.rs correctly in allowlist"
         ((passed++))
     else
@@ -90,7 +90,7 @@ run_self_test() {
         ((failed++))
     fi
 
-    if is_allowed_regex_file "crates/wa-core/src/policy.rs"; then
+    if is_allowed_regex_file "crates/frankenterm-core/src/policy.rs"; then
         echo -e "  ${GREEN}PASS${NC}: policy.rs correctly in allowlist"
         ((passed++))
     else
@@ -100,7 +100,7 @@ run_self_test() {
 
     # Test 3: non-allowed file should not be in allowlist
     echo "Test 3: Verifying non-allowed files are checked..."
-    if ! is_allowed_regex_file "crates/wa-core/src/workflows.rs"; then
+    if ! is_allowed_regex_file "crates/frankenterm-core/src/workflows.rs"; then
         echo -e "  ${GREEN}PASS${NC}: workflows.rs correctly not in allowlist"
         ((passed++))
     else

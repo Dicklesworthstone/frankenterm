@@ -45,7 +45,7 @@ TESTS_PASSED=0
 TESTS_FAILED=0
 
 # Binary path
-WA_BIN=""
+FT_BIN=""
 
 # Logging functions
 log_test() {
@@ -69,15 +69,15 @@ log_info() {
 }
 
 # Find the wa binary
-find_wa_binary() {
+find_ft_binary() {
     local candidates=(
-        "$PROJECT_ROOT/target/release/wa"
+        "$PROJECT_ROOT/target/release/ft"
         "$PROJECT_ROOT/target/debug/wa"
     )
 
     for candidate in "${candidates[@]}"; do
         if [[ -x "$candidate" ]]; then
-            WA_BIN="$candidate"
+            FT_BIN="$candidate"
             return 0
         fi
     done
@@ -91,7 +91,7 @@ run_wa_timeout() {
     local timeout_secs="${1:-5}"
     shift
     local raw_output
-    raw_output=$(timeout "$timeout_secs" "$WA_BIN" "$@" 2>&1 || true)
+    raw_output=$(timeout "$timeout_secs" "$FT_BIN" "$@" 2>&1 || true)
 
     # Strip ANSI codes and extract JSON object
     local stripped
@@ -112,7 +112,7 @@ test_command_candidate_unit() {
     log_test "is_command_candidate Unit Tests"
 
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core command_candidate -- --nocapture 2>&1 || true)
+    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core command_candidate -- --nocapture 2>&1 || true)
 
     e2e_add_file "command_candidate_unit.txt" "$output"
 
@@ -132,7 +132,7 @@ test_command_gate_rules_unit() {
     log_test "Command Gate Rule Unit Tests"
 
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core command_gate -- --nocapture 2>&1 || true)
+    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core command_gate -- --nocapture 2>&1 || true)
 
     e2e_add_file "command_gate_rules_unit.txt" "$output"
 
@@ -184,7 +184,7 @@ test_policy_bypass_detection() {
     log_test "Policy Bypass Detection (Interpreter Abuse)"
 
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core --test policy_bypass -- --nocapture 2>&1 || true)
+    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core --test policy_bypass -- --nocapture 2>&1 || true)
 
     e2e_add_file "policy_bypass_tests.txt" "$output"
 
@@ -292,7 +292,7 @@ test_dryrun_redacts_sensitive_text() {
         if [[ "$error_check" == "robot.wezterm_not_running" ]] || [[ -z "$output" ]]; then
             log_info "WezTerm not running -- checking redaction via unit tests"
             local fallback_output
-            fallback_output=$(cd "$PROJECT_ROOT" && cargo test -p wa redact -- --nocapture 2>&1 || true)
+            fallback_output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm redact -- --nocapture 2>&1 || true)
             if echo "$fallback_output" | grep -q "test result: ok\|0 tests"; then
                 log_pass "Redaction validated (unit tests or no redact tests found)"
             else
@@ -325,7 +325,7 @@ test_command_gate_deny_rm_rf_root() {
     # The command gate is evaluated in the actual send path, not dry-run.
     # Validate via the dedicated unit test.
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core command_gate_blocks_rm_rf_root -- --nocapture 2>&1 || true)
+    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core command_gate_blocks_rm_rf_root -- --nocapture 2>&1 || true)
 
     e2e_add_file "gate_deny_rm_rf_root.txt" "$output"
 
@@ -344,7 +344,7 @@ test_command_gate_approval_git_reset() {
     log_test "Command Gate: git reset --hard Requires Approval"
 
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core command_gate_requires_approval_for_git_reset -- --nocapture 2>&1 || true)
+    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core command_gate_requires_approval_for_git_reset -- --nocapture 2>&1 || true)
 
     e2e_add_file "gate_approval_git_reset.txt" "$output"
 
@@ -363,7 +363,7 @@ test_command_gate_allows_safe_text() {
     log_test "Command Gate: Safe Text Passes Through"
 
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core command_gate_ignores_non_command_text -- --nocapture 2>&1 || true)
+    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core command_gate_ignores_non_command_text -- --nocapture 2>&1 || true)
 
     e2e_add_file "gate_allows_safe_text.txt" "$output"
 
@@ -383,7 +383,7 @@ test_command_gate_coverage() {
 
     # Verify each built-in rule has at least one test
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core command_gate -- --nocapture 2>&1 || true)
+    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core command_gate -- --nocapture 2>&1 || true)
 
     e2e_add_file "command_gate_coverage.txt" "$output"
 
@@ -440,10 +440,10 @@ test_sql_destructive_commands() {
     log_test "SQL Destructive Command Detection"
 
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core --test policy_bypass 2>&1 || true)
+    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core --test policy_bypass 2>&1 || true)
     # Also run the main policy tests for SQL
     local policy_output
-    policy_output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core command_gate 2>&1 || true)
+    policy_output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core command_gate 2>&1 || true)
 
     e2e_add_file "sql_destructive_tests.txt" "$output"$'\n'"$policy_output"
 
@@ -468,10 +468,10 @@ test_shell_operator_detection() {
     # Test that is_command_candidate detects shell operators
     # This runs all command_candidate tests which include operator checks
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core is_command_candidate -- --nocapture 2>&1 || true)
+    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core is_command_candidate -- --nocapture 2>&1 || true)
     # Also try the more specific test name
     local output2
-    output2=$(cd "$PROJECT_ROOT" && cargo test -p wa-core command_candidate -- --nocapture 2>&1 || true)
+    output2=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core command_candidate -- --nocapture 2>&1 || true)
 
     local combined="$output"$'\n'"$output2"
     e2e_add_file "shell_operator_detection.txt" "$combined"
@@ -492,7 +492,7 @@ test_interpreter_bypass() {
 
     # Verify that interpreters used to bypass safety are caught
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core --test policy_bypass dangerous_interpreters -- --nocapture 2>&1 || true)
+    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core --test policy_bypass dangerous_interpreters -- --nocapture 2>&1 || true)
 
     e2e_add_file "interpreter_bypass.txt" "$output"
 
@@ -518,8 +518,8 @@ main() {
     e2e_init_artifacts "command-safety"
 
     # Find wa binary
-    find_wa_binary
-    log_info "Using wa binary: $WA_BIN"
+    find_ft_binary
+    log_info "Using wa binary: $FT_BIN"
     log_info "Project root: $PROJECT_ROOT"
     echo ""
 

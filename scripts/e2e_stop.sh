@@ -50,7 +50,7 @@ TESTS_PASSED=0
 TESTS_FAILED=0
 
 # Binary path
-WA_BIN=""
+FT_BIN=""
 
 # Temp workspace for isolation
 TEMP_WORKSPACE=""
@@ -77,15 +77,15 @@ log_info() {
 }
 
 # Find the wa binary
-find_wa_binary() {
+find_ft_binary() {
     local candidates=(
-        "$PROJECT_ROOT/target/release/wa"
+        "$PROJECT_ROOT/target/release/ft"
         "$PROJECT_ROOT/target/debug/wa"
     )
 
     for candidate in "${candidates[@]}"; do
         if [[ -x "$candidate" ]]; then
-            WA_BIN="$candidate"
+            FT_BIN="$candidate"
             return 0
         fi
     done
@@ -116,7 +116,7 @@ test_stop_cli_help() {
     log_test "CLI Contract: wa stop --help"
 
     local output
-    output=$("$WA_BIN" stop --help 2>&1 || true)
+    output=$("$FT_BIN" stop --help 2>&1 || true)
 
     e2e_add_file "stop_cli_help.txt" "$output"
 
@@ -154,7 +154,7 @@ test_stop_no_watcher() {
     log_test "CLI: wa stop with No Watcher Running"
 
     local output exit_code
-    output=$("$WA_BIN" stop --workspace "$TEMP_WORKSPACE" 2>&1) && exit_code=$? || exit_code=$?
+    output=$("$FT_BIN" stop --workspace "$TEMP_WORKSPACE" 2>&1) && exit_code=$? || exit_code=$?
 
     e2e_add_file "stop_no_watcher.txt" "$output"
 
@@ -180,7 +180,7 @@ test_stop_force_no_watcher() {
     log_test "CLI: wa stop --force with No Watcher Running"
 
     local output exit_code
-    output=$("$WA_BIN" stop --force --workspace "$TEMP_WORKSPACE" 2>&1) && exit_code=$? || exit_code=$?
+    output=$("$FT_BIN" stop --force --workspace "$TEMP_WORKSPACE" 2>&1) && exit_code=$? || exit_code=$?
 
     e2e_add_file "stop_force_no_watcher.txt" "$output"
 
@@ -199,7 +199,7 @@ test_lock_acquire_release() {
     log_test "Lock: Acquire and Release Lifecycle"
 
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core lock::tests -- --nocapture 2>&1 || true)
+    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core lock::tests -- --nocapture 2>&1 || true)
 
     e2e_add_file "lock_tests.txt" "$output"
 
@@ -220,7 +220,7 @@ test_check_running_no_lock() {
     log_test "Lock: check_running Returns None Without Lock File"
 
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core check_running_returns_none -- --nocapture 2>&1 || true)
+    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core check_running_returns_none -- --nocapture 2>&1 || true)
 
     e2e_add_file "check_running_no_lock.txt" "$output"
 
@@ -241,7 +241,7 @@ test_stale_lock_detection() {
     log_test "Lock: Stale Lock Detection"
 
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core stale_lock -- --nocapture 2>&1 || true)
+    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core stale_lock -- --nocapture 2>&1 || true)
 
     e2e_add_file "stale_lock_detection.txt" "$output"
 
@@ -262,7 +262,7 @@ test_lock_metadata() {
     log_test "Lock: Metadata Written Correctly"
 
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core lock_metadata -- --nocapture 2>&1 || true)
+    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core lock_metadata -- --nocapture 2>&1 || true)
 
     e2e_add_file "lock_metadata.txt" "$output"
 
@@ -287,7 +287,7 @@ test_workspace_lock_path() {
     log_test "Workspace: Lock Path Resolution"
 
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core workspace_layout -- --nocapture 2>&1 || true)
+    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core workspace_layout -- --nocapture 2>&1 || true)
 
     e2e_add_file "workspace_layout.txt" "$output"
 
@@ -306,7 +306,7 @@ test_watcher_signal_handling() {
     log_test "Watcher: Signal Handling Tests"
 
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core signal -- --nocapture 2>&1 || true)
+    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core signal -- --nocapture 2>&1 || true)
 
     e2e_add_file "signal_handling.txt" "$output"
 
@@ -328,7 +328,7 @@ test_watchdog_shutdown() {
     log_test "Watchdog: Shutdown on Signal"
 
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core watchdog_shuts_down_on_signal -- --nocapture 2>&1 || true)
+    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core watchdog_shuts_down_on_signal -- --nocapture 2>&1 || true)
 
     e2e_add_file "watchdog_shutdown.txt" "$output"
 
@@ -350,8 +350,8 @@ test_stop_exit_code_deterministic() {
 
     local exit_code_1 exit_code_2
 
-    "$WA_BIN" stop --workspace "$TEMP_WORKSPACE" 2>/dev/null && exit_code_1=$? || exit_code_1=$?
-    "$WA_BIN" stop --workspace "$TEMP_WORKSPACE" 2>/dev/null && exit_code_2=$? || exit_code_2=$?
+    "$FT_BIN" stop --workspace "$TEMP_WORKSPACE" 2>/dev/null && exit_code_1=$? || exit_code_1=$?
+    "$FT_BIN" stop --workspace "$TEMP_WORKSPACE" 2>/dev/null && exit_code_2=$? || exit_code_2=$?
 
     e2e_add_file "exit_code_deterministic.txt" "run1=$exit_code_1 run2=$exit_code_2"
 
@@ -370,7 +370,7 @@ test_effective_config_lock_path() {
     log_test "Config: Effective Config Includes Lock Path"
 
     local output
-    output=$("$WA_BIN" config show --effective --json --workspace "$TEMP_WORKSPACE" 2>/dev/null || true)
+    output=$("$FT_BIN" config show --effective --json --workspace "$TEMP_WORKSPACE" 2>/dev/null || true)
 
     e2e_add_file "effective_config.json" "$output"
 
@@ -401,8 +401,8 @@ main() {
     e2e_init_artifacts "stop-shutdown"
 
     # Find wa binary
-    find_wa_binary
-    log_info "Using wa binary: $WA_BIN"
+    find_ft_binary
+    log_info "Using wa binary: $FT_BIN"
     log_info "Project root: $PROJECT_ROOT"
     echo ""
 

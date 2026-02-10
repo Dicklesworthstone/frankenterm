@@ -11,7 +11,7 @@
 #   - Output schemas are stable and parseable
 #
 # Requirements:
-#   - wa binary built (cargo build -p wa)
+#   - wa binary built (cargo build -p frankenterm)
 #   - jq for JSON manipulation
 # =============================================================================
 
@@ -43,7 +43,7 @@ TESTS_FAILED=0
 TESTS_SKIPPED=0
 
 # Configuration
-WA_BIN=""
+FT_BIN=""
 VERBOSE=false
 CORPUS_DIR=""
 
@@ -103,7 +103,7 @@ log_info() {
 # Run wa robot command, extracting JSON from output (strips log lines)
 run_robot() {
     local raw_output
-    raw_output=$("$WA_BIN" "$@" 2>/dev/null) || true
+    raw_output=$("$FT_BIN" "$@" 2>/dev/null) || true
     # Extract JSON (first { to last })
     echo "$raw_output" | awk '/^{/{found=1} found{print}'
 }
@@ -167,14 +167,14 @@ check_prerequisites() {
     log_test "Prerequisites"
 
     if [[ -x "$PROJECT_ROOT/target/debug/wa" ]]; then
-        WA_BIN="$PROJECT_ROOT/target/debug/wa"
-    elif [[ -x "$PROJECT_ROOT/target/release/wa" ]]; then
-        WA_BIN="$PROJECT_ROOT/target/release/wa"
+        FT_BIN="$PROJECT_ROOT/target/debug/wa"
+    elif [[ -x "$PROJECT_ROOT/target/release/ft" ]]; then
+        FT_BIN="$PROJECT_ROOT/target/release/ft"
     else
-        echo -e "${RED}ERROR:${NC} wa binary not found. Run: cargo build -p wa" >&2
+        echo -e "${RED}ERROR:${NC} wa binary not found. Run: cargo build -p frankenterm" >&2
         exit 5
     fi
-    log_pass "wa binary found: $WA_BIN"
+    log_pass "wa binary found: $FT_BIN"
 
     if ! command -v jq &>/dev/null; then
         echo -e "${RED}ERROR:${NC} jq not found. Install: sudo apt install jq" >&2
@@ -182,7 +182,7 @@ check_prerequisites() {
     fi
     log_pass "jq available"
 
-    CORPUS_DIR="$PROJECT_ROOT/crates/wa-core/tests/corpus"
+    CORPUS_DIR="$PROJECT_ROOT/crates/frankenterm-core/tests/corpus"
     if [[ -d "$CORPUS_DIR" ]]; then
         log_pass "corpus directory found: $CORPUS_DIR"
     else

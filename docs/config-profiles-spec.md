@@ -13,7 +13,7 @@ config directory while keeping profiles forward-compatible and safe to update.
 
 ## Design Principles
 
-1. **Default remains implicit**: the base `wa.toml` config is always the default profile.
+1. **Default remains implicit**: the base `ft.toml` config is always the default profile.
 2. **Profiles are overlays**: a profile contains only overrides to the base config.
 3. **Discoverable without full scan**: a single manifest indexes profiles.
 4. **Forward-compatible metadata**: unknown fields are ignored.
@@ -23,10 +23,10 @@ config directory while keeping profiles forward-compatible and safe to update.
 
 ```
 ~/.config/wa/
-├── wa.toml                 # Base config (implicit "default" profile)
+├── ft.toml                 # Base config (implicit "default" profile)
 └── profiles/
     ├── manifest.json       # Profile index + metadata (single-file listing)
-    ├── local-dev.toml      # Profile override (same schema as wa.toml)
+    ├── local-dev.toml      # Profile override (same schema as ft.toml)
     ├── incident.toml
     └── ...
 ```
@@ -38,8 +38,8 @@ Notes:
 
 ## Profile File Format
 
-Each profile file is a partial `wa.toml` that overrides the base configuration.
-The schema is identical to `wa.toml`, with all fields optional.
+Each profile file is a partial `ft.toml` that overrides the base configuration.
+The schema is identical to `ft.toml`, with all fields optional.
 
 Example `profiles/incident.toml`:
 

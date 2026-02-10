@@ -126,7 +126,7 @@ scenario_fts_search_correctness() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p wa-core 'storage::fts_search' \
+    cargo test -p frankenterm-core 'storage::fts_search' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -161,7 +161,7 @@ scenario_fts_sync_pipeline() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p wa-core 'storage::fts_sync_tests' \
+    cargo test -p frankenterm-core 'storage::fts_sync_tests' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -203,7 +203,7 @@ scenario_fts_benchmark_scales() {
     start_time=$(date +%s)
     exit_code=0
 
-    timeout 120 cargo test -p wa-core --bench fts_query \
+    timeout 120 cargo test -p frankenterm-core --bench fts_query \
         -- --test --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -262,7 +262,7 @@ scenario_storage_regression_benchmarks() {
     start_time=$(date +%s)
     exit_code=0
 
-    timeout 120 cargo test -p wa-core --bench storage_regression \
+    timeout 120 cargo test -p frankenterm-core --bench storage_regression \
         -- --test --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -309,7 +309,7 @@ scenario_db_sizing_benchmarks() {
     start_time=$(date +%s)
     exit_code=0
 
-    timeout 180 cargo test -p wa-core --bench sizing_benchmark \
+    timeout 180 cargo test -p frankenterm-core --bench sizing_benchmark \
         -- --test --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -349,7 +349,7 @@ scenario_search_linting() {
     exit_code=0
 
     # Run search linting tests if they exist
-    cargo test -p wa-core 'search' \
+    cargo test -p frankenterm-core 'search' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -391,7 +391,7 @@ scenario_bounded_execution() {
     start_time=$(date +%s)
     exit_code=0
 
-    timeout 60 cargo test -p wa-core 'storage::fts' \
+    timeout 60 cargo test -p frankenterm-core 'storage::fts' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 

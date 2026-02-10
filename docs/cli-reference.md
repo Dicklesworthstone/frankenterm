@@ -121,8 +121,8 @@ wa auth bootstrap <service> [--account <name>]
 ```
 
 Notes:
-- `wa auth` requires the `browser` feature to enable Playwright-based flows.
-- `wa show` and `wa get-text` exist but are currently placeholders.
+- `ft auth` requires the `browser` feature to enable Playwright-based flows.
+- `ft show` and `ft get-text` exist but are currently placeholders.
 
 ## Feature-gated commands
 

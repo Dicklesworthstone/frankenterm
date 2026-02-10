@@ -147,9 +147,9 @@ CHK3=$(make_checker_with_dir "$DIR3")
 bash "$CHK3" --check > /dev/null 2>&1 || true
 rm -f "$CHK3"
 
-REPORT3="$DIR3/wa-budget-report.json"
+REPORT3="$DIR3/ft-budget-report.json"
 assert_json_field "report has version field" "$REPORT3" '.version' "1"
-assert_json_field "report has format field" "$REPORT3" '.format' "wa-budget-report"
+assert_json_field "report has format field" "$REPORT3" '.format' "ft-budget-report"
 assert_json_field "report has pass count" "$REPORT3" '.pass' "2"
 assert_json_field "report has zero failures" "$REPORT3" '.fail' "0"
 assert_json_field "results is array" "$REPORT3" '.results | type' "array"
@@ -168,7 +168,7 @@ CHK4=$(make_checker_with_dir "$DIR4")
 bash "$CHK4" --check > /dev/null 2>&1 || true
 rm -f "$CHK4"
 
-REPORT4="$DIR4/wa-budget-report.json"
+REPORT4="$DIR4/ft-budget-report.json"
 assert_json_field "report shows 1 failure" "$REPORT4" '.fail' "1"
 assert_json_field "report shows 1 pass" "$REPORT4" '.pass' "1"
 assert_json_field "failed result has FAIL status" "$REPORT4" \
@@ -198,7 +198,7 @@ CHK6=$(make_checker_with_dir "$DIR6")
 assert_pass "lazy init budgets pass" bash "$CHK6" --check
 rm -f "$CHK6"
 
-REPORT6="$DIR6/wa-budget-report.json"
+REPORT6="$DIR6/ft-budget-report.json"
 assert_json_field "all 3 lazy init pass" "$REPORT6" '.pass' "3"
 assert_json_field "no failures" "$REPORT6" '.fail' "0"
 

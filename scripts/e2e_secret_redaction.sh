@@ -46,7 +46,7 @@ TESTS_PASSED=0
 TESTS_FAILED=0
 
 # Binary path
-WA_BIN=""
+FT_BIN=""
 
 # Fake secrets used throughout the tests.  These MUST NOT appear in any artifact.
 FAKE_OPENAI_KEY="sk-proj-abcdefghijklmnopqrstuvwxyz1234567890"
@@ -79,15 +79,15 @@ log_info() {
 }
 
 # Find the wa binary
-find_wa_binary() {
+find_ft_binary() {
     local candidates=(
-        "$PROJECT_ROOT/target/release/wa"
+        "$PROJECT_ROOT/target/release/ft"
         "$PROJECT_ROOT/target/debug/wa"
     )
 
     for candidate in "${candidates[@]}"; do
         if [[ -x "$candidate" ]]; then
-            WA_BIN="$candidate"
+            FT_BIN="$candidate"
             return 0
         fi
     done
@@ -101,7 +101,7 @@ run_wa_timeout() {
     local timeout_secs="${1:-5}"
     shift
     local raw_output
-    raw_output=$(timeout "$timeout_secs" "$WA_BIN" "$@" 2>&1 || true)
+    raw_output=$(timeout "$timeout_secs" "$FT_BIN" "$@" 2>&1 || true)
 
     local stripped
     stripped=$(echo "$raw_output" | sed 's/\x1b\[[0-9;]*m//g')
@@ -120,7 +120,7 @@ test_redactor_true_positives() {
     log_test "Redactor True Positives (All Secret Patterns)"
 
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core redactor_redacts -- --nocapture 2>&1 || true)
+    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core redactor_redacts -- --nocapture 2>&1 || true)
 
     e2e_add_file "redactor_true_positives.txt" "$output"
 
@@ -183,7 +183,7 @@ test_redactor_false_positives() {
     log_test "Redactor False Positive Avoidance"
 
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core redactor_does_not_redact -- --nocapture 2>&1 || true)
+    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core redactor_does_not_redact -- --nocapture 2>&1 || true)
 
     e2e_add_file "redactor_false_positives.txt" "$output"
 
@@ -235,15 +235,15 @@ test_redactor_helpers() {
     log_test "Redactor Helper Functions"
 
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core redactor_contains_secrets -- --nocapture 2>&1 || true)
+    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core redactor_contains_secrets -- --nocapture 2>&1 || true)
     local output2
-    output2=$(cd "$PROJECT_ROOT" && cargo test -p wa-core redactor_detect -- --nocapture 2>&1 || true)
+    output2=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core redactor_detect -- --nocapture 2>&1 || true)
     local output3
-    output3=$(cd "$PROJECT_ROOT" && cargo test -p wa-core redactor_debug_markers -- --nocapture 2>&1 || true)
+    output3=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core redactor_debug_markers -- --nocapture 2>&1 || true)
     local output4
-    output4=$(cd "$PROJECT_ROOT" && cargo test -p wa-core redactor_handles_multiple -- --nocapture 2>&1 || true)
+    output4=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core redactor_handles_multiple -- --nocapture 2>&1 || true)
     local output5
-    output5=$(cd "$PROJECT_ROOT" && cargo test -p wa-core redactor_preserves_surrounding -- --nocapture 2>&1 || true)
+    output5=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core redactor_preserves_surrounding -- --nocapture 2>&1 || true)
 
     local combined="$output"$'\n'"$output2"$'\n'"$output3"$'\n'"$output4"$'\n'"$output5"
     e2e_add_file "redactor_helpers.txt" "$combined"
@@ -303,7 +303,7 @@ test_redactor_policy_integration() {
     log_test "Redactor PolicyEngine Integration"
 
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core redactor_policy_engine_integration -- --nocapture 2>&1 || true)
+    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core redactor_policy_engine_integration -- --nocapture 2>&1 || true)
 
     e2e_add_file "redactor_policy_integration.txt" "$output"
 
@@ -323,7 +323,7 @@ test_audit_summary_redaction() {
 
     # Run the audit-related tests to verify summary building redacts content
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core send_text_audit -- --nocapture 2>&1 || true)
+    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core send_text_audit -- --nocapture 2>&1 || true)
 
     e2e_add_file "audit_summary_redaction.txt" "$output"
 
@@ -354,10 +354,10 @@ test_audit_record_redact_fields() {
     log_test "AuditActionRecord redact_fields"
 
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core audit_action_record -- --nocapture 2>&1 || true)
+    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core audit_action_record -- --nocapture 2>&1 || true)
     # Also try alternate test name patterns
     local output2
-    output2=$(cd "$PROJECT_ROOT" && cargo test -p wa-core redact_fields -- --nocapture 2>&1 || true)
+    output2=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core redact_fields -- --nocapture 2>&1 || true)
 
     local combined="$output"$'\n'"$output2"
     e2e_add_file "audit_record_redact_fields.txt" "$combined"
@@ -396,7 +396,7 @@ test_dryrun_redacts_openai_key() {
         if [[ "$error_check" == "robot.wezterm_not_running" ]] || [[ -z "$output" ]]; then
             log_info "WezTerm not running -- checking redaction via unit tests"
             local fallback_output
-            fallback_output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core redactor_redacts_openai -- --nocapture 2>&1 || true)
+            fallback_output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core redactor_redacts_openai -- --nocapture 2>&1 || true)
             if echo "$fallback_output" | grep -q "ok"; then
                 log_pass "OpenAI key redacted (validated via unit test)"
             else
@@ -436,7 +436,7 @@ test_dryrun_redacts_github_pat() {
         if [[ "$error_check" == "robot.wezterm_not_running" ]] || [[ -z "$output" ]]; then
             log_info "WezTerm not running -- checking redaction via unit test"
             local fallback_output
-            fallback_output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core redactor_redacts_github -- --nocapture 2>&1 || true)
+            fallback_output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core redactor_redacts_github -- --nocapture 2>&1 || true)
             if echo "$fallback_output" | grep -q "ok"; then
                 log_pass "GitHub PAT redacted (validated via unit test)"
             else
@@ -476,7 +476,7 @@ test_dryrun_redacts_db_url() {
         if [[ "$error_check" == "robot.wezterm_not_running" ]] || [[ -z "$output" ]]; then
             log_info "WezTerm not running -- checking redaction via unit test"
             local fallback_output
-            fallback_output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core redactor_redacts_database -- --nocapture 2>&1 || true)
+            fallback_output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core redactor_redacts_database -- --nocapture 2>&1 || true)
             if echo "$fallback_output" | grep -q "ok"; then
                 log_pass "Database URL password redacted (validated via unit test)"
             else
@@ -557,7 +557,7 @@ test_redaction_test_coverage() {
     log_test "Redaction Test Coverage Count"
 
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core redactor -- --nocapture 2>&1 || true)
+    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core redactor -- --nocapture 2>&1 || true)
 
     e2e_add_file "redaction_test_coverage.txt" "$output"
 
@@ -588,8 +588,8 @@ main() {
     e2e_init_artifacts "secret-redaction"
 
     # Find wa binary
-    find_wa_binary
-    log_info "Using wa binary: $WA_BIN"
+    find_ft_binary
+    log_info "Using wa binary: $FT_BIN"
     log_info "Project root: $PROJECT_ROOT"
     echo ""
 

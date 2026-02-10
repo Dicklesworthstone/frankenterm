@@ -10,7 +10,7 @@ Migrate wa's interactive TUI from ratatui/crossterm to FrankenTUI (ftui).
 
 ## Context
 
-wa's TUI (`crates/wa-core/src/tui/`) is built on ratatui 0.30.0 + crossterm 0.29.0.
+wa's TUI (`crates/frankenterm-core/src/tui/`) is built on ratatui 0.30.0 + crossterm 0.29.0.
 It provides 7 views (Home, Panes, Events, Triage, History, Search, Help) behind a
 `tui` feature flag. The implementation spans ~6,050 lines:
 
@@ -111,6 +111,6 @@ Remove the TUI entirely and rely on robot mode + external dashboards.
 
 ## References
 
-- Current TUI: `crates/wa-core/src/tui/{mod,app,views,query}.rs`
+- Current TUI: `crates/frankenterm-core/src/tui/{mod,app,views,query}.rs`
 - Migration epic: wa-2wed (FTUI Adoption Program)
 - Architecture contract: wa-p85q (FTUI-01)

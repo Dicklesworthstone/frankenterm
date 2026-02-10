@@ -28,7 +28,7 @@ wa robot rules test "Usage limit" --trace
 ```
 
 Notes:
-- `wa robot rules test --trace` currently returns a minimal trace
+- `ft robot rules test --trace` currently returns a minimal trace
   (`anchors_checked`, `regex_matched`). Full trace output is planned.
 - `--pack` is accepted for robot rules test, but filtering is not yet implemented.
 
@@ -72,7 +72,7 @@ enabled). Do not expect raw secrets to appear in traces.
 
 ## Incident bundles
 
-`wa diag bundle` includes rule traces for recent events when available:
+`ft diag bundle` includes rule traces for recent events when available:
 
 - `traces/rule_traces.json`
 

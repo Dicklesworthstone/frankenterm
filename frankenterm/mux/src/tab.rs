@@ -5,6 +5,7 @@ use crate::{Mux, MuxNotification, WindowId};
 use bintree::PathBranch;
 use config::configuration;
 use config::keyassignment::PaneDirection;
+use frankenterm_term::{StableRowIndex, TerminalSize};
 use parking_lot::Mutex;
 use rangeset::intersects_range;
 use serde::{Deserialize, Serialize};
@@ -12,7 +13,6 @@ use std::collections::HashMap;
 use std::convert::TryInto;
 use std::sync::Arc;
 use url::Url;
-use wezterm_term::{StableRowIndex, TerminalSize};
 
 pub type Tree = bintree::Tree<Arc<dyn Pane>, SplitDirectionAndSize>;
 pub type Cursor = bintree::Cursor<Arc<dyn Pane>, SplitDirectionAndSize>;
@@ -2196,13 +2196,13 @@ impl Into<String> for SerdeUrl {
 mod test {
     use super::*;
     use crate::renderable::*;
+    use frankenterm_term::color::ColorPalette;
+    use frankenterm_term::{KeyCode, KeyModifiers, Line, MouseEvent, StableRowIndex};
     use parking_lot::{MappedMutexGuard, Mutex};
     use rangeset::RangeSet;
     use std::ops::Range;
     use termwiz::surface::SequenceNo;
     use url::Url;
-    use wezterm_term::color::ColorPalette;
-    use wezterm_term::{KeyCode, KeyModifiers, Line, MouseEvent, StableRowIndex};
 
     struct FakePane {
         id: PaneId,

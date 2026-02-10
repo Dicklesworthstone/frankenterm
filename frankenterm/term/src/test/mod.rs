@@ -8,11 +8,11 @@ mod c1;
 mod csi;
 // mod selection; FIXME: port to render layer
 use crate::color::ColorPalette;
+use frankenterm_escape_parser::csi::{Edit, EraseInDisplay, EraseInLine};
+use frankenterm_escape_parser::{OneBased, OperatingSystemCommand, CSI};
+use frankenterm_surface::{CursorShape, CursorVisibility, SequenceNo, SEQ_ZERO};
 use k9::assert_equal as assert_eq;
 use std::sync::{Arc, Mutex};
-use wezterm_escape_parser::csi::{Edit, EraseInDisplay, EraseInLine};
-use wezterm_escape_parser::{OneBased, OperatingSystemCommand, CSI};
-use wezterm_surface::{CursorShape, CursorVisibility, SequenceNo, SEQ_ZERO};
 
 #[derive(Debug)]
 struct LocalClip {
@@ -312,7 +312,7 @@ fn assert_all_contents(term: &Terminal, file: &str, line: u32, expect_lines: &[&
 
 #[test]
 fn test_semantic_1539() {
-    use wezterm_escape_parser::osc::FinalTermSemanticPrompt;
+    use frankenterm_escape_parser::osc::FinalTermSemanticPrompt;
     let mut term = TestTerm::new(5, 10, 0);
     term.print(format!(
         "{}prompt\r\nwoot",
@@ -348,7 +348,7 @@ fn test_semantic_1539() {
 
 #[test]
 fn test_semantic() {
-    use wezterm_escape_parser::osc::FinalTermSemanticPrompt;
+    use frankenterm_escape_parser::osc::FinalTermSemanticPrompt;
     let mut term = TestTerm::new(5, 10, 0);
     term.print("hello");
     term.print(format!(
@@ -1127,10 +1127,12 @@ fn test_scroll_margins() {
     term.print("1\n2\n3\n4\n");
     assert_all_contents(&term, file!(), line!(), &["1", "2", "3", "4", ""]);
 
-    let margins = CSI::Cursor(wezterm_escape_parser::csi::Cursor::SetTopAndBottomMargins {
-        top: OneBased::new(1),
-        bottom: OneBased::new(2),
-    });
+    let margins = CSI::Cursor(
+        frankenterm_escape_parser::csi::Cursor::SetTopAndBottomMargins {
+            top: OneBased::new(1),
+            bottom: OneBased::new(2),
+        },
+    );
     term.print(format!("{}", margins));
 
     term.print("z\n");

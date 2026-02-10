@@ -1,9 +1,9 @@
 use crate::config::validate_domain_name;
 use crate::*;
+use frankenterm_dynamic::{FromDynamic, ToDynamic};
 use luahelper::impl_lua_conversion_dynamic;
 use std::fmt::Display;
 use std::str::FromStr;
-use wezterm_dynamic::{FromDynamic, ToDynamic};
 
 #[derive(Debug, Clone, Copy, FromDynamic, ToDynamic)]
 pub enum SshBackend {
@@ -109,7 +109,7 @@ impl_lua_conversion_dynamic!(SshDomain);
 
 impl SshDomain {
     pub fn default_domains() -> Vec<Self> {
-        let mut config = wezterm_ssh::Config::new();
+        let mut config = frankenterm_ssh::Config::new();
         config.add_default_config_files();
 
         let mut plain_ssh = vec![];

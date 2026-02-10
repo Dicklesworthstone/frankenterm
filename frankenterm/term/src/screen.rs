@@ -1,11 +1,11 @@
 #![allow(clippy::range_plus_one)]
 use super::*;
 use crate::config::BidiMode;
+use frankenterm_surface::SequenceNo;
 use log::debug;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use termwiz::input::KeyboardEncoding;
-use wezterm_surface::SequenceNo;
 
 /// Holds the model of a screen.  This can either be the primary screen
 /// which includes lines of scrollback text, or the alternate screen

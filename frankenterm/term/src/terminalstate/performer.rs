@@ -4,6 +4,20 @@ use crate::terminalstate::{
 };
 use crate::{ClipboardSelection, Position, TerminalState, VisibleRowIndex, DCS, ST};
 use finl_unicode::grapheme_clusters::Graphemes;
+use frankenterm_bidi::ParagraphDirectionHint;
+use frankenterm_cell::{
+    grapheme_column_width, is_white_space_grapheme, Cell, CellAttributes, SemanticType,
+};
+use frankenterm_escape_parser::csi::{
+    CharacterPath, EraseInDisplay, Keyboard, KittyKeyboardFlags, KittyKeyboardMode,
+};
+use frankenterm_escape_parser::osc::{
+    ChangeColorPair, ColorOrQuery, FinalTermSemanticPrompt, ITermProprietary,
+    ITermUnicodeVersionOp, Selection,
+};
+use frankenterm_escape_parser::{
+    Action, ControlCode, DeviceControlMode, Esc, EscCode, OperatingSystemCommand, CSI,
+};
 use log::{debug, error};
 use num_traits::FromPrimitive;
 use ordered_float::NotNan;
@@ -13,20 +27,6 @@ use std::ops::{Deref, DerefMut};
 use termwiz::input::KeyboardEncoding;
 use unicode_normalization::{is_nfc_quick, IsNormalized, UnicodeNormalization};
 use url::Url;
-use wezterm_bidi::ParagraphDirectionHint;
-use wezterm_cell::{
-    grapheme_column_width, is_white_space_grapheme, Cell, CellAttributes, SemanticType,
-};
-use wezterm_escape_parser::csi::{
-    CharacterPath, EraseInDisplay, Keyboard, KittyKeyboardFlags, KittyKeyboardMode,
-};
-use wezterm_escape_parser::osc::{
-    ChangeColorPair, ColorOrQuery, FinalTermSemanticPrompt, ITermProprietary,
-    ITermUnicodeVersionOp, Selection,
-};
-use wezterm_escape_parser::{
-    Action, ControlCode, DeviceControlMode, Esc, EscCode, OperatingSystemCommand, CSI,
-};
 
 /// A helper struct for implementing `vtparse::VTActor` while compartmentalizing
 /// the terminal state and the embedding/host terminal interface
@@ -493,7 +493,7 @@ impl<'a> Performer<'a> {
         self.flush_print();
         match csi {
             CSI::Sgr(sgr) => self.state.perform_csi_sgr(sgr),
-            CSI::Cursor(wezterm_escape_parser::csi::Cursor::Left(n)) => {
+            CSI::Cursor(frankenterm_escape_parser::csi::Cursor::Left(n)) => {
                 // We treat CUB (Cursor::Left) the same as Backspace as
                 // that is what xterm does.
                 // <https://github.com/wezterm/wezterm/issues/1273>
@@ -986,7 +986,7 @@ impl<'a> Performer<'a> {
 
             OperatingSystemCommand::ChangeDynamicColors(first_color, colors) => {
                 log::trace!("ChangeDynamicColors: {:?} {:?}", first_color, colors);
-                use wezterm_escape_parser::osc::DynamicColorNumber;
+                use frankenterm_escape_parser::osc::DynamicColorNumber;
                 let mut idx: u8 = first_color as u8;
                 for color in colors {
                     let which_color: Option<DynamicColorNumber> = FromPrimitive::from_u8(idx);
@@ -1041,7 +1041,7 @@ impl<'a> Performer<'a> {
 
             OperatingSystemCommand::ResetDynamicColor(color) => {
                 log::trace!("ResetDynamicColor: {:?}", color);
-                use wezterm_escape_parser::osc::DynamicColorNumber;
+                use frankenterm_escape_parser::osc::DynamicColorNumber;
                 let which_color: Option<DynamicColorNumber> = FromPrimitive::from_u8(color as u8);
                 if let Some(which_color) = which_color {
                     macro_rules! reset {
@@ -1076,7 +1076,7 @@ impl<'a> Performer<'a> {
                 self.palette_did_change();
             }
             OperatingSystemCommand::ConEmuProgress(prog) => {
-                use wezterm_escape_parser::osc::Progress as TProg;
+                use frankenterm_escape_parser::osc::Progress as TProg;
                 let prog = match prog {
                     TProg::None => Progress::None,
                     TProg::SetPercentage(p) => Progress::Percentage(p),

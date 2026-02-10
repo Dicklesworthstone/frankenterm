@@ -2,9 +2,9 @@ use crate::terminalstate::image::*;
 use crate::terminalstate::{default_color_map, ImageAttachParams};
 use crate::TerminalState;
 use ::image::RgbaImage;
-use wezterm_cell::color::RgbColor;
-use wezterm_cell::image::ImageDataType;
-use wezterm_escape_parser::{Sixel, SixelData};
+use frankenterm_cell::color::RgbColor;
+use frankenterm_cell::image::ImageDataType;
+use frankenterm_escape_parser::{Sixel, SixelData};
 
 impl TerminalState {
     pub(crate) fn sixel(&mut self, sixel: Box<Sixel>) {

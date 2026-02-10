@@ -100,18 +100,18 @@ Suggested storage model:
 - Mute decisions are applied before dedupe/cooldown decisions
 
 Suggested UX surfaces:
-- `wa mute add <rule_id> [--pane <id>] [--ttl <duration>]`
-- `wa mute list`
-- `wa mute remove <key>`
+- `ft mute add <rule_id> [--pane <id>] [--ttl <duration>]`
+- `ft mute list`
+- `ft mute remove <key>`
 - TUI: mark selected event muted; provide "show muted" filter
 
 ## Implementation Crosswalk
 Existing components that align with this policy:
-- `Detection::dedup_key` in `crates/wa-core/src/patterns.rs`
-- `EventDeduplicator` and `NotificationCooldown` in `crates/wa-core/src/events.rs`
-- `NotificationConfig` in `crates/wa-core/src/config.rs`
-- `events.dedupe_key` column in `crates/wa-core/src/storage.rs`
-- TUI mute action in `crates/wa-core/src/tui/query.rs`
+- `Detection::dedup_key` in `crates/frankenterm-core/src/patterns.rs`
+- `EventDeduplicator` and `NotificationCooldown` in `crates/frankenterm-core/src/events.rs`
+- `NotificationConfig` in `crates/frankenterm-core/src/config.rs`
+- `events.dedupe_key` column in `crates/frankenterm-core/src/storage.rs`
+- TUI mute action in `crates/frankenterm-core/src/tui/query.rs`
 
 Recommended adjustments to align with this spec:
 - Base dedupe and cooldown keys on `pane_uuid` instead of `pane_id`.

@@ -23,7 +23,7 @@ non-blocking IPC protocol.
 ## Event Sink Trait (WezTerm-side)
 
 `wa` exposes a trait that WezTerm can call into (vendored build only). This
-trait is defined in `crates/wa-core/src/wezterm_native.rs` and is intended to be
+trait is defined in `crates/frankenterm-core/src/wezterm_native.rs` and is intended to be
 implemented by a lightweight IPC sender in WezTerm.
 
 ```rust

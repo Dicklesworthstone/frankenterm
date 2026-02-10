@@ -1,8 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/wa",
-    "crates/wa-core",
+    "crates/frankenterm",
+    "crates/frankenterm-core",
     "fuzz",
     # FrankenTerm crates (ex-WezTerm, owned in-tree)
     "frankenterm/async_ossl",
@@ -25,25 +25,25 @@ members = [
     "frankenterm/termwiz",
     "frankenterm/umask",
     "frankenterm/vtparse",
-    "frankenterm/wezterm-blob-leases",
-    "frankenterm/wezterm-cell",
-    "frankenterm/wezterm-char-props",
-    "frankenterm/wezterm-dynamic",
-    "frankenterm/wezterm-dynamic/derive",
-    "frankenterm/wezterm-escape-parser",
-    "frankenterm/wezterm-input-types",
-    "frankenterm/wezterm-ssh",
-    "frankenterm/wezterm-surface",
-    "frankenterm/wezterm-uds",
+    "frankenterm/blob-leases",
+    "frankenterm/cell",
+    "frankenterm/char-props",
+    "frankenterm/dynamic",
+    "frankenterm/dynamic/derive",
+    "frankenterm/escape-parser",
+    "frankenterm/input-types",
+    "frankenterm/ssh",
+    "frankenterm/surface",
+    "frankenterm/uds",
 ]
 exclude = [
-    "frankenterm/wezterm-char-props/codegen",
+    "frankenterm/char-props/codegen",
     "frankenterm/bidi/generate",
 ]
 
 # Crate boundary rules:
-# - wa-core: business logic only (no UI/transport deps by default)
-# - wa: thin CLI wrapper over wa-core
+# - frankenterm-core: business logic only (no UI/transport deps by default)
+# - frankenterm: thin CLI wrapper over frankenterm-core
 # - optional frontends (mcp/web/tui/browser) are feature-gated
 
 [workspace.package]
@@ -52,7 +52,7 @@ edition = "2024"
 rust-version = "1.85"
 authors = ["Dicklesworthstone"]
 license = "MIT"
-repository = "https://github.com/Dicklesworthstone/wezterm_automata"
+repository = "https://github.com/Dicklesworthstone/frankenterm"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -236,20 +236,20 @@ termwiz = { version = "0.24.0", path = "frankenterm/termwiz" }
 termwiz-funcs = { path = "frankenterm/lua-api-crates/termwiz-funcs" }
 umask = { path = "frankenterm/umask" }
 vtparse = { version = "0.7", path = "frankenterm/vtparse", default-features = false }
-wezterm-bidi = { version = "0.2.3", path = "frankenterm/bidi", default-features = false }
-wezterm-blob-leases = { version = "0.1.1", path = "frankenterm/wezterm-blob-leases" }
-wezterm-cell = { path = "frankenterm/wezterm-cell" }
-wezterm-char-props = { path = "frankenterm/wezterm-char-props", default-features = false }
-wezterm-color-types = { version = "0.3", path = "frankenterm/color-types", default-features = false }
-wezterm-config-derive = { version = "0.1", path = "frankenterm/config/derive" }
-wezterm-dynamic = { version = "0.2.1", path = "frankenterm/wezterm-dynamic", default-features = false }
-wezterm-dynamic-derive = { version = "0.1.1", path = "frankenterm/wezterm-dynamic/derive" }
-wezterm-escape-parser = { version = "0.1.0", path = "frankenterm/wezterm-escape-parser" }
-wezterm-input-types = { version = "0.1", path = "frankenterm/wezterm-input-types", default-features = false }
-wezterm-ssh = { path = "frankenterm/wezterm-ssh" }
-wezterm-surface = { path = "frankenterm/wezterm-surface" }
-wezterm-term = { path = "frankenterm/term" }
-wezterm-uds = { path = "frankenterm/wezterm-uds" }
+frankenterm-bidi = { version = "0.2.3", path = "frankenterm/bidi", default-features = false }
+frankenterm-blob-leases = { version = "0.1.1", path = "frankenterm/blob-leases" }
+frankenterm-cell = { path = "frankenterm/cell" }
+frankenterm-char-props = { path = "frankenterm/char-props", default-features = false }
+frankenterm-color-types = { version = "0.3", path = "frankenterm/color-types", default-features = false }
+frankenterm-config-derive = { version = "0.1", path = "frankenterm/config/derive" }
+frankenterm-dynamic = { version = "0.2.1", path = "frankenterm/dynamic", default-features = false }
+frankenterm-dynamic-derive = { version = "0.1.1", path = "frankenterm/dynamic/derive" }
+frankenterm-escape-parser = { version = "0.1.0", path = "frankenterm/escape-parser" }
+frankenterm-input-types = { version = "0.1", path = "frankenterm/input-types", default-features = false }
+frankenterm-ssh = { path = "frankenterm/ssh" }
+frankenterm-surface = { path = "frankenterm/surface" }
+frankenterm-term = { path = "frankenterm/term" }
+frankenterm-uds = { path = "frankenterm/uds" }
 
 # External deps needed by FrankenTerm crates
 assert_fs = "1.0.4"
@@ -340,7 +340,7 @@ winapi = "0.3.9"
 winreg = "0.10"
 zstd = "0.11"
 
-# Notify: upstream uses 5.0, we use 8.x for wa crates.
+# Notify: upstream uses 5.0, we use 8.x for frankenterm crates.
 # FrankenTerm config crate pins to 5.0 until migrated.
 notify = "5.0.0"
 
@@ -387,7 +387,7 @@ fastapi-openapi = { git = "https://github.com/Dicklesworthstone/fastapi_rust" }
 fastapi-output = { git = "https://github.com/Dicklesworthstone/fastapi_rust" }
 
 # Internal crates
-wa-core = { path = "crates/wa-core" }
+frankenterm-core = { path = "crates/frankenterm-core" }
 
 [profile.release]
 opt-level = "z"     # Optimize for size

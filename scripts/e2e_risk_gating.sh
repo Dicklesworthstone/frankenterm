@@ -43,7 +43,7 @@ TESTS_PASSED=0
 TESTS_FAILED=0
 
 # Binary path
-WA_BIN=""
+FT_BIN=""
 
 # Logging functions
 log_test() {
@@ -67,15 +67,15 @@ log_info() {
 }
 
 # Find the wa binary
-find_wa_binary() {
+find_ft_binary() {
     local candidates=(
-        "$PROJECT_ROOT/target/release/wa"
+        "$PROJECT_ROOT/target/release/ft"
         "$PROJECT_ROOT/target/debug/wa"
     )
 
     for candidate in "${candidates[@]}"; do
         if [[ -x "$candidate" ]]; then
-            WA_BIN="$candidate"
+            FT_BIN="$candidate"
             return 0
         fi
     done
@@ -89,7 +89,7 @@ run_wa_timeout() {
     local timeout_secs="${1:-5}"
     shift
     local raw_output
-    raw_output=$(timeout "$timeout_secs" "$WA_BIN" "$@" 2>&1 || true)
+    raw_output=$(timeout "$timeout_secs" "$FT_BIN" "$@" 2>&1 || true)
 
     # Strip ANSI codes and extract JSON object
     local stripped
@@ -193,7 +193,7 @@ test_risk_scoring_unit_tests() {
 
     # Run the comprehensive risk scoring tests
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core risk 2>&1 || true)
+    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core risk 2>&1 || true)
 
     e2e_add_file "risk_scoring_unit_tests" "cargo_test_output.txt" "$output"
 
@@ -218,7 +218,7 @@ test_risk_determinism() {
 
     # Run the determinism test specifically
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core risk_score_deterministic -- --nocapture 2>&1 || true)
+    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core risk_score_deterministic -- --nocapture 2>&1 || true)
 
     e2e_add_file "risk_determinism" "determinism_test.txt" "$output"
 
@@ -238,7 +238,7 @@ test_risk_factor_ordering() {
     log_test "Risk Factor Ordering Stability"
 
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core risk_factors_have_stable_ordering -- --nocapture 2>&1 || true)
+    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core risk_factors_have_stable_ordering -- --nocapture 2>&1 || true)
 
     e2e_add_file "risk_factor_ordering" "ordering_test.txt" "$output"
 
@@ -259,7 +259,7 @@ test_risk_decision_mapping() {
 
     # Run all three decision mapping tests
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core risk_to_decision -- --nocapture 2>&1 || true)
+    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core risk_to_decision -- --nocapture 2>&1 || true)
 
     e2e_add_file "risk_decision_mapping" "decision_tests.txt" "$output"
 
@@ -298,9 +298,9 @@ test_risk_json_schema() {
 
     # Run each test separately since cargo test only accepts one filter
     local output1 output2 output3 output
-    output1=$(cd "$PROJECT_ROOT" && cargo test -p wa-core risk_score_json_schema -- --nocapture 2>&1 || true)
-    output2=$(cd "$PROJECT_ROOT" && cargo test -p wa-core risk_factor_json_schema -- --nocapture 2>&1 || true)
-    output3=$(cd "$PROJECT_ROOT" && cargo test -p wa-core decision_context_risk -- --nocapture 2>&1 || true)
+    output1=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core risk_score_json_schema -- --nocapture 2>&1 || true)
+    output2=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core risk_factor_json_schema -- --nocapture 2>&1 || true)
+    output3=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core decision_context_risk -- --nocapture 2>&1 || true)
     output="$output1"$'\n'"$output2"$'\n'"$output3"
 
     e2e_add_file "risk_json_schema" "schema_tests.txt" "$output"
@@ -339,7 +339,7 @@ test_risk_matrix() {
     log_test "Risk Scoring Matrix Coverage"
 
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core risk_matrix -- --nocapture 2>&1 || true)
+    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core risk_matrix -- --nocapture 2>&1 || true)
 
     e2e_add_file "risk_matrix" "matrix_tests.txt" "$output"
 
@@ -398,8 +398,8 @@ main() {
     e2e_init_artifacts "risk-gating"
 
     # Find wa binary
-    find_wa_binary
-    log_info "Using wa binary: $WA_BIN"
+    find_ft_binary
+    log_info "Using wa binary: $FT_BIN"
 
     # Run tests
     test_risk_scoring_unit_tests || true

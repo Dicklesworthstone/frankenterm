@@ -6,7 +6,7 @@
 ## Purpose
 
 This document formalizes the `QueryClient` trait as the stable data boundary
-between TUI rendering code and wa-core's storage/IPC layers. The ftui migration
+between TUI rendering code and frankenterm-core's storage/IPC layers. The ftui migration
 replaces everything above this boundary (rendering, terminal management, event
 loop) while leaving the boundary itself and everything below it unchanged.
 
@@ -32,7 +32,7 @@ pub trait QueryClient: Send + Sync {
 }
 ```
 
-**Location:** `crates/wa-core/src/tui/query.rs`
+**Location:** `crates/frankenterm-core/src/tui/query.rs`
 
 **Bounds:** `Send + Sync` required because the TUI event loop may call methods
 from a thread other than main (e.g., data refresh timer).
@@ -240,7 +240,7 @@ Search uses FTS5 with `snippet_max_tokens=30`, `highlight_prefix=">>"`,
 
 ### Shared Types (from ui_query.rs)
 
-These types live in `crates/wa-core/src/ui_query.rs` and are framework-agnostic:
+These types live in `crates/frankenterm-core/src/ui_query.rs` and are framework-agnostic:
 
 **PaneBookmarkView:** `{ pane_id, alias, tags, description, created_at, updated_at }`
 
@@ -255,12 +255,12 @@ created_at, updated_at }`
 
 ## Production Implementation
 
-`ProductionQueryClient` bridges sync TUI code with async wa-core operations.
+`ProductionQueryClient` bridges sync TUI code with async frankenterm-core operations.
 
 ### Architecture
 
 ```
-TUI Thread                    ProductionQueryClient               wa-core (async)
+TUI Thread                    ProductionQueryClient               frankenterm-core (async)
     |                                 |                                 |
     |-- list_panes() --------------->|                                 |
     |                                |-- runtime.block_on(async {     |
@@ -348,12 +348,12 @@ For ftui view testing, the mock should additionally support:
 
 5. **`ui_query.rs` types stay framework-agnostic.** Shared types in `ui_query.rs`
    must not import ratatui, crossterm, ftui, or any rendering framework types.
-   They use only `std`, `serde`, and wa-core internal types.
+   They use only `std`, `serde`, and frankenterm-core internal types.
 
 ## References
 
-- QueryClient source: `crates/wa-core/src/tui/query.rs`
-- Shared UI types: `crates/wa-core/src/ui_query.rs`
+- QueryClient source: `crates/frankenterm-core/src/tui/query.rs`
+- Shared UI types: `crates/frankenterm-core/src/ui_query.rs`
 - ADR-0005: Architecture Ring Map (QueryClient is Ring 3 / Ring 2 boundary)
 - ADR-0006: Parity Contract (data flow section)
 - Downstream: wa-1utb (FTUI-02.1), FTUI-05.* (view migration)

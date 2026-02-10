@@ -41,7 +41,7 @@ TESTS_FAILED=0
 TESTS_SKIPPED=0
 
 # Binary and schema paths
-WA_BIN=""
+FT_BIN=""
 SCHEMA_DIR="$PROJECT_ROOT/docs/json-schema"
 ENVELOPE_SCHEMA="$SCHEMA_DIR/wa-robot-envelope.json"
 
@@ -73,7 +73,7 @@ run_wa_timeout() {
     local timeout_secs="${1:-5}"
     shift
     local raw_output
-    raw_output=$(timeout "$timeout_secs" "$WA_BIN" "$@" 2>&1 || true)
+    raw_output=$(timeout "$timeout_secs" "$FT_BIN" "$@" 2>&1 || true)
 
     # Strip ANSI codes and find JSON object
     # First, remove ANSI escape sequences
@@ -142,18 +142,18 @@ check_prerequisites() {
     log_test "Checking Prerequisites"
 
     # Find wa binary
-    WA_BIN="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}/debug/wa"
-    if [[ ! -x "$WA_BIN" ]]; then
-        WA_BIN="$PROJECT_ROOT/target/debug/wa"
+    FT_BIN="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}/debug/wa"
+    if [[ ! -x "$FT_BIN" ]]; then
+        FT_BIN="$PROJECT_ROOT/target/debug/wa"
     fi
 
-    if [[ ! -x "$WA_BIN" ]]; then
+    if [[ ! -x "$FT_BIN" ]]; then
         echo "[INFO] Building wa binary..."
-        cargo build -p wa 2>&1 | tail -5
+        cargo build -p frankenterm 2>&1 | tail -5
     fi
 
-    if [[ -x "$WA_BIN" ]]; then
-        log_pass "wa binary found: $WA_BIN"
+    if [[ -x "$FT_BIN" ]]; then
+        log_pass "wa binary found: $FT_BIN"
     else
         log_fail "wa binary not found"
         exit 1

@@ -128,7 +128,7 @@ scenario_uuid_assignment() {
     exit_code=0
 
     # Run UUID format + assignment tests (pane_uuid matches both format and entropy tests)
-    cargo test -p wa-core 'pane_uuid' \
+    cargo test -p frankenterm-core 'pane_uuid' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -167,7 +167,7 @@ scenario_uuid_stability_metadata() {
     exit_code=0
 
     # Run all registry_uuid_stable tests
-    cargo test -p wa-core 'registry_uuid_stable' \
+    cargo test -p frankenterm-core 'registry_uuid_stable' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -212,7 +212,7 @@ scenario_multi_pane_churn() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p wa-core 'registry_multi_pane_churn_stability' \
+    cargo test -p frankenterm-core 'registry_multi_pane_churn_stability' \
         -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -226,7 +226,7 @@ scenario_multi_pane_churn() {
 
     # Test pane close/reappearance handling
     exit_code=0
-    cargo test -p wa-core 'registry_new_uuid_on_reappearance' \
+    cargo test -p frankenterm-core 'registry_new_uuid_on_reappearance' \
         -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -238,7 +238,7 @@ scenario_multi_pane_churn() {
 
     # UUID removed on close
     exit_code=0
-    cargo test -p wa-core 'registry_uuid_removed_on_close' \
+    cargo test -p frankenterm-core 'registry_uuid_removed_on_close' \
         -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -262,7 +262,7 @@ scenario_fingerprint_generation() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p wa-core 'ingest::tests::fingerprint' \
+    cargo test -p frankenterm-core 'ingest::tests::fingerprint' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -314,7 +314,7 @@ scenario_registry_lifecycle() {
     exit_code=0
 
     # Run all registry tests
-    cargo test -p wa-core 'ingest::tests::registry' \
+    cargo test -p frankenterm-core 'ingest::tests::registry' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -359,7 +359,7 @@ scenario_discovery_tick() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p wa-core 'ingest::tests::discovery_tick' \
+    cargo test -p frankenterm-core 'ingest::tests::discovery_tick' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -404,7 +404,7 @@ scenario_pane_storage_persistence() {
     exit_code=0
 
     # Run pane entry conversion and persistence tests
-    cargo test -p wa-core 'ingest::tests::pane_entry' \
+    cargo test -p frankenterm-core 'ingest::tests::pane_entry' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -418,7 +418,7 @@ scenario_pane_storage_persistence() {
 
     # Also check persist_captured tests
     exit_code=0
-    cargo test -p wa-core 'ingest::tests::persist_captured' \
+    cargo test -p frankenterm-core 'ingest::tests::persist_captured' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -444,7 +444,7 @@ scenario_bounded_execution() {
     start_time=$(date +%s)
     exit_code=0
 
-    timeout 60 cargo test -p wa-core 'ingest::tests' \
+    timeout 60 cargo test -p frankenterm-core 'ingest::tests' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 

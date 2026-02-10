@@ -2,7 +2,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use rusqlite::{Connection, params};
-use wa_core::storage::initialize_schema;
+use frankenterm_core::storage::initialize_schema;
 
 fuzz_target!(|data: &[u8]| {
     if data.len() > 8_192 {

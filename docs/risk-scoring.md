@@ -65,7 +65,7 @@ These analyze the command text (SendText only):
 
 ## Configuration
 
-Configure risk scoring in `~/.config/wa/wa.toml` or `.wa/config.toml`:
+Configure risk scoring in `~/.config/wa/ft.toml` or `.ft/config.toml`:
 
 ### Basic Configuration
 
@@ -208,7 +208,7 @@ wa why denied --pane 3
 ### "Why was my action denied?"
 
 1. Check the risk score and contributing factors in the response
-2. Use `wa why denied` for detailed explanation
+2. Use `ft why denied` for detailed explanation
 3. Consider if any factors are false positives for your use case
 
 ### "How do I allow this specific action?"

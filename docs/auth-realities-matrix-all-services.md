@@ -18,9 +18,9 @@
 
 | Outcome | Meaning |
 |---------|---------|
-| `Automated` | wa can proceed without a human |
-| `NeedsHuman` | wa must open a browser (or otherwise prompt) for a human bootstrap step |
-| `Fail` | wa cannot proceed now; retry later or abort |
+| `Automated` | ft can proceed without a human |
+| `NeedsHuman` | ft must open a browser (or otherwise prompt) for a human bootstrap step |
+| `Fail` | ft cannot proceed now; retry later or abort |
 
 ---
 
@@ -28,7 +28,7 @@
 
 Notes:
 - "Detection signals" should map to either:
-  - stable `rule_id`s in `wa-core` (preferred), or
+  - stable `rule_id`s in `frankenterm-core` (preferred), or
   - stable CLI output substrings/URLs for browser automation.
 - "Automated steps" MUST NOT include entering passwords/OTP secrets.
 

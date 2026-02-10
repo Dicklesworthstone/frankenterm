@@ -75,17 +75,17 @@ Search explain for query: "error"
 Use the reason codes below to self-diagnose and resolve issues:
 
 - `NO_INDEXED_DATA`: No output has been captured yet.
-  Start `wa watch` and ensure panes are active and not excluded.
+  Start `ft watch` and ensure panes are active and not excluded.
 - `PANE_EXCLUDED`: The requested pane is excluded by config rules.
-  Adjust `ingest.panes` include/exclude rules and re-check `wa list`.
+  Adjust `ingest.panes` include/exclude rules and re-check `ft list`.
 - `PANES_EXCLUDED`: One or more panes are excluded from capture.
   Review pane filters and confirm the desired panes are observed.
 - `PANE_NOT_FOUND`: The pane ID is not known to the watcher.
-  Verify with `wa list`; the pane may be closed or undiscovered.
+  Verify with `ft list`; the pane may be closed or undiscovered.
 - `FTS_INDEX_INCONSISTENT`: FTS rows do not match segment counts.
-  Run `wa search fts verify`, then `wa search fts rebuild` if needed.
+  Run `ft search fts verify`, then `ft search fts rebuild` if needed.
 - `CAPTURE_GAPS`: Gaps were detected in captured output.
-  Check `wa events --rule-id gap` and consider lowering poll interval.
+  Check `ft events --rule-id gap` and consider lowering poll interval.
 - `RETENTION_CLEANUP`: Retention has removed older content.
   Review retention settings and increase retention if needed.
 - `STALE_PANES`: Observed panes have not been seen recently.
@@ -155,10 +155,10 @@ wa list
 
 Use these steps before any destructive actions:
 
-1. `wa status` to confirm watcher health.
-2. `wa list` to confirm panes and ignore reasons.
-3. `wa search fts verify` to detect index inconsistencies.
-4. `wa doctor` for a full health snapshot.
-5. `wa db check -f plain` for DB health.
-6. `wa db repair --dry-run` to preview fixes (if needed).
+1. `ft status` to confirm watcher health.
+2. `ft list` to confirm panes and ignore reasons.
+3. `ft search fts verify` to detect index inconsistencies.
+4. `ft doctor` for a full health snapshot.
+5. `ft db check -f plain` for DB health.
+6. `ft db repair --dry-run` to preview fixes (if needed).
 

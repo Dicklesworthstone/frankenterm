@@ -71,11 +71,11 @@ pub enum InternalError {
 
     #[cfg(feature = "use_image")]
     #[error(transparent)]
-    ImageCellError(#[from] wezterm_cell::image::ImageCellError),
+    ImageCellError(#[from] frankenterm_cell::image::ImageCellError),
 
     #[cfg(feature = "image")]
     #[error(transparent)]
-    BlobLease(#[from] wezterm_blob_leases::Error),
+    BlobLease(#[from] frankenterm_blob_leases::Error),
 
     #[error("{}", .context)]
     Context {

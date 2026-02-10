@@ -172,7 +172,7 @@ FAIL pty_e2e::basic_navigation
     meta.json, transcript.jsonl, screenshot.txt, input.json, env.json, diag.txt
 
   Reproduce:
-    RUST_TEST_THREADS=1 cargo test -p wa-core --features ftui -- pty_e2e::basic_navigation
+    RUST_TEST_THREADS=1 cargo test -p frankenterm-core --features ftui -- pty_e2e::basic_navigation
 ```
 
 ### 2.2  CI Job Summary
@@ -264,7 +264,7 @@ If output gate is Active when it shouldn't be → **lifecycle bug** (S2).
 #### Step 7: Reproduce locally
 
 ```bash
-RUST_TEST_THREADS=1 cargo test -p wa-core --features ftui -- pty_e2e::basic_navigation
+RUST_TEST_THREADS=1 cargo test -p frankenterm-core --features ftui -- pty_e2e::basic_navigation
 ```
 
 If it passes locally → **flake** (S4). Check:
@@ -307,5 +307,5 @@ If it passes locally → **flake** (S4). Check:
 - `docs/ftui-pty-fixture-strategy.md` — seed/timing strategy (wa-1qr1)
 - `docs/ftui-teardown-harness.md` — restoration invariants (wa-3fed)
 - `docs/ftui-command-handoff-traces.md` — handoff state machine (wa-bjvg)
-- `crates/wa-core/src/crash.rs` — crash bundle format (existing)
-- `crates/wa-core/src/tui/ftui_stub.rs:6432-7045` — headless E2E tests
+- `crates/frankenterm-core/src/crash.rs` — crash bundle format (existing)
+- `crates/frankenterm-core/src/tui/ftui_stub.rs:6432-7045` — headless E2E tests

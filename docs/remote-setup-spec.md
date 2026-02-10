@@ -44,7 +44,7 @@ wa setup remote --host <ssh_host>
 
 ### Output Format
 - Human output by default.
-- If `WA_OUTPUT_FORMAT=json`, also emit machine-parsable JSON plan/results.
+- If `FT_OUTPUT_FORMAT=json`, also emit machine-parsable JSON plan/results.
 
 ---
 

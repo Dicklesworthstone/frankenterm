@@ -28,8 +28,8 @@ This document defines the evidence-based criteria for deciding whether the ratat
 | # | Criterion | Evidence Artifact | Status |
 |---|-----------|------------------|--------|
 | I1 | Feature flags compile correctly (headless, tui, ftui) | `docs/ftui-cargo-feature-matrix.md` | Verified |
-| I2 | Mutual exclusion enforced (`tui` + `ftui` = compile_error) | `wa-core/src/lib.rs:129` | Verified |
-| I3 | Import guardrails prevent ratatui reintroduction | `wa-core/src/tui/mod.rs` guardrail tests | Verified |
+| I2 | Mutual exclusion enforced (`tui` + `ftui` = compile_error) | `frankenterm-core/src/lib.rs:129` | Verified |
+| I3 | Import guardrails prevent ratatui reintroduction | `frankenterm-core/src/tui/mod.rs` guardrail tests | Verified |
 | I4 | CI gates configured (fmt, clippy, tests, snapshots) | `.github/workflows/` | Verified |
 | I5 | Terminal session lifecycle tested (50+) | `cargo test --features tui --lib -- terminal_session` | Verified |
 | I6 | Command handoff state machine tested (19+) | `cargo test --features tui --lib -- command_handoff` | Verified |

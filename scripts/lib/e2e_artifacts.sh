@@ -196,9 +196,9 @@ _e2e_capture_env() {
   },
   "env_vars": {
     "WA_DATA_DIR": "${WA_DATA_DIR:-}",
-    "WA_WORKSPACE": "${WA_WORKSPACE:-}",
+    "FT_WORKSPACE": "${FT_WORKSPACE:-}",
     "WA_CONFIG": "${WA_CONFIG:-}",
-    "WA_LOG_LEVEL": "${WA_LOG_LEVEL:-}",
+    "FT_LOG_LEVEL": "${FT_LOG_LEVEL:-}",
     "CI": "${CI:-}",
     "GITHUB_ACTIONS": "${GITHUB_ACTIONS:-}",
     "TERM": "${TERM:-}"

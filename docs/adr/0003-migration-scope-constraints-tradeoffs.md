@@ -61,9 +61,9 @@ All ftui code must be behind `#[cfg(feature = "ftui")]`. The project must build
 and pass tests with either `--features tui` (legacy) or `--features ftui` (new)
 but not both simultaneously. This prevents cross-contamination.
 
-### C3: No ratatui API leakage into wa-core public interface
+### C3: No ratatui API leakage into frankenterm-core public interface
 
-ratatui types (Widget, Buffer, Rect, etc.) must not appear in wa-core's public
+ratatui types (Widget, Buffer, Rect, etc.) must not appear in frankenterm-core's public
 API outside the `tui` module. This is already true today and must remain true
 during migration. Similarly, ftui types must not leak.
 
@@ -147,7 +147,7 @@ means. Intentional deltas are logged in the parity ledger with rationale.
 
 ## References
 
-- Current TUI source: `crates/wa-core/src/tui/`
+- Current TUI source: `crates/frankenterm-core/src/tui/`
 - Current views: Home, Panes, Events, Triage, History, Search, Help
 - Current keybindings: `app.rs:170-237` (global), per-view handlers following
 - Parity contract bead: wa-136q (FTUI-01.3)

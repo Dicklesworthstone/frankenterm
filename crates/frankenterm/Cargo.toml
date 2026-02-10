@@ -1,0 +1,58 @@
+[package]
+name = "frankenterm"
+description = "FrankenTerm CLI - terminal hypervisor for AI agent swarms"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["terminal", "frankenterm", "automation", "ai-agents"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "ft"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+frankenterm-core.workspace = true
+clap.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+fancy-regex.workspace = true
+toml.workspace = true
+toml_edit.workspace = true
+toon_rust.workspace = true
+rusqlite.workspace = true
+reqwest.workspace = true
+dirs = "6.0.0"
+fastmcp = { workspace = true, optional = true }
+
+[features]
+default = []
+frankenterm = ["frankenterm-core/frankenterm"]
+vendored = ["frankenterm"]  # backward compat alias
+browser = ["frankenterm-core/browser"]
+mcp = ["frankenterm-core/mcp", "dep:fastmcp"]
+web = ["frankenterm-core/web"]
+tui = ["frankenterm-core/tui"]
+ftui = ["frankenterm-core/ftui"]
+rollout = ["frankenterm-core/rollout", "tui", "ftui"]
+metrics = ["frankenterm-core/metrics"]
+native-wezterm = ["frankenterm-core/native-wezterm"]
+distributed = ["frankenterm-core/distributed"]
+sync = ["frankenterm-core/sync"]
+
+[dev-dependencies]
+assert_cmd = "2.1.2"
+predicates = "3.1.3"
+tempfile = "3.23.0"

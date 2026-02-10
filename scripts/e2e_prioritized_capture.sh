@@ -129,7 +129,7 @@ scenario_scheduler_budget() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p wa-core 'tailer::tests::scheduler' \
+    cargo test -p frankenterm-core 'tailer::tests::scheduler' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -206,7 +206,7 @@ scenario_scheduler_determinism() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p wa-core 'tailer::tests::scheduler' \
+    cargo test -p frankenterm-core 'tailer::tests::scheduler' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -267,7 +267,7 @@ scenario_supervisor_integration() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p wa-core 'tailer::tests::supervisor' \
+    cargo test -p frankenterm-core 'tailer::tests::supervisor' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -328,7 +328,7 @@ scenario_overflow_gap() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p wa-core 'overflow' \
+    cargo test -p frankenterm-core 'overflow' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -391,7 +391,7 @@ scenario_priority_config() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p wa-core 'pane_priority' \
+    cargo test -p frankenterm-core 'pane_priority' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -431,7 +431,7 @@ scenario_capture_backpressure() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p wa-core 'capture_channel' \
+    cargo test -p frankenterm-core 'capture_channel' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -471,7 +471,7 @@ scenario_health_scheduler() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p wa-core 'health_snapshot' \
+    cargo test -p frankenterm-core 'health_snapshot' \
         --no-fail-fast -- --nocapture --skip health_json_schema \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -514,7 +514,7 @@ scenario_bounded_execution() {
     exit_code=0
 
     # Run all scheduler, supervisor, overflow, priority, and capture tests
-    timeout 90 cargo test -p wa-core 'tailer::tests' \
+    timeout 90 cargo test -p frankenterm-core 'tailer::tests' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 

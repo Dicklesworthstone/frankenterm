@@ -1,10 +1,10 @@
 //! Colors for attributes
 
+pub use frankenterm_cell::color::{AnsiColor, ColorAttribute, RgbColor, SrgbaTuple};
 #[cfg(feature = "use_serde")]
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use std::result::Result;
-pub use wezterm_cell::color::{AnsiColor, ColorAttribute, RgbColor, SrgbaTuple};
 
 #[derive(Clone, PartialEq)]
 pub struct Palette256(pub [SrgbaTuple; 256]);

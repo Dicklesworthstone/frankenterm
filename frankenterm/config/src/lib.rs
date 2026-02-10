@@ -1,6 +1,8 @@
 //! Configuration for the gui portion of the terminal
 
 use anyhow::{anyhow, bail, Context, Error};
+use frankenterm_dynamic::{FromDynamic, FromDynamicOptions, ToDynamic, UnknownFieldAction, Value};
+use frankenterm_term::UnicodeVersion;
 use lazy_static::lazy_static;
 use mlua::Lua;
 use ordered_float::NotNan;
@@ -17,8 +19,6 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use wezterm_dynamic::{FromDynamic, FromDynamicOptions, ToDynamic, UnknownFieldAction, Value};
-use wezterm_term::UnicodeVersion;
 
 mod background;
 mod bell;
@@ -444,7 +444,7 @@ pub fn configuration() -> ConfigHandle {
 
 /// Returns a version of the config (loaded from the config file)
 /// with some field overridden based on the supplied overrides object.
-pub fn overridden_config(overrides: &wezterm_dynamic::Value) -> Result<ConfigHandle, Error> {
+pub fn overridden_config(overrides: &frankenterm_dynamic::Value) -> Result<ConfigHandle, Error> {
     CONFIG.overridden(overrides)
 }
 
@@ -655,7 +655,10 @@ impl ConfigInner {
         self.generation += 1;
     }
 
-    fn overridden(&mut self, overrides: &wezterm_dynamic::Value) -> Result<ConfigHandle, Error> {
+    fn overridden(
+        &mut self,
+        overrides: &frankenterm_dynamic::Value,
+    ) -> Result<ConfigHandle, Error> {
         let config = Config::load_with_overrides(overrides);
         Ok(ConfigHandle {
             config: Arc::new(config.config?),
@@ -730,7 +733,7 @@ impl Configuration {
         inner.use_this_config(cfg);
     }
 
-    fn overridden(&self, overrides: &wezterm_dynamic::Value) -> Result<ConfigHandle, Error> {
+    fn overridden(&self, overrides: &frankenterm_dynamic::Value) -> Result<ConfigHandle, Error> {
         let mut inner = self.inner.lock().unwrap();
         inner.overridden(overrides)
     }

@@ -103,8 +103,8 @@ wa prepare workflow run handle_compaction --pane-id 3
 Output requirements:
 - Show a **plan preview** (steps, preconditions, verification).
 - Print `plan_id` and `plan_hash`.
-- Print approval command: `wa approve <code>` (if approval required).
-- Print commit command: `wa commit <plan_id>`.
+- Print approval command: `ft approve <code>` (if approval required).
+- Print commit command: `ft commit <plan_id>`.
 - If approval not required, still require commit (to ensure the plan preview is the exact plan executed).
 
 **Commit**
@@ -149,8 +149,8 @@ Returns:
 ### MCP Flow
 
 MCP mirrors Robot Mode:
-- `wa.prepare` → same fields as `wa robot prepare`
-- `wa.commit` → same fields as `wa robot commit`
+- `wa.prepare` → same fields as `ft robot prepare`
+- `wa.commit` → same fields as `ft robot commit`
 
 ### Binding Semantics (Required)
 
@@ -172,10 +172,10 @@ Commit MUST refuse execution if **any** binding check fails:
 
 | Error Code | Meaning | Remediation |
 | --- | --- | --- |
-| `E_PLAN_NOT_FOUND` | Plan ID missing | Re-run `wa prepare ...` |
+| `E_PLAN_NOT_FOUND` | Plan ID missing | Re-run `ft prepare ...` |
 | `E_PLAN_EXPIRED` | Plan TTL expired | Re-run prepare + approve |
 | `E_PLAN_HASH_MISMATCH` | Approval bound to different plan hash | Re-run prepare + approve |
-| `E_PLAN_APPROVAL_MISSING` | Approval required but missing | Run `wa approve <code>` |
+| `E_PLAN_APPROVAL_MISSING` | Approval required but missing | Run `ft approve <code>` |
 | `E_PLAN_PANE_MISMATCH` | Pane identity changed | Re-run prepare for current pane |
 | `E_PLAN_PRECONDITION_FAILED` | Plan preconditions no longer true | Re-run prepare |
 
@@ -185,7 +185,7 @@ This design ensures **explicit user intent**: the plan preview is exactly what g
 
 If prepare/commit fails, use this checklist before retrying:
 
-1. **Plan expired** (`E_PLAN_EXPIRED`): plans have TTLs to prevent replay. Re-run `wa prepare ...` and approve again.
+1. **Plan expired** (`E_PLAN_EXPIRED`): plans have TTLs to prevent replay. Re-run `ft prepare ...` and approve again.
 2. **Hash mismatch** (`E_PLAN_HASH_MISMATCH`): the plan changed. Re-run prepare and use the new plan hash/ID.
 3. **Pane mismatch** (`E_PLAN_PANE_MISMATCH`): the pane identity changed (pane restarted, new session). Re-run prepare on the current pane.
 4. **Precondition failed** (`E_PLAN_PRECONDITION_FAILED`): environment drift (alt-screen, prompt state, etc.). Resolve the precondition and re-run prepare.
@@ -196,7 +196,7 @@ If you keep hitting mismatches, capture the plan preview, compare it to the late
 
 When introducing a new StepAction, Precondition, or Verification strategy:
 
-1. **Define the enum variant** in `crates/wa-core/src/plan.rs` with stable serde tags.
+1. **Define the enum variant** in `crates/frankenterm-core/src/plan.rs` with stable serde tags.
 2. **Implement canonical_string** for determinism. Avoid volatile fields (timestamps, random IDs).
 3. **Add tests** that assert canonical stability and serialization round-trips.
 4. **Wire policy/audit**:
@@ -215,25 +215,25 @@ If a step needs *conditional branching*, prefer representing it as multiple expl
 Use this checklist when adding a new `StepAction`/`Precondition`/`VerificationStrategy` variant so implementation stays deterministic and auditable:
 
 1. **Schema + serde tags**
-   - Edit `crates/wa-core/src/plan.rs`.
+   - Edit `crates/frankenterm-core/src/plan.rs`.
    - Add the new enum variant with stable `snake_case` serde tags and deterministic field ordering.
 2. **Canonicalization + hashing**
-   - Update canonical string helpers in `crates/wa-core/src/plan.rs` (`canonical_*` helpers).
+   - Update canonical string helpers in `crates/frankenterm-core/src/plan.rs` (`canonical_*` helpers).
    - Ensure no volatile values (timestamps, random IDs, non-deterministic map iteration) influence hashes.
 3. **Execution wiring**
-   - Wire execution semantics in `crates/wa-core/src/workflows.rs` (plan generation + runtime handling).
+   - Wire execution semantics in `crates/frankenterm-core/src/workflows.rs` (plan generation + runtime handling).
    - Ensure precondition and verification behavior is explicit (no hidden branching).
 4. **Policy + redaction**
-   - If the action can mutate panes or carry user text, verify policy gating and redaction paths in `crates/wa-core/src/policy.rs`, `crates/wa-core/src/approval.rs`, and storage/audit logging paths.
+   - If the action can mutate panes or carry user text, verify policy gating and redaction paths in `crates/frankenterm-core/src/policy.rs`, `crates/frankenterm-core/src/approval.rs`, and storage/audit logging paths.
 5. **Surface parity**
    - Verify dry-run/human CLI (`crates/wa/src/main.rs`), robot output, and MCP output expose the new variant consistently.
    - Update docs/schemas if output contracts change.
 6. **Tests (required before merge)**
-   - Add/extend tests in `crates/wa-core/src/plan.rs` for serialization and canonical hash stability.
-   - Add/extend execution tests in `crates/wa-core/src/workflows.rs` or `crates/wa-core/tests/`.
+   - Add/extend tests in `crates/frankenterm-core/src/plan.rs` for serialization and canonical hash stability.
+   - Add/extend execution tests in `crates/frankenterm-core/src/workflows.rs` or `crates/frankenterm-core/tests/`.
    - Run:
-     - `cargo test -p wa-core plan`
-     - `cargo test -p wa-core workflows`
+     - `cargo test -p frankenterm-core plan`
+     - `cargo test -p frankenterm-core workflows`
      - `cargo check --all-targets`
 
 ## Rust Type Definitions
@@ -853,7 +853,7 @@ impl toon_rust::ToToon for ActionPlan {
 
 ## References
 
-- `crates/wa-core/src/dry_run.rs` - Existing dry-run infrastructure
-- `crates/wa-core/src/workflows.rs` - Workflow execution engine
-- `crates/wa-core/src/approval.rs` - Approval and fingerprinting patterns
-- `crates/wa-core/src/policy.rs` - Policy evaluation
+- `crates/frankenterm-core/src/dry_run.rs` - Existing dry-run infrastructure
+- `crates/frankenterm-core/src/workflows.rs` - Workflow execution engine
+- `crates/frankenterm-core/src/approval.rs` - Approval and fingerprinting patterns
+- `crates/frankenterm-core/src/policy.rs` - Policy evaluation

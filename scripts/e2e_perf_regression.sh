@@ -130,7 +130,7 @@ scenario_pattern_detection() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p wa-core 'patterns::tests' \
+    cargo test -p frankenterm-core 'patterns::tests' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -172,7 +172,7 @@ scenario_delta_extraction() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p wa-core 'extract_delta' \
+    cargo test -p frankenterm-core 'extract_delta' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -213,7 +213,7 @@ scenario_output_cache() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p wa-core 'output_cache' \
+    cargo test -p frankenterm-core 'output_cache' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -250,7 +250,7 @@ scenario_storage_benchmarks() {
     start_time=$(date +%s)
     exit_code=0
 
-    timeout 120 cargo test -p wa-core --bench storage_regression \
+    timeout 120 cargo test -p frankenterm-core --bench storage_regression \
         -- --test --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -291,7 +291,7 @@ scenario_delta_benchmarks() {
     start_time=$(date +%s)
     exit_code=0
 
-    timeout 60 cargo test -p wa-core --bench delta_extraction \
+    timeout 60 cargo test -p frankenterm-core --bench delta_extraction \
         -- --test --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -325,7 +325,7 @@ scenario_pattern_benchmarks() {
     start_time=$(date +%s)
     exit_code=0
 
-    timeout 60 cargo test -p wa-core --bench pattern_detection \
+    timeout 60 cargo test -p frankenterm-core --bench pattern_detection \
         -- --test --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -359,7 +359,7 @@ scenario_backpressure_watcher_benchmarks() {
     start_time=$(date +%s)
     exit_code=0
 
-    timeout 120 cargo test -p wa-core --bench backpressure_performance \
+    timeout 120 cargo test -p frankenterm-core --bench backpressure_performance \
         -- --test --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -382,7 +382,7 @@ scenario_backpressure_watcher_benchmarks() {
     watcher_start=$(date +%s)
     watcher_exit=0
 
-    timeout 60 cargo test -p wa-core --bench watcher_loop \
+    timeout 60 cargo test -p frankenterm-core --bench watcher_loop \
         -- --test --nocapture \
         >"$watcher_output" 2>&1 || watcher_exit=$?
 
@@ -416,7 +416,7 @@ scenario_bounded_execution() {
     exit_code=0
 
     # Run pattern + delta + cache tests together
-    timeout 60 cargo test -p wa-core 'patterns::tests' \
+    timeout 60 cargo test -p frankenterm-core 'patterns::tests' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 

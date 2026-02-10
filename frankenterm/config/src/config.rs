@@ -28,6 +28,14 @@ use crate::{
     CONFIG_OVERRIDES, CONFIG_SKIP, HOME_DIR,
 };
 use anyhow::Context;
+use frankenterm_bidi::ParagraphDirectionHint;
+use frankenterm_config_derive::ConfigMeta;
+use frankenterm_dynamic::{FromDynamic, ToDynamic};
+use frankenterm_input_types::{
+    IntegratedTitleButton, IntegratedTitleButtonAlignment, IntegratedTitleButtonStyle, Modifiers,
+    UIKeyCapRendering, WindowDecorations,
+};
+use frankenterm_term::TerminalSize;
 use luahelper::impl_lua_conversion_dynamic;
 use mlua::FromLua;
 use portable_pty::CommandBuilder;
@@ -39,14 +47,6 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use termwiz::hyperlink;
 use termwiz::surface::CursorShape;
-use wezterm_bidi::ParagraphDirectionHint;
-use wezterm_config_derive::ConfigMeta;
-use wezterm_dynamic::{FromDynamic, ToDynamic};
-use wezterm_input_types::{
-    IntegratedTitleButton, IntegratedTitleButtonAlignment, IntegratedTitleButtonStyle, Modifiers,
-    UIKeyCapRendering, WindowDecorations,
-};
-use wezterm_term::TerminalSize;
 
 #[derive(Debug, Clone, FromDynamic, ToDynamic, ConfigMeta)]
 pub struct Config {
@@ -907,7 +907,7 @@ impl Default for Config {
         // specified in the struct so that we don't have to repeat
         // the same thing in a different form down here
         Config::from_dynamic(
-            &wezterm_dynamic::Value::Object(Default::default()),
+            &frankenterm_dynamic::Value::Object(Default::default()),
             Default::default(),
         )
         .unwrap()
@@ -916,7 +916,7 @@ impl Default for Config {
 
 impl Config {
     pub fn load() -> LoadedConfig {
-        Self::load_with_overrides(&wezterm_dynamic::Value::default())
+        Self::load_with_overrides(&frankenterm_dynamic::Value::default())
     }
 
     /// It is relatively expensive to parse all the ssh config files,
@@ -1000,7 +1000,7 @@ impl Config {
         Ok(())
     }
 
-    pub fn load_with_overrides(overrides: &wezterm_dynamic::Value) -> LoadedConfig {
+    pub fn load_with_overrides(overrides: &frankenterm_dynamic::Value) -> LoadedConfig {
         // Note that the directories crate has methods for locating project
         // specific config directories, but only returns one of them, not
         // multiple.  In addition, it spawns a lot of subprocesses,
@@ -1074,7 +1074,7 @@ impl Config {
 
     pub fn try_default() -> anyhow::Result<LoadedConfig> {
         let (config, warnings) =
-            wezterm_dynamic::Error::capture_warnings(|| -> anyhow::Result<Config> {
+            frankenterm_dynamic::Error::capture_warnings(|| -> anyhow::Result<Config> {
                 Ok(default_config_with_overrides_applied()?.compute_extra_defaults(None))
             });
 
@@ -1088,7 +1088,7 @@ impl Config {
 
     fn try_load(
         path_item: &PathPossibility,
-        overrides: &wezterm_dynamic::Value,
+        overrides: &frankenterm_dynamic::Value,
     ) -> anyhow::Result<Option<LoadedConfig>> {
         let p = path_item.path.as_path();
         log::trace!("consider config: {}", p.display());
@@ -1105,7 +1105,7 @@ impl Config {
         let lua = make_lua_context(p)?;
 
         let (config, warnings) =
-            wezterm_dynamic::Error::capture_warnings(|| -> anyhow::Result<Config> {
+            frankenterm_dynamic::Error::capture_warnings(|| -> anyhow::Result<Config> {
                 let cfg: Config;
 
                 let config: mlua::Value = smol::block_on(
@@ -1149,7 +1149,7 @@ impl Config {
     pub(crate) fn apply_overrides_obj_to<'l>(
         lua: &'l mlua::Lua,
         mut config: mlua::Value<'l>,
-        overrides: &wezterm_dynamic::Value,
+        overrides: &frankenterm_dynamic::Value,
     ) -> anyhow::Result<mlua::Value<'l>> {
         // config may be a table, or it may be a config builder.
         // We'll leave it up to lua to call the appropriate
@@ -1166,7 +1166,7 @@ impl Config {
             .eval()?;
 
         match overrides {
-            wezterm_dynamic::Value::Object(obj) => {
+            frankenterm_dynamic::Value::Object(obj) => {
                 for (key, value) in obj {
                     let key = luahelper::dynamic_to_lua_value(lua, key.clone())?;
                     let value = luahelper::dynamic_to_lua_value(lua, value.clone())?;
@@ -1344,35 +1344,35 @@ impl Config {
 
         cfg.font_rules.push(StyleRule {
             italic: Some(true),
-            intensity: Some(wezterm_term::Intensity::Half),
+            intensity: Some(frankenterm_term::Intensity::Half),
             font: half_bright_italic,
             ..Default::default()
         });
 
         cfg.font_rules.push(StyleRule {
             italic: Some(false),
-            intensity: Some(wezterm_term::Intensity::Half),
+            intensity: Some(frankenterm_term::Intensity::Half),
             font: half_bright,
             ..Default::default()
         });
 
         cfg.font_rules.push(StyleRule {
             italic: Some(false),
-            intensity: Some(wezterm_term::Intensity::Bold),
+            intensity: Some(frankenterm_term::Intensity::Bold),
             font: bold,
             ..Default::default()
         });
 
         cfg.font_rules.push(StyleRule {
             italic: Some(true),
-            intensity: Some(wezterm_term::Intensity::Bold),
+            intensity: Some(frankenterm_term::Intensity::Bold),
             font: bold_italic,
             ..Default::default()
         });
 
         cfg.font_rules.push(StyleRule {
             italic: Some(true),
-            intensity: Some(wezterm_term::Intensity::Normal),
+            intensity: Some(frankenterm_term::Intensity::Normal),
             font: italic,
             ..Default::default()
         });
@@ -2113,15 +2113,15 @@ pub enum BoldBrightening {
 
 impl FromDynamic for BoldBrightening {
     fn from_dynamic(
-        value: &wezterm_dynamic::Value,
-        options: wezterm_dynamic::FromDynamicOptions,
-    ) -> Result<Self, wezterm_dynamic::Error> {
+        value: &frankenterm_dynamic::Value,
+        options: frankenterm_dynamic::FromDynamicOptions,
+    ) -> Result<Self, frankenterm_dynamic::Error> {
         match String::from_dynamic(value, options) {
             Ok(s) => match s.as_str() {
                 "No" => Ok(Self::No),
                 "BrightAndBold" => Ok(Self::BrightAndBold),
                 "BrightOnly" => Ok(Self::BrightOnly),
-                s => Err(wezterm_dynamic::Error::Message(format!(
+                s => Err(frankenterm_dynamic::Error::Message(format!(
                     "`{s}` is not valid, use one of `No`, `BrightAndBold` or `BrightOnly`"
                 ))),
             },

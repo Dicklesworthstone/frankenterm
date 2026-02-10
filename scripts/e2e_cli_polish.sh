@@ -27,7 +27,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$SCRIPT_DIR/lib/e2e_artifacts.sh"
 
 # Build the wa binary first
-WA_BIN=""
+FT_BIN=""
 
 # Colors for output (only when TTY)
 if [[ -t 1 ]]; then
@@ -81,14 +81,14 @@ log_test() {
 
 # Capture wa command output (ensures binary path is used)
 run_wa() {
-    "$WA_BIN" "$@"
+    "$FT_BIN" "$@"
 }
 
 # Run wa command with a timeout (for commands that might hang without watcher)
 run_wa_timeout() {
     local timeout_secs="${1:-5}"
     shift
-    timeout "$timeout_secs" "$WA_BIN" "$@" 2>&1 || true
+    timeout "$timeout_secs" "$FT_BIN" "$@" 2>&1 || true
 }
 
 # Check if output contains ANSI escape sequences
@@ -106,23 +106,23 @@ check_prerequisites() {
 
     # Build wa
     log_info "Building wa binary..."
-    if ! cargo build -p wa --quiet 2>/dev/null; then
+    if ! cargo build -p frankenterm --quiet 2>/dev/null; then
         log_fail "Failed to build wa binary"
         exit 2
     fi
 
     # Try cargo target directory first (used by cargo run), then project target
-    WA_BIN="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}/debug/wa"
-    if [[ ! -x "$WA_BIN" ]]; then
-        WA_BIN="$PROJECT_ROOT/target/debug/wa"
+    FT_BIN="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}/debug/wa"
+    if [[ ! -x "$FT_BIN" ]]; then
+        FT_BIN="$PROJECT_ROOT/target/debug/wa"
     fi
 
-    if [[ ! -x "$WA_BIN" ]]; then
+    if [[ ! -x "$FT_BIN" ]]; then
         log_fail "wa binary not found after build"
         exit 2
     fi
 
-    log_pass "wa binary built: $WA_BIN"
+    log_pass "wa binary built: $FT_BIN"
 
     # Check jq for JSON validation
     if command -v jq &>/dev/null; then

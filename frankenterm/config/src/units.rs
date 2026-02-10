@@ -1,5 +1,5 @@
+use frankenterm_dynamic::{FromDynamic, FromDynamicOptions, ToDynamic, Value};
 use std::str::FromStr;
-use wezterm_dynamic::{FromDynamic, FromDynamicOptions, ToDynamic, Value};
 
 #[derive(Debug, Copy, Clone)]
 pub struct OptPixelUnit(Option<Dimension>);
@@ -8,7 +8,7 @@ impl FromDynamic for OptPixelUnit {
     fn from_dynamic(
         value: &Value,
         _options: FromDynamicOptions,
-    ) -> Result<Self, wezterm_dynamic::Error> {
+    ) -> Result<Self, frankenterm_dynamic::Error> {
         match value {
             Value::Null => Ok(Self(None)),
             value => Ok(Self(Some(DefaultUnit::Pixels.from_dynamic_impl(value)?))),
@@ -35,7 +35,7 @@ impl FromDynamic for PixelUnit {
     fn from_dynamic(
         value: &Value,
         _options: FromDynamicOptions,
-    ) -> Result<Self, wezterm_dynamic::Error> {
+    ) -> Result<Self, frankenterm_dynamic::Error> {
         Ok(Self(DefaultUnit::Pixels.from_dynamic_impl(value)?))
     }
 }

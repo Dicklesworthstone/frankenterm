@@ -61,28 +61,28 @@ echo ""
 echo "--- Check 2: Feature matrix smoke ---"
 
 # Headless (no features)
-if cargo check -p wa-core 2>/dev/null; then
-    pass "cargo check -p wa-core (headless)"
+if cargo check -p frankenterm-core 2>/dev/null; then
+    pass "cargo check -p frankenterm-core (headless)"
 else
-    fail "cargo check -p wa-core (headless)"
+    fail "cargo check -p frankenterm-core (headless)"
 fi
 
 # Legacy TUI
-if cargo check -p wa-core --features tui 2>/dev/null; then
+if cargo check -p frankenterm-core --features tui 2>/dev/null; then
     pass "cargo check --features tui"
 else
     fail "cargo check --features tui"
 fi
 
 # FrankenTUI
-if cargo check -p wa-core --features ftui 2>/dev/null; then
+if cargo check -p frankenterm-core --features ftui 2>/dev/null; then
     pass "cargo check --features ftui"
 else
     fail "cargo check --features ftui"
 fi
 
 # Mutual exclusion (must FAIL)
-if cargo check -p wa-core --features tui,ftui 2>/dev/null; then
+if cargo check -p frankenterm-core --features tui,ftui 2>/dev/null; then
     fail "tui+ftui compiled — mutual exclusion broken"
 else
     pass "tui+ftui correctly rejected"
@@ -95,7 +95,7 @@ echo ""
 # ---------------------------------------------------------------------------
 echo "--- Check 3: View contract consistency ---"
 
-FTUI_STUB="crates/wa-core/src/tui/ftui_stub.rs"
+FTUI_STUB="crates/frankenterm-core/src/tui/ftui_stub.rs"
 PARITY_ADR="docs/adr/0006-parity-contract.md"
 
 # Extract View variants from code
@@ -147,7 +147,7 @@ echo ""
 # ---------------------------------------------------------------------------
 echo "--- Check 4: Adapter contract coverage ---"
 
-VIEW_ADAPTERS="crates/wa-core/src/tui/view_adapters.rs"
+VIEW_ADAPTERS="crates/frankenterm-core/src/tui/view_adapters.rs"
 
 if [ -f "$VIEW_ADAPTERS" ]; then
     EXPECTED_ADAPTERS=(

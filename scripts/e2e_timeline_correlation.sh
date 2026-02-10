@@ -126,30 +126,30 @@ check_prerequisites() {
 # Binary discovery
 # ==============================================================================
 
-WA_BINARY=""
+FT_BINARY=""
 
-find_wa_binary() {
-    if [[ -n "${WA_BINARY:-}" ]] && [[ -x "${WA_BINARY:-}" ]]; then
+find_ft_binary() {
+    if [[ -n "${FT_BINARY:-}" ]] && [[ -x "${FT_BINARY:-}" ]]; then
         return 0
     fi
 
     # Try release build first, then debug
     for candidate in \
-        "$PROJECT_ROOT/target/release/wa" \
+        "$PROJECT_ROOT/target/release/ft" \
         "$PROJECT_ROOT/target/debug/wa"; do
         if [[ -x "$candidate" ]]; then
-            WA_BINARY="$candidate"
-            log_pass "wa binary: $WA_BINARY"
+            FT_BINARY="$candidate"
+            log_pass "wa binary: $FT_BINARY"
             return 0
         fi
     done
 
     # Build if not found
     log_info "Building wa binary..."
-    if cargo build -p wa --quiet 2>/dev/null; then
-        WA_BINARY="$PROJECT_ROOT/target/debug/wa"
-        if [[ -x "$WA_BINARY" ]]; then
-            log_pass "wa binary built: $WA_BINARY"
+    if cargo build -p frankenterm --quiet 2>/dev/null; then
+        FT_BINARY="$PROJECT_ROOT/target/debug/wa"
+        if [[ -x "$FT_BINARY" ]]; then
+            log_pass "wa binary built: $FT_BINARY"
             return 0
         fi
     fi
@@ -173,7 +173,7 @@ setup_workspace() {
     TEMP_WORKSPACE="$(mktemp -d /tmp/wa-e2e-timeline-XXXXXX)"
     local wa_dir="$TEMP_WORKSPACE/.wa"
     mkdir -p "$wa_dir"
-    DB_PATH="$wa_dir/wa.db"
+    DB_PATH="$wa_dir/ft.db"
 
     # Calculate a stable "now" in epoch ms
     NOW_MS=$(date +%s)000
@@ -184,10 +184,10 @@ setup_workspace() {
 
     # Initialize the DB by running wa db migrate (creates schema + migrations)
     export WA_DATA_DIR="$wa_dir"
-    export WA_WORKSPACE="$TEMP_WORKSPACE"
+    export FT_WORKSPACE="$TEMP_WORKSPACE"
 
-    "$WA_BINARY" db migrate --yes > "$TEMP_WORKSPACE/db_migrate.log" 2>&1 || true
-    "$WA_BINARY" db check -f json > "$TEMP_WORKSPACE/db_check.json" 2>&1 || true
+    "$FT_BINARY" db migrate --yes > "$TEMP_WORKSPACE/db_migrate.log" 2>&1 || true
+    "$FT_BINARY" db check -f json > "$TEMP_WORKSPACE/db_check.json" 2>&1 || true
 
     if [[ ! -f "$DB_PATH" ]]; then
         echo -e "${RED}ERROR:${NC} DB not created at $DB_PATH" >&2
@@ -255,7 +255,7 @@ SQL
 
     # Query timeline in JSON mode
     local output
-    output=$("$WA_BINARY" timeline --last 30m -f json --limit 100 2>/dev/null) || {
+    output=$("$FT_BINARY" timeline --last 30m -f json --limit 100 2>/dev/null) || {
         log_fail "S1.1: wa timeline JSON query failed"
         return 1
     }
@@ -347,7 +347,7 @@ SQL
 
     # Query timeline in JSON
     local output
-    output=$("$WA_BINARY" timeline --last 30m -f json --limit 200 2>/dev/null) || {
+    output=$("$FT_BINARY" timeline --last 30m -f json --limit 200 2>/dev/null) || {
         log_fail "S2.1: wa timeline JSON query failed"
         return 1
     }
@@ -438,7 +438,7 @@ SQL
 
     # Query timeline
     local output
-    output=$("$WA_BINARY" timeline --last 30m -f json --limit 200 2>/dev/null) || {
+    output=$("$FT_BINARY" timeline --last 30m -f json --limit 200 2>/dev/null) || {
         log_fail "S3.1: wa timeline JSON query failed"
         return 1
     }
@@ -490,7 +490,7 @@ scenario_human_readable() {
 
     # Query timeline in plain text
     local output
-    output=$("$WA_BINARY" timeline --last 30m -f plain --limit 200 2>/dev/null) || {
+    output=$("$FT_BINARY" timeline --last 30m -f plain --limit 200 2>/dev/null) || {
         log_fail "S4.1: wa timeline plain query failed"
         return 1
     }
@@ -568,7 +568,7 @@ SQL
     start_time=$(date +%s%N)
 
     local output
-    output=$("$WA_BINARY" timeline --last 60m -f json --limit 1100 2>/dev/null) || {
+    output=$("$FT_BINARY" timeline --last 60m -f json --limit 1100 2>/dev/null) || {
         log_fail "S5.1: wa timeline query with 1k events failed"
         return 1
     }
@@ -619,7 +619,7 @@ scenario_json_schema() {
     log_test "Scenario 6: JSON schema stability"
 
     local output
-    output=$("$WA_BINARY" timeline --last 30m -f json --limit 50 2>/dev/null) || {
+    output=$("$FT_BINARY" timeline --last 30m -f json --limit 50 2>/dev/null) || {
         log_fail "S6.1: wa timeline JSON query failed"
         return 1
     }
@@ -685,7 +685,7 @@ main() {
     echo -e "${BLUE}================================================${NC}"
 
     check_prerequisites
-    find_wa_binary
+    find_ft_binary
 
     e2e_init_artifacts "timeline-correlation" >/dev/null
 

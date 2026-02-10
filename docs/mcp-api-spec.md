@@ -1,7 +1,7 @@
 # MCP API Spec (v1)
 
 This document defines the MCP surface for wa (WezTerm Automata). The MCP API
-mirrors `wa robot` for parity, stability, and token-efficient responses.
+mirrors `ft robot` for parity, stability, and token-efficient responses.
 
 ## Goals
 - Stable, versioned surface for agent integrations.
@@ -47,7 +47,7 @@ Notes:
 
 ## Tool List (v1)
 
-All tools mirror `wa robot` semantics and schemas.
+All tools mirror `ft robot` semantics and schemas.
 
 | Tool | Description | Data Schema |
 |------|-------------|-------------|

@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use wa_core::ingest::{Osc133State, parse_osc133_markers};
+use frankenterm_core::ingest::{Osc133State, parse_osc133_markers};
 
 fuzz_target!(|data: &[u8]| {
     if data.len() > 64_000 {

@@ -1,4 +1,4 @@
-# Incident Bundles and `wa reproduce`
+# Incident Bundles and `ft reproduce`
 
 Incident bundles are self-contained directories that capture enough context
 to diagnose a problem without access to the original machine. They are
@@ -299,7 +299,7 @@ $ wa reproduce replay /path/to/bundle --mode workflow
 
 ### Before sharing
 
-1. Run `wa reproduce replay --mode policy` to verify redaction
+1. Run `ft reproduce replay --mode policy` to verify redaction
 2. Review `redaction_report.json` to confirm secrets were caught
 3. Check that the privacy budget tier matches your sharing context
    (use `strict` for external vendors)
@@ -394,7 +394,7 @@ early startup failures).
 ### Redaction missed a secret
 
 Report the pattern to improve detection. The redactor uses the same
-patterns as `wa secrets scan`. Verify with:
+patterns as `ft secrets scan`. Verify with:
 
 ```bash
 wa reproduce replay /path/to/bundle --mode policy

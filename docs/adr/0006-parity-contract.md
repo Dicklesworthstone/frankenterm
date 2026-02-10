@@ -169,9 +169,9 @@ are unchanged by the migration.
 
 ## References
 
-- Current views: `crates/wa-core/src/tui/views.rs`
-- Current event loop: `crates/wa-core/src/tui/app.rs`
-- Current keybindings: `crates/wa-core/src/tui/app.rs:170-540`
+- Current views: `crates/frankenterm-core/src/tui/views.rs`
+- Current event loop: `crates/frankenterm-core/src/tui/app.rs`
+- Current keybindings: `crates/frankenterm-core/src/tui/app.rs:170-540`
 - ADR-0001: Migration decision
 - ADR-0003: Migration scope and constraints
 - Ring map: ADR-0005

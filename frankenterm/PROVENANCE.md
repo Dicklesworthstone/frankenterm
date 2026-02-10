@@ -13,15 +13,15 @@ binary crates.
 
 ## Crates included
 
-async_ossl, bintree, codec, config, wezterm-config-derive, filedescriptor,
+async_ossl, bintree, codec, config, frankenterm-config-derive, filedescriptor,
 luahelper, mux, portable-pty, procinfo, promise, rangeset, termwiz,
-termwiz-funcs, umask, vtparse, wezterm-bidi, wezterm-blob-leases,
-wezterm-cell, wezterm-char-props, wezterm-color-types, wezterm-dynamic,
-wezterm-dynamic-derive, wezterm-escape-parser, wezterm-input-types,
-wezterm-ssh, wezterm-surface, wezterm-term, wezterm-uds
+termwiz-funcs, umask, vtparse, frankenterm-bidi, frankenterm-blob-leases,
+frankenterm-cell, frankenterm-char-props, frankenterm-color-types, frankenterm-dynamic,
+frankenterm-dynamic-derive, frankenterm-escape-parser, frankenterm-input-types,
+frankenterm-ssh, frankenterm-surface, frankenterm-term, frankenterm-uds
 
 ## Ownership
 
-This code is now owned by the wezterm_automata project. Radical modifications
+This code is now owned by the FrankenTerm project. Radical modifications
 (memory leak fixes, Lua removal, custom allocators, event hooks) are expected.
 Upstream compatibility is NOT maintained.

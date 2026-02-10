@@ -4,6 +4,16 @@
 use super::*;
 use crate::color::{ColorPalette, RgbColor};
 use crate::config::{BidiMode, NewlineCanon};
+use frankenterm_bidi::ParagraphDirectionHint;
+use frankenterm_cell::image::ImageData;
+use frankenterm_cell::UnicodeVersion;
+use frankenterm_escape_parser::csi::{
+    Cursor, CursorStyle, DecPrivateMode, DecPrivateModeCode, Device, Edit, EraseInDisplay,
+    EraseInLine, Mode, Sgr, TabulationClear, TerminalMode, TerminalModeCode, Window, XtSmGraphics,
+    XtSmGraphicsAction, XtSmGraphicsItem, XtSmGraphicsStatus, XtermKeyModifierResource,
+};
+use frankenterm_escape_parser::{OneBased, OperatingSystemCommand, CSI};
+use frankenterm_surface::{CursorShape, CursorVisibility, SequenceNo};
 use log::debug;
 use num_traits::ToPrimitive;
 use std::collections::HashMap;
@@ -14,16 +24,6 @@ use std::sync::Arc;
 use terminfo::{Database, Value};
 use termwiz::input::KeyboardEncoding;
 use url::Url;
-use wezterm_bidi::ParagraphDirectionHint;
-use wezterm_cell::image::ImageData;
-use wezterm_cell::UnicodeVersion;
-use wezterm_escape_parser::csi::{
-    Cursor, CursorStyle, DecPrivateMode, DecPrivateModeCode, Device, Edit, EraseInDisplay,
-    EraseInLine, Mode, Sgr, TabulationClear, TerminalMode, TerminalModeCode, Window, XtSmGraphics,
-    XtSmGraphicsAction, XtSmGraphicsItem, XtSmGraphicsStatus, XtermKeyModifierResource,
-};
-use wezterm_escape_parser::{OneBased, OperatingSystemCommand, CSI};
-use wezterm_surface::{CursorShape, CursorVisibility, SequenceNo};
 
 mod image;
 mod iterm;

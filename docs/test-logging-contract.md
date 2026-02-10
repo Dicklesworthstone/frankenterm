@@ -14,7 +14,7 @@ This document defines the logging and artifact contract for all tests in `wa`. F
 
 This contract applies to:
 - **Unit tests** (`cargo test`)
-- **Integration tests** (`crates/wa-core/tests/`)
+- **Integration tests** (`crates/frankenterm-core/tests/`)
 - **E2E tests** (`scripts/e2e_test.sh`)
 - **Benchmarks** (`cargo bench`)
 
@@ -446,8 +446,8 @@ For a test to comply with this contract:
 ## Related Documents
 
 - **[E2E Harness Spec](e2e-harness-spec.md)** - E2E test harness specification
-- **[wa-core/src/logging.rs](../crates/wa-core/src/logging.rs)** - Logging implementation
-- **[wa-core/src/policy.rs](../crates/wa-core/src/policy.rs)** - Redactor implementation
+- **[frankenterm-core/src/logging.rs](../crates/frankenterm-core/src/logging.rs)** - Logging implementation
+- **[frankenterm-core/src/policy.rs](../crates/frankenterm-core/src/policy.rs)** - Redactor implementation
 
 ---
 

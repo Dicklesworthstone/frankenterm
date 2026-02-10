@@ -16,22 +16,22 @@ wa is migrating its TUI backend from ratatui+crossterm to FrankenTUI (ftui). Bot
 | `tui` | ratatui + crossterm (legacy) | Production, will be decommissioned |
 | `ftui` | FrankenTUI | Migration target, will become default |
 
-These features are **mutually exclusive** — enabling both causes a `compile_error!` (enforced in `wa-core/src/lib.rs`).
+These features are **mutually exclusive** — enabling both causes a `compile_error!` (enforced in `frankenterm-core/src/lib.rs`).
 
 ### Building and Testing
 
 ```bash
 # Headless (no TUI, robot/CLI/MCP only)
-cargo check -p wa-core
-cargo test -p wa-core
+cargo check -p frankenterm-core
+cargo test -p frankenterm-core
 
 # Legacy TUI
-cargo check -p wa-core --features tui
-cargo test -p wa-core --features tui --lib
+cargo check -p frankenterm-core --features tui
+cargo test -p frankenterm-core --features tui --lib
 
 # FrankenTUI (migration target)
-cargo check -p wa-core --features ftui
-cargo test -p wa-core --features ftui --lib
+cargo check -p frankenterm-core --features ftui
+cargo test -p frankenterm-core --features ftui --lib
 
 # Full binary
 cargo check -p wa --features ftui,mcp,web,metrics
@@ -44,7 +44,7 @@ See `docs/ftui-cargo-feature-matrix.md` for the complete feature matrix.
 ### TUI Module Layout
 
 ```
-crates/wa-core/src/tui/
+crates/frankenterm-core/src/tui/
 ├── mod.rs              # cfg-gated re-exports
 ├── terminal_session.rs # Shared: alt-screen, raw mode, SessionGuard
 ├── command_handoff.rs  # Shared: suspend/resume for subprocess exec

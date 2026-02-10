@@ -1,7 +1,7 @@
 use super::*;
 use crate::terminalstate::performer::Performer;
+use frankenterm_escape_parser::parser::Parser;
 use std::sync::Arc;
-use wezterm_escape_parser::parser::Parser;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
@@ -29,7 +29,7 @@ impl Clipboard for Box<dyn Clipboard> {
 }
 
 pub trait DeviceControlHandler: Send + Sync {
-    fn handle_device_control(&mut self, _control: wezterm_escape_parser::DeviceControlMode);
+    fn handle_device_control(&mut self, _control: frankenterm_escape_parser::DeviceControlMode);
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -173,7 +173,7 @@ impl Terminal {
         self.trigger_unseen_output_notif();
     }
 
-    pub fn perform_actions(&mut self, actions: Vec<wezterm_escape_parser::Action>) {
+    pub fn perform_actions(&mut self, actions: Vec<frankenterm_escape_parser::Action>) {
         self.state.increment_seqno();
         {
             let mut performer = Performer::new(&mut self.state);

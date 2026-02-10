@@ -5,6 +5,9 @@ use crate::{
     TextStyle,
 };
 use anyhow::{anyhow, Context};
+use frankenterm_dynamic::{
+    FromDynamic, FromDynamicOptions, ToDynamic, UnknownFieldAction, Value as DynValue,
+};
 use luahelper::{from_lua_value_dynamic, lua_value_to_dynamic, to_lua};
 use mlua::{FromLua, IntoLuaMulti, Lua, Table, Value, Variadic};
 use ordered_float::NotNan;
@@ -12,9 +15,6 @@ use portable_pty::CommandBuilder;
 use std::convert::TryFrom;
 use std::path::Path;
 use std::sync::Mutex;
-use wezterm_dynamic::{
-    FromDynamic, FromDynamicOptions, ToDynamic, UnknownFieldAction, Value as DynValue,
-};
 
 pub use mlua;
 
@@ -169,7 +169,7 @@ fn config_builder_new_index<'lua>(
                             break;
                         }
                     }
-                    wezterm_dynamic::Error::warn(message);
+                    frankenterm_dynamic::Error::warn(message);
                 }
                 Some(_dvalue) => {
                     myself.raw_set(key, value)?;

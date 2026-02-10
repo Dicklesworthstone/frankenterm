@@ -8,6 +8,7 @@ use config::keyassignment::SpawnTabDomain;
 use config::{configuration, ExitBehavior, GuiPosition};
 use domain::{Domain, DomainId, DomainState, SplitSource};
 use filedescriptor::{poll, pollfd, socketpair, AsRawSocketDescriptor, FileDescriptor, POLLIN};
+use frankenterm_term::{Clipboard, ClipboardSelection, DownloadHandler, TerminalSize};
 #[cfg(unix)]
 use libc::{c_int, SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
 use log::error;
@@ -29,7 +30,6 @@ use std::time::{Duration, Instant};
 use termwiz::escape::csi::{DecPrivateMode, DecPrivateModeCode, Device, Mode};
 use termwiz::escape::{Action, CSI};
 use thiserror::*;
-use wezterm_term::{Clipboard, ClipboardSelection, DownloadHandler, TerminalSize};
 #[cfg(windows)]
 use winapi::um::winsock2::{SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
 
@@ -65,7 +65,7 @@ pub enum MuxNotification {
     ActiveWorkspaceChanged(Arc<ClientId>),
     Alert {
         pane_id: PaneId,
-        alert: wezterm_term::Alert,
+        alert: frankenterm_term::Alert,
     },
     Empty,
     AssignClipboard {
@@ -1454,7 +1454,7 @@ impl Clipboard for MuxClipboard {
 
 struct MuxDownloader {}
 
-impl wezterm_term::DownloadHandler for MuxDownloader {
+impl frankenterm_term::DownloadHandler for MuxDownloader {
     fn save_to_downloads(&self, name: Option<String>, data: Vec<u8>) {
         if let Some(mux) = Mux::try_get() {
             mux.notify(MuxNotification::SaveToDownloads {

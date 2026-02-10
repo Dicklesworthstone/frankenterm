@@ -1,6 +1,7 @@
 use config::lua::get_or_create_module;
 use config::lua::mlua::{self, IntoLua, Lua};
 use finl_unicode::grapheme_clusters::Graphemes;
+use frankenterm_dynamic::{FromDynamic, ToDynamic};
 use luahelper::impl_lua_conversion_dynamic;
 use std::str::FromStr;
 use termwiz::caps::{Capabilities, ColorLevel, ProbeHints};
@@ -9,7 +10,6 @@ use termwiz::color::{AnsiColor, ColorAttribute, ColorSpec, SrgbaTuple};
 use termwiz::render::terminfo::TerminfoRenderer;
 use termwiz::surface::change::Change;
 use termwiz::surface::Line;
-use wezterm_dynamic::{FromDynamic, ToDynamic};
 
 pub fn register(lua: &Lua) -> anyhow::Result<()> {
     let wezterm_mod = get_or_create_module(lua, "wezterm")?;
@@ -137,7 +137,7 @@ impl termwiz::render::RenderTty for FormatTarget {
 pub fn format_as_escapes(items: Vec<FormatItem>) -> anyhow::Result<String> {
     let mut changes: Vec<Change> = items.into_iter().map(Into::into).collect();
     changes.push(Change::AllAttributes(CellAttributes::default()).into());
-    let mut renderer = new_wezterm_terminfo_renderer();
+    let mut renderer = new_frankenterm_terminfo_renderer();
     let mut target = FormatTarget { target: vec![] };
     renderer.render_to(&changes, &mut target)?;
     Ok(String::from_utf8(target.target)?)
@@ -203,7 +203,7 @@ fn permute_mods<'lua>(
     item: mlua::Table,
     allow_none: bool,
 ) -> mlua::Result<Vec<mlua::Value<'lua>>> {
-    use wezterm_input_types::Modifiers;
+    use frankenterm_input_types::Modifiers;
 
     let mut result = vec![];
     for ctrl in &[Modifiers::NONE, Modifiers::CTRL] {
@@ -261,7 +261,7 @@ lazy_static::lazy_static! {
     };
 }
 
-pub fn new_wezterm_terminfo_renderer() -> TerminfoRenderer {
+pub fn new_frankenterm_terminfo_renderer() -> TerminfoRenderer {
     TerminfoRenderer::new(CAPS.clone())
 }
 
@@ -276,7 +276,7 @@ pub fn lines_to_escapes(lines: Vec<Line>) -> anyhow::Result<String> {
         }
     }
     changes.push(Change::AllAttributes(CellAttributes::blank()));
-    let mut renderer = new_wezterm_terminfo_renderer();
+    let mut renderer = new_frankenterm_terminfo_renderer();
 
     struct Target {
         target: Vec<u8>,

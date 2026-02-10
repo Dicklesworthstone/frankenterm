@@ -127,7 +127,7 @@ scenario_bundle_format_contracts() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p wa-core 'incident_bundle::tests' \
+    cargo test -p frankenterm-core 'incident_bundle::tests' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -187,7 +187,7 @@ scenario_crash_bundle_redaction() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p wa-core --test incident_bundle_tests 'crash_bundle_redacts' \
+    cargo test -p frankenterm-core --test incident_bundle_tests 'crash_bundle_redacts' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -222,7 +222,7 @@ scenario_incident_bundle_collector() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p wa-core --test incident_bundle_tests 'collect_incident_bundle' \
+    cargo test -p frankenterm-core --test incident_bundle_tests 'collect_incident_bundle' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -257,7 +257,7 @@ scenario_replay_validation() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p wa-core --test incident_bundle_tests 'replay' \
+    cargo test -p frankenterm-core --test incident_bundle_tests 'replay' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -292,7 +292,7 @@ scenario_crash_module_tests() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p wa-core 'crash::tests' \
+    cargo test -p frankenterm-core 'crash::tests' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -343,7 +343,7 @@ scenario_redaction_standalone() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p wa-core 'redact' \
+    cargo test -p frankenterm-core 'redact' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -385,7 +385,7 @@ scenario_replay_module() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p wa-core 'replay::tests' \
+    cargo test -p frankenterm-core 'replay::tests' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -437,7 +437,7 @@ scenario_edge_cases() {
     exit_code=0
 
     # Run full integration test suite and validate edge cases are present
-    cargo test -p wa-core --test incident_bundle_tests \
+    cargo test -p frankenterm-core --test incident_bundle_tests \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -474,7 +474,7 @@ scenario_bounded_execution() {
     start_time=$(date +%s)
     exit_code=0
 
-    timeout 120 cargo test -p wa-core --test incident_bundle_tests \
+    timeout 120 cargo test -p frankenterm-core --test incident_bundle_tests \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 

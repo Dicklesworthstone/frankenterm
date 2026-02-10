@@ -16,8 +16,8 @@ wa has multiple subsystems that produce terminal output:
 
 1. **TUI** - Renders interactive views (ratatui widgets via crossterm)
 2. **Watcher daemon** - Logs capture progress, pattern matches, errors
-3. **CLI commands** - Human-readable output from `wa status`, `wa search`, etc.
-4. **Subprocess output** - Commands launched from TUI actions (e.g., `wa send`)
+3. **CLI commands** - Human-readable output from `ft status`, `ft search`, etc.
+4. **Subprocess output** - Commands launched from TUI actions (e.g., `ft send`)
 
 Currently, the TUI uses crossterm's alternate screen to isolate itself, but:
 
@@ -34,7 +34,7 @@ Currently, the TUI uses crossterm's alternate screen to isolate itself, but:
 | Logging | sink to buffer or file | restored to stderr | sink to buffer |
 | Subprocess output | captured, not displayed | direct to terminal | captured |
 | Workflow runners | silent (sink/file) | direct to terminal | captured |
-| wa status/show | prohibited | allowed | prohibited |
+| ft status/show | prohibited | allowed | prohibited |
 
 ## Rules
 
@@ -117,6 +117,6 @@ should be caught by tests, not runtime panics.
 
 ## References
 
-- Current alt-screen handling: `crates/wa-core/src/tui/app.rs:101-131`
-- Current command handoff: `crates/wa-core/src/tui/app.rs` `run_command` method
+- Current alt-screen handling: `crates/frankenterm-core/src/tui/app.rs:101-131`
+- Current command handoff: `crates/frankenterm-core/src/tui/app.rs` `run_command` method
 - Related bead: wa-2qyt (FTUI-03.1 terminal session ownership abstraction)

@@ -12,7 +12,7 @@
 #   - No secrets leak into logs/artifacts
 #
 # Requirements:
-#   - wa binary built (cargo build -p wa)
+#   - wa binary built (cargo build -p frankenterm)
 #   - jq for JSON manipulation
 #   - sqlite3 for test data population
 # =============================================================================
@@ -45,7 +45,7 @@ TESTS_FAILED=0
 TESTS_SKIPPED=0
 
 # Configuration
-WA_BIN=""
+FT_BIN=""
 VERBOSE=false
 
 # Temp workspaces (cleaned up at exit)
@@ -109,7 +109,7 @@ log_info() {
 # Run wa command, extracting JSON from output (strips log lines)
 run_wa_json() {
     local raw_output
-    raw_output=$("$WA_BIN" "$@" 2>/dev/null) || true
+    raw_output=$("$FT_BIN" "$@" 2>/dev/null) || true
     # Extract JSON (first { to last })
     echo "$raw_output" | awk '/^{/{found=1} found{print}'
 }
@@ -182,14 +182,14 @@ assert_fails() {
 create_workspace() {
     local ws
     ws=$(mktemp -d)
-    "$WA_BIN" db migrate --workspace "$ws" --yes >/dev/null 2>&1
+    "$FT_BIN" db migrate --workspace "$ws" --yes >/dev/null 2>&1
     echo "$ws"
 }
 
 # Populate a workspace with test data (pane + segments + event)
 populate_workspace() {
     local ws="$1"
-    local db_path="$ws/.wa/wa.db"
+    local db_path="$ws/.ft/ft.db"
     local epoch_ms
     epoch_ms=$(date +%s)000
 
@@ -219,14 +219,14 @@ check_prerequisites() {
     log_test "Prerequisites"
 
     if [[ -x "$PROJECT_ROOT/target/debug/wa" ]]; then
-        WA_BIN="$PROJECT_ROOT/target/debug/wa"
-    elif [[ -x "$PROJECT_ROOT/target/release/wa" ]]; then
-        WA_BIN="$PROJECT_ROOT/target/release/wa"
+        FT_BIN="$PROJECT_ROOT/target/debug/wa"
+    elif [[ -x "$PROJECT_ROOT/target/release/ft" ]]; then
+        FT_BIN="$PROJECT_ROOT/target/release/ft"
     else
-        echo -e "${RED}ERROR:${NC} wa binary not found. Run: cargo build -p wa" >&2
+        echo -e "${RED}ERROR:${NC} wa binary not found. Run: cargo build -p frankenterm" >&2
         exit 5
     fi
-    log_pass "P.1: wa binary found: $WA_BIN"
+    log_pass "P.1: wa binary found: $FT_BIN"
 
     if ! command -v jq &>/dev/null; then
         echo -e "${RED}ERROR:${NC} jq not found" >&2
@@ -255,9 +255,9 @@ test_roundtrip() {
 
     # Record evidence from workspace A
     local pane_count_a seg_count_a event_count_a
-    pane_count_a=$(get_count "$WORKSPACE_A/.wa/wa.db" "panes")
-    seg_count_a=$(get_count "$WORKSPACE_A/.wa/wa.db" "output_segments")
-    event_count_a=$(get_count "$WORKSPACE_A/.wa/wa.db" "events")
+    pane_count_a=$(get_count "$WORKSPACE_A/.ft/ft.db" "panes")
+    seg_count_a=$(get_count "$WORKSPACE_A/.ft/ft.db" "output_segments")
+    event_count_a=$(get_count "$WORKSPACE_A/.ft/ft.db" "events")
 
     log_info "Workspace A: panes=$pane_count_a, segments=$seg_count_a, events=$event_count_a"
 
@@ -316,9 +316,9 @@ test_roundtrip() {
 
     # 1.12: Workspace B has same data as workspace A
     local pane_count_b seg_count_b event_count_b
-    pane_count_b=$(get_count "$WORKSPACE_B/.wa/wa.db" "panes")
-    seg_count_b=$(get_count "$WORKSPACE_B/.wa/wa.db" "output_segments")
-    event_count_b=$(get_count "$WORKSPACE_B/.wa/wa.db" "events")
+    pane_count_b=$(get_count "$WORKSPACE_B/.ft/ft.db" "panes")
+    seg_count_b=$(get_count "$WORKSPACE_B/.ft/ft.db" "output_segments")
+    event_count_b=$(get_count "$WORKSPACE_B/.ft/ft.db" "events")
 
     if [[ "$pane_count_b" == "$pane_count_a" ]]; then
         log_pass "1.12: pane count matches after import ($pane_count_b)"
@@ -340,7 +340,7 @@ test_roundtrip() {
 
     # 1.15: Verify the unique token is searchable in workspace B
     local token_hit
-    token_hit=$(sqlite3 "$WORKSPACE_B/.wa/wa.db" "SELECT COUNT(*) FROM output_segments WHERE content LIKE '%TOKEN_BACKUP_ABC123%';" 2>/dev/null || echo "0")
+    token_hit=$(sqlite3 "$WORKSPACE_B/.ft/ft.db" "SELECT COUNT(*) FROM output_segments WHERE content LIKE '%TOKEN_BACKUP_ABC123%';" 2>/dev/null || echo "0")
     if [[ "$token_hit" -gt 0 ]]; then
         log_pass "1.15: unique token found in workspace B"
     else
@@ -349,7 +349,7 @@ test_roundtrip() {
 
     # 1.16: FTS index works after import
     local fts_hit
-    fts_hit=$(sqlite3 "$WORKSPACE_B/.wa/wa.db" "SELECT COUNT(*) FROM output_segments_fts WHERE output_segments_fts MATCH 'TOKEN_BACKUP_ABC123';" 2>/dev/null || echo "0")
+    fts_hit=$(sqlite3 "$WORKSPACE_B/.ft/ft.db" "SELECT COUNT(*) FROM output_segments_fts WHERE output_segments_fts MATCH 'TOKEN_BACKUP_ABC123';" 2>/dev/null || echo "0")
     if [[ "$fts_hit" -gt 0 ]]; then
         log_pass "1.16: FTS search works after import"
     else
@@ -373,7 +373,7 @@ test_corrupt_backup() {
 
     # Export a valid backup
     local export_json
-    export_json=$(run_wa_json backup export --workspace "$WORKSPACE_A" -f json -o "$WORKSPACE_A/.wa/backups/corrupt_test")
+    export_json=$(run_wa_json backup export --workspace "$WORKSPACE_A" -f json -o "$WORKSPACE_A/.ft/backups/corrupt_test")
     local export_path
     export_path=$(echo "$export_json" | jq -r '.data.output_path' 2>/dev/null || echo "")
 
@@ -383,7 +383,7 @@ test_corrupt_backup() {
     fi
 
     # 2.1: Corrupt the database file by appending garbage
-    local corrupt_backup="$WORKSPACE_A/.wa/backups/corrupt_test_bad"
+    local corrupt_backup="$WORKSPACE_A/.ft/backups/corrupt_test_bad"
     cp -r "$export_path" "$corrupt_backup"
     printf 'GARBAGE_DATA_CORRUPTION_12345' >> "$corrupt_backup/database.db"
 
@@ -409,7 +409,7 @@ test_corrupt_backup() {
     fi
 
     # 2.3: Corrupt the manifest checksum (verification uses manifest.db_checksum)
-    local corrupt_manifest="$WORKSPACE_A/.wa/backups/corrupt_test_manifest"
+    local corrupt_manifest="$WORKSPACE_A/.ft/backups/corrupt_test_manifest"
     cp -r "$export_path" "$corrupt_manifest"
     # Replace the db_checksum in manifest.json with a wrong value
     local tmp_manifest
@@ -451,12 +451,12 @@ test_corrupt_backup() {
     fi
 
     # 2.6: Missing manifest causes failure (returns non-JSON error)
-    local no_manifest="$WORKSPACE_A/.wa/backups/no_manifest_test"
+    local no_manifest="$WORKSPACE_A/.ft/backups/no_manifest_test"
     mkdir -p "$no_manifest"
     cp "$export_path/database.db" "$no_manifest/" 2>/dev/null || true
 
     local no_manifest_exit=0
-    "$WA_BIN" backup import --workspace "$(mktemp -d)" "$no_manifest" --verify -f json >/dev/null 2>&1 || no_manifest_exit=$?
+    "$FT_BIN" backup import --workspace "$(mktemp -d)" "$no_manifest" --verify -f json >/dev/null 2>&1 || no_manifest_exit=$?
     if [[ "$no_manifest_exit" -ne 0 ]]; then
         log_pass "2.5: missing manifest is detected (exit=$no_manifest_exit)"
     else
@@ -477,14 +477,14 @@ test_safety_backup() {
 
     # Record C's original data
     local orig_seg_count
-    orig_seg_count=$(get_count "$WORKSPACE_C/.wa/wa.db" "output_segments")
+    orig_seg_count=$(get_count "$WORKSPACE_C/.ft/ft.db" "output_segments")
     log_info "Workspace C original segments: $orig_seg_count"
 
     # Export from workspace A (if available) or create a new backup
     local backup_for_import
     if [[ -n "$WORKSPACE_A" && -d "$WORKSPACE_A" ]]; then
         local export_json
-        export_json=$(run_wa_json backup export --workspace "$WORKSPACE_A" -f json -o "$WORKSPACE_A/.wa/backups/safety_test")
+        export_json=$(run_wa_json backup export --workspace "$WORKSPACE_A" -f json -o "$WORKSPACE_A/.ft/backups/safety_test")
         backup_for_import=$(echo "$export_json" | jq -r '.data.output_path' 2>/dev/null || echo "")
     fi
 
@@ -566,7 +566,7 @@ test_export_options() {
 
     # 4.1: Export with --sql-dump
     local sqldump_json
-    sqldump_json=$(run_wa_json backup export --workspace "$WORKSPACE_A" -f json --sql-dump -o "$WORKSPACE_A/.wa/backups/sqldump_test")
+    sqldump_json=$(run_wa_json backup export --workspace "$WORKSPACE_A" -f json --sql-dump -o "$WORKSPACE_A/.ft/backups/sqldump_test")
     assert_json_eq "$sqldump_json" '.ok' "true" "4.1: export with --sql-dump succeeds"
 
     local sqldump_path
@@ -592,7 +592,7 @@ test_export_options() {
 
     # 4.4: Export with --no-verify
     local noverify_json
-    noverify_json=$(run_wa_json backup export --workspace "$WORKSPACE_A" -f json --no-verify -o "$WORKSPACE_A/.wa/backups/noverify_test")
+    noverify_json=$(run_wa_json backup export --workspace "$WORKSPACE_A" -f json --no-verify -o "$WORKSPACE_A/.ft/backups/noverify_test")
     assert_json_eq "$noverify_json" '.ok' "true" "4.4: export with --no-verify succeeds"
 
     # 4.5: Total size is reported
@@ -619,7 +619,7 @@ test_dry_run() {
     fi
 
     local export_json
-    export_json=$(run_wa_json backup export --workspace "$WORKSPACE_A" -f json -o "$WORKSPACE_A/.wa/backups/dryrun_source")
+    export_json=$(run_wa_json backup export --workspace "$WORKSPACE_A" -f json -o "$WORKSPACE_A/.ft/backups/dryrun_source")
     local backup_path
     backup_path=$(echo "$export_json" | jq -r '.data.output_path' 2>/dev/null || echo "")
 
@@ -635,7 +635,7 @@ test_dry_run() {
 
     # Record original state
     local orig_checksum
-    orig_checksum=$(sha256sum "$target_ws/.wa/wa.db" | awk '{print $1}')
+    orig_checksum=$(sha256sum "$target_ws/.ft/ft.db" | awk '{print $1}')
 
     # 5.1: Dry-run import
     local dryrun_json
@@ -645,7 +645,7 @@ test_dry_run() {
 
     # 5.3: Database was NOT modified
     local new_checksum
-    new_checksum=$(sha256sum "$target_ws/.wa/wa.db" | awk '{print $1}')
+    new_checksum=$(sha256sum "$target_ws/.ft/ft.db" | awk '{print $1}')
     if [[ "$orig_checksum" == "$new_checksum" ]]; then
         log_pass "5.3: database unchanged after dry-run (checksum matches)"
     else
@@ -699,7 +699,7 @@ test_no_secrets() {
     fi
 
     # Scan backup directory for secret-like patterns
-    local backup_dir="$WORKSPACE_A/.wa/backups"
+    local backup_dir="$WORKSPACE_A/.ft/backups"
     if [[ ! -d "$backup_dir" ]]; then
         log_skip "7.1: no backup directory to scan"
         return

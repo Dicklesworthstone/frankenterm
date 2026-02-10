@@ -1,6 +1,10 @@
 use crate::default_true;
 use crate::keys::KeyNoAction;
 use crate::window::WindowLevel;
+use frankenterm_dynamic::{FromDynamic, FromDynamicOptions, ToDynamic, Value};
+use frankenterm_input_types::{KeyCode, Modifiers};
+use frankenterm_term::input::MouseButton;
+use frankenterm_term::SemanticType;
 use luahelper::impl_lua_conversion_dynamic;
 use ordered_float::NotNan;
 use portable_pty::CommandBuilder;
@@ -8,10 +12,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::path::PathBuf;
-use wezterm_dynamic::{FromDynamic, FromDynamicOptions, ToDynamic, Value};
-use wezterm_input_types::{KeyCode, Modifiers};
-use wezterm_term::input::MouseButton;
-use wezterm_term::SemanticType;
 
 #[derive(Default, Debug, Clone, FromDynamic, ToDynamic, PartialEq, Eq)]
 pub struct LauncherActionArgs {

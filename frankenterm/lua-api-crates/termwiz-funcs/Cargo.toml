@@ -14,5 +14,5 @@ lazy_static.workspace = true
 luahelper.workspace = true
 terminfo.workspace = true
 termwiz = { workspace=true, features=["use_serde"] }
-wezterm-dynamic.workspace = true
-wezterm-input-types.workspace = true
+frankenterm-dynamic.workspace = true
+frankenterm-input-types.workspace = true

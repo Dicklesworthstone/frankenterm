@@ -76,10 +76,10 @@ already been consumed, you must re-run prepare and approve again.
 
 Common refusal reasons and what to do next:
 
-- Plan not found: re-run `wa prepare ...` to create a new plan.
+- Plan not found: re-run `ft prepare ...` to create a new plan.
 - Plan expired: re-run prepare and approve again.
 - Plan hash mismatch: re-run prepare; approvals only work for the exact plan.
-- Approval missing: run `wa approve <code>` or pass `--approval-code` on commit.
+- Approval missing: run `ft approve <code>` or pass `--approval-code` on commit.
 - Pane mismatch: the pane identity changed; re-run prepare for the current pane.
 - Preconditions failed: state changed; re-run prepare and re-check the preview.
 

@@ -1,7 +1,7 @@
 use crate::keyassignment::{KeyAssignment, MouseEventTrigger};
+use frankenterm_dynamic::{Error as DynError, FromDynamic, FromDynamicOptions, ToDynamic, Value};
+use frankenterm_input_types::{KeyCode, Modifiers, PhysKeyCode};
 use std::convert::TryFrom;
-use wezterm_dynamic::{Error as DynError, FromDynamic, FromDynamicOptions, ToDynamic, Value};
-use wezterm_input_types::{KeyCode, Modifiers, PhysKeyCode};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, FromDynamic, ToDynamic)]
 pub enum KeyMapPreference {

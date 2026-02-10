@@ -1,4 +1,4 @@
-use wezterm_bidi::{BidiContext, Direction, ParagraphDirectionHint};
+use frankenterm_bidi::{BidiContext, Direction, ParagraphDirectionHint};
 
 fn main() {
     // The UBA is strongly coupled with codepoints and indices into the

@@ -18,7 +18,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 
 CRITERION_DIR="target/criterion"
-SUMMARY_FILE="$CRITERION_DIR/wa-budget-report.json"
+SUMMARY_FILE="$CRITERION_DIR/ft-budget-report.json"
 
 RUN_BENCH=true
 if [[ "${1:-}" == "--check" ]]; then
@@ -74,7 +74,7 @@ declare -A BUDGETS=(
 if $RUN_BENCH; then
     mkdir -p "$CRITERION_DIR"
     echo "[bench-budgets] Running benchmarks..."
-    cargo bench -p wa-core 2>&1 | tee "$CRITERION_DIR/bench-output.log"
+    cargo bench -p frankenterm-core 2>&1 | tee "$CRITERION_DIR/bench-output.log"
     echo "[bench-budgets] Benchmarks complete."
 fi
 
@@ -174,7 +174,7 @@ mkdir -p "$(dirname "$SUMMARY_FILE")"
 cat > "$SUMMARY_FILE" <<EOF
 {
   "version": "1",
-  "format": "wa-budget-report",
+  "format": "ft-budget-report",
   "generated_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "total": $total,
   "pass": $pass,

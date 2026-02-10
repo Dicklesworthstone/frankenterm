@@ -7,7 +7,7 @@
 #   Validate CLI-driven profile management and rollback safety.
 #
 # Requirements:
-#   - wa binary built (cargo build -p wa)
+#   - wa binary built (cargo build -p frankenterm)
 #   - jq for JSON validation
 # =============================================================================
 
@@ -17,23 +17,23 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$SCRIPT_DIR/lib/e2e_artifacts.sh"
 
-WA_BIN=""
+FT_BIN=""
 TESTS_FAILED=0
 
-find_wa_binary() {
+find_ft_binary() {
     local candidates=(
-        "$PROJECT_ROOT/target/release/wa"
+        "$PROJECT_ROOT/target/release/ft"
         "$PROJECT_ROOT/target/debug/wa"
     )
 
     for candidate in "${candidates[@]}"; do
         if [[ -x "$candidate" ]]; then
-            WA_BIN="$candidate"
+            FT_BIN="$candidate"
             return 0
         fi
     done
 
-    echo "Error: wa binary not found. Run 'cargo build -p wa' first." >&2
+    echo "Error: wa binary not found. Run 'cargo build -p frankenterm' first." >&2
     exit 1
 }
 
@@ -58,24 +58,24 @@ write_file() {
 scenario_profile_create_list_diff() {
     local workspace config_path profile_path list_out diff_out json_out
     workspace=$(make_temp_workspace)
-    config_path="$workspace/wa.toml"
+    config_path="$workspace/ft.toml"
 
     write_file "$config_path" "[general]\nlog_level = \"info\"\n"
 
-    "$WA_BIN" config profile create incident --from empty --path "$config_path"
+    "$FT_BIN" config profile create incident --from empty --path "$config_path"
     profile_path="$workspace/profiles/incident.toml"
     write_file "$profile_path" "[general]\nlog_level = \"debug\"\n"
 
-    list_out=$("$WA_BIN" config profile list --path "$config_path")
+    list_out=$("$FT_BIN" config profile list --path "$config_path")
     e2e_add_file "profile_list.txt" "$list_out"
     echo "$list_out" | grep -q "incident"
 
-    diff_out=$("$WA_BIN" config profile diff incident --path "$config_path")
+    diff_out=$("$FT_BIN" config profile diff incident --path "$config_path")
     e2e_add_file "profile_diff.txt" "$diff_out"
     echo "$diff_out" | grep -q "log_level = \"debug\""
     echo "$diff_out" | grep -q "log_level = \"info\""
 
-    json_out=$("$WA_BIN" config profile list --json --path "$config_path")
+    json_out=$("$FT_BIN" config profile list --json --path "$config_path")
     e2e_add_file "profile_list.json" "$json_out"
     echo "$json_out" | jq -e '.[] | select(.name=="incident")' >/dev/null
 }
@@ -83,13 +83,13 @@ scenario_profile_create_list_diff() {
 scenario_profile_apply_rollback() {
     local workspace config_path profile_path apply_out rollback_out
     workspace=$(make_temp_workspace)
-    config_path="$workspace/wa.toml"
+    config_path="$workspace/ft.toml"
 
     write_file "$config_path" "[general]\nlog_level = \"info\"\n"
     profile_path="$workspace/profiles/incident.toml"
     write_file "$profile_path" "[general]\nlog_level = \"debug\"\n"
 
-    apply_out=$("$WA_BIN" config profile apply incident --path "$config_path")
+    apply_out=$("$FT_BIN" config profile apply incident --path "$config_path")
     e2e_add_file "apply_output.txt" "$apply_out"
 
     local applied
@@ -97,7 +97,7 @@ scenario_profile_apply_rollback() {
     e2e_add_file "config_after_apply.toml" "$applied"
     echo "$applied" | grep -q "log_level = \"debug\""
 
-    rollback_out=$("$WA_BIN" config profile rollback --yes --path "$config_path")
+    rollback_out=$("$FT_BIN" config profile rollback --yes --path "$config_path")
     e2e_add_file "rollback_output.txt" "$rollback_out"
 
     local restored
@@ -114,7 +114,7 @@ scenario_profile_apply_rollback() {
 }
 
 main() {
-    find_wa_binary
+    find_ft_binary
     require_jq
 
     e2e_init_artifacts "config-profiles" >/dev/null

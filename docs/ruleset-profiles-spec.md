@@ -17,13 +17,13 @@ rule overrides. The goal is deterministic load behavior across environments
 2. **Composable**: profiles can inherit from the base config or another profile.
 3. **Minimal**: profile files only describe pattern configuration.
 4. **Forward-compatible**: unknown fields ignored.
-5. **Default remains implicit**: base `wa.toml` patterns config is the default.
+5. **Default remains implicit**: base `ft.toml` patterns config is the default.
 
 ## Storage Layout
 
 ```
 ~/.config/wa/
-├── wa.toml                  # Base config (implicit default ruleset)
+├── ft.toml                  # Base config (implicit default ruleset)
 └── rulesets/
     ├── manifest.json        # Ruleset index + metadata
     ├── incident.toml        # Ruleset profile (pattern overrides)
@@ -95,7 +95,7 @@ Patterns section (same schema as `PatternsConfig`):
 
 ## Resolution Algorithm
 
-1. Load base `PatternsConfig` from `wa.toml`.
+1. Load base `PatternsConfig` from `ft.toml`.
 2. If profile name is `default` or missing, use base config only.
 3. If profile selected:
    - Load profile file.

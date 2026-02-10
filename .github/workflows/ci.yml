@@ -44,8 +44,8 @@ jobs:
       - name: Clippy (all features)
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-      - name: Compile benches (wa-core)
-        run: cargo bench -p wa-core --benches --no-run
+      - name: Compile benches (frankenterm-core)
+        run: cargo bench -p frankenterm-core --benches --no-run
 
   generated-artifacts:
     name: Generated Artifacts
@@ -275,9 +275,9 @@ jobs:
         with:
           name: benchmark-results
           path: |
-            target/criterion/wa-budget-report.json
-            target/criterion/wa-bench-meta.jsonl
-            target/criterion/wa-bench-manifest-*.json
+            target/criterion/ft-budget-report.json
+            target/criterion/ft-bench-meta.jsonl
+            target/criterion/ft-bench-manifest-*.json
             target/criterion/bench-output.log
           if-no-files-found: ignore
           retention-days: 14
@@ -351,8 +351,8 @@ jobs:
       - name: Install jq
         run: sudo apt-get update -qq && sudo apt-get install -qq -y jq
 
-      - name: Build wa (release)
-        run: cargo build --release -p wa
+      - name: Build ft (release)
+        run: cargo build --release -p frankenterm
 
       - name: E2E harness self-check
         run: scripts/e2e_test.sh --self-check --skip-self-check 2>&1 || true
@@ -362,10 +362,10 @@ jobs:
         run: |
           scripts/e2e_approval_flow.sh 2>&1 | tee e2e-approval-output.log
         env:
-          WA_LOG_LEVEL: debug
-          WA_LOG_FORMAT: json
-          WA_E2E_VERBOSE: "1"
-          WA_E2E_KEEP_ARTIFACTS: "1"
+          FT_LOG_LEVEL: debug
+          FT_LOG_FORMAT: json
+          FT_E2E_VERBOSE: "1"
+          FT_E2E_KEEP_ARTIFACTS: "1"
 
       - name: Summarize approval E2E results
         if: always()
@@ -420,8 +420,8 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
       - uses: actions/upload-artifact@v4
         with:
-          name: wa-${{ matrix.target }}
+          name: ft-${{ matrix.target }}
           path: |
-            target/${{ matrix.target }}/release/wa
-            target/${{ matrix.target }}/release/wa.exe
+            target/${{ matrix.target }}/release/ft
+            target/${{ matrix.target }}/release/ft.exe
           if-no-files-found: ignore

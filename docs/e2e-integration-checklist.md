@@ -67,7 +67,7 @@ Registry lives in `scripts/e2e_test.sh` (SCENARIO_REGISTRY). Current entries:
 - [x] E2E: explain-match trace surfaces (rules list/test + lint artifacts). Scenario(s): rules_explain_trace
 
 #### Daemon/runtime (wa-4vx.6)
-- [x] E2E: `wa watch` starts, runs, and exits cleanly. Scenario(s): graceful_shutdown
+- [x] E2E: `ft watch` starts, runs, and exits cleanly. Scenario(s): graceful_shutdown
 - [x] E2E: intentional watcher crash writes crash bundle and is surfaced by triage/doctor/reproduce. Scenario(s): watcher_crash_bundle (wa-upg.13.6)
 - [ ] E2E: graceful shutdown flushes storage queue and releases lock. Scenario(s): graceful_shutdown (partial; lacks explicit lock/queue assertions)
 - [ ] E2E: restart recovers cleanly (no corrupt state). Scenario(s): workflow_resume (partial; restart focused on workflow, not general state)
@@ -76,7 +76,7 @@ Registry lives in `scripts/e2e_test.sh` (SCENARIO_REGISTRY). Current entries:
 #### Robot mode (wa-4vx.7)
 - [x] E2E: core robot commands produce valid JSON envelopes. Scenario(s): capture_search (robot state only; partial)
 - [ ] E2E: stable error codes for common failures (pane missing, policy denied). Scenario(s): none
-- [ ] E2E: `wa robot send` verification (`--wait-for`) works (or PaneWaiter equivalent). Scenario(s): none
+- [ ] E2E: `ft robot send` verification (`--wait-for`) works (or PaneWaiter equivalent). Scenario(s): none
 - [ ] Artifacts: raw JSON outputs for each command + schema validation results. Scenario(s): none
 
 #### Safety/policy (wa-4vx.8)
@@ -106,7 +106,7 @@ Registry lives in `scripts/e2e_test.sh` (SCENARIO_REGISTRY). Current entries:
 ### Phase 3-4: Polish / integration
 
 #### Diagnostics/health/metrics (wa-nu4.3.4)
-- [ ] E2E: `wa doctor` healthy vs broken output is actionable. Scenario(s): none
+- [ ] E2E: `ft doctor` healthy vs broken output is actionable. Scenario(s): none
 - [ ] E2E: metrics endpoint responds when enabled. Scenario(s): none
 - [ ] E2E: watcher health snapshot visible via CLI. Scenario(s): none
 - [ ] Artifacts: diag bundle layout + redaction proofs. Scenario(s): none

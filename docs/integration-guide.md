@@ -10,8 +10,8 @@ wa exposes two equivalent surfaces:
 
 | Surface | Invocation | Transport | Use case |
 |---------|-----------|-----------|----------|
-| Robot CLI | `wa robot <cmd> --format json` | stdout JSON | Shell scripts, subprocess calls |
-| MCP | `wa mcp serve` | stdio JSON-RPC | LLM tool-use, agent frameworks |
+| Robot CLI | `ft robot <cmd> --format json` | stdout JSON | Shell scripts, subprocess calls |
+| MCP | `ft mcp serve` | stdio JSON-RPC | LLM tool-use, agent frameworks |
 
 Both return the same response envelope and data schemas.
 
@@ -40,7 +40,7 @@ Every response is wrapped in a standard envelope:
 | `error_code` | string/null | Machine-readable code like `"WA-1003"` |
 | `hint` | string/null | Actionable recovery suggestion |
 | `elapsed_ms` | u64 | Wall-clock milliseconds the command took |
-| `version` | string | wa version that produced this response |
+| `version` | string | ft version that produced this response |
 | `now` | u64 | Unix epoch milliseconds when the response was generated |
 
 Always check `ok` first. Never assume `data` is present on errors.
@@ -48,11 +48,11 @@ Always check `ok` first. Never assume `data` is present on errors.
 ## Using the Typed Rust Client
 
 The `wa_core::robot_types` module provides `Deserialize` types for all
-response payloads. Add `wa-core` as a dependency:
+response payloads. Add `frankenterm-core` as a dependency:
 
 ```toml
 [dependencies]
-wa-core = { path = "../crates/wa-core" }
+frankenterm-core = { path = "../crates/frankenterm-core" }
 ```
 
 ### Parse a response
@@ -279,12 +279,12 @@ This should not happen. If it does, the wa version may have a bug. Use
 
 The typed client uses `#[serde(default)]` on all optional fields. If
 deserialization fails, the wa version likely added a new required field.
-Update your `wa-core` dependency.
+Update your `frankenterm-core` dependency.
 
 ### Schema validation fails
 
 If you validate responses against JSON schemas and get failures:
 1. Check if the schema file is in the `known_drift_schemas()` set.
 2. The Rust types in `main.rs` are the source of truth; schemas may lag.
-3. Run `cargo test -p wa-core --test typed_client_integration` to see the
+3. Run `cargo test -p frankenterm-core --test typed_client_integration` to see the
    current drift report.

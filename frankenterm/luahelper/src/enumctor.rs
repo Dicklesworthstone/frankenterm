@@ -1,11 +1,11 @@
 use crate::{dynamic_to_lua_value, lua_value_to_dynamic};
-use mlua::{IntoLua, Lua, MetaMethod, UserData, UserDataMethods, Value};
-use std::collections::BTreeMap;
-use std::marker::PhantomData;
-use wezterm_dynamic::{
+use frankenterm_dynamic::{
     Error as DynError, FromDynamic, FromDynamicOptions, ToDynamic, UnknownFieldAction,
     Value as DynValue,
 };
+use mlua::{IntoLua, Lua, MetaMethod, UserData, UserDataMethods, Value};
+use std::collections::BTreeMap;
+use std::marker::PhantomData;
 
 struct EnumVariant<T> {
     phantom: PhantomData<T>,

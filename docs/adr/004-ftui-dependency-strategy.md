@@ -34,7 +34,7 @@ release, this will switch to a git dependency pinned to a specific commit
 
 ### Feature Flags
 
-Two mutually exclusive TUI features exist in `crates/wa-core/Cargo.toml`:
+Two mutually exclusive TUI features exist in `crates/frankenterm-core/Cargo.toml`:
 
 | Feature | Dependencies | Purpose |
 |---------|-------------|---------|

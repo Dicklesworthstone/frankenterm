@@ -5,17 +5,17 @@ use ::image::{
     DynamicImage, GenericImage, GenericImageView, ImageBuffer, RgbImage, Rgba, RgbaImage,
 };
 use anyhow::Context;
-use std::collections::{HashMap, HashSet};
-use std::io::Write;
-use std::sync::Arc;
-use std::time::Duration;
-use wezterm_cell::image::ImageDataType;
-use wezterm_escape_parser::apc::{
+use frankenterm_cell::image::ImageDataType;
+use frankenterm_escape_parser::apc::{
     KittyFrameCompositionMode, KittyImage, KittyImageCompression, KittyImageData, KittyImageDelete,
     KittyImageFormat, KittyImageFrame, KittyImageFrameCompose, KittyImagePlacement,
     KittyImageTransmit, KittyImageVerbosity,
 };
-use wezterm_surface::change::ImageData;
+use frankenterm_surface::change::ImageData;
+use std::collections::{HashMap, HashSet};
+use std::io::Write;
+use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Debug, Default)]
 pub struct KittyImageState {

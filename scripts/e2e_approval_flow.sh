@@ -50,7 +50,7 @@ TESTS_PASSED=0
 TESTS_FAILED=0
 
 # Binary path
-WA_BIN=""
+FT_BIN=""
 
 # Logging functions
 log_test() {
@@ -74,15 +74,15 @@ log_info() {
 }
 
 # Find the wa binary
-find_wa_binary() {
+find_ft_binary() {
     local candidates=(
-        "$PROJECT_ROOT/target/release/wa"
+        "$PROJECT_ROOT/target/release/ft"
         "$PROJECT_ROOT/target/debug/wa"
     )
 
     for candidate in "${candidates[@]}"; do
         if [[ -x "$candidate" ]]; then
-            WA_BIN="$candidate"
+            FT_BIN="$candidate"
             return 0
         fi
     done
@@ -99,7 +99,7 @@ test_issue_and_consume() {
     log_test "Issue and Consume Allow-Once Token"
 
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core issue_and_consume_allow_once -- --nocapture 2>&1 || true)
+    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core issue_and_consume_allow_once -- --nocapture 2>&1 || true)
 
     e2e_add_file "issue_and_consume.txt" "$output"
 
@@ -120,7 +120,7 @@ test_single_use_enforcement() {
     # The issue_and_consume test already validates second use returns None.
     # Run it explicitly to confirm.
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core issue_and_consume_allow_once -- --nocapture 2>&1 || true)
+    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core issue_and_consume_allow_once -- --nocapture 2>&1 || true)
 
     e2e_add_file "single_use_enforcement.txt" "$output"
 
@@ -139,7 +139,7 @@ test_scope_mismatch() {
     log_test "Scope Mismatch Prevents Token Consumption"
 
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core scope_mismatch_does_not_consume -- --nocapture 2>&1 || true)
+    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core scope_mismatch_does_not_consume -- --nocapture 2>&1 || true)
 
     e2e_add_file "scope_mismatch.txt" "$output"
 
@@ -158,7 +158,7 @@ test_fingerprint_mismatch() {
     log_test "Fingerprint Mismatch Prevents Token Consumption"
 
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core different_action_fingerprint -- --nocapture 2>&1 || true)
+    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core different_action_fingerprint -- --nocapture 2>&1 || true)
 
     e2e_add_file "fingerprint_mismatch.txt" "$output"
 
@@ -177,7 +177,7 @@ test_expired_token() {
     log_test "Expired Token Cannot Be Consumed"
 
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core expired_token_cannot_be_consumed -- --nocapture 2>&1 || true)
+    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core expired_token_cannot_be_consumed -- --nocapture 2>&1 || true)
 
     e2e_add_file "expired_token.txt" "$output"
 
@@ -196,7 +196,7 @@ test_max_active_tokens() {
     log_test "Max Active Token Limit Enforced"
 
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core max_active_tokens_enforced -- --nocapture 2>&1 || true)
+    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core max_active_tokens_enforced -- --nocapture 2>&1 || true)
 
     e2e_add_file "max_active_tokens.txt" "$output"
 
@@ -215,7 +215,7 @@ test_fingerprint_deterministic() {
     log_test "Action Fingerprint Is Deterministic"
 
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core fingerprint_is_deterministic -- --nocapture 2>&1 || true)
+    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core fingerprint_is_deterministic -- --nocapture 2>&1 || true)
 
     e2e_add_file "fingerprint_deterministic.txt" "$output"
 
@@ -234,7 +234,7 @@ test_command_text_changes_fingerprint() {
     log_test "Command Text Changes Fingerprint"
 
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core command_text_changes_fingerprint -- --nocapture 2>&1 || true)
+    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core command_text_changes_fingerprint -- --nocapture 2>&1 || true)
 
     e2e_add_file "command_text_fingerprint.txt" "$output"
 
@@ -253,7 +253,7 @@ test_storage_approval_token() {
     log_test "Storage: Approval Token Insert and Consume"
 
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core can_insert_and_consume_approval_token -- --nocapture 2>&1 || true)
+    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core can_insert_and_consume_approval_token -- --nocapture 2>&1 || true)
 
     e2e_add_file "storage_approval_token.txt" "$output"
 
@@ -272,7 +272,7 @@ test_approve_cli_help() {
     log_test "CLI Contract: wa approve --help"
 
     local output
-    output=$("$WA_BIN" approve --help 2>&1 || true)
+    output=$("$FT_BIN" approve --help 2>&1 || true)
 
     e2e_add_file "approve_cli_help.txt" "$output"
 
@@ -310,7 +310,7 @@ test_approve_invalid_code() {
     log_test "CLI: wa approve with Invalid Code"
 
     local output exit_code
-    output=$("$WA_BIN" approve "INVALIDCODE" 2>&1) && exit_code=$? || exit_code=$?
+    output=$("$FT_BIN" approve "INVALIDCODE" 2>&1) && exit_code=$? || exit_code=$?
 
     e2e_add_file "approve_invalid_code.txt" "$output"
 
@@ -329,7 +329,7 @@ test_approve_dryrun() {
     log_test "CLI: wa approve --dry-run"
 
     local output exit_code
-    output=$("$WA_BIN" approve "TESTCODE1" --dry-run 2>&1) && exit_code=$? || exit_code=$?
+    output=$("$FT_BIN" approve "TESTCODE1" --dry-run 2>&1) && exit_code=$? || exit_code=$?
 
     e2e_add_file "approve_dryrun.txt" "$output"
 
@@ -351,7 +351,7 @@ test_require_approval_response_format() {
     # The PolicyDecision::RequireApproval variant should include approval_request
     # when attached. Validate via the policy engine integration test.
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core command_gate_requires_approval -- --nocapture 2>&1 || true)
+    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core command_gate_requires_approval -- --nocapture 2>&1 || true)
 
     e2e_add_file "require_approval_response.txt" "$output"
 
@@ -372,7 +372,7 @@ test_approval_audit_trail() {
     # The issue_and_consume test consumes a token, which triggers
     # audit_approval_grant() internally. Verify the audit path.
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core issue_and_consume_allow_once -- --nocapture 2>&1 || true)
+    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core issue_and_consume_allow_once -- --nocapture 2>&1 || true)
 
     e2e_add_file "approval_audit_trail.txt" "$output"
 
@@ -391,7 +391,7 @@ test_approval_coverage() {
     log_test "Approval Module Test Coverage"
 
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core --lib approval -- --nocapture 2>&1 || true)
+    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core --lib approval -- --nocapture 2>&1 || true)
 
     e2e_add_file "approval_coverage.txt" "$output"
 
@@ -423,8 +423,8 @@ main() {
     e2e_init_artifacts "approval-flow"
 
     # Find wa binary
-    find_wa_binary
-    log_info "Using wa binary: $WA_BIN"
+    find_ft_binary
+    log_info "Using wa binary: $FT_BIN"
     log_info "Project root: $PROJECT_ROOT"
     echo ""
 

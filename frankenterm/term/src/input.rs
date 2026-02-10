@@ -2,10 +2,10 @@
 #![allow(clippy::suspicious_arithmetic_impl, clippy::redundant_field_names)]
 
 use super::VisibleRowIndex;
+use frankenterm_dynamic::{FromDynamic, ToDynamic};
 #[cfg(feature = "use_serde")]
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
-use wezterm_dynamic::{FromDynamic, ToDynamic};
 
 pub use termwiz::input::{KeyCode, Modifiers as KeyModifiers};
 

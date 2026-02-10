@@ -1,5 +1,5 @@
 [package]
-name = "wezterm-config-derive"
+name = "frankenterm-config-derive"
 version = "0.1.0"
 edition = "2021"
 repository = "https://github.com/wezterm/wezterm"

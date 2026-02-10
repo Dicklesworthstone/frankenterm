@@ -52,7 +52,7 @@ umask 077
 openssl rand -hex 32 > ~/.config/wa/distributed.token
 ```
 2. Provision server cert and key (from your CA or dev self-signed certs).
-3. Configure `wa.toml`:
+3. Configure `ft.toml`:
 ```toml
 [distributed]
 enabled = true
@@ -104,13 +104,13 @@ Token rotation (recommended via `token_path`):
 2. Write to a temp file with strict permissions.
 3. Atomically replace the old token file (`mv` temp file into place).
 4. Restart wa distributed services if your deployment caches credentials.
-5. Run `wa doctor` and a client smoke test.
+5. Run `ft doctor` and a client smoke test.
 
 Certificate rotation:
 1. Stage new cert/key files.
 2. Update `distributed.tls.cert_path`/`key_path` (or rotate symlink targets).
 3. Restart services to pick up new TLS material.
-4. Re-run `wa doctor` and connection checks.
+4. Re-run `ft doctor` and connection checks.
 
 ## Troubleshooting
 Start with:

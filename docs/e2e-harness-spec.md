@@ -33,7 +33,7 @@ This document specifies the end-to-end test harness for `wa`. The harness valida
 | `--self-check` | Run harness self-check only | - |
 | `--parallel N` | Run N scenarios in parallel | 1 (sequential) |
 | `--workspace DIR` | Override workspace for isolation | temp directory |
-| `--config FILE` | Override wa.toml for testing | generated default |
+| `--config FILE` | Override ft.toml for testing | generated default |
 | `--default-only` | Run only scenarios marked `default=true` in registry | off |
 
 ### Arguments
@@ -138,7 +138,7 @@ Before running scenarios, the harness validates prerequisites:
 3. **wa binary built** - `cargo build --release` or binary exists
 4. **Artifacts writable** - Can create artifacts directory
 5. **Temp space available** - At least 100MB free in temp
-6. **Required features** - Check `wa --version` for feature flags
+6. **Required features** - Check `ft --version` for feature flags
 
 ### Self-Check Output
 
@@ -181,10 +181,10 @@ Exit code: 2
 
 1. Start isolated mux server (or use existing)
 2. Spawn dummy pane that prints N unique lines with marker token
-3. Start `wa watch` in background
-4. Wait for watcher to capture (poll `wa robot state`)
-5. Stop `wa watch`
-6. Run `wa search <marker_token>`
+3. Start `ft watch` in background
+4. Wait for watcher to capture (poll `ft robot state`)
+5. Stop `ft watch`
+6. Run `ft search <marker_token>`
 7. Assert: search returns expected hits with correct pane_id
 
 **Success Criteria**:
@@ -216,7 +216,7 @@ echo "Done: $MARKER"
 
 1. Start isolated workspace
 2. Spawn dummy pane that will emit compaction marker
-3. Start `wa watch --auto-handle` in background
+3. Start `ft watch --auto-handle` in background
 4. Trigger dummy pane to emit: `[CODEX] Compaction required: context...`
 5. Wait for workflow execution (poll events/workflow status)
 6. Assert: workflow sent refresh prompt to pane
@@ -256,8 +256,8 @@ done
 
 1. Start isolated workspace
 2. Spawn dummy pane and mark it as having `in_alt_screen=true` (via fixture state or marker)
-3. Start `wa watch` in background
-4. Attempt `wa robot send <pane_id> "test"`
+3. Start `ft watch` in background
+4. Attempt `ft robot send <pane_id> "test"`
 5. Assert: send denied with policy error
 
 **Success Criteria**:
@@ -283,7 +283,7 @@ send_text = true  # Allow attempt, but policy should block
 
 ### Structured Logs
 
-When `--verbose` or `WA_LOG_FORMAT=json`:
+When `--verbose` or `FT_LOG_FORMAT=json`:
 
 ```json
 {"timestamp":"2026-01-19T09:00:00.123Z","level":"INFO","target":"wa::ingest","pane_id":123,"seq":45,"message":"Captured segment","span":"capture_pane"}
@@ -346,12 +346,12 @@ Hint: Check if watcher started successfully and pane was observed.
 
 | Variable | Description | Example |
 |----------|-------------|---------|
-| `WA_E2E_KEEP_ARTIFACTS` | Always keep artifacts | `1` |
-| `WA_E2E_TIMEOUT` | Override timeout (seconds) | `300` |
-| `WA_E2E_VERBOSE` | Enable verbose output | `1` |
-| `WA_E2E_WORKSPACE` | Override workspace path | `/tmp/wa-e2e` |
-| `WA_LOG_LEVEL` | Log level for wa processes | `debug` |
-| `WA_LOG_FORMAT` | Log format (`pretty`/`json`) | `json` |
+| `FT_E2E_KEEP_ARTIFACTS` | Always keep artifacts | `1` |
+| `FT_E2E_TIMEOUT` | Override timeout (seconds) | `300` |
+| `FT_E2E_VERBOSE` | Enable verbose output | `1` |
+| `FT_E2E_WORKSPACE` | Override workspace path | `/tmp/wa-e2e` |
+| `FT_LOG_LEVEL` | Log level for wa processes | `debug` |
+| `FT_LOG_FORMAT` | Log format (`pretty`/`json`) | `json` |
 
 ---
 
@@ -363,7 +363,7 @@ Each scenario runs in an isolated workspace:
 
 ```bash
 WORKSPACE=$(mktemp -d /tmp/wa-e2e-XXXXXX)
-export WA_WORKSPACE="$WORKSPACE"
+export FT_WORKSPACE="$WORKSPACE"
 export WA_DATA_DIR="$WORKSPACE/.wa"
 ```
 

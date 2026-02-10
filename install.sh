@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 #
-# wa (wezterm_automata) installer - Terminal hypervisor for AI agent swarms
+# ft (frankenterm) installer - Terminal hypervisor for AI agent swarms
 #
 # One-liner install:
-#   curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/wezterm_automata/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/frankenterm/main/install.sh | bash
 #
 # Or with specific version:
-#   curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/wezterm_automata/main/install.sh | bash -s -- --version v0.1.0
+#   curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/frankenterm/main/install.sh | bash -s -- --version v0.1.0
 #
 set -euo pipefail
 
-REPO_URL="https://github.com/Dicklesworthstone/wezterm_automata.git"
-BINARY_NAME="wa"
+REPO_URL="https://github.com/Dicklesworthstone/frankenterm.git"
+BINARY_NAME="ft"
 
 # Colors
 RED='\033[0;31m'
@@ -43,13 +43,13 @@ check_requirements() {
     log_success "All requirements met"
 }
 
-# Install wa
-install_wa() {
-    log_info "Installing wa (wezterm_automata)..."
+# Install ft
+install_ft() {
+    log_info "Installing ft (frankenterm)..."
 
     # Use cargo install from git
     if cargo install --git "$REPO_URL" "$BINARY_NAME" --locked; then
-        log_success "wa installed successfully"
+        log_success "ft installed successfully"
     else
         log_warn "Locked install failed, trying without --locked"
         cargo install --git "$REPO_URL" "$BINARY_NAME"
@@ -63,14 +63,14 @@ verify_install() {
     if command -v "$BINARY_NAME" &>/dev/null; then
         local version
         version=$("$BINARY_NAME" --version 2>/dev/null || echo "version unknown")
-        log_success "wa is installed: $version"
+        log_success "ft is installed: $version"
 
         # Show binary location
         local binary_path
         binary_path=$(command -v "$BINARY_NAME")
         log_info "Binary location: $binary_path"
     else
-        log_error "Installation verification failed - wa not found in PATH"
+        log_error "Installation verification failed - ft not found in PATH"
         log_info "Ensure ~/.cargo/bin is in your PATH"
         exit 1
     fi
@@ -80,31 +80,31 @@ verify_install() {
 show_info() {
     echo ""
     echo "========================================"
-    echo "  wa (WezTerm Automata) installed!"
+    echo "  ft (FrankenTerm) installed!"
     echo "========================================"
     echo ""
     echo "Usage:"
-    echo "  wa help          - Show all commands"
-    echo "  wa spawn         - Launch agent in terminal"
-    echo "  wa list          - List active sessions"
-    echo "  wa monitor       - Real-time monitoring"
+    echo "  ft help          - Show all commands"
+    echo "  ft spawn         - Launch agent in terminal"
+    echo "  ft list          - List active sessions"
+    echo "  ft monitor       - Real-time monitoring"
     echo ""
     echo "Quick start:"
-    echo "  wa spawn cc --prompt 'Hello Claude'"
+    echo "  ft spawn cc --prompt 'Hello Claude'"
     echo ""
     echo "Documentation:"
-    echo "  https://github.com/Dicklesworthstone/wezterm_automata"
+    echo "  https://github.com/Dicklesworthstone/frankenterm"
     echo ""
 }
 
 main() {
     echo "========================================="
-    echo "  wa (WezTerm Automata) Installer"
+    echo "  ft (FrankenTerm) Installer"
     echo "========================================="
     echo ""
 
     check_requirements
-    install_wa
+    install_ft
     verify_install
     show_info
 }

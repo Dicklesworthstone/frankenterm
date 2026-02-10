@@ -12,7 +12,7 @@ allowed/forbidden paths, negative examples, and validation evidence hooks.
 
 ## Module-to-Principle Mapping
 
-| ADR-0002 Rule | wa Module | Enforcement Mechanism |
+| ADR-0002 Rule | ft Module | Enforcement Mechanism |
 |---|---|---|
 | R1 Exclusive write ownership | `output_gate.rs` `OutputGate` | Atomic phase gate; `TuiAwareWriter` checks before stderr writes |
 | R2 Log routing | `output_gate.rs` `TuiAwareWriter` | tracing subscriber wraps stderr with gate check |
@@ -147,9 +147,9 @@ routing, and `TerminalSession` is replaced by ftui's `Program` lifecycle.
 ## References
 
 - ADR-0002: One-Writer Terminal Ownership Rule (principles)
-- `crates/wa-core/src/tui/output_gate.rs` (atomic phase gate)
-- `crates/wa-core/src/tui/terminal_session.rs` (session lifecycle)
-- `crates/wa-core/src/tui/command_handoff.rs` (suspend/resume handoff)
-- `crates/wa-core/src/crash.rs` (panic hook with gate check)
+- `crates/frankenterm-core/src/tui/output_gate.rs` (atomic phase gate)
+- `crates/frankenterm-core/src/tui/terminal_session.rs` (session lifecycle)
+- `crates/frankenterm-core/src/tui/command_handoff.rs` (suspend/resume handoff)
+- `crates/frankenterm-core/src/crash.rs` (panic hook with gate check)
 - Bead wa-2q5r (FTUI-01.1.a)
 - Bead wa-1q7m (FTUI-09.3, decommission plan)

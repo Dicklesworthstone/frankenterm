@@ -22,7 +22,7 @@
 | Property | Value |
 |----------|-------|
 | **Feature default** | `tui` (legacy) |
-| **ftui access** | `WA_TUI_BACKEND=ftui` environment variable |
+| **ftui access** | `FT_TUI_BACKEND=ftui` environment variable |
 | **Audience** | Internal operators, power users |
 | **Duration** | 2 weeks minimum |
 | **Entry criteria** | Stage 0 exit criteria met |
@@ -31,14 +31,14 @@
 **Canary activation:**
 ```bash
 # Operator enables ftui for their session
-export WA_TUI_BACKEND=ftui
+export FT_TUI_BACKEND=ftui
 wa tui
 ```
 
 **Fallback:**
 ```bash
 # Revert to legacy
-unset WA_TUI_BACKEND
+unset FT_TUI_BACKEND
 wa tui
 ```
 
@@ -47,7 +47,7 @@ wa tui
 | Property | Value |
 |----------|-------|
 | **Feature default** | `ftui` (new default) |
-| **Legacy access** | `WA_TUI_BACKEND=ratatui` override |
+| **Legacy access** | `FT_TUI_BACKEND=ratatui` override |
 | **Audience** | All users |
 | **Duration** | 4 weeks minimum |
 | **Entry criteria** | Stage 1 exit criteria met |
@@ -55,7 +55,7 @@ wa tui
 
 **Override to legacy (escape hatch):**
 ```bash
-export WA_TUI_BACKEND=ratatui
+export FT_TUI_BACKEND=ratatui
 wa tui
 ```
 
@@ -72,14 +72,14 @@ wa tui
 
 ### Runtime Backend Selection (implemented)
 
-The `WA_TUI_BACKEND` environment variable controls which backend is used at
+The `FT_TUI_BACKEND` environment variable controls which backend is used at
 runtime.  Build with `--features rollout` to compile both backends into a single
 binary.
 
-**Implementation:** `crates/wa-core/src/tui/rollout.rs`
+**Implementation:** `crates/frankenterm-core/src/tui/rollout.rs`
 
 ```rust
-// select_backend() reads WA_TUI_BACKEND and returns the active backend.
+// select_backend() reads FT_TUI_BACKEND and returns the active backend.
 // Recognized values: "ftui", "frankentui", "ratatui", "legacy".
 // Unrecognized or unset → stage default (currently Ratatui for Stage 1).
 pub fn select_backend() -> TuiBackend { ... }
@@ -123,7 +123,7 @@ Each stage transition requires:
 **Stage 1 → Stage 0:**
 ```bash
 # Remove canary environment variable
-unset WA_TUI_BACKEND
+unset FT_TUI_BACKEND
 # Rebuild with legacy-only features
 cargo build -p wa --features tui
 ```
@@ -162,7 +162,7 @@ Each stage transition must produce:
 ## 5  Communication Plan
 
 ### Stage 1 Entry
-- CHANGELOG entry: "ftui canary available via `WA_TUI_BACKEND=ftui`"
+- CHANGELOG entry: "ftui canary available via `FT_TUI_BACKEND=ftui`"
 - Migration guide link: `docs/ftui-contributor-migration-guide.md`
 - Known limitations from compatibility matrix
 
@@ -184,7 +184,7 @@ Each stage transition must produce:
 | Performance regression vs ratatui | Low | S3 | Pre/post baselines (wa-290k) + hot path optimization (wa-avl6) |
 | Key binding behavioral change | Low | S3 | Configurable keymap + defaults matching legacy |
 | Panic in production during Stage 1 | Low | S1 | Panic hook restores terminal; canary is opt-in |
-| Stage 2 default change breaks automation | Low | S2 | `WA_TUI_BACKEND=ratatui` escape hatch |
+| Stage 2 default change breaks automation | Low | S2 | `FT_TUI_BACKEND=ratatui` escape hatch |
 | Stage 3 removes escape hatch too early | Medium | S2 | 4-week minimum beta period; rollback not possible |
 
 ## 7  References

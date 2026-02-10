@@ -42,7 +42,7 @@ TESTS_FAILED=0
 TESTS_SKIPPED=0
 
 # Binary path
-WA_BIN=""
+FT_BIN=""
 TEST_WORKSPACE=""
 TEST_PANE_ID=""
 
@@ -73,7 +73,7 @@ run_wa_timeout() {
     local timeout_secs="${1:-5}"
     shift
     local raw_output
-    raw_output=$(timeout "$timeout_secs" "$WA_BIN" "$@" 2>&1 || true)
+    raw_output=$(timeout "$timeout_secs" "$FT_BIN" "$@" 2>&1 || true)
 
     # Strip ANSI codes and extract JSON
     local stripped
@@ -149,18 +149,18 @@ check_prerequisites() {
     log_test "Checking Prerequisites"
 
     # Find wa binary
-    WA_BIN="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}/debug/wa"
-    if [[ ! -x "$WA_BIN" ]]; then
-        WA_BIN="$PROJECT_ROOT/target/debug/wa"
+    FT_BIN="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}/debug/wa"
+    if [[ ! -x "$FT_BIN" ]]; then
+        FT_BIN="$PROJECT_ROOT/target/debug/wa"
     fi
 
-    if [[ ! -x "$WA_BIN" ]]; then
+    if [[ ! -x "$FT_BIN" ]]; then
         echo "[INFO] Building wa binary..."
-        cargo build -p wa 2>&1 | tail -5
+        cargo build -p frankenterm 2>&1 | tail -5
     fi
 
-    if [[ -x "$WA_BIN" ]]; then
-        log_pass "wa binary found: $WA_BIN"
+    if [[ -x "$FT_BIN" ]]; then
+        log_pass "wa binary found: $FT_BIN"
     else
         log_fail "wa binary not found"
         exit 1
@@ -192,7 +192,7 @@ check_prerequisites() {
 
     # Create isolated workspace so this test never mutates the caller workspace
     TEST_WORKSPACE=$(mktemp -d /tmp/wa-e2e-plan-workflow-XXXXXX)
-    export WA_WORKSPACE="$TEST_WORKSPACE"
+    export FT_WORKSPACE="$TEST_WORKSPACE"
     export WA_DATA_DIR="$TEST_WORKSPACE/.wa"
     mkdir -p "$WA_DATA_DIR"
     log_pass "isolated workspace initialized: $TEST_WORKSPACE"
@@ -200,8 +200,8 @@ check_prerequisites() {
     # Copy baseline config when present
     local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
     if [[ -f "$baseline_config" ]]; then
-        cp "$baseline_config" "$TEST_WORKSPACE/wa.toml"
-        export WA_CONFIG="$TEST_WORKSPACE/wa.toml"
+        cp "$baseline_config" "$TEST_WORKSPACE/ft.toml"
+        export WA_CONFIG="$TEST_WORKSPACE/ft.toml"
         log_pass "baseline config applied"
     else
         log_skip "baseline config not found; using defaults"
@@ -366,7 +366,7 @@ test_workflow_execution_logs() {
         return
     fi
 
-    local db_path="$WA_DATA_DIR/wa.db"
+    local db_path="$WA_DATA_DIR/ft.db"
     local before_count=0
     if [[ -f "$db_path" ]]; then
         before_count=$(sqlite3 "$db_path" "SELECT COUNT(*) FROM workflow_executions;" 2>/dev/null || echo "0")

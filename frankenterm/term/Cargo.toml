@@ -1,18 +1,18 @@
 [package]
 authors = ["Wez Furlong <wez@wezfurlong.org>"]
-name = "wezterm-term"
+name = "frankenterm-term"
 version = "0.1.0"
 edition = "2018"
 repository = "https://github.com/wezterm/wezterm"
 description = "The Virtual Terminal Emulator core from wezterm; helpful for implementing terminal emulators"
 license = "MIT"
-documentation = "https://docs.rs/wezterm-term"
+documentation = "https://docs.rs/frankenterm-term"
 keywords = ["terminal", "emulator", "vte"]
 readme = "README.md"
 publish = false
 
 [features]
-use_serde = ["termwiz/use_serde", "wezterm-cell/use_serde", "wezterm-escape-parser/use_serde", "wezterm-surface/use_serde"]
+use_serde = ["termwiz/use_serde", "frankenterm-cell/use_serde", "frankenterm-escape-parser/use_serde", "frankenterm-surface/use_serde"]
 
 [dependencies]
 anyhow.workspace = true
@@ -33,11 +33,11 @@ serde = {workspace=true, features = ["rc"]}
 terminfo.workspace = true
 unicode-normalization.workspace = true
 url.workspace = true
-wezterm-bidi.workspace = true
-wezterm-dynamic = {workspace = true, features=["std"]}
-wezterm-cell = {workspace = true, features=["std", "use_image"]}
-wezterm-escape-parser = {workspace = true, features=["std", "use_image"]}
-wezterm-surface = {workspace = true, features=["std", "appdata", "use_image"]}
+frankenterm-bidi.workspace = true
+frankenterm-dynamic = {workspace = true, features=["std"]}
+frankenterm-cell = {workspace = true, features=["std", "use_image"]}
+frankenterm-escape-parser = {workspace = true, features=["std", "use_image"]}
+frankenterm-surface = {workspace = true, features=["std", "appdata", "use_image"]}
 
 [dev-dependencies]
 env_logger.workspace = true

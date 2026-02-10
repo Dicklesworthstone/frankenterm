@@ -1,4 +1,4 @@
-# ast-grep configuration for wezterm_automata
+# ast-grep configuration for frankenterm
 # Enforces pattern code organization and bans ad-hoc regex usage
 #
 # Run: ast-grep scan --rule rules/

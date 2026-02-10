@@ -104,8 +104,8 @@ Strip or normalize control sequences that could corrupt terminal state:
 |----------|--------|--------|
 | Title-set (`\e]0;...\a`) | Strip | Prevents subprocess from changing wa's title |
 | Alternate screen (`\e[?1049h/l`) | Strip | Prevents nesting alternate screens |
-| Bracketed paste mode (`\e[?2004h/l`) | Strip | wa manages paste mode |
-| Mouse mode (`\e[?1000h` etc.) | Strip | wa manages mouse capture |
+| Bracketed paste mode (`\e[?2004h/l`) | Strip | ft manages paste mode |
+| Mouse mode (`\e[?1000h` etc.) | Strip | ft manages mouse capture |
 | Cursor visibility (`\e[?25h/l`) | Pass through | Subprocess may legitimately show/hide cursor |
 | SGR (color/style) | Pass through | Normal terminal output |
 | Cursor movement | Pass through | Normal terminal output |
@@ -255,7 +255,7 @@ This report is:
 
 ### Phase 1: PTY Capture Module (new file)
 
-Create `crates/wa-core/src/subprocess_capture.rs`:
+Create `crates/frankenterm-core/src/subprocess_capture.rs`:
 
 1. `PtyPair` struct wrapping `openpty(2)` via the `nix` crate
 2. `CaptureLoop` async task that reads from master fd
@@ -266,7 +266,7 @@ Create `crates/wa-core/src/subprocess_capture.rs`:
 
 ### Phase 2: Integration with Command Handoff
 
-Modify `crates/wa-core/src/tui/command_handoff.rs`:
+Modify `crates/frankenterm-core/src/tui/command_handoff.rs`:
 
 1. Replace `Command::new().stdin(Inherited)` with PTY-based spawn
 2. Create `SubprocessForwarder` before spawn
@@ -276,7 +276,7 @@ Modify `crates/wa-core/src/tui/command_handoff.rs`:
 
 ### Phase 3: Integration with Recording Engine
 
-Modify `crates/wa-core/src/recording.rs`:
+Modify `crates/frankenterm-core/src/recording.rs`:
 
 1. Accept `SubprocessFrame` in `Recorder::record_output()`
 2. Preserve gap markers from backpressure drops
@@ -339,12 +339,12 @@ should be feature-gated behind `cfg(unix)` since PTY capture is POSIX-only.
 
 ## References
 
-- `crates/wa-core/src/tui/output_gate.rs` — gate phase tracking
-- `crates/wa-core/src/tui/command_handoff.rs` — current subprocess execution
-- `crates/wa-core/src/tui/terminal_session.rs` — session lifecycle
-- `crates/wa-core/src/recording.rs` — recording frame engine
-- `crates/wa-core/src/replay.rs` — OutputSink trait + TerminalSink
-- `crates/wa-core/src/policy.rs` — Redactor secret patterns
-- `crates/wa-core/src/backpressure.rs` — queue depth tiers
+- `crates/frankenterm-core/src/tui/output_gate.rs` — gate phase tracking
+- `crates/frankenterm-core/src/tui/command_handoff.rs` — current subprocess execution
+- `crates/frankenterm-core/src/tui/terminal_session.rs` — session lifecycle
+- `crates/frankenterm-core/src/recording.rs` — recording frame engine
+- `crates/frankenterm-core/src/replay.rs` — OutputSink trait + TerminalSink
+- `crates/frankenterm-core/src/policy.rs` — Redactor secret patterns
+- `crates/frankenterm-core/src/backpressure.rs` — queue depth tiers
 - `docs/ftui-output-sink-routing.md` — output sink routing contract (wa-1uqi)
 - `docs/adr/0010-one-writer-rule-adaptation.md` — one-writer rule ADR

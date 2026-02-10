@@ -31,24 +31,24 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact: wa
-            asset: wa-linux-amd64
+            artifact: ft
+            asset: ft-linux-amd64
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            artifact: wa
-            asset: wa-linux-arm64
+            artifact: ft
+            asset: ft-linux-arm64
           - os: macos-15-intel
             target: x86_64-apple-darwin
-            artifact: wa
-            asset: wa-darwin-amd64
+            artifact: ft
+            asset: ft-darwin-amd64
           - os: macos-14
             target: aarch64-apple-darwin
-            artifact: wa
-            asset: wa-darwin-arm64
+            artifact: ft
+            asset: ft-darwin-arm64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact: wa.exe
-            asset: wa-windows-amd64.exe
+            artifact: ft.exe
+            asset: ft-windows-amd64.exe
     steps:
       - uses: actions/checkout@v4
         with:
@@ -69,11 +69,11 @@ jobs:
         if: matrix.target == 'x86_64-unknown-linux-gnu' || startsWith(matrix.target, 'aarch64-apple') || startsWith(matrix.target, 'x86_64-apple')
         run: |
           BINARY="target/${{ matrix.target }}/release/${{ matrix.artifact }}"
-          echo "=== wa --version ==="
+          echo "=== ft --version ==="
           "$BINARY" --version
-          echo "=== wa version --full ==="
+          echo "=== ft version --full ==="
           "$BINARY" version --full
-          echo "=== wa --help ==="
+          echo "=== ft --help ==="
           "$BINARY" --help
           echo "=== All smoke tests passed ==="
 

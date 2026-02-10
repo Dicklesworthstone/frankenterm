@@ -4,7 +4,7 @@ Use this playbook when AI agents are operating `wa` directly.
 
 ## Choose Interface
 
-- Use `wa robot` when the agent can run shell commands directly.
+- Use `ft robot` when the agent can run shell commands directly.
 - Use MCP when the agent is already in a tool-calling runtime and should avoid shell parsing.
 - Prefer `--format toon` for AI-to-AI loops when JSON structure is not required.
 - Prefer `--format json` when responses are fed into strict schema checks.

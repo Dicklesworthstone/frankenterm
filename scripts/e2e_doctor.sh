@@ -8,7 +8,7 @@
 #   and redacted diagnostics across healthy and broken workspace scenarios.
 #
 # Requirements:
-#   - wa binary built (cargo build -p wa)
+#   - wa binary built (cargo build -p frankenterm)
 #   - jq for JSON manipulation
 #   - WezTerm running (for healthy-workspace scenario)
 #
@@ -44,7 +44,7 @@ TESTS_FAILED=0
 TESTS_SKIPPED=0
 
 # Configuration
-WA_BIN=""
+FT_BIN=""
 VERBOSE=false
 KEEP_ARTIFACTS=false
 TEMP_DIRS=()
@@ -123,7 +123,7 @@ run_doctor() {
     stderr_file=$(mktemp)
 
     DOCTOR_EXIT=0
-    "$WA_BIN" doctor "$@" >"$stdout_file" 2>"$stderr_file" || DOCTOR_EXIT=$?
+    "$FT_BIN" doctor "$@" >"$stdout_file" 2>"$stderr_file" || DOCTOR_EXIT=$?
     DOCTOR_STDOUT=$(cat "$stdout_file")
     DOCTOR_STDERR=$(cat "$stderr_file")
 
@@ -141,7 +141,7 @@ run_doctor_env() {
     stderr_file=$(mktemp)
 
     DOCTOR_EXIT=0
-    env "$env_setting" "$WA_BIN" doctor "$@" >"$stdout_file" 2>"$stderr_file" || DOCTOR_EXIT=$?
+    env "$env_setting" "$FT_BIN" doctor "$@" >"$stdout_file" 2>"$stderr_file" || DOCTOR_EXIT=$?
     DOCTOR_STDOUT=$(cat "$stdout_file")
     DOCTOR_STDERR=$(cat "$stderr_file")
 
@@ -198,14 +198,14 @@ check_prerequisites() {
 
     # Find wa binary
     if [[ -x "$PROJECT_ROOT/target/debug/wa" ]]; then
-        WA_BIN="$PROJECT_ROOT/target/debug/wa"
-    elif [[ -x "$PROJECT_ROOT/target/release/wa" ]]; then
-        WA_BIN="$PROJECT_ROOT/target/release/wa"
+        FT_BIN="$PROJECT_ROOT/target/debug/wa"
+    elif [[ -x "$PROJECT_ROOT/target/release/ft" ]]; then
+        FT_BIN="$PROJECT_ROOT/target/release/ft"
     else
-        echo -e "${RED}ERROR:${NC} wa binary not found. Run: cargo build -p wa" >&2
+        echo -e "${RED}ERROR:${NC} wa binary not found. Run: cargo build -p frankenterm" >&2
         exit 5
     fi
-    log_pass "wa binary found: $WA_BIN"
+    log_pass "wa binary found: $FT_BIN"
 
     # Check jq
     if ! command -v jq &>/dev/null; then
@@ -215,8 +215,8 @@ check_prerequisites() {
     log_pass "jq available"
 
     echo ""
-    echo "Binary: $WA_BIN"
-    echo "Version: $("$WA_BIN" --version 2>/dev/null || echo 'unknown')"
+    echo "Binary: $FT_BIN"
+    echo "Version: $("$FT_BIN" --version 2>/dev/null || echo 'unknown')"
 }
 
 # ==============================================================================
@@ -233,7 +233,7 @@ test_healthy_workspace() {
 
     # A2: Output should contain success markers
     assert_contains "$DOCTOR_STDOUT" "[OK]" "A2: output contains [OK] markers"
-    assert_contains "$DOCTOR_STDOUT" "wa-core loaded" "A3: reports wa-core version"
+    assert_contains "$DOCTOR_STDOUT" "frankenterm-core loaded" "A3: reports frankenterm-core version"
     assert_contains "$DOCTOR_STDOUT" "workspace root" "A4: reports workspace root"
     assert_contains "$DOCTOR_STDOUT" "database" "A5: reports database status"
 
@@ -322,7 +322,7 @@ test_broken_unwritable() {
     fi
 
     # B1.3: Error should contain actionable hint
-    if echo "$combined" | grep -qi "workspace\|WA_WORKSPACE\|--workspace"; then
+    if echo "$combined" | grep -qi "workspace\|FT_WORKSPACE\|--workspace"; then
         log_pass "B1.3: error contains actionable hint about workspace"
     else
         log_fail "B1.3: error should contain workspace hint"
@@ -353,7 +353,7 @@ test_broken_no_wezterm() {
     # Run with empty PATH so wezterm is not found
     # Keep only the directory containing wa binary itself
     local wa_dir
-    wa_dir=$(dirname "$WA_BIN")
+    wa_dir=$(dirname "$FT_BIN")
     run_doctor_env "PATH=$wa_dir" --workspace "$ws"
 
     # B2.1: Should fail (exit non-zero)
@@ -381,7 +381,7 @@ test_broken_no_wezterm() {
     fi
 
     # B2.4: Other checks should still run (not bail early)
-    if echo "$DOCTOR_STDOUT" | grep -qF "wa-core loaded"; then
+    if echo "$DOCTOR_STDOUT" | grep -qF "frankenterm-core loaded"; then
         log_pass "B2.4: other checks still execute"
     else
         # If wezterm missing causes early exit via config validation, that's also valid
@@ -510,8 +510,8 @@ test_output_stability() {
 
     # D3: Same check names appear in both runs
     local names1 names2
-    names1=$(echo "$output1" | grep -oE '(wa-core|workspace|database|daemon|logs|features|config|WezTerm|filesystem|connection)' | sort -u)
-    names2=$(echo "$output2" | grep -oE '(wa-core|workspace|database|daemon|logs|features|config|WezTerm|filesystem|connection)' | sort -u)
+    names1=$(echo "$output1" | grep -oE '(frankenterm-core|workspace|database|daemon|logs|features|config|WezTerm|filesystem|connection)' | sort -u)
+    names2=$(echo "$output2" | grep -oE '(frankenterm-core|workspace|database|daemon|logs|features|config|WezTerm|filesystem|connection)' | sort -u)
 
     if [[ "$names1" == "$names2" ]]; then
         log_pass "D3: check names are deterministic"
@@ -544,7 +544,7 @@ test_nonexistent_workspace() {
     assert_contains "$DOCTOR_STDOUT" "WARN" "E2: warns about missing database"
 
     # E3: Should still report all checks
-    assert_contains "$DOCTOR_STDOUT" "wa-core loaded" "E3: reports wa-core version"
+    assert_contains "$DOCTOR_STDOUT" "frankenterm-core loaded" "E3: reports frankenterm-core version"
 
     if [[ -n "${E2E_RUN_DIR:-}" ]]; then
         local scenario_dir="$E2E_SCENARIOS_DIR/nonexistent_workspace"

@@ -2,9 +2,9 @@ use crate::terminalstate::image::*;
 use crate::TerminalState;
 use ::image::imageops::FilterType;
 use ::image::ImageFormat;
+use frankenterm_cell::image::ImageDataType;
+use frankenterm_escape_parser::osc::ITermFileData;
 use log::error;
-use wezterm_cell::image::ImageDataType;
-use wezterm_escape_parser::osc::ITermFileData;
 
 impl TerminalState {
     pub(crate) fn set_image(&mut self, image: ITermFileData) {

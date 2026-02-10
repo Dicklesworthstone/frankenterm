@@ -31,7 +31,7 @@ MIN_TOTAL_TESTS=50
 echo "[ftui-tests] Listing ftui tests..."
 
 TEST_LIST_FILE="$ARTIFACT_DIR/test-list.txt"
-cargo test -p wa-core --features ftui --lib -- --list 2>/dev/null \
+cargo test -p frankenterm-core --features ftui --lib -- --list 2>/dev/null \
     | grep ': test$' > "$TEST_LIST_FILE" || true
 
 TOTAL_COUNT=$(wc -l < "$TEST_LIST_FILE" | tr -d ' ')
@@ -80,7 +80,7 @@ echo "[ftui-tests] === Running snapshot tests ==="
 
 SNAPSHOT_LOG="$ARTIFACT_DIR/snapshot-tests.log"
 SNAPSHOT_EXIT=0
-cargo test -p wa-core --features ftui --lib -- snapshot_ --nocapture 2>&1 \
+cargo test -p frankenterm-core --features ftui --lib -- snapshot_ --nocapture 2>&1 \
     | tee "$SNAPSHOT_LOG" || SNAPSHOT_EXIT=$?
 
 SNAPSHOT_PASSED=$(grep -c '^test .* ok$' "$SNAPSHOT_LOG" || true)
@@ -96,7 +96,7 @@ echo "[ftui-tests] === Running E2E tests ==="
 
 E2E_LOG="$ARTIFACT_DIR/e2e-tests.log"
 E2E_EXIT=0
-cargo test -p wa-core --features ftui --lib -- e2e_ --nocapture 2>&1 \
+cargo test -p frankenterm-core --features ftui --lib -- e2e_ --nocapture 2>&1 \
     | tee "$E2E_LOG" || E2E_EXIT=$?
 
 E2E_PASSED=$(grep -c '^test .* ok$' "$E2E_LOG" || true)
@@ -112,7 +112,7 @@ echo "[ftui-tests] === Running unit tests ==="
 
 UNIT_LOG="$ARTIFACT_DIR/unit-tests.log"
 UNIT_EXIT=0
-cargo test -p wa-core --features ftui --lib -- --skip snapshot_ --skip e2e_ 2>&1 \
+cargo test -p frankenterm-core --features ftui --lib -- --skip snapshot_ --skip e2e_ 2>&1 \
     | tee "$UNIT_LOG" || UNIT_EXIT=$?
 
 UNIT_PASSED=$(grep -c '^test .* ok$' "$UNIT_LOG" || true)

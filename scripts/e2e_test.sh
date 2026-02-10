@@ -117,7 +117,7 @@ Options:
     --default-only        Run only scenarios marked default in the registry
     --parallel N          Run N scenarios in parallel (default: 1)
     --workspace DIR       Override workspace for isolation
-    --config FILE         Override wa.toml for testing
+    --config FILE         Override ft.toml for testing
     --case NAME           Run a single scenario by name (alias for positional arg)
     --all                 Run all registered scenarios (default if no args)
     -h, --help            Show this help
@@ -134,12 +134,12 @@ Exit Codes:
     5 - Prerequisites missing
 
 Environment Variables:
-    WA_E2E_KEEP_ARTIFACTS  Always keep artifacts (1)
-    WA_E2E_TIMEOUT         Override timeout (seconds)
-    WA_E2E_VERBOSE         Enable verbose output (1)
-    WA_E2E_WORKSPACE       Override workspace path
-    WA_LOG_LEVEL           Log level for wa processes
-    WA_LOG_FORMAT          Log format (pretty/json)
+    FT_E2E_KEEP_ARTIFACTS  Always keep artifacts (1)
+    FT_E2E_TIMEOUT         Override timeout (seconds)
+    FT_E2E_VERBOSE         Enable verbose output (1)
+    FT_E2E_WORKSPACE       Override workspace path
+    FT_LOG_LEVEL           Log level for wa processes
+    FT_LOG_FORMAT          Log format (pretty/json)
 
 Examples:
     $0                     # Run all scenarios
@@ -226,10 +226,10 @@ parse_args() {
     done
 
     # Apply environment variable overrides
-    if [[ -n "${WA_E2E_KEEP_ARTIFACTS:-}" ]]; then KEEP_ARTIFACTS=true; fi
-    if [[ -n "${WA_E2E_TIMEOUT:-}" ]]; then TIMEOUT="$WA_E2E_TIMEOUT"; fi
-    if [[ -n "${WA_E2E_VERBOSE:-}" ]]; then VERBOSE=true; fi
-    if [[ -n "${WA_E2E_WORKSPACE:-}" ]]; then WORKSPACE="$WA_E2E_WORKSPACE"; fi
+    if [[ -n "${FT_E2E_KEEP_ARTIFACTS:-}" ]]; then KEEP_ARTIFACTS=true; fi
+    if [[ -n "${FT_E2E_TIMEOUT:-}" ]]; then TIMEOUT="$FT_E2E_TIMEOUT"; fi
+    if [[ -n "${FT_E2E_VERBOSE:-}" ]]; then VERBOSE=true; fi
+    if [[ -n "${FT_E2E_WORKSPACE:-}" ]]; then WORKSPACE="$FT_E2E_WORKSPACE"; fi
 }
 
 # ==============================================================================
@@ -272,18 +272,18 @@ run_self_check() {
     fi
 
     # Check 3: wa binary
-    local wa_binary="$PROJECT_ROOT/target/release/wa"
-    if [[ -x "$wa_binary" ]]; then
+    local ft_binary="$PROJECT_ROOT/target/release/ft"
+    if [[ -x "$ft_binary" ]]; then
         local wa_version
-        wa_version=$("$wa_binary" --version 2>/dev/null | head -1 || echo "unknown")
-        check_pass "wa binary: $wa_binary ($wa_version)"
+        wa_version=$("$ft_binary" --version 2>/dev/null | head -1 || echo "unknown")
+        check_pass "wa binary: $ft_binary ($wa_version)"
     else
         # Try debug build
-        wa_binary="$PROJECT_ROOT/target/debug/wa"
-        if [[ -x "$wa_binary" ]]; then
+        ft_binary="$PROJECT_ROOT/target/debug/wa"
+        if [[ -x "$ft_binary" ]]; then
             local wa_version
-            wa_version=$("$wa_binary" --version 2>/dev/null | head -1 || echo "unknown")
-            check_pass "wa binary (debug): $wa_binary ($wa_version)"
+            wa_version=$("$ft_binary" --version 2>/dev/null | head -1 || echo "unknown")
+            check_pass "wa binary (debug): $ft_binary ($wa_version)"
         else
             check_fail "wa binary not found"
             echo "       Hint: Run 'cargo build --release' or 'cargo build'"
@@ -477,7 +477,7 @@ setup_artifacts() {
 hostname: $(hostname)
 timestamp: $TIMESTAMP
 wezterm_version: $(wezterm --version 2>/dev/null | head -1 || echo "N/A")
-wa_version: $(find_wa_binary && "$WA_BINARY" --version 2>/dev/null | head -1 || echo "N/A")
+wa_version: $(find_ft_binary && "$FT_BINARY" --version 2>/dev/null | head -1 || echo "N/A")
 rust_version: $(rustc --version 2>/dev/null || echo "N/A")
 os: $(uname -a)
 shell: $SHELL
@@ -534,13 +534,13 @@ EOF
 # WA Binary
 # ==============================================================================
 
-WA_BINARY=""
+FT_BINARY=""
 
-find_wa_binary() {
-    if [[ -x "$PROJECT_ROOT/target/release/wa" ]]; then
-        WA_BINARY="$PROJECT_ROOT/target/release/wa"
+find_ft_binary() {
+    if [[ -x "$PROJECT_ROOT/target/release/ft" ]]; then
+        FT_BINARY="$PROJECT_ROOT/target/release/ft"
     elif [[ -x "$PROJECT_ROOT/target/debug/wa" ]]; then
-        WA_BINARY="$PROJECT_ROOT/target/debug/wa"
+        FT_BINARY="$PROJECT_ROOT/target/debug/wa"
     else
         return 1
     fi
@@ -594,7 +594,7 @@ run_scenario_capture_search() {
 
     # Setup environment for isolated wa instance
     export WA_DATA_DIR="$temp_workspace/.wa"
-    export WA_WORKSPACE="$temp_workspace"
+    export FT_WORKSPACE="$temp_workspace"
     mkdir -p "$WA_DATA_DIR"
 
     # Cleanup function
@@ -641,7 +641,7 @@ run_scenario_capture_search() {
 
     # Step 2: Start wa watch in background
     log_info "Step 2: Starting wa watch..."
-    "$WA_BINARY" watch --foreground \
+    "$FT_BINARY" watch --foreground \
         > "$scenario_dir/wa_watch.log" 2>&1 &
     wa_pid=$!
     log_verbose "wa watch started with PID $wa_pid"
@@ -656,25 +656,25 @@ run_scenario_capture_search() {
     # Step 3: Wait for pane to be observed
     log_info "Step 3: Waiting for pane capture..."
     local wait_timeout=${TIMEOUT:-30}
-    local check_cmd="\"$WA_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane_id)' >/dev/null 2>&1"
+    local check_cmd="\"$FT_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane_id)' >/dev/null 2>&1"
 
     if ! wait_for_condition "pane $pane_id observed" "$check_cmd" "$wait_timeout"; then
         log_fail "Timeout waiting for pane to be observed"
         # Capture robot state for diagnostics
-        "$WA_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
+        "$FT_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
         return 1
     fi
     log_pass "Pane observed"
 
     # Step 4: Wait for dummy script to complete (check for "Done:" marker)
     log_info "Step 4: Waiting for dummy script completion..."
-    local done_check_cmd="\"$WA_BINARY\" robot get-text $pane_id --tail 200 2>/dev/null | grep -q \"Done:\""
+    local done_check_cmd="\"$FT_BINARY\" robot get-text $pane_id --tail 200 2>/dev/null | grep -q \"Done:\""
     if ! wait_for_condition "dummy script done marker captured" "$done_check_cmd" "$wait_timeout"; then
         log_warn "Timed out waiting for Done: marker; proceeding with best-effort capture"
     fi
 
     # Capture robot state
-    "$WA_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
+    "$FT_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
 
     # Step 5: Stop wa watch gracefully
     log_info "Step 5: Stopping wa watch..."
@@ -686,7 +686,7 @@ run_scenario_capture_search() {
     # Step 6: Search for the marker
     log_info "Step 6: Searching for marker..."
     local search_output
-    search_output=$("$WA_BINARY" search "$marker" --limit 200 2>&1)
+    search_output=$("$FT_BINARY" search "$marker" --limit 200 2>&1)
     echo "$search_output" > "$scenario_dir/search_output.txt"
 
     # Count hits (lines containing the marker, excluding header lines)
@@ -707,9 +707,9 @@ run_scenario_capture_search() {
     fi
 
     # Verify pane_id in search results (if using JSON output)
-    if "$WA_BINARY" search "$marker" --limit 10 2>/dev/null | jq -e '.' >/dev/null 2>&1; then
+    if "$FT_BINARY" search "$marker" --limit 10 2>/dev/null | jq -e '.' >/dev/null 2>&1; then
         log_verbose "Search output is JSON, checking pane_id..."
-        if "$WA_BINARY" search "$marker" --limit 10 2>/dev/null | jq -e ".results[]? | select(.pane_id == $pane_id)" >/dev/null 2>&1; then
+        if "$FT_BINARY" search "$marker" --limit 10 2>/dev/null | jq -e ".results[]? | select(.pane_id == $pane_id)" >/dev/null 2>&1; then
             log_pass "Correct pane_id in search results"
         else
             log_warn "Could not verify pane_id in search results (may be expected)"
@@ -733,7 +733,7 @@ run_scenario_search_linting_rebuild() {
     echo "workspace: $temp_workspace" >> "$scenario_dir/scenario.log"
 
     export WA_DATA_DIR="$temp_workspace/.wa"
-    export WA_WORKSPACE="$temp_workspace"
+    export FT_WORKSPACE="$temp_workspace"
     mkdir -p "$WA_DATA_DIR"
 
     cleanup_search_linting_rebuild() {
@@ -745,7 +745,7 @@ run_scenario_search_linting_rebuild() {
     trap cleanup_search_linting_rebuild EXIT
 
     log_info "Step 1: Verify FTS index health..."
-    "$WA_BINARY" search fts verify -f json > "$scenario_dir/fts_verify.json" 2>&1 || result=1
+    "$FT_BINARY" search fts verify -f json > "$scenario_dir/fts_verify.json" 2>&1 || result=1
     if jq -e '.ok == true' "$scenario_dir/fts_verify.json" >/dev/null 2>&1; then
         log_pass "FTS verify succeeded"
     else
@@ -756,7 +756,7 @@ run_scenario_search_linting_rebuild() {
     log_info "Step 2: Validate linting on invalid query..."
     local lint_exit=0
     set +e
-    "$WA_BINARY" search "\"unterminated" -f json > "$scenario_dir/search_lint.json" 2>&1
+    "$FT_BINARY" search "\"unterminated" -f json > "$scenario_dir/search_lint.json" 2>&1
     lint_exit=$?
     set -e
     if [[ "$lint_exit" -eq 0 ]]; then
@@ -772,7 +772,7 @@ run_scenario_search_linting_rebuild() {
     fi
 
     log_info "Step 3: Rebuild FTS index..."
-    "$WA_BINARY" search fts rebuild -f json > "$scenario_dir/fts_rebuild.json" 2>&1 || result=1
+    "$FT_BINARY" search fts rebuild -f json > "$scenario_dir/fts_rebuild.json" 2>&1 || result=1
     if jq -e '.ok == true and .result.full_rebuild == true' \
         "$scenario_dir/fts_rebuild.json" >/dev/null 2>&1; then
         log_pass "FTS rebuild succeeded"
@@ -801,7 +801,7 @@ run_scenario_natural_language() {
 
     # Setup environment for isolated wa instance
     export WA_DATA_DIR="$temp_workspace/.wa"
-    export WA_WORKSPACE="$temp_workspace"
+    export FT_WORKSPACE="$temp_workspace"
     mkdir -p "$WA_DATA_DIR"
 
     cleanup_natural_language() {
@@ -844,7 +844,7 @@ run_scenario_natural_language() {
 
     # Step 2: Start wa watch in background
     log_info "Step 2: Starting wa watch..."
-    "$WA_BINARY" watch --foreground \
+    "$FT_BINARY" watch --foreground \
         > "$scenario_dir/wa_watch.log" 2>&1 &
     wa_pid=$!
     log_verbose "wa watch started with PID $wa_pid"
@@ -858,21 +858,21 @@ run_scenario_natural_language() {
     # Step 3: Wait for pane to be observed
     log_info "Step 3: Waiting for pane capture..."
     local wait_timeout=${TIMEOUT:-30}
-    local check_cmd="\"$WA_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane_id)' >/dev/null 2>&1"
+    local check_cmd="\"$FT_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane_id)' >/dev/null 2>&1"
 
     if ! wait_for_condition "pane $pane_id observed" "$check_cmd" "$wait_timeout"; then
         log_fail "Timeout waiting for pane to be observed"
-        "$WA_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
+        "$FT_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
         return 1
     fi
     log_pass "Pane observed"
 
     # Step 4: Wait for usage limit event to be detected
     log_info "Step 4: Waiting for usage limit event..."
-    local event_cmd="\"$WA_BINARY\" events --format json --rule-id codex.usage.reached --limit 5 2>/dev/null | jq -e 'length > 0' >/dev/null 2>&1"
+    local event_cmd="\"$FT_BINARY\" events --format json --rule-id codex.usage.reached --limit 5 2>/dev/null | jq -e 'length > 0' >/dev/null 2>&1"
     if ! wait_for_condition "usage limit event detected" "$event_cmd" "$wait_timeout"; then
         log_fail "Timeout waiting for usage limit event"
-        "$WA_BINARY" events --format json --limit 20 > "$scenario_dir/events_debug.json" 2>&1 || true
+        "$FT_BINARY" events --format json --limit 20 > "$scenario_dir/events_debug.json" 2>&1 || true
         result=1
     else
         log_pass "Usage limit event detected"
@@ -881,11 +881,11 @@ run_scenario_natural_language() {
     # Step 5: Capture CLI outputs
     log_info "Step 5: Capturing CLI outputs..."
     local events_output
-    events_output=$("$WA_BINARY" events --rule-id codex.usage.reached --limit 5 2>&1)
+    events_output=$("$FT_BINARY" events --rule-id codex.usage.reached --limit 5 2>&1)
     echo "$events_output" > "$scenario_dir/events_output.txt"
 
     local why_output
-    why_output=$("$WA_BINARY" why workflow.usage_limit 2>&1)
+    why_output=$("$FT_BINARY" why workflow.usage_limit 2>&1)
     echo "$why_output" > "$scenario_dir/why_output.txt"
 
     # Step 6: Assert outputs are human-readable
@@ -929,14 +929,14 @@ run_scenario_compaction_workflow() {
 
     # Setup environment for isolated wa instance
     export WA_DATA_DIR="$temp_workspace/.wa"
-    export WA_WORKSPACE="$temp_workspace"
+    export FT_WORKSPACE="$temp_workspace"
     mkdir -p "$WA_DATA_DIR"
 
     # Copy baseline config for workflow testing
     local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
     if [[ -f "$baseline_config" ]]; then
-        cp "$baseline_config" "$temp_workspace/wa.toml"
-        export WA_CONFIG="$temp_workspace/wa.toml"
+        cp "$baseline_config" "$temp_workspace/ft.toml"
+        export WA_CONFIG="$temp_workspace/ft.toml"
         log_verbose "Using baseline config: $baseline_config"
     fi
 
@@ -957,7 +957,7 @@ run_scenario_compaction_workflow() {
         # Copy artifacts before cleanup
         if [[ -d "$temp_workspace" ]]; then
             cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
-            cp "$temp_workspace/wa.toml" "$scenario_dir/" 2>/dev/null || true
+            cp "$temp_workspace/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
         rm -rf "$temp_workspace"
     }
@@ -966,7 +966,7 @@ run_scenario_compaction_workflow() {
     # Step 1: Start wa watch with auto-handle BEFORE spawning pane
     # This ensures it's ready to detect and respond
     log_info "Step 1: Starting wa watch with --auto-handle..."
-    "$WA_BINARY" watch --foreground --auto-handle \
+    "$FT_BINARY" watch --foreground --auto-handle \
         > "$scenario_dir/wa_watch.log" 2>&1 &
     wa_pid=$!
     log_verbose "wa watch started with PID $wa_pid"
@@ -1002,11 +1002,11 @@ run_scenario_compaction_workflow() {
     # Step 3: Wait for pane to be observed
     log_info "Step 3: Waiting for pane to be observed..."
     local wait_timeout=${TIMEOUT:-30}
-    local check_cmd="\"$WA_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane_id)' >/dev/null 2>&1"
+    local check_cmd="\"$FT_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane_id)' >/dev/null 2>&1"
 
     if ! wait_for_condition "pane $pane_id observed" "$check_cmd" "$wait_timeout"; then
         log_fail "Timeout waiting for pane to be observed"
-        "$WA_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
+        "$FT_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
         return 1
     fi
     log_pass "Pane observed"
@@ -1015,7 +1015,7 @@ run_scenario_compaction_workflow() {
     # The dummy_agent.sh will print "[CODEX] Compaction required:" after delay
     log_info "Step 4: Waiting for compaction detection..."
     # Wait for the compaction marker to be captured in pane output (deterministic).
-    local compaction_marker_cmd="\"$WA_BINARY\" robot get-text $pane_id --tail 200 2>/dev/null | grep -q \"Compaction required\""
+    local compaction_marker_cmd="\"$FT_BINARY\" robot get-text $pane_id --tail 200 2>/dev/null | grep -q \"Compaction required\""
     if ! wait_for_condition "compaction marker captured" "$compaction_marker_cmd" "$wait_timeout"; then
         log_warn "Compaction marker not observed within timeout; workflow may still run"
     else
@@ -1023,7 +1023,7 @@ run_scenario_compaction_workflow() {
     fi
 
     # Capture robot state for diagnostics.
-    "$WA_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
+    "$FT_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
 
     # Step 5: Wait for workflow to execute and send text to pane
     log_info "Step 5: Waiting for workflow execution..."
@@ -1031,7 +1031,7 @@ run_scenario_compaction_workflow() {
     # Wait and then check pane content
 
     # Poll for "Received:" or "Refresh acknowledged" in pane output
-    local check_workflow_cmd='pane_text=$("'"$WA_BINARY"'" robot get-text '"$pane_id"' 2>/dev/null); echo "$pane_text" | grep -q "Received:"'
+    local check_workflow_cmd='pane_text=$("'"$FT_BINARY"'" robot get-text '"$pane_id"' 2>/dev/null); echo "$pane_text" | grep -q "Received:"'
 
     if wait_for_condition "workflow send detected in pane" "$check_workflow_cmd" "$wait_timeout"; then
         log_pass "Workflow send detected in pane"
@@ -1042,7 +1042,7 @@ run_scenario_compaction_workflow() {
     # Step 6: Capture and verify pane content
     log_info "Step 6: Verifying pane received workflow input..."
     local pane_text
-    pane_text=$("$WA_BINARY" robot get-text "$pane_id" 2>&1 || true)
+    pane_text=$("$FT_BINARY" robot get-text "$pane_id" 2>&1 || true)
     echo "$pane_text" > "$scenario_dir/pane_text.txt"
 
     # Check for evidence that workflow sent text
@@ -1095,14 +1095,14 @@ run_scenario_unhandled_event_lifecycle() {
 
     # Setup environment for isolated wa instance
     export WA_DATA_DIR="$temp_workspace/.wa"
-    export WA_WORKSPACE="$temp_workspace"
+    export FT_WORKSPACE="$temp_workspace"
     mkdir -p "$WA_DATA_DIR"
 
     # Copy baseline config for workflow testing
     local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
     if [[ -f "$baseline_config" ]]; then
-        cp "$baseline_config" "$temp_workspace/wa.toml"
-        export WA_CONFIG="$temp_workspace/wa.toml"
+        cp "$baseline_config" "$temp_workspace/ft.toml"
+        export WA_CONFIG="$temp_workspace/ft.toml"
         log_verbose "Using baseline config: $baseline_config"
     fi
 
@@ -1123,7 +1123,7 @@ run_scenario_unhandled_event_lifecycle() {
         # Copy artifacts before cleanup
         if [[ -d "$temp_workspace" ]]; then
             cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
-            cp "$temp_workspace/wa.toml" "$scenario_dir/" 2>/dev/null || true
+            cp "$temp_workspace/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
         rm -rf "$temp_workspace"
     }
@@ -1131,7 +1131,7 @@ run_scenario_unhandled_event_lifecycle() {
 
     # Step 1: Start wa watch (manual workflow trigger)
     log_info "Step 1: Starting wa watch..."
-    "$WA_BINARY" watch --foreground \
+    "$FT_BINARY" watch --foreground \
         > "$scenario_dir/wa_watch.log" 2>&1 &
     wa_pid=$!
     log_verbose "wa watch started with PID $wa_pid"
@@ -1164,21 +1164,21 @@ run_scenario_unhandled_event_lifecycle() {
 
     # Step 3: Wait for pane to be observed
     log_info "Step 3: Waiting for pane to be observed..."
-    local check_cmd="\"$WA_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane_id)' >/dev/null 2>&1"
+    local check_cmd="\"$FT_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane_id)' >/dev/null 2>&1"
 
     if ! wait_for_condition "pane $pane_id observed" "$check_cmd" "$wait_timeout"; then
         log_fail "Timeout waiting for pane to be observed"
-        "$WA_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
+        "$FT_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
         return 1
     fi
     log_pass "Pane observed"
 
     # Step 4: Wait for unhandled compaction event (dedupe/cooldown)
     log_info "Step 4: Waiting for unhandled compaction event..."
-    local unhandled_cmd="\"$WA_BINARY\" events -f json --unhandled --rule-id \"codex:compaction\" --limit 20 2>/dev/null | jq -e 'length >= 1' >/dev/null 2>&1"
+    local unhandled_cmd="\"$FT_BINARY\" events -f json --unhandled --rule-id \"codex:compaction\" --limit 20 2>/dev/null | jq -e 'length >= 1' >/dev/null 2>&1"
     if ! wait_for_condition "unhandled compaction event detected" "$unhandled_cmd" "$wait_timeout"; then
         log_fail "Timeout waiting for unhandled compaction event"
-        "$WA_BINARY" events -f json --limit 20 > "$scenario_dir/events_debug.json" 2>&1 || true
+        "$FT_BINARY" events -f json --limit 20 > "$scenario_dir/events_debug.json" 2>&1 || true
         result=1
     else
         log_pass "Unhandled compaction event detected"
@@ -1186,7 +1186,7 @@ run_scenario_unhandled_event_lifecycle() {
 
     # Step 5: Capture unhandled events and assert dedupe
     log_info "Step 5: Capturing unhandled events..."
-    "$WA_BINARY" events -f json --unhandled --rule-id "codex:compaction" --limit 20 \
+    "$FT_BINARY" events -f json --unhandled --rule-id "codex:compaction" --limit 20 \
         > "$scenario_dir/events_unhandled_pre.json" 2>&1 || true
 
     local unhandled_count
@@ -1202,7 +1202,7 @@ run_scenario_unhandled_event_lifecycle() {
 
     # Step 6: Capture recommended workflow preview (avoid hard-coding)
     log_info "Step 6: Capturing recommended workflow preview..."
-    "$WA_BINARY" robot events --unhandled --rule-id "codex:compaction" --limit 5 --would-handle --dry-run \
+    "$FT_BINARY" robot events --unhandled --rule-id "codex:compaction" --limit 5 --would-handle --dry-run \
         > "$scenario_dir/robot_events_preview.json" 2>&1 || true
     local recommended_workflow
     recommended_workflow=$(jq -r '.data.events[0].would_handle_with.workflow // empty' \
@@ -1215,7 +1215,7 @@ run_scenario_unhandled_event_lifecycle() {
         log_warn "No recommended workflow found in preview"
     fi
 
-    db_path="$temp_workspace/.wa/wa.db"
+    db_path="$temp_workspace/.ft/ft.db"
     if [[ -f "$db_path" ]]; then
         sqlite3 "$db_path" -json \
             "SELECT action_kind, actor_kind, result FROM audit_actions ORDER BY id DESC LIMIT 50;" \
@@ -1228,7 +1228,7 @@ run_scenario_unhandled_event_lifecycle() {
         workflow_to_run="handle_compaction"
     fi
     log_info "Step 7: Running workflow ($workflow_to_run) on pane $pane_id..."
-    if "$WA_BINARY" workflow run "$workflow_to_run" --pane "$pane_id" \
+    if "$FT_BINARY" workflow run "$workflow_to_run" --pane "$pane_id" \
         > "$scenario_dir/workflow_run_output.txt" 2>&1; then
         log_pass "Workflow run completed"
     else
@@ -1238,7 +1238,7 @@ run_scenario_unhandled_event_lifecycle() {
 
     # Step 8: Wait for event to be handled (unhandled list empty)
     log_info "Step 8: Waiting for event to be handled..."
-    local handled_cmd="\"$WA_BINARY\" events -f json --unhandled --rule-id \"codex:compaction\" --limit 20 2>/dev/null | jq -e 'length == 0' >/dev/null 2>&1"
+    local handled_cmd="\"$FT_BINARY\" events -f json --unhandled --rule-id \"codex:compaction\" --limit 20 2>/dev/null | jq -e 'length == 0' >/dev/null 2>&1"
     if ! wait_for_condition "compaction event handled" "$handled_cmd" "$wait_timeout"; then
         log_fail "Timeout waiting for event to be handled"
         result=1
@@ -1248,7 +1248,7 @@ run_scenario_unhandled_event_lifecycle() {
 
     # Step 9: Capture handled events and audit trail slice
     log_info "Step 9: Capturing handled events and audit trail..."
-    "$WA_BINARY" events -f json --rule-id "codex:compaction" --limit 20 \
+    "$FT_BINARY" events -f json --rule-id "codex:compaction" --limit 20 \
         > "$scenario_dir/events_post.json" 2>&1 || true
 
     local handled_count
@@ -1337,7 +1337,7 @@ run_scenario_usage_limit_safe_pause() {
     local wait_timeout=${TIMEOUT:-90}
     local old_path="$PATH"
     local old_wa_data_dir="${WA_DATA_DIR:-}"
-    local old_wa_workspace="${WA_WORKSPACE:-}"
+    local old_wa_workspace="${FT_WORKSPACE:-}"
     local old_wa_config="${WA_CONFIG:-}"
     local old_caut_mode="${CAUT_FAKE_MODE:-}"
     local old_caut_log="${CAUT_FAKE_LOG:-}"
@@ -1367,9 +1367,9 @@ run_scenario_usage_limit_safe_pause() {
             unset WA_DATA_DIR
         fi
         if [[ -n "$old_wa_workspace" ]]; then
-            export WA_WORKSPACE="$old_wa_workspace"
+            export FT_WORKSPACE="$old_wa_workspace"
         else
-            unset WA_WORKSPACE
+            unset FT_WORKSPACE
         fi
         if [[ -n "$old_wa_config" ]]; then
             export WA_CONFIG="$old_wa_config"
@@ -1388,7 +1388,7 @@ run_scenario_usage_limit_safe_pause() {
         fi
         if [[ -d "${temp_workspace:-}" ]]; then
             cp -r "${temp_workspace}/.wa"/* "$scenario_dir/" 2>/dev/null || true
-            cp "${temp_workspace}/wa.toml" "$scenario_dir/" 2>/dev/null || true
+            cp "${temp_workspace}/ft.toml" "$scenario_dir/" 2>/dev/null || true
             cp "${temp_workspace}/caut_invocations.log" "$scenario_dir/" 2>/dev/null || true
         fi
         rm -rf "${temp_workspace:-}"
@@ -1481,13 +1481,13 @@ EOF
     # Step 1: Configure isolated workspace
     log_info "Step 1: Preparing isolated workspace..."
     export WA_DATA_DIR="$temp_workspace/.wa"
-    export WA_WORKSPACE="$temp_workspace"
+    export FT_WORKSPACE="$temp_workspace"
     mkdir -p "$WA_DATA_DIR"
 
     local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
     if [[ -f "$baseline_config" ]]; then
-        cp "$baseline_config" "$temp_workspace/wa.toml"
-        export WA_CONFIG="$temp_workspace/wa.toml"
+        cp "$baseline_config" "$temp_workspace/ft.toml"
+        export WA_CONFIG="$temp_workspace/ft.toml"
         log_verbose "Using baseline config: $baseline_config"
     else
         log_fail "Baseline config not found: $baseline_config"
@@ -1496,7 +1496,7 @@ EOF
 
     # Step 2: Start wa watch with auto-handle
     log_info "Step 2: Starting wa watch with --auto-handle..."
-    "$WA_BINARY" watch --foreground --auto-handle --config "$temp_workspace/wa.toml" \
+    "$FT_BINARY" watch --foreground --auto-handle --config "$temp_workspace/ft.toml" \
         > "$scenario_dir/wa_watch_1.log" 2>&1 &
     wa_pid=$!
     log_verbose "wa watch started with PID $wa_pid"
@@ -1529,20 +1529,20 @@ EOF
 
     # Step 4: Wait for pane to be observed
     log_info "Step 4: Waiting for pane to be observed..."
-    local check_cmd="\"$WA_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane_id)' >/dev/null 2>&1"
+    local check_cmd="\"$FT_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane_id)' >/dev/null 2>&1"
     if ! wait_for_condition "pane $pane_id observed" "$check_cmd" "$wait_timeout"; then
         log_fail "Timeout waiting for pane to be observed"
-        "$WA_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
+        "$FT_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
         return 1
     fi
     log_pass "Pane observed"
 
     # Step 5: Wait for unhandled usage-limit event
     log_info "Step 5: Waiting for unhandled usage-limit event..."
-    local unhandled_cmd="\"$WA_BINARY\" events -f json --unhandled --rule-id \"codex.usage.reached\" --limit 20 2>/dev/null | jq -e 'length >= 1' >/dev/null 2>&1"
+    local unhandled_cmd="\"$FT_BINARY\" events -f json --unhandled --rule-id \"codex.usage.reached\" --limit 20 2>/dev/null | jq -e 'length >= 1' >/dev/null 2>&1"
     if ! wait_for_condition "unhandled usage-limit event detected" "$unhandled_cmd" "$wait_timeout"; then
         log_fail "Timeout waiting for unhandled usage-limit event"
-        "$WA_BINARY" events -f json --limit 20 > "$scenario_dir/events_debug.json" 2>&1 || true
+        "$FT_BINARY" events -f json --limit 20 > "$scenario_dir/events_debug.json" 2>&1 || true
         result=1
     else
         log_pass "Unhandled usage-limit event detected"
@@ -1550,10 +1550,10 @@ EOF
 
     # Step 6: Capture unhandled events + recommended workflow preview
     log_info "Step 6: Capturing unhandled events and workflow preview..."
-    "$WA_BINARY" events -f json --unhandled --rule-id "codex.usage.reached" --limit 20 \
+    "$FT_BINARY" events -f json --unhandled --rule-id "codex.usage.reached" --limit 20 \
         > "$scenario_dir/events_unhandled_pre.json" 2>&1 || true
 
-    "$WA_BINARY" robot events --unhandled --rule-id "codex.usage.reached" --limit 5 --would-handle --dry-run \
+    "$FT_BINARY" robot events --unhandled --rule-id "codex.usage.reached" --limit 5 --would-handle --dry-run \
         > "$scenario_dir/robot_events_preview.json" 2>&1 || true
 
     local recommended_workflow
@@ -1569,7 +1569,7 @@ EOF
 
     # Step 7: Wait for event to be handled (unhandled list empty)
     log_info "Step 7: Waiting for event to be handled..."
-    local handled_cmd="\"$WA_BINARY\" events -f json --unhandled --rule-id \"codex.usage.reached\" --limit 20 2>/dev/null | jq -e 'length == 0' >/dev/null 2>&1"
+    local handled_cmd="\"$FT_BINARY\" events -f json --unhandled --rule-id \"codex.usage.reached\" --limit 20 2>/dev/null | jq -e 'length == 0' >/dev/null 2>&1"
     if ! wait_for_condition "usage-limit event handled" "$handled_cmd" "$wait_timeout"; then
         log_fail "Timeout waiting for usage-limit event to be handled"
         result=1
@@ -1579,10 +1579,10 @@ EOF
 
     # Step 8: Capture handled event + workflow result
     log_info "Step 8: Capturing handled events and workflow result..."
-    "$WA_BINARY" events -f json --rule-id "codex.usage.reached" --limit 20 \
+    "$FT_BINARY" events -f json --rule-id "codex.usage.reached" --limit 20 \
         > "$scenario_dir/events_post.json" 2>&1 || true
 
-    local db_path="$temp_workspace/.wa/wa.db"
+    local db_path="$temp_workspace/.ft/ft.db"
     if [[ -f "$db_path" ]]; then
         sqlite3 "$db_path" -header -csv \
             "SELECT id, rule_id, handled_at, handled_status FROM events WHERE rule_id = 'codex.usage.reached' ORDER BY detected_at DESC LIMIT 1;" \
@@ -1650,7 +1650,7 @@ EOF
     wait "$wa_pid" 2>/dev/null || true
     wa_pid=""
 
-    "$WA_BINARY" watch --foreground --auto-handle --config "$temp_workspace/wa.toml" \
+    "$FT_BINARY" watch --foreground --auto-handle --config "$temp_workspace/ft.toml" \
         > "$scenario_dir/wa_watch_2.log" 2>&1 &
     wa_pid_restart=$!
     log_verbose "wa watch restart PID $wa_pid_restart"
@@ -1706,7 +1706,7 @@ run_scenario_notification_webhook() {
     local mock_port=""
     local mock_addr=""
     local old_wa_data_dir="${WA_DATA_DIR:-}"
-    local old_wa_workspace="${WA_WORKSPACE:-}"
+    local old_wa_workspace="${FT_WORKSPACE:-}"
     local old_wa_config="${WA_CONFIG:-}"
 
     log_info "Workspace: $temp_workspace"
@@ -1742,9 +1742,9 @@ run_scenario_notification_webhook() {
             unset WA_DATA_DIR
         fi
         if [[ -n "$old_wa_workspace" ]]; then
-            export WA_WORKSPACE="$old_wa_workspace"
+            export FT_WORKSPACE="$old_wa_workspace"
         else
-            unset WA_WORKSPACE
+            unset FT_WORKSPACE
         fi
         if [[ -n "$old_wa_config" ]]; then
             export WA_CONFIG="$old_wa_config"
@@ -1753,7 +1753,7 @@ run_scenario_notification_webhook() {
         fi
         if [[ -d "${temp_workspace:-}" ]]; then
             cp -r "${temp_workspace}/.wa"/* "$scenario_dir/" 2>/dev/null || true
-            cp "${temp_workspace}/wa.toml" "$scenario_dir/" 2>/dev/null || true
+            cp "${temp_workspace}/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
         rm -rf "${temp_workspace:-}"
     }
@@ -2015,25 +2015,25 @@ PY
 
     wait_for_pane_observed() {
         local pane="$1"
-        local check_cmd="\"$WA_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane)' >/dev/null 2>&1"
+        local check_cmd="\"$FT_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane)' >/dev/null 2>&1"
         wait_for_condition "pane $pane observed" "$check_cmd" "$wait_timeout"
     }
 
     # Step 1: Configure isolated workspace and notifications
     log_info "Step 1: Preparing workspace + notifications config..."
     export WA_DATA_DIR="$temp_workspace/.wa"
-    export WA_WORKSPACE="$temp_workspace"
+    export FT_WORKSPACE="$temp_workspace"
     mkdir -p "$WA_DATA_DIR"
 
     local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
     if [[ -f "$baseline_config" ]]; then
-        cp "$baseline_config" "$temp_workspace/wa.toml"
+        cp "$baseline_config" "$temp_workspace/ft.toml"
     else
         log_fail "Baseline config not found: $baseline_config"
         return 1
     fi
 
-    cat >> "$temp_workspace/wa.toml" <<EOF
+    cat >> "$temp_workspace/ft.toml" <<EOF
 
 [notifications]
 enabled = true
@@ -2049,12 +2049,12 @@ template = "generic"
 events = ["codex:compaction"]
 EOF
 
-    export WA_CONFIG="$temp_workspace/wa.toml"
+    export WA_CONFIG="$temp_workspace/ft.toml"
     log_pass "Notifications configured for $mock_addr"
 
     # Step 2: Start wa watch
     log_info "Step 2: Starting wa watch..."
-    "$WA_BINARY" watch --foreground --config "$temp_workspace/wa.toml" \
+    "$FT_BINARY" watch --foreground --config "$temp_workspace/ft.toml" \
         > "$scenario_dir/wa_watch.log" 2>&1 &
     wa_pid=$!
     echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
@@ -2222,8 +2222,8 @@ EOF
 
     # Step 7: Capture events + audit slice artifacts
     log_info "Step 7: Capturing events + audit slice..."
-    "$WA_BINARY" events -f json --limit 200 > "$scenario_dir/events.json" 2>&1 || true
-    local db_path="$temp_workspace/.wa/wa.db"
+    "$FT_BINARY" events -f json --limit 200 > "$scenario_dir/events.json" 2>&1 || true
+    local db_path="$temp_workspace/.ft/ft.db"
     if [[ -f "$db_path" ]]; then
         sqlite3 "$db_path" -json \
             "SELECT id, action_kind, actor_kind, result, summary, error FROM audit_actions ORDER BY id DESC LIMIT 200;" \
@@ -2255,7 +2255,7 @@ run_scenario_watch_notify_only() {
     local mock_port=""
     local mock_addr=""
     local old_wa_data_dir="${WA_DATA_DIR:-}"
-    local old_wa_workspace="${WA_WORKSPACE:-}"
+    local old_wa_workspace="${FT_WORKSPACE:-}"
     local old_wa_config="${WA_CONFIG:-}"
 
     log_info "Workspace: $temp_workspace"
@@ -2293,9 +2293,9 @@ run_scenario_watch_notify_only() {
             unset WA_DATA_DIR
         fi
         if [[ -n "$old_wa_workspace" ]]; then
-            export WA_WORKSPACE="$old_wa_workspace"
+            export FT_WORKSPACE="$old_wa_workspace"
         else
-            unset WA_WORKSPACE
+            unset FT_WORKSPACE
         fi
         if [[ -n "$old_wa_config" ]]; then
             export WA_CONFIG="$old_wa_config"
@@ -2304,7 +2304,7 @@ run_scenario_watch_notify_only() {
         fi
         if [[ -d "${temp_workspace:-}" ]]; then
             cp -r "${temp_workspace}/.wa"/* "$scenario_dir/" 2>/dev/null || true
-            cp "${temp_workspace}/wa.toml" "$scenario_dir/" 2>/dev/null || true
+            cp "${temp_workspace}/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
         rm -rf "${temp_workspace:-}"
     }
@@ -2539,7 +2539,7 @@ PY
 
     wait_for_pane_observed() {
         local pane="$1"
-        local check_cmd="\"$WA_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane)' >/dev/null 2>&1"
+        local check_cmd="\"$FT_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane)' >/dev/null 2>&1"
         wait_for_condition "pane $pane observed" "$check_cmd" "$wait_timeout"
     }
 
@@ -2552,7 +2552,7 @@ PY
             wait "$wa_pid" 2>/dev/null || true
         fi
 
-        "$WA_BINARY" watch --foreground --config "$temp_workspace/wa.toml" "$@" \
+        "$FT_BINARY" watch --foreground --config "$temp_workspace/ft.toml" "$@" \
             > "$log_file" 2>&1 &
         wa_pid=$!
         echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
@@ -2576,18 +2576,18 @@ PY
     # Step 1: Configure isolated workspace and notifications
     log_info "Step 1: Preparing workspace + notifications config..."
     export WA_DATA_DIR="$temp_workspace/.wa"
-    export WA_WORKSPACE="$temp_workspace"
+    export FT_WORKSPACE="$temp_workspace"
     mkdir -p "$WA_DATA_DIR"
 
     local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
     if [[ -f "$baseline_config" ]]; then
-        cp "$baseline_config" "$temp_workspace/wa.toml"
+        cp "$baseline_config" "$temp_workspace/ft.toml"
     else
         log_fail "Baseline config not found: $baseline_config"
         return 1
     fi
 
-    cat >> "$temp_workspace/wa.toml" <<EOF
+    cat >> "$temp_workspace/ft.toml" <<EOF
 
 [notifications]
 enabled = true
@@ -2602,7 +2602,7 @@ url = "${mock_addr}/webhook"
 template = "generic"
 EOF
 
-    export WA_CONFIG="$temp_workspace/wa.toml"
+    export WA_CONFIG="$temp_workspace/ft.toml"
     log_pass "Notify-only config written"
 
     if ! start_mock_server; then
@@ -2663,7 +2663,7 @@ EOF
     fi
 
     log_info "Step 4: Verifying event remains unhandled + no workflow runs..."
-    "$WA_BINARY" events -f json --unhandled --rule-id "codex.usage.reached" --limit 20 \
+    "$FT_BINARY" events -f json --unhandled --rule-id "codex.usage.reached" --limit 20 \
         > "$scenario_dir/events_unhandled_notify_only.json" 2>&1 || true
 
     if jq -e ".[] | select(.pane_id == $pane_usage)" \
@@ -2674,7 +2674,7 @@ EOF
         result=1
     fi
 
-    local db_path="$temp_workspace/.wa/wa.db"
+    local db_path="$temp_workspace/.ft/ft.db"
     if [[ -f "$db_path" ]]; then
         sqlite3 "$db_path" -json \
             "SELECT id, workflow_name, status FROM workflow_executions ORDER BY started_at DESC LIMIT 50;" \
@@ -2823,14 +2823,14 @@ run_scenario_policy_denial() {
 
     # Setup environment for isolated wa instance with strict config
     export WA_DATA_DIR="$temp_workspace/.wa"
-    export WA_WORKSPACE="$temp_workspace"
+    export FT_WORKSPACE="$temp_workspace"
     mkdir -p "$WA_DATA_DIR"
 
     # Copy strict config for policy testing
     local strict_config="$PROJECT_ROOT/fixtures/e2e/config_strict.toml"
     if [[ -f "$strict_config" ]]; then
-        cp "$strict_config" "$temp_workspace/wa.toml"
-        export WA_CONFIG="$temp_workspace/wa.toml"
+        cp "$strict_config" "$temp_workspace/ft.toml"
+        export WA_CONFIG="$temp_workspace/ft.toml"
         log_verbose "Using strict config: $strict_config"
     fi
 
@@ -2851,7 +2851,7 @@ run_scenario_policy_denial() {
         # Copy artifacts before cleanup
         if [[ -d "$temp_workspace" ]]; then
             cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
-            cp "$temp_workspace/wa.toml" "$scenario_dir/" 2>/dev/null || true
+            cp "$temp_workspace/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
         rm -rf "$temp_workspace"
     }
@@ -2886,7 +2886,7 @@ run_scenario_policy_denial() {
 
     # Step 2: Start wa watch in background
     log_info "Step 2: Starting wa watch..."
-    "$WA_BINARY" watch --foreground \
+    "$FT_BINARY" watch --foreground \
         > "$scenario_dir/wa_watch.log" 2>&1 &
     wa_pid=$!
     log_verbose "wa watch started with PID $wa_pid"
@@ -2901,22 +2901,22 @@ run_scenario_policy_denial() {
     # Step 3: Wait for pane to be observed
     log_info "Step 3: Waiting for pane to be observed..."
     local wait_timeout=${TIMEOUT:-30}
-    local check_cmd="\"$WA_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane_id)' >/dev/null 2>&1"
+    local check_cmd="\"$FT_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane_id)' >/dev/null 2>&1"
 
     if ! wait_for_condition "pane $pane_id observed" "$check_cmd" "$wait_timeout"; then
         log_fail "Timeout waiting for pane to be observed"
-        "$WA_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
+        "$FT_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
         return 1
     fi
     log_pass "Pane observed"
 
     # Capture robot state for diagnostics
-    "$WA_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
+    "$FT_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
 
     # Step 4: Attempt to send text to the alt-screen pane
     log_info "Step 4: Attempting send to alt-screen pane (should be denied)..."
     local send_output
-    send_output=$("$WA_BINARY" robot send "$pane_id" "test_text_should_be_denied" 2>&1)
+    send_output=$("$FT_BINARY" robot send "$pane_id" "test_text_should_be_denied" 2>&1)
     local send_exit_code=$?
     echo "$send_output" > "$scenario_dir/send_attempt.json"
     echo "send_exit_code: $send_exit_code" >> "$scenario_dir/scenario.log"
@@ -2970,7 +2970,7 @@ run_scenario_policy_denial() {
     # Step 6: Verify no text was actually sent (check pane content)
     log_info "Step 6: Verifying no text was sent to pane..."
     local pane_text
-    pane_text=$("$WA_BINARY" robot get-text "$pane_id" 2>&1 || true)
+    pane_text=$("$FT_BINARY" robot get-text "$pane_id" 2>&1 || true)
     echo "$pane_text" > "$scenario_dir/pane_text.txt"
 
     if echo "$pane_text" | grep -q "test_text_should_be_denied"; then
@@ -3007,13 +3007,13 @@ run_scenario_audit_tail_streaming() {
 
     # Setup environment for isolated wa instance
     export WA_DATA_DIR="$temp_workspace/.wa"
-    export WA_WORKSPACE="$temp_workspace"
+    export FT_WORKSPACE="$temp_workspace"
     mkdir -p "$WA_DATA_DIR"
 
     local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
     if [[ -f "$baseline_config" ]]; then
-        cp "$baseline_config" "$temp_workspace/wa.toml"
-        export WA_CONFIG="$temp_workspace/wa.toml"
+        cp "$baseline_config" "$temp_workspace/ft.toml"
+        export WA_CONFIG="$temp_workspace/ft.toml"
         log_verbose "Using baseline config: $baseline_config"
     fi
 
@@ -3035,7 +3035,7 @@ run_scenario_audit_tail_streaming() {
         fi
         if [[ -d "$temp_workspace" ]]; then
             cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
-            cp "$temp_workspace/wa.toml" "$scenario_dir/" 2>/dev/null || true
+            cp "$temp_workspace/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
         rm -rf "$temp_workspace"
     }
@@ -3069,7 +3069,7 @@ run_scenario_audit_tail_streaming() {
 
     # Step 2: Start wa watch in background
     log_info "Step 2: Starting wa watch..."
-    "$WA_BINARY" watch --foreground \
+    "$FT_BINARY" watch --foreground \
         > "$scenario_dir/wa_watch.log" 2>&1 &
     wa_pid=$!
     log_verbose "wa watch started with PID $wa_pid"
@@ -3078,21 +3078,21 @@ run_scenario_audit_tail_streaming() {
     # Step 3: Wait for pane to be observed
     log_info "Step 3: Waiting for pane to be observed..."
     local wait_timeout=${TIMEOUT:-30}
-    local check_cmd="\"$WA_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane_id)' >/dev/null 2>&1"
+    local check_cmd="\"$FT_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane_id)' >/dev/null 2>&1"
 
     if ! wait_for_condition "pane $pane_id observed" "$check_cmd" "$wait_timeout"; then
         log_fail "Timeout waiting for pane to be observed"
-        "$WA_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
+        "$FT_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
         return 1
     fi
     log_pass "Pane observed"
-    "$WA_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
+    "$FT_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
 
     # Step 4: Start audit tail in follow mode
     log_info "Step 4: Starting audit tail stream..."
     local since_ms
     since_ms=$(( $(date +%s) * 1000 ))
-    timeout 8 "$WA_BINARY" audit tail --follow --since "$since_ms" --limit 50 \
+    timeout 8 "$FT_BINARY" audit tail --follow --since "$since_ms" --limit 50 \
         > "$scenario_dir/audit_tail.jsonl" 2> "$scenario_dir/audit_tail.stderr" &
     tail_pid=$!
     echo "audit_tail_pid: $tail_pid" >> "$scenario_dir/scenario.log"
@@ -3106,7 +3106,7 @@ run_scenario_audit_tail_streaming() {
     # Step 5: Generate an audit action (intentional denial) with redaction
     log_info "Step 5: Triggering audit action..."
     local send_output
-    send_output=$("$WA_BINARY" robot send "$pane_id" "echo $secret_token" 2>&1 || true)
+    send_output=$("$FT_BINARY" robot send "$pane_id" "echo $secret_token" 2>&1 || true)
     echo "$send_output" > "$scenario_dir/send_output.json"
 
     # Step 6: Wait for audit tail output
@@ -3172,16 +3172,16 @@ run_scenario_ipc_rpc_roundtrip() {
     log_info "Workspace: $temp_workspace"
 
     export WA_DATA_DIR="$temp_workspace/.wa"
-    export WA_WORKSPACE="$temp_workspace"
+    export FT_WORKSPACE="$temp_workspace"
     mkdir -p "$WA_DATA_DIR"
 
     local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
     if [[ -f "$baseline_config" ]]; then
-        cp "$baseline_config" "$temp_workspace/wa.toml"
+        cp "$baseline_config" "$temp_workspace/ft.toml"
         log_verbose "Using baseline config: $baseline_config"
     fi
 
-    cat >> "$temp_workspace/wa.toml" <<EOF
+    cat >> "$temp_workspace/ft.toml" <<EOF
 
 [ipc]
 enabled = true
@@ -3196,7 +3196,7 @@ token = "$write_token"
 scopes = ["write"]
 EOF
 
-    export WA_CONFIG="$temp_workspace/wa.toml"
+    export WA_CONFIG="$temp_workspace/ft.toml"
 
     cleanup_ipc_rpc_roundtrip() {
         log_verbose "Cleaning up ipc_rpc_roundtrip scenario"
@@ -3207,7 +3207,7 @@ EOF
         fi
         if [[ -d "$temp_workspace" ]]; then
             cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
-            cp "$temp_workspace/wa.toml" "$scenario_dir/" 2>/dev/null || true
+            cp "$temp_workspace/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
         rm -rf "$temp_workspace"
     }
@@ -3240,7 +3240,7 @@ PY
 
     # Step 1: Start wa watch
     log_info "Step 1: Starting wa watch..."
-    "$WA_BINARY" watch --foreground --config "$temp_workspace/wa.toml" \
+    "$FT_BINARY" watch --foreground --config "$temp_workspace/ft.toml" \
         > "$scenario_dir/wa_watch.log" 2>&1 &
     wa_pid=$!
     echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
@@ -3326,7 +3326,7 @@ EOF
 
     # Step 6: Audit entries for RPC requests
     log_info "Step 6: Checking audit trail for IPC RPC..."
-    "$WA_BINARY" audit -f json -l 50 > "$scenario_dir/audit_actions.json" 2>&1 || true
+    "$FT_BINARY" audit -f json -l 50 > "$scenario_dir/audit_actions.json" 2>&1 || true
 
     if jq -e --arg rid "$request_id_help" \
         '.[]? | select(.action_kind == "ipc.rpc" and .correlation_id == $rid)' \
@@ -3360,11 +3360,11 @@ run_scenario_prepare_commit_approvals() {
 
     # Setup environment for isolated wa instance
     export WA_DATA_DIR="$temp_workspace/.wa"
-    export WA_WORKSPACE="$temp_workspace"
+    export FT_WORKSPACE="$temp_workspace"
     mkdir -p "$WA_DATA_DIR"
 
     # Build a permissive config that forces approval for send_text
-    local config_path="$temp_workspace/wa.toml"
+    local config_path="$temp_workspace/ft.toml"
     local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
     if [[ -f "$baseline_config" ]]; then
         cp "$baseline_config" "$config_path"
@@ -3402,7 +3402,7 @@ EOF
         fi
         if [[ -d "$temp_workspace" ]]; then
             cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
-            cp "$temp_workspace/wa.toml" "$scenario_dir/" 2>/dev/null || true
+            cp "$temp_workspace/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
         rm -rf "$temp_workspace"
     }
@@ -3428,7 +3428,7 @@ EOF
 
     # Step 2: Prepare plan (expect approval required)
     log_info "Step 2: Preparing plan (expect approval)..."
-    "$WA_BINARY" prepare send --pane "$pane_id" --format json --wait-for "$marker" --timeout-secs 10 \
+    "$FT_BINARY" prepare send --pane "$pane_id" --format json --wait-for "$marker" --timeout-secs 10 \
         "$send_text" > "$scenario_dir/prepare_output.json" 2>&1 || true
 
     if jq -e '.plan_id and .plan_hash' "$scenario_dir/prepare_output.json" >/dev/null 2>&1; then
@@ -3474,7 +3474,7 @@ EOF
     # Step 3: Commit with mismatched text (expect failure)
     log_info "Step 3: Commit with mismatched text (expect failure)..."
     local mismatch_rc=0
-    "$WA_BINARY" commit "$plan_id" --approval-code "$approval_code" \
+    "$FT_BINARY" commit "$plan_id" --approval-code "$approval_code" \
         --text "echo ${marker}_MISMATCH" > "$scenario_dir/commit_mismatch.log" 2>&1 || mismatch_rc=$?
     echo "commit_mismatch_rc: $mismatch_rc" >> "$scenario_dir/scenario.log"
 
@@ -3495,7 +3495,7 @@ EOF
     # Step 4: Commit with correct text (expect success)
     log_info "Step 4: Commit with correct text..."
     local commit_rc=0
-    "$WA_BINARY" commit "$plan_id" --approval-code "$approval_code" \
+    "$FT_BINARY" commit "$plan_id" --approval-code "$approval_code" \
         --text "$send_text" > "$scenario_dir/commit_output.log" 2>&1 || commit_rc=$?
     echo "commit_rc: $commit_rc" >> "$scenario_dir/scenario.log"
 
@@ -3515,7 +3515,7 @@ EOF
 
     # Step 5: Capture audit actions (approval + send)
     log_info "Step 5: Capturing audit trail..."
-    "$WA_BINARY" audit -f json -l 50 > "$scenario_dir/audit_actions.json" 2>&1 || true
+    "$FT_BINARY" audit -f json -l 50 > "$scenario_dir/audit_actions.json" 2>&1 || true
 
     if jq -e 'map(select(.action_kind == "approve_allow_once")) | length > 0' \
         "$scenario_dir/audit_actions.json" >/dev/null 2>&1; then
@@ -3533,7 +3533,7 @@ EOF
     fi
 
     # Step 6: Capture pane output for evidence
-    "$WA_BINARY" robot get-text "$pane_id" --tail 50 > "$scenario_dir/pane_text.txt" 2>&1 || true
+    "$FT_BINARY" robot get-text "$pane_id" --tail 50 > "$scenario_dir/pane_text.txt" 2>&1 || true
     if grep -q "$marker" "$scenario_dir/pane_text.txt" 2>/dev/null; then
         log_pass "Marker observed in pane output"
     else
@@ -3556,7 +3556,7 @@ run_scenario_quickfix_suggestions() {
     local result=0
     local wait_timeout=${TIMEOUT:-60}
     local old_wa_data_dir="${WA_DATA_DIR:-}"
-    local old_wa_workspace="${WA_WORKSPACE:-}"
+    local old_wa_workspace="${FT_WORKSPACE:-}"
     local old_wa_config="${WA_CONFIG:-}"
 
     log_info "Workspace: $temp_workspace"
@@ -3578,7 +3578,7 @@ run_scenario_quickfix_suggestions() {
         fi
         if [[ -d "${temp_workspace:-}" ]]; then
             cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
-            cp "$temp_workspace/wa.toml" "$scenario_dir/" 2>/dev/null || true
+            cp "$temp_workspace/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
         if [[ -n "$old_wa_data_dir" ]]; then
             export WA_DATA_DIR="$old_wa_data_dir"
@@ -3586,9 +3586,9 @@ run_scenario_quickfix_suggestions() {
             unset WA_DATA_DIR
         fi
         if [[ -n "$old_wa_workspace" ]]; then
-            export WA_WORKSPACE="$old_wa_workspace"
+            export FT_WORKSPACE="$old_wa_workspace"
         else
-            unset WA_WORKSPACE
+            unset FT_WORKSPACE
         fi
         if [[ -n "$old_wa_config" ]]; then
             export WA_CONFIG="$old_wa_config"
@@ -3641,19 +3641,19 @@ PY
 
     # Setup environment for isolated wa instance
     export WA_DATA_DIR="$temp_workspace/.wa"
-    export WA_WORKSPACE="$temp_workspace"
+    export FT_WORKSPACE="$temp_workspace"
     mkdir -p "$WA_DATA_DIR"
 
     local strict_config="$PROJECT_ROOT/fixtures/e2e/config_strict.toml"
     if [[ -f "$strict_config" ]]; then
-        cp "$strict_config" "$temp_workspace/wa.toml"
-        export WA_CONFIG="$temp_workspace/wa.toml"
+        cp "$strict_config" "$temp_workspace/ft.toml"
+        export WA_CONFIG="$temp_workspace/ft.toml"
         log_verbose "Using strict config: $strict_config"
     fi
 
     # Start wa watch
     log_info "Step 1: Starting wa watch..."
-    "$WA_BINARY" watch --foreground --config "$temp_workspace/wa.toml" \
+    "$FT_BINARY" watch --foreground --config "$temp_workspace/ft.toml" \
         > "$scenario_dir/wa_watch.log" 2>&1 &
     wa_pid=$!
     echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
@@ -3690,25 +3690,25 @@ EOS
     log_info "Spawned compaction pane: $compaction_pane"
     echo "compaction_pane_id: $compaction_pane" >> "$scenario_dir/scenario.log"
 
-    local check_pane_cmd="\"$WA_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $compaction_pane)' >/dev/null 2>&1"
+    local check_pane_cmd="\"$FT_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $compaction_pane)' >/dev/null 2>&1"
     if ! wait_for_condition "pane $compaction_pane observed" "$check_pane_cmd" "$wait_timeout"; then
         log_fail "Timeout waiting for compaction pane to be observed"
-        "$WA_BINARY" robot state > "$scenario_dir/robot_state_compaction.json" 2>&1 || true
+        "$FT_BINARY" robot state > "$scenario_dir/robot_state_compaction.json" 2>&1 || true
         result=1
     else
         log_pass "Compaction pane observed"
     fi
 
-    local event_cmd="\"$WA_BINARY\" events -f json --unhandled --rule-id \"claude_code.compaction\" --limit 20 2>/dev/null | jq -e 'length >= 1' >/dev/null 2>&1"
+    local event_cmd="\"$FT_BINARY\" events -f json --unhandled --rule-id \"claude_code.compaction\" --limit 20 2>/dev/null | jq -e 'length >= 1' >/dev/null 2>&1"
     if ! wait_for_condition "unhandled compaction event detected" "$event_cmd" "$wait_timeout"; then
         log_fail "Timeout waiting for compaction event"
-        "$WA_BINARY" events -f json --limit 20 > "$scenario_dir/events_debug.json" 2>&1 || true
+        "$FT_BINARY" events -f json --limit 20 > "$scenario_dir/events_debug.json" 2>&1 || true
         result=1
     else
         log_pass "Compaction event detected"
     fi
 
-    "$WA_BINARY" events -f json --unhandled --rule-id "claude_code.compaction" --limit 20 \
+    "$FT_BINARY" events -f json --unhandled --rule-id "claude_code.compaction" --limit 20 \
         > "$scenario_dir/suggestions_output.json" 2>&1 || true
 
     if jq -e '.[0]' "$scenario_dir/suggestions_output.json" >/dev/null 2>&1; then
@@ -3717,10 +3717,10 @@ EOS
         cp "$scenario_dir/suggestions_output.json" "$scenario_dir/events.jsonl" 2>/dev/null || true
     fi
 
-    "$WA_BINARY" robot events --unhandled --rule-id "claude_code.compaction" --limit 5 --would-handle --dry-run \
+    "$FT_BINARY" robot events --unhandled --rule-id "claude_code.compaction" --limit 5 --would-handle --dry-run \
         > "$scenario_dir/robot_events_preview.json" 2>&1 || true
 
-    "$WA_BINARY" robot rules show "claude_code.compaction" \
+    "$FT_BINARY" robot rules show "claude_code.compaction" \
         > "$scenario_dir/robot_rule_detail.json" 2>&1 || true
 
     local preview_command=""
@@ -3765,7 +3765,7 @@ EOS
     if [[ -n "$preview_command" ]] && is_safe_command "$preview_command"; then
         local exec_cmd="$preview_command"
         if [[ "$exec_cmd" == wa\ * ]]; then
-            exec_cmd="${exec_cmd/wa /$WA_BINARY }"
+            exec_cmd="${exec_cmd/wa /$FT_BINARY }"
         fi
         read -r -a preview_argv <<< "$exec_cmd"
         set +e
@@ -3786,7 +3786,7 @@ EOS
     # Step 3: Error suggestions for invalid pane id
     log_info "Step 3: Validating error remediation for invalid pane..."
     local error_output=""
-    error_output=$("$WA_BINARY" send --pane 999 "hello" 2>&1 || true)
+    error_output=$("$FT_BINARY" send --pane 999 "hello" 2>&1 || true)
     echo "$error_output" > "$scenario_dir/error_invalid_pane.json"
 
     if echo "$error_output" | jq -e '.ok == false' >/dev/null 2>&1; then
@@ -3825,7 +3825,7 @@ EOS
             log_info "Spawned alt-screen pane: $alt_pane"
             echo "alt_screen_pane_id: $alt_pane" >> "$scenario_dir/scenario.log"
 
-            local check_alt_pane_cmd="\"$WA_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $alt_pane)' >/dev/null 2>&1"
+            local check_alt_pane_cmd="\"$FT_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $alt_pane)' >/dev/null 2>&1"
             if ! wait_for_condition "alt-screen pane observed" "$check_alt_pane_cmd" "$wait_timeout"; then
                 log_fail "Timeout waiting for alt-screen pane to be observed"
                 result=1
@@ -3843,7 +3843,7 @@ EOS
             fi
 
             local deny_output=""
-            deny_output=$("$WA_BINARY" send --pane "$alt_pane" "test_text_should_be_denied" 2>&1 || true)
+            deny_output=$("$FT_BINARY" send --pane "$alt_pane" "test_text_should_be_denied" 2>&1 || true)
             echo "$deny_output" > "$scenario_dir/policy_denial.json"
 
             if echo "$deny_output" | jq -e '.injection.Denied or .injection.RequiresApproval' >/dev/null 2>&1; then
@@ -3856,7 +3856,7 @@ EOS
             fi
 
             local recent_output=""
-            recent_output=$("$WA_BINARY" why --recent --pane "$alt_pane" -f json 2>&1 || true)
+            recent_output=$("$FT_BINARY" why --recent --pane "$alt_pane" -f json 2>&1 || true)
             echo "$recent_output" > "$scenario_dir/why_recent.json"
 
             local decision_id=""
@@ -3867,7 +3867,7 @@ EOS
             if [[ -n "$decision_id" ]]; then
                 log_pass "Captured recent policy decision id"
                 local detail_output=""
-                detail_output=$("$WA_BINARY" why --recent --decision-id "$decision_id" -f json 2>&1 || true)
+                detail_output=$("$FT_BINARY" why --recent --decision-id "$decision_id" -f json 2>&1 || true)
                 echo "$detail_output" > "$scenario_dir/why_decision_detail.json"
                 local suggestion_count=0
                 suggestion_count=$(echo "$detail_output" | jq '.explanation.suggestions | length' 2>/dev/null || echo "0")
@@ -3892,7 +3892,7 @@ EOS
     # Step 5: Fuzzy match / typo recovery (soft check)
     log_info "Step 5: Checking typo recovery hints (soft check)..."
     local typo_output=""
-    typo_output=$("$WA_BINARY" workflow run handle_compactoin --dry-run 2>&1 || true)
+    typo_output=$("$FT_BINARY" workflow run handle_compactoin --dry-run 2>&1 || true)
     echo "$typo_output" > "$scenario_dir/typo_workflow.json"
 
     if echo "$typo_output" | grep -qi "did you mean"; then
@@ -3922,7 +3922,7 @@ run_scenario_triage_multi_issue() {
     local db_path=""
     local pane_id=9001
     local old_wa_data_dir="${WA_DATA_DIR:-}"
-    local old_wa_workspace="${WA_WORKSPACE:-}"
+    local old_wa_workspace="${FT_WORKSPACE:-}"
     local old_wa_config="${WA_CONFIG:-}"
 
     log_info "Workspace: $temp_workspace"
@@ -3931,7 +3931,7 @@ run_scenario_triage_multi_issue() {
         log_verbose "Cleaning up triage_multi_issue scenario"
         if [[ -d "${temp_workspace:-}" ]]; then
             cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
-            cp "$temp_workspace/wa.toml" "$scenario_dir/" 2>/dev/null || true
+            cp "$temp_workspace/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
         if [[ -n "$old_wa_data_dir" ]]; then
             export WA_DATA_DIR="$old_wa_data_dir"
@@ -3939,9 +3939,9 @@ run_scenario_triage_multi_issue() {
             unset WA_DATA_DIR
         fi
         if [[ -n "$old_wa_workspace" ]]; then
-            export WA_WORKSPACE="$old_wa_workspace"
+            export FT_WORKSPACE="$old_wa_workspace"
         else
-            unset WA_WORKSPACE
+            unset FT_WORKSPACE
         fi
         if [[ -n "$old_wa_config" ]]; then
             export WA_CONFIG="$old_wa_config"
@@ -3954,21 +3954,21 @@ run_scenario_triage_multi_issue() {
 
     # Setup environment for isolated wa instance
     export WA_DATA_DIR="$temp_workspace/.wa"
-    export WA_WORKSPACE="$temp_workspace"
+    export FT_WORKSPACE="$temp_workspace"
     mkdir -p "$WA_DATA_DIR"
 
     local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
     if [[ -f "$baseline_config" ]]; then
-        cp "$baseline_config" "$temp_workspace/wa.toml"
-        export WA_CONFIG="$temp_workspace/wa.toml"
+        cp "$baseline_config" "$temp_workspace/ft.toml"
+        export WA_CONFIG="$temp_workspace/ft.toml"
         log_verbose "Using baseline config: $baseline_config"
     fi
 
     # Step 1: Initialize DB
     log_info "Step 1: Initializing DB..."
-    "$WA_BINARY" db migrate --yes > "$scenario_dir/db_migrate.txt" 2>&1 || true
-    "$WA_BINARY" db check -f json > "$scenario_dir/db_check.json" 2>&1 || true
-    db_path="$temp_workspace/.wa/wa.db"
+    "$FT_BINARY" db migrate --yes > "$scenario_dir/db_migrate.txt" 2>&1 || true
+    "$FT_BINARY" db check -f json > "$scenario_dir/db_check.json" 2>&1 || true
+    db_path="$temp_workspace/.ft/ft.db"
     if [[ ! -f "$db_path" ]]; then
         log_fail "DB not created at $db_path"
         result=1
@@ -3983,7 +3983,7 @@ import time
 print(int(time.time() * 1000))
 PY
 )
-        cat > "$temp_workspace/.wa/health_snapshot.json" <<EOF
+        cat > "$temp_workspace/.ft/health_snapshot.json" <<EOF
 {
   "timestamp": $now_ms,
   "observed_panes": 1,
@@ -4000,7 +4000,7 @@ EOF
 
         # Step 3: Create crash bundle
         log_info "Step 3: Creating crash bundle..."
-        local crash_dir="$temp_workspace/.wa/crash"
+        local crash_dir="$temp_workspace/.ft/crash"
         mkdir -p "$crash_dir"
         local crash_ts
         crash_ts=$(date -u +"%Y%m%d_%H%M%S")
@@ -4076,9 +4076,9 @@ SQL
 
         # Step 5: Run triage and capture output
         log_info "Step 5: Running wa triage..."
-        "$WA_BINARY" triage -f json > "$scenario_dir/triage.json" \
+        "$FT_BINARY" triage -f json > "$scenario_dir/triage.json" \
             2> "$scenario_dir/triage_stderr.log" || true
-        "$WA_BINARY" triage --details > "$scenario_dir/triage.txt" \
+        "$FT_BINARY" triage --details > "$scenario_dir/triage.txt" \
             2> "$scenario_dir/triage_details_stderr.log" || true
 
         if ! jq -e '.ok == true' "$scenario_dir/triage.json" >/dev/null 2>&1; then
@@ -4154,7 +4154,7 @@ run_scenario_rules_explain_trace() {
     # Step 1: Capture rules list (human JSON)
     log_info "Step 1: Capturing rules list (JSON)..."
     local list_output
-    list_output=$("$WA_BINARY" rules list --format json 2>&1 || true)
+    list_output=$("$FT_BINARY" rules list --format json 2>&1 || true)
     echo "$list_output" > "$scenario_dir/rules_list.json"
     if echo "$list_output" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
         log_pass "Rules list JSON captured"
@@ -4166,7 +4166,7 @@ run_scenario_rules_explain_trace() {
     # Step 2: Run robot rules test with trace
     log_info "Step 2: Running robot rules test with trace..."
     local robot_output
-    robot_output=$("$WA_BINARY" robot --format json rules test "$test_text" --trace 2>&1 || true)
+    robot_output=$("$FT_BINARY" robot --format json rules test "$test_text" --trace 2>&1 || true)
     echo "$robot_output" > "$scenario_dir/robot_rules_test_trace.json"
 
     if echo "$robot_output" | jq -e '.ok == true and (.data.match_count // 0) >= 1' >/dev/null 2>&1; then
@@ -4195,7 +4195,7 @@ run_scenario_rules_explain_trace() {
     # Step 3: Run human rules test (plain output)
     log_info "Step 3: Running human rules test (plain)..."
     local human_output
-    human_output=$("$WA_BINARY" rules test "$test_text" --format plain 2>&1 || true)
+    human_output=$("$FT_BINARY" rules test "$test_text" --format plain 2>&1 || true)
     echo "$human_output" > "$scenario_dir/rules_test_output.txt"
 
     if echo "$human_output" | grep -q "Matches ("; then
@@ -4217,7 +4217,7 @@ run_scenario_rules_explain_trace() {
     # Step 4: Run robot rules lint (fixtures)
     log_info "Step 4: Running robot rules lint (fixtures)..."
     local lint_output
-    lint_output=$("$WA_BINARY" robot --format json rules lint --fixtures 2>&1 || true)
+    lint_output=$("$FT_BINARY" robot --format json rules lint --fixtures 2>&1 || true)
     echo "$lint_output" > "$scenario_dir/robot_rules_lint.json"
     if echo "$lint_output" | jq -e '.ok == true and (.data.rules_checked // 0) > 0' >/dev/null 2>&1; then
         log_pass "Robot rules lint output captured"
@@ -4282,7 +4282,7 @@ run_scenario_stress_scale() {
         done
         if [[ -d "${temp_workspace:-}" ]]; then
             cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
-            cp "$temp_workspace/wa.toml" "$scenario_dir/" 2>/dev/null || true
+            cp "$temp_workspace/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
         rm -rf "${temp_workspace:-}"
     }
@@ -4310,18 +4310,18 @@ EOS
 
     # Setup environment for isolated wa instance
     export WA_DATA_DIR="$temp_workspace/.wa"
-    export WA_WORKSPACE="$temp_workspace"
+    export FT_WORKSPACE="$temp_workspace"
     mkdir -p "$WA_DATA_DIR"
 
     local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
     if [[ -f "$baseline_config" ]]; then
-        cp "$baseline_config" "$temp_workspace/wa.toml"
+        cp "$baseline_config" "$temp_workspace/ft.toml"
     fi
-    export WA_CONFIG="$temp_workspace/wa.toml"
+    export WA_CONFIG="$temp_workspace/ft.toml"
 
     # Start wa watch
     log_info "Step 1: Starting wa watch..."
-    "$WA_BINARY" watch --foreground --config "$temp_workspace/wa.toml" \
+    "$FT_BINARY" watch --foreground --config "$temp_workspace/ft.toml" \
         > "$scenario_dir/wa_watch.log" 2>&1 &
     wa_pid=$!
     echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
@@ -4356,10 +4356,10 @@ EOS
         log_pass "Spawned $pane_count panes"
     fi
 
-    local check_health_cmd="\"$WA_BINARY\" status --health 2>/dev/null | jq -e '.health != null and .health.observed_panes >= $pane_count' >/dev/null 2>&1"
+    local check_health_cmd="\"$FT_BINARY\" status --health 2>/dev/null | jq -e '.health != null and .health.observed_panes >= $pane_count' >/dev/null 2>&1"
     if ! wait_for_condition "observed panes >= $pane_count" "$check_health_cmd" "$wait_timeout"; then
         log_fail "Timeout waiting for observed panes"
-        "$WA_BINARY" status --health > "$scenario_dir/status_health_initial.json" 2>&1 || true
+        "$FT_BINARY" status --health > "$scenario_dir/status_health_initial.json" 2>&1 || true
         result=1
     else
         log_pass "Observed panes >= $pane_count"
@@ -4381,10 +4381,10 @@ EOS
         echo "burst_pane_id: $burst_pane" >> "$scenario_dir/scenario.log"
     fi
 
-    local search_ready_cmd="\"$WA_BINARY\" search \"$marker\" --limit 5 -f json 2>/dev/null | jq -e 'length > 0' >/dev/null 2>&1"
+    local search_ready_cmd="\"$FT_BINARY\" search \"$marker\" --limit 5 -f json 2>/dev/null | jq -e 'length > 0' >/dev/null 2>&1"
     if ! wait_for_condition "fts search sees marker" "$search_ready_cmd" "$wait_timeout"; then
         log_fail "FTS search did not return results in time"
-        "$WA_BINARY" search "$marker" --limit 5 -f json > "$scenario_dir/search_debug.json" 2>&1 || true
+        "$FT_BINARY" search "$marker" --limit 5 -f json > "$scenario_dir/search_debug.json" 2>&1 || true
         result=1
     else
         log_pass "FTS search returned results"
@@ -4392,7 +4392,7 @@ EOS
 
     # Step 4: Capture health snapshot and enforce budgets
     log_info "Step 4: Capturing health snapshot and enforcing budgets..."
-    "$WA_BINARY" status --health > "$scenario_dir/status_health.json" 2>&1 || true
+    "$FT_BINARY" status --health > "$scenario_dir/status_health.json" 2>&1 || true
     local ingest_lag_max
     ingest_lag_max=$(jq -r '.health.ingest_lag_max_ms // 0' "$scenario_dir/status_health.json" 2>/dev/null || echo "0")
     local observed_panes
@@ -4467,7 +4467,7 @@ EOS
     # Step 5: Measure FTS query latency
     log_info "Step 5: Measuring FTS query latency..."
     local fts_metrics
-    fts_metrics=$(python3 - "$WA_BINARY" "$marker" <<'PY'
+    fts_metrics=$(python3 - "$FT_BINARY" "$marker" <<'PY'
 import json
 import subprocess
 import sys
@@ -4555,7 +4555,7 @@ run_scenario_graceful_shutdown() {
 
     # Setup environment for isolated wa instance
     export WA_DATA_DIR="$temp_workspace/.wa"
-    export WA_WORKSPACE="$temp_workspace"
+    export FT_WORKSPACE="$temp_workspace"
     mkdir -p "$WA_DATA_DIR"
 
     # Cleanup function
@@ -4602,7 +4602,7 @@ run_scenario_graceful_shutdown() {
 
     # Step 2: Start wa watch in foreground mode (so we can control it)
     log_info "Step 2: Starting wa watch..."
-    "$WA_BINARY" watch --foreground \
+    "$FT_BINARY" watch --foreground \
         > "$scenario_dir/wa_watch.log" 2>&1 &
     wa_pid=$!
     log_verbose "wa watch started with PID $wa_pid"
@@ -4619,17 +4619,17 @@ run_scenario_graceful_shutdown() {
     local wait_timeout=${TIMEOUT:-30}
 
     # Wait for pane to be observed first
-    local check_observed_cmd="\"$WA_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane_id)' >/dev/null 2>&1"
+    local check_observed_cmd="\"$FT_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane_id)' >/dev/null 2>&1"
     if ! wait_for_condition "pane $pane_id observed" "$check_observed_cmd" "$wait_timeout"; then
         log_fail "Timeout waiting for pane to be observed"
-        "$WA_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
+        "$FT_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
         return 1
     fi
     log_pass "Pane observed"
 
     # Wait for marker to appear in search (proves FTS is working and data is persisted)
     log_info "Step 3b: Waiting for marker to appear in FTS index..."
-    local search_check_cmd="\"$WA_BINARY\" search \"$marker\" --limit 10 2>/dev/null | grep -q \"$marker\""
+    local search_check_cmd="\"$FT_BINARY\" search \"$marker\" --limit 10 2>/dev/null | grep -q \"$marker\""
     if ! wait_for_condition "marker in FTS" "$search_check_cmd" "$wait_timeout"; then
         log_warn "Marker not found in FTS before shutdown (may be normal if not persisted yet)"
         # Continue anyway - we'll check after shutdown
@@ -4638,8 +4638,8 @@ run_scenario_graceful_shutdown() {
     fi
 
     # Record pre-shutdown state
-    "$WA_BINARY" robot state > "$scenario_dir/robot_state_before_shutdown.json" 2>&1 || true
-    "$WA_BINARY" search "$marker" --limit 10 > "$scenario_dir/search_before_shutdown.txt" 2>&1 || true
+    "$FT_BINARY" robot state > "$scenario_dir/robot_state_before_shutdown.json" 2>&1 || true
+    "$FT_BINARY" search "$marker" --limit 10 > "$scenario_dir/search_before_shutdown.txt" 2>&1 || true
 
     # Step 4: Send SIGINT to wa watch and measure shutdown time
     log_info "Step 4: Sending SIGINT to wa watch..."
@@ -4681,7 +4681,7 @@ run_scenario_graceful_shutdown() {
     # Step 5: Verify storage was flushed (FTS still works)
     log_info "Step 5: Verifying storage flush (FTS search after shutdown)..."
     local search_output
-    search_output=$("$WA_BINARY" search "$marker" --limit 50 2>&1)
+    search_output=$("$FT_BINARY" search "$marker" --limit 50 2>&1)
     echo "$search_output" > "$scenario_dir/search_after_shutdown.txt"
 
     local hit_count
@@ -4699,7 +4699,7 @@ run_scenario_graceful_shutdown() {
     log_info "Step 6: Verifying lock release (attempting restart)..."
 
     local restart_pid=""
-    "$WA_BINARY" watch --foreground \
+    "$FT_BINARY" watch --foreground \
         > "$scenario_dir/wa_watch_restart.log" 2>&1 &
     restart_pid=$!
 
@@ -4778,14 +4778,14 @@ run_scenario_pane_exclude_filter() {
 
     # Setup environment for isolated wa instance
     export WA_DATA_DIR="$temp_workspace/.wa"
-    export WA_WORKSPACE="$temp_workspace"
+    export FT_WORKSPACE="$temp_workspace"
     mkdir -p "$WA_DATA_DIR"
 
     # Copy pane exclude config
     local exclude_config="$PROJECT_ROOT/fixtures/e2e/config_pane_exclude.toml"
     if [[ -f "$exclude_config" ]]; then
-        cp "$exclude_config" "$temp_workspace/wa.toml"
-        export WA_CONFIG="$temp_workspace/wa.toml"
+        cp "$exclude_config" "$temp_workspace/ft.toml"
+        export WA_CONFIG="$temp_workspace/ft.toml"
         log_verbose "Using exclude config: $exclude_config"
     else
         log_fail "Pane exclude config not found: $exclude_config"
@@ -4818,7 +4818,7 @@ run_scenario_pane_exclude_filter() {
         # Copy artifacts before cleanup (use :- to avoid unbound variable with set -u)
         if [[ -d "${temp_workspace:-}" ]]; then
             cp -r "${temp_workspace}/.wa"/* "$scenario_dir/" 2>/dev/null || true
-            cp "${temp_workspace}/wa.toml" "$scenario_dir/" 2>/dev/null || true
+            cp "${temp_workspace}/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
         rm -rf "${temp_workspace:-}"
     }
@@ -4872,7 +4872,7 @@ run_scenario_pane_exclude_filter() {
 
     # Step 3: Start wa watch in background with custom config
     log_info "Step 3: Starting wa watch with exclude config..."
-    "$WA_BINARY" watch --foreground --config "$temp_workspace/wa.toml" \
+    "$FT_BINARY" watch --foreground --config "$temp_workspace/ft.toml" \
         > "$scenario_dir/wa_watch.log" 2>&1 &
     wa_pid=$!
     log_verbose "wa watch started with PID $wa_pid"
@@ -4887,11 +4887,11 @@ run_scenario_pane_exclude_filter() {
     # Step 4a: Wait for observed pane to appear in robot state
     log_info "Step 4a: Waiting for observed pane to be observed..."
     local wait_timeout=${TIMEOUT:-60}
-    local check_observed_cmd="\"$WA_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $observed_pane_id)' >/dev/null 2>&1"
+    local check_observed_cmd="\"$FT_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $observed_pane_id)' >/dev/null 2>&1"
 
     if ! wait_for_condition "observed pane $observed_pane_id in robot state" "$check_observed_cmd" "$wait_timeout"; then
         log_fail "Timeout waiting for observed pane to appear in robot state"
-        "$WA_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
+        "$FT_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
         return 1
     fi
     log_pass "Observed pane detected in robot state"
@@ -4899,23 +4899,23 @@ run_scenario_pane_exclude_filter() {
     # Step 4b: Wait for observed content to be searchable (proves FTS indexing works)
     log_info "Step 4b: Waiting for observed content to be searchable..."
     # Search for the observed marker - check total_hits > 0
-    local check_search_cmd="\"$WA_BINARY\" robot search \"$observed_marker\" 2>/dev/null | jq -e '.data.total_hits > 0' >/dev/null 2>&1"
+    local check_search_cmd="\"$FT_BINARY\" robot search \"$observed_marker\" 2>/dev/null | jq -e '.data.total_hits > 0' >/dev/null 2>&1"
 
     if ! wait_for_condition "observed content searchable" "$check_search_cmd" "$wait_timeout"; then
         log_fail "Timeout waiting for observed content to be searchable"
-        "$WA_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
-        "$WA_BINARY" robot search "$observed_marker" > "$scenario_dir/search_debug.json" 2>&1 || true
+        "$FT_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
+        "$FT_BINARY" robot search "$observed_marker" > "$scenario_dir/search_debug.json" 2>&1 || true
         return 1
     fi
     log_pass "Observed content captured and searchable"
 
     # Capture robot state (while watcher is still running)
-    "$WA_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
+    "$FT_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
 
     # Step 5: Assert OBSERVED_TOKEN is searchable (watcher still running for IPC)
     log_info "Step 5: Asserting observed token is searchable..."
     local search_output
-    search_output=$("$WA_BINARY" robot search "$observed_marker" 2>&1)
+    search_output=$("$FT_BINARY" robot search "$observed_marker" 2>&1)
     echo "$search_output" > "$scenario_dir/search_observed.json"
 
     local observed_count
@@ -4930,7 +4930,7 @@ run_scenario_pane_exclude_filter() {
 
     # Step 6: Assert SECRET_TOKEN is NOT searchable (privacy guarantee)
     log_info "Step 6: Asserting secret token is NOT searchable..."
-    search_output=$("$WA_BINARY" robot search "$secret_token" 2>&1)
+    search_output=$("$FT_BINARY" robot search "$secret_token" 2>&1)
     echo "$search_output" > "$scenario_dir/search_secret.json"
 
     local secret_count
@@ -5056,8 +5056,8 @@ run_scenario_workspace_isolation() {
             cp -r "$workspace_b/.wa"/* "$scenario_dir/workspace_b/" 2>/dev/null || true
         fi
 
-        if [[ "${WA_E2E_PRESERVE_TEMP:-}" == "1" ]]; then
-            log_warn "Preserving temp workspaces (WA_E2E_PRESERVE_TEMP=1)"
+        if [[ "${FT_E2E_PRESERVE_TEMP:-}" == "1" ]]; then
+            log_warn "Preserving temp workspaces (FT_E2E_PRESERVE_TEMP=1)"
         else
             rm -rf "${workspace_a:-}" "${workspace_b:-}"
         fi
@@ -5086,8 +5086,8 @@ run_scenario_workspace_isolation() {
 
     # Step 2: Start wa watch for workspace A
     log_info "Step 2: Starting wa watch for workspace A..."
-    WA_WORKSPACE="$workspace_a" WA_DATA_DIR="$workspace_a/.wa" \
-        "$WA_BINARY" watch --foreground \
+    FT_WORKSPACE="$workspace_a" WA_DATA_DIR="$workspace_a/.wa" \
+        "$FT_BINARY" watch --foreground \
         > "$scenario_dir/wa_watch_a.log" 2>&1 &
     wa_pid=$!
     log_verbose "wa watch (A) started with PID $wa_pid"
@@ -5101,33 +5101,33 @@ run_scenario_workspace_isolation() {
     # Step 3: Wait for workspace A pane to be observed
     log_info "Step 3: Waiting for workspace A pane to be observed..."
     local wait_timeout=${TIMEOUT:-60}
-    local check_observed_a="WA_LOG_LEVEL=error WA_WORKSPACE=\"$workspace_a\" WA_DATA_DIR=\"$workspace_a/.wa\" \"$WA_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane_a_id)' >/dev/null 2>&1"
+    local check_observed_a="FT_LOG_LEVEL=error FT_WORKSPACE=\"$workspace_a\" WA_DATA_DIR=\"$workspace_a/.wa\" \"$FT_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane_a_id)' >/dev/null 2>&1"
 
     if ! wait_for_condition "workspace A pane observed" "$check_observed_a" "$wait_timeout"; then
         log_fail "Timeout waiting for workspace A pane to be observed"
-        WA_WORKSPACE="$workspace_a" WA_DATA_DIR="$workspace_a/.wa" \
-            "$WA_BINARY" robot state > "$scenario_dir/robot_state_a.json" 2>&1 || true
+        FT_WORKSPACE="$workspace_a" WA_DATA_DIR="$workspace_a/.wa" \
+            "$FT_BINARY" robot state > "$scenario_dir/robot_state_a.json" 2>&1 || true
         return 1
     fi
     log_pass "Workspace A pane observed"
 
     # Step 4: Wait for token A to be searchable in workspace A
     log_info "Step 4: Waiting for token A to be searchable..."
-    local check_search_a="WA_LOG_LEVEL=error WA_WORKSPACE=\"$workspace_a\" WA_DATA_DIR=\"$workspace_a/.wa\" \"$WA_BINARY\" robot search \"$token_a\" 2>/dev/null | jq -e '.data.total_hits > 0' >/dev/null 2>&1"
+    local check_search_a="FT_LOG_LEVEL=error FT_WORKSPACE=\"$workspace_a\" WA_DATA_DIR=\"$workspace_a/.wa\" \"$FT_BINARY\" robot search \"$token_a\" 2>/dev/null | jq -e '.data.total_hits > 0' >/dev/null 2>&1"
     if ! wait_for_condition "token A searchable" "$check_search_a" "$wait_timeout"; then
         log_fail "Timeout waiting for token A to be searchable"
-        WA_WORKSPACE="$workspace_a" WA_DATA_DIR="$workspace_a/.wa" \
-            "$WA_BINARY" robot search "$token_a" > "$scenario_dir/search_a.json" 2>&1 || true
+        FT_WORKSPACE="$workspace_a" WA_DATA_DIR="$workspace_a/.wa" \
+            "$FT_BINARY" robot search "$token_a" > "$scenario_dir/search_a.json" 2>&1 || true
         return 1
     fi
     log_pass "Token A searchable in workspace A"
 
-    WA_LOG_LEVEL=error WA_WORKSPACE="$workspace_a" WA_DATA_DIR="$workspace_a/.wa" \
-        "$WA_BINARY" robot state > "$scenario_dir/robot_state_a.json" 2>&1 || true
-    WA_LOG_LEVEL=error WA_WORKSPACE="$workspace_a" WA_DATA_DIR="$workspace_a/.wa" \
-        "$WA_BINARY" robot search "$token_a" > "$scenario_dir/search_a.json" 2>&1 || true
-    WA_LOG_LEVEL=error WA_WORKSPACE="$workspace_a" WA_DATA_DIR="$workspace_a/.wa" \
-        "$WA_BINARY" config show --effective --json > "$scenario_dir/config_effective_a.json" 2>&1 || true
+    FT_LOG_LEVEL=error FT_WORKSPACE="$workspace_a" WA_DATA_DIR="$workspace_a/.wa" \
+        "$FT_BINARY" robot state > "$scenario_dir/robot_state_a.json" 2>&1 || true
+    FT_LOG_LEVEL=error FT_WORKSPACE="$workspace_a" WA_DATA_DIR="$workspace_a/.wa" \
+        "$FT_BINARY" robot search "$token_a" > "$scenario_dir/search_a.json" 2>&1 || true
+    FT_LOG_LEVEL=error FT_WORKSPACE="$workspace_a" WA_DATA_DIR="$workspace_a/.wa" \
+        "$FT_BINARY" config show --effective --json > "$scenario_dir/config_effective_a.json" 2>&1 || true
 
     # Step 5: Stop wa watch for workspace A
     log_info "Step 5: Stopping wa watch for workspace A..."
@@ -5150,8 +5150,8 @@ run_scenario_workspace_isolation() {
 
     # Step 7: Start wa watch for workspace B
     log_info "Step 7: Starting wa watch for workspace B..."
-    WA_WORKSPACE="$workspace_b" WA_DATA_DIR="$workspace_b/.wa" \
-        "$WA_BINARY" watch --foreground \
+    FT_WORKSPACE="$workspace_b" WA_DATA_DIR="$workspace_b/.wa" \
+        "$FT_BINARY" watch --foreground \
         > "$scenario_dir/wa_watch_b.log" 2>&1 &
     wa_pid=$!
     log_verbose "wa watch (B) started with PID $wa_pid"
@@ -5164,39 +5164,39 @@ run_scenario_workspace_isolation() {
 
     # Step 8: Wait for workspace B pane to be observed
     log_info "Step 8: Waiting for workspace B pane to be observed..."
-    local check_observed_b="WA_LOG_LEVEL=error WA_WORKSPACE=\"$workspace_b\" WA_DATA_DIR=\"$workspace_b/.wa\" \"$WA_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane_b_id)' >/dev/null 2>&1"
+    local check_observed_b="FT_LOG_LEVEL=error FT_WORKSPACE=\"$workspace_b\" WA_DATA_DIR=\"$workspace_b/.wa\" \"$FT_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane_b_id)' >/dev/null 2>&1"
 
     if ! wait_for_condition "workspace B pane observed" "$check_observed_b" "$wait_timeout"; then
         log_fail "Timeout waiting for workspace B pane to be observed"
-        WA_WORKSPACE="$workspace_b" WA_DATA_DIR="$workspace_b/.wa" \
-            "$WA_BINARY" robot state > "$scenario_dir/robot_state_b.json" 2>&1 || true
+        FT_WORKSPACE="$workspace_b" WA_DATA_DIR="$workspace_b/.wa" \
+            "$FT_BINARY" robot state > "$scenario_dir/robot_state_b.json" 2>&1 || true
         return 1
     fi
     log_pass "Workspace B pane observed"
 
     # Step 9: Wait for token B to be searchable in workspace B
     log_info "Step 9: Waiting for token B to be searchable..."
-    local check_search_b="WA_LOG_LEVEL=error WA_WORKSPACE=\"$workspace_b\" WA_DATA_DIR=\"$workspace_b/.wa\" \"$WA_BINARY\" robot search \"$token_b\" 2>/dev/null | jq -e '.data.total_hits > 0' >/dev/null 2>&1"
+    local check_search_b="FT_LOG_LEVEL=error FT_WORKSPACE=\"$workspace_b\" WA_DATA_DIR=\"$workspace_b/.wa\" \"$FT_BINARY\" robot search \"$token_b\" 2>/dev/null | jq -e '.data.total_hits > 0' >/dev/null 2>&1"
     if ! wait_for_condition "token B searchable" "$check_search_b" "$wait_timeout"; then
         log_fail "Timeout waiting for token B to be searchable"
-        WA_WORKSPACE="$workspace_b" WA_DATA_DIR="$workspace_b/.wa" \
-            "$WA_BINARY" robot search "$token_b" > "$scenario_dir/search_b.json" 2>&1 || true
+        FT_WORKSPACE="$workspace_b" WA_DATA_DIR="$workspace_b/.wa" \
+            "$FT_BINARY" robot search "$token_b" > "$scenario_dir/search_b.json" 2>&1 || true
         return 1
     fi
     log_pass "Token B searchable in workspace B"
 
-    WA_LOG_LEVEL=error WA_WORKSPACE="$workspace_b" WA_DATA_DIR="$workspace_b/.wa" \
-        "$WA_BINARY" robot state > "$scenario_dir/robot_state_b.json" 2>&1 || true
-    WA_LOG_LEVEL=error WA_WORKSPACE="$workspace_b" WA_DATA_DIR="$workspace_b/.wa" \
-        "$WA_BINARY" robot search "$token_b" > "$scenario_dir/search_b.json" 2>&1 || true
-    WA_LOG_LEVEL=error WA_WORKSPACE="$workspace_b" WA_DATA_DIR="$workspace_b/.wa" \
-        "$WA_BINARY" config show --effective --json > "$scenario_dir/config_effective_b.json" 2>&1 || true
+    FT_LOG_LEVEL=error FT_WORKSPACE="$workspace_b" WA_DATA_DIR="$workspace_b/.wa" \
+        "$FT_BINARY" robot state > "$scenario_dir/robot_state_b.json" 2>&1 || true
+    FT_LOG_LEVEL=error FT_WORKSPACE="$workspace_b" WA_DATA_DIR="$workspace_b/.wa" \
+        "$FT_BINARY" robot search "$token_b" > "$scenario_dir/search_b.json" 2>&1 || true
+    FT_LOG_LEVEL=error FT_WORKSPACE="$workspace_b" WA_DATA_DIR="$workspace_b/.wa" \
+        "$FT_BINARY" config show --effective --json > "$scenario_dir/config_effective_b.json" 2>&1 || true
 
     # Step 10: Assert token A is NOT searchable in workspace B
     log_info "Step 10: Asserting token A is NOT searchable in workspace B..."
     local search_output_ba
-    search_output_ba=$(WA_LOG_LEVEL=error WA_WORKSPACE="$workspace_b" WA_DATA_DIR="$workspace_b/.wa" \
-        "$WA_BINARY" robot search "$token_a" 2>&1)
+    search_output_ba=$(FT_LOG_LEVEL=error FT_WORKSPACE="$workspace_b" WA_DATA_DIR="$workspace_b/.wa" \
+        "$FT_BINARY" robot search "$token_a" 2>&1)
     echo "$search_output_ba" > "$scenario_dir/search_a_in_b.json"
 
     local token_a_hits
@@ -5330,8 +5330,8 @@ EOF
         if [[ -d "${temp_home:-}" ]]; then
             cp -r "$temp_home" "$scenario_dir/temp_home_snapshot" 2>/dev/null || true
         fi
-        if [[ "${WA_E2E_PRESERVE_TEMP:-}" == "1" ]]; then
-            log_warn "Preserving temp home (WA_E2E_PRESERVE_TEMP=1)"
+        if [[ "${FT_E2E_PRESERVE_TEMP:-}" == "1" ]]; then
+            log_warn "Preserving temp home (FT_E2E_PRESERVE_TEMP=1)"
         else
             rm -rf "${temp_home:-}"
         fi
@@ -5351,7 +5351,7 @@ EOF
     # Step 1: Dry-run (should not modify files)
     log_info "Step 1: wa setup --dry-run"
     HOME="$temp_home" XDG_CONFIG_HOME="$temp_home/.config" SHELL="/bin/zsh" \
-        "$WA_BINARY" setup --dry-run > "$scenario_dir/setup_dry_run.log" 2>&1 || result=1
+        "$FT_BINARY" setup --dry-run > "$scenario_dir/setup_dry_run.log" 2>&1 || result=1
 
     find "$temp_home" -type f -print0 | sort -z | xargs -0 sha256sum > "$files_after_dry"
     if diff -u "$files_before" "$files_after_dry" > "$scenario_dir/dry_run_diff.txt"; then
@@ -5364,7 +5364,7 @@ EOF
     # Step 2: Apply setup
     log_info "Step 2: wa setup --apply"
     HOME="$temp_home" XDG_CONFIG_HOME="$temp_home/.config" SHELL="/bin/zsh" \
-        "$WA_BINARY" setup --apply > "$scenario_dir/setup_apply.log" 2>&1 || result=1
+        "$FT_BINARY" setup --apply > "$scenario_dir/setup_apply.log" 2>&1 || result=1
 
     find "$temp_home" -type f -print0 | sort -z | xargs -0 sha256sum > "$files_after_apply"
     cp "$wezterm_file" "$scenario_dir/wezterm_after_apply.lua" 2>/dev/null || true
@@ -5394,7 +5394,7 @@ EOF
     cp "$zshrc" "$scenario_dir/zshrc_before_second" 2>/dev/null || true
 
     HOME="$temp_home" XDG_CONFIG_HOME="$temp_home/.config" SHELL="/bin/zsh" \
-        "$WA_BINARY" setup --apply > "$scenario_dir/setup_apply_again.log" 2>&1 || result=1
+        "$FT_BINARY" setup --apply > "$scenario_dir/setup_apply_again.log" 2>&1 || result=1
 
     find "$temp_home" -type f -print0 | sort -z | xargs -0 sha256sum > "$files_after_second"
 
@@ -5509,7 +5509,7 @@ run_scenario_uservar_forwarding() {
     log_info "Step 1: Writing wezterm.lua forwarding snippet..."
     cat > "$config_file" <<'EOF'
 local wezterm = require 'wezterm'
-local wa_bin = os.getenv("WA_E2E_WA_BINARY") or "wa"
+local ft_bin = os.getenv("FT_E2E_BINARY") or "ft"
 
 wezterm.on('user-var-changed', function(window, pane, name, value)
   if not name or name == "" then
@@ -5517,7 +5517,7 @@ wezterm.on('user-var-changed', function(window, pane, name, value)
   end
   local pane_id = tostring(pane:pane_id())
   wezterm.background_child_process {
-    wa_bin,
+    ft_bin,
     "event",
     "--from-uservar",
     "--pane",
@@ -5534,7 +5534,7 @@ EOF
 
     # Step 2: Start a dedicated wezterm instance with the forwarding config
     log_info "Step 2: Starting wezterm with forwarding config..."
-    WA_E2E_WA_BINARY="$WA_BINARY" wezterm --config-file "$config_file" start \
+    FT_E2E_BINARY="$FT_BINARY" wezterm --config-file "$config_file" start \
         --always-new-process --class "$wezterm_class" --workspace "wa-e2e-uservar" \
         > "$scenario_dir/wezterm.log" 2>&1 &
     wezterm_pid=$!
@@ -5550,8 +5550,8 @@ EOF
 
     # Step 3: Start wa watch with debug logging
     log_info "Step 3: Starting wa watch..."
-    WA_WORKSPACE="$temp_workspace" WA_DATA_DIR="$temp_workspace/.wa" WA_LOG_LEVEL=debug \
-        "$WA_BINARY" watch --foreground \
+    FT_WORKSPACE="$temp_workspace" WA_DATA_DIR="$temp_workspace/.wa" FT_LOG_LEVEL=debug \
+        "$FT_BINARY" watch --foreground \
         > "$scenario_dir/wa_watch.log" 2>&1 &
     wa_pid=$!
     log_verbose "wa watch started with PID $wa_pid"
@@ -5609,8 +5609,8 @@ EOS
     local invalid_output=""
     local invalid_exit=0
     set +e
-    invalid_output=$(WA_WORKSPACE="$temp_workspace" WA_DATA_DIR="$temp_workspace/.wa" \
-        "$WA_BINARY" event --from-uservar --pane "${pane_id:-0}" \
+    invalid_output=$(FT_WORKSPACE="$temp_workspace" WA_DATA_DIR="$temp_workspace/.wa" \
+        "$FT_BINARY" event --from-uservar --pane "${pane_id:-0}" \
         --name "$uservar_name" --value "invalid_base64" 2>&1)
     invalid_exit=$?
     set -e
@@ -5654,14 +5654,14 @@ run_scenario_workflow_resume() {
 
     # Setup environment for isolated wa instance
     export WA_DATA_DIR="$temp_workspace/.wa"
-    export WA_WORKSPACE="$temp_workspace"
+    export FT_WORKSPACE="$temp_workspace"
     mkdir -p "$WA_DATA_DIR"
 
     # Copy baseline config for workflow testing
     local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
     if [[ -f "$baseline_config" ]]; then
-        cp "$baseline_config" "$temp_workspace/wa.toml"
-        export WA_CONFIG="$temp_workspace/wa.toml"
+        cp "$baseline_config" "$temp_workspace/ft.toml"
+        export WA_CONFIG="$temp_workspace/ft.toml"
         log_verbose "Using baseline config: $baseline_config"
     fi
 
@@ -5682,7 +5682,7 @@ run_scenario_workflow_resume() {
         # Copy artifacts before cleanup
         if [[ -d "$temp_workspace" ]]; then
             cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
-            cp "$temp_workspace/wa.toml" "$scenario_dir/" 2>/dev/null || true
+            cp "$temp_workspace/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
         rm -rf "$temp_workspace"
     }
@@ -5690,7 +5690,7 @@ run_scenario_workflow_resume() {
 
     # Step 1: Start wa watch with auto-handle
     log_info "Step 1: Starting wa watch with --auto-handle..."
-    "$WA_BINARY" watch --foreground --auto-handle \
+    "$FT_BINARY" watch --foreground --auto-handle \
         > "$scenario_dir/wa_watch_1.log" 2>&1 &
     wa_pid=$!
     log_verbose "wa watch started with PID $wa_pid"
@@ -5725,11 +5725,11 @@ run_scenario_workflow_resume() {
 
     # Step 3: Wait for pane to be observed
     log_info "Step 3: Waiting for pane to be observed..."
-    local check_cmd="\"$WA_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane_id)' >/dev/null 2>&1"
+    local check_cmd="\"$FT_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane_id)' >/dev/null 2>&1"
 
     if ! wait_for_condition "pane $pane_id observed" "$check_cmd" "$wait_timeout"; then
         log_fail "Timeout waiting for pane to be observed"
-        "$WA_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
+        "$FT_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
         return 1
     fi
     log_pass "Pane observed"
@@ -5752,7 +5752,7 @@ run_scenario_workflow_resume() {
 
     # Step 6: Check database for incomplete workflow
     log_info "Step 6: Checking database for incomplete workflow..."
-    local db_path="$temp_workspace/.wa/wa.db"
+    local db_path="$temp_workspace/.ft/ft.db"
     if [[ -f "$db_path" ]]; then
         local workflow_status
         workflow_status=$(sqlite3 "$db_path" "SELECT id, status, current_step FROM workflow_executions ORDER BY started_at DESC LIMIT 1;" 2>/dev/null || echo "")
@@ -5775,7 +5775,7 @@ run_scenario_workflow_resume() {
 
     # Step 7: Restart wa watch with auto-handle
     log_info "Step 7: Restarting wa watch with --auto-handle..."
-    "$WA_BINARY" watch --foreground --auto-handle \
+    "$FT_BINARY" watch --foreground --auto-handle \
         > "$scenario_dir/wa_watch_2.log" 2>&1 &
     wa_pid=$!
     log_verbose "wa watch restarted with PID $wa_pid"
@@ -5883,14 +5883,14 @@ run_scenario_dry_run_mode() {
     log_info "Workspace: $temp_workspace"
 
     export WA_DATA_DIR="$temp_workspace/.wa"
-    export WA_WORKSPACE="$temp_workspace"
+    export FT_WORKSPACE="$temp_workspace"
     mkdir -p "$WA_DATA_DIR"
 
     # Copy baseline config for permissive, deterministic policy behavior
     local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
     if [[ -f "$baseline_config" ]]; then
-        cp "$baseline_config" "$temp_workspace/wa.toml"
-        export WA_CONFIG="$temp_workspace/wa.toml"
+        cp "$baseline_config" "$temp_workspace/ft.toml"
+        export WA_CONFIG="$temp_workspace/ft.toml"
         log_verbose "Using baseline config: $baseline_config"
     fi
 
@@ -5907,7 +5907,7 @@ run_scenario_dry_run_mode() {
         fi
         if [[ -d "$temp_workspace" ]]; then
             cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
-            cp "$temp_workspace/wa.toml" "$scenario_dir/" 2>/dev/null || true
+            cp "$temp_workspace/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
         rm -rf "$temp_workspace"
     }
@@ -5915,7 +5915,7 @@ run_scenario_dry_run_mode() {
 
     # Step 1: Start wa watch (no auto-handle; we want to control side effects)
     log_info "Step 1: Starting wa watch..."
-    "$WA_BINARY" watch --foreground > "$scenario_dir/wa_watch.log" 2>&1 &
+    "$FT_BINARY" watch --foreground > "$scenario_dir/wa_watch.log" 2>&1 &
     wa_pid=$!
     echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
 
@@ -5946,27 +5946,27 @@ run_scenario_dry_run_mode() {
     # Step 3: Wait for pane to be observed
     log_info "Step 3: Waiting for pane to be observed..."
     local wait_timeout=${TIMEOUT:-30}
-    local observe_cmd="\"$WA_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane_id)' >/dev/null 2>&1"
+    local observe_cmd="\"$FT_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane_id)' >/dev/null 2>&1"
     if ! wait_for_condition "pane $pane_id observed" "$observe_cmd" "$wait_timeout"; then
         log_fail "Timeout waiting for pane to be observed"
-        "$WA_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
+        "$FT_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
         return 1
     fi
     log_pass "Pane observed"
 
     # Step 4: Wait for a compaction event so workflow dry-run has a realistic precondition
     log_info "Step 4: Waiting for compaction detection..."
-    local compaction_cmd="\"$WA_BINARY\" events -f json --unhandled --rule-id \"codex:compaction\" --limit 20 2>/dev/null | jq -e 'length > 0' >/dev/null 2>&1"
+    local compaction_cmd="\"$FT_BINARY\" events -f json --unhandled --rule-id \"codex:compaction\" --limit 20 2>/dev/null | jq -e 'length > 0' >/dev/null 2>&1"
     if ! wait_for_condition "compaction event detected" "$compaction_cmd" "$wait_timeout"; then
         log_fail "Timeout waiting for compaction event"
-        "$WA_BINARY" events -f json --rule-id "codex:compaction" --limit 20 > "$scenario_dir/events_debug.json" 2>&1 || true
+        "$FT_BINARY" events -f json --rule-id "codex:compaction" --limit 20 > "$scenario_dir/events_debug.json" 2>&1 || true
         result=1
     else
         log_pass "Compaction event detected"
     fi
 
     # Ensure DB exists for audit/workflow assertions
-    local db_path="$temp_workspace/.wa/wa.db"
+    local db_path="$temp_workspace/.ft/ft.db"
     if [[ ! -f "$db_path" ]]; then
         log_warn "DB not found at $db_path (some checks will be skipped)"
     fi
@@ -5985,7 +5985,7 @@ run_scenario_dry_run_mode() {
     local marker_send=""
     marker_send="E2E_DRYRUN_SEND_$(date +%s%N)"
     log_info "Step 5: wa send --dry-run (human)..."
-    "$WA_BINARY" send "$pane_id" "$marker_send" --dry-run > "$scenario_dir/human_send_dry_run.json" 2>&1 || true
+    "$FT_BINARY" send "$pane_id" "$marker_send" --dry-run > "$scenario_dir/human_send_dry_run.json" 2>&1 || true
     if jq -e ".target_resolution.pane_id == $pane_id and (.expected_actions | length) > 0" \
         "$scenario_dir/human_send_dry_run.json" >/dev/null 2>&1; then
         log_pass "human send dry-run: report looks valid"
@@ -5996,7 +5996,7 @@ run_scenario_dry_run_mode() {
 
     # Step 6: Robot send dry-run (enveloped JSON)
     log_info "Step 6: wa robot send --dry-run..."
-    "$WA_BINARY" robot send "$pane_id" "$marker_send" --dry-run --format json \
+    "$FT_BINARY" robot send "$pane_id" "$marker_send" --dry-run --format json \
         > "$scenario_dir/robot_send_dry_run.json" 2>&1 || true
     if jq -e ".ok == true and (.data.target_resolution.pane_id == $pane_id) and ((.data.expected_actions | length) > 0)" \
         "$scenario_dir/robot_send_dry_run.json" >/dev/null 2>&1; then
@@ -6020,7 +6020,7 @@ run_scenario_dry_run_mode() {
     fi
 
     log_info "Step 7b: Verify dummy pane did not echo dry-run marker..."
-    "$WA_BINARY" robot wait-for "$pane_id" "Received: $marker_send" --timeout-secs 2 --format json \
+    "$FT_BINARY" robot wait-for "$pane_id" "Received: $marker_send" --timeout-secs 2 --format json \
         > "$scenario_dir/no_echo_wait.json" 2>&1 || true
     if jq -e '.ok == false and .error.code == "WA-ROBOT-TIMEOUT"' "$scenario_dir/no_echo_wait.json" >/dev/null 2>&1; then
         log_pass "dry-run marker not observed (expected)"
@@ -6031,7 +6031,7 @@ run_scenario_dry_run_mode() {
 
     # Step 8: Preview vs actual stable-field checks (robot send)
     log_info "Step 8: wa robot send (actual)..."
-    "$WA_BINARY" robot send "$pane_id" "$marker_send" --format json \
+    "$FT_BINARY" robot send "$pane_id" "$marker_send" --format json \
         > "$scenario_dir/robot_send_actual.json" 2>&1 || true
     if jq -e ".ok == true and (.data.pane_id == $pane_id)" "$scenario_dir/robot_send_actual.json" >/dev/null 2>&1; then
         log_pass "robot send actual: ok"
@@ -6041,7 +6041,7 @@ run_scenario_dry_run_mode() {
     fi
 
     log_info "Step 8b: Waiting for echo of actual send..."
-    "$WA_BINARY" robot wait-for "$pane_id" "Received: $marker_send" --timeout-secs 10 --format json \
+    "$FT_BINARY" robot wait-for "$pane_id" "Received: $marker_send" --timeout-secs 10 --format json \
         > "$scenario_dir/echo_wait.json" 2>&1 || true
     if jq -e '.ok == true and .data.matched == true' "$scenario_dir/echo_wait.json" >/dev/null 2>&1; then
         log_pass "actual send echoed by dummy pane"
@@ -6070,7 +6070,7 @@ run_scenario_dry_run_mode() {
 
     # Step 9: Workflow dry-run (human + robot) without workflow_executions side effects
     log_info "Step 9: wa workflow run --dry-run (human)..."
-    "$WA_BINARY" workflow run --pane "$pane_id" handle_compaction --dry-run \
+    "$FT_BINARY" workflow run --pane "$pane_id" handle_compaction --dry-run \
         > "$scenario_dir/human_workflow_dry_run.json" 2>&1 || true
     if jq -e "(.expected_actions | length) > 0" "$scenario_dir/human_workflow_dry_run.json" >/dev/null 2>&1; then
         log_pass "human workflow dry-run: report looks valid"
@@ -6080,7 +6080,7 @@ run_scenario_dry_run_mode() {
     fi
 
     log_info "Step 9b: wa robot workflow run --dry-run..."
-    "$WA_BINARY" robot workflow run handle_compaction "$pane_id" --dry-run --format json \
+    "$FT_BINARY" robot workflow run handle_compaction "$pane_id" --dry-run --format json \
         > "$scenario_dir/robot_workflow_dry_run.json" 2>&1 || true
     if jq -e ".ok == true and (.data.target_resolution.pane_id == $pane_id) and ((.data.expected_actions | length) > 0)" \
         "$scenario_dir/robot_workflow_dry_run.json" >/dev/null 2>&1; then
@@ -6104,7 +6104,7 @@ run_scenario_dry_run_mode() {
 
     # Step 10: Actual robot workflow run should create an execution (sanity check + stable-field match)
     log_info "Step 10: wa robot workflow run (actual)..."
-    "$WA_BINARY" robot workflow run handle_compaction "$pane_id" --format json \
+    "$FT_BINARY" robot workflow run handle_compaction "$pane_id" --format json \
         > "$scenario_dir/robot_workflow_actual.json" 2>&1 || true
     if jq -e ".ok == true and (.data.pane_id == $pane_id)" "$scenario_dir/robot_workflow_actual.json" >/dev/null 2>&1; then
         log_pass "robot workflow run: ok"
@@ -6153,14 +6153,14 @@ run_scenario_workflow_lifecycle() {
 
     # Setup environment for isolated wa instance
     export WA_DATA_DIR="$temp_workspace/.wa"
-    export WA_WORKSPACE="$temp_workspace"
+    export FT_WORKSPACE="$temp_workspace"
     mkdir -p "$WA_DATA_DIR"
 
     # Copy baseline config when available
     local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
     if [[ -f "$baseline_config" ]]; then
-        cp "$baseline_config" "$temp_workspace/wa.toml"
-        export WA_CONFIG="$temp_workspace/wa.toml"
+        cp "$baseline_config" "$temp_workspace/ft.toml"
+        export WA_CONFIG="$temp_workspace/ft.toml"
         log_verbose "Using baseline config: $baseline_config"
     fi
 
@@ -6168,7 +6168,7 @@ run_scenario_workflow_lifecycle() {
         log_verbose "Cleaning up workflow_lifecycle scenario"
         if [[ -d "$temp_workspace" ]]; then
             cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
-            cp "$temp_workspace/wa.toml" "$scenario_dir/" 2>/dev/null || true
+            cp "$temp_workspace/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
         rm -rf "$temp_workspace"
     }
@@ -6176,7 +6176,7 @@ run_scenario_workflow_lifecycle() {
 
     # Step 1: List workflows
     log_info "Step 1: Listing workflows..."
-    "$WA_BINARY" robot workflow list > "$scenario_dir/workflow_list.json" 2>&1 || true
+    "$FT_BINARY" robot workflow list > "$scenario_dir/workflow_list.json" 2>&1 || true
     if jq -e '.ok == true' "$scenario_dir/workflow_list.json" >/dev/null 2>&1; then
         log_pass "workflow list: ok"
     else
@@ -6186,7 +6186,7 @@ run_scenario_workflow_lifecycle() {
 
     # Step 2: Dry-run workflow
     log_info "Step 2: Dry-run workflow..."
-    "$WA_BINARY" robot workflow run handle_compaction 0 --dry-run \
+    "$FT_BINARY" robot workflow run handle_compaction 0 --dry-run \
         > "$scenario_dir/workflow_run_dry.json" 2>&1 || true
     if jq -e '.ok == true' "$scenario_dir/workflow_run_dry.json" >/dev/null 2>&1; then
         log_pass "workflow run dry-run: ok"
@@ -6197,7 +6197,7 @@ run_scenario_workflow_lifecycle() {
 
     # Step 3: Status --active (may be empty)
     log_info "Step 3: Workflow status --active..."
-    "$WA_BINARY" robot workflow status --active \
+    "$FT_BINARY" robot workflow status --active \
         > "$scenario_dir/workflow_status_active.json" 2>&1 || true
     if jq -e '.ok == true' "$scenario_dir/workflow_status_active.json" >/dev/null 2>&1; then
         log_pass "workflow status --active: ok"
@@ -6210,7 +6210,7 @@ run_scenario_workflow_lifecycle() {
 
     # Step 4: Abort with nonexistent execution ID (expect not found)
     log_info "Step 4: Workflow abort (nonexistent)..."
-    "$WA_BINARY" robot workflow abort "nonexistent-id" \
+    "$FT_BINARY" robot workflow abort "nonexistent-id" \
         > "$scenario_dir/workflow_abort.json" 2>&1 || true
     if jq -e '.ok == false and .error_code == "E_EXECUTION_NOT_FOUND"' \
         "$scenario_dir/workflow_abort.json" >/dev/null 2>&1; then
@@ -6242,14 +6242,14 @@ run_scenario_events_unhandled_alias() {
 
     # Setup environment for isolated wa instance
     export WA_DATA_DIR="$temp_workspace/.wa"
-    export WA_WORKSPACE="$temp_workspace"
+    export FT_WORKSPACE="$temp_workspace"
     mkdir -p "$WA_DATA_DIR"
 
     # Copy baseline config when available
     local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
     if [[ -f "$baseline_config" ]]; then
-        cp "$baseline_config" "$temp_workspace/wa.toml"
-        export WA_CONFIG="$temp_workspace/wa.toml"
+        cp "$baseline_config" "$temp_workspace/ft.toml"
+        export WA_CONFIG="$temp_workspace/ft.toml"
         log_verbose "Using baseline config: $baseline_config"
     fi
 
@@ -6257,7 +6257,7 @@ run_scenario_events_unhandled_alias() {
         log_verbose "Cleaning up events_unhandled_alias scenario"
         if [[ -d "$temp_workspace" ]]; then
             cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
-            cp "$temp_workspace/wa.toml" "$scenario_dir/" 2>/dev/null || true
+            cp "$temp_workspace/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
         rm -rf "$temp_workspace"
     }
@@ -6265,7 +6265,7 @@ run_scenario_events_unhandled_alias() {
 
     # Step 1: --unhandled
     log_info "Step 1: wa robot events --unhandled..."
-    "$WA_BINARY" robot events --unhandled \
+    "$FT_BINARY" robot events --unhandled \
         > "$scenario_dir/events_unhandled.json" 2>&1 || true
     if jq -e '.ok == true' "$scenario_dir/events_unhandled.json" >/dev/null 2>&1; then
         log_pass "events --unhandled: ok"
@@ -6278,7 +6278,7 @@ run_scenario_events_unhandled_alias() {
 
     # Step 2: --unhandled-only (alias)
     log_info "Step 2: wa robot events --unhandled-only..."
-    "$WA_BINARY" robot events --unhandled-only \
+    "$FT_BINARY" robot events --unhandled-only \
         > "$scenario_dir/events_unhandled_only.json" 2>&1 || true
     if jq -e '.ok == true' "$scenario_dir/events_unhandled_only.json" >/dev/null 2>&1; then
         log_pass "events --unhandled-only: ok"
@@ -6317,7 +6317,7 @@ run_scenario_events_annotations_triage() {
     local noise_event_id=""
     local note_secret="investigating sk-test-should-redact-events-1234567890abcdef"
     local old_wa_data_dir="${WA_DATA_DIR:-}"
-    local old_wa_workspace="${WA_WORKSPACE:-}"
+    local old_wa_workspace="${FT_WORKSPACE:-}"
     local old_wa_config="${WA_CONFIG:-}"
 
     log_info "Workspace: $temp_workspace"
@@ -6326,7 +6326,7 @@ run_scenario_events_annotations_triage() {
         log_verbose "Cleaning up events_annotations_triage scenario"
         if [[ -d "${temp_workspace:-}" ]]; then
             cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
-            cp "$temp_workspace/wa.toml" "$scenario_dir/" 2>/dev/null || true
+            cp "$temp_workspace/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
         if [[ -n "$old_wa_data_dir" ]]; then
             export WA_DATA_DIR="$old_wa_data_dir"
@@ -6334,9 +6334,9 @@ run_scenario_events_annotations_triage() {
             unset WA_DATA_DIR
         fi
         if [[ -n "$old_wa_workspace" ]]; then
-            export WA_WORKSPACE="$old_wa_workspace"
+            export FT_WORKSPACE="$old_wa_workspace"
         else
-            unset WA_WORKSPACE
+            unset FT_WORKSPACE
         fi
         if [[ -n "$old_wa_config" ]]; then
             export WA_CONFIG="$old_wa_config"
@@ -6351,21 +6351,21 @@ run_scenario_events_annotations_triage() {
 
     # Setup environment for isolated wa instance
     export WA_DATA_DIR="$temp_workspace/.wa"
-    export WA_WORKSPACE="$temp_workspace"
+    export FT_WORKSPACE="$temp_workspace"
     mkdir -p "$WA_DATA_DIR"
 
     local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
     if [[ -f "$baseline_config" ]]; then
-        cp "$baseline_config" "$temp_workspace/wa.toml"
-        export WA_CONFIG="$temp_workspace/wa.toml"
+        cp "$baseline_config" "$temp_workspace/ft.toml"
+        export WA_CONFIG="$temp_workspace/ft.toml"
         log_verbose "Using baseline config: $baseline_config"
     fi
 
     # Step 1: Initialize DB
     log_info "Step 1: Initializing DB..."
-    "$WA_BINARY" db migrate --yes > "$scenario_dir/db_migrate.txt" 2>&1 || true
-    "$WA_BINARY" db check -f json > "$scenario_dir/db_check.json" 2>&1 || true
-    db_path="$temp_workspace/.wa/wa.db"
+    "$FT_BINARY" db migrate --yes > "$scenario_dir/db_migrate.txt" 2>&1 || true
+    "$FT_BINARY" db check -f json > "$scenario_dir/db_check.json" 2>&1 || true
+    db_path="$temp_workspace/.ft/ft.db"
     if [[ ! -f "$db_path" ]]; then
         log_fail "DB not created at $db_path"
         result=1
@@ -6430,7 +6430,7 @@ SQL
     if [[ $result -eq 0 ]]; then
         # Step 3: Annotate target event with secret-like note (must redact)
         log_info "Step 3: Annotating event note with redaction check..."
-        "$WA_BINARY" events --format json annotate "$target_event_id" \
+        "$FT_BINARY" events --format json annotate "$target_event_id" \
             --note "$note_secret" --by "e2e-user" \
             > "$scenario_dir/annotate.json" 2> "$scenario_dir/annotate.stderr" || true
 
@@ -6456,7 +6456,7 @@ SQL
     if [[ $result -eq 0 ]]; then
         # Step 4: Add label + triage state
         log_info "Step 4: Applying label + triage mutations..."
-        "$WA_BINARY" events --format json label "$target_event_id" --add urgent --by "e2e-user" \
+        "$FT_BINARY" events --format json label "$target_event_id" --add urgent --by "e2e-user" \
             > "$scenario_dir/label_add.json" 2> "$scenario_dir/label_add.stderr" || true
         if jq -e '.ok == true and (.annotations.labels | index("urgent") != null)' \
             "$scenario_dir/label_add.json" >/dev/null 2>&1; then
@@ -6466,7 +6466,7 @@ SQL
             result=1
         fi
 
-        "$WA_BINARY" events --format json triage "$target_event_id" \
+        "$FT_BINARY" events --format json triage "$target_event_id" \
             --state investigating --by "e2e-user" \
             > "$scenario_dir/triage_set.json" 2> "$scenario_dir/triage_set.stderr" || true
         if jq -e '.ok == true and .annotations.triage_state == "investigating"' \
@@ -6481,7 +6481,7 @@ SQL
     if [[ $result -eq 0 ]]; then
         # Step 5: Verify label/state filters via robot CLI
         log_info "Step 5: Validating robot filters by label + triage state..."
-        "$WA_BINARY" robot events --label urgent --triage-state investigating --limit 10 \
+        "$FT_BINARY" robot events --label urgent --triage-state investigating --limit 10 \
             > "$scenario_dir/robot_events_filtered.json" \
             2> "$scenario_dir/robot_events_filtered.stderr" || true
 
@@ -6499,7 +6499,7 @@ SQL
             result=1
         fi
 
-        "$WA_BINARY" events --format json > "$scenario_dir/events_after_mutation.json" \
+        "$FT_BINARY" events --format json > "$scenario_dir/events_after_mutation.json" \
             2> "$scenario_dir/events_after_mutation.stderr" || true
         if grep -q "$note_secret" "$scenario_dir/events_after_mutation.json" 2>/dev/null; then
             log_fail "Event list output leaked raw secret-like note"
@@ -6512,7 +6512,7 @@ SQL
     if [[ $result -eq 0 ]]; then
         # Step 6: Capture and verify audit evidence
         log_info "Step 6: Validating audit records for mutation lifecycle..."
-        "$WA_BINARY" audit -f json -l 50 > "$scenario_dir/audit.json" \
+        "$FT_BINARY" audit -f json -l 50 > "$scenario_dir/audit.json" \
             2> "$scenario_dir/audit.stderr" || true
 
         if ! jq \
@@ -6605,7 +6605,7 @@ run_scenario_history_undo_workflow() {
     local start_action_id=900001
     local step_action_id=900002
     local old_wa_data_dir="${WA_DATA_DIR:-}"
-    local old_wa_workspace="${WA_WORKSPACE:-}"
+    local old_wa_workspace="${FT_WORKSPACE:-}"
     local old_wa_config="${WA_CONFIG:-}"
 
     log_info "Workspace: $temp_workspace"
@@ -6614,7 +6614,7 @@ run_scenario_history_undo_workflow() {
         log_verbose "Cleaning up history_undo_workflow scenario"
         if [[ -d "${temp_workspace:-}" ]]; then
             cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
-            cp "$temp_workspace/wa.toml" "$scenario_dir/" 2>/dev/null || true
+            cp "$temp_workspace/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
         if [[ -n "$old_wa_data_dir" ]]; then
             export WA_DATA_DIR="$old_wa_data_dir"
@@ -6622,9 +6622,9 @@ run_scenario_history_undo_workflow() {
             unset WA_DATA_DIR
         fi
         if [[ -n "$old_wa_workspace" ]]; then
-            export WA_WORKSPACE="$old_wa_workspace"
+            export FT_WORKSPACE="$old_wa_workspace"
         else
-            unset WA_WORKSPACE
+            unset FT_WORKSPACE
         fi
         if [[ -n "$old_wa_config" ]]; then
             export WA_CONFIG="$old_wa_config"
@@ -6638,21 +6638,21 @@ run_scenario_history_undo_workflow() {
     trap cleanup_history_undo_workflow EXIT
 
     export WA_DATA_DIR="$temp_workspace/.wa"
-    export WA_WORKSPACE="$temp_workspace"
+    export FT_WORKSPACE="$temp_workspace"
     mkdir -p "$WA_DATA_DIR"
 
     local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
     if [[ -f "$baseline_config" ]]; then
-        cp "$baseline_config" "$temp_workspace/wa.toml"
-        export WA_CONFIG="$temp_workspace/wa.toml"
+        cp "$baseline_config" "$temp_workspace/ft.toml"
+        export WA_CONFIG="$temp_workspace/ft.toml"
         log_verbose "Using baseline config: $baseline_config"
     fi
 
     # Step 1: Initialize DB
     log_info "Step 1: Initializing DB..."
-    "$WA_BINARY" db migrate --yes > "$scenario_dir/db_migrate.txt" 2>&1 || true
-    "$WA_BINARY" db check -f json > "$scenario_dir/db_check.json" 2>&1 || true
-    db_path="$temp_workspace/.wa/wa.db"
+    "$FT_BINARY" db migrate --yes > "$scenario_dir/db_migrate.txt" 2>&1 || true
+    "$FT_BINARY" db check -f json > "$scenario_dir/db_check.json" 2>&1 || true
+    db_path="$temp_workspace/.ft/ft.db"
     if [[ ! -f "$db_path" ]]; then
         log_fail "DB not created at $db_path"
         result=1
@@ -6723,11 +6723,11 @@ SQL
     if [[ $result -eq 0 ]]; then
         # Step 3: Verify workflow history rendering and undo list surface
         log_info "Step 3: Verifying history + undo list..."
-        "$WA_BINARY" history --workflow "$workflow_id" --format plain --limit 20 \
+        "$FT_BINARY" history --workflow "$workflow_id" --format plain --limit 20 \
             > "$scenario_dir/history_workflow_plain.txt" 2> "$scenario_dir/history_workflow_plain.stderr" || true
-        "$WA_BINARY" history --workflow "$workflow_id" --export json --limit 20 \
+        "$FT_BINARY" history --workflow "$workflow_id" --export json --limit 20 \
             > "$scenario_dir/history_workflow.json" 2> "$scenario_dir/history_workflow_json.stderr" || true
-        "$WA_BINARY" undo --list --format json --limit 20 \
+        "$FT_BINARY" undo --list --format json --limit 20 \
             > "$scenario_dir/undo_list.json" 2> "$scenario_dir/undo_list.stderr" || true
 
         if grep -q "workflow_start" "$scenario_dir/history_workflow_plain.txt" \
@@ -6752,9 +6752,9 @@ SQL
     if [[ $result -eq 0 ]]; then
         # Step 4: Execute undo and validate lifecycle transition
         log_info "Step 4: Executing undo and validating state transitions..."
-        "$WA_BINARY" undo "$start_action_id" --yes --format json \
+        "$FT_BINARY" undo "$start_action_id" --yes --format json \
             > "$scenario_dir/undo_execute.json" 2> "$scenario_dir/undo_execute.stderr" || true
-        "$WA_BINARY" audit -f json -l 20 > "$scenario_dir/audit_after_undo.json" \
+        "$FT_BINARY" audit -f json -l 20 > "$scenario_dir/audit_after_undo.json" \
             2> "$scenario_dir/audit_after_undo.stderr" || true
 
         if jq -e \
@@ -6833,7 +6833,7 @@ run_scenario_accounts_refresh() {
     local result=0
     local old_path="$PATH"
     local old_wa_data_dir="${WA_DATA_DIR:-}"
-    local old_wa_workspace="${WA_WORKSPACE:-}"
+    local old_wa_workspace="${FT_WORKSPACE:-}"
     local old_wa_config="${WA_CONFIG:-}"
     local old_caut_mode="${CAUT_FAKE_MODE:-}"
     local old_caut_log="${CAUT_FAKE_LOG:-}"
@@ -6851,9 +6851,9 @@ run_scenario_accounts_refresh() {
             unset WA_DATA_DIR
         fi
         if [[ -n "$old_wa_workspace" ]]; then
-            export WA_WORKSPACE="$old_wa_workspace"
+            export FT_WORKSPACE="$old_wa_workspace"
         else
-            unset WA_WORKSPACE
+            unset FT_WORKSPACE
         fi
         if [[ -n "$old_wa_config" ]]; then
             export WA_CONFIG="$old_wa_config"
@@ -6990,12 +6990,12 @@ EOF
     # Step 1: Refresh accounts (success path)
     log_info "Step 1: Running accounts refresh (success)..."
     export WA_DATA_DIR="$temp_workspace/.wa"
-    export WA_WORKSPACE="$temp_workspace"
+    export FT_WORKSPACE="$temp_workspace"
     unset WA_CONFIG
     mkdir -p "$WA_DATA_DIR"
 
     local refresh_output
-    refresh_output=$("$WA_BINARY" robot --format json accounts refresh --service openai \
+    refresh_output=$("$FT_BINARY" robot --format json accounts refresh --service openai \
         2> "$scenario_dir/refresh_output.stderr" || true)
     echo "$refresh_output" > "$scenario_dir/refresh_output.json"
 
@@ -7016,7 +7016,7 @@ EOF
     # Step 2: List accounts with pick preview
     log_info "Step 2: Listing accounts with pick preview..."
     local list_output
-    list_output=$("$WA_BINARY" robot --format json accounts list --service openai --pick \
+    list_output=$("$FT_BINARY" robot --format json accounts list --service openai --pick \
         2> "$scenario_dir/accounts_list.stderr" || true)
     echo "$list_output" > "$scenario_dir/accounts_list.json"
 
@@ -7037,12 +7037,12 @@ EOF
     # Step 3: Refresh failure path (redaction)
     log_info "Step 3: Refresh failure path (redaction)..."
     export WA_DATA_DIR="$temp_workspace_fail/.wa"
-    export WA_WORKSPACE="$temp_workspace_fail"
+    export FT_WORKSPACE="$temp_workspace_fail"
     mkdir -p "$WA_DATA_DIR"
     export CAUT_FAKE_MODE="fail"
 
     local fail_output
-    fail_output=$("$WA_BINARY" robot --format json accounts refresh --service openai \
+    fail_output=$("$FT_BINARY" robot --format json accounts refresh --service openai \
         2> "$scenario_dir/refresh_fail_output.stderr" || true)
     echo "$fail_output" > "$scenario_dir/refresh_fail_output.json"
 
@@ -7063,12 +7063,12 @@ EOF
     # Step 4: Invalid JSON path (redaction)
     log_info "Step 4: Refresh invalid JSON (redaction)..."
     export WA_DATA_DIR="$temp_workspace_invalid/.wa"
-    export WA_WORKSPACE="$temp_workspace_invalid"
+    export FT_WORKSPACE="$temp_workspace_invalid"
     mkdir -p "$WA_DATA_DIR"
     export CAUT_FAKE_MODE="invalid_json"
 
     local invalid_output
-    invalid_output=$("$WA_BINARY" robot --format json accounts refresh --service openai \
+    invalid_output=$("$FT_BINARY" robot --format json accounts refresh --service openai \
         2> "$scenario_dir/refresh_invalid_output.stderr" || true)
     echo "$invalid_output" > "$scenario_dir/refresh_invalid_output.json"
 
@@ -7139,7 +7139,7 @@ PY
 
     # Setup environment for isolated wa instance
     export WA_DATA_DIR="$temp_workspace/.wa"
-    export WA_WORKSPACE="$temp_workspace"
+    export FT_WORKSPACE="$temp_workspace"
     mkdir -p "$WA_DATA_DIR"
 
     echo "scenario: alt_screen_detection" >> "$scenario_dir/scenario.log"
@@ -7183,7 +7183,7 @@ EOF
 
     # Step 2: Start a dedicated wezterm instance with the config
     log_info "Step 2: Starting wezterm..."
-    WA_WORKSPACE="$temp_workspace" WA_DATA_DIR="$WA_DATA_DIR" \
+    FT_WORKSPACE="$temp_workspace" WA_DATA_DIR="$WA_DATA_DIR" \
         WEZTERM_UNIX_SOCKET="$wezterm_socket" \
         wezterm start --always-new-process --config-file "$config_file" \
         --workspace "wa-e2e-alt" > "$scenario_dir/wezterm.log" 2>&1 &
@@ -7200,9 +7200,9 @@ EOF
 
     # Step 3: Start wa watch against the test mux
     log_info "Step 3: Starting wa watch..."
-    WA_WORKSPACE="$temp_workspace" WA_DATA_DIR="$temp_workspace/.wa" \
-        WEZTERM_UNIX_SOCKET="$wezterm_socket" WA_LOG_LEVEL=debug \
-        "$WA_BINARY" watch --foreground > "$scenario_dir/wa_watch.log" 2>&1 &
+    FT_WORKSPACE="$temp_workspace" WA_DATA_DIR="$temp_workspace/.wa" \
+        WEZTERM_UNIX_SOCKET="$wezterm_socket" FT_LOG_LEVEL=debug \
+        "$FT_BINARY" watch --foreground > "$scenario_dir/wa_watch.log" 2>&1 &
     wa_pid=$!
     echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
 
@@ -7248,15 +7248,15 @@ EOS
 
     # Step 6: Wait for pane to be observed
     log_info "Step 6: Waiting for pane observation..."
-    local check_cmd="WEZTERM_UNIX_SOCKET=\"$wezterm_socket\" WA_WORKSPACE=\"$temp_workspace\" WA_DATA_DIR=\"$temp_workspace/.wa\" \"$WA_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane_id)' >/dev/null 2>&1"
+    local check_cmd="WEZTERM_UNIX_SOCKET=\"$wezterm_socket\" FT_WORKSPACE=\"$temp_workspace\" WA_DATA_DIR=\"$temp_workspace/.wa\" \"$FT_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane_id)' >/dev/null 2>&1"
     if ! wait_for_condition "pane $pane_id observed" "$check_cmd" "$wait_timeout"; then
         log_fail "Timeout waiting for pane to be observed"
-        WEZTERM_UNIX_SOCKET="$wezterm_socket" "$WA_BINARY" robot state > "$scenario_dir/robot_state_initial.json" 2>&1 || true
+        WEZTERM_UNIX_SOCKET="$wezterm_socket" "$FT_BINARY" robot state > "$scenario_dir/robot_state_initial.json" 2>&1 || true
         result=1
         return $result
     fi
     log_pass "Pane observed"
-    WEZTERM_UNIX_SOCKET="$wezterm_socket" "$WA_BINARY" robot state > "$scenario_dir/robot_state_initial.json" 2>&1 || true
+    WEZTERM_UNIX_SOCKET="$wezterm_socket" "$FT_BINARY" robot state > "$scenario_dir/robot_state_initial.json" 2>&1 || true
 
     # Step 7: Verify initial alt-screen state is false
     log_info "Step 7: Verifying initial alt-screen state..."
@@ -7323,7 +7323,7 @@ EOF
     local setup_output=""
     local setup_exit=0
     set +e
-    setup_output=$("$WA_BINARY" setup patch --config-path "$wezterm_file" 2>&1)
+    setup_output=$("$FT_BINARY" setup patch --config-path "$wezterm_file" 2>&1)
     setup_exit=$?
     set -e
     echo "$setup_output" > "$scenario_dir/setup_patch.log"
@@ -7372,9 +7372,9 @@ run_scenario_watcher_crash_bundle() {
     local wa_pid=""
     local result=0
     local wait_timeout=${TIMEOUT:-60}
-    local old_wa_workspace="${WA_WORKSPACE:-}"
+    local old_wa_workspace="${FT_WORKSPACE:-}"
     local old_wa_data_dir="${WA_DATA_DIR:-}"
-    local old_crash_flag="${WA_E2E_WATCHER_PANIC_ONCE:-}"
+    local old_crash_flag="${FT_E2E_WATCHER_PANIC_ONCE:-}"
 
     log_info "Workspace: $temp_workspace"
 
@@ -7391,14 +7391,14 @@ run_scenario_watcher_crash_bundle() {
             unset WA_DATA_DIR
         fi
         if [[ -n "$old_wa_workspace" ]]; then
-            export WA_WORKSPACE="$old_wa_workspace"
+            export FT_WORKSPACE="$old_wa_workspace"
         else
-            unset WA_WORKSPACE
+            unset FT_WORKSPACE
         fi
         if [[ -n "$old_crash_flag" ]]; then
-            export WA_E2E_WATCHER_PANIC_ONCE="$old_crash_flag"
+            export FT_E2E_WATCHER_PANIC_ONCE="$old_crash_flag"
         else
-            unset WA_E2E_WATCHER_PANIC_ONCE
+            unset FT_E2E_WATCHER_PANIC_ONCE
         fi
         if [[ -d "${temp_workspace:-}" ]]; then
             cp -r "${temp_workspace}/.wa"/* "$scenario_dir/" 2>/dev/null || true
@@ -7407,22 +7407,22 @@ run_scenario_watcher_crash_bundle() {
     }
     trap cleanup_watcher_crash_bundle EXIT
 
-    export WA_WORKSPACE="$temp_workspace"
+    export FT_WORKSPACE="$temp_workspace"
     export WA_DATA_DIR="$temp_workspace/.wa"
-    export WA_E2E_WATCHER_PANIC_ONCE="1"
+    export FT_E2E_WATCHER_PANIC_ONCE="1"
 
     echo "workspace: $temp_workspace" >> "$scenario_dir/scenario.log"
 
     # Step 1: Start watcher in foreground (should intentionally panic once)
     log_info "Step 1: Starting watcher (intentional panic once)..."
-    "$WA_BINARY" watch --foreground > "$scenario_dir/wa_watch.log" 2>&1 &
+    "$FT_BINARY" watch --foreground > "$scenario_dir/wa_watch.log" 2>&1 &
     wa_pid=$!
     echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
 
     # Step 2: Wait for crash bundle to exist and watcher to exit
     log_info "Step 2: Waiting for crash bundle + watcher exit..."
-    local crash_glob="$temp_workspace/.wa/crash/wa_crash_*"
-    local crash_check="[ -d \"$temp_workspace/.wa/crash\" ] && ls -d $crash_glob >/dev/null 2>&1"
+    local crash_glob="$temp_workspace/.ft/crash/wa_crash_*"
+    local crash_check="[ -d \"$temp_workspace/.ft/crash\" ] && ls -d $crash_glob >/dev/null 2>&1"
     if ! wait_for_condition "crash bundle written" "$crash_check" "$wait_timeout"; then
         log_fail "Crash bundle not written within timeout"
         result=1
@@ -7440,7 +7440,7 @@ run_scenario_watcher_crash_bundle() {
 
     # Step 3: Verify triage surfaces crash
     log_info "Step 3: Verifying wa triage surfaces crash..."
-    "$WA_BINARY" triage -f json > "$scenario_dir/triage.json" 2>&1 || result=1
+    "$FT_BINARY" triage -f json > "$scenario_dir/triage.json" 2>&1 || result=1
     if ! jq -e '.ok == true' "$scenario_dir/triage.json" >/dev/null 2>&1; then
         log_fail "triage.json did not have ok=true"
         result=1
@@ -7453,7 +7453,7 @@ run_scenario_watcher_crash_bundle() {
 
     # Step 4: Verify doctor surfaces crash
     log_info "Step 4: Verifying wa doctor surfaces crash..."
-    "$WA_BINARY" doctor --json > "$scenario_dir/doctor.json" 2>&1 || result=1
+    "$FT_BINARY" doctor --json > "$scenario_dir/doctor.json" 2>&1 || result=1
     if ! jq -e '.checks[]? | select(.name == "Recent crash" and .status == "warning")' \
         "$scenario_dir/doctor.json" >/dev/null 2>&1; then
         log_fail "doctor.json did not include Recent crash warning"
@@ -7464,7 +7464,7 @@ run_scenario_watcher_crash_bundle() {
     log_info "Step 5: Verifying wa reproduce export --kind crash..."
     local out_dir="$temp_workspace/reproduce_out"
     mkdir -p "$out_dir"
-    "$WA_BINARY" reproduce export --kind crash --out "$out_dir" --format json \
+    "$FT_BINARY" reproduce export --kind crash --out "$out_dir" --format json \
         > "$scenario_dir/reproduce.json" 2>&1 || result=1
     if ! jq -e '.path and (.files | length >= 1)' "$scenario_dir/reproduce.json" \
         >/dev/null 2>&1; then
@@ -7533,8 +7533,8 @@ LUAEOF
         if [[ -d "${temp_home:-}" ]]; then
             cp -r "$temp_home" "$scenario_dir/temp_home_snapshot" 2>/dev/null || true
         fi
-        if [[ "${WA_E2E_PRESERVE_TEMP:-}" == "1" ]]; then
-            log_warn "Preserving temp home (WA_E2E_PRESERVE_TEMP=1)"
+        if [[ "${FT_E2E_PRESERVE_TEMP:-}" == "1" ]]; then
+            log_warn "Preserving temp home (FT_E2E_PRESERVE_TEMP=1)"
         else
             rm -rf "${temp_home:-}"
         fi
@@ -7544,7 +7544,7 @@ LUAEOF
     # ---- Step 1: wa doctor --json (captures environment detection) ----
     log_info "Step 1: wa doctor --json (environment detection)"
     HOME="$temp_home" XDG_CONFIG_HOME="$temp_home/.config" SHELL="/bin/zsh" \
-        "$WA_BINARY" doctor --json > "$scenario_dir/doctor.json" 2>"$scenario_dir/doctor.stderr" || true
+        "$FT_BINARY" doctor --json > "$scenario_dir/doctor.json" 2>"$scenario_dir/doctor.stderr" || true
 
     # Artifact: save doctor output
     if [[ -s "$scenario_dir/doctor.json" ]]; then
@@ -7574,7 +7574,7 @@ LUAEOF
     # ---- Step 2: wa setup --dry-run with zsh (OSC 133 installed) ----
     log_info "Step 2: wa setup --dry-run (zsh, OSC 133 enabled)"
     HOME="$temp_home" XDG_CONFIG_HOME="$temp_home/.config" SHELL="/bin/zsh" \
-        "$WA_BINARY" setup --dry-run > "$scenario_dir/setup_dry_run_zsh.log" 2>&1 || true
+        "$FT_BINARY" setup --dry-run > "$scenario_dir/setup_dry_run_zsh.log" 2>&1 || true
 
     # Verify setup detects shell type
     if grep -qi "zsh\|shell" "$scenario_dir/setup_dry_run_zsh.log"; then
@@ -7605,7 +7605,7 @@ SHELLEOF
     # ---- Step 3: wa setup --dry-run with bash (no OSC 133) ----
     log_info "Step 3: wa setup --dry-run (bash, no OSC 133)"
     HOME="$temp_home" XDG_CONFIG_HOME="$temp_home/.config" SHELL="/bin/bash" \
-        "$WA_BINARY" setup --dry-run > "$scenario_dir/setup_dry_run_bash.log" 2>&1 || true
+        "$FT_BINARY" setup --dry-run > "$scenario_dir/setup_dry_run_bash.log" 2>&1 || true
 
     # Verify setup detects bash
     if grep -qi "bash\|shell" "$scenario_dir/setup_dry_run_bash.log"; then
@@ -7632,12 +7632,12 @@ SHELLEOF
 
     # First apply
     HOME="$temp_home" XDG_CONFIG_HOME="$temp_home/.config" SHELL="/bin/zsh" \
-        "$WA_BINARY" setup --apply > "$scenario_dir/setup_apply_1.log" 2>&1 || true
+        "$FT_BINARY" setup --apply > "$scenario_dir/setup_apply_1.log" 2>&1 || true
     cp "$zshrc" "$scenario_dir/zshrc_after_apply1"
 
     # Second apply (should be no-op)
     HOME="$temp_home" XDG_CONFIG_HOME="$temp_home/.config" SHELL="/bin/zsh" \
-        "$WA_BINARY" setup --apply > "$scenario_dir/setup_apply_2.log" 2>&1 || true
+        "$FT_BINARY" setup --apply > "$scenario_dir/setup_apply_2.log" 2>&1 || true
     cp "$zshrc" "$scenario_dir/zshrc_after_apply2"
 
     if diff -u "$scenario_dir/zshrc_after_apply1" "$scenario_dir/zshrc_after_apply2" \
@@ -7878,11 +7878,11 @@ main() {
     echo ""
 
     # Find wa binary
-    if ! find_wa_binary; then
+    if ! find_ft_binary; then
         log_fail "Could not find wa binary"
         exit 5
     fi
-    log_verbose "Using wa binary: $WA_BINARY"
+    log_verbose "Using wa binary: $FT_BINARY"
 
     # Setup artifacts
     setup_artifacts

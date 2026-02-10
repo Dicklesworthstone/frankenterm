@@ -55,7 +55,7 @@ deterministic under load and make data loss explicit rather than silent.
 ### Responses (deterministic)
 
 - Warning:
-  - Surface warning in `HealthSnapshot` and `wa status/doctor`.
+  - Surface warning in `HealthSnapshot` and `ft status/doctor`.
   - Continue observing, but prioritize draining queues.
 - Critical:
   - Slow down polling (adaptive backoff).

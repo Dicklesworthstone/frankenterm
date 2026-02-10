@@ -60,7 +60,7 @@ and what compatibility risks to watch for.
    ```
 5. Run the full test suite:
    ```bash
-   cargo test -p wa-core --features ftui
+   cargo test -p frankenterm-core --features ftui
    ```
 6. Commit with message: `chore(deps): bump ftui pin to <rev>`
 
@@ -71,7 +71,7 @@ When bumping the ftui pin, review the upstream diff for:
 - [ ] **Breaking API changes** in types wa uses (`Model`, `Cmd`, `Frame`,
       `Buffer`, `Event`, `KeyCode`, `Style`, `App`, `ScreenMode`)
 - [ ] **Feature flag changes** — verify `runtime` feature still exports what
-      wa needs
+      ft needs
 - [ ] **Dependency additions** — check for new transitive deps that might
       conflict with wa's dependency graph (especially `unicode-width`,
       `crossterm`, or async runtime crates)

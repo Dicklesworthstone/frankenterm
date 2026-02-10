@@ -266,8 +266,8 @@ subprocess fail?" is answerable from log target alone.
 
 ## References
 
-- `crates/wa-core/src/tui/command_handoff.rs` — handoff implementation + tests
-- `crates/wa-core/src/tui/terminal_session.rs` — session lifecycle + teardown harness
-- `crates/wa-core/src/tui/output_gate.rs` — gate phase management
+- `crates/frankenterm-core/src/tui/command_handoff.rs` — handoff implementation + tests
+- `crates/frankenterm-core/src/tui/terminal_session.rs` — session lifecycle + teardown harness
+- `crates/frankenterm-core/src/tui/output_gate.rs` — gate phase management
 - `docs/ftui-teardown-harness.md` — teardown invariants (wa-3fed)
 - `docs/ftui-subprocess-forwarding-contract.md` — PTY capture (wa-3gsu)

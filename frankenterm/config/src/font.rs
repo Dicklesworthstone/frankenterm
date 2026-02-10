@@ -2,10 +2,10 @@ use crate::color::RgbaColor;
 use crate::*;
 use bitflags::*;
 use enum_display_derive::Display;
+use frankenterm_dynamic::{FromDynamic, FromDynamicOptions, ToDynamic, Value};
 use luahelper::impl_lua_conversion_dynamic;
 use std::convert::TryFrom;
 use std::fmt::Display;
-use wezterm_dynamic::{FromDynamic, FromDynamicOptions, ToDynamic, Value};
 
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, Display, PartialOrd, Ord, FromDynamic, ToDynamic,
@@ -147,7 +147,7 @@ impl FromDynamic for FontWeight {
     fn from_dynamic(
         value: &Value,
         _options: FromDynamicOptions,
-    ) -> Result<Self, wezterm_dynamic::Error> {
+    ) -> Result<Self, frankenterm_dynamic::Error> {
         match value {
             Value::String(s) => {
                 Ok(Self::from_str(s).ok_or_else(|| format!("invalid font weight {}", s))?)
@@ -160,7 +160,7 @@ impl FromDynamic for FontWeight {
                         Err(format!("invalid font weight {}", value).into())
                     }
                 } else {
-                    Err(wezterm_dynamic::Error::NoConversion {
+                    Err(frankenterm_dynamic::Error::NoConversion {
                         source_type: other.variant_name().to_string(),
                         dest_type: "FontWeight",
                     })
@@ -624,17 +624,17 @@ pub struct StyleRule {
     /// If present, this rule matches when CellAttributes::intensity holds
     /// a value that matches this rule.  Valid values are "Bold", "Normal",
     /// "Half".
-    pub intensity: Option<wezterm_term::Intensity>,
+    pub intensity: Option<frankenterm_term::Intensity>,
     /// If present, this rule matches when CellAttributes::underline holds
     /// a value that matches this rule.  Valid values are "None", "Single",
     /// "Double".
-    pub underline: Option<wezterm_term::Underline>,
+    pub underline: Option<frankenterm_term::Underline>,
     /// If present, this rule matches when CellAttributes::italic holds
     /// a value that matches this rule.
     pub italic: Option<bool>,
     /// If present, this rule matches when CellAttributes::blink holds
     /// a value that matches this rule.
-    pub blink: Option<wezterm_term::Blink>,
+    pub blink: Option<frankenterm_term::Blink>,
     /// If present, this rule matches when CellAttributes::reverse holds
     /// a value that matches this rule.
     pub reverse: Option<bool>,

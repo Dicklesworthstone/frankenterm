@@ -24,7 +24,7 @@ SQLite database. Only approved assets are allowed to move.
 - Default is dry-run with a full plan preview.
 - No overwriting unless explicitly enabled and confirmed.
 - Denylist always wins over allowlist.
-- Never sync live DB files: `wa.db`, `wa.db-wal`, `wa.db-shm`.
+- Never sync live DB files: `ft.db`, `ft.db-wal`, `ft.db-shm`.
 - Never sync secrets; redaction must be applied before transfer.
 
 ## CLI contract (planned)
@@ -46,7 +46,7 @@ wa sync pull <target> [--dry-run] [--yes]
 
 ### Output
 - Human output by default.
-- JSON output when `WA_OUTPUT_FORMAT=json` is set.
+- JSON output when `FT_OUTPUT_FORMAT=json` is set.
 - Plan preview includes:
   - target name + endpoint
   - payload list with source/target paths
@@ -72,11 +72,11 @@ allow_binary = false
 allow_config = true
 allow_snapshots = true
 # Optional allow/deny path globs
-allow_paths = ["~/.config/wa/wa.toml", "~/.config/wa/patterns.toml"]
+allow_paths = ["~/.config/wa/ft.toml", "~/.config/wa/patterns.toml"]
 deny_paths = [
-  "~/.local/share/wa/wa.db",
-  "~/.local/share/wa/wa.db-wal",
-  "~/.local/share/wa/wa.db-shm"
+  "~/.local/share/wa/ft.db",
+  "~/.local/share/wa/ft.db-wal",
+  "~/.local/share/wa/ft.db-shm"
 ]
 
 [[sync.targets]]
@@ -98,14 +98,14 @@ allow_snapshots = true
   bin/
     wa
   config/
-    wa.toml
+    ft.toml
     patterns.toml
   snapshots/
     wa-export-YYYYMMDD-HHMMSS.jsonl
 ```
 
 ## Snapshots
-- Snapshots must be produced by `wa export ...` or backup tooling.
+- Snapshots must be produced by `ft export ...` or backup tooling.
 - Sync never reads or writes the live database file.
 
 ## Logging and audit

@@ -16,7 +16,7 @@ Before executing any removal steps, all of the following must be true:
 - [ ] Stage 2 (Beta) has run for >= 4 weeks with zero S1/S2 issues
 - [ ] Go/no-go cutover review completed (wa-1i50)
 - [ ] All P0+P1 environments pass compatibility certification
-- [ ] No open `WA_TUI_BACKEND=ratatui` override usage reports
+- [ ] No open `FT_TUI_BACKEND=ratatui` override usage reports
 - [ ] Import guardrail tests pass (`agnostic_modules_have_no_bare_ratatui_imports`)
 
 ## 3  Module-by-Module Removal Sequence
@@ -27,36 +27,36 @@ Execute in the order listed. Each step includes its verification check.
 
 | Step | File | Action | Verification |
 |------|------|--------|-------------|
-| 1.1 | `crates/wa-core/src/tui/app.rs` | Delete | `cargo check -p wa-core --features ftui` passes |
-| 1.2 | `crates/wa-core/src/tui/views.rs` | Delete | `cargo check -p wa-core --features ftui` passes |
-| 1.3 | `crates/wa-core/src/tui/mod.rs` | Remove `#[cfg(feature = "tui")]` blocks for app/views imports (lines 85-93) | Compile check |
+| 1.1 | `crates/frankenterm-core/src/tui/app.rs` | Delete | `cargo check -p frankenterm-core --features ftui` passes |
+| 1.2 | `crates/frankenterm-core/src/tui/views.rs` | Delete | `cargo check -p frankenterm-core --features ftui` passes |
+| 1.3 | `crates/frankenterm-core/src/tui/mod.rs` | Remove `#[cfg(feature = "tui")]` blocks for app/views imports (lines 85-93) | Compile check |
 
 ### Phase 2: Remove Compatibility Layer
 
 | Step | File | Action | Verification |
 |------|------|--------|-------------|
-| 2.1 | `crates/wa-core/src/tui/ftui_compat.rs` | Remove all `#[cfg(feature = "tui")]` conversion blocks | No ratatui types in compat layer |
-| 2.2 | `crates/wa-core/src/tui/ftui_compat.rs` | If only ftui conversions remain, inline into calling code and delete module | Compile check |
-| 2.3 | `crates/wa-core/src/tui/mod.rs` | Remove `pub mod ftui_compat;` if module deleted | Compile check |
+| 2.1 | `crates/frankenterm-core/src/tui/ftui_compat.rs` | Remove all `#[cfg(feature = "tui")]` conversion blocks | No ratatui types in compat layer |
+| 2.2 | `crates/frankenterm-core/src/tui/ftui_compat.rs` | If only ftui conversions remain, inline into calling code and delete module | Compile check |
+| 2.3 | `crates/frankenterm-core/src/tui/mod.rs` | Remove `pub mod ftui_compat;` if module deleted | Compile check |
 
 ### Phase 3: Remove Feature Flag Plumbing
 
 | Step | File | Action | Verification |
 |------|------|--------|-------------|
-| 3.1 | `crates/wa-core/src/lib.rs` | Remove `compile_error!` for `tui+ftui` mutual exclusion (line 129-131) | Compile check |
-| 3.2 | `crates/wa-core/src/lib.rs` | Remove `cfg(feature = "tui")` guards | Compile check |
-| 3.3 | `crates/wa-core/src/tui/mod.rs` | Remove `#[cfg(feature = "ftui")]` guards — make ftui the unconditional backend | Compile check |
-| 3.4 | `crates/wa-core/src/tui/mod.rs` | Remove import guardrail tests (no longer needed) | Test suite still passes |
-| 3.5 | `crates/wa-core/src/logging.rs` | Replace `cfg(any(feature = "tui", feature = "ftui"))` with `cfg(feature = "ftui")`, then simplify | Compile check |
-| 3.6 | `crates/wa-core/src/crash.rs` | Same cfg simplification | Compile check |
-| 3.7 | `crates/wa-core/src/replay.rs` | Same cfg simplification | Compile check |
+| 3.1 | `crates/frankenterm-core/src/lib.rs` | Remove `compile_error!` for `tui+ftui` mutual exclusion (line 129-131) | Compile check |
+| 3.2 | `crates/frankenterm-core/src/lib.rs` | Remove `cfg(feature = "tui")` guards | Compile check |
+| 3.3 | `crates/frankenterm-core/src/tui/mod.rs` | Remove `#[cfg(feature = "ftui")]` guards — make ftui the unconditional backend | Compile check |
+| 3.4 | `crates/frankenterm-core/src/tui/mod.rs` | Remove import guardrail tests (no longer needed) | Test suite still passes |
+| 3.5 | `crates/frankenterm-core/src/logging.rs` | Replace `cfg(any(feature = "tui", feature = "ftui"))` with `cfg(feature = "ftui")`, then simplify | Compile check |
+| 3.6 | `crates/frankenterm-core/src/crash.rs` | Same cfg simplification | Compile check |
+| 3.7 | `crates/frankenterm-core/src/replay.rs` | Same cfg simplification | Compile check |
 
 ### Phase 4: Remove Cargo Dependencies
 
 | Step | File | Action | Verification |
 |------|------|--------|-------------|
-| 4.1 | `crates/wa-core/Cargo.toml` | Remove `ratatui` and `crossterm` from `[dependencies]` | `cargo check` passes |
-| 4.2 | `crates/wa-core/Cargo.toml` | Remove `tui` from `[features]` section (line 120) | Feature no longer exists |
+| 4.1 | `crates/frankenterm-core/Cargo.toml` | Remove `ratatui` and `crossterm` from `[dependencies]` | `cargo check` passes |
+| 4.2 | `crates/frankenterm-core/Cargo.toml` | Remove `tui` from `[features]` section (line 120) | Feature no longer exists |
 | 4.3 | `Cargo.toml` (workspace) | Remove `ratatui` and `crossterm` from `[workspace.dependencies]` (lines 197-198) | `cargo check` passes |
 | 4.4 | Run `cargo update` | Prune lock file | `Cargo.lock` shrinks |
 
@@ -64,7 +64,7 @@ Execute in the order listed. Each step includes its verification check.
 
 | Step | File | Action | Verification |
 |------|------|--------|-------------|
-| 5.1 | `crates/wa-core/Cargo.toml` | Rename `ftui` feature to `tui` (now the only backend) | Compile check |
+| 5.1 | `crates/frankenterm-core/Cargo.toml` | Rename `ftui` feature to `tui` (now the only backend) | Compile check |
 | 5.2 | All source files | Replace `cfg(feature = "ftui")` with `cfg(feature = "tui")` | Compile check |
 | 5.3 | `crates/wa/Cargo.toml` | Update feature references | Compile check |
 | 5.4 | CI workflows | Update `--features ftui` to `--features tui` | CI passes |
@@ -87,11 +87,11 @@ These modules are currently shared between backends. After ratatui removal, they
 
 After all removal phases complete:
 
-- [ ] `cargo check -p wa-core` (headless) passes
-- [ ] `cargo check -p wa-core --features tui` (renamed from ftui) passes
+- [ ] `cargo check -p frankenterm-core` (headless) passes
+- [ ] `cargo check -p frankenterm-core --features tui` (renamed from ftui) passes
 - [ ] `cargo check -p wa --features tui` passes
-- [ ] `cargo test -p wa-core --features tui --lib` — all tests pass (320+)
-- [ ] `cargo clippy -p wa-core --features tui -- -D warnings` clean
+- [ ] `cargo test -p frankenterm-core --features tui --lib` — all tests pass (320+)
+- [ ] `cargo clippy -p frankenterm-core --features tui -- -D warnings` clean
 - [ ] `cargo fmt --check` clean
 - [ ] `grep -r "ratatui\|crossterm" crates/` returns only comments/docs/changelogs
 - [ ] `grep -r 'feature.*"tui".*"ftui"' crates/` returns 0 hits (no dual-feature code)
@@ -139,4 +139,4 @@ fn no_ratatui_references_in_codebase() {
 - `docs/ftui-rollout-strategy.md` — Rollout stages and transitions
 - `docs/ftui-cargo-feature-matrix.md` — Current feature matrix
 - `docs/ftui-contributor-migration-guide.md` — Contributor migration guide
-- `crates/wa-core/src/tui/mod.rs` — Import guardrail tests (FTUI-09.3.a)
+- `crates/frankenterm-core/src/tui/mod.rs` — Import guardrail tests (FTUI-09.3.a)

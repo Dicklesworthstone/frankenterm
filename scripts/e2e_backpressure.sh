@@ -21,7 +21,7 @@
 # Requirements:
 #   - cargo (Rust toolchain)
 #   - jq for JSON manipulation
-#   - wa binary built (cargo build -p wa)
+#   - wa binary built (cargo build -p frankenterm)
 # =============================================================================
 
 set -euo pipefail
@@ -52,7 +52,7 @@ TESTS_FAILED=0
 TESTS_SKIPPED=0
 
 # Configuration
-WA_BIN=""
+FT_BIN=""
 VERBOSE=false
 
 # ==============================================================================
@@ -137,15 +137,15 @@ check_prerequisites() {
 
     # Find wa binary
     if [[ -x "$PROJECT_ROOT/target/debug/wa" ]]; then
-        WA_BIN="$PROJECT_ROOT/target/debug/wa"
-    elif [[ -x "$PROJECT_ROOT/target/release/wa" ]]; then
-        WA_BIN="$PROJECT_ROOT/target/release/wa"
+        FT_BIN="$PROJECT_ROOT/target/debug/wa"
+    elif [[ -x "$PROJECT_ROOT/target/release/ft" ]]; then
+        FT_BIN="$PROJECT_ROOT/target/release/ft"
     else
         log_skip "wa binary not found (some scenarios will be skipped)"
     fi
 
-    if [[ -n "$WA_BIN" ]]; then
-        log_pass "wa binary found: $WA_BIN"
+    if [[ -n "$FT_BIN" ]]; then
+        log_pass "wa binary found: $FT_BIN"
     fi
 }
 
@@ -160,7 +160,7 @@ scenario_backpressure_unit_tests() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p wa-core backpressure::tests \
+    cargo test -p frankenterm-core backpressure::tests \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -212,7 +212,7 @@ scenario_overflow_gap_tests() {
     exit_code=0
 
     # Run tailer overflow gap tests
-    cargo test -p wa-core tailer::tests::overflow_gap \
+    cargo test -p frankenterm-core tailer::tests::overflow_gap \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -226,7 +226,7 @@ scenario_overflow_gap_tests() {
 
     # Run ingest overflow gap tests
     exit_code=0
-    cargo test -p wa-core ingest::tests::emit_overflow_gap \
+    cargo test -p frankenterm-core ingest::tests::emit_overflow_gap \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -240,7 +240,7 @@ scenario_overflow_gap_tests() {
 
     # Verify the overflow threshold is reasonable
     exit_code=0
-    cargo test -p wa-core tailer::tests::overflow_threshold_constant_is_reasonable \
+    cargo test -p frankenterm-core tailer::tests::overflow_threshold_constant_is_reasonable \
         -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -264,7 +264,7 @@ scenario_storage_backpressure_integration() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p wa-core storage::backpressure_integration_tests \
+    cargo test -p frankenterm-core storage::backpressure_integration_tests \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -316,7 +316,7 @@ scenario_tailer_backpressure_counters() {
     exit_code=0
 
     # Run tailer backpressure-related tests (exclude overflow_gap which has its own scenario)
-    cargo test -p wa-core 'tailer::tests' \
+    cargo test -p frankenterm-core 'tailer::tests' \
         --no-fail-fast -- --nocapture --skip overflow_gap \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -342,7 +342,7 @@ scenario_runtime_backpressure_warnings() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p wa-core runtime::tests::backpressure \
+    cargo test -p frankenterm-core runtime::tests::backpressure \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -356,7 +356,7 @@ scenario_runtime_backpressure_warnings() {
 
     # Also run the events backpressure-causes-lag test
     exit_code=0
-    cargo test -p wa-core events::tests::backpressure_causes_lag \
+    cargo test -p frankenterm-core events::tests::backpressure_causes_lag \
         -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -381,7 +381,7 @@ scenario_health_snapshot_schema() {
     exit_code=0
 
     # Run health snapshot renderer tests that validate backpressure display
-    cargo test -p wa-core 'output::renderers::tests::health_' \
+    cargo test -p frankenterm-core 'output::renderers::tests::health_' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -395,7 +395,7 @@ scenario_health_snapshot_schema() {
 
     # Verify that BackpressureSnapshot serializes to valid JSON with expected fields
     exit_code=0
-    cargo test -p wa-core backpressure::tests::snapshot_serialization_roundtrip \
+    cargo test -p frankenterm-core backpressure::tests::snapshot_serialization_roundtrip \
         -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -415,7 +415,7 @@ scenario_health_snapshot_schema() {
 scenario_cli_status_contract() {
     log_test "Scenario 7: CLI status contract includes backpressure"
 
-    if [[ -z "$WA_BIN" ]]; then
+    if [[ -z "$FT_BIN" ]]; then
         log_skip "S7: wa binary not available"
         return 0
     fi
@@ -429,7 +429,7 @@ scenario_cli_status_contract() {
     stdout_file=$(mktemp)
     exit_code=0
 
-    timeout 15 "$WA_BIN" status --workspace "$workspace" --format json \
+    timeout 15 "$FT_BIN" status --workspace "$workspace" --format json \
         >"$stdout_file" 2>&1 || exit_code=$?
 
     local status_output
@@ -489,7 +489,7 @@ scenario_bounded_execution() {
     start_time=$(date +%s)
     exit_code=0
 
-    timeout 120 cargo test -p wa-core \
+    timeout 120 cargo test -p frankenterm-core \
         backpressure \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?

@@ -1,4 +1,4 @@
-# AGENTS.md — wa (WezTerm Automata)
+# AGENTS.md — ft (FrankenTerm)
 
 > Guidelines for AI coding agents working in this Rust codebase.
 
@@ -8,12 +8,12 @@
 
 | Command | Purpose | Output |
 |---------|---------|--------|
-| `wa robot state` | Get all pane states | JSON/TOON |
-| `wa robot get-text <pane_id>` | Read pane content | JSON/TOON |
-| `wa robot send <pane_id> "text"` | Send input to pane | JSON/TOON |
-| `wa robot wait-for <pane_id> "pattern"` | Wait for pattern match | JSON/TOON |
-| `wa robot search "query"` | Full-text search output | JSON/TOON |
-| `wa robot events` | Get detection events | JSON/TOON |
+| `ft robot state` | Get all pane states | JSON/TOON |
+| `ft robot get-text <pane_id>` | Read pane content | JSON/TOON |
+| `ft robot send <pane_id> "text"` | Send input to pane | JSON/TOON |
+| `ft robot wait-for <pane_id> "pattern"` | Wait for pattern match | JSON/TOON |
+| `ft robot search "query"` | Full-text search output | JSON/TOON |
+| `ft robot events` | Get detection events | JSON/TOON |
 
 **Always use `--format toon` for token-efficient output when processing results with another AI agent.**
 
@@ -39,9 +39,9 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 ---
 
-## What wa Does
+## What ft Does
 
-**wa (WezTerm Automata)** is a terminal hypervisor for AI agent swarms. It:
+**ft (FrankenTerm)** is a terminal hypervisor for AI agent swarms. It:
 
 1. **Observes** all WezTerm panes in real-time via delta extraction
 2. **Detects** agent state transitions through pattern matching (rate limits, errors, prompts)
@@ -52,12 +52,12 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 ```
 ┌────────────────────────────────────────────────────────────┐
-│                      wa (CLI/API)                          │
+│                      ft (CLI/API)                          │
 ├────────────────────────────────────────────────────────────┤
 │  Robot Mode API    │  Human CLI      │  Watch Daemon       │
 │  (wa robot ...)    │  (wa status)    │  (wa watch)         │
 ├────────────────────────────────────────────────────────────┤
-│                     wa-core                                │
+│                     frankenterm-core                                │
 │  Pattern Engine │ Capture │ Workflows │ Policy │ Search   │
 ├────────────────────────────────────────────────────────────┤
 │                     WezTerm IPC                            │
@@ -68,7 +68,7 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 ## Robot Mode API
 
-The `wa robot` subcommand provides machine-optimized output for AI agents.
+The `ft robot` subcommand provides machine-optimized output for AI agents.
 
 ### Output Formats
 
@@ -82,11 +82,11 @@ The `wa robot` subcommand provides machine-optimized output for AI agents.
 
 | Variable | Purpose |
 |----------|---------|
-| `WA_OUTPUT_FORMAT` | Default format (`json` or `toon`) |
+| `FT_OUTPUT_FORMAT` | Default format (`json` or `toon`) |
 | `TOON_DEFAULT_FORMAT` | Fallback default format |
-| `WA_WORKSPACE` | Workspace root directory |
+| `FT_WORKSPACE` | Workspace root directory |
 
-**Precedence:** CLI flag > `WA_OUTPUT_FORMAT` > `TOON_DEFAULT_FORMAT` > json
+**Precedence:** CLI flag > `FT_OUTPUT_FORMAT` > `TOON_DEFAULT_FORMAT` > json
 
 ### Commands
 
@@ -186,7 +186,7 @@ wa robot events --unhandled
 
 - **Edition:** Rust 2024 (nightly required — see `rust-toolchain.toml`)
 - **Unsafe code:** Forbidden (via `[workspace.lints.rust]` in Cargo.toml)
-- **Workspace:** Multi-crate (wa, wa-core, fuzz)
+- **Workspace:** Multi-crate (wa, frankenterm-core, fuzz)
 
 ### Key Dependencies
 
@@ -304,16 +304,16 @@ When agent output patterns change (new versions, updated prompts), follow this f
 
 1. **Capture**: Record the new output that isn't matching
    ```bash
-   wa robot get-text <pane_id> --tail 500 > /tmp/new_output.txt
+   ft robot get-text <pane_id> --tail 500 > /tmp/new_output.txt
    ```
 
 2. **Add fixture**: Create a minimal test case
    ```bash
    # Copy relevant snippet to corpus
-   cp /tmp/new_output.txt crates/wa-core/tests/corpus/<agent>/<event>.txt
+   cp /tmp/new_output.txt crates/frankenterm-core/tests/corpus/<agent>/<event>.txt
 
    # Create expected output (initially empty to see what matches)
-   echo "[]" > crates/wa-core/tests/corpus/<agent>/<event>.expect.json
+   echo "[]" > crates/frankenterm-core/tests/corpus/<agent>/<event>.expect.json
    ```
 
 3. **Test and iterate**: Run corpus tests to see the diff
@@ -325,7 +325,7 @@ When agent output patterns change (new versions, updated prompts), follow this f
 
 5. **Validate**: Run the linter to ensure no regressions
    ```bash
-   wa robot rules lint --fixtures --strict
+   ft robot rules lint --fixtures --strict
    ```
 
 6. **Ship**: Commit the fixture and rule changes together
@@ -399,7 +399,7 @@ Error codes:
 
 ## Configuration
 
-Config file: `~/.config/wa/wa.toml` or `$WA_WORKSPACE/.wa/config.toml`
+Config file: `~/.config/wa/ft.toml` or `$FT_WORKSPACE/.ft/config.toml`
 
 ```toml
 [general]
@@ -412,7 +412,7 @@ min_poll_interval_ms = 50
 max_concurrent_captures = 10
 
 [storage]
-db_path = "wa.db"
+db_path = "ft.db"
 retention_days = 30
 
 [patterns]
@@ -435,7 +435,7 @@ block_alt_screen = true
 wezterm_automata/
 ├── crates/
 │   ├── wa/           # CLI binary (main.rs ~6000 lines)
-│   └── wa-core/      # Core library
+│   └── frankenterm-core/      # Core library
 │       └── src/
 │           ├── config.rs      # Configuration parsing
 │           ├── ingest.rs      # Pane output capture

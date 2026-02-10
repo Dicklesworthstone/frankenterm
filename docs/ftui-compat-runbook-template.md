@@ -33,13 +33,13 @@ Delete instructions in italics before submitting.*
 
 | Test Suite | Command | Expected |
 |-----------|---------|----------|
-| View adapters | `cargo test -p wa-core --features ftui -- view_adapters` | All pass |
-| TextInput edge cases | `cargo test -p wa-core --features ftui -- edge_` | All pass |
-| Terminal session lifecycle | `cargo test -p wa-core --features tui -- tui::terminal_session` | All pass |
-| Command handoff traces | `cargo test -p wa-core --features tui -- tui::command_handoff` | All pass |
-| Output gate | `cargo test -p wa-core --features tui -- output_gate` | All pass |
-| E2E headless scenarios | `cargo test -p wa-core --features ftui -- e2e_` | All pass |
-| Snapshot/golden suite | `cargo test -p wa-core --features ftui -- snapshot_` | All pass |
+| View adapters | `cargo test -p frankenterm-core --features ftui -- view_adapters` | All pass |
+| TextInput edge cases | `cargo test -p frankenterm-core --features ftui -- edge_` | All pass |
+| Terminal session lifecycle | `cargo test -p frankenterm-core --features tui -- tui::terminal_session` | All pass |
+| Command handoff traces | `cargo test -p frankenterm-core --features tui -- tui::command_handoff` | All pass |
+| Output gate | `cargo test -p frankenterm-core --features tui -- output_gate` | All pass |
+| E2E headless scenarios | `cargo test -p frankenterm-core --features ftui -- e2e_` | All pass |
+| Snapshot/golden suite | `cargo test -p frankenterm-core --features ftui -- snapshot_` | All pass |
 
 ### 2.2  PTY E2E Tests
 

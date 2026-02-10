@@ -1,12 +1,12 @@
-# wa — WezTerm Automata
+# ft — FrankenTerm
 
 <div align="center">
-  <img src="wa_illustration.webp" alt="wa - Terminal Hypervisor for AI Agent Swarms">
+  <img src="ft_illustration.webp" alt="wa - Terminal Hypervisor for AI Agent Swarms">
 </div>
 
 <div align="center">
 
-[![CI](https://github.com/Dicklesworthstone/wezterm_automata/actions/workflows/ci.yml/badge.svg)](https://github.com/Dicklesworthstone/wezterm_automata/actions/workflows/ci.yml)
+[![CI](https://github.com/Dicklesworthstone/frankenterm/actions/workflows/ci.yml/badge.svg)](https://github.com/Dicklesworthstone/frankenterm/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/rust-1.85+-orange.svg)](https://www.rust-lang.org/)
 
@@ -18,7 +18,7 @@
 <h3>Quick Install</h3>
 
 ```bash
-cargo install --git https://github.com/Dicklesworthstone/wezterm_automata.git wa
+cargo install --git https://github.com/Dicklesworthstone/frankenterm.git wa
 ```
 
 </div>
@@ -29,7 +29,7 @@ cargo install --git https://github.com/Dicklesworthstone/wezterm_automata.git wa
 
 **The Problem**: Running multiple AI coding agents (Claude Code, Codex CLI, Gemini CLI) across terminal panes is chaos. You can't see what they're doing, can't detect when they hit rate limits or need input, and can't coordinate their work without manual babysitting and fragile timing heuristics.
 
-**The Solution**: `wa` transforms WezTerm into a **terminal hypervisor** — capturing all pane output in real-time, detecting agent state transitions through pattern matching, automatically executing workflows in response, and exposing a machine-optimized Robot Mode API for AI-to-AI orchestration.
+**The Solution**: `ft` transforms WezTerm into a **terminal hypervisor** — capturing all pane output in real-time, detecting agent state transitions through pattern matching, automatically executing workflows in response, and exposing a machine-optimized Robot Mode API for AI-to-AI orchestration.
 
 ### Why Use wa?
 
@@ -98,7 +98,7 @@ No `sleep(5)` loops hoping the agent is ready. Every wait is condition-based: wa
 
 ### 3. Delta Extraction Over Full Capture
 
-Instead of repeatedly capturing entire scrollback buffers, `wa` uses 4KB overlap matching to extract only new content. Efficient storage, minimal latency, explicit gap markers for discontinuities.
+Instead of repeatedly capturing entire scrollback buffers, `ft` uses 4KB overlap matching to extract only new content. Efficient storage, minimal latency, explicit gap markers for discontinuities.
 
 ### 4. Single-Writer Integrity
 
@@ -110,9 +110,9 @@ Robot Mode returns structured JSON with consistent schemas. Every response inclu
 
 ## Safety Guarantees
 
-- **Observe vs act split**: `wa watch` is read-only; mutating actions must pass the Policy Engine.
+- **Observe vs act split**: `ft watch` is read-only; mutating actions must pass the Policy Engine.
 - **No silent gaps**: capture gaps are recorded explicitly and surfaced in events/diagnostics.
-- **Policy-gated sending**: `wa send` and workflows enforce prompt/alt-screen checks, rate limits, and approvals.
+- **Policy-gated sending**: `ft send` and workflows enforce prompt/alt-screen checks, rate limits, and approvals.
 
 ## Secure Distributed Mode
 
@@ -127,7 +127,7 @@ cargo build -p wa --release --features distributed
 Operator guidance:
 - Keep `distributed.bind_addr` on loopback unless you explicitly need remote access.
 - For non-loopback binds, enable TLS and use file/env token sources (avoid inline tokens).
-- Use `wa doctor` (or `wa doctor --json`) to verify effective distributed security status.
+- Use `ft doctor` (or `ft doctor --json`) to verify effective distributed security status.
 - Follow `docs/distributed-security-spec.md` for setup, rotation, and troubleshooting.
 
 ---
@@ -160,8 +160,8 @@ Operator guidance:
 
 ```bash
 # Clone and build
-git clone https://github.com/Dicklesworthstone/wezterm_automata.git
-cd wezterm_automata
+git clone https://github.com/Dicklesworthstone/frankenterm.git
+cd frankenterm
 cargo build --release
 
 # Install to PATH
@@ -171,7 +171,7 @@ cp target/release/wa ~/.local/bin/
 ### Via Cargo
 
 ```bash
-cargo install --git https://github.com/Dicklesworthstone/wezterm_automata.git wa
+cargo install --git https://github.com/Dicklesworthstone/frankenterm.git wa
 ```
 
 ### Requirements
@@ -221,7 +221,7 @@ wa robot state
 ### 5. Search Captured Output
 
 ```bash
-# Full-text search across all panes (alias: `wa query`)
+# Full-text search across all panes (alias: `ft query`)
 wa search "error"
 wa query "error"
 
@@ -327,7 +327,7 @@ wa reproduce --kind crash               # Export latest crash bundle
 
 ### Robot Mode (JSON API)
 
-Use `--format toon` for token-efficient output and `wa robot help` for the full command list.
+Use `--format toon` for token-efficient output and `ft robot help` for the full command list.
 
 ```bash
 wa robot state               # All panes as JSON
@@ -367,7 +367,7 @@ For the full command matrix (human + robot + MCP), see `docs/cli-reference.md`.
 
 ## Configuration
 
-Configuration lives in `~/.config/wa/wa.toml`:
+Configuration lives in `~/.config/wa/ft.toml`:
 
 ```toml
 [general]
@@ -441,7 +441,7 @@ allow_config = true
 allow_snapshots = true
 # Optional allow/deny path globs
 allow_paths = []
-deny_paths = ["~/.local/share/wa/wa.db", "~/.local/share/wa/wa.db-wal", "~/.local/share/wa/wa.db-shm"]
+deny_paths = ["~/.local/share/wa/ft.db", "~/.local/share/wa/ft.db-wal", "~/.local/share/wa/ft.db-shm"]
 
 [[sync.targets]]
 name = "staging"
@@ -512,8 +512,8 @@ send_text = { max_per_second = 2 }
                                    ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                 Robot Mode API + MCP (stdio)                             │
-│   wa robot state │ get-text │ send │ wait-for │ search │ events        │
-│   wa mcp serve (feature-gated, stdio transport)                          │
+│   ft robot state │ get-text │ send │ wait-for │ search │ events        │
+│   ft mcp serve (feature-gated, stdio transport)                          │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -535,7 +535,7 @@ For a deeper architecture writeup (OSC 133 prompt markers, gap semantics, librar
 
 ## Pattern Detection
 
-`wa` detects state transitions across multiple AI coding agents:
+`ft` detects state transitions across multiple AI coding agents:
 
 | Agent | Pattern Examples |
 |-------|------------------|
@@ -547,7 +547,7 @@ For a deeper architecture writeup (OSC 133 prompt markers, gap semantics, librar
 ### Pattern IDs
 
 Every detection has a stable `rule_id` like `core.codex:usage_reached`. Use these in:
-- `wa robot wait-for <pane_id> <rule_id>` — wait for specific condition
+- `ft robot wait-for <pane_id> <rule_id>` — wait for specific condition
 - Workflow triggers — automatically react to patterns
 - Allowlists — suppress false positives
 
@@ -555,16 +555,16 @@ Every detection has a stable `rule_id` like `core.codex:usage_reached`. Use thes
 
 ## Performance Benchmarks
 
-Benchmarks live under `crates/wa-core/benches/` and use Criterion. Each bench includes a short, human-readable budget and emits machine-readable artifacts under `target/criterion/`.
+Benchmarks live under `crates/frankenterm-core/benches/` and use Criterion. Each bench includes a short, human-readable budget and emits machine-readable artifacts under `target/criterion/`.
 
 ```bash
 # Compile benches (fast sanity check)
-cargo bench -p wa-core --benches --no-run
+cargo bench -p frankenterm-core --benches --no-run
 
 # Run a specific bench
-cargo bench -p wa-core --bench pattern_detection
-cargo bench -p wa-core --bench delta_extraction
-cargo bench -p wa-core --bench fts_query
+cargo bench -p frankenterm-core --bench pattern_detection
+cargo bench -p frankenterm-core --bench delta_extraction
+cargo bench -p frankenterm-core --bench fts_query
 ```
 
 When a bench runs, it prints a `[BENCH] {...}` metadata line and writes:
@@ -586,7 +586,7 @@ wezterm start --always-new-process
 
 ### Daemon won't start: "watcher lock held"
 
-Another `wa` watcher is already running.
+Another `ft` watcher is already running.
 
 ```bash
 # Check for existing watcher
@@ -608,7 +608,7 @@ Delta extraction is failing; falling back to full captures.
 wa robot events --event-type gap
 
 # Reduce poll interval
-# In wa.toml:
+# In ft.toml:
 [ingest]
 poll_interval_ms = 500  # Slower polling
 ```
@@ -666,7 +666,7 @@ wa robot send 0 "test" --dry-run
 
 ### Is my terminal output stored permanently?
 
-By default, output is retained for 30 days (configurable via `storage.retention_days`). Data is stored locally in SQLite at `~/.local/share/wa/wa.db`.
+By default, output is retained for 30 days (configurable via `storage.retention_days`). Data is stored locally in SQLite at `~/.local/share/wa/ft.db`.
 
 ### Does wa send data anywhere?
 

@@ -19,14 +19,14 @@ wa treats a crash as an observable event with artifacts, not a silent failure.
 On panic, the watcher writes a bounded, redacted crash bundle and then exits.
 
 Crash bundle facts:
-- Default location: `<workspace>/.wa/crash/wa_crash_YYYYMMDD_HHMMSS/`
+- Default location: `<workspace>/.ft/crash/wa_crash_YYYYMMDD_HHMMSS/`
 - Files included: `manifest.json`, `crash_report.json`, and `health_snapshot.json` (if available)
 - Redaction: all text is passed through the policy redactor before writing
 - Size bounds: backtrace truncated to 64 KiB, total bundle capped at 1 MiB
 
 Where to find the crash directory:
-- It lives under the workspace root. Use `wa config show` or `wa status` to confirm the workspace path.
-- You can change the workspace via `--workspace` or `WA_WORKSPACE` if you need bundles elsewhere.
+- It lives under the workspace root. Use `ft config show` or `ft status` to confirm the workspace path.
+- You can change the workspace via `--workspace` or `FT_WORKSPACE` if you need bundles elsewhere.
 
 ---
 
@@ -84,7 +84,7 @@ wa diag bundle --output /tmp/wa-diag
 
 3) File an issue with:
 - crash bundle path
-- incident bundle path (from `wa reproduce --kind crash`)
+- incident bundle path (from `ft reproduce --kind crash`)
 - triage output (plain or JSON)
 - any recent wa logs
 
@@ -105,7 +105,7 @@ In the TUI triage view:
 You can silence a specific detection rule via pack overrides:
 
 ```toml
-# ~/.config/wa/wa.toml
+# ~/.config/wa/ft.toml
 [patterns.pack_overrides.core]
 disabled_rules = ["core.codex:usage_reached"]
 ```

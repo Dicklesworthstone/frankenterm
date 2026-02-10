@@ -4,6 +4,12 @@ use crate::ExitBehavior;
 use async_trait::async_trait;
 use config::keyassignment::{KeyAssignment, ScrollbackEraseMode};
 use downcast_rs::{impl_downcast, Downcast};
+use frankenterm_dynamic::Value;
+use frankenterm_term::color::ColorPalette;
+use frankenterm_term::{
+    Clipboard, DownloadHandler, KeyCode, KeyModifiers, MouseEvent, Progress, SemanticZone,
+    StableRowIndex, TerminalConfiguration, TerminalSize,
+};
 use parking_lot::MappedMutexGuard;
 use rangeset::RangeSet;
 use serde::{Deserialize, Serialize};
@@ -14,12 +20,6 @@ use termwiz::hyperlink::Rule;
 use termwiz::input::KeyboardEncoding;
 use termwiz::surface::{Line, SequenceNo};
 use url::Url;
-use wezterm_dynamic::Value;
-use wezterm_term::color::ColorPalette;
-use wezterm_term::{
-    Clipboard, DownloadHandler, KeyCode, KeyModifiers, MouseEvent, Progress, SemanticZone,
-    StableRowIndex, TerminalConfiguration, TerminalSize,
-};
 
 static PANE_ID: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::AtomicUsize::new(0);
 pub type PaneId = usize;

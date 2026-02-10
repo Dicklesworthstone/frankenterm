@@ -7,12 +7,12 @@ use crate::escape::parser::Parser;
 use crate::escape::{Action, CSI};
 use crate::keymap::{Found, KeyMap};
 use crate::readbuf::ReadBuffer;
+use frankenterm_input_types::ctrl_mapping;
 #[cfg(feature = "use_serde")]
 use serde::{Deserialize, Serialize};
 use std::fmt::Write;
-use wezterm_input_types::ctrl_mapping;
 
-pub use wezterm_input_types::Modifiers;
+pub use frankenterm_input_types::Modifiers;
 
 pub const CSI: &str = "\x1b[";
 pub const SS3: &str = "\x1bO";
@@ -44,7 +44,7 @@ use winapi::um::wincon::{
     WINDOW_BUFFER_SIZE_EVENT, WINDOW_BUFFER_SIZE_RECORD,
 };
 
-pub use wezterm_escape_parser::csi::MouseButtons;
+pub use frankenterm_escape_parser::csi::MouseButtons;
 
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]

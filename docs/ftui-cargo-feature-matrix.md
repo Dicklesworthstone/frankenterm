@@ -2,7 +2,7 @@
 
 **Bead:** wa-3g47 (FTUI-02.1.a)
 **Date:** 2026-02-09
-**Crate boundary:** `wa-core` (library), `wa` (binary)
+**Crate boundary:** `frankenterm-core` (library), `wa` (binary)
 
 ## 1  Canonical Feature Combinations
 
@@ -10,11 +10,11 @@
 
 | Mode | Features | Purpose | CI Gate |
 |------|----------|---------|---------|
-| **Headless** | (none) | Robot/CLI/MCP: no UI deps compiled | `cargo check -p wa-core` |
-| **Legacy TUI** | `tui` | Production ratatui+crossterm backend | `cargo check -p wa-core --features tui` |
-| **FrankenTUI** | `ftui` | Migration target ftui backend | `cargo check -p wa-core --features ftui` |
-| **Legacy test** | `tui` | Unit + integration tests for legacy | `cargo test -p wa-core --features tui` |
-| **ftui test** | `ftui` | Unit + integration tests for ftui | `cargo test -p wa-core --features ftui` |
+| **Headless** | (none) | Robot/CLI/MCP: no UI deps compiled | `cargo check -p frankenterm-core` |
+| **Legacy TUI** | `tui` | Production ratatui+crossterm backend | `cargo check -p frankenterm-core --features tui` |
+| **FrankenTUI** | `ftui` | Migration target ftui backend | `cargo check -p frankenterm-core --features ftui` |
+| **Legacy test** | `tui` | Unit + integration tests for legacy | `cargo test -p frankenterm-core --features tui` |
+| **ftui test** | `ftui` | Unit + integration tests for ftui | `cargo test -p frankenterm-core --features ftui` |
 | **Full legacy** | `tui,mcp,web,metrics` | Legacy binary with all optional frontends | `cargo check -p wa --features tui,mcp,web,metrics` |
 | **Full ftui** | `ftui,mcp,web,metrics` | ftui binary with all optional frontends | `cargo check -p wa --features ftui,mcp,web,metrics` |
 
@@ -22,7 +22,7 @@
 
 | Mode | Features | Purpose | CI Gate |
 |------|----------|---------|---------|
-| **Rollout** | `rollout` | Both backends compiled; runtime selection via `WA_TUI_BACKEND` | `cargo check -p wa-core --features rollout` |
+| **Rollout** | `rollout` | Both backends compiled; runtime selection via `FT_TUI_BACKEND` | `cargo check -p frankenterm-core --features rollout` |
 
 The `rollout` feature implies `tui` + `ftui` and bypasses the mutual-exclusion
 guard.  Backend selection happens at runtime via `tui::select_backend()`.
@@ -31,7 +31,7 @@ guard.  Backend selection happens at runtime via `tui::select_backend()`.
 
 | Combination | Enforcement | Error Message |
 |-------------|-------------|---------------|
-| `tui` + `ftui` (without `rollout`) | `compile_error!` in `wa-core/src/lib.rs` | "Features `tui` and `ftui` are mutually exclusive... Use `--features rollout` for runtime backend selection during migration." |
+| `tui` + `ftui` (without `rollout`) | `compile_error!` in `frankenterm-core/src/lib.rs` | "Features `tui` and `ftui` are mutually exclusive... Use `--features rollout` for runtime backend selection during migration." |
 
 ### Orthogonal Features
 
@@ -57,27 +57,27 @@ Each CI run must verify these compile combinations deterministically:
 
 ```bash
 # 1. Headless (no features) — must always compile
-cargo check -p wa-core
-cargo test -p wa-core
+cargo check -p frankenterm-core
+cargo test -p frankenterm-core
 
 # 2. Legacy TUI — must compile and pass tests until tui feature is removed
-cargo check -p wa-core --features tui
-cargo test -p wa-core --features tui
+cargo check -p frankenterm-core --features tui
+cargo test -p frankenterm-core --features tui
 
 # 3. FrankenTUI — must compile and pass tests
-cargo check -p wa-core --features ftui
-cargo test -p wa-core --features ftui
+cargo check -p frankenterm-core --features ftui
+cargo test -p frankenterm-core --features ftui
 
 # 4. Mutual exclusion — must fail to compile
-cargo check -p wa-core --features tui,ftui 2>&1 | grep -q "mutually exclusive"
+cargo check -p frankenterm-core --features tui,ftui 2>&1 | grep -q "mutually exclusive"
 
 # 5. Binary crate — both backends
 cargo check -p wa --features tui
 cargo check -p wa --features ftui
 
 # 6. Clippy for both backends
-cargo clippy -p wa-core --features tui -- -D warnings
-cargo clippy -p wa-core --features ftui -- -D warnings
+cargo clippy -p frankenterm-core --features tui -- -D warnings
+cargo clippy -p frankenterm-core --features ftui -- -D warnings
 ```
 
 ### Deterministic Failure Reporting
@@ -134,7 +134,7 @@ Each check logs:
 
 ### Current: `tui` + `ftui`
 
-The `compile_error!` at `wa-core/src/lib.rs` fires when both features are active
+The `compile_error!` at `frankenterm-core/src/lib.rs` fires when both features are active
 **without** the `rollout` feature.  This is the only disallowed combination.
 
 **Name collision handling:**  Both backends export `App`, `AppConfig`, `View`,
@@ -146,7 +146,7 @@ re-exports are suppressed via `#[cfg(not(feature = "rollout"))]` guards, and the
 
 When FTUI-09.3 (decommission) is reached:
 
-1. Remove `tui` and `rollout` features from `wa-core/Cargo.toml` and `wa/Cargo.toml`
+1. Remove `tui` and `rollout` features from `frankenterm-core/Cargo.toml` and `wa/Cargo.toml`
 2. Remove `compile_error!` guard and `rollout.rs` dispatch module
 3. Remove all `#[cfg(feature = "tui")]` blocks
 4. Rename `ftui` to `tui` (or make ftui the default)
@@ -175,9 +175,9 @@ and CI must verify all.
 
 ## References
 
-- `crates/wa-core/Cargo.toml:113-135` — feature definitions
+- `crates/frankenterm-core/Cargo.toml:113-135` — feature definitions
 - `crates/wa/Cargo.toml:40-51` — binary feature passthrough
-- `crates/wa-core/src/lib.rs:129-134` — mutual exclusion guard
+- `crates/frankenterm-core/src/lib.rs:129-134` — mutual exclusion guard
 - ADR-0004: Phased Rollout and Rollback
 - wa-36xw (FTUI-07.4): CI gate wiring (consumes this matrix)
 - wa-1uqi (FTUI-03.2.a): Output sink routing (blocked by this)

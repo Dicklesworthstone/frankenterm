@@ -127,7 +127,7 @@ scenario_circuit_breaker() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p wa-core 'circuit_breaker::tests' \
+    cargo test -p frankenterm-core 'circuit_breaker::tests' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -161,7 +161,7 @@ scenario_retry_logic() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p wa-core 'retry::tests' \
+    cargo test -p frankenterm-core 'retry::tests' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -195,7 +195,7 @@ scenario_graceful_degradation() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p wa-core 'degradation::tests' \
+    cargo test -p frankenterm-core 'degradation::tests' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -245,7 +245,7 @@ scenario_fault_injection() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p wa-core 'chaos::tests' \
+    cargo test -p frankenterm-core 'chaos::tests' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -305,7 +305,7 @@ scenario_health_monitoring() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p wa-core 'watchdog::tests' \
+    cargo test -p frankenterm-core 'watchdog::tests' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -340,7 +340,7 @@ scenario_cross_module_integration() {
     exit_code=0
 
     # Run retry+circuit integration and global injector lifecycle
-    cargo test -p wa-core 'circuit_breaker_integration\|global_injector_lifecycle\|free_functions_fail_open' \
+    cargo test -p frankenterm-core 'circuit_breaker_integration\|global_injector_lifecycle\|free_functions_fail_open' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -358,7 +358,7 @@ scenario_cross_module_integration() {
     if [[ "$passed_count" -eq 0 ]]; then
         # Cargo test doesn't support \| — run a broader filter
         exit_code=0
-        cargo test -p wa-core 'circuit_breaker_integration' \
+        cargo test -p frankenterm-core 'circuit_breaker_integration' \
             --no-fail-fast -- --nocapture \
             >"$test_output" 2>&1 || exit_code=$?
     fi
@@ -393,7 +393,7 @@ scenario_bounded_execution() {
     exit_code=0
 
     # Run all 5 reliability modules together
-    timeout 120 cargo test -p wa-core 'circuit_breaker::tests\|retry::tests\|degradation::tests\|chaos::tests\|watchdog::tests' \
+    timeout 120 cargo test -p frankenterm-core 'circuit_breaker::tests\|retry::tests\|degradation::tests\|chaos::tests\|watchdog::tests' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -412,7 +412,7 @@ scenario_bounded_execution() {
             local mod_output mod_exit
             mod_output=$(mktemp)
             mod_exit=0
-            timeout 30 cargo test -p wa-core "$module" \
+            timeout 30 cargo test -p frankenterm-core "$module" \
                 --no-fail-fast -- --nocapture \
                 >"$mod_output" 2>&1 || mod_exit=$?
 

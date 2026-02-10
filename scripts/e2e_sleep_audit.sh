@@ -412,7 +412,7 @@ scenario_rust_test_infrastructure() {
 
     # Verify Rust tests don't use thread::sleep (they use tokio::time or instant mocking)
     # Run a subset of timing-sensitive tests
-    cargo test -p wa-core 'scheduler_per_pane_window_resets' \
+    cargo test -p frankenterm-core 'scheduler_per_pane_window_resets' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -427,7 +427,7 @@ scenario_rust_test_infrastructure() {
     # Verify quiescence helpers exist in test infrastructure
     local quiescence_hits
     quiescence_hits=$(command grep -rl 'wait_for\|quiescence\|poll_until\|assert_eventually' \
-        "$PROJECT_ROOT/crates/wa-core/src/" 2>/dev/null | wc -l)
+        "$PROJECT_ROOT/crates/frankenterm-core/src/" 2>/dev/null | wc -l)
 
     if [[ "$quiescence_hits" -gt 0 ]]; then
         log_pass "S5.2: Wait-for/quiescence helpers found in $quiescence_hits source files"

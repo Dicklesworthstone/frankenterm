@@ -1,12 +1,12 @@
 use crate::*;
+use frankenterm_dynamic::{FromDynamic, ToDynamic};
+use frankenterm_term::color::ColorPalette;
 use luahelper::impl_lua_conversion_dynamic;
 use std::convert::{TryFrom, TryInto};
 use std::str::FromStr;
 use termwiz::cell::CellAttributes;
 use termwiz::color::ColorSpec as TWColorSpec;
 pub use termwiz::color::{AnsiColor, ColorAttribute, RgbColor, SrgbaTuple};
-use wezterm_dynamic::{FromDynamic, ToDynamic};
-use wezterm_term::color::ColorPalette;
 
 #[derive(Debug, Copy, Clone, FromDynamic, ToDynamic)]
 pub struct HsbTransform {
@@ -321,10 +321,10 @@ impl From<Palette> for ColorPalette {
 pub struct TabBarColor {
     /// Specifies the intensity attribute for the tab title text
     #[dynamic(default)]
-    pub intensity: wezterm_term::Intensity,
+    pub intensity: frankenterm_term::Intensity,
     /// Specifies the underline attribute for the tab title text
     #[dynamic(default)]
-    pub underline: wezterm_term::Underline,
+    pub underline: frankenterm_term::Underline,
     /// Specifies the italic attribute for the tab title text
     #[dynamic(default)]
     pub italic: bool,

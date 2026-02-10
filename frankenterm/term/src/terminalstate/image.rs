@@ -1,13 +1,13 @@
 use crate::{Position, StableRowIndex, TerminalState};
 use anyhow::Context;
+use frankenterm_cell::image::{ImageCell, ImageDataType};
+use frankenterm_cell::Cell;
+use frankenterm_surface::change::ImageData;
+use frankenterm_surface::TextureCoordinate;
 use humansize::{SizeFormatter, DECIMAL};
 use num_traits::{One, Zero};
 use ordered_float::NotNan;
 use std::sync::Arc;
-use wezterm_cell::image::{ImageCell, ImageDataType};
-use wezterm_cell::Cell;
-use wezterm_surface::change::ImageData;
-use wezterm_surface::TextureCoordinate;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlacementInfo {
