@@ -16,6 +16,11 @@ pub use mux_client::{
     SubscriptionConfig, subscribe_pane_output,
 };
 
+#[cfg(all(feature = "vendored", unix))]
+pub mod mux_pool;
+#[cfg(all(feature = "vendored", unix))]
+pub use mux_pool::{MuxPool, MuxPoolConfig, MuxPoolError, MuxPoolStats};
+
 #[cfg(all(feature = "vendored", not(unix)))]
 #[derive(Debug, thiserror::Error)]
 pub enum DirectMuxError {

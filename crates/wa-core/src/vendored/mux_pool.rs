@@ -1,0 +1,582 @@
+//! Connection pool for `DirectMuxClient` connections.
+//!
+//! Wraps [`Pool<DirectMuxClient>`](crate::pool::Pool) to manage persistent
+//! Unix socket connections to the WezTerm mux server. Instead of spawning
+//! a `wezterm cli` subprocess for every operation (which creates 60+ stuck
+//! processes under agent swarm load), this pool reuses persistent connections.
+//!
+//! # Design
+//!
+//! - Connections are created on-demand when the pool has no idle entries.
+//! - Each connection is a full `DirectMuxClient` with completed handshake
+//!   (codec version + client registration).
+//! - On success, the connection is returned to the pool for reuse.
+//! - On error, the connection is dropped (buffer state may be corrupt).
+//! - The underlying `Pool<C>` provides semaphore-based concurrency limiting
+//!   and idle timeout eviction.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use serde::{Deserialize, Serialize};
+
+use crate::pool::{Pool, PoolAcquireGuard, PoolConfig, PoolError, PoolStats};
+
+use super::mux_client::{DirectMuxClient, DirectMuxClientConfig, DirectMuxError};
+use codec::{GetLinesResponse, GetPaneRenderChangesResponse, ListPanesResponse};
+
+/// Error type for mux pool operations.
+#[derive(Debug, thiserror::Error)]
+pub enum MuxPoolError {
+    /// The pool could not acquire a slot (timeout or closed).
+    #[error("pool: {0}")]
+    Pool(#[from] PoolError),
+    /// The mux client encountered an error.
+    #[error("mux: {0}")]
+    Mux(#[from] DirectMuxError),
+}
+
+impl MuxPoolError {
+    /// Whether this error is a pool-level timeout (vs a mux protocol error).
+    #[must_use]
+    pub fn is_pool_timeout(&self) -> bool {
+        matches!(self, Self::Pool(PoolError::AcquireTimeout))
+    }
+
+    /// Whether this error indicates the mux server disconnected.
+    #[must_use]
+    pub fn is_disconnected(&self) -> bool {
+        matches!(self, Self::Mux(DirectMuxError::Disconnected))
+    }
+}
+
+/// Configuration for the mux connection pool.
+#[derive(Debug, Clone)]
+pub struct MuxPoolConfig {
+    /// Pool concurrency and eviction settings.
+    pub pool: PoolConfig,
+    /// DirectMuxClient connection settings.
+    pub mux: DirectMuxClientConfig,
+}
+
+impl Default for MuxPoolConfig {
+    fn default() -> Self {
+        Self {
+            pool: PoolConfig {
+                max_size: 8,
+                idle_timeout: std::time::Duration::from_secs(300),
+                acquire_timeout: std::time::Duration::from_secs(10),
+            },
+            mux: DirectMuxClientConfig::default(),
+        }
+    }
+}
+
+/// Pool statistics including mux-specific counters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MuxPoolStats {
+    /// Underlying pool stats (idle count, active count, etc.).
+    pub pool: PoolStats,
+    /// Total connections successfully created.
+    pub connections_created: u64,
+    /// Total connection creation failures.
+    pub connections_failed: u64,
+    /// Total health check attempts.
+    pub health_checks: u64,
+    /// Total health check failures.
+    pub health_check_failures: u64,
+}
+
+/// A connection pool for `DirectMuxClient` instances.
+///
+/// Manages persistent Unix socket connections to the WezTerm mux server,
+/// reusing them across operations instead of spawning CLI subprocesses.
+pub struct MuxPool {
+    pool: Pool<DirectMuxClient>,
+    mux_config: DirectMuxClientConfig,
+    connections_created: AtomicU64,
+    connections_failed: AtomicU64,
+    health_checks: AtomicU64,
+    health_check_failures: AtomicU64,
+}
+
+impl MuxPool {
+    /// Create a new mux connection pool.
+    #[must_use]
+    pub fn new(config: MuxPoolConfig) -> Self {
+        Self {
+            pool: Pool::new(config.pool),
+            mux_config: config.mux,
+            connections_created: AtomicU64::new(0),
+            connections_failed: AtomicU64::new(0),
+            health_checks: AtomicU64::new(0),
+            health_check_failures: AtomicU64::new(0),
+        }
+    }
+
+    /// Acquire a client from the pool or create a new one.
+    ///
+    /// Returns the client and a guard that holds the concurrency slot.
+    /// The guard must be dropped after the client is returned (or discarded).
+    async fn acquire_client(&self) -> Result<(DirectMuxClient, PoolAcquireGuard), MuxPoolError> {
+        let result = self.pool.acquire().await?;
+        let (conn, guard) = result.into_parts();
+        let client = match conn {
+            Some(c) => c,
+            None => match DirectMuxClient::connect(self.mux_config.clone()).await {
+                Ok(client) => {
+                    self.connections_created.fetch_add(1, Ordering::Relaxed);
+                    client
+                }
+                Err(e) => {
+                    self.connections_failed.fetch_add(1, Ordering::Relaxed);
+                    return Err(MuxPoolError::Mux(e));
+                }
+            },
+        };
+        Ok((client, guard))
+    }
+
+    /// Return a healthy client to the pool for reuse.
+    async fn return_client(&self, client: DirectMuxClient) {
+        self.pool.put(client).await;
+    }
+
+    /// List all panes via a pooled connection.
+    pub async fn list_panes(&self) -> Result<ListPanesResponse, MuxPoolError> {
+        let (mut client, _guard) = self.acquire_client().await?;
+        let result = client.list_panes().await;
+        match result {
+            Ok(response) => {
+                self.return_client(client).await;
+                Ok(response)
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "mux pool: dropping client after list_panes error");
+                Err(MuxPoolError::Mux(e))
+            }
+        }
+    }
+
+    /// Get lines from a pane via a pooled connection.
+    pub async fn get_lines(
+        &self,
+        pane_id: u64,
+        lines: Vec<std::ops::Range<isize>>,
+    ) -> Result<GetLinesResponse, MuxPoolError> {
+        let (mut client, _guard) = self.acquire_client().await?;
+        let result = client.get_lines(pane_id, lines).await;
+        match result {
+            Ok(response) => {
+                self.return_client(client).await;
+                Ok(response)
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "mux pool: dropping client after get_lines error");
+                Err(MuxPoolError::Mux(e))
+            }
+        }
+    }
+
+    /// Poll for pane render changes via a pooled connection.
+    pub async fn get_pane_render_changes(
+        &self,
+        pane_id: u64,
+    ) -> Result<GetPaneRenderChangesResponse, MuxPoolError> {
+        let (mut client, _guard) = self.acquire_client().await?;
+        let result = client.get_pane_render_changes(pane_id).await;
+        match result {
+            Ok(response) => {
+                self.return_client(client).await;
+                Ok(response)
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "mux pool: dropping client after get_pane_render_changes error");
+                Err(MuxPoolError::Mux(e))
+            }
+        }
+    }
+
+    /// Run a health check by listing panes on a pooled connection.
+    pub async fn health_check(&self) -> Result<(), MuxPoolError> {
+        self.health_checks.fetch_add(1, Ordering::Relaxed);
+        match self.list_panes().await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                self.health_check_failures.fetch_add(1, Ordering::Relaxed);
+                Err(e)
+            }
+        }
+    }
+
+    /// Evict idle connections that have exceeded the idle timeout.
+    pub async fn evict_idle(&self) -> usize {
+        self.pool.evict_idle().await
+    }
+
+    /// Clear all idle connections from the pool.
+    pub async fn clear(&self) {
+        self.pool.clear().await;
+    }
+
+    /// Get pool statistics.
+    pub async fn stats(&self) -> MuxPoolStats {
+        MuxPoolStats {
+            pool: self.pool.stats().await,
+            connections_created: self.connections_created.load(Ordering::Relaxed),
+            connections_failed: self.connections_failed.load(Ordering::Relaxed),
+            health_checks: self.health_checks.load(Ordering::Relaxed),
+            health_check_failures: self.health_check_failures.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use codec::{CODEC_VERSION, GetCodecVersionResponse, ListPanesResponse, Pdu, UnitResponse};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Spawn a mock mux server that handles handshake + ListPanes.
+    /// Returns the socket path.
+    async fn spawn_mock_server(temp_dir: &tempfile::TempDir) -> PathBuf {
+        let socket_path = temp_dir.path().join("mux-pool-test.sock");
+        let listener =
+            tokio::net::UnixListener::bind(&socket_path).expect("bind mock mux listener");
+
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(conn) => conn,
+                    Err(_) => break,
+                };
+
+                tokio::spawn(async move {
+                    let mut read_buf = Vec::new();
+                    loop {
+                        let mut temp = vec![0u8; 4096];
+                        let read = match stream.read(&mut temp).await {
+                            Ok(0) => break,
+                            Ok(n) => n,
+                            Err(_) => break,
+                        };
+                        read_buf.extend_from_slice(&temp[..read]);
+                        let mut responses: Vec<(u64, Pdu)> = Vec::new();
+                        while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                            let response = match decoded.pdu {
+                                Pdu::GetCodecVersion(_) => {
+                                    Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                        codec_vers: CODEC_VERSION,
+                                        version_string: "mock-mux-pool-test".to_string(),
+                                        executable_path: PathBuf::from("/bin/wezterm"),
+                                        config_file_path: None,
+                                    })
+                                }
+                                Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
+                                Pdu::ListPanes(_) => Pdu::ListPanesResponse(ListPanesResponse {
+                                    tabs: Vec::new(),
+                                    tab_titles: Vec::new(),
+                                    window_titles: HashMap::new(),
+                                }),
+                                _ => continue,
+                            };
+                            responses.push((decoded.serial, response));
+                        }
+                        for (serial, pdu) in responses {
+                            let mut out = Vec::new();
+                            pdu.encode(&mut out, serial).expect("encode response");
+                            if stream.write_all(&out).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        socket_path
+    }
+
+    fn pool_config(socket_path: PathBuf, max_size: usize) -> MuxPoolConfig {
+        MuxPoolConfig {
+            pool: PoolConfig {
+                max_size,
+                idle_timeout: Duration::from_secs(60),
+                acquire_timeout: Duration::from_millis(500),
+            },
+            mux: DirectMuxClientConfig::default().with_socket_path(socket_path),
+        }
+    }
+
+    #[tokio::test]
+    async fn pool_creates_connection_on_first_acquire() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = spawn_mock_server(&temp_dir).await;
+
+        let pool = MuxPool::new(pool_config(socket_path, 4));
+        let result = pool.list_panes().await.expect("list_panes should succeed");
+        assert!(result.tabs.is_empty());
+
+        let stats = pool.stats().await;
+        assert_eq!(stats.connections_created, 1);
+        assert_eq!(stats.connections_failed, 0);
+    }
+
+    #[tokio::test]
+    async fn pool_reuses_idle_connection() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = spawn_mock_server(&temp_dir).await;
+
+        let pool = MuxPool::new(pool_config(socket_path, 4));
+
+        // First call creates a connection
+        pool.list_panes().await.expect("first list_panes");
+        // Second call should reuse the idle connection
+        pool.list_panes().await.expect("second list_panes");
+
+        let stats = pool.stats().await;
+        assert_eq!(
+            stats.connections_created, 1,
+            "should have created only one connection"
+        );
+        assert_eq!(stats.pool.total_acquired, 2, "two acquire calls");
+    }
+
+    #[tokio::test]
+    async fn pool_concurrent_operations_use_separate_connections() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = spawn_mock_server(&temp_dir).await;
+
+        let pool = Arc::new(MuxPool::new(pool_config(socket_path, 4)));
+
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let pool = pool.clone();
+            handles.push(tokio::spawn(async move {
+                pool.list_panes().await.expect("concurrent list_panes");
+            }));
+        }
+        for handle in handles {
+            handle.await.expect("task should not panic");
+        }
+
+        let stats = pool.stats().await;
+        // At least 1 connection created, possibly up to 4 if all ran concurrently
+        assert!(stats.connections_created >= 1);
+        assert_eq!(stats.pool.total_acquired, 4);
+    }
+
+    #[tokio::test]
+    async fn pool_connect_failure_increments_counter() {
+        let config = MuxPoolConfig {
+            pool: PoolConfig {
+                max_size: 2,
+                idle_timeout: Duration::from_secs(60),
+                acquire_timeout: Duration::from_millis(500),
+            },
+            mux: DirectMuxClientConfig::default()
+                .with_socket_path("/tmp/wa-mux-pool-test-nonexistent.sock"),
+        };
+        let pool = MuxPool::new(config);
+
+        let err = pool.list_panes().await.expect_err("should fail to connect");
+        assert!(
+            matches!(err, MuxPoolError::Mux(DirectMuxError::SocketNotFound(_))),
+            "expected SocketNotFound, got: {err}"
+        );
+
+        let stats = pool.stats().await;
+        assert_eq!(stats.connections_created, 0);
+        assert_eq!(stats.connections_failed, 1);
+    }
+
+    #[tokio::test]
+    async fn pool_health_check_success() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = spawn_mock_server(&temp_dir).await;
+
+        let pool = MuxPool::new(pool_config(socket_path, 2));
+        pool.health_check().await.expect("health check should pass");
+
+        let stats = pool.stats().await;
+        assert_eq!(stats.health_checks, 1);
+        assert_eq!(stats.health_check_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn pool_health_check_failure() {
+        let config = MuxPoolConfig {
+            pool: PoolConfig {
+                max_size: 2,
+                idle_timeout: Duration::from_secs(60),
+                acquire_timeout: Duration::from_millis(500),
+            },
+            mux: DirectMuxClientConfig::default()
+                .with_socket_path("/tmp/wa-mux-pool-test-nonexistent.sock"),
+        };
+        let pool = MuxPool::new(config);
+
+        pool.health_check()
+            .await
+            .expect_err("health check should fail");
+
+        let stats = pool.stats().await;
+        assert_eq!(stats.health_checks, 1);
+        assert_eq!(stats.health_check_failures, 1);
+    }
+
+    #[tokio::test]
+    async fn pool_clear_evicts_all_idle() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = spawn_mock_server(&temp_dir).await;
+
+        let pool = MuxPool::new(pool_config(socket_path, 4));
+
+        // Create a connection and return it to idle
+        pool.list_panes().await.expect("list_panes");
+
+        let stats = pool.stats().await;
+        assert_eq!(stats.pool.idle_count, 1);
+
+        pool.clear().await;
+
+        let stats = pool.stats().await;
+        assert_eq!(stats.pool.idle_count, 0);
+    }
+
+    #[tokio::test]
+    async fn pool_idle_timeout_eviction() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = spawn_mock_server(&temp_dir).await;
+
+        let config = MuxPoolConfig {
+            pool: PoolConfig {
+                max_size: 4,
+                idle_timeout: Duration::from_millis(50),
+                acquire_timeout: Duration::from_millis(500),
+            },
+            mux: DirectMuxClientConfig::default().with_socket_path(socket_path),
+        };
+        let pool = MuxPool::new(config);
+
+        // Create and return a connection
+        pool.list_panes().await.expect("list_panes");
+
+        let stats = pool.stats().await;
+        assert_eq!(stats.pool.idle_count, 1);
+
+        // Wait for idle timeout
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let evicted = pool.evict_idle().await;
+        assert_eq!(evicted, 1, "stale connection should be evicted");
+
+        let stats = pool.stats().await;
+        assert_eq!(stats.pool.idle_count, 0);
+    }
+
+    #[tokio::test]
+    async fn pool_stats_are_accurate() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = spawn_mock_server(&temp_dir).await;
+
+        let pool = MuxPool::new(pool_config(socket_path, 4));
+
+        let stats = pool.stats().await;
+        assert_eq!(stats.pool.max_size, 4);
+        assert_eq!(stats.pool.idle_count, 0);
+        assert_eq!(stats.pool.active_count, 0);
+        assert_eq!(stats.connections_created, 0);
+
+        pool.list_panes().await.expect("list_panes");
+
+        let stats = pool.stats().await;
+        assert_eq!(stats.pool.idle_count, 1);
+        assert_eq!(stats.pool.active_count, 0);
+        assert_eq!(stats.connections_created, 1);
+        assert_eq!(stats.pool.total_acquired, 1);
+    }
+
+    #[tokio::test]
+    async fn pool_respects_max_connections() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = spawn_mock_server(&temp_dir).await;
+
+        let config = MuxPoolConfig {
+            pool: PoolConfig {
+                max_size: 1,
+                idle_timeout: Duration::from_secs(60),
+                acquire_timeout: Duration::from_millis(100),
+            },
+            mux: DirectMuxClientConfig::default().with_socket_path(socket_path),
+        };
+        let pool = Arc::new(MuxPool::new(config));
+
+        // Acquire the only slot via internal method
+        let (client, _guard) = pool.acquire_client().await.expect("acquire");
+
+        // Second acquire should timeout
+        let pool2 = pool.clone();
+        let result = tokio::time::timeout(Duration::from_millis(200), pool2.list_panes()).await;
+
+        match result {
+            Ok(Err(MuxPoolError::Pool(PoolError::AcquireTimeout))) => {} // expected
+            Ok(Err(e)) => panic!("expected AcquireTimeout, got: {e}"),
+            Ok(Ok(_)) => panic!("should not have succeeded"),
+            Err(_) => {} // outer timeout is also acceptable
+        }
+
+        // Return the first client and drop the guard
+        pool.return_client(client).await;
+        drop(_guard);
+    }
+
+    #[test]
+    fn mux_pool_config_default_is_sane() {
+        let config = MuxPoolConfig::default();
+        assert_eq!(config.pool.max_size, 8);
+        assert_eq!(config.pool.idle_timeout, Duration::from_secs(300));
+        assert_eq!(config.pool.acquire_timeout, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn mux_pool_error_display() {
+        let pool_err = MuxPoolError::Pool(PoolError::AcquireTimeout);
+        assert!(pool_err.to_string().contains("pool"));
+        assert!(pool_err.is_pool_timeout());
+        assert!(!pool_err.is_disconnected());
+
+        let mux_err = MuxPoolError::Mux(DirectMuxError::Disconnected);
+        assert!(mux_err.to_string().contains("mux"));
+        assert!(!mux_err.is_pool_timeout());
+        assert!(mux_err.is_disconnected());
+    }
+
+    #[test]
+    fn mux_pool_stats_serde_roundtrip() {
+        let stats = MuxPoolStats {
+            pool: PoolStats {
+                max_size: 8,
+                idle_count: 2,
+                active_count: 1,
+                total_acquired: 100,
+                total_returned: 95,
+                total_evicted: 3,
+                total_timeouts: 2,
+            },
+            connections_created: 50,
+            connections_failed: 5,
+            health_checks: 10,
+            health_check_failures: 1,
+        };
+        let json = serde_json::to_string(&stats).expect("serialize");
+        let back: MuxPoolStats = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.connections_created, 50);
+        assert_eq!(back.health_check_failures, 1);
+        assert_eq!(back.pool.total_acquired, 100);
+    }
+}

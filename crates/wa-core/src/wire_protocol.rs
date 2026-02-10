@@ -1073,7 +1073,10 @@ mod tests {
         let envelope = WireEnvelope::new(1, "agent-1", WirePayload::Gap(sample_gap()));
         let bytes = envelope.to_json().unwrap();
         let result = agg.ingest(&bytes).unwrap();
-        assert!(matches!(result, IngestResult::Accepted(WirePayload::Gap(_))));
+        assert!(matches!(
+            result,
+            IngestResult::Accepted(WirePayload::Gap(_))
+        ));
         assert_eq!(agg.total_accepted(), 1);
         assert_eq!(agg.agent_count(), 1);
     }
