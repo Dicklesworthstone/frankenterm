@@ -36,6 +36,9 @@ legacy_wezterm/
 # Legacy Ghostty source (vendored for reference)
 legacy_ghostty/
 
+# Legacy Zellij source (vendored for reference)
+legacy_zellij/
+
 # SQLite databases (runtime)
 *.db
 *.db-journal
