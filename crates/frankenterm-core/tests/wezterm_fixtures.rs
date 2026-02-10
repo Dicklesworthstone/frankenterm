@@ -4,7 +4,7 @@
 //! various WezTerm CLI output formats.
 //!
 //! To capture a new fixture:
-//!   wezterm cli list --format json > crates/wa-core/tests/fixtures/wezterm_cli/<name>.json
+//!   wezterm cli list --format json > crates/frankenterm-core/tests/fixtures/wezterm_cli/<name>.json
 
 use frankenterm_core::wezterm::PaneInfo;
 use std::fs;

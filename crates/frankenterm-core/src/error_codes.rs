@@ -1,4 +1,4 @@
-//! Error code catalog for wa
+//! Error code catalog for ft
 //!
 //! Defines structured error codes (WA-XXXX) with human-readable descriptions,
 //! causes, and recovery steps. Used by `ft why <code>` for explainability.
@@ -172,7 +172,7 @@ pub static FT_1001: ErrorCodeDef = ErrorCodeDef {
     category: ErrorCategory::Wezterm,
     title: "WezTerm CLI not found",
     description: "The `wezterm` command-line tool could not be found in your PATH. \
-                  wa requires WezTerm to be installed and accessible.",
+                  ft requires WezTerm to be installed and accessible.",
     causes: &[
         "WezTerm is not installed",
         "WezTerm is installed but not in PATH",
@@ -191,7 +191,7 @@ pub static FT_1002: ErrorCodeDef = ErrorCodeDef {
     code: "FT-1002",
     category: ErrorCategory::Wezterm,
     title: "WezTerm not running",
-    description: "WezTerm is not currently running. wa requires an active WezTerm instance \
+    description: "WezTerm is not currently running. ft requires an active WezTerm instance \
                   to observe and control terminal panes.",
     causes: &[
         "WezTerm application is not started",
@@ -211,7 +211,7 @@ pub static FT_1003: ErrorCodeDef = ErrorCodeDef {
     category: ErrorCategory::Wezterm,
     title: "WezTerm socket not found",
     description: "The WezTerm IPC socket could not be found or accessed. \
-                  This is used for communication between wa and WezTerm.",
+                  This is used for communication between ft and WezTerm.",
     causes: &[
         "WezTerm is not running",
         "WEZTERM_UNIX_SOCKET environment variable points to wrong path",
@@ -275,7 +275,7 @@ pub static FT_1021: ErrorCodeDef = ErrorCodeDef {
     causes: &[
         "WezTerm returned unexpected output format",
         "Corrupted or truncated response",
-        "Version mismatch between wa and WezTerm",
+        "Version mismatch between ft and WezTerm",
     ],
     recovery_steps: &[
         RecoveryStep::with_command("Check WezTerm version", "wezterm --version"),
@@ -341,8 +341,8 @@ pub static FT_2001: ErrorCodeDef = ErrorCodeDef {
         "Database is locked by another process",
     ],
     recovery_steps: &[
-        RecoveryStep::with_command("Check disk space", "df -h ~/.local/share/wa"),
-        RecoveryStep::with_command("Check permissions", "ls -la ~/.local/share/wa"),
+        RecoveryStep::with_command("Check disk space", "df -h ~/.local/share/ft"),
+        RecoveryStep::with_command("Check permissions", "ls -la ~/.local/share/ft"),
         RecoveryStep::with_command("Run diagnostics", "ft doctor"),
     ],
     doc_link: None,
@@ -375,15 +375,15 @@ pub static FT_2003: ErrorCodeDef = ErrorCodeDef {
     code: "FT-2003",
     category: ErrorCategory::Storage,
     title: "Database schema too new",
-    description: "The database schema version is newer than this wa build supports.",
+    description: "The database schema version is newer than this ft build supports.",
     causes: &[
-        "Downgraded wa while keeping a newer database",
+        "Downgraded ft while keeping a newer database",
         "Database was created by a newer ft version",
     ],
     recovery_steps: &[
         RecoveryStep::with_command(
-            "Upgrade wa",
-            "cargo install --git https://github.com/Dicklesworthstone/wezterm_automata.git wa",
+            "Upgrade ft",
+            "cargo install --git https://github.com/Dicklesworthstone/frankenterm.git ft",
         ),
         RecoveryStep::text("Restore a database backup created by an older ft version"),
     ],
@@ -397,13 +397,13 @@ pub static FT_2004: ErrorCodeDef = ErrorCodeDef {
     title: "ft version too old",
     description: "This database requires a newer ft version than the one currently running.",
     causes: &[
-        "Downgraded wa while keeping a newer database",
+        "Downgraded ft while keeping a newer database",
         "Database migrations raised the minimum compatible ft version",
     ],
     recovery_steps: &[
         RecoveryStep::with_command(
-            "Upgrade wa",
-            "cargo install --git https://github.com/Dicklesworthstone/wezterm_automata.git wa",
+            "Upgrade ft",
+            "cargo install --git https://github.com/Dicklesworthstone/frankenterm.git ft",
         ),
         RecoveryStep::text("Restore an older database backup if upgrade is not possible"),
     ],
@@ -437,7 +437,7 @@ pub static FT_2020: ErrorCodeDef = ErrorCodeDef {
     code: "FT-2020",
     category: ErrorCategory::Storage,
     title: "Full-text search query error",
-    description: "The search query syntax is invalid. wa uses SQLite FTS5 \
+    description: "The search query syntax is invalid. ft uses SQLite FTS5 \
                   for full-text search which has specific syntax requirements.",
     causes: &[
         "Invalid FTS5 query syntax",
@@ -822,7 +822,7 @@ pub static FT_7001: ErrorCodeDef = ErrorCodeDef {
     causes: &[
         "ft.toml does not exist",
         "Wrong config path specified",
-        "First time running wa (no config created yet)",
+        "First time running ft (no config created yet)",
     ],
     recovery_steps: &[
         RecoveryStep::with_command("Initialize config", "ft config init"),
@@ -885,7 +885,7 @@ pub static FT_7004: ErrorCodeDef = ErrorCodeDef {
     recovery_steps: &[
         RecoveryStep::with_command("Run diagnostics", "ft doctor"),
         RecoveryStep::text(
-            "Report the issue at https://github.com/Dicklesworthstone/wezterm_automata/issues",
+            "Report the issue at https://github.com/Dicklesworthstone/frankenterm/issues",
         ),
     ],
     doc_link: None,
@@ -917,16 +917,16 @@ pub static FT_9001: ErrorCodeDef = ErrorCodeDef {
     code: "FT-9001",
     category: ErrorCategory::Internal,
     title: "Internal error",
-    description: "An unexpected internal error occurred. This is likely a bug in wa.",
-    causes: &["Bug in wa code", "Unexpected state", "Unhandled edge case"],
+    description: "An unexpected internal error occurred. This is likely a bug in ft.",
+    causes: &["Bug in ft code", "Unexpected state", "Unhandled edge case"],
     recovery_steps: &[
         RecoveryStep::with_command("Run diagnostics", "ft doctor"),
         RecoveryStep::text("Try restarting the watcher"),
         RecoveryStep::text(
-            "Report the issue at https://github.com/Dicklesworthstone/wezterm_automata/issues",
+            "Report the issue at https://github.com/Dicklesworthstone/frankenterm/issues",
         ),
     ],
-    doc_link: Some("https://github.com/Dicklesworthstone/wezterm_automata/issues"),
+    doc_link: Some("https://github.com/Dicklesworthstone/frankenterm/issues"),
 };
 
 /// WA-9002: I/O error
@@ -934,7 +934,7 @@ pub static FT_9002: ErrorCodeDef = ErrorCodeDef {
     code: "FT-9002",
     category: ErrorCategory::Internal,
     title: "I/O error",
-    description: "A filesystem or OS I/O error occurred while wa was running.",
+    description: "A filesystem or OS I/O error occurred while ft was running.",
     causes: &[
         "Missing files or directories",
         "Permission denied when reading or writing",

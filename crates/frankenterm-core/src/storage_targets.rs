@@ -76,7 +76,7 @@ impl Default for ScaleTargets {
 /// p95 latency budgets for storage operations.
 ///
 /// These are measured against benchmark data in
-/// `crates/wa-core/benches/storage_regression.rs` and enforced
+/// `crates/frankenterm-core/benches/storage_regression.rs` and enforced
 /// as performance gates.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LatencyBudgets {

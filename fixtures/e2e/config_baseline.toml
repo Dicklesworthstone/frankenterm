@@ -7,7 +7,7 @@ batch_size = 50
 max_segment_bytes = 65536
 
 [storage]
-# Use temp directory (set by WA_DATA_DIR env var)
+# Use temp directory (set by FT_DATA_DIR env var)
 retention_days = 1
 vacuum_interval_hours = 24
 

@@ -573,7 +573,7 @@ async fn full_pipeline_mixed_content() {
         // More shell output (no match)
         (
             2,
-            "$ cargo build\n   Compiling wa-core v0.1.0\n    Finished dev\n",
+            "$ cargo build\n   Compiling frankenterm-core v0.1.0\n    Finished dev\n",
             false,
         ),
         // Claude Code compaction (match expected)

@@ -24,7 +24,7 @@ use tempfile::TempDir;
 fn setup_workspace() -> (TempDir, String) {
     let dir = TempDir::new().expect("create temp dir");
     let ft_dir = dir.path().join(".ft");
-    std::fs::create_dir_all(&ft_dir).expect("create .wa dir");
+    std::fs::create_dir_all(&ft_dir).expect("create .ft dir");
 
     // Initialize database with schema
     let db_path = ft_dir.join("ft.db");

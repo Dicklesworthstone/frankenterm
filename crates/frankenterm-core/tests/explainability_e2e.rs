@@ -1,4 +1,4 @@
-//! E2E tests for wa explainability features (`ft why`, enriched errors, decision tracing).
+//! E2E tests for ft explainability features (`ft why`, enriched errors, decision tracing).
 //!
 //! These tests validate:
 //! - `ft why --list` returns all explanation templates
@@ -8,7 +8,7 @@
 //!
 //! # Test Approach
 //!
-//! Tests use the wa-core API directly rather than spawning CLI processes,
+//! Tests use the frankenterm-core API directly rather than spawning CLI processes,
 //! which allows testing in environments without the binary installed.
 //! This validates the same code paths used by the CLI.
 //!

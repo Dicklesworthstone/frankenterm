@@ -27,7 +27,7 @@ use crate::crash::HealthSnapshot;
 use crate::events::{Event, EventBus, UserVarError, UserVarPayload};
 use crate::ingest::PaneRegistry;
 
-/// Default IPC socket filename relative to workspace .wa directory.
+/// Default IPC socket filename relative to workspace .ft directory.
 pub const IPC_SOCKET_NAME: &str = "ipc.sock";
 
 /// Maximum message size in bytes (128KB).

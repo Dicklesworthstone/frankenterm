@@ -31,7 +31,7 @@ fn test_pane(pane_id: u64) -> PaneInfo {
         rows: None,
         cols: None,
         title: Some("zsh".to_string()),
-        cwd: Some("/home/user/projects/wezterm_automata".to_string()),
+        cwd: Some("/home/user/projects/frankenterm".to_string()),
         tty_name: None,
         cursor_x: Some(0),
         cursor_y: Some(24),
@@ -145,7 +145,7 @@ fn bench_pane_check_combined(c: &mut Criterion) {
 
     let filter = typical_filter();
     let pane = test_pane(1);
-    let content = "$ cargo build\n   Compiling wa-core v0.1.0\n    Finished dev\n";
+    let content = "$ cargo build\n   Compiling frankenterm-core v0.1.0\n    Finished dev\n";
 
     // Combined operation: filter + fingerprint (what happens each poll tick)
     // Budget: < 100µs total

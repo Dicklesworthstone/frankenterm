@@ -1,6 +1,6 @@
 //! Query client abstraction for TUI data access
 //!
-//! The `QueryClient` trait provides a clean abstraction over the wa-core
+//! The `QueryClient` trait provides a clean abstraction over the frankenterm-core
 //! query layer, enabling:
 //!
 //! - Testability: Mock implementations for unit tests
@@ -210,7 +210,7 @@ pub struct HealthStatus {
     pub last_capture_ts: Option<i64>,
 }
 
-/// Abstraction over wa-core query layer for TUI data access
+/// Abstraction over frankenterm-core query layer for TUI data access
 ///
 /// This trait allows the TUI to be tested with mock implementations
 /// while using the same query patterns as robot mode in production.
@@ -281,7 +281,7 @@ pub trait QueryClient: Send + Sync {
 
 /// Production implementation of QueryClient
 ///
-/// Uses the actual wa-core storage and wezterm client to query data.
+/// Uses the actual frankenterm-core storage and wezterm client to query data.
 /// Owns a dedicated tokio runtime for async operations, avoiding
 /// "cannot start a runtime from within a runtime" panics when the TUI
 /// runs in a separate thread from the main async context.

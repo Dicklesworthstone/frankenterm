@@ -1,5 +1,5 @@
 #!/bin/bash
-# E2E Test Harness Runner for wa (wezterm_automata)
+# E2E Test Harness Runner for ft (frankenterm)
 # Implements: wa-4vx.10.11
 # Spec: docs/e2e-harness-spec.md
 #
@@ -102,7 +102,7 @@ log_verbose() {
 
 usage() {
     cat <<EOF
-E2E Test Harness for wa (wezterm_automata)
+E2E Test Harness for ft (frankenterm)
 
 Usage: $0 [OPTIONS] [SCENARIO...]
 

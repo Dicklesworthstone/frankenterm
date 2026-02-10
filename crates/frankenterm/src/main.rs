@@ -33,7 +33,7 @@ mod build_meta {
     pub fn verbose_version() -> String {
         format!(
             "\
-wa {}
+ft {}
 commit:   {}{}
 built:    {}
 rustc:    {}
@@ -10548,7 +10548,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                                                 .parent()
                                                 .unwrap_or_else(|| std::path::Path::new("."))
-                                                .join("wa-core")
+                                                .join("frankenterm-core")
                                                 .join("tests")
                                                 .join("corpus");
 
@@ -24566,9 +24566,9 @@ fn run_diagnostics(
 ) -> Vec<DiagnosticCheck> {
     let mut checks = Vec::new();
 
-    // Check 1: wa-core loaded with version
+    // Check 1: frankenterm-core loaded with version
     checks.push(DiagnosticCheck::ok_with_detail(
-        "wa-core loaded",
+        "frankenterm-core loaded",
         format!("v{}", env!("CARGO_PKG_VERSION")),
     ));
 
@@ -24578,15 +24578,15 @@ fn run_diagnostics(
         layout.root.display().to_string(),
     ));
 
-    // Check 3: .wa directory
+    // Check 3: .ft directory
     if layout.ft_dir.exists() {
         checks.push(DiagnosticCheck::ok_with_detail(
-            ".wa directory",
+            ".ft directory",
             layout.ft_dir.display().to_string(),
         ));
     } else {
         checks.push(DiagnosticCheck::warning(
-            ".wa directory",
+            ".ft directory",
             format!("{} does not exist", layout.ft_dir.display()),
             "Will be created on first daemon start",
         ));
@@ -29812,9 +29812,9 @@ log_level = "debug"
 
     #[test]
     fn diagnostic_check_json_ok_shape() {
-        let check = DiagnosticCheck::ok_with_detail("wa-core loaded", "v0.1.2");
+        let check = DiagnosticCheck::ok_with_detail("frankenterm-core loaded", "v0.1.2");
         let json = check.to_json_value();
-        assert_eq!(json["name"], "wa-core loaded");
+        assert_eq!(json["name"], "frankenterm-core loaded");
         assert_eq!(json["status"], "ok");
         assert_eq!(json["detail"], "v0.1.2");
         // No recommendation for OK check
@@ -29914,7 +29914,7 @@ log_level = "debug"
     #[test]
     fn doctor_json_envelope_ok_when_no_errors() {
         let checks = [
-            DiagnosticCheck::ok_with_detail("wa-core loaded", "v0.1.0"),
+            DiagnosticCheck::ok_with_detail("frankenterm-core loaded", "v0.1.0"),
             DiagnosticCheck::ok_with_detail("workspace root", "/home/user/project"),
             DiagnosticCheck::warning("daemon status", "not running", "Start with ft watch"),
         ];
@@ -29945,7 +29945,7 @@ log_level = "debug"
     #[test]
     fn doctor_json_envelope_error_when_errors_present() {
         let checks = [
-            DiagnosticCheck::ok_with_detail("wa-core loaded", "v0.1.0"),
+            DiagnosticCheck::ok_with_detail("frankenterm-core loaded", "v0.1.0"),
             DiagnosticCheck::error("database", "corrupt", "Rebuild database"),
         ];
 
@@ -30064,7 +30064,7 @@ log_level = "debug"
         );
 
         // Find specific checks by name
-        let core_check = checks.iter().find(|c| c.name == "wa-core loaded");
+        let core_check = checks.iter().find(|c| c.name == "frankenterm-core loaded");
         assert!(core_check.is_some());
         assert_eq!(core_check.unwrap().status, DiagnosticStatus::Ok);
 
@@ -30072,7 +30072,7 @@ log_level = "debug"
         assert!(ws_check.is_some());
         assert_eq!(ws_check.unwrap().status, DiagnosticStatus::Ok);
 
-        let ft_dir_check = checks.iter().find(|c| c.name == ".wa directory");
+        let ft_dir_check = checks.iter().find(|c| c.name == ".ft directory");
         assert!(ft_dir_check.is_some());
         assert_eq!(ft_dir_check.unwrap().status, DiagnosticStatus::Ok);
 
@@ -30141,7 +30141,7 @@ log_level = "debug"
 
         let checks = run_diagnostics(&[], &config, &layout);
 
-        let ft_dir_check = checks.iter().find(|c| c.name == ".wa directory").unwrap();
+        let ft_dir_check = checks.iter().find(|c| c.name == ".ft directory").unwrap();
         assert_eq!(ft_dir_check.status, DiagnosticStatus::Warning);
         assert!(
             ft_dir_check

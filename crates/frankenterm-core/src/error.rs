@@ -1,4 +1,4 @@
-//! Error types for wa-core
+//! Error types for frankenterm-core
 
 use std::fmt::Write;
 use thiserror::Error;
@@ -116,7 +116,7 @@ impl Remediation {
 /// Result type alias using the library's Error type
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Main error type for wa-core
+/// Main error type for frankenterm-core
 #[derive(Error, Debug)]
 pub enum Error {
     /// WezTerm CLI errors
@@ -357,19 +357,19 @@ impl StorageError {
                     .alternative("Backup the database file before retrying.")
             }
             Self::SchemaTooNew { current, supported } => Remediation::new(format!(
-                "Database schema version {current} is newer than supported ({supported}). Upgrade wa."
+                "Database schema version {current} is newer than supported ({supported}). Upgrade ft."
             ))
             .command(
-                "Upgrade wa",
-                "cargo install --git https://github.com/Dicklesworthstone/wezterm_automata.git wa",
+                "Upgrade ft",
+                "cargo install --git https://github.com/Dicklesworthstone/frankenterm.git ft",
             )
             .alternative("If you must stay on this version, restore an older database backup."),
             Self::WaTooOld { min_compatible, .. } => Remediation::new(format!(
-                "This database requires wa {min_compatible} or newer."
+                "This database requires ft {min_compatible} or newer."
             ))
             .command(
-                "Upgrade wa",
-                "cargo install --git https://github.com/Dicklesworthstone/wezterm_automata.git wa",
+                "Upgrade ft",
+                "cargo install --git https://github.com/Dicklesworthstone/frankenterm.git ft",
             )
             .alternative("Restore a database created by an older ft version."),
             Self::FtsQueryError(_) => Remediation::new("Invalid FTS query syntax.")

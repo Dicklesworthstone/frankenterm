@@ -1,4 +1,4 @@
-//! TUI module for wa
+//! TUI module for ft
 //!
 //! Provides an optional interactive terminal UI for WezTerm Automata.
 //! Behind the `tui` (ratatui) or `ftui` (FrankenTUI) feature flag.
@@ -23,7 +23,7 @@
 //!              │
 //!              ▼
 //! ┌─────────────────────────────────────────────────┐
-//! │            wa-core query/model layer            │
+//! │        frankenterm-core query/model layer        │
 //! │       (same APIs used by robot commands)        │
 //! └─────────────────────────────────────────────────┘
 //! ```

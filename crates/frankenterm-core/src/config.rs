@@ -1,4 +1,4 @@
-//! Configuration management for wa
+//! Configuration management for ft
 //!
 //! Handles loading and validation of ft.toml configuration files.
 //!
@@ -31,7 +31,7 @@ use std::time::Duration;
 // Main Config
 // =============================================================================
 
-/// Main configuration structure for wa
+/// Main configuration structure for ft
 ///
 /// This struct represents the complete ft.toml configuration file.
 /// All sections are optional with sensible defaults.
@@ -567,7 +567,7 @@ impl Default for CaptureBudgetConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StorageConfig {
-    /// Database file path (relative to workspace .wa dir if not absolute)
+    /// Database file path (relative to workspace .ft dir if not absolute)
     pub db_path: String,
 
     /// Retention period in days (0 = no retention, keep forever).
@@ -1824,7 +1824,7 @@ pub struct IpcConfig {
     /// Enable the IPC server.
     pub enabled: bool,
 
-    /// Socket path for the IPC server (absolute or relative to workspace .wa).
+    /// Socket path for the IPC server (absolute or relative to workspace .ft).
     pub socket_path: String,
 
     /// File permissions for the socket (octal), e.g. 0o600.
@@ -3018,7 +3018,7 @@ impl Config {
 pub struct WorkspaceLayout {
     /// Workspace root directory
     pub root: PathBuf,
-    /// Workspace state directory (.wa)
+    /// Workspace state directory (.ft)
     pub ft_dir: PathBuf,
     /// SQLite database path
     pub db_path: PathBuf,

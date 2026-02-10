@@ -48,7 +48,7 @@ Your branch is up to date with 'origin/main'.
 nothing to commit, working tree clean
 
 $ cargo build
-   Compiling wa-core v0.1.0 (/path/to/project)
+   Compiling frankenterm-core v0.1.0 (/path/to/project)
     Finished dev [unoptimized + debuginfo] target(s) in 2.34s
 ";
 

@@ -1,4 +1,4 @@
-# Remote Setup Spec (wa setup remote)
+# Remote Setup Spec (ft setup remote)
 
 ## Summary
 A guided, idempotent, non-destructive workflow to bootstrap a remote host for WezTerm mux usage:
@@ -7,7 +7,7 @@ A guided, idempotent, non-destructive workflow to bootstrap a remote host for We
 - install WezTerm if missing
 - install and enable `wezterm-mux-server` as a systemd user service
 - enable linger so the mux survives logout
-- optionally install `wa` on the remote
+- optionally install `ft` on the remote
 
 Default behavior is dry-run with a full plan preview. No destructive actions are allowed.
 
@@ -28,16 +28,16 @@ Default behavior is dry-run with a full plan preview. No destructive actions are
 
 ### Command
 ```
-wa setup remote --host <ssh_host>
+ft setup remote --host <ssh_host>
 ```
 
 ### Flags
 - `--host <ssh_host>`: SSH alias from `~/.ssh/config` or explicit host.
 - `--dry-run`: default; prints plan, does not modify remote.
 - `--apply`: executes the plan (non-destructive). Requires explicit confirmation.
-- `--install-wa`: include installing `wa` on the remote.
-- `--wa-path <path>`: optional local path to `wa` binary for scp.
-- `--wa-version <version|git>`: if not using scp, specify install source.
+- `--install-ft`: include installing `ft` on the remote.
+- `--ft-path <path>`: optional local path to `ft` binary for scp.
+- `--ft-version <version|git>`: if not using scp, specify install source.
 - `--yes`: skip interactive prompts (only allowed with `--apply`).
 - `--timeout-secs <n>`: per-command timeout (default 30s).
 - `--verbose`: emit step-by-step logs with timings and remote command outputs.
@@ -153,16 +153,16 @@ ssh <host> "systemctl --user status wezterm-mux-server"
 ```
 - Parse status; report active/inactive.
 
-### 9) Optional: Install wa on remote
-If `--install-wa`:
+### 9) Optional: Install ft on remote
+If `--install-ft`:
 - Preferred: scp local binary
 ```
-scp <local_wa> <host>:~/.local/bin/wa
-ssh <host> "chmod +x ~/.local/bin/wa"
+scp <local_ft> <host>:~/.local/bin/ft
+ssh <host> "chmod +x ~/.local/bin/ft"
 ```
 - Alternative (if no local binary):
 ```
-ssh <host> "cargo install --git https://github.com/Dicklesworthstone/wezterm_automata.git wa"
+ssh <host> "cargo install --git https://github.com/Dicklesworthstone/frankenterm.git ft"
 ```
 
 ---
@@ -172,7 +172,7 @@ ssh <host> "cargo install --git https://github.com/Dicklesworthstone/wezterm_aut
 - If service file exists and matches expected content, skip rewrite.
 - If service is enabled/active, skip enable step.
 - If linger already enabled, skip.
-- If `wa` binary already present and matches version (if detectable), skip.
+- If `ft` binary already present and matches version (if detectable), skip.
 
 ---
 
@@ -194,7 +194,7 @@ ssh <host> "cargo install --git https://github.com/Dicklesworthstone/wezterm_aut
 ```
 ssh <host> "systemctl --user disable --now wezterm-mux-server"
 ```
-- Remove service file (manual; not automated by wa):
+- Remove service file (manual; not automated by ft):
 ```
 ssh <host> "rm ~/.config/systemd/user/wezterm-mux-server.service"
 ```
@@ -202,9 +202,9 @@ ssh <host> "rm ~/.config/systemd/user/wezterm-mux-server.service"
 ```
 ssh <host> "sudo loginctl disable-linger $USER"
 ```
-- Remove `wa` binary (manual):
+- Remove `ft` binary (manual):
 ```
-ssh <host> "rm ~/.local/bin/wa"
+ssh <host> "rm ~/.local/bin/ft"
 ```
 
 ---

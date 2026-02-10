@@ -18,7 +18,7 @@
 //! # Transport Abstraction
 //!
 //! The actual HTTP POST is behind a [`WebhookTransport`] trait so that
-//! wa-core stays free of HTTP client dependencies. The CLI crate (or
+//! frankenterm-core stays free of HTTP client dependencies. The CLI crate (or
 //! feature-gated code) provides the real implementation.
 
 use serde::{Deserialize, Serialize};
@@ -285,7 +285,7 @@ impl DeliveryResult {
 
 /// Trait for the HTTP transport layer.
 ///
-/// Implementations provide the actual HTTP POST. This decouples wa-core
+/// Implementations provide the actual HTTP POST. This decouples frankenterm-core
 /// from any specific HTTP client library.
 pub trait WebhookTransport: Send + Sync {
     /// Send a JSON payload to the given URL with optional headers.

@@ -1,4 +1,4 @@
-//! Integration tests for wa-core robot_types module (wa-upg.10.6).
+//! Integration tests for frankenterm-core robot_types module (wa-upg.10.6).
 //!
 //! These tests validate that the typed client response types are structurally
 //! compatible with the JSON schemas on disk and that deserialization works

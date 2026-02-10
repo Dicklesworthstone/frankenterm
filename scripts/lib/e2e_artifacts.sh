@@ -195,9 +195,9 @@ _e2e_capture_env() {
     "wezterm": "$(wezterm --version 2>/dev/null | head -1 || echo 'not installed')"
   },
   "env_vars": {
-    "WA_DATA_DIR": "${WA_DATA_DIR:-}",
+    "FT_DATA_DIR": "${FT_DATA_DIR:-}",
     "FT_WORKSPACE": "${FT_WORKSPACE:-}",
-    "WA_CONFIG": "${WA_CONFIG:-}",
+    "FT_CONFIG": "${FT_CONFIG:-}",
     "FT_LOG_LEVEL": "${FT_LOG_LEVEL:-}",
     "CI": "${CI:-}",
     "GITHUB_ACTIONS": "${GITHUB_ACTIONS:-}",
@@ -566,7 +566,7 @@ e2e_finalize() {
     cat > "$manifest_file" <<EOF
 {
   "version": "1.0.0",
-  "schema": "https://github.com/Dicklesworthstone/wezterm_automata/e2e-manifest-v1",
+  "schema": "https://github.com/Dicklesworthstone/frankenterm/e2e-manifest-v1",
   "generated_at": "$(_e2e_timestamp)",
   "generator": "e2e_artifacts.sh",
   "run": {

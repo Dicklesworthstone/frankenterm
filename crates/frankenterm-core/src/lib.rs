@@ -1,4 +1,4 @@
-//! wa-core: Core library for WezTerm Automata
+//! frankenterm-core: Core library for FrankenTerm
 //!
 //! This crate provides the core functionality for `wa`, a terminal hypervisor
 //! for AI agent swarms running in WezTerm.

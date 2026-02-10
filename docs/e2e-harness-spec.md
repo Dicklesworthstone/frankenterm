@@ -362,9 +362,9 @@ Hint: Check if watcher started successfully and pane was observed.
 Each scenario runs in an isolated workspace:
 
 ```bash
-WORKSPACE=$(mktemp -d /tmp/wa-e2e-XXXXXX)
+WORKSPACE=$(mktemp -d /tmp/ft-e2e-XXXXXX)
 export FT_WORKSPACE="$WORKSPACE"
-export WA_DATA_DIR="$WORKSPACE/.wa"
+export FT_DATA_DIR="$WORKSPACE/.ft"
 ```
 
 ### Cleanup

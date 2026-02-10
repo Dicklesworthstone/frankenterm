@@ -369,7 +369,7 @@ impl ObservationRuntime {
         let native_handle = {
             if native_socket.is_some() {
                 warn!(
-                    "Native event socket configured but wa-core built without native-wezterm feature"
+                    "Native event socket configured but frankenterm-core built without native-wezterm feature"
                 );
             }
             None
