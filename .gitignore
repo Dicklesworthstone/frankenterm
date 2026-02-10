@@ -33,6 +33,9 @@ Cargo.lock.bak
 # Legacy WezTerm source (vendored for reference)
 legacy_wezterm/
 
+# Legacy Ghostty source (vendored for reference)
+legacy_ghostty/
+
 # SQLite databases (runtime)
 *.db
 *.db-journal
