@@ -55,7 +55,7 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 │                      ft (CLI/API)                          │
 ├────────────────────────────────────────────────────────────┤
 │  Robot Mode API    │  Human CLI      │  Watch Daemon       │
-│  (wa robot ...)    │  (wa status)    │  (wa watch)         │
+│  (ft robot ...)    │  (ft status)    │  (ft watch)         │
 ├────────────────────────────────────────────────────────────┤
 │                     frankenterm-core                                │
 │  Pattern Engine │ Capture │ Workflows │ Policy │ Search   │
@@ -94,13 +94,13 @@ The `ft robot` subcommand provides machine-optimized output for AI agents.
 
 ```bash
 # Get all panes with their states
-wa robot state
+ft robot state
 
 # Get pane state (compact TOON, saves ~50% tokens)
-wa robot --format toon state
+ft robot --format toon state
 
 # With token statistics on stderr
-wa robot --format toon --stats state
+ft robot --format toon --stats state
 ```
 
 **Response envelope:**
@@ -119,65 +119,65 @@ wa robot --format toon --stats state
 
 ```bash
 # Get recent output from pane
-wa robot get-text 0
+ft robot get-text 0
 
 # Get last N lines (tail)
-wa robot get-text 0 --tail 50
+ft robot get-text 0 --tail 50
 
 # Include escape sequences
-wa robot get-text 0 --escapes
+ft robot get-text 0 --escapes
 ```
 
 #### Sending Input
 
 ```bash
 # Send text to pane (auto-detects paste mode)
-wa robot send 1 "/compact"
+ft robot send 1 "/compact"
 
 # Preview without executing
-wa robot send 1 "dangerous command" --dry-run
+ft robot send 1 "dangerous command" --dry-run
 
 # Send and wait for confirmation pattern
-wa robot send 1 "y" --wait-for "confirmed"
+ft robot send 1 "y" --wait-for "confirmed"
 ```
 
 #### Pattern Waiting
 
 ```bash
 # Wait for pattern with timeout (seconds)
-wa robot wait-for 0 "core.codex:usage_reached" --timeout-secs 3600
+ft robot wait-for 0 "core.codex:usage_reached" --timeout-secs 3600
 
 # Wait for completion marker
-wa robot wait-for 0 "✓ Done" --timeout-secs 60
+ft robot wait-for 0 "✓ Done" --timeout-secs 60
 ```
 
 #### Search
 
 ```bash
 # Full-text search across all captured output
-wa robot search "error: compilation failed"
+ft robot search "error: compilation failed"
 
 # Filter by pane
-wa robot search "rate limit" --pane 0
+ft robot search "rate limit" --pane 0
 
 # Limit results
-wa robot search "warning" --limit 5
+ft robot search "warning" --limit 5
 ```
 
 #### Events
 
 ```bash
 # Get recent detection events
-wa robot events --limit 10
+ft robot events --limit 10
 
 # Filter by pane
-wa robot events --pane 0
+ft robot events --pane 0
 
 # Filter by rule
-wa robot events --rule-id "usage_limit"
+ft robot events --rule-id "usage_limit"
 
 # Only unhandled events
-wa robot events --unhandled
+ft robot events --unhandled
 ```
 
 ---
@@ -186,7 +186,7 @@ wa robot events --unhandled
 
 - **Edition:** Rust 2024 (nightly required — see `rust-toolchain.toml`)
 - **Unsafe code:** Forbidden (via `[workspace.lints.rust]` in Cargo.toml)
-- **Workspace:** Multi-crate (wa, frankenterm-core, fuzz)
+- **Workspace:** Multi-crate (frankenterm, frankenterm-core, fuzz)
 
 ### Key Dependencies
 
@@ -253,43 +253,43 @@ Robot mode includes commands for inspecting and validating pattern rules.
 
 ```bash
 # List all rules
-wa robot rules list
+ft robot rules list
 
 # Filter by agent type
-wa robot rules list --agent-type codex
+ft robot rules list --agent-type codex
 
 # Include descriptions
-wa robot rules list --verbose
+ft robot rules list --verbose
 ```
 
 ### Test Rules
 
 ```bash
 # Test text against all rules
-wa robot rules test "Usage limit reached. Try again at 2026-01-20 12:34 UTC"
+ft robot rules test "Usage limit reached. Try again at 2026-01-20 12:34 UTC"
 
 # With full trace
-wa robot rules test "some text" --trace
+ft robot rules test "some text" --trace
 ```
 
 ### Show Rule Details
 
 ```bash
 # Show specific rule
-wa robot rules show "codex.usage.reached"
+ft robot rules show "codex.usage.reached"
 ```
 
 ### Lint Rules (Pack Validation)
 
 ```bash
 # Basic lint (ID naming + regex validation)
-wa robot rules lint
+ft robot rules lint
 
 # Include fixture coverage check
-wa robot rules lint --fixtures
+ft robot rules lint --fixtures
 
 # Strict mode (fail on warnings)
-wa robot rules lint --fixtures --strict
+ft robot rules lint --fixtures --strict
 ```
 
 Lint checks:
@@ -338,36 +338,36 @@ When agent output patterns change (new versions, updated prompts), follow this f
 
 ```bash
 # Start daemon (observe all panes)
-wa watch --foreground
+ft watch --foreground
 
 # In another terminal: check status
-wa robot state
+ft robot state
 
 # Wait for any rate limit
-wa robot wait-for 0 "usage_reached" --timeout-secs 3600
+ft robot wait-for 0 "usage_reached" --timeout-secs 3600
 ```
 
 ### 2. Orchestrate Agent Swarm
 
 ```bash
 # Check all pane states
-wa robot --format toon state
+ft robot --format toon state
 
 # Find pane with error
-wa robot search "error" --limit 1
+ft robot search "error" --limit 1
 
 # Send recovery command
-wa robot send 0 "/retry"
+ft robot send 0 "/retry"
 ```
 
 ### 3. Capture and Search
 
 ```bash
 # Search for specific output across all panes
-wa robot search "test failed"
+ft robot search "test failed"
 
 # Get context around match
-wa robot get-text 0 --tail 100
+ft robot get-text 0 --tail 100
 ```
 
 ---
@@ -382,7 +382,7 @@ Robot mode returns structured errors:
   "error": {
     "code": "robot.pane_not_found",
     "message": "Pane 99 not found",
-    "hint": "Use 'wa robot state' to list available panes"
+    "hint": "Use 'ft robot state' to list available panes"
   }
 }
 ```
@@ -399,7 +399,7 @@ Error codes:
 
 ## Configuration
 
-Config file: `~/.config/wa/ft.toml` or `$FT_WORKSPACE/.ft/config.toml`
+Config file: `~/.config/ft/ft.toml` or `$FT_WORKSPACE/.ft/config.toml`
 
 ```toml
 [general]
@@ -432,9 +432,9 @@ block_alt_screen = true
 ## Project Structure
 
 ```
-wezterm_automata/
+frankenterm/
 ├── crates/
-│   ├── wa/           # CLI binary (main.rs ~6000 lines)
+│   ├── frankenterm/  # CLI binary (main.rs ~6000 lines)
 │   └── frankenterm-core/      # Core library
 │       └── src/
 │           ├── config.rs      # Configuration parsing
@@ -455,15 +455,15 @@ wezterm_automata/
 
 | Tool | Relationship |
 |------|--------------|
-| `ntm` | Tmux equivalent (wa is for WezTerm) |
-| `slb` | Simultaneous Launch Button (may integrate with wa workflows) |
-| `caam` | Account manager (provides auth for AI agents wa orchestrates) |
+| `ntm` | Tmux equivalent (ft is for WezTerm) |
+| `slb` | Simultaneous Launch Button (may integrate with ft workflows) |
+| `caam` | Account manager (provides auth for AI agents ft orchestrates) |
 
 ---
 
 ## Version
 
-Generated for wa v0.1.0 (2026-01-25)
+Generated for ft v0.1.0 (2026-01-25)
 
 ## Landing the Plane (Session Completion)
 

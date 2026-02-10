@@ -1,7 +1,7 @@
 # ft — FrankenTerm
 
 <div align="center">
-  <img src="ft_illustration.webp" alt="wa - Terminal Hypervisor for AI Agent Swarms">
+  <img src="ft_illustration.webp" alt="ft - Terminal Hypervisor for AI Agent Swarms">
 </div>
 
 <div align="center">
@@ -18,7 +18,7 @@
 <h3>Quick Install</h3>
 
 ```bash
-cargo install --git https://github.com/Dicklesworthstone/frankenterm.git wa
+cargo install --git https://github.com/Dicklesworthstone/frankenterm.git ft
 ```
 
 </div>
@@ -31,7 +31,7 @@ cargo install --git https://github.com/Dicklesworthstone/frankenterm.git wa
 
 **The Solution**: `ft` transforms WezTerm into a **terminal hypervisor** — capturing all pane output in real-time, detecting agent state transitions through pattern matching, automatically executing workflows in response, and exposing a machine-optimized Robot Mode API for AI-to-AI orchestration.
 
-### Why Use wa?
+### Why Use ft?
 
 | Feature | What It Does |
 |---------|--------------|
@@ -47,11 +47,11 @@ cargo install --git https://github.com/Dicklesworthstone/frankenterm.git wa
 ## Quick Example
 
 ```bash
-# Start the wa watcher (observes all WezTerm panes)
-$ wa watch
+# Start the ft watcher (observes all WezTerm panes)
+$ ft watch
 
 # See all active panes as JSON
-$ wa robot state
+$ ft robot state
 {
   "ok": true,
   "data": {
@@ -63,25 +63,25 @@ $ wa robot state
 }
 
 # Compact TOON output (token-optimized)
-$ wa robot --format toon state
+$ ft robot --format toon state
 
 # Token stats (printed to stderr so stdout stays data-only)
-$ wa robot --format toon --stats state
+$ ft robot --format toon --stats state
 
 # Get recent output from a specific pane
-$ wa robot get-text 0 --tail 50
+$ ft robot get-text 0 --tail 50
 
 # Wait for a specific pattern (e.g., agent hitting rate limit)
-$ wa robot wait-for 0 "core.codex:usage_reached" --timeout-secs 3600
+$ ft robot wait-for 0 "core.codex:usage_reached" --timeout-secs 3600
 
 # Search all captured output
-$ wa robot search "error: compilation failed"
+$ ft robot search "error: compilation failed"
 
 # Send input to a pane (with policy checks)
-$ wa robot send 1 "/compact"
+$ ft robot send 1 "/compact"
 
 # View recent detection events
-$ wa robot events --limit 10
+$ ft robot events --limit 10
 ```
 
 ---
@@ -120,8 +120,8 @@ Secure distributed mode is available as an optional feature-gated build and is
 off by default.
 
 ```bash
-# Build wa with distributed mode support
-cargo build -p wa --release --features distributed
+# Build ft with distributed mode support
+cargo build -p frankenterm --release --features distributed
 ```
 
 Operator guidance:
@@ -132,9 +132,9 @@ Operator guidance:
 
 ---
 
-## How wa Compares
+## How ft Compares
 
-| Feature | wa | tmux scripting | Manual monitoring |
+| Feature | ft | tmux scripting | Manual monitoring |
 |---------|-----|----------------|-------------------|
 | Multi-pane capture | Full scrollback + delta | Capture-pane (snapshot) | One pane at a time |
 | Pattern detection | <5ms, multi-agent | Manual grep | Human eyes |
@@ -143,12 +143,12 @@ Operator guidance:
 | Policy/safety | Capability gates | None | Trust |
 | Robot Mode API | First-class JSON | Script parsing | N/A |
 
-**When to use wa:**
+**When to use ft:**
 - Running 2+ AI coding agents that need coordination
 - Building automation that reacts to terminal output
 - Debugging multi-agent workflows with full observability
 
-**When wa might not be ideal:**
+**When ft might not be ideal:**
 - Single terminal, single agent (overkill)
 - Non-WezTerm terminal emulators (WezTerm-specific APIs)
 
@@ -165,13 +165,13 @@ cd frankenterm
 cargo build --release
 
 # Install to PATH
-cp target/release/wa ~/.local/bin/
+cp target/release/ft ~/.local/bin/
 ```
 
 ### Via Cargo
 
 ```bash
-cargo install --git https://github.com/Dicklesworthstone/frankenterm.git wa
+cargo install --git https://github.com/Dicklesworthstone/frankenterm.git ft
 ```
 
 ### Requirements
@@ -188,7 +188,7 @@ cargo install --git https://github.com/Dicklesworthstone/frankenterm.git wa
 
 ```bash
 # Guided setup (generates config snippets and shell hooks)
-wa setup
+ft setup
 ```
 
 ### 2. Verify WezTerm CLI
@@ -202,49 +202,49 @@ wezterm cli list
 
 ```bash
 # Start observing all panes
-wa watch
+ft watch
 
 # Or run in foreground for debugging
-wa -v watch --foreground
+ft -v watch --foreground
 ```
 
 ### 4. Check Status
 
 ```bash
-# See what wa is observing
-wa status
+# See what ft is observing
+ft status
 
 # Robot mode for JSON output
-wa robot state
+ft robot state
 ```
 
 ### 5. Search Captured Output
 
 ```bash
 # Full-text search across all panes (alias: `ft query`)
-wa search "error"
-wa query "error"
+ft search "error"
+ft query "error"
 
 # Events feed (recent detections)
-wa events
+ft events
 
 # Annotate/triage events
-wa events annotate 123 --note "Investigating"
-wa events triage 123 --state investigating
-wa events label 123 --add urgent
+ft events annotate 123 --note "Investigating"
+ft events triage 123 --state investigating
+ft events label 123 --add urgent
 
 # Robot mode with structured results
-wa robot search "compilation failed" --limit 20
+ft robot search "compilation failed" --limit 20
 ```
 
 ### 6. React to Events
 
 ```bash
 # Wait for an agent to hit its rate limit
-wa robot wait-for 0 "core.codex:usage_reached"
+ft robot wait-for 0 "core.codex:usage_reached"
 
 # Then send a command to handle it
-wa robot send 0 "/compact"
+ft robot send 0 "/compact"
 ```
 
 ---
@@ -254,75 +254,75 @@ wa robot send 0 "/compact"
 ### Watcher Management
 
 ```bash
-wa watch                     # Start watcher in background
-wa watch --foreground        # Run in foreground
-wa watch --auto-handle       # Enable auto workflows
-wa stop                      # Stop running watcher
+ft watch                     # Start watcher in background
+ft watch --foreground        # Run in foreground
+ft watch --auto-handle       # Enable auto workflows
+ft stop                      # Stop running watcher
 ```
 
 ### Pane Inspection
 
 ```bash
-wa status                    # Overview of observed panes
-wa show <pane_id>           # Detailed pane info
-wa get-text <pane_id>       # Recent output from pane
+ft status                    # Overview of observed panes
+ft show <pane_id>           # Detailed pane info
+ft get-text <pane_id>       # Recent output from pane
 ```
 
 ### Pane Actions
 
 ```bash
-wa send <pane_id> "<text>"                 # Send input (policy-gated)
-wa send <pane_id> "<text>" --dry-run       # Preview without executing
-wa send <pane_id> "<text>" --wait-for "ok" # Verify via wait-for
-wa send <pane_id> "<text>" --no-paste --no-newline
+ft send <pane_id> "<text>"                 # Send input (policy-gated)
+ft send <pane_id> "<text>" --dry-run       # Preview without executing
+ft send <pane_id> "<text>" --wait-for "ok" # Verify via wait-for
+ft send <pane_id> "<text>" --no-paste --no-newline
 ```
 
 ### Search
 
 ```bash
-wa search "<query>"          # Full-text search
-wa search "<query>" --pane 0 # Scope to specific pane
-wa search "<query>" --limit 50
+ft search "<query>"          # Full-text search
+ft search "<query>" --pane 0 # Scope to specific pane
+ft search "<query>" --limit 50
 ```
 
 ### Explainability
 
 ```bash
-wa why --list                # List available explanation templates
-wa why deny.alt_screen       # Explain a common policy denial
+ft why --list                # List available explanation templates
+ft why deny.alt_screen       # Explain a common policy denial
 ```
 
 ### Workflows
 
 ```bash
-wa workflow list                         # List available workflows
-wa workflow run handle_usage_limits --pane 0
-wa workflow run handle_usage_limits --pane 0 --dry-run
-wa workflow status <execution_id> -v
+ft workflow list                         # List available workflows
+ft workflow run handle_usage_limits --pane 0
+ft workflow run handle_usage_limits --pane 0 --dry-run
+ft workflow status <execution_id> -v
 ```
 
 ### Rules
 
 ```bash
-wa rules list                            # List detection rules
-wa rules test "Usage limit reached"      # Test text against rules
-wa rules show codex.usage_reached        # Show rule details
+ft rules list                            # List detection rules
+ft rules test "Usage limit reached"      # Test text against rules
+ft rules show codex.usage_reached        # Show rule details
 ```
 
 ### Audit & Approvals
 
 ```bash
-wa approve AB12CD34 --dry-run            # Check approval status
-wa audit --limit 50 --pane 3             # Filter audit history
-wa audit --decision deny                 # Only denied decisions
+ft approve AB12CD34 --dry-run            # Check approval status
+ft audit --limit 50 --pane 3             # Filter audit history
+ft audit --decision deny                 # Only denied decisions
 ```
 
 ### Diagnostics
 
 ```bash
-wa triage                               # Summarize issues (health/crashes/events)
-wa diag bundle --output /tmp/wa-diag    # Collect diagnostic bundle
-wa reproduce --kind crash               # Export latest crash bundle
+ft triage                               # Summarize issues (health/crashes/events)
+ft diag bundle --output /tmp/ft-diag    # Collect diagnostic bundle
+ft reproduce --kind crash               # Export latest crash bundle
 ```
 
 ### Robot Mode (JSON API)
@@ -330,14 +330,14 @@ wa reproduce --kind crash               # Export latest crash bundle
 Use `--format toon` for token-efficient output and `ft robot help` for the full command list.
 
 ```bash
-wa robot state               # All panes as JSON
-wa robot get-text <id> --tail 50      # Pane output as JSON
-wa robot send <id> "<text>" # Send input (with policy)
-wa robot send <id> "<text>" --dry-run  # Preview without executing
-wa robot wait-for <id> <rule_id>       # Wait for pattern
-wa robot search "<query>"   # Search with structured results
-wa robot events             # Recent detection events
-wa robot help               # List all robot commands
+ft robot state               # All panes as JSON
+ft robot get-text <id> --tail 50      # Pane output as JSON
+ft robot send <id> "<text>" # Send input (with policy)
+ft robot send <id> "<text>" --dry-run  # Preview without executing
+ft robot wait-for <id> <rule_id>       # Wait for pattern
+ft robot search "<query>"   # Search with structured results
+ft robot events             # Recent detection events
+ft robot help               # List all robot commands
 ```
 
 ### MCP (Model Context Protocol)
@@ -347,7 +347,7 @@ wa robot help               # List all robot commands
 cargo build --release --features mcp
 
 # Start MCP server over stdio
-wa mcp serve
+ft mcp serve
 ```
 
 MCP mirrors robot mode. See `docs/mcp-api-spec.md` for the tool list and `docs/json-schema/` for response schemas.
@@ -356,9 +356,9 @@ For multi-agent operating procedures, see `docs/swarm-playbook.md`.
 ### Configuration
 
 ```bash
-wa config show               # Display current config
-wa config validate           # Check config syntax
-wa config reload             # Hot-reload config (SIGHUP)
+ft config show               # Display current config
+ft config validate           # Check config syntax
+ft config reload             # Hot-reload config (SIGHUP)
 ```
 
 For the full command matrix (human + robot + MCP), see `docs/cli-reference.md`.
@@ -367,7 +367,7 @@ For the full command matrix (human + robot + MCP), see `docs/cli-reference.md`.
 
 ## Configuration
 
-Configuration lives in `~/.config/wa/ft.toml`:
+Configuration lives in `~/.config/ft/ft.toml`:
 
 ```toml
 [general]
@@ -376,7 +376,7 @@ log_level = "info"
 # Output format: pretty (human) or json (machine)
 log_format = "pretty"
 # Data directory for database and locks
-data_dir = "~/.local/share/wa"
+data_dir = "~/.local/share/ft"
 
 [ingest]
 # How often to poll panes for new content (milliseconds)
@@ -420,7 +420,7 @@ schedule = "daily"
 retention_days = 30
 max_backups = 10
 # Optional destination root
-destination = "~/.local/share/wa/backups"
+destination = "~/.local/share/ft/backups"
 # Optional tweaks
 compress = false
 metadata_only = false
@@ -441,13 +441,13 @@ allow_config = true
 allow_snapshots = true
 # Optional allow/deny path globs
 allow_paths = []
-deny_paths = ["~/.local/share/wa/ft.db", "~/.local/share/wa/ft.db-wal", "~/.local/share/wa/ft.db-shm"]
+deny_paths = ["~/.local/share/ft/ft.db", "~/.local/share/ft/ft.db-wal", "~/.local/share/ft/ft.db-shm"]
 
 [[sync.targets]]
 name = "staging"
 transport = "ssh"
-endpoint = "wa@staging-host"
-root = "~/.local/share/wa/sync"
+endpoint = "ft@staging-host"
+root = "~/.local/share/ft/sync"
 default_direction = "push"
 
 [patterns]
@@ -568,8 +568,8 @@ cargo bench -p frankenterm-core --bench fts_query
 ```
 
 When a bench runs, it prints a `[BENCH] {...}` metadata line and writes:
-- `target/criterion/wa-bench-meta.jsonl` (budgets + environment)
-- `target/criterion/wa-bench-manifest-<bench>.json` (artifact manifest)
+- `target/criterion/ft-bench-meta.jsonl` (budgets + environment)
+- `target/criterion/ft-bench-manifest-<bench>.json` (artifact manifest)
 
 ---
 
@@ -590,13 +590,13 @@ Another `ft` watcher is already running.
 
 ```bash
 # Check for existing watcher
-wa status
+ft status
 
 # Force stop if stuck
-wa stop --force
+ft stop --force
 
 # Or remove stale lock
-rm ~/.local/share/wa/watcher.lock
+rm ~/.local/share/ft/watcher.lock
 ```
 
 ### High memory usage
@@ -605,7 +605,7 @@ Delta extraction is failing; falling back to full captures.
 
 ```bash
 # Check for gaps in capture
-wa robot events --event-type gap
+ft robot events --event-type gap
 
 # Reduce poll interval
 # In ft.toml:
@@ -617,30 +617,30 @@ poll_interval_ms = 500  # Slower polling
 
 ```bash
 # Enable debug logging
-wa -vv watch --foreground
+ft -vv watch --foreground
 
 # Test pattern manually
-wa rules test "Usage limit reached. Try again later."
+ft rules test "Usage limit reached. Try again later."
 ```
 
 ### Robot mode returns errors
 
 ```bash
 # Check watcher is running
-wa status
+ft status
 
 # Verify pane exists
 wezterm cli list
 
 # Check policy blocks
-wa robot send 0 "test" --dry-run
+ft robot send 0 "test" --dry-run
 ```
 
 ---
 
 ## Limitations
 
-### What wa Doesn't Do (Yet)
+### What ft Doesn't Do (Yet)
 
 - **Non-WezTerm terminals**: Relies on WezTerm's CLI protocol. tmux/iTerm2 not supported.
 - **Remote panes without SSH**: WezTerm SSH domains work; raw remote terminals don't.
@@ -660,25 +660,25 @@ wa robot send 0 "test" --dry-run
 
 ## FAQ
 
-### Why "wa"?
+### Why "ft"?
 
-**W**ezTerm **A**utomata. Short, typeable, memorable.
+**F**ranken**T**erm. Short, typeable, memorable.
 
 ### Is my terminal output stored permanently?
 
-By default, output is retained for 30 days (configurable via `storage.retention_days`). Data is stored locally in SQLite at `~/.local/share/wa/ft.db`.
+By default, output is retained for 30 days (configurable via `storage.retention_days`). Data is stored locally in SQLite at `~/.local/share/ft/ft.db`.
 
-### Does wa send data anywhere?
+### Does ft send data anywhere?
 
 No. Everything stays local. No telemetry, no cloud, no network calls except to WezTerm's local CLI.
 
-### Can I use wa without running AI agents?
+### Can I use ft without running AI agents?
 
 Yes. The pattern detection and search work for any terminal output. Useful for debugging, auditing, or building custom automation.
 
 ### How do I add custom patterns?
 
-Edit `~/.config/wa/patterns.toml`:
+Edit `~/.config/ft/patterns.toml`:
 
 ```toml
 [[patterns]]
