@@ -91,6 +91,7 @@ pub mod patterns;
 pub mod plan;
 pub mod policy;
 pub mod pool;
+pub mod process_tree;
 pub mod recording;
 pub mod replay;
 pub mod reports;
