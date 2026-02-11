@@ -1,4 +1,4 @@
-# Agent-Friendliness Report: wa (wezterm_automata)
+# Agent-Friendliness Report: ft (FrankenTerm)
 
 **Bead ID**: bd-o6r (re-underwriting)
 **Date**: 2026-01-25
@@ -8,7 +8,7 @@
 
 **Status: EXCELLENT AGENT-FRIENDLINESS MATURITY**
 
-wa is highly optimized for AI coding agent terminal automation:
+ft is highly optimized for AI coding agent terminal automation:
 - Full `robot` subcommand with stable JSON envelope
 - Comprehensive robot commands for terminal control
 - JSON schema documentation
@@ -22,9 +22,9 @@ wa is highly optimized for AI coding agent terminal automation:
 |---------|--------|---------|
 | `robot` subcommand | YES | Full robot mode with JSON envelope |
 | JSON envelope | YES | `ok`, `data`, `error`, `error_code`, `hint`, `elapsed_ms` |
-| `--format` flag | NO | Planned for TOON integration |
-| `WA_OUTPUT_FORMAT` env | YES | Existing format control |
-| JSON schemas | YES | `docs/json-schema/wa-robot-*.json` |
+| `--format` flag | YES | `ft robot --format json|toon` |
+| `FT_OUTPUT_FORMAT` env | YES | Robot output format control (also consults `TOON_DEFAULT_FORMAT`) |
+| JSON schemas | YES | `docs/json-schema/wa-robot-*.json` (legacy filename prefix) |
 
 ### 1.2 Robot Commands
 
@@ -97,18 +97,17 @@ Contains:
 
 ## 4. TOON Integration Status
 
-**Status: PLANNED, NOT YET IMPLEMENTED**
+**Status: IMPLEMENTED (robot mode)**
 
 From RESEARCH_FINDINGS.md:
-- `--format toon` flag planned
-- Two strategies: full envelope or data-only TOON
-- Recommended: Keep envelope JSON, TOON-encode data field
+- `ft robot --format toon` emits token-optimized TOON
+- `ft robot --stats` prints token stats to stderr (stdout stays data-only)
 
 ## 5. Recommendations
 
 ### 5.1 High Priority (P1)
 
-None - wa is already exceptionally agent-friendly
+None - ft is already exceptionally agent-friendly
 
 ### 5.2 Medium Priority (P2)
 
@@ -124,32 +123,32 @@ None - wa is already exceptionally agent-friendly
 
 ### Get Terminal State
 ```bash
-wa robot state
+ft robot state
 ```
 
 ### Send Commands to Pane
 ```bash
-wa robot send 0 "ls -la"
+ft robot send 0 "ls -la"
 ```
 
 ### Wait for Output Pattern
 ```bash
-wa robot wait-for 0 "Done"
+ft robot wait-for 0 "Done"
 ```
 
 ### Dry-Run Preview
 ```bash
-wa robot send 0 "rm -rf temp" --dry-run
+ft robot send 0 "rm -rf temp" --dry-run
 ```
 
 ### Explain Error Code
 ```bash
-wa robot why E001
+ft robot why E001
 ```
 
 ### Run Workflow
 ```bash
-wa robot workflow run my-workflow
+ft robot workflow run my-workflow
 ```
 
 ## 7. Unique Agent-Friendly Features
@@ -162,7 +161,7 @@ wa robot workflow run my-workflow
 
 ## 8. Conclusion
 
-wa demonstrates exceptional agent-friendliness for terminal automation:
+ft demonstrates exceptional agent-friendliness for terminal automation:
 - Stable JSON envelope with rich metadata
 - Comprehensive robot command set
 - Safety features (dry-run, approval codes)

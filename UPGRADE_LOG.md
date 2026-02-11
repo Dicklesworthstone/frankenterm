@@ -1,9 +1,9 @@
 # Dependency Upgrade Log
 
 **Date:** 2026-01-26
-**Project:** wezterm_automata
+**Project:** FrankenTerm (ft)
 **Language:** Rust
-**Manifest:** Cargo.toml (workspace), crates/wa/Cargo.toml, crates/wa-core/Cargo.toml, fuzz/Cargo.toml
+**Manifest:** Cargo.toml (workspace), crates/frankenterm/Cargo.toml, crates/frankenterm-core/Cargo.toml, fuzz/Cargo.toml
 
 ---
 

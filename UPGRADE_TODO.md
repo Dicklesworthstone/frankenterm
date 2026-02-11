@@ -1,7 +1,7 @@
 # Dependency Upgrade TODO (Granular)
 
 ## Phase 0: Setup & Safety
-- [ ] Confirm active manifests (root Cargo.toml, crates/wa/Cargo.toml, crates/wa-core/Cargo.toml, fuzz/Cargo.toml)
+- [ ] Confirm active manifests (root Cargo.toml, crates/frankenterm/Cargo.toml, crates/frankenterm-core/Cargo.toml, fuzz/Cargo.toml)
 - [ ] Create/refresh `UPGRADE_LOG.md`
 - [ ] Create/refresh `claude-upgrade-progress.json`
 - [ ] Enumerate all dependencies (workspace, crate-specific, dev-deps)
@@ -28,7 +28,7 @@
 - [ ] Post Agent Mail update in thread `wa-y6g`
 
 ## Phase 3: wa-y6g (Schema Migration Framework) continuation
-- [ ] Finish CLI wiring for `wa db migrate` in `crates/wa/src/main.rs`
+- [ ] Finish CLI wiring for `ft db migrate` in `crates/frankenterm/src/main.rs`
 - [ ] Add migration status/plan output formatting
 - [ ] Add migration tests (upgrade + rollback)
 - [ ] Run required checks after changes
