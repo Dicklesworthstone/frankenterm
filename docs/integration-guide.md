@@ -1,12 +1,12 @@
-# Integration Guide: wa Robot / MCP API
+# Integration Guide: ft Robot / MCP API
 
-This guide shows how to build integrations on top of wa's robot and MCP
+This guide shows how to build integrations on top of ft's robot and MCP
 surfaces. It covers typed clients, JSON schemas, error handling, and
 versioning.
 
 ## Surfaces
 
-wa exposes two equivalent surfaces:
+ft exposes two equivalent surfaces:
 
 | Surface | Invocation | Transport | Use case |
 |---------|-----------|-----------|----------|
@@ -37,7 +37,7 @@ Every response is wrapped in a standard envelope:
 | `ok` | bool | `true` on success, `false` on error |
 | `data` | object/null | Command-specific payload (present when `ok == true`) |
 | `error` | string/null | Human-readable error message |
-| `error_code` | string/null | Machine-readable code like `"WA-1003"` |
+| `error_code` | string/null | Machine-readable code like `"FT-1003"` |
 | `hint` | string/null | Actionable recovery suggestion |
 | `elapsed_ms` | u64 | Wall-clock milliseconds the command took |
 | `version` | string | ft version that produced this response |
@@ -47,7 +47,7 @@ Always check `ok` first. Never assume `data` is present on errors.
 
 ## Using the Typed Rust Client
 
-The `wa_core::robot_types` module provides `Deserialize` types for all
+The `frankenterm_core::robot_types` module provides `Deserialize` types for all
 response payloads. Add `frankenterm-core` as a dependency:
 
 ```toml
@@ -58,13 +58,13 @@ frankenterm-core = { path = "../crates/frankenterm-core" }
 ### Parse a response
 
 ```rust
-use wa_core::robot_types::{RobotResponse, GetTextData, parse_response};
+use frankenterm_core::robot_types::{RobotResponse, GetTextData};
 
 // From a string
-let json = std::process::Command::new("wa")
-    .args(["robot", "get-text", "--pane", "1", "--format", "json"])
+let json = std::process::Command::new("ft")
+    .args(["robot", "-f", "json", "get-text", "1", "--tail", "100"])
     .output()
-    .expect("wa failed");
+    .expect("ft failed");
 
 let resp: RobotResponse<GetTextData> =
     RobotResponse::from_json_bytes(&json.stdout).unwrap();
@@ -78,7 +78,7 @@ match resp.into_result() {
 ### Handle errors with codes
 
 ```rust
-use wa_core::robot_types::{RobotResponse, SendData, ErrorCode};
+use frankenterm_core::robot_types::{RobotResponse, SendData, ErrorCode};
 
 let resp: RobotResponse<SendData> = /* parse response */;
 
@@ -92,10 +92,10 @@ if let Some(code) = resp.parsed_error_code() {
             // Policy blocked this action
         }
         ErrorCode::ApprovalRequired => {
-            // Need to call wa robot approve first
+            // Need to call ft robot approve first
         }
         _ => {
-            // Use wa robot why <code> for explanation
+            // Use ft robot why <code> for explanation
         }
     }
 }
@@ -106,7 +106,7 @@ if let Some(code) = resp.parsed_error_code() {
 When the data type is not known at compile time:
 
 ```rust
-use wa_core::robot_types::parse_response_untyped;
+use frankenterm_core::robot_types::parse_response_untyped;
 
 let resp = parse_response_untyped(json_str).unwrap();
 if resp.ok {
@@ -146,7 +146,7 @@ Each robot command has a corresponding typed struct:
 | `robot help` | `QuickStartData` | Quick-start guide |
 
 All types derive `Serialize` + `Deserialize` and use `#[serde(default)]`
-for optional fields, so they tolerate missing fields from older wa versions.
+for optional fields, so they tolerate missing fields from older ft versions.
 
 ## JSON Schemas
 
@@ -156,7 +156,7 @@ Each schema describes the `data` field (not the envelope) for one endpoint.
 ### Schema Registry
 
 The canonical mapping from endpoints to schemas is in
-`wa_core::api_schema::SchemaRegistry::canonical()`. Each entry has:
+`frankenterm_core::api_schema::SchemaRegistry::canonical()`. Each entry has:
 
 ```rust
 EndpointMeta {
@@ -164,6 +164,7 @@ EndpointMeta {
     title: "Get Pane Text",
     description: "...",
     robot_command: Some("robot get-text"),
+    // Note: MCP tool names are currently legacy-prefixed with `wa.*`.
     mcp_tool: Some("wa.get_text"),
     schema_file: "wa-robot-get-text.json",
     stable: true,
@@ -174,7 +175,7 @@ EndpointMeta {
 ### Loading schemas at runtime
 
 ```rust
-use wa_core::api_schema::SchemaRegistry;
+use frankenterm_core::api_schema::SchemaRegistry;
 
 let registry = SchemaRegistry::canonical();
 for endpoint in &registry.endpoints {
@@ -192,7 +193,7 @@ be removed and the tests will enforce compatibility.
 
 ## Error Codes
 
-wa uses `WA-xxxx` error codes organized by category:
+ft uses `FT-xxxx` error codes organized by category:
 
 | Range | Category | Examples |
 |-------|----------|----------|
@@ -209,26 +210,26 @@ wa uses `WA-xxxx` error codes organized by category:
 
 The following codes are safe to retry with backoff:
 
-- `WA-1005` (WezTerm connection refused)
-- `WA-2001` (database locked)
-- `WA-3003` (pattern match timeout)
-- `WA-4002` (rate limit exceeded)
-- `WA-6001` (network timeout)
-- `WA-6002` (connection refused)
+- `FT-1005` (WezTerm connection refused)
+- `FT-2001` (database locked)
+- `FT-3003` (pattern match timeout)
+- `FT-4002` (rate limit exceeded)
+- `FT-6001` (network timeout)
+- `FT-6002` (connection refused)
 
 Use `ErrorCode::is_retryable()` to check programmatically.
 
 ### Getting help for an error
 
 ```bash
-wa robot why WA-2001
+ft robot why FT-2001
 ```
 
 Returns structured explanation with causes, recovery steps, and related codes.
 
 ## Versioning Policy
 
-- wa follows semver for the `version` field.
+- ft follows semver for the `version` field.
 - The `SchemaRegistry` tracks `since` (version when endpoint was added) and
   `stable` (whether the endpoint's contract is frozen).
 - Within a major version:
@@ -241,7 +242,7 @@ Returns structured explanation with causes, recovery steps, and related codes.
 ### Checking compatibility
 
 ```rust
-use wa_core::api_schema::ApiVersion;
+use frankenterm_core::api_schema::ApiVersion;
 
 let client_version = ApiVersion::parse("0.1.0").unwrap();
 let server_version = ApiVersion::parse("0.2.0").unwrap();
@@ -258,12 +259,13 @@ match client_version.check_compatibility(&server_version) {
 A robot-mode agent typically follows this loop:
 
 ```
-1. wa robot reserve --pane <id>        # claim a pane
-2. wa robot get-text --pane <id>       # read current state
-3. wa robot send --pane <id> --text .. # send commands
-4. wa robot wait-for --pane <id> ..    # wait for result
-5. wa robot events --pane <id>         # check for detections
-6. wa robot release --pane <id>        # release the pane
+1. ft robot reservations reserve <pane_id> --owner-id <agent>   # claim a pane
+2. ft robot get-text <pane_id> --tail 200                        # read current state
+3. ft robot send <pane_id> "<text>"                              # send commands
+4. ft robot wait-for <pane_id> "<pattern>"                       # wait for result
+5. ft robot events --pane <pane_id>                              # check for detections
+6. ft robot reservations list                                    # find reservation_id
+7. ft robot reservations release <reservation_id>                # release the pane
 ```
 
 All commands accept `--format json` for machine-readable output.
@@ -272,13 +274,13 @@ All commands accept `--format json` for machine-readable output.
 
 ### "data is null but ok is true"
 
-This should not happen. If it does, the wa version may have a bug. Use
+This should not happen. If it does, the ft version may have a bug. Use
 `parse_response_untyped()` to inspect the raw response.
 
 ### Deserialization fails on a new field
 
 The typed client uses `#[serde(default)]` on all optional fields. If
-deserialization fails, the wa version likely added a new required field.
+deserialization fails, the ft version likely added a new required field.
 Update your `frankenterm-core` dependency.
 
 ### Schema validation fails
