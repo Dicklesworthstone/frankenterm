@@ -87,6 +87,7 @@ pub mod logging;
 pub mod mcp;
 #[cfg(feature = "metrics")]
 pub mod metrics;
+pub mod memory_pressure;
 pub mod notifications;
 pub mod orphan_reaper;
 pub mod output;
