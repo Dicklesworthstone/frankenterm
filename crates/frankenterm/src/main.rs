@@ -7291,6 +7291,46 @@ async fn run_watcher(
         frankenterm_core::watchdog::spawn_mux_watchdog(watchdog_config, wezterm, shutdown_flag)
     };
 
+    // Start snapshot engine for session persistence
+    let snapshot_engine: Option<Arc<frankenterm_core::snapshot_engine::SnapshotEngine>> =
+        if config.snapshots.enabled {
+            let engine_db = Arc::new(db_path.to_string());
+            let engine = Arc::new(
+                frankenterm_core::snapshot_engine::SnapshotEngine::new(
+                    engine_db,
+                    config.snapshots.clone(),
+                ),
+            );
+            let engine_for_loop = Arc::clone(&engine);
+            let shutdown_flag_for_snap = Arc::clone(&handle.shutdown_flag);
+            let loop_timeout = config.cli.timeout_seconds;
+            // Bridge AtomicBool shutdown flag into a watch channel for run_periodic
+            let (snap_shutdown_tx, snap_shutdown_rx) = tokio::sync::watch::channel(false);
+            tokio::spawn(async move {
+                loop {
+                    if shutdown_flag_for_snap.load(std::sync::atomic::Ordering::SeqCst) {
+                        let _ = snap_shutdown_tx.send(true);
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            });
+            tokio::spawn(async move {
+                engine_for_loop
+                    .run_periodic(snap_shutdown_rx, || async move {
+                        let wez = frankenterm_core::wezterm::wezterm_handle_with_timeout(
+                            loop_timeout,
+                        );
+                        wez.list_panes().await.ok()
+                    })
+                    .await;
+            });
+            tracing::info!("Snapshot engine started");
+            Some(engine)
+        } else {
+            None
+        };
+
     // Track current config for hot reload
     let mut current_config = config.clone();
 
@@ -7377,6 +7417,38 @@ async fn run_watcher(
     if let Some((shutdown_tx, ipc_task)) = ipc_handle {
         let _ = shutdown_tx.send(()).await;
         let _ = ipc_task.await;
+    }
+
+    // Snapshot engine: capture final state before tearing down runtime
+    if let Some(ref engine) = snapshot_engine {
+        let wez =
+            frankenterm_core::wezterm::wezterm_handle_with_timeout(config.cli.timeout_seconds);
+        match wez.list_panes().await {
+            Ok(panes) if !panes.is_empty() => {
+                match engine
+                    .shutdown_checkpoint(&panes, Duration::from_secs(5))
+                    .await
+                {
+                    Ok(Some(snap)) => {
+                        tracing::info!(
+                            panes = snap.pane_count,
+                            bytes = snap.total_bytes,
+                            "Shutdown checkpoint captured"
+                        );
+                    }
+                    Ok(None) => {
+                        tracing::debug!("Shutdown checkpoint skipped (no changes)");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Shutdown checkpoint failed");
+                    }
+                }
+            }
+            _ => {
+                // No panes available, just mark shutdown
+                let _ = engine.mark_shutdown().await;
+            }
+        }
     }
 
     tracing::info!("Shutting down observation runtime...");

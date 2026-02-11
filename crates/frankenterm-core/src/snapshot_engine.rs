@@ -367,6 +367,43 @@ impl SnapshotEngine {
         Ok(session_id)
     }
 
+    /// Capture a final shutdown checkpoint and mark the session as cleanly shut down.
+    ///
+    /// Returns `None` if the capture was skipped (dedup, timeout).
+    pub async fn shutdown_checkpoint(
+        &self,
+        panes: &[PaneInfo],
+        timeout: Duration,
+    ) -> std::result::Result<Option<SnapshotResult>, SnapshotError> {
+        let result = tokio::time::timeout(timeout, async {
+            let capture_result = self.capture(panes, SnapshotTrigger::Shutdown).await;
+            if let Err(e) = self.mark_shutdown().await {
+                tracing::warn!(error = %e, "Failed to mark session as clean shutdown");
+            }
+            capture_result
+        })
+        .await;
+
+        match result {
+            Ok(Ok(snap)) => Ok(Some(snap)),
+            Ok(Err(SnapshotError::NoChanges)) => {
+                // No changes but still mark shutdown
+                let _ = self.mark_shutdown().await;
+                Ok(None)
+            }
+            Ok(Err(e)) => {
+                // Capture failed, still try to mark shutdown
+                let _ = self.mark_shutdown().await;
+                Err(e)
+            }
+            Err(_) => {
+                tracing::warn!("Shutdown checkpoint timed out after {timeout:?}");
+                let _ = self.mark_shutdown().await;
+                Ok(None)
+            }
+        }
+    }
+
     /// Mark current session as cleanly shut down.
     pub async fn mark_shutdown(&self) -> std::result::Result<(), SnapshotError> {
         let guard = self.session_id.read().await;
