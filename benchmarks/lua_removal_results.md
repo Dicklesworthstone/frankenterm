@@ -13,7 +13,7 @@ Status: **PENDING MANUAL MEASUREMENTS (headless environment)**
 - Date: 2026-01-28T22:54:56Z
 - OS: Linux 6.17.0-8-generic (Ubuntu), x86_64
 - WezTerm version: wezterm 20260117-154428-05343b38
-- wa version: wa 0.1.0
+- ft version: ft 0.1.0
 - Hardware (CPU/RAM): AMD EPYC 7282 (2 sockets, 64 vCPU), 251Gi RAM
 - Display (refresh rate / resolution): headless (no DISPLAY)
 - Notes: GUI/interactive WezTerm benchmarks cannot run in this headless environment.
@@ -25,8 +25,8 @@ Run the same scenarios **before** and **after** the Lua removal:
 1) Idle pane (cursor blink)
 2) Active output (fast printing)
 3) Multiple panes (4+), mixed activity
-4) wa watch running
-5) wa watch stopped
+4) ft watch running
+5) ft watch stopped
 
 Suggested commands:
 

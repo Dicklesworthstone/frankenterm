@@ -2,7 +2,7 @@
 
 **Date:** 2026-02-09
 **Baseline source:** `evidence/ftui-08.1/perf-baselines.md`
-**Benchmark:** `cargo bench -p wa-core --features ftui --bench tui_rendering`
+**Benchmark:** `cargo bench -p frankenterm-core --features ftui --bench tui_rendering`
 
 ---
 

@@ -43,7 +43,7 @@
 
 ## Test Location
 
-`crates/wa-core/src/tui/ftui_stub.rs` — tests module, after line 7319 (search for `FTUI-08.4`)
+`crates/frankenterm-core/src/tui/ftui_stub.rs` — tests module, after line 7319 (search for `FTUI-08.4`)
 
 ## Methodology
 

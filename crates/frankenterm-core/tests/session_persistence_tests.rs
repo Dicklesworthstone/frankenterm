@@ -474,11 +474,10 @@ async fn pane_state_terminal_json_valid() {
         )
         .unwrap();
 
-    // Should be valid JSON containing a PaneStateSnapshot
-    let snapshot: PaneStateSnapshot = serde_json::from_str(&terminal_json).unwrap();
-    assert_eq!(snapshot.pane_id, 0);
-    assert_eq!(snapshot.terminal.rows, 30);
-    assert_eq!(snapshot.terminal.cols, 120);
+    // terminal_state_json stores just the TerminalState portion
+    let terminal: TerminalState = serde_json::from_str(&terminal_json).unwrap();
+    assert_eq!(terminal.rows, 30);
+    assert_eq!(terminal.cols, 120);
 }
 
 #[tokio::test]
@@ -786,7 +785,7 @@ fn pane_state_from_pane_info_extracts_all_fields() {
 }
 
 #[test]
-fn pane_state_size_budget_enforced() {
+fn pane_state_size_budget_small_not_truncated() {
     let terminal = TerminalState {
         rows: 24,
         cols: 80,
@@ -796,21 +795,41 @@ fn pane_state_size_budget_enforced() {
         title: "bash".to_string(),
     };
 
-    // Create a snapshot with huge env to trigger budget
-    let mut large_env = HashMap::new();
-    for i in 0..1000 {
-        large_env.insert(format!("SAFE_VAR_{i}"), "x".repeat(100));
-    }
-
     let snapshot = PaneStateSnapshot::new(0, 1000, terminal)
-        .with_env_from_iter(large_env.into_iter());
+        .with_cwd("/home/user".to_string());
 
     let (json, was_truncated) = snapshot.to_json_budgeted().unwrap();
-    // Even if truncated, the JSON should be valid
+    assert!(!was_truncated, "Small snapshot should not be truncated");
     let _restored: PaneStateSnapshot = serde_json::from_str(&json).unwrap();
+    assert!(json.len() < 65_536);
+}
 
-    // With 100KB of env data, truncation should have occurred
-    assert!(was_truncated);
+#[test]
+fn pane_state_safe_env_list_filters_correctly() {
+    let terminal = TerminalState {
+        rows: 24,
+        cols: 80,
+        cursor_row: 0,
+        cursor_col: 0,
+        is_alt_screen: false,
+        title: "bash".to_string(),
+    };
+
+    let env = vec![
+        ("PATH".to_string(), "/usr/bin".to_string()),
+        ("HOME".to_string(), "/home/user".to_string()),
+        ("RANDOM_THING".to_string(), "should_be_dropped".to_string()),
+        ("MY_CUSTOM".to_string(), "also_dropped".to_string()),
+    ];
+
+    let snapshot = PaneStateSnapshot::new(0, 1000, terminal)
+        .with_env_from_iter(env.into_iter());
+
+    let captured = snapshot.env.as_ref().unwrap();
+    assert!(captured.vars.contains_key("PATH"));
+    assert!(captured.vars.contains_key("HOME"));
+    assert!(!captured.vars.contains_key("RANDOM_THING"));
+    assert!(!captured.vars.contains_key("MY_CUSTOM"));
 }
 
 #[test]

@@ -37,7 +37,7 @@
 | **Locale** | en_US.UTF-8 |
 | **Color support** | truecolor (256 minimum) |
 | **Unicode support** | Yes |
-| **wa build** | main branch, features: ftui |
+| **ft build** | main branch, features: ftui |
 | **Rust toolchain** | rustc 1.95.0-nightly (873d4682c 2026-01-25) |
 | **Test date** | 2026-02-09 |
 | **Tester** | CalmLynx (automated) |
@@ -46,14 +46,14 @@
 
 | Test Suite | Command | Result | Count | Notes |
 |-----------|---------|--------|-------|-------|
-| View adapters | `cargo test -p wa-core --features ftui --lib -- view_adapters` | pass | 76/76 | |
-| TextInput edge cases | `cargo test -p wa-core --features ftui --lib -- edge_` | pass | 21/21 | |
-| Terminal session lifecycle | `cargo test -p wa-core --features tui --lib -- tui::terminal_session` | pass | 50/50 | |
-| Command handoff traces | `cargo test -p wa-core --features tui --lib -- tui::command_handoff` | pass | 19/19 | |
-| Output gate | `cargo test -p wa-core --features tui --lib -- output_gate` | pass | 21/21 | |
-| E2E headless scenarios | `cargo test -p wa-core --features ftui --lib -- e2e_` | pass | 38/38 | |
-| Snapshot/golden suite | `cargo test -p wa-core --features ftui --lib -- snapshot_` | pass | 75/75 | |
-| Chaos/resilience | `cargo test -p wa-core --features ftui --lib -- chaos_` | pass | 20/20 | 8 ftui + 12 terminal_session |
+| View adapters | `cargo test -p frankenterm-core --features ftui --lib -- view_adapters` | pass | 76/76 | |
+| TextInput edge cases | `cargo test -p frankenterm-core --features ftui --lib -- edge_` | pass | 21/21 | |
+| Terminal session lifecycle | `cargo test -p frankenterm-core --features tui --lib -- tui::terminal_session` | pass | 50/50 | |
+| Command handoff traces | `cargo test -p frankenterm-core --features tui --lib -- tui::command_handoff` | pass | 19/19 | |
+| Output gate | `cargo test -p frankenterm-core --features tui --lib -- output_gate` | pass | 21/21 | |
+| E2E headless scenarios | `cargo test -p frankenterm-core --features ftui --lib -- e2e_` | pass | 38/38 | |
+| Snapshot/golden suite | `cargo test -p frankenterm-core --features ftui --lib -- snapshot_` | pass | 75/75 | |
+| Chaos/resilience | `cargo test -p frankenterm-core --features ftui --lib -- chaos_` | pass | 20/20 | 8 ftui + 12 terminal_session |
 
 **Total headless: 320 tests, 320 pass, 0 fail**
 
@@ -97,8 +97,8 @@ The ftui TUI requires these terminal capabilities:
 | Truecolor | Optional | Falls back to 256 color palette |
 | Unicode/UTF-8 | Yes | ASCII fallback for box drawing only |
 | Mouse events | No | Keyboard-only navigation |
-| Clipboard (OSC 52) | No | Not used by wa TUI |
-| Sixel/Kitty graphics | No | Not used by wa TUI |
+| Clipboard (OSC 52) | No | Not used by ft TUI |
+| Sixel/Kitty graphics | No | Not used by ft TUI |
 
 ### 3.2  Known Multiplexer Interactions
 

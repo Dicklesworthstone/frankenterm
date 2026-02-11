@@ -16,7 +16,7 @@ in `wezterm cli` I/O, which vendoring might address.
 - OS: Linux x86_64 (headless)
 - CPU: AMD EPYC 7282 16‑Core Processor
 - Rust: 1.95.0-nightly
-- Command: `cargo bench -p wa-core --bench watcher_loop -- --sample-size 10`
+- Command: `cargo bench -p frankenterm-core --bench watcher_loop -- --sample-size 10`
 
 ## Benchmarks (watcher_loop)
 These measure **filtering + fingerprinting** cost inside the watch loop (no

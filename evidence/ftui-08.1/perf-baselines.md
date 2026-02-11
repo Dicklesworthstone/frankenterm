@@ -1,7 +1,7 @@
 # FTUI-08.1 Performance Baselines
 
 **Date:** 2026-02-09
-**Benchmark:** `cargo bench -p wa-core --features ftui --bench tui_rendering`
+**Benchmark:** `cargo bench -p frankenterm-core --features ftui --bench tui_rendering`
 **Environment:** Linux 6.17.0-8-generic, rustc nightly, bench profile (optimized)
 
 ---
@@ -68,7 +68,7 @@ The rendering pipeline has > 190x headroom against the 60fps target at the large
 
 ## 7  Benchmark Infrastructure
 
-- **File:** `crates/wa-core/benches/tui_rendering.rs`
+- **File:** `crates/frankenterm-core/benches/tui_rendering.rs`
 - **Groups:** 5 (per_view, sizes, data_scale, update_key, refresh_data)
 - **Total benchmarks:** 22
 - **Framework:** Criterion 0.7 with 100-sample collection
