@@ -23,10 +23,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::process_tree::{PaneActivity, ProcessTree, infer_activity};
-use crate::process_triage::{
-    ClassifiedProcess, ProcessContext, TriageAction, TriageCategory, TriagePlan, build_plan,
-    classify,
-};
+use crate::process_triage::{ClassifiedProcess, ProcessContext, TriagePlan, build_plan, classify};
 
 // =============================================================================
 // Health Status
@@ -183,7 +180,10 @@ pub enum LifecycleAction {
     /// Renice the pane to reduce priority.
     Renice { nice: i32, reason: String },
     /// Gracefully terminate the pane (SIGTERM + grace period).
-    GracefulKill { grace_period: Duration, reason: String },
+    GracefulKill {
+        grace_period: Duration,
+        reason: String,
+    },
     /// Immediately kill the pane (SIGKILL).
     ForceKill { reason: String },
 }
@@ -381,6 +381,15 @@ impl PaneLifecycleEngine {
             .map(|s| s.last_health)
     }
 
+    /// Get the current process tree root PID for a pane.
+    #[must_use]
+    pub fn pane_root_pid(&self, pane_id: u64) -> Option<u32> {
+        self.pane_states
+            .iter()
+            .find(|s| s.pane_id == pane_id)
+            .map(|s| s.root_pid)
+    }
+
     /// Get the number of health samples collected for a pane.
     #[must_use]
     pub fn sample_count(&self, pane_id: u64) -> usize {
@@ -426,15 +435,14 @@ impl PaneLifecycleEngine {
     // Internal
     // ========================================================================
 
-    fn ensure_pane_state(
-        &mut self,
-        pane_id: u64,
-        root_pid: u32,
-        age: Duration,
-    ) -> &mut PaneState {
+    fn ensure_pane_state(&mut self, pane_id: u64, root_pid: u32, age: Duration) -> &mut PaneState {
         let pos = self.pane_states.iter().position(|s| s.pane_id == pane_id);
         match pos {
-            Some(idx) => &mut self.pane_states[idx],
+            Some(idx) => {
+                self.pane_states[idx].root_pid = root_pid;
+                self.pane_states[idx].age = age;
+                &mut self.pane_states[idx]
+            }
             None => {
                 self.pane_states.push(PaneState {
                     pane_id,
@@ -545,6 +553,7 @@ pub fn pressure_renice_candidates(
 mod tests {
     use super::*;
     use crate::process_tree::{ProcessNode, ProcessState};
+    use crate::process_triage::{TriageAction, TriageCategory};
 
     fn make_tree(name: &str, children: Vec<ProcessNode>) -> ProcessTree {
         let total = 1 + children.len();
@@ -665,8 +674,7 @@ mod tests {
     #[test]
     fn abandoned_pane_gets_force_kill() {
         let mut engine = PaneLifecycleEngine::with_defaults();
-        let (_, action) =
-            engine.health_check(1, 1000, Duration::from_secs(30 * 3600), 0.0, None);
+        let (_, action) = engine.health_check(1, 1000, Duration::from_secs(30 * 3600), 0.0, None);
         assert!(action.is_destructive());
         assert!(matches!(action, LifecycleAction::ForceKill { .. }));
     }
@@ -674,8 +682,7 @@ mod tests {
     #[test]
     fn likely_stuck_gets_graceful_kill() {
         let mut engine = PaneLifecycleEngine::with_defaults();
-        let (_, action) =
-            engine.health_check(1, 1000, Duration::from_secs(20 * 3600), 5.0, None);
+        let (_, action) = engine.health_check(1, 1000, Duration::from_secs(20 * 3600), 5.0, None);
         assert!(action.is_destructive());
         assert!(matches!(action, LifecycleAction::GracefulKill { .. }));
     }
@@ -685,13 +692,11 @@ mod tests {
         let mut engine = PaneLifecycleEngine::with_defaults();
 
         // First check: warn
-        let (_, action1) =
-            engine.health_check(1, 1000, Duration::from_secs(8 * 3600), 0.5, None);
+        let (_, action1) = engine.health_check(1, 1000, Duration::from_secs(8 * 3600), 0.5, None);
         assert!(matches!(action1, LifecycleAction::Warn { .. }));
 
         // Second check: review (already warned)
-        let (_, action2) =
-            engine.health_check(1, 1000, Duration::from_secs(9 * 3600), 0.3, None);
+        let (_, action2) = engine.health_check(1, 1000, Duration::from_secs(9 * 3600), 0.3, None);
         assert!(matches!(action2, LifecycleAction::Review { .. }));
     }
 
@@ -705,8 +710,7 @@ mod tests {
             protected_panes: vec![42],
             ..LifecycleConfig::default()
         });
-        let (_, action) =
-            engine.health_check(42, 1000, Duration::from_secs(30 * 3600), 0.0, None);
+        let (_, action) = engine.health_check(42, 1000, Duration::from_secs(30 * 3600), 0.0, None);
         assert!(matches!(action, LifecycleAction::None));
     }
 
@@ -756,13 +760,7 @@ mod tests {
     fn sample_count_tracks_history() {
         let mut engine = PaneLifecycleEngine::with_defaults();
         for i in 0..5 {
-            engine.health_check(
-                1,
-                1000,
-                Duration::from_secs(3600 + i * 30),
-                50.0,
-                None,
-            );
+            engine.health_check(1, 1000, Duration::from_secs(3600 + i * 30), 50.0, None);
         }
         assert_eq!(engine.sample_count(1), 5);
     }
@@ -774,13 +772,7 @@ mod tests {
             ..LifecycleConfig::default()
         });
         for i in 0..10 {
-            engine.health_check(
-                1,
-                1000,
-                Duration::from_secs(3600 + i * 30),
-                50.0,
-                None,
-            );
+            engine.health_check(1, 1000, Duration::from_secs(3600 + i * 30), 50.0, None);
         }
         assert_eq!(engine.sample_count(1), 3); // Capped at trend_window
     }
@@ -824,10 +816,7 @@ mod tests {
         let mut engine = PaneLifecycleEngine::with_defaults();
         let tree = make_tree(
             "zsh",
-            vec![
-                make_child("cargo", 1001),
-                make_child("rustc", 1002),
-            ],
+            vec![make_child("cargo", 1001), make_child("rustc", 1002)],
         );
         let (sample, _) =
             engine.health_check(1, 1000, Duration::from_secs(3600), 50.0, Some(&tree));
@@ -840,8 +829,7 @@ mod tests {
     #[test]
     fn health_check_without_tree() {
         let mut engine = PaneLifecycleEngine::with_defaults();
-        let (sample, _) =
-            engine.health_check(1, 1000, Duration::from_secs(3600), 50.0, None);
+        let (sample, _) = engine.health_check(1, 1000, Duration::from_secs(3600), 50.0, None);
 
         assert_eq!(sample.child_count, 0);
         assert_eq!(sample.rss_kb, 0);
@@ -925,24 +913,32 @@ mod tests {
 
     #[test]
     fn destructive_actions_identified() {
-        assert!(LifecycleAction::ForceKill {
-            reason: String::new()
-        }
-        .is_destructive());
-        assert!(LifecycleAction::GracefulKill {
-            grace_period: Duration::from_secs(30),
-            reason: String::new()
-        }
-        .is_destructive());
+        assert!(
+            LifecycleAction::ForceKill {
+                reason: String::new()
+            }
+            .is_destructive()
+        );
+        assert!(
+            LifecycleAction::GracefulKill {
+                grace_period: Duration::from_secs(30),
+                reason: String::new()
+            }
+            .is_destructive()
+        );
         assert!(!LifecycleAction::None.is_destructive());
-        assert!(!LifecycleAction::Warn {
-            reason: String::new()
-        }
-        .is_destructive());
-        assert!(!LifecycleAction::Review {
-            reason: String::new()
-        }
-        .is_destructive());
+        assert!(
+            !LifecycleAction::Warn {
+                reason: String::new()
+            }
+            .is_destructive()
+        );
+        assert!(
+            !LifecycleAction::Review {
+                reason: String::new()
+            }
+            .is_destructive()
+        );
     }
 
     // ========================================================================
