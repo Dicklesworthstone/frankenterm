@@ -20,20 +20,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
-- `wa event --from-status` CLI command (internal, not public API)
+- `ft events --from-status` CLI option (internal, not public API)
 - `StatusUpdate` IPC message type (internal)
-- `STATUS_UPDATE_LUA` snippet from `wa setup` output
+- `STATUS_UPDATE_LUA` snippet from `ft setup` output
 
 ### Migration
 
-If you previously ran `wa setup`, run it again to update your wezterm.lua:
+If you previously ran `ft setup`, run it again to update your wezterm.lua:
 
 ```bash
-wa setup --wezterm
+ft setup --wezterm
 ```
 
-This will automatically remove the deprecated Lua code from the WA-managed block.
-Your wezterm.lua's WA-managed block should no longer contain:
+This will automatically remove the deprecated Lua code from the ft-managed block.
+Your wezterm.lua's ft-managed block should no longer contain (legacy markers from older versions may still use `wa_*`/`WA_*` names):
 - `wezterm.on('update-status'`
 - `wa_last_status_update`
 - `WA_STATUS_UPDATE_INTERVAL_MS`
