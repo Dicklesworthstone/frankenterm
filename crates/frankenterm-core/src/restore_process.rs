@@ -18,7 +18,7 @@
 //! ```
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -328,7 +328,7 @@ impl ProcessLauncher {
         }
 
         // No process info at all — just cd to the working directory
-        if self.config.launch_shells && cwd != Path::new("/") {
+        if self.config.launch_shells && *cwd != *"/" {
             return (
                 LaunchAction::LaunchShell {
                     shell: default_shell(),

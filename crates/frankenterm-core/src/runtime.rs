@@ -30,6 +30,7 @@ use tracing::{debug, error, info, instrument, warn};
 
 use crate::config::{
     CaptureBudgetConfig, HotReloadableConfig, PaneFilterConfig, PanePriorityConfig, PatternsConfig,
+    SnapshotConfig,
 };
 use crate::crash::{HealthSnapshot, ShutdownSummary};
 use crate::error::Result;
@@ -248,6 +249,8 @@ pub struct ObservationRuntime {
     event_bus: Option<Arc<EventBus>>,
     /// Optional recording manager for capturing session recordings
     recording: Option<Arc<RecordingManager>>,
+    /// Optional snapshot engine configuration for session persistence
+    snapshot_config: Option<SnapshotConfig>,
     /// Heartbeat registry for watchdog monitoring
     heartbeats: Arc<HeartbeatRegistry>,
     /// Shared scheduler snapshot for health reporting (written by capture task).
@@ -302,6 +305,7 @@ impl ObservationRuntime {
             config_rx,
             event_bus: None,
             recording: None,
+            snapshot_config: None,
             heartbeats: Arc::new(HeartbeatRegistry::new()),
             scheduler_snapshot: Arc::new(RwLock::new(crate::tailer::SchedulerSnapshot::default())),
         }
@@ -329,6 +333,13 @@ impl ObservationRuntime {
     #[must_use]
     pub fn with_wezterm_handle(mut self, wezterm_handle: WeztermHandle) -> Self {
         self.wezterm_handle = wezterm_handle;
+        self
+    }
+
+    /// Set snapshot engine configuration for session persistence.
+    #[must_use]
+    pub fn with_snapshot_config(mut self, config: SnapshotConfig) -> Self {
+        self.snapshot_config = Some(config);
         self
     }
 
@@ -385,6 +396,49 @@ impl ObservationRuntime {
         // Spawn maintenance task
         let maintenance_handle = self.spawn_maintenance_task(capture_tx_probe.clone());
 
+        // Spawn snapshot engine task (session persistence) if configured
+        let (snapshot_handle, snapshot_shutdown_tx) =
+            if let Some(ref snap_config) = self.snapshot_config {
+                if snap_config.enabled {
+                    let db_path = {
+                        let storage_guard = self.storage.lock().await;
+                        Arc::new(storage_guard.db_path().to_string())
+                    };
+                    let engine = Arc::new(crate::snapshot_engine::SnapshotEngine::new(
+                        db_path,
+                        snap_config.clone(),
+                    ));
+                    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                    let wezterm = self.wezterm_handle.clone();
+
+                    let handle = tokio::spawn(async move {
+                        engine
+                            .run_periodic(shutdown_rx, move || {
+                                let wez = wezterm.clone();
+                                async move {
+                                    match wez.list_panes().await {
+                                        Ok(panes) => Some(panes),
+                                        Err(e) => {
+                                            warn!(
+                                                error = %e,
+                                                "snapshot pane listing failed"
+                                            );
+                                            None
+                                        }
+                                    }
+                                }
+                            })
+                            .await;
+                    });
+                    info!("Snapshot engine started");
+                    (Some(handle), Some(shutdown_tx))
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            };
+
         info!("Observation runtime started");
 
         Ok(RuntimeHandle {
@@ -392,6 +446,8 @@ impl ObservationRuntime {
             capture: capture_handle,
             persistence: persistence_handle,
             maintenance: Some(maintenance_handle),
+            snapshot: snapshot_handle,
+            snapshot_shutdown: snapshot_shutdown_tx,
             shutdown_flag: Arc::clone(&self.shutdown_flag),
             storage: Arc::clone(&self.storage),
             metrics: Arc::clone(&self.metrics),
@@ -1362,6 +1418,10 @@ pub struct RuntimeHandle {
     pub persistence: JoinHandle<()>,
     /// Maintenance task handle (retention, checkpointing)
     pub maintenance: Option<JoinHandle<()>>,
+    /// Snapshot engine task handle (session persistence)
+    pub snapshot: Option<JoinHandle<()>>,
+    /// Snapshot engine shutdown sender (bridges AtomicBool → watch channel)
+    snapshot_shutdown: Option<watch::Sender<bool>>,
     /// Shutdown flag for signaling tasks
     pub shutdown_flag: Arc<AtomicBool>,
     /// Storage handle for external access
@@ -1422,6 +1482,9 @@ impl RuntimeHandle {
         if let Some(maintenance) = self.maintenance {
             let _ = maintenance.await;
         }
+        if let Some(snapshot) = self.snapshot {
+            let _ = snapshot.await;
+        }
     }
 
     /// Request graceful shutdown and collect a summary.
@@ -1437,6 +1500,9 @@ impl RuntimeHandle {
 
         // Signal shutdown
         self.shutdown_flag.store(true, Ordering::SeqCst);
+        if let Some(ref tx) = self.snapshot_shutdown {
+            let _ = tx.send(true);
+        }
         info!("Shutdown signal sent");
 
         // Wait for tasks with timeout
@@ -1448,6 +1514,9 @@ impl RuntimeHandle {
                 let _ = native.await;
             }
             let _ = self.persistence.await;
+            if let Some(snapshot) = self.snapshot {
+                let _ = snapshot.await;
+            }
         })
         .await;
 
@@ -1496,12 +1565,18 @@ impl RuntimeHandle {
     /// Sets the shutdown flag and waits for tasks to complete.
     pub async fn shutdown(self) {
         self.shutdown_flag.store(true, Ordering::SeqCst);
+        if let Some(ref tx) = self.snapshot_shutdown {
+            let _ = tx.send(true);
+        }
         self.join().await;
     }
 
     /// Signal shutdown without waiting.
     pub fn signal_shutdown(&self) {
         self.shutdown_flag.store(true, Ordering::SeqCst);
+        if let Some(ref tx) = self.snapshot_shutdown {
+            let _ = tx.send(true);
+        }
     }
 
     /// Update the global health snapshot from current runtime state.
