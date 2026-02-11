@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 anyhow.workspace = true
+asupersync = { workspace = true, optional = true }
 config.workspace = true
 leb128.workspace = true
 log.workspace = true
@@ -17,7 +18,7 @@ mux.workspace = true
 portable-pty = { workspace = true, features = ["serde_support"]}
 rangeset.workspace = true
 serde = {workspace=true, features = ["rc", "derive"]}
-smol.workspace = true
+smol = { workspace = true, optional = true }
 termwiz.workspace = true
 thiserror.workspace = true
 varbincode.workspace = true
@@ -26,3 +27,9 @@ zstd.workspace = true
 
 [dev-dependencies]
 base91.workspace = true
+
+[features]
+default = ["async-smol"]
+
+async-smol = ["dep:smol"]
+async-asupersync = ["dep:asupersync"]
