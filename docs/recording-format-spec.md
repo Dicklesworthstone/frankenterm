@@ -9,7 +9,7 @@
 
 This document specifies the `.war` (ft recording) file format for storing terminal session
 recordings with efficient delta compression, rich metadata, and deterministic replay.
-The format is designed to be parseable **without** wa, forward-compatible via versioning,
+The format is designed to be parseable **without** `ft`, forward-compatible via versioning,
 and safe to store (redaction-aware for sensitive content).
 
 ## Design Goals

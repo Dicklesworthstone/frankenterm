@@ -81,7 +81,7 @@ CREATE TABLE IF NOT EXISTS ft_meta (
 );
 
 -- Panes: metadata and observation decisions
--- Supports: wa status, ft robot state, privacy/perf filtering
+-- Supports: ft status, ft robot state, privacy/perf filtering
 CREATE TABLE IF NOT EXISTS panes (
     pane_id INTEGER PRIMARY KEY,
     pane_uuid TEXT,                    -- stable UUID (persists across renames/moves)

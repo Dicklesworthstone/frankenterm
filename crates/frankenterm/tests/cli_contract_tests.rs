@@ -128,7 +128,7 @@ fn run_wa_json(workspace: &str, args: &[&str]) -> serde_json::Value {
 }
 
 // =============================================================================
-// wa status contract tests
+// ft status contract tests
 // =============================================================================
 
 #[test]
@@ -528,7 +528,7 @@ fn contract_accounts_empty_db() {
 }
 
 // =============================================================================
-// wa audit contract tests
+// ft audit contract tests
 // =============================================================================
 
 #[test]
@@ -630,7 +630,7 @@ fn contract_rules_list_json() {
 }
 
 // =============================================================================
-// wa export contract tests
+// ft export contract tests
 // =============================================================================
 
 #[test]
@@ -689,7 +689,7 @@ fn contract_export_unknown_kind_fails() {
 }
 
 // =============================================================================
-// wa reserve / wa reservations contract tests
+// ft reserve / ft reservations contract tests
 // =============================================================================
 
 #[test]
@@ -698,12 +698,12 @@ fn contract_reservations_empty_plain() {
     let output = wa_cmd_for(&ws)
         .args(["reservations"])
         .output()
-        .expect("wa reservations should execute");
+        .expect("ft reservations should execute");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success(),
-        "wa reservations should exit 0: {}",
+        "ft reservations should exit 0: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert_no_ansi(&stdout, "ft reservations (empty)");
@@ -715,15 +715,15 @@ fn contract_reservations_json() {
     let output = wa_cmd_for(&ws)
         .args(["reservations", "--json"])
         .output()
-        .expect("wa reservations --json should execute");
+        .expect("ft reservations --json should execute");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success());
     let parsed: serde_json::Value =
-        serde_json::from_str(&stdout).expect("wa reservations JSON should be valid");
+        serde_json::from_str(&stdout).expect("ft reservations JSON should be valid");
     assert!(
         parsed.is_array() || parsed.is_object(),
-        "wa reservations JSON should be structured"
+        "ft reservations JSON should be structured"
     );
 }
 
@@ -764,7 +764,7 @@ fn contract_doctor_json_schema() {
 }
 
 // =============================================================================
-// wa stop contract tests
+// ft stop contract tests
 // =============================================================================
 
 #[test]
@@ -773,14 +773,14 @@ fn contract_stop_no_watcher_running() {
     let output = wa_cmd_for(&ws)
         .args(["stop"])
         .output()
-        .expect("wa stop should execute");
+        .expect("ft stop should execute");
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     // Stop when no watcher is running should fail gracefully
     assert!(
         !stderr.contains("panicked"),
-        "wa stop should not panic when no watcher running"
+        "ft stop should not panic when no watcher running"
     );
     // Should indicate no watcher found
     let combined = format!("{stdout}{stderr}");
@@ -791,7 +791,7 @@ fn contract_stop_no_watcher_running() {
             || combined.contains("not found")
             || combined.contains("lock")
             || !output.status.success(),
-        "wa stop should indicate no watcher: stdout={stdout}, stderr={stderr}"
+        "ft stop should indicate no watcher: stdout={stdout}, stderr={stderr}"
     );
 }
 
@@ -831,7 +831,7 @@ fn contract_approve_invalid_code() {
 // =============================================================================
 
 // =============================================================================
-// wa history contract tests
+// ft history contract tests
 // =============================================================================
 
 #[test]
@@ -840,11 +840,11 @@ fn contract_history_plain_no_ansi_and_redacted_summary() {
     let output = wa_cmd_for(&ws)
         .args(["history", "--format", "plain", "--limit", "20"])
         .output()
-        .expect("wa history should execute");
+        .expect("ft history should execute");
 
     assert!(
         output.status.success(),
-        "wa history should exit 0, stderr: {}",
+        "ft history should exit 0, stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
@@ -852,15 +852,15 @@ fn contract_history_plain_no_ansi_and_redacted_summary() {
     assert_no_ansi(&stdout, "ft history (plain)");
     assert!(
         stdout.contains("Action history"),
-        "wa history plain should include heading: {stdout}"
+        "ft history plain should include heading: {stdout}"
     );
     assert!(
         stdout.contains("SUMMARY"),
-        "wa history plain should include table headers: {stdout}"
+        "ft history plain should include table headers: {stdout}"
     );
     assert!(
         stdout.contains("[REDACTED]"),
-        "wa history plain should preserve redacted summaries: {stdout}"
+        "ft history plain should preserve redacted summaries: {stdout}"
     );
 }
 
@@ -954,7 +954,7 @@ fn contract_history_json_filters_undoable_and_orders_newest_first() {
 }
 
 // =============================================================================
-// wa undo contract tests
+// ft undo contract tests
 // =============================================================================
 
 #[test]
@@ -1216,7 +1216,7 @@ fn contract_no_ansi_in_plain_mode() {
             .unwrap_or_else(|_| panic!("command {:?} should execute", args));
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert_no_ansi(&stdout, &format!("wa {}", args.join(" ")));
+        assert_no_ansi(&stdout, &format!("ft {}", args.join(" ")));
     }
 }
 
@@ -1248,7 +1248,7 @@ fn contract_json_mode_always_parseable() {
             let parsed: Result<serde_json::Value, _> = serde_json::from_str(&stdout);
             assert!(
                 parsed.is_ok(),
-                "wa {} should produce valid JSON: {}",
+                "ft {} should produce valid JSON: {}",
                 args.join(" "),
                 stdout
             );

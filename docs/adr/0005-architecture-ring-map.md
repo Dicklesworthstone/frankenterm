@@ -132,7 +132,7 @@ User-facing surfaces that consume logic and data.
 **FTUI migration scope:** Only the `tui` module in Ring 3 changes. All other Ring 3
 modules are unaffected.
 
-## Ring 4: Application (`wa` crate)
+## Ring 4: Application (`frankenterm` CLI crate)
 
 CLI binary that wires everything together.
 

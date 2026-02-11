@@ -453,7 +453,7 @@ fn check_stale_panes(ctx: &SearchExplainContext, reasons: &mut Vec<SearchExplain
         }],
         suggestions: vec![
             "Check pane status: ft list".to_string(),
-            "Verify the watcher is running: wa status".to_string(),
+            "Verify the watcher is running: ft status".to_string(),
         ],
         confidence: 0.3,
     });

@@ -16,10 +16,10 @@ use frankenterm_core::backpressure::{
 };
 use frankenterm_core::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitStateKind};
 use frankenterm_core::pool::{Pool, PoolConfig, PoolError};
-use frankenterm_core::retry::{RetryPolicy, with_retry, with_retry_and_circuit, with_retry_outcome};
-use frankenterm_core::watchdog::{
-    Component, HealthStatus, HeartbeatRegistry, WatchdogConfig,
+use frankenterm_core::retry::{
+    RetryPolicy, with_retry, with_retry_and_circuit, with_retry_outcome,
 };
+use frankenterm_core::watchdog::{Component, HealthStatus, HeartbeatRegistry, WatchdogConfig};
 
 // =============================================================================
 // 1. Connection pool integration
@@ -89,7 +89,11 @@ async fn pool_under_load() {
 
     assert_eq!(completed.load(Ordering::SeqCst), 50);
     let stats = pool.stats().await;
-    assert!(stats.total_acquired >= 50, "expected at least 50 acquires, got {}", stats.total_acquired);
+    assert!(
+        stats.total_acquired >= 50,
+        "expected at least 50 acquires, got {}",
+        stats.total_acquired
+    );
     assert_eq!(stats.total_timeouts, 0);
 }
 
@@ -808,10 +812,7 @@ async fn circuit_breaker_and_pool_integration() {
         drop(guard);
     }
 
-    assert_eq!(
-        cb.lock().unwrap().status().state,
-        CircuitStateKind::Closed
-    );
+    assert_eq!(cb.lock().unwrap().status().state, CircuitStateKind::Closed);
 
     // Simulate failures
     cb.lock().unwrap().record_failure();

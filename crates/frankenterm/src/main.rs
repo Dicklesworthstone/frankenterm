@@ -445,7 +445,7 @@ SEE ALSO:
     /// Note: --from-status was removed in v0.2.0 (Lua performance optimization).
     /// Alt-screen detection is now handled via escape sequence parsing.
     #[command(after_help = r#"EXAMPLES:
-    ft event --from-uservar --pane 3 --name wa_event --value <base64>
+    ft event --from-uservar --pane 3 --name ft_event --value <base64>
                                       Ingest a user-var signal from pane 3
 
 SEE ALSO:
@@ -460,7 +460,7 @@ SEE ALSO:
         #[arg(long)]
         pane: u64,
 
-        /// User-var name (e.g., "wa_event") - required for --from-uservar
+        /// User-var name (e.g., "ft_event") - required for --from-uservar
         #[arg(long, required_if_eq("from_uservar", "true"))]
         name: Option<String>,
 
@@ -532,6 +532,44 @@ SEE ALSO:
         /// Timeout in seconds for graceful shutdown before giving up (or escalating with --force)
         #[arg(long, default_value = "5")]
         timeout: u64,
+    },
+
+    /// Safe-restart the WezTerm mux server (snapshot → stop → start → restore)
+    #[command(after_help = r#"EXAMPLES:
+    ft restart                        Full safe restart cycle
+    ft restart --dry-run              Show what would happen
+    ft restart --skip-restore         Restart without restoring layout
+    ft restart --layout-only          Only restore split layout (no scrollback)
+    ft restart --stop-timeout 30      Custom stop timeout
+
+SEE ALSO:
+    ft snapshot   Save/restore snapshots manually
+    ft session    Manage session data
+    ft stop       Stop the watcher"#)]
+    Restart {
+        /// Maximum seconds to wait for mux server to stop
+        #[arg(long, default_value = "15")]
+        stop_timeout: u64,
+
+        /// Maximum seconds to wait for mux server to become ready
+        #[arg(long, default_value = "10")]
+        start_timeout: u64,
+
+        /// Skip the restore phase (just restart)
+        #[arg(long)]
+        skip_restore: bool,
+
+        /// Only restore layout (skip scrollback injection)
+        #[arg(long)]
+        layout_only: bool,
+
+        /// Show what would happen without executing
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Output format: auto, plain, or json
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
     },
 
     /// Prepare an action plan preview for commit
@@ -6471,7 +6509,13 @@ fn glob_match(pattern: &str, value: &str) -> bool {
 
 fn is_structured_uservar_name(name: &str) -> bool {
     let lower = name.to_lowercase();
-    lower.starts_with("wa-") || lower.starts_with("wa_") || lower == "wa_event"
+    lower.starts_with("ft-")
+        || lower.starts_with("ft_")
+        || lower == "ft_event"
+        // Backward compat: accept legacy wa_ prefix
+        || lower.starts_with("wa-")
+        || lower.starts_with("wa_")
+        || lower == "wa_event"
 }
 
 fn validate_uservar_request(pane_id: u64, name: &str, value: &str) -> Result<(), String> {
@@ -14743,6 +14787,54 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             }
         }
 
+        Some(Commands::Restart {
+            stop_timeout,
+            start_timeout,
+            skip_restore,
+            layout_only,
+            dry_run,
+            format,
+        }) => {
+            let output_format = resolve_prepare_output_format(&format);
+            let emit_json = matches!(output_format, frankenterm_core::output::OutputFormat::Json)
+                || (matches!(output_format, frankenterm_core::output::OutputFormat::Auto)
+                    && frankenterm_core::output::detect_format()
+                        == frankenterm_core::output::OutputFormat::Json);
+
+            if emit_json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "ok": false,
+                        "error": "ft restart is not yet fully wired",
+                        "planned": {
+                            "snapshot_trigger": "pre_restart",
+                            "stop_timeout_secs": stop_timeout,
+                            "start_timeout_secs": start_timeout,
+                            "skip_restore": skip_restore,
+                            "layout_only": layout_only,
+                            "dry_run": dry_run,
+                        },
+                        "hint": "Use `ft snapshot save --trigger pre_restart` + `ft stop` (watcher) for now. Full mux restart + restore wiring is pending.",
+                        "version": frankenterm_core::VERSION,
+                    })
+                );
+            } else {
+                eprintln!("ft restart is not yet fully wired.");
+                eprintln!(
+                    "Planned: snapshot(save trigger=pre_restart) → stop mux (timeout {stop_timeout}s) → start mux (timeout {start_timeout}s) → restore (skip_restore={skip_restore}, layout_only={layout_only})."
+                );
+                if dry_run {
+                    eprintln!("Dry-run requested; no actions were executed.");
+                }
+                eprintln!(
+                    "Hint: use `ft snapshot save --trigger pre_restart` + `ft stop` (watcher) for now. Full mux restart + restore wiring is pending."
+                );
+            }
+
+            std::process::exit(1);
+        }
+
         Some(Commands::Prepare { command }) => match command {
             PrepareCommands::Send {
                 pane_id,
@@ -16791,7 +16883,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         HealthDiagnosticStatus::Warning => DiagnosticCheck::warning(
                             hc.name,
                             &hc.detail,
-                            "Check wa status for details",
+                            "Check ft status for details",
                         ),
                         HealthDiagnosticStatus::Error => DiagnosticCheck::error(
                             hc.name,
@@ -24679,8 +24771,8 @@ async fn run_guided_setup(apply: bool, dry_run: bool, verbose: u8) -> anyhow::Re
     }
 
     println!("\nNext steps:");
-    println!("  wa daemon start");
-    println!("  wa status");
+    println!("  ft daemon start");
+    println!("  ft status");
     println!("  ft robot state");
 
     Ok(())
@@ -26568,9 +26660,15 @@ log_level = "debug"
 
     #[test]
     fn structured_uservar_name_detection() {
+        // New ft_ prefix
+        assert!(is_structured_uservar_name("ft_event"));
+        assert!(is_structured_uservar_name("ft-foo"));
+        assert!(is_structured_uservar_name("FT_FOO"));
+        // Legacy wa_ prefix (backward compat)
         assert!(is_structured_uservar_name("wa_event"));
         assert!(is_structured_uservar_name("wa-foo"));
         assert!(is_structured_uservar_name("WA_FOO"));
+        // Other prefixes rejected
         assert!(!is_structured_uservar_name("other_event"));
     }
 
@@ -27305,14 +27403,14 @@ log_level = "debug"
     #[test]
     fn validate_uservar_rejects_empty_fields() {
         assert!(validate_uservar_request(1, "", "x").is_err());
-        assert!(validate_uservar_request(1, "wa_event", "").is_err());
+        assert!(validate_uservar_request(1, "ft_event", "").is_err());
     }
 
     #[test]
     fn validate_uservar_rejects_oversize_payload() {
         // MAX_MESSAGE_SIZE is 131072 (128KB) - must match validate_uservar_request
         const MAX_MESSAGE_SIZE: usize = 131_072;
-        let name = "wa_event";
+        let name = "ft_event";
         let value = "a".repeat(MAX_MESSAGE_SIZE);
         let err = validate_uservar_request(1, name, &value).unwrap_err();
         assert!(err.contains("too large"));
@@ -27320,7 +27418,7 @@ log_level = "debug"
 
     #[test]
     fn validate_uservar_accepts_base64_json() {
-        let name = "wa_event";
+        let name = "ft_event";
         let value = "eyJraW5kIjoicHJvbXB0In0="; // {"kind":"prompt"}
         assert!(validate_uservar_request(1, name, value).is_ok());
     }

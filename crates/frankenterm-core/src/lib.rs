@@ -94,6 +94,7 @@ pub mod plan;
 pub mod policy;
 pub mod pool;
 pub mod process_tree;
+pub mod process_triage;
 pub mod recording;
 pub mod replay;
 pub mod reports;

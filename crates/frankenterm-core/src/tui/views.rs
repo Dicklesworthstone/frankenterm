@@ -1147,12 +1147,12 @@ pub fn render_history_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
             Style::default().add_modifier(Modifier::BOLD),
         )));
         if let Some(workflow_id) = &entry.workflow_id {
-            details.push(Line::from(format!("  wa history --workflow {workflow_id}")));
+            details.push(Line::from(format!("  ft history --workflow {workflow_id}")));
             details.push(Line::from(format!("  ft workflow status {workflow_id}")));
         }
         if let Some(pane_id) = entry.pane_id {
             details.push(Line::from(format!(
-                "  wa history --pane {pane_id} --limit 50"
+                "  ft history --pane {pane_id} --limit 50"
             )));
             details.push(Line::from(format!(
                 "  ft events --pane-id {pane_id} --limit 20"

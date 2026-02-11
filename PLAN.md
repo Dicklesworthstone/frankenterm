@@ -113,8 +113,8 @@ Grounding the design in concrete use cases ensures we build what matters.
 ### 2.3 Story-to-Feature Mapping
 
 ```
-H1, A1 → wa status / wa robot state
-H2, A3 → wa query / wa robot search
+H1, A1 → ft status / ft robot state
+H2, A3 → ft search / ft robot search
 H3     → handle_usage_limits workflow
 H4     → handle_compaction workflow
 H5     → ft setup
@@ -1416,12 +1416,12 @@ Each rule has:
 This makes it possible to:
 - Add rules without rewriting the engine
 - Test rules in isolation
-- Expose rules via robot mode (`wa rules list`, `wa rules test`)
+- Expose rules via CLI (`ft rules list`, `ft rules test`) and robot mode (`ft robot rules ...`)
 - Version rule packs independently
 
 #### 6.2.1 Explain-match trace (rules test)
 
-`wa rules test` / `wa robot rules test` can optionally return a per-detection
+`ft rules test` / `ft robot rules test` can optionally return a per-detection
 `match_trace` payload intended for debugging. The trace is **bounded** and
 **redacted** by design: it never includes raw input or secret values.
 
@@ -1624,7 +1624,7 @@ impl PatternEngine {
 We incorporate `ast-grep` in two **high-leverage** places:
 
 1. **Codebase understanding workflows** (not pane transcript matching):
-   - When an agent is stuck, `wa` can run AST scans to locate:
+   - When an agent is stuck, `ft` can run AST scans to locate:
      - `TODO`, `FIXME`, unsafe patterns, known bug signatures
      - "where is this function defined?" queries
    - Results are summarized and optionally injected into agent panes as context
@@ -2292,7 +2292,7 @@ impl Workflow for HandleCompaction {
 
 ### 8.1 Design Philosophy
 
-Robot mode is designed for AI coding agents to control wa. Key principles:
+Robot mode is designed for AI coding agents to control ft. Key principles:
 
 1. **Explicit over implicit**: Every command clearly states what it does
 2. **Structured output**: JSON for data, Markdown for reports
@@ -2322,11 +2322,11 @@ Error format:
   "ok": false,
   "data": null,
   "error": {
-    "code": "WA-ROBOT-PANE-NOT-FOUND",
+    "code": "robot.pane_not_found",
     "message": "Pane 123 does not exist",
     "details": { "pane_id": 123 }
   },
-  "hint": "Run: wa robot state",
+  "hint": "Run: ft robot state",
   "elapsed_ms": 3,
   "version": "0.1.0",
   "now": "2026-01-18T02:24:00Z"
@@ -2337,8 +2337,8 @@ Error format:
 
 ```rust
 #[derive(Parser)]
-#[command(name = "wa")]
-#[command(about = "WezTerm Automata - AI Coding Agent Fleet Manager")]
+#[command(name = "ft")]
+#[command(about = "ft — FrankenTerm — terminal hypervisor for AI agent swarms")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -2545,43 +2545,42 @@ impl<T: Serialize> RobotOutput<T> {
 fn quick_start_help() -> String {
     r#"
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║                         wa - WezTerm Automata                                ║
-║                    AI Coding Agent Fleet Manager                             ║
+║                         ft — FrankenTerm                                     ║
+║           Terminal hypervisor for AI agent swarms                             ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
 QUICK START
 ───────────
-  wa watch            Start monitoring daemon (background)
-  wa robot state      Get all panes as JSON
-  wa robot help       Agent-optimized documentation
+  ft watch            Start monitoring daemon (background)
+  ft robot state      Get all panes as JSON
+  ft robot help       Agent-optimized documentation
 
 CORE WORKFLOWS
 ──────────────
-  wa watch [--interval-ms 500]     Continuous monitoring + auto-handling
-  wa robot state                   List all panes with metadata
-  wa robot get-text <pane>         Read pane output
-  wa robot send <pane> "text"      Send input to pane
-  wa robot wait-for <pane> "pat"   Wait for pattern
-  wa robot search "query"          Full-text search history
+  ft watch [--interval-ms 500]     Continuous monitoring + auto-handling
+  ft robot state                   List all panes with metadata
+  ft robot get-text <pane>         Read pane output
+  ft robot send <pane> "text"      Send input to pane
+  ft robot wait-for <pane> "pat"   Wait for pattern
+  ft robot search "query"          Full-text search history
 
 AGENT PATTERNS
 ──────────────
   # Check if agent hit limit
-  wa robot events --unhandled --event-type usage_limit
+  ft robot events --unhandled --event-type usage_limit
 
   # Monitor specific agent
-  wa robot state --agent codex
+  ft robot state --agent codex
 
   # Send and wait for response
-  wa robot send 3 "continue" --wait-for ">"
+  ft robot send 3 "continue" --wait-for ">"
 
 OUTPUT FORMATS
 ──────────────
   --format json       Machine-readable (default for robot)
-  --format markdown   Human-readable with formatting
-  --format plain      Minimal text output
+  --format toon       Token-optimized object notation
 
-For detailed help: wa robot help --examples
+For detailed help: ft robot help --examples
 "#.to_string()
 }
 ```
@@ -3527,7 +3526,7 @@ impl OutputCache {
 
 ### 14.1 "Do No Harm" Principles
 
-`wa` must NEVER:
+`ft` must NEVER:
 - Spam input into the wrong pane
 - Type into alt-screen apps (vim/less) unless explicitly enabled
 - Inject destructive commands via automation
@@ -4160,15 +4159,15 @@ local ft_config = {
 
 ### 20.1 Deployment Modes
 
-**Mode A (Single-node)**: `wa` runs on the user workstation and connects to all WezTerm domains via CLI/mux.
+**Mode A (Single-node)**: `ft` runs on the user workstation and connects to all WezTerm domains via CLI/mux.
 
-**Mode B (Distributed)**: Lightweight `wa-agent` runs near each remote mux server.
+**Mode B (Distributed)**: Lightweight `ft-agent` runs near each remote mux server.
 
 ```
 ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
 │   Workstation   │     │   dev-server    │     │    staging      │
 │                 │     │                 │     │                 │
-│  wa-aggregator  │◄────│    wa-agent     │     │    wa-agent     │
+│  ft-aggregator  │◄────│    ft-agent     │     │    ft-agent     │
 │  (central)      │     │   (local tail)  │     │   (local tail)  │
 │                 │◄────┼─────────────────┼─────┤                 │
 └─────────────────┘     └─────────────────┘     └─────────────────┘
@@ -4176,7 +4175,7 @@ local ft_config = {
 
 ### 20.2 Agent Mode
 
-The `wa-agent` runs close to the mux server and streams:
+The `ft-agent` runs close to the mux server and streams:
 
 - `PaneDelta` segments (small deltas, not full pane content)
 - `Detection` events (pattern matches)
@@ -4185,15 +4184,15 @@ The `wa-agent` runs close to the mux server and streams:
 
 ```bash
 # On remote server
-wa-agent --mux-socket /tmp/wezterm-mux --upstream ws://workstation:9465
+ft-agent --mux-socket /tmp/wezterm-mux --upstream ws://workstation:9465
 ```
 
 ### 20.3 Aggregator Mode
 
-The workstation runs `wa` in aggregator mode:
+The workstation runs `ft` in aggregator mode:
 
 ```bash
-wa watch --aggregate --bind 0.0.0.0:9465
+ft watch --aggregate --bind 0.0.0.0:9465
 ```
 
 This:
@@ -4267,7 +4266,7 @@ from Rust and committed under `docs/json-schema/` for downstream consumers.
 **Versioning policy:**
 - Embed `schema_version` in the robot/MCP envelope.
 - **Additive-only changes** keep the same `schema_version`.
-- **Breaking changes** require a `schema_version` bump and a `wa` major version bump.
+- **Breaking changes** require a `schema_version` bump and a `ft` major version bump.
 - CI will regenerate schemas and fail if committed artifacts drift.
 
 ---
@@ -4286,7 +4285,7 @@ Explicit questions to resolve early in implementation:
 
 5. **Vendoring ROI**: What concrete capability is blocked by CLI+Lua that justifies vendoring? (Currently: real-time output streaming)
 
-6. **Multi-machine coordination**: When do we need cross-machine `wa` instances to communicate? (Phase 2 scope)
+6. **Multi-machine coordination**: When do we need cross-machine `ft` instances to communicate? (Phase 2 scope)
 
 7. **Agent-specific quirks**: What undocumented behaviors do Claude Code, Codex, and Gemini have that affect detection? (Need field testing)
 
@@ -4294,7 +4293,7 @@ Explicit questions to resolve early in implementation:
 
 ## 23. Definition of Done
 
-`wa` is "meaningfully real" when:
+`ft` is "meaningfully real" when:
 
 - [ ] It continuously captures pane output and can search it with FTS
 - [ ] It detects at least the primary patterns reliably (compaction, usage limits for all 3 agents)
@@ -4318,47 +4317,47 @@ Human-oriented (rich output by default via `rich_rust`):
 
 | Command | Description |
 |---------|-------------|
-| `wa status` | Panes + inferred agent state |
-| `wa watch` | Run daemon (foreground or background) |
-| `wa events` | Recent / unhandled events |
-| `wa query` | Full text search (FTS5) |
-| `wa send` | Send text / control codes to a pane (guarded) |
-| `wa workflow` | Run a workflow manually (guarded) |
-| `wa rules` | List/test rule packs, show matching traces |
-| `wa accounts` | List/refresh accounts, show rotation picks |
-| `wa setup` | Local/remote canonical WezTerm configuration |
-| `wa doctor` | Environment checks (wezterm presence, version parity, DB health) |
-| `wa export` | Export slices of history (JSONL/NDJSON), DB snapshot, or reports |
-| `wa web` | Start HTTP server (`fastapi_rust`) if enabled |
-| `wa tui` | Start interactive UI (`charmed_rust`) if enabled |
-| `wa sync` | Sync configs/binaries/db snapshots (`asupersync`) if enabled |
+| `ft status` | Panes + inferred agent state |
+| `ft watch` | Run daemon (foreground or background) |
+| `ft events` | Recent / unhandled events |
+| `ft search` (alias: `ft query`) | Full text search (FTS5) |
+| `ft send` | Send text / control codes to a pane (guarded) |
+| `ft workflow` | Run a workflow manually (guarded) |
+| `ft rules` | List/test rule packs, show matching traces |
+| `ft accounts` | List/refresh accounts, show rotation picks |
+| `ft setup` | Local/remote canonical WezTerm configuration |
+| `ft doctor` | Environment checks (wezterm presence, version parity, DB health) |
+| `ft export` | Export slices of history (JSONL/NDJSON), DB snapshot, or reports |
+| `ft web` | Start HTTP server (`fastapi_rust`) if enabled |
+| `ft tui` | Start interactive UI (`charmed_rust`) if enabled |
+| `ft sync` | Sync configs/binaries/db snapshots (`asupersync`) if enabled |
 
 Agent-oriented (stable schemas, token-efficient):
 
 | Command | Description |
 |---------|-------------|
-| `wa robot ...` | Canonical agent interface |
+| `ft robot ...` | Canonical agent interface |
 
 #### A.2 Robot Mode Commands
 
 ```
-wa robot state [--domain <name>] [--agent <type>]
-wa robot get-text <pane_id> [--tail N] [--escapes]
-wa robot send <pane_id> "<text>" [--no-newline] [--wait-for "<pat>"] [--timeout-secs N]
-wa robot wait-for <pane_id> "<pat>" [--timeout-secs N]
-wa robot search "<fts query>" [--pane-id <id>] [--since <iso8601>] [--limit N]
-wa robot events [--unhandled] [--pane-id <id>] [--type <event>] [--limit N]
-wa robot workflow <name> <pane_id> [--force]
-wa robot accounts [--service <openai|anthropic|google>]
-wa robot rules list [--pack <name>]
-wa robot rules test "<text>" [--agent <type>]
-wa robot quick-start
+ft robot state [--domain <name>] [--agent <type>]
+ft robot get-text <pane_id> [--tail N] [--escapes]
+ft robot send <pane_id> "<text>" [--no-newline] [--wait-for "<pat>"] [--timeout-secs N]
+ft robot wait-for <pane_id> "<pat>" [--timeout-secs N]
+ft robot search "<fts query>" [--pane-id <id>] [--since <iso8601>] [--limit N]
+ft robot events [--unhandled] [--pane-id <id>] [--type <event>] [--limit N]
+ft robot workflow <name> <pane_id> [--force]
+ft robot accounts [--service <openai|anthropic|google>]
+ft robot rules list [--pack <name>]
+ft robot rules test "<text>" [--agent <type>]
+ft robot quick-start
 ```
 
 #### A.3 MCP Tools/Resources (via `fastmcp_rust`)
 
 MCP mirrors robot mode: tools use `wa.*`, resources use `wa://...`. The goal is
-token-efficient parity with `wa robot` and stable, versioned schemas.
+token-efficient parity with `ft robot` and stable, versioned schemas.
 
 Tool naming (short and obvious):
 
@@ -4399,7 +4398,7 @@ All MCP tools return the same envelope shape:
 
 Notes:
 - `data` matches the corresponding robot `data` schema under `docs/json-schema/`.
-- `version` is the wa semver; `mcp_version` is the MCP surface version.
+- `version` is the ft semver; `mcp_version` is the MCP surface version.
 - Fields are stable; additions are backward-compatible only.
 
 ##### A.3.2 Error codes (stable)
@@ -4421,7 +4420,7 @@ All MCP errors use stable codes prefixed with `WA-MCP-`:
 
 ##### A.3.3 Tool specs (v1)
 
-Each tool maps 1:1 to `wa robot` with the same data schema:
+Each tool maps 1:1 to `ft robot` with the same data schema:
 
 - `wa.state`
   - Params: `{ domain?: string, agent?: string, pane_id?: u64 }`
@@ -4620,24 +4619,24 @@ See Section 5.2 for the complete schema. Key tables:
 - Pane becomes unsafe (AltScreen/OutputGap/CommandRunning) → abort or pause with reason.
 - Policy denies send/auth → record denial and abort safely; never inject input.
 
----
+---	
 
 ### Appendix E: Shell Integration Snippets
 
 #### E.1 Minimal `wezterm.lua` Forwarding Lane
 
 ```lua
--- Forward user-var events to wa daemon
-wezterm.on('user-var-changed', function(window, pane, name, value)
-  if name:match('^wa%-') then
-    wezterm.background_child_process {
-      'wa', 'event', '--from-uservar',
+  -- Forward user-var events to ft daemon (legacy prefix `wa-` supported)
+  wezterm.on('user-var-changed', function(window, pane, name, value)
+    if name:match('^ft%-') or name:match('^wa%-') then
+      wezterm.background_child_process {
+      'ft', 'event', '--from-uservar',
       '--pane', tostring(pane:pane_id()),
       '--name', name,
       '--value', value
-    }
-  end
-end)
+      }
+    end
+  end)
 ```
 
 #### E.2 Emitting User-Vars from Shells/Agents
@@ -4645,7 +4644,7 @@ end)
 ```bash
 # Emit a user-var from within a pane
 printf "\033]1337;SetUserVar=%s=%s\007" \
-  wa_event \
+  ft_event \
   "$(printf '%s' '{"kind":"prompt","pane":"$WEZTERM_PANE"}' | base64)"
 ```
 
@@ -4658,7 +4657,7 @@ Use this to:
 
 ### Appendix F: Library Integration Map
 
-| Library | Role in `wa` |
+| Library | Role in `ft` |
 |---------|--------------|
 | `cass` (`/dp/coding_agent_session_search`) | Correlation + session archaeology; used in status + workflows |
 | `caut` (`/dp/coding_agent_usage_tracker`) | Usage truth + selection; used in accounts + `handle_usage_limits` |
@@ -4689,7 +4688,7 @@ Use this to:
 #### G.3 End-to-End Tests (when WezTerm available)
 - Spin up `wezterm-mux-server` locally
 - Spawn dummy panes that emit known outputs
-- Verify `wa` captures and detects events
+- Verify `ft` captures and detects events
 - Verify workflow actions send expected bytes and stop safely
 
 #### G.4 Golden Corpus Regression Tests
@@ -4828,9 +4827,9 @@ Each time a real-world pattern changes (agent output format drift):
 If we enable vendoring:
 
 1. **Pin to commit hash**: Use git dependency in `Cargo.toml` or submodule
-2. **Store vendored commit** in build metadata (so `wa doctor` can compare)
+2. **Store vendored commit** in build metadata (so `ft doctor` can compare)
 3. **Add CI job** that:
-   - Builds `wa` with vendored feature
+   - Builds `ft` with vendored feature
    - Runs minimal mux protocol smoke test
    - Reports if upstream changes broke compilation
 

@@ -191,17 +191,17 @@ check_prerequisites() {
     fi
 
     # Create isolated workspace so this test never mutates the caller workspace
-    TEST_WORKSPACE=$(mktemp -d /tmp/wa-e2e-plan-workflow-XXXXXX)
+    TEST_WORKSPACE=$(mktemp -d /tmp/ft-e2e-plan-workflow-XXXXXX)
     export FT_WORKSPACE="$TEST_WORKSPACE"
-    export WA_DATA_DIR="$TEST_WORKSPACE/.wa"
-    mkdir -p "$WA_DATA_DIR"
+    export FT_DATA_DIR="$TEST_WORKSPACE/.ft"
+    mkdir -p "$FT_DATA_DIR"
     log_pass "isolated workspace initialized: $TEST_WORKSPACE"
 
     # Copy baseline config when present
     local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
     if [[ -f "$baseline_config" ]]; then
         cp "$baseline_config" "$TEST_WORKSPACE/ft.toml"
-        export WA_CONFIG="$TEST_WORKSPACE/ft.toml"
+        export FT_CONFIG="$TEST_WORKSPACE/ft.toml"
         log_pass "baseline config applied"
     else
         log_skip "baseline config not found; using defaults"
@@ -366,7 +366,7 @@ test_workflow_execution_logs() {
         return
     fi
 
-    local db_path="$WA_DATA_DIR/ft.db"
+    local db_path="$FT_DATA_DIR/ft.db"
     local before_count=0
     if [[ -f "$db_path" ]]; then
         before_count=$(sqlite3 "$db_path" "SELECT COUNT(*) FROM workflow_executions;" 2>/dev/null || echo "0")

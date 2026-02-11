@@ -66,7 +66,7 @@ Execute in the order listed. Each step includes its verification check.
 |------|------|--------|-------------|
 | 5.1 | `crates/frankenterm-core/Cargo.toml` | Rename `ftui` feature to `tui` (now the only backend) | Compile check |
 | 5.2 | All source files | Replace `cfg(feature = "ftui")` with `cfg(feature = "tui")` | Compile check |
-| 5.3 | `crates/wa/Cargo.toml` | Update feature references | Compile check |
+| 5.3 | `crates/frankenterm/Cargo.toml` | Update feature references | Compile check |
 | 5.4 | CI workflows | Update `--features ftui` to `--features tui` | CI passes |
 | 5.5 | Documentation | Update all feature flag references | Grep for "ftui" returns 0 hits |
 

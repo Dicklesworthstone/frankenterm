@@ -1,20 +1,20 @@
 #!/bin/bash
 # =============================================================================
-# E2E: wa stop — graceful watcher shutdown, lock release, restart
+# E2E: ft stop — graceful watcher shutdown, lock release, restart
 # Implements: wa-4vx.10.21
 #
 # Purpose:
 #   Validate the user-facing shutdown path end-to-end:
-#   1) wa stop --help exposes expected flags
-#   2) wa stop when no watcher is running exits non-zero with clear message
+#   1) ft stop --help exposes expected flags
+#   2) ft stop when no watcher is running exits non-zero with clear message
 #   3) Lock lifecycle (acquire, check, release) works correctly
 #   4) All lock-related unit tests pass
 #
 #   Since a live WezTerm mux + watcher daemon is not always available,
 #   this script validates the shutdown path via:
-#   - CLI contract tests (wa stop --help, exit codes)
+#   - CLI contract tests (ft stop --help, exit codes)
 #   - Lock module unit tests (acquire, release, stale detection)
-#   - Negative case: wa stop without a running watcher
+#   - Negative case: ft stop without a running watcher
 #   - Config/layout resolution (workspace lock path exists)
 #
 # Requirements:
@@ -109,11 +109,11 @@ cleanup_temp_workspace() {
 }
 
 # =============================================================================
-# Test: wa stop --help shows expected flags
+# Test: ft stop --help shows expected flags
 # =============================================================================
 
 test_stop_cli_help() {
-    log_test "CLI Contract: wa stop --help"
+    log_test "CLI Contract: ft stop --help"
 
     local output
     output=$("$FT_BIN" stop --help 2>&1 || true)
@@ -123,23 +123,23 @@ test_stop_cli_help() {
     local all_passed=true
 
     if echo "$output" | grep -q "\-\-force"; then
-        log_pass "wa stop --help includes --force flag"
+        log_pass "ft stop --help includes --force flag"
     else
-        log_fail "wa stop --help missing --force flag"
+        log_fail "ft stop --help missing --force flag"
         all_passed=false
     fi
 
     if echo "$output" | grep -q "\-\-timeout"; then
-        log_pass "wa stop --help includes --timeout flag"
+        log_pass "ft stop --help includes --timeout flag"
     else
-        log_fail "wa stop --help missing --timeout flag"
+        log_fail "ft stop --help missing --timeout flag"
         all_passed=false
     fi
 
     if echo "$output" | grep -qi "stop\|shutdown\|watcher"; then
-        log_pass "wa stop --help describes shutdown functionality"
+        log_pass "ft stop --help describes shutdown functionality"
     else
-        log_fail "wa stop --help has no shutdown description"
+        log_fail "ft stop --help has no shutdown description"
         all_passed=false
     fi
 
@@ -147,11 +147,11 @@ test_stop_cli_help() {
 }
 
 # =============================================================================
-# Test: wa stop with no watcher running exits non-zero
+# Test: ft stop with no watcher running exits non-zero
 # =============================================================================
 
 test_stop_no_watcher() {
-    log_test "CLI: wa stop with No Watcher Running"
+    log_test "CLI: ft stop with No Watcher Running"
 
     local output exit_code
     output=$("$FT_BIN" stop --workspace "$TEMP_WORKSPACE" 2>&1) && exit_code=$? || exit_code=$?
@@ -159,25 +159,25 @@ test_stop_no_watcher() {
     e2e_add_file "stop_no_watcher.txt" "$output"
 
     if [[ $exit_code -ne 0 ]]; then
-        log_pass "wa stop exits non-zero when no watcher is running (exit=$exit_code)"
+        log_pass "ft stop exits non-zero when no watcher is running (exit=$exit_code)"
     else
-        log_fail "wa stop should exit non-zero when no watcher is running"
+        log_fail "ft stop should exit non-zero when no watcher is running"
     fi
 
     # Check for a clear error message
     if echo "$output" | grep -qi "no watcher\|not running\|no.*running"; then
-        log_pass "wa stop provides clear message when no watcher is running"
+        log_pass "ft stop provides clear message when no watcher is running"
     else
-        log_fail "wa stop message is unclear when no watcher is running"
+        log_fail "ft stop message is unclear when no watcher is running"
     fi
 }
 
 # =============================================================================
-# Test: wa stop --force with no watcher running
+# Test: ft stop --force with no watcher running
 # =============================================================================
 
 test_stop_force_no_watcher() {
-    log_test "CLI: wa stop --force with No Watcher Running"
+    log_test "CLI: ft stop --force with No Watcher Running"
 
     local output exit_code
     output=$("$FT_BIN" stop --force --workspace "$TEMP_WORKSPACE" 2>&1) && exit_code=$? || exit_code=$?
@@ -185,9 +185,9 @@ test_stop_force_no_watcher() {
     e2e_add_file "stop_force_no_watcher.txt" "$output"
 
     if [[ $exit_code -ne 0 ]]; then
-        log_pass "wa stop --force exits non-zero when no watcher running (exit=$exit_code)"
+        log_pass "ft stop --force exits non-zero when no watcher running (exit=$exit_code)"
     else
-        log_fail "wa stop --force should exit non-zero when no watcher running"
+        log_fail "ft stop --force should exit non-zero when no watcher running"
     fi
 }
 
@@ -342,11 +342,11 @@ test_watchdog_shutdown() {
 }
 
 # =============================================================================
-# Test: wa stop exit code is deterministic
+# Test: ft stop exit code is deterministic
 # =============================================================================
 
 test_stop_exit_code_deterministic() {
-    log_test "CLI: wa stop Exit Code Is Deterministic"
+    log_test "CLI: ft stop Exit Code Is Deterministic"
 
     local exit_code_1 exit_code_2
 
@@ -356,9 +356,9 @@ test_stop_exit_code_deterministic() {
     e2e_add_file "exit_code_deterministic.txt" "run1=$exit_code_1 run2=$exit_code_2"
 
     if [[ $exit_code_1 -eq $exit_code_2 ]]; then
-        log_pass "wa stop exit code is deterministic ($exit_code_1 == $exit_code_2)"
+        log_pass "ft stop exit code is deterministic ($exit_code_1 == $exit_code_2)"
     else
-        log_fail "wa stop exit code is non-deterministic ($exit_code_1 != $exit_code_2)"
+        log_fail "ft stop exit code is non-deterministic ($exit_code_1 != $exit_code_2)"
     fi
 }
 
@@ -392,7 +392,7 @@ test_effective_config_lock_path() {
 
 main() {
     echo "=========================================="
-    echo "E2E: wa stop — Watcher Shutdown & Lock Release"
+    echo "E2E: ft stop — Watcher Shutdown & Lock Release"
     echo "Bead: wa-4vx.10.21"
     echo "=========================================="
     echo ""

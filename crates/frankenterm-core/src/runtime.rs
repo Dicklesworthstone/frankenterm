@@ -51,6 +51,166 @@ use crate::wezterm::{
     PaneInfo, WeztermHandle, WeztermHandleSource, WeztermInterface, wezterm_handle_with_timeout,
 };
 
+// ---------------------------------------------------------------------------
+// Native event output coalescing (wa-x4rq)
+// ---------------------------------------------------------------------------
+//
+// When using the `native-wezterm` integration, WezTerm can emit extremely
+// high-frequency pane output events during bursty terminal activity. Persisting
+// every micro-chunk as its own CapturedSegment creates avoidable overhead
+// (channel pressure, DB writes, pattern scans).
+//
+// We batch per-pane output events into a single capture delta within a short
+// coalescing window (default 50ms). This is a rate-limit style coalescer:
+// - output within the window is merged
+// - output is flushed once the window elapses (or sooner on state transitions)
+// - a max delay guard exists for safety when misconfigured
+
+#[cfg(feature = "native-wezterm")]
+const NATIVE_OUTPUT_COALESCE_WINDOW_MS: u64 = 50;
+#[cfg(feature = "native-wezterm")]
+const NATIVE_OUTPUT_COALESCE_MAX_DELAY_MS: u64 = 200;
+#[cfg(feature = "native-wezterm")]
+const NATIVE_OUTPUT_COALESCE_MAX_BYTES: usize = 256 * 1024;
+
+#[cfg(feature = "native-wezterm")]
+#[derive(Debug)]
+struct PendingNativeOutput {
+    first_seen_ms: u64,
+    last_timestamp_ms: i64,
+    input_events: u32,
+    bytes: Vec<u8>,
+}
+
+#[cfg(feature = "native-wezterm")]
+#[derive(Debug)]
+struct CoalescedNativeOutput {
+    pane_id: u64,
+    bytes: Vec<u8>,
+    timestamp_ms: i64,
+    input_events: u32,
+}
+
+#[cfg(feature = "native-wezterm")]
+#[derive(Debug)]
+struct NativeOutputCoalescer {
+    window_ms: u64,
+    max_delay_ms: u64,
+    max_bytes: usize,
+    pending: HashMap<u64, PendingNativeOutput>,
+}
+
+#[cfg(feature = "native-wezterm")]
+impl NativeOutputCoalescer {
+    fn new(window_ms: u64, max_delay_ms: u64, max_bytes: usize) -> Self {
+        Self {
+            window_ms,
+            max_delay_ms,
+            max_bytes,
+            pending: HashMap::new(),
+        }
+    }
+
+    fn push(
+        &mut self,
+        pane_id: u64,
+        bytes: Vec<u8>,
+        timestamp_ms: i64,
+        now_ms: u64,
+    ) -> Option<CoalescedNativeOutput> {
+        if bytes.is_empty() {
+            return None;
+        }
+
+        match self.pending.entry(pane_id) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(PendingNativeOutput {
+                    first_seen_ms: now_ms,
+                    last_timestamp_ms: timestamp_ms,
+                    input_events: 1,
+                    bytes,
+                });
+                None
+            }
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                let pending = o.get_mut();
+
+                if !pending.bytes.is_empty()
+                    && pending.bytes.len().saturating_add(bytes.len()) > self.max_bytes
+                {
+                    let flushed = CoalescedNativeOutput {
+                        pane_id,
+                        bytes: std::mem::take(&mut pending.bytes),
+                        timestamp_ms: pending.last_timestamp_ms,
+                        input_events: pending.input_events,
+                    };
+
+                    pending.first_seen_ms = now_ms;
+                    pending.last_timestamp_ms = timestamp_ms;
+                    pending.input_events = 1;
+                    pending.bytes = bytes;
+
+                    return Some(flushed);
+                }
+
+                pending.input_events = pending.input_events.saturating_add(1);
+                pending.last_timestamp_ms = timestamp_ms;
+                pending.bytes.extend(bytes);
+                None
+            }
+        }
+    }
+
+    fn drain_due(&mut self, now_ms: u64) -> Vec<CoalescedNativeOutput> {
+        let mut due = Vec::new();
+        let mut due_ids = Vec::new();
+
+        for (&pane_id, pending) in &self.pending {
+            let age_ms = now_ms.saturating_sub(pending.first_seen_ms);
+            if age_ms >= self.window_ms || age_ms >= self.max_delay_ms {
+                due_ids.push(pane_id);
+            }
+        }
+
+        for pane_id in due_ids {
+            if let Some(pending) = self.pending.remove(&pane_id) {
+                due.push(CoalescedNativeOutput {
+                    pane_id,
+                    bytes: pending.bytes,
+                    timestamp_ms: pending.last_timestamp_ms,
+                    input_events: pending.input_events,
+                });
+            }
+        }
+
+        due
+    }
+
+    fn flush_pane(&mut self, pane_id: u64) -> Option<CoalescedNativeOutput> {
+        self.pending
+            .remove(&pane_id)
+            .map(|pending| CoalescedNativeOutput {
+                pane_id,
+                bytes: pending.bytes,
+                timestamp_ms: pending.last_timestamp_ms,
+                input_events: pending.input_events,
+            })
+    }
+
+    fn drain_all(&mut self) -> Vec<CoalescedNativeOutput> {
+        let mut out = Vec::with_capacity(self.pending.len());
+        for (pane_id, pending) in self.pending.drain() {
+            out.push(CoalescedNativeOutput {
+                pane_id,
+                bytes: pending.bytes,
+                timestamp_ms: pending.last_timestamp_ms,
+                input_events: pending.input_events,
+            });
+        }
+        out
+    }
+}
+
 /// Configuration for the observation runtime.
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -125,6 +285,18 @@ pub struct RuntimeMetrics {
     ingest_lag_count: AtomicU64,
     /// Maximum ingest lag observed
     ingest_lag_max_ms: AtomicU64,
+    /// Total native pane output events received (pre-coalesce).
+    native_output_input_events: AtomicU64,
+    /// Total native pane output batches emitted (post-coalesce).
+    native_output_batches_emitted: AtomicU64,
+    /// Total native output bytes received (pre-coalesce).
+    native_output_input_bytes: AtomicU64,
+    /// Total native output bytes emitted (post-coalesce).
+    native_output_emitted_bytes: AtomicU64,
+    /// Maximum number of input events merged into one batch.
+    native_output_max_batch_events: AtomicU64,
+    /// Maximum size (bytes) of one emitted batch.
+    native_output_max_batch_bytes: AtomicU64,
 }
 
 impl Default for RuntimeMetrics {
@@ -137,6 +309,12 @@ impl Default for RuntimeMetrics {
             ingest_lag_sum_ms: AtomicU64::new(0),
             ingest_lag_count: AtomicU64::new(0),
             ingest_lag_max_ms: AtomicU64::new(0),
+            native_output_input_events: AtomicU64::new(0),
+            native_output_batches_emitted: AtomicU64::new(0),
+            native_output_input_bytes: AtomicU64::new(0),
+            native_output_emitted_bytes: AtomicU64::new(0),
+            native_output_max_batch_events: AtomicU64::new(0),
+            native_output_max_batch_bytes: AtomicU64::new(0),
         }
     }
 }
@@ -166,6 +344,48 @@ impl RuntimeMetrics {
     pub fn record_db_write(&self) {
         self.last_db_write_at
             .store(epoch_ms_u64(), Ordering::SeqCst);
+    }
+
+    pub fn record_native_output_input(&self, bytes: usize) {
+        self.native_output_input_events
+            .fetch_add(1, Ordering::SeqCst);
+        self.native_output_input_bytes
+            .fetch_add(bytes as u64, Ordering::SeqCst);
+    }
+
+    pub fn record_native_output_batch(&self, input_events: u32, bytes: usize) {
+        self.native_output_batches_emitted
+            .fetch_add(1, Ordering::SeqCst);
+        self.native_output_emitted_bytes
+            .fetch_add(bytes as u64, Ordering::SeqCst);
+
+        let input_events_u64 = u64::from(input_events);
+        let mut current_max = self.native_output_max_batch_events.load(Ordering::SeqCst);
+        while input_events_u64 > current_max {
+            match self.native_output_max_batch_events.compare_exchange_weak(
+                current_max,
+                input_events_u64,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(v) => current_max = v,
+            }
+        }
+
+        let bytes_u64 = bytes as u64;
+        let mut current_max = self.native_output_max_batch_bytes.load(Ordering::SeqCst);
+        while bytes_u64 > current_max {
+            match self.native_output_max_batch_bytes.compare_exchange_weak(
+                current_max,
+                bytes_u64,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(v) => current_max = v,
+            }
+        }
     }
 
     /// Get average ingest lag in milliseconds.
@@ -209,6 +429,30 @@ impl RuntimeMetrics {
     /// Get total events recorded.
     pub fn events_recorded(&self) -> u64 {
         self.events_recorded.load(Ordering::SeqCst)
+    }
+
+    pub fn native_output_input_events(&self) -> u64 {
+        self.native_output_input_events.load(Ordering::SeqCst)
+    }
+
+    pub fn native_output_batches_emitted(&self) -> u64 {
+        self.native_output_batches_emitted.load(Ordering::SeqCst)
+    }
+
+    pub fn native_output_input_bytes(&self) -> u64 {
+        self.native_output_input_bytes.load(Ordering::SeqCst)
+    }
+
+    pub fn native_output_emitted_bytes(&self) -> u64 {
+        self.native_output_emitted_bytes.load(Ordering::SeqCst)
+    }
+
+    pub fn native_output_max_batch_events(&self) -> u64 {
+        self.native_output_max_batch_events.load(Ordering::SeqCst)
+    }
+
+    pub fn native_output_max_batch_bytes(&self) -> u64 {
+        self.native_output_max_batch_bytes.load(Ordering::SeqCst)
     }
 }
 
@@ -1007,6 +1251,7 @@ impl ObservationRuntime {
         let cursors = Arc::clone(&self.cursors);
         let detection_contexts = Arc::clone(&self.detection_contexts);
         let storage = Arc::clone(&self.storage);
+        let metrics = Arc::clone(&self.metrics);
         let event_bus = self.event_bus.clone();
         let pane_filter = self.config.pane_filter.clone();
 
@@ -1023,15 +1268,109 @@ impl ObservationRuntime {
 
             let accept_handle = tokio::spawn(listener.run(event_tx, Arc::clone(&shutdown_flag)));
 
-            while let Some(event) = event_rx.recv().await {
-                handle_native_event(
-                    event,
+            let mut coalescer = NativeOutputCoalescer::new(
+                NATIVE_OUTPUT_COALESCE_WINDOW_MS,
+                NATIVE_OUTPUT_COALESCE_MAX_DELAY_MS,
+                NATIVE_OUTPUT_COALESCE_MAX_BYTES,
+            );
+            let start = tokio::time::Instant::now();
+            let flush_interval = Duration::from_millis(NATIVE_OUTPUT_COALESCE_WINDOW_MS / 2)
+                .max(Duration::from_millis(5));
+            let mut flush_tick = tokio::time::interval(flush_interval);
+            flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+            loop {
+                tokio::select! {
+                    _ = flush_tick.tick() => {
+                        let now_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        for item in coalescer.drain_due(now_ms) {
+                            metrics.record_native_output_batch(item.input_events, item.bytes.len());
+                            emit_native_output_delta(
+                                item.pane_id,
+                                item.bytes,
+                                item.timestamp_ms,
+                                &capture_tx,
+                                &cursors,
+                            )
+                            .await;
+                        }
+
+                        if shutdown_flag.load(Ordering::SeqCst) {
+                            break;
+                        }
+                    }
+                    maybe_event = event_rx.recv() => {
+                        let Some(event) = maybe_event else { break; };
+
+                        if shutdown_flag.load(Ordering::SeqCst) {
+                            break;
+                        }
+
+                        match event {
+                            NativeEvent::PaneOutput { pane_id, data, timestamp_ms } => {
+                                metrics.record_native_output_input(data.len());
+                                let now_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                                if let Some(item) = coalescer.push(pane_id, data, timestamp_ms, now_ms) {
+                                    metrics.record_native_output_batch(item.input_events, item.bytes.len());
+                                    emit_native_output_delta(
+                                        item.pane_id,
+                                        item.bytes,
+                                        item.timestamp_ms,
+                                        &capture_tx,
+                                        &cursors,
+                                    )
+                                    .await;
+                                }
+                            }
+                            NativeEvent::StateChange { pane_id, .. } | NativeEvent::PaneDestroyed { pane_id, .. } => {
+                                if let Some(item) = coalescer.flush_pane(pane_id) {
+                                    metrics.record_native_output_batch(item.input_events, item.bytes.len());
+                                    emit_native_output_delta(
+                                        item.pane_id,
+                                        item.bytes,
+                                        item.timestamp_ms,
+                                        &capture_tx,
+                                        &cursors,
+                                    )
+                                    .await;
+                                }
+
+                                handle_native_event(
+                                    event,
+                                    &capture_tx,
+                                    &cursors,
+                                    &detection_contexts,
+                                    &storage,
+                                    event_bus.as_ref(),
+                                    &pane_filter,
+                                )
+                                .await;
+                            }
+                            _ => {
+                                handle_native_event(
+                                    event,
+                                    &capture_tx,
+                                    &cursors,
+                                    &detection_contexts,
+                                    &storage,
+                                    event_bus.as_ref(),
+                                    &pane_filter,
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                }
+            }
+
+            for item in coalescer.drain_all() {
+                metrics.record_native_output_batch(item.input_events, item.bytes.len());
+                emit_native_output_delta(
+                    item.pane_id,
+                    item.bytes,
+                    item.timestamp_ms,
                     &capture_tx,
                     &cursors,
-                    &detection_contexts,
-                    &storage,
-                    event_bus.as_ref(),
-                    &pane_filter,
                 )
                 .await;
             }
@@ -1273,28 +1612,7 @@ async fn handle_native_event(
             data,
             timestamp_ms,
         } => {
-            if data.is_empty() {
-                return;
-            }
-
-            let content = String::from_utf8_lossy(&data).to_string();
-            let segment = {
-                let mut cursors_guard = cursors.write().await;
-                cursors_guard
-                    .get_mut(&pane_id)
-                    .map(|cursor| cursor.capture_delta(content, timestamp_ms))
-            };
-
-            if let Some(segment) = segment {
-                if capture_tx.try_send(CaptureEvent { segment }).is_err() {
-                    debug!(pane_id, "Native event queue full; dropping output");
-                }
-            } else {
-                debug!(
-                    pane_id,
-                    "Native output received before cursor initialized; dropping"
-                );
-            }
+            emit_native_output_delta(pane_id, data, timestamp_ms, capture_tx, cursors).await;
         }
         NativeEvent::StateChange { pane_id, state, .. } => {
             let mut gap_segment = None;
@@ -1403,6 +1721,38 @@ async fn handle_native_event(
             let mut contexts = detection_contexts.write().await;
             contexts.remove(&pane_id);
         }
+    }
+}
+
+#[cfg(feature = "native-wezterm")]
+async fn emit_native_output_delta(
+    pane_id: u64,
+    data: Vec<u8>,
+    timestamp_ms: i64,
+    capture_tx: &mpsc::Sender<CaptureEvent>,
+    cursors: &Arc<RwLock<HashMap<u64, PaneCursor>>>,
+) {
+    if data.is_empty() {
+        return;
+    }
+
+    let content = String::from_utf8_lossy(&data).to_string();
+    let segment = {
+        let mut cursors_guard = cursors.write().await;
+        cursors_guard
+            .get_mut(&pane_id)
+            .map(|cursor| cursor.capture_delta(content, timestamp_ms))
+    };
+
+    if let Some(segment) = segment {
+        if capture_tx.try_send(CaptureEvent { segment }).is_err() {
+            debug!(pane_id, "Native event queue full; dropping output");
+        }
+    } else {
+        debug!(
+            pane_id,
+            "Native output received before cursor initialized; dropping"
+        );
     }
 }
 
@@ -1948,6 +2298,39 @@ mod tests {
     // =========================================================================
     // Backpressure Instrumentation Tests (wa-upg.12.2)
     // =========================================================================
+
+    #[cfg(feature = "native-wezterm")]
+    #[test]
+    fn native_output_coalescer_batches_within_window() {
+        let mut c = NativeOutputCoalescer::new(50, 200, 1024 * 1024);
+
+        assert!(c.push(1, b"a".to_vec(), 1000, 0).is_none());
+        assert!(c.push(1, b"b".to_vec(), 1001, 10).is_none());
+        assert!(c.push(1, b"c".to_vec(), 1002, 20).is_none());
+
+        // Not due until >= window.
+        assert!(c.drain_due(49).is_empty());
+
+        let drained = c.drain_due(50);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].pane_id, 1);
+        assert_eq!(drained[0].bytes, b"abc");
+        assert_eq!(drained[0].timestamp_ms, 1002);
+        assert_eq!(drained[0].input_events, 3);
+    }
+
+    #[cfg(feature = "native-wezterm")]
+    #[test]
+    fn native_output_coalescer_enforces_max_delay_when_window_is_large() {
+        let mut c = NativeOutputCoalescer::new(1_000, 200, 1024 * 1024);
+        c.push(7, b"x".to_vec(), 555, 0);
+
+        // Not due by window, but due by max_delay.
+        assert!(c.drain_due(199).is_empty());
+        let drained = c.drain_due(200);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].pane_id, 7);
+    }
 
     #[test]
     fn backpressure_warn_ratio_is_valid() {

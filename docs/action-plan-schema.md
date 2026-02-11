@@ -226,7 +226,7 @@ Use this checklist when adding a new `StepAction`/`Precondition`/`VerificationSt
 4. **Policy + redaction**
    - If the action can mutate panes or carry user text, verify policy gating and redaction paths in `crates/frankenterm-core/src/policy.rs`, `crates/frankenterm-core/src/approval.rs`, and storage/audit logging paths.
 5. **Surface parity**
-   - Verify dry-run/human CLI (`crates/wa/src/main.rs`), robot output, and MCP output expose the new variant consistently.
+   - Verify dry-run/human CLI (`crates/frankenterm/src/main.rs`), robot output, and MCP output expose the new variant consistently.
    - Update docs/schemas if output contracts change.
 6. **Tests (required before merge)**
    - Add/extend tests in `crates/frankenterm-core/src/plan.rs` for serialization and canonical hash stability.

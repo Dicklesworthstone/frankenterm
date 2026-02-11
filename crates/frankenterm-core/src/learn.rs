@@ -435,7 +435,7 @@ impl TutorialEngine {
                     Exercise {
                         id: "basics.3".into(),
                         title: "Start the watcher".into(),
-                        description: "Launch the wa daemon to observe terminal activity".into(),
+                        description: "Launch the ft daemon to observe terminal activity".into(),
                         instructions: vec![
                             "Run: ft watch".into(),
                             "The watcher starts in the background".into(),
@@ -448,9 +448,9 @@ impl TutorialEngine {
                     Exercise {
                         id: "basics.4".into(),
                         title: "View pane status".into(),
-                        description: "See what panes wa is observing".into(),
+                        description: "See what panes ft is observing".into(),
                         instructions: vec![
-                            "Run: wa status".into(),
+                            "Run: ft status".into(),
                             "Run: ft list".into(),
                             "Check that pane metadata and watcher state make sense.".into(),
                         ],
@@ -832,8 +832,8 @@ impl TutorialEngine {
                                 .into(),
                         instructions: vec![
                             "Review: each pane has an independent capture stream and event history.".into(),
-                            "Run: wa status -- observe per-pane health and detection counts.".into(),
-                            "Goal: understand how wa tracks multiple agents in parallel.".into(),
+                            "Run: ft status -- observe per-pane health and detection counts.".into(),
+                            "Goal: understand how ft tracks multiple agents in parallel.".into(),
                         ],
                         verification_command: None,
                         verification_pattern: None,

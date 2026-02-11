@@ -71,9 +71,9 @@ All randomized aspects use `rand::rngs::StdRng::seed_from_u64(seed)`:
 When a test fails, the seed is printed in the failure message:
 
 ```
-PTY E2E FAILED: scenario=basic_navigation seed=0xCAFE0001 cols=80 rows=24
+  PTY E2E FAILED: scenario=basic_navigation seed=0xCAFE0001 cols=80 rows=24
   assertion failed at step 5: expected view "Events", got "Home"
-  transcript: /tmp/wa-pty-e2e/basic_navigation_0xCAFE0001.transcript
+  transcript: /tmp/ft-pty-e2e/basic_navigation_0xCAFE0001.transcript
 ```
 
 Rerunning with the same seed produces identical behavior.

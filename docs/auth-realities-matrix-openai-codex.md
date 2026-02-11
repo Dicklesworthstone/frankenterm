@@ -11,7 +11,7 @@
 
 ## 1. Overview
 
-When a Codex CLI session hits its usage limit, `wa` needs to decide whether to:
+When a Codex CLI session hits its usage limit, `ft` needs to decide whether to:
 1. Proceed automatically with credential failover, or
 2. Pause and request human action
 
@@ -167,7 +167,7 @@ The `handle_usage_limits` workflow should:
    - Wait for success signal or timeout
    - Message format:
      ```
-     [wa] Auth requires human intervention
+     [ft] Auth requires human intervention
 
      State: password_required
      Account: user@example.com
@@ -189,7 +189,7 @@ The `handle_usage_limits` workflow should:
 ### 5.1 Profile Directory Structure
 
 ```
-~/.local/share/wa/browser_profiles/
+~/.local/share/ft/browser_profiles/
 └── openai/
     └── <account_name>/
         ├── Default/
@@ -198,6 +198,8 @@ The `handle_usage_limits` workflow should:
         │   └── ...
         └── profile.json  # Metadata (created_at, last_used, etc.)
 ```
+
+Legacy path (older versions): `~/.local/share/wa/browser_profiles/`.
 
 ### 5.2 Profile Lifecycle
 

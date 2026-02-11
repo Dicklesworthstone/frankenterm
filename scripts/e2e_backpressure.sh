@@ -15,7 +15,7 @@
 #   Since a live WezTerm mux + watcher daemon is not always available,
 #   this script validates backpressure behavior via:
 #   - Targeted cargo test suites (backpressure, tailer overflow, storage)
-#   - CLI contract checks (wa status --format json includes backpressure)
+#   - CLI contract checks (ft status --format json includes backpressure)
 #   - Health snapshot schema validation
 #
 # Requirements:
@@ -110,7 +110,7 @@ log_info() {
 
 make_temp_workspace() {
     local dir
-    dir=$(mktemp -d "${TMPDIR:-/tmp}/wa-e2e-backpressure.XXXXXX")
+    dir=$(mktemp -d "${TMPDIR:-/tmp}/ft-e2e-backpressure.XXXXXX")
     echo "$dir"
 }
 
@@ -422,7 +422,7 @@ scenario_cli_status_contract() {
 
     local workspace stdout_file exit_code
 
-    # Test that wa status --format json is parseable
+    # Test that ft status --format json is parseable
     # (Without a running watcher, it should still produce valid JSON or
     #  fail gracefully with an informative message)
     workspace=$(make_temp_workspace)
@@ -439,9 +439,9 @@ scenario_cli_status_contract() {
     # Even without a watcher, the status command should handle gracefully
     # exit_code 124 = our timeout killed it (WezTerm socket timeout is 30s)
     if [[ $exit_code -le 1 || $exit_code -eq 124 ]]; then
-        log_pass "S7.1: wa status exits cleanly (exit=$exit_code)"
+        log_pass "S7.1: ft status exits cleanly (exit=$exit_code)"
     else
-        log_fail "S7.1: wa status crashed (exit=$exit_code)"
+        log_fail "S7.1: ft status crashed (exit=$exit_code)"
     fi
 
     # Extract just the JSON line (last line of output, skipping log/tracing lines)
@@ -450,7 +450,7 @@ scenario_cli_status_contract() {
 
     # If there's JSON output, check for backpressure_tier field presence
     if echo "$json_line" | jq . >/dev/null 2>&1; then
-        log_pass "S7.2: wa status produces valid JSON"
+        log_pass "S7.2: ft status produces valid JSON"
 
         # Check that the health schema would include backpressure_tier
         # (may be null without a running watcher, but the field should exist

@@ -73,7 +73,7 @@ wait_for_json_condition() {
 }
 
 TEMP_WORKSPACE=""
-WA_PID=""
+FT_PID=""
 PANE_A=""
 PANE_B=""
 MARKER=""
@@ -81,11 +81,11 @@ SAVED_NAME="saved-search-e2e"
 
 cleanup_best_effort() {
   set +e
-  if [[ -n "$WA_PID" ]] && kill -0 "$WA_PID" 2>/dev/null; then
-    kill "$WA_PID" 2>/dev/null || true
-    wait "$WA_PID" 2>/dev/null || true
+  if [[ -n "$FT_PID" ]] && kill -0 "$FT_PID" 2>/dev/null; then
+    kill "$FT_PID" 2>/dev/null || true
+    wait "$FT_PID" 2>/dev/null || true
   fi
-  WA_PID=""
+  FT_PID=""
 
   if [[ -n "$PANE_A" ]]; then
     wezterm cli kill-pane --pane-id "$PANE_A" 2>/dev/null || true
@@ -166,11 +166,11 @@ main() {
   find_ft_binary
 
   MARKER="E2E_SAVED_SEARCH_$(date +%s%N)"
-  TEMP_WORKSPACE="$(mktemp -d /tmp/wa-e2e-saved-searches.XXXXXX)"
+  TEMP_WORKSPACE="$(mktemp -d /tmp/ft-e2e-saved-searches.XXXXXX)"
 
-  export WA_DATA_DIR="$TEMP_WORKSPACE/.wa"
+  export FT_DATA_DIR="$TEMP_WORKSPACE/.ft"
   export FT_WORKSPACE="$TEMP_WORKSPACE"
-  mkdir -p "$WA_DATA_DIR"
+  mkdir -p "$FT_DATA_DIR"
 
   e2e_init_artifacts "saved-searches" >/dev/null
   e2e_add_file "workspace.txt" "$TEMP_WORKSPACE"
@@ -189,7 +189,7 @@ main() {
 
   # Start watcher (scheduler runs inside watcher).
   "$FT_BINARY" watch --foreground >"$E2E_RUN_DIR/wa_watch.log" 2>&1 &
-  WA_PID=$!
+  FT_PID=$!
 
   # Wait for pane observation.
   wait_for_json_condition \

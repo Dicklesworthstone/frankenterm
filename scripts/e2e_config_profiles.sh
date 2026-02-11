@@ -45,7 +45,7 @@ require_jq() {
 }
 
 make_temp_workspace() {
-    mktemp -d "${TMPDIR:-/tmp}/wa-e2e-profiles.XXXXXX"
+    mktemp -d "${TMPDIR:-/tmp}/ft-e2e-profiles.XXXXXX"
 }
 
 write_file() {

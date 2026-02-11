@@ -124,8 +124,7 @@ fn bench_acquire_with_idle(c: &mut Criterion) {
                     // Acquire should get the idle connection
                     let result = pool.acquire().await.unwrap();
                     assert!(result.has_connection());
-                    let (conn, _guard) = result.into_parts();
-                    drop(conn);
+                    let (_conn, _guard) = result.into_parts();
                 });
             },
         );

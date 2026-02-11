@@ -1,10 +1,10 @@
 #!/bin/bash
 # =============================================================================
-# E2E: wa doctor (healthy/broken) with verbose logs + artifacts
+# E2E: ft doctor (healthy/broken) with verbose logs + artifacts
 # Implements: wa-4vx.10.22
 #
 # Purpose:
-#   Validate that `wa doctor` produces correct exit codes, actionable output,
+#   Validate that `ft doctor` produces correct exit codes, actionable output,
 #   and redacted diagnostics across healthy and broken workspace scenarios.
 #
 # Requirements:
@@ -109,12 +109,12 @@ log_info() {
 # Create a temporary workspace directory and track it for cleanup
 make_temp_workspace() {
     local dir
-    dir=$(mktemp -d "${TMPDIR:-/tmp}/wa-e2e-doctor.XXXXXX")
+    dir=$(mktemp -d "${TMPDIR:-/tmp}/ft-e2e-doctor.XXXXXX")
     TEMP_DIRS+=("$dir")
     echo "$dir"
 }
 
-# Run wa doctor and capture output + exit code
+# Run ft doctor and capture output + exit code
 # Usage: run_doctor [extra_args...]
 # Sets: DOCTOR_STDOUT, DOCTOR_STDERR, DOCTOR_EXIT
 run_doctor() {
@@ -130,7 +130,7 @@ run_doctor() {
     rm -f "$stdout_file" "$stderr_file"
 }
 
-# Run wa doctor with a modified environment
+# Run ft doctor with a modified environment
 # Usage: run_doctor_env <env_var=val> [extra_args...]
 run_doctor_env() {
     local env_setting="$1"
@@ -534,7 +534,7 @@ test_output_stability() {
 test_nonexistent_workspace() {
     log_test "Scenario E: Nonexistent workspace path"
 
-    run_doctor --workspace "/tmp/wa-e2e-does-not-exist-$(date +%s)"
+    run_doctor --workspace "/tmp/ft-e2e-does-not-exist-$(date +%s)"
 
     # E1: wa treats nonexistent workspaces as fresh (creates on first watch),
     # so doctor should succeed with warnings, not fail.
@@ -577,7 +577,7 @@ trap cleanup EXIT
 
 main() {
     echo "================================================================"
-    echo "  E2E: wa doctor (wa-4vx.10.22)"
+    echo "  E2E: ft doctor (wa-4vx.10.22)"
     echo "================================================================"
     echo ""
 

@@ -440,7 +440,7 @@ fn read_process_info(pid: u32) -> Option<RawProcessInfo> {
     }
 
     let pid_val = fields[0].parse::<u32>().ok()?;
-    let ppid = fields[1].parse::<u32>().ok()?;
+    let parent_pid = fields[1].parse::<u32>().ok()?;
     let state = parse_macos_state(fields[2]);
     let rss_kb = fields[3].parse::<u64>().unwrap_or(0);
     // comm= gives the full path; extract basename.
@@ -452,7 +452,7 @@ fn read_process_info(pid: u32) -> Option<RawProcessInfo> {
 
     Some(RawProcessInfo {
         pid: pid_val,
-        ppid,
+        ppid: parent_pid,
         name,
         argv,
         state,
@@ -483,13 +483,7 @@ fn read_macos_argv(pid: u32) -> Vec<String> {
 
     output
         .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| {
-            s.trim()
-                .split_whitespace()
-                .take(8)
-                .map(String::from)
-                .collect()
-        })
+        .map(|s| s.split_whitespace().take(8).map(String::from).collect())
         .unwrap_or_default()
 }
 

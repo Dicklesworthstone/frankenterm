@@ -58,6 +58,14 @@ pub struct MetricsSnapshot {
     pub ingest_lag_sum_ms: u64,
     pub ingest_lag_count: u64,
     pub db_last_write_age_ms: Option<u64>,
+    // Native output coalescing metrics (wa-x4rq)
+    pub native_output_input_events: u64,
+    pub native_output_batches_emitted: u64,
+    pub native_output_input_bytes: u64,
+    pub native_output_emitted_bytes: u64,
+    pub native_output_max_batch_events: u64,
+    pub native_output_max_batch_bytes: u64,
+    pub native_output_coalesce_ratio: f64,
     pub event_bus: Option<EventBusSnapshot>,
 }
 
@@ -141,6 +149,49 @@ impl MetricsSnapshot {
             metric_name(&prefix, "db_last_write_age_ms"),
             "Age in milliseconds since last DB write (-1 means unknown)",
             db_age.to_string(),
+        );
+
+        push_counter(
+            &mut output,
+            metric_name(&prefix, "native_output_input_events_total"),
+            "Total native pane output events received (pre-coalesce)",
+            self.native_output_input_events.to_string(),
+        );
+        push_counter(
+            &mut output,
+            metric_name(&prefix, "native_output_batches_emitted_total"),
+            "Total native pane output batches emitted (post-coalesce)",
+            self.native_output_batches_emitted.to_string(),
+        );
+        push_counter(
+            &mut output,
+            metric_name(&prefix, "native_output_input_bytes_total"),
+            "Total native output bytes received (pre-coalesce)",
+            self.native_output_input_bytes.to_string(),
+        );
+        push_counter(
+            &mut output,
+            metric_name(&prefix, "native_output_emitted_bytes_total"),
+            "Total native output bytes emitted (post-coalesce)",
+            self.native_output_emitted_bytes.to_string(),
+        );
+        push_gauge(
+            &mut output,
+            metric_name(&prefix, "native_output_max_batch_events"),
+            "Maximum number of input events merged into one emitted batch",
+            self.native_output_max_batch_events.to_string(),
+        );
+        push_gauge(
+            &mut output,
+            metric_name(&prefix, "native_output_max_batch_bytes"),
+            "Maximum size in bytes of one emitted native output batch",
+            self.native_output_max_batch_bytes.to_string(),
+        );
+        push_gauge(
+            &mut output,
+            metric_name(&prefix, "native_output_coalesce_ratio"),
+            "Average native output coalescing ratio (input events / emitted batches)",
+            format_float(self.native_output_coalesce_ratio),
         );
 
         if let Some(ref bus) = self.event_bus {
@@ -274,6 +325,15 @@ impl MetricsCollector for RuntimeMetricsCollector {
                 .last_db_write()
                 .map(|ts| epoch_ms_u64().saturating_sub(ts));
 
+            let native_output_input_events = metrics.native_output_input_events();
+            let native_output_batches_emitted = metrics.native_output_batches_emitted();
+            #[allow(clippy::cast_precision_loss)]
+            let native_output_coalesce_ratio = if native_output_batches_emitted == 0 {
+                0.0
+            } else {
+                native_output_input_events as f64 / native_output_batches_emitted as f64
+            };
+
             MetricsSnapshot {
                 uptime_seconds: runtime.start_time.elapsed().as_secs_f64(),
                 observed_panes,
@@ -287,6 +347,13 @@ impl MetricsCollector for RuntimeMetricsCollector {
                 ingest_lag_sum_ms: metrics.ingest_lag_sum_ms(),
                 ingest_lag_count: metrics.ingest_lag_count(),
                 db_last_write_age_ms,
+                native_output_input_events,
+                native_output_batches_emitted,
+                native_output_input_bytes: metrics.native_output_input_bytes(),
+                native_output_emitted_bytes: metrics.native_output_emitted_bytes(),
+                native_output_max_batch_events: metrics.native_output_max_batch_events(),
+                native_output_max_batch_bytes: metrics.native_output_max_batch_bytes(),
+                native_output_coalesce_ratio,
                 event_bus,
             }
         })
@@ -565,6 +632,13 @@ mod tests {
             ingest_lag_sum_ms: 9,
             ingest_lag_count: 3,
             db_last_write_age_ms: Some(100),
+            native_output_input_events: 0,
+            native_output_batches_emitted: 0,
+            native_output_input_bytes: 0,
+            native_output_emitted_bytes: 0,
+            native_output_max_batch_events: 0,
+            native_output_max_batch_bytes: 0,
+            native_output_coalesce_ratio: 0.0,
             event_bus: None,
         };
 
@@ -589,6 +663,13 @@ mod tests {
             ingest_lag_sum_ms: 0,
             ingest_lag_count: 0,
             db_last_write_age_ms: None,
+            native_output_input_events: 0,
+            native_output_batches_emitted: 0,
+            native_output_input_bytes: 0,
+            native_output_emitted_bytes: 0,
+            native_output_max_batch_events: 0,
+            native_output_max_batch_bytes: 0,
+            native_output_coalesce_ratio: 0.0,
             event_bus: None,
         };
 

@@ -2,7 +2,7 @@
 
 **Bead:** wa-3g47 (FTUI-02.1.a)
 **Date:** 2026-02-09
-**Crate boundary:** `frankenterm-core` (library), `wa` (binary)
+**Crate boundary:** `frankenterm-core` (library), `frankenterm` (CLI/binary; installs as `ft`)
 
 ## 1  Canonical Feature Combinations
 
@@ -146,7 +146,7 @@ re-exports are suppressed via `#[cfg(not(feature = "rollout"))]` guards, and the
 
 When FTUI-09.3 (decommission) is reached:
 
-1. Remove `tui` and `rollout` features from `frankenterm-core/Cargo.toml` and `wa/Cargo.toml`
+1. Remove `tui` and `rollout` features from `crates/frankenterm-core/Cargo.toml` and `crates/frankenterm/Cargo.toml`
 2. Remove `compile_error!` guard and `rollout.rs` dispatch module
 3. Remove all `#[cfg(feature = "tui")]` blocks
 4. Rename `ftui` to `tui` (or make ftui the default)
@@ -176,7 +176,7 @@ and CI must verify all.
 ## References
 
 - `crates/frankenterm-core/Cargo.toml:113-135` — feature definitions
-- `crates/wa/Cargo.toml:40-51` — binary feature passthrough
+- `crates/frankenterm/Cargo.toml` — binary feature passthrough
 - `crates/frankenterm-core/src/lib.rs:129-134` — mutual exclusion guard
 - ADR-0004: Phased Rollout and Rollback
 - wa-36xw (FTUI-07.4): CI gate wiring (consumes this matrix)

@@ -376,7 +376,7 @@ SCENARIO_REGISTRY=(
     "triage_multi_issue|Validate triage ordering and suggested actions with multiple issues|true|wezterm,jq,sqlite3|Protects triage ranking output"
     "rules_explain_trace|Validate rules test trace + lint artifacts (explain-match)|true|wezterm,jq,sqlite3|Protects rule explainability"
     "stress_scale|Validate scaled stress test (panes + large transcript)|true|wezterm,jq,sqlite3|Protects scale handling"
-    "graceful_shutdown|Validate wa watch graceful shutdown (SIGINT flush, lock release, restart clean)|true|wezterm,jq,sqlite3|Protects shutdown and lock handling"
+    "graceful_shutdown|Validate ft watch graceful shutdown (SIGINT flush, lock release, restart clean)|true|wezterm,jq,sqlite3|Protects shutdown and lock handling"
     "watcher_crash_bundle|Validate crash bundles surfaced via triage/doctor/reproduce|true|wezterm,jq,sqlite3|Protects crash-only diagnosability surfaces"
     "pane_exclude_filter|Validate pane selection filters protect privacy (ignored pane absent from search)|true|wezterm,jq,sqlite3|Protects pane exclusion behavior"
     "workspace_isolation|Validate workspace isolation (no cross-project DB leakage)|true|wezterm,jq,sqlite3|Protects workspace separation"
@@ -583,8 +583,8 @@ run_scenario_capture_search() {
     local scenario_dir="$1"
     local marker="E2E_MARKER_$(date +%s%N)"
     local temp_workspace
-    temp_workspace=$(mktemp -d /tmp/wa-e2e-XXXXXX)
-    local wa_pid=""
+    temp_workspace=$(mktemp -d /tmp/ft-e2e-XXXXXX)
+    local ft_pid=""
     local pane_id=""
     local result=0
     local policy_suggestions_ok="false"
@@ -593,18 +593,18 @@ run_scenario_capture_search() {
     log_info "Workspace: $temp_workspace"
 
     # Setup environment for isolated wa instance
-    export WA_DATA_DIR="$temp_workspace/.wa"
+    export FT_DATA_DIR="$temp_workspace/.ft"
     export FT_WORKSPACE="$temp_workspace"
-    mkdir -p "$WA_DATA_DIR"
+    mkdir -p "$FT_DATA_DIR"
 
     # Cleanup function
     cleanup_capture_search() {
         log_verbose "Cleaning up capture_search scenario"
-        # Kill wa watch if running
-        if [[ -n "$wa_pid" ]] && kill -0 "$wa_pid" 2>/dev/null; then
-            log_verbose "Stopping wa watch (pid $wa_pid)"
-            kill "$wa_pid" 2>/dev/null || true
-            wait "$wa_pid" 2>/dev/null || true
+        # Kill ft watch if running
+        if [[ -n "$ft_pid" ]] && kill -0 "$ft_pid" 2>/dev/null; then
+            log_verbose "Stopping ft watch (pid $ft_pid)"
+            kill "$ft_pid" 2>/dev/null || true
+            wait "$ft_pid" 2>/dev/null || true
         fi
         # Close dummy pane if it exists
         if [[ -n "$pane_id" ]]; then
@@ -613,7 +613,7 @@ run_scenario_capture_search() {
         fi
         # Copy artifacts before cleanup
         if [[ -d "$temp_workspace" ]]; then
-            cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp -r "$temp_workspace/.ft"/* "$scenario_dir/" 2>/dev/null || true
         fi
         rm -rf "$temp_workspace"
     }
@@ -639,17 +639,17 @@ run_scenario_capture_search() {
     log_info "Spawned pane: $pane_id"
     echo "Spawned pane_id: $pane_id" >> "$scenario_dir/scenario.log"
 
-    # Step 2: Start wa watch in background
-    log_info "Step 2: Starting wa watch..."
+    # Step 2: Start ft watch in background
+    log_info "Step 2: Starting ft watch..."
     "$FT_BINARY" watch --foreground \
         > "$scenario_dir/wa_watch.log" 2>&1 &
-    wa_pid=$!
-    log_verbose "wa watch started with PID $wa_pid"
-    echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
+    ft_pid=$!
+    log_verbose "ft watch started with PID $ft_pid"
+    echo "ft_pid: $ft_pid" >> "$scenario_dir/scenario.log"
 
-    # Verify wa watch is running
-    if ! kill -0 "$wa_pid" 2>/dev/null; then
-        log_fail "wa watch exited immediately"
+    # Verify ft watch is running
+    if ! kill -0 "$ft_pid" 2>/dev/null; then
+        log_fail "ft watch exited immediately"
         return 1
     fi
 
@@ -676,12 +676,12 @@ run_scenario_capture_search() {
     # Capture robot state
     "$FT_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
 
-    # Step 5: Stop wa watch gracefully
-    log_info "Step 5: Stopping wa watch..."
-    kill -TERM "$wa_pid" 2>/dev/null || true
-    wait "$wa_pid" 2>/dev/null || true
-    wa_pid=""
-    log_verbose "wa watch stopped"
+    # Step 5: Stop ft watch gracefully
+    log_info "Step 5: Stopping ft watch..."
+    kill -TERM "$ft_pid" 2>/dev/null || true
+    wait "$ft_pid" 2>/dev/null || true
+    ft_pid=""
+    log_verbose "ft watch stopped"
 
     # Step 6: Search for the marker
     log_info "Step 6: Searching for marker..."
@@ -726,19 +726,19 @@ run_scenario_capture_search() {
 run_scenario_search_linting_rebuild() {
     local scenario_dir="$1"
     local temp_workspace
-    temp_workspace=$(mktemp -d /tmp/wa-e2e-search-XXXXXX)
+    temp_workspace=$(mktemp -d /tmp/ft-e2e-search-XXXXXX)
     local result=0
 
     log_info "Workspace: $temp_workspace"
     echo "workspace: $temp_workspace" >> "$scenario_dir/scenario.log"
 
-    export WA_DATA_DIR="$temp_workspace/.wa"
+    export FT_DATA_DIR="$temp_workspace/.ft"
     export FT_WORKSPACE="$temp_workspace"
-    mkdir -p "$WA_DATA_DIR"
+    mkdir -p "$FT_DATA_DIR"
 
     cleanup_search_linting_rebuild() {
         if [[ -d "$temp_workspace" ]]; then
-            cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp -r "$temp_workspace/.ft"/* "$scenario_dir/" 2>/dev/null || true
             rm -rf "$temp_workspace"
         fi
     }
@@ -791,8 +791,8 @@ run_scenario_natural_language() {
     local scenario_dir="$1"
     local marker="You've hit your usage limit, try again at 12:00."
     local temp_workspace
-    temp_workspace=$(mktemp -d /tmp/wa-e2e-XXXXXX)
-    local wa_pid=""
+    temp_workspace=$(mktemp -d /tmp/ft-e2e-XXXXXX)
+    local ft_pid=""
     local pane_id=""
     local result=0
 
@@ -800,23 +800,23 @@ run_scenario_natural_language() {
     log_info "Workspace: $temp_workspace"
 
     # Setup environment for isolated wa instance
-    export WA_DATA_DIR="$temp_workspace/.wa"
+    export FT_DATA_DIR="$temp_workspace/.ft"
     export FT_WORKSPACE="$temp_workspace"
-    mkdir -p "$WA_DATA_DIR"
+    mkdir -p "$FT_DATA_DIR"
 
     cleanup_natural_language() {
         log_verbose "Cleaning up natural_language scenario"
-        if [[ -n "$wa_pid" ]] && kill -0 "$wa_pid" 2>/dev/null; then
-            log_verbose "Stopping wa watch (pid $wa_pid)"
-            kill "$wa_pid" 2>/dev/null || true
-            wait "$wa_pid" 2>/dev/null || true
+        if [[ -n "$ft_pid" ]] && kill -0 "$ft_pid" 2>/dev/null; then
+            log_verbose "Stopping ft watch (pid $ft_pid)"
+            kill "$ft_pid" 2>/dev/null || true
+            wait "$ft_pid" 2>/dev/null || true
         fi
         if [[ -n "$pane_id" ]]; then
             log_verbose "Closing dummy pane $pane_id"
             wezterm cli kill-pane --pane-id "$pane_id" 2>/dev/null || true
         fi
         if [[ -d "$temp_workspace" ]]; then
-            cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp -r "$temp_workspace/.ft"/* "$scenario_dir/" 2>/dev/null || true
         fi
         rm -rf "$temp_workspace"
     }
@@ -842,16 +842,16 @@ run_scenario_natural_language() {
     log_info "Spawned pane: $pane_id"
     echo "Spawned pane_id: $pane_id" >> "$scenario_dir/scenario.log"
 
-    # Step 2: Start wa watch in background
-    log_info "Step 2: Starting wa watch..."
+    # Step 2: Start ft watch in background
+    log_info "Step 2: Starting ft watch..."
     "$FT_BINARY" watch --foreground \
         > "$scenario_dir/wa_watch.log" 2>&1 &
-    wa_pid=$!
-    log_verbose "wa watch started with PID $wa_pid"
-    echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
+    ft_pid=$!
+    log_verbose "ft watch started with PID $ft_pid"
+    echo "ft_pid: $ft_pid" >> "$scenario_dir/scenario.log"
 
-    if ! kill -0 "$wa_pid" 2>/dev/null; then
-        log_fail "wa watch exited immediately"
+    if ! kill -0 "$ft_pid" 2>/dev/null; then
+        log_fail "ft watch exited immediately"
         return 1
     fi
 
@@ -904,12 +904,12 @@ run_scenario_natural_language() {
         result=1
     fi
 
-    # Step 7: Stop wa watch gracefully
-    log_info "Step 7: Stopping wa watch..."
-    kill -TERM "$wa_pid" 2>/dev/null || true
-    wait "$wa_pid" 2>/dev/null || true
-    wa_pid=""
-    log_verbose "wa watch stopped"
+    # Step 7: Stop ft watch gracefully
+    log_info "Step 7: Stopping ft watch..."
+    kill -TERM "$ft_pid" 2>/dev/null || true
+    wait "$ft_pid" 2>/dev/null || true
+    ft_pid=""
+    log_verbose "ft watch stopped"
 
     trap - EXIT
     cleanup_natural_language
@@ -920,34 +920,34 @@ run_scenario_natural_language() {
 run_scenario_compaction_workflow() {
     local scenario_dir="$1"
     local temp_workspace
-    temp_workspace=$(mktemp -d /tmp/wa-e2e-XXXXXX)
-    local wa_pid=""
+    temp_workspace=$(mktemp -d /tmp/ft-e2e-XXXXXX)
+    local ft_pid=""
     local pane_id=""
     local result=0
 
     log_info "Workspace: $temp_workspace"
 
     # Setup environment for isolated wa instance
-    export WA_DATA_DIR="$temp_workspace/.wa"
+    export FT_DATA_DIR="$temp_workspace/.ft"
     export FT_WORKSPACE="$temp_workspace"
-    mkdir -p "$WA_DATA_DIR"
+    mkdir -p "$FT_DATA_DIR"
 
     # Copy baseline config for workflow testing
     local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
     if [[ -f "$baseline_config" ]]; then
         cp "$baseline_config" "$temp_workspace/ft.toml"
-        export WA_CONFIG="$temp_workspace/ft.toml"
+        export FT_CONFIG="$temp_workspace/ft.toml"
         log_verbose "Using baseline config: $baseline_config"
     fi
 
     # Cleanup function
     cleanup_compaction_workflow() {
         log_verbose "Cleaning up compaction_workflow scenario"
-        # Kill wa watch if running
-        if [[ -n "$wa_pid" ]] && kill -0 "$wa_pid" 2>/dev/null; then
-            log_verbose "Stopping wa watch (pid $wa_pid)"
-            kill "$wa_pid" 2>/dev/null || true
-            wait "$wa_pid" 2>/dev/null || true
+        # Kill ft watch if running
+        if [[ -n "$ft_pid" ]] && kill -0 "$ft_pid" 2>/dev/null; then
+            log_verbose "Stopping ft watch (pid $ft_pid)"
+            kill "$ft_pid" 2>/dev/null || true
+            wait "$ft_pid" 2>/dev/null || true
         fi
         # Close dummy pane if it exists
         if [[ -n "$pane_id" ]]; then
@@ -956,25 +956,25 @@ run_scenario_compaction_workflow() {
         fi
         # Copy artifacts before cleanup
         if [[ -d "$temp_workspace" ]]; then
-            cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp -r "$temp_workspace/.ft"/* "$scenario_dir/" 2>/dev/null || true
             cp "$temp_workspace/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
         rm -rf "$temp_workspace"
     }
     trap cleanup_compaction_workflow EXIT
 
-    # Step 1: Start wa watch with auto-handle BEFORE spawning pane
+    # Step 1: Start ft watch with auto-handle BEFORE spawning pane
     # This ensures it's ready to detect and respond
-    log_info "Step 1: Starting wa watch with --auto-handle..."
+    log_info "Step 1: Starting ft watch with --auto-handle..."
     "$FT_BINARY" watch --foreground --auto-handle \
         > "$scenario_dir/wa_watch.log" 2>&1 &
-    wa_pid=$!
-    log_verbose "wa watch started with PID $wa_pid"
-    echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
+    ft_pid=$!
+    log_verbose "ft watch started with PID $ft_pid"
+    echo "ft_pid: $ft_pid" >> "$scenario_dir/scenario.log"
 
-    # Verify wa watch is running
-    if ! kill -0 "$wa_pid" 2>/dev/null; then
-        log_fail "wa watch exited immediately"
+    # Verify ft watch is running
+    if ! kill -0 "$ft_pid" 2>/dev/null; then
+        log_fail "ft watch exited immediately"
         return 1
     fi
 
@@ -1062,8 +1062,8 @@ run_scenario_compaction_workflow() {
         # This may not be a failure if workflow isn't fully implemented
     fi
 
-    # Step 7: Check wa watch logs for workflow execution
-    log_info "Step 7: Checking wa watch logs for workflow activity..."
+    # Step 7: Check ft watch logs for workflow execution
+    log_info "Step 7: Checking ft watch logs for workflow activity..."
     if grep -qi "workflow\|compaction\|detection" "$scenario_dir/wa_watch.log" 2>/dev/null; then
         log_pass "Found workflow/detection activity in logs"
     else
@@ -1084,8 +1084,8 @@ run_scenario_compaction_workflow() {
 run_scenario_unhandled_event_lifecycle() {
     local scenario_dir="$1"
     local temp_workspace
-    temp_workspace=$(mktemp -d /tmp/wa-e2e-unhandled-XXXXXX)
-    local wa_pid=""
+    temp_workspace=$(mktemp -d /tmp/ft-e2e-unhandled-XXXXXX)
+    local ft_pid=""
     local pane_id=""
     local result=0
     local wait_timeout=${TIMEOUT:-45}
@@ -1094,26 +1094,26 @@ run_scenario_unhandled_event_lifecycle() {
     log_info "Workspace: $temp_workspace"
 
     # Setup environment for isolated wa instance
-    export WA_DATA_DIR="$temp_workspace/.wa"
+    export FT_DATA_DIR="$temp_workspace/.ft"
     export FT_WORKSPACE="$temp_workspace"
-    mkdir -p "$WA_DATA_DIR"
+    mkdir -p "$FT_DATA_DIR"
 
     # Copy baseline config for workflow testing
     local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
     if [[ -f "$baseline_config" ]]; then
         cp "$baseline_config" "$temp_workspace/ft.toml"
-        export WA_CONFIG="$temp_workspace/ft.toml"
+        export FT_CONFIG="$temp_workspace/ft.toml"
         log_verbose "Using baseline config: $baseline_config"
     fi
 
     # Cleanup function
     cleanup_unhandled_event_lifecycle() {
         log_verbose "Cleaning up unhandled_event_lifecycle scenario"
-        # Kill wa watch if running
-        if [[ -n "$wa_pid" ]] && kill -0 "$wa_pid" 2>/dev/null; then
-            log_verbose "Stopping wa watch (pid $wa_pid)"
-            kill "$wa_pid" 2>/dev/null || true
-            wait "$wa_pid" 2>/dev/null || true
+        # Kill ft watch if running
+        if [[ -n "$ft_pid" ]] && kill -0 "$ft_pid" 2>/dev/null; then
+            log_verbose "Stopping ft watch (pid $ft_pid)"
+            kill "$ft_pid" 2>/dev/null || true
+            wait "$ft_pid" 2>/dev/null || true
         fi
         # Close dummy pane if it exists
         if [[ -n "$pane_id" ]]; then
@@ -1122,23 +1122,23 @@ run_scenario_unhandled_event_lifecycle() {
         fi
         # Copy artifacts before cleanup
         if [[ -d "$temp_workspace" ]]; then
-            cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp -r "$temp_workspace/.ft"/* "$scenario_dir/" 2>/dev/null || true
             cp "$temp_workspace/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
         rm -rf "$temp_workspace"
     }
     trap cleanup_unhandled_event_lifecycle EXIT
 
-    # Step 1: Start wa watch (manual workflow trigger)
-    log_info "Step 1: Starting wa watch..."
+    # Step 1: Start ft watch (manual workflow trigger)
+    log_info "Step 1: Starting ft watch..."
     "$FT_BINARY" watch --foreground \
         > "$scenario_dir/wa_watch.log" 2>&1 &
-    wa_pid=$!
-    log_verbose "wa watch started with PID $wa_pid"
-    echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
+    ft_pid=$!
+    log_verbose "ft watch started with PID $ft_pid"
+    echo "ft_pid: $ft_pid" >> "$scenario_dir/scenario.log"
 
-    if ! kill -0 "$wa_pid" 2>/dev/null; then
-        log_fail "wa watch exited immediately"
+    if ! kill -0 "$ft_pid" 2>/dev/null; then
+        log_fail "ft watch exited immediately"
         return 1
     fi
 
@@ -1295,8 +1295,8 @@ run_scenario_unhandled_event_lifecycle() {
         log_warn "Database file not found at $db_path"
     fi
 
-    # Step 10: Check wa watch logs for workflow activity
-    log_info "Step 10: Checking wa watch logs for workflow activity..."
+    # Step 10: Check ft watch logs for workflow activity
+    log_info "Step 10: Checking ft watch logs for workflow activity..."
     if [[ -n "$recommended_workflow" ]]; then
         if grep -qi "$recommended_workflow" "$scenario_dir/wa_watch.log" 2>/dev/null; then
             log_pass "Workflow activity found in logs"
@@ -1311,12 +1311,12 @@ run_scenario_unhandled_event_lifecycle() {
         fi
     fi
 
-    # Step 11: Stop wa watch gracefully
-    log_info "Step 11: Stopping wa watch..."
-    kill -TERM "$wa_pid" 2>/dev/null || true
-    wait "$wa_pid" 2>/dev/null || true
-    wa_pid=""
-    log_verbose "wa watch stopped"
+    # Step 11: Stop ft watch gracefully
+    log_info "Step 11: Stopping ft watch..."
+    kill -TERM "$ft_pid" 2>/dev/null || true
+    wait "$ft_pid" 2>/dev/null || true
+    ft_pid=""
+    log_verbose "ft watch stopped"
 
     trap - EXIT
     cleanup_unhandled_event_lifecycle
@@ -1327,18 +1327,18 @@ run_scenario_unhandled_event_lifecycle() {
 run_scenario_usage_limit_safe_pause() {
     local scenario_dir="$1"
     local temp_workspace
-    temp_workspace=$(mktemp -d /tmp/wa-e2e-usage-limit-XXXXXX)
+    temp_workspace=$(mktemp -d /tmp/ft-e2e-usage-limit-XXXXXX)
     local temp_bin="$temp_workspace/bin"
     local fake_caut="$temp_bin/caut"
-    local wa_pid=""
-    local wa_pid_restart=""
+    local ft_pid=""
+    local ft_pid_restart=""
     local pane_id=""
     local result=0
     local wait_timeout=${TIMEOUT:-90}
     local old_path="$PATH"
-    local old_wa_data_dir="${WA_DATA_DIR:-}"
-    local old_wa_workspace="${FT_WORKSPACE:-}"
-    local old_wa_config="${WA_CONFIG:-}"
+    local old_ft_data_dir="${FT_DATA_DIR:-}"
+    local old_ft_workspace="${FT_WORKSPACE:-}"
+    local old_ft_config="${FT_CONFIG:-}"
     local old_caut_mode="${CAUT_FAKE_MODE:-}"
     local old_caut_log="${CAUT_FAKE_LOG:-}"
 
@@ -1346,35 +1346,35 @@ run_scenario_usage_limit_safe_pause() {
 
     cleanup_usage_limit_safe_pause() {
         log_verbose "Cleaning up usage_limit_safe_pause scenario"
-        if [[ -n "${wa_pid:-}" ]] && kill -0 "$wa_pid" 2>/dev/null; then
-            log_verbose "Stopping wa watch (pid $wa_pid)"
-            kill "$wa_pid" 2>/dev/null || true
-            wait "$wa_pid" 2>/dev/null || true
+        if [[ -n "${ft_pid:-}" ]] && kill -0 "$ft_pid" 2>/dev/null; then
+            log_verbose "Stopping ft watch (pid $ft_pid)"
+            kill "$ft_pid" 2>/dev/null || true
+            wait "$ft_pid" 2>/dev/null || true
         fi
-        if [[ -n "${wa_pid_restart:-}" ]] && kill -0 "$wa_pid_restart" 2>/dev/null; then
-            log_verbose "Stopping wa watch restart (pid $wa_pid_restart)"
-            kill "$wa_pid_restart" 2>/dev/null || true
-            wait "$wa_pid_restart" 2>/dev/null || true
+        if [[ -n "${ft_pid_restart:-}" ]] && kill -0 "$ft_pid_restart" 2>/dev/null; then
+            log_verbose "Stopping ft watch restart (pid $ft_pid_restart)"
+            kill "$ft_pid_restart" 2>/dev/null || true
+            wait "$ft_pid_restart" 2>/dev/null || true
         fi
         if [[ -n "${pane_id:-}" ]]; then
             log_verbose "Closing dummy agent pane $pane_id"
             wezterm cli kill-pane --pane-id "$pane_id" 2>/dev/null || true
         fi
         export PATH="$old_path"
-        if [[ -n "$old_wa_data_dir" ]]; then
-            export WA_DATA_DIR="$old_wa_data_dir"
+        if [[ -n "$old_ft_data_dir" ]]; then
+            export FT_DATA_DIR="$old_ft_data_dir"
         else
-            unset WA_DATA_DIR
+            unset FT_DATA_DIR
         fi
-        if [[ -n "$old_wa_workspace" ]]; then
-            export FT_WORKSPACE="$old_wa_workspace"
+        if [[ -n "$old_ft_workspace" ]]; then
+            export FT_WORKSPACE="$old_ft_workspace"
         else
             unset FT_WORKSPACE
         fi
-        if [[ -n "$old_wa_config" ]]; then
-            export WA_CONFIG="$old_wa_config"
+        if [[ -n "$old_ft_config" ]]; then
+            export FT_CONFIG="$old_ft_config"
         else
-            unset WA_CONFIG
+            unset FT_CONFIG
         fi
         if [[ -n "$old_caut_mode" ]]; then
             export CAUT_FAKE_MODE="$old_caut_mode"
@@ -1387,7 +1387,7 @@ run_scenario_usage_limit_safe_pause() {
             unset CAUT_FAKE_LOG
         fi
         if [[ -d "${temp_workspace:-}" ]]; then
-            cp -r "${temp_workspace}/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp -r "${temp_workspace}/.ft"/* "$scenario_dir/" 2>/dev/null || true
             cp "${temp_workspace}/ft.toml" "$scenario_dir/" 2>/dev/null || true
             cp "${temp_workspace}/caut_invocations.log" "$scenario_dir/" 2>/dev/null || true
         fi
@@ -1480,30 +1480,30 @@ EOF
 
     # Step 1: Configure isolated workspace
     log_info "Step 1: Preparing isolated workspace..."
-    export WA_DATA_DIR="$temp_workspace/.wa"
+    export FT_DATA_DIR="$temp_workspace/.ft"
     export FT_WORKSPACE="$temp_workspace"
-    mkdir -p "$WA_DATA_DIR"
+    mkdir -p "$FT_DATA_DIR"
 
     local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
     if [[ -f "$baseline_config" ]]; then
         cp "$baseline_config" "$temp_workspace/ft.toml"
-        export WA_CONFIG="$temp_workspace/ft.toml"
+        export FT_CONFIG="$temp_workspace/ft.toml"
         log_verbose "Using baseline config: $baseline_config"
     else
         log_fail "Baseline config not found: $baseline_config"
         return 1
     fi
 
-    # Step 2: Start wa watch with auto-handle
-    log_info "Step 2: Starting wa watch with --auto-handle..."
+    # Step 2: Start ft watch with auto-handle
+    log_info "Step 2: Starting ft watch with --auto-handle..."
     "$FT_BINARY" watch --foreground --auto-handle --config "$temp_workspace/ft.toml" \
         > "$scenario_dir/wa_watch_1.log" 2>&1 &
-    wa_pid=$!
-    log_verbose "wa watch started with PID $wa_pid"
-    echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
+    ft_pid=$!
+    log_verbose "ft watch started with PID $ft_pid"
+    echo "ft_pid: $ft_pid" >> "$scenario_dir/scenario.log"
 
-    if ! kill -0 "$wa_pid" 2>/dev/null; then
-        log_fail "wa watch exited immediately"
+    if ! kill -0 "$ft_pid" 2>/dev/null; then
+        log_fail "ft watch exited immediately"
         return 1
     fi
 
@@ -1644,20 +1644,20 @@ EOF
         result=1
     fi
 
-    # Step 10: Stop wa watch and restart to verify persistence
-    log_info "Step 10: Restarting wa watch to verify plan persistence..."
-    kill -TERM "$wa_pid" 2>/dev/null || true
-    wait "$wa_pid" 2>/dev/null || true
-    wa_pid=""
+    # Step 10: Stop ft watch and restart to verify persistence
+    log_info "Step 10: Restarting ft watch to verify plan persistence..."
+    kill -TERM "$ft_pid" 2>/dev/null || true
+    wait "$ft_pid" 2>/dev/null || true
+    ft_pid=""
 
     "$FT_BINARY" watch --foreground --auto-handle --config "$temp_workspace/ft.toml" \
         > "$scenario_dir/wa_watch_2.log" 2>&1 &
-    wa_pid_restart=$!
-    log_verbose "wa watch restart PID $wa_pid_restart"
-    echo "wa_pid_restart: $wa_pid_restart" >> "$scenario_dir/scenario.log"
+    ft_pid_restart=$!
+    log_verbose "ft watch restart PID $ft_pid_restart"
+    echo "ft_pid_restart: $ft_pid_restart" >> "$scenario_dir/scenario.log"
 
-    if ! kill -0 "$wa_pid_restart" 2>/dev/null; then
-        log_fail "wa watch restart exited immediately"
+    if ! kill -0 "$ft_pid_restart" 2>/dev/null; then
+        log_fail "ft watch restart exited immediately"
         result=1
     fi
 
@@ -1677,12 +1677,12 @@ EOF
         result=1
     fi
 
-    # Step 11: Stop wa watch restart
-    log_info "Step 11: Stopping wa watch restart..."
-    kill -TERM "$wa_pid_restart" 2>/dev/null || true
-    wait "$wa_pid_restart" 2>/dev/null || true
-    wa_pid_restart=""
-    log_verbose "wa watch restart stopped"
+    # Step 11: Stop ft watch restart
+    log_info "Step 11: Stopping ft watch restart..."
+    kill -TERM "$ft_pid_restart" 2>/dev/null || true
+    wait "$ft_pid_restart" 2>/dev/null || true
+    ft_pid_restart=""
+    log_verbose "ft watch restart stopped"
 
     trap - EXIT
     cleanup_usage_limit_safe_pause
@@ -1693,8 +1693,8 @@ EOF
 run_scenario_notification_webhook() {
     local scenario_dir="$1"
     local temp_workspace
-    temp_workspace=$(mktemp -d /tmp/wa-e2e-notify-XXXXXX)
-    local wa_pid=""
+    temp_workspace=$(mktemp -d /tmp/ft-e2e-notify-XXXXXX)
+    local ft_pid=""
     local mock_pid=""
     local pane_id=""
     local result=0
@@ -1705,9 +1705,9 @@ run_scenario_notification_webhook() {
     local throttle_script="$temp_workspace/emit_compaction_throttle.sh"
     local mock_port=""
     local mock_addr=""
-    local old_wa_data_dir="${WA_DATA_DIR:-}"
-    local old_wa_workspace="${FT_WORKSPACE:-}"
-    local old_wa_config="${WA_CONFIG:-}"
+    local old_ft_data_dir="${FT_DATA_DIR:-}"
+    local old_ft_workspace="${FT_WORKSPACE:-}"
+    local old_ft_config="${FT_CONFIG:-}"
 
     log_info "Workspace: $temp_workspace"
 
@@ -1727,32 +1727,32 @@ run_scenario_notification_webhook() {
             kill "$mock_pid" 2>/dev/null || true
             wait "$mock_pid" 2>/dev/null || true
         fi
-        if [[ -n "${wa_pid:-}" ]] && kill -0 "$wa_pid" 2>/dev/null; then
-            log_verbose "Stopping wa watch (pid $wa_pid)"
-            kill "$wa_pid" 2>/dev/null || true
-            wait "$wa_pid" 2>/dev/null || true
+        if [[ -n "${ft_pid:-}" ]] && kill -0 "$ft_pid" 2>/dev/null; then
+            log_verbose "Stopping ft watch (pid $ft_pid)"
+            kill "$ft_pid" 2>/dev/null || true
+            wait "$ft_pid" 2>/dev/null || true
         fi
         if [[ -n "${pane_id:-}" ]]; then
             log_verbose "Closing pane $pane_id"
             wezterm cli kill-pane --pane-id "$pane_id" 2>/dev/null || true
         fi
-        if [[ -n "$old_wa_data_dir" ]]; then
-            export WA_DATA_DIR="$old_wa_data_dir"
+        if [[ -n "$old_ft_data_dir" ]]; then
+            export FT_DATA_DIR="$old_ft_data_dir"
         else
-            unset WA_DATA_DIR
+            unset FT_DATA_DIR
         fi
-        if [[ -n "$old_wa_workspace" ]]; then
-            export FT_WORKSPACE="$old_wa_workspace"
+        if [[ -n "$old_ft_workspace" ]]; then
+            export FT_WORKSPACE="$old_ft_workspace"
         else
             unset FT_WORKSPACE
         fi
-        if [[ -n "$old_wa_config" ]]; then
-            export WA_CONFIG="$old_wa_config"
+        if [[ -n "$old_ft_config" ]]; then
+            export FT_CONFIG="$old_ft_config"
         else
-            unset WA_CONFIG
+            unset FT_CONFIG
         fi
         if [[ -d "${temp_workspace:-}" ]]; then
-            cp -r "${temp_workspace}/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp -r "${temp_workspace}/.ft"/* "$scenario_dir/" 2>/dev/null || true
             cp "${temp_workspace}/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
         rm -rf "${temp_workspace:-}"
@@ -2021,9 +2021,9 @@ PY
 
     # Step 1: Configure isolated workspace and notifications
     log_info "Step 1: Preparing workspace + notifications config..."
-    export WA_DATA_DIR="$temp_workspace/.wa"
+    export FT_DATA_DIR="$temp_workspace/.ft"
     export FT_WORKSPACE="$temp_workspace"
-    mkdir -p "$WA_DATA_DIR"
+    mkdir -p "$FT_DATA_DIR"
 
     local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
     if [[ -f "$baseline_config" ]]; then
@@ -2049,22 +2049,22 @@ template = "generic"
 events = ["codex:compaction"]
 EOF
 
-    export WA_CONFIG="$temp_workspace/ft.toml"
+    export FT_CONFIG="$temp_workspace/ft.toml"
     log_pass "Notifications configured for $mock_addr"
 
-    # Step 2: Start wa watch
-    log_info "Step 2: Starting wa watch..."
+    # Step 2: Start ft watch
+    log_info "Step 2: Starting ft watch..."
     "$FT_BINARY" watch --foreground --config "$temp_workspace/ft.toml" \
         > "$scenario_dir/wa_watch.log" 2>&1 &
-    wa_pid=$!
-    echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
+    ft_pid=$!
+    echo "ft_pid: $ft_pid" >> "$scenario_dir/scenario.log"
 
-    local check_watch_cmd="kill -0 $wa_pid 2>/dev/null"
-    if ! wait_for_condition "wa watch running" "$check_watch_cmd" "$wait_timeout"; then
-        log_fail "wa watch failed to start"
+    local check_watch_cmd="kill -0 $ft_pid 2>/dev/null"
+    if ! wait_for_condition "ft watch running" "$check_watch_cmd" "$wait_timeout"; then
+        log_fail "ft watch failed to start"
         return 1
     fi
-    log_pass "wa watch running"
+    log_pass "ft watch running"
 
     # Step 3: Successful delivery
     log_info "Step 3: Successful webhook delivery..."
@@ -2239,8 +2239,8 @@ EOF
 run_scenario_watch_notify_only() {
     local scenario_dir="$1"
     local temp_workspace
-    temp_workspace=$(mktemp -d /tmp/wa-e2e-notify-only-XXXXXX)
-    local wa_pid=""
+    temp_workspace=$(mktemp -d /tmp/ft-e2e-notify-only-XXXXXX)
+    local ft_pid=""
     local mock_pid=""
     local pane_usage=""
     local pane_token=""
@@ -2254,9 +2254,9 @@ run_scenario_watch_notify_only() {
     local burst_script="$temp_workspace/emit_usage_limit_burst.sh"
     local mock_port=""
     local mock_addr=""
-    local old_wa_data_dir="${WA_DATA_DIR:-}"
-    local old_wa_workspace="${FT_WORKSPACE:-}"
-    local old_wa_config="${WA_CONFIG:-}"
+    local old_ft_data_dir="${FT_DATA_DIR:-}"
+    local old_ft_workspace="${FT_WORKSPACE:-}"
+    local old_ft_config="${FT_CONFIG:-}"
 
     log_info "Workspace: $temp_workspace"
 
@@ -2276,10 +2276,10 @@ run_scenario_watch_notify_only() {
             kill "$mock_pid" 2>/dev/null || true
             wait "$mock_pid" 2>/dev/null || true
         fi
-        if [[ -n "${wa_pid:-}" ]] && kill -0 "$wa_pid" 2>/dev/null; then
-            log_verbose "Stopping wa watch (pid $wa_pid)"
-            kill "$wa_pid" 2>/dev/null || true
-            wait "$wa_pid" 2>/dev/null || true
+        if [[ -n "${ft_pid:-}" ]] && kill -0 "$ft_pid" 2>/dev/null; then
+            log_verbose "Stopping ft watch (pid $ft_pid)"
+            kill "$ft_pid" 2>/dev/null || true
+            wait "$ft_pid" 2>/dev/null || true
         fi
         for pane in "$pane_usage" "$pane_token" "$pane_burst"; do
             if [[ -n "$pane" ]]; then
@@ -2287,23 +2287,23 @@ run_scenario_watch_notify_only() {
                 wezterm cli kill-pane --pane-id "$pane" 2>/dev/null || true
             fi
         done
-        if [[ -n "$old_wa_data_dir" ]]; then
-            export WA_DATA_DIR="$old_wa_data_dir"
+        if [[ -n "$old_ft_data_dir" ]]; then
+            export FT_DATA_DIR="$old_ft_data_dir"
         else
-            unset WA_DATA_DIR
+            unset FT_DATA_DIR
         fi
-        if [[ -n "$old_wa_workspace" ]]; then
-            export FT_WORKSPACE="$old_wa_workspace"
+        if [[ -n "$old_ft_workspace" ]]; then
+            export FT_WORKSPACE="$old_ft_workspace"
         else
             unset FT_WORKSPACE
         fi
-        if [[ -n "$old_wa_config" ]]; then
-            export WA_CONFIG="$old_wa_config"
+        if [[ -n "$old_ft_config" ]]; then
+            export FT_CONFIG="$old_ft_config"
         else
-            unset WA_CONFIG
+            unset FT_CONFIG
         fi
         if [[ -d "${temp_workspace:-}" ]]; then
-            cp -r "${temp_workspace}/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp -r "${temp_workspace}/.ft"/* "$scenario_dir/" 2>/dev/null || true
             cp "${temp_workspace}/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
         rm -rf "${temp_workspace:-}"
@@ -2547,37 +2547,37 @@ PY
         local log_file="$1"
         shift
 
-        if [[ -n "${wa_pid:-}" ]] && kill -0 "$wa_pid" 2>/dev/null; then
-            kill "$wa_pid" 2>/dev/null || true
-            wait "$wa_pid" 2>/dev/null || true
+        if [[ -n "${ft_pid:-}" ]] && kill -0 "$ft_pid" 2>/dev/null; then
+            kill "$ft_pid" 2>/dev/null || true
+            wait "$ft_pid" 2>/dev/null || true
         fi
 
         "$FT_BINARY" watch --foreground --config "$temp_workspace/ft.toml" "$@" \
             > "$log_file" 2>&1 &
-        wa_pid=$!
-        echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
+        ft_pid=$!
+        echo "ft_pid: $ft_pid" >> "$scenario_dir/scenario.log"
 
-        local check_watch_cmd="kill -0 $wa_pid 2>/dev/null"
-        if ! wait_for_condition "wa watch running" "$check_watch_cmd" "$wait_timeout"; then
-            log_fail "wa watch failed to start"
+        local check_watch_cmd="kill -0 $ft_pid 2>/dev/null"
+        if ! wait_for_condition "ft watch running" "$check_watch_cmd" "$wait_timeout"; then
+            log_fail "ft watch failed to start"
             return 1
         fi
         return 0
     }
 
     stop_wa_watch() {
-        if [[ -n "${wa_pid:-}" ]] && kill -0 "$wa_pid" 2>/dev/null; then
-            kill -TERM "$wa_pid" 2>/dev/null || true
-            wait "$wa_pid" 2>/dev/null || true
+        if [[ -n "${ft_pid:-}" ]] && kill -0 "$ft_pid" 2>/dev/null; then
+            kill -TERM "$ft_pid" 2>/dev/null || true
+            wait "$ft_pid" 2>/dev/null || true
         fi
-        wa_pid=""
+        ft_pid=""
     }
 
     # Step 1: Configure isolated workspace and notifications
     log_info "Step 1: Preparing workspace + notifications config..."
-    export WA_DATA_DIR="$temp_workspace/.wa"
+    export FT_DATA_DIR="$temp_workspace/.ft"
     export FT_WORKSPACE="$temp_workspace"
-    mkdir -p "$WA_DATA_DIR"
+    mkdir -p "$FT_DATA_DIR"
 
     local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
     if [[ -f "$baseline_config" ]]; then
@@ -2602,7 +2602,7 @@ url = "${mock_addr}/webhook"
 template = "generic"
 EOF
 
-    export WA_CONFIG="$temp_workspace/ft.toml"
+    export FT_CONFIG="$temp_workspace/ft.toml"
     log_pass "Notify-only config written"
 
     if ! start_mock_server; then
@@ -2610,7 +2610,7 @@ EOF
     fi
 
     # Step 2: Notify-only mode delivers notifications but does not auto-handle
-    log_info "Step 2: Starting wa watch (notify-only baseline)..."
+    log_info "Step 2: Starting ft watch (notify-only baseline)..."
     if ! start_wa_watch "$scenario_dir/wa_watch_notify_only.log" --notify-only; then
         return 1
     fi
@@ -2708,7 +2708,7 @@ EOF
     fi
 
     # Step 5: Notification filter only delivers matching events
-    log_info "Step 5: Restarting wa watch with notify filter..."
+    log_info "Step 5: Restarting ft watch with notify filter..."
     reset_mock_server
     stop_wa_watch
     if ! start_wa_watch "$scenario_dir/wa_watch_notify_filter.log" \
@@ -2814,34 +2814,34 @@ EOF
 run_scenario_policy_denial() {
     local scenario_dir="$1"
     local temp_workspace
-    temp_workspace=$(mktemp -d /tmp/wa-e2e-XXXXXX)
-    local wa_pid=""
+    temp_workspace=$(mktemp -d /tmp/ft-e2e-XXXXXX)
+    local ft_pid=""
     local pane_id=""
     local result=0
 
     log_info "Workspace: $temp_workspace"
 
     # Setup environment for isolated wa instance with strict config
-    export WA_DATA_DIR="$temp_workspace/.wa"
+    export FT_DATA_DIR="$temp_workspace/.ft"
     export FT_WORKSPACE="$temp_workspace"
-    mkdir -p "$WA_DATA_DIR"
+    mkdir -p "$FT_DATA_DIR"
 
     # Copy strict config for policy testing
     local strict_config="$PROJECT_ROOT/fixtures/e2e/config_strict.toml"
     if [[ -f "$strict_config" ]]; then
         cp "$strict_config" "$temp_workspace/ft.toml"
-        export WA_CONFIG="$temp_workspace/ft.toml"
+        export FT_CONFIG="$temp_workspace/ft.toml"
         log_verbose "Using strict config: $strict_config"
     fi
 
     # Cleanup function
     cleanup_policy_denial() {
         log_verbose "Cleaning up policy_denial scenario"
-        # Kill wa watch if running
-        if [[ -n "$wa_pid" ]] && kill -0 "$wa_pid" 2>/dev/null; then
-            log_verbose "Stopping wa watch (pid $wa_pid)"
-            kill "$wa_pid" 2>/dev/null || true
-            wait "$wa_pid" 2>/dev/null || true
+        # Kill ft watch if running
+        if [[ -n "$ft_pid" ]] && kill -0 "$ft_pid" 2>/dev/null; then
+            log_verbose "Stopping ft watch (pid $ft_pid)"
+            kill "$ft_pid" 2>/dev/null || true
+            wait "$ft_pid" 2>/dev/null || true
         fi
         # Close alt-screen pane if it exists
         if [[ -n "$pane_id" ]]; then
@@ -2850,7 +2850,7 @@ run_scenario_policy_denial() {
         fi
         # Copy artifacts before cleanup
         if [[ -d "$temp_workspace" ]]; then
-            cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp -r "$temp_workspace/.ft"/* "$scenario_dir/" 2>/dev/null || true
             cp "$temp_workspace/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
         rm -rf "$temp_workspace"
@@ -2884,17 +2884,17 @@ run_scenario_policy_denial() {
         log_warn "Alt-screen banner not observed yet; continuing (policy may still block)"
     fi
 
-    # Step 2: Start wa watch in background
-    log_info "Step 2: Starting wa watch..."
+    # Step 2: Start ft watch in background
+    log_info "Step 2: Starting ft watch..."
     "$FT_BINARY" watch --foreground \
         > "$scenario_dir/wa_watch.log" 2>&1 &
-    wa_pid=$!
-    log_verbose "wa watch started with PID $wa_pid"
-    echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
+    ft_pid=$!
+    log_verbose "ft watch started with PID $ft_pid"
+    echo "ft_pid: $ft_pid" >> "$scenario_dir/scenario.log"
 
-    # Verify wa watch is running
-    if ! kill -0 "$wa_pid" 2>/dev/null; then
-        log_fail "wa watch exited immediately"
+    # Verify ft watch is running
+    if ! kill -0 "$ft_pid" 2>/dev/null; then
+        log_fail "ft watch exited immediately"
         return 1
     fi
 
@@ -2996,8 +2996,8 @@ run_scenario_policy_denial() {
 run_scenario_audit_tail_streaming() {
     local scenario_dir="$1"
     local temp_workspace
-    temp_workspace=$(mktemp -d /tmp/wa-e2e-audit-tail-XXXXXX)
-    local wa_pid=""
+    temp_workspace=$(mktemp -d /tmp/ft-e2e-audit-tail-XXXXXX)
+    local ft_pid=""
     local pane_id=""
     local tail_pid=""
     local result=0
@@ -3006,14 +3006,14 @@ run_scenario_audit_tail_streaming() {
     log_info "Workspace: $temp_workspace"
 
     # Setup environment for isolated wa instance
-    export WA_DATA_DIR="$temp_workspace/.wa"
+    export FT_DATA_DIR="$temp_workspace/.ft"
     export FT_WORKSPACE="$temp_workspace"
-    mkdir -p "$WA_DATA_DIR"
+    mkdir -p "$FT_DATA_DIR"
 
     local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
     if [[ -f "$baseline_config" ]]; then
         cp "$baseline_config" "$temp_workspace/ft.toml"
-        export WA_CONFIG="$temp_workspace/ft.toml"
+        export FT_CONFIG="$temp_workspace/ft.toml"
         log_verbose "Using baseline config: $baseline_config"
     fi
 
@@ -3024,17 +3024,17 @@ run_scenario_audit_tail_streaming() {
             kill "$tail_pid" 2>/dev/null || true
             wait "$tail_pid" 2>/dev/null || true
         fi
-        if [[ -n "$wa_pid" ]] && kill -0 "$wa_pid" 2>/dev/null; then
-            log_verbose "Stopping wa watch (pid $wa_pid)"
-            kill "$wa_pid" 2>/dev/null || true
-            wait "$wa_pid" 2>/dev/null || true
+        if [[ -n "$ft_pid" ]] && kill -0 "$ft_pid" 2>/dev/null; then
+            log_verbose "Stopping ft watch (pid $ft_pid)"
+            kill "$ft_pid" 2>/dev/null || true
+            wait "$ft_pid" 2>/dev/null || true
         fi
         if [[ -n "$pane_id" ]]; then
             log_verbose "Closing pane $pane_id"
             wezterm cli kill-pane --pane-id "$pane_id" 2>/dev/null || true
         fi
         if [[ -d "$temp_workspace" ]]; then
-            cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp -r "$temp_workspace/.ft"/* "$scenario_dir/" 2>/dev/null || true
             cp "$temp_workspace/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
         rm -rf "$temp_workspace"
@@ -3067,13 +3067,13 @@ run_scenario_audit_tail_streaming() {
         log_warn "Alt-screen banner not observed yet; continuing (denial may still work)"
     fi
 
-    # Step 2: Start wa watch in background
-    log_info "Step 2: Starting wa watch..."
+    # Step 2: Start ft watch in background
+    log_info "Step 2: Starting ft watch..."
     "$FT_BINARY" watch --foreground \
         > "$scenario_dir/wa_watch.log" 2>&1 &
-    wa_pid=$!
-    log_verbose "wa watch started with PID $wa_pid"
-    echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
+    ft_pid=$!
+    log_verbose "ft watch started with PID $ft_pid"
+    echo "ft_pid: $ft_pid" >> "$scenario_dir/scenario.log"
 
     # Step 3: Wait for pane to be observed
     log_info "Step 3: Waiting for pane to be observed..."
@@ -3160,8 +3160,8 @@ run_scenario_audit_tail_streaming() {
 run_scenario_ipc_rpc_roundtrip() {
     local scenario_dir="$1"
     local temp_workspace
-    temp_workspace=$(mktemp -d /tmp/wa-e2e-ipc-XXXXXX)
-    local wa_pid=""
+    temp_workspace=$(mktemp -d /tmp/ft-e2e-ipc-XXXXXX)
+    local ft_pid=""
     local result=0
     local read_token="e2e-read-$(date +%s%N)"
     local write_token="e2e-write-$(date +%s%N)"
@@ -3171,9 +3171,9 @@ run_scenario_ipc_rpc_roundtrip() {
 
     log_info "Workspace: $temp_workspace"
 
-    export WA_DATA_DIR="$temp_workspace/.wa"
+    export FT_DATA_DIR="$temp_workspace/.ft"
     export FT_WORKSPACE="$temp_workspace"
-    mkdir -p "$WA_DATA_DIR"
+    mkdir -p "$FT_DATA_DIR"
 
     local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
     if [[ -f "$baseline_config" ]]; then
@@ -3196,17 +3196,17 @@ token = "$write_token"
 scopes = ["write"]
 EOF
 
-    export WA_CONFIG="$temp_workspace/ft.toml"
+    export FT_CONFIG="$temp_workspace/ft.toml"
 
     cleanup_ipc_rpc_roundtrip() {
         log_verbose "Cleaning up ipc_rpc_roundtrip scenario"
-        if [[ -n "$wa_pid" ]] && kill -0 "$wa_pid" 2>/dev/null; then
-            log_verbose "Stopping wa watch (pid $wa_pid)"
-            kill "$wa_pid" 2>/dev/null || true
-            wait "$wa_pid" 2>/dev/null || true
+        if [[ -n "$ft_pid" ]] && kill -0 "$ft_pid" 2>/dev/null; then
+            log_verbose "Stopping ft watch (pid $ft_pid)"
+            kill "$ft_pid" 2>/dev/null || true
+            wait "$ft_pid" 2>/dev/null || true
         fi
         if [[ -d "$temp_workspace" ]]; then
-            cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp -r "$temp_workspace/.ft"/* "$scenario_dir/" 2>/dev/null || true
             cp "$temp_workspace/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
         rm -rf "$temp_workspace"
@@ -3238,21 +3238,21 @@ sys.stdout.write(data.decode("utf-8").strip())
 PY
     }
 
-    # Step 1: Start wa watch
-    log_info "Step 1: Starting wa watch..."
+    # Step 1: Start ft watch
+    log_info "Step 1: Starting ft watch..."
     "$FT_BINARY" watch --foreground --config "$temp_workspace/ft.toml" \
         > "$scenario_dir/wa_watch.log" 2>&1 &
-    wa_pid=$!
-    echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
+    ft_pid=$!
+    echo "ft_pid: $ft_pid" >> "$scenario_dir/scenario.log"
 
     local wait_timeout=${TIMEOUT:-30}
-    local check_watch_cmd="kill -0 $wa_pid 2>/dev/null"
-    if ! wait_for_condition "wa watch running" "$check_watch_cmd" "$wait_timeout"; then
-        log_fail "wa watch failed to start"
+    local check_watch_cmd="kill -0 $ft_pid 2>/dev/null"
+    if ! wait_for_condition "ft watch running" "$check_watch_cmd" "$wait_timeout"; then
+        log_fail "ft watch failed to start"
         return 1
     fi
 
-    local socket_path="$WA_DATA_DIR/ipc.sock"
+    local socket_path="$FT_DATA_DIR/ipc.sock"
     local check_socket_cmd="[[ -S \"$socket_path\" ]]"
     if ! wait_for_condition "ipc socket ready" "$check_socket_cmd" "$wait_timeout"; then
         log_fail "IPC socket not ready"
@@ -3352,16 +3352,16 @@ EOF
 run_scenario_prepare_commit_approvals() {
     local scenario_dir="$1"
     local temp_workspace
-    temp_workspace=$(mktemp -d /tmp/wa-e2e-prepare-commit-XXXXXX)
+    temp_workspace=$(mktemp -d /tmp/ft-e2e-prepare-commit-XXXXXX)
     local pane_id=""
     local result=0
 
     log_info "Workspace: $temp_workspace"
 
     # Setup environment for isolated wa instance
-    export WA_DATA_DIR="$temp_workspace/.wa"
+    export FT_DATA_DIR="$temp_workspace/.ft"
     export FT_WORKSPACE="$temp_workspace"
-    mkdir -p "$WA_DATA_DIR"
+    mkdir -p "$FT_DATA_DIR"
 
     # Build a permissive config that forces approval for send_text
     local config_path="$temp_workspace/ft.toml"
@@ -3393,7 +3393,7 @@ actions = ["send_text"]
 actors = ["human"]
 EOF
 
-    export WA_CONFIG="$config_path"
+    export FT_CONFIG="$config_path"
 
     cleanup_prepare_commit_approvals() {
         log_verbose "Cleaning up prepare_commit_approvals scenario"
@@ -3401,7 +3401,7 @@ EOF
             wezterm cli kill-pane --pane-id "$pane_id" 2>/dev/null || true
         fi
         if [[ -d "$temp_workspace" ]]; then
-            cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp -r "$temp_workspace/.ft"/* "$scenario_dir/" 2>/dev/null || true
             cp "$temp_workspace/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
         rm -rf "$temp_workspace"
@@ -3423,7 +3423,7 @@ EOF
     echo "pane_id: $pane_id" >> "$scenario_dir/scenario.log"
     echo "spawn_output: $spawn_output" >> "$scenario_dir/scenario.log"
 
-    local marker="WA_PREPARE_COMMIT_OK_$(date +%s%N)"
+    local marker="FT_PREPARE_COMMIT_OK_$(date +%s%N)"
     local send_text="echo $marker"
 
     # Step 2: Prepare plan (expect approval required)
@@ -3549,24 +3549,24 @@ EOF
 run_scenario_quickfix_suggestions() {
     local scenario_dir="$1"
     local temp_workspace
-    temp_workspace=$(mktemp -d /tmp/wa-e2e-quickfix-XXXXXX)
-    local wa_pid=""
+    temp_workspace=$(mktemp -d /tmp/ft-e2e-quickfix-XXXXXX)
+    local ft_pid=""
     local compaction_pane=""
     local alt_pane=""
     local result=0
     local wait_timeout=${TIMEOUT:-60}
-    local old_wa_data_dir="${WA_DATA_DIR:-}"
-    local old_wa_workspace="${FT_WORKSPACE:-}"
-    local old_wa_config="${WA_CONFIG:-}"
+    local old_ft_data_dir="${FT_DATA_DIR:-}"
+    local old_ft_workspace="${FT_WORKSPACE:-}"
+    local old_ft_config="${FT_CONFIG:-}"
 
     log_info "Workspace: $temp_workspace"
 
     cleanup_quickfix_suggestions() {
         log_verbose "Cleaning up quickfix_suggestions scenario"
-        if [[ -n "${wa_pid:-}" ]] && kill -0 "$wa_pid" 2>/dev/null; then
-            log_verbose "Stopping wa watch (pid $wa_pid)"
-            kill "$wa_pid" 2>/dev/null || true
-            wait "$wa_pid" 2>/dev/null || true
+        if [[ -n "${ft_pid:-}" ]] && kill -0 "$ft_pid" 2>/dev/null; then
+            log_verbose "Stopping ft watch (pid $ft_pid)"
+            kill "$ft_pid" 2>/dev/null || true
+            wait "$ft_pid" 2>/dev/null || true
         fi
         if [[ -n "${compaction_pane:-}" ]]; then
             log_verbose "Closing compaction pane $compaction_pane"
@@ -3577,23 +3577,23 @@ run_scenario_quickfix_suggestions() {
             wezterm cli kill-pane --pane-id "$alt_pane" 2>/dev/null || true
         fi
         if [[ -d "${temp_workspace:-}" ]]; then
-            cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp -r "$temp_workspace/.ft"/* "$scenario_dir/" 2>/dev/null || true
             cp "$temp_workspace/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
-        if [[ -n "$old_wa_data_dir" ]]; then
-            export WA_DATA_DIR="$old_wa_data_dir"
+        if [[ -n "$old_ft_data_dir" ]]; then
+            export FT_DATA_DIR="$old_ft_data_dir"
         else
-            unset WA_DATA_DIR
+            unset FT_DATA_DIR
         fi
-        if [[ -n "$old_wa_workspace" ]]; then
-            export FT_WORKSPACE="$old_wa_workspace"
+        if [[ -n "$old_ft_workspace" ]]; then
+            export FT_WORKSPACE="$old_ft_workspace"
         else
             unset FT_WORKSPACE
         fi
-        if [[ -n "$old_wa_config" ]]; then
-            export WA_CONFIG="$old_wa_config"
+        if [[ -n "$old_ft_config" ]]; then
+            export FT_CONFIG="$old_ft_config"
         else
-            unset WA_CONFIG
+            unset FT_CONFIG
         fi
         rm -rf "${temp_workspace:-}"
     }
@@ -3614,7 +3614,7 @@ run_scenario_quickfix_suggestions() {
 
     ipc_pane_state() {
         local target_pane="$1"
-        local socket_path="$WA_DATA_DIR/ipc.sock"
+        local socket_path="$FT_DATA_DIR/ipc.sock"
         python3 - "$socket_path" "$target_pane" <<'PY'
 import json
 import socket
@@ -3640,30 +3640,30 @@ PY
     }
 
     # Setup environment for isolated wa instance
-    export WA_DATA_DIR="$temp_workspace/.wa"
+    export FT_DATA_DIR="$temp_workspace/.ft"
     export FT_WORKSPACE="$temp_workspace"
-    mkdir -p "$WA_DATA_DIR"
+    mkdir -p "$FT_DATA_DIR"
 
     local strict_config="$PROJECT_ROOT/fixtures/e2e/config_strict.toml"
     if [[ -f "$strict_config" ]]; then
         cp "$strict_config" "$temp_workspace/ft.toml"
-        export WA_CONFIG="$temp_workspace/ft.toml"
+        export FT_CONFIG="$temp_workspace/ft.toml"
         log_verbose "Using strict config: $strict_config"
     fi
 
-    # Start wa watch
-    log_info "Step 1: Starting wa watch..."
+    # Start ft watch
+    log_info "Step 1: Starting ft watch..."
     "$FT_BINARY" watch --foreground --config "$temp_workspace/ft.toml" \
         > "$scenario_dir/wa_watch.log" 2>&1 &
-    wa_pid=$!
-    echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
+    ft_pid=$!
+    echo "ft_pid: $ft_pid" >> "$scenario_dir/scenario.log"
 
-    local check_watch_cmd="kill -0 $wa_pid 2>/dev/null"
-    if ! wait_for_condition "wa watch running" "$check_watch_cmd" "$wait_timeout"; then
-        log_fail "wa watch failed to start"
+    local check_watch_cmd="kill -0 $ft_pid 2>/dev/null"
+    if ! wait_for_condition "ft watch running" "$check_watch_cmd" "$wait_timeout"; then
+        log_fail "ft watch failed to start"
         return 1
     fi
-    log_pass "wa watch running"
+    log_pass "ft watch running"
 
     # Step 2: Emit a compaction marker to produce an unhandled event
     log_info "Step 2: Spawning compaction marker pane..."
@@ -3917,50 +3917,50 @@ EOF
 run_scenario_triage_multi_issue() {
     local scenario_dir="$1"
     local temp_workspace
-    temp_workspace=$(mktemp -d /tmp/wa-e2e-triage-XXXXXX)
+    temp_workspace=$(mktemp -d /tmp/ft-e2e-triage-XXXXXX)
     local result=0
     local db_path=""
     local pane_id=9001
-    local old_wa_data_dir="${WA_DATA_DIR:-}"
-    local old_wa_workspace="${FT_WORKSPACE:-}"
-    local old_wa_config="${WA_CONFIG:-}"
+    local old_ft_data_dir="${FT_DATA_DIR:-}"
+    local old_ft_workspace="${FT_WORKSPACE:-}"
+    local old_ft_config="${FT_CONFIG:-}"
 
     log_info "Workspace: $temp_workspace"
 
     cleanup_triage_multi_issue() {
         log_verbose "Cleaning up triage_multi_issue scenario"
         if [[ -d "${temp_workspace:-}" ]]; then
-            cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp -r "$temp_workspace/.ft"/* "$scenario_dir/" 2>/dev/null || true
             cp "$temp_workspace/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
-        if [[ -n "$old_wa_data_dir" ]]; then
-            export WA_DATA_DIR="$old_wa_data_dir"
+        if [[ -n "$old_ft_data_dir" ]]; then
+            export FT_DATA_DIR="$old_ft_data_dir"
         else
-            unset WA_DATA_DIR
+            unset FT_DATA_DIR
         fi
-        if [[ -n "$old_wa_workspace" ]]; then
-            export FT_WORKSPACE="$old_wa_workspace"
+        if [[ -n "$old_ft_workspace" ]]; then
+            export FT_WORKSPACE="$old_ft_workspace"
         else
             unset FT_WORKSPACE
         fi
-        if [[ -n "$old_wa_config" ]]; then
-            export WA_CONFIG="$old_wa_config"
+        if [[ -n "$old_ft_config" ]]; then
+            export FT_CONFIG="$old_ft_config"
         else
-            unset WA_CONFIG
+            unset FT_CONFIG
         fi
         rm -rf "${temp_workspace:-}"
     }
     trap cleanup_triage_multi_issue EXIT
 
     # Setup environment for isolated wa instance
-    export WA_DATA_DIR="$temp_workspace/.wa"
+    export FT_DATA_DIR="$temp_workspace/.ft"
     export FT_WORKSPACE="$temp_workspace"
-    mkdir -p "$WA_DATA_DIR"
+    mkdir -p "$FT_DATA_DIR"
 
     local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
     if [[ -f "$baseline_config" ]]; then
         cp "$baseline_config" "$temp_workspace/ft.toml"
-        export WA_CONFIG="$temp_workspace/ft.toml"
+        export FT_CONFIG="$temp_workspace/ft.toml"
         log_verbose "Using baseline config: $baseline_config"
     fi
 
@@ -4242,8 +4242,8 @@ run_scenario_stress_scale() {
     #   STRESS_LONG_RUN_SECS, STRESS_MEM_GROWTH_PCT_MAX
     local scenario_dir="$1"
     local temp_workspace
-    temp_workspace=$(mktemp -d /tmp/wa-e2e-stress-XXXXXX)
-    local wa_pid=""
+    temp_workspace=$(mktemp -d /tmp/ft-e2e-stress-XXXXXX)
+    local ft_pid=""
     local result=0
     local wait_timeout=${TIMEOUT:-120}
     local pane_count="${STRESS_PANES:-10}"
@@ -4272,16 +4272,16 @@ run_scenario_stress_scale() {
 
     cleanup_stress_scale() {
         log_verbose "Cleaning up stress_scale scenario"
-        if [[ -n "${wa_pid:-}" ]] && kill -0 "$wa_pid" 2>/dev/null; then
-            log_verbose "Stopping wa watch (pid $wa_pid)"
-            kill "$wa_pid" 2>/dev/null || true
-            wait "$wa_pid" 2>/dev/null || true
+        if [[ -n "${ft_pid:-}" ]] && kill -0 "$ft_pid" 2>/dev/null; then
+            log_verbose "Stopping ft watch (pid $ft_pid)"
+            kill "$ft_pid" 2>/dev/null || true
+            wait "$ft_pid" 2>/dev/null || true
         fi
         for pid in "${pane_ids[@]}"; do
             wezterm cli kill-pane --pane-id "$pid" 2>/dev/null || true
         done
         if [[ -d "${temp_workspace:-}" ]]; then
-            cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp -r "$temp_workspace/.ft"/* "$scenario_dir/" 2>/dev/null || true
             cp "$temp_workspace/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
         rm -rf "${temp_workspace:-}"
@@ -4309,29 +4309,29 @@ EOS
     chmod +x "$chatter_script"
 
     # Setup environment for isolated wa instance
-    export WA_DATA_DIR="$temp_workspace/.wa"
+    export FT_DATA_DIR="$temp_workspace/.ft"
     export FT_WORKSPACE="$temp_workspace"
-    mkdir -p "$WA_DATA_DIR"
+    mkdir -p "$FT_DATA_DIR"
 
     local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
     if [[ -f "$baseline_config" ]]; then
         cp "$baseline_config" "$temp_workspace/ft.toml"
     fi
-    export WA_CONFIG="$temp_workspace/ft.toml"
+    export FT_CONFIG="$temp_workspace/ft.toml"
 
-    # Start wa watch
-    log_info "Step 1: Starting wa watch..."
+    # Start ft watch
+    log_info "Step 1: Starting ft watch..."
     "$FT_BINARY" watch --foreground --config "$temp_workspace/ft.toml" \
         > "$scenario_dir/wa_watch.log" 2>&1 &
-    wa_pid=$!
-    echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
+    ft_pid=$!
+    echo "ft_pid: $ft_pid" >> "$scenario_dir/scenario.log"
 
-    local check_watch_cmd="kill -0 $wa_pid 2>/dev/null"
-    if ! wait_for_condition "wa watch running" "$check_watch_cmd" "$wait_timeout"; then
-        log_fail "wa watch failed to start"
+    local check_watch_cmd="kill -0 $ft_pid 2>/dev/null"
+    if ! wait_for_condition "ft watch running" "$check_watch_cmd" "$wait_timeout"; then
+        log_fail "ft watch failed to start"
         return 1
     fi
-    log_pass "wa watch running"
+    log_pass "ft watch running"
 
     # Step 2: Spawn multiple chatty panes
     log_info "Step 2: Spawning $pane_count chatty panes..."
@@ -4413,7 +4413,7 @@ EOS
     fi
 
     local ps_stats
-    ps_stats=$(ps -o %cpu= -o rss= -p "$wa_pid" 2>/dev/null | awk '{print $1, $2}')
+    ps_stats=$(ps -o %cpu= -o rss= -p "$ft_pid" 2>/dev/null | awk '{print $1, $2}')
     local cpu_pct="0"
     local rss_kb="0"
     if [[ -n "$ps_stats" ]]; then
@@ -4443,7 +4443,7 @@ EOS
         if [[ "$rss_kb_start" != "null" && "$rss_kb_start" -gt 0 ]]; then
             sleep "$long_run_secs"
             local rss_after
-            rss_after=$(ps -o rss= -p "$wa_pid" 2>/dev/null | awk '{print $1}')
+            rss_after=$(ps -o rss= -p "$ft_pid" 2>/dev/null | awk '{print $1}')
             if [[ -n "$rss_after" ]]; then
                 rss_kb_end="$rss_after"
                 mem_growth_pct=$(awk -v start="$rss_kb_start" -v end="$rss_kb_end" 'BEGIN { if (start <= 0) {print "null"; exit}; printf "%.2f", ((end - start) / start) * 100 }')
@@ -4545,8 +4545,8 @@ run_scenario_graceful_shutdown() {
     local scenario_dir="$1"
     local marker="E2E_SHUTDOWN_$(date +%s%N)"
     local temp_workspace
-    temp_workspace=$(mktemp -d /tmp/wa-e2e-XXXXXX)
-    local wa_pid=""
+    temp_workspace=$(mktemp -d /tmp/ft-e2e-XXXXXX)
+    local ft_pid=""
     local pane_id=""
     local result=0
 
@@ -4554,18 +4554,18 @@ run_scenario_graceful_shutdown() {
     log_info "Workspace: $temp_workspace"
 
     # Setup environment for isolated wa instance
-    export WA_DATA_DIR="$temp_workspace/.wa"
+    export FT_DATA_DIR="$temp_workspace/.ft"
     export FT_WORKSPACE="$temp_workspace"
-    mkdir -p "$WA_DATA_DIR"
+    mkdir -p "$FT_DATA_DIR"
 
     # Cleanup function
     cleanup_graceful_shutdown() {
         log_verbose "Cleaning up graceful_shutdown scenario"
-        # Kill wa watch if still running (should have exited gracefully)
-        if [[ -n "${wa_pid:-}" ]] && kill -0 "$wa_pid" 2>/dev/null; then
-            log_verbose "Force-killing wa watch (pid $wa_pid) - should have exited"
-            kill -9 "$wa_pid" 2>/dev/null || true
-            wait "$wa_pid" 2>/dev/null || true
+        # Kill ft watch if still running (should have exited gracefully)
+        if [[ -n "${ft_pid:-}" ]] && kill -0 "$ft_pid" 2>/dev/null; then
+            log_verbose "Force-killing ft watch (pid $ft_pid) - should have exited"
+            kill -9 "$ft_pid" 2>/dev/null || true
+            wait "$ft_pid" 2>/dev/null || true
         fi
         # Close dummy pane if it exists
         if [[ -n "${pane_id:-}" ]]; then
@@ -4574,7 +4574,7 @@ run_scenario_graceful_shutdown() {
         fi
         # Copy artifacts before cleanup
         if [[ -d "${temp_workspace:-}" ]]; then
-            cp -r "$temp_workspace/.wa"/* "${scenario_dir:-/dev/null}/" 2>/dev/null || true
+            cp -r "$temp_workspace/.ft"/* "${scenario_dir:-/dev/null}/" 2>/dev/null || true
         fi
         rm -rf "${temp_workspace:-}"
     }
@@ -4600,17 +4600,17 @@ run_scenario_graceful_shutdown() {
     log_info "Spawned pane: $pane_id"
     echo "Spawned pane_id: $pane_id" >> "$scenario_dir/scenario.log"
 
-    # Step 2: Start wa watch in foreground mode (so we can control it)
-    log_info "Step 2: Starting wa watch..."
+    # Step 2: Start ft watch in foreground mode (so we can control it)
+    log_info "Step 2: Starting ft watch..."
     "$FT_BINARY" watch --foreground \
         > "$scenario_dir/wa_watch.log" 2>&1 &
-    wa_pid=$!
-    log_verbose "wa watch started with PID $wa_pid"
-    echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
+    ft_pid=$!
+    log_verbose "ft watch started with PID $ft_pid"
+    echo "ft_pid: $ft_pid" >> "$scenario_dir/scenario.log"
 
-    # Verify wa watch is running
-    if ! kill -0 "$wa_pid" 2>/dev/null; then
-        log_fail "wa watch exited immediately"
+    # Verify ft watch is running
+    if ! kill -0 "$ft_pid" 2>/dev/null; then
+        log_fail "ft watch exited immediately"
         return 1
     fi
 
@@ -4641,24 +4641,24 @@ run_scenario_graceful_shutdown() {
     "$FT_BINARY" robot state > "$scenario_dir/robot_state_before_shutdown.json" 2>&1 || true
     "$FT_BINARY" search "$marker" --limit 10 > "$scenario_dir/search_before_shutdown.txt" 2>&1 || true
 
-    # Step 4: Send SIGINT to wa watch and measure shutdown time
-    log_info "Step 4: Sending SIGINT to wa watch..."
+    # Step 4: Send SIGINT to ft watch and measure shutdown time
+    log_info "Step 4: Sending SIGINT to ft watch..."
     local shutdown_start=$(date +%s)
-    kill -INT "$wa_pid" 2>/dev/null
+    kill -INT "$ft_pid" 2>/dev/null
 
     # Wait for graceful exit (bounded timeout)
     local shutdown_timeout=10
     local shutdown_result=0
-    if timeout "$shutdown_timeout" tail --pid="$wa_pid" -f /dev/null 2>/dev/null; then
+    if timeout "$shutdown_timeout" tail --pid="$ft_pid" -f /dev/null 2>/dev/null; then
         shutdown_result=0
     else
         # Fallback: poll for process exit
         local poll_count=0
-        while kill -0 "$wa_pid" 2>/dev/null && [[ $poll_count -lt $((shutdown_timeout * 2)) ]]; do
+        while kill -0 "$ft_pid" 2>/dev/null && [[ $poll_count -lt $((shutdown_timeout * 2)) ]]; do
             sleep 0.5
             ((poll_count++))
         done
-        if kill -0 "$wa_pid" 2>/dev/null; then
+        if kill -0 "$ft_pid" 2>/dev/null; then
             shutdown_result=1
         fi
     fi
@@ -4667,14 +4667,14 @@ run_scenario_graceful_shutdown() {
     local shutdown_duration=$((shutdown_end - shutdown_start))
     echo "shutdown_duration_secs: $shutdown_duration" >> "$scenario_dir/scenario.log"
 
-    if [[ $shutdown_result -eq 0 ]] || ! kill -0 "$wa_pid" 2>/dev/null; then
-        log_pass "wa watch exited cleanly within ${shutdown_duration}s"
-        wa_pid=""  # Mark as exited
+    if [[ $shutdown_result -eq 0 ]] || ! kill -0 "$ft_pid" 2>/dev/null; then
+        log_pass "ft watch exited cleanly within ${shutdown_duration}s"
+        ft_pid=""  # Mark as exited
     else
-        log_fail "wa watch did not exit within ${shutdown_timeout}s - forcing kill"
-        kill -9 "$wa_pid" 2>/dev/null || true
-        wait "$wa_pid" 2>/dev/null || true
-        wa_pid=""
+        log_fail "ft watch did not exit within ${shutdown_timeout}s - forcing kill"
+        kill -9 "$ft_pid" 2>/dev/null || true
+        wait "$ft_pid" 2>/dev/null || true
+        ft_pid=""
         result=1
     fi
 
@@ -4695,7 +4695,7 @@ run_scenario_graceful_shutdown() {
         result=1
     fi
 
-    # Step 6: Verify lock was released (can restart wa watch)
+    # Step 6: Verify lock was released (can restart ft watch)
     log_info "Step 6: Verifying lock release (attempting restart)..."
 
     local restart_pid=""
@@ -4704,27 +4704,27 @@ run_scenario_graceful_shutdown() {
     restart_pid=$!
 
     local restart_check_cmd="kill -0 $restart_pid 2>/dev/null"
-    if wait_for_condition "wa watch restarted" "$restart_check_cmd" 5; then
-        log_pass "wa watch restarted successfully (lock was released)"
+    if wait_for_condition "ft watch restarted" "$restart_check_cmd" 5; then
+        log_pass "ft watch restarted successfully (lock was released)"
         # Clean up the restarted process
         kill -INT "$restart_pid" 2>/dev/null || true
-        if ! wait_for_condition "wa watch restart exited" "! kill -0 $restart_pid 2>/dev/null" 5; then
+        if ! wait_for_condition "ft watch restart exited" "! kill -0 $restart_pid 2>/dev/null" 5; then
             kill -9 "$restart_pid" 2>/dev/null || true
         fi
         wait "$restart_pid" 2>/dev/null || true
     else
         # Check if it exited with lock error
         if grep -qi "lock\|already running\|another instance" "$scenario_dir/wa_watch_restart.log" 2>/dev/null; then
-            log_fail "wa watch restart failed - lock was NOT released"
+            log_fail "ft watch restart failed - lock was NOT released"
             result=1
         else
             # May have exited for other reason, check exit status
             wait "$restart_pid" 2>/dev/null
             local restart_exit=$?
             if [[ $restart_exit -eq 0 ]]; then
-                log_pass "wa watch restart exited cleanly (lock was available)"
+                log_pass "ft watch restart exited cleanly (lock was available)"
             else
-                log_warn "wa watch restart exited with code $restart_exit (check logs)"
+                log_warn "ft watch restart exited with code $restart_exit (check logs)"
                 # Not necessarily a failure - may be config issue
             fi
         fi
@@ -4758,7 +4758,7 @@ run_scenario_graceful_shutdown() {
 # - Spawns an "observed" pane that prints OBSERVED_TOKEN
 # - Spawns an "ignored" pane with title "IGNORED_PANE" that prints SECRET_TOKEN
 # - Asserts observed pane is searchable, ignored is NOT
-# - Asserts wa status shows ignored pane with exclude reason
+# - Asserts ft status shows ignored pane with exclude reason
 # - Asserts SECRET_TOKEN never appears in any artifacts (privacy guarantee)
 
 run_scenario_pane_exclude_filter() {
@@ -4766,8 +4766,8 @@ run_scenario_pane_exclude_filter() {
     local observed_marker="OBSERVED_TOKEN_$(date +%s%N)"
     local secret_token="SECRET_TOKEN_$(date +%s%N)"
     local temp_workspace
-    temp_workspace=$(mktemp -d /tmp/wa-e2e-XXXXXX)
-    local wa_pid=""
+    temp_workspace=$(mktemp -d /tmp/ft-e2e-XXXXXX)
+    local ft_pid=""
     local observed_pane_id=""
     local ignored_pane_id=""
     local result=0
@@ -4777,15 +4777,15 @@ run_scenario_pane_exclude_filter() {
     log_info "Workspace: $temp_workspace"
 
     # Setup environment for isolated wa instance
-    export WA_DATA_DIR="$temp_workspace/.wa"
+    export FT_DATA_DIR="$temp_workspace/.ft"
     export FT_WORKSPACE="$temp_workspace"
-    mkdir -p "$WA_DATA_DIR"
+    mkdir -p "$FT_DATA_DIR"
 
     # Copy pane exclude config
     local exclude_config="$PROJECT_ROOT/fixtures/e2e/config_pane_exclude.toml"
     if [[ -f "$exclude_config" ]]; then
         cp "$exclude_config" "$temp_workspace/ft.toml"
-        export WA_CONFIG="$temp_workspace/ft.toml"
+        export FT_CONFIG="$temp_workspace/ft.toml"
         log_verbose "Using exclude config: $exclude_config"
     else
         log_fail "Pane exclude config not found: $exclude_config"
@@ -4799,11 +4799,11 @@ run_scenario_pane_exclude_filter() {
     # Cleanup function
     cleanup_pane_exclude_filter() {
         log_verbose "Cleaning up pane_exclude_filter scenario"
-        # Kill wa watch if running (use :- to avoid unbound variable with set -u)
-        if [[ -n "${wa_pid:-}" ]] && kill -0 "$wa_pid" 2>/dev/null; then
-            log_verbose "Stopping wa watch (pid $wa_pid)"
-            kill "$wa_pid" 2>/dev/null || true
-            wait "$wa_pid" 2>/dev/null || true
+        # Kill ft watch if running (use :- to avoid unbound variable with set -u)
+        if [[ -n "${ft_pid:-}" ]] && kill -0 "$ft_pid" 2>/dev/null; then
+            log_verbose "Stopping ft watch (pid $ft_pid)"
+            kill "$ft_pid" 2>/dev/null || true
+            wait "$ft_pid" 2>/dev/null || true
         fi
         # Close observed pane if it exists
         if [[ -n "${observed_pane_id:-}" ]]; then
@@ -4817,7 +4817,7 @@ run_scenario_pane_exclude_filter() {
         fi
         # Copy artifacts before cleanup (use :- to avoid unbound variable with set -u)
         if [[ -d "${temp_workspace:-}" ]]; then
-            cp -r "${temp_workspace}/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp -r "${temp_workspace}/.ft"/* "$scenario_dir/" 2>/dev/null || true
             cp "${temp_workspace}/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
         rm -rf "${temp_workspace:-}"
@@ -4870,17 +4870,17 @@ run_scenario_pane_exclude_filter() {
         log_warn "Ignored pane title not observed in wezterm cli list yet; continuing"
     fi
 
-    # Step 3: Start wa watch in background with custom config
-    log_info "Step 3: Starting wa watch with exclude config..."
+    # Step 3: Start ft watch in background with custom config
+    log_info "Step 3: Starting ft watch with exclude config..."
     "$FT_BINARY" watch --foreground --config "$temp_workspace/ft.toml" \
         > "$scenario_dir/wa_watch.log" 2>&1 &
-    wa_pid=$!
-    log_verbose "wa watch started with PID $wa_pid"
-    echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
+    ft_pid=$!
+    log_verbose "ft watch started with PID $ft_pid"
+    echo "ft_pid: $ft_pid" >> "$scenario_dir/scenario.log"
 
-    # Verify wa watch is running
-    if ! kill -0 "$wa_pid" 2>/dev/null; then
-        log_fail "wa watch exited immediately"
+    # Verify ft watch is running
+    if ! kill -0 "$ft_pid" 2>/dev/null; then
+        log_fail "ft watch exited immediately"
         return 1
     fi
 
@@ -4943,17 +4943,17 @@ run_scenario_pane_exclude_filter() {
         result=1
     fi
 
-    # Step 7: Stop wa watch gracefully (after search tests complete)
-    log_info "Step 7: Stopping wa watch..."
-    kill -TERM "$wa_pid" 2>/dev/null || true
-    wait "$wa_pid" 2>/dev/null || true
-    wa_pid=""
+    # Step 7: Stop ft watch gracefully (after search tests complete)
+    log_info "Step 7: Stopping ft watch..."
+    kill -TERM "$ft_pid" 2>/dev/null || true
+    wait "$ft_pid" 2>/dev/null || true
+    ft_pid=""
 
     # Step 8: Assert SECRET_TOKEN never appears in any captured data files
     log_info "Step 8: Scanning captured data for secret token leakage..."
 
     # Copy all wa data artifacts first (database, logs, segments)
-    cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
+    cp -r "$temp_workspace/.ft"/* "$scenario_dir/" 2>/dev/null || true
 
     # Search for leaks in captured data - exclude our own test harness files:
     # - scenario.log: intentionally contains tokens for debugging
@@ -5012,9 +5012,9 @@ run_scenario_workspace_isolation() {
     local token_b="WORKSPACE_TOKEN_B_$(date +%s%N)"
     local workspace_a
     local workspace_b
-    workspace_a=$(mktemp -d /tmp/wa-e2e-a-XXXXXX)
-    workspace_b=$(mktemp -d /tmp/wa-e2e-b-XXXXXX)
-    local wa_pid=""
+    workspace_a=$(mktemp -d /tmp/ft-e2e-a-XXXXXX)
+    workspace_b=$(mktemp -d /tmp/ft-e2e-b-XXXXXX)
+    local ft_pid=""
     local pane_a_id=""
     local pane_b_id=""
     local result=0
@@ -5024,7 +5024,7 @@ run_scenario_workspace_isolation() {
     log_info "Workspace A: $workspace_a"
     log_info "Workspace B: $workspace_b"
 
-    mkdir -p "$workspace_a/.wa" "$workspace_b/.wa"
+    mkdir -p "$workspace_a/.ft" "$workspace_b/.ft"
 
     echo "workspace_a: $workspace_a" >> "$scenario_dir/scenario.log"
     echo "workspace_b: $workspace_b" >> "$scenario_dir/scenario.log"
@@ -5033,10 +5033,10 @@ run_scenario_workspace_isolation() {
 
     cleanup_workspace_isolation() {
         log_verbose "Cleaning up workspace_isolation scenario"
-        if [[ -n "${wa_pid:-}" ]] && kill -0 "$wa_pid" 2>/dev/null; then
-            log_verbose "Stopping wa watch (pid $wa_pid)"
-            kill "$wa_pid" 2>/dev/null || true
-            wait "$wa_pid" 2>/dev/null || true
+        if [[ -n "${ft_pid:-}" ]] && kill -0 "$ft_pid" 2>/dev/null; then
+            log_verbose "Stopping ft watch (pid $ft_pid)"
+            kill "$ft_pid" 2>/dev/null || true
+            wait "$ft_pid" 2>/dev/null || true
         fi
         if [[ -n "${pane_a_id:-}" ]]; then
             log_verbose "Closing workspace A pane $pane_a_id"
@@ -5049,11 +5049,11 @@ run_scenario_workspace_isolation() {
 
         if [[ -d "${workspace_a:-}" ]]; then
             mkdir -p "$scenario_dir/workspace_a"
-            cp -r "$workspace_a/.wa"/* "$scenario_dir/workspace_a/" 2>/dev/null || true
+            cp -r "$workspace_a/.ft"/* "$scenario_dir/workspace_a/" 2>/dev/null || true
         fi
         if [[ -d "${workspace_b:-}" ]]; then
             mkdir -p "$scenario_dir/workspace_b"
-            cp -r "$workspace_b/.wa"/* "$scenario_dir/workspace_b/" 2>/dev/null || true
+            cp -r "$workspace_b/.ft"/* "$scenario_dir/workspace_b/" 2>/dev/null || true
         fi
 
         if [[ "${FT_E2E_PRESERVE_TEMP:-}" == "1" ]]; then
@@ -5084,28 +5084,28 @@ run_scenario_workspace_isolation() {
     log_info "Spawned workspace A pane: $pane_a_id"
     echo "pane_a_id: $pane_a_id" >> "$scenario_dir/scenario.log"
 
-    # Step 2: Start wa watch for workspace A
-    log_info "Step 2: Starting wa watch for workspace A..."
-    FT_WORKSPACE="$workspace_a" WA_DATA_DIR="$workspace_a/.wa" \
+    # Step 2: Start ft watch for workspace A
+    log_info "Step 2: Starting ft watch for workspace A..."
+    FT_WORKSPACE="$workspace_a" FT_DATA_DIR="$workspace_a/.ft" \
         "$FT_BINARY" watch --foreground \
         > "$scenario_dir/wa_watch_a.log" 2>&1 &
-    wa_pid=$!
-    log_verbose "wa watch (A) started with PID $wa_pid"
-    echo "wa_pid_a: $wa_pid" >> "$scenario_dir/scenario.log"
+    ft_pid=$!
+    log_verbose "ft watch (A) started with PID $ft_pid"
+    echo "ft_pid_a: $ft_pid" >> "$scenario_dir/scenario.log"
 
-    if ! kill -0 "$wa_pid" 2>/dev/null; then
-        log_fail "wa watch (A) exited immediately"
+    if ! kill -0 "$ft_pid" 2>/dev/null; then
+        log_fail "ft watch (A) exited immediately"
         return 1
     fi
 
     # Step 3: Wait for workspace A pane to be observed
     log_info "Step 3: Waiting for workspace A pane to be observed..."
     local wait_timeout=${TIMEOUT:-60}
-    local check_observed_a="FT_LOG_LEVEL=error FT_WORKSPACE=\"$workspace_a\" WA_DATA_DIR=\"$workspace_a/.wa\" \"$FT_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane_a_id)' >/dev/null 2>&1"
+    local check_observed_a="FT_LOG_LEVEL=error FT_WORKSPACE=\"$workspace_a\" FT_DATA_DIR=\"$workspace_a/.wa\" \"$FT_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane_a_id)' >/dev/null 2>&1"
 
     if ! wait_for_condition "workspace A pane observed" "$check_observed_a" "$wait_timeout"; then
         log_fail "Timeout waiting for workspace A pane to be observed"
-        FT_WORKSPACE="$workspace_a" WA_DATA_DIR="$workspace_a/.wa" \
+        FT_WORKSPACE="$workspace_a" FT_DATA_DIR="$workspace_a/.ft" \
             "$FT_BINARY" robot state > "$scenario_dir/robot_state_a.json" 2>&1 || true
         return 1
     fi
@@ -5113,27 +5113,27 @@ run_scenario_workspace_isolation() {
 
     # Step 4: Wait for token A to be searchable in workspace A
     log_info "Step 4: Waiting for token A to be searchable..."
-    local check_search_a="FT_LOG_LEVEL=error FT_WORKSPACE=\"$workspace_a\" WA_DATA_DIR=\"$workspace_a/.wa\" \"$FT_BINARY\" robot search \"$token_a\" 2>/dev/null | jq -e '.data.total_hits > 0' >/dev/null 2>&1"
+    local check_search_a="FT_LOG_LEVEL=error FT_WORKSPACE=\"$workspace_a\" FT_DATA_DIR=\"$workspace_a/.wa\" \"$FT_BINARY\" robot search \"$token_a\" 2>/dev/null | jq -e '.data.total_hits > 0' >/dev/null 2>&1"
     if ! wait_for_condition "token A searchable" "$check_search_a" "$wait_timeout"; then
         log_fail "Timeout waiting for token A to be searchable"
-        FT_WORKSPACE="$workspace_a" WA_DATA_DIR="$workspace_a/.wa" \
+        FT_WORKSPACE="$workspace_a" FT_DATA_DIR="$workspace_a/.ft" \
             "$FT_BINARY" robot search "$token_a" > "$scenario_dir/search_a.json" 2>&1 || true
         return 1
     fi
     log_pass "Token A searchable in workspace A"
 
-    FT_LOG_LEVEL=error FT_WORKSPACE="$workspace_a" WA_DATA_DIR="$workspace_a/.wa" \
+    FT_LOG_LEVEL=error FT_WORKSPACE="$workspace_a" FT_DATA_DIR="$workspace_a/.ft" \
         "$FT_BINARY" robot state > "$scenario_dir/robot_state_a.json" 2>&1 || true
-    FT_LOG_LEVEL=error FT_WORKSPACE="$workspace_a" WA_DATA_DIR="$workspace_a/.wa" \
+    FT_LOG_LEVEL=error FT_WORKSPACE="$workspace_a" FT_DATA_DIR="$workspace_a/.ft" \
         "$FT_BINARY" robot search "$token_a" > "$scenario_dir/search_a.json" 2>&1 || true
-    FT_LOG_LEVEL=error FT_WORKSPACE="$workspace_a" WA_DATA_DIR="$workspace_a/.wa" \
+    FT_LOG_LEVEL=error FT_WORKSPACE="$workspace_a" FT_DATA_DIR="$workspace_a/.ft" \
         "$FT_BINARY" config show --effective --json > "$scenario_dir/config_effective_a.json" 2>&1 || true
 
-    # Step 5: Stop wa watch for workspace A
-    log_info "Step 5: Stopping wa watch for workspace A..."
-    kill -TERM "$wa_pid" 2>/dev/null || true
-    wait "$wa_pid" 2>/dev/null || true
-    wa_pid=""
+    # Step 5: Stop ft watch for workspace A
+    log_info "Step 5: Stopping ft watch for workspace A..."
+    kill -TERM "$ft_pid" 2>/dev/null || true
+    wait "$ft_pid" 2>/dev/null || true
+    ft_pid=""
 
     # Step 6: Spawn workspace B pane
     log_info "Step 6: Spawning workspace B pane..."
@@ -5148,27 +5148,27 @@ run_scenario_workspace_isolation() {
     log_info "Spawned workspace B pane: $pane_b_id"
     echo "pane_b_id: $pane_b_id" >> "$scenario_dir/scenario.log"
 
-    # Step 7: Start wa watch for workspace B
-    log_info "Step 7: Starting wa watch for workspace B..."
-    FT_WORKSPACE="$workspace_b" WA_DATA_DIR="$workspace_b/.wa" \
+    # Step 7: Start ft watch for workspace B
+    log_info "Step 7: Starting ft watch for workspace B..."
+    FT_WORKSPACE="$workspace_b" FT_DATA_DIR="$workspace_b/.ft" \
         "$FT_BINARY" watch --foreground \
         > "$scenario_dir/wa_watch_b.log" 2>&1 &
-    wa_pid=$!
-    log_verbose "wa watch (B) started with PID $wa_pid"
-    echo "wa_pid_b: $wa_pid" >> "$scenario_dir/scenario.log"
+    ft_pid=$!
+    log_verbose "ft watch (B) started with PID $ft_pid"
+    echo "ft_pid_b: $ft_pid" >> "$scenario_dir/scenario.log"
 
-    if ! kill -0 "$wa_pid" 2>/dev/null; then
-        log_fail "wa watch (B) exited immediately"
+    if ! kill -0 "$ft_pid" 2>/dev/null; then
+        log_fail "ft watch (B) exited immediately"
         return 1
     fi
 
     # Step 8: Wait for workspace B pane to be observed
     log_info "Step 8: Waiting for workspace B pane to be observed..."
-    local check_observed_b="FT_LOG_LEVEL=error FT_WORKSPACE=\"$workspace_b\" WA_DATA_DIR=\"$workspace_b/.wa\" \"$FT_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane_b_id)' >/dev/null 2>&1"
+    local check_observed_b="FT_LOG_LEVEL=error FT_WORKSPACE=\"$workspace_b\" FT_DATA_DIR=\"$workspace_b/.wa\" \"$FT_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane_b_id)' >/dev/null 2>&1"
 
     if ! wait_for_condition "workspace B pane observed" "$check_observed_b" "$wait_timeout"; then
         log_fail "Timeout waiting for workspace B pane to be observed"
-        FT_WORKSPACE="$workspace_b" WA_DATA_DIR="$workspace_b/.wa" \
+        FT_WORKSPACE="$workspace_b" FT_DATA_DIR="$workspace_b/.ft" \
             "$FT_BINARY" robot state > "$scenario_dir/robot_state_b.json" 2>&1 || true
         return 1
     fi
@@ -5176,26 +5176,26 @@ run_scenario_workspace_isolation() {
 
     # Step 9: Wait for token B to be searchable in workspace B
     log_info "Step 9: Waiting for token B to be searchable..."
-    local check_search_b="FT_LOG_LEVEL=error FT_WORKSPACE=\"$workspace_b\" WA_DATA_DIR=\"$workspace_b/.wa\" \"$FT_BINARY\" robot search \"$token_b\" 2>/dev/null | jq -e '.data.total_hits > 0' >/dev/null 2>&1"
+    local check_search_b="FT_LOG_LEVEL=error FT_WORKSPACE=\"$workspace_b\" FT_DATA_DIR=\"$workspace_b/.wa\" \"$FT_BINARY\" robot search \"$token_b\" 2>/dev/null | jq -e '.data.total_hits > 0' >/dev/null 2>&1"
     if ! wait_for_condition "token B searchable" "$check_search_b" "$wait_timeout"; then
         log_fail "Timeout waiting for token B to be searchable"
-        FT_WORKSPACE="$workspace_b" WA_DATA_DIR="$workspace_b/.wa" \
+        FT_WORKSPACE="$workspace_b" FT_DATA_DIR="$workspace_b/.ft" \
             "$FT_BINARY" robot search "$token_b" > "$scenario_dir/search_b.json" 2>&1 || true
         return 1
     fi
     log_pass "Token B searchable in workspace B"
 
-    FT_LOG_LEVEL=error FT_WORKSPACE="$workspace_b" WA_DATA_DIR="$workspace_b/.wa" \
+    FT_LOG_LEVEL=error FT_WORKSPACE="$workspace_b" FT_DATA_DIR="$workspace_b/.ft" \
         "$FT_BINARY" robot state > "$scenario_dir/robot_state_b.json" 2>&1 || true
-    FT_LOG_LEVEL=error FT_WORKSPACE="$workspace_b" WA_DATA_DIR="$workspace_b/.wa" \
+    FT_LOG_LEVEL=error FT_WORKSPACE="$workspace_b" FT_DATA_DIR="$workspace_b/.ft" \
         "$FT_BINARY" robot search "$token_b" > "$scenario_dir/search_b.json" 2>&1 || true
-    FT_LOG_LEVEL=error FT_WORKSPACE="$workspace_b" WA_DATA_DIR="$workspace_b/.wa" \
+    FT_LOG_LEVEL=error FT_WORKSPACE="$workspace_b" FT_DATA_DIR="$workspace_b/.ft" \
         "$FT_BINARY" config show --effective --json > "$scenario_dir/config_effective_b.json" 2>&1 || true
 
     # Step 10: Assert token A is NOT searchable in workspace B
     log_info "Step 10: Asserting token A is NOT searchable in workspace B..."
     local search_output_ba
-    search_output_ba=$(FT_LOG_LEVEL=error FT_WORKSPACE="$workspace_b" WA_DATA_DIR="$workspace_b/.wa" \
+    search_output_ba=$(FT_LOG_LEVEL=error FT_WORKSPACE="$workspace_b" FT_DATA_DIR="$workspace_b/.ft" \
         "$FT_BINARY" robot search "$token_a" 2>&1)
     echo "$search_output_ba" > "$scenario_dir/search_a_in_b.json"
 
@@ -5208,11 +5208,11 @@ run_scenario_workspace_isolation() {
         result=1
     fi
 
-    # Step 11: Stop wa watch for workspace B
-    log_info "Step 11: Stopping wa watch for workspace B..."
-    kill -TERM "$wa_pid" 2>/dev/null || true
-    wait "$wa_pid" 2>/dev/null || true
-    wa_pid=""
+    # Step 11: Stop ft watch for workspace B
+    log_info "Step 11: Stopping ft watch for workspace B..."
+    kill -TERM "$ft_pid" 2>/dev/null || true
+    wait "$ft_pid" 2>/dev/null || true
+    ft_pid=""
 
     # Step 12: Verify derived paths and workspace roots are distinct
     log_info "Step 12: Verifying workspace roots and derived paths..."
@@ -5299,7 +5299,7 @@ run_scenario_workspace_isolation() {
 run_scenario_setup_idempotency() {
     local scenario_dir="$1"
     local temp_home
-    temp_home=$(mktemp -d /tmp/wa-e2e-setup-XXXXXX)
+    temp_home=$(mktemp -d /tmp/ft-e2e-setup-XXXXXX)
     local result=0
     local wezterm_dir="$temp_home/.config/wezterm"
     local wezterm_file="$wezterm_dir/wezterm.lua"
@@ -5453,12 +5453,12 @@ EOF
 run_scenario_uservar_forwarding() {
     local scenario_dir="$1"
     local temp_workspace
-    temp_workspace=$(mktemp -d /tmp/wa-e2e-uservar-XXXXXX)
-    local wa_pid=""
+    temp_workspace=$(mktemp -d /tmp/ft-e2e-uservar-XXXXXX)
+    local ft_pid=""
     local wezterm_pid=""
     local pane_id=""
     local result=0
-    local wezterm_class="wa-e2e-uservar-$(date +%s%N)"
+    local wezterm_class="ft-e2e-uservar-$(date +%s%N)"
     local uservar_name="wa_event"
     local payload_json
     payload_json=$(printf '{"type":"e2e_uservar","ts":%s}' "$(date +%s)")
@@ -5473,7 +5473,7 @@ run_scenario_uservar_forwarding() {
     log_info "WezTerm class: $wezterm_class"
     log_info "Workspace: $temp_workspace"
 
-    mkdir -p "$temp_workspace/.wa"
+    mkdir -p "$temp_workspace/.ft"
 
     echo "workspace: $temp_workspace" >> "$scenario_dir/scenario.log"
     echo "wezterm_class: $wezterm_class" >> "$scenario_dir/scenario.log"
@@ -5482,10 +5482,10 @@ run_scenario_uservar_forwarding() {
 
     cleanup_uservar_forwarding() {
         log_verbose "Cleaning up uservar_forwarding scenario"
-        if [[ -n "${wa_pid:-}" ]] && kill -0 "$wa_pid" 2>/dev/null; then
-            log_verbose "Stopping wa watch (pid $wa_pid)"
-            kill "$wa_pid" 2>/dev/null || true
-            wait "$wa_pid" 2>/dev/null || true
+        if [[ -n "${ft_pid:-}" ]] && kill -0 "$ft_pid" 2>/dev/null; then
+            log_verbose "Stopping ft watch (pid $ft_pid)"
+            kill "$ft_pid" 2>/dev/null || true
+            wait "$ft_pid" 2>/dev/null || true
         fi
         if [[ -n "${pane_id:-}" ]]; then
             log_verbose "Closing uservar pane $pane_id"
@@ -5498,7 +5498,7 @@ run_scenario_uservar_forwarding() {
             wait "$wezterm_pid" 2>/dev/null || true
         fi
         if [[ -d "${temp_workspace:-}" ]]; then
-            cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp -r "$temp_workspace/.ft"/* "$scenario_dir/" 2>/dev/null || true
             cp "$config_file" "$scenario_dir/wezterm.lua" 2>/dev/null || true
         fi
         rm -rf "${temp_workspace:-}"
@@ -5535,7 +5535,7 @@ EOF
     # Step 2: Start a dedicated wezterm instance with the forwarding config
     log_info "Step 2: Starting wezterm with forwarding config..."
     FT_E2E_BINARY="$FT_BINARY" wezterm --config-file "$config_file" start \
-        --always-new-process --class "$wezterm_class" --workspace "wa-e2e-uservar" \
+        --always-new-process --class "$wezterm_class" --workspace "ft-e2e-uservar" \
         > "$scenario_dir/wezterm.log" 2>&1 &
     wezterm_pid=$!
     echo "wezterm_pid: $wezterm_pid" >> "$scenario_dir/scenario.log"
@@ -5548,17 +5548,17 @@ EOF
     fi
     log_pass "WezTerm mux ready"
 
-    # Step 3: Start wa watch with debug logging
-    log_info "Step 3: Starting wa watch..."
-    FT_WORKSPACE="$temp_workspace" WA_DATA_DIR="$temp_workspace/.wa" FT_LOG_LEVEL=debug \
+    # Step 3: Start ft watch with debug logging
+    log_info "Step 3: Starting ft watch..."
+    FT_WORKSPACE="$temp_workspace" FT_DATA_DIR="$temp_workspace/.ft" FT_LOG_LEVEL=debug \
         "$FT_BINARY" watch --foreground \
         > "$scenario_dir/wa_watch.log" 2>&1 &
-    wa_pid=$!
-    log_verbose "wa watch started with PID $wa_pid"
-    echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
+    ft_pid=$!
+    log_verbose "ft watch started with PID $ft_pid"
+    echo "ft_pid: $ft_pid" >> "$scenario_dir/scenario.log"
 
-    if ! kill -0 "$wa_pid" 2>/dev/null; then
-        log_fail "wa watch exited immediately"
+    if ! kill -0 "$ft_pid" 2>/dev/null; then
+        log_fail "ft watch exited immediately"
         result=1
         return $result
     fi
@@ -5593,7 +5593,7 @@ EOS
     log_info "Spawned uservar pane: $pane_id"
     echo "pane_id: $pane_id" >> "$scenario_dir/scenario.log"
 
-    # Step 6: Wait for wa watch to record the forwarded user-var event
+    # Step 6: Wait for ft watch to record the forwarded user-var event
     log_info "Step 6: Waiting for forwarded user-var event..."
     local check_event_cmd="grep -q \"Published user-var event\" \"$scenario_dir/wa_watch.log\""
     if ! wait_for_condition "user-var forwarded to watcher" "$check_event_cmd" "$wait_timeout"; then
@@ -5609,7 +5609,7 @@ EOS
     local invalid_output=""
     local invalid_exit=0
     set +e
-    invalid_output=$(FT_WORKSPACE="$temp_workspace" WA_DATA_DIR="$temp_workspace/.wa" \
+    invalid_output=$(FT_WORKSPACE="$temp_workspace" FT_DATA_DIR="$temp_workspace/.ft" \
         "$FT_BINARY" event --from-uservar --pane "${pane_id:-0}" \
         --name "$uservar_name" --value "invalid_base64" 2>&1)
     invalid_exit=$?
@@ -5644,8 +5644,8 @@ EOS
 run_scenario_workflow_resume() {
     local scenario_dir="$1"
     local temp_workspace
-    temp_workspace=$(mktemp -d /tmp/wa-e2e-resume-XXXXXX)
-    local wa_pid=""
+    temp_workspace=$(mktemp -d /tmp/ft-e2e-resume-XXXXXX)
+    local ft_pid=""
     local pane_id=""
     local result=0
     local wait_timeout=${TIMEOUT:-45}
@@ -5653,26 +5653,26 @@ run_scenario_workflow_resume() {
     log_info "Workspace: $temp_workspace"
 
     # Setup environment for isolated wa instance
-    export WA_DATA_DIR="$temp_workspace/.wa"
+    export FT_DATA_DIR="$temp_workspace/.ft"
     export FT_WORKSPACE="$temp_workspace"
-    mkdir -p "$WA_DATA_DIR"
+    mkdir -p "$FT_DATA_DIR"
 
     # Copy baseline config for workflow testing
     local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
     if [[ -f "$baseline_config" ]]; then
         cp "$baseline_config" "$temp_workspace/ft.toml"
-        export WA_CONFIG="$temp_workspace/ft.toml"
+        export FT_CONFIG="$temp_workspace/ft.toml"
         log_verbose "Using baseline config: $baseline_config"
     fi
 
     # Cleanup function
     cleanup_workflow_resume() {
         log_verbose "Cleaning up workflow_resume scenario"
-        # Kill wa watch if running
-        if [[ -n "$wa_pid" ]] && kill -0 "$wa_pid" 2>/dev/null; then
-            log_verbose "Stopping wa watch (pid $wa_pid)"
-            kill "$wa_pid" 2>/dev/null || true
-            wait "$wa_pid" 2>/dev/null || true
+        # Kill ft watch if running
+        if [[ -n "$ft_pid" ]] && kill -0 "$ft_pid" 2>/dev/null; then
+            log_verbose "Stopping ft watch (pid $ft_pid)"
+            kill "$ft_pid" 2>/dev/null || true
+            wait "$ft_pid" 2>/dev/null || true
         fi
         # Close dummy pane if it exists
         if [[ -n "$pane_id" ]]; then
@@ -5681,24 +5681,24 @@ run_scenario_workflow_resume() {
         fi
         # Copy artifacts before cleanup
         if [[ -d "$temp_workspace" ]]; then
-            cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp -r "$temp_workspace/.ft"/* "$scenario_dir/" 2>/dev/null || true
             cp "$temp_workspace/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
         rm -rf "$temp_workspace"
     }
     trap cleanup_workflow_resume EXIT
 
-    # Step 1: Start wa watch with auto-handle
-    log_info "Step 1: Starting wa watch with --auto-handle..."
+    # Step 1: Start ft watch with auto-handle
+    log_info "Step 1: Starting ft watch with --auto-handle..."
     "$FT_BINARY" watch --foreground --auto-handle \
         > "$scenario_dir/wa_watch_1.log" 2>&1 &
-    wa_pid=$!
-    log_verbose "wa watch started with PID $wa_pid"
-    echo "wa_pid_1: $wa_pid" >> "$scenario_dir/scenario.log"
+    ft_pid=$!
+    log_verbose "ft watch started with PID $ft_pid"
+    echo "ft_pid_1: $ft_pid" >> "$scenario_dir/scenario.log"
 
-    # Verify wa watch is running
-    if ! kill -0 "$wa_pid" 2>/dev/null; then
-        log_fail "wa watch exited immediately"
+    # Verify ft watch is running
+    if ! kill -0 "$ft_pid" 2>/dev/null; then
+        log_fail "ft watch exited immediately"
         return 1
     fi
 
@@ -5745,9 +5745,9 @@ run_scenario_workflow_resume() {
 
     # Step 5: Kill watcher abruptly (simulate crash)
     log_info "Step 5: Killing watcher (simulating crash)..."
-    kill -9 "$wa_pid" 2>/dev/null || true
-    wait "$wa_pid" 2>/dev/null || true
-    wa_pid=""
+    kill -9 "$ft_pid" 2>/dev/null || true
+    wait "$ft_pid" 2>/dev/null || true
+    ft_pid=""
     log_pass "Watcher killed"
 
     # Step 6: Check database for incomplete workflow
@@ -5773,17 +5773,17 @@ run_scenario_workflow_resume() {
         log_warn "Database file not found at $db_path"
     fi
 
-    # Step 7: Restart wa watch with auto-handle
-    log_info "Step 7: Restarting wa watch with --auto-handle..."
+    # Step 7: Restart ft watch with auto-handle
+    log_info "Step 7: Restarting ft watch with --auto-handle..."
     "$FT_BINARY" watch --foreground --auto-handle \
         > "$scenario_dir/wa_watch_2.log" 2>&1 &
-    wa_pid=$!
-    log_verbose "wa watch restarted with PID $wa_pid"
-    echo "wa_pid_2: $wa_pid" >> "$scenario_dir/scenario.log"
+    ft_pid=$!
+    log_verbose "ft watch restarted with PID $ft_pid"
+    echo "ft_pid_2: $ft_pid" >> "$scenario_dir/scenario.log"
 
-    # Verify wa watch is running
-    if ! kill -0 "$wa_pid" 2>/dev/null; then
-        log_fail "wa watch (restart) exited immediately"
+    # Verify ft watch is running
+    if ! kill -0 "$ft_pid" 2>/dev/null; then
+        log_fail "ft watch (restart) exited immediately"
         return 1
     fi
     log_pass "Watcher restarted"
@@ -5837,8 +5837,8 @@ run_scenario_workflow_resume() {
         log_warn "Database file not found after restart"
     fi
 
-    # Step 10: Check wa watch logs for workflow activity
-    log_info "Step 10: Checking wa watch logs for workflow activity..."
+    # Step 10: Check ft watch logs for workflow activity
+    log_info "Step 10: Checking ft watch logs for workflow activity..."
     cat "$scenario_dir/wa_watch_1.log" "$scenario_dir/wa_watch_2.log" > "$scenario_dir/wa_watch_combined.log" 2>/dev/null || true
 
     if grep -qi "workflow\|compaction\|detection" "$scenario_dir/wa_watch_combined.log" 2>/dev/null; then
@@ -5875,52 +5875,52 @@ run_scenario_workflow_resume() {
 run_scenario_dry_run_mode() {
     local scenario_dir="$1"
     local temp_workspace
-    temp_workspace=$(mktemp -d /tmp/wa-e2e-dry-run-XXXXXX)
-    local wa_pid=""
+    temp_workspace=$(mktemp -d /tmp/ft-e2e-dry-run-XXXXXX)
+    local ft_pid=""
     local pane_id=""
     local result=0
 
     log_info "Workspace: $temp_workspace"
 
-    export WA_DATA_DIR="$temp_workspace/.wa"
+    export FT_DATA_DIR="$temp_workspace/.ft"
     export FT_WORKSPACE="$temp_workspace"
-    mkdir -p "$WA_DATA_DIR"
+    mkdir -p "$FT_DATA_DIR"
 
     # Copy baseline config for permissive, deterministic policy behavior
     local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
     if [[ -f "$baseline_config" ]]; then
         cp "$baseline_config" "$temp_workspace/ft.toml"
-        export WA_CONFIG="$temp_workspace/ft.toml"
+        export FT_CONFIG="$temp_workspace/ft.toml"
         log_verbose "Using baseline config: $baseline_config"
     fi
 
     cleanup_dry_run_mode() {
         log_verbose "Cleaning up dry_run_mode scenario"
-        if [[ -n "$wa_pid" ]] && kill -0 "$wa_pid" 2>/dev/null; then
-            log_verbose "Stopping wa watch (pid $wa_pid)"
-            kill "$wa_pid" 2>/dev/null || true
-            wait "$wa_pid" 2>/dev/null || true
+        if [[ -n "$ft_pid" ]] && kill -0 "$ft_pid" 2>/dev/null; then
+            log_verbose "Stopping ft watch (pid $ft_pid)"
+            kill "$ft_pid" 2>/dev/null || true
+            wait "$ft_pid" 2>/dev/null || true
         fi
         if [[ -n "$pane_id" ]]; then
             log_verbose "Closing dummy pane $pane_id"
             wezterm cli kill-pane --pane-id "$pane_id" 2>/dev/null || true
         fi
         if [[ -d "$temp_workspace" ]]; then
-            cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp -r "$temp_workspace/.ft"/* "$scenario_dir/" 2>/dev/null || true
             cp "$temp_workspace/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
         rm -rf "$temp_workspace"
     }
     trap cleanup_dry_run_mode EXIT
 
-    # Step 1: Start wa watch (no auto-handle; we want to control side effects)
-    log_info "Step 1: Starting wa watch..."
+    # Step 1: Start ft watch (no auto-handle; we want to control side effects)
+    log_info "Step 1: Starting ft watch..."
     "$FT_BINARY" watch --foreground > "$scenario_dir/wa_watch.log" 2>&1 &
-    wa_pid=$!
-    echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
+    ft_pid=$!
+    echo "ft_pid: $ft_pid" >> "$scenario_dir/scenario.log"
 
-    if ! kill -0 "$wa_pid" 2>/dev/null; then
-        log_fail "wa watch exited immediately"
+    if ! kill -0 "$ft_pid" 2>/dev/null; then
+        log_fail "ft watch exited immediately"
         return 1
     fi
 
@@ -6124,11 +6124,11 @@ run_scenario_dry_run_mode() {
         fi
     fi
 
-    # Step 11: Stop wa watch
-    log_info "Step 11: Stopping wa watch..."
-    kill -TERM "$wa_pid" 2>/dev/null || true
-    wait "$wa_pid" 2>/dev/null || true
-    wa_pid=""
+    # Step 11: Stop ft watch
+    log_info "Step 11: Stopping ft watch..."
+    kill -TERM "$ft_pid" 2>/dev/null || true
+    wait "$ft_pid" 2>/dev/null || true
+    ft_pid=""
 
     trap - EXIT
     cleanup_dry_run_mode
@@ -6146,28 +6146,28 @@ run_scenario_dry_run_mode() {
 run_scenario_workflow_lifecycle() {
     local scenario_dir="$1"
     local temp_workspace
-    temp_workspace=$(mktemp -d /tmp/wa-e2e-workflow-lifecycle-XXXXXX)
+    temp_workspace=$(mktemp -d /tmp/ft-e2e-workflow-lifecycle-XXXXXX)
     local result=0
 
     log_info "Workspace: $temp_workspace"
 
     # Setup environment for isolated wa instance
-    export WA_DATA_DIR="$temp_workspace/.wa"
+    export FT_DATA_DIR="$temp_workspace/.ft"
     export FT_WORKSPACE="$temp_workspace"
-    mkdir -p "$WA_DATA_DIR"
+    mkdir -p "$FT_DATA_DIR"
 
     # Copy baseline config when available
     local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
     if [[ -f "$baseline_config" ]]; then
         cp "$baseline_config" "$temp_workspace/ft.toml"
-        export WA_CONFIG="$temp_workspace/ft.toml"
+        export FT_CONFIG="$temp_workspace/ft.toml"
         log_verbose "Using baseline config: $baseline_config"
     fi
 
     cleanup_workflow_lifecycle() {
         log_verbose "Cleaning up workflow_lifecycle scenario"
         if [[ -d "$temp_workspace" ]]; then
-            cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp -r "$temp_workspace/.ft"/* "$scenario_dir/" 2>/dev/null || true
             cp "$temp_workspace/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
         rm -rf "$temp_workspace"
@@ -6235,28 +6235,28 @@ run_scenario_workflow_lifecycle() {
 run_scenario_events_unhandled_alias() {
     local scenario_dir="$1"
     local temp_workspace
-    temp_workspace=$(mktemp -d /tmp/wa-e2e-events-unhandled-XXXXXX)
+    temp_workspace=$(mktemp -d /tmp/ft-e2e-events-unhandled-XXXXXX)
     local result=0
 
     log_info "Workspace: $temp_workspace"
 
     # Setup environment for isolated wa instance
-    export WA_DATA_DIR="$temp_workspace/.wa"
+    export FT_DATA_DIR="$temp_workspace/.ft"
     export FT_WORKSPACE="$temp_workspace"
-    mkdir -p "$WA_DATA_DIR"
+    mkdir -p "$FT_DATA_DIR"
 
     # Copy baseline config when available
     local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
     if [[ -f "$baseline_config" ]]; then
         cp "$baseline_config" "$temp_workspace/ft.toml"
-        export WA_CONFIG="$temp_workspace/ft.toml"
+        export FT_CONFIG="$temp_workspace/ft.toml"
         log_verbose "Using baseline config: $baseline_config"
     fi
 
     cleanup_events_unhandled_alias() {
         log_verbose "Cleaning up events_unhandled_alias scenario"
         if [[ -d "$temp_workspace" ]]; then
-            cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp -r "$temp_workspace/.ft"/* "$scenario_dir/" 2>/dev/null || true
             cp "$temp_workspace/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
         rm -rf "$temp_workspace"
@@ -6309,39 +6309,39 @@ run_scenario_events_unhandled_alias() {
 run_scenario_events_annotations_triage() {
     local scenario_dir="$1"
     local temp_workspace
-    temp_workspace=$(mktemp -d /tmp/wa-e2e-events-annotations-XXXXXX)
+    temp_workspace=$(mktemp -d /tmp/ft-e2e-events-annotations-XXXXXX)
     local result=0
     local db_path=""
     local pane_id=9101
     local target_event_id=""
     local noise_event_id=""
     local note_secret="investigating sk-test-should-redact-events-1234567890abcdef"
-    local old_wa_data_dir="${WA_DATA_DIR:-}"
-    local old_wa_workspace="${FT_WORKSPACE:-}"
-    local old_wa_config="${WA_CONFIG:-}"
+    local old_ft_data_dir="${FT_DATA_DIR:-}"
+    local old_ft_workspace="${FT_WORKSPACE:-}"
+    local old_ft_config="${FT_CONFIG:-}"
 
     log_info "Workspace: $temp_workspace"
 
     cleanup_events_annotations_triage() {
         log_verbose "Cleaning up events_annotations_triage scenario"
         if [[ -d "${temp_workspace:-}" ]]; then
-            cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp -r "$temp_workspace/.ft"/* "$scenario_dir/" 2>/dev/null || true
             cp "$temp_workspace/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
-        if [[ -n "$old_wa_data_dir" ]]; then
-            export WA_DATA_DIR="$old_wa_data_dir"
+        if [[ -n "$old_ft_data_dir" ]]; then
+            export FT_DATA_DIR="$old_ft_data_dir"
         else
-            unset WA_DATA_DIR
+            unset FT_DATA_DIR
         fi
-        if [[ -n "$old_wa_workspace" ]]; then
-            export FT_WORKSPACE="$old_wa_workspace"
+        if [[ -n "$old_ft_workspace" ]]; then
+            export FT_WORKSPACE="$old_ft_workspace"
         else
             unset FT_WORKSPACE
         fi
-        if [[ -n "$old_wa_config" ]]; then
-            export WA_CONFIG="$old_wa_config"
+        if [[ -n "$old_ft_config" ]]; then
+            export FT_CONFIG="$old_ft_config"
         else
-            unset WA_CONFIG
+            unset FT_CONFIG
         fi
 
         # Intentionally keep the temp workspace for postmortem/debug review.
@@ -6350,14 +6350,14 @@ run_scenario_events_annotations_triage() {
     trap cleanup_events_annotations_triage EXIT
 
     # Setup environment for isolated wa instance
-    export WA_DATA_DIR="$temp_workspace/.wa"
+    export FT_DATA_DIR="$temp_workspace/.ft"
     export FT_WORKSPACE="$temp_workspace"
-    mkdir -p "$WA_DATA_DIR"
+    mkdir -p "$FT_DATA_DIR"
 
     local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
     if [[ -f "$baseline_config" ]]; then
         cp "$baseline_config" "$temp_workspace/ft.toml"
-        export WA_CONFIG="$temp_workspace/ft.toml"
+        export FT_CONFIG="$temp_workspace/ft.toml"
         log_verbose "Using baseline config: $baseline_config"
     fi
 
@@ -6588,7 +6588,7 @@ SQL
 # Scenario: History + Undo Workflow Lifecycle
 # ==============================================================================
 # Validates that:
-# 1) wa history --workflow renders expected workflow action tree lines
+# 1) ft history --workflow renders expected workflow action tree lines
 # 2) wa undo --list surfaces currently undoable workflow action
 # 3) wa undo <action-id> succeeds for workflow_abort and marks action undone
 # 4) workflow execution transitions to aborted and remains auditable
@@ -6597,39 +6597,39 @@ SQL
 run_scenario_history_undo_workflow() {
     local scenario_dir="$1"
     local temp_workspace
-    temp_workspace=$(mktemp -d /tmp/wa-e2e-history-undo-XXXXXX)
+    temp_workspace=$(mktemp -d /tmp/ft-e2e-history-undo-XXXXXX)
     local result=0
     local db_path=""
     local pane_id=9301
     local workflow_id="wf-e2e-history-undo"
     local start_action_id=900001
     local step_action_id=900002
-    local old_wa_data_dir="${WA_DATA_DIR:-}"
-    local old_wa_workspace="${FT_WORKSPACE:-}"
-    local old_wa_config="${WA_CONFIG:-}"
+    local old_ft_data_dir="${FT_DATA_DIR:-}"
+    local old_ft_workspace="${FT_WORKSPACE:-}"
+    local old_ft_config="${FT_CONFIG:-}"
 
     log_info "Workspace: $temp_workspace"
 
     cleanup_history_undo_workflow() {
         log_verbose "Cleaning up history_undo_workflow scenario"
         if [[ -d "${temp_workspace:-}" ]]; then
-            cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp -r "$temp_workspace/.ft"/* "$scenario_dir/" 2>/dev/null || true
             cp "$temp_workspace/ft.toml" "$scenario_dir/" 2>/dev/null || true
         fi
-        if [[ -n "$old_wa_data_dir" ]]; then
-            export WA_DATA_DIR="$old_wa_data_dir"
+        if [[ -n "$old_ft_data_dir" ]]; then
+            export FT_DATA_DIR="$old_ft_data_dir"
         else
-            unset WA_DATA_DIR
+            unset FT_DATA_DIR
         fi
-        if [[ -n "$old_wa_workspace" ]]; then
-            export FT_WORKSPACE="$old_wa_workspace"
+        if [[ -n "$old_ft_workspace" ]]; then
+            export FT_WORKSPACE="$old_ft_workspace"
         else
             unset FT_WORKSPACE
         fi
-        if [[ -n "$old_wa_config" ]]; then
-            export WA_CONFIG="$old_wa_config"
+        if [[ -n "$old_ft_config" ]]; then
+            export FT_CONFIG="$old_ft_config"
         else
-            unset WA_CONFIG
+            unset FT_CONFIG
         fi
 
         # Keep workspace for postmortem/debug review.
@@ -6637,14 +6637,14 @@ run_scenario_history_undo_workflow() {
     }
     trap cleanup_history_undo_workflow EXIT
 
-    export WA_DATA_DIR="$temp_workspace/.wa"
+    export FT_DATA_DIR="$temp_workspace/.ft"
     export FT_WORKSPACE="$temp_workspace"
-    mkdir -p "$WA_DATA_DIR"
+    mkdir -p "$FT_DATA_DIR"
 
     local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
     if [[ -f "$baseline_config" ]]; then
         cp "$baseline_config" "$temp_workspace/ft.toml"
-        export WA_CONFIG="$temp_workspace/ft.toml"
+        export FT_CONFIG="$temp_workspace/ft.toml"
         log_verbose "Using baseline config: $baseline_config"
     fi
 
@@ -6732,9 +6732,9 @@ SQL
 
         if grep -q "workflow_start" "$scenario_dir/history_workflow_plain.txt" \
             && grep -q "workflow_step" "$scenario_dir/history_workflow_plain.txt"; then
-            log_pass "wa history --workflow contains expected workflow actions"
+            log_pass "ft history --workflow contains expected workflow actions"
         else
-            log_fail "wa history --workflow missing expected action tree lines"
+            log_fail "ft history --workflow missing expected action tree lines"
             result=1
         fi
 
@@ -6823,18 +6823,18 @@ SQL
 run_scenario_accounts_refresh() {
     local scenario_dir="$1"
     local temp_workspace
-    temp_workspace=$(mktemp -d /tmp/wa-e2e-accounts-XXXXXX)
+    temp_workspace=$(mktemp -d /tmp/ft-e2e-accounts-XXXXXX)
     local temp_workspace_fail
-    temp_workspace_fail=$(mktemp -d /tmp/wa-e2e-accounts-fail-XXXXXX)
+    temp_workspace_fail=$(mktemp -d /tmp/ft-e2e-accounts-fail-XXXXXX)
     local temp_workspace_invalid
-    temp_workspace_invalid=$(mktemp -d /tmp/wa-e2e-accounts-invalid-XXXXXX)
+    temp_workspace_invalid=$(mktemp -d /tmp/ft-e2e-accounts-invalid-XXXXXX)
     local temp_bin="$temp_workspace/bin"
     local fake_caut="$temp_bin/caut"
     local result=0
     local old_path="$PATH"
-    local old_wa_data_dir="${WA_DATA_DIR:-}"
-    local old_wa_workspace="${FT_WORKSPACE:-}"
-    local old_wa_config="${WA_CONFIG:-}"
+    local old_ft_data_dir="${FT_DATA_DIR:-}"
+    local old_ft_workspace="${FT_WORKSPACE:-}"
+    local old_ft_config="${FT_CONFIG:-}"
     local old_caut_mode="${CAUT_FAKE_MODE:-}"
     local old_caut_log="${CAUT_FAKE_LOG:-}"
 
@@ -6845,20 +6845,20 @@ run_scenario_accounts_refresh() {
     cleanup_accounts_refresh() {
         log_verbose "Cleaning up accounts_refresh scenario"
         export PATH="$old_path"
-        if [[ -n "$old_wa_data_dir" ]]; then
-            export WA_DATA_DIR="$old_wa_data_dir"
+        if [[ -n "$old_ft_data_dir" ]]; then
+            export FT_DATA_DIR="$old_ft_data_dir"
         else
-            unset WA_DATA_DIR
+            unset FT_DATA_DIR
         fi
-        if [[ -n "$old_wa_workspace" ]]; then
-            export FT_WORKSPACE="$old_wa_workspace"
+        if [[ -n "$old_ft_workspace" ]]; then
+            export FT_WORKSPACE="$old_ft_workspace"
         else
             unset FT_WORKSPACE
         fi
-        if [[ -n "$old_wa_config" ]]; then
-            export WA_CONFIG="$old_wa_config"
+        if [[ -n "$old_ft_config" ]]; then
+            export FT_CONFIG="$old_ft_config"
         else
-            unset WA_CONFIG
+            unset FT_CONFIG
         fi
         if [[ -n "$old_caut_mode" ]]; then
             export CAUT_FAKE_MODE="$old_caut_mode"
@@ -6871,14 +6871,14 @@ run_scenario_accounts_refresh() {
             unset CAUT_FAKE_LOG
         fi
         if [[ -d "$temp_workspace" ]]; then
-            cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp -r "$temp_workspace/.ft"/* "$scenario_dir/" 2>/dev/null || true
             cp "$temp_workspace/caut_invocations.log" "$scenario_dir/" 2>/dev/null || true
         fi
         if [[ -d "$temp_workspace_fail" ]]; then
-            cp -r "$temp_workspace_fail/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp -r "$temp_workspace_fail/.ft"/* "$scenario_dir/" 2>/dev/null || true
         fi
         if [[ -d "$temp_workspace_invalid" ]]; then
-            cp -r "$temp_workspace_invalid/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp -r "$temp_workspace_invalid/.ft"/* "$scenario_dir/" 2>/dev/null || true
         fi
         rm -rf "$temp_workspace" "$temp_workspace_fail" "$temp_workspace_invalid"
     }
@@ -6989,10 +6989,10 @@ EOF
 
     # Step 1: Refresh accounts (success path)
     log_info "Step 1: Running accounts refresh (success)..."
-    export WA_DATA_DIR="$temp_workspace/.wa"
+    export FT_DATA_DIR="$temp_workspace/.ft"
     export FT_WORKSPACE="$temp_workspace"
-    unset WA_CONFIG
-    mkdir -p "$WA_DATA_DIR"
+    unset FT_CONFIG
+    mkdir -p "$FT_DATA_DIR"
 
     local refresh_output
     refresh_output=$("$FT_BINARY" robot --format json accounts refresh --service openai \
@@ -7036,9 +7036,9 @@ EOF
 
     # Step 3: Refresh failure path (redaction)
     log_info "Step 3: Refresh failure path (redaction)..."
-    export WA_DATA_DIR="$temp_workspace_fail/.wa"
+    export FT_DATA_DIR="$temp_workspace_fail/.ft"
     export FT_WORKSPACE="$temp_workspace_fail"
-    mkdir -p "$WA_DATA_DIR"
+    mkdir -p "$FT_DATA_DIR"
     export CAUT_FAKE_MODE="fail"
 
     local fail_output
@@ -7062,9 +7062,9 @@ EOF
 
     # Step 4: Invalid JSON path (redaction)
     log_info "Step 4: Refresh invalid JSON (redaction)..."
-    export WA_DATA_DIR="$temp_workspace_invalid/.wa"
+    export FT_DATA_DIR="$temp_workspace_invalid/.ft"
     export FT_WORKSPACE="$temp_workspace_invalid"
-    mkdir -p "$WA_DATA_DIR"
+    mkdir -p "$FT_DATA_DIR"
     export CAUT_FAKE_MODE="invalid_json"
 
     local invalid_output
@@ -7095,8 +7095,8 @@ EOF
 run_scenario_alt_screen_detection() {
     local scenario_dir="$1"
     local temp_workspace
-    temp_workspace=$(mktemp -d /tmp/wa-e2e-alt-XXXXXX)
-    local wa_pid=""
+    temp_workspace=$(mktemp -d /tmp/ft-e2e-alt-XXXXXX)
+    local ft_pid=""
     local wezterm_pid=""
     local pane_id=""
     local result=0
@@ -7109,7 +7109,7 @@ run_scenario_alt_screen_detection() {
 
     ipc_pane_state() {
         local target_pane="$1"
-        local socket_path="$WA_DATA_DIR/ipc.sock"
+        local socket_path="$FT_DATA_DIR/ipc.sock"
         python3 - "$socket_path" "$target_pane" <<'PY'
 import json
 import socket
@@ -7138,9 +7138,9 @@ PY
     log_info "WezTerm socket: $wezterm_socket"
 
     # Setup environment for isolated wa instance
-    export WA_DATA_DIR="$temp_workspace/.wa"
+    export FT_DATA_DIR="$temp_workspace/.ft"
     export FT_WORKSPACE="$temp_workspace"
-    mkdir -p "$WA_DATA_DIR"
+    mkdir -p "$FT_DATA_DIR"
 
     echo "scenario: alt_screen_detection" >> "$scenario_dir/scenario.log"
     echo "workspace: $temp_workspace" >> "$scenario_dir/scenario.log"
@@ -7150,10 +7150,10 @@ PY
 
     cleanup_alt_screen_detection() {
         log_verbose "Cleaning up alt_screen_detection scenario"
-        if [[ -n "$wa_pid" ]] && kill -0 "$wa_pid" 2>/dev/null; then
-            log_verbose "Stopping wa watch (pid $wa_pid)"
-            kill "$wa_pid" 2>/dev/null || true
-            wait "$wa_pid" 2>/dev/null || true
+        if [[ -n "$ft_pid" ]] && kill -0 "$ft_pid" 2>/dev/null; then
+            log_verbose "Stopping ft watch (pid $ft_pid)"
+            kill "$ft_pid" 2>/dev/null || true
+            wait "$ft_pid" 2>/dev/null || true
         fi
         if [[ -n "$pane_id" ]]; then
             log_verbose "Closing test pane $pane_id"
@@ -7166,7 +7166,7 @@ PY
             wait "$wezterm_pid" 2>/dev/null || true
         fi
         if [[ -d "$temp_workspace" ]]; then
-            cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp -r "$temp_workspace/.ft"/* "$scenario_dir/" 2>/dev/null || true
             cp "$config_file" "$scenario_dir/wezterm.lua" 2>/dev/null || true
             cp "$emit_script" "$scenario_dir/emit_alt_screen.sh" 2>/dev/null || true
         fi
@@ -7183,10 +7183,10 @@ EOF
 
     # Step 2: Start a dedicated wezterm instance with the config
     log_info "Step 2: Starting wezterm..."
-    FT_WORKSPACE="$temp_workspace" WA_DATA_DIR="$WA_DATA_DIR" \
+    FT_WORKSPACE="$temp_workspace" FT_DATA_DIR="$FT_DATA_DIR" \
         WEZTERM_UNIX_SOCKET="$wezterm_socket" \
         wezterm start --always-new-process --config-file "$config_file" \
-        --workspace "wa-e2e-alt" > "$scenario_dir/wezterm.log" 2>&1 &
+        --workspace "ft-e2e-alt" > "$scenario_dir/wezterm.log" 2>&1 &
     wezterm_pid=$!
     echo "wezterm_pid: $wezterm_pid" >> "$scenario_dir/scenario.log"
 
@@ -7198,21 +7198,21 @@ EOF
     fi
     log_pass "WezTerm mux ready"
 
-    # Step 3: Start wa watch against the test mux
-    log_info "Step 3: Starting wa watch..."
-    FT_WORKSPACE="$temp_workspace" WA_DATA_DIR="$temp_workspace/.wa" \
+    # Step 3: Start ft watch against the test mux
+    log_info "Step 3: Starting ft watch..."
+    FT_WORKSPACE="$temp_workspace" FT_DATA_DIR="$temp_workspace/.ft" \
         WEZTERM_UNIX_SOCKET="$wezterm_socket" FT_LOG_LEVEL=debug \
         "$FT_BINARY" watch --foreground > "$scenario_dir/wa_watch.log" 2>&1 &
-    wa_pid=$!
-    echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
+    ft_pid=$!
+    echo "ft_pid: $ft_pid" >> "$scenario_dir/scenario.log"
 
-    local check_watch_cmd="kill -0 $wa_pid 2>/dev/null"
-    if ! wait_for_condition "wa watch running" "$check_watch_cmd" 10; then
-        log_fail "wa watch exited immediately"
+    local check_watch_cmd="kill -0 $ft_pid 2>/dev/null"
+    if ! wait_for_condition "ft watch running" "$check_watch_cmd" 10; then
+        log_fail "ft watch exited immediately"
         result=1
         return $result
     fi
-    log_pass "wa watch running"
+    log_pass "ft watch running"
 
     # Step 4: Prepare a pane script that toggles alt screen
     log_info "Step 4: Preparing alt-screen script..."
@@ -7248,7 +7248,7 @@ EOS
 
     # Step 6: Wait for pane to be observed
     log_info "Step 6: Waiting for pane observation..."
-    local check_cmd="WEZTERM_UNIX_SOCKET=\"$wezterm_socket\" FT_WORKSPACE=\"$temp_workspace\" WA_DATA_DIR=\"$temp_workspace/.wa\" \"$FT_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane_id)' >/dev/null 2>&1"
+    local check_cmd="WEZTERM_UNIX_SOCKET=\"$wezterm_socket\" FT_WORKSPACE=\"$temp_workspace\" FT_DATA_DIR=\"$temp_workspace/.wa\" \"$FT_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane_id)' >/dev/null 2>&1"
     if ! wait_for_condition "pane $pane_id observed" "$check_cmd" "$wait_timeout"; then
         log_fail "Timeout waiting for pane to be observed"
         WEZTERM_UNIX_SOCKET="$wezterm_socket" "$FT_BINARY" robot state > "$scenario_dir/robot_state_initial.json" 2>&1 || true
@@ -7305,7 +7305,7 @@ EOS
 run_scenario_no_lua_status_hook() {
     local scenario_dir="$1"
     local temp_home
-    temp_home=$(mktemp -d /tmp/wa-e2e-nolua-XXXXXX)
+    temp_home=$(mktemp -d /tmp/ft-e2e-nolua-XXXXXX)
     local wezterm_dir="$temp_home/.config/wezterm"
     local wezterm_file="$wezterm_dir/wezterm.lua"
     local result=0
@@ -7368,30 +7368,30 @@ EOF
 run_scenario_watcher_crash_bundle() {
     local scenario_dir="$1"
     local temp_workspace
-    temp_workspace=$(mktemp -d /tmp/wa-e2e-crash-bundle-XXXXXX)
-    local wa_pid=""
+    temp_workspace=$(mktemp -d /tmp/ft-e2e-crash-bundle-XXXXXX)
+    local ft_pid=""
     local result=0
     local wait_timeout=${TIMEOUT:-60}
-    local old_wa_workspace="${FT_WORKSPACE:-}"
-    local old_wa_data_dir="${WA_DATA_DIR:-}"
+    local old_ft_workspace="${FT_WORKSPACE:-}"
+    local old_ft_data_dir="${FT_DATA_DIR:-}"
     local old_crash_flag="${FT_E2E_WATCHER_PANIC_ONCE:-}"
 
     log_info "Workspace: $temp_workspace"
 
     cleanup_watcher_crash_bundle() {
         log_verbose "Cleaning up watcher_crash_bundle scenario"
-        if [[ -n "${wa_pid:-}" ]] && kill -0 "$wa_pid" 2>/dev/null; then
-            log_verbose "Stopping wa watch (pid $wa_pid)"
-            kill "$wa_pid" 2>/dev/null || true
-            wait "$wa_pid" 2>/dev/null || true
+        if [[ -n "${ft_pid:-}" ]] && kill -0 "$ft_pid" 2>/dev/null; then
+            log_verbose "Stopping ft watch (pid $ft_pid)"
+            kill "$ft_pid" 2>/dev/null || true
+            wait "$ft_pid" 2>/dev/null || true
         fi
-        if [[ -n "$old_wa_data_dir" ]]; then
-            export WA_DATA_DIR="$old_wa_data_dir"
+        if [[ -n "$old_ft_data_dir" ]]; then
+            export FT_DATA_DIR="$old_ft_data_dir"
         else
-            unset WA_DATA_DIR
+            unset FT_DATA_DIR
         fi
-        if [[ -n "$old_wa_workspace" ]]; then
-            export FT_WORKSPACE="$old_wa_workspace"
+        if [[ -n "$old_ft_workspace" ]]; then
+            export FT_WORKSPACE="$old_ft_workspace"
         else
             unset FT_WORKSPACE
         fi
@@ -7401,14 +7401,14 @@ run_scenario_watcher_crash_bundle() {
             unset FT_E2E_WATCHER_PANIC_ONCE
         fi
         if [[ -d "${temp_workspace:-}" ]]; then
-            cp -r "${temp_workspace}/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp -r "${temp_workspace}/.ft"/* "$scenario_dir/" 2>/dev/null || true
         fi
         rm -rf "${temp_workspace:-}"
     }
     trap cleanup_watcher_crash_bundle EXIT
 
     export FT_WORKSPACE="$temp_workspace"
-    export WA_DATA_DIR="$temp_workspace/.wa"
+    export FT_DATA_DIR="$temp_workspace/.ft"
     export FT_E2E_WATCHER_PANIC_ONCE="1"
 
     echo "workspace: $temp_workspace" >> "$scenario_dir/scenario.log"
@@ -7416,8 +7416,8 @@ run_scenario_watcher_crash_bundle() {
     # Step 1: Start watcher in foreground (should intentionally panic once)
     log_info "Step 1: Starting watcher (intentional panic once)..."
     "$FT_BINARY" watch --foreground > "$scenario_dir/wa_watch.log" 2>&1 &
-    wa_pid=$!
-    echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
+    ft_pid=$!
+    echo "ft_pid: $ft_pid" >> "$scenario_dir/scenario.log"
 
     # Step 2: Wait for crash bundle to exist and watcher to exit
     log_info "Step 2: Waiting for crash bundle + watcher exit..."
@@ -7428,15 +7428,15 @@ run_scenario_watcher_crash_bundle() {
         result=1
     fi
 
-    local exit_check="! kill -0 $wa_pid 2>/dev/null"
+    local exit_check="! kill -0 $ft_pid 2>/dev/null"
     if ! wait_for_condition "watcher process exited" "$exit_check" "$wait_timeout"; then
         log_fail "Watcher did not exit within timeout"
         result=1
     fi
 
     # Capture exit status for artifacts (ignore because crash is expected)
-    wait "$wa_pid" 2>/dev/null || true
-    wa_pid=""
+    wait "$ft_pid" 2>/dev/null || true
+    ft_pid=""
 
     # Step 3: Verify triage surfaces crash
     log_info "Step 3: Verifying wa triage surfaces crash..."
@@ -7452,7 +7452,7 @@ run_scenario_watcher_crash_bundle() {
     fi
 
     # Step 4: Verify doctor surfaces crash
-    log_info "Step 4: Verifying wa doctor surfaces crash..."
+    log_info "Step 4: Verifying ft doctor surfaces crash..."
     "$FT_BINARY" doctor --json > "$scenario_dir/doctor.json" 2>&1 || result=1
     if ! jq -e '.checks[]? | select(.name == "Recent crash" and .status == "warning")' \
         "$scenario_dir/doctor.json" >/dev/null 2>&1; then
@@ -7493,7 +7493,7 @@ run_scenario_watcher_crash_bundle() {
 run_scenario_environment_detection() {
     local scenario_dir="$1"
     local temp_home
-    temp_home=$(mktemp -d /tmp/wa-e2e-envdetect-XXXXXX)
+    temp_home=$(mktemp -d /tmp/ft-e2e-envdetect-XXXXXX)
     local result=0
 
     log_info "Temp home: $temp_home"
@@ -7541,8 +7541,8 @@ LUAEOF
     }
     trap cleanup_environment_detection EXIT
 
-    # ---- Step 1: wa doctor --json (captures environment detection) ----
-    log_info "Step 1: wa doctor --json (environment detection)"
+    # ---- Step 1: ft doctor --json (captures environment detection) ----
+    log_info "Step 1: ft doctor --json (environment detection)"
     HOME="$temp_home" XDG_CONFIG_HOME="$temp_home/.config" SHELL="/bin/zsh" \
         "$FT_BINARY" doctor --json > "$scenario_dir/doctor.json" 2>"$scenario_dir/doctor.stderr" || true
 

@@ -170,10 +170,10 @@ DB_PATH=""
 NOW_MS=""
 
 setup_workspace() {
-    TEMP_WORKSPACE="$(mktemp -d /tmp/wa-e2e-timeline-XXXXXX)"
-    local wa_dir="$TEMP_WORKSPACE/.wa"
-    mkdir -p "$wa_dir"
-    DB_PATH="$wa_dir/ft.db"
+    TEMP_WORKSPACE="$(mktemp -d /tmp/ft-e2e-timeline-XXXXXX)"
+    local ft_dir="$TEMP_WORKSPACE/.ft"
+    mkdir -p "$ft_dir"
+    DB_PATH="$ft_dir/ft.db"
 
     # Calculate a stable "now" in epoch ms
     NOW_MS=$(date +%s)000
@@ -182,8 +182,8 @@ setup_workspace() {
     log_info "DB: $DB_PATH"
     log_info "NOW_MS: $NOW_MS"
 
-    # Initialize the DB by running wa db migrate (creates schema + migrations)
-    export WA_DATA_DIR="$wa_dir"
+    # Initialize the DB by running ft db migrate (creates schema + migrations)
+    export FT_DATA_DIR="$ft_dir"
     export FT_WORKSPACE="$TEMP_WORKSPACE"
 
     "$FT_BINARY" db migrate --yes > "$TEMP_WORKSPACE/db_migrate.log" 2>&1 || true

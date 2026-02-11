@@ -48,7 +48,7 @@ require_jq() {
 }
 
 make_temp_workspace() {
-    mktemp -d "${TMPDIR:-/tmp}/wa-e2e-profile-bookmarks.XXXXXX"
+    mktemp -d "${TMPDIR:-/tmp}/ft-e2e-profile-bookmarks.XXXXXX"
 }
 
 write_file() {
@@ -156,9 +156,9 @@ scenario_pane_bookmarks() {
     config_path="$workspace/ft.toml"
     write_file "$config_path" "[general]\nlog_level = \"info\"\n"
 
-    export WA_DATA_DIR="$workspace/.wa"
+    export FT_DATA_DIR="$workspace/.ft"
     export FT_WORKSPACE="$workspace"
-    mkdir -p "$WA_DATA_DIR"
+    mkdir -p "$FT_DATA_DIR"
 
     # Add bookmarks for different panes
     local add1 add2 add3
@@ -218,7 +218,7 @@ scenario_pane_bookmarks() {
     remove_bad=$("$FT_BIN" panes bookmark remove nonexistent --json 2>&1) || true
     e2e_add_file "bookmark_remove_nonexistent.json" "$remove_bad"
 
-    unset WA_DATA_DIR FT_WORKSPACE
+    unset FT_DATA_DIR FT_WORKSPACE
 }
 
 # =============================================================================
@@ -231,9 +231,9 @@ scenario_combined_profile_and_bookmarks() {
     config_path="$workspace/ft.toml"
     write_file "$config_path" "[general]\nlog_level = \"info\"\n"
 
-    export WA_DATA_DIR="$workspace/.wa"
+    export FT_DATA_DIR="$workspace/.ft"
     export FT_WORKSPACE="$workspace"
-    mkdir -p "$WA_DATA_DIR"
+    mkdir -p "$FT_DATA_DIR"
 
     # Create + apply a config profile
     "$FT_BIN" config profile create dev --from empty --path "$config_path"
@@ -276,7 +276,7 @@ scenario_combined_profile_and_bookmarks() {
     e2e_add_file "combined_bookmark_list_after_rollback.json" "$bm_after"
     echo "$bm_after" | jq -e 'length == 2' >/dev/null
 
-    unset WA_DATA_DIR FT_WORKSPACE
+    unset FT_DATA_DIR FT_WORKSPACE
 }
 
 # =============================================================================

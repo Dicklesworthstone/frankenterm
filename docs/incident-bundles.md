@@ -25,16 +25,16 @@ ft reproduce export --kind crash
 ft reproduce export --kind manual
 
 # Replay a bundle to validate its contents
-ft reproduce replay /path/to/wa_incident_crash_20260206_183000/ --mode policy
+ft reproduce replay /path/to/ft_incident_crash_20260206_183000/ --mode policy
 ```
 
 ## Bundle Layout
 
 Each bundle is a directory following the naming convention
-`wa_incident_{kind}_{YYYYMMDD_HHMMSS}`:
+`ft_incident_{kind}_{YYYYMMDD_HHMMSS}` (legacy: `wa_incident_{kind}_{YYYYMMDD_HHMMSS}`):
 
 ```
-wa_incident_crash_20260206_183000/
+ft_incident_crash_20260206_183000/
 ├── incident_manifest.json   # versioned metadata (always present)
 ├── README.md                # human-readable instructions (always present)
 ├── redaction_report.json    # what was redacted — counts only, no secrets
@@ -254,7 +254,7 @@ $ ft reproduce export --kind crash
 ft reproduce export - Incident bundle exported
 
   Kind:     crash
-  Path:     /home/user/.local/share/wa/crashes/wa_incident_crash_20260206_183000
+  Path:     /home/user/.local/share/ft/crashes/ft_incident_crash_20260206_183000
   Files:    incident_manifest.json, README.md, redaction_report.json,
             crash_report.json, crash_manifest.json, health_snapshot.json,
             config_summary.toml
@@ -265,7 +265,7 @@ ft reproduce export - Incident bundle exported
   3. Run 'ft reproduce replay <path>' to replay
 
 # Validate before sharing
-$ ft reproduce replay ~/.local/share/wa/crashes/wa_incident_crash_20260206_183000 --mode policy
+$ ft reproduce replay ~/.local/share/ft/crashes/ft_incident_crash_20260206_183000 --mode policy
 ```
 
 ### Example 2: Unexpected policy denial
@@ -308,7 +308,7 @@ $ ft reproduce replay /path/to/bundle --mode workflow
 
 ```bash
 # Create a tarball
-tar czf incident_bundle.tar.gz wa_incident_crash_20260206_183000/
+tar czf incident_bundle.tar.gz ft_incident_crash_20260206_183000/
 
 # Attach to the issue or share via a file hosting service
 ```
@@ -377,7 +377,7 @@ The replay command requires a path to an existing bundle directory:
 ft reproduce replay /path/to/incident_manifest.json
 
 # Right — directory path
-ft reproduce replay /path/to/wa_incident_crash_20260206_183000/
+ft reproduce replay /path/to/ft_incident_crash_20260206_183000/
 ```
 
 ### "Incompatible bundle format"
