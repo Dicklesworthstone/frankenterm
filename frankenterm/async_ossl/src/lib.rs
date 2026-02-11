@@ -1,6 +1,16 @@
 use openssl::ssl::SslStream;
 use std::net::TcpStream;
 
+#[cfg(all(feature = "async-io", feature = "async-asupersync"))]
+compile_error!("Features `async-io` and `async-asupersync` are mutually exclusive.");
+
+#[cfg(not(any(feature = "async-io", feature = "async-asupersync")))]
+compile_error!("Enable either `async-io` (default) or `async-asupersync`.");
+
+#[cfg(feature = "async-asupersync")]
+#[allow(dead_code)]
+struct _AsupersyncDep(asupersync::io::IoNotAvailable);
+
 #[cfg(unix)]
 pub trait AsRawDesc: std::os::unix::io::AsRawFd {}
 #[cfg(windows)]
@@ -11,6 +21,7 @@ pub struct AsyncSslStream {
     s: SslStream<TcpStream>,
 }
 
+#[cfg(feature = "async-io")]
 unsafe impl async_io::IoSafe for AsyncSslStream {}
 
 impl AsyncSslStream {

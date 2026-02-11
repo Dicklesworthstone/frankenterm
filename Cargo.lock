@@ -402,6 +402,7 @@ dependencies = [
 name = "async_ossl"
 version = "0.1.0"
 dependencies = [
+ "asupersync",
  "async-io",
  "openssl",
 ]
@@ -2336,6 +2337,7 @@ dependencies = [
 name = "frankenterm-uds"
 version = "0.1.0"
 dependencies = [
+ "asupersync",
  "async-io",
  "uds_windows",
 ]

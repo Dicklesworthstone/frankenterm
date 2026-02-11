@@ -11,6 +11,16 @@ use std::path::Path;
 #[cfg(windows)]
 use uds_windows::UnixStream as StreamImpl;
 
+#[cfg(all(feature = "async-io", feature = "async-asupersync"))]
+compile_error!("Features `async-io` and `async-asupersync` are mutually exclusive.");
+
+#[cfg(not(any(feature = "async-io", feature = "async-asupersync")))]
+compile_error!("Enable either `async-io` (default) or `async-asupersync`.");
+
+#[cfg(feature = "async-asupersync")]
+#[allow(dead_code)]
+struct _AsupersyncDep(asupersync::io::IoNotAvailable);
+
 #[cfg(unix)]
 use std::os::unix::net::UnixListener as ListenerImpl;
 #[cfg(windows)]
@@ -95,6 +105,7 @@ impl Write for UnixStream {
     }
 }
 
+#[cfg(feature = "async-io")]
 unsafe impl async_io::IoSafe for UnixStream {}
 
 impl UnixStream {

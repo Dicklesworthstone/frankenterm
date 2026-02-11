@@ -9,5 +9,12 @@ documentation = "https://docs.rs/frankenterm-uds"
 publish = false
 
 [dependencies]
-async-io.workspace = true
+async-io = { workspace = true, optional = true }
+asupersync = { workspace = true, optional = true }
 uds_windows.workspace = true
+
+[features]
+default = ["async-io"]
+
+async-io = ["dep:async-io"]
+async-asupersync = ["dep:asupersync"]
