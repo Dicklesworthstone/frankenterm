@@ -128,8 +128,8 @@ static CASCADE_TRACKER: OnceLock<Mutex<CascadeTracker>> = OnceLock::new();
 fn subsystem_for_circuit(name: &str) -> Option<Subsystem> {
     match name {
         "wezterm_cli" => Some(Subsystem::WeztermCli),
-        // Historical circuit names retained for compatibility with older logs/configs.
-        "mux_connection" | "capture_pipeline" => Some(Subsystem::WeztermCli),
+        "mux_connection" => Some(Subsystem::MuxConnection),
+        "capture_pipeline" => Some(Subsystem::Capture),
         "db_write" => Some(Subsystem::DbWrite),
         "pattern_engine" => Some(Subsystem::PatternEngine),
         "workflow_engine" => Some(Subsystem::WorkflowEngine),
@@ -521,7 +521,7 @@ mod tests {
     fn cascade_detection_degrades_workflow_engine() {
         let _ = DegradationManager::init_global();
         recover(Subsystem::WeztermCli);
-        recover(Subsystem::DbWrite);
+        recover(Subsystem::MuxConnection);
         recover(Subsystem::WorkflowEngine);
 
         let tracker = CASCADE_TRACKER.get_or_init(|| Mutex::new(CascadeTracker::default()));
@@ -542,11 +542,11 @@ mod tests {
             CircuitBreakerConfig::new(1, 1, Duration::from_secs(10)),
         );
         cli.record_failure();
-        let mut db = CircuitBreaker::with_name(
-            "db_write",
+        let mut mux = CircuitBreaker::with_name(
+            "mux_connection",
             CircuitBreakerConfig::new(1, 1, Duration::from_secs(10)),
         );
-        db.record_failure();
+        mux.record_failure();
 
         assert_eq!(
             crate::degradation::overall_status(),
@@ -560,7 +560,7 @@ mod tests {
         );
 
         recover(Subsystem::WeztermCli);
-        recover(Subsystem::DbWrite);
+        recover(Subsystem::MuxConnection);
         recover(Subsystem::WorkflowEngine);
     }
 }

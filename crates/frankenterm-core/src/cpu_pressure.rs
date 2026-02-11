@@ -9,8 +9,8 @@
 //!   by CPU count (no PSI equivalent, no unsafe FFI required).
 //! - **Other**: returns `Green` (no monitoring available).
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -164,7 +164,8 @@ impl CpuPressureMonitor {
     pub fn sample(&self) -> CpuSample {
         let pressure = self.read_cpu_pressure();
         let tier = self.classify(pressure);
-        self.latest_tier.store(tier.as_u8() as u64, Ordering::Relaxed);
+        self.latest_tier
+            .store(tier.as_u8() as u64, Ordering::Relaxed);
         CpuSample {
             pressure,
             tier,
@@ -281,7 +282,11 @@ fn read_macos_load_avg() -> f64 {
     output
         .and_then(|o| {
             let s = String::from_utf8(o.stdout).ok()?;
-            let trimmed = s.trim().trim_start_matches('{').trim_end_matches('}').trim();
+            let trimmed = s
+                .trim()
+                .trim_start_matches('{')
+                .trim_end_matches('}')
+                .trim();
             trimmed.split_whitespace().next()?.parse::<f64>().ok()
         })
         .unwrap_or(0.0)
