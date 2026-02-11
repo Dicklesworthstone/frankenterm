@@ -143,6 +143,7 @@ pub mod survival;
 pub mod tailer;
 pub mod telemetry;
 pub mod undo;
+pub mod user_preferences;
 pub mod voi;
 pub mod wait;
 pub mod watchdog;
