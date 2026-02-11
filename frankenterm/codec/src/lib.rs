@@ -11,12 +11,6 @@
 #![allow(dead_code)]
 #![allow(clippy::range_plus_one)]
 
-#[cfg(all(feature = "async-smol", feature = "async-asupersync"))]
-compile_error!("Features `async-smol` and `async-asupersync` are mutually exclusive.");
-
-#[cfg(not(any(feature = "async-smol", feature = "async-asupersync")))]
-compile_error!("Enable either `async-smol` (default) or `async-asupersync`.");
-
 use anyhow::{bail, Context as _, Error};
 use config::keyassignment::{PaneDirection, ScrollbackEraseMode};
 use frankenterm_term::color::ColorPalette;
@@ -29,15 +23,8 @@ use mux::window::WindowId;
 use portable_pty::CommandBuilder;
 use rangeset::*;
 use serde::{Deserialize, Serialize};
-
-#[cfg(feature = "async-asupersync")]
-use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-
-#[cfg(feature = "async-smol")]
 use smol::io::AsyncWriteExt;
-#[cfg(feature = "async-smol")]
 use smol::prelude::*;
-
 use std::collections::HashMap;
 use std::convert::TryInto;
 use std::io::Cursor;
@@ -142,16 +129,13 @@ where
     let mut buf = vec![];
     loop {
         let mut byte = [0u8];
-        if let Err(err) = r.read_exact(&mut byte).await {
-            if err.kind() == std::io::ErrorKind::UnexpectedEof {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "EOF while reading leb128 encoded value",
-                )
-                .into());
-            }
-
-            return Err(err.into());
+        let nread = r.read(&mut byte).await?;
+        if nread == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "EOF while reading leb128 encoded value",
+            )
+            .into());
         }
         buf.push(byte[0]);
 
@@ -317,6 +301,7 @@ fn serialize<T: serde::Serialize>(t: &T) -> Result<(Vec<u8>, bool), Error> {
     let mut compress = zstd::Encoder::new(&mut compressed, zstd::DEFAULT_COMPRESSION_LEVEL)?;
     let mut encode = varbincode::Serializer::new(&mut compress);
     t.serialize(&mut encode)?;
+    drop(encode);
     compress.finish()?;
 
     log::debug!(
@@ -349,7 +334,6 @@ fn deserialize<T: serde::de::DeserializeOwned, R: std::io::Read>(
 macro_rules! pdu {
     ($( $name:ident:$vers:expr),* $(,)?) => {
         #[derive(PartialEq, Debug)]
-        #[allow(clippy::large_enum_variant)]
         pub enum Pdu {
             Invalid{ident: u64},
             $(
@@ -525,17 +509,17 @@ impl Pdu {
     /// directly by a user, rather than background traffic on
     /// a live connection
     pub fn is_user_input(&self) -> bool {
-        matches!(
-            self,
+        match self {
             Self::WriteToPane(_)
-                | Self::SendKeyDown(_)
-                | Self::SendMouseEvent(_)
-                | Self::SendPaste(_)
-                | Self::Resize(_)
-                | Self::SetClipboard(_)
-                | Self::SetPaneZoomed(_)
-                | Self::SpawnV2(_)
-        )
+            | Self::SendKeyDown(_)
+            | Self::SendMouseEvent(_)
+            | Self::SendPaste(_)
+            | Self::Resize(_)
+            | Self::SetClipboard(_)
+            | Self::SetPaneZoomed(_)
+            | Self::SpawnV2(_) => true,
+            _ => false,
+        }
     }
 
     pub fn stream_decode(buffer: &mut Vec<u8>) -> anyhow::Result<Option<DecodedPdu>> {
@@ -1043,7 +1027,7 @@ impl From<Vec<(StableRowIndex, Line)>> for SerializedLines {
                 if let Some(link) = cell.attrs_mut().hyperlink().map(Arc::clone) {
                     cell.attrs_mut().set_hyperlink(None);
                     match current_link.as_ref() {
-                        Some(current) if Arc::ptr_eq(current, &link) => {
+                        Some(current) if Arc::ptr_eq(&current, &link) => {
                             // Continue the current streak
                             current_range = range_union(current_range, x..x + 1);
                         }

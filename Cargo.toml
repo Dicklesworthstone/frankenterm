@@ -374,7 +374,7 @@ criterion = { version = "0.5", features = ["async_tokio"] }
 asupersync = { git = "https://github.com/Dicklesworthstone/asupersync" }
 rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", branch = "master" }
 log = "0.4"
-chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 glob = "0.3"
 console = "0.15"
 getrandom = "0.3"
