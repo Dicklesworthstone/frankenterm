@@ -62,6 +62,7 @@ pub mod cleanup;
 pub mod command_guard;
 pub mod conformal;
 pub mod config;
+pub mod continuous_backpressure;
 pub mod config_profiles;
 pub mod cpu_pressure;
 pub mod cross_pane_correlation;
