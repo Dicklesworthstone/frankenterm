@@ -19,6 +19,26 @@
 
 ---
 
+## Session Persistence (Quick Reference)
+
+| Command | Purpose |
+|---------|---------|
+| `ft snapshot save` | Capture current mux state (session checkpoint) |
+| `ft snapshot list` | List recent snapshots |
+| `ft snapshot inspect <id>` | Inspect snapshot contents |
+| `ft snapshot diff <id1> <id2>` | Compare two snapshots |
+| `ft snapshot delete <id> --force` | Delete a snapshot |
+| `ft session list` | List saved sessions |
+| `ft session show <session_id>` | Show session + checkpoints |
+| `ft session doctor` | Health check for session persistence tables |
+| `ft watch` | Startup detection + restore prompt for unclean shutdowns |
+
+Notes:
+- `ft snapshot restore` and `ft restart` are currently not fully wired; restore is via `ft watch` on startup.
+- Most snapshot/session commands accept `-f json` (auto/plain/json) for machine-friendly output.
+
+---
+
 ## RULE 0 - THE FUNDAMENTAL OVERRIDE PREROGATIVE
 
 If I tell you to do something, even if it goes against what follows below, YOU MUST LISTEN TO ME. I AM IN CHARGE, NOT YOU.
