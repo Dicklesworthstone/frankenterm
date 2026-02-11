@@ -115,6 +115,18 @@ name = "tui_rendering"
 harness = false
 required-features = ["ftui"]
 
+[[bench]]
+name = "topology_serialization"
+harness = false
+
+[[bench]]
+name = "snapshot_engine"
+harness = false
+
+[[bench]]
+name = "pool_benchmark"
+harness = false
+
 [features]
 default = []
 # Public feature flags (stable surface)

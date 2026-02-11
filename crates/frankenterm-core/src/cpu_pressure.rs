@@ -402,9 +402,8 @@ mod tests {
     fn sample_updates_tier() {
         let monitor = CpuPressureMonitor::new(test_config());
         let sample = monitor.sample();
-        // On a real system, we just verify the sample is valid
+        // Load-average based pressure can exceed 100% on busy systems
         assert!(sample.pressure >= 0.0);
-        assert!(sample.pressure <= 100.0);
         assert_eq!(sample.tier, monitor.current_tier());
     }
 
