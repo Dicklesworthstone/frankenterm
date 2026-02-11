@@ -452,9 +452,9 @@ impl DriftMonitor {
 
     /// Register a rule for drift monitoring.
     pub fn register_rule(&mut self, rule_id: &str) {
-        self.monitors.entry(rule_id.to_string()).or_insert_with(|| {
-            RuleMonitor::new(rule_id.to_string(), self.config.confidence)
-        });
+        self.monitors
+            .entry(rule_id.to_string())
+            .or_insert_with(|| RuleMonitor::new(rule_id.to_string(), self.config.confidence));
     }
 
     /// Record a detection rate observation for a rule.
@@ -657,14 +657,8 @@ mod tests {
         let mut triggered = false;
         for _ in 0..100 {
             if let Some(info) = w.push(100.0) {
-                assert!(
-                    info.dropped_count > 0,
-                    "drift should drop old observations"
-                );
-                assert!(
-                    w.len() < size_before,
-                    "window should shrink after drift"
-                );
+                assert!(info.dropped_count > 0, "drift should drop old observations");
+                assert!(w.len() < size_before, "window should shrink after drift");
                 triggered = true;
                 break;
             }

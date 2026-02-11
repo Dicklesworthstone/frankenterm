@@ -21,7 +21,6 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 
 // =============================================================================
 // Content Hashing
@@ -308,6 +307,7 @@ impl EngineCounters {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     // ── In-memory content store ───────────────────────────────────────
 
@@ -366,16 +366,8 @@ mod tests {
 
         fn stats(&self) -> Result<DedupStats, String> {
             let unique_blocks = self.blocks.len() as u64;
-            let unique_bytes: u64 = self
-                .blocks
-                .values()
-                .map(|(_, b)| b.byte_size as u64)
-                .sum();
-            let total_references: u64 = self
-                .blocks
-                .values()
-                .map(|(_, b)| b.ref_count)
-                .sum();
+            let unique_bytes: u64 = self.blocks.values().map(|(_, b)| b.byte_size as u64).sum();
+            let total_references: u64 = self.blocks.values().map(|(_, b)| b.ref_count).sum();
             let logical_bytes: u64 = self
                 .blocks
                 .values()
@@ -399,10 +391,6 @@ mod tests {
 
     fn engine() -> DedupEngine<MemoryStore> {
         DedupEngine::new(DedupConfig::default(), MemoryStore::default())
-    }
-
-    fn engine_with_config(config: DedupConfig) -> DedupEngine<MemoryStore> {
-        DedupEngine::new(config, MemoryStore::default())
     }
 
     // ── Hashing tests ─────────────────────────────────────────────────
@@ -720,10 +708,7 @@ mod tests {
                 stats.unique_blocks, 1,
                 "n={n}: should have exactly 1 unique block"
             );
-            assert_eq!(
-                stats.total_references, n,
-                "n={n}: ref_count should be {n}"
-            );
+            assert_eq!(stats.total_references, n, "n={n}: ref_count should be {n}");
         }
     }
 
@@ -743,7 +728,8 @@ mod tests {
             if !result.stored_inline {
                 let retrieved = eng.get_content(&result.hash).unwrap().unwrap();
                 assert_eq!(
-                    &retrieved, content,
+                    &retrieved,
+                    content,
                     "roundtrip failed for content of len {}",
                     content.len()
                 );
@@ -800,11 +786,7 @@ mod tests {
         let mut eng = engine();
 
         // 3 unique contents, each stored 3 times = 9 segments, 3 unique blocks
-        let contents: Vec<Vec<u8>> = vec![
-            vec![0u8; 100],
-            vec![1u8; 100],
-            vec![2u8; 100],
-        ];
+        let contents: Vec<Vec<u8>> = vec![vec![0u8; 100], vec![1u8; 100], vec![2u8; 100]];
 
         for content in &contents {
             for i in 0..3 {

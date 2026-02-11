@@ -152,36 +152,38 @@ pub struct CausalEdge {
 ///
 /// Returns TE in bits (log₂). Returns 0.0 if inputs are too short.
 #[must_use]
-pub fn transfer_entropy(x: &[f64], y: &[f64], k: usize, l: usize, n_bins: usize) -> f64 {
-    let n = x.len().min(y.len());
-    let offset = k.max(l);
-    if n <= offset + 1 || n_bins == 0 {
+pub fn transfer_entropy(
+    source: &[f64],
+    target: &[f64],
+    target_history: usize,
+    source_history: usize,
+    n_bins: usize,
+) -> f64 {
+    let series_len = source.len().min(target.len());
+    let offset = target_history.max(source_history);
+    if series_len <= offset + 1 || n_bins == 0 {
         return 0.0;
     }
 
     // Bin the time series
-    let x_binned = bin_series(x, n_bins);
-    let y_binned = bin_series(y, n_bins);
+    let source_binned = bin_series(source, n_bins);
+    let target_binned = bin_series(target, n_bins);
 
-    let effective_n = n - offset;
+    let effective_n = series_len - offset;
 
     // Count joint and marginal frequencies using hash maps
     // Joint: (y_{t+1}, y_t^k, x_t^l)
     // We use a simplified k=1, l=1 approach: (y_next, y_cur, x_cur)
     let mut joint_yyx = HashMap::<(usize, usize, usize), u64>::new();
     let mut marginal_yy = HashMap::<(usize, usize), u64>::new();
-    let mut joint_yx = HashMap::<(usize, usize, usize), u64>::new();
-    let mut marginal_y = HashMap::<(usize,), u64>::new();
 
-    for t in offset..n - 1 {
-        let y_next = y_binned[t + 1];
-        let y_cur = y_binned[t - k + 1]; // simplified: just y[t] for k=1
-        let x_cur = x_binned[t - l + 1]; // simplified: just x[t] for l=1
+    for t in offset..series_len - 1 {
+        let y_next = target_binned[t + 1];
+        let y_cur = target_binned[t - target_history + 1]; // simplified: just y[t] for k=1
+        let x_cur = source_binned[t - source_history + 1]; // simplified: just x[t] for l=1
 
         *joint_yyx.entry((y_next, y_cur, x_cur)).or_insert(0) += 1;
         *marginal_yy.entry((y_next, y_cur)).or_insert(0) += 1;
-        *joint_yx.entry((y_next, y_cur, x_cur)).or_insert(0) += 1;
-        *marginal_y.entry((y_cur,)).or_insert(0) += 1;
     }
 
     // Need: p(y_next | y_cur, x_cur) and p(y_next | y_cur)
@@ -210,14 +212,14 @@ pub fn transfer_entropy(x: &[f64], y: &[f64], k: usize, l: usize, n_bins: usize)
     for (&(y_next, y_cur, x_cur), &count_joint) in &joint_yyx {
         let p_joint = count_joint as f64 / n_f64;
 
-        let p_yx = count_yx.get(&(y_cur, x_cur)).copied().unwrap_or(1) as f64 / n_f64;
-        let p_yy = marginal_yy.get(&(y_next, y_cur)).copied().unwrap_or(1) as f64 / n_f64;
-        let p_y = count_y.get(&y_cur).copied().unwrap_or(1) as f64 / n_f64;
+        let p_y_cur_x_cur = count_yx.get(&(y_cur, x_cur)).copied().unwrap_or(1) as f64 / n_f64;
+        let p_y_next_y_cur = marginal_yy.get(&(y_next, y_cur)).copied().unwrap_or(1) as f64 / n_f64;
+        let p_y_cur = count_y.get(&y_cur).copied().unwrap_or(1) as f64 / n_f64;
 
         // p(y_next | y_cur, x_cur) = p_joint / p_yx
         // p(y_next | y_cur) = p_yy / p_y
-        let cond_joint = p_joint / p_yx;
-        let cond_marginal = p_yy / p_y;
+        let cond_joint = p_joint / p_y_cur_x_cur;
+        let cond_marginal = p_y_next_y_cur / p_y_cur;
 
         if cond_joint > 0.0 && cond_marginal > 0.0 {
             te += p_joint * (cond_joint / cond_marginal).log2();
@@ -617,10 +619,7 @@ mod tests {
 
         let te_xy = transfer_entropy(&x, &y, 1, 1, 5);
 
-        assert!(
-            te_xy > 0.0,
-            "X→Y should have positive TE: {te_xy}"
-        );
+        assert!(te_xy > 0.0, "X→Y should have positive TE: {te_xy}");
     }
 
     #[test]
@@ -657,10 +656,7 @@ mod tests {
         let te = transfer_entropy(&x, &y, 1, 1, 8);
         let p = permutation_test(&x, &y, 1, 1, 8, 50, te);
 
-        assert!(
-            p > 0.01,
-            "independent series should have high p-value: {p}"
-        );
+        assert!(p > 0.01, "independent series should have high p-value: {p}");
     }
 
     #[test]

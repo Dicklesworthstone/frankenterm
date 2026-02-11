@@ -2,7 +2,7 @@
 mod tests {
     use frankenterm_core::config::{CommandGateConfig, DcgDenyPolicy, DcgMode};
     use frankenterm_core::policy::{
-        is_command_candidate, ActionKind, ActorKind, PaneCapabilities, PolicyEngine, PolicyInput,
+        ActionKind, ActorKind, PaneCapabilities, PolicyEngine, PolicyInput, is_command_candidate,
     };
 
     #[test]
@@ -64,10 +64,14 @@ mod tests {
             .with_command_text(input_text);
 
         let decision = engine.authorize(&input);
-        
+
         // This MUST be Denied (or RequireApproval)
         // With dcg disabled, built-in rules apply. rm -rf / matches command.rm_rf_root (Deny)
-        assert!(decision.is_denied(), "Multiline command with 'rm -rf /' should be denied! Decision: {:?}", decision);
+        assert!(
+            decision.is_denied(),
+            "Multiline command with 'rm -rf /' should be denied! Decision: {:?}",
+            decision
+        );
     }
 
     #[test]
@@ -88,6 +92,10 @@ mod tests {
 
         let decision = engine.authorize(&input);
 
-        assert!(decision.is_denied(), "Command hidden after comment should be denied! Decision: {:?}", decision);
+        assert!(
+            decision.is_denied(),
+            "Command hidden after comment should be denied! Decision: {:?}",
+            decision
+        );
     }
 }

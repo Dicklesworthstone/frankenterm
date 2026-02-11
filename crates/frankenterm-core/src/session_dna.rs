@@ -301,8 +301,7 @@ impl SessionDnaBuilder {
 
         // Update time_to_first_error
         if let (Some(start), Some(first_err)) = (self.start_time_s, self.first_error_time_s) {
-            self.dna.time_to_first_error =
-                Some(((first_err - start) / 3600.0) as f32);
+            self.dna.time_to_first_error = Some(((first_err - start) / 3600.0) as f32);
         }
     }
 
@@ -550,12 +549,7 @@ impl SessionStore {
     }
 
     /// Add a completed session.
-    pub fn add_session(
-        &mut self,
-        session_id: String,
-        dna: SessionDna,
-        successful: bool,
-    ) {
+    pub fn add_session(&mut self, session_id: String, dna: SessionDna, successful: bool) {
         let raw = dna.to_raw_features();
         let raw_vec: Vec<f64> = raw.to_vec();
 
@@ -772,10 +766,7 @@ impl PcaModel {
 }
 
 /// Power iteration to find the dominant eigenvector of a symmetric matrix.
-fn pca_power_iteration(
-    matrix: &[Vec<f64>],
-    max_iter: usize,
-) -> (f64, [f64; RAW_FEATURE_DIM]) {
+fn pca_power_iteration(matrix: &[Vec<f64>], max_iter: usize) -> (f64, [f64; RAW_FEATURE_DIM]) {
     let d = RAW_FEATURE_DIM;
     let mut v = [0.0f64; RAW_FEATURE_DIM];
     v[0] = 1.0;

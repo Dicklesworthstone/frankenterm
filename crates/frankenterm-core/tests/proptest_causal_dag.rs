@@ -12,8 +12,8 @@
 use proptest::prelude::*;
 
 use frankenterm_core::causal_dag::{
-    CausalDag, CausalDagConfig, CausalDagSnapshot, PaneTimeSeries, transfer_entropy,
-    permutation_test,
+    CausalDag, CausalDagConfig, CausalDagSnapshot, PaneTimeSeries, permutation_test,
+    transfer_entropy,
 };
 
 // =============================================================================
@@ -139,20 +139,9 @@ proptest! {
 
     #[test]
     fn downstream_upstream_consistency(
-        n_edges in 1usize..10,
+        _n_edges in 1usize..10,
     ) {
-        let mut dag = CausalDag::new(CausalDagConfig::default());
-
-        // Build a chain: 0 → 1 → 2 → ... → n_edges
-        let edges: Vec<frankenterm_core::causal_dag::CausalEdge> = (0..n_edges)
-            .map(|i| frankenterm_core::causal_dag::CausalEdge {
-                source: i as u64,
-                target: (i + 1) as u64,
-                transfer_entropy: 0.5,
-                p_value: 0.001,
-                lag_samples: 1,
-            })
-            .collect();
+        let dag = CausalDag::new(CausalDagConfig::default());
 
         // Set edges directly via snapshot (need to access internals)
         // Since we can't set edges directly, we test via downstream/upstream
@@ -166,7 +155,7 @@ proptest! {
 
         // Simple consistency check: if A→B edge exists, B is in downstream(A)
         // and A is in upstream(B)
-        let mut dag2 = CausalDag::new(CausalDagConfig::default());
+        let dag2 = CausalDag::new(CausalDagConfig::default());
         // We can't easily test without public edge access, so just verify
         // that empty DAGs return empty traversals
         let ds = dag2.downstream(0);

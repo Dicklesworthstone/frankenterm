@@ -13,8 +13,8 @@
 use proptest::prelude::*;
 
 use frankenterm_core::spectral::{
-    classify, detect_peaks, hann_window, power_spectral_density, spectral_flatness, AgentClass,
-    SpectralConfig, SpectralFingerprint,
+    AgentClass, SpectralConfig, SpectralFingerprint, classify_signal, detect_peaks, hann_window,
+    power_spectral_density, spectral_flatness,
 };
 
 // =============================================================================
@@ -116,8 +116,8 @@ proptest! {
         signal in prop::collection::vec(-100.0f64..100.0, 32..256),
     ) {
         let config = SpectralConfig::default();
-        let fp1 = classify(&signal, &config);
-        let fp2 = classify(&signal, &config);
+        let fp1 = classify_signal(&signal, &config);
+        let fp2 = classify_signal(&signal, &config);
         prop_assert_eq!(
             fp1.classification,
             fp2.classification,
@@ -142,12 +142,17 @@ proptest! {
         psd in prop::collection::vec(0.01f64..100.0, 10..256),
         threshold in 2.0f64..20.0,
     ) {
-        let peaks = detect_peaks(&psd, threshold, 10.0, 1024);
+        let peaks = detect_peaks(&psd, threshold, 10.0);
 
         // Compute median
         let mut sorted = psd.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let median = sorted[sorted.len() / 2];
+        let mid = sorted.len() / 2;
+        let median = if sorted.len() % 2 == 0 {
+            (sorted[mid - 1] + sorted[mid]) / 2.0
+        } else {
+            sorted[mid]
+        };
 
         for peak in &peaks {
             // SNR should equal power / median
@@ -182,7 +187,7 @@ proptest! {
         signal in prop::collection::vec(-100.0f64..100.0, 32..256),
     ) {
         let config = SpectralConfig::default();
-        let fp = classify(&signal, &config);
+        let fp = classify_signal(&signal, &config);
 
         let json = serde_json::to_string(&fp).unwrap();
         let parsed: SpectralFingerprint = serde_json::from_str(&json).unwrap();
@@ -204,7 +209,7 @@ proptest! {
         signal in prop::collection::vec(-100.0f64..100.0, 16..512),
     ) {
         let config = SpectralConfig::default();
-        let fp = classify(&signal, &config);
+        let fp = classify_signal(&signal, &config);
         // Just verify it's one of the known variants (exhaustive match)
         match fp.classification {
             AgentClass::Polling | AgentClass::Burst |

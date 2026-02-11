@@ -88,10 +88,10 @@ impl ThrottleActions {
         let s = severity.clamp(0.0, 1.0);
         Self {
             severity: s,
-            poll_backoff_multiplier: 1.0 + 3.0 * s,
+            poll_backoff_multiplier: 3.0f64.mul_add(s, 1.0),
             pane_skip_fraction: 0.5 * s * s,
             detection_skip_fraction: 0.25 * s,
-            buffer_limit_factor: 1.0 - 0.8 * s,
+            buffer_limit_factor: 0.8f64.mul_add(-s, 1.0),
         }
     }
 }
@@ -145,7 +145,7 @@ impl ContinuousBackpressure {
             // Initialize EMA with first observation.
             self.smoothed_ratio = ratio;
         } else {
-            self.smoothed_ratio = alpha * ratio + (1.0 - alpha) * self.smoothed_ratio;
+            self.smoothed_ratio = alpha.mul_add(ratio, (1.0 - alpha) * self.smoothed_ratio);
         }
         self.observation_count += 1;
 
@@ -225,10 +225,6 @@ fn sigmoid(x: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn default_config() -> SeverityConfig {
-        SeverityConfig::default()
-    }
 
     // -- Sigmoid tests --
 

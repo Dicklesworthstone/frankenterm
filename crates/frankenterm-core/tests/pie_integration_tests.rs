@@ -13,14 +13,12 @@ use frankenterm_core::backpressure::BackpressureTier;
 use frankenterm_core::bayesian_ledger::{BayesianClassifier, Evidence, LedgerConfig, PaneState};
 use frankenterm_core::bocpd::{BocpdConfig, BocpdModel};
 use frankenterm_core::causal_dag::{CausalDag, CausalDagConfig};
-use frankenterm_core::conformal::{ConformalForecaster};
+use frankenterm_core::conformal::ConformalForecaster;
 use frankenterm_core::continuous_backpressure::{
     ContinuousBackpressure, ContinuousBackpressureConfig,
 };
 use frankenterm_core::cross_pane_correlation::{CorrelationConfig, CorrelationEngine, EventRecord};
-use frankenterm_core::kalman_watchdog::{
-    AdaptiveWatchdog, AdaptiveWatchdogConfig,
-};
+use frankenterm_core::kalman_watchdog::{AdaptiveWatchdog, AdaptiveWatchdogConfig};
 use frankenterm_core::survival::{Covariates, SurvivalConfig, SurvivalModel};
 use frankenterm_core::voi::{BackpressureTierInput, VoiConfig, VoiScheduler};
 use frankenterm_core::watchdog::{Component, HealthStatus};
@@ -102,18 +100,8 @@ fn voi_prioritizes_uncertain_panes() {
     let result = sched.schedule(5000);
 
     // Pane 2 (uncertain) should have higher VOI than Pane 1 (certain).
-    let voi_1 = result
-        .schedule
-        .iter()
-        .find(|d| d.pane_id == 1)
-        .unwrap()
-        .voi;
-    let voi_2 = result
-        .schedule
-        .iter()
-        .find(|d| d.pane_id == 2)
-        .unwrap()
-        .voi;
+    let voi_1 = result.schedule.iter().find(|d| d.pane_id == 1).unwrap().voi;
+    let voi_2 = result.schedule.iter().find(|d| d.pane_id == 2).unwrap().voi;
 
     assert!(
         voi_2 > voi_1,
@@ -179,8 +167,8 @@ fn survival_hazard_drives_scheduling_priority() {
 
     // With default params (beta=[0;5]), covariates don't matter — only time does.
     // Use different time horizons: short vs long.
-    let report_short = model.report(24.0, &cov);   // 24 hours
-    let report_long = model.report(500.0, &cov);    // 500 hours
+    let report_short = model.report(24.0, &cov); // 24 hours
+    let report_long = model.report(500.0, &cov); // 500 hours
 
     // Longer uptime should have higher failure probability.
     assert!(
@@ -198,18 +186,8 @@ fn survival_hazard_drives_scheduling_priority() {
     sched.set_importance(2, 1.0 + report_long.failure_probability * 10.0);
 
     let result = sched.schedule(5000);
-    let voi_short = result
-        .schedule
-        .iter()
-        .find(|d| d.pane_id == 1)
-        .unwrap()
-        .voi;
-    let voi_long = result
-        .schedule
-        .iter()
-        .find(|d| d.pane_id == 2)
-        .unwrap()
-        .voi;
+    let voi_short = result.schedule.iter().find(|d| d.pane_id == 1).unwrap().voi;
+    let voi_long = result.schedule.iter().find(|d| d.pane_id == 2).unwrap().voi;
 
     assert!(
         voi_long > voi_short,
@@ -453,8 +431,16 @@ fn posterior_converges_with_consistent_evidence() {
     let result = classifier.classify(1).unwrap();
 
     // Posterior should concentrate on Idle or Background.
-    let idle_prob = result.posterior.get(PaneState::Idle.name()).copied().unwrap_or(0.0);
-    let bg_prob = result.posterior.get(PaneState::Background.name()).copied().unwrap_or(0.0);
+    let idle_prob = result
+        .posterior
+        .get(PaneState::Idle.name())
+        .copied()
+        .unwrap_or(0.0);
+    let bg_prob = result
+        .posterior
+        .get(PaneState::Background.name())
+        .copied()
+        .unwrap_or(0.0);
 
     assert!(
         idle_prob + bg_prob > 0.5,
@@ -516,10 +502,7 @@ fn survival_function_properties() {
 
     // S(0) should be 1.
     let s0 = model.params().survival_probability(0.0, &cov);
-    assert!(
-        (s0 - 1.0).abs() < 1e-10,
-        "S(0) should be 1.0, got {s0}"
-    );
+    assert!((s0 - 1.0).abs() < 1e-10, "S(0) should be 1.0, got {s0}");
 
     // S(t) should be monotonically decreasing.
     let mut prev_s = 1.0;

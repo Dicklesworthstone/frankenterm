@@ -323,8 +323,7 @@ impl MemoryBudgetManager {
 
     /// Run the monitoring loop until the shutdown flag is set.
     pub async fn run(&self, shutdown: Arc<std::sync::atomic::AtomicBool>) {
-        let interval =
-            std::time::Duration::from_millis(self.config.sample_interval_ms.max(1000));
+        let interval = std::time::Duration::from_millis(self.config.sample_interval_ms.max(1000));
         let mut ticker = tokio::time::interval(interval);
 
         loop {

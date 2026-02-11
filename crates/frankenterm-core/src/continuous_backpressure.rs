@@ -107,7 +107,7 @@ impl EmaSmoother {
             self.value = raw;
             self.initialized = true;
         } else {
-            self.value = self.alpha * raw + (1.0 - self.alpha) * self.value;
+            self.value = self.alpha.mul_add(raw, (1.0 - self.alpha) * self.value);
         }
         self.value
     }
@@ -221,11 +221,7 @@ impl ContinuousBackpressure {
     /// - `write_ratio`: Current write queue depth / capacity (0.0–1.0).
     ///
     /// Returns the new throttle actions.
-    pub fn update(
-        &mut self,
-        capture_ratio: f64,
-        write_ratio: f64,
-    ) -> ThrottleActions {
+    pub fn update(&mut self, capture_ratio: f64, write_ratio: f64) -> ThrottleActions {
         let capture_ratio = capture_ratio.clamp(0.0, 1.0);
         let write_ratio = write_ratio.clamp(0.0, 1.0);
 
@@ -293,10 +289,10 @@ impl ContinuousBackpressure {
 
         ThrottleActions {
             severity: s,
-            poll_multiplier: 1.0 + self.config.max_backoff_multiplier * s,
+            poll_multiplier: self.config.max_backoff_multiplier.mul_add(s, 1.0),
             pane_skip_fraction: self.config.max_pane_skip * s * s, // Quadratic
             detection_skip_fraction: self.config.max_detection_skip * s,
-            buffer_limit_fraction: 1.0 - (1.0 - self.config.min_buffer_fraction) * s,
+            buffer_limit_fraction: (1.0 - self.config.min_buffer_fraction).mul_add(-s, 1.0),
             equivalent_tier: severity_to_tier(s),
         }
     }
@@ -379,7 +375,10 @@ mod tests {
     #[test]
     fn severity_at_center() {
         let s = severity(0.6, 0.6, 8.0);
-        assert!((s - 0.5).abs() < 1e-10, "severity at center should be 0.5, got {s}");
+        assert!(
+            (s - 0.5).abs() < 1e-10,
+            "severity at center should be 0.5, got {s}"
+        );
     }
 
     #[test]
@@ -391,7 +390,10 @@ mod tests {
     #[test]
     fn severity_high_queue() {
         let s = severity(0.95, 0.6, 8.0);
-        assert!(s > 0.9, "high queue ratio should give high severity, got {s}");
+        assert!(
+            s > 0.9,
+            "high queue ratio should give high severity, got {s}"
+        );
     }
 
     #[test]
@@ -423,7 +425,10 @@ mod tests {
         let s_gentle = severity(0.7, 0.6, 2.0);
         let s_steep = severity(0.7, 0.6, 20.0);
         // Both above 0.5 since q > center, but steep should be closer to 1
-        assert!(s_steep > s_gentle, "steeper should give higher severity above center");
+        assert!(
+            s_steep > s_gentle,
+            "steeper should give higher severity above center"
+        );
     }
 
     // ── EMA Smoother ────────────────────────────────────────────────────
@@ -634,11 +639,7 @@ mod tests {
         // Severity should increase smoothly (no big jumps)
         for window in severity_values.windows(2) {
             let jump = window[1] - window[0];
-            assert!(
-                jump < 0.3,
-                "severity jump {} too large (not smooth)",
-                jump
-            );
+            assert!(jump < 0.3, "severity jump {} too large (not smooth)", jump);
         }
 
         // Overall should have increased

@@ -17,7 +17,6 @@
 //! then delegates actual deletion to a [`SegmentStore`] trait implementor.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 use crate::memory_pressure::MemoryPressureTier;
 use crate::pane_tiers::PaneTier;
@@ -62,11 +61,7 @@ impl Default for EvictionConfig {
 impl EvictionConfig {
     /// Compute the max segments for a pane given its tier and current pressure.
     #[must_use]
-    pub fn max_segments_for(
-        &self,
-        tier: PaneTier,
-        pressure: MemoryPressureTier,
-    ) -> usize {
+    pub fn max_segments_for(&self, tier: PaneTier, pressure: MemoryPressureTier) -> usize {
         let base = match tier {
             PaneTier::Active => self.active_max_segments,
             PaneTier::Thinking => self.thinking_max_segments,
@@ -145,11 +140,7 @@ pub trait SegmentStore: Send + Sync {
     /// Delete the oldest `count` segments for a pane, preserving the newest.
     ///
     /// Returns the number of segments actually deleted.
-    fn delete_oldest_segments(
-        &self,
-        pane_id: u64,
-        count: usize,
-    ) -> Result<usize, String>;
+    fn delete_oldest_segments(&self, pane_id: u64, count: usize) -> Result<usize, String>;
 
     /// List all known pane IDs.
     fn list_pane_ids(&self) -> Result<Vec<u64>, String>;
@@ -271,6 +262,7 @@ impl<S: SegmentStore, T: PaneTierSource> ScrollbackEvictor<S, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     // ── Mock implementations ──────────────────────────────────────────
 
@@ -293,11 +285,7 @@ mod tests {
             Ok(*self.segments.get(&pane_id).unwrap_or(&0))
         }
 
-        fn delete_oldest_segments(
-            &self,
-            _pane_id: u64,
-            count: usize,
-        ) -> Result<usize, String> {
+        fn delete_oldest_segments(&self, _pane_id: u64, count: usize) -> Result<usize, String> {
             Ok(count) // Pretend we deleted them
         }
 
@@ -542,10 +530,7 @@ mod tests {
 
     #[test]
     fn execute_empty_plan_is_noop() {
-        let ev = default_evictor(
-            &[(1, 100)],
-            &[(1, PaneTier::Active)],
-        );
+        let ev = default_evictor(&[(1, 100)], &[(1, PaneTier::Active)]);
 
         let plan = ev.plan(MemoryPressureTier::Green).unwrap();
         let report = ev.execute(&plan);
@@ -556,10 +541,7 @@ mod tests {
 
     #[test]
     fn evict_convenience_method() {
-        let ev = default_evictor(
-            &[(1, 500)],
-            &[(1, PaneTier::Dormant)],
-        );
+        let ev = default_evictor(&[(1, 500)], &[(1, PaneTier::Dormant)]);
 
         let report = ev.evict(MemoryPressureTier::Green).unwrap();
         assert_eq!(report.segments_removed, 400);
@@ -574,11 +556,7 @@ mod tests {
             Ok(1000)
         }
 
-        fn delete_oldest_segments(
-            &self,
-            _pane_id: u64,
-            _count: usize,
-        ) -> Result<usize, String> {
+        fn delete_oldest_segments(&self, _pane_id: u64, _count: usize) -> Result<usize, String> {
             Err("disk full".to_string())
         }
 
@@ -615,7 +593,10 @@ mod tests {
         let plan = ev.plan(MemoryPressureTier::Yellow).unwrap();
         let json = serde_json::to_string(&plan).unwrap();
         let parsed: EvictionPlan = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.total_segments_to_remove, plan.total_segments_to_remove);
+        assert_eq!(
+            parsed.total_segments_to_remove,
+            plan.total_segments_to_remove
+        );
     }
 
     #[test]
@@ -744,7 +725,10 @@ mod tests {
         let plan1 = ev.plan(MemoryPressureTier::Green).unwrap();
         let plan2 = ev.plan(MemoryPressureTier::Green).unwrap();
 
-        assert_eq!(plan1.total_segments_to_remove, plan2.total_segments_to_remove);
+        assert_eq!(
+            plan1.total_segments_to_remove,
+            plan2.total_segments_to_remove
+        );
         assert_eq!(plan1.panes_affected, plan2.panes_affected);
     }
 

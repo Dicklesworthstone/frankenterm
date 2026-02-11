@@ -372,6 +372,7 @@ criterion = { version = "0.5", features = ["async_tokio"] }
 
 # FastMCP (optional MCP server dependencies)
 asupersync = { git = "https://github.com/Dicklesworthstone/asupersync" }
+asupersync-macros = { git = "https://github.com/Dicklesworthstone/asupersync" }
 rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", branch = "master" }
 log = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }

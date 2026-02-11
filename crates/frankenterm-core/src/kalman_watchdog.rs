@@ -413,10 +413,7 @@ impl AdaptiveWatchdog {
 
     /// Create with custom fallback thresholds per component.
     #[must_use]
-    pub fn with_fallbacks(
-        config: AdaptiveWatchdogConfig,
-        fallbacks: &[(Component, u64)],
-    ) -> Self {
+    pub fn with_fallbacks(config: AdaptiveWatchdogConfig, fallbacks: &[(Component, u64)]) -> Self {
         let trackers = fallbacks
             .iter()
             .map(|(comp, threshold)| (*comp, ComponentTracker::new(&config, *threshold)))
@@ -609,8 +606,10 @@ mod tests {
         let true_value = 75.0;
 
         // Simulate noisy observations: 75 ± some variation
-        let observations = [73.0, 78.0, 71.0, 76.0, 74.0, 77.0, 72.0, 79.0, 75.0, 74.0,
-                           76.0, 73.0, 77.0, 74.0, 76.0, 75.0, 73.0, 78.0, 74.0, 76.0];
+        let observations = [
+            73.0, 78.0, 71.0, 76.0, 74.0, 77.0, 72.0, 79.0, 75.0, 74.0, 76.0, 73.0, 77.0, 74.0,
+            76.0, 75.0, 73.0, 78.0, 74.0, 76.0,
+        ];
 
         for &z in &observations {
             kf.update(z);
@@ -917,10 +916,7 @@ mod tests {
         let config = AdaptiveWatchdogConfig::default();
         let wd = AdaptiveWatchdog::with_fallbacks(
             config,
-            &[
-                (Component::Discovery, 10_000),
-                (Component::Capture, 2_000),
-            ],
+            &[(Component::Discovery, 10_000), (Component::Capture, 2_000)],
         );
 
         // Should only have the specified components
@@ -937,12 +933,19 @@ mod tests {
             wd.observe(Component::Discovery, i * 1000);
         }
 
-        assert!(wd.tracker(Component::Discovery).unwrap().observation_count() > 0);
+        assert!(
+            wd.tracker(Component::Discovery)
+                .unwrap()
+                .observation_count()
+                > 0
+        );
 
         wd.reset();
 
         assert_eq!(
-            wd.tracker(Component::Discovery).unwrap().observation_count(),
+            wd.tracker(Component::Discovery)
+                .unwrap()
+                .observation_count(),
             0
         );
     }

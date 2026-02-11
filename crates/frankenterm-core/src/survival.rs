@@ -633,6 +633,8 @@ impl std::fmt::Debug for SurvivalModel {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::float_cmp)]
+
     use super::*;
 
     // -- Weibull parameters ---------------------------------------------------

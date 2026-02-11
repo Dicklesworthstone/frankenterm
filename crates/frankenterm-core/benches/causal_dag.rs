@@ -85,15 +85,9 @@ fn bench_permutation(c: &mut Criterion) {
     let te = transfer_entropy(&x, &y, 1, 1, 8);
 
     for n_perms in [50, 100] {
-        group.bench_with_input(
-            BenchmarkId::new("shuffles", n_perms),
-            &n_perms,
-            |b, &n| {
-                b.iter(|| {
-                    frankenterm_core::causal_dag::permutation_test(&x, &y, 1, 1, 8, n, te)
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("shuffles", n_perms), &n_perms, |b, &n| {
+            b.iter(|| frankenterm_core::causal_dag::permutation_test(&x, &y, 1, 1, 8, n, te));
+        });
     }
 
     group.finish();
@@ -107,31 +101,27 @@ fn bench_dag_full_update(c: &mut Criterion) {
     let mut group = c.benchmark_group("dag_full_update_50_panes");
 
     for n_panes in [10, 25, 50] {
-        group.bench_with_input(
-            BenchmarkId::new("panes", n_panes),
-            &n_panes,
-            |b, &n| {
-                let config = CausalDagConfig {
-                    window_size: 300,
-                    n_permutations: 20, // Reduced for benchmark speed
-                    n_bins: 8,
-                    significance_level: 0.05,
-                    min_te_bits: 0.01,
-                    ..Default::default()
-                };
-                let mut dag = CausalDag::new(config);
+        group.bench_with_input(BenchmarkId::new("panes", n_panes), &n_panes, |b, &n| {
+            let config = CausalDagConfig {
+                window_size: 300,
+                n_permutations: 20, // Reduced for benchmark speed
+                n_bins: 8,
+                significance_level: 0.05,
+                min_te_bits: 0.01,
+                ..Default::default()
+            };
+            let mut dag = CausalDag::new(config);
 
-                for pane_id in 0..n as u64 {
-                    dag.register_pane(pane_id);
-                    let series = pseudo_random_series(300, pane_id * 1000 + 42);
-                    for val in series {
-                        dag.observe(pane_id, val);
-                    }
+            for pane_id in 0..n as u64 {
+                dag.register_pane(pane_id);
+                let series = pseudo_random_series(300, pane_id * 1000 + 42);
+                for val in series {
+                    dag.observe(pane_id, val);
                 }
+            }
 
-                b.iter(|| dag.update_dag());
-            },
-        );
+            b.iter(|| dag.update_dag());
+        });
     }
 
     group.finish();

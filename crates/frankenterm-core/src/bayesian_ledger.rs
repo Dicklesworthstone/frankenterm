@@ -282,14 +282,22 @@ impl PaneClassifier {
         // Record ledger entry
         let (top_idx, second_idx) = self.top_two_indices();
         let log_lr = log_liks[top_idx] - log_liks[second_idx];
-        let favors_idx = if log_liks.iter().enumerate().max_by(|(_, a), (_, b)| {
-            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-        }).map(|(i, _)| i).unwrap_or(0) == top_idx {
+        let favors_idx = if log_liks
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i)
+            .unwrap_or(0)
+            == top_idx
+        {
             top_idx
         } else {
-            log_liks.iter().enumerate().max_by(|(_, a), (_, b)| {
-                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-            }).map(|(i, _)| i).unwrap_or(0)
+            log_liks
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(i, _)| i)
+                .unwrap_or(0)
         };
 
         let entry = LedgerEntry {
@@ -517,13 +525,13 @@ fn output_rate_log_likelihoods(rate: f64) -> [f64; PaneState::COUNT] {
     // Active: high rate (~10-50 lps), Thinking: low (~0.5-2), Idle: ~0,
     // RateLimited: ~0, Error: burst (~5-20), Stuck: very high (~50+), Background: ~0
     let params: [(f64, f64); PaneState::COUNT] = [
-        (15.0, 10.0),  // Active: mean=15, std=10
-        (1.0, 1.5),    // Thinking: mean=1, std=1.5
-        (0.1, 0.5),    // Idle: mean=0.1, std=0.5
-        (0.0, 0.3),    // RateLimited: mean=0, std=0.3
-        (10.0, 8.0),   // Error: mean=10, std=8
-        (30.0, 15.0),  // Stuck: mean=30 (repetitive output), std=15
-        (0.0, 0.2),    // Background: mean=0, std=0.2
+        (15.0, 10.0), // Active: mean=15, std=10
+        (1.0, 1.5),   // Thinking: mean=1, std=1.5
+        (0.1, 0.5),   // Idle: mean=0.1, std=0.5
+        (0.0, 0.3),   // RateLimited: mean=0, std=0.3
+        (10.0, 8.0),  // Error: mean=10, std=8
+        (30.0, 15.0), // Stuck: mean=30 (repetitive output), std=15
+        (0.0, 0.2),   // Background: mean=0, std=0.2
     ];
     gaussian_log_likelihoods(rate, &params)
 }
@@ -532,13 +540,13 @@ fn output_rate_log_likelihoods(rate: f64) -> [f64; PaneState::COUNT] {
 fn entropy_log_likelihoods(entropy: f64) -> [f64; PaneState::COUNT] {
     // Active: high entropy (~4-6), Stuck: low (~1-2), Error: moderate (~3-4)
     let params: [(f64, f64); PaneState::COUNT] = [
-        (5.0, 1.0),   // Active: diverse output
-        (4.0, 1.0),   // Thinking: moderate diversity
-        (3.0, 2.0),   // Idle: low/variable
-        (2.0, 1.5),   // RateLimited: repetitive messages
-        (4.0, 1.5),   // Error: moderate (error messages)
-        (1.5, 0.8),   // Stuck: low entropy (repetitive)
-        (2.0, 2.0),   // Background: variable
+        (5.0, 1.0), // Active: diverse output
+        (4.0, 1.0), // Thinking: moderate diversity
+        (3.0, 2.0), // Idle: low/variable
+        (2.0, 1.5), // RateLimited: repetitive messages
+        (4.0, 1.5), // Error: moderate (error messages)
+        (1.5, 0.8), // Stuck: low entropy (repetitive)
+        (2.0, 2.0), // Background: variable
     ];
     gaussian_log_likelihoods(entropy, &params)
 }
@@ -576,13 +584,13 @@ fn time_since_output_log_likelihoods(secs: f64) -> [f64; PaneState::COUNT] {
     // Exponential decay model: P(time|state) ∝ λ * exp(-λ * time)
     // Higher λ = more frequent output expected
     let rates: [f64; PaneState::COUNT] = [
-        2.0,    // Active: output every ~0.5s
-        0.2,    // Thinking: output every ~5s
-        0.02,   // Idle: output every ~50s
-        0.01,   // RateLimited: very infrequent
-        0.5,    // Error: moderate frequency
-        0.5,    // Stuck: moderate (repetitive)
-        0.005,  // Background: very infrequent
+        2.0,   // Active: output every ~0.5s
+        0.2,   // Thinking: output every ~5s
+        0.02,  // Idle: output every ~50s
+        0.01,  // RateLimited: very infrequent
+        0.5,   // Error: moderate frequency
+        0.5,   // Stuck: moderate (repetitive)
+        0.005, // Background: very infrequent
     ];
 
     let mut lls = [0.0f64; PaneState::COUNT];
@@ -628,10 +636,7 @@ fn gaussian_log_likelihoods(
 
 /// Numerically stable log-softmax: convert log-unnormalized to probabilities.
 fn log_softmax(log_values: &[f64; PaneState::COUNT]) -> [f64; PaneState::COUNT] {
-    let max = log_values
-        .iter()
-        .copied()
-        .fold(f64::NEG_INFINITY, f64::max);
+    let max = log_values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
 
     let mut probs = [0.0f64; PaneState::COUNT];
     let sum: f64 = log_values.iter().map(|&lp| (lp - max).exp()).sum();
@@ -735,10 +740,7 @@ mod tests {
         let log_vals = [1.0, 2.0, 3.0, 0.5, -1.0, 0.0, -0.5];
         let probs = log_softmax(&log_vals);
         let sum: f64 = probs.iter().sum();
-        assert!(
-            (sum - 1.0).abs() < 1e-10,
-            "sum={sum}, expected ~1.0"
-        );
+        assert!((sum - 1.0).abs() < 1e-10, "sum={sum}, expected ~1.0");
     }
 
     #[test]
@@ -761,10 +763,7 @@ mod tests {
         let probs = log_softmax(&log_vals);
         let expected = 1.0 / PaneState::COUNT as f64;
         for &p in &probs {
-            assert!(
-                (p - expected).abs() < 1e-10,
-                "p={p}, expected {expected}"
-            );
+            assert!((p - expected).abs() < 1e-10, "p={p}, expected {expected}");
         }
     }
 
@@ -988,9 +987,15 @@ mod tests {
     #[test]
     fn evidence_strength_classification() {
         assert_eq!(EvidenceStrength::from_log_lr(0.5), EvidenceStrength::Weak);
-        assert_eq!(EvidenceStrength::from_log_lr(1.5), EvidenceStrength::Moderate);
+        assert_eq!(
+            EvidenceStrength::from_log_lr(1.5),
+            EvidenceStrength::Moderate
+        );
         assert_eq!(EvidenceStrength::from_log_lr(2.5), EvidenceStrength::Strong);
-        assert_eq!(EvidenceStrength::from_log_lr(4.0), EvidenceStrength::VeryStrong);
+        assert_eq!(
+            EvidenceStrength::from_log_lr(4.0),
+            EvidenceStrength::VeryStrong
+        );
     }
 
     // -- Snapshot -------------------------------------------------------------

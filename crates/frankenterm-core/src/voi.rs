@@ -488,10 +488,7 @@ impl std::fmt::Debug for VoiScheduler {
 
 /// Convert log-probabilities to normalized probabilities via softmax.
 fn log_softmax_to_probs(log_probs: &[f64; PaneState::COUNT]) -> [f64; PaneState::COUNT] {
-    let max_lp = log_probs
-        .iter()
-        .copied()
-        .fold(f64::NEG_INFINITY, f64::max);
+    let max_lp = log_probs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
 
     let mut probs = [0.0; PaneState::COUNT];
     let mut sum = 0.0;

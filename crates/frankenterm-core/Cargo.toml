@@ -100,6 +100,11 @@ name = "watcher_loop"
 harness = false
 
 [[bench]]
+name = "cx_creation"
+harness = false
+required-features = ["asupersync-runtime"]
+
+[[bench]]
 name = "sizing_benchmark"
 harness = false
 
@@ -168,6 +173,7 @@ distributed = [
     "dep:x509-parser",
 ]
 sync = ["dep:asupersync"]
+asupersync-runtime = ["dep:asupersync"]
 
 # Optional heavy integrations - feature-gated (internal)
 frankenterm-deps = ["dep:codec", "dep:config", "dep:mux", "dep:frankenterm-term"]

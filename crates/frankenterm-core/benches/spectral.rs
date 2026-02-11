@@ -7,7 +7,8 @@
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use frankenterm_core::spectral::{
-    classify, detect_peaks, hann_window, power_spectral_density, spectral_flatness, SpectralConfig,
+    SpectralConfig, classify_signal, detect_peaks, hann_window, power_spectral_density,
+    spectral_flatness,
 };
 
 mod bench_common;
@@ -58,24 +59,16 @@ fn bench_fft_psd(c: &mut Criterion) {
     for size in [256, 512, 1024, 2048] {
         let signal = pseudo_random_series(size, 42);
 
-        group.bench_with_input(
-            BenchmarkId::new("random", size),
-            &signal,
-            |b, signal| {
-                b.iter(|| power_spectral_density(signal));
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("random", size), &signal, |b, signal| {
+            b.iter(|| power_spectral_density(signal));
+        });
     }
 
     // Sine wave — tests worst case for twiddle factor computation
     let sine = sine_signal(1024, 32);
-    group.bench_with_input(
-        BenchmarkId::new("sine_1024", 1024),
-        &sine,
-        |b, signal| {
-            b.iter(|| power_spectral_density(signal));
-        },
-    );
+    group.bench_with_input(BenchmarkId::new("sine_1024", 1024), &sine, |b, signal| {
+        b.iter(|| power_spectral_density(signal));
+    });
 
     group.finish();
 }
@@ -90,33 +83,21 @@ fn bench_classify_pipeline(c: &mut Criterion) {
 
     // Random signal (Burst/Steady)
     let random = pseudo_random_series(1024, 42);
-    group.bench_with_input(
-        BenchmarkId::new("random", 1024),
-        &random,
-        |b, signal| {
-            b.iter(|| classify(signal, &config));
-        },
-    );
+    group.bench_with_input(BenchmarkId::new("random", 1024), &random, |b, signal| {
+        b.iter(|| classify_signal(signal, &config));
+    });
 
     // Periodic signal (Polling)
     let sine = sine_signal(1024, 32);
-    group.bench_with_input(
-        BenchmarkId::new("sine", 1024),
-        &sine,
-        |b, signal| {
-            b.iter(|| classify(signal, &config));
-        },
-    );
+    group.bench_with_input(BenchmarkId::new("sine", 1024), &sine, |b, signal| {
+        b.iter(|| classify_signal(signal, &config));
+    });
 
     // Idle signal (zeros)
     let zeros = vec![0.0; 1024];
-    group.bench_with_input(
-        BenchmarkId::new("idle", 1024),
-        &zeros,
-        |b, signal| {
-            b.iter(|| classify(signal, &config));
-        },
-    );
+    group.bench_with_input(BenchmarkId::new("idle", 1024), &zeros, |b, signal| {
+        b.iter(|| classify_signal(signal, &config));
+    });
 
     group.finish();
 }
@@ -130,26 +111,18 @@ fn bench_peak_detection(c: &mut Criterion) {
 
     // Flat PSD (no peaks — fast path)
     let flat_psd = vec![1.0; 513];
-    group.bench_with_input(
-        BenchmarkId::new("flat", 513),
-        &flat_psd,
-        |b, psd| {
-            b.iter(|| detect_peaks(psd, 6.0, 10.0, 1024));
-        },
-    );
+    group.bench_with_input(BenchmarkId::new("flat", 513), &flat_psd, |b, psd| {
+        b.iter(|| detect_peaks(psd, 6.0, 10.0));
+    });
 
     // PSD with a few peaks
     let mut peaked_psd = vec![1.0; 513];
     peaked_psd[32] = 100.0;
     peaked_psd[64] = 80.0;
     peaked_psd[128] = 60.0;
-    group.bench_with_input(
-        BenchmarkId::new("peaked", 513),
-        &peaked_psd,
-        |b, psd| {
-            b.iter(|| detect_peaks(psd, 6.0, 10.0, 1024));
-        },
-    );
+    group.bench_with_input(BenchmarkId::new("peaked", 513), &peaked_psd, |b, psd| {
+        b.iter(|| detect_peaks(psd, 6.0, 10.0));
+    });
 
     group.finish();
 }
@@ -162,22 +135,14 @@ fn bench_hann_flatness(c: &mut Criterion) {
     let mut group = c.benchmark_group("hann_flatness");
 
     let signal = pseudo_random_series(1024, 42);
-    group.bench_with_input(
-        BenchmarkId::new("hann_1024", 1024),
-        &signal,
-        |b, signal| {
-            b.iter(|| hann_window(signal));
-        },
-    );
+    group.bench_with_input(BenchmarkId::new("hann_1024", 1024), &signal, |b, signal| {
+        b.iter(|| hann_window(signal));
+    });
 
     let psd = vec![1.0; 513];
-    group.bench_with_input(
-        BenchmarkId::new("flatness_513", 513),
-        &psd,
-        |b, psd| {
-            b.iter(|| spectral_flatness(psd));
-        },
-    );
+    group.bench_with_input(BenchmarkId::new("flatness_513", 513), &psd, |b, psd| {
+        b.iter(|| spectral_flatness(psd));
+    });
 
     group.finish();
 }

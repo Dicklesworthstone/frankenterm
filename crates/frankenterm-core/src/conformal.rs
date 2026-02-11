@@ -547,8 +547,7 @@ impl ConformalForecaster {
         }
         match forecast.metric_name.as_str() {
             "rss_bytes" if self.available_memory_bytes > 0 => {
-                let threshold =
-                    self.config.rss_alarm_fraction * self.available_memory_bytes as f64;
+                let threshold = self.config.rss_alarm_fraction * self.available_memory_bytes as f64;
                 if forecast.upper_bound > threshold {
                     debug!(
                         upper_bound = forecast.upper_bound,
@@ -633,10 +632,7 @@ mod tests {
             holt.update(i as f64);
         }
         let forecast_10 = holt.forecast(10.0);
-        assert!(
-            (forecast_10 - 109.0).abs() < 5.0,
-            "forecast={forecast_10}"
-        );
+        assert!((forecast_10 - 109.0).abs() < 5.0, "forecast={forecast_10}");
     }
 
     #[test]
@@ -716,15 +712,7 @@ mod tests {
 
     #[test]
     fn metric_forecaster_constant() {
-        let mut mf = MetricForecaster::new(
-            "test".into(),
-            0.3,
-            0.1,
-            &[5, 10],
-            100,
-            1000,
-            0.95,
-        );
+        let mut mf = MetricForecaster::new("test".into(), 0.3, 0.1, &[5, 10], 100, 1000, 0.95);
         for _ in 0..200 {
             mf.observe(100.0);
         }
@@ -760,8 +748,7 @@ mod tests {
 
     #[test]
     fn metric_forecaster_needs_warmup() {
-        let mut mf =
-            MetricForecaster::new("test".into(), 0.3, 0.1, &[50], 100, 1000, 0.95);
+        let mut mf = MetricForecaster::new("test".into(), 0.3, 0.1, &[50], 100, 1000, 0.95);
         for i in 0..10 {
             mf.observe(i as f64);
         }
@@ -809,7 +796,10 @@ mod tests {
         }
         let forecasts = forecaster.forecast_metric("rss_bytes");
         let has_alert = forecasts.iter().any(|f| f.alert.is_some());
-        assert!(has_alert, "should trigger RSS alert for rapidly growing memory");
+        assert!(
+            has_alert,
+            "should trigger RSS alert for rapidly growing memory"
+        );
     }
 
     #[test]
@@ -902,7 +892,9 @@ mod tests {
         // Deterministic pseudo-random via LCG
         let mut rng = 12345u64;
         let next_val = |state: &mut u64| -> f64 {
-            *state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            *state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
             let u = (*state >> 33) as f64 / (1u64 << 31) as f64;
             1000.0 + (u - 0.5) * 200.0
         };
@@ -973,8 +965,7 @@ mod tests {
 
     #[test]
     fn metric_forecaster_specific_horizon() {
-        let mut mf =
-            MetricForecaster::new("test".into(), 0.3, 0.1, &[5, 10, 20], 100, 1000, 0.90);
+        let mut mf = MetricForecaster::new("test".into(), 0.3, 0.1, &[5, 10, 20], 100, 1000, 0.90);
         for _ in 0..200 {
             mf.observe(50.0);
         }

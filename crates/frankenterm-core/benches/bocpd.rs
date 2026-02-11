@@ -48,21 +48,17 @@ fn bench_single_update(c: &mut Criterion) {
 
     // Warm model — pre-fed with N observations
     for warmup in [50, 100, 200] {
-        group.bench_with_input(
-            BenchmarkId::new("warm_model", warmup),
-            &warmup,
-            |b, &n| {
-                let mut model = BocpdModel::new(BocpdConfig::default());
-                for i in 0..n {
-                    model.update(i as f64 * 0.1);
-                }
-                let mut counter = n as f64;
-                b.iter(|| {
-                    counter += 0.1;
-                    model.update(counter);
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("warm_model", warmup), &warmup, |b, &n| {
+            let mut model = BocpdModel::new(BocpdConfig::default());
+            for i in 0..n {
+                model.update(i as f64 * 0.1);
+            }
+            let mut counter = n as f64;
+            b.iter(|| {
+                counter += 0.1;
+                model.update(counter);
+            });
+        });
     }
 
     // Regime change scenario: stable → spike
@@ -101,14 +97,10 @@ fn bench_feature_vector(c: &mut Criterion) {
     for size in sizes {
         let text = generate_terminal_output(size);
         group.throughput(Throughput::Bytes(text.len() as u64));
-        group.bench_with_input(
-            BenchmarkId::new("compute", size),
-            &text,
-            |b, text| {
-                let elapsed = Duration::from_millis(500);
-                b.iter(|| OutputFeatures::compute(text, elapsed));
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("compute", size), &text, |b, text| {
+            let elapsed = Duration::from_millis(500);
+            b.iter(|| OutputFeatures::compute(text, elapsed));
+        });
     }
 
     // Measure entropy computation specifically via large output

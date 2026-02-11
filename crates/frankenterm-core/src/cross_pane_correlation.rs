@@ -209,33 +209,33 @@ pub fn chi_squared_test(
     event_a: &str,
     event_b: &str,
 ) -> Option<ChiSquaredResult> {
-    let n = matrix.total_windows() as f64;
-    if n < 1.0 {
+    let total_windows = matrix.total_windows() as f64;
+    if total_windows < 1.0 {
         return None;
     }
 
-    let n_a = matrix.marginal(event_a) as f64;
-    let n_b = matrix.marginal(event_b) as f64;
-    let n_ab = matrix.pair_count(event_a, event_b) as f64;
+    let event_a_count = matrix.marginal(event_a) as f64;
+    let event_b_count = matrix.marginal(event_b) as f64;
+    let cooccurrence_count = matrix.pair_count(event_a, event_b) as f64;
 
-    let expected = n_a * n_b / n;
+    let expected = event_a_count * event_b_count / total_windows;
     if expected < 1.0 {
         return None;
     }
 
-    let o11 = n_ab;
-    let o12 = n_a - n_ab;
-    let o21 = n_b - n_ab;
-    let o22 = n - n_a - n_b + n_ab;
+    let o11 = cooccurrence_count;
+    let o12 = event_a_count - cooccurrence_count;
+    let o21 = event_b_count - cooccurrence_count;
+    let o22 = total_windows - event_a_count - event_b_count + cooccurrence_count;
 
     if o12 < 0.0 || o21 < 0.0 || o22 < 0.0 {
         return None;
     }
 
     let e11 = expected;
-    let e12 = n_a * (n - n_b) / n;
-    let e21 = (n - n_a) * n_b / n;
-    let e22 = (n - n_a) * (n - n_b) / n;
+    let e12 = event_a_count * (total_windows - event_b_count) / total_windows;
+    let e21 = (total_windows - event_a_count) * event_b_count / total_windows;
+    let e22 = (total_windows - event_a_count) * (total_windows - event_b_count) / total_windows;
 
     if e11 <= 0.0 || e12 <= 0.0 || e21 <= 0.0 || e22 <= 0.0 {
         return None;
@@ -253,9 +253,9 @@ pub fn chi_squared_test(
         event_b: event_b.to_string(),
         chi_squared: chi_sq,
         p_value,
-        observed: n_ab as u64,
+        observed: cooccurrence_count as u64,
         expected,
-        positive_association: n_ab > expected,
+        positive_association: cooccurrence_count > expected,
     })
 }
 
@@ -267,8 +267,8 @@ fn chi_squared_survival(x: f64, dof: f64) -> f64 {
     if (dof - 1.0).abs() < 0.01 {
         erfc((x / 2.0).sqrt())
     } else {
-        let z = ((x / dof).powf(1.0 / 3.0) - (1.0 - 2.0 / (9.0 * dof)))
-            / (2.0 / (9.0 * dof)).sqrt();
+        let z =
+            ((x / dof).powf(1.0 / 3.0) - (1.0 - 2.0 / (9.0 * dof))) / (2.0 / (9.0 * dof)).sqrt();
         0.5 * erfc(z / std::f64::consts::SQRT_2)
     }
 }
@@ -405,8 +405,7 @@ impl CorrelationEngine {
                 if (count as usize) < self.config.min_observations {
                     continue;
                 }
-                if let Some(test) =
-                    chi_squared_test(&self.matrix, &event_types[i], &event_types[j])
+                if let Some(test) = chi_squared_test(&self.matrix, &event_types[i], &event_types[j])
                 {
                     if test.p_value < self.config.p_value_threshold && test.positive_association {
                         let mut panes = Vec::new();
@@ -564,7 +563,11 @@ mod tests {
             m.record_window(&[]);
         }
         let result = chi_squared_test(&m, "error", "rate_limit").unwrap();
-        assert!(result.p_value < 0.001, "p={} should be very small", result.p_value);
+        assert!(
+            result.p_value < 0.001,
+            "p={} should be very small",
+            result.p_value
+        );
         assert!(result.positive_association);
         assert_eq!(result.observed, 100);
     }

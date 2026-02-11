@@ -117,19 +117,31 @@ pub struct SampleBuffer {
 
 impl SampleBuffer {
     pub fn new(capacity: usize) -> Self {
-        Self { data: vec![0.0; capacity], write_pos: 0, count: 0 }
+        Self {
+            data: vec![0.0; capacity],
+            write_pos: 0,
+            count: 0,
+        }
     }
 
     pub fn push(&mut self, value: f64) {
         let cap = self.data.len();
         self.data[self.write_pos] = value;
         self.write_pos = (self.write_pos + 1) % cap;
-        if self.count < cap { self.count += 1; }
+        if self.count < cap {
+            self.count += 1;
+        }
     }
 
-    pub fn is_full(&self) -> bool { self.count == self.data.len() }
-    pub fn len(&self) -> usize { self.count }
-    pub fn is_empty(&self) -> bool { self.count == 0 }
+    pub fn is_full(&self) -> bool {
+        self.count == self.data.len()
+    }
+    pub fn len(&self) -> usize {
+        self.count
+    }
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
 
     pub fn to_vec(&self) -> Vec<f64> {
         let cap = self.data.len();
@@ -156,16 +168,30 @@ pub struct SpectralClassifier {
 impl SpectralClassifier {
     pub fn new(config: SpectralConfig) -> Self {
         let size = config.fft_size;
-        Self { buffer: SampleBuffer::new(size), config, last_fingerprint: None }
+        Self {
+            buffer: SampleBuffer::new(size),
+            config,
+            last_fingerprint: None,
+        }
     }
 
-    pub fn with_defaults() -> Self { Self::new(SpectralConfig::default()) }
-    pub fn push_sample(&mut self, value: f64) { self.buffer.push(value); }
-    pub fn is_ready(&self) -> bool { self.buffer.is_full() }
-    pub fn sample_count(&self) -> usize { self.buffer.len() }
+    pub fn with_defaults() -> Self {
+        Self::new(SpectralConfig::default())
+    }
+    pub fn push_sample(&mut self, value: f64) {
+        self.buffer.push(value);
+    }
+    pub fn is_ready(&self) -> bool {
+        self.buffer.is_full()
+    }
+    pub fn sample_count(&self) -> usize {
+        self.buffer.len()
+    }
 
     pub fn classify(&mut self) -> Option<&SpectralFingerprint> {
-        if !self.is_ready() { return None; }
+        if !self.is_ready() {
+            return None;
+        }
         let signal = self.buffer.to_vec();
         let fp = classify_signal(&signal, &self.config);
         self.last_fingerprint = Some(fp);
@@ -186,9 +212,13 @@ impl SpectralClassifier {
 #[must_use]
 pub fn hann_window(signal: &[f64]) -> Vec<f64> {
     let n = signal.len();
-    if n <= 1 { return signal.to_vec(); }
+    if n <= 1 {
+        return signal.to_vec();
+    }
     let denom = (n - 1) as f64;
-    signal.iter().enumerate()
+    signal
+        .iter()
+        .enumerate()
         .map(|(i, &x)| {
             let w = 0.5 * (1.0 - (2.0 * PI * i as f64 / denom).cos());
             x * w
@@ -197,21 +227,32 @@ pub fn hann_window(signal: &[f64]) -> Vec<f64> {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct Complex { re: f64, im: f64 }
+struct Complex {
+    re: f64,
+    im: f64,
+}
 
 impl Complex {
-    fn new(re: f64, im: f64) -> Self { Self { re, im } }
-    fn mag_sq(self) -> f64 { self.re.mul_add(self.re, self.im * self.im) }
+    fn new(re: f64, im: f64) -> Self {
+        Self { re, im }
+    }
+    fn mag_sq(self) -> f64 {
+        self.re.mul_add(self.re, self.im * self.im)
+    }
 }
 
 impl std::ops::Add for Complex {
     type Output = Self;
-    fn add(self, rhs: Self) -> Self { Self::new(self.re + rhs.re, self.im + rhs.im) }
+    fn add(self, rhs: Self) -> Self {
+        Self::new(self.re + rhs.re, self.im + rhs.im)
+    }
 }
 
 impl std::ops::Sub for Complex {
     type Output = Self;
-    fn sub(self, rhs: Self) -> Self { Self::new(self.re - rhs.re, self.im - rhs.im) }
+    fn sub(self, rhs: Self) -> Self {
+        Self::new(self.re - rhs.re, self.im - rhs.im)
+    }
 }
 
 impl std::ops::Mul for Complex {
@@ -226,14 +267,21 @@ impl std::ops::Mul for Complex {
 
 fn fft_in_place(data: &mut [Complex]) {
     let n = data.len();
-    if n <= 1 { return; }
+    if n <= 1 {
+        return;
+    }
     assert!(n.is_power_of_two(), "FFT size must be power of 2");
 
     let mut j = 0usize;
     for i in 0..n {
-        if i < j { data.swap(i, j); }
+        if i < j {
+            data.swap(i, j);
+        }
         let mut m = n >> 1;
-        while m >= 1 && j >= m { j -= m; m >>= 1; }
+        while m >= 1 && j >= m {
+            j -= m;
+            m >>= 1;
+        }
         j += m;
     }
 
@@ -258,7 +306,9 @@ fn fft_in_place(data: &mut [Complex]) {
 #[must_use]
 pub fn power_spectral_density(signal: &[f64]) -> Vec<f64> {
     let n = signal.len();
-    if n == 0 { return vec![]; }
+    if n == 0 {
+        return vec![];
+    }
     let fft_n = n.next_power_of_two();
     let mut data: Vec<Complex> = signal.iter().map(|&x| Complex::new(x, 0.0)).collect();
     data.resize(fft_n, Complex::new(0.0, 0.0));
@@ -270,13 +320,19 @@ pub fn power_spectral_density(signal: &[f64]) -> Vec<f64> {
 /// Spectral flatness (Wiener entropy). Range [0, 1].
 #[must_use]
 pub fn spectral_flatness(psd: &[f64]) -> f64 {
-    if psd.is_empty() { return 0.0; }
+    if psd.is_empty() {
+        return 0.0;
+    }
     let positive: Vec<f64> = psd.iter().copied().filter(|&x| x > 0.0).collect();
-    if positive.is_empty() { return 0.0; }
+    if positive.is_empty() {
+        return 0.0;
+    }
     let n = positive.len() as f64;
     let log_mean = positive.iter().map(|x| x.ln()).sum::<f64>() / n;
     let arith_mean = positive.iter().sum::<f64>() / n;
-    if arith_mean <= 0.0 { return 0.0; }
+    if arith_mean <= 0.0 {
+        return 0.0;
+    }
     let geometric_mean = log_mean.exp();
     (geometric_mean / arith_mean).clamp(0.0, 1.0)
 }
@@ -285,30 +341,49 @@ pub fn spectral_flatness(psd: &[f64]) -> f64 {
 #[must_use]
 pub fn spectral_centroid(psd: &[f64], sample_rate_hz: f64) -> f64 {
     let total_power: f64 = psd.iter().sum();
-    if total_power <= 0.0 { return 0.0; }
+    if total_power <= 0.0 {
+        return 0.0;
+    }
     let fft_n = (psd.len().saturating_sub(1)) * 2;
-    if fft_n == 0 { return 0.0; }
+    if fft_n == 0 {
+        return 0.0;
+    }
     let freq_res = sample_rate_hz / fft_n as f64;
-    let weighted: f64 = psd.iter().enumerate()
-        .map(|(k, &s)| k as f64 * freq_res * s).sum();
+    let weighted: f64 = psd
+        .iter()
+        .enumerate()
+        .map(|(k, &s)| k as f64 * freq_res * s)
+        .sum();
     weighted / total_power
 }
 
 fn median_of(data: &[f64]) -> f64 {
-    if data.is_empty() { return 0.0; }
+    if data.is_empty() {
+        return 0.0;
+    }
     let mut sorted: Vec<f64> = data.iter().copied().filter(|x| x.is_finite()).collect();
-    if sorted.is_empty() { return 0.0; }
+    if sorted.is_empty() {
+        return 0.0;
+    }
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let mid = sorted.len() / 2;
-    if sorted.len() % 2 == 0 { (sorted[mid - 1] + sorted[mid]) / 2.0 } else { sorted[mid] }
+    if sorted.len() % 2 == 0 {
+        (sorted[mid - 1] + sorted[mid]) / 2.0
+    } else {
+        sorted[mid]
+    }
 }
 
 fn peak_quality_factor(psd: &[f64], peak_bin: usize, freq_res: f64) -> f64 {
     let half_power = psd[peak_bin] / 2.0;
     let mut left = peak_bin;
-    while left > 0 && psd[left] > half_power { left -= 1; }
+    while left > 0 && psd[left] > half_power {
+        left -= 1;
+    }
     let mut right = peak_bin;
-    while right < psd.len() - 1 && psd[right] > half_power { right += 1; }
+    while right < psd.len() - 1 && psd[right] > half_power {
+        right += 1;
+    }
     let bw_bins = (right - left).max(1) as f64;
     let bw_hz = bw_bins * freq_res;
     let center_hz = peak_bin as f64 * freq_res;
@@ -318,31 +393,48 @@ fn peak_quality_factor(psd: &[f64], peak_bin: usize, freq_res: f64) -> f64 {
 /// Detect peaks in a PSD exceeding the noise floor.
 #[must_use]
 pub fn detect_peaks(psd: &[f64], snr_threshold: f64, sample_rate_hz: f64) -> Vec<SpectralPeak> {
-    if psd.len() < 3 { return vec![]; }
+    if psd.len() < 3 {
+        return vec![];
+    }
     let noise_floor = median_of(psd);
-    if noise_floor <= 0.0 { return vec![]; }
+    if noise_floor <= 0.0 {
+        return vec![];
+    }
     let threshold = noise_floor * snr_threshold;
     let fft_n = (psd.len().saturating_sub(1)) * 2;
-    let freq_res = if fft_n > 0 { sample_rate_hz / fft_n as f64 } else { 1.0 };
+    let freq_res = if fft_n > 0 {
+        sample_rate_hz / fft_n as f64
+    } else {
+        1.0
+    };
 
     let mut peaks = Vec::new();
     for i in 1..psd.len() - 1 {
         if psd[i] > threshold && psd[i] >= psd[i - 1] && psd[i] >= psd[i + 1] {
             let q = peak_quality_factor(psd, i, freq_res);
             peaks.push(SpectralPeak {
-                bin: i, frequency_hz: i as f64 * freq_res, power: psd[i],
-                snr: psd[i] / noise_floor, quality_factor: q,
+                bin: i,
+                frequency_hz: i as f64 * freq_res,
+                power: psd[i],
+                snr: psd[i] / noise_floor,
+                quality_factor: q,
             });
         }
     }
-    peaks.sort_by(|a, b| b.power.partial_cmp(&a.power).unwrap_or(std::cmp::Ordering::Equal));
+    peaks.sort_by(|a, b| {
+        b.power
+            .partial_cmp(&a.power)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     // Cluster nearby peaks: Hann window main lobe spans ~4 bins, so peaks
     // within 8 bins of a stronger peak are side lobes, not independent peaks.
     let mut clustered = Vec::new();
     let mut used = vec![false; peaks.len()];
     for i in 0..peaks.len() {
-        if used[i] { continue; }
+        if used[i] {
+            continue;
+        }
         clustered.push(peaks[i].clone());
         // Mark nearby weaker peaks as used
         for j in (i + 1)..peaks.len() {
@@ -370,9 +462,12 @@ pub fn classify_signal(signal: &[f64], config: &SpectralConfig) -> SpectralFinge
 
     if total_power < config.idle_power_threshold {
         return SpectralFingerprint {
-            classification: AgentClass::Idle, total_power,
-            spectral_flatness: 0.0, centroid_hz: 0.0,
-            peaks: vec![], fft_size: psd.len().saturating_sub(1) * 2,
+            classification: AgentClass::Idle,
+            total_power,
+            spectral_flatness: 0.0,
+            centroid_hz: 0.0,
+            peaks: vec![],
+            fft_size: psd.len().saturating_sub(1) * 2,
         };
     }
 
@@ -380,8 +475,10 @@ pub fn classify_signal(signal: &[f64], config: &SpectralConfig) -> SpectralFinge
     let centroid = spectral_centroid(&psd, config.sample_rate_hz);
     let peaks = detect_peaks(&psd, config.peak_snr_threshold, config.sample_rate_hz);
 
-    let sharp_peaks: usize = peaks.iter()
-        .filter(|p| p.quality_factor >= config.min_peak_quality).count();
+    let sharp_peaks: usize = peaks
+        .iter()
+        .filter(|p| p.quality_factor >= config.min_peak_quality)
+        .count();
 
     // Flatness check first: a flat spectrum is noise/steady, even if it has
     // accidental peaks. Only non-flat signals can be Polling.
@@ -394,19 +491,27 @@ pub fn classify_signal(signal: &[f64], config: &SpectralConfig) -> SpectralFinge
     };
 
     SpectralFingerprint {
-        classification, total_power, spectral_flatness: flatness, centroid_hz: centroid,
-        peaks, fft_size: psd.len().saturating_sub(1) * 2,
+        classification,
+        total_power,
+        spectral_flatness: flatness,
+        centroid_hz: centroid,
+        peaks,
+        fft_size: psd.len().saturating_sub(1) * 2,
     }
 }
 
 /// Cosine similarity between two PSD vectors. Returns 0-1.
 #[must_use]
 pub fn psd_similarity(a: &[f64], b: &[f64]) -> f64 {
-    if a.len() != b.len() || a.is_empty() { return 0.0; }
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
     let dot: f64 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
     let mag_a = a.iter().map(|x| x * x).sum::<f64>().sqrt();
     let mag_b = b.iter().map(|x| x * x).sum::<f64>().sqrt();
-    if mag_a == 0.0 || mag_b == 0.0 { return 0.0; }
+    if mag_a == 0.0 || mag_b == 0.0 {
+        return 0.0;
+    }
     (dot / (mag_a * mag_b)).clamp(0.0, 1.0)
 }
 
@@ -421,10 +526,13 @@ fn xorshift64(state: &mut u64) -> f64 {
 pub fn generate_sine(freq_hz: f64, amplitude: f64, noise_level: f64, n: usize) -> Vec<f64> {
     let sr = DEFAULT_SAMPLE_RATE_HZ;
     let mut rng = ((freq_hz * 1e6) as u64).wrapping_add(42);
-    (0..n).map(|i| {
-        let t = i as f64 / sr;
-        amplitude * (2.0 * PI * freq_hz * t).sin() + (xorshift64(&mut rng) * 2.0 - 1.0) * noise_level
-    }).collect()
+    (0..n)
+        .map(|i| {
+            let t = i as f64 / sr;
+            amplitude * (2.0 * PI * freq_hz * t).sin()
+                + (xorshift64(&mut rng) * 2.0 - 1.0) * noise_level
+        })
+        .collect()
 }
 
 /// Generate white noise with a given seed.
@@ -435,12 +543,23 @@ pub fn generate_white_noise(seed: u64, n: usize) -> Vec<f64> {
 
 /// Generate white noise scaled by amplitude.
 pub fn generate_white_noise_scaled(amplitude: f64, n: usize) -> Vec<f64> {
-    generate_white_noise(42, n).iter().map(|x| x * amplitude).collect()
+    generate_white_noise(42, n)
+        .iter()
+        .map(|x| x * amplitude)
+        .collect()
 }
 
 /// Generate an impulse train with a given period in samples.
 pub fn generate_impulse_train(period: usize, amplitude: f64, n: usize) -> Vec<f64> {
-    (0..n).map(|i| if period > 0 && i % period == 0 { amplitude } else { 0.0 }).collect()
+    (0..n)
+        .map(|i| {
+            if period > 0 && i % period == 0 {
+                amplitude
+            } else {
+                0.0
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -457,18 +576,28 @@ mod tests {
     fn fft_pure_sine() {
         let n = 64;
         let fb = 8;
-        let signal: Vec<f64> = (0..n).map(|i| (2.0 * PI * fb as f64 * i as f64 / n as f64).sin()).collect();
+        let signal: Vec<f64> = (0..n)
+            .map(|i| (2.0 * PI * fb as f64 * i as f64 / n as f64).sin())
+            .collect();
         let psd = power_spectral_density(&signal);
-        let (peak, _) = psd.iter().enumerate().skip(1)
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap()).unwrap();
+        let (peak, _) = psd
+            .iter()
+            .enumerate()
+            .skip(1)
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .unwrap();
         assert_eq!(peak, fb);
     }
 
     #[test]
-    fn fft_empty() { assert!(power_spectral_density(&[]).is_empty()); }
+    fn fft_empty() {
+        assert!(power_spectral_density(&[]).is_empty());
+    }
 
     #[test]
-    fn fft_single() { assert_eq!(power_spectral_density(&[42.0]).len(), 1); }
+    fn fft_single() {
+        assert_eq!(power_spectral_density(&[42.0]).len(), 1);
+    }
 
     #[test]
     fn fft_psd_non_negative() {
@@ -490,12 +619,16 @@ mod tests {
     }
 
     #[test]
-    fn hann_empty() { assert!(hann_window(&[]).is_empty()); }
+    fn hann_empty() {
+        assert!(hann_window(&[]).is_empty());
+    }
 
     #[test]
     fn hann_symmetry() {
         let w = hann_window(&[1.0; 128]);
-        for i in 0..64 { assert!((w[i] - w[127 - i]).abs() < 1e-10); }
+        for i in 0..64 {
+            assert!((w[i] - w[127 - i]).abs() < 1e-10);
+        }
     }
 
     #[test]
@@ -506,14 +639,19 @@ mod tests {
 
     #[test]
     fn flatness_tonal_low() {
-        let mut psd = vec![0.001; 100]; psd[10] = 1000.0;
+        let mut psd = vec![0.001; 100];
+        psd[10] = 1000.0;
         assert!(spectral_flatness(&psd) < 0.1);
     }
 
     #[test]
-    fn flatness_empty() { assert_eq!(spectral_flatness(&[]), 0.0); }
+    fn flatness_empty() {
+        assert_eq!(spectral_flatness(&[]), 0.0);
+    }
     #[test]
-    fn flatness_zero() { assert_eq!(spectral_flatness(&[0.0; 50]), 0.0); }
+    fn flatness_zero() {
+        assert_eq!(spectral_flatness(&[0.0; 50]), 0.0);
+    }
 
     #[test]
     fn centroid_low() {
@@ -528,11 +666,14 @@ mod tests {
     }
 
     #[test]
-    fn centroid_zero() { assert_eq!(spectral_centroid(&[0.0; 100], 10.0), 0.0); }
+    fn centroid_zero() {
+        assert_eq!(spectral_centroid(&[0.0; 100], 10.0), 0.0);
+    }
 
     #[test]
     fn peaks_finds_peak() {
-        let mut psd = vec![1.0; 50]; psd[10] = 100.0;
+        let mut psd = vec![1.0; 50];
+        psd[10] = 100.0;
         let peaks = detect_peaks(&psd, 6.0, 10.0);
         assert!(!peaks.is_empty());
         assert_eq!(peaks[0].bin, 10);
@@ -540,25 +681,35 @@ mod tests {
     }
 
     #[test]
-    fn peaks_flat_none() { assert!(detect_peaks(&vec![1.0; 50], 6.0, 10.0).is_empty()); }
+    fn peaks_flat_none() {
+        assert!(detect_peaks(&vec![1.0; 50], 6.0, 10.0).is_empty());
+    }
     #[test]
-    fn peaks_short() { assert!(detect_peaks(&[1.0, 2.0], 6.0, 10.0).is_empty()); }
+    fn peaks_short() {
+        assert!(detect_peaks(&[1.0, 2.0], 6.0, 10.0).is_empty());
+    }
 
     #[test]
     fn quality_sharp() {
-        let mut psd = vec![0.01; 100]; psd[50] = 100.0;
+        let mut psd = vec![0.01; 100];
+        psd[50] = 100.0;
         assert!(peak_quality_factor(&psd, 50, 0.1) > 1.0);
     }
 
     #[test]
     fn classify_idle() {
-        assert_eq!(classify_signal(&vec![0.0; 1024], &SpectralConfig::default()).classification, AgentClass::Idle);
+        assert_eq!(
+            classify_signal(&vec![0.0; 1024], &SpectralConfig::default()).classification,
+            AgentClass::Idle
+        );
     }
 
     #[test]
     fn classify_polling() {
         let n = 1024;
-        let signal: Vec<f64> = (0..n).map(|i| (2.0 * PI * 32.0 * i as f64 / n as f64).sin()).collect();
+        let signal: Vec<f64> = (0..n)
+            .map(|i| (2.0 * PI * 32.0 * i as f64 / n as f64).sin())
+            .collect();
         let fp = classify_signal(&signal, &SpectralConfig::default());
         assert_eq!(fp.classification, AgentClass::Polling);
         assert!(!fp.peaks.is_empty());
@@ -566,28 +717,53 @@ mod tests {
 
     #[test]
     fn classify_steady() {
-        let fp = classify_signal(&generate_white_noise(12345, 1024), &SpectralConfig::default());
-        assert_eq!(fp.classification, AgentClass::Steady, "flatness={}", fp.spectral_flatness);
+        let fp = classify_signal(
+            &generate_white_noise(12345, 1024),
+            &SpectralConfig::default(),
+        );
+        assert_eq!(
+            fp.classification,
+            AgentClass::Steady,
+            "flatness={}",
+            fp.spectral_flatness
+        );
     }
 
     #[test]
     fn classify_burst() {
         let mut signal = vec![0.0; 1024];
-        signal[100] = 100.0; signal[300] = 80.0; signal[600] = 90.0;
-        let config = SpectralConfig { steady_flatness_threshold: 0.8, ..Default::default() };
-        assert_eq!(classify_signal(&signal, &config).classification, AgentClass::Burst);
+        signal[100] = 100.0;
+        signal[300] = 80.0;
+        signal[600] = 90.0;
+        let config = SpectralConfig {
+            steady_flatness_threshold: 0.8,
+            ..Default::default()
+        };
+        assert_eq!(
+            classify_signal(&signal, &config).classification,
+            AgentClass::Burst
+        );
     }
 
     #[test]
     fn classify_has_centroid() {
-        assert!(classify_signal(&generate_sine(2.0, 10.0, 0.1, 1024), &SpectralConfig::default()).centroid_hz > 0.0);
+        assert!(
+            classify_signal(
+                &generate_sine(2.0, 10.0, 0.1, 1024),
+                &SpectralConfig::default()
+            )
+            .centroid_hz
+                > 0.0
+        );
     }
 
     #[test]
     fn buffer_basic() {
         let mut buf = SampleBuffer::new(4);
         assert!(buf.is_empty());
-        for i in 1..=4 { buf.push(i as f64); }
+        for i in 1..=4 {
+            buf.push(i as f64);
+        }
         assert!(buf.is_full());
         assert_eq!(buf.to_vec(), vec![1.0, 2.0, 3.0, 4.0]);
     }
@@ -595,14 +771,17 @@ mod tests {
     #[test]
     fn buffer_circular() {
         let mut buf = SampleBuffer::new(4);
-        for i in 1..=5 { buf.push(i as f64); }
+        for i in 1..=5 {
+            buf.push(i as f64);
+        }
         assert_eq!(buf.to_vec(), vec![2.0, 3.0, 4.0, 5.0]);
     }
 
     #[test]
     fn buffer_partial() {
         let mut buf = SampleBuffer::new(8);
-        buf.push(1.0); buf.push(2.0);
+        buf.push(1.0);
+        buf.push(2.0);
         let v = buf.to_vec();
         assert_eq!((v[0], v[1], v[2]), (1.0, 2.0, 0.0));
     }
@@ -610,7 +789,9 @@ mod tests {
     #[test]
     fn classifier_not_ready() {
         let mut c = SpectralClassifier::with_defaults();
-        for i in 0..100 { c.push_sample(i as f64); }
+        for i in 0..100 {
+            c.push_sample(i as f64);
+        }
         assert!(!c.is_ready());
         assert!(c.classify().is_none());
     }
@@ -618,7 +799,9 @@ mod tests {
     #[test]
     fn classifier_ready() {
         let mut c = SpectralClassifier::with_defaults();
-        for &s in &generate_sine(1.0, 50.0, 0.1, DEFAULT_FFT_SIZE) { c.push_sample(s); }
+        for &s in &generate_sine(1.0, 50.0, 0.1, DEFAULT_FFT_SIZE) {
+            c.push_sample(s);
+        }
         assert!(c.is_ready());
         assert!(c.classify().is_some());
     }
@@ -626,7 +809,9 @@ mod tests {
     #[test]
     fn classifier_reset() {
         let mut c = SpectralClassifier::with_defaults();
-        for i in 0..DEFAULT_FFT_SIZE { c.push_sample(i as f64); }
+        for i in 0..DEFAULT_FFT_SIZE {
+            c.push_sample(i as f64);
+        }
         c.reset();
         assert!(!c.is_ready());
         assert_eq!(c.sample_count(), 0);
@@ -644,16 +829,28 @@ mod tests {
     }
 
     #[test]
-    fn sim_zero() { assert_eq!(psd_similarity(&[0.0; 10], &[0.0; 10]), 0.0); }
+    fn sim_zero() {
+        assert_eq!(psd_similarity(&[0.0; 10], &[0.0; 10]), 0.0);
+    }
     #[test]
-    fn sim_mismatch() { assert_eq!(psd_similarity(&[1.0, 2.0], &[1.0]), 0.0); }
+    fn sim_mismatch() {
+        assert_eq!(psd_similarity(&[1.0, 2.0], &[1.0]), 0.0);
+    }
 
     #[test]
     fn fingerprint_serde() {
         let fp = SpectralFingerprint {
-            classification: AgentClass::Polling, total_power: 42.5,
-            spectral_flatness: 0.15, centroid_hz: 2.5,
-            peaks: vec![SpectralPeak { bin: 10, frequency_hz: 1.0, power: 100.0, snr: 50.0, quality_factor: 15.0 }],
+            classification: AgentClass::Polling,
+            total_power: 42.5,
+            spectral_flatness: 0.15,
+            centroid_hz: 2.5,
+            peaks: vec![SpectralPeak {
+                bin: 10,
+                frequency_hz: 1.0,
+                power: 100.0,
+                snr: 50.0,
+                quality_factor: 15.0,
+            }],
             fft_size: 1024,
         };
         let json = serde_json::to_string(&fp).unwrap();
@@ -665,7 +862,12 @@ mod tests {
     #[test]
     fn config_serde() {
         let json = serde_json::to_string(&SpectralConfig::default()).unwrap();
-        assert_eq!(serde_json::from_str::<SpectralConfig>(&json).unwrap().fft_size, 1024);
+        assert_eq!(
+            serde_json::from_str::<SpectralConfig>(&json)
+                .unwrap()
+                .fft_size,
+            1024
+        );
     }
 
     #[test]
@@ -683,9 +885,13 @@ mod tests {
     }
 
     #[test]
-    fn gen_sine_len() { assert_eq!(generate_sine(1.0, 10.0, 0.0, 512).len(), 512); }
+    fn gen_sine_len() {
+        assert_eq!(generate_sine(1.0, 10.0, 0.0, 512).len(), 512);
+    }
     #[test]
-    fn gen_noise_len() { assert_eq!(generate_white_noise(99, 256).len(), 256); }
+    fn gen_noise_len() {
+        assert_eq!(generate_white_noise(99, 256).len(), 256);
+    }
 
     #[test]
     fn gen_impulse_spikes() {

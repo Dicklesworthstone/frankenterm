@@ -159,7 +159,6 @@ impl BandIndex {
         candidates.dedup();
         candidates
     }
-
 }
 
 // =============================================================================
@@ -299,14 +298,17 @@ impl ErrorClusterer {
         let root = self.union_find.find(root);
 
         // Update cluster metadata
-        let meta = self.cluster_meta.entry(root).or_insert_with(|| ClusterMeta {
-            size: 0,
-            representative: text.to_string(),
-            samples: Vec::new(),
-            pane_ids: Vec::new(),
-            first_seen_secs: timestamp_secs,
-            last_seen_secs: timestamp_secs,
-        });
+        let meta = self
+            .cluster_meta
+            .entry(root)
+            .or_insert_with(|| ClusterMeta {
+                size: 0,
+                representative: text.to_string(),
+                samples: Vec::new(),
+                pane_ids: Vec::new(),
+                first_seen_secs: timestamp_secs,
+                last_seen_secs: timestamp_secs,
+            });
         meta.size += 1;
         meta.last_seen_secs = meta.last_seen_secs.max(timestamp_secs);
         meta.first_seen_secs = meta.first_seen_secs.min(timestamp_secs);
@@ -354,8 +356,7 @@ impl ErrorClusterer {
                     new_meta.size += old_meta.size;
                     new_meta.first_seen_secs =
                         new_meta.first_seen_secs.min(old_meta.first_seen_secs);
-                    new_meta.last_seen_secs =
-                        new_meta.last_seen_secs.max(old_meta.last_seen_secs);
+                    new_meta.last_seen_secs = new_meta.last_seen_secs.max(old_meta.last_seen_secs);
                     for pid in old_meta.pane_ids {
                         if !new_meta.pane_ids.contains(&pid) {
                             new_meta.pane_ids.push(pid);
@@ -554,7 +555,11 @@ mod tests {
     fn clusterer_separates_different_errors() {
         let mut c = ErrorClusterer::with_defaults();
         c.insert("ConnectionRefusedError: port 5432", Some(1), 100);
-        c.insert("SyntaxError: unexpected token 'foo' at line 42", Some(2), 101);
+        c.insert(
+            "SyntaxError: unexpected token 'foo' at line 42",
+            Some(2),
+            101,
+        );
         c.insert("PermissionDenied: /etc/shadow", Some(3), 102);
 
         let clusters = c.clusters();
@@ -573,7 +578,9 @@ mod tests {
         c.insert("timeout after 30s", Some(3), 102);
 
         let clusters = c.clusters();
-        let timeout_cluster = clusters.iter().find(|c| c.representative.contains("timeout"));
+        let timeout_cluster = clusters
+            .iter()
+            .find(|c| c.representative.contains("timeout"));
         assert!(timeout_cluster.is_some());
         let tc = timeout_cluster.unwrap();
         assert_eq!(tc.pane_ids.len(), 3);
@@ -595,7 +602,11 @@ mod tests {
         assert_eq!(c.error_count(), 0);
         assert_eq!(c.cluster_count(), 0);
         c.insert("error one", None, 100);
-        c.insert("something completely different and unrelated to any other message", None, 101);
+        c.insert(
+            "something completely different and unrelated to any other message",
+            None,
+            101,
+        );
         assert_eq!(c.error_count(), 2);
         assert!(c.cluster_count() >= 1);
     }

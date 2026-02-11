@@ -96,10 +96,7 @@ pub fn extract_features(obs: &Observation, action: &UserAction) -> [f64; NUM_FEA
         _ => obs.current_pane_id,
     };
 
-    let target = obs
-        .pane_states
-        .iter()
-        .find(|p| p.pane_id == target_pane_id);
+    let target = obs.pane_states.iter().find(|p| p.pane_id == target_pane_id);
 
     let current = obs
         .pane_states
@@ -236,10 +233,7 @@ impl RewardFunction {
             })
             .collect();
 
-        let max_r = rewards
-            .iter()
-            .copied()
-            .fold(f64::NEG_INFINITY, f64::max);
+        let max_r = rewards.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         let exp_rewards: Vec<f64> = rewards.iter().map(|r| (r - max_r).exp()).collect();
         let sum: f64 = exp_rewards.iter().sum();
 
@@ -688,7 +682,7 @@ fn make_test_panes(pane_ids: &[u64], seed: u64) -> Vec<PaneState> {
                 has_new_output: r > 0.5,
                 time_since_focus_s: r * 60.0,
                 output_rate: r * 10.0,
-                error_count: if r > 0.8 { 1 } else { 0 },
+                error_count: u32::from(r > 0.8),
                 process_active: r > 0.3,
                 scroll_depth: r,
                 interaction_count: (r * 20.0) as u32,
@@ -726,7 +720,6 @@ fn generate_trajectories(
             // Choose action using softmax policy with ground-truth theta
             let actions = available_actions(&obs_base);
             let mut best_action = UserAction::Ignore;
-            let mut best_reward = f64::NEG_INFINITY;
 
             // Compute rewards for all actions
             let rewards: Vec<f64> = actions
@@ -742,10 +735,7 @@ fn generate_trajectories(
                 .collect();
 
             // Softmax sampling (deterministic via seed)
-            let max_r = rewards
-                .iter()
-                .copied()
-                .fold(f64::NEG_INFINITY, f64::max);
+            let max_r = rewards.iter().copied().fold(f64::NEG_INFINITY, f64::max);
             let exp_r: Vec<f64> = rewards.iter().map(|r| (r - max_r).exp()).collect();
             let sum: f64 = exp_r.iter().sum();
 
@@ -758,10 +748,6 @@ fn generate_trajectories(
                     break;
                 }
             }
-            if let f64::NEG_INFINITY = best_reward {
-                // just pick whatever softmax chose
-            }
-            let _ = best_reward;
 
             if let UserAction::FocusPane(id) = best_action {
                 current_pane = id;
@@ -783,6 +769,8 @@ fn generate_trajectories(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::float_cmp)]
+
     use super::*;
 
     // =========================================================================

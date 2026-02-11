@@ -51,6 +51,7 @@ metrics = ["frankenterm-core/metrics"]
 native-wezterm = ["frankenterm-core/native-wezterm"]
 distributed = ["frankenterm-core/distributed"]
 sync = ["frankenterm-core/sync"]
+asupersync-runtime = ["frankenterm-core/asupersync-runtime"]
 
 [dev-dependencies]
 assert_cmd = "2.1.2"

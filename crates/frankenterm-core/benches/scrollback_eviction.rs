@@ -147,18 +147,14 @@ fn bench_plan_computation(c: &mut Criterion) {
 
     for &n_panes in &[10, 50, 100, 200] {
         group.throughput(Throughput::Elements(n_panes as u64));
-        group.bench_with_input(
-            BenchmarkId::from_parameter(n_panes),
-            &n_panes,
-            |b, &n| {
-                let evictor = ScrollbackEvictor::new(
-                    EvictionConfig::default(),
-                    BenchStore::mixed(n),
-                    BenchTierSource::cyclic(n),
-                );
-                b.iter(|| evictor.plan(MemoryPressureTier::Yellow).unwrap());
-            },
-        );
+        group.bench_with_input(BenchmarkId::from_parameter(n_panes), &n_panes, |b, &n| {
+            let evictor = ScrollbackEvictor::new(
+                EvictionConfig::default(),
+                BenchStore::mixed(n),
+                BenchTierSource::cyclic(n),
+            );
+            b.iter(|| evictor.plan(MemoryPressureTier::Yellow).unwrap());
+        });
     }
 
     group.finish();

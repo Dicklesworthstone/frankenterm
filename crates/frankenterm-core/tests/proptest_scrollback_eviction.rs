@@ -58,7 +58,15 @@ impl PaneTierSource for PropTierSource {
 /// descending limits: active >= thinking >= idle >= background >= dormant >= min_segments.
 fn arb_eviction_config() -> impl Strategy<Value = EvictionConfig> {
     // min_segments: 1..50, then build ascending limits
-    (1usize..50, 1usize..200, 1usize..200, 1usize..200, 1usize..200, 1usize..200, 1usize..500)
+    (
+        1usize..50,
+        1usize..200,
+        1usize..200,
+        1usize..200,
+        1usize..200,
+        1usize..200,
+        1usize..500,
+    )
         .prop_map(|(min_seg, d0, d1, d2, d3, d4, pressure_max)| {
             // Build limits by accumulating deltas onto min_segments
             let dormant = min_seg + d0;

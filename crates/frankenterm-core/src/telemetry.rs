@@ -1343,7 +1343,7 @@ mod tests {
         assert_eq!(h.min_max(), Some((0.0, 19.0)));
         // retained samples are 10..19 (FIFO eviction)
         let p50 = h.p50().unwrap();
-        assert!(p50 >= 10.0 && p50 <= 19.0, "p50={p50}");
+        assert!((10.0..=19.0).contains(&p50), "p50={p50}");
     }
 
     #[test]

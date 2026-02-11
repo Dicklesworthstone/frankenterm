@@ -601,12 +601,12 @@ fn log_sum_exp(log_values: &[f64]) -> f64 {
 /// Stirling's approximation for ln(Γ(x)) — sufficient for our quantile needs.
 ///
 /// Uses the Lanczos approximation for better accuracy.
-fn ln_gamma(x: f64) -> f64 {
-    if x <= 0.0 {
+fn ln_gamma(value: f64) -> f64 {
+    if value <= 0.0 {
         return 0.0;
     }
     // Lanczos approximation (g=7, n=9)
-    let g = 7.0;
+    let lanczos_g = 7.0;
     #[allow(clippy::excessive_precision)]
     let coefficients = [
         0.999_999_999_999_809_93,
@@ -620,20 +620,22 @@ fn ln_gamma(x: f64) -> f64 {
         1.505_632_735_149_311_6e-7,
     ];
 
-    if x < 0.5 {
+    if value < 0.5 {
         // Reflection formula
         let pi = std::f64::consts::PI;
-        return pi.ln() - (pi * x).sin().ln() - ln_gamma(1.0 - x);
+        return pi.ln() - (pi * value).sin().ln() - ln_gamma(1.0 - value);
     }
 
-    let x = x - 1.0;
+    let x_minus_one = value - 1.0;
     let mut base = coefficients[0];
     for (i, &c) in coefficients.iter().enumerate().skip(1) {
-        base += c / (x + i as f64);
+        base += c / (x_minus_one + i as f64);
     }
 
-    let t = x + g + 0.5;
-    0.5 * (2.0 * std::f64::consts::PI).ln() + (t.ln() * (x + 0.5)) - t + base.ln()
+    let lanczos_t = x_minus_one + lanczos_g + 0.5;
+    let log_2pi = (2.0 * std::f64::consts::PI).ln();
+    let log_power_term = lanczos_t.ln() * (x_minus_one + 0.5);
+    0.5f64.mul_add(log_2pi, log_power_term) - lanczos_t + base.ln()
 }
 
 /// Shannon entropy of a byte sequence (bits).
