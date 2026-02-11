@@ -5,6 +5,7 @@ use frankenterm_dynamic::{FromDynamic, FromDynamicOptions, ToDynamic, Value};
 use frankenterm_input_types::{KeyCode, Modifiers};
 use frankenterm_term::input::MouseButton;
 use frankenterm_term::SemanticType;
+#[cfg(feature = "lua")]
 use luahelper::impl_lua_conversion_dynamic;
 use ordered_float::NotNan;
 use portable_pty::CommandBuilder;
@@ -199,6 +200,7 @@ pub struct SpawnCommand {
 
     pub position: Option<crate::GuiPosition>,
 }
+#[cfg(feature = "lua")]
 impl_lua_conversion_dynamic!(SpawnCommand);
 
 impl std::fmt::Debug for SpawnCommand {
@@ -313,6 +315,7 @@ pub enum ClipboardCopyDestination {
     PrimarySelection,
     ClipboardAndPrimarySelection,
 }
+#[cfg(feature = "lua")]
 impl_lua_conversion_dynamic!(ClipboardCopyDestination);
 
 impl Default for ClipboardCopyDestination {
@@ -647,6 +650,7 @@ pub enum KeyAssignment {
     InputSelector(InputSelector),
     Confirmation(Confirmation),
 }
+#[cfg(feature = "lua")]
 impl_lua_conversion_dynamic!(KeyAssignment);
 
 #[derive(Debug, Clone, PartialEq, FromDynamic, ToDynamic)]

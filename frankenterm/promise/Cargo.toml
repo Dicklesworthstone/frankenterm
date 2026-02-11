@@ -7,9 +7,17 @@ publish = false
 
 [dependencies]
 anyhow.workspace = true
+asupersync = { workspace = true, optional = true }
 async-executor.workspace = true
 async-io.workspace = true
 async-task.workspace = true
 flume.workspace = true
 lazy_static.workspace = true
 thiserror.workspace =true
+
+[features]
+# Default behavior matches the current implementation (async-io's `block_on`).
+default = []
+
+# Opt-in: use asupersync runtime for `promise::spawn::block_on`.
+async-asupersync = ["dep:asupersync"]

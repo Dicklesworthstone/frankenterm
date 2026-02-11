@@ -14,18 +14,23 @@ use crate::keyassignment::{
     KeyAssignment, KeyTable, KeyTableEntry, KeyTables, MouseEventTrigger, SpawnCommand,
 };
 use crate::keys::{Key, LeaderKey, Mouse};
+#[cfg(feature = "lua")]
 use crate::lua::make_lua_context;
 use crate::ssh::{SshBackend, SshDomain};
 use crate::tls::{TlsDomainClient, TlsDomainServer};
 use crate::units::Dimension;
 use crate::unix::UnixDomain;
 use crate::wsl::WslDomain;
+#[cfg(feature = "lua")]
 use crate::{
-    default_config_with_overrides_applied, default_one_point_oh, default_one_point_oh_f64,
-    default_true, default_win32_acrylic_accent_color, CellWidth, GpuInfo,
-    IntegratedTitleButtonColor, KeyMapPreference, LoadedConfig, MouseEventTriggerMods, RgbaColor,
-    SerialDomain, SystemBackdrop, WebGpuPowerPreference, CONFIG_DIRS, CONFIG_FILE_OVERRIDE,
-    CONFIG_OVERRIDES, CONFIG_SKIP, HOME_DIR,
+    default_config_with_overrides_applied, CONFIG_FILE_OVERRIDE, CONFIG_OVERRIDES, CONFIG_SKIP,
+    HOME_DIR,
+};
+use crate::{
+    default_one_point_oh, default_one_point_oh_f64, default_true,
+    default_win32_acrylic_accent_color, CellWidth, GpuInfo, IntegratedTitleButtonColor,
+    KeyMapPreference, LoadedConfig, MouseEventTriggerMods, RgbaColor, SerialDomain, SystemBackdrop,
+    WebGpuPowerPreference, CONFIG_DIRS,
 };
 use anyhow::Context;
 use frankenterm_bidi::ParagraphDirectionHint;
@@ -36,13 +41,17 @@ use frankenterm_input_types::{
     UIKeyCapRendering, WindowDecorations,
 };
 use frankenterm_term::TerminalSize;
+#[cfg(feature = "lua")]
 use luahelper::impl_lua_conversion_dynamic;
+#[cfg(feature = "lua")]
 use mlua::FromLua;
 use portable_pty::CommandBuilder;
 use std::collections::HashMap;
 use std::ffi::OsStr;
+#[cfg(feature = "lua")]
 use std::io::Read;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "lua")]
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use termwiz::hyperlink;
@@ -887,6 +896,7 @@ pub struct Config {
     #[dynamic(default = "default_ulimit_nproc")]
     pub ulimit_nproc: u64,
 }
+#[cfg(feature = "lua")]
 impl_lua_conversion_dynamic!(Config);
 
 fn default_one() -> usize {
@@ -1000,6 +1010,17 @@ impl Config {
         Ok(())
     }
 
+    #[cfg(not(feature = "lua"))]
+    pub fn load_with_overrides(_overrides: &frankenterm_dynamic::Value) -> LoadedConfig {
+        LoadedConfig {
+            config: Ok(Self::default_config()),
+            file_name: None,
+            lua: None,
+            warnings: vec![],
+        }
+    }
+
+    #[cfg(feature = "lua")]
     pub fn load_with_overrides(overrides: &frankenterm_dynamic::Value) -> LoadedConfig {
         // Note that the directories crate has methods for locating project
         // specific config directories, but only returns one of them, not
@@ -1072,6 +1093,17 @@ impl Config {
         }
     }
 
+    #[cfg(not(feature = "lua"))]
+    pub fn try_default() -> anyhow::Result<LoadedConfig> {
+        Ok(LoadedConfig {
+            config: Ok(Self::default_config()),
+            file_name: None,
+            lua: None,
+            warnings: vec![],
+        })
+    }
+
+    #[cfg(feature = "lua")]
     pub fn try_default() -> anyhow::Result<LoadedConfig> {
         let (config, warnings) =
             frankenterm_dynamic::Error::capture_warnings(|| -> anyhow::Result<Config> {
@@ -1086,6 +1118,7 @@ impl Config {
         })
     }
 
+    #[cfg(feature = "lua")]
     fn try_load(
         path_item: &PathPossibility,
         overrides: &frankenterm_dynamic::Value,
@@ -1146,6 +1179,7 @@ impl Config {
         }))
     }
 
+    #[cfg(feature = "lua")]
     pub(crate) fn apply_overrides_obj_to<'l>(
         lua: &'l mlua::Lua,
         mut config: mlua::Value<'l>,
@@ -1178,6 +1212,7 @@ impl Config {
         }
     }
 
+    #[cfg(feature = "lua")]
     pub(crate) fn apply_overrides_to<'l>(
         lua: &'l mlua::Lua,
         mut config: mlua::Value<'l>,
@@ -1994,10 +2029,12 @@ pub enum WindowCloseConfirmation {
     // running programs are stateful
 }
 
+#[cfg(feature = "lua")]
 struct PathPossibility {
     path: PathBuf,
     is_required: bool,
 }
+#[cfg(feature = "lua")]
 impl PathPossibility {
     pub fn required(path: PathBuf) -> PathPossibility {
         PathPossibility {

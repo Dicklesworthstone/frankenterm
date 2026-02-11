@@ -1,6 +1,7 @@
 use crate::config::validate_domain_name;
 use crate::*;
 use frankenterm_dynamic::{FromDynamic, ToDynamic};
+#[cfg(feature = "lua")]
 use luahelper::impl_lua_conversion_dynamic;
 use std::fmt::Display;
 use std::str::FromStr;
@@ -105,6 +106,7 @@ pub struct SshDomain {
     #[dynamic(default)]
     pub assume_shell: Shell,
 }
+#[cfg(feature = "lua")]
 impl_lua_conversion_dynamic!(SshDomain);
 
 impl SshDomain {

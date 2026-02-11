@@ -1,10 +1,11 @@
 //! Configuration for the gui portion of the terminal
 
 use anyhow::{anyhow, bail, Context, Error};
-use frankenterm_dynamic::{FromDynamic, FromDynamicOptions, ToDynamic, UnknownFieldAction, Value};
+#[cfg(feature = "lua")]
+use frankenterm_dynamic::{FromDynamic, FromDynamicOptions, UnknownFieldAction};
+use frankenterm_dynamic::{ToDynamic, Value};
 use frankenterm_term::UnicodeVersion;
 use lazy_static::lazy_static;
-use mlua::Lua;
 use ordered_float::NotNan;
 use smol::channel::{Receiver, Sender};
 use smol::prelude::*;
@@ -20,6 +21,15 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[cfg(all(feature = "lua", feature = "no-lua"))]
+compile_error!("Features `lua` and `no-lua` cannot both be enabled. Use `--no-default-features --features no-lua` for a no-Lua build.");
+
+#[cfg(feature = "lua")]
+use mlua::Lua;
+#[cfg(not(feature = "lua"))]
+#[derive(Debug)]
+pub struct Lua;
+
 mod background;
 mod bell;
 mod cell;
@@ -31,6 +41,7 @@ mod font;
 mod frontend;
 pub mod keyassignment;
 mod keys;
+#[cfg(feature = "lua")]
 pub mod lua;
 pub mod meta;
 mod scheme_data;
@@ -172,8 +183,8 @@ pub fn build_default_schemes() -> HashMap<String, Palette> {
 }
 
 struct LuaPipe {
-    sender: Sender<mlua::Lua>,
-    receiver: Receiver<mlua::Lua>,
+    sender: Sender<Lua>,
+    receiver: Receiver<Lua>,
 }
 impl LuaPipe {
     pub fn new() -> Self {
@@ -203,7 +214,7 @@ impl LuaPipe {
 /// The main thread pops the loaded configs to obtain the latest one
 /// and updates LuaConfigState
 struct LuaConfigState {
-    lua: Option<Rc<mlua::Lua>>,
+    lua: Option<Rc<Lua>>,
 }
 
 impl LuaConfigState {
@@ -217,7 +228,7 @@ impl LuaConfigState {
     }
 
     /// Take a reference on the latest generation of the lua context
-    fn get_lua(&self) -> Option<Rc<mlua::Lua>> {
+    fn get_lua(&self) -> Option<Rc<Lua>> {
         self.lua.as_ref().map(Rc::clone)
     }
 }
@@ -260,7 +271,7 @@ where
 /// call from a secondary thread.
 pub async fn with_lua_config_on_main_thread<F, RETF, RET>(func: F) -> anyhow::Result<RET>
 where
-    F: FnOnce(Option<Rc<mlua::Lua>>) -> RETF,
+    F: FnOnce(Option<Rc<Lua>>) -> RETF,
     RETF: Future<Output = anyhow::Result<RET>>,
 {
     let lua = LUA_CONFIG.with(|lc| {
@@ -278,7 +289,7 @@ where
 
 pub fn run_immediate_with_lua_config<F, RET>(func: F) -> anyhow::Result<RET>
 where
-    F: FnOnce(Option<Rc<mlua::Lua>>) -> anyhow::Result<RET>,
+    F: FnOnce(Option<Rc<Lua>>) -> anyhow::Result<RET>,
 {
     let lua = LUA_CONFIG.with(|lc| {
         let mut lc = lc.borrow_mut();
@@ -297,7 +308,7 @@ fn schedule_with_lua<F, RETF, RET>(func: F) -> promise::spawn::Task<anyhow::Resu
 where
     F: 'static,
     RET: 'static,
-    F: Fn(Option<Rc<mlua::Lua>>) -> RETF,
+    F: Fn(Option<Rc<Lua>>) -> RETF,
     RETF: Future<Output = anyhow::Result<RET>>,
 {
     promise::spawn::spawn(async move { with_lua_config_on_main_thread(func).await })
@@ -308,7 +319,7 @@ where
 /// The `func` argument is passed the lua state and must return a Future.
 pub async fn with_lua_config<F, RETF, RET>(func: F) -> anyhow::Result<RET>
 where
-    F: Fn(Option<Rc<mlua::Lua>>) -> RETF,
+    F: Fn(Option<Rc<Lua>>) -> RETF,
     RETF: Future<Output = anyhow::Result<RET>> + Send + 'static,
     F: Send + 'static,
     RET: Send + 'static,
@@ -316,6 +327,7 @@ where
     promise::spawn::spawn_into_main_thread(async move { schedule_with_lua(func).await }).await
 }
 
+#[cfg(feature = "lua")]
 fn default_config_with_overrides_applied() -> anyhow::Result<Config> {
     // Cause the default config to be re-evaluated with the overrides applied
     let lua = lua::make_lua_context(Path::new("override")).context("make_lua_context")?;
@@ -339,6 +351,11 @@ fn default_config_with_overrides_applied() -> anyhow::Result<Config> {
     cfg.check_consistency().context("check_consistency")?;
 
     Ok(cfg)
+}
+
+#[cfg(not(feature = "lua"))]
+fn default_config_with_overrides_applied() -> anyhow::Result<Config> {
+    Ok(Config::default_config())
 }
 
 pub fn common_init(
@@ -560,6 +577,7 @@ impl ConfigInner {
         }
     }
 
+    #[cfg(feature = "lua")]
     fn accumulate_watch_paths(lua: &Lua, watch_paths: &mut Vec<PathBuf>) {
         if let Ok(mlua::Value::Table(tbl)) = lua.named_registry_value("wezterm-watch-paths") {
             for path in tbl.sequence_values::<String>() {
@@ -569,6 +587,9 @@ impl ConfigInner {
             }
         }
     }
+
+    #[cfg(not(feature = "lua"))]
+    fn accumulate_watch_paths(_lua: &Lua, _watch_paths: &mut Vec<PathBuf>) {}
 
     /// Attempt to load the user's configuration.
     /// On success, clear any error and replace the current
@@ -820,7 +841,7 @@ impl std::ops::Deref for ConfigHandle {
 pub struct LoadedConfig {
     pub config: anyhow::Result<Config>,
     pub file_name: Option<PathBuf>,
-    pub lua: Option<mlua::Lua>,
+    pub lua: Option<Lua>,
     pub warnings: Vec<String>,
 }
 

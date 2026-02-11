@@ -1,5 +1,6 @@
 use crate::{default_one_point_oh, Config, Dimension, HsbTransform, PixelUnit, RgbaColor};
 use frankenterm_dynamic::{FromDynamic, FromDynamicOptions, ToDynamic, Value};
+#[cfg(feature = "lua")]
 use luahelper::impl_lua_conversion_dynamic;
 use termwiz::color::SrgbaTuple;
 
@@ -455,6 +456,7 @@ pub struct Gradient {
     #[dynamic(default)]
     pub noise: Option<usize>,
 }
+#[cfg(feature = "lua")]
 impl_lua_conversion_dynamic!(Gradient);
 
 impl Gradient {

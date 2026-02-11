@@ -5264,6 +5264,7 @@ name = "promise"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "asupersync",
  "async-executor",
  "async-io",
  "async-task",

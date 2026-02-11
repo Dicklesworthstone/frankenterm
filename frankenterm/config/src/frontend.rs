@@ -1,4 +1,5 @@
 use frankenterm_dynamic::{FromDynamic, ToDynamic};
+#[cfg(feature = "lua")]
 use luahelper::impl_lua_conversion_dynamic;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic, Default)]
@@ -20,6 +21,7 @@ pub struct GpuInfo {
     pub vendor: Option<u32>,
     pub device: Option<u32>,
 }
+#[cfg(feature = "lua")]
 impl_lua_conversion_dynamic!(GpuInfo);
 
 impl ToString for GpuInfo {

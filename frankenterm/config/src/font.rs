@@ -3,6 +3,7 @@ use crate::*;
 use bitflags::*;
 use enum_display_derive::Display;
 use frankenterm_dynamic::{FromDynamic, FromDynamicOptions, ToDynamic, Value};
+#[cfg(feature = "lua")]
 use luahelper::impl_lua_conversion_dynamic;
 use std::convert::TryFrom;
 use std::fmt::Display;
@@ -380,6 +381,7 @@ pub struct FontAttributes {
     #[dynamic(default)]
     pub assume_emoji_presentation: Option<bool>,
 }
+#[cfg(feature = "lua")]
 impl_lua_conversion_dynamic!(FontAttributes);
 
 impl std::fmt::Display for FontAttributes {
@@ -459,6 +461,7 @@ pub struct TextStyle {
     /// the text color for eg: bold text.
     pub foreground: Option<RgbaColor>,
 }
+#[cfg(feature = "lua")]
 impl_lua_conversion_dynamic!(TextStyle);
 
 impl Default for TextStyle {
