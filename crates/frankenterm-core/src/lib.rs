@@ -70,6 +70,7 @@ pub mod cpu_pressure;
 pub mod cross_pane_correlation;
 pub mod crash;
 pub mod degradation;
+pub mod differential_snapshot;
 pub mod desktop_notify;
 pub mod diagnostic;
 pub mod docs_gen;
@@ -97,6 +98,7 @@ pub mod lock;
 pub mod logging;
 #[cfg(feature = "mcp")]
 pub mod mcp;
+pub mod memory_budget;
 pub mod memory_pressure;
 #[cfg(feature = "metrics")]
 pub mod metrics;
