@@ -463,17 +463,19 @@ fn save_checkpoint_sync(
     _topology_json: &str,
     pane_states: &[PaneStateSnapshot],
 ) -> std::result::Result<(String, i64, usize), rusqlite::Error> {
-    let conn = open_conn(db_path)?;
-
-    // Serialize all pane states and compute total bytes
-    let mut serialized_states: Vec<(
+    type SerializedPaneState = (
         u64,
         String,
         Option<String>,
         Option<String>,
         Option<i64>,
         Option<i64>,
-    )> = Vec::new();
+    );
+
+    let conn = open_conn(db_path)?;
+
+    // Serialize all pane states and compute total bytes
+    let mut serialized_states: Vec<SerializedPaneState> = Vec::new();
     let mut total_bytes: usize = 0;
 
     for ps in pane_states {

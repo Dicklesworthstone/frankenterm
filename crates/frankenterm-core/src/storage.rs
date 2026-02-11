@@ -5868,10 +5868,10 @@ impl StorageHandle {
             .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
     }
 
-    /// Upsert an agent session record
-    ///
-    /// Creates a new session or updates an existing one.
-    /// Returns the session ID.
+    // Upsert an agent session record
+    //
+    // Creates a new session or updates an existing one.
+    // Returns the session ID.
     // =========================================================================
     // Session Checkpoint Methods
     // =========================================================================

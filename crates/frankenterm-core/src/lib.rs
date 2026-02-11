@@ -43,6 +43,7 @@
 #![feature(stmt_expr_attributes)]
 
 pub mod accounts;
+pub mod agent_correlator;
 pub mod alerts;
 pub mod api_schema;
 pub mod approval;
