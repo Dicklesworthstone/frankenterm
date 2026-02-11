@@ -123,7 +123,7 @@ create_workspace() {
     local db_path="$db_dir/ft.db"
 
     # Initialize database with session persistence schema
-    sqlite3 -cmd "PRAGMA foreign_keys = ON;" -cmd "PRAGMA journal_mode = WAL;" "$db_path" <<'SQL'
+    sqlite3 -cmd "PRAGMA foreign_keys = ON;" -cmd "PRAGMA journal_mode = WAL;" "$db_path" >/dev/null <<'SQL'
 CREATE TABLE IF NOT EXISTS mux_sessions (
     session_id TEXT PRIMARY KEY,
     created_at INTEGER NOT NULL,
@@ -407,7 +407,7 @@ test_checkpoint_dedup() {
     # In real code, the snapshot engine would skip writes with duplicate hashes.
     # Here we verify the schema allows tracking via state_hash.
     local unique_hashes
-    unique_hashes=$(sqlite3 "$db_path" "SELECT COUNT(DISTINCT state_hash) FROM session_checkpoints WHERE session_id = 'session-dedup-001';")
+    unique_hashes=$(sql "$db_path" "SELECT COUNT(DISTINCT state_hash) FROM session_checkpoints WHERE session_id = 'session-dedup-001';")
 
     if [[ "$unique_hashes" -eq 1 ]]; then
         log_pass "2.1: All 3 checkpoints share the same state_hash (dedup detectable)"
@@ -418,7 +418,7 @@ test_checkpoint_dedup() {
     # Insert a checkpoint with a DIFFERENT hash (simulates state change)
     insert_checkpoint "$db_path" "session-dedup-001" "event" "blake3_new_state_xyz789"
 
-    unique_hashes=$(sqlite3 "$db_path" "SELECT COUNT(DISTINCT state_hash) FROM session_checkpoints WHERE session_id = 'session-dedup-001';")
+    unique_hashes=$(sql "$db_path" "SELECT COUNT(DISTINCT state_hash) FROM session_checkpoints WHERE session_id = 'session-dedup-001';")
     if [[ "$unique_hashes" -eq 2 ]]; then
         log_pass "2.2: State change produces new hash ($unique_hashes distinct hashes)"
     else
@@ -465,7 +465,7 @@ test_shutdown_semantics() {
 
     # 3.3: Only crash session should appear in unclean query
     local unclean_ids
-    unclean_ids=$(sqlite3 "$db_path" "SELECT session_id FROM mux_sessions WHERE shutdown_clean = 0;")
+    unclean_ids=$(sql "$db_path" "SELECT session_id FROM mux_sessions WHERE shutdown_clean = 0;")
     if [[ "$unclean_ids" == "session-crash-200" ]]; then
         log_pass "3.3: Only crashed session appears as unclean"
     else
