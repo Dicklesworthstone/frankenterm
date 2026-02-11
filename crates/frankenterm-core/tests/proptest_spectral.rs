@@ -142,7 +142,7 @@ proptest! {
         psd in prop::collection::vec(0.01f64..100.0, 10..256),
         threshold in 2.0f64..20.0,
     ) {
-        let peaks = detect_peaks(&psd, threshold);
+        let peaks = detect_peaks(&psd, threshold, 10.0, 1024);
 
         // Compute median
         let mut sorted = psd.clone();

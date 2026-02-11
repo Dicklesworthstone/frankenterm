@@ -134,7 +134,7 @@ fn bench_peak_detection(c: &mut Criterion) {
         BenchmarkId::new("flat", 513),
         &flat_psd,
         |b, psd| {
-            b.iter(|| detect_peaks(psd, 6.0));
+            b.iter(|| detect_peaks(psd, 6.0, 10.0, 1024));
         },
     );
 
@@ -147,7 +147,7 @@ fn bench_peak_detection(c: &mut Criterion) {
         BenchmarkId::new("peaked", 513),
         &peaked_psd,
         |b, psd| {
-            b.iter(|| detect_peaks(psd, 6.0));
+            b.iter(|| detect_peaks(psd, 6.0, 10.0, 1024));
         },
     );
 
