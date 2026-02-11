@@ -174,7 +174,7 @@ SQL
 sql() {
     local db_path="$1"
     shift
-    sqlite3 -cmd "PRAGMA foreign_keys = ON;" "$db_path" "$*" 2>/dev/null
+    sqlite3 -cmd "PRAGMA foreign_keys = ON;" "$db_path" "$*"
 }
 
 # Get row count from a table
@@ -398,11 +398,11 @@ test_checkpoint_dedup() {
 
     # Insert 3 checkpoints with the SAME state hash (simulates no-change periodic ticks)
     local same_hash="blake3_dedup_test_hash_abc123"
-    insert_checkpoint "$db_path" "session-dedup-001" "startup" "$same_hash"
+    insert_checkpoint "$db_path" "session-dedup-001" "startup" "$same_hash" >/dev/null
     sleep 0.1
-    insert_checkpoint "$db_path" "session-dedup-001" "periodic" "$same_hash"
+    insert_checkpoint "$db_path" "session-dedup-001" "periodic" "$same_hash" >/dev/null
     sleep 0.1
-    insert_checkpoint "$db_path" "session-dedup-001" "periodic" "$same_hash"
+    insert_checkpoint "$db_path" "session-dedup-001" "periodic" "$same_hash" >/dev/null
 
     # In real code, the snapshot engine would skip writes with duplicate hashes.
     # Here we verify the schema allows tracking via state_hash.
@@ -416,7 +416,7 @@ test_checkpoint_dedup() {
     fi
 
     # Insert a checkpoint with a DIFFERENT hash (simulates state change)
-    insert_checkpoint "$db_path" "session-dedup-001" "event" "blake3_new_state_xyz789"
+    insert_checkpoint "$db_path" "session-dedup-001" "event" "blake3_new_state_xyz789" >/dev/null
 
     unique_hashes=$(sql "$db_path" "SELECT COUNT(DISTINCT state_hash) FROM session_checkpoints WHERE session_id = 'session-dedup-001';")
     if [[ "$unique_hashes" -eq 2 ]]; then
@@ -439,11 +439,11 @@ test_shutdown_semantics() {
 
     # Simulate clean shutdown
     insert_session "$db_path" "session-clean-100" 1
-    insert_checkpoint "$db_path" "session-clean-100" "shutdown" "shutdown_hash_001"
+    insert_checkpoint "$db_path" "session-clean-100" "shutdown" "shutdown_hash_001" >/dev/null
 
     # Simulate crash (no shutdown checkpoint, shutdown_clean = 0)
     insert_session "$db_path" "session-crash-200" 0
-    insert_checkpoint "$db_path" "session-crash-200" "periodic" "periodic_hash_001"
+    insert_checkpoint "$db_path" "session-crash-200" "periodic" "periodic_hash_001" >/dev/null
 
     # 3.1: Clean session should NOT need restore
     local clean_flag
