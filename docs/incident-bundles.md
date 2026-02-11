@@ -146,7 +146,7 @@ Use this mode for general bundle validation and before sharing externally.
 Validates event data structure and text boundaries:
 
 ```bash
-wa reproduce replay /path/to/bundle --mode rules
+ft reproduce replay /path/to/bundle --mode rules
 ```
 
 **Checks run:**
@@ -165,7 +165,7 @@ Use this when investigating rule or pattern matching issues.
 Validates workflow step logs and execution traces:
 
 ```bash
-wa reproduce replay /path/to/bundle --mode workflow
+ft reproduce replay /path/to/bundle --mode workflow
 ```
 
 **Checks run:**
@@ -224,7 +224,7 @@ The policy replay mode includes a `no_secrets_leaked` check that re-scans
 all bundle files for known secret patterns. Run it before sharing:
 
 ```bash
-wa reproduce replay /path/to/bundle --mode policy
+ft reproduce replay /path/to/bundle --mode policy
 ```
 
 If the check fails, the bundle should not be shared until the leak is
@@ -240,7 +240,7 @@ manifest. Replay tooling uses this to determine compatibility:
   older readers (warning issued)
 - **Different major version** — incompatible, replay refuses to proceed
 
-This allows bundles to be shared across wa versions within the same major
+This allows bundles to be shared across ft versions within the same major
 release.
 
 ## Examples
@@ -248,10 +248,10 @@ release.
 ### Example 1: Watcher crash
 
 ```bash
-# wa crashes during capture — crash report is auto-written
+# ft crashes during capture — crash report is auto-written
 # Export the crash bundle
-$ wa reproduce export --kind crash
-wa reproduce export - Incident bundle exported
+$ ft reproduce export --kind crash
+ft reproduce export - Incident bundle exported
 
   Kind:     crash
   Path:     /home/user/.local/share/wa/crashes/wa_incident_crash_20260206_183000
@@ -262,37 +262,37 @@ wa reproduce export - Incident bundle exported
   Next steps:
   1. Review the bundle for sensitive data
   2. Share the bundle directory for analysis
-  3. Run 'wa reproduce replay <path>' to replay
+  3. Run 'ft reproduce replay <path>' to replay
 
 # Validate before sharing
-$ wa reproduce replay ~/.local/share/wa/crashes/wa_incident_crash_20260206_183000 --mode policy
+$ ft reproduce replay ~/.local/share/wa/crashes/wa_incident_crash_20260206_183000 --mode policy
 ```
 
 ### Example 2: Unexpected policy denial
 
 ```bash
 # A send command was denied but shouldn't have been
-$ wa reproduce export --kind manual
+$ ft reproduce export --kind manual
 # Replay to check policy consistency
-$ wa reproduce replay /path/to/bundle --mode policy
+$ ft reproduce replay /path/to/bundle --mode policy
 ```
 
 ### Example 3: Rule matching issue
 
 ```bash
 # A rule didn't fire when expected
-$ wa reproduce export --kind manual
+$ ft reproduce export --kind manual
 # Replay to validate event structure
-$ wa reproduce replay /path/to/bundle --mode rules
+$ ft reproduce replay /path/to/bundle --mode rules
 ```
 
 ### Example 4: Workflow failure
 
 ```bash
 # A workflow timed out mid-execution
-$ wa reproduce export --kind manual
+$ ft reproduce export --kind manual
 # Replay to check step timing and logs
-$ wa reproduce replay /path/to/bundle --mode workflow
+$ ft reproduce replay /path/to/bundle --mode workflow
 ```
 
 ## Sharing Bundles
@@ -308,7 +308,7 @@ $ wa reproduce replay /path/to/bundle --mode workflow
 
 ```bash
 # Create a tarball
-tar czf wa_incident.tar.gz wa_incident_crash_20260206_183000/
+tar czf incident_bundle.tar.gz wa_incident_crash_20260206_183000/
 
 # Attach to the issue or share via a file hosting service
 ```
@@ -319,19 +319,19 @@ For internal debugging, the `verbose` tier provides more data. Adjust the
 budget by passing options to the export:
 
 ```bash
-wa reproduce export --kind manual --events 200
+ft reproduce export --kind manual --events 200
 ```
 
 ## Diagnostic Bundles
 
-Separate from incident bundles, wa also provides a general diagnostic
+Separate from incident bundles, ft also provides a general diagnostic
 bundle for health reporting:
 
 ```bash
-wa diag bundle                        # generate diagnostic bundle
-wa diag bundle --output /tmp/diag     # write to specific directory
-wa diag bundle --force                # overwrite existing output
-wa diag bundle --events 200           # include more recent events
+ft diag bundle                        # generate diagnostic bundle
+ft diag bundle --output /tmp/diag     # write to specific directory
+ft diag bundle --force                # overwrite existing output
+ft diag bundle --events 200           # include more recent events
 ```
 
 Diagnostic bundles capture similar data (health, config, events, storage
@@ -343,7 +343,7 @@ health checks and capacity planning.
 ### Rust client
 
 ```rust
-use wa_core::crash::{IncidentBundleOptions, IncidentKind, collect_incident_bundle};
+use frankenterm_core::crash::{collect_incident_bundle, IncidentBundleOptions, IncidentKind};
 
 let opts = IncidentBundleOptions {
     crash_dir: &layout.crash_dir,
@@ -361,7 +361,7 @@ println!("Files: {:?}", result.files);
 ### Robot mode
 
 ```bash
-wa robot reproduce export --kind crash --format json
+ft robot reproduce export --kind crash --format json
 ```
 
 Returns a JSON response envelope with the bundle path and file list.
@@ -374,20 +374,20 @@ The replay command requires a path to an existing bundle directory:
 
 ```bash
 # Wrong — file path
-wa reproduce replay /path/to/incident_manifest.json
+ft reproduce replay /path/to/incident_manifest.json
 
 # Right — directory path
-wa reproduce replay /path/to/wa_incident_crash_20260206_183000/
+ft reproduce replay /path/to/wa_incident_crash_20260206_183000/
 ```
 
 ### "Incompatible bundle format"
 
-The bundle was created with a different major version of wa. Upgrade or
-downgrade wa to match the bundle's format version (shown in the manifest).
+The bundle was created with a different major version of ft. Upgrade or
+downgrade ft to match the bundle's format version (shown in the manifest).
 
 ### "No crash bundles found"
 
-No crash report exists in the crash directory. If wa crashed but no report
+No crash report exists in the crash directory. If ft crashed but no report
 was written, the panic hook may not have been installed (happens only in
 early startup failures).
 
@@ -397,7 +397,7 @@ Report the pattern to improve detection. The redactor uses the same
 patterns as `ft secrets scan`. Verify with:
 
 ```bash
-wa reproduce replay /path/to/bundle --mode policy
+ft reproduce replay /path/to/bundle --mode policy
 ```
 
 The `no_secrets_leaked` check will flag any remaining patterns.

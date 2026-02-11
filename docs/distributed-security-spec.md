@@ -1,4 +1,4 @@
-# Distributed Security Guide (wa distributed mode)
+# Distributed Security Guide (ft distributed mode)
 
 ## Summary
 This guide covers operator setup and operations for secure distributed mode
@@ -10,7 +10,7 @@ Distributed mode is feature-gated at compile time.
 
 ```bash
 # Build from source with distributed mode enabled
-cargo build -p wa --release --features distributed
+cargo build -p frankenterm --release --features distributed
 ```
 
 If `distributed` is not compiled in, distributed runtime behavior is unavailable.
@@ -49,7 +49,7 @@ Security invariants:
 1. Create a token file with strict permissions:
 ```bash
 umask 077
-openssl rand -hex 32 > ~/.config/wa/distributed.token
+openssl rand -hex 32 > ~/.config/ft/distributed.token
 ```
 2. Provision server cert and key (from your CA or dev self-signed certs).
 3. Configure `ft.toml`:
@@ -60,20 +60,20 @@ bind_addr = "0.0.0.0:4141"
 allow_insecure = false
 require_tls_for_non_loopback = true
 auth_mode = "token"
-token_path = "/home/you/.config/wa/distributed.token"
+token_path = "/home/you/.config/ft/distributed.token"
 allow_agent_ids = []
 
 [distributed.tls]
 enabled = true
-cert_path = "/etc/wa/tls/server.crt"
-key_path = "/etc/wa/tls/server.key"
+cert_path = "/etc/ft/tls/server.crt"
+key_path = "/etc/ft/tls/server.key"
 min_tls_version = "1.2"
 ```
-4. Start wa with your normal runtime entrypoint.
+4. Start ft with your normal runtime entrypoint.
 5. Verify effective security posture:
 ```bash
-wa doctor
-wa doctor --json
+ft doctor
+ft doctor --json
 ```
 
 ## mTLS and Mixed Mode (`token+mtls`)
@@ -82,14 +82,14 @@ For stronger identity guarantees, enable mTLS:
 ```toml
 [distributed]
 auth_mode = "token+mtls"
-token_path = "/home/you/.config/wa/distributed.token"
+token_path = "/home/you/.config/ft/distributed.token"
 allow_agent_ids = ["agent-a", "agent-b"]
 
 [distributed.tls]
 enabled = true
-cert_path = "/etc/wa/tls/server.crt"
-key_path = "/etc/wa/tls/server.key"
-client_ca_path = "/etc/wa/tls/clients-ca.pem"
+cert_path = "/etc/ft/tls/server.crt"
+key_path = "/etc/ft/tls/server.key"
+client_ca_path = "/etc/ft/tls/clients-ca.pem"
 min_tls_version = "1.2"
 ```
 
@@ -103,7 +103,7 @@ Token rotation (recommended via `token_path`):
 1. Generate new token.
 2. Write to a temp file with strict permissions.
 3. Atomically replace the old token file (`mv` temp file into place).
-4. Restart wa distributed services if your deployment caches credentials.
+4. Restart ft distributed services if your deployment caches credentials.
 5. Run `ft doctor` and a client smoke test.
 
 Certificate rotation:
@@ -115,8 +115,8 @@ Certificate rotation:
 ## Troubleshooting
 Start with:
 ```bash
-wa doctor
-wa doctor --json
+ft doctor
+ft doctor --json
 ```
 
 Runtime distributed security codes currently emitted:

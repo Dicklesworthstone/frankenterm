@@ -1,6 +1,6 @@
 # Noise Control: Dedupe, Cooldown, and Mute
 
-wa suppresses noisy events through three mechanisms: deduplication,
+ft suppresses noisy events through three mechanisms: deduplication,
 notification cooldown, and explicit muting. All three are deterministic
 and independent — dedupe controls event storage, cooldown controls
 notification frequency, and muting is user-driven suppression.
@@ -105,11 +105,11 @@ listings, but marked as `muted` and excluded from notifications.
 
 ```bash
 # Mute permanently
-wa mute add evt:abc123
+ft mute add evt:abc123
 
 # Mute for a duration
-wa mute add evt:abc123 --for 1h
-wa mute add evt:abc123 --for 30m
+ft mute add evt:abc123 --for 1h
+ft mute add evt:abc123 --for 30m
 ```
 
 The `evt:abc123` is the event identity key shown in event listings and
@@ -118,14 +118,14 @@ triage output.
 ### List active mutes
 
 ```bash
-wa mute list
-wa mute list --format json
+ft mute list
+ft mute list --format json
 ```
 
 ### Remove a mute
 
 ```bash
-wa mute remove evt:abc123
+ft mute remove evt:abc123
 ```
 
 ### Mute behavior

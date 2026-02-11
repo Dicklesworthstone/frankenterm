@@ -1,6 +1,6 @@
 # Storage and Index Tuning
 
-wa uses SQLite in WAL (Write-Ahead Logging) mode with a single-writer,
+ft uses SQLite in WAL (Write-Ahead Logging) mode with a single-writer,
 multiple-reader architecture. Full-text search is powered by FTS5. This
 document covers how to monitor, tune, and maintain both.
 
@@ -22,7 +22,7 @@ Search path: caller → FTS5 query → output_segments_fts virtual table
 
 ### SQLite Configuration
 
-wa sets these PRAGMAs at connection time:
+ft sets these PRAGMAs at connection time:
 
 | PRAGMA | Value | Purpose |
 |--------|-------|---------|
@@ -57,23 +57,23 @@ was rebuilt incompletely.
 
 ### FTS query syntax
 
-wa supports FTS5 query syntax:
+ft supports FTS5 query syntax:
 
 ```bash
 # Simple term
-wa search "error"
+ft search "error"
 
 # Phrase
-wa search '"connection refused"'
+ft search '"connection refused"'
 
 # Prefix
-wa search "timeout*"
+ft search "timeout*"
 
 # Boolean
-wa search "error AND NOT warning"
+ft search "error AND NOT warning"
 
 # Combined
-wa search '"api key" OR "access token"'
+ft search '"api key" OR "access token"'
 ```
 
 Invalid syntax is caught by the query linter before execution. Use
@@ -85,7 +85,7 @@ unexpected results.
 ### Quick health check
 
 ```bash
-wa db check
+ft db check
 ```
 
 Runs five checks and reports pass/fail:
@@ -101,13 +101,13 @@ Exit codes: 0 = OK, 1 = errors found, 2 = warnings only.
 For machine-readable output:
 
 ```bash
-wa db check -f json
+ft db check -f json
 ```
 
 ### FTS index health
 
 ```bash
-wa search fts verify
+ft search fts verify
 ```
 
 Reports:
@@ -121,7 +121,7 @@ source data. Run a rebuild (see below).
 ### Doctor diagnostics
 
 ```bash
-wa doctor
+ft doctor
 ```
 
 Includes storage checks alongside environment, config, and runtime
@@ -132,7 +132,7 @@ CLI calls.
 
 ### Checkpoint and optimize (routine)
 
-Under normal operation, SQLite checkpoints the WAL automatically. wa
+Under normal operation, SQLite checkpoints the WAL automatically. ft
 also runs periodic maintenance:
 
 - **Passive checkpoint** — non-blocking, runs during the normal write
@@ -147,7 +147,7 @@ This happens automatically. Manual intervention is rarely needed.
 ### FTS rebuild (when index is unhealthy)
 
 ```bash
-wa search fts rebuild
+ft search fts rebuild
 ```
 
 Drops the FTS index and reindexes all segments from scratch. This runs
@@ -164,10 +164,10 @@ Output includes:
 ### Database repair (when checks fail)
 
 ```bash
-wa db repair              # interactive — prompts for confirmation
-wa db repair --dry-run    # preview repairs without executing
-wa db repair --yes        # skip confirmation
-wa db repair -f json      # machine-readable output
+ft db repair              # interactive — prompts for confirmation
+ft db repair --dry-run    # preview repairs without executing
+ft db repair --yes        # skip confirmation
+ft db repair -f json      # machine-readable output
 ```
 
 Repair performs:
@@ -192,10 +192,10 @@ during maintenance windows.
 ### Schema migrations
 
 ```bash
-wa db migrate              # run pending migrations
-wa db migrate --status     # check current version and pending migrations
-wa db migrate --to 5       # migrate to a specific version
-wa db migrate --dry-run    # preview without applying
+ft db migrate              # run pending migrations
+ft db migrate --status     # check current version and pending migrations
+ft db migrate --to 5       # migrate to a specific version
+ft db migrate --dry-run    # preview without applying
 ```
 
 Migrations are versioned and support rollback. The schema version is
@@ -282,18 +282,18 @@ For reference, these are the tables relevant to storage tuning:
 ### "Database locked" errors
 
 The single-writer architecture should prevent lock contention. If you
-see `WA-2001` (database locked):
+see `FT-2001` (database locked):
 
 1. Check for external tools accessing the same database file
-2. Ensure only one wa instance is running per database
-3. Use `ft robot why WA-2001` for recovery guidance
+2. Ensure only one ft instance is running per database
+3. Use `ft robot why FT-2001` for recovery guidance
 
 ### FTS returns stale results
 
 Run `ft search fts verify`. If inconsistent panes are reported, rebuild:
 
 ```bash
-wa search fts rebuild
+ft search fts rebuild
 ```
 
 ### Database grows unexpectedly

@@ -2,7 +2,7 @@
 
 > wa-4vx.10.6: Deterministic scenarios + logging/artifacts contract
 
-This document specifies the end-to-end test harness for `wa`. The harness validates the complete system: ingest, storage, pattern detection, workflows, and CLI surfaces.
+This document specifies the end-to-end test harness for `ft`. The harness validates the complete system: ingest, storage, pattern detection, workflows, and CLI surfaces.
 
 ---
 
@@ -63,10 +63,10 @@ e2e-artifacts/
     ├── env.txt                      # Environment snapshot
     ├── summary.json                 # Machine-readable results
     ├── summary.txt                  # Human-readable summary
-    ├── wa_config_effective.toml     # Resolved configuration
+    ├── ft_config_effective.toml     # Resolved configuration
     ├── scenario_01_capture_search/
-    │   ├── wa_watch.log             # Watcher stdout/stderr
-    │   ├── wa_watch.jsonl           # JSON-lines structured logs
+    │   ├── ft_watch.log             # Watcher stdout/stderr
+    │   ├── ft_watch.jsonl           # JSON-lines structured logs
     │   ├── robot_state.json         # Final pane state
     │   ├── events.jsonl             # All detected events
     │   ├── scenario.log             # Test script output
@@ -84,12 +84,12 @@ e2e-artifacts/
 hostname: devbox
 timestamp: 2026-01-19T09:00:00Z
 wezterm_version: 20250101-120000-abc123
-wa_version: 0.1.0
-wa_commit: deadbeef
+ft_version: 0.1.0
+ft_commit: deadbeef
 rust_version: 1.85.0-nightly
 os: Linux 6.x x86_64
 shell: /bin/bash
-temp_workspace: /tmp/wa-e2e-abc123
+temp_workspace: /tmp/ft-e2e-abc123
 ```
 
 ### `summary.json` Schema
@@ -135,7 +135,7 @@ Before running scenarios, the harness validates prerequisites:
 
 1. **WezTerm installed** - `wezterm --version` succeeds
 2. **WezTerm mux available** - Can spawn and list panes
-3. **wa binary built** - `cargo build --release` or binary exists
+3. **ft binary built** - `cargo build --release` or binary exists
 4. **Artifacts writable** - Can create artifacts directory
 5. **Temp space available** - At least 100MB free in temp
 6. **Required features** - Check `ft --version` for feature flags
@@ -147,7 +147,7 @@ E2E Harness Self-Check
 ======================
 [PASS] WezTerm installed: 20250101-120000-abc123
 [PASS] WezTerm mux operational: spawned test pane
-[PASS] wa binary: ./target/release/wa (0.1.0)
+[PASS] ft binary: ./target/release/ft (0.1.0)
 [PASS] Artifacts directory: writable
 [PASS] Temp space: 50GB available
 [PASS] Feature flags: all required features present
@@ -163,7 +163,7 @@ E2E Harness Self-Check
 [PASS] WezTerm installed: 20250101-120000-abc123
 [FAIL] WezTerm mux operational: cannot connect to mux server
        Hint: Start WezTerm with `wezterm start --mux`
-[PASS] wa binary: ./target/release/wa (0.1.0)
+[PASS] ft binary: ./target/release/ft (0.1.0)
 
 Self-check failed. Fix issues above before running E2E tests.
 Exit code: 2
@@ -310,7 +310,7 @@ For human runs (no `--verbose`):
 ```
 [09:00:01] Starting scenario: capture_search
 [09:00:01] Spawning dummy pane...
-[09:00:02] Starting wa watch...
+[09:00:02] Starting ft watch...
 [09:00:05] Waiting for capture...
 [09:00:08] Running search...
 [09:00:08] PASS: Found 100 hits for marker
@@ -333,7 +333,7 @@ Error: Search returned no results
 Artifacts saved to: ./e2e-artifacts/2026-01-19T09-00-00Z/scenario_01_capture_search/
 
 Key files to examine:
-  wa_watch.log    - Watcher output (check for errors)
+  ft_watch.log    - Watcher output (check for errors)
   events.jsonl    - Detected events (should have entries)
   robot_state.json - Final pane state
 
@@ -349,8 +349,8 @@ Hint: Check if watcher started successfully and pane was observed.
 | `FT_E2E_KEEP_ARTIFACTS` | Always keep artifacts | `1` |
 | `FT_E2E_TIMEOUT` | Override timeout (seconds) | `300` |
 | `FT_E2E_VERBOSE` | Enable verbose output | `1` |
-| `FT_E2E_WORKSPACE` | Override workspace path | `/tmp/wa-e2e` |
-| `FT_LOG_LEVEL` | Log level for wa processes | `debug` |
+| `FT_E2E_WORKSPACE` | Override workspace path | `/tmp/ft-e2e` |
+| `FT_LOG_LEVEL` | Log level for ft processes | `debug` |
 | `FT_LOG_FORMAT` | Log format (`pretty`/`json`) | `json` |
 
 ---
@@ -382,12 +382,12 @@ On failure:
 ### Timeout Handling
 
 ```bash
-timeout --signal=KILL $TIMEOUT wa watch &
-WA_PID=$!
+timeout --signal=KILL $TIMEOUT ft watch &
+FT_PID=$!
 
 # Wait for condition or timeout
 if ! wait_for_condition "pane_captured" $TIMEOUT; then
-    kill $WA_PID 2>/dev/null
+    kill $FT_PID 2>/dev/null
     collect_artifacts
     exit 4  # Timeout
 fi
@@ -404,7 +404,7 @@ wait_for_pane_observed() {
     local start=$(date +%s)
 
     while true; do
-        if wa robot state | jq -e ".data[] | select(.pane_id == $pane_id and .observed)" >/dev/null; then
+        if ft robot state | jq -e ".data[] | select(.pane_id == $pane_id and .observed)" >/dev/null; then
             return 0
         fi
 

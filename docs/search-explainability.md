@@ -9,34 +9,34 @@ incomplete search results without risky actions.
 1. Confirm the watcher is running and panes are visible.
 
 ```bash
-wa status
-wa list
+ft status
+ft list
 ```
 
 2. Run a normal search and verify the pane scope.
 
 ```bash
-wa search "error"
-wa search "error" --pane 3
+ft search "error"
+ft search "error" --pane 3
 ```
 
 3. Check FTS index health.
 
 ```bash
-wa search fts verify
+ft search fts verify
 ```
 
 4. If results are still missing, collect diagnostics.
 
 ```bash
-wa doctor
-wa db check -f plain
+ft doctor
+ft db check -f plain
 ```
 
 5. If the index is inconsistent, rebuild it (safe but may be slow).
 
 ```bash
-wa search fts rebuild
+ft search fts rebuild
 ```
 
 ## Search explain output shape
@@ -66,7 +66,7 @@ Search explain for query: "error"
      pane_3_segments: 120
      pane_3_fts_rows: 95
      Suggestions:
-       - Run diagnostics: wa doctor
+       - Run diagnostics: ft doctor
        - The FTS index may need rebuilding.
 ```
 
@@ -101,27 +101,27 @@ Use the sequence below to diagnose and correct it.
 1. Confirm data is being captured.
 
 ```bash
-wa list
-wa search fts verify
+ft list
+ft search fts verify
 ```
 
 2. If segment counts are increasing but FTS rows lag, run diagnostics.
 
 ```bash
-wa doctor
+ft doctor
 ```
 
 3. If the index is inconsistent, rebuild it.
 
 ```bash
-wa search fts rebuild
+ft search fts rebuild
 ```
 
 4. If lag persists, check for capture gaps or backpressure warnings.
 
 ```bash
-wa events --rule-id gap
-wa status
+ft events --rule-id gap
+ft status
 ```
 
 ## Adjusting pane include/exclude rules
@@ -146,9 +146,9 @@ cwd = "/home/user/private"
 After editing config:
 
 ```bash
-wa config validate
-wa config show --effective
-wa list
+ft config validate
+ft config show --effective
+ft list
 ```
 
 ## Safe diagnostics checklist
@@ -161,4 +161,3 @@ Use these steps before any destructive actions:
 4. `ft doctor` for a full health snapshot.
 5. `ft db check -f plain` for DB health.
 6. `ft db repair --dry-run` to preview fixes (if needed).
-
