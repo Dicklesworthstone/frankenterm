@@ -22,6 +22,14 @@ lazy_static::lazy_static! {
 
 static SCHEDULER_CONFIGURED: AtomicBool = AtomicBool::new(false);
 
+#[cfg(feature = "async-asupersync")]
+static ASUPERSYNC_RUNTIME: std::sync::LazyLock<asupersync::runtime::Runtime> =
+    std::sync::LazyLock::new(|| {
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("failed to build asupersync runtime")
+    });
+
 fn schedule_runnable(runnable: Runnable, high_pri: bool) {
     let func = if high_pri {
         ON_MAIN_THREAD.lock()
@@ -181,10 +189,22 @@ where
 }
 
 /// Block the current thread until the passed future completes.
+#[cfg(not(feature = "async-asupersync"))]
 pub use async_io::block_on;
+
+#[cfg(feature = "async-asupersync")]
+pub fn block_on<F: Future>(future: F) -> F::Output {
+    ASUPERSYNC_RUNTIME.block_on(future)
+}
 
 pub struct SimpleExecutor {
     rx: Receiver<SpawnFunc>,
+}
+
+impl Default for SimpleExecutor {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SimpleExecutor {
@@ -224,6 +244,12 @@ impl SimpleExecutor {
 }
 
 pub struct ScopedExecutor {}
+
+impl Default for ScopedExecutor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl ScopedExecutor {
     pub fn new() -> Self {
