@@ -302,6 +302,192 @@ fn save_restore_checkpoint(
 }
 
 // =============================================================================
+// CLI query functions
+// =============================================================================
+
+/// Session summary for CLI display.
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionInfo {
+    pub session_id: String,
+    pub created_at: u64,
+    pub last_checkpoint_at: Option<u64>,
+    pub shutdown_clean: bool,
+    pub ft_version: String,
+    pub host_id: Option<String>,
+    pub checkpoint_count: usize,
+    pub pane_count: Option<usize>,
+}
+
+/// List all sessions with their checkpoint counts.
+pub fn list_sessions(db_path: &str) -> Result<Vec<SessionInfo>, RestoreError> {
+    let conn = open_conn(db_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT s.session_id, s.created_at, s.last_checkpoint_at, s.shutdown_clean,
+                s.ft_version, s.host_id,
+                (SELECT COUNT(*) FROM session_checkpoints c WHERE c.session_id = s.session_id),
+                (SELECT c.pane_count FROM session_checkpoints c
+                 WHERE c.session_id = s.session_id ORDER BY c.checkpoint_at DESC LIMIT 1)
+         FROM mux_sessions s
+         ORDER BY COALESCE(s.last_checkpoint_at, s.created_at) DESC",
+    )?;
+
+    let sessions = stmt
+        .query_map([], |row| {
+            Ok(SessionInfo {
+                session_id: row.get(0)?,
+                created_at: row.get::<_, i64>(1)? as u64,
+                last_checkpoint_at: row.get::<_, Option<i64>>(2)?.map(|v| v as u64),
+                shutdown_clean: row.get::<_, i64>(3)? != 0,
+                ft_version: row.get(4)?,
+                host_id: row.get(5)?,
+                checkpoint_count: row.get::<_, i64>(6)? as usize,
+                pane_count: row.get::<_, Option<i64>>(7)?.map(|v| v as usize),
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(sessions)
+}
+
+/// Checkpoint summary for show command.
+#[derive(Debug, Clone, Serialize)]
+pub struct CheckpointInfo {
+    pub id: i64,
+    pub checkpoint_at: u64,
+    pub checkpoint_type: Option<String>,
+    pub pane_count: usize,
+    pub total_bytes: usize,
+}
+
+/// Show detailed session info including checkpoints.
+pub fn show_session(
+    db_path: &str,
+    session_id: &str,
+) -> Result<(SessionCandidate, Vec<CheckpointInfo>), RestoreError> {
+    let conn = open_conn(db_path)?;
+
+    // Get session
+    let session = conn
+        .query_row(
+            "SELECT session_id, created_at, last_checkpoint_at, topology_json, ft_version, host_id
+             FROM mux_sessions WHERE session_id = ?1",
+            [session_id],
+            |row| {
+                Ok(SessionCandidate {
+                    session_id: row.get(0)?,
+                    created_at: row.get::<_, i64>(1)? as u64,
+                    last_checkpoint_at: row.get::<_, Option<i64>>(2)?.map(|v| v as u64),
+                    topology_json: row.get(3)?,
+                    ft_version: row.get(4)?,
+                    host_id: row.get(5)?,
+                })
+            },
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => RestoreError::NoSessions,
+            other => RestoreError::Database(other.to_string()),
+        })?;
+
+    // Get checkpoints
+    let mut stmt = conn.prepare(
+        "SELECT id, checkpoint_at, checkpoint_type, pane_count, total_bytes
+         FROM session_checkpoints
+         WHERE session_id = ?1
+         ORDER BY checkpoint_at DESC",
+    )?;
+
+    let checkpoints = stmt
+        .query_map([session_id], |row| {
+            Ok(CheckpointInfo {
+                id: row.get(0)?,
+                checkpoint_at: row.get::<_, i64>(1)? as u64,
+                checkpoint_type: row.get(2)?,
+                pane_count: row.get::<_, i64>(3)? as usize,
+                total_bytes: row.get::<_, i64>(4)? as usize,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok((session, checkpoints))
+}
+
+/// Session health check result.
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionDoctorReport {
+    pub total_sessions: usize,
+    pub unclean_sessions: usize,
+    pub total_checkpoints: usize,
+    pub orphaned_pane_states: usize,
+    pub total_data_bytes: usize,
+}
+
+/// Run health check on session data.
+pub fn session_doctor(db_path: &str) -> Result<SessionDoctorReport, RestoreError> {
+    let conn = open_conn(db_path)?;
+
+    let total_sessions: i64 =
+        conn.query_row("SELECT COUNT(*) FROM mux_sessions", [], |row| row.get(0))?;
+
+    let unclean_sessions: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM mux_sessions WHERE shutdown_clean = 0",
+        [],
+        |row| row.get(0),
+    )?;
+
+    let total_checkpoints: i64 =
+        conn.query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| {
+            row.get(0)
+        })?;
+
+    let orphaned_pane_states: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM mux_pane_state
+         WHERE checkpoint_id NOT IN (SELECT id FROM session_checkpoints)",
+        [],
+        |row| row.get(0),
+    )?;
+
+    let total_data_bytes: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(total_bytes), 0) FROM session_checkpoints",
+        [],
+        |row| row.get(0),
+    )?;
+
+    Ok(SessionDoctorReport {
+        total_sessions: total_sessions as usize,
+        unclean_sessions: unclean_sessions as usize,
+        total_checkpoints: total_checkpoints as usize,
+        orphaned_pane_states: orphaned_pane_states as usize,
+        total_data_bytes: total_data_bytes as usize,
+    })
+}
+
+/// Delete a session and all its checkpoints (cascading via SQL).
+pub fn delete_session(db_path: &str, session_id: &str) -> Result<bool, RestoreError> {
+    let conn = open_conn(db_path)?;
+
+    // Delete pane states via checkpoint cascade
+    conn.execute(
+        "DELETE FROM mux_pane_state WHERE checkpoint_id IN
+         (SELECT id FROM session_checkpoints WHERE session_id = ?1)",
+        [session_id],
+    )?;
+
+    // Delete checkpoints
+    conn.execute(
+        "DELETE FROM session_checkpoints WHERE session_id = ?1",
+        [session_id],
+    )?;
+
+    // Delete session
+    let deleted = conn.execute(
+        "DELETE FROM mux_sessions WHERE session_id = ?1",
+        [session_id],
+    )?;
+
+    Ok(deleted > 0)
+}
+
+// =============================================================================
 // Restore banner
 // =============================================================================
 
@@ -1009,5 +1195,139 @@ mod tests {
         let agent = data.pane_states[0].agent_metadata.as_ref().unwrap();
         assert_eq!(agent.agent_type, "claude_code");
         assert_eq!(agent.state.as_deref(), Some("idle"));
+    }
+
+    // =========================================================================
+    // CLI query function tests
+    // =========================================================================
+
+    #[test]
+    fn list_sessions_empty() {
+        let (db_path, _conn) = setup_test_db();
+        let sessions = list_sessions(&db_path).unwrap();
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn list_sessions_with_data() {
+        let (db_path, conn) = setup_test_db();
+        insert_session(&conn, "sess-a", true);
+        insert_session(&conn, "sess-b", false);
+        let cp_id = insert_checkpoint(&conn, "sess-b", 2000, 3);
+        insert_pane_state(&conn, cp_id, 0, Some("/tmp"), None);
+
+        let sessions = list_sessions(&db_path).unwrap();
+        assert_eq!(sessions.len(), 2);
+
+        // sess-b has a checkpoint so it sorts first (higher last_checkpoint_at)
+        let b = sessions.iter().find(|s| s.session_id == "sess-b").unwrap();
+        assert!(!b.shutdown_clean);
+        assert_eq!(b.checkpoint_count, 1);
+        assert_eq!(b.pane_count, Some(3));
+
+        let a = sessions.iter().find(|s| s.session_id == "sess-a").unwrap();
+        assert!(a.shutdown_clean);
+        assert_eq!(a.checkpoint_count, 0);
+    }
+
+    #[test]
+    fn show_session_not_found() {
+        let (db_path, _conn) = setup_test_db();
+        let result = show_session(&db_path, "nonexistent");
+        assert!(matches!(result, Err(RestoreError::NoSessions)));
+    }
+
+    #[test]
+    fn show_session_with_checkpoints() {
+        let (db_path, conn) = setup_test_db();
+        insert_session(&conn, "sess-show", false);
+        insert_checkpoint(&conn, "sess-show", 1000, 2);
+        insert_checkpoint(&conn, "sess-show", 2000, 3);
+
+        let (session, checkpoints) = show_session(&db_path, "sess-show").unwrap();
+        assert_eq!(session.session_id, "sess-show");
+        assert_eq!(checkpoints.len(), 2);
+        // Newest first
+        assert_eq!(checkpoints[0].checkpoint_at, 2000);
+        assert_eq!(checkpoints[0].pane_count, 3);
+        assert_eq!(checkpoints[1].checkpoint_at, 1000);
+    }
+
+    #[test]
+    fn session_doctor_healthy() {
+        let (db_path, conn) = setup_test_db();
+        insert_session(&conn, "sess-d", true);
+        let cp_id = insert_checkpoint(&conn, "sess-d", 1000, 1);
+        insert_pane_state(&conn, cp_id, 0, None, None);
+
+        let report = session_doctor(&db_path).unwrap();
+        assert_eq!(report.total_sessions, 1);
+        assert_eq!(report.unclean_sessions, 0);
+        assert_eq!(report.total_checkpoints, 1);
+        assert_eq!(report.orphaned_pane_states, 0);
+    }
+
+    #[test]
+    fn session_doctor_detects_unclean() {
+        let (db_path, conn) = setup_test_db();
+        insert_session(&conn, "sess-crash1", false);
+        insert_session(&conn, "sess-crash2", false);
+        insert_session(&conn, "sess-clean", true);
+
+        let report = session_doctor(&db_path).unwrap();
+        assert_eq!(report.total_sessions, 3);
+        assert_eq!(report.unclean_sessions, 2);
+    }
+
+    #[test]
+    fn session_doctor_detects_orphans() {
+        let (db_path, conn) = setup_test_db();
+        insert_session(&conn, "sess-o", true);
+
+        // Insert an orphaned pane state (checkpoint_id 999 doesn't exist)
+        conn.execute(
+            "INSERT INTO mux_pane_state (checkpoint_id, pane_id, terminal_state_json)
+             VALUES (999, 0, '{}')",
+            [],
+        )
+        .unwrap();
+
+        let report = session_doctor(&db_path).unwrap();
+        assert_eq!(report.orphaned_pane_states, 1);
+    }
+
+    #[test]
+    fn delete_session_cascades() {
+        let (db_path, conn) = setup_test_db();
+        insert_session(&conn, "sess-del", false);
+        let cp_id = insert_checkpoint(&conn, "sess-del", 1000, 2);
+        insert_pane_state(&conn, cp_id, 0, None, None);
+        insert_pane_state(&conn, cp_id, 1, None, None);
+
+        let deleted = delete_session(&db_path, "sess-del").unwrap();
+        assert!(deleted);
+
+        // Verify cascade
+        let sessions = list_sessions(&db_path).unwrap();
+        assert!(sessions.is_empty());
+
+        let cp_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(cp_count, 0);
+
+        let ps_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM mux_pane_state", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(ps_count, 0);
+    }
+
+    #[test]
+    fn delete_session_nonexistent() {
+        let (db_path, _conn) = setup_test_db();
+        let deleted = delete_session(&db_path, "nonexistent").unwrap();
+        assert!(!deleted);
     }
 }

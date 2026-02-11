@@ -963,6 +963,38 @@ SEE ALSO:
         command: BackupCommands,
     },
 
+    /// Session snapshot commands (save, restore, list, inspect, diff, delete)
+    #[command(after_help = r#"EXAMPLES:
+    ft snapshot save                  Capture current session state
+    ft snapshot list                  Show recent snapshots
+    ft snapshot inspect <id>          Detailed view of a snapshot
+    ft snapshot restore <id>          Restore session layout from snapshot
+    ft snapshot diff <id1> <id2>      Compare two snapshots
+    ft snapshot delete <id>           Delete a snapshot
+
+SEE ALSO:
+    ft backup     Backup and restore
+    ft status     Show watcher status"#)]
+    Snapshot {
+        #[command(subcommand)]
+        command: SnapshotCommands,
+    },
+
+    /// Session persistence commands (list, show, delete, doctor)
+    #[command(after_help = r#"EXAMPLES:
+    ft session list                   Show saved sessions
+    ft session show <session_id>      Detailed session view
+    ft session delete <id>            Delete a session
+    ft session doctor                 Health check on session data
+
+SEE ALSO:
+    ft snapshot   Snapshot save/restore
+    ft watch      Start the watcher"#)]
+    Session {
+        #[command(subcommand)]
+        command: SessionCommands,
+    },
+
     /// Sync commands (feature-gated)
     #[cfg(feature = "sync")]
     #[command(after_help = r#"EXAMPLES:
@@ -2965,6 +2997,135 @@ enum BackupCommands {
         #[arg(long)]
         verify: bool,
 
+        /// Output format: auto, plain, or json
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum SnapshotCommands {
+    /// Capture current session state to a snapshot
+    Save {
+        /// Snapshot trigger label (manual, pre_restart, pre_shutdown)
+        #[arg(long, default_value = "manual")]
+        trigger: String,
+
+        /// Human-readable label for this snapshot
+        #[arg(long)]
+        label: Option<String>,
+
+        /// Output format: auto, plain, or json
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+    },
+
+    /// Restore session layout from a snapshot
+    Restore {
+        /// Snapshot ID or "latest" for most recent
+        snapshot_id: String,
+
+        /// Only restore layout (skip scrollback injection)
+        #[arg(long)]
+        layout_only: bool,
+
+        /// Show what would be restored without executing
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Output format: auto, plain, or json
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+    },
+
+    /// List recent snapshots
+    List {
+        /// Maximum number of snapshots to show
+        #[arg(long, default_value = "10")]
+        limit: usize,
+
+        /// Filter by session ID
+        #[arg(long)]
+        session: Option<String>,
+
+        /// Output format: auto, plain, or json
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+    },
+
+    /// Compare two snapshots
+    Diff {
+        /// First snapshot ID
+        id1: String,
+
+        /// Second snapshot ID
+        id2: String,
+
+        /// Output format: auto, plain, or json
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+    },
+
+    /// Show detailed snapshot contents
+    Inspect {
+        /// Snapshot ID to inspect
+        snapshot_id: String,
+
+        /// Filter to specific pane
+        #[arg(long)]
+        pane: Option<u64>,
+
+        /// Output format: auto, plain, or json
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+    },
+
+    /// Delete a snapshot
+    Delete {
+        /// Snapshot ID to delete
+        snapshot_id: String,
+
+        /// Skip confirmation
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum SessionCommands {
+    /// List all saved sessions
+    List {
+        /// Output format: auto, plain, or json
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+    },
+
+    /// Show detailed session info with checkpoints
+    Show {
+        /// Session ID to show
+        session_id: String,
+
+        /// Show specific pane state
+        #[arg(long)]
+        pane: Option<u64>,
+
+        /// Output format: auto, plain, or json
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+    },
+
+    /// Delete a session and all its data
+    Delete {
+        /// Session ID to delete
+        session_id: String,
+
+        /// Skip confirmation
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Health check on session persistence data
+    Doctor {
         /// Output format: auto, plain, or json
         #[arg(long, short = 'f', default_value = "auto")]
         format: String,
@@ -17382,6 +17543,14 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             handle_backup_command(command, &layout, &workspace_root).await?;
         }
 
+        Some(Commands::Snapshot { command }) => {
+            handle_snapshot_command(command, &layout, &config).await?;
+        }
+
+        Some(Commands::Session { command }) => {
+            handle_session_command(command, &layout).await?;
+        }
+
         #[cfg(feature = "sync")]
         Some(Commands::Sync { command }) => {
             use frankenterm_core::output::{OutputFormat, detect_format};
@@ -23060,6 +23229,676 @@ fn print_migration_plan(plan: &MigrationPlan) {
             to = step.resulting_version,
             desc = step.description
         );
+    }
+}
+
+// =============================================================================
+// Snapshot command handler
+// =============================================================================
+
+async fn handle_snapshot_command(
+    command: SnapshotCommands,
+    layout: &frankenterm_core::config::WorkspaceLayout,
+    config: &frankenterm_core::config::Config,
+) -> anyhow::Result<()> {
+    use frankenterm_core::snapshot_engine::{SnapshotEngine, SnapshotTrigger};
+    use std::sync::Arc;
+
+    let db_path = Arc::new(layout.db_path.to_string_lossy().to_string());
+
+    match command {
+        SnapshotCommands::Save {
+            trigger,
+            label: _label,
+            format,
+        } => {
+            let snap_trigger = match trigger.as_str() {
+                "manual" | "event" => SnapshotTrigger::Manual,
+                "pre_restart" | "pre_shutdown" | "shutdown" => SnapshotTrigger::Shutdown,
+                "startup" => SnapshotTrigger::Startup,
+                _ => SnapshotTrigger::Manual,
+            };
+
+            let engine = SnapshotEngine::new(db_path, config.snapshots.clone());
+
+            // Get current pane list
+            let wezterm =
+                frankenterm_core::wezterm::wezterm_handle_with_timeout(config.cli.timeout_seconds);
+            let panes = wezterm
+                .list_panes()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to list panes: {e}"))?;
+
+            if panes.is_empty() {
+                if format == "json" {
+                    println!(
+                        "{}",
+                        serde_json::json!({"ok": false, "error": "No panes found"})
+                    );
+                } else {
+                    eprintln!("No panes found. Is WezTerm running?");
+                }
+                std::process::exit(1);
+            }
+
+            match engine.capture(&panes, snap_trigger).await {
+                Ok(result) => {
+                    if format == "json" {
+                        let resp = serde_json::json!({
+                            "ok": true,
+                            "session_id": result.session_id,
+                            "checkpoint_id": result.checkpoint_id,
+                            "pane_count": result.pane_count,
+                            "total_bytes": result.total_bytes,
+                            "trigger": format!("{:?}", result.trigger),
+                        });
+                        println!("{}", serde_json::to_string_pretty(&resp)?);
+                    } else {
+                        println!("Snapshot saved");
+                        println!("  Session:    {}", result.session_id);
+                        println!("  Checkpoint: {}", result.checkpoint_id);
+                        println!("  Panes:      {}", result.pane_count);
+                        println!("  Size:       {} bytes", result.total_bytes);
+                    }
+                }
+                Err(e) => {
+                    if format == "json" {
+                        println!(
+                            "{}",
+                            serde_json::json!({"ok": false, "error": format!("{e}")})
+                        );
+                    } else {
+                        eprintln!("Snapshot failed: {e}");
+                    }
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        SnapshotCommands::List {
+            limit,
+            session,
+            format,
+        } => {
+            let conn = rusqlite::Connection::open(db_path.as_str())?;
+
+            let query = if let Some(ref sid) = session {
+                format!(
+                    "SELECT sc.id, sc.session_id, sc.checkpoint_at, sc.checkpoint_type, \
+                     sc.pane_count, sc.total_bytes, sc.state_hash \
+                     FROM session_checkpoints sc \
+                     WHERE sc.session_id = '{}' \
+                     ORDER BY sc.checkpoint_at DESC LIMIT {}",
+                    sid.replace('\'', "''"),
+                    limit
+                )
+            } else {
+                format!(
+                    "SELECT sc.id, sc.session_id, sc.checkpoint_at, sc.checkpoint_type, \
+                     sc.pane_count, sc.total_bytes, sc.state_hash \
+                     FROM session_checkpoints sc \
+                     ORDER BY sc.checkpoint_at DESC LIMIT {}",
+                    limit
+                )
+            };
+
+            let mut stmt = conn.prepare(&query)?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            })?;
+
+            let snapshots: Vec<_> = rows.filter_map(|r| r.ok()).collect();
+
+            if format == "json" {
+                let items: Vec<serde_json::Value> = snapshots
+                    .iter()
+                    .map(|(id, session_id, at, cp_type, panes, bytes, hash)| {
+                        serde_json::json!({
+                            "checkpoint_id": id,
+                            "session_id": session_id,
+                            "checkpoint_at": at,
+                            "checkpoint_type": cp_type,
+                            "pane_count": panes,
+                            "total_bytes": bytes,
+                            "state_hash": hash,
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "ok": true,
+                        "count": items.len(),
+                        "snapshots": items,
+                    }))?
+                );
+            } else if snapshots.is_empty() {
+                println!("No snapshots found.");
+            } else {
+                println!(
+                    "{:<6} {:<36} {:<10} {:<6} {:<10}",
+                    "ID", "Session", "Type", "Panes", "Bytes"
+                );
+                println!("{}", "-".repeat(70));
+                for (id, session_id, _at, cp_type, panes, bytes, _hash) in &snapshots {
+                    let short_session = if session_id.len() > 34 {
+                        &session_id[..34]
+                    } else {
+                        session_id
+                    };
+                    println!(
+                        "{:<6} {:<36} {:<10} {:<6} {:<10}",
+                        id, short_session, cp_type, panes, bytes
+                    );
+                }
+            }
+        }
+
+        SnapshotCommands::Inspect {
+            snapshot_id,
+            pane,
+            format,
+        } => {
+            let conn = rusqlite::Connection::open(db_path.as_str())?;
+            let cp_id: i64 = snapshot_id.parse().map_err(|_| {
+                anyhow::anyhow!("Invalid snapshot ID: {snapshot_id} (expected integer)")
+            })?;
+
+            // Get checkpoint metadata
+            let checkpoint = conn.query_row(
+                "SELECT id, session_id, checkpoint_at, checkpoint_type, pane_count, total_bytes, state_hash \
+                 FROM session_checkpoints WHERE id = ?1",
+                [cp_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                },
+            );
+
+            let (id, session_id, at, cp_type, pane_count, total_bytes, hash) = match checkpoint {
+                Ok(cp) => cp,
+                Err(_) => {
+                    if format == "json" {
+                        println!(
+                            "{}",
+                            serde_json::json!({"ok": false, "error": format!("Snapshot {cp_id} not found")})
+                        );
+                    } else {
+                        eprintln!("Snapshot {} not found", cp_id);
+                    }
+                    std::process::exit(1);
+                }
+            };
+
+            // Get pane states
+            let pane_query = if let Some(pane_id) = pane {
+                format!(
+                    "SELECT pane_id, cwd, command, terminal_state_json, agent_metadata_json \
+                     FROM mux_pane_state WHERE checkpoint_id = {} AND pane_id = {}",
+                    id, pane_id
+                )
+            } else {
+                format!(
+                    "SELECT pane_id, cwd, command, terminal_state_json, agent_metadata_json \
+                     FROM mux_pane_state WHERE checkpoint_id = {}",
+                    id
+                )
+            };
+
+            let mut stmt = conn.prepare(&pane_query)?;
+            let pane_rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            })?;
+            let pane_states: Vec<_> = pane_rows.filter_map(|r| r.ok()).collect();
+
+            if format == "json" {
+                let panes_json: Vec<serde_json::Value> = pane_states
+                    .iter()
+                    .map(|(pid, cwd, cmd, term_json, agent_json)| {
+                        let mut obj = serde_json::json!({
+                            "pane_id": pid,
+                            "cwd": cwd,
+                            "command": cmd,
+                        });
+                        if let Ok(term) = serde_json::from_str::<serde_json::Value>(term_json) {
+                            obj["terminal"] = term;
+                        }
+                        if let Some(aj) = agent_json {
+                            if let Ok(agent) = serde_json::from_str::<serde_json::Value>(aj) {
+                                obj["agent"] = agent;
+                            }
+                        }
+                        obj
+                    })
+                    .collect();
+                let resp = serde_json::json!({
+                    "ok": true,
+                    "checkpoint_id": id,
+                    "session_id": session_id,
+                    "checkpoint_at": at,
+                    "checkpoint_type": cp_type,
+                    "pane_count": pane_count,
+                    "total_bytes": total_bytes,
+                    "state_hash": hash,
+                    "panes": panes_json,
+                });
+                println!("{}", serde_json::to_string_pretty(&resp)?);
+            } else {
+                println!("Snapshot #{id}");
+                println!("  Session:  {session_id}");
+                println!("  Type:     {cp_type}");
+                println!("  Panes:    {pane_count}");
+                println!("  Bytes:    {total_bytes}");
+                println!("  Hash:     {hash}");
+                println!();
+
+                for (pid, cwd, cmd, term_json, agent_json) in &pane_states {
+                    println!("  Pane {pid}:");
+                    if let Some(cwd) = cwd {
+                        println!("    CWD:     {cwd}");
+                    }
+                    if let Some(cmd) = cmd {
+                        println!("    Command: {cmd}");
+                    }
+                    if let Ok(term) = serde_json::from_str::<
+                        frankenterm_core::session_pane_state::TerminalState,
+                    >(term_json)
+                    {
+                        println!(
+                            "    Size:    {}x{}  Cursor: ({}, {})",
+                            term.cols, term.rows, term.cursor_col, term.cursor_row
+                        );
+                        if term.is_alt_screen {
+                            println!("    Alt screen: active");
+                        }
+                    }
+                    if let Some(aj) = agent_json {
+                        if let Ok(agent) = serde_json::from_str::<
+                            frankenterm_core::session_pane_state::AgentMetadata,
+                        >(aj)
+                        {
+                            println!("    Agent:   {} ({:?})", agent.agent_type, agent.state);
+                        }
+                    }
+                    println!();
+                }
+            }
+        }
+
+        SnapshotCommands::Diff { id1, id2, format } => {
+            let conn = rusqlite::Connection::open(db_path.as_str())?;
+            let cp1: i64 = id1
+                .parse()
+                .map_err(|_| anyhow::anyhow!("Invalid ID: {id1}"))?;
+            let cp2: i64 = id2
+                .parse()
+                .map_err(|_| anyhow::anyhow!("Invalid ID: {id2}"))?;
+
+            // Get pane IDs for each checkpoint
+            let get_pane_ids = |cp_id: i64| -> anyhow::Result<Vec<i64>> {
+                let mut stmt = conn.prepare(
+                    "SELECT pane_id FROM mux_pane_state WHERE checkpoint_id = ?1 ORDER BY pane_id",
+                )?;
+                let ids: Vec<i64> = stmt
+                    .query_map([cp_id], |row| row.get(0))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                Ok(ids)
+            };
+
+            let panes1 = get_pane_ids(cp1)?;
+            let panes2 = get_pane_ids(cp2)?;
+
+            let set1: std::collections::HashSet<i64> = panes1.iter().copied().collect();
+            let set2: std::collections::HashSet<i64> = panes2.iter().copied().collect();
+
+            let added: Vec<i64> = set2.difference(&set1).copied().collect();
+            let removed: Vec<i64> = set1.difference(&set2).copied().collect();
+            let common: Vec<i64> = set1.intersection(&set2).copied().collect();
+
+            if format == "json" {
+                let resp = serde_json::json!({
+                    "ok": true,
+                    "snapshot_1": cp1,
+                    "snapshot_2": cp2,
+                    "panes_added": added,
+                    "panes_removed": removed,
+                    "panes_common": common.len(),
+                    "panes_in_1": panes1.len(),
+                    "panes_in_2": panes2.len(),
+                });
+                println!("{}", serde_json::to_string_pretty(&resp)?);
+            } else {
+                println!("Diff: Snapshot #{cp1} -> #{cp2}");
+                println!(
+                    "  Panes: {} -> {} ({:+})",
+                    panes1.len(),
+                    panes2.len(),
+                    panes2.len() as i64 - panes1.len() as i64
+                );
+                if !added.is_empty() {
+                    println!("  Added:   {:?}", added);
+                }
+                if !removed.is_empty() {
+                    println!("  Removed: {:?}", removed);
+                }
+                println!("  Common:  {} panes", common.len());
+            }
+        }
+
+        SnapshotCommands::Delete { snapshot_id, force } => {
+            let conn = rusqlite::Connection::open(db_path.as_str())?;
+            conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+            let cp_id: i64 = snapshot_id
+                .parse()
+                .map_err(|_| anyhow::anyhow!("Invalid snapshot ID: {snapshot_id}"))?;
+
+            // Check it exists
+            let exists: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM session_checkpoints WHERE id = ?1",
+                    [cp_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map(|c| c > 0)
+                .unwrap_or(false);
+
+            if !exists {
+                eprintln!("Snapshot {cp_id} not found");
+                std::process::exit(1);
+            }
+
+            if !force {
+                eprint!("Delete snapshot #{cp_id}? [y/N] ");
+                use std::io::Read;
+                let mut buf = [0u8; 1];
+                let _ = std::io::stdin().read(&mut buf);
+                if buf[0] != b'y' && buf[0] != b'Y' {
+                    println!("Cancelled.");
+                    return Ok(());
+                }
+            }
+
+            conn.execute("DELETE FROM session_checkpoints WHERE id = ?1", [cp_id])?;
+            println!("Deleted snapshot #{cp_id}");
+        }
+
+        SnapshotCommands::Restore {
+            snapshot_id: _,
+            layout_only: _,
+            dry_run: _,
+            format,
+        } => {
+            // Restore is complex and depends on the restore_layout module.
+            // For now, show a helpful message pointing to the existing restore machinery.
+            if format == "json" {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "ok": false,
+                        "error": "Snapshot restore via CLI is not yet fully wired. Use the watcher's automatic restore-on-startup feature.",
+                        "hint": "ft watch will automatically detect and offer to restore from the latest unclean shutdown snapshot."
+                    })
+                );
+            } else {
+                eprintln!(
+                    "Snapshot restore via CLI is not yet fully wired.\n\
+                     The watcher automatically detects and offers to restore from unclean shutdown snapshots.\n\
+                     Use: ft watch"
+                );
+            }
+            std::process::exit(1);
+        }
+    }
+    Ok(())
+}
+
+// =============================================================================
+// Session command handler
+// =============================================================================
+
+async fn handle_session_command(
+    command: SessionCommands,
+    layout: &frankenterm_core::config::WorkspaceLayout,
+) -> anyhow::Result<()> {
+    use frankenterm_core::session_restore;
+
+    let db_path = layout.db_path.to_string_lossy().to_string();
+
+    match command {
+        SessionCommands::List { format } => {
+            let sessions = session_restore::list_sessions(&db_path)?;
+
+            if format == "json" {
+                println!("{}", serde_json::to_string_pretty(&sessions)?);
+                return Ok(());
+            }
+
+            if sessions.is_empty() {
+                println!("No saved sessions.");
+                return Ok(());
+            }
+
+            // Table header
+            println!(
+                "{:<30} {:<12} {:<18} {:>5}  {}",
+                "Session ID", "Created", "Last Checkpoint", "Panes", "Status"
+            );
+            println!("{}", "-".repeat(85));
+
+            for s in &sessions {
+                let created = format_epoch_display(s.created_at);
+                let last_cp = s
+                    .last_checkpoint_at
+                    .map(format_epoch_display)
+                    .unwrap_or_else(|| "—".to_string());
+                let panes = s
+                    .pane_count
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "—".to_string());
+                let status = if s.shutdown_clean {
+                    "clean"
+                } else {
+                    "unclean (crash)"
+                };
+
+                println!(
+                    "{:<30} {:<12} {:<18} {:>5}  {}",
+                    truncate_id(&s.session_id, 28),
+                    created,
+                    last_cp,
+                    panes,
+                    status,
+                );
+            }
+
+            println!("\n{} session(s) total.", sessions.len());
+        }
+
+        SessionCommands::Show {
+            session_id,
+            pane,
+            format,
+        } => {
+            let (session, checkpoints) = session_restore::show_session(&db_path, &session_id)?;
+
+            if format == "json" {
+                let data = serde_json::json!({
+                    "session": {
+                        "session_id": session.session_id,
+                        "created_at": session.created_at,
+                        "last_checkpoint_at": session.last_checkpoint_at,
+                        "ft_version": session.ft_version,
+                        "host_id": session.host_id,
+                    },
+                    "checkpoints": checkpoints,
+                });
+                println!("{}", serde_json::to_string_pretty(&data)?);
+                return Ok(());
+            }
+
+            println!("Session: {}", session.session_id);
+            println!("  Created:   {}", format_epoch_display(session.created_at));
+            if let Some(lcp) = session.last_checkpoint_at {
+                println!("  Last CP:   {}", format_epoch_display(lcp));
+            }
+            println!("  Version:   {}", session.ft_version);
+            if let Some(ref host) = session.host_id {
+                println!("  Host:      {host}");
+            }
+            println!("\nCheckpoints ({}):", checkpoints.len());
+
+            for cp in &checkpoints {
+                let cp_type = cp.checkpoint_type.as_deref().unwrap_or("unknown");
+                println!(
+                    "  #{:<6} {} {:>3} panes  {:>8}  type={}",
+                    cp.id,
+                    format_epoch_display(cp.checkpoint_at),
+                    cp.pane_count,
+                    format_bytes(cp.total_bytes),
+                    cp_type,
+                );
+            }
+
+            // Show specific pane if requested
+            if let Some(pane_id) = pane {
+                if let Some(latest_cp) = checkpoints.first() {
+                    match session_restore::load_latest_checkpoint(&db_path, &session_id)? {
+                        Some(data) => {
+                            if let Some(ps) = data.pane_states.iter().find(|p| p.pane_id == pane_id)
+                            {
+                                println!("\nPane {pane_id} (checkpoint #{}):", latest_cp.id);
+                                if let Some(ref cwd) = ps.cwd {
+                                    println!("  CWD:     {cwd}");
+                                }
+                                if let Some(ref cmd) = ps.command {
+                                    println!("  Process: {cmd}");
+                                }
+                                if let Some(ref ts) = ps.terminal_state {
+                                    println!(
+                                        "  Size:    {}x{} alt_screen={}",
+                                        ts.cols, ts.rows, ts.is_alt_screen
+                                    );
+                                }
+                                if let Some(ref agent) = ps.agent_metadata {
+                                    println!(
+                                        "  Agent:   {} (state: {})",
+                                        agent.agent_type,
+                                        agent.state.as_deref().unwrap_or("unknown")
+                                    );
+                                }
+                            } else {
+                                eprintln!("Pane {pane_id} not found in latest checkpoint.");
+                            }
+                        }
+                        None => {
+                            eprintln!("No checkpoint data available.");
+                        }
+                    }
+                }
+            }
+        }
+
+        SessionCommands::Delete { session_id, force } => {
+            if !force {
+                eprintln!("Are you sure you want to delete session {session_id}?");
+                eprintln!("Use --force to confirm.");
+                std::process::exit(1);
+            }
+
+            let deleted = session_restore::delete_session(&db_path, &session_id)?;
+            if deleted {
+                println!("Session {session_id} deleted.");
+            } else {
+                eprintln!("Session {session_id} not found.");
+                std::process::exit(1);
+            }
+        }
+
+        SessionCommands::Doctor { format } => {
+            let report = session_restore::session_doctor(&db_path)?;
+
+            if format == "json" {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                return Ok(());
+            }
+
+            println!("Session Persistence Health Check");
+            println!("{}", "-".repeat(40));
+            println!("Sessions:        {} total", report.total_sessions);
+            println!("  Unclean:       {}", report.unclean_sessions);
+            println!("Checkpoints:     {}", report.total_checkpoints);
+            println!("Data size:       {}", format_bytes(report.total_data_bytes));
+            println!("Orphaned states: {}", report.orphaned_pane_states);
+            println!();
+
+            if report.unclean_sessions > 0 {
+                println!(
+                    "⚠ {} session(s) from unclean shutdown — run `ft watch` to restore.",
+                    report.unclean_sessions
+                );
+            }
+            if report.orphaned_pane_states > 0 {
+                println!(
+                    "⚠ {} orphaned pane state(s) — consider running cleanup.",
+                    report.orphaned_pane_states
+                );
+            }
+            if report.unclean_sessions == 0 && report.orphaned_pane_states == 0 {
+                println!("✓ All healthy.");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Truncate a session ID for display.
+fn truncate_id(id: &str, max: usize) -> String {
+    if id.len() <= max {
+        id.to_string()
+    } else {
+        format!("{}…", &id[..max - 1])
+    }
+}
+
+/// Format epoch ms for display.
+fn format_epoch_display(epoch_ms: u64) -> String {
+    let secs = (epoch_ms / 1000) as i64;
+    let dt = chrono::DateTime::from_timestamp(secs, 0);
+    dt.map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Format bytes for human display.
+fn format_bytes(bytes: usize) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
     }
 }
 
