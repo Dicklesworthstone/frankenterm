@@ -91,6 +91,44 @@ pub enum DirectMuxError {
     Io(#[from] std::io::Error),
 }
 
+/// Coarse classification of mux protocol errors for retry/reconnect decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolErrorKind {
+    /// Connection is likely corrupted/out-of-sync; reconnect and retry.
+    Recoverable,
+    /// Configuration/version problems; don't retry.
+    Permanent,
+    /// Temporary condition; retry may succeed without requiring reconnection.
+    Transient,
+}
+
+impl DirectMuxError {
+    /// Classify an error into a retry/reconnect decision bucket.
+    #[must_use]
+    pub fn protocol_error_kind(&self) -> ProtocolErrorKind {
+        match self {
+            Self::UnexpectedResponse { .. }
+            | Self::Disconnected
+            | Self::ReadTimeout
+            | Self::WriteTimeout
+            | Self::ConnectTimeout(_)
+            | Self::FrameTooLarge { .. }
+            | Self::Codec(_) => ProtocolErrorKind::Recoverable,
+            Self::IncompatibleCodec { .. }
+            | Self::SocketPathMissing
+            | Self::SocketNotFound(_)
+            | Self::ProxyUnsupported => ProtocolErrorKind::Permanent,
+            Self::RemoteError(_) => ProtocolErrorKind::Transient,
+            Self::Io(err) => match err.kind() {
+                std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::NotConnected => ProtocolErrorKind::Recoverable,
+                _ => ProtocolErrorKind::Transient,
+            },
+        }
+    }
+}
+
 pub struct DirectMuxClient {
     stream: UnixStream,
     socket_path: PathBuf,

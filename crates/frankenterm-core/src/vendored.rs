@@ -19,7 +19,7 @@ pub use mux_client::{
 #[cfg(all(feature = "vendored", unix))]
 pub mod mux_pool;
 #[cfg(all(feature = "vendored", unix))]
-pub use mux_pool::{MuxPool, MuxPoolConfig, MuxPoolError, MuxPoolStats};
+pub use mux_pool::{MuxPool, MuxPoolConfig, MuxPoolError, MuxPoolStats, MuxRecoveryConfig};
 
 #[cfg(all(feature = "vendored", not(unix)))]
 #[derive(Debug, thiserror::Error)]

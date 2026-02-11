@@ -2502,7 +2502,11 @@ pub fn build_unified_client(config: &crate::config::Config) -> UnifiedClient {
                 config.vendored.mux_pool.acquire_timeout_seconds.max(1),
             ),
         };
-        let pool = crate::vendored::MuxPoolConfig { pool, mux };
+        let pool = crate::vendored::MuxPoolConfig {
+            pool,
+            mux,
+            recovery: crate::vendored::MuxRecoveryConfig::default(),
+        };
         let pool = Arc::new(crate::vendored::MuxPool::new(pool));
         client.with_mux_pool(pool)
     } else {

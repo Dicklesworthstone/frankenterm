@@ -15,13 +15,17 @@
 //! - The underlying `Pool<C>` provides semaphore-based concurrency limiting
 //!   and idle timeout eviction.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use crate::pool::{Pool, PoolAcquireGuard, PoolConfig, PoolError, PoolStats};
+use crate::retry::RetryPolicy;
 
-use super::mux_client::{DirectMuxClient, DirectMuxClientConfig, DirectMuxError};
+use super::mux_client::{DirectMuxClient, DirectMuxClientConfig, DirectMuxError, ProtocolErrorKind};
 use codec::{GetLinesResponse, GetPaneRenderChangesResponse, ListPanesResponse, UnitResponse};
 
 /// Error type for mux pool operations.
@@ -49,6 +53,32 @@ impl MuxPoolError {
     }
 }
 
+/// Recovery settings for mux protocol errors.
+#[derive(Debug, Clone)]
+pub struct MuxRecoveryConfig {
+    /// Enable reconnect+retry recovery for protocol corruption (`UnexpectedResponse`, codec errors,
+    /// disconnects).
+    pub enabled: bool,
+    /// Backoff policy for recovery attempts.
+    pub retry_policy: RetryPolicy,
+}
+
+impl Default for MuxRecoveryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            // Default: allow one retry with a very short delay (avoid hammering).
+            retry_policy: RetryPolicy::new(
+                Duration::from_millis(10),
+                Duration::from_millis(50),
+                2.0,
+                0.0,
+                Some(2),
+            ),
+        }
+    }
+}
+
 /// Configuration for the mux connection pool.
 #[derive(Debug, Clone)]
 pub struct MuxPoolConfig {
@@ -56,6 +86,8 @@ pub struct MuxPoolConfig {
     pub pool: PoolConfig,
     /// DirectMuxClient connection settings.
     pub mux: DirectMuxClientConfig,
+    /// Auto-recovery configuration for protocol errors.
+    pub recovery: MuxRecoveryConfig,
 }
 
 impl Default for MuxPoolConfig {
@@ -67,6 +99,7 @@ impl Default for MuxPoolConfig {
                 acquire_timeout: std::time::Duration::from_secs(10),
             },
             mux: DirectMuxClientConfig::default(),
+            recovery: MuxRecoveryConfig::default(),
         }
     }
 }
@@ -84,6 +117,12 @@ pub struct MuxPoolStats {
     pub health_checks: u64,
     /// Total health check failures.
     pub health_check_failures: u64,
+    /// Number of recovery retries performed (reconnect+retry).
+    pub recovery_attempts: u64,
+    /// Number of operations that succeeded after at least one recovery retry.
+    pub recovery_successes: u64,
+    /// Number of errors classified as permanent (not retried).
+    pub permanent_failures: u64,
 }
 
 /// A connection pool for `DirectMuxClient` instances.
@@ -93,11 +132,17 @@ pub struct MuxPoolStats {
 pub struct MuxPool {
     pool: Pool<DirectMuxClient>,
     mux_config: DirectMuxClientConfig,
+    recovery: MuxRecoveryConfig,
     connections_created: AtomicU64,
     connections_failed: AtomicU64,
     health_checks: AtomicU64,
     health_check_failures: AtomicU64,
+    recovery_attempts: AtomicU64,
+    recovery_successes: AtomicU64,
+    permanent_failures: AtomicU64,
 }
+
+type MuxOpFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, DirectMuxError>> + Send + 'a>>;
 
 impl MuxPool {
     /// Create a new mux connection pool.
@@ -106,10 +151,14 @@ impl MuxPool {
         Self {
             pool: Pool::new(config.pool),
             mux_config: config.mux,
+            recovery: config.recovery,
             connections_created: AtomicU64::new(0),
             connections_failed: AtomicU64::new(0),
             health_checks: AtomicU64::new(0),
             health_check_failures: AtomicU64::new(0),
+            recovery_attempts: AtomicU64::new(0),
+            recovery_successes: AtomicU64::new(0),
+            permanent_failures: AtomicU64::new(0),
         }
     }
 
@@ -141,20 +190,89 @@ impl MuxPool {
         self.pool.put(client).await;
     }
 
-    /// List all panes via a pooled connection.
-    pub async fn list_panes(&self) -> Result<ListPanesResponse, MuxPoolError> {
-        let (mut client, _guard) = self.acquire_client().await?;
-        let result = client.list_panes().await;
-        match result {
-            Ok(response) => {
-                self.return_client(client).await;
-                Ok(response)
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "mux pool: dropping client after list_panes error");
-                Err(MuxPoolError::Mux(e))
+    async fn execute_with_recovery<T, Op>(
+        &self,
+        op_name: &'static str,
+        mut op: Op,
+    ) -> Result<T, MuxPoolError>
+    where
+        Op: for<'a> FnMut(&'a mut DirectMuxClient) -> MuxOpFuture<'a, T>,
+    {
+        let max_attempts = if self.recovery.enabled {
+            self.recovery
+                .retry_policy
+                .max_attempts
+                .unwrap_or(1)
+                .max(1)
+        } else {
+            1
+        };
+
+        let mut attempt: u32 = 0;
+        loop {
+            attempt = attempt.saturating_add(1);
+
+            let (mut client, _guard) = self.acquire_client().await?;
+            let result = op(&mut client).await;
+            match result {
+                Ok(value) => {
+                    self.return_client(client).await;
+                    if attempt > 1 {
+                        self.recovery_successes.fetch_add(1, Ordering::Relaxed);
+                    }
+                    return Ok(value);
+                }
+                Err(err) => {
+                    let kind = err.protocol_error_kind();
+                    let can_retry = self.recovery.enabled
+                        && attempt < max_attempts
+                        && matches!(
+                            kind,
+                            ProtocolErrorKind::Recoverable | ProtocolErrorKind::Transient
+                        );
+                    if can_retry {
+                        self.recovery_attempts.fetch_add(1, Ordering::Relaxed);
+                        tracing::debug!(
+                            op = op_name,
+                            attempt,
+                            max_attempts,
+                            kind = ?kind,
+                            error = %err,
+                            "mux pool op failed; reconnecting and retrying"
+                        );
+
+                        let delay = self
+                            .recovery
+                            .retry_policy
+                            .delay_for_attempt(attempt.saturating_sub(1));
+                        if !delay.is_zero() {
+                            tokio::time::sleep(delay).await;
+                        }
+                        continue;
+                    }
+
+                    if kind == ProtocolErrorKind::Permanent {
+                        self.permanent_failures.fetch_add(1, Ordering::Relaxed);
+                    }
+
+                    tracing::debug!(
+                        op = op_name,
+                        attempt,
+                        max_attempts,
+                        kind = ?kind,
+                        error = %err,
+                        "mux pool op failed; dropping client"
+                    );
+                    return Err(MuxPoolError::Mux(err));
+                }
             }
         }
+    }
+
+    /// List all panes via a pooled connection.
+    pub async fn list_panes(&self) -> Result<ListPanesResponse, MuxPoolError> {
+        self.execute_with_recovery("list_panes", |client| Box::pin(client.list_panes()))
+            .await
     }
 
     /// Get lines from a pane via a pooled connection.
@@ -163,18 +281,11 @@ impl MuxPool {
         pane_id: u64,
         lines: Vec<std::ops::Range<isize>>,
     ) -> Result<GetLinesResponse, MuxPoolError> {
-        let (mut client, _guard) = self.acquire_client().await?;
-        let result = client.get_lines(pane_id, lines).await;
-        match result {
-            Ok(response) => {
-                self.return_client(client).await;
-                Ok(response)
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "mux pool: dropping client after get_lines error");
-                Err(MuxPoolError::Mux(e))
-            }
-        }
+        self.execute_with_recovery("get_lines", move |client| {
+            let lines = lines.clone();
+            Box::pin(client.get_lines(pane_id, lines))
+        })
+        .await
     }
 
     /// Poll for pane render changes via a pooled connection.
@@ -182,18 +293,10 @@ impl MuxPool {
         &self,
         pane_id: u64,
     ) -> Result<GetPaneRenderChangesResponse, MuxPoolError> {
-        let (mut client, _guard) = self.acquire_client().await?;
-        let result = client.get_pane_render_changes(pane_id).await;
-        match result {
-            Ok(response) => {
-                self.return_client(client).await;
-                Ok(response)
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "mux pool: dropping client after get_pane_render_changes error");
-                Err(MuxPoolError::Mux(e))
-            }
-        }
+        self.execute_with_recovery("get_pane_render_changes", |client| {
+            Box::pin(client.get_pane_render_changes(pane_id))
+        })
+        .await
     }
 
     /// Write raw bytes to a pane via a pooled connection (no-paste mode).
@@ -202,18 +305,11 @@ impl MuxPool {
         pane_id: u64,
         data: Vec<u8>,
     ) -> Result<UnitResponse, MuxPoolError> {
-        let (mut client, _guard) = self.acquire_client().await?;
-        let result = client.write_to_pane(pane_id, data).await;
-        match result {
-            Ok(response) => {
-                self.return_client(client).await;
-                Ok(response)
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "mux pool: dropping client after write_to_pane error");
-                Err(MuxPoolError::Mux(e))
-            }
-        }
+        self.execute_with_recovery("write_to_pane", move |client| {
+            let data = data.clone();
+            Box::pin(client.write_to_pane(pane_id, data))
+        })
+        .await
     }
 
     /// Send text via paste mode through a pooled connection.
@@ -222,18 +318,11 @@ impl MuxPool {
         pane_id: u64,
         data: String,
     ) -> Result<UnitResponse, MuxPoolError> {
-        let (mut client, _guard) = self.acquire_client().await?;
-        let result = client.send_paste(pane_id, data).await;
-        match result {
-            Ok(response) => {
-                self.return_client(client).await;
-                Ok(response)
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "mux pool: dropping client after send_paste error");
-                Err(MuxPoolError::Mux(e))
-            }
-        }
+        self.execute_with_recovery("send_paste", move |client| {
+            let data = data.clone();
+            Box::pin(client.send_paste(pane_id, data))
+        })
+        .await
     }
 
     /// Run a health check by listing panes on a pooled connection.
@@ -266,6 +355,9 @@ impl MuxPool {
             connections_failed: self.connections_failed.load(Ordering::Relaxed),
             health_checks: self.health_checks.load(Ordering::Relaxed),
             health_check_failures: self.health_check_failures.load(Ordering::Relaxed),
+            recovery_attempts: self.recovery_attempts.load(Ordering::Relaxed),
+            recovery_successes: self.recovery_successes.load(Ordering::Relaxed),
+            permanent_failures: self.permanent_failures.load(Ordering::Relaxed),
         }
     }
 }
@@ -276,6 +368,7 @@ mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
     use std::time::Duration;
 
     use codec::{CODEC_VERSION, GetCodecVersionResponse, ListPanesResponse, Pdu, UnitResponse};
@@ -341,6 +434,77 @@ mod tests {
         socket_path
     }
 
+    /// Spawn a mock mux server that returns an unexpected response for the first ListPanes.
+    async fn spawn_mock_server_unexpected_list_panes_once(temp_dir: &tempfile::TempDir) -> PathBuf {
+        let socket_path = temp_dir.path().join("mux-pool-test-unexpected.sock");
+        let listener =
+            tokio::net::UnixListener::bind(&socket_path).expect("bind mock mux listener");
+
+        let first_bad = Arc::new(AtomicBool::new(true));
+
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(conn) => conn,
+                    Err(_) => break,
+                };
+
+                let first_bad = Arc::clone(&first_bad);
+                tokio::spawn(async move {
+                    let mut read_buf = Vec::new();
+                    loop {
+                        let mut temp = vec![0u8; 4096];
+                        let read = match stream.read(&mut temp).await {
+                            Ok(0) => break,
+                            Ok(n) => n,
+                            Err(_) => break,
+                        };
+                        read_buf.extend_from_slice(&temp[..read]);
+
+                        let mut responses: Vec<(u64, Pdu)> = Vec::new();
+                        while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                            let response = match decoded.pdu {
+                                Pdu::GetCodecVersion(_) => {
+                                    Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                        codec_vers: CODEC_VERSION,
+                                        version_string: "mock-mux-pool-test".to_string(),
+                                        executable_path: PathBuf::from("/bin/wezterm"),
+                                        config_file_path: None,
+                                    })
+                                }
+                                Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
+                                Pdu::ListPanes(_) => {
+                                    if first_bad.swap(false, AtomicOrdering::SeqCst) {
+                                        // Wrong response type: triggers UnexpectedResponse.
+                                        Pdu::UnitResponse(UnitResponse {})
+                                    } else {
+                                        Pdu::ListPanesResponse(ListPanesResponse {
+                                            tabs: Vec::new(),
+                                            tab_titles: Vec::new(),
+                                            window_titles: HashMap::new(),
+                                        })
+                                    }
+                                }
+                                _ => continue,
+                            };
+                            responses.push((decoded.serial, response));
+                        }
+
+                        for (serial, pdu) in responses {
+                            let mut out = Vec::new();
+                            pdu.encode(&mut out, serial).expect("encode response");
+                            if stream.write_all(&out).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        socket_path
+    }
+
     fn pool_config(socket_path: PathBuf, max_size: usize) -> MuxPoolConfig {
         MuxPoolConfig {
             pool: PoolConfig {
@@ -349,6 +513,7 @@ mod tests {
                 acquire_timeout: Duration::from_millis(500),
             },
             mux: DirectMuxClientConfig::default().with_socket_path(socket_path),
+            recovery: MuxRecoveryConfig::default(),
         }
     }
 
@@ -420,6 +585,7 @@ mod tests {
             },
             mux: DirectMuxClientConfig::default()
                 .with_socket_path("/tmp/wa-mux-pool-test-nonexistent.sock"),
+            recovery: MuxRecoveryConfig::default(),
         };
         let pool = MuxPool::new(config);
 
@@ -432,6 +598,43 @@ mod tests {
         let stats = pool.stats().await;
         assert_eq!(stats.connections_created, 0);
         assert_eq!(stats.connections_failed, 1);
+    }
+
+    #[tokio::test]
+    async fn pool_recovers_from_unexpected_response_by_reconnecting() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = spawn_mock_server_unexpected_list_panes_once(&temp_dir).await;
+
+        let config = MuxPoolConfig {
+            pool: PoolConfig {
+                max_size: 2,
+                idle_timeout: Duration::from_secs(60),
+                acquire_timeout: Duration::from_millis(500),
+            },
+            mux: DirectMuxClientConfig::default().with_socket_path(socket_path),
+            recovery: MuxRecoveryConfig {
+                enabled: true,
+                retry_policy: RetryPolicy::new(
+                    Duration::from_millis(0),
+                    Duration::from_millis(0),
+                    1.0,
+                    0.0,
+                    Some(2),
+                ),
+            },
+        };
+
+        let pool = MuxPool::new(config);
+        let resp = pool
+            .list_panes()
+            .await
+            .expect("list_panes should recover after reconnect");
+        assert!(resp.tabs.is_empty());
+
+        let stats = pool.stats().await;
+        assert_eq!(stats.recovery_attempts, 1);
+        assert_eq!(stats.recovery_successes, 1);
+        assert_eq!(stats.connections_created, 2);
     }
 
     #[tokio::test]
@@ -457,6 +660,7 @@ mod tests {
             },
             mux: DirectMuxClientConfig::default()
                 .with_socket_path("/tmp/wa-mux-pool-test-nonexistent.sock"),
+            recovery: MuxRecoveryConfig::default(),
         };
         let pool = MuxPool::new(config);
 
@@ -500,6 +704,7 @@ mod tests {
                 acquire_timeout: Duration::from_millis(500),
             },
             mux: DirectMuxClientConfig::default().with_socket_path(socket_path),
+            recovery: MuxRecoveryConfig::default(),
         };
         let pool = MuxPool::new(config);
 
@@ -553,6 +758,7 @@ mod tests {
                 acquire_timeout: Duration::from_millis(100),
             },
             mux: DirectMuxClientConfig::default().with_socket_path(socket_path),
+            recovery: MuxRecoveryConfig::default(),
         };
         let pool = Arc::new(MuxPool::new(config));
 
@@ -612,6 +818,9 @@ mod tests {
             connections_failed: 5,
             health_checks: 10,
             health_check_failures: 1,
+            recovery_attempts: 2,
+            recovery_successes: 1,
+            permanent_failures: 3,
         };
         let json = serde_json::to_string(&stats).expect("serialize");
         let back: MuxPoolStats = serde_json::from_str(&json).expect("deserialize");
