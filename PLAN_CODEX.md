@@ -123,7 +123,7 @@ We standardize (and optionally auto-install) the remote mux server approach:
 - pinned WezTerm version parity across local + remotes
 - no nested tmux/screen in panes (assumed)
 
-`wa setup` should:
+`ft setup` should:
 - Parse `~/.ssh/config`, and optionally scan shell rc files for `ssh` aliases.
 - Offer an interactive selection (TUI) and/or robot-friendly JSON plan (“what will be installed where”).
 - Perform remote bootstrap over SSH.
@@ -620,7 +620,7 @@ Each time a real-world pattern changes (agent output format drift), add:
 - optional `charmed_rust` TUI for pane browsing
 
 ### Phase 6: Setup automation + sync (week 7)
-- `wa setup` local + remote (systemd mux server)
+- `ft setup` local + remote (systemd mux server)
 - optional `asupersync` for distributing configs/binaries
 
 ### Phase 7: Vendoring spike (week 8+; only if warranted)
@@ -1034,7 +1034,7 @@ Because Claude Code session IDs are not always printed:
 ### E.1 Minimal `wezterm.lua` forwarding lane (non-blocking)
 
 Concept:
-- inside `wezterm.lua`, on `user-var-changed`, call `wezterm.background_child_process { 'wa', 'event', ... }`
+- inside `wezterm.lua`, on `user-var-changed`, call `wezterm.background_child_process { 'ft', 'event', ... }`
 	- `ft event` ingests the JSON and appends to DB as “signals”
 
 ### E.2 Emitting user-vars from shells/agents

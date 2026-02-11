@@ -49,6 +49,7 @@ pub mod api_schema;
 pub mod approval;
 pub mod backpressure;
 pub mod backup;
+pub mod build_coord;
 pub mod cass;
 pub mod caut;
 #[cfg(test)]
