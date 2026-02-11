@@ -2,7 +2,7 @@
 
 > bd-u194: Structured logs + artifact manifest for unit and E2E tests
 
-This document defines the logging and artifact contract for all tests in `wa`. Following this contract ensures:
+This document defines the logging and artifact contract for all tests in `ft`. Following this contract ensures:
 - Consistent, machine-parseable output across test types
 - Reliable CI failure detection
 - Reproducible debugging with complete artifacts
@@ -55,7 +55,7 @@ All structured logs MUST include relevant correlation fields for filtering and d
 |-------|------|-------------|
 | `timestamp` | ISO 8601 | Time with millisecond precision |
 | `level` | string | TRACE/DEBUG/INFO/WARN/ERROR |
-| `target` | string | Module path (e.g., `wa_core::ingest`) |
+| `target` | string | Module path (e.g., `frankenterm_core::ingest`) |
 | `message` | string | Human-readable log message |
 
 ### Context Fields (When Applicable)
@@ -83,7 +83,7 @@ All structured logs MUST include relevant correlation fields for filtering and d
 {
   "timestamp": "2026-01-21T09:00:00.123Z",
   "level": "INFO",
-  "target": "wa_core::ingest",
+  "target": "frankenterm_core::ingest",
   "message": "Captured segment",
   "test_type": "e2e",
   "scenario": "capture_search",
@@ -110,7 +110,7 @@ Every test run that produces artifacts MUST generate a manifest file.
 ```json
 {
   "version": "1",
-  "format": "wa-test-manifest",
+  "format": "ft-test-manifest",
   "generated_at": "2026-01-21T09:00:00Z",
   "test_run": {
     "type": "e2e",
@@ -123,15 +123,15 @@ Every test run that produces artifacts MUST generate a manifest file.
     "hostname": "devbox",
     "os": "Linux 6.x x86_64",
     "rust_version": "1.85.0-nightly",
-    "wa_version": "0.1.0",
-    "wa_commit": "deadbeef",
+    "ft_version": "0.1.0",
+    "ft_commit": "deadbeef",
     "wezterm_version": "20250101-120000-abc123",
-    "workspace": "/tmp/wa-e2e-abc123"
+    "workspace": "/tmp/ft-e2e-abc123"
   },
   "artifacts": [
     {
       "type": "log",
-      "path": "wa_watch.log",
+      "path": "ft_watch.log",
       "format": "text",
       "description": "Watcher stdout/stderr",
       "size_bytes": 12345,
@@ -139,7 +139,7 @@ Every test run that produces artifacts MUST generate a manifest file.
     },
     {
       "type": "structured_log",
-      "path": "wa_watch.jsonl",
+      "path": "ft_watch.jsonl",
       "format": "jsonl",
       "description": "JSON-lines structured logs",
       "size_bytes": 23456,
@@ -171,7 +171,7 @@ Every test run that produces artifacts MUST generate a manifest file.
     },
     {
       "type": "config",
-      "path": "wa_config_effective.toml",
+      "path": "ft_config_effective.toml",
       "format": "toml",
       "description": "Resolved configuration",
       "size_bytes": 2048,
@@ -187,7 +187,7 @@ Every test run that produces artifacts MUST generate a manifest file.
     }
   ],
   "checksums": {
-    "wa_watch.log": "sha256:abc123...",
+    "ft_watch.log": "sha256:abc123...",
     "robot_state.json": "sha256:def456..."
   }
 }
@@ -232,7 +232,7 @@ These patterns are redacted by default:
 | Password | `password[=:]["']?[^\s"']+` | `password=secret` | `password=[REDACTED]` |
 | Private Key | `-----BEGIN.*PRIVATE KEY-----` | PEM block | `[REDACTED:private_key]` |
 | Home Path | `/home/[^/]+/` | `/home/user/` | `/home/[USER]/` |
-| Temp Path | `/tmp/wa-e2e-[A-Za-z0-9]+` | `/tmp/wa-e2e-abc123` | `/tmp/wa-e2e-[TEMP]` |
+| Temp Path | `/tmp/ft-e2e-[A-Za-z0-9]+` | `/tmp/ft-e2e-abc123` | `/tmp/ft-e2e-[TEMP]` |
 
 ### Redaction Verification
 
@@ -341,7 +341,7 @@ Integration tests include timing and correlation:
 
 ```
 [INT] daemon_integration::ingest_pipeline
-  [DEBUG] workspace=/tmp/wa-test-xyz123
+  [DEBUG] workspace=/tmp/ft-test-xyz123
   [INFO] Starting watcher...
   [INFO] Ingested 100 segments in 1.23s
   [INFO] PASS (1.45s)
@@ -360,7 +360,7 @@ E2E Test Run: 2026-01-21T09:00:00Z
 
 [E2E] Scenario 1/3: capture_search
   [INFO] Spawning dummy pane...
-  [INFO] Starting wa watch...
+  [INFO] Starting ft watch...
   [INFO] Captured 100 segments
   [INFO] Search found 100 hits
   [PASS] capture_search (7.2s)
@@ -393,8 +393,8 @@ scenario_XX_failed/
 ├── FAIL                      # Marker file
 ├── error.json                # Structured error info
 ├── error.txt                 # Human-readable error
-├── wa_watch.log              # Full log
-├── wa_watch.jsonl            # Structured log
+├── ft_watch.log              # Full log
+├── ft_watch.jsonl            # Structured log
 ├── recent_logs.txt           # Last 50 lines
 ├── robot_state.json          # State at failure
 ├── events.jsonl              # Events up to failure
@@ -418,7 +418,7 @@ scenario_XX_failed/
     "execution_id": "exec-abc123"
   },
   "hints": [
-    "Check wa_watch.log for workflow errors",
+    "Check ft_watch.log for workflow errors",
     "Verify pattern detection triggered (events.jsonl)",
     "Confirm dummy pane emitted compaction marker"
   ]

@@ -1,6 +1,6 @@
 # Architecture
 
-This document captures the wa core architecture for operators and contributors.
+This document captures the ft core architecture for operators and contributors.
 
 ## High-level pipeline
 
@@ -19,14 +19,14 @@ WezTerm panes
 
 ## Deterministic state (OSC 133)
 
-- wa relies on OSC 133 prompt markers to infer prompt-active vs command-running.
+- ft relies on OSC 133 prompt markers to infer prompt-active vs command-running.
 - These markers are parsed during ingest and recorded into pane state.
 - Policy gating and workflows use this state to decide if a send is safe.
 
 ## Explicit GAP semantics
 
 - Delta extraction uses overlap matching to avoid full scrollback captures.
-- If overlap fails (or alt-screen content blocks stable capture), wa records an
+- If overlap fails (or alt-screen content blocks stable capture), ft records an
   explicit gap segment and emits a gap event.
 - Gap events are treated as uncertainty: policy checks can require approval
   when recent gaps are present.
@@ -72,7 +72,7 @@ deterministic under load and make data loss explicit rather than silent.
   - Continue ingesting and storing segments.
 
 These rules are designed to be implementable with existing metrics and to keep
-failure modes explicit: if wa cannot keep up, it must record a gap rather than
+failure modes explicit: if ft cannot keep up, it must record a gap rather than
 pretend the stream is continuous.
 
 ## Interfaces
@@ -83,7 +83,7 @@ pretend the stream is continuous.
 
 ## Library integration map (Appendix F)
 
-| Library | Role in wa | Status |
+| Library | Role in ft | Status |
 |---------|------------|--------|
 | cass (/dp/coding_agent_session_search) | Correlation + session archaeology; used in status/workflows | integrated |
 | caut (/dp/coding_agent_usage_tracker) | Usage truth + selection; used in accounts/workflows | integrated |

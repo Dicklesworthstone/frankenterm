@@ -9,7 +9,7 @@ is bounded, and a privacy budget limits total data volume.
 
 Generate a bundle when:
 
-- wa crashes and you need to report the issue
+- ft crashes and you need to report the issue
 - A policy decision seems wrong and you want to reproduce it
 - Rule matching behaves unexpectedly
 - A workflow fails and you need to trace the execution
@@ -19,13 +19,13 @@ Generate a bundle when:
 
 ```bash
 # Export the latest crash as an incident bundle
-wa reproduce export --kind crash
+ft reproduce export --kind crash
 
 # Export a manual bundle (no crash required)
-wa reproduce export --kind manual
+ft reproduce export --kind manual
 
 # Replay a bundle to validate its contents
-wa reproduce replay /path/to/wa_incident_crash_20260206_183000/ --mode policy
+ft reproduce replay /path/to/wa_incident_crash_20260206_183000/ --mode policy
 ```
 
 ## Bundle Layout
@@ -52,7 +52,7 @@ Every valid bundle contains at least:
 
 | File | Purpose |
 |------|---------|
-| `incident_manifest.json` | Root metadata: kind, wa version, format version, file list, privacy budget |
+| `incident_manifest.json` | Root metadata: kind, ft version, format version, file list, privacy budget |
 | `README.md` | Human-readable overview with replay instructions |
 | `redaction_report.json` | Counts of redactions applied (never contains secrets) |
 
@@ -80,10 +80,10 @@ Present when the relevant data source is available:
 
 ### Crash bundles
 
-After a crash, wa writes a crash report to the crash directory. Export it:
+After a crash, ft writes a crash report to the crash directory. Export it:
 
 ```bash
-wa reproduce export --kind crash
+ft reproduce export --kind crash
 ```
 
 This finds the latest crash report and packages it with health data,
@@ -94,7 +94,7 @@ config, and recent events into a single directory.
 For non-crash diagnostics (unexpected policy decisions, rule misbehavior):
 
 ```bash
-wa reproduce export --kind manual
+ft reproduce export --kind manual
 ```
 
 This captures the same supporting data (health, config, events) without
@@ -106,7 +106,7 @@ By default, bundles are written to the crash directory. Override with
 `--out`:
 
 ```bash
-wa reproduce export --kind manual --out /tmp/bundle
+ft reproduce export --kind manual --out /tmp/bundle
 ```
 
 ### JSON output
@@ -114,7 +114,7 @@ wa reproduce export --kind manual --out /tmp/bundle
 Add `--format json` for machine-readable output:
 
 ```bash
-wa reproduce export --kind crash --format json
+ft reproduce export --kind crash --format json
 ```
 
 ## Replaying Bundles
@@ -127,12 +127,12 @@ replay modes are available, each with a defined set of checks.
 Validates crash/incident consistency and redaction correctness:
 
 ```bash
-wa reproduce replay /path/to/bundle --mode policy
+ft reproduce replay /path/to/bundle --mode policy
 ```
 
 **Checks run:**
 1. `manifest_valid` — manifest parses correctly
-2. `version_compatible` — format version is readable by this wa version
+2. `version_compatible` — format version is readable by this ft version
 3. `redaction_report_valid` — redaction report is well-formed
 4. `no_secrets_leaked` — no secret patterns detected in any file
 5. `crash_report_valid` — crash report parses (if present)

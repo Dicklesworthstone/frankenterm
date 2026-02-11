@@ -7,7 +7,7 @@
 
 ## Overview
 
-This document defines the **saved search** data model and **scheduling semantics** for `wa`.
+This document defines the **saved search** data model and **scheduling semantics** for `ft`.
 The goal is to make search reuse and scheduled alerts deterministic across CLI/TUI/web, while
 reusing the existing FTS search pipeline and redaction rules.
 

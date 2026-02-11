@@ -8,40 +8,40 @@ Commands marked as feature-gated require building with the corresponding feature
 ### Watcher and status
 
 ```bash
-wa watch [--foreground] [--auto-handle] [--poll-interval <ms>]
-wa stop [--force] [--timeout <secs>]
-wa status
-wa list [--json]
-wa show <pane_id> [--output]        # stub (not yet implemented)
-wa get-text <pane_id> [--escapes]   # stub (not yet implemented)
+ft watch [--foreground] [--auto-handle] [--poll-interval <ms>]
+ft stop [--force] [--timeout <secs>]
+ft status
+ft list [--json]
+ft show <pane_id> [--output]        # stub (not yet implemented)
+ft get-text <pane_id> [--escapes]   # stub (not yet implemented)
 ```
 
 ### Search and events
 
 ```bash
-wa search "<fts query>" [--pane <id>] [--limit <n>] [--since <epoch_ms>]
-wa query "<fts query>"             # alias for wa search
-wa events [--unhandled] [--pane-id <id>] [--rule-id <id>] [--event-type <type>]
-wa events annotate <event_id> --note "<text>" [--by <actor>]
-wa events annotate <event_id> --clear [--by <actor>]
-wa events triage <event_id> --state <state> [--by <actor>]
-wa events triage <event_id> --clear [--by <actor>]
-wa events label <event_id> --add <label> [--by <actor>]
-wa events label <event_id> --remove <label>
-wa events label <event_id> --list
-wa triage [--severity <error|warning|info>] [--only <section>] [--details]
+ft search "<fts query>" [--pane <id>] [--limit <n>] [--since <epoch_ms>]
+ft query "<fts query>"             # alias for ft search
+ft events [--unhandled] [--pane-id <id>] [--rule-id <id>] [--event-type <type>]
+ft events annotate <event_id> --note "<text>" [--by <actor>]
+ft events annotate <event_id> --clear [--by <actor>]
+ft events triage <event_id> --state <state> [--by <actor>]
+ft events triage <event_id> --clear [--by <actor>]
+ft events label <event_id> --add <label> [--by <actor>]
+ft events label <event_id> --remove <label>
+ft events label <event_id> --list
+ft triage [--severity <error|warning|info>] [--only <section>] [--details]
 ```
 
 ### Actions, approvals, and audit
 
 ```bash
-wa send <pane_id> "<text>" [--dry-run] [--wait-for "<pat>"] [--timeout-secs <n>]
-wa send <pane_id> "<text>" --no-paste --no-newline
-wa prepare send --pane-id <id> "<text>"
-wa prepare workflow run <name> --pane-id <id>
-wa commit <plan_id> [--text "<text>"] [--text-file <path>] [--approval-code <code>]
-wa approve <code> [--pane <id>] [--fingerprint <hash>] [--dry-run]
-wa audit [--limit <n>] [--pane <id>] [--action <kind>] [--decision <allow|deny|require_approval>]
+ft send <pane_id> "<text>" [--dry-run] [--wait-for "<pat>"] [--timeout-secs <n>]
+ft send <pane_id> "<text>" --no-paste --no-newline
+ft prepare send --pane-id <id> "<text>"
+ft prepare workflow run <name> --pane-id <id>
+ft commit <plan_id> [--text "<text>"] [--text-file <path>] [--approval-code <code>]
+ft approve <code> [--pane <id>] [--fingerprint <hash>] [--dry-run]
+ft audit [--limit <n>] [--pane <id>] [--action <kind>] [--decision <allow|deny|require_approval>]
 ```
 
 See `docs/approvals.md` for the prepare/commit mental model and troubleshooting.
@@ -49,24 +49,24 @@ See `docs/approvals.md` for the prepare/commit mental model and troubleshooting.
 ### Reservations
 
 ```bash
-wa reserve <pane_id> [--ttl <secs>] [--owner-kind <workflow|agent|manual>] [--owner-id <id>]
-wa reservations [--json]
+ft reserve <pane_id> [--ttl <secs>] [--owner-kind <workflow|agent|manual>] [--owner-id <id>]
+ft reservations [--json]
 ```
 
 ### Workflows
 
 ```bash
-wa workflow list
-wa workflow run <name> --pane <id> [--dry-run]
-wa workflow status <execution_id> [-v|-vv]
+ft workflow list
+ft workflow run <name> --pane <id> [--dry-run]
+ft workflow status <execution_id> [-v|-vv]
 ```
 
 ### Rules
 
 ```bash
-wa rules list [--agent-type <codex|claude_code|gemini|wezterm>]
-wa rules test "<text>"
-wa rules show <rule_id>
+ft rules list [--agent-type <codex|claude_code|gemini|wezterm>]
+ft rules test "<text>"
+ft rules show <rule_id>
 ```
 
 For explain-match traces and how to interpret robot `--trace` output, see
@@ -75,49 +75,49 @@ For explain-match traces and how to interpret robot `--trace` output, see
 ### Diagnostics and bundles
 
 ```bash
-wa doctor
-wa diag bundle [--output <dir>] [--events <n>] [--audit <n>] [--workflows <n>]
-wa reproduce [--kind <crash|manual>] [--out <dir>] [--format <text|json>]
+ft doctor
+ft diag bundle [--output <dir>] [--events <n>] [--audit <n>] [--workflows <n>]
+ft reproduce [--kind <crash|manual>] [--out <dir>] [--format <text|json>]
 ```
 
 ### Setup and config
 
 ```bash
-wa setup [--list-hosts] [--dry-run] [--apply]
-wa setup local
-wa setup remote <host> [--yes] [--install-wa]
-wa setup config
-wa setup patch [--remove]
-wa setup shell [--remove] [--shell <bash|zsh|fish>]
+ft setup [--list-hosts] [--dry-run] [--apply]
+ft setup local
+ft setup remote <host> [--yes] [--install-wa]
+ft setup config
+ft setup patch [--remove]
+ft setup shell [--remove] [--shell <bash|zsh|fish>]
 
-wa config init [--force]
-wa config validate [--strict]
-wa config show [--effective] [--json]
-wa config set <key> <value> [--dry-run]
-wa config export [-o <path>] [--json]
-wa config import <path> [--dry-run] [--replace] [--yes]
+ft config init [--force]
+ft config validate [--strict]
+ft config show [--effective] [--json]
+ft config set <key> <value> [--dry-run]
+ft config export [-o <path>] [--json]
+ft config import <path> [--dry-run] [--replace] [--yes]
 ```
 
 ### Data management
 
 ```bash
-wa db migrate [--status] [--dry-run]
-wa db check [-f <auto|plain|json>]
-wa db repair [--dry-run] [--yes] [--no-backup]
+ft db migrate [--status] [--dry-run]
+ft db check [-f <auto|plain|json>]
+ft db repair [--dry-run] [--yes] [--no-backup]
 
-wa backup export [-o <dir>] [--sql-dump]
-wa backup import <path> [--dry-run] [--verify]
+ft backup export [-o <dir>] [--sql-dump]
+ft backup import <path> [--dry-run] [--verify]
 
-wa export <segments|events|audit|workflows|sessions> [--pane-id <id>] [--since <epoch_ms>]
+ft export <segments|events|audit|workflows|sessions> [--pane-id <id>] [--since <epoch_ms>]
 ```
 
 ### Learning and auth
 
 ```bash
-wa learn [basics|events|workflows] [--status] [--reset]
-wa auth test <service> [--account <name>] [--headful]
-wa auth status <service> [--account <name>] [--all]
-wa auth bootstrap <service> [--account <name>]
+ft learn [basics|events|workflows] [--status] [--reset]
+ft auth test <service> [--account <name>] [--headful]
+ft auth status <service> [--account <name>] [--all]
+ft auth bootstrap <service> [--account <name>]
 ```
 
 Notes:
@@ -127,17 +127,17 @@ Notes:
 ## Feature-gated commands
 
 ```bash
-wa tui          # requires --features tui
-wa mcp serve    # requires --features mcp
-wa web          # requires --features web
-wa sync         # requires --features sync
+ft tui          # requires --features tui
+ft mcp serve    # requires --features mcp
+ft web          # requires --features web
+ft sync         # requires --features sync
 ```
 
 ## Planned (not yet implemented)
 
 ```text
-wa history
-wa undo
+ft history
+ft undo
 ```
 
 ## Robot mode (stable JSON/TOON)
@@ -145,46 +145,46 @@ wa undo
 Robot mode uses a stable envelope and mirrors MCP schemas.
 
 ```bash
-wa robot state [--domain <name>] [--agent <type>]
-wa robot get-text <pane_id> [--tail <n>] [--escapes]
-wa robot send <pane_id> "<text>" [--dry-run] [--wait-for "<pat>"] [--timeout-secs <n>]
-wa robot wait-for <pane_id> "<pat>" [--timeout-secs <n>] [--regex]
-wa robot search "<fts query>" [--pane <id>] [--since <epoch_ms>] [--limit <n>]
-wa robot events [--unhandled] [--pane <id>] [--rule-id <id>] [--event-type <type>] [--triage-state <state>] [--label <label>]
-wa robot events annotate <event_id> --note "<text>" [--by <actor>]
-wa robot events annotate <event_id> --clear [--by <actor>]
-wa robot events triage <event_id> --state <state> [--by <actor>]
-wa robot events triage <event_id> --clear [--by <actor>]
-wa robot events label <event_id> --add <label> [--by <actor>]
-wa robot events label <event_id> --remove <label>
-wa robot events label <event_id> --list
+ft robot state [--domain <name>] [--agent <type>]
+ft robot get-text <pane_id> [--tail <n>] [--escapes]
+ft robot send <pane_id> "<text>" [--dry-run] [--wait-for "<pat>"] [--timeout-secs <n>]
+ft robot wait-for <pane_id> "<pat>" [--timeout-secs <n>] [--regex]
+ft robot search "<fts query>" [--pane <id>] [--since <epoch_ms>] [--limit <n>]
+ft robot events [--unhandled] [--pane <id>] [--rule-id <id>] [--event-type <type>] [--triage-state <state>] [--label <label>]
+ft robot events annotate <event_id> --note "<text>" [--by <actor>]
+ft robot events annotate <event_id> --clear [--by <actor>]
+ft robot events triage <event_id> --state <state> [--by <actor>]
+ft robot events triage <event_id> --clear [--by <actor>]
+ft robot events label <event_id> --add <label> [--by <actor>]
+ft robot events label <event_id> --remove <label>
+ft robot events label <event_id> --list
 
-wa robot workflow list
-wa robot workflow run <name> <pane_id> [--force] [--dry-run]
-wa robot workflow status [<execution_id>] [--pane <id>] [--active] [--verbose]
-wa robot workflow abort <execution_id> [--reason "..."] [--force]
+ft robot workflow list
+ft robot workflow run <name> <pane_id> [--force] [--dry-run]
+ft robot workflow status [<execution_id>] [--pane <id>] [--active] [--verbose]
+ft robot workflow abort <execution_id> [--reason "..."] [--force]
 
-wa robot rules list [--pack <name>] [--agent-type <type>]
-wa robot rules test "<text>" [--trace] [--pack <name>]
-wa robot rules show <rule_id>
-wa robot rules lint [--pack <name>] [--fixtures] [--strict]
+ft robot rules list [--pack <name>] [--agent-type <type>]
+ft robot rules test "<text>" [--trace] [--pack <name>]
+ft robot rules show <rule_id>
+ft robot rules lint [--pack <name>] [--fixtures] [--strict]
 
-wa robot approve <code> [--pane <id>] [--fingerprint <hash>] [--dry-run]
-wa robot why <code>
+ft robot approve <code> [--pane <id>] [--fingerprint <hash>] [--dry-run]
+ft robot why <code>
 
-wa robot reservations list
-wa robot reservations reserve <pane_id> [--ttl <secs>] --owner-id <id>
-wa robot reservations release <reservation_id>
+ft robot reservations list
+ft robot reservations reserve <pane_id> [--ttl <secs>] --owner-id <id>
+ft robot reservations release <reservation_id>
 
-wa robot accounts list [--service <openai|anthropic|google>] [--pick]
-wa robot accounts refresh [--service <openai|anthropic|google>]
+ft robot accounts list [--service <openai|anthropic|google>] [--pick]
+ft robot accounts refresh [--service <openai|anthropic|google>]
 ```
 
 ## MCP reference
 
 MCP tools mirror robot mode. See `docs/mcp-api-spec.md` and `docs/json-schema/` for details.
 
-Tools:
+Tools (tool IDs currently still use the `wa.*` prefix):
 - wa.state
 - wa.get_text
 - wa.send
@@ -210,7 +210,7 @@ Tools:
 - wa.workflow_status
 - wa.workflow_abort
 
-Resources:
+Resources (resource URIs currently still use the `wa://` scheme):
 - wa://panes
 - wa://events
 - wa://accounts

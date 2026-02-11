@@ -4417,8 +4417,65 @@ enum WriteCommand {
         alias: String,
         respond: oneshot::Sender<Result<bool>>,
     },
+    /// Insert a new mux session record
+    InsertMuxSession {
+        session_id: String,
+        topology_json: String,
+        ft_version: String,
+        host_id: Option<String>,
+        respond: oneshot::Sender<Result<()>>,
+    },
+    /// Insert a session checkpoint with per-pane state
+    InsertSessionCheckpoint {
+        session_id: String,
+        checkpoint_type: String,
+        state_hash: String,
+        pane_count: usize,
+        total_bytes: usize,
+        metadata_json: Option<String>,
+        pane_states: Vec<SessionPaneStateRow>,
+        respond: oneshot::Sender<Result<i64>>,
+    },
+    /// Update last_checkpoint_at on mux_sessions
+    UpdateSessionCheckpointTimestamp {
+        session_id: String,
+        checkpoint_at: i64,
+        respond: oneshot::Sender<Result<()>>,
+    },
+    /// Prune old checkpoints beyond retention limit
+    PruneSessionCheckpoints {
+        session_id: String,
+        retention: usize,
+        respond: oneshot::Sender<Result<usize>>,
+    },
+    /// Mark a session as cleanly shut down
+    MarkSessionShutdownClean {
+        session_id: String,
+        respond: oneshot::Sender<Result<()>>,
+    },
     /// Shutdown the writer thread (flush pending writes)
     Shutdown { respond: oneshot::Sender<()> },
+}
+
+/// Row data for inserting into mux_pane_state.
+#[derive(Debug, Clone)]
+pub struct SessionPaneStateRow {
+    /// WezTerm pane ID.
+    pub pane_id: u64,
+    /// Current working directory.
+    pub cwd: Option<String>,
+    /// Best-effort process name.
+    pub command: Option<String>,
+    /// Selected environment variables (JSON, redacted).
+    pub env_json: Option<String>,
+    /// Terminal state (JSON: cursor, alt-screen, scrollback ref).
+    pub terminal_state_json: String,
+    /// Agent metadata (JSON: agent type, session ID, state).
+    pub agent_metadata_json: Option<String>,
+    /// Links to output_segments.seq for replay.
+    pub scrollback_checkpoint_seq: Option<i64>,
+    /// Epoch ms of last captured output.
+    pub last_output_at: Option<i64>,
 }
 
 /// Configuration for the storage handle
@@ -5821,6 +5878,113 @@ impl StorageHandle {
     ///
     /// Creates a new session or updates an existing one.
     /// Returns the session ID.
+    // =========================================================================
+    // Session Checkpoint Methods
+    // =========================================================================
+
+    /// Insert a new mux session record.
+    pub async fn insert_mux_session(
+        &self,
+        session_id: String,
+        topology_json: String,
+        ft_version: String,
+        host_id: Option<String>,
+    ) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::InsertMuxSession {
+                session_id,
+                topology_json,
+                ft_version,
+                host_id,
+                respond: tx,
+            })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    /// Insert a session checkpoint with per-pane state rows.
+    /// Returns the checkpoint ID.
+    pub async fn insert_session_checkpoint(
+        &self,
+        session_id: String,
+        checkpoint_type: String,
+        state_hash: String,
+        pane_count: usize,
+        total_bytes: usize,
+        metadata_json: Option<String>,
+        pane_states: Vec<SessionPaneStateRow>,
+    ) -> Result<i64> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::InsertSessionCheckpoint {
+                session_id,
+                checkpoint_type,
+                state_hash,
+                pane_count,
+                total_bytes,
+                metadata_json,
+                pane_states,
+                respond: tx,
+            })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    /// Prune old checkpoints beyond the retention limit.
+    /// Returns the number of pruned checkpoints.
+    pub async fn prune_session_checkpoints(
+        &self,
+        session_id: String,
+        retention: usize,
+    ) -> Result<usize> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::PruneSessionCheckpoints {
+                session_id,
+                retention,
+                respond: tx,
+            })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    /// Mark a session as cleanly shut down.
+    pub async fn mark_session_shutdown_clean(&self, session_id: String) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::MarkSessionShutdownClean {
+                session_id,
+                respond: tx,
+            })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    /// Get the state_hash of the latest checkpoint for a session.
+    pub async fn get_latest_checkpoint_hash(
+        &self,
+        session_id: String,
+    ) -> Result<Option<String>> {
+        let db_path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            get_latest_checkpoint_hash(&conn, &session_id)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+    }
+
     pub async fn upsert_agent_session(&self, session: AgentSessionRecord) -> Result<i64> {
         let (tx, rx) = oneshot::channel();
         self.write_tx
@@ -7670,6 +7834,62 @@ fn dispatch_write_command(conn: &mut Connection, cmd: WriteCommand, should_break
             let result = delete_pane_bookmark_sync(conn, &alias);
             let _ = respond.send(result);
         }
+        WriteCommand::InsertMuxSession {
+            session_id,
+            topology_json,
+            ft_version,
+            host_id,
+            respond,
+        } => {
+            let result =
+                insert_mux_session_sync(conn, &session_id, &topology_json, &ft_version, host_id.as_deref());
+            let _ = respond.send(result);
+        }
+        WriteCommand::InsertSessionCheckpoint {
+            session_id,
+            checkpoint_type,
+            state_hash,
+            pane_count,
+            total_bytes,
+            metadata_json,
+            pane_states,
+            respond,
+        } => {
+            let result = insert_session_checkpoint_sync(
+                conn,
+                &session_id,
+                &checkpoint_type,
+                &state_hash,
+                pane_count,
+                total_bytes,
+                metadata_json.as_deref(),
+                &pane_states,
+            );
+            let _ = respond.send(result);
+        }
+        WriteCommand::UpdateSessionCheckpointTimestamp {
+            session_id,
+            checkpoint_at,
+            respond,
+        } => {
+            let result = update_session_checkpoint_timestamp_sync(conn, &session_id, checkpoint_at);
+            let _ = respond.send(result);
+        }
+        WriteCommand::PruneSessionCheckpoints {
+            session_id,
+            retention,
+            respond,
+        } => {
+            let result = prune_session_checkpoints_sync(conn, &session_id, retention);
+            let _ = respond.send(result);
+        }
+        WriteCommand::MarkSessionShutdownClean {
+            session_id,
+            respond,
+        } => {
+            let result = mark_session_shutdown_clean_sync(conn, &session_id);
+            let _ = respond.send(result);
+        }
         WriteCommand::Shutdown { respond } => {
             let _ = respond.send(());
             *should_break = true;
@@ -8771,6 +8991,163 @@ fn delete_pane_bookmark_sync(conn: &Connection, alias: &str) -> Result<bool> {
         .execute("DELETE FROM pane_bookmarks WHERE alias = ?1", [alias])
         .map_err(|e| StorageError::Database(format!("Failed to delete pane bookmark: {e}")))?;
     Ok(deleted > 0)
+}
+
+// =============================================================================
+// Session Checkpoint Sync Operations
+// =============================================================================
+
+fn insert_mux_session_sync(
+    conn: &Connection,
+    session_id: &str,
+    topology_json: &str,
+    ft_version: &str,
+    host_id: Option<&str>,
+) -> Result<()> {
+    let now = now_ms();
+    conn.execute(
+        "INSERT INTO mux_sessions (session_id, created_at, topology_json, ft_version, host_id)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![session_id, now, topology_json, ft_version, host_id],
+    )
+    .map_err(|e| StorageError::Database(format!("Failed to insert mux session: {e}")))?;
+    Ok(())
+}
+
+fn insert_session_checkpoint_sync(
+    conn: &Connection,
+    session_id: &str,
+    checkpoint_type: &str,
+    state_hash: &str,
+    pane_count: usize,
+    total_bytes: usize,
+    metadata_json: Option<&str>,
+    pane_states: &[SessionPaneStateRow],
+) -> Result<i64> {
+    let now = now_ms();
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| StorageError::Database(format!("Failed to begin checkpoint txn: {e}")))?;
+
+    tx.execute(
+        "INSERT INTO session_checkpoints
+         (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes, metadata_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            session_id,
+            now,
+            checkpoint_type,
+            state_hash,
+            pane_count as i64,
+            total_bytes as i64,
+            metadata_json,
+        ],
+    )
+    .map_err(|e| StorageError::Database(format!("Failed to insert session checkpoint: {e}")))?;
+
+    let checkpoint_id = tx.last_insert_rowid();
+
+    {
+        let mut stmt = tx
+            .prepare_cached(
+                "INSERT INTO mux_pane_state
+                 (checkpoint_id, pane_id, cwd, command, env_json, terminal_state_json,
+                  agent_metadata_json, scrollback_checkpoint_seq, last_output_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )
+            .map_err(|e| StorageError::Database(format!("Failed to prepare pane state insert: {e}")))?;
+
+        for ps in pane_states {
+            stmt.execute(params![
+                checkpoint_id,
+                ps.pane_id as i64,
+                ps.cwd,
+                ps.command,
+                ps.env_json,
+                ps.terminal_state_json,
+                ps.agent_metadata_json,
+                ps.scrollback_checkpoint_seq,
+                ps.last_output_at,
+            ])
+            .map_err(|e| StorageError::Database(format!("Failed to insert pane state: {e}")))?;
+        }
+    } // drop stmt before further tx operations
+
+    tx.execute(
+        "UPDATE mux_sessions SET last_checkpoint_at = ?1 WHERE session_id = ?2",
+        params![now, session_id],
+    )
+    .map_err(|e| {
+        StorageError::Database(format!("Failed to update session checkpoint timestamp: {e}"))
+    })?;
+
+    tx.commit()
+        .map_err(|e| StorageError::Database(format!("Failed to commit checkpoint: {e}")))?;
+
+    Ok(checkpoint_id)
+}
+
+fn update_session_checkpoint_timestamp_sync(
+    conn: &Connection,
+    session_id: &str,
+    checkpoint_at: i64,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE mux_sessions SET last_checkpoint_at = ?1 WHERE session_id = ?2",
+        params![checkpoint_at, session_id],
+    )
+    .map_err(|e| {
+        StorageError::Database(format!("Failed to update session checkpoint timestamp: {e}"))
+    })?;
+    Ok(())
+}
+
+fn prune_session_checkpoints_sync(
+    conn: &Connection,
+    session_id: &str,
+    retention: usize,
+) -> Result<usize> {
+    let keep_count = retention as i64;
+    let deleted = conn
+        .execute(
+            "DELETE FROM session_checkpoints
+             WHERE session_id = ?1
+             AND id NOT IN (
+                 SELECT id FROM session_checkpoints
+                 WHERE session_id = ?1
+                 ORDER BY checkpoint_at DESC
+                 LIMIT ?2
+             )",
+            params![session_id, keep_count],
+        )
+        .map_err(|e| StorageError::Database(format!("Failed to prune session checkpoints: {e}")))?;
+    Ok(deleted)
+}
+
+fn mark_session_shutdown_clean_sync(conn: &Connection, session_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE mux_sessions SET shutdown_clean = 1 WHERE session_id = ?1",
+        params![session_id],
+    )
+    .map_err(|e| StorageError::Database(format!("Failed to mark session shutdown clean: {e}")))?;
+    Ok(())
+}
+
+/// Get the state_hash of the latest checkpoint for a session (read-only).
+pub fn get_latest_checkpoint_hash(conn: &Connection, session_id: &str) -> Result<Option<String>> {
+    let result = conn
+        .query_row(
+            "SELECT state_hash FROM session_checkpoints
+             WHERE session_id = ?1
+             ORDER BY checkpoint_at DESC LIMIT 1",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| {
+            StorageError::Database(format!("Failed to get latest checkpoint hash: {e}"))
+        })?;
+    Ok(result)
 }
 
 fn pane_bookmark_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PaneBookmarkRecord> {

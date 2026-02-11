@@ -16,15 +16,15 @@ rule drift.
 Human CLI (quick sanity checks):
 
 ```bash
-wa rules list
-wa rules test "Usage limit"  # shows matches, no trace
+ft rules list
+ft rules test "Usage limit"  # shows matches, no trace
 ```
 
 Robot CLI (machine-readable + trace):
 
 ```bash
-wa robot rules list
-wa robot rules test "Usage limit" --trace
+ft robot rules list
+ft robot rules test "Usage limit" --trace
 ```
 
 Notes:
@@ -78,4 +78,3 @@ enabled). Do not expect raw secrets to appear in traces.
 
 These traces include redacted `matched_text` and extracted fields to help debug
 rule behavior safely and share artifacts without leaking secrets.
-

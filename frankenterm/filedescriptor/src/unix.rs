@@ -5,7 +5,8 @@ use crate::{
 };
 use std::os::unix::prelude::*;
 
-pub(crate) type HandleType = ();
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct HandleType;
 
 /// `RawFileDescriptor` is a platform independent type alias for the
 /// underlying platform file descriptor type.  It is primarily useful
@@ -85,7 +86,7 @@ impl FromRawFd for OwnedHandle {
     unsafe fn from_raw_fd(fd: RawFd) -> Self {
         Self {
             handle: fd,
-            handle_type: (),
+            handle_type: HandleType,
         }
     }
 }
@@ -115,7 +116,7 @@ impl OwnedHandle {
         } else {
             let mut owned = OwnedHandle {
                 handle: duped,
-                handle_type: (),
+                handle_type: HandleType,
             };
             owned.cloexec()?;
             Ok(owned)
@@ -133,7 +134,7 @@ impl OwnedHandle {
         } else {
             let mut owned = OwnedHandle {
                 handle: duped,
-                handle_type: (),
+                handle_type: HandleType,
             };
             owned.cloexec()?;
             Ok(owned)
@@ -194,14 +195,14 @@ impl OwnedHandle {
             } else {
                 Ok(OwnedHandle {
                     handle: duped,
-                    handle_type: (),
+                    handle_type: HandleType,
                 })
             }
         }
     }
 
     pub(crate) fn probe_handle_type(_handle: RawFileDescriptor) -> HandleType {
-        ()
+        HandleType
     }
 }
 
@@ -291,6 +292,16 @@ impl FileDescriptor {
     /// resources that may not be available, this is a potentially fallible operation.
     /// The returned handle has a separate lifetime from the source, but
     /// references the same object at the kernel level.
+    ///
+    /// # Safety
+    ///
+    /// - `dest_fd` must be a valid file descriptor number for the current
+    ///   process.
+    /// - If `dest_fd` is already open, it may be closed and replaced by this
+    ///   operation; the caller must ensure this is acceptable for the process.
+    /// - The caller is responsible for any higher-level invariants associated
+    ///   with reassigning standard fds (stdin/stdout/stderr) or other
+    ///   well-known descriptors.
     pub unsafe fn dup2<F: AsRawFileDescriptor>(f: &F, dest_fd: RawFd) -> Result<Self> {
         OwnedHandle::dup2_impl(f, dest_fd).map(|handle| Self { handle })
     }
@@ -342,13 +353,13 @@ impl Pipe {
             let read = FileDescriptor {
                 handle: OwnedHandle {
                     handle: fds[0],
-                    handle_type: (),
+                    handle_type: HandleType,
                 },
             };
             let write = FileDescriptor {
                 handle: OwnedHandle {
                     handle: fds[1],
-                    handle_type: (),
+                    handle_type: HandleType,
                 },
             };
             Ok(Pipe { read, write })
@@ -365,13 +376,13 @@ impl Pipe {
             let mut read = FileDescriptor {
                 handle: OwnedHandle {
                     handle: fds[0],
-                    handle_type: (),
+                    handle_type: HandleType,
                 },
             };
             let mut write = FileDescriptor {
                 handle: OwnedHandle {
                     handle: fds[1],
-                    handle_type: (),
+                    handle_type: HandleType,
                 },
             };
             read.handle.cloexec()?;
@@ -399,13 +410,13 @@ pub fn socketpair_impl() -> Result<(FileDescriptor, FileDescriptor)> {
         let read = FileDescriptor {
             handle: OwnedHandle {
                 handle: fds[0],
-                handle_type: (),
+                handle_type: HandleType,
             },
         };
         let write = FileDescriptor {
             handle: OwnedHandle {
                 handle: fds[1],
-                handle_type: (),
+                handle_type: HandleType,
             },
         };
         Ok((read, write))
@@ -423,13 +434,13 @@ pub fn socketpair_impl() -> Result<(FileDescriptor, FileDescriptor)> {
         let mut read = FileDescriptor {
             handle: OwnedHandle {
                 handle: fds[0],
-                handle_type: (),
+                handle_type: HandleType,
             },
         };
         let mut write = FileDescriptor {
             handle: OwnedHandle {
                 handle: fds[1],
-                handle_type: (),
+                handle_type: HandleType,
             },
         };
         read.handle.cloexec()?;
@@ -501,9 +512,9 @@ mod macos {
             Ok(())
         }
 
-        pub fn contains(&mut self, fd: RawFd) -> bool {
+        pub fn contains(&self, fd: RawFd) -> bool {
             check_fd(fd).unwrap();
-            unsafe { FD_ISSET(fd, &mut self.set) }
+            unsafe { FD_ISSET(fd, &self.set) }
         }
     }
 
@@ -518,7 +529,7 @@ mod macos {
     }
 
     fn is_set(set: &mut Option<FdSet>, fd: RawFd) -> bool {
-        set.as_mut().map(|s| s.contains(fd)).unwrap_or(false)
+        set.as_ref().map(|s| s.contains(fd)).unwrap_or(false)
     }
 
     pub fn poll_impl(pfd: &mut [pollfd], duration: Option<Duration>) -> Result<usize> {

@@ -85,6 +85,9 @@ pub struct Config {
 
     /// CLI subprocess settings (timeouts, orphan reaper)
     pub cli: CliConfig,
+
+    /// Session snapshot settings (periodic capture, retention)
+    pub snapshots: SnapshotConfig,
 }
 
 // =============================================================================
@@ -2029,6 +2032,57 @@ impl Default for CliConfig {
             timeout_seconds: 15,
             orphan_reap_interval_seconds: 60,
             orphan_max_age_seconds: 30,
+        }
+    }
+}
+
+// =============================================================================
+// Snapshot Config
+// =============================================================================
+
+/// Session snapshot configuration — periodic capture and retention.
+///
+/// Controls how `ft watch` captures mux session state for crash-resilient
+/// session persistence. Snapshots include layout topology, pane states,
+/// and scrollback references.
+///
+/// # Example (ft.toml)
+///
+/// ```toml
+/// [snapshots]
+/// enabled = true
+/// interval_seconds = 300
+/// max_concurrent_captures = 10
+/// retention_count = 10
+/// retention_days = 7
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SnapshotConfig {
+    /// Enable periodic session snapshots.
+    pub enabled: bool,
+
+    /// Interval between periodic snapshots (seconds). Minimum: 30.
+    pub interval_seconds: u64,
+
+    /// Maximum number of panes to capture concurrently.
+    pub max_concurrent_captures: usize,
+
+    /// Maximum number of snapshots to retain (oldest are pruned first).
+    pub retention_count: usize,
+
+    /// Maximum age of snapshots in days (older are pruned).
+    pub retention_days: u64,
+}
+
+impl Default for SnapshotConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_seconds: 300,
+            max_concurrent_captures: 10,
+            retention_count: 10,
+            retention_days: 7,
         }
     }
 }

@@ -197,6 +197,12 @@ impl PaneStateSnapshot {
     /// Set scrollback reference.
     #[must_use]
     pub fn with_scrollback(mut self, scrollback: ScrollbackRef) -> Self {
+        debug!(
+            pane_id = self.pane_id,
+            seq = scrollback.output_segments_seq,
+            lines = scrollback.total_lines_captured,
+            "Scrollback ref for pane"
+        );
         self.scrollback_ref = Some(scrollback);
         self
     }
@@ -213,14 +219,28 @@ impl PaneStateSnapshot {
     /// Only captures variables from the safe-list and redacts sensitive ones.
     #[must_use]
     pub fn with_env_from_current(mut self) -> Self {
-        self.env = Some(capture_env_from_iter(std::env::vars()));
+        let env = capture_env_from_iter(std::env::vars());
+        trace!(
+            pane_id = self.pane_id,
+            var_count = env.vars.len(),
+            redacted_count = env.redacted_count,
+            "Environment capture for pane"
+        );
+        self.env = Some(env);
         self
     }
 
     /// Capture environment from an explicit iterator (for testing).
     #[must_use]
     pub fn with_env_from_iter(mut self, vars: impl Iterator<Item = (String, String)>) -> Self {
-        self.env = Some(capture_env_from_iter(vars));
+        let env = capture_env_from_iter(vars);
+        trace!(
+            pane_id = self.pane_id,
+            var_count = env.vars.len(),
+            redacted_count = env.redacted_count,
+            "Environment capture for pane"
+        );
+        self.env = Some(env);
         self
     }
 
@@ -339,6 +359,13 @@ impl PaneStateSnapshot {
             let parsed = crate::wezterm::CwdInfo::parse(cwd);
             snapshot.cwd = Some(parsed.path);
         }
+
+        debug!(
+            pane_id = pane.pane_id,
+            cwd = ?snapshot.cwd,
+            alt_screen = is_alt_screen,
+            "Captured state for pane"
+        );
 
         snapshot
     }
