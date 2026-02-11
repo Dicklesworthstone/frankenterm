@@ -2077,6 +2077,10 @@ pub struct SnapshotConfig {
     /// Session-level retention policy.
     #[serde(default)]
     pub session_retention: SessionRetentionConfig,
+
+    /// Process re-launch configuration for session restoration.
+    #[serde(default)]
+    pub process_relaunch: ProcessRelaunchConfig,
 }
 
 impl Default for SnapshotConfig {
@@ -2088,6 +2092,53 @@ impl Default for SnapshotConfig {
             retention_count: 10,
             retention_days: 7,
             session_retention: SessionRetentionConfig::default(),
+            process_relaunch: ProcessRelaunchConfig::default(),
+        }
+    }
+}
+
+/// Process re-launch configuration for session restoration.
+///
+/// Controls how processes are restarted in restored panes after a
+/// mux server restart.
+///
+/// # Example (ft.toml)
+///
+/// ```toml
+/// [snapshots.process_relaunch]
+/// launch_shells = true
+/// launch_agents = false
+/// launch_delay_ms = 500
+///
+/// [snapshots.process_relaunch.agent_commands]
+/// claude_code = "cd {cwd} && claude"
+/// codex = "cd {cwd} && codex"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProcessRelaunchConfig {
+    /// Automatically re-launch shell processes in their original working directories.
+    pub launch_shells: bool,
+
+    /// Automatically re-launch agent processes (Claude Code, Codex, Gemini).
+    /// Disabled by default because agent sessions start fresh (state is lost).
+    pub launch_agents: bool,
+
+    /// Delay between successive process launches in milliseconds.
+    pub launch_delay_ms: u64,
+
+    /// Custom agent launch commands keyed by agent type.
+    /// Supports `{cwd}` placeholder for the original working directory.
+    pub agent_commands: std::collections::HashMap<String, String>,
+}
+
+impl Default for ProcessRelaunchConfig {
+    fn default() -> Self {
+        Self {
+            launch_shells: true,
+            launch_agents: false,
+            launch_delay_ms: 500,
+            agent_commands: std::collections::HashMap::new(),
         }
     }
 }

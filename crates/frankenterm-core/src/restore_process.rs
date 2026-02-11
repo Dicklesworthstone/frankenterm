@@ -18,8 +18,7 @@
 //! ```
 
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -57,6 +56,17 @@ impl Default for LaunchConfig {
             launch_agents: false,
             launch_delay_ms: 500,
             agent_commands: HashMap::new(),
+        }
+    }
+}
+
+impl From<crate::config::ProcessRelaunchConfig> for LaunchConfig {
+    fn from(cfg: crate::config::ProcessRelaunchConfig) -> Self {
+        Self {
+            launch_shells: cfg.launch_shells,
+            launch_agents: cfg.launch_agents,
+            launch_delay_ms: cfg.launch_delay_ms,
+            agent_commands: cfg.agent_commands,
         }
     }
 }
@@ -159,8 +169,7 @@ impl ProcessLauncher {
                 }
             };
 
-            let (action, state_warning) =
-                self.resolve_action(state);
+            let (action, state_warning) = self.resolve_action(state);
 
             plans.push(ProcessPlan {
                 old_pane_id: state.pane_id,
@@ -282,10 +291,7 @@ impl ProcessLauncher {
     // -------------------------------------------------------------------------
 
     /// Determine what action to take for a pane based on its snapshot.
-    fn resolve_action(
-        &self,
-        state: &PaneStateSnapshot,
-    ) -> (LaunchAction, Option<String>) {
+    fn resolve_action(&self, state: &PaneStateSnapshot) -> (LaunchAction, Option<String>) {
         let cwd = state
             .cwd
             .as_deref()
@@ -322,7 +328,7 @@ impl ProcessLauncher {
         }
 
         // No process info at all — just cd to the working directory
-        if self.config.launch_shells && cwd != PathBuf::from("/") {
+        if self.config.launch_shells && cwd != Path::new("/") {
             return (
                 LaunchAction::LaunchShell {
                     shell: default_shell(),
@@ -448,10 +454,7 @@ impl ProcessLauncher {
         if is_interactive_program(name) {
             return (
                 LaunchAction::Manual {
-                    hint: format!(
-                        "Was running {name} in {}. Restart manually.",
-                        cwd.display()
-                    ),
+                    hint: format!("Was running {name} in {}. Restart manually.", cwd.display()),
                     original_process: name.clone(),
                 },
                 None,
@@ -479,12 +482,7 @@ impl ProcessLauncher {
     // -------------------------------------------------------------------------
 
     /// Send shell launch commands to a pane.
-    async fn launch_shell(
-        &self,
-        pane_id: u64,
-        shell: &str,
-        cwd: &PathBuf,
-    ) -> Result<(), String> {
+    async fn launch_shell(&self, pane_id: u64, shell: &str, cwd: &PathBuf) -> Result<(), String> {
         // cd to the working directory first
         let cd_cmd = format!("cd {}\r", shell_escape(cwd));
         self.wezterm
@@ -606,11 +604,30 @@ fn is_interactive_program(name: &str) -> bool {
     let basename = name.rsplit('/').next().unwrap_or(name);
     matches!(
         basename,
-        "vim" | "nvim" | "vi" | "nano" | "emacs" | "helix" | "hx"
-            | "htop" | "btop" | "top" | "less" | "more" | "man"
-            | "tmux" | "screen"
-            | "python" | "python3" | "ipython" | "node" | "irb" | "ghci"
-            | "psql" | "mysql" | "sqlite3"
+        "vim"
+            | "nvim"
+            | "vi"
+            | "nano"
+            | "emacs"
+            | "helix"
+            | "hx"
+            | "htop"
+            | "btop"
+            | "top"
+            | "less"
+            | "more"
+            | "man"
+            | "tmux"
+            | "screen"
+            | "python"
+            | "python3"
+            | "ipython"
+            | "node"
+            | "irb"
+            | "ghci"
+            | "psql"
+            | "mysql"
+            | "sqlite3"
     )
 }
 
@@ -679,7 +696,7 @@ mod tests {
     }
 
     fn test_launcher() -> ProcessLauncher {
-        let wez = crate::wezterm::create_mock_handle();
+        let wez = crate::wezterm::mock_wezterm_handle();
         ProcessLauncher::new(wez, LaunchConfig::default())
     }
 
@@ -743,7 +760,7 @@ mod tests {
             launch_agents: true,
             ..Default::default()
         };
-        let wez = crate::wezterm::create_mock_handle();
+        let wez = crate::wezterm::mock_wezterm_handle();
         let launcher = ProcessLauncher::new(wez, config);
         let id_map = test_pane_id_map();
 
@@ -774,16 +791,13 @@ mod tests {
     #[test]
     fn plan_agent_with_custom_command() {
         let mut agent_commands = HashMap::new();
-        agent_commands.insert(
-            "claude_code".into(),
-            "cd {cwd} && claude --resume".into(),
-        );
+        agent_commands.insert("claude_code".into(), "cd {cwd} && claude --resume".into());
         let config = LaunchConfig {
             launch_agents: true,
             agent_commands,
             ..Default::default()
         };
-        let wez = crate::wezterm::create_mock_handle();
+        let wez = crate::wezterm::mock_wezterm_handle();
         let launcher = ProcessLauncher::new(wez, config);
         let id_map = test_pane_id_map();
 
@@ -819,7 +833,10 @@ mod tests {
 
         let plans = launcher.plan(&id_map, &[state]);
         match &plans[0].action {
-            LaunchAction::Manual { hint, original_process } => {
+            LaunchAction::Manual {
+                hint,
+                original_process,
+            } => {
                 assert!(hint.contains("vim"));
                 assert_eq!(original_process, "vim");
             }
@@ -878,7 +895,7 @@ mod tests {
             launch_shells: false,
             ..Default::default()
         };
-        let wez = crate::wezterm::create_mock_handle();
+        let wez = crate::wezterm::mock_wezterm_handle();
         let launcher = ProcessLauncher::new(wez, config);
         let id_map = test_pane_id_map();
         let states = vec![test_pane_state(1)];
@@ -963,29 +980,27 @@ mod tests {
             agent_type_from_process_name("claude"),
             AgentType::ClaudeCode
         );
-        assert_eq!(
-            agent_type_from_process_name("codex-cli"),
-            AgentType::Codex
-        );
+        assert_eq!(agent_type_from_process_name("codex-cli"), AgentType::Codex);
         assert_eq!(
             agent_type_from_process_name("gemini-cli"),
             AgentType::Gemini
         );
-        assert_eq!(
-            agent_type_from_process_name("bash"),
-            AgentType::Unknown
-        );
+        assert_eq!(agent_type_from_process_name("bash"), AgentType::Unknown);
     }
 
     #[test]
     fn default_agent_commands_populated() {
         let cwd = PathBuf::from("/project");
-        assert!(default_agent_command(AgentType::ClaudeCode, &cwd)
-            .unwrap()
-            .contains("claude"));
-        assert!(default_agent_command(AgentType::Codex, &cwd)
-            .unwrap()
-            .contains("codex"));
+        assert!(
+            default_agent_command(AgentType::ClaudeCode, &cwd)
+                .unwrap()
+                .contains("claude")
+        );
+        assert!(
+            default_agent_command(AgentType::Codex, &cwd)
+                .unwrap()
+                .contains("codex")
+        );
         assert!(default_agent_command(AgentType::Unknown, &cwd).is_none());
     }
 
@@ -1013,11 +1028,7 @@ mod tests {
         let launcher = test_launcher();
         let id_map = test_pane_id_map();
 
-        let mut states = vec![
-            test_pane_state(1),
-            test_pane_state(2),
-            test_pane_state(3),
-        ];
+        let mut states = vec![test_pane_state(1), test_pane_state(2), test_pane_state(3)];
         states[1].pane_id = 2;
         states[2].pane_id = 3;
         states[2].cwd = None; // No cwd
@@ -1025,8 +1036,7 @@ mod tests {
         let plans = launcher.plan(&id_map, &states);
         for plan in &plans {
             match &plan.action {
-                LaunchAction::LaunchShell { cwd, .. }
-                | LaunchAction::LaunchAgent { cwd, .. } => {
+                LaunchAction::LaunchShell { cwd, .. } | LaunchAction::LaunchAgent { cwd, .. } => {
                     assert!(
                         cwd.is_absolute(),
                         "cwd must be absolute, got: {}",
@@ -1038,9 +1048,19 @@ mod tests {
         }
     }
 
+    /// Create a mock with panes pre-registered at the given IDs.
+    async fn mock_with_panes(pane_ids: &[u64]) -> WeztermHandle {
+        let mock = crate::wezterm::MockWezterm::new();
+        for &id in pane_ids {
+            mock.add_default_pane(id).await;
+        }
+        std::sync::Arc::new(mock) as WeztermHandle
+    }
+
     #[tokio::test]
     async fn execute_shell_launch() {
-        let launcher = test_launcher();
+        let wez = mock_with_panes(&[100]).await;
+        let launcher = ProcessLauncher::new(wez, LaunchConfig::default());
         let plans = vec![ProcessPlan {
             old_pane_id: 1,
             new_pane_id: 100,
@@ -1058,7 +1078,8 @@ mod tests {
 
     #[tokio::test]
     async fn execute_mixed_plan() {
-        let launcher = test_launcher();
+        let wez = mock_with_panes(&[100, 200, 300]).await;
+        let launcher = ProcessLauncher::new(wez, LaunchConfig::default());
         let plans = vec![
             ProcessPlan {
                 old_pane_id: 1,

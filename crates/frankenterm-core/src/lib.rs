@@ -94,6 +94,7 @@ pub mod recording;
 pub mod replay;
 pub mod reports;
 pub mod restore_layout;
+pub mod restore_process;
 pub mod restore_scrollback;
 pub mod retry;
 pub mod robot_types;
