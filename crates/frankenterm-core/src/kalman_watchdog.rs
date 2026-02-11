@@ -254,7 +254,7 @@ impl ComponentTracker {
         if !self.filter.is_initialized() {
             return None;
         }
-        Some(self.filter.estimate() + k * self.filter.std_dev())
+        Some(k.mul_add(self.filter.std_dev(), self.filter.estimate()))
     }
 
     /// Classify the health of this component based on the time since last heartbeat.
