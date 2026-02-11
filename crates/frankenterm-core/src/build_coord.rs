@@ -322,10 +322,14 @@ impl BuildEnv {
         BuildEnv { vars }
     }
 
-    /// Apply the build environment variables to the current process.
-    pub fn apply(&self) {
+    /// Apply the build environment to a [`std::process::Command`].
+    ///
+    /// This is the safe way to inject the build environment — instead of
+    /// modifying the process environment (which requires unsafe in Rust 2024),
+    /// we set env vars on the command that will be spawned.
+    pub fn apply_to_command(&self, cmd: &mut std::process::Command) {
         for (key, value) in &self.vars {
-            std::env::set_var(key, value);
+            cmd.env(key, value);
         }
     }
 }

@@ -102,7 +102,7 @@ Strip or normalize control sequences that could corrupt terminal state:
 
 | Category | Action | Reason |
 |----------|--------|--------|
-| Title-set (`\e]0;...\a`) | Strip | Prevents subprocess from changing wa's title |
+| Title-set (`\e]0;...\a`) | Strip | Prevents subprocess from changing ft's title |
 | Alternate screen (`\e[?1049h/l`) | Strip | Prevents nesting alternate screens |
 | Bracketed paste mode (`\e[?2004h/l`) | Strip | ft manages paste mode |
 | Mouse mode (`\e[?1000h` etc.) | Strip | ft manages mouse capture |
@@ -218,8 +218,8 @@ The forwarding pipeline exposes the following counters:
 Subprocess-origin issues use a dedicated tracing target:
 
 ```rust
-tracing::warn!(target: "wa::subprocess", dropped_bytes, "backpressure: dropping frames");
-tracing::error!(target: "wa::subprocess", "black tier: killing subprocess");
+tracing::warn!(target: "ft::subprocess", dropped_bytes, "backpressure: dropping frames");
+tracing::error!(target: "ft::subprocess", "black tier: killing subprocess");
 ```
 
 This allows filtering subprocess diagnostics separately from UI/runtime logs
@@ -248,7 +248,7 @@ struct SubprocessReport {
 
 This report is:
 - Written to the recording as a `FrameType::Marker` (JSON-encoded)
-- Logged at `info` level to the `wa::subprocess` target
+- Logged at `info` level to the `ft::subprocess` target
 - Available via `SubprocessForwarder::report()` for the command handoff caller
 
 ## 8  Implementation Plan

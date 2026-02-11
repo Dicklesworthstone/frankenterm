@@ -286,7 +286,7 @@ send_text = true  # Allow attempt, but policy should block
 When `--verbose` or `FT_LOG_FORMAT=json`:
 
 ```json
-{"timestamp":"2026-01-19T09:00:00.123Z","level":"INFO","target":"wa::ingest","pane_id":123,"seq":45,"message":"Captured segment","span":"capture_pane"}
+{"timestamp":"2026-01-19T09:00:00.123Z","level":"INFO","target":"frankenterm_core::ingest","pane_id":123,"seq":45,"message":"Captured segment","span":"capture_pane"}
 ```
 
 Required fields:

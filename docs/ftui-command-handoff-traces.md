@@ -186,7 +186,7 @@ Session: Suspended Gate: Suspended
 
 ### 5.1  Structured Log Events
 
-All handoff events use the `wa::handoff` tracing target for filterable diagnostics.
+All handoff events use the `ft::handoff` tracing target for filterable diagnostics.
 
 | Event | Level | Fields | When |
 |-------|-------|--------|------|
@@ -204,12 +204,12 @@ All handoff events use the `wa::handoff` tracing target for filterable diagnosti
 ### 5.2  Example Log Output
 
 ```
-INFO  wa::handoff handoff.start command="git status" session_phase=Active screen_mode=AltScreen
-DEBUG wa::handoff handoff.suspended elapsed_ms=2
-INFO  wa::handoff handoff.cmd.spawn program="git" args=["status"]
-INFO  wa::handoff handoff.cmd.exit exit_code=0 elapsed_ms=145
-DEBUG wa::handoff handoff.resumed elapsed_ms=1
-INFO  wa::handoff handoff.complete success=true total_elapsed_ms=4523
+INFO  ft::handoff handoff.start command="git status" session_phase=Active screen_mode=AltScreen
+DEBUG ft::handoff handoff.suspended elapsed_ms=2
+INFO  ft::handoff handoff.cmd.spawn program="git" args=["status"]
+INFO  ft::handoff handoff.cmd.exit exit_code=0 elapsed_ms=145
+DEBUG ft::handoff handoff.resumed elapsed_ms=1
+INFO  ft::handoff handoff.complete success=true total_elapsed_ms=4523
 ```
 
 ### 5.3  Failure Isolation
@@ -218,9 +218,9 @@ The diagnostic schema separates three failure domains:
 
 | Domain | Log Target | Example |
 |--------|-----------|---------|
-| Session lifecycle | `wa::handoff handoff.error.*` | suspend/resume phase violation |
-| Command execution | `wa::handoff handoff.cmd.*` | spawn failure, non-zero exit |
-| Terminal state | `wa::session` (terminal_session.rs) | raw mode, alt screen errors |
+| Session lifecycle | `ft::handoff handoff.error.*` | suspend/resume phase violation |
+| Command execution | `ft::handoff handoff.cmd.*` | spawn failure, non-zero exit |
+| Terminal state | `ft::session` (terminal_session.rs) | raw mode, alt screen errors |
 
 This separation allows fast triage: "was this a TUI lifecycle bug or did the
 subprocess fail?" is answerable from log target alone.

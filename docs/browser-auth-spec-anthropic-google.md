@@ -65,8 +65,8 @@ pub enum AuthResult {
 
 ## 5. Profile Strategy
 
-- **Profile root**: `~/<data_dir>/wa/browser_profiles/<service>/<account_key>/`
-- Profiles are treated as **opaque** by wa.
+- **Profile root**: `~/<data_dir>/ft/browser_profiles/<service>/<account_key>/` (legacy: `.../wa/...`)
+- Profiles are treated as **opaque** by ft.
 - If a profile exists, try **already-authenticated fast path** first.
 - The only persisted data in ft DB:
   - profile path
