@@ -134,8 +134,12 @@ impl HoltPredictor {
             return;
         }
         let prev_level = self.level;
-        self.level = self.alpha * value + (1.0 - self.alpha) * (self.level + self.trend);
-        self.trend = self.beta * (self.level - prev_level) + (1.0 - self.beta) * self.trend;
+        self.level = self
+            .alpha
+            .mul_add(value, (1.0 - self.alpha) * (self.level + self.trend));
+        self.trend = self
+            .beta
+            .mul_add(self.level - prev_level, (1.0 - self.beta) * self.trend);
         self.observations += 1;
         // Clamp to prevent divergence on extreme inputs
         if !self.level.is_finite() {
@@ -149,7 +153,7 @@ impl HoltPredictor {
     /// Forecast h steps ahead from the current state.
     #[must_use]
     pub fn forecast(&self, steps_ahead: f64) -> f64 {
-        self.level + steps_ahead * self.trend
+        steps_ahead.mul_add(self.trend, self.level)
     }
 
     /// Current level estimate.
@@ -306,7 +310,7 @@ impl MetricForecaster {
             if history_len > *horizon {
                 let past_idx = history_len - 1 - *horizon;
                 let past = &self.history[past_idx];
-                let predicted = past.level + (*horizon as f64) * past.trend;
+                let predicted = (*horizon as f64).mul_add(past.trend, past.level);
                 let score = (value - predicted).abs();
                 cal.push(score);
             }
