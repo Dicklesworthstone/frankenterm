@@ -7317,7 +7317,7 @@ async fn run_watcher(
             });
             tokio::spawn(async move {
                 engine_for_loop
-                    .run_periodic(snap_shutdown_rx, || async move {
+                    .run_periodic(snap_shutdown_rx, move || async move {
                         let wez = frankenterm_core::wezterm::wezterm_handle_with_timeout(
                             loop_timeout,
                         );
