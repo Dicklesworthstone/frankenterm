@@ -23,8 +23,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
+use crate::agent_correlator::AgentCorrelator;
 use crate::config::SnapshotConfig;
+use crate::patterns::{AgentType, Detection, Severity};
 use crate::session_pane_state::PaneStateSnapshot;
 use crate::session_topology::TopologySnapshot;
 use crate::wezterm::PaneInfo;
@@ -32,6 +35,9 @@ use crate::wezterm::PaneInfo;
 // =============================================================================
 // Types
 // =============================================================================
+
+/// Maximum age of a stored detection event to consider for agent state inference.
+const STATE_DETECTION_MAX_AGE: Duration = Duration::from_secs(300); // 5 minutes
 
 /// What triggered the snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -160,10 +166,41 @@ impl SnapshotEngine {
             .to_json()
             .map_err(|e: serde_json::Error| SnapshotError::Serialization(e.to_string()))?;
 
-        // 3. Build per-pane state snapshots
+        // 3. Correlate agent identity/state (best-effort) and build per-pane snapshots
+        let mut correlator = AgentCorrelator::new();
+        let pane_ids: Vec<u64> = panes.iter().map(|p| p.pane_id).collect();
+        let db_path_for_detections = Arc::clone(&self.db_path);
+        let cutoff_ms: i64 =
+            now_ms.saturating_sub(STATE_DETECTION_MAX_AGE.as_millis() as u64) as i64;
+
+        let detections_by_pane = tokio::task::spawn_blocking(move || {
+            load_latest_detections_by_pane_sync(
+                db_path_for_detections.as_str(),
+                &pane_ids,
+                cutoff_ms,
+            )
+        })
+        .await
+        .ok()
+        .and_then(|res| res.ok())
+        .unwrap_or_default();
+
+        for (pane_id, detections) in detections_by_pane {
+            correlator.ingest_detections(pane_id, &detections);
+        }
+        for pane in panes {
+            correlator.update_from_pane_info(pane);
+        }
+
         let pane_states: Vec<PaneStateSnapshot> = panes
             .iter()
-            .map(|p| PaneStateSnapshot::from_pane_info(p, now_ms, false))
+            .map(|p| {
+                let mut snapshot = PaneStateSnapshot::from_pane_info(p, now_ms, false);
+                if let Some(agent) = correlator.get_metadata(p.pane_id) {
+                    snapshot = snapshot.with_agent(agent);
+                }
+                snapshot
+            })
             .collect();
 
         // 4. Compute state hash for dedup (from raw pane data, not timestamps)
@@ -342,6 +379,112 @@ impl SnapshotEngine {
                 .map_err(|e| SnapshotError::Database(e.to_string()))?;
         }
         Ok(())
+    }
+}
+
+/// Load the most recent detections per pane from storage.
+///
+/// This is best-effort: if the `events` table does not exist (e.g., tests using a
+/// minimal schema), it returns an empty map.
+fn load_latest_detections_by_pane_sync(
+    db_path: &str,
+    pane_ids: &[u64],
+    cutoff_ms: i64,
+) -> std::result::Result<std::collections::HashMap<u64, Vec<Detection>>, rusqlite::Error> {
+    use std::collections::HashMap;
+
+    if pane_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let conn = open_conn(db_path)?;
+
+    let placeholders = std::iter::repeat_n("?", pane_ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let sql = format!(
+        "WITH ranked AS (
+            SELECT pane_id,
+                   rule_id,
+                   agent_type,
+                   event_type,
+                   severity,
+                   confidence,
+                   extracted,
+                   matched_text,
+                   ROW_NUMBER() OVER (PARTITION BY pane_id ORDER BY detected_at DESC) AS rn
+            FROM events
+            WHERE pane_id IN ({placeholders})
+              AND detected_at >= ?
+              AND agent_type NOT IN ('unknown', 'wezterm')
+        )
+        SELECT pane_id, rule_id, agent_type, event_type, severity, confidence, extracted, matched_text
+        FROM ranked
+        WHERE rn = 1"
+    );
+
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(stmt) => stmt,
+        Err(err) if is_missing_events_table(&err) => return Ok(HashMap::new()),
+        Err(err) => return Err(err),
+    };
+
+    let mut params: Vec<i64> = pane_ids.iter().map(|id| *id as i64).collect();
+    params.push(cutoff_ms);
+
+    let mut rows = stmt.query(rusqlite::params_from_iter(params))?;
+    let mut out: HashMap<u64, Vec<Detection>> = HashMap::new();
+
+    while let Some(row) = rows.next()? {
+        let pane_id: i64 = row.get(0)?;
+        let rule_id: String = row.get(1)?;
+        let agent_type: String = row.get(2)?;
+        let event_type: String = row.get(3)?;
+        let severity: String = row.get(4)?;
+        let confidence: f64 = row.get(5)?;
+        let extracted: Option<String> = row.get(6)?;
+        let matched_text: Option<String> = row.get(7)?;
+
+        let detection = Detection {
+            rule_id,
+            agent_type: agent_type_from_db(&agent_type),
+            event_type,
+            severity: severity_from_db(&severity),
+            confidence,
+            extracted: extracted
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                .unwrap_or(Value::Null),
+            matched_text: matched_text.unwrap_or_default(),
+            span: (0, 0),
+        };
+
+        out.insert(pane_id as u64, vec![detection]);
+    }
+
+    Ok(out)
+}
+
+fn is_missing_events_table(err: &rusqlite::Error) -> bool {
+    err.to_string().contains("no such table: events")
+}
+
+fn agent_type_from_db(agent_type: &str) -> AgentType {
+    match agent_type {
+        "codex" => AgentType::Codex,
+        "claude_code" => AgentType::ClaudeCode,
+        "gemini" => AgentType::Gemini,
+        "wezterm" => AgentType::Wezterm,
+        _ => AgentType::Unknown,
+    }
+}
+
+fn severity_from_db(severity: &str) -> Severity {
+    match severity {
+        "warning" => Severity::Warning,
+        "critical" => Severity::Critical,
+        _ => Severity::Info,
     }
 }
 
@@ -716,6 +859,34 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 3);
+    }
+
+    #[tokio::test]
+    async fn agent_metadata_persisted_when_detected_from_title() {
+        let (_tmp, db_path) = setup_test_db();
+        let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+        let mut pane = make_test_pane(1, 24, 80);
+        pane.title = Some("claude-code".to_string());
+
+        let result = engine
+            .capture(&[pane], SnapshotTrigger::Manual)
+            .await
+            .unwrap();
+
+        let conn = Connection::open(db_path.as_str()).unwrap();
+        let meta_json: Option<String> = conn
+            .query_row(
+                "SELECT agent_metadata_json FROM mux_pane_state WHERE checkpoint_id = ?1 AND pane_id = ?2",
+                rusqlite::params![result.checkpoint_id, 1i64],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let meta_json = meta_json.expect("agent_metadata_json should be present");
+        let meta: crate::session_pane_state::AgentMetadata =
+            serde_json::from_str(&meta_json).unwrap();
+        assert_eq!(meta.agent_type, "claude_code");
+        assert_eq!(meta.state.as_deref(), Some("active"));
     }
 
     #[tokio::test]
