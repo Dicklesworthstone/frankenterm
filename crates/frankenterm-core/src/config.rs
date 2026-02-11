@@ -1947,18 +1947,47 @@ impl Default for NativeEventsConfig {
 // Vendored Config
 // =============================================================================
 
+/// Vendored mux connection pool settings.
+///
+/// These settings control how many persistent Unix socket connections to the
+/// WezTerm mux server may be held concurrently, and how long the client waits
+/// to acquire a connection before falling back to CLI subprocesses.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VendoredMuxPoolConfig {
+    /// Maximum number of pooled mux connections.
+    pub max_connections: usize,
+    /// How long idle connections are kept before eviction.
+    pub idle_timeout_seconds: u64,
+    /// How long to wait to acquire a pooled connection.
+    pub acquire_timeout_seconds: u64,
+}
+
+impl Default for VendoredMuxPoolConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: 8,
+            idle_timeout_seconds: 300,
+            acquire_timeout_seconds: 10,
+        }
+    }
+}
+
 /// Vendored WezTerm configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct VendoredConfig {
     /// Optional mux socket path override (WEZTERM_UNIX_SOCKET equivalent)
     pub mux_socket_path: Option<String>,
+    /// Vendored mux connection pool settings.
+    pub mux_pool: VendoredMuxPoolConfig,
 }
 
 impl Default for VendoredConfig {
     fn default() -> Self {
         Self {
             mux_socket_path: None,
+            mux_pool: VendoredMuxPoolConfig::default(),
         }
     }
 }

@@ -94,13 +94,9 @@ pub async fn reap_orphans(max_age_secs: u64) -> ReapReport {
 fn reap_orphans_sync(max_age_secs: u64) -> ReapReport {
     let mut report = ReapReport::default();
 
-    let processes = match list_wezterm_cli_processes() {
-        Ok(processes) => processes,
-        Err(e) => {
-            report.errors.push(format!("process scan failed: {e}"));
-            return report;
-        }
-    };
+    let scan = list_wezterm_cli_processes();
+    report.errors.extend(scan.errors);
+    let processes = scan.processes;
 
     report.scanned = processes.len();
 
@@ -110,7 +106,9 @@ fn reap_orphans_sync(max_age_secs: u64) -> ReapReport {
         }
 
         if let Err(e) = kill_process(proc.pid) {
-            report.errors.push(format!("failed to kill pid {}: {e}", proc.pid));
+            report
+                .errors
+                .push(format!("failed to kill pid {}: {e}", proc.pid));
         } else {
             report.killed += 1;
             report.killed_pids.push(proc.pid);
@@ -126,68 +124,98 @@ struct ScannedProcess {
     age_secs: u64,
 }
 
+#[derive(Debug, Default)]
+struct ProcessScan {
+    processes: Vec<ScannedProcess>,
+    errors: Vec<String>,
+}
+
 #[cfg(target_os = "linux")]
-fn list_wezterm_cli_processes() -> Result<Vec<ScannedProcess>, String> {
+fn list_wezterm_cli_processes() -> ProcessScan {
     list_wezterm_cli_processes_via_ps(["-eo", "pid=,etimes=,args="], parse_ps_age_secs_linux)
 }
 
 #[cfg(target_os = "macos")]
-fn list_wezterm_cli_processes() -> Result<Vec<ScannedProcess>, String> {
-    list_wezterm_cli_processes_via_ps(
-        ["-axo", "pid=,etime=,command="],
-        parse_ps_age_secs_macos,
-    )
+fn list_wezterm_cli_processes() -> ProcessScan {
+    list_wezterm_cli_processes_via_ps(["-axo", "pid=,etime=,command="], parse_ps_age_secs_macos)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn list_wezterm_cli_processes() -> Result<Vec<ScannedProcess>, String> {
-    Err("orphan reaper not supported on this platform".to_string())
+fn list_wezterm_cli_processes() -> ProcessScan {
+    ProcessScan {
+        processes: Vec::new(),
+        errors: vec!["orphan reaper not supported on this platform".to_string()],
+    }
 }
 
 fn list_wezterm_cli_processes_via_ps<const N: usize>(
     ps_args: [&str; N],
     parse_age_secs: fn(&str) -> Result<u64, String>,
-) -> Result<Vec<ScannedProcess>, String> {
+) -> ProcessScan {
     use std::process::Command;
 
-    let output = Command::new("ps")
-        .args(ps_args)
-        .output()
-        .map_err(|e| format!("ps failed: {e}"))?;
+    let output = match Command::new("ps").args(ps_args).output() {
+        Ok(output) => output,
+        Err(e) => {
+            return ProcessScan {
+                processes: Vec::new(),
+                errors: vec![format!("ps failed: {e}")],
+            };
+        }
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("ps returned non-zero: {stderr}"));
+        return ProcessScan {
+            processes: Vec::new(),
+            errors: vec![format!("ps returned non-zero: {stderr}")],
+        };
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut processes = Vec::new();
+    let mut scan = ProcessScan::default();
     for line in stdout.lines() {
         let line = line.trim_start();
         if line.is_empty() {
             continue;
         }
 
-        let (pid_str, rest) = split_first_token(line)
-            .ok_or_else(|| format!("unexpected ps line (pid missing): {line}"))?;
-        let pid: u32 = pid_str
-            .parse()
-            .map_err(|e| format!("parse pid {pid_str:?}: {e}"))?;
+        let Some((pid_str, rest)) = split_first_token(line) else {
+            scan.errors
+                .push(format!("unexpected ps line (pid missing): {line}"));
+            continue;
+        };
+        let pid: u32 = pid_str.parse().unwrap_or_else(|e| {
+            scan.errors.push(format!("parse pid {pid_str:?}: {e}"));
+            0
+        });
+        if pid == 0 {
+            continue;
+        }
 
         let rest = rest.trim_start();
-        let (age_str, rest) = split_first_token(rest)
-            .ok_or_else(|| format!("unexpected ps line (age missing): {line}"))?;
-        let age_secs = parse_age_secs(age_str)?;
+        let Some((age_str, rest)) = split_first_token(rest) else {
+            scan.errors
+                .push(format!("unexpected ps line (age missing): {line}"));
+            continue;
+        };
+        let age_secs = match parse_age_secs(age_str) {
+            Ok(age_secs) => age_secs,
+            Err(e) => {
+                debug!(pid, error = %e, "Could not parse process age");
+                continue;
+            }
+        };
 
         let command = rest.trim_start();
         if !command.contains("wezterm cli") {
             continue;
         }
 
-        processes.push(ScannedProcess { pid, age_secs });
+        scan.processes.push(ScannedProcess { pid, age_secs });
     }
 
-    Ok(processes)
+    scan
 }
 
 fn split_first_token(input: &str) -> Option<(&str, &str)> {

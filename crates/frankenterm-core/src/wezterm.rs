@@ -96,6 +96,16 @@ pub fn wezterm_handle_with_timeout(timeout_secs: u64) -> WeztermHandle {
     Arc::new(WeztermClient::new().with_timeout(timeout_secs))
 }
 
+/// Create a WezTerm handle configured from the provided `ft` config.
+///
+/// When the `vendored` feature is available and a mux socket is discoverable,
+/// this prefers the direct mux socket backend with a connection pool, falling
+/// back to `wezterm cli` subprocesses when needed.
+#[must_use]
+pub fn wezterm_handle_from_config(config: &crate::config::Config) -> WeztermHandle {
+    Arc::new(build_unified_client(config))
+}
+
 /// Pane size information
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PaneSize {
@@ -628,6 +638,97 @@ impl WeztermClient {
     /// * `pane_id` - The pane to read from
     /// * `escapes` - Whether to include escape sequences (useful for capturing color info)
     pub async fn get_text(&self, pane_id: u64, escapes: bool) -> Result<String> {
+        // Vendored mux backend does not currently support escape-sequence text
+        // extraction; fall back to CLI for `--escapes`.
+        #[cfg(all(feature = "vendored", unix))]
+        if let Some(ref pool) = self.mux_pool {
+            if escapes {
+                tracing::debug!("mux pool get_text does not support escapes; falling back to CLI");
+            } else {
+                let mut pool_text: Option<String> = None;
+                'mux_text: {
+                    let changes = match pool.get_pane_render_changes(pane_id).await {
+                        Ok(changes) => changes,
+                        Err(e) => {
+                            tracing::debug!(
+                                error = %e,
+                                "mux pool get_text: render_changes failed; falling back to CLI"
+                            );
+                            break 'mux_text;
+                        }
+                    };
+
+                    let scrollback_top = changes.dimensions.scrollback_top;
+                    let scrollback_rows: isize = match changes.dimensions.scrollback_rows.try_into()
+                    {
+                        Ok(v) => v,
+                        Err(_) => {
+                            tracing::debug!(
+                                rows = changes.dimensions.scrollback_rows,
+                                "mux pool get_text: scrollback_rows overflow; falling back to CLI"
+                            );
+                            break 'mux_text;
+                        }
+                    };
+                    let scrollback_end = match scrollback_top.checked_add(scrollback_rows) {
+                        Some(v) => v,
+                        None => {
+                            tracing::debug!(
+                                top = scrollback_top,
+                                rows = scrollback_rows,
+                                "mux pool get_text: scrollback range overflow; falling back to CLI"
+                            );
+                            break 'mux_text;
+                        }
+                    };
+
+                    if scrollback_rows <= 0 || scrollback_end <= scrollback_top {
+                        pool_text = Some(String::new());
+                        break 'mux_text;
+                    }
+
+                    // Fetch the full scrollback in bounded chunks to avoid
+                    // mux frame size limits.
+                    const CHUNK_ROWS: isize = 2_000;
+                    let mut out = String::new();
+                    let mut start = scrollback_top;
+
+                    while start < scrollback_end {
+                        let chunk_end = start
+                            .checked_add(CHUNK_ROWS)
+                            .unwrap_or(scrollback_end)
+                            .min(scrollback_end);
+
+                        match pool.get_lines(pane_id, vec![start..chunk_end]).await {
+                            Ok(resp) => {
+                                let (mut lines, _images) = resp.lines.extract_data();
+                                lines.sort_by_key(|(idx, _)| *idx);
+                                for (_, line) in lines {
+                                    out.push_str(line.as_str().as_ref());
+                                    out.push('\n');
+                                }
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    error = %e,
+                                    "mux pool get_text: get_lines failed; falling back to CLI"
+                                );
+                                break 'mux_text;
+                            }
+                        }
+
+                        start = chunk_end;
+                    }
+
+                    pool_text = Some(out);
+                }
+
+                if let Some(text) = pool_text {
+                    return Ok(text);
+                }
+            }
+        }
+
         let pane_id_str = pane_id.to_string();
         let mut args = vec!["cli", "get-text", "--pane-id", &pane_id_str];
         if escapes {
@@ -2299,20 +2400,32 @@ pub fn build_unified_client(config: &crate::config::Config) -> UnifiedClient {
         "UnifiedClient backend selection"
     );
 
-    let inner: WeztermHandle = match selection.kind {
-        BackendKind::Cli => Arc::new(WeztermClient::new()),
-        BackendKind::Vendored => {
-            // Even though selection says Vendored, we still wrap the CLI client
-            // because DirectMuxClient doesn't implement WeztermInterface (it has a
-            // different async API with &mut self). A future bead can bridge the gap
-            // with a proper adapter; for now, vendored selection is recorded for
-            // observability while we use CLI as the transport.
-            //
-            // TODO(wa-nu4.4.1.5): Implement VendoredAdapter that wraps
-            // DirectMuxClient behind WeztermInterface.
-            Arc::new(WeztermClient::new())
-        }
+    let client = match config.vendored.mux_socket_path.as_deref() {
+        Some(path) if !path.trim().is_empty() => WeztermClient::with_socket(path.to_string()),
+        _ => WeztermClient::new(),
+    }
+    .with_timeout(config.cli.timeout_seconds);
+
+    #[cfg(all(feature = "vendored", unix))]
+    let client = if selection.kind == BackendKind::Vendored {
+        let mux = crate::vendored::DirectMuxClientConfig::from_wa_config(config);
+        let pool = crate::pool::PoolConfig {
+            max_size: config.vendored.mux_pool.max_connections.max(1),
+            idle_timeout: std::time::Duration::from_secs(
+                config.vendored.mux_pool.idle_timeout_seconds,
+            ),
+            acquire_timeout: std::time::Duration::from_secs(
+                config.vendored.mux_pool.acquire_timeout_seconds.max(1),
+            ),
+        };
+        let pool = crate::vendored::MuxPoolConfig { pool, mux };
+        let pool = Arc::new(crate::vendored::MuxPool::new(pool));
+        client.with_mux_pool(pool)
+    } else {
+        client
     };
+
+    let inner: WeztermHandle = Arc::new(client);
 
     UnifiedClient { inner, selection }
 }
@@ -2706,6 +2819,84 @@ impl WeztermInterface for MockWezterm {
     fn circuit_status(&self) -> CircuitBreakerStatus {
         CircuitBreakerStatus::default()
     }
+}
+
+/// Create a mock `WeztermHandle` for testing.
+///
+/// The mock succeeds on all operations (list_panes returns empty, etc.).
+#[cfg(test)]
+#[must_use]
+pub fn mock_wezterm_handle() -> WeztermHandle {
+    Arc::new(MockWezterm::new())
+}
+
+/// Mock that always fails for list_panes (simulates unresponsive mux server).
+#[cfg(test)]
+struct FailingMockWezterm;
+
+#[cfg(test)]
+impl WeztermInterface for FailingMockWezterm {
+    fn list_panes(&self) -> WeztermFuture<'_, Vec<PaneInfo>> {
+        Box::pin(async { Err(crate::Error::Wezterm(WeztermError::Timeout(5))) })
+    }
+    fn get_pane(&self, pane_id: u64) -> WeztermFuture<'_, PaneInfo> {
+        Box::pin(async move { Err(crate::Error::Wezterm(WeztermError::PaneNotFound(pane_id))) })
+    }
+    fn get_text(&self, _: u64, _: bool) -> WeztermFuture<'_, String> {
+        Box::pin(async { Err(crate::Error::Wezterm(WeztermError::Timeout(5))) })
+    }
+    fn send_text(&self, _: u64, _: &str) -> WeztermFuture<'_, ()> {
+        Box::pin(async { Err(crate::Error::Wezterm(WeztermError::Timeout(5))) })
+    }
+    fn send_text_no_paste(&self, _: u64, _: &str) -> WeztermFuture<'_, ()> {
+        Box::pin(async { Err(crate::Error::Wezterm(WeztermError::Timeout(5))) })
+    }
+    fn send_text_with_options(&self, _: u64, _: &str, _: bool, _: bool) -> WeztermFuture<'_, ()> {
+        Box::pin(async { Err(crate::Error::Wezterm(WeztermError::Timeout(5))) })
+    }
+    fn send_control(&self, _: u64, _: &str) -> WeztermFuture<'_, ()> {
+        Box::pin(async { Err(crate::Error::Wezterm(WeztermError::Timeout(5))) })
+    }
+    fn send_ctrl_c(&self, _: u64) -> WeztermFuture<'_, ()> {
+        Box::pin(async { Err(crate::Error::Wezterm(WeztermError::Timeout(5))) })
+    }
+    fn send_ctrl_d(&self, _: u64) -> WeztermFuture<'_, ()> {
+        Box::pin(async { Err(crate::Error::Wezterm(WeztermError::Timeout(5))) })
+    }
+    fn spawn(&self, _: Option<&str>, _: Option<&str>) -> WeztermFuture<'_, u64> {
+        Box::pin(async { Err(crate::Error::Wezterm(WeztermError::Timeout(5))) })
+    }
+    fn activate_pane(&self, _: u64) -> WeztermFuture<'_, ()> {
+        Box::pin(async { Err(crate::Error::Wezterm(WeztermError::Timeout(5))) })
+    }
+    fn split_pane(
+        &self,
+        _: u64,
+        _: SplitDirection,
+        _: Option<&str>,
+        _: Option<u8>,
+    ) -> WeztermFuture<'_, u64> {
+        Box::pin(async { Err(crate::Error::Wezterm(WeztermError::Timeout(5))) })
+    }
+    fn get_pane_direction(&self, _: u64, _: MoveDirection) -> WeztermFuture<'_, Option<u64>> {
+        Box::pin(async { Err(crate::Error::Wezterm(WeztermError::Timeout(5))) })
+    }
+    fn kill_pane(&self, _: u64) -> WeztermFuture<'_, ()> {
+        Box::pin(async { Err(crate::Error::Wezterm(WeztermError::Timeout(5))) })
+    }
+    fn zoom_pane(&self, _: u64, _: bool) -> WeztermFuture<'_, ()> {
+        Box::pin(async { Err(crate::Error::Wezterm(WeztermError::Timeout(5))) })
+    }
+    fn circuit_status(&self) -> CircuitBreakerStatus {
+        CircuitBreakerStatus::default()
+    }
+}
+
+/// Create a mock `WeztermHandle` that always fails (for testing failure paths).
+#[cfg(test)]
+#[must_use]
+pub fn mock_wezterm_handle_failing() -> WeztermHandle {
+    Arc::new(FailingMockWezterm)
 }
 
 #[cfg(test)]

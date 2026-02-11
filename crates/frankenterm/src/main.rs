@@ -7025,6 +7025,12 @@ async fn run_watcher(
         None
     };
 
+    // Build a single shared WezTerm handle for this watcher process.
+    //
+    // When vendored mux pooling is available/configured, this will avoid
+    // spawning `wezterm cli` subprocesses on hot paths.
+    let wezterm_handle = frankenterm_core::wezterm::wezterm_handle_from_config(&config);
+
     // Set up workflow runner if auto_handle is enabled
     let _workflow_runner_handle = if auto_handle {
         // Create shared storage for workflow runner (recreate config since it doesn't impl Clone)
@@ -7036,7 +7042,7 @@ async fn run_watcher(
 
         // Create policy engine (permissive defaults for auto-handling)
         let policy_engine = PolicyEngine::permissive();
-        let wezterm_handle = frankenterm_core::wezterm::default_wezterm_handle();
+        let wezterm_handle = wezterm_handle.clone();
         let injector = Arc::new(tokio::sync::Mutex::new(PolicyGatedInjector::with_storage(
             policy_engine,
             wezterm_handle,
@@ -7126,7 +7132,8 @@ async fn run_watcher(
 
     // Create and start the observation runtime (with event bus for workflow integration)
     let mut runtime = ObservationRuntime::new(runtime_config, storage, pattern_engine)
-        .with_event_bus(Arc::clone(&event_bus));
+        .with_event_bus(Arc::clone(&event_bus))
+        .with_wezterm_handle(wezterm_handle.clone());
     let handle = Arc::new(runtime.start().await?);
     tracing::info!("Observation runtime started");
 
@@ -7273,6 +7280,15 @@ async fn run_watcher(
         tokio::spawn(async move {
             frankenterm_core::orphan_reaper::run_orphan_reaper(cli_config, shutdown_flag).await;
         })
+    };
+
+    // Start mux server watchdog (health monitoring + memory tracking)
+    let _mux_watchdog_handle = {
+        let watchdog_config = frankenterm_core::watchdog::MuxWatchdogConfig::default();
+        let wezterm =
+            frankenterm_core::wezterm::wezterm_handle_with_timeout(config.cli.timeout_seconds);
+        let shutdown_flag = Arc::clone(&handle.shutdown_flag);
+        frankenterm_core::watchdog::spawn_mux_watchdog(watchdog_config, wezterm, shutdown_flag)
     };
 
     // Track current config for hot reload

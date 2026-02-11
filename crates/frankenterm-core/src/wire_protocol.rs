@@ -964,7 +964,7 @@ mod tests {
     #[test]
     fn streamer_seq_increments() {
         let mut streamer = AgentStreamer::new("test");
-        let events = vec![
+        let events = [
             Event::SegmentCaptured {
                 pane_id: 1,
                 seq: 1,

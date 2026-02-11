@@ -343,6 +343,318 @@ pub fn spawn_watchdog(
     }
 }
 
+// =============================================================================
+// Mux Server Watchdog
+// =============================================================================
+
+/// Configuration for the mux server watchdog.
+#[derive(Debug, Clone)]
+pub struct MuxWatchdogConfig {
+    /// How often to check mux server health (default: 30s).
+    pub check_interval: Duration,
+    /// Timeout for the ping health check (default: 5s).
+    pub ping_timeout: Duration,
+    /// Consecutive failures before reporting to DegradationManager.
+    pub failure_threshold: u32,
+    /// RSS memory warning threshold in bytes (default: 32 GB).
+    pub memory_warning_bytes: u64,
+    /// RSS memory critical threshold in bytes (default: 64 GB).
+    pub memory_critical_bytes: u64,
+    /// Ring buffer capacity for health history.
+    pub history_capacity: usize,
+}
+
+impl Default for MuxWatchdogConfig {
+    fn default() -> Self {
+        Self {
+            check_interval: Duration::from_secs(30),
+            ping_timeout: Duration::from_secs(5),
+            failure_threshold: 3,
+            memory_warning_bytes: 32 * 1024 * 1024 * 1024, // 32 GB
+            memory_critical_bytes: 64 * 1024 * 1024 * 1024, // 64 GB
+            history_capacity: 1000,
+        }
+    }
+}
+
+/// Result of a single mux server health check.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MuxHealthSample {
+    /// Epoch ms when sample was taken.
+    pub timestamp_ms: u64,
+    /// Whether the ping succeeded.
+    pub ping_ok: bool,
+    /// Ping latency in milliseconds (None if failed).
+    pub ping_latency_ms: Option<u64>,
+    /// Resident set size in bytes (None if unavailable).
+    pub rss_bytes: Option<u64>,
+    /// Health status derived from this sample.
+    pub status: HealthStatus,
+}
+
+/// Mux server health report with history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MuxHealthReport {
+    pub timestamp_ms: u64,
+    pub status: HealthStatus,
+    pub consecutive_failures: u32,
+    pub latest_sample: Option<MuxHealthSample>,
+    pub total_checks: u64,
+    pub total_failures: u64,
+}
+
+/// Mux server watchdog — monitors mux server health and reports to DegradationManager.
+pub struct MuxWatchdog {
+    config: MuxWatchdogConfig,
+    wezterm: crate::wezterm::WeztermHandle,
+    /// Ring buffer of recent health samples.
+    history: std::collections::VecDeque<MuxHealthSample>,
+    consecutive_failures: u32,
+    total_checks: u64,
+    total_failures: u64,
+}
+
+impl MuxWatchdog {
+    /// Create a new mux watchdog.
+    #[must_use]
+    pub fn new(config: MuxWatchdogConfig, wezterm: crate::wezterm::WeztermHandle) -> Self {
+        Self {
+            config,
+            wezterm,
+            history: std::collections::VecDeque::with_capacity(1000),
+            consecutive_failures: 0,
+            total_checks: 0,
+            total_failures: 0,
+        }
+    }
+
+    /// Run a single health check and return the sample.
+    pub async fn check(&mut self) -> MuxHealthSample {
+        self.total_checks += 1;
+        let now = epoch_ms();
+        let start = std::time::Instant::now();
+
+        // Ping: try listing panes with timeout
+        let ping_ok = matches!(
+            tokio::time::timeout(self.config.ping_timeout, self.wezterm.list_panes()).await,
+            Ok(Ok(_))
+        );
+
+        let ping_latency_ms = if ping_ok {
+            Some(start.elapsed().as_millis() as u64)
+        } else {
+            None
+        };
+
+        // Memory check: get mux server RSS
+        let rss_bytes = get_mux_server_rss().await;
+
+        // Determine status
+        let status = if !ping_ok {
+            self.consecutive_failures += 1;
+            self.total_failures += 1;
+            if self.consecutive_failures >= self.config.failure_threshold {
+                HealthStatus::Critical
+            } else {
+                HealthStatus::Degraded
+            }
+        } else {
+            self.consecutive_failures = 0;
+            match rss_bytes {
+                Some(rss) if rss >= self.config.memory_critical_bytes => HealthStatus::Critical,
+                Some(rss) if rss >= self.config.memory_warning_bytes => HealthStatus::Degraded,
+                _ => HealthStatus::Healthy,
+            }
+        };
+
+        let sample = MuxHealthSample {
+            timestamp_ms: now,
+            ping_ok,
+            ping_latency_ms,
+            rss_bytes,
+            status,
+        };
+
+        // Store in history ring buffer
+        if self.history.len() >= self.config.history_capacity {
+            self.history.pop_front();
+        }
+        self.history.push_back(sample.clone());
+
+        sample
+    }
+
+    /// Get the current health report.
+    #[must_use]
+    pub fn report(&self) -> MuxHealthReport {
+        MuxHealthReport {
+            timestamp_ms: epoch_ms(),
+            status: self
+                .history
+                .back()
+                .map_or(HealthStatus::Healthy, |s| s.status),
+            consecutive_failures: self.consecutive_failures,
+            latest_sample: self.history.back().cloned(),
+            total_checks: self.total_checks,
+            total_failures: self.total_failures,
+        }
+    }
+}
+
+/// Spawn the mux watchdog as a background task.
+#[must_use]
+pub fn spawn_mux_watchdog(
+    config: MuxWatchdogConfig,
+    wezterm: crate::wezterm::WeztermHandle,
+    shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
+) -> JoinHandle<()> {
+    let check_interval = config.check_interval;
+    let failure_threshold = config.failure_threshold;
+
+    tokio::spawn(async move {
+        let mut watchdog = MuxWatchdog::new(config, wezterm);
+        let mut interval = tokio::time::interval(check_interval);
+
+        info!("Mux watchdog started");
+
+        loop {
+            interval.tick().await;
+
+            if shutdown_flag.load(Ordering::SeqCst) {
+                info!("Mux watchdog shutting down");
+                break;
+            }
+
+            let sample = watchdog.check().await;
+
+            match sample.status {
+                HealthStatus::Healthy => {
+                    if watchdog.total_checks % 10 == 0 {
+                        info!(
+                            ping_ms = sample.ping_latency_ms,
+                            rss_mb = sample.rss_bytes.map(|b| b / (1024 * 1024)),
+                            "Mux watchdog: healthy"
+                        );
+                    }
+                }
+                HealthStatus::Degraded => {
+                    warn!(
+                        consecutive_failures = watchdog.consecutive_failures,
+                        rss_mb = sample.rss_bytes.map(|b| b / (1024 * 1024)),
+                        ping_ok = sample.ping_ok,
+                        "Mux watchdog: degraded"
+                    );
+                    crate::degradation::enter_degraded(
+                        crate::degradation::Subsystem::WeztermCli,
+                        format!(
+                            "Mux health degraded: {} consecutive failures",
+                            watchdog.consecutive_failures
+                        ),
+                    );
+                }
+                HealthStatus::Critical => {
+                    error!(
+                        consecutive_failures = watchdog.consecutive_failures,
+                        rss_mb = sample.rss_bytes.map(|b| b / (1024 * 1024)),
+                        ping_ok = sample.ping_ok,
+                        threshold = failure_threshold,
+                        "Mux watchdog: CRITICAL — mux server unresponsive or memory critical"
+                    );
+                    crate::degradation::enter_degraded(
+                        crate::degradation::Subsystem::WeztermCli,
+                        format!(
+                            "Mux health critical: {} consecutive failures, RSS={} MB",
+                            watchdog.consecutive_failures,
+                            sample.rss_bytes.map_or(0, |b| b / (1024 * 1024))
+                        ),
+                    );
+                }
+            }
+        }
+    })
+}
+
+/// Get the RSS (resident set size) of the wezterm-mux-server process.
+async fn get_mux_server_rss() -> Option<u64> {
+    tokio::task::spawn_blocking(get_mux_server_rss_sync)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Synchronous RSS lookup for wezterm-mux-server.
+#[cfg(target_os = "macos")]
+fn get_mux_server_rss_sync() -> Option<u64> {
+    use std::process::Command;
+
+    // Find the mux server PID
+    let pgrep = Command::new("pgrep")
+        .args(["-f", "wezterm-mux-server"])
+        .output()
+        .ok()?;
+
+    if !pgrep.status.success() {
+        return None;
+    }
+
+    let pid_str = String::from_utf8_lossy(&pgrep.stdout);
+    let pid: u32 = pid_str.lines().next()?.trim().parse().ok()?;
+
+    // Get RSS via ps (in KB on macOS)
+    let ps = Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+
+    if !ps.status.success() {
+        return None;
+    }
+
+    let rss_kb: u64 = String::from_utf8_lossy(&ps.stdout).trim().parse().ok()?;
+
+    Some(rss_kb * 1024) // Convert KB to bytes
+}
+
+/// Synchronous RSS lookup for wezterm-mux-server.
+#[cfg(target_os = "linux")]
+fn get_mux_server_rss_sync() -> Option<u64> {
+    use std::process::Command;
+
+    // Find the mux server PID
+    let pgrep = Command::new("pgrep")
+        .args(["-f", "wezterm-mux-server"])
+        .output()
+        .ok()?;
+
+    if !pgrep.status.success() {
+        return None;
+    }
+
+    let pid_str = String::from_utf8_lossy(&pgrep.stdout);
+    let pid: &str = pid_str.lines().next()?.trim();
+
+    // Read VmRSS from /proc/<pid>/status
+    let status_path = format!("/proc/{pid}/status");
+    let contents = std::fs::read_to_string(status_path).ok()?;
+
+    for line in contents.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            let rest = rest.trim();
+            // Format: "12345 kB"
+            let kb_str = rest.split_whitespace().next()?;
+            let rss_kb: u64 = kb_str.parse().ok()?;
+            return Some(rss_kb * 1024); // Convert KB to bytes
+        }
+    }
+
+    None
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn get_mux_server_rss_sync() -> Option<u64> {
+    None
+}
+
 fn epoch_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -485,5 +797,132 @@ mod tests {
     fn health_status_ordering() {
         assert!(HealthStatus::Healthy < HealthStatus::Degraded);
         assert!(HealthStatus::Degraded < HealthStatus::Critical);
+    }
+
+    // =================================================================
+    // MuxWatchdog tests
+    // =================================================================
+
+    #[test]
+    fn mux_watchdog_config_defaults() {
+        let config = MuxWatchdogConfig::default();
+        assert_eq!(config.check_interval, Duration::from_secs(30));
+        assert_eq!(config.ping_timeout, Duration::from_secs(5));
+        assert_eq!(config.failure_threshold, 3);
+        assert_eq!(config.memory_warning_bytes, 32 * 1024 * 1024 * 1024);
+        assert_eq!(config.memory_critical_bytes, 64 * 1024 * 1024 * 1024);
+        assert_eq!(config.history_capacity, 1000);
+    }
+
+    #[test]
+    fn mux_health_sample_serializes() {
+        let sample = MuxHealthSample {
+            timestamp_ms: 1_700_000_000_000,
+            ping_ok: true,
+            ping_latency_ms: Some(5),
+            rss_bytes: Some(1024 * 1024 * 100),
+            status: HealthStatus::Healthy,
+        };
+        let json = serde_json::to_string(&sample).unwrap();
+        assert!(json.contains("\"ping_ok\":true"));
+        assert!(json.contains("\"ping_latency_ms\":5"));
+        let parsed: MuxHealthSample = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.status, HealthStatus::Healthy);
+    }
+
+    #[test]
+    fn mux_health_report_serializes() {
+        let report = MuxHealthReport {
+            timestamp_ms: 1_700_000_000_000,
+            status: HealthStatus::Healthy,
+            consecutive_failures: 0,
+            latest_sample: None,
+            total_checks: 10,
+            total_failures: 1,
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"total_checks\":10"));
+        let parsed: MuxHealthReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.total_failures, 1);
+    }
+
+    #[test]
+    fn mux_watchdog_initial_report_is_healthy() {
+        let config = MuxWatchdogConfig::default();
+        let wezterm = crate::wezterm::mock_wezterm_handle();
+        let watchdog = MuxWatchdog::new(config, wezterm);
+        let report = watchdog.report();
+        assert_eq!(report.status, HealthStatus::Healthy);
+        assert_eq!(report.consecutive_failures, 0);
+        assert_eq!(report.total_checks, 0);
+    }
+
+    #[tokio::test]
+    async fn mux_watchdog_records_successful_check() {
+        let config = MuxWatchdogConfig::default();
+        let wezterm = crate::wezterm::mock_wezterm_handle();
+        let mut watchdog = MuxWatchdog::new(config, wezterm);
+
+        let sample = watchdog.check().await;
+        assert!(sample.ping_ok);
+        assert_eq!(sample.status, HealthStatus::Healthy);
+        assert_eq!(watchdog.consecutive_failures, 0);
+        assert_eq!(watchdog.total_checks, 1);
+        assert_eq!(watchdog.history.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn mux_watchdog_detects_failure() {
+        let config = MuxWatchdogConfig {
+            failure_threshold: 2,
+            ..MuxWatchdogConfig::default()
+        };
+        let wezterm = crate::wezterm::mock_wezterm_handle_failing();
+        let mut watchdog = MuxWatchdog::new(config, wezterm);
+
+        // First failure: degraded
+        let sample = watchdog.check().await;
+        assert!(!sample.ping_ok);
+        assert_eq!(sample.status, HealthStatus::Degraded);
+        assert_eq!(watchdog.consecutive_failures, 1);
+
+        // Second failure: critical (meets threshold)
+        let sample = watchdog.check().await;
+        assert_eq!(sample.status, HealthStatus::Critical);
+        assert_eq!(watchdog.consecutive_failures, 2);
+    }
+
+    #[tokio::test]
+    async fn mux_watchdog_resets_on_success() {
+        let config = MuxWatchdogConfig::default();
+        let wezterm = crate::wezterm::mock_wezterm_handle();
+        let mut watchdog = MuxWatchdog::new(config, wezterm);
+
+        // Simulate prior failures
+        watchdog.consecutive_failures = 5;
+        watchdog.total_failures = 5;
+
+        let sample = watchdog.check().await;
+        assert!(sample.ping_ok);
+        assert_eq!(watchdog.consecutive_failures, 0);
+        // total_failures should NOT reset
+        assert_eq!(watchdog.total_failures, 5);
+    }
+
+    #[tokio::test]
+    async fn mux_watchdog_history_bounded() {
+        let config = MuxWatchdogConfig {
+            history_capacity: 3,
+            ..MuxWatchdogConfig::default()
+        };
+        let wezterm = crate::wezterm::mock_wezterm_handle();
+        let mut watchdog = MuxWatchdog::new(config, wezterm);
+
+        for _ in 0..5 {
+            watchdog.check().await;
+        }
+
+        assert_eq!(watchdog.history.len(), 3, "history should be bounded");
+        assert_eq!(watchdog.total_checks, 5);
     }
 }
