@@ -23,7 +23,7 @@ Top picks (ranked by impact/effort, and mapped to existing work where possible):
 
 | Rank | Pattern | Why it matters | Existing beads / work |
 |------|---------|----------------|------------------------|
-| 1 | Coalesced wakeups + “drain then notify once” | Prevent notification storms; reduces task churn and lock contention under bursty output | `wa-x4rq` (native output coalescing + batching); consider extending to mux notifications + workflow triggers |
+| 1 | Coalesced wakeups + “drain then notify once” | Prevent notification storms; reduces task churn and lock contention under bursty output | `wa-x4rq` (native output coalescing + batching); `wa-7o4f` (mux notification coalescing + callback-outside-lock) |
 | 2 | Data-plane vs control-plane split | Treat “bulk output deltas” differently from “structural events” (resize/title/pane lifecycle); simplifies backpressure and schemas | `wa-3dfxb.13` (native event hooks) + native event listener beads; `wa-x4rq` |
 | 3 | Byte-budgeted pools + coarse eviction/reuse | Predictable memory envelopes under output floods; reduces allocator churn | `wa-2ahu0` (memory pressure engine), `wa-8vla` (mmap scrollback), `wa-3axa` (allocator work) |
 | 4 | Keep bytes→state locality where possible | Avoid per-pane “byte shuttle” overhead; fewer threads/copies and less coordination | Native integration beads + runtime/tailer evolution; see wa-3bja.3 for WezTerm vs Ghostty thread model delta |
@@ -154,5 +154,14 @@ This section should list:
 - Which recommendations map to existing beads (preferred).
 - New beads created for genuinely uncovered work, each requiring `/porting-to-rust`.
 
-TBD: populate after bead creation pass.
+### Existing beads to lean on
 
+- Coalescing notifications: `wa-x4rq`
+- Native event hook surface (data/control split): `wa-3dfxb.13` (and the in-progress native event listener beads)
+- Memory pressure / budgeting: `wa-2ahu0`, `wa-3axa`, `wa-8vla`
+
+### New beads created from this synthesis
+
+- `wa-7o4f` — Mux notifications: coalesce `PaneOutput` and run subscribers outside lock
+  - Derived from `evidence/ghostty/event-system.md` (Ghostty wakeup + mailbox drain model vs mux fan-out).
+  - Requires `/porting-to-rust` (spec-first).
