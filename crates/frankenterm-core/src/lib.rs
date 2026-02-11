@@ -73,6 +73,8 @@ pub mod events;
 pub mod explanations;
 pub mod export;
 pub mod extensions;
+#[cfg(unix)]
+pub mod fd_budget;
 pub mod incident_bundle;
 pub mod ingest;
 #[cfg(unix)]
