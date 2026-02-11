@@ -560,14 +560,30 @@ fn affected_capabilities(s: Subsystem) -> Vec<String> {
 
 // ── Free functions for convenience ──────────────────────────────────
 
+fn with_global_degradation_lock<T>(f: impl FnOnce() -> T) -> T {
+    #[cfg(test)]
+    {
+        static TEST_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+        let lock = TEST_LOCK.get_or_init(|| std::sync::Mutex::new(()));
+        let _guard = lock.lock().unwrap();
+        f()
+    }
+    #[cfg(not(test))]
+    {
+        f()
+    }
+}
+
 /// Check if a subsystem is currently operational (not degraded or unavailable).
 ///
 /// Returns `true` if the global manager is not initialized (fail-open).
 #[must_use]
 pub fn is_operational(subsystem: Subsystem) -> bool {
-    DegradationManager::global().is_none_or(|dm| {
-        dm.read()
-            .map_or(true, |guard| !guard.is_degraded(subsystem))
+    with_global_degradation_lock(|| {
+        DegradationManager::global().is_none_or(|dm| match dm.read() {
+            Ok(guard) => !guard.is_degraded(subsystem),
+            Err(poisoned) => !poisoned.into_inner().is_degraded(subsystem),
+        })
     })
 }
 
@@ -591,83 +607,109 @@ pub fn can_access_wezterm() -> bool {
 
 /// Enter degraded mode for a subsystem (convenience function).
 pub fn enter_degraded(subsystem: Subsystem, reason: String) {
-    if let Some(dm) = DegradationManager::global() {
-        if let Ok(mut guard) = dm.write() {
-            guard.enter_degraded(subsystem, reason);
+    with_global_degradation_lock(|| {
+        if let Some(dm) = DegradationManager::global() {
+            match dm.write() {
+                Ok(mut guard) => guard.enter_degraded(subsystem, reason),
+                Err(poisoned) => poisoned.into_inner().enter_degraded(subsystem, reason),
+            }
         }
-    }
+    });
 }
 
 /// Enter unavailable mode for a subsystem (convenience function).
 pub fn enter_unavailable(subsystem: Subsystem, reason: String) {
-    if let Some(dm) = DegradationManager::global() {
-        if let Ok(mut guard) = dm.write() {
-            guard.enter_unavailable(subsystem, reason);
+    with_global_degradation_lock(|| {
+        if let Some(dm) = DegradationManager::global() {
+            match dm.write() {
+                Ok(mut guard) => guard.enter_unavailable(subsystem, reason),
+                Err(poisoned) => poisoned.into_inner().enter_unavailable(subsystem, reason),
+            }
         }
-    }
+    });
 }
 
 /// Recover a subsystem (convenience function).
 pub fn recover(subsystem: Subsystem) {
-    if let Some(dm) = DegradationManager::global() {
-        if let Ok(mut guard) = dm.write() {
-            guard.recover(subsystem);
+    with_global_degradation_lock(|| {
+        if let Some(dm) = DegradationManager::global() {
+            match dm.write() {
+                Ok(mut guard) => guard.recover(subsystem),
+                Err(poisoned) => poisoned.into_inner().recover(subsystem),
+            }
         }
-    }
+    });
 }
 
 /// Get all active degradation snapshots (convenience function).
 #[must_use]
 pub fn active_degradations() -> Vec<DegradationSnapshot> {
-    DegradationManager::global()
-        .and_then(|dm| dm.read().ok().map(|guard| guard.snapshots()))
-        .unwrap_or_default()
+    with_global_degradation_lock(|| {
+        DegradationManager::global()
+            .map(|dm| match dm.read() {
+                Ok(guard) => guard.snapshots(),
+                Err(poisoned) => poisoned.into_inner().snapshots(),
+            })
+            .unwrap_or_default()
+    })
 }
 
 /// Get the overall system status (convenience function).
 #[must_use]
 pub fn overall_status() -> OverallStatus {
-    DegradationManager::global()
-        .and_then(|dm| dm.read().ok().map(|guard| guard.overall_status()))
-        .unwrap_or(OverallStatus::Healthy)
+    with_global_degradation_lock(|| {
+        DegradationManager::global()
+            .map(|dm| match dm.read() {
+                Ok(guard) => guard.overall_status(),
+                Err(poisoned) => poisoned.into_inner().overall_status(),
+            })
+            .unwrap_or(OverallStatus::Healthy)
+    })
 }
 
 /// Get a full degradation report (convenience function).
 #[must_use]
 pub fn full_report() -> DegradationReport {
-    DegradationManager::global()
-        .and_then(|dm| dm.read().ok().map(|guard| guard.report()))
-        .unwrap_or(DegradationReport {
-            overall: OverallStatus::Healthy,
-            active_degradations: Vec::new(),
-            queued_write_count: 0,
-            disabled_pattern_count: 0,
-            paused_workflow_count: 0,
-        })
+    with_global_degradation_lock(|| {
+        DegradationManager::global()
+            .map(|dm| match dm.read() {
+                Ok(guard) => guard.report(),
+                Err(poisoned) => poisoned.into_inner().report(),
+            })
+            .unwrap_or(DegradationReport {
+                overall: OverallStatus::Healthy,
+                active_degradations: Vec::new(),
+                queued_write_count: 0,
+                disabled_pattern_count: 0,
+                paused_workflow_count: 0,
+            })
+    })
 }
 
 /// Check if a specific pattern rule is disabled (convenience function).
 #[must_use]
 pub fn is_pattern_disabled(rule_id: &str) -> bool {
-    DegradationManager::global()
-        .and_then(|dm| {
-            dm.read()
-                .ok()
-                .map(|guard| guard.is_pattern_disabled(rule_id))
-        })
-        .unwrap_or(false)
+    with_global_degradation_lock(|| {
+        DegradationManager::global()
+            .map(|dm| match dm.read() {
+                Ok(guard) => guard.is_pattern_disabled(rule_id),
+                Err(poisoned) => poisoned.into_inner().is_pattern_disabled(rule_id),
+            })
+            .unwrap_or(false)
+    })
 }
 
 /// Check if a specific workflow is paused (convenience function).
 #[must_use]
 pub fn is_workflow_paused(workflow_id: &str) -> bool {
-    DegradationManager::global()
-        .and_then(|dm| {
-            dm.read()
-                .ok()
-                .map(|guard| guard.is_workflow_paused(workflow_id))
-        })
-        .unwrap_or(false)
+    with_global_degradation_lock(|| {
+        DegradationManager::global()
+            .map(|dm| match dm.read() {
+                Ok(guard) => guard.is_workflow_paused(workflow_id),
+                Err(poisoned) => poisoned.into_inner().is_workflow_paused(workflow_id),
+            })
+            .unwrap_or(false)
+    })
 }
 
 fn epoch_ms() -> u64 {

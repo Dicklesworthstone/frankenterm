@@ -220,13 +220,14 @@ impl CpuPressureMonitor {
     fn read_cpu_pressure(&self) -> f64 {
         #[cfg(target_os = "linux")]
         {
-            read_linux_psi_avg10()
+            read_linux_psi_avg10().clamp(0.0, 100.0)
         }
         #[cfg(target_os = "macos")]
         {
             let load = read_macos_load_avg();
             // Normalize: load_avg / ncpu * 100 → percentage-like metric
-            (load / self.ncpu.max(1) as f64) * 100.0
+            let normalized = (load / self.ncpu.max(1) as f64) * 100.0;
+            normalized.clamp(0.0, 100.0)
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
@@ -425,14 +426,22 @@ mod tests {
         assert_eq!(monitor.current_tier(), CpuPressureTier::Red);
     }
 
+    fn assert_approx_eq(a: f64, b: f64) {
+        let diff = (a - b).abs();
+        assert!(
+            diff < 1e-9,
+            "expected approximately equal: left={a}, right={b}, diff={diff}"
+        );
+    }
+
     #[test]
     fn default_config_values() {
         let cfg = CpuPressureConfig::default();
         assert!(cfg.enabled);
         assert_eq!(cfg.sample_interval_ms, 5000);
-        assert_eq!(cfg.yellow_threshold, 15.0);
-        assert_eq!(cfg.orange_threshold, 30.0);
-        assert_eq!(cfg.red_threshold, 50.0);
+        assert_approx_eq(cfg.yellow_threshold, 15.0);
+        assert_approx_eq(cfg.orange_threshold, 30.0);
+        assert_approx_eq(cfg.red_threshold, 50.0);
     }
 
     #[test]
@@ -440,8 +449,8 @@ mod tests {
         let cfg = CpuPressureConfig::default();
         let json = serde_json::to_string(&cfg).unwrap();
         let parsed: CpuPressureConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.yellow_threshold, cfg.yellow_threshold);
-        assert_eq!(parsed.red_threshold, cfg.red_threshold);
+        assert_approx_eq(parsed.yellow_threshold, cfg.yellow_threshold);
+        assert_approx_eq(parsed.red_threshold, cfg.red_threshold);
     }
 
     #[test]
