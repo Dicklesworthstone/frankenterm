@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::pool::{Pool, PoolAcquireGuard, PoolConfig, PoolError, PoolStats};
 
 use super::mux_client::{DirectMuxClient, DirectMuxClientConfig, DirectMuxError};
-use codec::{GetLinesResponse, GetPaneRenderChangesResponse, ListPanesResponse};
+use codec::{GetLinesResponse, GetPaneRenderChangesResponse, ListPanesResponse, UnitResponse};
 
 /// Error type for mux pool operations.
 #[derive(Debug, thiserror::Error)]
@@ -191,6 +191,46 @@ impl MuxPool {
             }
             Err(e) => {
                 tracing::debug!(error = %e, "mux pool: dropping client after get_pane_render_changes error");
+                Err(MuxPoolError::Mux(e))
+            }
+        }
+    }
+
+    /// Write raw bytes to a pane via a pooled connection (no-paste mode).
+    pub async fn write_to_pane(
+        &self,
+        pane_id: u64,
+        data: Vec<u8>,
+    ) -> Result<UnitResponse, MuxPoolError> {
+        let (mut client, _guard) = self.acquire_client().await?;
+        let result = client.write_to_pane(pane_id, data).await;
+        match result {
+            Ok(response) => {
+                self.return_client(client).await;
+                Ok(response)
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "mux pool: dropping client after write_to_pane error");
+                Err(MuxPoolError::Mux(e))
+            }
+        }
+    }
+
+    /// Send text via paste mode through a pooled connection.
+    pub async fn send_paste(
+        &self,
+        pane_id: u64,
+        data: String,
+    ) -> Result<UnitResponse, MuxPoolError> {
+        let (mut client, _guard) = self.acquire_client().await?;
+        let result = client.send_paste(pane_id, data).await;
+        match result {
+            Ok(response) => {
+                self.return_client(client).await;
+                Ok(response)
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "mux pool: dropping client after send_paste error");
                 Err(MuxPoolError::Mux(e))
             }
         }

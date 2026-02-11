@@ -642,8 +642,15 @@ fn latest_crash_bundle_with_no_bundles_returns_none() {
 fn create_test_db(db_path: &Path) {
     let conn = rusqlite::Connection::open(db_path).unwrap();
     conn.execute_batch(
-        "CREATE TABLE wa_meta (key TEXT PRIMARY KEY, value TEXT);
-         INSERT INTO wa_meta (key, value) VALUES ('schema_version', '7');
+        "CREATE TABLE ft_meta (
+             id INTEGER PRIMARY KEY CHECK (id = 1),
+             schema_version INTEGER NOT NULL,
+             min_compatible_ft TEXT NOT NULL,
+             created_by_ft TEXT NOT NULL,
+             created_at INTEGER NOT NULL
+         );
+         INSERT INTO ft_meta (id, schema_version, min_compatible_ft, created_by_ft, created_at)
+             VALUES (1, 7, '0.1.0', '0.1.0-test', 1700000000000);
          CREATE TABLE events (
              id INTEGER PRIMARY KEY, pane_id INTEGER, rule_id TEXT,
              event_type TEXT, severity TEXT, detected_at INTEGER,

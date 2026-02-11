@@ -679,7 +679,7 @@ pub struct FileRedactionEntry {
 /// Database metadata collected for the bundle.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DbMetadata {
-    /// Schema version (from wa_meta table)
+    /// Schema version (from ft_meta/wa_meta table)
     pub schema_version: Option<i64>,
     /// Database file size in bytes
     pub db_size_bytes: Option<u64>,
@@ -880,12 +880,19 @@ fn collect_db_metadata(db_path: &Path) -> DbMetadata {
 
     let schema_version = conn
         .query_row(
-            "SELECT value FROM wa_meta WHERE key = 'schema_version'",
+            "SELECT schema_version FROM ft_meta WHERE id = 1",
             [],
-            |row| row.get::<_, String>(0),
+            |row| row.get::<_, i64>(0),
         )
         .ok()
-        .and_then(|v| v.parse::<i64>().ok());
+        .or_else(|| {
+            conn.query_row(
+                "SELECT schema_version FROM wa_meta WHERE id = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .ok()
+        });
 
     let journal_mode = conn
         .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))

@@ -7266,6 +7266,15 @@ async fn run_watcher(
         None
     };
 
+    // Start orphan reaper for stuck wezterm cli processes
+    let _orphan_reaper_handle = {
+        let cli_config = config.cli.clone();
+        let shutdown_flag = Arc::clone(&handle.shutdown_flag);
+        tokio::spawn(async move {
+            frankenterm_core::orphan_reaper::run_orphan_reaper(cli_config, shutdown_flag).await;
+        })
+    };
+
     // Track current config for hot reload
     let mut current_config = config.clone();
 

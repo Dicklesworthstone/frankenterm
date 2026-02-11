@@ -82,6 +82,9 @@ pub struct Config {
 
     /// Backpressure policy settings (tiered queue-depth responses)
     pub backpressure: crate::backpressure::BackpressureConfig,
+
+    /// CLI subprocess settings (timeouts, orphan reaper)
+    pub cli: CliConfig,
 }
 
 // =============================================================================
@@ -1956,6 +1959,47 @@ impl Default for VendoredConfig {
     fn default() -> Self {
         Self {
             mux_socket_path: None,
+        }
+    }
+}
+
+// =============================================================================
+// CLI Config
+// =============================================================================
+
+/// CLI subprocess configuration — timeouts and orphan process reaper.
+///
+/// Controls how `wezterm cli` subprocesses are managed to prevent
+/// accumulation of stuck processes under agent swarm workloads.
+///
+/// # Example (ft.toml)
+///
+/// ```toml
+/// [cli]
+/// timeout_seconds = 15
+/// orphan_reap_interval_seconds = 60
+/// orphan_max_age_seconds = 30
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CliConfig {
+    /// Command timeout in seconds. Processes exceeding this are killed.
+    pub timeout_seconds: u64,
+
+    /// How often the orphan reaper scans for stuck processes (seconds).
+    /// Set to 0 to disable the reaper.
+    pub orphan_reap_interval_seconds: u64,
+
+    /// Maximum age in seconds before a wezterm cli process is considered orphaned.
+    pub orphan_max_age_seconds: u64,
+}
+
+impl Default for CliConfig {
+    fn default() -> Self {
+        Self {
+            timeout_seconds: 15,
+            orphan_reap_interval_seconds: 60,
+            orphan_max_age_seconds: 30,
         }
     }
 }

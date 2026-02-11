@@ -50,7 +50,7 @@ use crate::policy::Redactor;
 /// This is the target version that new databases will be initialized to,
 /// and existing databases will be migrated to.
 /// Uses SQLite's PRAGMA user_version for atomic version tracking.
-pub const SCHEMA_VERSION: i32 = 20;
+pub const SCHEMA_VERSION: i32 = 21;
 
 /// Schema initialization SQL
 ///
@@ -71,12 +71,12 @@ CREATE TABLE IF NOT EXISTS schema_version (
     description TEXT
 );
 
--- wa metadata: version compatibility + provenance
-CREATE TABLE IF NOT EXISTS wa_meta (
+-- ft metadata: version compatibility + provenance
+CREATE TABLE IF NOT EXISTS ft_meta (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     schema_version INTEGER NOT NULL,
-    min_compatible_wa TEXT NOT NULL,
-    created_by_wa TEXT NOT NULL,
+    min_compatible_ft TEXT NOT NULL,
+    created_by_ft TEXT NOT NULL,
     created_at INTEGER NOT NULL  -- epoch ms
 );
 
@@ -560,6 +560,49 @@ CREATE TABLE IF NOT EXISTS pane_bookmarks (
 
 CREATE INDEX IF NOT EXISTS idx_pane_bookmarks_pane_id ON pane_bookmarks(pane_id);
 CREATE INDEX IF NOT EXISTS idx_pane_bookmarks_alias ON pane_bookmarks(alias);
+
+-- Mux sessions: top-level session tracking (one per watcher invocation)
+CREATE TABLE IF NOT EXISTS mux_sessions (
+    session_id TEXT PRIMARY KEY,           -- UUID v7 for time-ordering
+    created_at INTEGER NOT NULL,           -- epoch ms
+    last_checkpoint_at INTEGER,            -- epoch ms
+    shutdown_clean INTEGER NOT NULL DEFAULT 0,  -- 1 = graceful, 0 = crash/power loss
+    topology_json TEXT NOT NULL,           -- serialized tab/split tree
+    window_metadata_json TEXT,             -- window size, title, position
+    ft_version TEXT NOT NULL,              -- binary version at creation
+    host_id TEXT                           -- hostname + boot_id for multi-host disambiguation
+);
+
+-- Session checkpoints: individual checkpoint snapshots (many per session)
+CREATE TABLE IF NOT EXISTS session_checkpoints (
+    id INTEGER PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES mux_sessions(session_id) ON DELETE CASCADE,
+    checkpoint_at INTEGER NOT NULL,        -- epoch ms
+    checkpoint_type TEXT NOT NULL CHECK(checkpoint_type IN ('periodic','event','shutdown','startup')),
+    state_hash TEXT NOT NULL,              -- BLAKE3 of serialized state for dedup
+    pane_count INTEGER NOT NULL,
+    total_bytes INTEGER NOT NULL,          -- serialized size for budget tracking
+    metadata_json TEXT                     -- trigger reason for 'event' type
+);
+
+CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON session_checkpoints(session_id, checkpoint_at);
+
+-- Mux pane state: per-pane state snapshot, linked to a checkpoint
+CREATE TABLE IF NOT EXISTS mux_pane_state (
+    id INTEGER PRIMARY KEY,
+    checkpoint_id INTEGER NOT NULL REFERENCES session_checkpoints(id) ON DELETE CASCADE,
+    pane_id INTEGER NOT NULL,              -- WezTerm pane ID at capture time
+    cwd TEXT,
+    command TEXT,                           -- best-effort process name
+    env_json TEXT,                          -- selected env vars (redacted)
+    terminal_state_json TEXT NOT NULL,      -- cursor pos, attributes, alt-screen, scrollback ref
+    agent_metadata_json TEXT,               -- agent type, session ID, state
+    scrollback_checkpoint_seq INTEGER,      -- links to output_segments.seq for replay
+    last_output_at INTEGER                 -- epoch ms of last captured output
+);
+
+CREATE INDEX IF NOT EXISTS idx_pane_state_checkpoint ON mux_pane_state(checkpoint_id);
+CREATE INDEX IF NOT EXISTS idx_pane_state_pane ON mux_pane_state(pane_id);
 
 -- Action history view (audit + undo + workflow step info)
 CREATE VIEW IF NOT EXISTS action_history AS
@@ -1157,6 +1200,96 @@ static MIGRATIONS: &[Migration] = &[
             DROP INDEX IF EXISTS idx_pane_bookmarks_alias;
             DROP INDEX IF EXISTS idx_pane_bookmarks_pane_id;
             DROP TABLE IF EXISTS pane_bookmarks;
+        ",
+        ),
+    },
+    Migration {
+        version: 21,
+        description: "Add session persistence tables and rename wa_meta to ft_meta",
+        up_sql: r"
+            -- Rename wa_meta → ft_meta (rebuild table for column renames)
+            CREATE TABLE IF NOT EXISTS ft_meta (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                schema_version INTEGER NOT NULL,
+                min_compatible_ft TEXT NOT NULL,
+                created_by_ft TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+
+            INSERT OR IGNORE INTO ft_meta (id, schema_version, min_compatible_ft, created_by_ft, created_at)
+                SELECT id, schema_version, min_compatible_wa, created_by_wa, created_at
+                FROM wa_meta WHERE id = 1;
+
+            DROP TABLE IF EXISTS wa_meta;
+
+            -- Session persistence tables
+            CREATE TABLE IF NOT EXISTS mux_sessions (
+                session_id TEXT PRIMARY KEY,
+                created_at INTEGER NOT NULL,
+                last_checkpoint_at INTEGER,
+                shutdown_clean INTEGER NOT NULL DEFAULT 0,
+                topology_json TEXT NOT NULL,
+                window_metadata_json TEXT,
+                ft_version TEXT NOT NULL,
+                host_id TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS session_checkpoints (
+                id INTEGER PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES mux_sessions(session_id) ON DELETE CASCADE,
+                checkpoint_at INTEGER NOT NULL,
+                checkpoint_type TEXT NOT NULL CHECK(checkpoint_type IN ('periodic','event','shutdown','startup')),
+                state_hash TEXT NOT NULL,
+                pane_count INTEGER NOT NULL,
+                total_bytes INTEGER NOT NULL,
+                metadata_json TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_checkpoints_session
+                ON session_checkpoints(session_id, checkpoint_at);
+
+            CREATE TABLE IF NOT EXISTS mux_pane_state (
+                id INTEGER PRIMARY KEY,
+                checkpoint_id INTEGER NOT NULL REFERENCES session_checkpoints(id) ON DELETE CASCADE,
+                pane_id INTEGER NOT NULL,
+                cwd TEXT,
+                command TEXT,
+                env_json TEXT,
+                terminal_state_json TEXT NOT NULL,
+                agent_metadata_json TEXT,
+                scrollback_checkpoint_seq INTEGER,
+                last_output_at INTEGER
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_pane_state_checkpoint ON mux_pane_state(checkpoint_id);
+            CREATE INDEX IF NOT EXISTS idx_pane_state_pane ON mux_pane_state(pane_id);
+        ",
+        down_sql: Some(
+            r"
+            -- Drop session persistence tables
+            DROP INDEX IF EXISTS idx_pane_state_pane;
+            DROP INDEX IF EXISTS idx_pane_state_checkpoint;
+            DROP TABLE IF EXISTS mux_pane_state;
+
+            DROP INDEX IF EXISTS idx_checkpoints_session;
+            DROP TABLE IF EXISTS session_checkpoints;
+
+            DROP TABLE IF EXISTS mux_sessions;
+
+            -- Restore wa_meta from ft_meta
+            CREATE TABLE IF NOT EXISTS wa_meta (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                schema_version INTEGER NOT NULL,
+                min_compatible_wa TEXT NOT NULL,
+                created_by_wa TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+
+            INSERT OR IGNORE INTO wa_meta (id, schema_version, min_compatible_wa, created_by_wa, created_at)
+                SELECT id, schema_version, min_compatible_ft, created_by_ft, created_at
+                FROM ft_meta WHERE id = 1;
+
+            DROP TABLE IF EXISTS ft_meta;
         ",
         ),
     },
@@ -3243,12 +3376,12 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
     }
 
     if current != 0 {
-        check_wa_version_compatibility(conn)?;
+        check_ft_version_compatibility(conn)?;
     }
 
     if current == SCHEMA_VERSION {
         // Already up to date
-        ensure_wa_meta(conn, SCHEMA_VERSION)?;
+        ensure_ft_meta(conn, SCHEMA_VERSION)?;
         return Ok(());
     }
 
@@ -3258,7 +3391,7 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
             .map_err(|e| StorageError::MigrationFailed(format!("Schema init failed: {e}")))?;
         set_user_version(conn, SCHEMA_VERSION)?;
         record_migration(conn, SCHEMA_VERSION, "Initial schema")?;
-        ensure_wa_meta(conn, SCHEMA_VERSION)?;
+        ensure_ft_meta(conn, SCHEMA_VERSION)?;
         return Ok(());
     }
 
@@ -3282,14 +3415,14 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
             .map_err(|e| StorageError::MigrationFailed(format!("Schema init failed: {e}")))?;
         set_user_version(conn, SCHEMA_VERSION)?;
         record_migration(conn, SCHEMA_VERSION, "Schema init from v0")?;
-        ensure_wa_meta(conn, SCHEMA_VERSION)?;
+        ensure_ft_meta(conn, SCHEMA_VERSION)?;
         return Ok(());
     }
 
     // Apply pending migrations for existing databases (version > 0)
     run_migrations(conn, current)?;
 
-    ensure_wa_meta(conn, SCHEMA_VERSION)?;
+    ensure_ft_meta(conn, SCHEMA_VERSION)?;
 
     Ok(())
 }
@@ -3594,21 +3727,21 @@ pub fn get_schema_version(conn: &Connection) -> Result<Option<i32>> {
 }
 
 #[derive(Debug, Clone)]
-struct WaMeta {
+struct FtMeta {
     schema_version: i32,
-    min_compatible_wa: String,
-    created_by_wa: String,
+    min_compatible_ft: String,
+    created_by_ft: String,
     created_at: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct WaVersion {
+struct FtVersion {
     major: u64,
     minor: u64,
     patch: u64,
 }
 
-impl WaVersion {
+impl FtVersion {
     fn parse(input: &str) -> Option<Self> {
         let core = input.split(['-', '+']).next().unwrap_or_default();
         let mut parts = core.split('.');
@@ -3680,64 +3813,100 @@ fn action_plan_record_from_plan(
     })
 }
 
-fn load_wa_meta(conn: &Connection) -> Result<Option<WaMeta>> {
-    if !table_exists(conn, "wa_meta")? {
-        return Ok(None);
+fn load_ft_meta(conn: &Connection) -> Result<Option<FtMeta>> {
+    // Check for new ft_meta table first, fall back to legacy wa_meta
+    if table_exists(conn, "ft_meta")? {
+        return conn
+            .query_row(
+                "SELECT schema_version, min_compatible_ft, created_by_ft, created_at \
+                 FROM ft_meta WHERE id = 1",
+                [],
+                |row| {
+                    Ok(FtMeta {
+                        schema_version: row.get(0)?,
+                        min_compatible_ft: row.get(1)?,
+                        created_by_ft: row.get(2)?,
+                        created_at: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| StorageError::Database(e.to_string()).into());
     }
 
-    conn.query_row(
-        "SELECT schema_version, min_compatible_wa, created_by_wa, created_at \
-         FROM wa_meta WHERE id = 1",
-        [],
-        |row| {
-            Ok(WaMeta {
-                schema_version: row.get(0)?,
-                min_compatible_wa: row.get(1)?,
-                created_by_wa: row.get(2)?,
-                created_at: row.get(3)?,
-            })
-        },
-    )
-    .optional()
-    .map_err(|e| StorageError::Database(e.to_string()).into())
+    // Fall back to legacy wa_meta table for databases not yet migrated
+    if table_exists(conn, "wa_meta")? {
+        return conn
+            .query_row(
+                "SELECT schema_version, min_compatible_wa, created_by_wa, created_at \
+                 FROM wa_meta WHERE id = 1",
+                [],
+                |row| {
+                    Ok(FtMeta {
+                        schema_version: row.get(0)?,
+                        min_compatible_ft: row.get(1)?,
+                        created_by_ft: row.get(2)?,
+                        created_at: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| StorageError::Database(e.to_string()).into());
+    }
+
+    Ok(None)
 }
 
-fn ensure_wa_meta(conn: &Connection, schema_version: i32) -> Result<()> {
-    if !table_exists(conn, "wa_meta")? {
+fn ensure_ft_meta(conn: &Connection, schema_version: i32) -> Result<()> {
+    // Use ft_meta if it exists; otherwise fall back to wa_meta for pre-v21 databases
+    let meta_table = if table_exists(conn, "ft_meta")? {
+        "ft_meta"
+    } else if table_exists(conn, "wa_meta")? {
+        "wa_meta"
+    } else {
         return Ok(());
-    }
+    };
+
+    // Column names differ between tables
+    let (col_min, col_created) = if meta_table == "ft_meta" {
+        ("min_compatible_ft", "created_by_ft")
+    } else {
+        ("min_compatible_wa", "created_by_wa")
+    };
 
     let now_ms = now_epoch_ms();
-    let mut current_wa = crate::VERSION.to_string();
+    let mut current_ft = crate::VERSION.to_string();
 
-    let existing = load_wa_meta(conn)?;
+    let existing = load_ft_meta(conn)?;
     match existing {
         None => {
             conn.execute(
-                "INSERT INTO wa_meta \
-                 (id, schema_version, min_compatible_wa, created_by_wa, created_at) \
-                 VALUES (1, ?1, ?2, ?3, ?4)",
-                params![schema_version, current_wa, current_wa, now_ms],
+                &format!(
+                    "INSERT INTO {meta_table} \
+                     (id, schema_version, {col_min}, {col_created}, created_at) \
+                     VALUES (1, ?1, ?2, ?3, ?4)"
+                ),
+                params![schema_version, current_ft, current_ft, now_ms],
             )
             .map_err(|e| StorageError::Database(e.to_string()))?;
         }
         Some(meta) => {
-            let mut min_compatible = meta.min_compatible_wa.clone();
+            let mut min_compatible = meta.min_compatible_ft.clone();
             if let (Some(current), Some(existing_min)) = (
-                WaVersion::parse(&current_wa),
-                WaVersion::parse(&meta.min_compatible_wa),
+                FtVersion::parse(&current_ft),
+                FtVersion::parse(&meta.min_compatible_ft),
             ) {
                 if current > existing_min {
-                    min_compatible.clone_from(&current_wa);
+                    min_compatible.clone_from(&current_ft);
                 }
-            } else if meta.min_compatible_wa != current_wa {
-                min_compatible.clone_from(&current_wa);
+            } else if meta.min_compatible_ft != current_ft {
+                min_compatible.clone_from(&current_ft);
             }
 
-            let created_by = if meta.created_by_wa.is_empty() {
-                std::mem::take(&mut current_wa)
+            let created_by = if meta.created_by_ft.is_empty() {
+                std::mem::take(&mut current_ft)
             } else {
-                meta.created_by_wa.clone()
+                meta.created_by_ft.clone()
             };
             let created_at = if meta.created_at <= 0 {
                 now_ms
@@ -3746,14 +3915,16 @@ fn ensure_wa_meta(conn: &Connection, schema_version: i32) -> Result<()> {
             };
 
             if meta.schema_version != schema_version
-                || meta.min_compatible_wa != min_compatible
-                || meta.created_by_wa != created_by
+                || meta.min_compatible_ft != min_compatible
+                || meta.created_by_ft != created_by
                 || meta.created_at != created_at
             {
                 conn.execute(
-                    "UPDATE wa_meta \
-                     SET schema_version=?1, min_compatible_wa=?2, created_by_wa=?3, created_at=?4 \
-                     WHERE id = 1",
+                    &format!(
+                        "UPDATE {meta_table} \
+                         SET schema_version=?1, {col_min}=?2, {col_created}=?3, created_at=?4 \
+                         WHERE id = 1"
+                    ),
                     params![schema_version, min_compatible, created_by, created_at],
                 )
                 .map_err(|e| StorageError::Database(e.to_string()))?;
@@ -3764,12 +3935,12 @@ fn ensure_wa_meta(conn: &Connection, schema_version: i32) -> Result<()> {
     Ok(())
 }
 
-fn check_wa_version_compatibility(conn: &Connection) -> Result<()> {
-    let Some(meta) = load_wa_meta(conn)? else {
+fn check_ft_version_compatibility(conn: &Connection) -> Result<()> {
+    let Some(meta) = load_ft_meta(conn)? else {
         return Ok(());
     };
 
-    let Some(current) = WaVersion::parse(crate::VERSION) else {
+    let Some(current) = FtVersion::parse(crate::VERSION) else {
         return Err(StorageError::MigrationFailed(format!(
             "Invalid ft version string: {}",
             crate::VERSION
@@ -3777,10 +3948,10 @@ fn check_wa_version_compatibility(conn: &Connection) -> Result<()> {
         .into());
     };
 
-    let Some(min) = WaVersion::parse(&meta.min_compatible_wa) else {
+    let Some(min) = FtVersion::parse(&meta.min_compatible_ft) else {
         return Err(StorageError::MigrationFailed(format!(
-            "Invalid min_compatible_wa value in database: {}",
-            meta.min_compatible_wa
+            "Invalid min_compatible_ft value in database: {}",
+            meta.min_compatible_ft
         ))
         .into());
     };
@@ -3788,7 +3959,7 @@ fn check_wa_version_compatibility(conn: &Connection) -> Result<()> {
     if current < min {
         return Err(StorageError::WaTooOld {
             current: crate::VERSION.to_string(),
-            min_compatible: meta.min_compatible_wa,
+            min_compatible: meta.min_compatible_ft,
         }
         .into());
     }
@@ -13121,14 +13292,14 @@ mod tests {
     }
 
     #[test]
-    fn wa_meta_initialized_on_fresh_db() {
+    fn ft_meta_initialized_on_fresh_db() {
         let conn = Connection::open_in_memory().unwrap();
         initialize_schema(&conn).unwrap();
 
         let (schema_version, min_compatible, created_by, created_at): (i32, String, String, i64) =
             conn.query_row(
-                "SELECT schema_version, min_compatible_wa, created_by_wa, created_at \
-                 FROM wa_meta WHERE id = 1",
+                "SELECT schema_version, min_compatible_ft, created_by_ft, created_at \
+                 FROM ft_meta WHERE id = 1",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
@@ -13141,12 +13312,12 @@ mod tests {
     }
 
     #[test]
-    fn wa_too_old_rejected_by_meta() {
+    fn ft_too_old_rejected_by_meta() {
         let conn = Connection::open_in_memory().unwrap();
         initialize_schema(&conn).unwrap();
 
         conn.execute(
-            "UPDATE wa_meta SET min_compatible_wa = '99.0.0' WHERE id = 1",
+            "UPDATE ft_meta SET min_compatible_ft = '99.0.0' WHERE id = 1",
             [],
         )
         .unwrap();
@@ -20436,6 +20607,248 @@ mod timeline_correlation_tests {
 
         let by_tag = list_pane_bookmarks_by_tag_sync(&conn, "anything").unwrap();
         assert!(by_tag.is_empty());
+    }
+
+    // =========================================================================
+    // Migration v20 → v21: Session persistence tables + wa_meta → ft_meta
+    // =========================================================================
+
+    /// Helper: create a v20 database with wa_meta populated
+    fn create_v20_database() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")
+            .unwrap();
+
+        // Create minimal schema at v20 (only tables needed for migration testing)
+        conn.execute_batch(
+            r"
+            CREATE TABLE schema_version (
+                version INTEGER NOT NULL,
+                applied_at INTEGER NOT NULL,
+                description TEXT
+            );
+            CREATE TABLE wa_meta (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                schema_version INTEGER NOT NULL,
+                min_compatible_wa TEXT NOT NULL,
+                created_by_wa TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE TABLE panes (
+                pane_id INTEGER PRIMARY KEY,
+                pane_uuid TEXT,
+                domain TEXT NOT NULL DEFAULT 'local',
+                window_id INTEGER,
+                tab_id INTEGER,
+                title TEXT,
+                cwd TEXT,
+                tty_name TEXT,
+                first_seen_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL,
+                observed INTEGER NOT NULL DEFAULT 1,
+                ignore_reason TEXT,
+                last_decision_at INTEGER
+            );
+            INSERT INTO schema_version (version, applied_at, description)
+                VALUES (20, 1700000000000, 'test v20');
+            INSERT INTO wa_meta (id, schema_version, min_compatible_wa, created_by_wa, created_at)
+                VALUES (1, 20, '0.1.0', '0.1.0', 1700000000000);
+            PRAGMA user_version = 20;
+            ",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn migrate_v20_to_v21_creates_session_tables() {
+        let conn = create_v20_database();
+        let plan = build_migration_plan(20, 21).unwrap();
+        assert_eq!(plan.steps.len(), 1);
+        assert_eq!(plan.steps[0].migration_version, 21);
+
+        apply_migration_plan(&conn, &plan).unwrap();
+
+        // Verify ft_meta exists with migrated data
+        let (sv, min_ft, created_ft): (i32, String, String) = conn
+            .query_row(
+                "SELECT schema_version, min_compatible_ft, created_by_ft FROM ft_meta WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(sv, 20); // wa_meta had schema_version=20
+        assert_eq!(min_ft, "0.1.0");
+        assert_eq!(created_ft, "0.1.0");
+
+        // Verify wa_meta was dropped
+        assert!(!table_exists(&conn, "wa_meta").unwrap());
+
+        // Verify session tables exist
+        assert!(table_exists(&conn, "mux_sessions").unwrap());
+        assert!(table_exists(&conn, "session_checkpoints").unwrap());
+        assert!(table_exists(&conn, "mux_pane_state").unwrap());
+
+        // Verify user_version updated
+        assert_eq!(get_user_version(&conn).unwrap(), 21);
+    }
+
+    #[test]
+    fn migrate_v20_to_v21_idempotent_on_v21_db() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        assert_eq!(get_user_version(&conn).unwrap(), SCHEMA_VERSION);
+
+        // Running migration on already-v21 db is a no-op
+        let plan = build_migration_plan(21, 21).unwrap();
+        assert!(plan.steps.is_empty());
+    }
+
+    #[test]
+    fn migrate_v21_session_tables_foreign_keys() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        // Insert a session
+        conn.execute(
+            "INSERT INTO mux_sessions (session_id, created_at, topology_json, ft_version) \
+             VALUES ('sess-1', 1700000000000, '{}', '0.1.0')",
+            [],
+        )
+        .unwrap();
+
+        // Insert a checkpoint referencing the session
+        conn.execute(
+            "INSERT INTO session_checkpoints \
+             (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes) \
+             VALUES ('sess-1', 1700000001000, 'periodic', 'hash123', 2, 1024)",
+            [],
+        )
+        .unwrap();
+
+        let checkpoint_id: i64 = conn
+            .query_row(
+                "SELECT id FROM session_checkpoints WHERE session_id = 'sess-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        // Insert pane state referencing the checkpoint
+        conn.execute(
+            "INSERT INTO mux_pane_state \
+             (checkpoint_id, pane_id, terminal_state_json) \
+             VALUES (?1, 1, '{}')",
+            params![checkpoint_id],
+        )
+        .unwrap();
+
+        // Verify cascade delete: removing session cascades to checkpoints and pane state
+        conn.execute("DELETE FROM mux_sessions WHERE session_id = 'sess-1'", [])
+            .unwrap();
+
+        let checkpoint_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(checkpoint_count, 0, "Checkpoints should cascade-delete");
+
+        let pane_state_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM mux_pane_state", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(pane_state_count, 0, "Pane state should cascade-delete");
+    }
+
+    #[test]
+    fn migrate_v21_checkpoint_type_constraint() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO mux_sessions (session_id, created_at, topology_json, ft_version) \
+             VALUES ('sess-1', 1700000000000, '{}', '0.1.0')",
+            [],
+        )
+        .unwrap();
+
+        // Valid types should succeed
+        for valid_type in &["periodic", "event", "shutdown", "startup"] {
+            conn.execute(
+                &format!(
+                    "INSERT INTO session_checkpoints \
+                     (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes) \
+                     VALUES ('sess-1', 1700000001000, '{valid_type}', 'hash', 1, 100)"
+                ),
+                [],
+            )
+            .unwrap();
+        }
+
+        // Invalid type should fail
+        let result = conn.execute(
+            "INSERT INTO session_checkpoints \
+             (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes) \
+             VALUES ('sess-1', 1700000002000, 'invalid_type', 'hash', 1, 100)",
+            [],
+        );
+        assert!(
+            result.is_err(),
+            "Invalid checkpoint_type should be rejected by CHECK constraint"
+        );
+    }
+
+    #[test]
+    fn migrate_v21_ft_meta_columns_renamed() {
+        let conn = create_v20_database();
+        let plan = build_migration_plan(20, 21).unwrap();
+        apply_migration_plan(&conn, &plan).unwrap();
+
+        // Verify old wa_meta column names don't exist
+        assert!(!table_exists(&conn, "wa_meta").unwrap());
+
+        // Verify new ft_meta columns are accessible
+        let meta = load_ft_meta(&conn).unwrap().expect("ft_meta should exist");
+        assert_eq!(meta.min_compatible_ft, "0.1.0");
+        assert_eq!(meta.created_by_ft, "0.1.0");
+        assert_eq!(meta.created_at, 1_700_000_000_000);
+    }
+
+    #[test]
+    fn migrate_v21_rollback_restores_wa_meta() {
+        let conn = create_v20_database();
+
+        // Migrate up to v21
+        let up_plan = build_migration_plan(20, 21).unwrap();
+        apply_migration_plan(&conn, &up_plan).unwrap();
+        assert!(!table_exists(&conn, "wa_meta").unwrap());
+        assert!(table_exists(&conn, "ft_meta").unwrap());
+
+        // Roll back to v20
+        let down_plan = build_migration_plan(21, 20).unwrap();
+        apply_migration_plan(&conn, &down_plan).unwrap();
+
+        // wa_meta should be restored with data from ft_meta
+        assert!(table_exists(&conn, "wa_meta").unwrap());
+        assert!(!table_exists(&conn, "ft_meta").unwrap());
+
+        let (sv, min_wa, created_wa): (i32, String, String) = conn
+            .query_row(
+                "SELECT schema_version, min_compatible_wa, created_by_wa FROM wa_meta WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(sv, 20);
+        assert_eq!(min_wa, "0.1.0");
+        assert_eq!(created_wa, "0.1.0");
+
+        // Session tables should be dropped
+        assert!(!table_exists(&conn, "mux_sessions").unwrap());
+        assert!(!table_exists(&conn, "session_checkpoints").unwrap());
+        assert!(!table_exists(&conn, "mux_pane_state").unwrap());
+
+        assert_eq!(get_user_version(&conn).unwrap(), 20);
     }
 }
 

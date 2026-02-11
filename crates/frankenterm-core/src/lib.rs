@@ -83,6 +83,7 @@ pub mod mcp;
 #[cfg(feature = "metrics")]
 pub mod metrics;
 pub mod notifications;
+pub mod orphan_reaper;
 pub mod output;
 pub mod patterns;
 pub mod plan;

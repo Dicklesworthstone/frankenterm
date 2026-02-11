@@ -2095,9 +2095,11 @@ dependencies = [
 name = "frankenterm-char-props"
 version = "0.1.3"
 dependencies = [
+ "criterion 0.5.1",
  "k9",
  "phf",
  "serde",
+ "termwiz 0.24.0",
  "ucd-trie",
 ]
 

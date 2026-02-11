@@ -8,7 +8,7 @@ use crate::config as wa_config;
 use codec::{
     CODEC_VERSION, DecodedPdu, GetCodecVersion, GetCodecVersionResponse, GetLines,
     GetLinesResponse, GetPaneRenderChanges, GetPaneRenderChangesResponse, ListPanes,
-    ListPanesResponse, Pdu, SetClientId, UnitResponse,
+    ListPanesResponse, Pdu, SendPaste, SetClientId, UnitResponse, WriteToPane,
 };
 use config as wezterm_config;
 use mux::client::ClientId;
@@ -184,6 +184,48 @@ impl DirectMuxClient {
             Pdu::GetLinesResponse(payload) => Ok(payload),
             other => Err(DirectMuxError::UnexpectedResponse {
                 expected: "GetLinesResponse".to_string(),
+                got: other.pdu_name().to_string(),
+            }),
+        }
+    }
+
+    /// Write raw bytes to a pane (no-paste mode, character-by-character).
+    pub async fn write_to_pane(
+        &mut self,
+        pane_id: u64,
+        data: Vec<u8>,
+    ) -> Result<UnitResponse, DirectMuxError> {
+        let response = self
+            .send_request(Pdu::WriteToPane(WriteToPane {
+                pane_id: pane_id as usize,
+                data,
+            }))
+            .await?;
+        match response {
+            Pdu::UnitResponse(payload) => Ok(payload),
+            other => Err(DirectMuxError::UnexpectedResponse {
+                expected: "UnitResponse".to_string(),
+                got: other.pdu_name().to_string(),
+            }),
+        }
+    }
+
+    /// Send text via paste mode (efficient for multi-character input).
+    pub async fn send_paste(
+        &mut self,
+        pane_id: u64,
+        data: String,
+    ) -> Result<UnitResponse, DirectMuxError> {
+        let response = self
+            .send_request(Pdu::SendPaste(SendPaste {
+                pane_id: pane_id as usize,
+                data,
+            }))
+            .await?;
+        match response {
+            Pdu::UnitResponse(payload) => Ok(payload),
+            other => Err(DirectMuxError::UnexpectedResponse {
+                expected: "UnitResponse".to_string(),
                 got: other.pdu_name().to_string(),
             }),
         }

@@ -73,9 +73,10 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         let version = UnicodeVersion {
             version: 14,
             ambiguous_are_wide: false,
+            cell_widths: None,
         };
         group.bench_function("grapheme_column_width", |b| {
-            b.iter(|| grapheme_column_width(black_box("\u{00a9}\u{FE0F}"), Some(version)))
+            b.iter(|| grapheme_column_width(black_box("\u{00a9}\u{FE0F}"), Some(&version)))
         });
         group.finish();
     }

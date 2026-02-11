@@ -342,6 +342,67 @@ impl PaneInfo {
     }
 }
 
+/// Convert a `ListPanesResponse` from the mux protocol into a flat `Vec<PaneInfo>`.
+///
+/// The mux protocol returns a tree of `PaneNode` per tab. This function walks
+/// every tree, collects leaf `PaneEntry` nodes, and converts them to `PaneInfo`.
+#[cfg(all(feature = "vendored", unix))]
+pub fn pane_info_from_mux_response(response: &codec::ListPanesResponse) -> Vec<PaneInfo> {
+    let mut panes = Vec::new();
+    for tab_node in &response.tabs {
+        collect_pane_entries(tab_node, &mut panes);
+    }
+    panes
+}
+
+#[cfg(all(feature = "vendored", unix))]
+fn collect_pane_entries(node: &mux::tab::PaneNode, out: &mut Vec<PaneInfo>) {
+    match node {
+        mux::tab::PaneNode::Empty => {}
+        mux::tab::PaneNode::Split { left, right, .. } => {
+            collect_pane_entries(left, out);
+            collect_pane_entries(right, out);
+        }
+        mux::tab::PaneNode::Leaf(entry) => {
+            out.push(PaneInfo::from(entry));
+        }
+    }
+}
+
+#[cfg(all(feature = "vendored", unix))]
+impl From<&mux::tab::PaneEntry> for PaneInfo {
+    fn from(entry: &mux::tab::PaneEntry) -> Self {
+        Self {
+            pane_id: entry.pane_id as u64,
+            tab_id: entry.tab_id as u64,
+            window_id: entry.window_id as u64,
+            domain_id: None,
+            domain_name: None,
+            workspace: Some(entry.workspace.clone()),
+            size: Some(PaneSize {
+                rows: entry.size.rows as u32,
+                cols: entry.size.cols as u32,
+                pixel_width: Some(entry.size.pixel_width as u32),
+                pixel_height: Some(entry.size.pixel_height as u32),
+                dpi: Some(entry.size.dpi),
+            }),
+            rows: None,
+            cols: None,
+            title: Some(entry.title.clone()),
+            cwd: entry.working_dir.as_ref().map(|u| u.url.to_string()),
+            tty_name: entry.tty_name.clone(),
+            cursor_x: Some(entry.cursor_pos.x as u32),
+            cursor_y: Some(entry.cursor_pos.y as u32),
+            cursor_visibility: None,
+            left_col: Some(entry.left_col as u32),
+            top_row: Some(entry.top_row as i64),
+            is_active: entry.is_active_pane,
+            is_zoomed: entry.is_zoomed_pane,
+            extra: std::collections::HashMap::new(),
+        }
+    }
+}
+
 /// Control characters that can be sent to panes
 pub mod control {
     /// Ctrl+C (SIGINT / interrupt)
@@ -384,7 +445,10 @@ pub enum MoveDirection {
     Down,
 }
 
-/// Default command timeout in seconds
+/// Default command timeout in seconds.
+///
+/// This is the fallback when no `CliConfig` is provided. The recommended
+/// production default is 15s (see `CliConfig::default()`).
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 /// Default retry attempts for safe operations
 const DEFAULT_RETRY_ATTEMPTS: u32 = 3;
@@ -426,6 +490,10 @@ pub struct WeztermClient {
     retry_delay_ms: u64,
     /// Circuit breaker for CLI reliability
     circuit_breaker: Arc<Mutex<CircuitBreaker>>,
+    /// Optional mux connection pool for direct socket communication.
+    /// When present, operations try the pool first and fall back to CLI.
+    #[cfg(all(feature = "vendored", unix))]
+    mux_pool: Option<Arc<crate::vendored::MuxPool>>,
 }
 
 impl Default for WeztermClient {
@@ -447,6 +515,8 @@ impl WeztermClient {
                 "wezterm_cli",
                 CircuitBreakerConfig::default(),
             ),
+            #[cfg(all(feature = "vendored", unix))]
+            mux_pool: None,
         }
     }
 
@@ -462,6 +532,8 @@ impl WeztermClient {
                 "wezterm_cli",
                 CircuitBreakerConfig::default(),
             ),
+            #[cfg(all(feature = "vendored", unix))]
+            mux_pool: None,
         }
     }
 
@@ -486,6 +558,17 @@ impl WeztermClient {
         self
     }
 
+    /// Attach a mux connection pool for direct socket communication.
+    ///
+    /// When a pool is attached, operations like `list_panes()` and `send_text()`
+    /// try the pool first and fall back to CLI subprocess spawning on failure.
+    #[cfg(all(feature = "vendored", unix))]
+    #[must_use]
+    pub fn with_mux_pool(mut self, pool: Arc<crate::vendored::MuxPool>) -> Self {
+        self.mux_pool = Some(pool);
+        self
+    }
+
     /// Configure circuit breaker settings.
     #[must_use]
     pub fn with_circuit_breaker_config(mut self, config: CircuitBreakerConfig) -> Self {
@@ -507,7 +590,19 @@ impl WeztermClient {
     /// List all panes across all windows and tabs
     ///
     /// Returns a vector of `PaneInfo` structs with full metadata about each pane.
+    /// When a mux pool is configured, tries direct socket communication first
+    /// and falls back to CLI subprocess spawning on failure.
     pub async fn list_panes(&self) -> Result<Vec<PaneInfo>> {
+        #[cfg(all(feature = "vendored", unix))]
+        if let Some(ref pool) = self.mux_pool {
+            match pool.list_panes().await {
+                Ok(response) => return Ok(pane_info_from_mux_response(&response)),
+                Err(e) => {
+                    tracing::debug!(error = %e, "mux pool list_panes failed, falling back to CLI");
+                }
+            }
+        }
+
         let output = self
             .run_cli_with_retry(&["cli", "list", "--format", "json"])
             .await?;
@@ -853,7 +948,10 @@ impl WeztermClient {
         })
     }
 
-    /// Internal implementation for send_text with paste mode option
+    /// Internal implementation for send_text with paste mode option.
+    ///
+    /// When a mux pool is available, uses direct socket communication
+    /// (paste mode or raw write) and falls back to CLI on failure.
     async fn send_text_impl(
         &self,
         pane_id: u64,
@@ -861,6 +959,26 @@ impl WeztermClient {
         no_paste: bool,
         no_newline: bool,
     ) -> Result<()> {
+        #[cfg(all(feature = "vendored", unix))]
+        if let Some(ref pool) = self.mux_pool {
+            let data = if no_newline {
+                text.to_string()
+            } else {
+                format!("{text}\n")
+            };
+            let pool_result = if no_paste {
+                pool.write_to_pane(pane_id, data.into_bytes()).await
+            } else {
+                pool.send_paste(pane_id, data).await
+            };
+            match pool_result {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    tracing::debug!(error = %e, "mux pool send failed, falling back to CLI");
+                }
+            }
+        }
+
         let pane_id_str = pane_id.to_string();
         let mut args = vec!["cli", "send-text", "--pane-id", &pane_id_str];
         if no_paste {
@@ -892,6 +1010,9 @@ impl WeztermClient {
     }
 
     /// Run a WezTerm CLI command with timeout
+    ///
+    /// Uses `kill_on_drop(true)` to ensure child processes are killed when the
+    /// future is dropped (e.g., on timeout), preventing orphan process accumulation.
     async fn run_cli(&self, args: &[&str]) -> Result<String> {
         use tokio::process::Command;
         use tokio::time::{Duration, timeout};
@@ -904,6 +1025,9 @@ impl WeztermClient {
 
         let mut cmd = Command::new(wezterm_binary());
         cmd.args(args);
+        // Kill the child process when the future is dropped (e.g., on timeout).
+        // Without this, timed-out processes become orphans that accumulate.
+        cmd.kill_on_drop(true);
 
         // Add socket path if specified
         if let Some(ref socket) = self.socket_path {
