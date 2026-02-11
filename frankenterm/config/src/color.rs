@@ -1,6 +1,7 @@
 use crate::*;
 use frankenterm_dynamic::{FromDynamic, ToDynamic};
 use frankenterm_term::color::ColorPalette;
+#[cfg(feature = "lua")]
 use luahelper::impl_lua_conversion_dynamic;
 use std::convert::{TryFrom, TryInto};
 use std::str::FromStr;
@@ -177,6 +178,7 @@ pub struct Palette {
     pub launcher_label_fg: Option<ColorSpec>,
     pub launcher_label_bg: Option<ColorSpec>,
 }
+#[cfg(feature = "lua")]
 impl_lua_conversion_dynamic!(Palette);
 
 impl Palette {
@@ -688,6 +690,7 @@ pub struct ColorSchemeMetaData {
     #[dynamic(default)]
     pub aliases: Vec<String>,
 }
+#[cfg(feature = "lua")]
 impl_lua_conversion_dynamic!(ColorSchemeMetaData);
 
 #[derive(Debug, Clone, PartialEq, FromDynamic, ToDynamic)]
@@ -698,6 +701,7 @@ pub struct ColorSchemeFile {
     #[dynamic(default)]
     pub metadata: ColorSchemeMetaData,
 }
+#[cfg(feature = "lua")]
 impl_lua_conversion_dynamic!(ColorSchemeFile);
 
 fn dynamic_to_toml(value: Value) -> anyhow::Result<toml::Value> {

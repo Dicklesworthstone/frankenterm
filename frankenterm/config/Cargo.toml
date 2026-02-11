@@ -11,6 +11,9 @@ publish = false
 env_logger.workspace = true
 
 [features]
+default = ["lua"]
+lua = ["dep:luahelper", "dep:mlua"]
+no-lua = []
 distro-defaults = []
 
 [dependencies]
@@ -23,8 +26,8 @@ hostname.workspace = true
 lazy_static.workspace = true
 libc.workspace = true
 log.workspace = true
-luahelper.workspace = true
-mlua = {workspace=true, features=["vendored", "lua54", "async", "send", "serialize"]}
+luahelper = { workspace = true, optional = true }
+mlua = { workspace = true, optional = true, features = ["vendored", "lua54", "async", "send", "serialize"] }
 notify.workspace = true
 ordered-float = { workspace=true, features = ["serde"] }
 portable-pty = { workspace=true, features = ["serde_support"]}

@@ -1,6 +1,7 @@
 use crate::config::validate_domain_name;
 use crate::*;
 use frankenterm_dynamic::{FromDynamic, ToDynamic};
+#[cfg(feature = "lua")]
 use luahelper::impl_lua_conversion_dynamic;
 use std::collections::HashMap;
 
@@ -13,6 +14,7 @@ pub struct WslDomain {
     pub default_cwd: Option<PathBuf>,
     pub default_prog: Option<Vec<String>>,
 }
+#[cfg(feature = "lua")]
 impl_lua_conversion_dynamic!(WslDomain);
 
 impl WslDomain {
