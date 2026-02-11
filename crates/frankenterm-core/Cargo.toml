@@ -140,6 +140,10 @@ harness = false
 name = "kalman_watchdog"
 harness = false
 
+[[bench]]
+name = "scrollback_eviction"
+harness = false
+
 [features]
 default = []
 # Public feature flags (stable surface)
