@@ -542,17 +542,17 @@ The "Deterministic over probabilistic" principle means we must NOT rely on `look
 
 **Design**:
 
-During `wa setup`, we install a small, idempotent shell snippet for bash/zsh/fish that emits:
+During `ft setup`, we install a small, idempotent shell snippet for bash/zsh/fish that emits:
 - `prompt_start` / `prompt_end`
 - `command_start` / `command_end(exit_status)`
 
 ```bash
-# ~/.config/wa/shell-integration.bash (sourced by user's .bashrc)
-__wa_prompt_start() { printf '\e]133;A\a'; }
-__wa_command_start() { printf '\e]133;C\a'; }
-__wa_command_end() { printf '\e]133;D;%s\a' "$?"; }
-PROMPT_COMMAND='__wa_prompt_start'
-trap '__wa_command_end' DEBUG  # Simplified; real impl is more robust
+# ~/.config/ft/shell-integration.bash (sourced by user's .bashrc)
+__ft_prompt_start() { printf '\e]133;A\a'; }
+__ft_command_start() { printf '\e]133;C\a'; }
+__ft_command_end() { printf '\e]133;D;%s\a' "$?"; }
+PROMPT_COMMAND='__ft_prompt_start'
+trap '__ft_command_end' DEBUG  # Simplified; real impl is more robust
 ```
 
 **How ingest uses it**:
@@ -3977,7 +3977,7 @@ frankenterm/
 
 ### 18.1 Health Model
 
-`wa status --health --format json` reports:
+`ft status --health --format json` reports:
 
 ```json
 {
@@ -4009,10 +4009,10 @@ frankenterm/
 
 ### 18.2 Metrics
 
-Expose optional Prometheus endpoint (`wa watch --metrics :9464`):
+Expose optional Prometheus endpoint (`ft watch --metrics :9464`):
 
 ```
-# Ingest metrics
+# Ingest metrics (note: metric name prefix is currently legacy `wa_`)
 wa_ingest_deltas_total{domain="local",agent="codex"}
 wa_ingest_gap_total{domain="dev-server"}
 wa_ingest_lag_ms_bucket{le="10"}
@@ -4040,18 +4040,18 @@ wa_queue_depth{queue="detection"}
 
 ### 18.3 Diagnostic Bundle
 
-`wa diag bundle --last 15m` produces a single tarball containing:
+`ft diag bundle --last 15m` produces a single tarball containing:
 
-- **Config (redacted)**: wa.toml with secrets replaced
-- **Version matrix**: wezterm version, wa version, enabled features, Rust version
+- **Config (redacted)**: ft.toml with secrets replaced
+- **Version matrix**: wezterm version, ft version, enabled features, Rust version
 - **Recent events**: Last N events + workflow logs
 - **Gap summary**: List of output gaps with timestamps and reasons
 - **Health snapshot**: Current health status
 - **Optional output excerpts**: Anonymized samples around detections (opt-in)
 
 ```bash
-$ wa diag bundle --last 15m --output /tmp/wa-diag.tar.gz
-Created diagnostic bundle: /tmp/wa-diag.tar.gz (124 KB)
+$ ft diag bundle --last 15m --output /tmp/ft-diag.tar.gz
+Created diagnostic bundle: /tmp/ft-diag.tar.gz (124 KB)
 Contents:
   - config.toml.redacted
   - versions.json

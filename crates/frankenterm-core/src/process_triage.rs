@@ -527,10 +527,10 @@ fn classify_tree(
 mod tests {
     use super::*;
 
-    fn make_node(pid: u32, ppid: u32, name: &str, state: ProcessState) -> ProcessNode {
+    fn make_node(pid: u32, parent_pid: u32, name: &str, state: ProcessState) -> ProcessNode {
         ProcessNode {
             pid,
-            ppid,
+            ppid: parent_pid,
             name: name.into(),
             argv: vec![],
             state,
