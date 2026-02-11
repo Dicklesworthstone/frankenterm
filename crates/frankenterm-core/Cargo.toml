@@ -128,6 +128,10 @@ harness = false
 name = "pool_benchmark"
 harness = false
 
+[[bench]]
+name = "bocpd"
+harness = false
+
 [features]
 default = []
 # Public feature flags (stable surface)

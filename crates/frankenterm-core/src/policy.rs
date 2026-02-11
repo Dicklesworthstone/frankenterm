@@ -1510,63 +1510,91 @@ where
         return CommandGateOutcome::Allow;
     }
 
-    if !is_command_candidate(text) {
-        return CommandGateOutcome::Allow;
-    }
+    let mut worst_outcome: Option<CommandGateOutcome> = None;
 
-    let command_line = first_nonempty_line(text).unwrap_or(text);
-    if let Some(result) = evaluate_builtin_rules(command_line) {
-        return result;
-    }
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
 
-    match config.dcg_mode {
-        DcgMode::Disabled => CommandGateOutcome::Allow,
-        DcgMode::Native => match crate::command_guard::evaluate_stateless(command_line) {
-            Some((rule_id, _pack, reason, _suggestions)) => {
-                let full_rule = format!("dcg.{rule_id}");
-                match config.dcg_deny_policy {
-                    DcgDenyPolicy::Deny => CommandGateOutcome::Deny {
-                        reason,
-                        rule_id: full_rule,
-                    },
-                    DcgDenyPolicy::RequireApproval => CommandGateOutcome::RequireApproval {
-                        reason,
-                        rule_id: full_rule,
-                    },
+        if !is_command_candidate(line) {
+            continue;
+        }
+
+        if let Some(result) = evaluate_builtin_rules(line) {
+            match result {
+                CommandGateOutcome::Deny { .. } => return result,
+                CommandGateOutcome::RequireApproval { .. } => {
+                    if !matches!(worst_outcome, Some(CommandGateOutcome::Deny { .. })) {
+                        worst_outcome = Some(result);
+                    }
+                    continue;
                 }
+                CommandGateOutcome::Allow => {}
             }
-            None => CommandGateOutcome::Allow,
-        },
-        DcgMode::Opportunistic | DcgMode::Required => match dcg_runner(command_line) {
-            Ok(DcgDecision::Allow) => CommandGateOutcome::Allow,
-            Ok(DcgDecision::Deny { rule_id }) => {
-                let rule = rule_id.unwrap_or_else(|| "unknown".to_string());
-                let rule_id = format!("dcg.{rule}");
-                let reason = format!("Command safety gate blocked by dcg (rule {rule})");
-                match config.dcg_deny_policy {
-                    DcgDenyPolicy::Deny => CommandGateOutcome::Deny { reason, rule_id },
-                    DcgDenyPolicy::RequireApproval => {
-                        CommandGateOutcome::RequireApproval { reason, rule_id }
+        }
+
+        let dcg_result = match config.dcg_mode {
+            DcgMode::Disabled => CommandGateOutcome::Allow,
+            DcgMode::Native => match crate::command_guard::evaluate_stateless(line) {
+                Some((rule_id, _pack, reason, _suggestions)) => {
+                    let full_rule = format!("dcg.{rule_id}");
+                    match config.dcg_deny_policy {
+                        DcgDenyPolicy::Deny => CommandGateOutcome::Deny {
+                            reason,
+                            rule_id: full_rule,
+                        },
+                        DcgDenyPolicy::RequireApproval => CommandGateOutcome::RequireApproval {
+                            reason,
+                            rule_id: full_rule,
+                        },
                     }
                 }
-            }
-            Err(err) => match config.dcg_mode {
-                DcgMode::Required => {
-                    let detail = match err {
-                        DcgError::NotAvailable => "dcg not available".to_string(),
-                        DcgError::Failed(detail) => format!("dcg error: {detail}"),
-                    };
-                    CommandGateOutcome::RequireApproval {
-                        reason: format!(
-                            "Command safety gate requires dcg but it is unavailable ({detail})"
-                        ),
-                        rule_id: "command_gate.dcg_unavailable".to_string(),
-                    }
-                }
-                _ => CommandGateOutcome::Allow,
+                None => CommandGateOutcome::Allow,
             },
-        },
+            DcgMode::Opportunistic | DcgMode::Required => match dcg_runner(line) {
+                Ok(DcgDecision::Allow) => CommandGateOutcome::Allow,
+                Ok(DcgDecision::Deny { rule_id }) => {
+                    let rule = rule_id.unwrap_or_else(|| "unknown".to_string());
+                    let rule_id = format!("dcg.{rule}");
+                    let reason = format!("Command safety gate blocked by dcg (rule {rule})");
+                    match config.dcg_deny_policy {
+                        DcgDenyPolicy::Deny => CommandGateOutcome::Deny { reason, rule_id },
+                        DcgDenyPolicy::RequireApproval => {
+                            CommandGateOutcome::RequireApproval { reason, rule_id }
+                        }
+                    }
+                }
+                Err(err) => match config.dcg_mode {
+                    DcgMode::Required => {
+                        let detail = match err {
+                            DcgError::NotAvailable => "dcg not available".to_string(),
+                            DcgError::Failed(detail) => format!("dcg error: {detail}"),
+                        };
+                        CommandGateOutcome::RequireApproval {
+                            reason: format!(
+                                "Command safety gate requires dcg but it is unavailable ({detail})"
+                            ),
+                            rule_id: "command_gate.dcg_unavailable".to_string(),
+                        }
+                    }
+                    _ => CommandGateOutcome::Allow,
+                },
+            },
+        };
+
+        match dcg_result {
+            CommandGateOutcome::Deny { .. } => return dcg_result,
+            CommandGateOutcome::RequireApproval { .. } => {
+                if !matches!(worst_outcome, Some(CommandGateOutcome::Deny { .. })) {
+                    worst_outcome = Some(dcg_result);
+                }
+            }
+            CommandGateOutcome::Allow => {}
+        }
     }
+
+    worst_outcome.unwrap_or(CommandGateOutcome::Allow)
 }
 
 fn evaluate_command_gate(text: &str, config: &CommandGateConfig) -> CommandGateOutcome {

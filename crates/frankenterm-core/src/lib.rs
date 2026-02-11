@@ -84,6 +84,7 @@ pub mod incident_bundle;
 pub mod ingest;
 #[cfg(unix)]
 pub mod ipc;
+pub mod kalman_watchdog;
 pub mod learn;
 pub mod lock;
 pub mod logging;
