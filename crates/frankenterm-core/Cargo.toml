@@ -141,6 +141,10 @@ name = "kalman_watchdog"
 harness = false
 
 [[bench]]
+name = "spectral"
+harness = false
+
+[[bench]]
 name = "scrollback_eviction"
 harness = false
 

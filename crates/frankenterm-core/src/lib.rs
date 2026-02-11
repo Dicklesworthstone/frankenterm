@@ -134,6 +134,7 @@ pub mod session_retention;
 pub mod session_topology;
 pub mod setup;
 pub mod snapshot_engine;
+pub mod spectral;
 pub mod storage;
 pub mod storage_targets;
 pub mod suggestions;
