@@ -121,6 +121,7 @@ pub mod storage;
 pub mod storage_targets;
 pub mod suggestions;
 pub mod tailer;
+pub mod telemetry;
 pub mod undo;
 pub mod wait;
 pub mod watchdog;
