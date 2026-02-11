@@ -324,8 +324,10 @@ impl ComponentTracker {
             HealthStatus::Healthy
         } else if z < config.critical_z {
             HealthStatus::Degraded
-        } else {
+        } else if z < config.hung_z {
             HealthStatus::Critical
+        } else {
+            HealthStatus::Hung
         };
 
         HealthClassification {
@@ -762,6 +764,7 @@ mod tests {
             measurement_noise: 10.0,
             degraded_z: 2.0,
             critical_z: 3.0,
+            hung_z: 5.0,
             ..Default::default()
         };
         let mut tracker = ComponentTracker::new(&config, 5_000);
@@ -771,15 +774,15 @@ mod tests {
             tracker.observe(i * 1000);
         }
 
-        // Now simulate a hung component: 20s since last heartbeat (was expecting ~1s)
+        // 20s since last heartbeat (was expecting ~1s) -> z >> 5 -> Hung
         let c = tracker.classify(39_000, &config);
         assert!(c.adaptive_mode);
         assert!(
-            c.z_score.unwrap() > 3.0,
-            "z-score {} should indicate anomaly",
+            c.z_score.unwrap() >= 5.0,
+            "z-score {} should indicate hung (>= 5.0)",
             c.z_score.unwrap()
         );
-        assert_eq!(c.status, HealthStatus::Critical);
+        assert_eq!(c.status, HealthStatus::Hung);
     }
 
     #[test]

@@ -51,6 +51,17 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 ---
 
+## RULE NUMBER 2: ABSOLUTELY NO GIT WORKTREES
+
+**GIT WORKTREES ARE STRICTLY FORBIDDEN IN THIS REPO. DO NOT USE THEM.**
+
+1. **Never run:** `git worktree add`, `git worktree remove`, `git worktree prune`, or any related worktree command.
+2. **No exceptions by convenience:** Do not create temporary directories, detached worktrees, or parallel checkout trees for agent work.
+3. **Use branches in the main repo only:** All agent work must happen on normal branches in the primary checkout.
+4. **If you discover existing worktrees:** stop and report them, then rescue useful commits back into normal branches.
+
+---
+
 ## Irreversible Git & Filesystem Actions — DO NOT EVER BREAK GLASS
 
 1. **Absolutely forbidden commands:** `git reset --hard`, `git clean -fd`, `rm -rf`, or any command that can delete or overwrite code/data must never be run unless the user explicitly provides the exact command and states, in the same message, that they understand and want the irreversible consequences.

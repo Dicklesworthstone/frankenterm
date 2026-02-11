@@ -214,28 +214,28 @@ pub fn chi_squared_test(
         return None;
     }
 
-    let event_a_count = matrix.marginal(event_a) as f64;
-    let event_b_count = matrix.marginal(event_b) as f64;
+    let left_marginal = matrix.marginal(event_a) as f64;
+    let right_marginal = matrix.marginal(event_b) as f64;
     let cooccurrence_count = matrix.pair_count(event_a, event_b) as f64;
 
-    let expected = event_a_count * event_b_count / total_windows;
+    let expected = left_marginal * right_marginal / total_windows;
     if expected < 1.0 {
         return None;
     }
 
     let o11 = cooccurrence_count;
-    let o12 = event_a_count - cooccurrence_count;
-    let o21 = event_b_count - cooccurrence_count;
-    let o22 = total_windows - event_a_count - event_b_count + cooccurrence_count;
+    let o12 = left_marginal - cooccurrence_count;
+    let o21 = right_marginal - cooccurrence_count;
+    let o22 = total_windows - left_marginal - right_marginal + cooccurrence_count;
 
     if o12 < 0.0 || o21 < 0.0 || o22 < 0.0 {
         return None;
     }
 
     let e11 = expected;
-    let e12 = event_a_count * (total_windows - event_b_count) / total_windows;
-    let e21 = (total_windows - event_a_count) * event_b_count / total_windows;
-    let e22 = (total_windows - event_a_count) * (total_windows - event_b_count) / total_windows;
+    let e12 = left_marginal * (total_windows - right_marginal) / total_windows;
+    let e21 = (total_windows - left_marginal) * right_marginal / total_windows;
+    let e22 = (total_windows - left_marginal) * (total_windows - right_marginal) / total_windows;
 
     if e11 <= 0.0 || e12 <= 0.0 || e21 <= 0.0 || e22 <= 0.0 {
         return None;
