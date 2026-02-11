@@ -132,6 +132,14 @@ harness = false
 name = "bocpd"
 harness = false
 
+[[bench]]
+name = "causal_dag"
+harness = false
+
+[[bench]]
+name = "kalman_watchdog"
+harness = false
+
 [features]
 default = []
 # Public feature flags (stable surface)
