@@ -1,8 +1,8 @@
 Automating WezTerm with Lua for AI Coding Agent Fleet Management
 
-Managing a fleet of coding agents (e.g. Claude, Codex, Gemini CLI, etc.) across multiple remote servers can be streamlined by leveraging WezTerm’s built-in terminal multiplexer and Lua scripting capabilities. This comprehensive guide covers end-to-end automation of WezTerm for such use cases – from setting up persistent remote sessions, to capturing and reacting to terminal output in real-time, to building a high-performance Rust CLI (“wezterm_automaton” or wa) that can manage these agent sessions automatically. We will discuss best practices for maximum performance, reliability, robustness, responsiveness, and safety in this automated environment.
+Managing a fleet of coding agents (e.g. Claude, Codex, Gemini CLI, etc.) across multiple remote servers can be streamlined by leveraging WezTerm’s built-in terminal multiplexer and Lua scripting capabilities. This comprehensive guide covers end-to-end automation of WezTerm for such use cases – from setting up persistent remote sessions, to capturing and reacting to terminal output in real-time, to building a high-performance Rust CLI FrankenTerm (`ft`) that can manage these agent sessions automatically. We will discuss best practices for maximum performance, reliability, robustness, responsiveness, and safety in this automated environment.
 
-Note: wa removed the Lua `update-status` hook in v0.2.0 due to performance overhead. Any `update-status`
+Note: ft removed the Lua `update-status` hook in v0.2.0 due to performance overhead. Any `update-status`
 examples below should be treated as historical; prefer CLI polling + user-var signaling + escape-sequence
 detection instead.
 
@@ -260,7 +260,7 @@ local domain_info = {
 }
 
 -- DYNAMIC OVERRIDES ON DOMAIN CHANGE: apply colors and status when active pane's domain changes
--- NOTE: update-status was removed in wa v0.2.0. This example is HISTORICAL.
+-- NOTE: update-status was removed in ft v0.2.0. This example is HISTORICAL.
 -- Prefer CLI polling + user-var signaling instead.
 local last_domain = {}
 wezterm.on('update-status', function(window, pane)  -- DEPRECATED: see note above
@@ -425,7 +425,7 @@ would output the last 20 lines of scrollback (the negative index means lines fro
 
 	•	Other useful commands: wezterm cli spawn to launch a new process/tab in a running WezTerm, wezterm cli split-pane to split an existing pane, wezterm cli activate-tab or activate-pane to switch focus (though for automation, focus is less important). Also wezterm cli set-tab-title can rename tabs (perhaps to label them with agent names).
 
-These CLI commands allow external scripts/tools to control and observe the state of WezTerm. They are the backbone of how our wezterm_automaton (wa) Rust tool will interface with WezTerm.
+These CLI commands allow external scripts/tools to control and observe the state of WezTerm. They are the backbone of how FrankenTerm (`ft`) interfaces with WezTerm.
 
 Automating Agent Sessions: Observing and Reacting to Terminal Output
 
@@ -563,33 +563,33 @@ For instance, upon “hit limit”, enter LimitReached state:
 
 All of this can be done without user intervention.
 
-Implementing the wezterm_automaton (wa) CLI Tool
+Implementing FrankenTerm (`ft`) CLI Tool
 
-Now we bring it together by building a dedicated Rust CLI tool, which we’ll call wa (short for WezTerm Automaton). The design goals for this tool:
+Now we bring it together by building a dedicated Rust CLI tool, which we’ll call `ft` (short for FrankenTerm). The design goals for this tool:
 	•	Agent-first interface: It should be easily usable by AI coding agents themselves (not just humans). That means providing outputs in structured formats (JSON or concise Markdown) that are easy to parse. It also means having a clear “robot mode” with minimal non-determinism.
 	•	High performance: It should handle rapid output from multiple sessions without lag, thanks to Rust’s efficiency and concurrency.
-	•	Cross-platform: Rust and WezTerm are cross-platform, so wa should run wherever WezTerm runs (Linux, macOS, Windows WSL).
+	•	Cross-platform: Rust and WezTerm are cross-platform, so ft should run wherever WezTerm runs (Linux, macOS, Windows WSL).
 	•	Ease of use for humans: It can also double as a power-user tool for humans, e.g. to quickly search logs or send canned commands to all agents.
 
 Key Functionalities
-	1.	Session Discovery: When wa starts (or on demand), it will use wezterm cli list --format json to enumerate all current sessions ￼. This provides pane IDs, titles, CWDs, etc. wa can present these in a quick summary (e.g., list of domains and active processes) or use them internally to map which pane corresponds to which agent.
-If your agents have identifiable prompts or titles, wa could auto-label them. For example, Codex’s title might show as node /path/to/codex.js -- user@host:dir or similar; Claude might just be a bash process. We may instead identify agent sessions by a heuristic:
+	1.	Session Discovery: When ft starts (or on demand), it will use wezterm cli list --format json to enumerate all current sessions ￼. This provides pane IDs, titles, CWDs, etc. ft can present these in a quick summary (e.g., list of domains and active processes) or use them internally to map which pane corresponds to which agent.
+If your agents have identifiable prompts or titles, ft could auto-label them. For example, Codex’s title might show as node /path/to/codex.js -- user@host:dir or similar; Claude might just be a bash process. We may instead identify agent sessions by a heuristic:
 	•	If the pane title contains the agent name or a known token (like “Claude” or “codex”), or
 	•	By looking at the first few lines of output (which usually include a welcome message unique to each agent, e.g. “Claude Code vX.Y.Z” or “Welcome to Codex…”).
 	•	We could also require the user/agent to tag a tab by name (WezTerm allows renaming tab title manually or via script) and look for that. But let’s assume we can identify by content.
-	2.	Continuous Monitoring: wa will spawn background threads or an async task per pane to poll for new output every second (or even more frequently if needed, though 1Hz is often enough for interactive usage). It will compare and log new lines, and run pattern matching on them.
-	3.	Reactive Actions: When a pattern is matched, wa triggers the corresponding handler. This might involve printing a message to its own output (for human/agent info) and performing a wezterm cli send-text to the terminal. For potentially complex sequences (like re-auth flow), it might spawn a sub-task that orchestrates multiple steps with some delays as needed:
-	•	e.g., after sending login and launching Playwright to do the web login, wa will need to wait for that to complete (with a timeout) and then send resume command.
-	4.	Logging to SQLite: wa will open (or create) a SQLite database file (perhaps ~/.wezterm_automaton/log.sqlite). As new lines come in, it will insert them. It could batch inserts for efficiency. We might also provide a way to query this DB (like a subcommand wa search "error" that does an SQL query or uses FTS if configured).
+	2.	Continuous Monitoring: ft will spawn background threads or an async task per pane to poll for new output every second (or even more frequently if needed, though 1Hz is often enough for interactive usage). It will compare and log new lines, and run pattern matching on them.
+	3.	Reactive Actions: When a pattern is matched, ft triggers the corresponding handler. This might involve printing a message to its own output (for human/agent info) and performing a wezterm cli send-text to the terminal. For potentially complex sequences (like re-auth flow), it might spawn a sub-task that orchestrates multiple steps with some delays as needed:
+	•	e.g., after sending login and launching Playwright to do the web login, ft will need to wait for that to complete (with a timeout) and then send resume command.
+	4.	Logging to SQLite: ft will open (or create) a SQLite database file (e.g., `~/.local/share/ft/ft.db`). As new lines come in, it will insert them. It could batch inserts for efficiency. We might also provide a way to query this DB (like `ft query "error"`) or use FTS if configured.
 	5.	Expose a Command Interface: The tool should allow the agent (or user) to query the state and perform operations. For example:
-	•	wa status – returns a summary of all sessions and their states (maybe in JSON).
-	•	wa logs <pane_id> [--tail N] – fetch recent logs for a given session.
-	•	wa send <pane_id> "<text>" – send text to a session (essentially a wrapper around wezterm cli send-text).
-	•	wa switch-account <agent> – triggers an account rotation for the specified agent (this would encapsulate the logout/login flow described).
-	•	wa help – quick-start usage information.
-If no arguments are given (wa quick start mode), it could output a brief guide of the most important commands and what they do, optimized for an AI agent to quickly learn the interface (token-efficient descriptions, possibly JSON-formatted help).
+	•	ft status – returns a summary of all sessions and their states (maybe in JSON).
+	•	ft get-text <pane_id> [--tail N] – fetch recent output for a given session.
+	•	ft send <pane_id> "<text>" – send text to a session (essentially a wrapper around wezterm cli send-text).
+	•	ft workflow run handle_usage_limits --pane <pane_id> – handle quota/rotation workflows.
+	•	ft robot help – quick-start usage information for agents.
+If no arguments are given (ft quick start mode), it could output a brief guide of the most important commands and what they do, optimized for an AI agent to quickly learn the interface (token-efficient descriptions, possibly JSON-formatted help).
 
-For example, wa status might output:
+For example, ft status might output:
 
 {
   "sessions": [
@@ -601,35 +601,35 @@ For example, wa status might output:
 
 This tells the agent user which sessions exist, what agent is in each (if identified), and any notable status (like one is nearing limit). The agent could then decide to issue a switch or focus on a particular one.
 
-Alternatively, wa status could return a Markdown table if that’s easier for an AI to parse in some contexts, but JSON is straightforward.
+Alternatively, ft status could return a Markdown table if that’s easier for an AI to parse in some contexts, but JSON is straightforward.
 
 Robustness and Safety
 	•	Concurrency: WezTerm CLI commands are lightweight, but if we have many sessions, we should poll responsibly. The list command is cheap; get-text on a pane of moderate size is also fairly cheap (it just dumps text from memory). We will still ensure we don’t call get-text too rapidly. Perhaps adjust frequency based on activity: if a pane is producing output (we detect new lines every poll), we keep polling fast; if it’s idle for a while, we can slow down polling that pane to reduce overhead.
-	•	Error Handling: If a wezterm cli command fails (e.g., if WezTerm was closed or a pane disappeared mid-run), wa should handle gracefully – maybe refresh the session list and update its state (remove that pane from monitoring, etc.). If WezTerm is not running at all, wa can either start a WezTerm instance (via wezterm start command) or just warn and exit.
+	•	Error Handling: If a wezterm cli command fails (e.g., if WezTerm was closed or a pane disappeared mid-run), ft should handle gracefully – maybe refresh the session list and update its state (remove that pane from monitoring, etc.). If WezTerm is not running at all, ft can either start a WezTerm instance (via wezterm start command) or just warn and exit.
 	•	Security: The automation should be careful when sending commands to avoid accidental destructive actions. For instance, ensure that triggered commands (like sending the “Reread AGENTS.md” prompt) only happen in the intended context (after a compaction event in an agent pane, not just because someone typed those words in a code file). Our pattern matching should be specific enough (anchored or with context) to minimize false positives. Additionally, storing logs in SQLite means sensitive info might be recorded – ensure the database file is in a secure location with proper permissions.
-	•	Responsiveness: The whole point is to react faster and more reliably than a human could. With wa, reactions happen within maybe 0.5–1 second of the trigger (depending on poll interval). If needed, we can reduce the interval or even use WezTerm’s update-status event as a trigger to poll (since update-status fires roughly once per second by default). WezTerm doesn’t yet have a direct hook “on new output” for remote panes due to PTY limitations ￼, so polling is our method.
-	•	Play nice with UI: Our automation should not interfere with manual control. For example, if the user is actively typing in a session, wa might still send automated input – that’s potentially disruptive. One approach is to suppress automated actions if we detect the user is currently active in that pane (WezTerm can tell if a pane is focused, and we might only auto-send if it’s not currently focused by the user, or if a certain mode is enabled). Another approach is to have a “consent” from the agent – since here the “user” might actually be an AI agent controlling it, we assume it’s fine. If a human is using the system, they would know about wa and could pause it if needed.
+	•	Responsiveness: The whole point is to react faster and more reliably than a human could. With ft, reactions happen within maybe 0.5–1 second of the trigger (depending on poll interval). If needed, we can reduce the interval or even use WezTerm’s update-status event as a trigger to poll (since update-status fires roughly once per second by default). WezTerm doesn’t yet have a direct hook “on new output” for remote panes due to PTY limitations ￼, so polling is our method.
+	•	Play nice with UI: Our automation should not interfere with manual control. For example, if the user is actively typing in a session, ft might still send automated input – that’s potentially disruptive. One approach is to suppress automated actions if we detect the user is currently active in that pane (WezTerm can tell if a pane is focused, and we might only auto-send if it’s not currently focused by the user, or if a certain mode is enabled). Another approach is to have a “consent” from the agent – since here the “user” might actually be an AI agent controlling it, we assume it’s fine. If a human is using the system, they would know about ft and could pause it if needed.
 
 Example Workflow Automation
 
 Let’s walk through an example scenario combining everything:
-	•	Step 0: You launch WezTerm and wa. WezTerm opens your 3 remote windows (Dev, Staging, Workstation). In one tab on Dev, you start a Claude coding session (cc for Claude Code). In another tab on Dev, you start a Codex session (cod for Codex CLI). wa detects new processes (perhaps by noticing lines like “Claude Code v2.1.12” and “Welcome to Codex…” in those panes) and labels pane 5 as Claude, pane 7 as Codex. It begins monitoring them.
-	•	Step 1: As you work with Claude, after a while, the conversation gets long and Claude triggers compaction. In the pane 5 output, wa sees “Conversation compacted”. Within a second, wa reacts by sending the prompt to reread a key file. This happens automatically; in the UI, you’ll just see that message appear as if you typed it instantly after compaction. Claude reads the file as instructed, ensuring continuity.
-	•	Step 2: Meanwhile, in the Codex session on pane 7, you’ve been coding for a few hours. A warning appears: “⚠ … less than 5% of your limit left.” wa logs it and might output a note on its side-channel (maybe in its own console or status) that Codex is low on time, but it doesn’t intervene yet.
-	•	Step 3: Eventually, Codex says “You’ve hit your usage limit… resets at 12:37 AM.” The agent in Codex stops responding to new prompts. wa immediately catches this and proceeds to handle it:
+	•	Step 0: You launch WezTerm and ft. WezTerm opens your 3 remote windows (Dev, Staging, Workstation). In one tab on Dev, you start a Claude coding session (cc for Claude Code). In another tab on Dev, you start a Codex session (cod for Codex CLI). ft detects new processes (perhaps by noticing lines like “Claude Code v2.1.12” and “Welcome to Codex…” in those panes) and labels pane 5 as Claude, pane 7 as Codex. It begins monitoring them.
+	•	Step 1: As you work with Claude, after a while, the conversation gets long and Claude triggers compaction. In the pane 5 output, ft sees “Conversation compacted”. Within a second, ft reacts by sending the prompt to reread a key file. This happens automatically; in the UI, you’ll just see that message appear as if you typed it instantly after compaction. Claude reads the file as instructed, ensuring continuity.
+	•	Step 2: Meanwhile, in the Codex session on pane 7, you’ve been coding for a few hours. A warning appears: “⚠ … less than 5% of your limit left.” ft logs it and might output a note on its side-channel (maybe in its own console or status) that Codex is low on time, but it doesn’t intervene yet.
+	•	Step 3: Eventually, Codex says “You’ve hit your usage limit… resets at 12:37 AM.” The agent in Codex stops responding to new prompts. ft immediately catches this and proceeds to handle it:
 	•	It sends Ctrl+C twice to pane 7 to terminate the Codex session (this causes Codex to print the token usage summary and resume ID).
 	•	It parses the resume ID from the output (e.g., 019bcd5e-1de1-7402-a508-b4c57ab6fb62).
-	•	It initiates the account switching: since this is Codex, which uses ChatGPT auth, wa uses an available stored account (or the next API key). It runs cod login --device-auth in pane 7. This prints the device code and URL.
-	•	wa launches an automated browser process that opens the URL, logs in with the next account’s credentials (which could be pre-saved or provided via a secure method), and enters the device code. Suppose all goes well, after maybe 5-10 seconds, the Codex CLI prints “Successfully logged in”.
-	•	wa now sends cod resume 019bcd5e-... to pane 7, which reopens the session exactly where it left off (but under the new account). It then sends a simple “proceed.” or presses Enter to prompt the agent to continue. Codex, now running with fresh quota, continues the conversation.
-	•	Throughout, wa logs each of these steps (maybe at least to its own debug log). To the user, this all happened almost automatically – they just see Codex say limit hit, then a flurry of actions and then it resumes. No manual login steps were needed.
-	•	Step 4: Later, if the user or AI agent controlling these wants to review what happened, they can use wa to query the log. For instance, wa search "reset your usage limit" could find instances of usage resets. Or they could query all compactions events across sessions to see how often context is being cleared.
-	•	Step 5: If something goes wrong (say the login fails because of wrong password or device code expiry), wa can detect lack of success message within a timeout and report an error status for that session (so the agent controlling it knows human intervention is needed).
+	•	It initiates the account switching: since this is Codex, which uses ChatGPT auth, ft uses an available stored account (or the next API key). It runs cod login --device-auth in pane 7. This prints the device code and URL.
+	•	ft launches an automated browser process that opens the URL, logs in with the next account’s credentials (which could be pre-saved or provided via a secure method), and enters the device code. Suppose all goes well, after maybe 5-10 seconds, the Codex CLI prints “Successfully logged in”.
+	•	ft now sends cod resume 019bcd5e-... to pane 7, which reopens the session exactly where it left off (but under the new account). It then sends a simple “proceed.” or presses Enter to prompt the agent to continue. Codex, now running with fresh quota, continues the conversation.
+	•	Throughout, ft logs each of these steps (maybe at least to its own debug log). To the user, this all happened almost automatically – they just see Codex say limit hit, then a flurry of actions and then it resumes. No manual login steps were needed.
+	•	Step 4: Later, if the user or AI agent controlling these wants to review what happened, they can use ft to query the log. For instance, `ft query "reset your usage limit"` could find instances of usage resets. Or they could query all compactions events across sessions to see how often context is being cleared.
+	•	Step 5: If something goes wrong (say the login fails because of wrong password or device code expiry), ft can detect lack of success message within a timeout and report an error status for that session (so the agent controlling it knows human intervention is needed).
 
 Additional Tips for Lua Integration (Advanced)
 
 While we focus on the external tool, note that some tasks can also be aided by WezTerm’s Lua if desired:
-	•	You could define a custom status indicator for each pane that shows an automation status (like if an account switch is in progress). For example, using wezterm.on("update-right-status", ...) to maybe add a symbol in the tab title if a pane has unseen output or a warning. The has_unseen_output field can signal that a background tab produced output ￼, which could hint that an agent responded or some event happened. Our config above already colors tabs when they are active/inactive; one could extend it to flash a different color if pane.has_unseen_output is true and maybe the output contains a keyword. However, doing heavy text parsing in Lua config isn’t ideal – better to let wa handle it.
+	•	You could define a custom status indicator for each pane that shows an automation status (like if an account switch is in progress). For example, using wezterm.on("update-right-status", ...) to maybe add a symbol in the tab title if a pane has unseen output or a warning. The has_unseen_output field can signal that a background tab produced output ￼, which could hint that an agent responded or some event happened. Our config above already colors tabs when they are active/inactive; one could extend it to flash a different color if pane.has_unseen_output is true and maybe the output contains a keyword. However, doing heavy text parsing in Lua config isn’t ideal – better to let ft handle it.
 	•	Use User Vars or OSC: If we had control over the agent programs, we could make them emit a custom OSC (Operating System Command) sequence to signal events. For instance, the Codex CLI could theoretically output OSC 1337;SetUserVar=LIMIT=hit ST upon hitting limit (if it were programmed to do so). WezTerm would catch that as a user-var-changed event ￼, and we could handle it in Lua without text parsing. But since we cannot easily change these closed-source agents, parsing their plain text is the way.
 	•	WezTerm also has an Open URI event (when you Cmd+Click or launch a URL) ￼. If device auth codes come with URLs in output, one could imagine auto-catching them. But our approach is to use an external browser automation, which is fine.
 
@@ -641,19 +641,19 @@ Problem / Symptom	Likely Cause	Solution / Fix
 Cannot connect to remote domain (WezTerm says “Timed out” or “Connection failed”)	SSH to server failed, or wezterm-mux-server not running on remote, or version mismatch.	Verify you can ssh user@host from terminal. Ensure the remote service is active (systemctl --user status wezterm-mux-server). Check for version mismatches and update if needed. Also ensure your local config’s ssh_domains entries are correct (hostnames, usernames).
 Remote sessions don’t persist (get closed when Mac closes)	The mux server likely isn’t running persistently. Perhaps linger not enabled or service not started.	SSH into remote after a disconnect, run systemctl --user status wezterm-mux-server. If it’s not running, enable linger (loginctl enable-linger). If it crashed, check logs. Make sure you used multiplexing = "WezTerm" in config; if you used plain SSH mode, sessions won’t persist.
 Too many tabs opening on each launch	The gui-startup logic might be creating new tabs every time instead of reusing.	Check the condition that determines if a remote already had tabs. In our config, we used #tabs <= 1. If you accidentally removed that or always spawn tabs, you’ll duplicate. Also ensure you don’t have multiple gui-startup handlers stacking via config reloads. Only one should run.
-Colors or domain-specific config not applying	Possibly the pane:get_domain_name() isn't matching your domain (maybe domain name typo).	Print/debug the domain name to see what it is. It should match one of the keys in domain_colors. Note: wa v0.2.0+ removed the Lua update-status hook; use CLI polling and user-var signaling instead.
+Colors or domain-specific config not applying	Possibly the pane:get_domain_name() isn't matching your domain (maybe domain name typo).	Print/debug the domain name to see what it is. It should match one of the keys in domain_colors. Note: ft v0.2.0+ removed the Lua update-status hook; use CLI polling and user-var signaling instead.
 Keybindings conflicts	Leader key or others not working as expected.	Make sure no other app (or macOS itself) is intercepting the combo. On macOS, Ctrl+Arrow might be tied to Mission Control; you may need to adjust those OS shortcuts. Also note WezTerm doesn’t allow duplicate key assignments – ensure your config isn’t merging multiple tables causing duplicates. Use wezterm show-keys to see active bindings.
-Automation tool (wa) isn’t catching events	The pattern might not match exactly due to formatting differences, or wa might not be polling frequently enough.	Test your regex patterns against sample output to ensure they match (taking into account punctuation, etc.). Increase polling frequency or use a manual trigger (you can always force a read with wa logs pane_id). Also confirm wa has correct pane IDs – they can change if you close and reopen tabs. wa should refresh the list if needed.
+Automation tool (ft) isn’t catching events	The pattern might not match exactly due to formatting differences, or ft might not be polling frequently enough.	Test your regex patterns against sample output to ensure they match (taking into account punctuation, etc.). Increase polling frequency or use a manual trigger (you can always force a read with `ft get-text <pane_id> --tail 200`). Also confirm ft has correct pane IDs – they can change if you close and reopen tabs. ft should refresh the list if needed.
 Unable to send Ctrl+C or special keys	wezterm cli send-text by itself doesn’t send special keycodes.	Use --no-paste and the literal control character if possible. In bash, ^C is 0x03. You could echo that via printf "\x03". On Linux/macOS, you might also use wezterm cli send-text --pane-id X $'\x03' --no-paste (using shell ANSI C quoting). If that fails, consider sending the escape sequence for SIGINT – in some contexts \x03 should work. Alternatively, as a last resort, ssh into the remote and kill -INT <pid> of the process. But that’s heavier.
 WezTerm high CPU usage or slow	Possibly the Lua config doing expensive work (like large text processing) on every frame.	Offload text scanning to the external tool (as we do). If you attempted to parse output in update-status, that could slow things. Also, extremely frequent polling (many times per second) could stress things – 1 Hz to 2 Hz per pane is usually fine. WezTerm itself is quite efficient with render, but if you use very large scrollback (default is 3500 lines; if you increased it to say 50k) and constantly dump it, that’s more data to handle. Tune as needed.
-SQLite database growing large	Logging everything can consume space.	Implement log rotation or pruning in wa. For example, you might delete old entries after X days, or use an FTS (full-text search) virtual table with a content limit. If the DB is huge, queries also slow down. So consider only indexing key fields or compressing old logs.
-Agent sessions interfering with each other	If wa sends a command to the wrong pane (misidentified agent) or timing issues cause overlap.	Ensure that each pane’s automation is isolated. Use per-pane locks if sending multi-step sequences. Double-check your identification logic (e.g., don’t send a Claude-specific command to a Codex pane). It might be safer to require user to tag a tab (perhaps rename the tab title to include agent name) to positively identify. In absence of that, use multiple pattern checks (Claude’s ASCII art vs Codex’s warnings are quite distinct).
+SQLite database growing large	Logging everything can consume space.	Implement log rotation or pruning in ft. For example, you might delete old entries after X days, or use an FTS (full-text search) virtual table with a content limit. If the DB is huge, queries also slow down. So consider only indexing key fields or compressing old logs.
+Agent sessions interfering with each other	If ft sends a command to the wrong pane (misidentified agent) or timing issues cause overlap.	Ensure that each pane’s automation is isolated. Use per-pane locks if sending multi-step sequences. Double-check your identification logic (e.g., don’t send a Claude-specific command to a Codex pane). It might be safer to require user to tag a tab (perhaps rename the tab title to include agent name) to positively identify. In absence of that, use multiple pattern checks (Claude’s ASCII art vs Codex’s warnings are quite distinct).
 
 Finally, if you run into issues not covered here, the WezTerm community is active. Check the WezTerm [FAQ/Troubleshooting docs] ￼ and GitHub discussions. Often, problems come down to configuration mistakes or environmental quirks that can be resolved.
 
 Conclusion
 
-By harnessing WezTerm’s modern multiplexing and Lua automation capabilities, we can create a robust environment to manage multiple AI coding agents across various machines as if they were just tabs in one window. WezTerm provides the persistence, performance, and scriptability needed for such advanced workflows ￼, while a dedicated automation tool like wezterm_automaton can serve as the “brain” coordinating all the agents.
+By harnessing WezTerm’s modern multiplexing and Lua automation capabilities, we can create a robust environment to manage multiple AI coding agents across various machines as if they were just tabs in one window. WezTerm provides the persistence, performance, and scriptability needed for such advanced workflows ￼, while a dedicated automation tool like FrankenTerm (`ft`) can serve as the “brain” coordinating all the agents.
 
 This approach offers:
 	•	Resilience: Sessions survive network issues and restarts, and usage limits can be handled by swiftly switching contexts or accounts.
@@ -661,6 +661,6 @@ This approach offers:
 	•	Transparency: Everything is logged. You can query past conversations or events easily, enabling analysis of agent behavior over time (e.g., how often does compaction happen? How many tokens used?).
 	•	Extensibility: Adding a new agent type or new automation trigger is as simple as adding another pattern and handler. The same infrastructure can manage any CLI tool running in a terminal.
 
-In summary, WezTerm + Lua + Rust form a powerful trio for building an AI agent management console that is far more capable than a traditional terminal or tmux setup. We’ve covered the full spectrum from initial configuration to the internals of capturing output and reacting to it. With this guide, a coding agent (or a savvy developer) should be equipped to implement wa and tailor it to their needs – ultimately creating a system where AI agents can oversee other AI agents, all orchestrated through WezTerm.
+In summary, WezTerm + Lua + Rust form a powerful trio for building an AI agent management console that is far more capable than a traditional terminal or tmux setup. We’ve covered the full spectrum from initial configuration to the internals of capturing output and reacting to it. With this guide, a coding agent (or a savvy developer) should be equipped to implement ft and tailor it to their needs – ultimately creating a system where AI agents can oversee other AI agents, all orchestrated through WezTerm.
 
 Last Updated: January 2026

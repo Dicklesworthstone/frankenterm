@@ -1,14 +1,14 @@
-# PLAN_CODEX.md — WezTerm Automata (`wa`) — End-to-End System Plan (Codex)
+# PLAN_CODEX.md — FrankenTerm (`ft`) — End-to-End System Plan (Codex)
 
 *Created:* 2026-01-18  
-*Primary spec:* `wezterm_automata_prompt_je.md` (JE)  
-*Background:* `wezterm_automata_guide.md`, `wezterm_automation_guide_chatgpt.md`, `wezterm_guide_gemini.md`, `PLAN.md`  
+*Primary spec:* `wezterm_automata_prompt_je.md` (JE; legacy filename)  
+*Background:* `frankenterm_guide.md`, `wezterm_automation_guide_chatgpt.md`, `wezterm_guide_gemini.md`, `PLAN.md`  
 
 ---
 
 ## 0) What this plan is (and isn’t)
 
-This document is a **single, comprehensive build plan** for `wa`: a Rust-first control plane for **observing and orchestrating WezTerm mux panes** that run AI coding agents (Claude Code, Codex CLI, Gemini CLI, and future agents).
+This document is a **single, comprehensive build plan** for `ft`: a Rust-first control plane for **observing and orchestrating WezTerm mux panes** that run AI coding agents (Claude Code, Codex CLI, Gemini CLI, and future agents).
 
 It is deliberately:
 - **Deterministic** (no timing-based “sendkeys” automation).
@@ -41,7 +41,7 @@ Turn WezTerm’s mux into a **high-reliability “terminal hypervisor”** for a
    - `handle_usage_limits` (cc/cod/gmi)
    - `handle_compaction` (cc/cod/gmi)
    - Additional workflows evolve, but these are foundational.
-6. `wa` must have **agent-first “robot mode”** (JSON/Markdown, token-efficient, quick-start when no args).
+6. `ft` must have **agent-first “robot mode”** (JSON/Markdown, token-efficient, quick-start when no args).
 7. Integrate existing tooling:
    - `cass` (`/dp/coding_agent_session_search`)
    - `caut` (`/dp/coding_agent_usage_tracker`, CodexBar logic in Rust)
@@ -76,7 +76,7 @@ Turn WezTerm’s mux into a **high-reliability “terminal hypervisor”** for a
 
 ### 3.1 High-level architecture
 
-`wa` is a **local control plane** that speaks to WezTerm (local GUI + remote mux servers) and exposes:
+`ft` is a **local control plane** that speaks to WezTerm (local GUI + remote mux servers) and exposes:
 - **Daemon**: continuous capture + detection + workflow orchestration
 - **SQLite**: durable store + FTS5
 - **CLI**: human + robot modes
@@ -108,14 +108,14 @@ Tier 1 (required): **WezTerm CLI** (`wezterm cli`)
 
 Tier 2 (strongly recommended): **Lua + OSC user-vars as a signaling lane**
 - Use OSC 1337 `SetUserVar` from within panes to publish *structured events* (JSON) to WezTerm.
-- Use `wezterm.on('user-var-changed', ...)` in `wezterm.lua` to forward these signals to `wa` (non-blocking via `wezterm.background_child_process`).
+- Use `wezterm.on('user-var-changed', ...)` in `wezterm.lua` to forward these signals to `ft` (non-blocking via `wezterm.background_child_process`).
 - This becomes the “low-latency interrupt line” (e.g., “agent is ready”, “workflow step completed”, “I’m at prompt”, “session id is X”).
 
 Tier 3 (optional, high ROI only): **Selective vendoring of WezTerm crates**
 - Goal: reduce subprocess overhead + enable “subscribe to output” instead of polling.
 - Done as an *optional feature* with hard version checks and clear fallback to Tier 1.
 
-### 4.2 Canonical WezTerm setup (enforced by `wa setup`)
+### 4.2 Canonical WezTerm setup (enforced by `ft setup`)
 
 We standardize (and optionally auto-install) the remote mux server approach:
 - systemd user unit for `wezterm-mux-server`

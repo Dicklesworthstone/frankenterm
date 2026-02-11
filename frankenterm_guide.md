@@ -1,8 +1,8 @@
-# FrankenTerm (wa): A Comprehensive Guide to Automating AI Coding Agent Fleets
+# FrankenTerm (ft): A Comprehensive Guide to Automating AI Coding Agent Fleets
 
-> **Purpose**: A complete technical guide for building `frankenterm` (`wa`), a high-performance Rust CLI tool for orchestrating fleets of AI coding agents (Claude Code, Codex CLI, Gemini CLI) across distributed WezTerm multiplexer sessions.
+> **Purpose**: A complete technical guide for building `frankenterm` (`ft`), a high-performance Rust CLI tool for orchestrating fleets of AI coding agents (Claude Code, Codex CLI, Gemini CLI) across distributed WezTerm multiplexer sessions.
 
-> **Note**: wa removed the Lua `update-status` hook in v0.2.0 due to performance overhead. Prefer
+> **Note**: ft removed the Lua `update-status` hook in v0.2.0 due to performance overhead. Prefer
 > `wezterm cli list` polling, user-var signaling, and escape-sequence detection instead.
 
 ---
@@ -13,7 +13,7 @@
 2. [WezTerm Fundamentals for Automation](#2-wezterm-fundamentals-for-automation)
 3. [The WezTerm CLI: Your Primary Interface](#3-the-wezterm-cli-your-primary-interface)
 4. [Lua API Deep Dive](#4-lua-api-deep-dive)
-5. [Building the wa Rust CLI](#5-building-the-wa-rust-cli)
+5. [Building the ft Rust CLI](#5-building-the-ft-rust-cli)
 6. [SQLite Storage Architecture](#6-sqlite-storage-architecture)
 7. [Pattern Detection Engine](#7-pattern-detection-engine)
 8. [Agent Workflow Automation](#8-agent-workflow-automation)
@@ -29,9 +29,9 @@
 
 ## 1. Architecture Overview
 
-### 1.1 The wa Vision
+### 1.1 The ft Vision
 
-`frankenterm` (wa) is designed to be the central nervous system for managing AI coding agent fleets. Unlike brittle sendkeys-based automation that relies on timing and blind faith, wa leverages WezTerm's rich multiplexer protocol to achieve:
+`frankenterm` (`ft`) is designed to be the central nervous system for managing AI coding agent fleets. Unlike brittle sendkeys-based automation that relies on timing and blind faith, ft leverages WezTerm's rich multiplexer protocol to achieve:
 
 - **Perfect observability**: Real-time capture of all terminal output across all panes
 - **Deterministic control**: Send input only when the terminal is in the expected state  
@@ -74,7 +74,7 @@
 
 1. **Never guess, always observe**: Every action is predicated on observable terminal state
 2. **Deterministic over probabilistic**: No sleep/delay heuristics; use actual state transitions
-3. **Atomic operations**: Each wa operation either fully succeeds or safely fails
+3. **Atomic operations**: Each ft operation either fully succeeds or safely fails
 4. **Agent-first ergonomics**: Designed for AI agents to use, not just humans
 5. **High-performance by default**: SIMD regex, zero-copy where possible, async I/O
 
@@ -104,7 +104,7 @@ Multiplexer (mux)
 ### 2.2 Domain Types for Remote Automation
 
 ```lua
--- SSH Domain with native multiplexing (RECOMMENDED for wa)
+-- SSH Domain with native multiplexing (RECOMMENDED for ft)
 config.ssh_domains = {
   {
     name = 'dev-server',
@@ -172,9 +172,9 @@ immediate CLI actions (get-text, send-text), but it is not a stable long-lived
 identity. Pane ids can be recycled after a pane closes, and they do not survive
 daemon restarts or a new mux session.
 
-wa therefore assigns a stable `pane_uuid` at discovery time and persists it:
+ft therefore assigns a stable `pane_uuid` at discovery time and persists it:
 
-- Assignment: when a pane is first discovered, wa generates a `pane_uuid` from
+- Assignment: when a pane is first discovered, ft generates a `pane_uuid` from
   the pane's domain, `pane_id`, first-seen timestamp, and random entropy.
 - Stability: the `pane_uuid` never changes while that pane exists, even if the
   pane title, cwd, tab, or window changes.
@@ -192,7 +192,7 @@ Identity vs generation:
 
 Observe/act separation:
 
-- `pane_uuid` assignment is passive. wa does not write to panes or use OSC
+- `pane_uuid` assignment is passive. ft does not write to panes or use OSC
   handshakes for identity in the current design.
 - If a future handshake is added, it must be explicit and rate-limited to avoid
   any "spam" writes in observed panes.
@@ -210,7 +210,7 @@ Debugging guidance:
 
 ## 3. The WezTerm CLI: Your Primary Interface
 
-The `wezterm cli` commands are the primary mechanism for wa to interact with WezTerm. This is more reliable than IPC or Lua callbacks for external tools.
+The `wezterm cli` commands are the primary mechanism for ft to interact with WezTerm. This is more reliable than IPC or Lua callbacks for external tools.
 
 ### 3.1 Essential CLI Commands
 
@@ -274,7 +274,7 @@ wezterm cli spawn --domain-name staging --new-window \
 
 ### 3.3 JSON Output Parsing Strategy
 
-wa should always use `--format json` and parse structured output:
+ft should always use `--format json` and parse structured output:
 
 ```rust
 use serde::{Deserialize, Serialize};
@@ -311,7 +311,7 @@ pub async fn list_panes() -> Result<Vec<PaneInfo>> {
 
 ## 4. Lua API Deep Dive
 
-While wa primarily uses the CLI, understanding Lua enables sophisticated integrations.
+While ft primarily uses the CLI, understanding Lua enables sophisticated integrations.
 
 ### 4.1 Event System
 
@@ -330,7 +330,7 @@ wezterm.on('mux-startup', function()
   -- Initialize mux-level state
 end)
 
--- DEPRECATED in wa v0.2.0: update-status hook removed for performance.
+-- DEPRECATED in ft v0.2.0: update-status hook removed for performance.
 -- Use CLI polling + user-var signaling instead. Shown here for reference only.
 -- wezterm.on('update-status', function(window, pane)
 --   -- Update status bar, check conditions
@@ -343,9 +343,9 @@ end)
 
 -- Called when user vars change (powerful for signaling)
 wezterm.on('user-var-changed', function(window, pane, name, value)
-  if name == 'wa-signal' then
+  if name == 'ft-signal' then
     local cmd = wezterm.json_parse(value)
-    -- Handle wa commands from within the terminal
+    -- Handle ft commands from within the terminal
   end
 end)
 ```
@@ -360,19 +360,19 @@ User variables allow programs inside a pane to communicate with wezterm.lua:
 printf "\033]1337;SetUserVar=%s=%s\007" status $(echo -n ready | base64)
 
 # Complex data via JSON
-printf "\033]1337;SetUserVar=%s=%s\007" wa-data \
+printf "\033]1337;SetUserVar=%s=%s\007" ft-data \
   $(echo -n '{"event":"compaction","agent":"claude-code"}' | base64)
 ```
 
 ```lua
 -- In wezterm.lua
 wezterm.on('user-var-changed', function(window, pane, name, value)
-  if name == 'wa-data' then
+  if name == 'ft-data' then
     local data = wezterm.json_parse(value)
     if data.event == 'compaction' then
-      -- Trigger wa notification
+      -- Trigger ft notification
       wezterm.background_child_process {
-        'wa', 'notify', '--event', 'compaction', '--pane', tostring(pane:pane_id())
+        'ft', 'notify', '--event', 'compaction', '--pane', tostring(pane:pane_id())
       }
     end
   end
@@ -380,7 +380,7 @@ end)
 
 -- Read all user vars
 local vars = pane:get_user_vars()
--- vars.status, vars['wa-data'], etc.
+-- vars.status, vars['ft-data'], etc.
 ```
 
 ### 4.3 Pane Methods for Output Capture
@@ -433,7 +433,7 @@ window:perform_action(
 
 ---
 
-## 5. Building the wa Rust CLI
+## 5. Building the ft Rust CLI
 
 ### 5.1 Project Structure
 
@@ -490,7 +490,7 @@ version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "wa"
+name = "ft"
 path = "src/main.rs"
 
 [dependencies]
@@ -558,7 +558,7 @@ mod browser;
 mod config;
 
 #[derive(Parser)]
-#[command(name = "wa")]
+#[command(name = "ft")]
 #[command(about = "FrankenTerm - AI Coding Agent Fleet Manager")]
 #[command(version)]
 struct Cli {
@@ -609,7 +609,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("wa=info".parse()?)
+                .add_directive("frankenterm=info".parse()?)
         )
         .init();
 
@@ -835,8 +835,8 @@ CREATE TABLE IF NOT EXISTS events (
     detected_at TEXT NOT NULL,
     raw_match TEXT,            -- The matched text
     metadata TEXT,             -- JSON with extracted data
-    handled_at TEXT,           -- When wa responded
-    action_taken TEXT          -- What wa did
+    handled_at TEXT,           -- When ft responded
+    action_taken TEXT          -- What ft did
 );
 
 -- Agent session tracking (correlates with cass)
@@ -893,9 +893,9 @@ pub struct Storage {
 impl Storage {
     pub fn open(path: Option<PathBuf>) -> Result<Self> {
         let path = path.unwrap_or_else(|| {
-            let dirs = directories::ProjectDirs::from("", "", "wa")
+            let dirs = directories::ProjectDirs::from("", "", "ft")
                 .expect("Could not determine data directory");
-            dirs.data_dir().join("wa.db")
+            dirs.data_dir().join("ft.db")
         });
         
         std::fs::create_dir_all(path.parent().unwrap())?;
@@ -1584,7 +1584,7 @@ pub async fn run(args: WatchArgs) -> Result<()> {
     
     let mut ticker = interval(Duration::from_millis(args.interval_ms));
     
-    tracing::info!("Starting wa watcher daemon (interval={}ms)", args.interval_ms);
+    tracing::info!("Starting ft watcher daemon (interval={}ms)", args.interval_ms);
     
     loop {
         ticker.tick().await;
@@ -1784,7 +1784,7 @@ pub async fn complete_openai_device_auth(
 
 ### 10.1 Design Philosophy
 
-Robot mode is designed for AI coding agents to interact with wa. Key principles:
+Robot mode is designed for AI coding agents to interact with ft. Key principles:
 
 1. **Explicit over implicit**: Every command clearly states what it does
 2. **Structured output**: JSON for data, Markdown for reports
@@ -1963,7 +1963,7 @@ async fn state_command() -> Result<RobotOutput> {
 }
 
 fn help_output() -> RobotOutput {
-    let help = r#"# wa robot - Agent Interface
+    let help = r#"# ft robot - Agent Interface
 
 ## Quick Reference
 
@@ -1981,12 +1981,12 @@ fn help_output() -> RobotOutput {
 
 ### Check if agent hit usage limit
 ```bash
-wa robot search "hit your limit" --pane-id 3
+ft robot search "hit your limit" --pane-id 3
 ```
 
 ### Send multi-line input
 ```bash
-wa robot send 3 "cat << 'EOF'
+ft robot send 3 "cat << 'EOF'
 line 1
 line 2
 EOF"
@@ -1994,7 +1994,7 @@ EOF"
 
 ### Wait for prompt then send
 ```bash
-wa robot wait-for 3 ">" && wa robot send 3 "continue"
+ft robot wait-for 3 ">" && ft robot send 3 "continue"
 ```
 
 ## Output Format
@@ -2780,7 +2780,7 @@ To continue this session, run codex resume 019bcea5-acb4-7370-a50d-8a2b59553cf6
 
 ## Conclusion
 
-This guide provides the complete technical foundation for building `frankenterm` (wa), a high-performance Rust CLI for orchestrating AI coding agent fleets. Key takeaways:
+This guide provides the complete technical foundation for building `frankenterm` (`ft`), a high-performance Rust CLI for orchestrating AI coding agent fleets. Key takeaways:
 
 1. **WezTerm's native multiplexing** provides the reliable, observable foundation that makes timing-independent automation possible.
 
@@ -2790,7 +2790,7 @@ This guide provides the complete technical foundation for building `frankenterm`
 
 4. **Aho-Corasick + regex** provides the high-performance pattern matching needed to detect agent events in real-time.
 
-5. **Robot mode** makes wa itself controllable by AI agents, enabling meta-automation where one agent manages a fleet of others.
+5. **Robot mode** makes ft itself controllable by AI agents, enabling meta-automation where one agent manages a fleet of others.
 
 6. **The workflow engine** codifies common patterns (usage limits, compaction, errors) into reliable, automated responses.
 

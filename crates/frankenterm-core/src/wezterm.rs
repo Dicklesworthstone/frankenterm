@@ -500,6 +500,9 @@ pub struct WeztermClient {
     retry_delay_ms: u64,
     /// Circuit breaker for CLI reliability
     circuit_breaker: Arc<Mutex<CircuitBreaker>>,
+    /// Circuit breaker for direct mux connection reliability.
+    #[cfg(all(feature = "vendored", unix))]
+    mux_circuit_breaker: Arc<Mutex<CircuitBreaker>>,
     /// Optional mux connection pool for direct socket communication.
     /// When present, operations try the pool first and fall back to CLI.
     #[cfg(all(feature = "vendored", unix))]
@@ -526,6 +529,11 @@ impl WeztermClient {
                 CircuitBreakerConfig::default(),
             ),
             #[cfg(all(feature = "vendored", unix))]
+            mux_circuit_breaker: get_or_register_circuit(
+                "mux_connection",
+                CircuitBreakerConfig::default(),
+            ),
+            #[cfg(all(feature = "vendored", unix))]
             mux_pool: None,
         }
     }
@@ -540,6 +548,11 @@ impl WeztermClient {
             retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
             circuit_breaker: get_or_register_circuit(
                 "wezterm_cli",
+                CircuitBreakerConfig::default(),
+            ),
+            #[cfg(all(feature = "vendored", unix))]
+            mux_circuit_breaker: get_or_register_circuit(
+                "mux_connection",
                 CircuitBreakerConfig::default(),
             ),
             #[cfg(all(feature = "vendored", unix))]
@@ -605,10 +618,19 @@ impl WeztermClient {
     pub async fn list_panes(&self) -> Result<Vec<PaneInfo>> {
         #[cfg(all(feature = "vendored", unix))]
         if let Some(ref pool) = self.mux_pool {
-            match pool.list_panes().await {
-                Ok(response) => return Ok(pane_info_from_mux_response(&response)),
-                Err(e) => {
-                    tracing::debug!(error = %e, "mux pool list_panes failed, falling back to CLI");
+            if self.mux_circuit_guard() {
+                match pool.list_panes().await {
+                    Ok(response) => {
+                        self.mux_circuit_record_success();
+                        return Ok(pane_info_from_mux_response(&response));
+                    }
+                    Err(e) => {
+                        self.mux_circuit_record_failure(&e);
+                        tracing::debug!(
+                            error = %e,
+                            "mux pool list_panes failed, falling back to CLI"
+                        );
+                    }
                 }
             }
         }
@@ -644,12 +666,13 @@ impl WeztermClient {
         if let Some(ref pool) = self.mux_pool {
             if escapes {
                 tracing::debug!("mux pool get_text does not support escapes; falling back to CLI");
-            } else {
+            } else if self.mux_circuit_guard() {
                 let mut pool_text: Option<String> = None;
                 'mux_text: {
                     let changes = match pool.get_pane_render_changes(pane_id).await {
                         Ok(changes) => changes,
                         Err(e) => {
+                            self.mux_circuit_record_failure(&e);
                             tracing::debug!(
                                 error = %e,
                                 "mux pool get_text: render_changes failed; falling back to CLI"
@@ -709,6 +732,7 @@ impl WeztermClient {
                                 }
                             }
                             Err(e) => {
+                                self.mux_circuit_record_failure(&e);
                                 tracing::debug!(
                                     error = %e,
                                     "mux pool get_text: get_lines failed; falling back to CLI"
@@ -724,6 +748,7 @@ impl WeztermClient {
                 }
 
                 if let Some(text) = pool_text {
+                    self.mux_circuit_record_success();
                     return Ok(text);
                 }
             }
@@ -1062,20 +1087,28 @@ impl WeztermClient {
     ) -> Result<()> {
         #[cfg(all(feature = "vendored", unix))]
         if let Some(ref pool) = self.mux_pool {
-            let data = if no_newline {
-                text.to_string()
+            if !self.mux_circuit_guard() {
+                tracing::debug!("mux connection circuit open; falling back to CLI send");
             } else {
-                format!("{text}\n")
-            };
-            let pool_result = if no_paste {
-                pool.write_to_pane(pane_id, data.into_bytes()).await
-            } else {
-                pool.send_paste(pane_id, data).await
-            };
-            match pool_result {
-                Ok(_) => return Ok(()),
-                Err(e) => {
-                    tracing::debug!(error = %e, "mux pool send failed, falling back to CLI");
+                let data = if no_newline {
+                    text.to_string()
+                } else {
+                    format!("{text}\n")
+                };
+                let pool_result = if no_paste {
+                    pool.write_to_pane(pane_id, data.into_bytes()).await
+                } else {
+                    pool.send_paste(pane_id, data).await
+                };
+                match pool_result {
+                    Ok(_) => {
+                        self.mux_circuit_record_success();
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        self.mux_circuit_record_failure(&e);
+                        tracing::debug!(error = %e, "mux pool send failed, falling back to CLI");
+                    }
                 }
             }
         }
@@ -1202,6 +1235,57 @@ impl WeztermClient {
                 }
             }
         }
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    fn mux_error_is_circuit_breaker_trigger(err: &crate::vendored::MuxPoolError) -> bool {
+        match err {
+            crate::vendored::MuxPoolError::Pool(_) => true,
+            crate::vendored::MuxPoolError::Mux(mux) => {
+                !matches!(mux, crate::vendored::DirectMuxError::RemoteError(_))
+            }
+        }
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    fn mux_circuit_guard(&self) -> bool {
+        let mut guard = match self.mux_circuit_breaker.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        if guard.allow() {
+            true
+        } else {
+            let status = guard.status();
+            tracing::debug!(
+                retry_after_ms = status.cooldown_remaining_ms.unwrap_or(0),
+                "mux connection circuit breaker open"
+            );
+            false
+        }
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    fn mux_circuit_record_success(&self) {
+        let mut guard = match self.mux_circuit_breaker.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.record_success();
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    fn mux_circuit_record_failure(&self, err: &crate::vendored::MuxPoolError) {
+        if !Self::mux_error_is_circuit_breaker_trigger(err) {
+            return;
+        }
+
+        let mut guard = match self.mux_circuit_breaker.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.record_failure();
     }
 
     async fn run_cli_with_pane_check_retry(&self, args: &[&str], pane_id: u64) -> Result<String> {

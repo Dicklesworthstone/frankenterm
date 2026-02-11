@@ -413,7 +413,7 @@ fn find_safe_split(content: &str, start: usize, target: usize) -> usize {
 fn has_csi_terminator(seq: &str) -> bool {
     // CSI sequences end with a letter in the range 0x40-0x7E.
     for (i, b) in seq.bytes().enumerate() {
-        if i >= 2 && b >= 0x40 && b <= 0x7E {
+        if i >= 2 && (0x40..=0x7E).contains(&b) {
             return true;
         }
     }

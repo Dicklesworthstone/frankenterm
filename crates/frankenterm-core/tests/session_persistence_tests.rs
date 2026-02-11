@@ -443,7 +443,7 @@ async fn pane_state_cwd_and_title_persisted() {
         .unwrap();
 
     let conn = Connection::open(db_path.as_str()).unwrap();
-    let (cwd, command): (Option<String>, Option<String>) = conn
+    let (cwd, _command): (Option<String>, Option<String>) = conn
         .query_row(
             "SELECT cwd, command FROM mux_pane_state WHERE checkpoint_id = ?1",
             [result.checkpoint_id],

@@ -1,4 +1,4 @@
-# WezTerm Automata (wa) — Master Implementation Plan
+# FrankenTerm (ft) — Master Implementation Plan
 
 > **Vision**: Build the central nervous system for AI coding agent fleets—a tool so robust, intelligent, and ergonomic that it enables supersmart swarms of AI agents to coordinate seamlessly and solve humanity's hardest problems.
 
@@ -47,7 +47,7 @@
 
 ### 1.1 What We're Building
 
-`wezterm_automata` (wa) is a high-performance Rust CLI and MCP server that provides:
+`frankenterm` (`ft`) is a high-performance Rust CLI and MCP server that provides:
 
 1. **Perfect Observability**: Real-time capture of ALL terminal output across ALL panes in ALL WezTerm domains
 2. **Intelligent Detection**: SIMD-accelerated pattern matching to identify agent events (compaction, usage limits, errors, session boundaries)
@@ -77,7 +77,7 @@
 
 ### 1.4 Non-Goals (Explicit Scope Boundaries)
 
-- **Not replacing agents**: wa orchestrates agents, it doesn't replace Claude Code/Codex/Gemini
+- **Not replacing agents**: ft orchestrates agents, it doesn't replace Claude Code/Codex/Gemini
 - **Not a general scheduler**: Day 1 is single-machine coordination; distributed scheduling comes later
 - **Not forking WezTerm**: Selective vendoring if ROI is overwhelming, but prefer upstream CLI
 
@@ -117,12 +117,12 @@ H1, A1 → wa status / wa robot state
 H2, A3 → wa query / wa robot search
 H3     → handle_usage_limits workflow
 H4     → handle_compaction workflow
-H5     → wa setup
-H6     → wa tui (charmed_rust)
-H7     → wa export
-A2     → wa robot send --wait-for
-A4     → wa robot workflow
-A5     → wa robot quick-start
+H5     → ft setup
+H6     → ft tui (charmed_rust)
+H7     → ft export
+A2     → ft robot send --wait-for
+A4     → ft robot workflow
+A5     → ft robot quick-start
 A6     → pane locking mechanism
 ```
 
@@ -134,7 +134,7 @@ A6     → pane locking mechanism
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────────────┐
-│                                    wa (wezterm_automata)                                 │
+│                                    ft (FrankenTerm)                                      │
 │                                                                                          │
 │  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐ │
 │  │ Ingest Pipeline  │  │  Pattern Engine  │  │ Workflow Engine  │  │   Robot Mode     │ │
@@ -3949,68 +3949,25 @@ pub fn check_version_compatibility() -> Result<VersionStatus> {
 ## 17. Project Structure
 
 ```
-wezterm_automata/
+frankenterm/
 ├── Cargo.toml                    # Workspace manifest
 ├── crates/
-│   ├── wa/                       # Main binary
-│   │   ├── Cargo.toml
+│   ├── frankenterm/              # CLI binary (ft)
 │   │   └── src/
 │   │       ├── main.rs
-│   │       └── cli/
-│   │           ├── mod.rs
-│   │           ├── watch.rs
-│   │           ├── robot.rs
-│   │           ├── setup.rs
-│   │           └── workflow.rs
-│   ├── wa-core/                  # Core library
-│   │   ├── Cargo.toml
-│   │   └── src/
-│   │       ├── lib.rs
-│   │       ├── wezterm/
-│   │       │   ├── mod.rs
-│   │       │   ├── client.rs
-│   │       │   └── domain.rs
-│   │       ├── storage/
-│   │       │   ├── mod.rs
-│   │       │   ├── schema.rs
-│   │       │   └── queries.rs
-│   │       ├── patterns/
-│   │       │   ├── mod.rs
-│   │       │   ├── engine.rs
-│   │       │   └── agents/
-│   │       │       ├── mod.rs
-│   │       │       ├── claude_code.rs
-│   │       │       ├── codex.rs
-│   │       │       └── gemini.rs
-│   │       └── workflows/
-│   │           ├── mod.rs
-│   │           ├── engine.rs
-│   │           ├── usage_limits.rs
-│   │           └── compaction.rs
-│   ├── wa-browser/               # Browser automation
-│   │   ├── Cargo.toml
-│   │   └── src/
-│   │       ├── lib.rs
-│   │       ├── openai.rs
-│   │       ├── anthropic.rs
-│   │       └── google.rs
-│   └── wa-mcp/                   # MCP server
-│       ├── Cargo.toml
+│   │       └── mcp.rs            # MCP wiring (feature-gated)
+│   └── frankenterm-core/         # Core library (capture/storage/patterns/workflows/policy)
 │       └── src/
-│           ├── lib.rs
-│           └── server.rs
-├── skills/
-│   ├── AGENTS.md
-│   └── workflows/
-│       ├── handle_usage_limits.md
-│       ├── handle_compaction.md
-│       └── coordinate_agents.md
-├── tests/
-│   ├── integration/
-│   └── patterns/
-└── resources/
-    ├── wezterm-mux-server.service
-    └── wezterm.lua.template
+│           ├── config.rs
+│           ├── ingest.rs
+│           ├── patterns.rs
+│           ├── workflows.rs
+│           ├── policy.rs
+│           ├── storage.rs
+│           └── wezterm.rs
+├── docs/                         # Architecture + operator docs
+├── fixtures/                     # Test fixtures (E2E + corpus)
+└── fuzz/                         # Fuzz targets
 ```
 
 ---
@@ -4109,16 +4066,16 @@ Contents:
 
 ## 19. Unified Configuration
 
-### 19.1 Config File: `wa.toml`
+### 19.1 Config File: `ft.toml`
 
-Primary config file: `~/.config/wa/wa.toml`
+Primary config file: `~/.config/ft/ft.toml`
 
 ```toml
-# wa.toml - Unified configuration for wezterm_automata
+# ft.toml - Unified configuration for FrankenTerm
 
 [general]
 log_level = "info"
-data_dir = "~/.local/share/wa"
+data_dir = "~/.local/share/ft"
 
 [ingest]
 poll_interval_ms = 200
@@ -4126,13 +4083,13 @@ backpressure_limit = 4096
 gap_detection = true
 
 [storage]
-db_path = "~/.local/share/wa/wa.db"
+db_path = "~/.local/share/ft/ft.db"
 retention_days = 30
 checkpoint_interval_ms = 60000
 
 [patterns]
 # Pattern packs in priority order (later overrides earlier)
-packs = ["builtin:core", "builtin:codex", "builtin:claude_code", "~/.config/wa/packs/custom.toml"]
+packs = ["builtin:core", "builtin:codex", "builtin:claude_code", "~/.config/ft/packs/custom.toml"]
 
 [patterns.state_gating]
 enabled = true
@@ -4161,11 +4118,11 @@ bind = "127.0.0.1:9464"
 ### 19.2 Config Commands
 
 ```bash
-wa config init                    # Create default config
-wa config validate                # Schema + semantic checks
-wa config show --effective        # Show config with env/CLI overrides applied
-wa config set storage.retention_days 60  # Update single value
-wa watch --reload-config          # Hot reload for non-destructive settings
+ft config init                    # Create default config
+ft config validate                # Schema + semantic checks
+ft config show --effective        # Show config with env/CLI overrides applied
+ft config set storage.retention_days 60  # Update single value
+ft watch --reload-config          # Hot reload for non-destructive settings
 ```
 
 ### 19.3 Environment Overrides
@@ -4173,9 +4130,9 @@ wa watch --reload-config          # Hot reload for non-destructive settings
 Environment variables override config file values:
 
 ```bash
-WA_LOG_LEVEL=debug wa watch
-WA_STORAGE_DB_PATH=/tmp/test.db wa query "error"
-WA_METRICS_ENABLED=true wa watch
+FT_LOG_LEVEL=debug ft watch
+FT_STORAGE_DB_PATH=/tmp/test.db ft query "error"
+FT_METRICS_ENABLED=true ft watch
 ```
 
 ### 19.4 WezTerm Config Patching (Idempotent)
@@ -4185,17 +4142,17 @@ Generated snippets are wrapped in markers for safe re-running:
 ```lua
 -- ~/.wezterm.lua
 
--- WA-BEGIN (do not edit manually)
-local wa_config = {
+-- FT-BEGIN (do not edit manually)
+local ft_config = {
   domains = { ... },
   hooks = { ... },
 }
--- WA-END
+-- FT-END
 
 -- Your custom config continues here...
 ```
 
-`wa setup wezterm` can safely re-run and update-in-place without duplicating hooks.
+`ft setup patch` can safely re-run and update-in-place without duplicating hooks.
 
 ---
 

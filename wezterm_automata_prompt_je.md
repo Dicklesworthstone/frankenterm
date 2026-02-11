@@ -1,6 +1,6 @@
 Research and write for me an extremely long, detailed, comprehensive, and elaborate guide all about automating wezterm from end to end using Lua in a way that would be suitable for the automated management of a fleet of ai coding agents (claude code, codex-cli, gemini-cli, etc.) operating in one or more remote domains using wezterm's built in terminal multiplexer;  Research all the best practices and techniques and strategies and things that you can do to achieve maximum performance, reliability, robustness, responsiveness, safety, etc for doing that. 
 
-Note: wa removed the Lua `update-status` hook in v0.2.0 due to performance overhead. Any `update-status`
+Note: ft removed the Lua `update-status` hook in v0.2.0 due to performance overhead. Any `update-status`
 examples in this prompt should be treated as historical; prefer CLI polling + user-var signaling +
 escape-sequence detection instead.
 
@@ -292,7 +292,7 @@ local domain_info = {
 
 local last_domain = {}
 
--- DEPRECATED in wa v0.2.0: shown for historical reference only.
+-- DEPRECATED in ft v0.2.0: shown for historical reference only.
 -- Prefer CLI polling + user-var signaling instead.
 wezterm.on('update-status', function(window, pane)  -- DEPRECATED
   local domain = pane:get_domain_name()
@@ -487,7 +487,7 @@ Both should show the same version (e.g., `20240101-123456-abcdef`).
 |:--------|:------|:----|
 | "Connection failed" on startup | Remote unreachable or mux-server not running | Check SSH connectivity; verify systemd service is active |
 | Wrong number of tabs on remote | Previous session state persisted | Restart mux-server: `ssh host 'systemctl --user restart wezterm-mux-server'` |
-| Colors not applying | Domain name not matching config table | Check `pane:get_domain_name()` returns expected value. Note: wa v0.2.0+ removed `update-status` hook; use CLI polling instead |
+| Colors not applying | Domain name not matching config table | Check `pane:get_domain_name()` returns expected value. Note: ft v0.2.0+ removed `update-status` hook; use CLI polling instead |
 | Version mismatch errors | Local and remote WezTerm versions differ | Update WezTerm on both ends to same version |
 | Mux-server dies on disconnect | Lingering not enabled | Run `sudo loginctl enable-linger $USER` on remote |
 | Can't create new tabs in domain | Mux-server crashed | Check logs; restart service |
@@ -521,7 +521,7 @@ Open WezTerm's debug overlay with `Ctrl+Shift+L` to inspect the current domain a
 *Last updated: January 2026*
 ```
 
-Basically we want to make a rust cli tool wezterm_automata (wa for short) that is highly optimized for controlling and observing wezterm; it would need to track the output and keep a log of ALL data in ALL tabs in ALL wezterm domains (you can assume for simplicity that none of these tabs will themselves be running tmux or another multiplexer) and storing this in sqlite in a smart way that makes it easy to do full text search. We would have specialized routines for detecting certain tell-tale signs of activity within a session; for instance, when claude code does a compaction, it looks similar to this:
+Basically we want to make a Rust CLI tool FrankenTerm (`ft`) that is highly optimized for controlling and observing WezTerm; it would need to track the output and keep a log of ALL data in ALL tabs in ALL WezTerm domains (you can assume for simplicity that none of these tabs will themselves be running tmux or another multiplexer) and storing this in sqlite in a smart way that makes it easy to do full text search. We would have specialized routines for detecting certain tell-tale signs of activity within a session; for instance, when claude code does a compaction, it looks similar to this:
 
 ```
  ▐▛███▜▌   Claude Code v2.1.12
@@ -704,13 +704,13 @@ where each of those is a different workflow but use shared code wherever possibl
 
 Then we can have more general workflows which I can explain later for managing agent coding sessions using a collection of canned prompts in a way that follows a basic pattern.
 
-Now, this project is called wezterm_automaton (wa for short, which would be the binary name). This wa cli tool would feature an "agent-first" robot mode as described here: "Next, I want you to create a "robot mode" for coding agents that want to interact with this so they don't need to use the UI but can instead access all the same functionality via a cli in the console that is hyper-optimized and ergonomic for agents, while also being ultra-intuitive for coding agents like yourself; the agent users should get back as output either json or markdown-- whatever fits best in the context and is most token-efficient and intuitive for you. Basically, the agent users should get all the same information as a human would get from manipulating and visually observing the UI, but in a more usable, helpful, intuitive, and accessible form for agents. Make the tooling here that YOU would want if YOU were using it (because you WILL be!), that maximizes agent ergonomics and agent intuition. Be sure to give the command a quick-start mode (when no arguments are supplied) that explains the most critical functionality in the most intuitive, token-dense way possible."
+Now, this project is called FrankenTerm (`ft`, which is the binary name). This `ft` CLI tool would feature an "agent-first" robot mode as described here: "Next, I want you to create a "robot mode" for coding agents that want to interact with this so they don't need to use the UI but can instead access all the same functionality via a cli in the console that is hyper-optimized and ergonomic for agents, while also being ultra-intuitive for coding agents like yourself; the agent users should get back as output either json or markdown-- whatever fits best in the context and is most token-efficient and intuitive for you. Basically, the agent users should get all the same information as a human would get from manipulating and visually observing the UI, but in a more usable, helpful, intuitive, and accessible form for agents. Make the tooling here that YOU would want if YOU were using it (because you WILL be!), that maximizes agent ergonomics and agent intuition. Be sure to give the command a quick-start mode (when no arguments are supplied) that explains the most critical functionality in the most intuitive, token-dense way possible."
 
 The goal is to ultimately put Codex or Claude Code, running on the local machine-- say, a mac, and controlling remote linux machines via ssh in wezterm-- itself in charge of managing the fleet of other coding agent, using skills.md and similar that codify workflows.
 
-One of the things wa would do would be to completely automate the setup and config of wezterm in this way, where you could easily select your remote machines that would be prepopulated into a menu based on looking at you ~/.ssh dir or scanning your zshrc or bashrc file for ssh alias command. It would connec to these machines remotely and set them up for you automatically to in this exact way shown in the guide, because it's critical that we have that standardized to make wa is simple as possible in terms of only supporting one canonical setup.
+One of the things `ft` would do would be to completely automate the setup and config of wezterm in this way, where you could easily select your remote machines that would be prepopulated into a menu based on looking at you ~/.ssh dir or scanning your zshrc or bashrc file for ssh alias command. It would connec to these machines remotely and set them up for you automatically to in this exact way shown in the guide, because it's critical that we have that standardized to make `ft` as simple as possible in terms of only supporting one canonical setup.
 
-wa could also integrate with my cass tool (/dp/coding_agent_session_search) to correlate session histories for token tracking and stuff like that. And we wannt wa to basically have all the logic that's in CodexBar but expressed as ultra-high performance rust.
+`ft` could also integrate with my cass tool (/dp/coding_agent_session_search) to correlate session histories for token tracking and stuff like that. And we want `ft` to basically have all the logic that's in CodexBar but expressed as ultra-high performance rust.
 
 
 ---

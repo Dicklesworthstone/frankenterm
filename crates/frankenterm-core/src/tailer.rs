@@ -5,8 +5,8 @@
 //! enforcement.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{RwLock, Semaphore, mpsc};
@@ -14,6 +14,7 @@ use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tracing::{debug, trace, warn};
 
+use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, get_or_register_circuit};
 use crate::config::CaptureBudgetConfig;
 use crate::ingest::{CapturedSegment, PaneCursor, PaneRegistry};
 use crate::wezterm::{PaneInfo, PaneTextSource};
@@ -403,6 +404,8 @@ where
     shutdown_flag: Arc<AtomicBool>,
     /// Pane text source (WezTerm client or test double)
     source: Arc<S>,
+    /// Circuit breaker for capture pipeline reliability.
+    capture_circuit_breaker: Arc<Mutex<CircuitBreaker>>,
     /// Concurrency limiter for in-flight polls
     semaphore: Arc<Semaphore>,
     /// Per-pane tailer state
@@ -442,6 +445,10 @@ where
             registry,
             shutdown_flag,
             source,
+            capture_circuit_breaker: get_or_register_circuit(
+                "capture_pipeline",
+                CircuitBreakerConfig::default(),
+            ),
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
             tailers: HashMap::new(),
             capturing_panes: HashSet::new(),
@@ -470,6 +477,10 @@ where
             registry,
             shutdown_flag,
             source,
+            capture_circuit_breaker: get_or_register_circuit(
+                "capture_pipeline",
+                CircuitBreakerConfig::default(),
+            ),
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
             tailers: HashMap::new(),
             capturing_panes: HashSet::new(),
@@ -629,6 +640,7 @@ where
             let cursors = Arc::clone(&self.cursors);
             let registry = Arc::clone(&self.registry);
             let source = Arc::clone(&self.source);
+            let capture_circuit_breaker = Arc::clone(&self.capture_circuit_breaker);
             let semaphore = Arc::clone(&self.semaphore);
             let overlap_size = self.config.overlap_size;
             let send_timeout = self.config.send_timeout;
@@ -673,6 +685,24 @@ where
                     return (pane_id, PollOutcome::NoCursor);
                 }
 
+                let retry_after_ms = {
+                    let mut guard = match capture_circuit_breaker.lock() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+
+                    if guard.allow() {
+                        None
+                    } else {
+                        let status = guard.status();
+                        Some(status.cooldown_remaining_ms.unwrap_or(0))
+                    }
+                };
+
+                if let Some(retry_after_ms) = retry_after_ms {
+                    return (pane_id, PollOutcome::CircuitOpen { retry_after_ms });
+                }
+
                 let permit = match timeout(send_timeout, tx.reserve()).await {
                     Ok(Ok(permit)) => permit,
                     Ok(Err(_)) => return (pane_id, PollOutcome::ChannelClosed),
@@ -680,8 +710,35 @@ where
                 };
 
                 let text = match source.get_text(pane_id, false).await {
-                    Ok(text) => text,
+                    Ok(text) => {
+                        let mut guard = match capture_circuit_breaker.lock() {
+                            Ok(guard) => guard,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        guard.record_success();
+                        text
+                    }
                     Err(err) => {
+                        if let crate::Error::Wezterm(wez) = &err {
+                            if let crate::error::WeztermError::CircuitOpen { retry_after_ms } = wez
+                            {
+                                drop(permit);
+                                return (
+                                    pane_id,
+                                    PollOutcome::CircuitOpen {
+                                        retry_after_ms: *retry_after_ms,
+                                    },
+                                );
+                            }
+
+                            if wez.is_circuit_breaker_trigger() {
+                                let mut guard = match capture_circuit_breaker.lock() {
+                                    Ok(guard) => guard,
+                                    Err(poisoned) => poisoned.into_inner(),
+                                };
+                                guard.record_failure();
+                            }
+                        }
                         drop(permit);
                         return (pane_id, PollOutcome::Error(err.to_string()));
                     }
@@ -762,6 +819,13 @@ where
                     tailer.record_poll(false, &self.config);
                     warn!(pane_id, "Tailer channel closed");
                 }
+                PollOutcome::CircuitOpen { retry_after_ms } => {
+                    tailer.record_poll(false, &self.config);
+                    trace!(
+                        pane_id,
+                        retry_after_ms, "Tailer poll skipped (capture circuit breaker open)"
+                    );
+                }
                 PollOutcome::Error(error) => {
                     tailer.record_poll(false, &self.config);
                     warn!(pane_id, error = %error, "Tailer poll failed");
@@ -805,6 +869,9 @@ pub enum PollOutcome {
     OverflowGapEmitted,
     NoCursor,
     ChannelClosed,
+    CircuitOpen {
+        retry_after_ms: u64,
+    },
     Error(String),
 }
 

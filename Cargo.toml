@@ -41,6 +41,11 @@ exclude = [
     "frankenterm/bidi/generate",
 ]
 
+# Limit default workspace operations (check/clippy/test) to the ft crates.
+# Vendored WezTerm-derived crates are still built as dependencies, but aren't
+# clippy-linted as primary targets under `cargo clippy --all-targets`.
+default-members = ["crates/frankenterm", "crates/frankenterm-core", "fuzz"]
+
 # Crate boundary rules:
 # - frankenterm-core: business logic only (no UI/transport deps by default)
 # - frankenterm: thin CLI wrapper over frankenterm-core
@@ -77,6 +82,10 @@ collection_is_never_read = "allow"
 missing_const_for_fn = "allow"
 # Cargo lints - we don't have full metadata yet
 multiple_crate_versions = "allow"
+# Vendored WezTerm crates carry upstream feature names (e.g. use_serde/no_std)
+# that we don't want to rename in-tree.
+redundant_feature_names = "allow"
+negative_feature_names = "allow"
 # Style lints that conflict with panic!/assert! macros in tests
 uninlined_format_args = "allow"
 # Range patterns lint that's too strict
@@ -169,6 +178,9 @@ single_match = "allow"
 ptr_arg = "allow"
 # Large stack allocations acceptable
 large_stack_frames = "allow"
+# Some test-only code paths use large local arrays; prefer correctness over
+# clippy pedantry here.
+large_stack_arrays = "allow"
 # Manual let else acceptable
 manual_let_else = "allow"
 # Format strings acceptable
@@ -410,4 +422,3 @@ rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", branch = "
 
 [patch."https://github.com/Dicklesworthstone/fastapi_rust"]
 asupersync = { git = "https://github.com/Dicklesworthstone/asupersync" }
-

@@ -57,6 +57,7 @@ pub mod circuit_breaker;
 pub mod cleanup;
 pub mod config;
 pub mod config_profiles;
+pub mod cpu_pressure;
 pub mod crash;
 pub mod degradation;
 pub mod desktop_notify;

@@ -128,8 +128,11 @@ static CASCADE_TRACKER: OnceLock<Mutex<CascadeTracker>> = OnceLock::new();
 fn subsystem_for_circuit(name: &str) -> Option<Subsystem> {
     match name {
         "wezterm_cli" => Some(Subsystem::WeztermCli),
-        "mux_connection" => Some(Subsystem::MuxConnection),
-        "capture_pipeline" => Some(Subsystem::Capture),
+        // Historical circuit names retained for compatibility with older logs/configs.
+        "mux_connection" | "capture_pipeline" => Some(Subsystem::WeztermCli),
+        "db_write" => Some(Subsystem::DbWrite),
+        "pattern_engine" => Some(Subsystem::PatternEngine),
+        "workflow_engine" => Some(Subsystem::WorkflowEngine),
         _ => None,
     }
 }
@@ -165,7 +168,10 @@ fn handle_circuit_opened(name: &str, failures: u32, threshold: u32) {
 
         crate::degradation::enter_degraded(
             Subsystem::WorkflowEngine,
-            format!("circuit breaker cascade detected: {}", cascade.circuits.join(", ")),
+            format!(
+                "circuit breaker cascade detected: {}",
+                cascade.circuits.join(", ")
+            ),
         );
     }
 }
@@ -496,12 +502,18 @@ mod tests {
         let _ = DegradationManager::init_global();
         recover(Subsystem::WeztermCli);
 
-        let mut breaker =
-            CircuitBreaker::with_name("wezterm_cli", CircuitBreakerConfig::new(1, 1, Duration::from_secs(10)));
+        let mut breaker = CircuitBreaker::with_name(
+            "wezterm_cli",
+            CircuitBreakerConfig::new(1, 1, Duration::from_secs(10)),
+        );
         breaker.record_failure();
 
         let degradations = active_degradations();
-        assert!(degradations.iter().any(|s| s.subsystem == Subsystem::WeztermCli));
+        assert!(
+            degradations
+                .iter()
+                .any(|s| s.subsystem == Subsystem::WeztermCli)
+        );
         recover(Subsystem::WeztermCli);
     }
 
@@ -509,7 +521,7 @@ mod tests {
     fn cascade_detection_degrades_workflow_engine() {
         let _ = DegradationManager::init_global();
         recover(Subsystem::WeztermCli);
-        recover(Subsystem::MuxConnection);
+        recover(Subsystem::DbWrite);
         recover(Subsystem::WorkflowEngine);
 
         let tracker = CASCADE_TRACKER.get_or_init(|| Mutex::new(CascadeTracker::default()));
@@ -525,19 +537,30 @@ mod tests {
             }
         }
 
-        let mut cli =
-            CircuitBreaker::with_name("wezterm_cli", CircuitBreakerConfig::new(1, 1, Duration::from_secs(10)));
+        let mut cli = CircuitBreaker::with_name(
+            "wezterm_cli",
+            CircuitBreakerConfig::new(1, 1, Duration::from_secs(10)),
+        );
         cli.record_failure();
-        let mut mux =
-            CircuitBreaker::with_name("mux_connection", CircuitBreakerConfig::new(1, 1, Duration::from_secs(10)));
-        mux.record_failure();
+        let mut db = CircuitBreaker::with_name(
+            "db_write",
+            CircuitBreakerConfig::new(1, 1, Duration::from_secs(10)),
+        );
+        db.record_failure();
 
-        assert_eq!(crate::degradation::overall_status(), OverallStatus::Degraded);
+        assert_eq!(
+            crate::degradation::overall_status(),
+            OverallStatus::Degraded
+        );
         let degradations = active_degradations();
-        assert!(degradations.iter().any(|s| s.subsystem == Subsystem::WorkflowEngine));
+        assert!(
+            degradations
+                .iter()
+                .any(|s| s.subsystem == Subsystem::WorkflowEngine)
+        );
 
         recover(Subsystem::WeztermCli);
-        recover(Subsystem::MuxConnection);
+        recover(Subsystem::DbWrite);
         recover(Subsystem::WorkflowEngine);
     }
 }
