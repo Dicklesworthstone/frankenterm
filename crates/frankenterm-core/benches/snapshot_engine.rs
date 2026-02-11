@@ -203,7 +203,7 @@ fn bench_state_hash(c: &mut Criterion) {
                     use std::hash::{Hash, Hasher};
                     let mut hasher = DefaultHasher::new();
                     topo.hash(&mut hasher);
-                    for p in *panes {
+                    for p in panes {
                         p.hash(&mut hasher);
                     }
                     hasher.finish()

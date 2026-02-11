@@ -20,12 +20,14 @@
 //! | > 0.8       | Trigger immediate full snapshot            |
 //! | > 0.95      | Alert user + prepare graceful restart      |
 
+#[cfg(test)]
+use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
+use tracing::debug;
 
 // =============================================================================
 // Configuration
@@ -573,23 +575,23 @@ impl SurvivalModel {
             //   δ_j = event * x_j - t_over_lam^k * exp(β·x) * x_j
             for j in 0..Covariates::COUNT {
                 let event_term = if obs.event_observed { x[j] } else { 0.0 };
-                grad_beta[j] += event_term - t_over_lam_k * exp_lin * x[j];
+                grad_beta[j] += (t_over_lam_k * exp_lin).mul_add(-x[j], event_term);
             }
 
             // Gradient w.r.t. log(k):
             //   event * (1 + k*ln(t/λ)) - k * ln(t/λ) * t_over_lam^k * exp(β·x)
             let ln_t_lam = (t / lam).ln();
             let event_k = if obs.event_observed {
-                1.0 + k * ln_t_lam
+                k.mul_add(ln_t_lam, 1.0)
             } else {
                 0.0
             };
-            grad_log_shape += event_k - k * ln_t_lam * t_over_lam_k * exp_lin;
+            grad_log_shape += (k * ln_t_lam * t_over_lam_k).mul_add(-exp_lin, event_k);
 
             // Gradient w.r.t. log(λ):
             //   event * (-k) + k * t_over_lam^k * exp(β·x)
             let event_lam = if obs.event_observed { -k } else { 0.0 };
-            grad_log_scale += event_lam + k * t_over_lam_k * exp_lin;
+            grad_log_scale += (k * t_over_lam_k).mul_add(exp_lin, event_lam);
         }
 
         // Normalize by observation count
@@ -601,13 +603,13 @@ impl SurvivalModel {
         grad_log_scale /= n;
 
         // Gradient step for betas
-        for j in 0..Covariates::COUNT {
-            params.beta[j] += lr * grad_beta[j];
+        for (beta, grad) in params.beta.iter_mut().zip(grad_beta.iter()) {
+            *beta += lr * *grad;
         }
 
         // Update shape and scale in log-space to maintain positivity
-        let new_log_k = k.ln() + lr * grad_log_shape;
-        let new_log_lam = lam.ln() + lr * grad_log_scale;
+        let new_log_k = lr.mul_add(grad_log_shape, k.ln());
+        let new_log_lam = lr.mul_add(grad_log_scale, lam.ln());
 
         // Clamp to reasonable ranges
         params.shape = new_log_k.exp().clamp(0.1, 10.0);

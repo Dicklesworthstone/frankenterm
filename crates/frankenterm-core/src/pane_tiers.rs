@@ -694,7 +694,7 @@ mod tests {
         clf.register_pane(1);
 
         clf.set_rate_limited(1, true);
-        clf.classify(1);
+        let _ = clf.classify(1);
         assert_eq!(clf.current_tier(1), PaneTier::Dormant);
 
         // Clear rate limit and send output
@@ -743,7 +743,7 @@ mod tests {
         clf.register_pane(3);
 
         clf.set_background(2, true);
-        clf.classify_all();
+        let _ = clf.classify_all();
 
         let m = clf.metrics();
         assert_eq!(m.total_panes, 3);
@@ -760,7 +760,7 @@ mod tests {
 
         // Force tier change
         clf.set_rate_limited(1, true);
-        clf.classify(1); // Active → Dormant
+        let _ = clf.classify(1); // Active → Dormant
 
         clf.set_rate_limited(1, false);
         clf.on_pane_output(1); // Dormant → Active
