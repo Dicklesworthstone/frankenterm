@@ -23,6 +23,8 @@
 //! | `PatternEngine`| Regex timeout, compile err | Skip detection, keep ingesting        |
 //! | `WorkflowEngine`| Step fails repeatedly     | Pause failing workflow, keep others    |
 //! | `WeztermCli`   | CLI hangs, not found       | Stop capture, poll for recovery       |
+//! | `MuxConnection`| Socket disconnect/timeouts | Fall back to CLI, poll for recovery   |
+//! | `Capture`      | Repeated capture failures  | Pause capture attempts temporarily    |
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock, RwLock};
@@ -46,6 +48,10 @@ pub enum Subsystem {
     WorkflowEngine,
     /// WezTerm CLI communication (not found, hanging, crashes).
     WeztermCli,
+    /// Direct mux socket connection failures (disconnect, timeouts).
+    MuxConnection,
+    /// Capture pipeline failures (tailer polling/streaming).
+    Capture,
 }
 
 impl std::fmt::Display for Subsystem {
@@ -55,16 +61,20 @@ impl std::fmt::Display for Subsystem {
             Self::PatternEngine => write!(f, "pattern_engine"),
             Self::WorkflowEngine => write!(f, "workflow_engine"),
             Self::WeztermCli => write!(f, "wezterm_cli"),
+            Self::MuxConnection => write!(f, "mux_connection"),
+            Self::Capture => write!(f, "capture"),
         }
     }
 }
 
 /// All known subsystems, in display order.
-const ALL_SUBSYSTEMS: [Subsystem; 4] = [
+const ALL_SUBSYSTEMS: [Subsystem; 6] = [
     Subsystem::DbWrite,
     Subsystem::PatternEngine,
     Subsystem::WorkflowEngine,
     Subsystem::WeztermCli,
+    Subsystem::MuxConnection,
+    Subsystem::Capture,
 ];
 
 /// The current operating mode for a subsystem.
@@ -535,6 +545,16 @@ fn affected_capabilities(s: Subsystem) -> Vec<String> {
             "content capture".into(),
             "text sending".into(),
         ],
+        Subsystem::MuxConnection => vec![
+            "mux socket operations".into(),
+            "streaming tailers".into(),
+            "pane I/O (direct)".into(),
+        ],
+        Subsystem::Capture => vec![
+            "tailer polling".into(),
+            "delta extraction".into(),
+            "segment emission".into(),
+        ],
     }
 }
 
@@ -891,6 +911,8 @@ mod tests {
         assert_eq!(Subsystem::PatternEngine.to_string(), "pattern_engine");
         assert_eq!(Subsystem::WorkflowEngine.to_string(), "workflow_engine");
         assert_eq!(Subsystem::WeztermCli.to_string(), "wezterm_cli");
+        assert_eq!(Subsystem::MuxConnection.to_string(), "mux_connection");
+        assert_eq!(Subsystem::Capture.to_string(), "capture");
     }
 
     #[test]

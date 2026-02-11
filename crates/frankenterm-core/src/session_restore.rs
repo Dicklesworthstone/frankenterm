@@ -17,9 +17,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
-use crate::config::SnapshotConfig;
 use crate::restore_layout::{LayoutRestorer, RestoreConfig, RestoreResult};
 use crate::session_pane_state::{AgentMetadata, TerminalState};
 use crate::session_topology::TopologySnapshot;
@@ -412,10 +411,10 @@ impl SessionRestorer {
         &self,
         session: &SessionCandidate,
     ) -> Result<CheckpointData, RestoreError> {
-        let checkpoint = load_latest_checkpoint(&self.db_path, &session.session_id)?
-            .ok_or(RestoreError::CorruptCheckpoint(
-                "no checkpoints found for session".to_string(),
-            ))?;
+        let checkpoint =
+            load_latest_checkpoint(&self.db_path, &session.session_id)?.ok_or_else(|| {
+                RestoreError::CorruptCheckpoint("no checkpoints found for session".to_string())
+            })?;
 
         info!(
             session_id = %session.session_id,
@@ -589,9 +588,7 @@ impl SessionRestorer {
                 debug!("WezTerm running with no panes — clean slate for restore");
             }
             Err(e) => {
-                return Err(RestoreError::Wezterm(format!(
-                    "cannot reach WezTerm: {e}"
-                )));
+                return Err(RestoreError::Wezterm(format!("cannot reach WezTerm: {e}")));
             }
         }
 
@@ -789,7 +786,9 @@ mod tests {
         insert_pane_state(&conn, cp_id, 0, Some("/home/user"), Some("bash"));
         insert_pane_state(&conn, cp_id, 1, Some("/tmp"), Some("vim"));
 
-        let data = load_latest_checkpoint(&db_path, "sess-ok").unwrap().unwrap();
+        let data = load_latest_checkpoint(&db_path, "sess-ok")
+            .unwrap()
+            .unwrap();
         assert_eq!(data.checkpoint_id, cp_id);
         assert_eq!(data.pane_states.len(), 2);
         assert_eq!(data.pane_states[0].cwd.as_deref(), Some("/home/user"));
@@ -925,7 +924,9 @@ mod tests {
         let cp_id = insert_checkpoint(&conn, "sess-ts", 5000, 1);
         insert_pane_state(&conn, cp_id, 0, Some("/home"), None);
 
-        let data = load_latest_checkpoint(&db_path, "sess-ts").unwrap().unwrap();
+        let data = load_latest_checkpoint(&db_path, "sess-ts")
+            .unwrap()
+            .unwrap();
         let ts = data.pane_states[0].terminal_state.as_ref().unwrap();
         assert_eq!(ts.rows, 24);
         assert_eq!(ts.cols, 80);

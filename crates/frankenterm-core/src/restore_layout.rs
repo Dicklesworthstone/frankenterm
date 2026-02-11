@@ -347,9 +347,9 @@ impl LayoutRestorer {
 fn first_leaf_cwd(node: &PaneNode) -> Option<String> {
     match node {
         PaneNode::Leaf { cwd, .. } => cwd.as_ref().map(|c| normalize_cwd(c)),
-        PaneNode::HSplit { children } | PaneNode::VSplit { children } => {
-            children.first().and_then(|(_, child)| first_leaf_cwd(child))
-        }
+        PaneNode::HSplit { children } | PaneNode::VSplit { children } => children
+            .first()
+            .and_then(|(_, child)| first_leaf_cwd(child)),
     }
 }
 
@@ -592,10 +592,7 @@ mod tests {
                                     (0.5, leaf(4, None)),
                                     (
                                         0.5,
-                                        hsplit(vec![
-                                            (0.5, leaf(5, None)),
-                                            (0.5, leaf(6, None)),
-                                        ]),
+                                        hsplit(vec![(0.5, leaf(5, None)), (0.5, leaf(6, None))]),
                                     ),
                                 ]),
                             ),
@@ -637,10 +634,7 @@ mod tests {
                     TabSnapshot {
                         tab_id: 1,
                         title: None,
-                        pane_tree: vsplit(vec![
-                            (0.5, leaf(2, None)),
-                            (0.5, leaf(3, None)),
-                        ]),
+                        pane_tree: vsplit(vec![(0.5, leaf(2, None)), (0.5, leaf(3, None))]),
                         active_pane_id: Some(3),
                     },
                 ],
@@ -717,10 +711,7 @@ mod tests {
                 tabs: vec![TabSnapshot {
                     tab_id: 0,
                     title: None,
-                    pane_tree: vsplit(vec![
-                        (0.5, leaf(1, None)),
-                        (0.5, active_leaf(2)),
-                    ]),
+                    pane_tree: vsplit(vec![(0.5, leaf(1, None)), (0.5, active_leaf(2))]),
                     active_pane_id: Some(2),
                 }],
                 active_tab_index: None,

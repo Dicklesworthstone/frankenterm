@@ -369,8 +369,8 @@ async fn multi_tab_topology_persisted() {
 
     // 2 tabs, 3 panes total
     let panes = vec![
-        make_pane(0, 0, 0, 24, 80), // tab 0, left pane
-        make_pane(1, 0, 0, 24, 80), // tab 0, right pane (vsplit)
+        make_pane(0, 0, 0, 24, 80),  // tab 0, left pane
+        make_pane(1, 0, 0, 24, 80),  // tab 0, right pane (vsplit)
         make_pane(2, 1, 0, 30, 120), // tab 1, single pane
     ];
 
@@ -518,7 +518,11 @@ async fn session_id_stable_across_captures() {
 
     let panes1 = vec![make_pane_simple(0)];
     let panes2 = vec![make_pane_simple(0), make_pane_simple(1)];
-    let panes3 = vec![make_pane_simple(0), make_pane_simple(1), make_pane_simple(2)];
+    let panes3 = vec![
+        make_pane_simple(0),
+        make_pane_simple(1),
+        make_pane_simple(2),
+    ];
 
     let r1 = engine
         .capture(&panes1, SnapshotTrigger::Startup)
@@ -573,10 +577,7 @@ fn topology_from_panes_single_pane() {
 #[test]
 fn topology_from_panes_hsplit() {
     // Two panes stacked vertically: same cols, different rows (top=24, bottom=24)
-    let panes = vec![
-        make_pane(0, 0, 0, 24, 80),
-        make_pane(1, 0, 0, 24, 80),
-    ];
+    let panes = vec![make_pane(0, 0, 0, 24, 80), make_pane(1, 0, 0, 24, 80)];
     let (topo, _) = TopologySnapshot::from_panes(&panes, 1000);
 
     assert_eq!(topo.pane_count(), 2);
@@ -640,14 +641,14 @@ fn topology_empty_snapshot() {
 #[test]
 fn pane_matching_by_cwd_and_title() {
     let old_panes = vec![
-        make_pane(10, 0, 0, 24, 80), // cwd: project-10, title: pane-10
+        make_pane(10, 0, 0, 24, 80),  // cwd: project-10, title: pane-10
         make_pane(20, 0, 0, 30, 120), // cwd: project-20, title: pane-20
     ];
     let (old_topo, _) = TopologySnapshot::from_panes(&old_panes, 1000);
 
     // After restart: new pane IDs, but same cwds
     let new_panes = vec![
-        make_pane(100, 0, 0, 24, 80), // same cwd as old pane 10
+        make_pane(100, 0, 0, 24, 80),  // same cwd as old pane 10
         make_pane(200, 0, 0, 30, 120), // same cwd as old pane 20
     ];
     // Override cwds to match
@@ -655,8 +656,7 @@ fn pane_matching_by_cwd_and_title() {
     new_panes[0].cwd = Some("file:///home/user/project-10".to_string());
     new_panes[1].cwd = Some("file:///home/user/project-20".to_string());
 
-    let mapping =
-        frankenterm_core::session_topology::match_panes(&old_topo, &new_panes);
+    let mapping = frankenterm_core::session_topology::match_panes(&old_topo, &new_panes);
 
     // Should match old→new by cwd
     assert!(mapping.mappings.contains_key(&10) || mapping.mappings.contains_key(&20));
@@ -716,7 +716,11 @@ fn pane_state_json_roundtrip_with_all_fields() {
         .with_process(ProcessInfo {
             name: "nvim".to_string(),
             pid: Some(5678),
-            argv: Some(vec!["nvim".to_string(), "+42".to_string(), "file.rs".to_string()]),
+            argv: Some(vec![
+                "nvim".to_string(),
+                "+42".to_string(),
+                "file.rs".to_string(),
+            ]),
         })
         .with_agent(AgentMetadata {
             agent_type: "codex".to_string(),
@@ -733,14 +737,8 @@ fn pane_state_json_roundtrip_with_all_fields() {
     assert_eq!(restored.terminal.cols, 120);
     assert_eq!(restored.cwd.as_deref(), Some("/tmp/test"));
     assert_eq!(restored.shell.as_deref(), Some("zsh"));
-    assert_eq!(
-        restored.foreground_process.as_ref().unwrap().name,
-        "nvim"
-    );
-    assert_eq!(
-        restored.agent.as_ref().unwrap().agent_type,
-        "codex"
-    );
+    assert_eq!(restored.foreground_process.as_ref().unwrap().name, "nvim");
+    assert_eq!(restored.agent.as_ref().unwrap().agent_type, "codex");
 }
 
 #[test]
@@ -795,8 +793,7 @@ fn pane_state_size_budget_small_not_truncated() {
         title: "bash".to_string(),
     };
 
-    let snapshot = PaneStateSnapshot::new(0, 1000, terminal)
-        .with_cwd("/home/user".to_string());
+    let snapshot = PaneStateSnapshot::new(0, 1000, terminal).with_cwd("/home/user".to_string());
 
     let (json, was_truncated) = snapshot.to_json_budgeted().unwrap();
     assert!(!was_truncated, "Small snapshot should not be truncated");
@@ -822,8 +819,7 @@ fn pane_state_safe_env_list_filters_correctly() {
         ("MY_CUSTOM".to_string(), "also_dropped".to_string()),
     ];
 
-    let snapshot = PaneStateSnapshot::new(0, 1000, terminal)
-        .with_env_from_iter(env.into_iter());
+    let snapshot = PaneStateSnapshot::new(0, 1000, terminal).with_env_from_iter(env.into_iter());
 
     let captured = snapshot.env.as_ref().unwrap();
     assert!(captured.vars.contains_key("PATH"));
@@ -837,8 +833,14 @@ fn pane_state_env_redacts_secrets() {
     let env = vec![
         ("HOME".to_string(), "/home/user".to_string()),
         ("PATH".to_string(), "/usr/bin:/usr/local/bin".to_string()),
-        ("AWS_SECRET_ACCESS_KEY".to_string(), "AKIA...secret".to_string()),
-        ("DATABASE_URL".to_string(), "postgres://user:pass@host/db".to_string()),
+        (
+            "AWS_SECRET_ACCESS_KEY".to_string(),
+            "AKIA...secret".to_string(),
+        ),
+        (
+            "DATABASE_URL".to_string(),
+            "postgres://user:pass@host/db".to_string(),
+        ),
         ("API_KEY".to_string(), "sk-live-abcdef".to_string()),
     ];
 
@@ -851,8 +853,7 @@ fn pane_state_env_redacts_secrets() {
         title: "bash".to_string(),
     };
 
-    let snapshot = PaneStateSnapshot::new(0, 1000, terminal)
-        .with_env_from_iter(env.into_iter());
+    let snapshot = PaneStateSnapshot::new(0, 1000, terminal).with_env_from_iter(env.into_iter());
 
     let captured = snapshot.env.as_ref().unwrap();
 
@@ -924,7 +925,11 @@ async fn foreign_key_cascade_on_checkpoint_delete() {
     let (_tmp, db_path) = setup_test_db();
     let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
 
-    let panes = vec![make_pane_simple(0), make_pane_simple(1), make_pane_simple(2)];
+    let panes = vec![
+        make_pane_simple(0),
+        make_pane_simple(1),
+        make_pane_simple(2),
+    ];
     let result = engine
         .capture(&panes, SnapshotTrigger::Manual)
         .await
@@ -1100,9 +1105,7 @@ async fn capture_50_panes() {
 
 #[test]
 fn topology_pane_ids_complete() {
-    let panes: Vec<PaneInfo> = (0..10)
-        .map(|i| make_pane(i, 0, 0, 24, 80))
-        .collect();
+    let panes: Vec<PaneInfo> = (0..10).map(|i| make_pane(i, 0, 0, 24, 80)).collect();
     let (topo, _) = TopologySnapshot::from_panes(&panes, 1000);
 
     let mut ids = topo.pane_ids();

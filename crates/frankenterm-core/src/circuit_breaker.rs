@@ -2,12 +2,14 @@
 //!
 //! Provides a small state machine with cooldowns and status reporting.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
+
+use crate::degradation::{DegradationManager, Subsystem};
 
 /// Configuration for a circuit breaker.
 #[derive(Debug, Clone)]
@@ -48,6 +50,133 @@ enum CircuitState {
     Closed,
     Open { opened_at: Instant },
     HalfOpen { successes: u32 },
+}
+
+const CASCADE_WINDOW: Duration = Duration::from_secs(30);
+const CASCADE_SUBSYSTEM_THRESHOLD: usize = 2;
+
+#[derive(Debug, Clone)]
+struct CircuitOpenRecord {
+    circuit: String,
+    subsystem: Option<Subsystem>,
+    opened_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct CascadeEvent {
+    circuits: Vec<String>,
+    subsystems: Vec<Subsystem>,
+    window: Duration,
+}
+
+#[derive(Debug, Default)]
+struct CascadeTracker {
+    open_events: VecDeque<CircuitOpenRecord>,
+    last_cascade_at: Option<Instant>,
+}
+
+impl CascadeTracker {
+    fn record_open(&mut self, circuit: &str, subsystem: Option<Subsystem>) -> Option<CascadeEvent> {
+        let now = Instant::now();
+
+        while let Some(front) = self.open_events.front() {
+            if now.duration_since(front.opened_at) > CASCADE_WINDOW {
+                self.open_events.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        self.open_events.push_back(CircuitOpenRecord {
+            circuit: circuit.to_string(),
+            subsystem,
+            opened_at: now,
+        });
+
+        let mut subsystems: BTreeSet<Subsystem> = BTreeSet::new();
+        let mut circuits: BTreeSet<String> = BTreeSet::new();
+        for event in &self.open_events {
+            if let Some(subsystem) = event.subsystem {
+                subsystems.insert(subsystem);
+                circuits.insert(event.circuit.clone());
+            }
+        }
+
+        if subsystems.len() < CASCADE_SUBSYSTEM_THRESHOLD {
+            return None;
+        }
+
+        if self
+            .last_cascade_at
+            .is_some_and(|ts| now.duration_since(ts) <= CASCADE_WINDOW)
+        {
+            return None;
+        }
+
+        self.last_cascade_at = Some(now);
+
+        Some(CascadeEvent {
+            circuits: circuits.into_iter().collect(),
+            subsystems: subsystems.into_iter().collect(),
+            window: CASCADE_WINDOW,
+        })
+    }
+}
+
+static CASCADE_TRACKER: OnceLock<Mutex<CascadeTracker>> = OnceLock::new();
+
+fn subsystem_for_circuit(name: &str) -> Option<Subsystem> {
+    match name {
+        "wezterm_cli" => Some(Subsystem::WeztermCli),
+        "mux_connection" => Some(Subsystem::MuxConnection),
+        "capture_pipeline" => Some(Subsystem::Capture),
+        _ => None,
+    }
+}
+
+fn handle_circuit_opened(name: &str, failures: u32, threshold: u32) {
+    let subsystem = subsystem_for_circuit(name);
+    if subsystem.is_some() {
+        let _ = DegradationManager::init_global();
+    }
+
+    if let Some(subsystem) = subsystem {
+        crate::degradation::enter_degraded(
+            subsystem,
+            format!(
+                "circuit breaker `{name}` opened after {failures} consecutive failures (threshold {threshold})"
+            ),
+        );
+    }
+
+    let tracker = CASCADE_TRACKER.get_or_init(|| Mutex::new(CascadeTracker::default()));
+    let cascade = match tracker.lock() {
+        Ok(mut guard) => guard.record_open(name, subsystem),
+        Err(poisoned) => poisoned.into_inner().record_open(name, subsystem),
+    };
+
+    if let Some(cascade) = cascade {
+        error!(
+            circuits = ?cascade.circuits,
+            subsystems = ?cascade.subsystems,
+            window_ms = cascade.window.as_millis() as u64,
+            "Circuit breaker cascade detected"
+        );
+
+        crate::degradation::enter_degraded(
+            Subsystem::WorkflowEngine,
+            format!("circuit breaker cascade detected: {}", cascade.circuits.join(", ")),
+        );
+    }
+}
+
+fn handle_circuit_closed(name: &str) {
+    let Some(subsystem) = subsystem_for_circuit(name) else {
+        return;
+    };
+    if DegradationManager::global().is_some() {
+        crate::degradation::recover(subsystem);
+    }
 }
 
 /// Public-facing circuit state for status reporting.
@@ -148,6 +277,7 @@ impl CircuitBreaker {
                     self.consecutive_failures = 0;
                     self.state = CircuitState::Closed;
                     info!(circuit = %self.name, "Circuit closed after successful probe");
+                    handle_circuit_closed(&self.name);
                 } else {
                     self.state = CircuitState::HalfOpen { successes };
                 }
@@ -173,6 +303,11 @@ impl CircuitBreaker {
                         threshold = self.config.failure_threshold,
                         "Circuit opened after consecutive failures"
                     );
+                    handle_circuit_opened(
+                        &self.name,
+                        self.consecutive_failures,
+                        self.config.failure_threshold,
+                    );
                 }
             }
             CircuitState::HalfOpen { .. } => {
@@ -180,6 +315,11 @@ impl CircuitBreaker {
                     opened_at: Instant::now(),
                 };
                 warn!(circuit = %self.name, "Circuit re-opened after half-open failure");
+                handle_circuit_opened(
+                    &self.name,
+                    self.consecutive_failures,
+                    self.config.failure_threshold,
+                );
             }
             CircuitState::Open { .. } => {
                 // Already open; keep cooldown ticking.
@@ -267,7 +407,14 @@ pub fn get_or_register_circuit(
 
 /// Ensure default circuits exist for status reporting.
 pub fn ensure_default_circuits() {
-    let defaults = ["wezterm_cli", "caut_cli", "browser_auth", "webhook"];
+    let defaults = [
+        "wezterm_cli",
+        "mux_connection",
+        "capture_pipeline",
+        "caut_cli",
+        "browser_auth",
+        "webhook",
+    ];
     for name in defaults {
         let _ = get_or_register_circuit(name, CircuitBreakerConfig::default());
     }
@@ -300,6 +447,7 @@ pub fn circuit_snapshots() -> Vec<CircuitBreakerSnapshot> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::degradation::{OverallStatus, active_degradations, recover};
 
     #[test]
     fn circuit_opens_after_threshold() {
@@ -341,5 +489,55 @@ mod tests {
 
         breaker.record_failure();
         assert!(matches!(breaker.status().state, CircuitStateKind::Open));
+    }
+
+    #[test]
+    fn circuit_open_enters_degraded_mode_for_mapped_subsystem() {
+        let _ = DegradationManager::init_global();
+        recover(Subsystem::WeztermCli);
+
+        let mut breaker =
+            CircuitBreaker::with_name("wezterm_cli", CircuitBreakerConfig::new(1, 1, Duration::from_secs(10)));
+        breaker.record_failure();
+
+        let degradations = active_degradations();
+        assert!(degradations.iter().any(|s| s.subsystem == Subsystem::WeztermCli));
+        recover(Subsystem::WeztermCli);
+    }
+
+    #[test]
+    fn cascade_detection_degrades_workflow_engine() {
+        let _ = DegradationManager::init_global();
+        recover(Subsystem::WeztermCli);
+        recover(Subsystem::MuxConnection);
+        recover(Subsystem::WorkflowEngine);
+
+        let tracker = CASCADE_TRACKER.get_or_init(|| Mutex::new(CascadeTracker::default()));
+        match tracker.lock() {
+            Ok(mut guard) => {
+                guard.open_events.clear();
+                guard.last_cascade_at = None;
+            }
+            Err(poisoned) => {
+                let mut guard = poisoned.into_inner();
+                guard.open_events.clear();
+                guard.last_cascade_at = None;
+            }
+        }
+
+        let mut cli =
+            CircuitBreaker::with_name("wezterm_cli", CircuitBreakerConfig::new(1, 1, Duration::from_secs(10)));
+        cli.record_failure();
+        let mut mux =
+            CircuitBreaker::with_name("mux_connection", CircuitBreakerConfig::new(1, 1, Duration::from_secs(10)));
+        mux.record_failure();
+
+        assert_eq!(crate::degradation::overall_status(), OverallStatus::Degraded);
+        let degradations = active_degradations();
+        assert!(degradations.iter().any(|s| s.subsystem == Subsystem::WorkflowEngine));
+
+        recover(Subsystem::WeztermCli);
+        recover(Subsystem::MuxConnection);
+        recover(Subsystem::WorkflowEngine);
     }
 }

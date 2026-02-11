@@ -7295,12 +7295,10 @@ async fn run_watcher(
     let snapshot_engine: Option<Arc<frankenterm_core::snapshot_engine::SnapshotEngine>> =
         if config.snapshots.enabled {
             let engine_db = Arc::new(db_path.to_string());
-            let engine = Arc::new(
-                frankenterm_core::snapshot_engine::SnapshotEngine::new(
-                    engine_db,
-                    config.snapshots.clone(),
-                ),
-            );
+            let engine = Arc::new(frankenterm_core::snapshot_engine::SnapshotEngine::new(
+                engine_db,
+                config.snapshots.clone(),
+            ));
             let engine_for_loop = Arc::clone(&engine);
             let shutdown_flag_for_snap = Arc::clone(&handle.shutdown_flag);
             let loop_timeout = config.cli.timeout_seconds;
@@ -7318,9 +7316,8 @@ async fn run_watcher(
             tokio::spawn(async move {
                 engine_for_loop
                     .run_periodic(snap_shutdown_rx, move || async move {
-                        let wez = frankenterm_core::wezterm::wezterm_handle_with_timeout(
-                            loop_timeout,
-                        );
+                        let wez =
+                            frankenterm_core::wezterm::wezterm_handle_with_timeout(loop_timeout);
                         wez.list_panes().await.ok()
                     })
                     .await;

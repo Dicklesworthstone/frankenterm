@@ -2072,14 +2072,14 @@ EXAMPLES
   # Agent checking status
   ft robot state | jq '.data[] | select(.title | contains("claude"))'
 
-For detailed help: wa <command> --help
-Documentation: https://github.com/your-repo/wa
+For detailed help: ft <command> --help
+Documentation: https://github.com/Dicklesworthstone/frankenterm
 "#;
     
     match format {
         super::OutputFormat::Json => {
             println!("{}", serde_json::json!({
-                "name": "wa",
+                "name": "ft",
                 "version": env!("CARGO_PKG_VERSION"),
                 "commands": ["watch", "robot", "query", "send", "workflow", "setup", "status"],
                 "robot_commands": ["state", "get-text", "send", "wait-for", "search", "events", "workflow", "help"],
@@ -2582,11 +2582,11 @@ Backpressure and GAPs (what happens under load):
   bounded writer queue. A saturated queue increases ingest lag and can delay
   event persistence.
 - GAP insertion: if delta extraction cannot guarantee continuity (overlap
-  failure, in-place edits, alt-screen toggles, or sequence discontinuity), wa
+  failure, in-place edits, alt-screen toggles, or sequence discontinuity), ft
   records an explicit GAP with a reason and stores the full snapshot to make
   the discontinuity auditable.
 
-Troubleshooting "wa is behind":
+Troubleshooting "ft is behind":
 
 - Check `ft status` (or `ft robot state`) for last-seen timestamps and pane
   observation state.
@@ -2640,7 +2640,7 @@ pub fn log_action(
     result: &str,
 ) {
     tracing::info!(
-        target: "wa::audit",
+        target: "frankenterm::audit",
         pane_id = pane_id,
         action = action,
         input = input,
@@ -2658,7 +2658,7 @@ pub fn log_action(
 
 ```
 skills/
-├── AGENTS.md                    # Main instructions for AI agents using wa
+├── AGENTS.md                    # Main instructions for AI agents using ft
 ├── workflows/
 │   ├── handle_usage_limits.md   # Detailed workflow for account rotation
 │   ├── handle_compaction.md     # Context refresh after compaction
@@ -2673,11 +2673,11 @@ skills/
 ### 15.2 Example AGENTS.md
 
 ```markdown
-# wa Agent Skills
+# ft Agent Skills
 
 ## Quick Reference
 
-You are controlling AI coding agents through wa. Key capabilities:
+You are controlling AI coding agents through ft. Key capabilities:
 
 1. **Monitor**: Watch for events across all agents
 2. **React**: Automatically handle usage limits, compaction, errors
@@ -2687,19 +2687,19 @@ You are controlling AI coding agents through wa. Key capabilities:
 
 ```bash
 # Get current state of all agents
-wa robot state
+ft robot state
 
 # Watch for events (run in background)
-wa watch --auto-handle &
+ft watch --auto-handle &
 
 # Search for specific output
-wa robot search "error" --pane-id 3
+ft robot search "error" --pane-id 3
 
 # Send command to agent
-wa robot send 3 "continue with the refactoring"
+ft robot send 3 "continue with the refactoring"
 
 # Wait for completion signal
-wa robot wait-for 3 "Task completed" --timeout-secs 300
+ft robot wait-for 3 "Task completed" --timeout-secs 300
 ```
 
 ## Workflow Patterns
@@ -2707,7 +2707,7 @@ wa robot wait-for 3 "Task completed" --timeout-secs 300
 ### Handling Usage Limits
 
 When an agent hits usage limits:
-1. wa detects the pattern
+1. ft detects the pattern
 2. Gracefully exits the session (Ctrl-C)
 3. Parses session ID
 4. Rotates to next available account
@@ -2717,7 +2717,7 @@ When an agent hits usage limits:
 ### After Compaction
 
 When context is compacted:
-1. wa detects "Conversation compacted" 
+1. ft detects "Conversation compacted" 
 2. Waits 1 second for completion
 3. Sends: "Reread AGENTS.md so it's still fresh in your mind."
 

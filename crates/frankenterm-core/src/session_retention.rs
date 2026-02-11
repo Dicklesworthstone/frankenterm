@@ -79,8 +79,7 @@ pub fn cleanup_sessions(
 
     // 2. Delete excess closed sessions
     if config.max_closed_sessions > 0 {
-        result.deleted_by_count =
-            delete_excess_closed_sessions(conn, config.max_closed_sessions)?;
+        result.deleted_by_count = delete_excess_closed_sessions(conn, config.max_closed_sessions)?;
         if result.deleted_by_count > 0 {
             info!(
                 deleted = result.deleted_by_count,
@@ -92,8 +91,7 @@ pub fn cleanup_sessions(
 
     // 3. Delete by size budget
     if config.max_total_size_mb > 0 {
-        result.deleted_by_size =
-            delete_sessions_by_size(conn, config.max_total_size_mb)?;
+        result.deleted_by_size = delete_sessions_by_size(conn, config.max_total_size_mb)?;
         if result.deleted_by_size > 0 {
             info!(
                 deleted = result.deleted_by_size,
@@ -133,10 +131,7 @@ pub fn cleanup_sessions(
 /// Delete closed sessions older than `max_age_days`.
 ///
 /// Active sessions (shutdown_clean = 0 with recent checkpoints) are preserved.
-fn delete_sessions_by_age(
-    conn: &Connection,
-    max_age_days: u64,
-) -> Result<usize, rusqlite::Error> {
+fn delete_sessions_by_age(conn: &Connection, max_age_days: u64) -> Result<usize, rusqlite::Error> {
     let cutoff_ms = epoch_ms().saturating_sub(max_age_days * 86_400_000);
 
     let deleted = conn.execute(
@@ -170,10 +165,7 @@ fn delete_excess_closed_sessions(
 }
 
 /// Delete oldest closed sessions until total session data size is under budget.
-fn delete_sessions_by_size(
-    conn: &Connection,
-    max_total_mb: u64,
-) -> Result<usize, rusqlite::Error> {
+fn delete_sessions_by_size(conn: &Connection, max_total_mb: u64) -> Result<usize, rusqlite::Error> {
     let max_bytes = max_total_mb * 1_024 * 1_024;
 
     // Get total size of session data
@@ -269,8 +261,10 @@ pub async fn cleanup_sessions_async(
     tokio::task::spawn_blocking(move || {
         let conn = Connection::open(db_path.as_str())
             .map_err(|e| format!("Failed to open database: {e}"))?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;")
-            .map_err(|e| format!("Failed to set PRAGMAs: {e}"))?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;",
+        )
+        .map_err(|e| format!("Failed to set PRAGMAs: {e}"))?;
         cleanup_sessions(&conn, &config).map_err(|e| format!("Cleanup failed: {e}"))
     })
     .await
@@ -341,11 +335,9 @@ mod tests {
     }
 
     fn count_checkpoints(conn: &Connection) -> i64 {
-        conn.query_row(
-            "SELECT COUNT(*) FROM session_checkpoints",
-            [],
-            |row| row.get(0),
-        )
+        conn.query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| {
+            row.get(0)
+        })
         .unwrap()
     }
 

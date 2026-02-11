@@ -623,9 +623,7 @@ mod tests {
         assert!(report.successes[0].bytes_written > 0);
 
         // Verify content was sent to the mock pane.
-        let text: String = WeztermInterface::get_text(&*mock, 10, false)
-            .await
-            .unwrap();
+        let text: String = WeztermInterface::get_text(&*mock, 10, false).await.unwrap();
         assert!(text.contains("line1"));
         assert!(text.contains("line3"));
     }
@@ -710,9 +708,7 @@ mod tests {
         assert_eq!(report.successes[0].lines_injected, 3);
 
         // Should have kept the last 3 lines (97, 98, 99).
-        let text: String = WeztermInterface::get_text(&*mock, 10, false)
-            .await
-            .unwrap();
+        let text: String = WeztermInterface::get_text(&*mock, 10, false).await.unwrap();
         assert!(text.contains("line-99"));
         assert!(text.contains("line-97"));
     }
@@ -775,7 +771,9 @@ mod tests {
         let mut scrollbacks = HashMap::new();
         scrollbacks.insert(
             1,
-            mock_scrollback(vec!["this is a longer line that will require multiple chunks"]),
+            mock_scrollback(vec![
+                "this is a longer line that will require multiple chunks",
+            ]),
         );
 
         let report = injector.inject(&pane_id_map, &scrollbacks).await;
@@ -784,9 +782,7 @@ mod tests {
         assert!(report.successes[0].chunks_sent > 1);
 
         // All content should arrive.
-        let text: String = WeztermInterface::get_text(&*mock, 10, false)
-            .await
-            .unwrap();
+        let text: String = WeztermInterface::get_text(&*mock, 10, false).await.unwrap();
         assert!(text.contains("multiple chunks"));
     }
 }
