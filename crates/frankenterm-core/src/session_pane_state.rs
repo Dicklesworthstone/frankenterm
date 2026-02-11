@@ -10,6 +10,7 @@
 //! truncated and a warning is logged.
 
 use serde::{Deserialize, Serialize};
+use tracing::{debug, trace};
 
 /// Maximum serialized size per pane state (64KB).
 pub const PANE_STATE_SIZE_BUDGET: usize = 65_536;
