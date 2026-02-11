@@ -14,7 +14,7 @@ in `Suspended` phase (gate allows writes). However it means:
 - No capture of subprocess output for recording/replay
 - No sanitization or redaction of secrets in subprocess output
 - No backpressure if the subprocess produces output faster than the terminal can render
-- No ordering guarantees between subprocess output and wa detection events
+- No ordering guarantees between subprocess output and ft detection events
 - No diagnostics for dropped, reordered, or blocked output
 
 PTY capture solves these by interposing a pseudoterminal between the subprocess
@@ -147,12 +147,12 @@ The sequence number provides total ordering even when timestamps collide.
 
 ### 5.1  Causality
 
-Subprocess output and wa detection events can interleave. The ordering contract:
+Subprocess output and ft detection events can interleave. The ordering contract:
 
 1. **Within subprocess output:** Total order preserved by `seq` field
 2. **Between subprocess output and events:** Temporal order via `timestamp_ms`
    (monotonic clock). Events are timestamped at detection time, frames at read time.
-3. **Between multiple subprocesses:** Not applicable — wa runs one subprocess
+3. **Between multiple subprocesses:** Not applicable — ft runs one subprocess
    at a time during `Suspended` phase (enforced by `command_handoff.rs` state machine)
 
 ### 5.2  Deterministic Replay
@@ -335,7 +335,7 @@ should be feature-gated behind `cfg(unix)` since PTY capture is POSIX-only.
 | Redaction false positives mask output | Medium | Redaction report in SubprocessReport; `WAS_REDACTED` flag |
 | Ring buffer too small for long output | Low | 256 KiB is ~10x a typical terminal screen |
 | Chunk-boundary redaction misses | Low | 256-byte overlap window covers all pattern lengths |
-| Platform incompatibility (non-POSIX) | N/A | Feature-gated `cfg(unix)` — wa targets Linux/macOS only |
+| Platform incompatibility (non-POSIX) | N/A | Feature-gated `cfg(unix)` — ft targets Linux/macOS only |
 
 ## References
 

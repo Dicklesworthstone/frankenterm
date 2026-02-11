@@ -25,13 +25,13 @@ This matrix documents the real-world auth states and provides deterministic guid
 
 ```
 1. Codex CLI: "Usage limit reached, try again at <reset_time>"
-2. wa detects: rule_id = "codex.usage.reached"
+2. ft detects: rule_id = "codex.usage.reached"
 3. Workflow: start `cod login --device-auth`
 4. Codex CLI outputs: "Please open https://auth.openai.com/codex/device and enter code: XXXX-XXXXX"
-5. wa detects: rule_id = "codex.auth.device_code"
+5. ft detects: rule_id = "codex.auth.device_code"
 6. Browser automation: Navigate to auth.openai.com/codex/device
 7. Browser state determines outcome (see matrix below)
-8. On success: Codex CLI proceeds, wa resumes session
+8. On success: Codex CLI proceeds, ft resumes session
 ```
 
 ### 2.2 Key URLs
@@ -173,7 +173,7 @@ The `handle_usage_limits` workflow should:
      Account: user@example.com
      Action: Complete login in the opened browser window
 
-     Once complete, wa will automatically detect success and resume.
+     Once complete, ft will automatically detect success and resume.
      Timeout: 5 minutes
      ```
 3. **On `Fail` outcome**:

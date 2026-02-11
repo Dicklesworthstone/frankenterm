@@ -7,7 +7,7 @@
 
 ## Context
 
-wa consumes `/dp/frankentui` (ftui) as an optional dependency during the TUI
+ft consumes `/dp/frankentui` (ftui) as an optional dependency during the TUI
 migration. The dependency is currently a path dep for fast iteration
 (see ADR-004). Before any release, the dependency must be pinned to a
 specific upstream commit to guarantee reproducible builds.
@@ -22,16 +22,16 @@ and what compatibility risks to watch for.
 | Phase | Cargo Dependency | When |
 |-------|-----------------|------|
 | **Development** | `path = "../frankentui/crates/ftui"` | Default during migration work |
-| **Pre-release** | `git = "...", rev = "<sha>"` | Before tagging any wa release |
+| **Pre-release** | `git = "...", rev = "<sha>"` | Before tagging any ft release |
 | **Post-migration** | `version = "x.y"` (crates.io) | After ftui is published and stable |
 
 ### Pin Cadence
 
 - **During migration**: Pin to a specific commit at least weekly, or when
   a breaking API change lands in ftui.
-- **Before wa release**: Pin is mandatory. The exact rev is recorded in the
+- **Before ft release**: Pin is mandatory. The exact rev is recorded in the
   root `Cargo.toml` comment (already present: `Pinned rev for reference: 65b8538`).
-- **Routine bumps**: Bump the pin when ftui adds features wa needs, or when
+- **Routine bumps**: Bump the pin when ftui adds features ft needs, or when
   security/correctness fixes land upstream.
 
 ### Pin Procedure
@@ -68,16 +68,16 @@ and what compatibility risks to watch for.
 
 When bumping the ftui pin, review the upstream diff for:
 
-- [ ] **Breaking API changes** in types wa uses (`Model`, `Cmd`, `Frame`,
+- [ ] **Breaking API changes** in types ft uses (`Model`, `Cmd`, `Frame`,
       `Buffer`, `Event`, `KeyCode`, `Style`, `App`, `ScreenMode`)
 - [ ] **Feature flag changes** — verify `runtime` feature still exports what
       ft needs
 - [ ] **Dependency additions** — check for new transitive deps that might
-      conflict with wa's dependency graph (especially `unicode-width`,
+      conflict with ft's dependency graph (especially `unicode-width`,
       `crossterm`, or async runtime crates)
-- [ ] **Minimum Rust version** — ftui must not require a newer MSRV than wa
+- [ ] **Minimum Rust version** — ftui must not require a newer MSRV than ft
       (currently nightly/1.85)
-- [ ] **Removed re-exports** — ensure nothing wa imports was dropped from
+- [ ] **Removed re-exports** — ensure nothing ft imports was dropped from
       `ftui/src/lib.rs`
 
 ### Compatibility Risk Checklist

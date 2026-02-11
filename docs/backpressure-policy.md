@@ -2,13 +2,13 @@
 
 > Design specification for bead `wa-upg.12.1`. Provides deterministic,
 > implementable backpressure signals, thresholds, and degradation responses
-> for the wa watcher pipeline.
+> for the ft watcher pipeline.
 
 ---
 
 ## Problem Statement
 
-The wa watcher pipeline has three bounded queues in series:
+The ft watcher pipeline has three bounded queues in series:
 
 ```
 Tailers ─► capture channel (1024) ─► persistence task ─► write queue (10000) ─► SQLite

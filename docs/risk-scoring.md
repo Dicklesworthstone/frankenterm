@@ -1,10 +1,10 @@
 # Risk Scoring Guide
 
-This guide explains how wa's risk scoring system works and how to configure it for your environment.
+This guide explains how ft's risk scoring system works and how to configure it for your environment.
 
 ## Overview
 
-wa uses a risk scoring model to make nuanced authorization decisions. Instead of binary allow/deny, actions receive a risk score from 0-100 that determines the response:
+ft uses a risk scoring model to make nuanced authorization decisions. Instead of binary allow/deny, actions receive a risk score from 0-100 that determines the response:
 
 | Score Range | Risk Level | Default Response |
 |-------------|------------|------------------|
@@ -65,7 +65,7 @@ These analyze the command text (SendText only):
 
 ## Configuration
 
-Configure risk scoring in `~/.config/wa/ft.toml` or `.ft/config.toml`:
+Configure risk scoring in `~/.config/ft/ft.toml` or `.ft/config.toml`:
 
 ### Basic Configuration
 
@@ -173,11 +173,11 @@ Risk information appears in policy decision JSON:
 }
 ```
 
-### Using wa why
+### Using ft why
 
 ```bash
 # Explain why an action was denied/required approval
-wa why denied --pane 3
+ft why denied --pane 3
 ```
 
 ## Safety Guidelines
@@ -215,7 +215,7 @@ wa why denied --pane 3
 
 For one-time approval:
 ```bash
-wa approve <code>  # Use the approval code from the denial response
+ft approve <code>  # Use the approval code from the denial response
 ```
 
 For recurring actions, adjust the relevant factor weight or threshold.
@@ -229,4 +229,4 @@ For recurring actions, adjust the relevant factor weight or threshold.
 ## Related Documentation
 
 - [Risk Model Design](risk-model-design.md) - Technical implementation details
-- [Policy Configuration](../AGENTS.md#configuration) - General wa configuration
+- [Policy Configuration](../AGENTS.md#configuration) - General ft configuration

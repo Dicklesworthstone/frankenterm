@@ -296,7 +296,7 @@ Risk information appears in policy outputs:
   "approval": {
     "allow_once_code": "XK7P2M",
     "summary": "Allow SendText to pane 3 (risk: 65)",
-    "command": "wa approve XK7P2M"
+    "command": "ft approve XK7P2M"
   }
 }
 ```
@@ -434,10 +434,10 @@ impl PolicyEngine {
 }
 ```
 
-### wa why Integration
+### ft why Integration
 
 ```rust
-// In wa why output
+// In ft why output
 pub fn explain_risk_decision(decision: &PolicyDecision) -> String {
     let Some(context) = decision.context() else {
         return "No decision context available".to_string();

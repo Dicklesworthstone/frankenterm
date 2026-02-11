@@ -15,8 +15,8 @@
 | **FrankenTUI** | `ftui` | Migration target ftui backend | `cargo check -p frankenterm-core --features ftui` |
 | **Legacy test** | `tui` | Unit + integration tests for legacy | `cargo test -p frankenterm-core --features tui` |
 | **ftui test** | `ftui` | Unit + integration tests for ftui | `cargo test -p frankenterm-core --features ftui` |
-| **Full legacy** | `tui,mcp,web,metrics` | Legacy binary with all optional frontends | `cargo check -p wa --features tui,mcp,web,metrics` |
-| **Full ftui** | `ftui,mcp,web,metrics` | ftui binary with all optional frontends | `cargo check -p wa --features ftui,mcp,web,metrics` |
+| **Full legacy** | `tui,mcp,web,metrics` | Legacy binary with all optional frontends | `cargo check -p frankenterm --features tui,mcp,web,metrics` |
+| **Full ftui** | `ftui,mcp,web,metrics` | ftui binary with all optional frontends | `cargo check -p frankenterm --features ftui,mcp,web,metrics` |
 
 ### Rollout Mode (Stages 1-2)
 
@@ -72,8 +72,8 @@ cargo test -p frankenterm-core --features ftui
 cargo check -p frankenterm-core --features tui,ftui 2>&1 | grep -q "mutually exclusive"
 
 # 5. Binary crate — both backends
-cargo check -p wa --features tui
-cargo check -p wa --features ftui
+cargo check -p frankenterm --features tui
+cargo check -p frankenterm --features ftui
 
 # 6. Clippy for both backends
 cargo clippy -p frankenterm-core --features tui -- -D warnings

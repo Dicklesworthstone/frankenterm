@@ -18,7 +18,7 @@ validates rendering logic but misses:
 - Terminal resize (SIGWINCH) propagation
 - Multi-byte character and paste bracket handling
 
-PTY E2E tests address these gaps by running wa in a real pseudoterminal and
+PTY E2E tests address these gaps by running ft in a real pseudoterminal and
 interacting via scripted input/output assertions.
 
 ## 2  Seed Policy

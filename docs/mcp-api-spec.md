@@ -1,6 +1,6 @@
 # MCP API Spec (v1)
 
-This document defines the MCP surface for wa (WezTerm Automata). The MCP API
+This document defines the MCP surface for ft (FrankenTerm). The MCP API
 mirrors `ft robot` for parity, stability, and token-efficient responses.
 
 ## Goals
@@ -14,12 +14,12 @@ The MCP server is feature-gated. Build with MCP enabled and run over stdio:
 
 ```bash
 cargo build --release --features mcp
-wa mcp serve
+ft mcp serve
 ```
 
 ## Versioning
 - `mcp_version`: MCP surface version (currently `v1`).
-- `version`: wa semver (e.g., `0.1.0`).
+- `version`: ft semver (e.g., `0.1.0`).
 - Changes are additive and backward-compatible within a major surface version.
 
 ## Response Envelope (v1)

@@ -7,7 +7,7 @@
 
 ## 1  Overview
 
-wa is migrating its TUI backend from ratatui+crossterm to FrankenTUI (ftui). Both backends coexist behind mutually exclusive Cargo features (`tui` vs `ftui`) during the migration period. This guide covers what contributors need to know to work in the codebase during and after the transition.
+ft is migrating its TUI backend from ratatui+crossterm to FrankenTUI (ftui). Both backends coexist behind mutually exclusive Cargo features (`tui` vs `ftui`) during the migration period. This guide covers what contributors need to know to work in the codebase during and after the transition.
 
 ## 2  Feature Flags
 
@@ -34,7 +34,7 @@ cargo check -p frankenterm-core --features ftui
 cargo test -p frankenterm-core --features ftui --lib
 
 # Full binary
-cargo check -p wa --features ftui,mcp,web,metrics
+cargo check -p frankenterm --features ftui,mcp,web,metrics
 ```
 
 See `docs/ftui-cargo-feature-matrix.md` for the complete feature matrix.

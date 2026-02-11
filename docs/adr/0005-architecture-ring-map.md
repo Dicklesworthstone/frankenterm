@@ -11,7 +11,7 @@ only Ring 3 (Presentation). All other rings are untouched.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│  Ring 4: Application (wa crate — main.rs CLI binary)                │
+│  Ring 4: Application (frankenterm crate — main.rs CLI binary)       │
 │  ┌────────────────────────────────────────────────────────────────┐  │
 │  │  Ring 3: Presentation (TUI, Robot Types, MCP, Web)            │  │
 │  │  ┌──────────────────────────────────────────────────────────┐  │  │
@@ -29,7 +29,7 @@ only Ring 3 (Presentation). All other rings are untouched.
 
 ## Ring 0: Core (Types, Config, Errors)
 
-Foundation types with no dependencies on wa business logic.
+Foundation types with no dependencies on ft business logic.
 
 | Module | Responsibility |
 |--------|---------------|

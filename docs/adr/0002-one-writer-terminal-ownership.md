@@ -12,7 +12,7 @@ is routed through a controlled sink that the UI runtime manages.
 
 ## Context
 
-wa has multiple subsystems that produce terminal output:
+ft has multiple subsystems that produce terminal output:
 
 1. **TUI** - Renders interactive views (ratatui widgets via crossterm)
 2. **Watcher daemon** - Logs capture progress, pattern matches, errors
@@ -82,7 +82,7 @@ The ftui lifecycle must guarantee terminal restoration:
 - Panic hook calls `exit()` before unwinding
 - Signal handler calls `exit()` on SIGINT/SIGTERM
 
-Current wa uses `panic = "abort"` in release. The cleanup hook must run
+Current ft uses `panic = "abort"` in release. The cleanup hook must run
 before abort via `std::panic::set_hook`.
 
 ## Consequences

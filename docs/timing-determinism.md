@@ -1,6 +1,6 @@
 # Timing Determinism Guidelines
 
-wa uses condition-based waiting throughout. Every wait is driven by an
+ft uses condition-based waiting throughout. Every wait is driven by an
 observable state change — a pattern match, a queue drain, or an external
 signal — rather than a fixed delay. This document explains the available
 patterns, when to use each, and how to write deterministic tests.
@@ -19,7 +19,7 @@ one of the patterns below instead.
 
 ## Three Levels of Waiting
 
-wa provides waiting primitives at three granularities. Choose the
+ft provides waiting primitives at three granularities. Choose the
 narrowest one that fits your situation.
 
 ### Level 1: Generic `wait_for` with Backoff
@@ -27,7 +27,7 @@ narrowest one that fits your situation.
 For waiting on an arbitrary condition:
 
 ```rust
-use wa_core::wait::{wait_for, wait_for_condition, Backoff};
+use frankenterm_core::wait::{wait_for, wait_for_condition, Backoff};
 use std::time::Duration;
 
 // Simple boolean condition
@@ -67,7 +67,7 @@ never exceeds the deadline.
 For waiting until a pane's output matches a pattern:
 
 ```rust
-use wa_core::wezterm::{PaneWaiter, WaitMatcher, WaitOptions};
+use frankenterm_core::wezterm::{PaneWaiter, WaitMatcher, WaitOptions};
 
 let waiter = PaneWaiter::new(source, WaitOptions::default());
 let result = waiter.wait_for(
@@ -95,8 +95,8 @@ match result {
 The CLI equivalent is `ft send --wait-for`:
 
 ```bash
-wa send 3 "ls -la" --wait-for "\\$" --timeout-secs 30
-wa send 3 "grep error" --wait-for-regex "found \\d+ matches"
+ft send 3 "ls -la" --wait-for "\\$" --timeout-secs 30
+ft send 3 "grep error" --wait-for-regex "found \\d+ matches"
 ```
 
 Use `WaitMatcher::substring()` for simple prompts and
@@ -108,7 +108,7 @@ For waiting until all subsystems are idle (queues drained, no recent
 activity):
 
 ```rust
-use wa_core::wait::{
+use frankenterm_core::wait::{
     QuiescenceDetector, QueueDepthGauge, ActivityTracker,
     wait_for_quiescence,
 };
@@ -170,7 +170,7 @@ avoids wasting CPU on quiet panes while responding quickly to active ones.
 
 ## Explicit GAP Semantics
 
-When wa cannot guarantee continuity — overlap matching fails, alt-screen
+When ft cannot guarantee continuity — overlap matching fails, alt-screen
 blocks stable capture, or backpressure overflows — it records an explicit
 **GAP segment** and emits a gap event.
 
@@ -214,7 +214,7 @@ expected, what was last seen, and how many attempts were made.
 For external calls (WezTerm CLI, database writes), use `RetryPolicy`:
 
 ```rust
-use wa_core::retry::RetryPolicy;
+use frankenterm_core::retry::RetryPolicy;
 
 // Pre-configured policies
 let wezterm = RetryPolicy::wezterm_cli();  // 3 attempts, 100ms initial

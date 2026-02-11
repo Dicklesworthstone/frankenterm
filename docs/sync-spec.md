@@ -1,12 +1,12 @@
-# Sync Spec (wa sync / asupersync)
+# Sync Spec (ft sync / asupersync)
 
 ## Summary
-Define a safe, explicit sync contract for moving wa assets between machines.
+Define a safe, explicit sync contract for moving ft assets between machines.
 The sync feature is plan-first, dry-run by default, and never touches the live
 SQLite database. Only approved assets are allowed to move.
 
 ## Goals
-- Allow operators to sync wa assets between machines safely.
+- Allow operators to sync ft assets between machines safely.
 - Make sync behavior explicit, deterministic, and auditable.
 - Provide a simple target model for remote destinations.
 
@@ -16,8 +16,8 @@ SQLite database. Only approved assets are allowed to move.
 - Implicit overwrites without confirmation.
 
 ## What can be synced (initial scope)
-- `wa` binary (optional)
-- `~/.config/wa/` (config)
+- `ft` binary (optional)
+- `~/.config/ft/` (config)
 - exported DB snapshots (never live DB files)
 
 ## Safety rules
@@ -31,9 +31,9 @@ SQLite database. Only approved assets are allowed to move.
 
 ### Commands
 ```
-wa sync targets list
-wa sync push <target> [--dry-run] [--yes]
-wa sync pull <target> [--dry-run] [--yes]
+ft sync targets list
+ft sync push <target> [--dry-run] [--yes]
+ft sync pull <target> [--dry-run] [--yes]
 ```
 
 ### Flags
@@ -72,18 +72,18 @@ allow_binary = false
 allow_config = true
 allow_snapshots = true
 # Optional allow/deny path globs
-allow_paths = ["~/.config/wa/ft.toml", "~/.config/wa/patterns.toml"]
+allow_paths = ["~/.config/ft/ft.toml", "~/.config/ft/patterns.toml"]
 deny_paths = [
-  "~/.local/share/wa/ft.db",
-  "~/.local/share/wa/ft.db-wal",
-  "~/.local/share/wa/ft.db-shm"
+  "~/.local/share/ft/ft.db",
+  "~/.local/share/ft/ft.db-wal",
+  "~/.local/share/ft/ft.db-shm"
 ]
 
 [[sync.targets]]
 name = "staging"
 transport = "ssh"
-endpoint = "wa@staging-host"
-root = "~/.local/share/wa/sync"
+endpoint = "user@staging-host"
+root = "~/.local/share/ft/sync"
 # push or pull
 default_direction = "push"
 # Optional per-target overrides
@@ -96,12 +96,12 @@ allow_snapshots = true
 ```
 <root>/
   bin/
-    wa
+    ft
   config/
     ft.toml
     patterns.toml
   snapshots/
-    wa-export-YYYYMMDD-HHMMSS.jsonl
+    ft-export-YYYYMMDD-HHMMSS.jsonl
 ```
 
 ## Snapshots

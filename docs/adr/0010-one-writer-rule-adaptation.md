@@ -6,7 +6,7 @@
 
 ## Decision
 
-Map the one-writer rule (ADR-0002) to concrete wa modules, process boundaries,
+Map the one-writer rule (ADR-0002) to concrete ft modules, process boundaries,
 and lifecycle phases.  Define an enforceable write-path matrix with per-phase
 allowed/forbidden paths, negative examples, and validation evidence hooks.
 

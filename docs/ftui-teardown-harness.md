@@ -96,12 +96,12 @@ Located in `crates/frankenterm-core/src/tui/terminal_session.rs`, `tests` module
 
 ## 4  Failure Artifact Capture Requirements
 
-When wa crashes (panic or signal), the following artifacts must be produced
+When ft crashes (panic or signal), the following artifacts must be produced
 for post-mortem analysis without rerunning interactively.
 
 ### 4.1  Crash Bundle (existing — crash.rs)
 
-Written to `.ft/crash/wa_crash_YYYYMMDD_HHMMSS/`:
+Written to `.ft/crash/ft_crash_YYYYMMDD_HHMMSS/`:
 
 | File | Content | Redacted |
 |------|---------|----------|

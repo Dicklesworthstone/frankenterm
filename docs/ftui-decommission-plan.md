@@ -89,7 +89,7 @@ After all removal phases complete:
 
 - [ ] `cargo check -p frankenterm-core` (headless) passes
 - [ ] `cargo check -p frankenterm-core --features tui` (renamed from ftui) passes
-- [ ] `cargo check -p wa --features tui` passes
+- [ ] `cargo check -p frankenterm --features tui` passes
 - [ ] `cargo test -p frankenterm-core --features tui --lib` — all tests pass (320+)
 - [ ] `cargo clippy -p frankenterm-core --features tui -- -D warnings` clean
 - [ ] `cargo fmt --check` clean

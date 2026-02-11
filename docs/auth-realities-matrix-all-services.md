@@ -1,6 +1,6 @@
 # Auth Realities Matrix: OpenAI + Anthropic + Google
 
-> **Purpose**: One place to answer: "Can wa automate this auth state, or does a human have to step in?"
+> **Purpose**: One place to answer: "Can ft automate this auth state, or does a human have to step in?"
 >
 > This extends `docs/auth-realities-matrix-openai-codex.md` with Anthropic and Google, using the
 > same outcome taxonomy so workflows can make deterministic decisions.
@@ -57,9 +57,9 @@ Notes:
 When a state is `NeedsHuman`, the workflow output should be consistent:
 - State name (snake_case)
 - Service + account_key
-- What wa did (opened URL, where profile lives)
+- What ft did (opened URL, where profile lives)
 - Clear next steps
-- Clear "how wa will know it's done" (pattern match / CLI success)
+- Clear "how ft will know it's done" (pattern match / CLI success)
 
 ---
 
@@ -83,4 +83,3 @@ This bead requires at least one real-world validation run per service.
 
 - Anthropic: TODO (record observed CLI prompts + URLs without secrets)
 - Google: TODO (record observed `/auth` prompts + URLs without secrets)
-

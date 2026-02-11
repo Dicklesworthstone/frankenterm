@@ -171,7 +171,7 @@ Pane state inference priority: alt-screen active -> `"AltScreen"`, cursor hidden
 | `severity` | `String` | `"error"`, `"warning"`, `"info"` |
 | `title` | `String` | Human-readable summary |
 | `detail` | `String` | Extended description (truncated to 120 chars for events) |
-| `actions` | `Vec<TriageAction>` | Suggested wa CLI commands |
+| `actions` | `Vec<TriageAction>` | Suggested ft CLI commands |
 | `event_id` | `Option<i64>` | Source event if applicable |
 | `pane_id` | `Option<u64>` | Source pane if applicable |
 | `workflow_id` | `Option<String>` | Source workflow if applicable |

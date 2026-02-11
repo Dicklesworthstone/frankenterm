@@ -23,7 +23,7 @@ Delete instructions in italics before submitting.*
 | **Locale** | *e.g., en_US.UTF-8* |
 | **Color support** | *256 / truecolor / none* |
 | **Unicode support** | *Yes / Limited / No* |
-| **wa build** | *commit hash + features (ftui)* |
+| **ft build** | *commit hash + features (ftui)* |
 | **Test date** | *YYYY-MM-DD* |
 | **Tester** | *Agent name or human* |
 
@@ -58,9 +58,9 @@ Delete instructions in italics before submitting.*
 
 | Check | Procedure | Expected |
 |-------|-----------|----------|
-| **Alternate screen** | Start wa TUI, quit | Terminal restored, no leftover alt-screen |
-| **Raw mode** | Start wa TUI, quit | Terminal echoes input normally |
-| **Cursor visibility** | Start wa TUI, quit | Cursor visible after exit |
+| **Alternate screen** | Start ft TUI, quit | Terminal restored, no leftover alt-screen |
+| **Raw mode** | Start ft TUI, quit | Terminal echoes input normally |
+| **Cursor visibility** | Start ft TUI, quit | Cursor visible after exit |
 | **Color rendering** | View all 7 TUI views | Colors match design (severity, status labels) |
 | **Unicode rendering** | Add event with Unicode chars | Characters display correctly |
 | **Wide characters** | CJK text in pane titles | Characters occupy correct width |
@@ -85,7 +85,7 @@ All of the following must be true:
 
 | ID | Description | Severity | Workaround |
 |----|-------------|----------|------------|
-| *KL-001* | *tmux does not forward OSC 52 (clipboard)* | *Cosmetic* | *N/A — clipboard not used by wa TUI* |
+| *KL-001* | *tmux does not forward OSC 52 (clipboard)* | *Cosmetic* | *N/A — clipboard not used by ft TUI* |
 
 ## 4  Results
 

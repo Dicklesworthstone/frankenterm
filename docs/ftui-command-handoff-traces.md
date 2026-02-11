@@ -146,7 +146,7 @@ Session: Active Gate: Active  ← no suspension occurred
 
 ```
 Session: Suspended Gate: Suspended
-  │ [command panics or wa panics]
+  │ [command panics or ft panics]
   │ SessionGuard::Drop runs
   │   → session.leave()
   │   → gate = Inactive

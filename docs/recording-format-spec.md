@@ -7,7 +7,7 @@
 
 ## Overview
 
-This document specifies the `.war` (wa recording) file format for storing terminal session
+This document specifies the `.war` (ft recording) file format for storing terminal session
 recordings with efficient delta compression, rich metadata, and deterministic replay.
 The format is designed to be parseable **without** wa, forward-compatible via versioning,
 and safe to store (redaction-aware for sensitive content).
@@ -133,7 +133,7 @@ pub struct FrameHeader {
 pub enum FrameType {
     Output = 1,   // Terminal output delta
     Resize = 2,   // Terminal size change
-    Event = 3,    // wa detection event
+    Event = 3,    // ft detection event
     Marker = 4,   // User annotation
     Input = 5,    // Optional captured input (redacted)
 }
@@ -176,7 +176,7 @@ pub struct ResizeFrame {
 
 ### Event Frame
 
-Event frames store wa detection events in redacted JSON form.
+Event frames store ft detection events in redacted JSON form.
 
 ```json
 {
@@ -265,7 +265,7 @@ Readers should verify checksum if supported; otherwise continue with a warning.
 
 - Never store raw secrets, tokenized URLs, or session cookies.
 - Input frames must always store redacted previews or be omitted.
-- Event and metadata JSON must run through the same redactor as wa output.
+- Event and metadata JSON must run through the same redactor as ft output.
 
 ## Testing Requirements
 

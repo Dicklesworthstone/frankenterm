@@ -59,7 +59,7 @@ Run 2 bug-bash sessions during the stabilization window:
 
 ```markdown
 **Environment:** [terminal] [OS] [multiplexer] [$TERM]
-**wa version:** [commit hash]
+**ft version:** [commit hash]
 **Severity:** S[1-4]
 
 **Steps to reproduce:**

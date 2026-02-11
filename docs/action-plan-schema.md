@@ -7,7 +7,7 @@
 
 ## Overview
 
-This document specifies the unified action plan schema for `wa` workflows. The goal is to provide a single, consistent representation for planned actions across all command paths (Robot Mode, workflows, dry-run preview) with:
+This document specifies the unified action plan schema for `ft` workflows. The goal is to provide a single, consistent representation for planned actions across all command paths (Robot Mode, workflows, dry-run preview) with:
 
 - Deterministic serialization for stable hashing
 - Idempotency tracking for safe replay
@@ -96,8 +96,8 @@ Approvals are bound to this hash (or its `plan_id` derivative). That means:
 **Prepare**
 
 ```
-wa prepare send --pane-id 3 "text"
-wa prepare workflow run handle_compaction --pane-id 3
+ft prepare send --pane-id 3 "text"
+ft prepare workflow run handle_compaction --pane-id 3
 ```
 
 Output requirements:
@@ -110,7 +110,7 @@ Output requirements:
 **Commit**
 
 ```
-wa commit <plan_id>
+ft commit <plan_id>
 ```
 
 Commit checks:
@@ -125,7 +125,7 @@ Commit checks:
 **Prepare**
 
 ```
-wa robot prepare send --pane-id 3 "text"
+ft robot prepare send --pane-id 3 "text"
 ```
 
 Returns structured JSON:
@@ -138,7 +138,7 @@ Returns structured JSON:
 **Commit**
 
 ```
-wa robot commit <plan_id>
+ft robot commit <plan_id>
 ```
 
 Returns:
@@ -203,7 +203,7 @@ When introducing a new StepAction, Precondition, or Verification strategy:
    - Ensure actions that mutate panes are policy-gated.
    - Ensure any text payload is redacted in logs/audits (never store raw secrets).
 5. **Update renderers**:
-   - Human output (`wa` CLI) should show a clear summary line.
+- Human output (`ft` CLI) should show a clear summary line.
    - Robot/MCP output should include structured fields without secrets.
 6. **Update JSON schemas** if ActionPlan shapes appear in robot/web outputs (e.g., `docs/json-schema/wa-robot-workflow-status.json`).
 7. **Document behavior** here so future contributors understand when to use the new step.

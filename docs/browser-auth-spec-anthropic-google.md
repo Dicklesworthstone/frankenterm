@@ -15,7 +15,7 @@
 - Provide a **single contract** for multi-service browser auth.
 - Keep the contract **stable and versioned**.
 - Ensure **safe failure** with explicit Next Steps.
-- Persist **profiles only** (no secrets in wa DB).
+- Persist **profiles only** (no secrets in ft DB).
 
 ## 2. Non-Goals (v0.1)
 
@@ -68,7 +68,7 @@ pub enum AuthResult {
 - **Profile root**: `~/<data_dir>/wa/browser_profiles/<service>/<account_key>/`
 - Profiles are treated as **opaque** by wa.
 - If a profile exists, try **already-authenticated fast path** first.
-- The only persisted data in wa DB:
+- The only persisted data in ft DB:
   - profile path
   - timestamps
   - last_success_at

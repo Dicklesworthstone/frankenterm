@@ -28,13 +28,13 @@ The current architecture works but has structural limitations:
 
 1. **Alt-screen only.** The TUI enters alternate screen mode on startup
    (`EnterAlternateScreen`) and leaves on exit. This destroys scrollback context
-   and prevents wa from coexisting with ongoing terminal output (e.g., logs).
+   and prevents ft from coexisting with ongoing terminal output (e.g., logs).
 
 2. **No deterministic rendering contract.** ratatui draws via a diff-based backend
    but does not enforce a deterministic buffer/diff/present pipeline. Test assertions
    require terminal mocking, not snapshot comparison.
 
-3. **Terminal ownership is implicit.** Nothing prevents other wa subsystems (logging,
+3. **Terminal ownership is implicit.** Nothing prevents other ft subsystems (logging,
    subprocess output) from writing to stdout while the TUI owns the terminal. This
    creates potential output corruption under concurrent use.
 
@@ -93,7 +93,7 @@ Remove the TUI entirely and rely on robot mode + external dashboards.
 
 - Terminal ownership becomes explicit and enforceable.
 - Tests can use deterministic snapshots instead of mocked terminals.
-- Inline mode enables wa to show status without losing scrollback.
+- Inline mode enables ft to show status without losing scrollback.
 - Shared infrastructure with other `/dp/` projects reduces per-project TUI cost.
 
 ### Negative

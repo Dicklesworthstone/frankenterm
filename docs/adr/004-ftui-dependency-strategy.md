@@ -7,7 +7,7 @@
 
 ## Context
 
-wa needs to consume `/dp/frankentui` (ftui) as an optional dependency during
+ft needs to consume `/dp/frankentui` (ftui) as an optional dependency during
 the TUI migration (ADR-001). The integration must allow both the legacy
 ratatui stack and the new ftui stack to coexist in the dependency graph during
 the migration period, while ensuring:

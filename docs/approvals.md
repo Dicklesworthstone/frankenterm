@@ -32,8 +32,8 @@ predictable path.
 Prepare a plan (no side effects):
 
 ```bash
-wa prepare send --pane-id 3 "ls"
-wa prepare workflow run handle_compaction --pane-id 3
+ft prepare send --pane-id 3 "ls"
+ft prepare workflow run handle_compaction --pane-id 3
 ```
 
 The output includes:
@@ -46,13 +46,13 @@ The output includes:
 Commit the prepared plan:
 
 ```bash
-wa commit plan:abcd1234 --text "ls"
+ft commit plan:abcd1234 --text "ls"
 ```
 
 If approval is required, include the approval code from prepare:
 
 ```bash
-wa commit plan:abcd1234 --text "rm -rf /tmp/test" --approval-code AB12CD34
+ft commit plan:abcd1234 --text "rm -rf /tmp/test" --approval-code AB12CD34
 ```
 
 ## Plan hash and scope

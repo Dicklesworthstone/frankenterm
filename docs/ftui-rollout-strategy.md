@@ -32,14 +32,14 @@
 ```bash
 # Operator enables ftui for their session
 export FT_TUI_BACKEND=ftui
-wa tui
+ft tui
 ```
 
 **Fallback:**
 ```bash
 # Revert to legacy
 unset FT_TUI_BACKEND
-wa tui
+ft tui
 ```
 
 ### Stage 2: Beta
@@ -56,7 +56,7 @@ wa tui
 **Override to legacy (escape hatch):**
 ```bash
 export FT_TUI_BACKEND=ratatui
-wa tui
+ft tui
 ```
 
 ### Stage 3: General Availability
@@ -125,7 +125,7 @@ Each stage transition requires:
 # Remove canary environment variable
 unset FT_TUI_BACKEND
 # Rebuild with legacy-only features
-cargo build -p wa --features tui
+cargo build -p frankenterm --features tui
 ```
 
 **Stage 2 → Stage 1:**
