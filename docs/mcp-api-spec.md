@@ -6,7 +6,7 @@ mirrors `ft robot` for parity, stability, and token-efficient responses.
 ## Goals
 - Stable, versioned surface for agent integrations.
 - Token-efficient responses that match robot schemas.
-- Minimal, complete tool set required to operate wa.
+- Minimal, complete tool set required to operate ft (FrankenTerm).
 
 ## Running the MCP Server
 
@@ -48,6 +48,9 @@ Notes:
 ## Tool List (v1)
 
 All tools mirror `ft robot` semantics and schemas.
+
+Note: Tool IDs currently still use the legacy `wa.*` prefix and resources use the
+legacy `wa://...` scheme for backward compatibility.
 
 | Tool | Description | Data Schema |
 |------|-------------|-------------|

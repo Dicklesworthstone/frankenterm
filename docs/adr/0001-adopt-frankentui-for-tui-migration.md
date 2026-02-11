@@ -6,11 +6,11 @@
 
 ## Decision
 
-Migrate wa's interactive TUI from ratatui/crossterm to FrankenTUI (ftui).
+Migrate ft's interactive TUI from ratatui/crossterm to FrankenTUI (ftui).
 
 ## Context
 
-wa's TUI (`crates/frankenterm-core/src/tui/`) is built on ratatui 0.30.0 + crossterm 0.29.0.
+ft's TUI (`crates/frankenterm-core/src/tui/`) is built on ratatui 0.30.0 + crossterm 0.29.0.
 It provides 7 views (Home, Panes, Events, Triage, History, Search, Help) behind a
 `tui` feature flag. The implementation spans ~6,050 lines:
 
@@ -38,7 +38,7 @@ The current architecture works but has structural limitations:
    subprocess output) from writing to stdout while the TUI owns the terminal. This
    creates potential output corruption under concurrent use.
 
-4. **No inline-mode path.** wa's watcher daemon logs to the same terminal session.
+4. **No inline-mode path.** ft's watcher daemon logs to the same terminal session.
    Switching between TUI and daemon output requires full alt-screen transitions
    with no intermediate inline option.
 

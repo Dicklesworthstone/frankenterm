@@ -17,7 +17,7 @@ Rules whose anchors fire on unrelated text from other programs.
 ### Mitigation
 
 These rules use single-word or two-word anchors that are common in
-infrastructure logs. wa's domain filter (agent-scoped pane assignment) limits
+infrastructure logs. ft's domain filter (agent-scoped pane assignment) limits
 exposure: a pane assigned to `claude_code` won't run Codex rules. Still, for
 panes without an assigned agent type, all rules run and FPs are possible.
 
