@@ -17,8 +17,8 @@
 //!
 //! See `wa-29k1` bead for the full design.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
@@ -220,12 +220,10 @@ impl SnapshotEngine {
         let retention_count = self.config.retention_count;
         let retention_days = self.config.retention_days;
 
-        tokio::task::spawn_blocking(move || {
-            cleanup_sync(&db_path, retention_count, retention_days)
-        })
-        .await
-        .map_err(|e| SnapshotError::Database(format!("task join: {e}")))?
-        .map_err(|e| SnapshotError::Database(e.to_string()))
+        tokio::task::spawn_blocking(move || cleanup_sync(&db_path, retention_count, retention_days))
+            .await
+            .map_err(|e| SnapshotError::Database(format!("task join: {e}")))?
+            .map_err(|e| SnapshotError::Database(e.to_string()))
     }
 
     /// Run the periodic snapshot loop.
@@ -419,7 +417,13 @@ fn create_session_sync(
     conn.execute(
         "INSERT INTO mux_sessions (session_id, created_at, topology_json, ft_version, host_id)
          VALUES (?1, ?2, ?3, ?4, ?5)",
-        rusqlite::params![session_id, now_ms as i64, topology_json, ft_version, host_id],
+        rusqlite::params![
+            session_id,
+            now_ms as i64,
+            topology_json,
+            ft_version,
+            host_id
+        ],
     )?;
     Ok(())
 }
@@ -462,25 +466,26 @@ fn save_checkpoint_sync(
     let conn = open_conn(db_path)?;
 
     // Serialize all pane states and compute total bytes
-    let mut serialized_states: Vec<(u64, String, Option<String>, Option<String>, Option<i64>, Option<i64>)> = Vec::new();
+    let mut serialized_states: Vec<(
+        u64,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+    )> = Vec::new();
     let mut total_bytes: usize = 0;
 
     for ps in pane_states {
         let terminal_json =
             serde_json::to_string(&ps.terminal).unwrap_or_else(|_| "{}".to_string());
-        let env_json = ps
-            .env
-            .as_ref()
-            .and_then(|e| serde_json::to_string(e).ok());
+        let env_json = ps.env.as_ref().and_then(|e| serde_json::to_string(e).ok());
         let agent_json = ps
             .agent
             .as_ref()
             .and_then(|a| serde_json::to_string(a).ok());
         let scrollback_seq = ps.scrollback_ref.as_ref().map(|s| s.output_segments_seq);
-        let last_output_at = ps
-            .scrollback_ref
-            .as_ref()
-            .map(|s| s.last_capture_at as i64);
+        let last_output_at = ps.scrollback_ref.as_ref().map(|s| s.last_capture_at as i64);
 
         total_bytes += terminal_json.len()
             + env_json.as_ref().map_or(0, |s| s.len())
@@ -525,8 +530,14 @@ fn save_checkpoint_sync(
         )?;
 
         for (i, ps) in pane_states.iter().enumerate() {
-            let (_, ref terminal_json, ref env_json, ref agent_json, scrollback_seq, last_output_at) =
-                serialized_states[i];
+            let (
+                _,
+                ref terminal_json,
+                ref env_json,
+                ref agent_json,
+                scrollback_seq,
+                last_output_at,
+            ) = serialized_states[i];
             stmt.execute(rusqlite::params![
                 checkpoint_id,
                 ps.pane_id as i64,
@@ -687,7 +698,10 @@ mod tests {
             make_test_pane(3, 30, 120),
         ];
 
-        let result = engine.capture(&panes, SnapshotTrigger::Startup).await.unwrap();
+        let result = engine
+            .capture(&panes, SnapshotTrigger::Startup)
+            .await
+            .unwrap();
         assert_eq!(result.pane_count, 3);
 
         // Verify pane states were written
@@ -748,8 +762,14 @@ mod tests {
         let panes1 = vec![make_test_pane(1, 24, 80)];
         let panes2 = vec![make_test_pane(1, 30, 120)]; // changed size
 
-        let r1 = engine.capture(&panes1, SnapshotTrigger::Startup).await.unwrap();
-        let r2 = engine.capture(&panes2, SnapshotTrigger::Periodic).await.unwrap();
+        let r1 = engine
+            .capture(&panes1, SnapshotTrigger::Startup)
+            .await
+            .unwrap();
+        let r2 = engine
+            .capture(&panes2, SnapshotTrigger::Periodic)
+            .await
+            .unwrap();
 
         // Same session, different checkpoints
         assert_eq!(r1.session_id, r2.session_id);
@@ -769,7 +789,10 @@ mod tests {
         // Create 4 snapshots with different pane data
         for i in 0..4u64 {
             let panes = vec![make_test_pane(i, 24 + i as u32, 80)];
-            engine.capture(&panes, SnapshotTrigger::Manual).await.unwrap();
+            engine
+                .capture(&panes, SnapshotTrigger::Manual)
+                .await
+                .unwrap();
         }
 
         // Should have 4 checkpoints
@@ -799,7 +822,10 @@ mod tests {
         let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
         let panes = vec![make_test_pane(1, 24, 80)];
 
-        let r = engine.capture(&panes, SnapshotTrigger::Startup).await.unwrap();
+        let r = engine
+            .capture(&panes, SnapshotTrigger::Startup)
+            .await
+            .unwrap();
         engine.mark_shutdown().await.unwrap();
 
         let conn = Connection::open(db_path.as_str()).unwrap();

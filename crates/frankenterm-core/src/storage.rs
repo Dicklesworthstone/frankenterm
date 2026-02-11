@@ -4436,12 +4436,6 @@ enum WriteCommand {
         pane_states: Vec<SessionPaneStateRow>,
         respond: oneshot::Sender<Result<i64>>,
     },
-    /// Update last_checkpoint_at on mux_sessions
-    UpdateSessionCheckpointTimestamp {
-        session_id: String,
-        checkpoint_at: i64,
-        respond: oneshot::Sender<Result<()>>,
-    },
     /// Prune old checkpoints beyond retention limit
     PruneSessionCheckpoints {
         session_id: String,
@@ -5970,10 +5964,7 @@ impl StorageHandle {
     }
 
     /// Get the state_hash of the latest checkpoint for a session.
-    pub async fn get_latest_checkpoint_hash(
-        &self,
-        session_id: String,
-    ) -> Result<Option<String>> {
+    pub async fn get_latest_checkpoint_hash(&self, session_id: String) -> Result<Option<String>> {
         let db_path = Arc::clone(&self.db_path);
         tokio::task::spawn_blocking(move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
@@ -7841,8 +7832,13 @@ fn dispatch_write_command(conn: &mut Connection, cmd: WriteCommand, should_break
             host_id,
             respond,
         } => {
-            let result =
-                insert_mux_session_sync(conn, &session_id, &topology_json, &ft_version, host_id.as_deref());
+            let result = insert_mux_session_sync(
+                conn,
+                &session_id,
+                &topology_json,
+                &ft_version,
+                host_id.as_deref(),
+            );
             let _ = respond.send(result);
         }
         WriteCommand::InsertSessionCheckpoint {
@@ -7865,14 +7861,6 @@ fn dispatch_write_command(conn: &mut Connection, cmd: WriteCommand, should_break
                 metadata_json.as_deref(),
                 &pane_states,
             );
-            let _ = respond.send(result);
-        }
-        WriteCommand::UpdateSessionCheckpointTimestamp {
-            session_id,
-            checkpoint_at,
-            respond,
-        } => {
-            let result = update_session_checkpoint_timestamp_sync(conn, &session_id, checkpoint_at);
             let _ = respond.send(result);
         }
         WriteCommand::PruneSessionCheckpoints {
@@ -9055,7 +9043,9 @@ fn insert_session_checkpoint_sync(
                   agent_metadata_json, scrollback_checkpoint_seq, last_output_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )
-            .map_err(|e| StorageError::Database(format!("Failed to prepare pane state insert: {e}")))?;
+            .map_err(|e| {
+                StorageError::Database(format!("Failed to prepare pane state insert: {e}"))
+            })?;
 
         for ps in pane_states {
             stmt.execute(params![
@@ -9078,28 +9068,15 @@ fn insert_session_checkpoint_sync(
         params![now, session_id],
     )
     .map_err(|e| {
-        StorageError::Database(format!("Failed to update session checkpoint timestamp: {e}"))
+        StorageError::Database(format!(
+            "Failed to update session checkpoint timestamp: {e}"
+        ))
     })?;
 
     tx.commit()
         .map_err(|e| StorageError::Database(format!("Failed to commit checkpoint: {e}")))?;
 
     Ok(checkpoint_id)
-}
-
-fn update_session_checkpoint_timestamp_sync(
-    conn: &Connection,
-    session_id: &str,
-    checkpoint_at: i64,
-) -> Result<()> {
-    conn.execute(
-        "UPDATE mux_sessions SET last_checkpoint_at = ?1 WHERE session_id = ?2",
-        params![checkpoint_at, session_id],
-    )
-    .map_err(|e| {
-        StorageError::Database(format!("Failed to update session checkpoint timestamp: {e}"))
-    })?;
-    Ok(())
 }
 
 fn prune_session_checkpoints_sync(
