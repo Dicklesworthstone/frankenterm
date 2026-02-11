@@ -103,6 +103,7 @@ pub mod search_explain;
 pub mod secrets;
 pub mod session_correlation;
 pub mod session_pane_state;
+pub mod session_retention;
 pub mod session_topology;
 pub mod setup;
 pub mod snapshot_engine;

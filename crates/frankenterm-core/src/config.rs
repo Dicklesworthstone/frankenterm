@@ -2073,6 +2073,10 @@ pub struct SnapshotConfig {
 
     /// Maximum age of snapshots in days (older are pruned).
     pub retention_days: u64,
+
+    /// Session-level retention policy.
+    #[serde(default)]
+    pub session_retention: SessionRetentionConfig,
 }
 
 impl Default for SnapshotConfig {
@@ -2083,6 +2087,47 @@ impl Default for SnapshotConfig {
             max_concurrent_captures: 10,
             retention_count: 10,
             retention_days: 7,
+            session_retention: SessionRetentionConfig::default(),
+        }
+    }
+}
+
+/// Session-level retention policy for mux_sessions.
+///
+/// Controls how old sessions are cleaned up to prevent unbounded growth.
+///
+/// # Example (ft.toml)
+///
+/// ```toml
+/// [snapshots.session_retention]
+/// max_age_days = 30
+/// max_closed_sessions = 50
+/// max_total_size_mb = 500
+/// cleanup_interval_hours = 24
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionRetentionConfig {
+    /// Maximum age in days for closed sessions (0 = forever).
+    pub max_age_days: u64,
+
+    /// Maximum number of closed sessions to retain (0 = unlimited).
+    pub max_closed_sessions: usize,
+
+    /// Maximum total session data size in MB (0 = unlimited).
+    pub max_total_size_mb: u64,
+
+    /// Run cleanup every N hours (0 = only on startup).
+    pub cleanup_interval_hours: u64,
+}
+
+impl Default for SessionRetentionConfig {
+    fn default() -> Self {
+        Self {
+            max_age_days: 30,
+            max_closed_sessions: 50,
+            max_total_size_mb: 500,
+            cleanup_interval_hours: 24,
         }
     }
 }
