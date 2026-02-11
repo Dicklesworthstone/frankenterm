@@ -89,11 +89,7 @@ impl ResourceSnapshot {
     /// observed (e.g., it exited or permissions are denied).
     #[must_use]
     pub fn collect(pid: u32) -> Option<Self> {
-        let effective_pid = if pid == 0 {
-            std::process::id()
-        } else {
-            pid
-        };
+        let effective_pid = if pid == 0 { std::process::id() } else { pid };
 
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -297,8 +293,16 @@ impl Histogram {
             count: self.total_count,
             retained: self.samples.len() as u64,
             mean: self.mean(),
-            min: if self.total_count > 0 { Some(self.min) } else { None },
-            max: if self.total_count > 0 { Some(self.max) } else { None },
+            min: if self.total_count > 0 {
+                Some(self.min)
+            } else {
+                None
+            },
+            max: if self.total_count > 0 {
+                Some(self.max)
+            } else {
+                None
+            },
             p50: self.p50(),
             p95: self.p95(),
             p99: self.p99(),
@@ -364,7 +368,11 @@ impl CircularMetricBuffer {
     /// Get the most recent snapshot.
     #[must_use]
     pub fn latest(&self) -> Option<ResourceSnapshot> {
-        self.snapshots.read().expect("buffer lock poisoned").last().cloned()
+        self.snapshots
+            .read()
+            .expect("buffer lock poisoned")
+            .last()
+            .cloned()
     }
 
     /// Number of retained snapshots.
@@ -500,7 +508,10 @@ impl MetricRegistry {
     /// Number of registered histograms.
     #[must_use]
     pub fn histogram_count(&self) -> usize {
-        self.histograms.read().expect("histogram lock poisoned").len()
+        self.histograms
+            .read()
+            .expect("histogram lock poisoned")
+            .len()
     }
 
     /// Number of registered counters.

@@ -1521,6 +1521,22 @@ where
 
     match config.dcg_mode {
         DcgMode::Disabled => CommandGateOutcome::Allow,
+        DcgMode::Native => match crate::command_guard::evaluate_stateless(command_line) {
+            Some((rule_id, _pack, reason, _suggestions)) => {
+                let full_rule = format!("dcg.{rule_id}");
+                match config.dcg_deny_policy {
+                    DcgDenyPolicy::Deny => CommandGateOutcome::Deny {
+                        reason,
+                        rule_id: full_rule,
+                    },
+                    DcgDenyPolicy::RequireApproval => CommandGateOutcome::RequireApproval {
+                        reason,
+                        rule_id: full_rule,
+                    },
+                }
+            }
+            None => CommandGateOutcome::Allow,
+        },
         DcgMode::Opportunistic | DcgMode::Required => match dcg_runner(command_line) {
             Ok(DcgDecision::Allow) => CommandGateOutcome::Allow,
             Ok(DcgDecision::Deny { rule_id }) => {
@@ -3600,6 +3616,41 @@ mod tests {
             }
             _ => panic!("Expected require approval"),
         }
+    }
+
+    #[test]
+    fn command_gate_native_blocks_destructive() {
+        let config = CommandGateConfig {
+            enabled: true,
+            dcg_mode: DcgMode::Native,
+            dcg_deny_policy: DcgDenyPolicy::Deny,
+        };
+        // docker system prune is only in native guard packs, not built-in rules
+        let outcome = evaluate_command_gate_with_runner("docker system prune -af", &config, |_| {
+            panic!("Native mode should not call external dcg runner");
+        });
+        match outcome {
+            CommandGateOutcome::Deny { rule_id, .. } => {
+                assert!(
+                    rule_id.starts_with("dcg."),
+                    "expected dcg. prefix: {rule_id}"
+                );
+            }
+            _ => panic!("Expected deny for docker system prune in native mode"),
+        }
+    }
+
+    #[test]
+    fn command_gate_native_allows_safe() {
+        let config = CommandGateConfig {
+            enabled: true,
+            dcg_mode: DcgMode::Native,
+            dcg_deny_policy: DcgDenyPolicy::Deny,
+        };
+        let outcome = evaluate_command_gate_with_runner("git status", &config, |_| {
+            panic!("Native mode should not call external dcg runner");
+        });
+        assert!(matches!(outcome, CommandGateOutcome::Allow));
     }
 
     // ========================================================================

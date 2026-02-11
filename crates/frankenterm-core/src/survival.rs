@@ -660,10 +660,7 @@ mod tests {
         };
         let h1 = params.baseline_hazard(10.0);
         let h2 = params.baseline_hazard(50.0);
-        assert!(
-            (h1 - h2).abs() < 1e-10,
-            "constant hazard: h1={h1}, h2={h2}"
-        );
+        assert!((h1 - h2).abs() < 1e-10, "constant hazard: h1={h1}, h2={h2}");
         assert!((h1 - 0.01).abs() < 1e-10, "h(t)=k/λ=1/100=0.01");
     }
 
@@ -933,7 +930,7 @@ mod tests {
             config,
             WeibullParams {
                 shape: 1.0,
-                scale: 1.0, // h₀(t) = 1.0 for all t
+                scale: 1.0,                      // h₀(t) = 1.0 for all t
                 beta: [1.0, 0.0, 0.0, 0.0, 0.0], // only RSS matters
             },
         );
@@ -986,7 +983,11 @@ mod tests {
         assert!(!report.in_warmup);
 
         // Check risk factor names match
-        let names: Vec<&str> = report.risk_factors.iter().map(|r| r.name.as_str()).collect();
+        let names: Vec<&str> = report
+            .risk_factors
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect();
         assert_eq!(
             names,
             vec![

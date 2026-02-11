@@ -1480,7 +1480,7 @@ impl Default for CommandGateConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            dcg_mode: DcgMode::Opportunistic,
+            dcg_mode: DcgMode::Native,
             dcg_deny_policy: DcgDenyPolicy::RequireApproval,
         }
     }
@@ -1491,6 +1491,8 @@ impl Default for CommandGateConfig {
 #[serde(rename_all = "snake_case")]
 pub enum DcgMode {
     Disabled,
+    /// In-process command guard (zero-latency, no subprocess).
+    Native,
     Opportunistic,
     Required,
 }

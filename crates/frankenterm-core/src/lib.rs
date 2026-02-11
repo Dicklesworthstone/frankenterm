@@ -86,12 +86,13 @@ pub mod lock;
 pub mod logging;
 #[cfg(feature = "mcp")]
 pub mod mcp;
+pub mod memory_pressure;
 #[cfg(feature = "metrics")]
 pub mod metrics;
-pub mod memory_pressure;
 pub mod notifications;
 pub mod orphan_reaper;
 pub mod output;
+pub mod pane_tiers;
 pub mod patterns;
 pub mod plan;
 pub mod policy;

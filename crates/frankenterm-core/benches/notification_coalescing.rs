@@ -7,9 +7,7 @@
 use std::collections::HashMap;
 use std::hint::black_box;
 
-use criterion::{
-    BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
-};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 mod bench_common;
 

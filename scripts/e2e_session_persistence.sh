@@ -123,9 +123,7 @@ create_workspace() {
     local db_path="$db_dir/ft.db"
 
     # Initialize database with session persistence schema
-    sqlite3 "$db_path" <<'SQL'
-PRAGMA foreign_keys = ON;
-PRAGMA journal_mode = WAL;
+    sqlite3 -cmd "PRAGMA foreign_keys = ON;" -cmd "PRAGMA journal_mode = WAL;" "$db_path" <<'SQL'
 CREATE TABLE IF NOT EXISTS mux_sessions (
     session_id TEXT PRIMARY KEY,
     created_at INTEGER NOT NULL,
@@ -176,7 +174,7 @@ SQL
 sql() {
     local db_path="$1"
     shift
-    sqlite3 "$db_path" "PRAGMA foreign_keys = ON; $*" 2>/dev/null
+    sqlite3 -cmd "PRAGMA foreign_keys = ON;" "$db_path" "$*" 2>/dev/null
 }
 
 # Get row count from a table
@@ -632,7 +630,7 @@ test_pane_state_integrity() {
     local agent_claude='{"agent_type":"claude-code","session_id":"abc123","state":"working"}'
     local agent_codex='{"agent_type":"codex","session_id":"xyz789","state":"idle"}'
 
-    sqlite3 "$db_path" "
+    sql "$db_path" "
         INSERT INTO mux_pane_state (checkpoint_id, pane_id, cwd, command, terminal_state_json, agent_metadata_json)
             VALUES ($cp_id, 1, '/home/user/project-a', 'vim', '$terminal_1', '$agent_claude');
         INSERT INTO mux_pane_state (checkpoint_id, pane_id, cwd, command, terminal_state_json, agent_metadata_json)
@@ -645,7 +643,7 @@ test_pane_state_integrity() {
 
     # 6.1: All 4 pane states persisted
     local pane_count
-    pane_count=$(sqlite3 "$db_path" "SELECT COUNT(*) FROM mux_pane_state WHERE checkpoint_id = $cp_id;")
+    pane_count=$(get_scalar "$db_path" "SELECT COUNT(*) FROM mux_pane_state WHERE checkpoint_id = $cp_id;")
     if [[ "$pane_count" -eq 4 ]]; then
         log_pass "6.1: All 4 pane states persisted"
     else
@@ -654,7 +652,7 @@ test_pane_state_integrity() {
 
     # 6.2: CWD values preserved correctly
     local cwds
-    cwds=$(sqlite3 "$db_path" "SELECT cwd FROM mux_pane_state WHERE checkpoint_id = $cp_id ORDER BY pane_id;")
+    cwds=$(get_scalar "$db_path" "SELECT cwd FROM mux_pane_state WHERE checkpoint_id = $cp_id ORDER BY pane_id;")
     local expected_cwds="/home/user/project-a
 /home/user/project-b
 /tmp
@@ -669,7 +667,7 @@ test_pane_state_integrity() {
 
     # 6.3: Agent metadata preserved as valid JSON
     local agent_json
-    agent_json=$(sqlite3 "$db_path" "SELECT agent_metadata_json FROM mux_pane_state WHERE checkpoint_id = $cp_id AND pane_id = 1;")
+    agent_json=$(get_scalar "$db_path" "SELECT agent_metadata_json FROM mux_pane_state WHERE checkpoint_id = $cp_id AND pane_id = 1;")
     if echo "$agent_json" | jq -e '.agent_type == "claude-code"' &>/dev/null; then
         log_pass "6.3: Agent metadata is valid JSON with correct type"
     else
@@ -678,7 +676,7 @@ test_pane_state_integrity() {
 
     # 6.4: Terminal state preserved as valid JSON
     local term_json
-    term_json=$(sqlite3 "$db_path" "SELECT terminal_state_json FROM mux_pane_state WHERE checkpoint_id = $cp_id AND pane_id = 1;")
+    term_json=$(get_scalar "$db_path" "SELECT terminal_state_json FROM mux_pane_state WHERE checkpoint_id = $cp_id AND pane_id = 1;")
     if echo "$term_json" | jq -e '.cursor_x == 42' &>/dev/null; then
         log_pass "6.4: Terminal state JSON preserved with cursor position"
     else
@@ -687,7 +685,7 @@ test_pane_state_integrity() {
 
     # 6.5: NULL agent metadata allowed (non-agent panes)
     local null_agent
-    null_agent=$(sqlite3 "$db_path" "SELECT COUNT(*) FROM mux_pane_state WHERE checkpoint_id = $cp_id AND agent_metadata_json IS NULL;")
+    null_agent=$(get_scalar "$db_path" "SELECT COUNT(*) FROM mux_pane_state WHERE checkpoint_id = $cp_id AND agent_metadata_json IS NULL;")
     if [[ "$null_agent" -ge 1 ]]; then
         log_pass "6.5: NULL agent metadata accepted for non-agent panes"
     else
@@ -706,26 +704,23 @@ test_schema_constraints() {
     ws=$(create_workspace)
     local db_path="$ws/.ft/ft.db"
 
-    # Enable foreign keys
-    sqlite3 "$db_path" "PRAGMA foreign_keys = ON;"
-
     insert_session "$db_path" "session-fk-001" 0
 
     # 7.1: checkpoint_type CHECK constraint should reject invalid types
     local invalid_result
-    invalid_result=$(sqlite3 "$db_path" "INSERT INTO session_checkpoints (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes)
+    invalid_result=$(sql "$db_path" "INSERT INTO session_checkpoints (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes)
         VALUES ('session-fk-001', $(epoch_ms), 'invalid_type', 'hash_bad', 1, 100);" 2>&1 || true)
     if echo "$invalid_result" | grep -qi "constraint\|check"; then
         log_pass "7.1: CHECK constraint rejects invalid checkpoint_type"
     else
         # Clean up if it was inserted
-        sqlite3 "$db_path" "DELETE FROM session_checkpoints WHERE checkpoint_type = 'invalid_type';" 2>/dev/null || true
+        sql "$db_path" "DELETE FROM session_checkpoints WHERE checkpoint_type = 'invalid_type';" || true
         log_fail "7.1: CHECK constraint did not reject 'invalid_type'"
     fi
 
     # 7.2: Foreign key constraint on session_checkpoints → mux_sessions
     local fk_result
-    fk_result=$(sqlite3 "$db_path" "PRAGMA foreign_keys = ON; INSERT INTO session_checkpoints (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes)
+    fk_result=$(sql "$db_path" "INSERT INTO session_checkpoints (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes)
         VALUES ('nonexistent-session', $(epoch_ms), 'periodic', 'hash_fk', 1, 100);" 2>&1 || true)
     if echo "$fk_result" | grep -qi "foreign key\|constraint"; then
         log_pass "7.2: Foreign key prevents orphaned checkpoints"
@@ -737,14 +732,14 @@ test_schema_constraints() {
     # 7.3: Valid checkpoint types accepted
     for ctype in "periodic" "event" "shutdown" "startup"; do
         local insert_ok
-        insert_ok=$(sqlite3 "$db_path" "INSERT INTO session_checkpoints (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes)
+        insert_ok=$(sql "$db_path" "INSERT INTO session_checkpoints (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes)
             VALUES ('session-fk-001', $(epoch_ms), '$ctype', 'hash_$ctype', 1, 100);" 2>&1 || true)
         if echo "$insert_ok" | grep -qi "error\|constraint"; then
             log_fail "7.3: Valid checkpoint_type '$ctype' was rejected"
         fi
     done
     local valid_types
-    valid_types=$(sqlite3 "$db_path" "SELECT COUNT(DISTINCT checkpoint_type) FROM session_checkpoints WHERE session_id = 'session-fk-001';")
+    valid_types=$(get_scalar "$db_path" "SELECT COUNT(DISTINCT checkpoint_type) FROM session_checkpoints WHERE session_id = 'session-fk-001';")
     if [[ "$valid_types" -eq 4 ]]; then
         log_pass "7.3: All 4 valid checkpoint types accepted"
     else

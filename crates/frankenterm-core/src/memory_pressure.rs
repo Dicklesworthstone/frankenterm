@@ -7,8 +7,8 @@
 //! - **macOS**: reads memory stats via `vm_stat` and `sysctl`
 //! - **Other**: returns `Green` (no monitoring available)
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -207,7 +207,8 @@ impl MemoryPressureMonitor {
             0.0
         };
         let tier = self.classify(used_percent);
-        self.latest_tier.store(tier.as_u8() as u64, Ordering::Relaxed);
+        self.latest_tier
+            .store(tier.as_u8() as u64, Ordering::Relaxed);
 
         MemorySample {
             used_percent,

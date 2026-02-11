@@ -152,20 +152,19 @@ static RM_RF_ROOT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\brm\s+(-[a-z]*r[a-z]*\s+(-[a-z]*f[a-z]*\s+)?|-[a-z]*f[a-z]*\s+(-[a-z]*r[a-z]*\s+)?)\s*(/\s*$|~\s*$|\$HOME\s*$)").unwrap()
 });
 static RM_RF: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\brm\s+(-[a-z]*r[a-z]*\s+(-[a-z]*f[a-z]*\s+)?|-[a-z]*f[a-z]*\s+(-[a-z]*r[a-z]*\s+)?)").unwrap()
+    Regex::new(
+        r"(?i)\brm\s+(-[a-z]*r[a-z]*\s+(-[a-z]*f[a-z]*\s+)?|-[a-z]*f[a-z]*\s+(-[a-z]*r[a-z]*\s+)?)",
+    )
+    .unwrap()
 });
 static RM_RF_SAFE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\brm\s+(-[a-z]*r[a-z]*f?[a-z]*\s+)(node_modules|target|__pycache__|\.cache|dist|build|\.next|\.turbo|tmp)\b").unwrap()
 });
-static CHMOD_RECURSIVE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\bchmod\s+(-[a-z]*R[a-z]*\s+)?(777|666|000)\s").unwrap()
-});
-static DD_OF: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\bdd\b.*\bof=\s*/dev/(sd[a-z]|nvme|disk|hd[a-z])").unwrap()
-});
-static MKFS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(mkfs|mke2fs)\b").unwrap()
-});
+static CHMOD_RECURSIVE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bchmod\s+(-[a-z]*R[a-z]*\s+)?(777|666|000)\s").unwrap());
+static DD_OF: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bdd\b.*\bof=\s*/dev/(sd[a-z]|nvme|disk|hd[a-z])").unwrap());
+static MKFS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\b(mkfs|mke2fs)\b").unwrap());
 
 static PACK_FILESYSTEM: SecurityPack = SecurityPack {
     id: "core.filesystem",
@@ -211,30 +210,23 @@ static PACK_FILESYSTEM: SecurityPack = SecurityPack {
 // Pack: core.git
 // ---------------------------------------------------------------------------
 
-static GIT_PUSH_FORCE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\bgit\s+push\b.*(\s--force\b|\s-f\b)").unwrap()
-});
-static GIT_PUSH_FORCE_LEASE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\bgit\s+push\b.*--force-with-lease\b").unwrap()
-});
-static GIT_RESET_HARD: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\bgit\s+reset\s+--hard\b").unwrap()
-});
+static GIT_PUSH_FORCE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bgit\s+push\b.*(\s--force\b|\s-f\b)").unwrap());
+static GIT_PUSH_FORCE_LEASE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bgit\s+push\b.*--force-with-lease\b").unwrap());
+static GIT_RESET_HARD: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bgit\s+reset\s+--hard\b").unwrap());
 static GIT_CLEAN_FD: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\bgit\s+clean\b.*(-[a-z]*f[a-z]*d|-[a-z]*d[a-z]*f)").unwrap()
 });
-static GIT_BRANCH_DELETE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\bgit\s+branch\s+-D\b").unwrap()
-});
-static GIT_CHECKOUT_DOT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\bgit\s+checkout\s+--\s*\.\s*$").unwrap()
-});
-static GIT_STASH_DROP: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\bgit\s+stash\s+(drop|clear)\b").unwrap()
-});
-static GIT_REBASE_FORCE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\bgit\s+rebase\b.*\b(--force-rebase|--root)\b").unwrap()
-});
+static GIT_BRANCH_DELETE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bgit\s+branch\s+-D\b").unwrap());
+static GIT_CHECKOUT_DOT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bgit\s+checkout\s+--\s*\.\s*$").unwrap());
+static GIT_STASH_DROP: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bgit\s+stash\s+(drop|clear)\b").unwrap());
+static GIT_REBASE_FORCE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bgit\s+rebase\b.*\b(--force-rebase|--root)\b").unwrap());
 
 static PACK_GIT: SecurityPack = SecurityPack {
     id: "core.git",
@@ -296,12 +288,10 @@ static SQL_DROP: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(DROP\s+(TABLE|DATABASE|SCHEMA|INDEX|VIEW|TRIGGER|FUNCTION|PROCEDURE))\b")
         .unwrap()
 });
-static SQL_TRUNCATE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\bTRUNCATE\s+(TABLE\s+)?\w").unwrap()
-});
-static SQL_DELETE_NO_WHERE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\bDELETE\s+FROM\s+\w+\s*;").unwrap()
-});
+static SQL_TRUNCATE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bTRUNCATE\s+(TABLE\s+)?\w").unwrap());
+static SQL_DELETE_NO_WHERE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bDELETE\s+FROM\s+\w+\s*;").unwrap());
 static SQL_ALTER_DROP: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\bALTER\s+TABLE\s+\w+\s+DROP\s+(COLUMN|CONSTRAINT|INDEX)\b").unwrap()
 });
@@ -309,8 +299,19 @@ static SQL_ALTER_DROP: LazyLock<Regex> = LazyLock::new(|| {
 static PACK_DATABASE: SecurityPack = SecurityPack {
     id: "database",
     keywords: &[
-        "DROP", "drop", "TRUNCATE", "truncate", "DELETE", "delete", "ALTER", "alter", "psql",
-        "mysql", "sqlite3", "mongosh", "redis-cli",
+        "DROP",
+        "drop",
+        "TRUNCATE",
+        "truncate",
+        "DELETE",
+        "delete",
+        "ALTER",
+        "alter",
+        "psql",
+        "mysql",
+        "sqlite3",
+        "mongosh",
+        "redis-cli",
     ],
     safe_rules: &[],
     destructive_rules: &[
@@ -345,15 +346,12 @@ static PACK_DATABASE: SecurityPack = SecurityPack {
 // Pack: containers
 // ---------------------------------------------------------------------------
 
-static DOCKER_SYSTEM_PRUNE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\bdocker\s+system\s+prune\b").unwrap()
-});
-static DOCKER_RM_FORCE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\bdocker\s+(rm|rmi)\s+(-[a-z]*f[a-z]*\s+)?").unwrap()
-});
-static DOCKER_VOLUME_RM: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\bdocker\s+volume\s+(rm|prune)\b").unwrap()
-});
+static DOCKER_SYSTEM_PRUNE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bdocker\s+system\s+prune\b").unwrap());
+static DOCKER_RM_FORCE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bdocker\s+(rm|rmi)\s+(-[a-z]*f[a-z]*\s+)?").unwrap());
+static DOCKER_VOLUME_RM: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bdocker\s+volume\s+(rm|prune)\b").unwrap());
 
 static PACK_CONTAINERS: SecurityPack = SecurityPack {
     id: "containers",
@@ -385,18 +383,14 @@ static PACK_CONTAINERS: SecurityPack = SecurityPack {
 // Pack: kubernetes
 // ---------------------------------------------------------------------------
 
-static KUBECTL_DELETE_NS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\bkubectl\s+delete\s+(namespace|ns)\b").unwrap()
-});
-static KUBECTL_DELETE_ALL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\bkubectl\s+delete\b.*--all\b").unwrap()
-});
-static KUBECTL_DRAIN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\bkubectl\s+drain\b").unwrap()
-});
-static HELM_UNINSTALL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\bhelm\s+(uninstall|delete)\b").unwrap()
-});
+static KUBECTL_DELETE_NS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bkubectl\s+delete\s+(namespace|ns)\b").unwrap());
+static KUBECTL_DELETE_ALL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bkubectl\s+delete\b.*--all\b").unwrap());
+static KUBECTL_DRAIN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bkubectl\s+drain\b").unwrap());
+static HELM_UNINSTALL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bhelm\s+(uninstall|delete)\b").unwrap());
 
 static PACK_KUBERNETES: SecurityPack = SecurityPack {
     id: "kubernetes",
@@ -434,15 +428,12 @@ static PACK_KUBERNETES: SecurityPack = SecurityPack {
 // Pack: cloud (AWS/GCP/Azure)
 // ---------------------------------------------------------------------------
 
-static AWS_S3_RM: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\baws\s+s3\s+(rm|rb)\b.*--recursive\b").unwrap()
-});
-static AWS_EC2_TERMINATE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\baws\s+ec2\s+terminate-instances\b").unwrap()
-});
-static TERRAFORM_DESTROY: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\bterraform\s+destroy\b").unwrap()
-});
+static AWS_S3_RM: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\baws\s+s3\s+(rm|rb)\b.*--recursive\b").unwrap());
+static AWS_EC2_TERMINATE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\baws\s+ec2\s+terminate-instances\b").unwrap());
+static TERRAFORM_DESTROY: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bterraform\s+destroy\b").unwrap());
 
 static PACK_CLOUD: SecurityPack = SecurityPack {
     id: "cloud",
@@ -474,21 +465,26 @@ static PACK_CLOUD: SecurityPack = SecurityPack {
 // Pack: system
 // ---------------------------------------------------------------------------
 
-static KILL_MINUS_9: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(kill\s+-9|kill\s+-KILL|killall\s+-9)\b").unwrap()
-});
-static SYSTEMCTL_STOP: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(systemctl|service)\s+(stop|disable|mask)\b").unwrap()
-});
-static REBOOT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(reboot|shutdown|halt|poweroff|init\s+[06])\b").unwrap()
-});
+static KILL_MINUS_9: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\b(kill\s+-9|kill\s+-KILL|killall\s+-9)\b").unwrap());
+static SYSTEMCTL_STOP: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\b(systemctl|service)\s+(stop|disable|mask)\b").unwrap());
+static REBOOT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\b(reboot|shutdown|halt|poweroff|init\s+[06])\b").unwrap());
 
 static PACK_SYSTEM: SecurityPack = SecurityPack {
     id: "system",
     keywords: &[
-        "kill", "killall", "pkill", "systemctl", "service", "reboot", "shutdown", "halt",
-        "poweroff", "init",
+        "kill",
+        "killall",
+        "pkill",
+        "systemctl",
+        "service",
+        "reboot",
+        "shutdown",
+        "halt",
+        "poweroff",
+        "init",
     ],
     safe_rules: &[],
     destructive_rules: &[
@@ -517,15 +513,11 @@ static PACK_SYSTEM: SecurityPack = SecurityPack {
 // Pack: package_managers
 // ---------------------------------------------------------------------------
 
-static NPM_UNPUBLISH: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\bnpm\s+unpublish\b").unwrap()
-});
-static CARGO_YANK: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\bcargo\s+yank\b").unwrap()
-});
-static PIP_UNINSTALL_ALL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\bpip3?\s+uninstall\b.*-y\b").unwrap()
-});
+static NPM_UNPUBLISH: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bnpm\s+unpublish\b").unwrap());
+static CARGO_YANK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bcargo\s+yank\b").unwrap());
+static PIP_UNINSTALL_ALL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bpip3?\s+uninstall\b.*-y\b").unwrap());
 
 static PACK_PACKAGE_MANAGERS: SecurityPack = SecurityPack {
     id: "package_managers",
@@ -746,12 +738,12 @@ impl CommandGuard {
 
         let (dec_str, rule, pack) = match &decision {
             GuardDecision::Allow => ("allow", None, None),
-            GuardDecision::Block {
-                rule_id, pack, ..
-            } => ("block", Some(rule_id.clone()), Some(pack.clone())),
-            GuardDecision::Warn {
-                rule_id, pack, ..
-            } => ("warn", Some(rule_id.clone()), Some(pack.clone())),
+            GuardDecision::Block { rule_id, pack, .. } => {
+                ("block", Some(rule_id.clone()), Some(pack.clone()))
+            }
+            GuardDecision::Warn { rule_id, pack, .. } => {
+                ("warn", Some(rule_id.clone()), Some(pack.clone()))
+            }
         };
         self.record(pane_id, command, dec_str, rule, pack, elapsed);
 
@@ -881,11 +873,7 @@ impl CommandGuard {
         pack_ids
     }
 
-    fn scan_packs(
-        command: &str,
-        relevant_pack_ids: &[&str],
-        trust: TrustLevel,
-    ) -> GuardDecision {
+    fn scan_packs(command: &str, relevant_pack_ids: &[&str], trust: TrustLevel) -> GuardDecision {
         for pack in ALL_PACKS {
             if !relevant_pack_ids.contains(&pack.id) {
                 continue;
