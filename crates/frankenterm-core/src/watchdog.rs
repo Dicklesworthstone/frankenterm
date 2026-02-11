@@ -78,8 +78,14 @@ impl HeartbeatRegistry {
         self.maintenance.store(epoch_ms(), Ordering::SeqCst);
     }
 
+    /// Epoch ms when the registry was created.
+    #[must_use]
+    pub fn created_at_ms(&self) -> u64 {
+        self.created_at
+    }
+
     /// Read the last heartbeat timestamp for a component (epoch ms, 0 = never).
-    fn last_heartbeat(&self, component: Component) -> u64 {
+    pub fn last_heartbeat(&self, component: Component) -> u64 {
         match component {
             Component::Discovery => self.discovery.load(Ordering::SeqCst),
             Component::Capture => self.capture.load(Ordering::SeqCst),
@@ -187,6 +193,16 @@ pub enum Component {
     Capture,
     Persistence,
     Maintenance,
+}
+
+impl Component {
+    /// All component variants.
+    pub const ALL: [Component; 4] = [
+        Component::Discovery,
+        Component::Capture,
+        Component::Persistence,
+        Component::Maintenance,
+    ];
 }
 
 impl std::fmt::Display for Component {
