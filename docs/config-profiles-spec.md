@@ -22,7 +22,7 @@ config directory while keeping profiles forward-compatible and safe to update.
 ## Directory Layout
 
 ```
-~/.config/wa/
+~/.config/ft/
 ├── ft.toml                 # Base config (implicit "default" profile)
 └── profiles/
     ├── manifest.json       # Profile index + metadata (single-file listing)

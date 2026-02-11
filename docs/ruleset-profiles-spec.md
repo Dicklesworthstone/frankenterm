@@ -22,7 +22,7 @@ rule overrides. The goal is deterministic load behavior across environments
 ## Storage Layout
 
 ```
-~/.config/wa/
+~/.config/ft/
 ├── ft.toml                  # Base config (implicit default ruleset)
 └── rulesets/
     ├── manifest.json        # Ruleset index + metadata

@@ -1,4 +1,4 @@
-//! MCP server wiring for wa (feature-gated).
+//! MCP server wiring for ft (feature-gated).
 
 use std::path::Path;
 

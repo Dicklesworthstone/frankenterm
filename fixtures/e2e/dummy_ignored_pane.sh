@@ -5,11 +5,11 @@
 # Usage: ./dummy_ignored_pane.sh [SECRET_TOKEN] [COUNT]
 #
 # Arguments:
-#   SECRET_TOKEN - Secret string that should NEVER appear in wa artifacts (default: SECRET_TOKEN_<timestamp>)
+#   SECRET_TOKEN - Secret string that should NEVER appear in ft artifacts (default: SECRET_TOKEN_<timestamp>)
 #   COUNT        - Number of lines to print (default: 50)
 #
 # The pane title "IGNORED_PANE" matches the exclude rule in config_pane_exclude.toml,
-# so wa should NOT capture any output from this pane.
+# so ft should NOT capture any output from this pane.
 
 set -euo pipefail
 

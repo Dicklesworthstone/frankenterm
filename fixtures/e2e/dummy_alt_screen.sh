@@ -22,7 +22,7 @@ printf '\033[2J\033[H'
 echo "=== ALTERNATE SCREEN MODE ==="
 echo ""
 echo "This pane is in alternate screen buffer."
-echo "wa policy should block send_text to this pane."
+echo "ft policy should block send_text to this pane."
 echo ""
 echo "Press Ctrl+C or wait ${DURATION}s to exit."
 
