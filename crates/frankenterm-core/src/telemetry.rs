@@ -841,7 +841,7 @@ fn collect_process_resources(pid: u32, snap: &mut ResourceSnapshot) {
     {
         if output.status.success() {
             let text = String::from_utf8_lossy(&output.stdout);
-            let parts: Vec<&str> = text.trim().split_whitespace().collect();
+            let parts: Vec<&str> = text.split_whitespace().collect();
             if parts.len() >= 2 {
                 if let Ok(rss_kb) = parts[0].parse::<u64>() {
                     snap.rss_bytes = rss_kb * 1024;
