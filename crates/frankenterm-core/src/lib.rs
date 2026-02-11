@@ -93,6 +93,7 @@ pub mod pool;
 pub mod recording;
 pub mod replay;
 pub mod reports;
+pub mod restore_layout;
 pub mod retry;
 pub mod robot_types;
 pub mod rulesets;
