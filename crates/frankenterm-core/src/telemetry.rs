@@ -7,19 +7,22 @@
 //! - **Histograms**: Latency distributions with accurate quantile estimation
 //! - **Circular metric buffer**: In-memory ring buffer with configurable retention
 //! - **Platform abstraction**: Linux `/proc` and macOS `sysctl`/`vm_stat` behind
-//!   a unified [`ResourceSampler`] trait
+//!   a unified [`SystemMetrics`] trait
+//! - **Long-term storage**: SQLite-backed hourly aggregates via [`TelemetryStore`]
 //!
 //! # Performance target
 //!
 //! Recording a metric point must cost < 100ns on the hot path.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use tracing::{debug, info_span, warn};
 
 // =============================================================================
 // Configuration
@@ -89,7 +92,11 @@ impl ResourceSnapshot {
     /// observed (e.g., it exited or permissions are denied).
     #[must_use]
     pub fn collect(pid: u32) -> Option<Self> {
-        let effective_pid = if pid == 0 { std::process::id() } else { pid };
+        let effective_pid = if pid == 0 {
+            std::process::id()
+        } else {
+            pid
+        };
 
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -109,6 +116,121 @@ impl ResourceSnapshot {
         collect_process_resources(effective_pid, &mut snap);
         Some(snap)
     }
+}
+
+// =============================================================================
+// SystemMetrics trait — platform-abstracted resource collection
+// =============================================================================
+
+/// Platform-abstracted interface for collecting system and process metrics.
+///
+/// Implementations collect resource snapshots, system memory info, and CPU
+/// counts using platform-specific APIs. The default implementation
+/// ([`PlatformMetrics`]) delegates to the existing free functions in this
+/// module.
+pub trait SystemMetrics: Send + Sync {
+    /// Collect a resource snapshot for the given PID (0 = self).
+    fn collect_snapshot(&self, pid: u32) -> Option<ResourceSnapshot>;
+
+    /// Return (total_bytes, available_bytes) of system memory.
+    fn system_memory(&self) -> (u64, u64);
+
+    /// Number of logical CPUs.
+    fn cpu_count(&self) -> usize;
+}
+
+/// Default [`SystemMetrics`] implementation backed by platform-specific code.
+pub struct PlatformMetrics;
+
+impl SystemMetrics for PlatformMetrics {
+    fn collect_snapshot(&self, pid: u32) -> Option<ResourceSnapshot> {
+        ResourceSnapshot::collect(pid)
+    }
+
+    fn system_memory(&self) -> (u64, u64) {
+        collect_system_memory()
+    }
+
+    fn cpu_count(&self) -> usize {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    }
+}
+
+/// Collect system-wide memory statistics: (total_bytes, available_bytes).
+///
+/// Uses `/proc/meminfo` on Linux and `sysctl`/`vm_stat` on macOS.
+#[cfg(target_os = "linux")]
+fn collect_system_memory() -> (u64, u64) {
+    let mut total: u64 = 0;
+    let mut available: u64 = 0;
+
+    if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
+        for line in meminfo.lines() {
+            if let Some(val) = line.strip_prefix("MemTotal:") {
+                if let Some(kb) = parse_kb_value(val) {
+                    total = kb * 1024;
+                }
+            } else if let Some(val) = line.strip_prefix("MemAvailable:") {
+                if let Some(kb) = parse_kb_value(val) {
+                    available = kb * 1024;
+                }
+            }
+        }
+    }
+    (total, available)
+}
+
+/// Collect system-wide memory statistics: (total_bytes, available_bytes).
+#[cfg(target_os = "macos")]
+fn collect_system_memory() -> (u64, u64) {
+    // Total memory via sysctl
+    let total = std::process::Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                String::from_utf8_lossy(&o.stdout).trim().parse::<u64>().ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+
+    // Free pages via vm_stat
+    let available = std::process::Command::new("vm_stat")
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                let text = String::from_utf8_lossy(&o.stdout);
+                let mut free_pages: u64 = 0;
+                let page_size: u64 = 16384; // Apple Silicon default
+                for line in text.lines() {
+                    if line.starts_with("Pages free:") || line.starts_with("Pages inactive:") {
+                        if let Some(val) = line.split(':').nth(1) {
+                            if let Ok(n) = val.trim().trim_end_matches('.').parse::<u64>() {
+                                free_pages += n;
+                            }
+                        }
+                    }
+                }
+                Some(free_pages * page_size)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+
+    (total, available)
+}
+
+/// Collect system-wide memory statistics (stub for unsupported platforms).
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn collect_system_memory() -> (u64, u64) {
+    (0, 0)
 }
 
 // =============================================================================
@@ -293,16 +415,8 @@ impl Histogram {
             count: self.total_count,
             retained: self.samples.len() as u64,
             mean: self.mean(),
-            min: if self.total_count > 0 {
-                Some(self.min)
-            } else {
-                None
-            },
-            max: if self.total_count > 0 {
-                Some(self.max)
-            } else {
-                None
-            },
+            min: if self.total_count > 0 { Some(self.min) } else { None },
+            max: if self.total_count > 0 { Some(self.max) } else { None },
             p50: self.p50(),
             p95: self.p95(),
             p99: self.p99(),
@@ -368,11 +482,7 @@ impl CircularMetricBuffer {
     /// Get the most recent snapshot.
     #[must_use]
     pub fn latest(&self) -> Option<ResourceSnapshot> {
-        self.snapshots
-            .read()
-            .expect("buffer lock poisoned")
-            .last()
-            .cloned()
+        self.snapshots.read().expect("buffer lock poisoned").last().cloned()
     }
 
     /// Number of retained snapshots.
@@ -508,10 +618,7 @@ impl MetricRegistry {
     /// Number of registered histograms.
     #[must_use]
     pub fn histogram_count(&self) -> usize {
-        self.histograms
-            .read()
-            .expect("histogram lock poisoned")
-            .len()
+        self.histograms.read().expect("histogram lock poisoned").len()
     }
 
     /// Number of registered counters.
@@ -819,6 +926,254 @@ impl Drop for ScopeTimer<'_> {
     fn drop(&mut self) {
         let elapsed_us = self.start.elapsed().as_nanos() as f64 / 1000.0;
         self.registry.record_histogram(self.name, elapsed_us);
+    }
+}
+
+// =============================================================================
+// Long-term storage: SQLite hourly aggregates
+// =============================================================================
+
+/// Hourly aggregate of resource snapshots for long-term storage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HourlyAggregate {
+    /// Start of the hour (unix timestamp truncated to hour boundary).
+    pub hour_ts: u64,
+    /// Number of snapshots aggregated.
+    pub sample_count: u32,
+    /// Mean RSS bytes across all snapshots in the hour.
+    pub mean_rss_bytes: u64,
+    /// Peak RSS bytes in the hour.
+    pub peak_rss_bytes: u64,
+    /// Mean FD count.
+    pub mean_fd_count: u64,
+    /// Peak FD count.
+    pub peak_fd_count: u64,
+    /// Mean CPU percent (if available).
+    pub mean_cpu_percent: Option<f64>,
+}
+
+/// Errors from [`TelemetryStore`] operations.
+#[derive(Debug)]
+pub enum TelemetryStoreError {
+    /// SQLite error.
+    Sqlite(rusqlite::Error),
+    /// Schema or migration error.
+    Schema(String),
+}
+
+impl std::fmt::Display for TelemetryStoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Sqlite(e) => write!(f, "SQLite error: {e}"),
+            Self::Schema(msg) => write!(f, "Schema error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for TelemetryStoreError {}
+
+impl From<rusqlite::Error> for TelemetryStoreError {
+    fn from(e: rusqlite::Error) -> Self {
+        Self::Sqlite(e)
+    }
+}
+
+/// DDL for the telemetry hourly aggregates table.
+const TELEMETRY_SCHEMA: &str = r"
+CREATE TABLE IF NOT EXISTS telemetry_hourly (
+    hour_ts         INTEGER PRIMARY KEY,
+    sample_count    INTEGER NOT NULL,
+    mean_rss_bytes  INTEGER NOT NULL,
+    peak_rss_bytes  INTEGER NOT NULL,
+    mean_fd_count   INTEGER NOT NULL,
+    peak_fd_count   INTEGER NOT NULL,
+    mean_cpu_pct    REAL
+);
+";
+
+/// SQLite-backed long-term telemetry storage.
+///
+/// Stores hourly aggregates with configurable retention. Uses WAL mode for
+/// concurrent read/write safety.
+pub struct TelemetryStore {
+    conn: Connection,
+    retention_hours: u64,
+}
+
+impl TelemetryStore {
+    /// Open or create a telemetry store at the given path.
+    pub fn open(db_path: &Path, retention_days: u32) -> Result<Self, TelemetryStoreError> {
+        let _span = info_span!("telemetry_store_open", path = %db_path.display()).entered();
+
+        let conn = Connection::open(db_path)?;
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+        conn.execute_batch(TELEMETRY_SCHEMA)?;
+
+        Ok(Self {
+            conn,
+            retention_hours: u64::from(retention_days) * 24,
+        })
+    }
+
+    /// Open an in-memory store (for testing).
+    pub fn open_in_memory(retention_days: u32) -> Result<Self, TelemetryStoreError> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(TELEMETRY_SCHEMA)?;
+
+        Ok(Self {
+            conn,
+            retention_hours: u64::from(retention_days) * 24,
+        })
+    }
+
+    /// Persist a single hourly aggregate. Upserts on `hour_ts`.
+    pub fn persist_aggregate(&self, agg: &HourlyAggregate) -> Result<(), TelemetryStoreError> {
+        let _span = info_span!("telemetry_persist", hour_ts = agg.hour_ts).entered();
+
+        self.conn.execute(
+            "INSERT OR REPLACE INTO telemetry_hourly \
+             (hour_ts, sample_count, mean_rss_bytes, peak_rss_bytes, \
+              mean_fd_count, peak_fd_count, mean_cpu_pct) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                agg.hour_ts as i64,
+                agg.sample_count,
+                agg.mean_rss_bytes as i64,
+                agg.peak_rss_bytes as i64,
+                agg.mean_fd_count as i64,
+                agg.peak_fd_count as i64,
+                agg.mean_cpu_percent,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Compute an hourly aggregate from a slice of snapshots.
+    ///
+    /// Returns `None` if the slice is empty.
+    #[must_use]
+    pub fn aggregate_snapshots(
+        hour_ts: u64,
+        snapshots: &[ResourceSnapshot],
+    ) -> Option<HourlyAggregate> {
+        if snapshots.is_empty() {
+            return None;
+        }
+
+        let n = snapshots.len() as u64;
+        let sum_rss: u64 = snapshots.iter().map(|s| s.rss_bytes).sum();
+        let peak_rss = snapshots.iter().map(|s| s.rss_bytes).max().unwrap_or(0);
+        let sum_fd: u64 = snapshots.iter().map(|s| s.fd_count).sum();
+        let peak_fd = snapshots.iter().map(|s| s.fd_count).max().unwrap_or(0);
+
+        let cpu_values: Vec<f64> = snapshots.iter().filter_map(|s| s.cpu_percent).collect();
+        let mean_cpu = if cpu_values.is_empty() {
+            None
+        } else {
+            Some(cpu_values.iter().sum::<f64>() / cpu_values.len() as f64)
+        };
+
+        Some(HourlyAggregate {
+            hour_ts,
+            sample_count: snapshots.len() as u32,
+            mean_rss_bytes: sum_rss / n,
+            peak_rss_bytes: peak_rss,
+            mean_fd_count: sum_fd / n,
+            peak_fd_count: peak_fd,
+            mean_cpu_percent: mean_cpu,
+        })
+    }
+
+    /// Flush the current circular buffer contents as an aggregate for the
+    /// current hour. Returns the number of snapshots aggregated.
+    pub fn flush_buffer(
+        &self,
+        buffer: &CircularMetricBuffer,
+    ) -> Result<usize, TelemetryStoreError> {
+        let _span = info_span!("telemetry_flush_buffer").entered();
+
+        let snapshots = buffer.snapshots();
+        if snapshots.is_empty() {
+            return Ok(0);
+        }
+
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let hour_ts = now - (now % 3600);
+        let count = snapshots.len();
+
+        if let Some(agg) = Self::aggregate_snapshots(hour_ts, &snapshots) {
+            self.persist_aggregate(&agg)?;
+        }
+
+        // Prune old data while we're at it
+        self.prune_old_data(now)?;
+
+        Ok(count)
+    }
+
+    /// Query hourly aggregates within a time range.
+    pub fn query_history(
+        &self,
+        from_ts: u64,
+        to_ts: u64,
+    ) -> Result<Vec<HourlyAggregate>, TelemetryStoreError> {
+        let _span = info_span!("telemetry_query", from_ts, to_ts).entered();
+
+        let mut stmt = self.conn.prepare(
+            "SELECT hour_ts, sample_count, mean_rss_bytes, peak_rss_bytes, \
+                    mean_fd_count, peak_fd_count, mean_cpu_pct \
+             FROM telemetry_hourly \
+             WHERE hour_ts >= ?1 AND hour_ts <= ?2 \
+             ORDER BY hour_ts",
+        )?;
+
+        let rows = stmt.query_map(rusqlite::params![from_ts as i64, to_ts as i64], |row| {
+            Ok(HourlyAggregate {
+                hour_ts: row.get::<_, i64>(0)? as u64,
+                sample_count: row.get(1)?,
+                mean_rss_bytes: row.get::<_, i64>(2)? as u64,
+                peak_rss_bytes: row.get::<_, i64>(3)? as u64,
+                mean_fd_count: row.get::<_, i64>(4)? as u64,
+                peak_fd_count: row.get::<_, i64>(5)? as u64,
+                mean_cpu_percent: row.get(6)?,
+            })
+        })?;
+
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    /// Delete aggregates older than the configured retention period.
+    fn prune_old_data(&self, now_secs: u64) -> Result<(), TelemetryStoreError> {
+        let cutoff = now_secs.saturating_sub(self.retention_hours * 3600);
+        self.conn.execute(
+            "DELETE FROM telemetry_hourly WHERE hour_ts < ?1",
+            rusqlite::params![cutoff as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Number of hourly aggregates stored.
+    pub fn aggregate_count(&self) -> Result<u64, TelemetryStoreError> {
+        let count: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM telemetry_hourly", [], |row| {
+                    row.get(0)
+                })?;
+        Ok(count as u64)
+    }
+}
+
+impl std::fmt::Debug for TelemetryStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TelemetryStore")
+            .field("retention_hours", &self.retention_hours)
+            .finish_non_exhaustive()
     }
 }
 
@@ -1321,5 +1676,199 @@ mod tests {
         assert!(snap.rss_bytes > 0, "RSS should be positive for self");
         // FD count should be at least a few (stdin, stdout, stderr)
         assert!(snap.fd_count >= 3, "FD count should be >= 3");
+    }
+
+    // -- SystemMetrics trait --------------------------------------------------
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn platform_metrics_collect_self() {
+        let pm = PlatformMetrics;
+        let snap = pm.collect_snapshot(0).expect("should collect self");
+        assert_eq!(snap.pid, std::process::id());
+        assert!(snap.rss_bytes > 0);
+    }
+
+    #[test]
+    fn platform_metrics_system_memory() {
+        let pm = PlatformMetrics;
+        let (total, _available) = pm.system_memory();
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert!(total > 0, "total memory should be positive");
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let _ = total; // stub returns 0 on unsupported
+    }
+
+    #[test]
+    fn platform_metrics_cpu_count() {
+        let pm = PlatformMetrics;
+        assert!(pm.cpu_count() >= 1);
+    }
+
+    // -- TelemetryStore -------------------------------------------------------
+
+    #[test]
+    fn store_open_in_memory() {
+        let store = TelemetryStore::open_in_memory(30).unwrap();
+        assert_eq!(store.aggregate_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn store_persist_and_query() {
+        let store = TelemetryStore::open_in_memory(30).unwrap();
+        let agg = HourlyAggregate {
+            hour_ts: 1700000000,
+            sample_count: 120,
+            mean_rss_bytes: 50 * 1024 * 1024,
+            peak_rss_bytes: 80 * 1024 * 1024,
+            mean_fd_count: 42,
+            peak_fd_count: 60,
+            mean_cpu_percent: Some(15.5),
+        };
+        store.persist_aggregate(&agg).unwrap();
+        assert_eq!(store.aggregate_count().unwrap(), 1);
+
+        let results = store.query_history(0, i64::MAX as u64).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].hour_ts, 1700000000);
+        assert_eq!(results[0].sample_count, 120);
+        assert_eq!(results[0].peak_rss_bytes, 80 * 1024 * 1024);
+    }
+
+    #[test]
+    fn store_idempotent_persist() {
+        let store = TelemetryStore::open_in_memory(30).unwrap();
+        let agg = HourlyAggregate {
+            hour_ts: 1700000000,
+            sample_count: 100,
+            mean_rss_bytes: 50_000_000,
+            peak_rss_bytes: 80_000_000,
+            mean_fd_count: 42,
+            peak_fd_count: 60,
+            mean_cpu_percent: None,
+        };
+        store.persist_aggregate(&agg).unwrap();
+        // Persist again with updated values — should upsert
+        let agg2 = HourlyAggregate {
+            sample_count: 200,
+            ..agg
+        };
+        store.persist_aggregate(&agg2).unwrap();
+        assert_eq!(store.aggregate_count().unwrap(), 1);
+        let results = store.query_history(0, i64::MAX as u64).unwrap();
+        assert_eq!(results[0].sample_count, 200);
+    }
+
+    #[test]
+    fn store_aggregate_snapshots() {
+        let snapshots = vec![
+            ResourceSnapshot {
+                pid: 1,
+                rss_bytes: 100,
+                virt_bytes: 200,
+                fd_count: 10,
+                io_read_bytes: None,
+                io_write_bytes: None,
+                cpu_percent: Some(10.0),
+                timestamp_secs: 1000,
+            },
+            ResourceSnapshot {
+                pid: 1,
+                rss_bytes: 200,
+                virt_bytes: 400,
+                fd_count: 20,
+                io_read_bytes: None,
+                io_write_bytes: None,
+                cpu_percent: Some(20.0),
+                timestamp_secs: 1030,
+            },
+        ];
+
+        let agg = TelemetryStore::aggregate_snapshots(1000, &snapshots).unwrap();
+        assert_eq!(agg.hour_ts, 1000);
+        assert_eq!(agg.sample_count, 2);
+        assert_eq!(agg.mean_rss_bytes, 150); // (100+200)/2
+        assert_eq!(agg.peak_rss_bytes, 200);
+        assert_eq!(agg.mean_fd_count, 15); // (10+20)/2
+        assert_eq!(agg.peak_fd_count, 20);
+        assert!((agg.mean_cpu_percent.unwrap() - 15.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn store_aggregate_snapshots_empty() {
+        assert!(TelemetryStore::aggregate_snapshots(1000, &[]).is_none());
+    }
+
+    #[test]
+    fn store_flush_buffer() {
+        let store = TelemetryStore::open_in_memory(30).unwrap();
+        let buf = CircularMetricBuffer::new(100);
+
+        buf.push(ResourceSnapshot {
+            pid: 1,
+            rss_bytes: 1024,
+            virt_bytes: 2048,
+            fd_count: 5,
+            io_read_bytes: None,
+            io_write_bytes: None,
+            cpu_percent: None,
+            timestamp_secs: 1700000000,
+        });
+        buf.push(ResourceSnapshot {
+            pid: 1,
+            rss_bytes: 2048,
+            virt_bytes: 4096,
+            fd_count: 10,
+            io_read_bytes: None,
+            io_write_bytes: None,
+            cpu_percent: None,
+            timestamp_secs: 1700000030,
+        });
+
+        let count = store.flush_buffer(&buf).unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(store.aggregate_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn store_query_range() {
+        let store = TelemetryStore::open_in_memory(30).unwrap();
+
+        for hour in 0..5 {
+            let agg = HourlyAggregate {
+                hour_ts: 1700000000 + hour * 3600,
+                sample_count: 120,
+                mean_rss_bytes: 50_000_000,
+                peak_rss_bytes: 80_000_000,
+                mean_fd_count: 42,
+                peak_fd_count: 60,
+                mean_cpu_percent: None,
+            };
+            store.persist_aggregate(&agg).unwrap();
+        }
+
+        // Query a sub-range: hours 1-3
+        let results = store
+            .query_history(1700000000 + 3600, 1700000000 + 3 * 3600)
+            .unwrap();
+        assert_eq!(results.len(), 3);
+    }
+
+    #[test]
+    fn store_hourly_aggregate_serde() {
+        let agg = HourlyAggregate {
+            hour_ts: 1700000000,
+            sample_count: 120,
+            mean_rss_bytes: 50_000_000,
+            peak_rss_bytes: 80_000_000,
+            mean_fd_count: 42,
+            peak_fd_count: 60,
+            mean_cpu_percent: Some(15.5),
+        };
+        let json = serde_json::to_string(&agg).unwrap();
+        let back: HourlyAggregate = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.hour_ts, 1700000000);
+        assert_eq!(back.peak_rss_bytes, 80_000_000);
+        assert!((back.mean_cpu_percent.unwrap() - 15.5).abs() < f64::EPSILON);
     }
 }
