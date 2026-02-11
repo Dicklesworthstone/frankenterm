@@ -821,7 +821,6 @@ mod tests {
         let mut buf = Vec::new();
         let pdu = Pdu::Ping(codec::Ping {});
         pdu.encode(&mut buf, 7).expect("encode");
-        let valid_len = buf.len();
         buf.extend_from_slice(&[0xFF, 0xFE, 0xFD]);
 
         // First decode should succeed and consume the valid portion.
