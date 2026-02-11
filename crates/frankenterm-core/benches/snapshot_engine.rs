@@ -194,15 +194,15 @@ fn bench_state_hash(c: &mut Criterion) {
             .collect();
         let pane_jsons: Vec<String> = pane_states.iter().map(|ps| ps.to_json().unwrap()).collect();
 
-            group.bench_with_input(
-                BenchmarkId::from_parameter(count),
-                &(&topo_json, &pane_jsons),
-                |b, &(topo, panes)| {
-                    b.iter(|| {
-                        use std::collections::hash_map::DefaultHasher;
-                        use std::hash::{Hash, Hasher};
-                        let mut hasher = DefaultHasher::new();
-                        topo.hash(&mut hasher);
+        group.bench_with_input(
+            BenchmarkId::from_parameter(count),
+            &(&topo_json, &pane_jsons),
+            |b, &(topo, panes)| {
+                b.iter(|| {
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = DefaultHasher::new();
+                    topo.hash(&mut hasher);
                     for p in *panes {
                         p.hash(&mut hasher);
                     }

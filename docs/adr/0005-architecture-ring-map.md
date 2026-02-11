@@ -5,7 +5,7 @@
 
 ## Ring Model
 
-wa's modules are organized into concentric rings with strict dependency direction:
+ft's modules are organized into concentric rings with strict dependency direction:
 outer rings depend on inner rings, never the reverse. The ftui migration affects
 only Ring 3 (Presentation). All other rings are untouched.
 

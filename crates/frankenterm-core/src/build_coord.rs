@@ -144,7 +144,6 @@ impl BuildLockMetadata {
 /// An acquired build lock. Released automatically on drop.
 pub struct BuildLock {
     _lock_file: File,
-    lock_path: PathBuf,
     meta_path: PathBuf,
     project_root: PathBuf,
 }
@@ -175,7 +174,6 @@ impl BuildLock {
             Ok(()) => {
                 let lock = Self {
                     _lock_file: lock_file,
-                    lock_path,
                     meta_path,
                     project_root: project_root.to_path_buf(),
                 };
@@ -418,7 +416,7 @@ pub fn detect_cargo_command(command: &str) -> Option<&str> {
         return match subcommand {
             "build" | "b" => Some("build"),
             "check" | "c" => Some("check"),
-            "test" | "t" => Some("test"),
+            "test" | "t" | "nextest" => Some("test"),
             "bench" => Some("bench"),
             "clippy" => Some("clippy"),
             "run" | "r" => Some("run"),
