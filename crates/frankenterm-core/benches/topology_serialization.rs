@@ -7,72 +7,68 @@
 //! - Pane matching: **< 200µs** for 50-pane topology
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use frankenterm_core::session_topology::{PaneNode, TopologySnapshot};
-use frankenterm_core::wezterm::PaneInfo;
+use frankenterm_core::session_topology::TopologySnapshot;
+use frankenterm_core::wezterm::{PaneInfo, PaneSize};
+use std::collections::HashMap;
 
 mod bench_common;
 
 const BUDGETS: &[bench_common::BenchBudget] = &[
     bench_common::BenchBudget {
         name: "from_panes_small",
-        budget: "p50 < 100µs (10-pane topology)",
+        budget: "p50 < 100us (10-pane topology)",
     },
     bench_common::BenchBudget {
         name: "from_panes_medium",
-        budget: "p50 < 500µs (50-pane topology)",
+        budget: "p50 < 500us (50-pane topology)",
     },
     bench_common::BenchBudget {
         name: "json_roundtrip",
-        budget: "p50 < 50µs per snapshot",
+        budget: "p50 < 50us per snapshot",
     },
     bench_common::BenchBudget {
         name: "pane_matching",
-        budget: "p50 < 200µs (50-pane matching)",
+        budget: "p50 < 200us (50-pane matching)",
     },
 ];
 
 /// Generate mock PaneInfo entries simulating a multi-window layout.
 fn generate_panes(count: usize) -> Vec<PaneInfo> {
     let mut panes = Vec::with_capacity(count);
-    let panes_per_tab = 4; // 2x2 grid per tab
+    let panes_per_tab = 4;
     let tabs_per_window = 3;
 
     for i in 0..count {
         let window_id = (i / (panes_per_tab * tabs_per_window)) as u64;
         let tab_id = (i / panes_per_tab) as u64;
-        let pane_in_tab = i % panes_per_tab;
-
-        // Simulate 2x2 grid positions
-        let (left, top) = match pane_in_tab {
-            0 => (0, 0),
-            1 => (80, 0),
-            2 => (0, 24),
-            3 => (80, 24),
-            _ => (0, 0),
-        };
-
-        let mut extra = serde_json::Map::new();
-        extra.insert("workspace".to_string(), serde_json::json!("default"));
 
         panes.push(PaneInfo {
             window_id,
             tab_id,
             pane_id: i as u64,
-            title: format!("pane-{i}"),
-            cwd: format!("file:///home/user/project-{i}"),
-            cursor_x: 0,
-            cursor_y: 0,
-            cursor_visibility: "visible".to_string(),
-            left,
-            top,
-            width: 80,
-            height: 24,
-            pixel_width: 640,
-            pixel_height: 384,
+            domain_id: None,
+            domain_name: None,
+            workspace: Some("default".to_string()),
+            size: Some(PaneSize {
+                rows: 24,
+                cols: 80,
+                pixel_width: Some(640),
+                pixel_height: Some(384),
+                dpi: None,
+            }),
+            rows: None,
+            cols: None,
+            title: Some(format!("pane-{i}")),
+            cwd: Some(format!("file:///home/user/project-{i}")),
+            tty_name: None,
+            cursor_x: Some(0),
+            cursor_y: Some(0),
+            cursor_visibility: None,
+            left_col: None,
+            top_row: None,
             is_active: i == 0,
             is_zoomed: false,
-            tab_is_active: true,
-            extra: serde_json::Value::Object(extra),
+            extra: HashMap::new(),
         });
     }
     panes
@@ -120,13 +116,9 @@ fn bench_json_roundtrip(c: &mut Criterion) {
             },
         );
 
-        group.bench_with_input(
-            BenchmarkId::new("deserialize", count),
-            &json,
-            |b, json| {
-                b.iter(|| TopologySnapshot::from_json(json).unwrap());
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("deserialize", count), &json, |b, json| {
+            b.iter(|| TopologySnapshot::from_json(json).unwrap());
+        });
     }
 
     group.finish();
@@ -178,9 +170,7 @@ fn bench_pane_matching(c: &mut Criterion) {
             BenchmarkId::from_parameter(count),
             &(&old_snapshot, &new_panes),
             |b, (old, new)| {
-                b.iter(|| {
-                    frankenterm_core::session_topology::match_panes(old, new)
-                });
+                b.iter(|| frankenterm_core::session_topology::match_panes(old, new));
             },
         );
     }
@@ -188,12 +178,18 @@ fn bench_pane_matching(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_config() -> Criterion {
+    bench_common::emit_bench_artifacts("topology_serialization", BUDGETS);
+    Criterion::default().configure_from_args()
+}
+
 criterion_group!(
-    benches,
-    bench_from_panes,
-    bench_json_roundtrip,
-    bench_pane_count,
-    bench_pane_ids,
-    bench_pane_matching,
+    name = benches;
+    config = bench_config();
+    targets = bench_from_panes,
+        bench_json_roundtrip,
+        bench_pane_count,
+        bench_pane_ids,
+        bench_pane_matching
 );
 criterion_main!(benches);

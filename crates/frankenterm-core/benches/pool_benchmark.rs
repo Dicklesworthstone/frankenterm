@@ -1,11 +1,11 @@
 //! Benchmarks for the generic async connection pool.
 //!
 //! Performance budgets:
-//! - Pool construction: **< 10µs**
-//! - Acquire + return cycle: **< 50µs**
-//! - try_acquire (non-blocking): **< 10µs**
-//! - Stats collection: **< 5µs**
-//! - Idle eviction (100 conns): **< 100µs**
+//! - Pool construction: **< 10us**
+//! - Acquire + return cycle: **< 50us**
+//! - try_acquire (non-blocking): **< 10us**
+//! - Stats collection: **< 5us**
+//! - Idle eviction (100 conns): **< 100us**
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use frankenterm_core::pool::{Pool, PoolConfig};
@@ -16,28 +16,29 @@ mod bench_common;
 const BUDGETS: &[bench_common::BenchBudget] = &[
     bench_common::BenchBudget {
         name: "pool_construct",
-        budget: "p50 < 10µs (pool construction)",
+        budget: "p50 < 10us (pool construction)",
     },
     bench_common::BenchBudget {
         name: "acquire_return",
-        budget: "p50 < 50µs (acquire + put cycle)",
+        budget: "p50 < 50us (acquire + put cycle)",
     },
     bench_common::BenchBudget {
         name: "try_acquire",
-        budget: "p50 < 10µs (non-blocking acquire)",
+        budget: "p50 < 10us (non-blocking acquire)",
     },
     bench_common::BenchBudget {
         name: "pool_stats",
-        budget: "p50 < 5µs (stats snapshot)",
+        budget: "p50 < 5us (stats snapshot)",
     },
     bench_common::BenchBudget {
         name: "idle_eviction",
-        budget: "p50 < 100µs (evict 100 idle conns)",
+        budget: "p50 < 100us (evict 100 idle conns)",
     },
 ];
 
 /// Dummy connection type for benchmarking.
 #[derive(Debug)]
+#[allow(dead_code)]
 struct DummyConn(u64);
 
 fn make_runtime() -> tokio::runtime::Runtime {
@@ -88,9 +89,9 @@ fn bench_acquire_return(c: &mut Criterion) {
                 b.to_async(&rt).iter(|| async {
                     let pool = Pool::<DummyConn>::new(config.clone());
                     let result = pool.acquire().await.unwrap();
-                    // Simulate: caller creates connection if none provided
-                    let conn = result.conn.unwrap_or(DummyConn(42));
-                    let _guard = result.permit;
+                    // Decompose via public API
+                    let (conn, _guard) = result.into_parts();
+                    let conn = conn.unwrap_or(DummyConn(42));
                     // Return connection to pool
                     pool.put(conn).await;
                 });
@@ -186,27 +187,23 @@ fn bench_idle_eviction(c: &mut Criterion) {
 
     for &count in &[10, 50, 100] {
         group.throughput(Throughput::Elements(count as u64));
-        group.bench_with_input(
-            BenchmarkId::from_parameter(count),
-            &count,
-            |b, &count| {
-                b.to_async(&rt).iter(|| async {
-                    let config = PoolConfig {
-                        max_size: count + 10,
-                        // Zero timeout so everything is instantly evictable
-                        idle_timeout: Duration::from_secs(0),
-                        acquire_timeout: Duration::from_secs(5),
-                    };
-                    let pool = Pool::<DummyConn>::new(config);
-                    // Fill idle queue
-                    for i in 0..count {
-                        pool.put(DummyConn(i as u64)).await;
-                    }
-                    // Evict all
-                    pool.evict_idle().await
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, &count| {
+            b.to_async(&rt).iter(|| async {
+                let config = PoolConfig {
+                    max_size: count + 10,
+                    // Zero timeout so everything is instantly evictable
+                    idle_timeout: Duration::from_secs(0),
+                    acquire_timeout: Duration::from_secs(5),
+                };
+                let pool = Pool::<DummyConn>::new(config);
+                // Fill idle queue
+                for i in 0..count {
+                    pool.put(DummyConn(i as u64)).await;
+                }
+                // Evict all
+                pool.evict_idle().await
+            });
+        });
     }
 
     group.finish();
@@ -218,37 +215,39 @@ fn bench_pool_clear(c: &mut Criterion) {
 
     for &count in &[10, 50, 100] {
         group.throughput(Throughput::Elements(count as u64));
-        group.bench_with_input(
-            BenchmarkId::from_parameter(count),
-            &count,
-            |b, &count| {
-                b.to_async(&rt).iter(|| async {
-                    let config = PoolConfig {
-                        max_size: count + 10,
-                        idle_timeout: Duration::from_secs(300),
-                        acquire_timeout: Duration::from_secs(5),
-                    };
-                    let pool = Pool::<DummyConn>::new(config);
-                    for i in 0..count {
-                        pool.put(DummyConn(i as u64)).await;
-                    }
-                    pool.clear().await;
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, &count| {
+            b.to_async(&rt).iter(|| async {
+                let config = PoolConfig {
+                    max_size: count + 10,
+                    idle_timeout: Duration::from_secs(300),
+                    acquire_timeout: Duration::from_secs(5),
+                };
+                let pool = Pool::<DummyConn>::new(config);
+                for i in 0..count {
+                    pool.put(DummyConn(i as u64)).await;
+                }
+                pool.clear().await;
+            });
+        });
     }
 
     group.finish();
 }
 
+fn bench_config() -> Criterion {
+    bench_common::emit_bench_artifacts("pool_benchmark", BUDGETS);
+    Criterion::default().configure_from_args()
+}
+
 criterion_group!(
-    benches,
-    bench_pool_construct,
-    bench_acquire_return,
-    bench_acquire_with_idle,
-    bench_try_acquire,
-    bench_pool_stats,
-    bench_idle_eviction,
-    bench_pool_clear,
+    name = benches;
+    config = bench_config();
+    targets = bench_pool_construct,
+        bench_acquire_return,
+        bench_acquire_with_idle,
+        bench_try_acquire,
+        bench_pool_stats,
+        bench_idle_eviction,
+        bench_pool_clear
 );
 criterion_main!(benches);

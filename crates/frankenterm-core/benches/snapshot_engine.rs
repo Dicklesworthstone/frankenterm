@@ -3,16 +3,17 @@
 //! Performance budgets:
 //! - Snapshot capture (10 panes): **< 5ms**
 //! - Snapshot capture (50 panes): **< 20ms**
-//! - State hash computation: **< 100µs**
+//! - State hash computation: **< 100us**
 //! - Checkpoint save to SQLite: **< 10ms**
 //! - Checkpoint load from SQLite: **< 5ms**
-//! - Dedup check: **< 50µs**
+//! - Dedup check: **< 50us**
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use frankenterm_core::session_pane_state::PaneStateSnapshot;
 use frankenterm_core::session_topology::TopologySnapshot;
-use frankenterm_core::wezterm::PaneInfo;
+use frankenterm_core::wezterm::{PaneInfo, PaneSize};
 use rusqlite::Connection;
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod bench_common;
@@ -24,11 +25,11 @@ const BUDGETS: &[bench_common::BenchBudget] = &[
     },
     bench_common::BenchBudget {
         name: "pane_state_from_info",
-        budget: "p50 < 10µs per pane (extract pane state)",
+        budget: "p50 < 10us per pane (extract pane state)",
     },
     bench_common::BenchBudget {
         name: "state_hash",
-        budget: "p50 < 100µs (hash computation for dedup)",
+        budget: "p50 < 100us (hash computation for dedup)",
     },
     bench_common::BenchBudget {
         name: "checkpoint_save",
@@ -50,28 +51,33 @@ fn now_ms() -> u64 {
 fn generate_panes(count: usize) -> Vec<PaneInfo> {
     let mut panes = Vec::with_capacity(count);
     for i in 0..count {
-        let mut extra = serde_json::Map::new();
-        extra.insert("workspace".to_string(), serde_json::json!("default"));
-
         panes.push(PaneInfo {
             window_id: 0,
             tab_id: (i / 4) as u64,
             pane_id: i as u64,
-            title: format!("pane-{i}"),
-            cwd: format!("file:///home/user/project-{i}"),
-            cursor_x: 0,
-            cursor_y: 0,
-            cursor_visibility: "visible".to_string(),
-            left: (i % 2 * 80) as u32,
-            top: (i / 2 % 2 * 24) as u32,
-            width: 80,
-            height: 24,
-            pixel_width: 640,
-            pixel_height: 384,
+            domain_id: None,
+            domain_name: None,
+            workspace: Some("default".to_string()),
+            size: Some(PaneSize {
+                rows: 24,
+                cols: 80,
+                pixel_width: Some(640),
+                pixel_height: Some(384),
+                dpi: None,
+            }),
+            rows: None,
+            cols: None,
+            title: Some(format!("pane-{i}")),
+            cwd: Some(format!("file:///home/user/project-{i}")),
+            tty_name: None,
+            cursor_x: Some(0),
+            cursor_y: Some(0),
+            cursor_visibility: None,
+            left_col: None,
+            top_row: None,
             is_active: i == 0,
             is_zoomed: false,
-            tab_is_active: true,
-            extra: serde_json::Value::Object(extra),
+            extra: HashMap::new(),
         });
     }
     panes
@@ -186,10 +192,7 @@ fn bench_state_hash(c: &mut Criterion) {
             .iter()
             .map(|p| PaneStateSnapshot::from_pane_info(p, ts, false))
             .collect();
-        let pane_jsons: Vec<String> = pane_states
-            .iter()
-            .map(|ps| ps.to_json().unwrap())
-            .collect();
+        let pane_jsons: Vec<String> = pane_states.iter().map(|ps| ps.to_json().unwrap()).collect();
 
         group.bench_with_input(
             BenchmarkId::from_parameter(count),
@@ -290,7 +293,7 @@ fn bench_checkpoint_load(c: &mut Criterion) {
                 "INSERT INTO mux_pane_state
                  (checkpoint_id, pane_id, cwd, terminal_state_json)
                  VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![cp_id, p.pane_id as i64, p.cwd, ts_json],
+                rusqlite::params![cp_id, p.pane_id as i64, &p.cwd, ts_json],
             )
             .unwrap();
         }
@@ -330,21 +333,25 @@ fn bench_session_list(c: &mut Criterion) {
     }
 
     group.bench_function("20_sessions", |b| {
-        b.iter(|| {
-            frankenterm_core::session_restore::list_sessions(&db_path).unwrap()
-        });
+        b.iter(|| frankenterm_core::session_restore::list_sessions(&db_path).unwrap());
     });
 
     group.finish();
 }
 
+fn bench_config() -> Criterion {
+    bench_common::emit_bench_artifacts("snapshot_engine", BUDGETS);
+    Criterion::default().configure_from_args()
+}
+
 criterion_group!(
-    benches,
-    bench_topology_capture,
-    bench_pane_state_extraction,
-    bench_state_hash,
-    bench_checkpoint_save,
-    bench_checkpoint_load,
-    bench_session_list,
+    name = benches;
+    config = bench_config();
+    targets = bench_topology_capture,
+        bench_pane_state_extraction,
+        bench_state_hash,
+        bench_checkpoint_save,
+        bench_checkpoint_load,
+        bench_session_list
 );
 criterion_main!(benches);
