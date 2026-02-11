@@ -25,7 +25,9 @@ use serde::{Deserialize, Serialize};
 use crate::pool::{Pool, PoolAcquireGuard, PoolConfig, PoolError, PoolStats};
 use crate::retry::RetryPolicy;
 
-use super::mux_client::{DirectMuxClient, DirectMuxClientConfig, DirectMuxError, ProtocolErrorKind};
+use super::mux_client::{
+    DirectMuxClient, DirectMuxClientConfig, DirectMuxError, ProtocolErrorKind,
+};
 use codec::{GetLinesResponse, GetPaneRenderChangesResponse, ListPanesResponse, UnitResponse};
 
 /// Error type for mux pool operations.
@@ -199,11 +201,7 @@ impl MuxPool {
         Op: for<'a> FnMut(&'a mut DirectMuxClient) -> MuxOpFuture<'a, T>,
     {
         let max_attempts = if self.recovery.enabled {
-            self.recovery
-                .retry_policy
-                .max_attempts
-                .unwrap_or(1)
-                .max(1)
+            self.recovery.retry_policy.max_attempts.unwrap_or(1).max(1)
         } else {
             1
         };
