@@ -180,7 +180,7 @@ impl Default for WatchdogConfig {
 }
 
 /// Monitored subsystem identifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Component {
     Discovery,
@@ -207,6 +207,8 @@ pub enum HealthStatus {
     Healthy,
     Degraded,
     Critical,
+    /// Component is almost certainly hung (z-score >= 5 in adaptive mode).
+    Hung,
 }
 
 impl std::fmt::Display for HealthStatus {
@@ -215,6 +217,7 @@ impl std::fmt::Display for HealthStatus {
             Self::Healthy => write!(f, "healthy"),
             Self::Degraded => write!(f, "degraded"),
             Self::Critical => write!(f, "critical"),
+            Self::Hung => write!(f, "hung"),
         }
     }
 }
@@ -317,7 +320,7 @@ pub fn spawn_watchdog(
                         );
                     }
                 }
-                HealthStatus::Critical => {
+                HealthStatus::Critical | HealthStatus::Hung => {
                     for ch in report.unhealthy_components() {
                         error!(
                             component = %ch.component,
@@ -552,7 +555,7 @@ pub fn spawn_mux_watchdog(
                         ),
                     );
                 }
-                HealthStatus::Critical => {
+                HealthStatus::Critical | HealthStatus::Hung => {
                     error!(
                         consecutive_failures = watchdog.consecutive_failures,
                         rss_mb = sample.rss_bytes.map(|b| b / (1024 * 1024)),
@@ -797,6 +800,7 @@ mod tests {
     fn health_status_ordering() {
         assert!(HealthStatus::Healthy < HealthStatus::Degraded);
         assert!(HealthStatus::Degraded < HealthStatus::Critical);
+        assert!(HealthStatus::Critical < HealthStatus::Hung);
     }
 
     // =================================================================
