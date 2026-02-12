@@ -25,6 +25,8 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
+use crate::concurrent_map::PaneMap;
+
 // =============================================================================
 // Configuration
 // =============================================================================
@@ -280,8 +282,8 @@ pub fn validate_system_limits(config: &FdBudgetConfig, target_panes: u64) -> Lim
 /// Tracks per-pane FD allocation and provides budget-aware admission control.
 pub struct FdBudget {
     config: FdBudgetConfig,
-    /// Per-pane FD counts.
-    pane_fds: RwLock<HashMap<u64, u64>>,
+    /// Per-pane FD counts (sharded lock-free map).
+    pane_fds: PaneMap<u64>,
     /// Total allocated FDs across all panes.
     total_allocated: AtomicU64,
     /// Effective limit (nofile_soft at init time).
@@ -297,7 +299,7 @@ impl FdBudget {
         Self {
             effective_limit: limits.nofile_soft,
             config,
-            pane_fds: RwLock::new(HashMap::new()),
+            pane_fds: PaneMap::new(),
             total_allocated: AtomicU64::new(0),
             audit_history: RwLock::new(Vec::new()),
         }
@@ -308,7 +310,7 @@ impl FdBudget {
         Self {
             effective_limit: limit,
             config,
-            pane_fds: RwLock::new(HashMap::new()),
+            pane_fds: PaneMap::new(),
             total_allocated: AtomicU64::new(0),
             audit_history: RwLock::new(Vec::new()),
         }
@@ -340,19 +342,13 @@ impl FdBudget {
     /// Register a new pane's FD allocation.
     pub fn register_pane(&self, pane_id: u64) {
         let fds = self.config.fds_per_pane;
-        {
-            let mut map = self.pane_fds.write().expect("lock poisoned");
-            map.insert(pane_id, fds);
-        }
+        self.pane_fds.insert(pane_id, fds);
         self.total_allocated.fetch_add(fds, Ordering::SeqCst);
     }
 
     /// Unregister a pane (releases its FD allocation).
     pub fn unregister_pane(&self, pane_id: u64) {
-        let fds = {
-            let mut map = self.pane_fds.write().expect("lock poisoned");
-            map.remove(&pane_id).unwrap_or(0)
-        };
+        let fds = self.pane_fds.remove(pane_id).unwrap_or(0);
         self.total_allocated.fetch_sub(fds, Ordering::SeqCst);
     }
 
@@ -360,7 +356,7 @@ impl FdBudget {
     pub fn snapshot(&self) -> FdSnapshot {
         let current_open = count_open_fds();
         let total_allocated = self.total_allocated.load(Ordering::SeqCst);
-        let pane_count = self.pane_fds.read().expect("lock poisoned").len();
+        let pane_count = self.pane_fds.len();
 
         FdSnapshot {
             current_open,
@@ -434,7 +430,7 @@ impl FdBudget {
 
     /// Get per-pane FD breakdown.
     pub fn pane_breakdown(&self) -> HashMap<u64, u64> {
-        self.pane_fds.read().expect("lock poisoned").clone()
+        self.pane_fds.entries().into_iter().collect()
     }
 }
 

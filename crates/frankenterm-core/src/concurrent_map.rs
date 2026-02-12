@@ -79,8 +79,14 @@ impl<K, V> Shard<K, V> {
 impl<K: std::fmt::Debug, V: std::fmt::Debug> std::fmt::Debug for Shard<K, V> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.map.read() {
-            Ok(guard) => f.debug_struct("Shard").field("entries", &guard.len()).finish(),
-            Err(_) => f.debug_struct("Shard").field("entries", &"<poisoned>").finish(),
+            Ok(guard) => f
+                .debug_struct("Shard")
+                .field("entries", &guard.len())
+                .finish(),
+            Err(_) => f
+                .debug_struct("Shard")
+                .field("entries", &"<poisoned>")
+                .finish(),
         }
     }
 }
@@ -194,23 +200,15 @@ where
     pub fn len(&self) -> usize {
         self.shards
             .iter()
-            .map(|s| {
-                s.map
-                    .read()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .len()
-            })
+            .map(|s| s.map.read().unwrap_or_else(|e| e.into_inner()).len())
             .sum()
     }
 
     /// Whether the map is empty.
     pub fn is_empty(&self) -> bool {
-        self.shards.iter().all(|s| {
-            s.map
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_empty()
-        })
+        self.shards
+            .iter()
+            .all(|s| s.map.read().unwrap_or_else(|e| e.into_inner()).is_empty())
     }
 
     /// Apply a function to a value under a read lock.
@@ -304,10 +302,7 @@ where
         F: FnMut(&K, &V) -> bool,
     {
         for shard in self.shards.iter() {
-            let mut guard = shard
-                .map
-                .write()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut guard = shard.map.write().unwrap_or_else(|e| e.into_inner());
             guard.retain(|k, v| f(k, v));
         }
     }
@@ -316,22 +311,14 @@ where
     pub fn shard_sizes(&self) -> Vec<usize> {
         self.shards
             .iter()
-            .map(|s| {
-                s.map
-                    .read()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .len()
-            })
+            .map(|s| s.map.read().unwrap_or_else(|e| e.into_inner()).len())
             .collect()
     }
 
     /// Clear all entries.
     pub fn clear(&self) {
         for shard in self.shards.iter() {
-            let mut guard = shard
-                .map
-                .write()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut guard = shard.map.write().unwrap_or_else(|e| e.into_inner());
             guard.clear();
         }
     }
@@ -459,23 +446,15 @@ impl<V> PaneMap<V> {
     pub fn len(&self) -> usize {
         self.shards
             .iter()
-            .map(|s| {
-                s.map
-                    .read()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .len()
-            })
+            .map(|s| s.map.read().unwrap_or_else(|e| e.into_inner()).len())
             .sum()
     }
 
     /// Whether the map is empty.
     pub fn is_empty(&self) -> bool {
-        self.shards.iter().all(|s| {
-            s.map
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_empty()
-        })
+        self.shards
+            .iter()
+            .all(|s| s.map.read().unwrap_or_else(|e| e.into_inner()).is_empty())
     }
 
     /// All pane IDs.
@@ -494,10 +473,7 @@ impl<V> PaneMap<V> {
         F: FnMut(u64, &V) -> bool,
     {
         for shard in self.shards.iter() {
-            let mut guard = shard
-                .map
-                .write()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut guard = shard.map.write().unwrap_or_else(|e| e.into_inner());
             guard.retain(|k, v| f(*k, v));
         }
     }
@@ -506,22 +482,85 @@ impl<V> PaneMap<V> {
     pub fn shard_sizes(&self) -> Vec<usize> {
         self.shards
             .iter()
-            .map(|s| {
-                s.map
-                    .read()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .len()
-            })
+            .map(|s| s.map.read().unwrap_or_else(|e| e.into_inner()).len())
             .collect()
+    }
+
+    /// Collect all values (snapshot).
+    pub fn values(&self) -> Vec<V>
+    where
+        V: Clone,
+    {
+        let mut result = Vec::new();
+        for shard in self.shards.iter() {
+            let guard = shard.map.read().unwrap_or_else(|e| e.into_inner());
+            result.extend(guard.values().cloned());
+        }
+        result
+    }
+
+    /// Collect all key-value pairs (snapshot).
+    pub fn entries(&self) -> Vec<(u64, V)>
+    where
+        V: Clone,
+    {
+        let mut result = Vec::new();
+        for shard in self.shards.iter() {
+            let guard = shard.map.read().unwrap_or_else(|e| e.into_inner());
+            for (&k, v) in guard.iter() {
+                result.push((k, v.clone()));
+            }
+        }
+        result
+    }
+
+    /// Insert if absent, returning `true` if a new entry was inserted.
+    pub fn insert_if_absent(&self, pane_id: u64, value: V) -> bool {
+        let idx = self.shard_idx(pane_id);
+        let mut guard = self.shards[idx]
+            .map
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        if guard.contains_key(&pane_id) {
+            false
+        } else {
+            guard.insert(pane_id, value);
+            true
+        }
+    }
+
+    /// Apply a mutating function to every entry, shard by shard.
+    pub fn for_each_mut<F>(&self, mut f: F)
+    where
+        F: FnMut(u64, &mut V),
+    {
+        for shard in self.shards.iter() {
+            let mut guard = shard.map.write().unwrap_or_else(|e| e.into_inner());
+            for (&pane_id, value) in guard.iter_mut() {
+                f(pane_id, value);
+            }
+        }
+    }
+
+    /// Apply a mutating function to every entry, collecting results.
+    pub fn map_all_mut<F, R>(&self, mut f: F) -> Vec<(u64, R)>
+    where
+        F: FnMut(u64, &mut V) -> R,
+    {
+        let mut result = Vec::new();
+        for shard in self.shards.iter() {
+            let mut guard = shard.map.write().unwrap_or_else(|e| e.into_inner());
+            for (&pane_id, value) in guard.iter_mut() {
+                result.push((pane_id, f(pane_id, value)));
+            }
+        }
+        result
     }
 
     /// Clear all entries.
     pub fn clear(&self) {
         for shard in self.shards.iter() {
-            let mut guard = shard
-                .map
-                .write()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut guard = shard.map.write().unwrap_or_else(|e| e.into_inner());
             guard.clear();
         }
     }
@@ -564,7 +603,11 @@ impl DistributionStats {
         let variance = if sizes.is_empty() {
             0.0
         } else {
-            sizes.iter().map(|&s| (s as f64 - mean).powi(2)).sum::<f64>() / sizes.len() as f64
+            sizes
+                .iter()
+                .map(|&s| (s as f64 - mean).powi(2))
+                .sum::<f64>()
+                / sizes.len() as f64
         };
 
         Self {

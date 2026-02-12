@@ -29,12 +29,12 @@
 
 use std::collections::HashMap;
 use std::hash::BuildHasher;
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::concurrent_map::PaneMap;
 use crate::pane_tiers::PaneTier;
 
 // =============================================================================
@@ -262,10 +262,10 @@ pub struct PriorityMetrics {
 
 /// Classifies panes into priority levels for resource allocation.
 ///
-/// Thread-safe: all access goes through an internal `RwLock`.
+/// Thread-safe: per-pane state is distributed across a sharded `PaneMap`.
 pub struct PriorityClassifier {
     config: PriorityConfig,
-    panes: RwLock<HashMap<u64, PaneClassification>>,
+    panes: PaneMap<PaneClassification>,
     total_classifications: AtomicU64,
 }
 
@@ -282,7 +282,7 @@ impl PriorityClassifier {
     pub fn new(config: PriorityConfig) -> Self {
         Self {
             config,
-            panes: RwLock::new(HashMap::new()),
+            panes: PaneMap::new(),
             total_classifications: AtomicU64::new(0),
         }
     }
@@ -295,8 +295,7 @@ impl PriorityClassifier {
     /// Register a pane for priority tracking.
     pub fn register_pane(&self, pane_id: u64) {
         let half_life = Duration::from_secs_f64(self.config.rate_half_life_secs);
-        let mut panes = self.panes.write().expect("lock poisoned");
-        panes.entry(pane_id).or_insert_with(|| PaneClassification {
+        self.panes.insert_if_absent(pane_id, PaneClassification {
             priority: PanePriority::Medium,
             tier: PaneTier::Active,
             rate: OutputRateTracker::new(half_life),
@@ -308,8 +307,7 @@ impl PriorityClassifier {
 
     /// Unregister a pane.
     pub fn unregister_pane(&self, pane_id: u64) {
-        let mut panes = self.panes.write().expect("lock poisoned");
-        panes.remove(&pane_id);
+        self.panes.remove(pane_id);
     }
 
     /// Record output lines for a pane.
@@ -319,24 +317,21 @@ impl PriorityClassifier {
 
     /// Record output with explicit timestamp (for testing).
     pub fn record_output_at(&self, pane_id: u64, line_count: usize, now: Instant) {
-        let mut panes = self.panes.write().expect("lock poisoned");
-        if let Some(state) = panes.get_mut(&pane_id) {
+        self.panes.write_with(pane_id, |state| {
             state.rate.record_output(line_count, now);
-        }
+        });
     }
 
     /// Update the activity tier for a pane (from PaneTierClassifier).
     pub fn update_tier(&self, pane_id: u64, tier: PaneTier) {
-        let mut panes = self.panes.write().expect("lock poisoned");
-        if let Some(state) = panes.get_mut(&pane_id) {
+        self.panes.write_with(pane_id, |state| {
             state.tier = tier;
-        }
+        });
     }
 
     /// Feed a detection signal into the classifier.
     pub fn observe_signal(&self, pane_id: u64, signal: &PrioritySignal) {
-        let mut panes = self.panes.write().expect("lock poisoned");
-        if let Some(state) = panes.get_mut(&pane_id) {
+        self.panes.write_with(pane_id, |state| {
             if signal.severity >= 2
                 || signal.event_type == "error"
                 || signal.event_type == "needs_attention"
@@ -346,23 +341,21 @@ impl PriorityClassifier {
             if signal.event_type == "rate_limited" {
                 state.last_rate_limited_signal = Some(signal.observed_at);
             }
-        }
+        });
     }
 
     /// Set a manual priority override (takes precedence over auto).
     pub fn set_override(&self, pane_id: u64, priority: PanePriority) {
-        let mut panes = self.panes.write().expect("lock poisoned");
-        if let Some(state) = panes.get_mut(&pane_id) {
+        self.panes.write_with(pane_id, |state| {
             state.manual_override = Some(priority);
-        }
+        });
     }
 
     /// Clear a manual override, returning to automatic classification.
     pub fn clear_override(&self, pane_id: u64) {
-        let mut panes = self.panes.write().expect("lock poisoned");
-        if let Some(state) = panes.get_mut(&pane_id) {
+        self.panes.write_with(pane_id, |state| {
             state.manual_override = None;
-        }
+        });
     }
 
     /// Classify a single pane and return its priority.
@@ -373,14 +366,13 @@ impl PriorityClassifier {
     /// Classify with explicit timestamp (for testing).
     pub fn classify_at(&self, pane_id: u64, now: Instant) -> PanePriority {
         self.total_classifications.fetch_add(1, Ordering::Relaxed);
-        let mut panes = self.panes.write().expect("lock poisoned");
-        let Some(state) = panes.get_mut(&pane_id) else {
-            return PanePriority::Low;
-        };
-
-        let priority = self.compute_priority(state, now);
-        state.priority = priority;
-        priority
+        self.panes
+            .write_with(pane_id, |state| {
+                let priority = self.compute_priority(state, now);
+                state.priority = priority;
+                priority
+            })
+            .unwrap_or(PanePriority::Low)
     }
 
     /// Classify all tracked panes.
@@ -390,23 +382,22 @@ impl PriorityClassifier {
 
     /// Classify all with explicit timestamp.
     pub fn classify_all_at(&self, now: Instant) -> HashMap<u64, PanePriority> {
-        let mut panes = self.panes.write().expect("lock poisoned");
-        let mut result = HashMap::with_capacity(panes.len());
-        for (&pane_id, state) in panes.iter_mut() {
-            self.total_classifications.fetch_add(1, Ordering::Relaxed);
-            let priority = self.compute_priority(state, now);
-            state.priority = priority;
-            result.insert(pane_id, priority);
-        }
-        result
+        self.panes
+            .map_all_mut(|_pane_id, state| {
+                self.total_classifications
+                    .fetch_add(1, Ordering::Relaxed);
+                let priority = self.compute_priority(state, now);
+                state.priority = priority;
+                priority
+            })
+            .into_iter()
+            .collect()
     }
 
     /// Get the current cached priority without reclassifying.
     pub fn current_priority(&self, pane_id: u64) -> PanePriority {
-        let panes = self.panes.read().expect("lock poisoned");
-        panes
-            .get(&pane_id)
-            .map(|s| s.priority)
+        self.panes
+            .read_with(pane_id, |s| s.priority)
             .unwrap_or(PanePriority::Low)
     }
 
@@ -417,49 +408,43 @@ impl PriorityClassifier {
 
     /// Get output rate at explicit timestamp.
     pub fn output_rate_at(&self, pane_id: u64, now: Instant) -> f64 {
-        let panes = self.panes.read().expect("lock poisoned");
-        panes
-            .get(&pane_id)
-            .map(|s| s.rate.lines_per_second(now))
+        self.panes
+            .read_with(pane_id, |s| s.rate.lines_per_second(now))
             .unwrap_or(0.0)
     }
 
     /// Check if a pane has a manual override set.
     pub fn has_override(&self, pane_id: u64) -> bool {
-        let panes = self.panes.read().expect("lock poisoned");
-        panes
-            .get(&pane_id)
-            .map(|s| s.manual_override.is_some())
+        self.panes
+            .read_with(pane_id, |s| s.manual_override.is_some())
             .unwrap_or(false)
     }
 
     /// Return aggregate metrics.
     pub fn metrics(&self) -> PriorityMetrics {
-        let panes = self.panes.read().expect("lock poisoned");
         let mut counts: HashMap<String, usize> = HashMap::new();
         let mut override_count = 0;
 
-        for state in panes.values() {
+        self.panes.for_each_mut(|_pane_id, state| {
             *counts
                 .entry(state.priority.label().to_string())
                 .or_insert(0) += 1;
             if state.manual_override.is_some() {
                 override_count += 1;
             }
-        }
+        });
 
         PriorityMetrics {
             counts,
             total_classifications: self.total_classifications.load(Ordering::Relaxed),
             override_count,
-            tracked_panes: panes.len(),
+            tracked_panes: self.panes.len(),
         }
     }
 
     /// Number of tracked panes.
     pub fn tracked_pane_count(&self) -> usize {
-        let panes = self.panes.read().expect("lock poisoned");
-        panes.len()
+        self.panes.len()
     }
 
     // -------------------------------------------------------------------------
