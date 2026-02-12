@@ -2042,6 +2042,59 @@ impl Default for CliConfig {
 // Snapshot Config
 // =============================================================================
 
+/// Snapshot scheduling mode.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotSchedulingMode {
+    /// Legacy fixed-interval scheduling.
+    Periodic,
+    /// Event/value-driven scheduling with periodic fallback.
+    Intelligent,
+}
+
+impl Default for SnapshotSchedulingMode {
+    fn default() -> Self {
+        Self::Intelligent
+    }
+}
+
+/// Intelligent snapshot scheduling knobs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SnapshotSchedulingConfig {
+    /// Scheduling mode selector.
+    pub mode: SnapshotSchedulingMode,
+    /// Trigger value sum needed to capture a snapshot.
+    pub snapshot_threshold: f64,
+    /// Value contribution for work completion events.
+    pub work_completed_value: f64,
+    /// Value contribution for state transitions.
+    pub state_transition_value: f64,
+    /// Value contribution for idle windows.
+    pub idle_window_value: f64,
+    /// Value contribution for memory pressure signals.
+    pub memory_pressure_value: f64,
+    /// Value contribution for hazard spikes.
+    pub hazard_trigger_value: f64,
+    /// Fallback timer in minutes when no meaningful triggers occur.
+    pub periodic_fallback_minutes: u64,
+}
+
+impl Default for SnapshotSchedulingConfig {
+    fn default() -> Self {
+        Self {
+            mode: SnapshotSchedulingMode::Intelligent,
+            snapshot_threshold: 5.0,
+            work_completed_value: 2.0,
+            state_transition_value: 1.0,
+            idle_window_value: 3.0,
+            memory_pressure_value: 4.0,
+            hazard_trigger_value: 10.0,
+            periodic_fallback_minutes: 30,
+        }
+    }
+}
+
 /// Session snapshot configuration — periodic capture and retention.
 ///
 /// Controls how `ft watch` captures mux session state for crash-resilient
@@ -2057,6 +2110,12 @@ impl Default for CliConfig {
 /// max_concurrent_captures = 10
 /// retention_count = 10
 /// retention_days = 7
+///
+/// [snapshots.scheduling]
+/// mode = "intelligent"
+/// snapshot_threshold = 5.0
+/// hazard_trigger_value = 10.0
+/// periodic_fallback_minutes = 30
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -2083,6 +2142,10 @@ pub struct SnapshotConfig {
     /// Process re-launch configuration for session restoration.
     #[serde(default)]
     pub process_relaunch: ProcessRelaunchConfig,
+
+    /// Snapshot scheduling mode and value weighting.
+    #[serde(default)]
+    pub scheduling: SnapshotSchedulingConfig,
 }
 
 impl Default for SnapshotConfig {
@@ -2095,6 +2158,7 @@ impl Default for SnapshotConfig {
             retention_days: 7,
             session_retention: SessionRetentionConfig::default(),
             process_relaunch: ProcessRelaunchConfig::default(),
+            scheduling: SnapshotSchedulingConfig::default(),
         }
     }
 }
