@@ -1600,4 +1600,398 @@ mod tests {
             "channel full: returns false"
         );
     }
+
+    // =========================================================================
+    // Additional intelligent scheduling tests (wa-w9rd)
+    // =========================================================================
+
+    #[tokio::test]
+    async fn intelligent_mixed_accumulate_then_immediate_resets() {
+        // Accumulate below threshold, then an immediate trigger should
+        // capture AND reset the accumulator, so subsequent triggers
+        // need to re-accumulate from zero.
+        let (_tmp, db_path) = setup_test_db();
+        let engine = Arc::new(SnapshotEngine::new(db_path.clone(), intelligent_config(5.0)));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let e2 = engine.clone();
+        let handle = tokio::spawn(async move {
+            e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let after_startup = checkpoint_count(db_path.as_str());
+        assert_eq!(after_startup, 1, "startup capture");
+
+        // Accumulate 2.0 < 5.0 threshold
+        engine.emit_trigger(SnapshotTrigger::WorkCompleted); // +2.0
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // HazardThreshold is immediate — captures + resets accumulator
+        engine.emit_trigger(SnapshotTrigger::HazardThreshold);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            checkpoint_count(db_path.as_str()),
+            2,
+            "startup + immediate (hazard)"
+        );
+
+        // After reset: 2 x WorkCompleted = 4.0 < 5.0 — no capture
+        engine.emit_trigger(SnapshotTrigger::WorkCompleted); // +2.0
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        engine.emit_trigger(SnapshotTrigger::WorkCompleted); // +2.0 = 4.0
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            checkpoint_count(db_path.as_str()),
+            2,
+            "4.0 < 5.0 after reset — still 2"
+        );
+
+        // One more pushes over: 4.0 + 2.0 = 6.0 >= 5.0
+        engine.emit_trigger(SnapshotTrigger::WorkCompleted);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            checkpoint_count(db_path.as_str()),
+            3,
+            "startup + hazard + threshold"
+        );
+
+        shutdown_tx.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn intelligent_non_accumulating_triggers_dont_capture() {
+        // Manual, Startup, Periodic, PeriodicFallback, Shutdown all have
+        // trigger_value = 0.0 and are not immediate. Sending them through
+        // the channel should not cause any captures (beyond startup).
+        let (_tmp, db_path) = setup_test_db();
+        let engine = Arc::new(SnapshotEngine::new(
+            db_path.clone(),
+            intelligent_config(5.0),
+        ));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let e2 = engine.clone();
+        let handle = tokio::spawn(async move {
+            e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(checkpoint_count(db_path.as_str()), 1, "startup only");
+
+        // Send non-accumulating triggers
+        engine.emit_trigger(SnapshotTrigger::Manual);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        engine.emit_trigger(SnapshotTrigger::Periodic);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        engine.emit_trigger(SnapshotTrigger::PeriodicFallback);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        engine.emit_trigger(SnapshotTrigger::Startup);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert_eq!(
+            checkpoint_count(db_path.as_str()),
+            1,
+            "no captures from zero-value triggers"
+        );
+
+        shutdown_tx.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn intelligent_exact_threshold_boundary() {
+        // threshold = 5.0, send WorkCompleted(2.0) + IdleWindow(3.0) = exactly 5.0
+        let (_tmp, db_path) = setup_test_db();
+        let engine = Arc::new(SnapshotEngine::new(db_path.clone(), intelligent_config(5.0)));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let e2 = engine.clone();
+        let handle = tokio::spawn(async move {
+            e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(checkpoint_count(db_path.as_str()), 1, "startup");
+
+        engine.emit_trigger(SnapshotTrigger::WorkCompleted); // +2.0
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        engine.emit_trigger(SnapshotTrigger::IdleWindow); // +3.0 = 5.0
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert_eq!(
+            checkpoint_count(db_path.as_str()),
+            2,
+            "exactly at threshold captures"
+        );
+
+        shutdown_tx.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn intelligent_idle_window_accumulation() {
+        // IdleWindow has value 3.0; two IdleWindows = 6.0 >= threshold(5.0)
+        let (_tmp, db_path) = setup_test_db();
+        let engine = Arc::new(SnapshotEngine::new(db_path.clone(), intelligent_config(5.0)));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let e2 = engine.clone();
+        let handle = tokio::spawn(async move {
+            e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        engine.emit_trigger(SnapshotTrigger::IdleWindow); // +3.0
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(checkpoint_count(db_path.as_str()), 1, "3.0 < 5.0");
+
+        engine.emit_trigger(SnapshotTrigger::IdleWindow); // +3.0 = 6.0
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            checkpoint_count(db_path.as_str()),
+            2,
+            "6.0 >= 5.0 with IdleWindow"
+        );
+
+        shutdown_tx.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn intelligent_multiple_immediate_triggers() {
+        // Two consecutive immediate triggers should each cause a capture.
+        let (_tmp, db_path) = setup_test_db();
+        let engine = Arc::new(SnapshotEngine::new(
+            db_path.clone(),
+            intelligent_config(100.0), // high threshold so only immediates capture
+        ));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let e2 = engine.clone();
+        let handle = tokio::spawn(async move {
+            e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(checkpoint_count(db_path.as_str()), 1, "startup");
+
+        engine.emit_trigger(SnapshotTrigger::HazardThreshold);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        engine.emit_trigger(SnapshotTrigger::MemoryPressure);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert_eq!(
+            checkpoint_count(db_path.as_str()),
+            3,
+            "startup + hazard + memory_pressure"
+        );
+
+        shutdown_tx.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn intelligent_receiver_already_taken_returns_immediately() {
+        // If run_periodic is called twice, the second call should return
+        // immediately because the receiver was already taken.
+        let (_tmp, db_path) = setup_test_db();
+        let engine = Arc::new(SnapshotEngine::new(db_path.clone(), intelligent_config(5.0)));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        // First call takes the receiver
+        let e2 = engine.clone();
+        let handle = tokio::spawn(async move {
+            e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Second call should return immediately (receiver already taken)
+        let (_shutdown_tx2, shutdown_rx2) = tokio::sync::watch::channel(false);
+        let e3 = engine.clone();
+        let result =
+            tokio::time::timeout(Duration::from_secs(2), async move {
+                e3.run_periodic(shutdown_rx2, counting_pane_provider()).await;
+            })
+            .await;
+        assert!(result.is_ok(), "second run_periodic returns immediately");
+
+        shutdown_tx.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn intelligent_custom_config_values() {
+        // Test with non-default config: high work_completed_value so one trigger
+        // crosses the threshold.
+        let (_tmp, db_path) = setup_test_db();
+        let config = SnapshotConfig {
+            scheduling: crate::config::SnapshotSchedulingConfig {
+                mode: crate::config::SnapshotSchedulingMode::Intelligent,
+                snapshot_threshold: 5.0,
+                work_completed_value: 6.0, // one trigger crosses threshold
+                state_transition_value: 0.5,
+                idle_window_value: 0.5,
+                memory_pressure_value: 4.0,
+                hazard_trigger_value: 10.0,
+                periodic_fallback_minutes: 60,
+            },
+            ..SnapshotConfig::default()
+        };
+        let engine = Arc::new(SnapshotEngine::new(db_path.clone(), config));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let e2 = engine.clone();
+        let handle = tokio::spawn(async move {
+            e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // One WorkCompleted = 6.0 >= 5.0
+        engine.emit_trigger(SnapshotTrigger::WorkCompleted);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            checkpoint_count(db_path.as_str()),
+            2,
+            "single trigger crosses custom threshold"
+        );
+
+        // StateTransition = 0.5 < 5.0 — no additional capture
+        engine.emit_trigger(SnapshotTrigger::StateTransition);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            checkpoint_count(db_path.as_str()),
+            2,
+            "0.5 < 5.0 no capture"
+        );
+
+        shutdown_tx.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn intelligent_rapid_burst_all_processed() {
+        // Send a burst of triggers rapidly — all should be processed.
+        let (_tmp, db_path) = setup_test_db();
+        let engine = Arc::new(SnapshotEngine::new(db_path.clone(), intelligent_config(5.0)));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let e2 = engine.clone();
+        let handle = tokio::spawn(async move {
+            e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Fire 5 WorkCompleted triggers (5 x 2.0 = 10.0) as fast as possible
+        for _ in 0..5 {
+            engine.emit_trigger(SnapshotTrigger::WorkCompleted);
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Should have captured at least twice (startup + when >= 5.0)
+        let count = checkpoint_count(db_path.as_str());
+        assert!(
+            count >= 2,
+            "burst should produce at least 2 captures, got {}",
+            count
+        );
+
+        shutdown_tx.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[test]
+    fn snapshot_trigger_serde_roundtrip() {
+        let triggers = vec![
+            SnapshotTrigger::Periodic,
+            SnapshotTrigger::PeriodicFallback,
+            SnapshotTrigger::Manual,
+            SnapshotTrigger::Shutdown,
+            SnapshotTrigger::Startup,
+            SnapshotTrigger::Event,
+            SnapshotTrigger::WorkCompleted,
+            SnapshotTrigger::HazardThreshold,
+            SnapshotTrigger::StateTransition,
+            SnapshotTrigger::IdleWindow,
+            SnapshotTrigger::MemoryPressure,
+        ];
+        for trigger in triggers {
+            let json = serde_json::to_string(&trigger).unwrap();
+            let back: SnapshotTrigger = serde_json::from_str(&json).unwrap();
+            assert_eq!(trigger, back);
+        }
+    }
+
+    #[test]
+    fn snapshot_trigger_db_str_all_variants() {
+        // Verify all 11 trigger variants have valid db strings.
+        let mapping = vec![
+            (SnapshotTrigger::Periodic, "periodic"),
+            (SnapshotTrigger::PeriodicFallback, "periodic"),
+            (SnapshotTrigger::Manual, "event"),
+            (SnapshotTrigger::Shutdown, "shutdown"),
+            (SnapshotTrigger::Startup, "startup"),
+            (SnapshotTrigger::Event, "event"),
+            (SnapshotTrigger::WorkCompleted, "event"),
+            (SnapshotTrigger::HazardThreshold, "event"),
+            (SnapshotTrigger::StateTransition, "event"),
+            (SnapshotTrigger::IdleWindow, "event"),
+            (SnapshotTrigger::MemoryPressure, "event"),
+        ];
+        for (trigger, expected) in mapping {
+            assert_eq!(
+                trigger.as_db_str(),
+                expected,
+                "db_str mismatch for {:?}",
+                trigger
+            );
+        }
+    }
+
+    #[test]
+    fn trigger_value_non_accumulating_all_zero() {
+        let (_tmp, db_path) = setup_test_db();
+        let engine = SnapshotEngine::new(db_path, intelligent_config(5.0));
+
+        let zero_triggers = vec![
+            SnapshotTrigger::Periodic,
+            SnapshotTrigger::PeriodicFallback,
+            SnapshotTrigger::Manual,
+            SnapshotTrigger::Shutdown,
+            SnapshotTrigger::Startup,
+        ];
+        for trigger in zero_triggers {
+            assert!(
+                engine.trigger_value(trigger).abs() < f64::EPSILON,
+                "{:?} should have zero value",
+                trigger
+            );
+        }
+    }
+
+    #[test]
+    fn trigger_value_accumulating_all_positive() {
+        let (_tmp, db_path) = setup_test_db();
+        let engine = SnapshotEngine::new(db_path, intelligent_config(5.0));
+
+        let positive_triggers = vec![
+            SnapshotTrigger::WorkCompleted,
+            SnapshotTrigger::StateTransition,
+            SnapshotTrigger::IdleWindow,
+            SnapshotTrigger::MemoryPressure,
+            SnapshotTrigger::HazardThreshold,
+            SnapshotTrigger::Event,
+        ];
+        for trigger in positive_triggers {
+            assert!(
+                engine.trigger_value(trigger) > 0.0,
+                "{:?} should have positive value",
+                trigger
+            );
+        }
+    }
 }
