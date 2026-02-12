@@ -331,6 +331,10 @@ pub fn is_retryable(error: &Error) -> bool {
         Error::Runtime(_) => true,
         // Setup errors are not retryable
         Error::SetupError(_) => false,
+        // Cancelled operations are not retryable
+        Error::Cancelled(_) => false,
+        // Panicked operations are not retryable
+        Error::Panicked(_) => false,
     }
 }
 

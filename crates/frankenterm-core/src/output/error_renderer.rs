@@ -76,6 +76,8 @@ impl ErrorRenderer {
             Error::Json(_) => "FT-9003",
             Error::Runtime(_) => "FT-9001",
             Error::SetupError(_) => "FT-6001",
+            Error::Cancelled(_) => "FT-9004",
+            Error::Panicked(_) => "FT-9005",
         }
     }
 
