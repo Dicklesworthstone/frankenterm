@@ -488,4 +488,294 @@ mod tests {
     // - Logger initialization doesn't panic
     // - JSON log lines are valid JSON
     // - Required correlation fields appear on key spans
+
+    // ── LogError Display tests ──
+
+    #[test]
+    fn log_error_display_already_initialized() {
+        let err = LogError::AlreadyInitialized;
+        assert_eq!(err.to_string(), "logging already initialized");
+    }
+
+    #[test]
+    fn log_error_display_invalid_level() {
+        let err = LogError::InvalidLevel("verbose".to_string());
+        assert_eq!(err.to_string(), "invalid log level: verbose");
+    }
+
+    #[test]
+    fn log_error_display_file_create() {
+        let io_err = io::Error::new(io::ErrorKind::PermissionDenied, "access denied");
+        let err = LogError::FileCreate(io_err);
+        assert!(err.to_string().contains("failed to create log file"));
+        assert!(err.to_string().contains("access denied"));
+    }
+
+    #[test]
+    fn log_error_from_io_error() {
+        let io_err = io::Error::new(io::ErrorKind::NotFound, "no such file");
+        let err: LogError = io_err.into();
+        assert!(matches!(err, LogError::FileCreate(_)));
+    }
+
+    // ── LogLevel ordering tests ──
+
+    #[test]
+    fn log_level_ordering() {
+        assert!(LogLevel::Trace < LogLevel::Debug);
+        assert!(LogLevel::Debug < LogLevel::Info);
+        assert!(LogLevel::Info < LogLevel::Warn);
+        assert!(LogLevel::Warn < LogLevel::Error);
+    }
+
+    #[test]
+    fn log_level_ordering_transitive() {
+        assert!(LogLevel::Trace < LogLevel::Error);
+        assert!(LogLevel::Debug < LogLevel::Warn);
+        assert!(LogLevel::Trace < LogLevel::Info);
+    }
+
+    #[test]
+    fn log_level_equality() {
+        assert_eq!(LogLevel::Info, LogLevel::Info);
+        assert_ne!(LogLevel::Info, LogLevel::Debug);
+    }
+
+    // ── LogLevel Into<Level> conversion tests ──
+
+    #[test]
+    fn log_level_into_tracing_level() {
+        assert_eq!(Level::from(LogLevel::Trace), Level::TRACE);
+        assert_eq!(Level::from(LogLevel::Debug), Level::DEBUG);
+        assert_eq!(Level::from(LogLevel::Info), Level::INFO);
+        assert_eq!(Level::from(LogLevel::Warn), Level::WARN);
+        assert_eq!(Level::from(LogLevel::Error), Level::ERROR);
+    }
+
+    // ── LogLevel FromStr edge cases ──
+
+    #[test]
+    fn log_level_from_str_case_insensitive() {
+        assert_eq!("TRACE".parse::<LogLevel>().unwrap(), LogLevel::Trace);
+        assert_eq!("Debug".parse::<LogLevel>().unwrap(), LogLevel::Debug);
+        assert_eq!("INFO".parse::<LogLevel>().unwrap(), LogLevel::Info);
+        assert_eq!("WARN".parse::<LogLevel>().unwrap(), LogLevel::Warn);
+        assert_eq!("WARNING".parse::<LogLevel>().unwrap(), LogLevel::Warn);
+        assert_eq!("Error".parse::<LogLevel>().unwrap(), LogLevel::Error);
+    }
+
+    #[test]
+    fn log_level_from_str_error_message() {
+        let err = "verbose".parse::<LogLevel>().unwrap_err();
+        assert!(err.contains("unknown log level: verbose"));
+        assert!(err.contains("trace, debug, info, warn, error"));
+    }
+
+    #[test]
+    fn log_level_from_str_empty_string() {
+        assert!("".parse::<LogLevel>().is_err());
+    }
+
+    // ── LogLevel trait tests ──
+
+    #[test]
+    fn log_level_clone_and_copy() {
+        let level = LogLevel::Info;
+        let cloned = level.clone();
+        let copied = level;
+        assert_eq!(level, cloned);
+        assert_eq!(level, copied);
+    }
+
+    #[test]
+    fn log_level_debug_format() {
+        assert_eq!(format!("{:?}", LogLevel::Trace), "Trace");
+        assert_eq!(format!("{:?}", LogLevel::Error), "Error");
+    }
+
+    // ── LogConfig serde edge cases ──
+
+    #[test]
+    fn log_config_serde_defaults_from_empty_json() {
+        let config: LogConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.level, "info");
+        assert_eq!(config.format, LogFormat::Pretty);
+        assert!(config.file.is_none());
+    }
+
+    #[test]
+    fn log_config_serde_partial_fields() {
+        let config: LogConfig = serde_json::from_str(r#"{"level": "debug"}"#).unwrap();
+        assert_eq!(config.level, "debug");
+        assert_eq!(config.format, LogFormat::Pretty); // default
+        assert!(config.file.is_none()); // default
+    }
+
+    #[test]
+    fn log_config_serde_with_null_file() {
+        let config: LogConfig =
+            serde_json::from_str(r#"{"level":"warn","format":"json","file":null}"#).unwrap();
+        assert_eq!(config.level, "warn");
+        assert_eq!(config.format, LogFormat::Json);
+        assert!(config.file.is_none());
+    }
+
+    #[test]
+    fn log_config_clone() {
+        let config = LogConfig {
+            level: "error".to_string(),
+            format: LogFormat::Json,
+            file: Some(PathBuf::from("/var/log/wa.log")),
+        };
+        let cloned = config.clone();
+        assert_eq!(cloned.level, "error");
+        assert_eq!(cloned.format, LogFormat::Json);
+        assert_eq!(cloned.file.as_deref(), Some(std::path::Path::new("/var/log/wa.log")));
+    }
+
+    #[test]
+    fn log_config_debug_format() {
+        let config = LogConfig::default();
+        let debug = format!("{:?}", config);
+        assert!(debug.contains("LogConfig"));
+        assert!(debug.contains("info"));
+    }
+
+    // ── ensure_parent_dir tests ──
+
+    #[test]
+    fn ensure_parent_dir_creates_nested() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("a").join("b").join("c").join("file.log");
+        ensure_parent_dir(&path).unwrap();
+        assert!(tmp.path().join("a").join("b").join("c").exists());
+    }
+
+    #[test]
+    fn ensure_parent_dir_existing_is_noop() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("file.log");
+        // parent already exists (tmp dir itself)
+        ensure_parent_dir(&path).unwrap();
+        assert!(tmp.path().exists());
+    }
+
+    #[test]
+    fn ensure_parent_dir_empty_parent() {
+        // A bare filename has an empty parent
+        let path = std::path::Path::new("file.log");
+        ensure_parent_dir(path).unwrap(); // should not panic
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_parent_dir_sets_permissions() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("secure").join("file.log");
+        ensure_parent_dir(&path).unwrap();
+        let meta = std::fs::metadata(tmp.path().join("secure")).unwrap();
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    // ── set_file_permissions tests ──
+
+    #[cfg(unix)]
+    #[test]
+    fn set_file_permissions_works() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("test.log");
+        std::fs::write(&path, "data").unwrap();
+        set_file_permissions(&path, 0o600).unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    // ── MockLogWriter tests ──
+
+    #[test]
+    fn mock_log_writer_captures_output() {
+        let mut writer = MockLogWriter::new();
+        io::Write::write_all(&mut writer, b"hello world").unwrap();
+        assert_eq!(writer.contents(), "hello world");
+    }
+
+    #[test]
+    fn mock_log_writer_empty_initially() {
+        let writer = MockLogWriter::new();
+        assert_eq!(writer.contents(), "");
+    }
+
+    #[test]
+    fn mock_log_writer_multiple_writes() {
+        let mut writer = MockLogWriter::new();
+        io::Write::write_all(&mut writer, b"hello ").unwrap();
+        io::Write::write_all(&mut writer, b"world").unwrap();
+        assert_eq!(writer.contents(), "hello world");
+    }
+
+    #[test]
+    fn mock_log_writer_flush_succeeds() {
+        let mut writer = MockLogWriter::new();
+        assert!(io::Write::flush(&mut writer).is_ok());
+    }
+
+    #[test]
+    fn mock_log_writer_make_writer() {
+        let writer = MockLogWriter::new();
+        let made = MakeWriter::make_writer(&writer);
+        assert_eq!(made.contents(), "");
+    }
+
+    // ── Pretty format log output test ──
+
+    #[test]
+    fn pretty_logs_contain_message() {
+        let writer = MockLogWriter::new();
+        let subscriber = tracing_subscriber::registry()
+            .with(EnvFilter::new("info"))
+            .with(
+                fmt::layer()
+                    .with_writer(writer.clone())
+                    .with_target(true)
+                    .with_ansi(false),
+            );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("pretty test message");
+        });
+
+        let output = writer.contents();
+        assert!(output.contains("pretty test message"));
+    }
+
+    // ── JSON format with spans ──
+
+    #[test]
+    fn json_logs_with_span_context() {
+        let writer = MockLogWriter::new();
+        let subscriber = tracing_subscriber::registry()
+            .with(EnvFilter::new("info"))
+            .with(
+                fmt::layer()
+                    .json()
+                    .with_timer(SystemTime)
+                    .with_writer(writer.clone())
+                    .with_target(true)
+                    .with_current_span(true)
+                    .flatten_event(true),
+            );
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("test_span", pane_id = 99u64);
+            let _guard = span.enter();
+            tracing::info!("inside span");
+        });
+
+        let output = writer.contents();
+        let line = output.lines().find(|l| !l.trim().is_empty()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert!(parsed.get("timestamp").is_some());
+    }
 }
