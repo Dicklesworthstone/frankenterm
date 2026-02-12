@@ -1221,7 +1221,7 @@ mod tests {
                 .await;
         });
 
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
         (shutdown_tx, handle)
     }
 
@@ -1338,7 +1338,7 @@ mod tests {
         });
 
         // Give server time to start
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
 
         // Create client and send ping
         let client = IpcClient::new(&socket_path);
@@ -1375,7 +1375,7 @@ mod tests {
             server.run(event_bus, shutdown_rx).await;
         });
 
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
         assert!(socket_path.exists());
 
         let _ = shutdown_tx.send(()).await;
@@ -1440,7 +1440,7 @@ mod tests {
                 .await;
         });
 
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
 
         let client = IpcClient::new(&socket_path);
         let response = client.pane_state(7).await.unwrap();
@@ -1513,7 +1513,7 @@ mod tests {
             server.run(server_bus, shutdown_rx).await;
         });
 
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
 
         // Send a user-var event
         let client = IpcClient::new(&socket_path);
@@ -1562,7 +1562,7 @@ mod tests {
             server.run(server_bus, shutdown_rx).await;
         });
 
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
 
         let client = IpcClient::new(&socket_path);
         let response = client.status().await.unwrap();
@@ -1604,7 +1604,7 @@ mod tests {
             server.run(server_bus, shutdown_rx).await;
         });
 
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
 
         // Send invalid JSON directly via raw socket
         let mut stream = UnixStream::connect(&socket_path).await.unwrap();
@@ -1642,7 +1642,7 @@ mod tests {
             server.run(server_bus, shutdown_rx).await;
         });
 
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
 
         // Create an oversized message (> MAX_MESSAGE_SIZE)
         let oversized_value = "x".repeat(MAX_MESSAGE_SIZE + 1000);
@@ -1687,7 +1687,7 @@ mod tests {
             server.run(server_bus, shutdown_rx).await;
         });
 
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
 
         // Spawn multiple concurrent clients
         let socket_path_clone = socket_path.clone();

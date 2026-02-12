@@ -15,7 +15,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::process::Command;
-use tokio::time::timeout;
+use crate::runtime_compat::timeout;
 
 /// Supported caut services.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
