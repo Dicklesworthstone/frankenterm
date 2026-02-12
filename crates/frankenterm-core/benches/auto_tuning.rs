@@ -7,7 +7,7 @@
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use frankenterm_core::auto_tune::{
-    AutoTuneConfig, AutoTuner, PinnedParams, TunableParams, TunerMetrics, TuningTargets,
+    AutoTuneConfig, AutoTuner, PinnedParams, TunableParams, TunerMetrics,
 };
 
 mod bench_common;
