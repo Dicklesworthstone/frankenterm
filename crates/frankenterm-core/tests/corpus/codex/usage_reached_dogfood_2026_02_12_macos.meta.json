@@ -1,0 +1,9 @@
+{
+  "scenario": "codex_usage_reached",
+  "source": "seeded_from_existing_corpus_fixture",
+  "captured_at": "2026-02-12T06:05:00Z",
+  "platform": "macos",
+  "cross_platform": "pending",
+  "sanitized": true,
+  "notes": "Dogfood metadata seed. Replace with direct ft robot capture when local ft/wezterm binaries are available."
+}

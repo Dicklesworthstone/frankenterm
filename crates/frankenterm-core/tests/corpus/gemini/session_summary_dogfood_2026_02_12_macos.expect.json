@@ -1,0 +1,14 @@
+[
+  {
+    "rule_id": "gemini.session.summary",
+    "agent_type": "gemini",
+    "event_type": "session.summary",
+    "severity": "info",
+    "confidence": 0.95,
+    "extracted": {
+      "session_id": "abcdef12-3456-7890-abcd-ef1234567890",
+      "tool_calls": "7"
+    },
+    "matched_text": "Session ID: abcdef12-3456-7890-abcd-ef1234567890 Tool Calls: 7"
+  }
+]
