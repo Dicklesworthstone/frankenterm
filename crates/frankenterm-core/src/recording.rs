@@ -13,8 +13,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use serde::{Deserialize, Serialize};
 use crate::runtime_compat::Mutex;
+use serde::{Deserialize, Serialize};
 
 use crate::Result;
 use crate::ingest::{CapturedSegment, CapturedSegmentKind};
@@ -541,8 +541,7 @@ pub struct RecorderEvent {
 /// Tolerates unknown additive fields for forward compatibility.
 pub fn parse_recorder_event_json(json: &str) -> crate::Result<RecorderEvent> {
     // First pass: check schema version before full deserialization.
-    let raw: serde_json::Value =
-        serde_json::from_str(json).map_err(|e| crate::Error::Json(e))?;
+    let raw: serde_json::Value = serde_json::from_str(json).map_err(|e| crate::Error::Json(e))?;
 
     let version = raw
         .get("schema_version")
@@ -557,8 +556,7 @@ pub fn parse_recorder_event_json(json: &str) -> crate::Result<RecorderEvent> {
     }
 
     // Second pass: deserialize with serde, tolerating unknown fields.
-    let event: RecorderEvent =
-        serde_json::from_value(raw).map_err(|e| crate::Error::Json(e))?;
+    let event: RecorderEvent = serde_json::from_value(raw).map_err(|e| crate::Error::Json(e))?;
     Ok(event)
 }
 
@@ -745,6 +743,111 @@ impl IngressTap for NoopTap {
 
 /// Convenience alias for a shared ingress tap.
 pub type SharedIngressTap = Arc<dyn IngressTap>;
+
+// ---------------------------------------------------------------------------
+// Egress tap — observer interface for mux egress capture (ft-oegrb.2.3)
+// ---------------------------------------------------------------------------
+
+/// An egress event captured at a tap point.
+///
+/// Contains all metadata needed to produce a [`RecorderEvent`] with
+/// an [`RecorderEventPayload::EgressOutput`] payload.
+#[derive(Debug, Clone)]
+pub struct EgressEvent {
+    /// Pane that produced this output.
+    pub pane_id: u64,
+    /// The captured output text (delta or full snapshot).
+    pub text: String,
+    /// Kind of egress segment (delta, gap, or snapshot).
+    pub segment_kind: RecorderSegmentKind,
+    /// True if this segment represents a capture discontinuity.
+    pub is_gap: bool,
+    /// Reason for the gap (only set when `is_gap` is true).
+    pub gap_reason: Option<String>,
+    /// Text encoding (always UTF-8 for now).
+    pub encoding: RecorderTextEncoding,
+    /// Redaction level applied to the captured text.
+    pub redaction: RecorderRedactionLevel,
+    /// Unix epoch milliseconds when the capture occurred.
+    pub occurred_at_ms: u64,
+    /// Per-pane monotonic sequence number.
+    pub sequence: u64,
+}
+
+/// Observer interface for egress event capture.
+///
+/// Implementations must be fast and non-blocking. The tap is called
+/// synchronously on the capture hot path — expensive work (persistence,
+/// network I/O) should be offloaded to a background task.
+pub trait EgressTap: Send + Sync {
+    /// Called when a pane output segment is captured.
+    ///
+    /// This fires for ALL segment kinds (delta, gap, snapshot) to provide
+    /// complete capture visibility including discontinuity markers.
+    fn on_egress(&self, event: EgressEvent);
+}
+
+/// No-op egress tap that discards all events (zero overhead).
+pub struct EgressNoopTap;
+
+impl EgressTap for EgressNoopTap {
+    #[inline]
+    fn on_egress(&self, _event: EgressEvent) {}
+}
+
+/// Convenience alias for a shared egress tap.
+pub type SharedEgressTap = Arc<dyn EgressTap>;
+
+/// Maps a [`crate::ingest::CapturedSegmentKind`] to a [`RecorderSegmentKind`]
+/// and derives the `is_gap` flag.
+#[must_use]
+pub fn captured_kind_to_segment(
+    kind: &crate::ingest::CapturedSegmentKind,
+) -> (RecorderSegmentKind, bool) {
+    use crate::ingest::CapturedSegmentKind;
+    match kind {
+        CapturedSegmentKind::Delta => (RecorderSegmentKind::Delta, false),
+        CapturedSegmentKind::Gap { .. } => (RecorderSegmentKind::Gap, true),
+    }
+}
+
+/// A collecting egress tap that stores all received events for testing.
+#[cfg(any(test, feature = "test-util"))]
+#[derive(Debug, Default)]
+pub struct CollectingEgressTap {
+    events: std::sync::Mutex<Vec<EgressEvent>>,
+}
+
+#[cfg(any(test, feature = "test-util"))]
+impl CollectingEgressTap {
+    /// Create a new empty collecting egress tap.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Return a snapshot of all collected events.
+    pub fn events(&self) -> Vec<EgressEvent> {
+        self.events.lock().unwrap().clone()
+    }
+
+    /// Return the number of collected events.
+    pub fn len(&self) -> usize {
+        self.events.lock().unwrap().len()
+    }
+
+    /// Return true if no events have been collected.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+#[cfg(any(test, feature = "test-util"))]
+impl EgressTap for CollectingEgressTap {
+    fn on_egress(&self, event: EgressEvent) {
+        self.events.lock().unwrap().push(event);
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1204,5 +1307,117 @@ mod tests {
         };
         // Should not error
         manager.record_segment(&segment).await.unwrap();
+    }
+
+    // Ingress tap unit tests (ft-oegrb.2.2)
+
+    #[test]
+    fn actor_to_source_maps_all_variants() {
+        use crate::policy::ActorKind;
+        assert_eq!(
+            actor_to_source(ActorKind::Human),
+            RecorderEventSource::OperatorAction
+        );
+        assert_eq!(
+            actor_to_source(ActorKind::Robot),
+            RecorderEventSource::RobotMode
+        );
+        assert_eq!(
+            actor_to_source(ActorKind::Mcp),
+            RecorderEventSource::RobotMode
+        );
+        assert_eq!(
+            actor_to_source(ActorKind::Workflow),
+            RecorderEventSource::WorkflowEngine
+        );
+    }
+
+    #[test]
+    fn action_to_ingress_kind_maps_correctly() {
+        use crate::policy::{ActionKind, ActorKind};
+        assert_eq!(
+            action_to_ingress_kind(ActionKind::SendText, ActorKind::Robot),
+            RecorderIngressKind::SendText
+        );
+        assert_eq!(
+            action_to_ingress_kind(ActionKind::SendText, ActorKind::Workflow),
+            RecorderIngressKind::WorkflowAction
+        );
+        assert_eq!(
+            action_to_ingress_kind(ActionKind::SendCtrlC, ActorKind::Robot),
+            RecorderIngressKind::SendText
+        );
+        assert_eq!(
+            action_to_ingress_kind(ActionKind::SendCtrlD, ActorKind::Workflow),
+            RecorderIngressKind::WorkflowAction
+        );
+    }
+
+    #[test]
+    fn ingress_sequence_monotonic() {
+        let seq = IngressSequence::new();
+        assert_eq!(seq.next(), 0);
+        assert_eq!(seq.next(), 1);
+        assert_eq!(seq.next(), 2);
+    }
+
+    #[test]
+    fn epoch_ms_now_reasonable() {
+        let ms = epoch_ms_now();
+        assert!(ms > 1_735_689_600_000);
+        assert!(ms < 4_102_444_800_000);
+    }
+
+    #[test]
+    fn noop_tap_is_zero_cost() {
+        let tap = NoopTap;
+        tap.on_ingress(IngressEvent {
+            pane_id: 0,
+            text: String::new(),
+            source: RecorderEventSource::RobotMode,
+            ingress_kind: RecorderIngressKind::SendText,
+            redaction: RecorderRedactionLevel::None,
+            occurred_at_ms: 0,
+            outcome: IngressOutcome::Allowed,
+            workflow_id: None,
+        });
+    }
+
+    #[test]
+    fn collecting_tap_accumulates() {
+        let tap = CollectingTap::new();
+        assert!(tap.is_empty());
+        for i in 0..3 {
+            tap.on_ingress(IngressEvent {
+                pane_id: i,
+                text: format!("cmd-{i}"),
+                source: RecorderEventSource::RobotMode,
+                ingress_kind: RecorderIngressKind::SendText,
+                redaction: RecorderRedactionLevel::None,
+                occurred_at_ms: 0,
+                outcome: IngressOutcome::Allowed,
+                workflow_id: None,
+            });
+        }
+        assert_eq!(tap.len(), 3);
+        assert_eq!(tap.events()[1].pane_id, 1);
+    }
+
+    #[test]
+    fn shared_tap_via_arc() {
+        let tap = Arc::new(CollectingTap::new());
+        let shared: SharedIngressTap = tap.clone();
+        shared.on_ingress(IngressEvent {
+            pane_id: 42,
+            text: "test".into(),
+            source: RecorderEventSource::WorkflowEngine,
+            ingress_kind: RecorderIngressKind::WorkflowAction,
+            redaction: RecorderRedactionLevel::None,
+            occurred_at_ms: 3000,
+            outcome: IngressOutcome::Allowed,
+            workflow_id: Some("wf-123".into()),
+        });
+        assert_eq!(tap.len(), 1);
+        assert_eq!(tap.events()[0].workflow_id, Some("wf-123".into()));
     }
 }

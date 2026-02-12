@@ -1,0 +1,223 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wezterm-automata.dev/schemas/ft-recorder-event-v1.json",
+  "title": "FT Recorder Event v1",
+  "description": "Canonical versioned event schema for mux ingress/egress capture used by the flight recorder.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "event_id",
+    "pane_id",
+    "session_id",
+    "workflow_id",
+    "correlation_id",
+    "source",
+    "occurred_at_ms",
+    "recorded_at_ms",
+    "sequence",
+    "causality",
+    "event_type"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "ft.recorder.event.v1",
+      "description": "Schema contract identifier. Consumers reject unknown schema versions."
+    },
+    "event_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Stable event identifier for deduplication and causal linkage."
+    },
+    "pane_id": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Mux pane identifier where capture occurred."
+    },
+    "session_id": {
+      "type": ["string", "null"],
+      "description": "Session correlation ID (null when session scope is not yet known)."
+    },
+    "workflow_id": {
+      "type": ["string", "null"],
+      "description": "Workflow correlation ID (null when no workflow context applies)."
+    },
+    "correlation_id": {
+      "type": ["string", "null"],
+      "description": "Cross-component trace/correlation ID for request causality."
+    },
+    "source": {
+      "$ref": "#/$defs/source"
+    },
+    "occurred_at_ms": {
+      "type": "integer",
+      "description": "Unix epoch milliseconds when the underlying mux action/output happened."
+    },
+    "recorded_at_ms": {
+      "type": "integer",
+      "description": "Unix epoch milliseconds when this event was persisted by recorder ingress."
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Monotonic per-pane sequence number for ordering/replay."
+    },
+    "causality": {
+      "type": "object",
+      "required": ["parent_event_id", "trigger_event_id", "root_event_id"],
+      "properties": {
+        "parent_event_id": {
+          "type": ["string", "null"],
+          "description": "Immediate predecessor event in the causal chain."
+        },
+        "trigger_event_id": {
+          "type": ["string", "null"],
+          "description": "Triggering event ID when this event is a response."
+        },
+        "root_event_id": {
+          "type": ["string", "null"],
+          "description": "Root event ID for end-to-end chain aggregation."
+        }
+      },
+      "additionalProperties": false
+    },
+    "event_type": {
+      "type": "string",
+      "enum": ["ingress_text", "egress_output", "control_marker", "lifecycle_marker"],
+      "description": "Canonical event variant."
+    },
+    "text": {
+      "type": "string",
+      "description": "Ingress/egress text payload for text-bearing variants."
+    },
+    "encoding": {
+      "$ref": "#/$defs/encoding"
+    },
+    "redaction": {
+      "$ref": "#/$defs/redaction_level"
+    },
+    "ingress_kind": {
+      "$ref": "#/$defs/ingress_kind"
+    },
+    "segment_kind": {
+      "$ref": "#/$defs/segment_kind"
+    },
+    "is_gap": {
+      "type": "boolean",
+      "description": "True if this egress record represents an explicit capture gap."
+    },
+    "control_marker_type": {
+      "$ref": "#/$defs/control_marker_type"
+    },
+    "lifecycle_phase": {
+      "$ref": "#/$defs/lifecycle_phase"
+    },
+    "reason": {
+      "type": ["string", "null"],
+      "description": "Optional lifecycle explanation."
+    },
+    "details": {
+      "type": "object",
+      "description": "Variant-specific structured details.",
+      "additionalProperties": true
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "event_type": { "const": "ingress_text" } },
+        "required": ["event_type"]
+      },
+      "then": {
+        "required": ["text", "encoding", "redaction", "ingress_kind"]
+      }
+    },
+    {
+      "if": {
+        "properties": { "event_type": { "const": "egress_output" } },
+        "required": ["event_type"]
+      },
+      "then": {
+        "required": ["text", "encoding", "redaction", "segment_kind", "is_gap"]
+      }
+    },
+    {
+      "if": {
+        "properties": { "event_type": { "const": "control_marker" } },
+        "required": ["event_type"]
+      },
+      "then": {
+        "required": ["control_marker_type", "details"]
+      }
+    },
+    {
+      "if": {
+        "properties": { "event_type": { "const": "lifecycle_marker" } },
+        "required": ["event_type"]
+      },
+      "then": {
+        "required": ["lifecycle_phase", "reason", "details"]
+      }
+    }
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "source": {
+      "type": "string",
+      "enum": [
+        "wezterm_mux",
+        "robot_mode",
+        "workflow_engine",
+        "operator_action",
+        "recovery_flow"
+      ]
+    },
+    "encoding": {
+      "type": "string",
+      "enum": ["utf8"]
+    },
+    "redaction_level": {
+      "type": "string",
+      "enum": ["none", "partial", "full"]
+    },
+    "ingress_kind": {
+      "type": "string",
+      "enum": ["send_text", "paste", "workflow_action"]
+    },
+    "segment_kind": {
+      "type": "string",
+      "enum": ["delta", "gap", "snapshot"]
+    },
+    "control_marker_type": {
+      "type": "string",
+      "enum": [
+        "prompt_boundary",
+        "resize",
+        "policy_decision",
+        "approval_checkpoint"
+      ]
+    },
+    "lifecycle_phase": {
+      "type": "string",
+      "enum": [
+        "capture_started",
+        "capture_stopped",
+        "pane_opened",
+        "pane_closed",
+        "replay_started",
+        "replay_finished"
+      ]
+    }
+  },
+  "x-evolution-rules": {
+    "additive-compatible": [
+      "Adding optional fields is compatible within v1.",
+      "Adding optional nested keys under details is compatible within v1."
+    ],
+    "breaking-requires-new-version": [
+      "Changing field meaning/type or removing required fields requires a new schema_version.",
+      "Adding new event_type variants requires a new schema_version."
+    ],
+    "reader-policy": "Readers must reject unknown schema_version values."
+  }
+}

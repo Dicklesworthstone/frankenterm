@@ -9,7 +9,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::sync::{RwLock, Semaphore, mpsc};
+use crate::runtime_compat::{RwLock, Semaphore};
+use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tracing::{debug, trace, warn};
@@ -422,6 +423,8 @@ where
     metrics: TailerMetrics,
     /// Supervisor metrics
     supervisor_metrics: SupervisorMetrics,
+    /// Optional egress tap for flight recorder capture (ft-oegrb.2.3)
+    egress_tap: Option<crate::recording::SharedEgressTap>,
 }
 
 impl<S> TailerSupervisor<S>
@@ -456,6 +459,7 @@ where
             scheduler: CaptureScheduler::new(CaptureBudgetConfig::default()),
             metrics: TailerMetrics::default(),
             supervisor_metrics: SupervisorMetrics::default(),
+            egress_tap: None,
         }
     }
 
@@ -488,7 +492,13 @@ where
             scheduler: CaptureScheduler::new(budget),
             metrics: TailerMetrics::default(),
             supervisor_metrics: SupervisorMetrics::default(),
+            egress_tap: None,
         }
+    }
+
+    /// Set the egress tap for flight recorder capture.
+    pub fn set_egress_tap(&mut self, tap: crate::recording::SharedEgressTap) {
+        self.egress_tap = Some(tap);
     }
 
     /// Number of active tailers.
@@ -641,6 +651,7 @@ where
             let registry = Arc::clone(&self.registry);
             let source = Arc::clone(&self.source);
             let capture_circuit_breaker = Arc::clone(&self.capture_circuit_breaker);
+            let egress_tap = self.egress_tap.clone();
             let semaphore = Arc::clone(&self.semaphore);
             let overlap_size = self.config.overlap_size;
             let send_timeout = self.config.send_timeout;
@@ -677,6 +688,24 @@ where
                     };
 
                     if let Some(segment) = gap_segment {
+                        // Fire egress tap for overflow gap (ft-oegrb.2.3)
+                        if let Some(ref tap) = egress_tap {
+                            use crate::recording::{
+                                EgressEvent, RecorderRedactionLevel, RecorderSegmentKind,
+                                RecorderTextEncoding, epoch_ms_now,
+                            };
+                            tap.on_egress(EgressEvent {
+                                pane_id,
+                                text: segment.content.clone(),
+                                segment_kind: RecorderSegmentKind::Gap,
+                                is_gap: true,
+                                gap_reason: Some("backpressure_overflow".to_string()),
+                                encoding: RecorderTextEncoding::Utf8,
+                                redaction: RecorderRedactionLevel::None,
+                                occurred_at_ms: epoch_ms_now(),
+                                sequence: segment.seq,
+                            });
+                        }
                         permit.send(CaptureEvent { segment });
                         return (pane_id, PollOutcome::OverflowGapEmitted);
                     }
@@ -759,6 +788,31 @@ where
 
                 if let Some(segment) = captured {
                     let bytes = segment.content.len() as u64;
+                    // Fire egress tap for captured segment (ft-oegrb.2.3)
+                    if let Some(ref tap) = egress_tap {
+                        use crate::recording::{
+                            EgressEvent, RecorderRedactionLevel, RecorderTextEncoding,
+                            captured_kind_to_segment, epoch_ms_now,
+                        };
+                        let (seg_kind, is_gap) = captured_kind_to_segment(&segment.kind);
+                        let gap_reason = match &segment.kind {
+                            crate::ingest::CapturedSegmentKind::Gap { reason } => {
+                                Some(reason.clone())
+                            }
+                            _ => None,
+                        };
+                        tap.on_egress(EgressEvent {
+                            pane_id,
+                            text: segment.content.clone(),
+                            segment_kind: seg_kind,
+                            is_gap,
+                            gap_reason,
+                            encoding: RecorderTextEncoding::Utf8,
+                            redaction: RecorderRedactionLevel::None,
+                            occurred_at_ms: epoch_ms_now(),
+                            sequence: segment.seq,
+                        });
+                    }
                     permit.send(CaptureEvent { segment });
                     (pane_id, PollOutcome::Changed { bytes })
                 } else {
