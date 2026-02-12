@@ -83,6 +83,7 @@ pub mod docs_gen;
 pub mod drift;
 pub mod dry_run;
 pub mod email_notify;
+pub mod entropy_accounting;
 pub mod environment;
 pub mod error;
 pub mod error_clustering;

@@ -9,6 +9,8 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -559,6 +561,190 @@ pub fn parse_recorder_event_json(json: &str) -> crate::Result<RecorderEvent> {
         serde_json::from_value(raw).map_err(|e| crate::Error::Json(e))?;
     Ok(event)
 }
+
+// ---------------------------------------------------------------------------
+// Ingress tap — observer interface for mux ingress capture
+// ---------------------------------------------------------------------------
+
+/// Outcome of an ingress injection attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IngressOutcome {
+    /// Injection was allowed and executed successfully.
+    Allowed,
+    /// Injection was denied by policy.
+    Denied { reason: String },
+    /// Injection requires human approval before execution.
+    RequiresApproval,
+    /// Injection was allowed but the send failed.
+    Error { error: String },
+}
+
+/// An ingress event captured at a tap point.
+///
+/// Contains all metadata needed to produce a [`RecorderEvent`] with
+/// an [`RecorderEventPayload::IngressText`] payload.
+#[derive(Debug, Clone)]
+pub struct IngressEvent {
+    /// Target pane for the injection.
+    pub pane_id: u64,
+    /// The injected text (may be redacted).
+    pub text: String,
+    /// Source subsystem that produced this injection.
+    pub source: RecorderEventSource,
+    /// How the text was injected.
+    pub ingress_kind: RecorderIngressKind,
+    /// Redaction level applied to the captured text.
+    pub redaction: RecorderRedactionLevel,
+    /// Unix epoch milliseconds when the injection occurred.
+    pub occurred_at_ms: u64,
+    /// Outcome of the injection attempt.
+    pub outcome: IngressOutcome,
+    /// Optional workflow correlation ID.
+    pub workflow_id: Option<String>,
+}
+
+/// Observer interface for ingress event capture.
+///
+/// Implementations must be fast and non-blocking. The tap is called
+/// synchronously on the injection hot path — expensive work (persistence,
+/// network I/O) should be offloaded to a background task.
+pub trait IngressTap: Send + Sync {
+    /// Called when an ingress injection is attempted.
+    ///
+    /// This fires for ALL outcomes (allowed, denied, requires_approval, error)
+    /// to provide complete forensic visibility.
+    fn on_ingress(&self, event: IngressEvent);
+}
+
+/// Maps a [`crate::policy::ActorKind`] to a [`RecorderEventSource`].
+#[must_use]
+pub fn actor_to_source(actor: crate::policy::ActorKind) -> RecorderEventSource {
+    use crate::policy::ActorKind;
+    match actor {
+        ActorKind::Human => RecorderEventSource::OperatorAction,
+        ActorKind::Robot => RecorderEventSource::RobotMode,
+        ActorKind::Mcp => RecorderEventSource::RobotMode,
+        ActorKind::Workflow => RecorderEventSource::WorkflowEngine,
+    }
+}
+
+/// Maps a [`crate::policy::ActionKind`] and [`crate::policy::ActorKind`]
+/// to a [`RecorderIngressKind`].
+#[must_use]
+pub fn action_to_ingress_kind(
+    action: crate::policy::ActionKind,
+    actor: crate::policy::ActorKind,
+) -> RecorderIngressKind {
+    use crate::policy::{ActionKind, ActorKind};
+    match action {
+        ActionKind::SendText if actor == ActorKind::Workflow => RecorderIngressKind::WorkflowAction,
+        ActionKind::SendText => RecorderIngressKind::SendText,
+        // Control key sends are still "send_text" in the recorder schema
+        ActionKind::SendCtrlC
+        | ActionKind::SendCtrlD
+        | ActionKind::SendCtrlZ
+        | ActionKind::SendControl => {
+            if actor == ActorKind::Workflow {
+                RecorderIngressKind::WorkflowAction
+            } else {
+                RecorderIngressKind::SendText
+            }
+        }
+        // Non-injection actions shouldn't reach the tap, but map defensively
+        _ => RecorderIngressKind::SendText,
+    }
+}
+
+/// Returns the current Unix epoch in milliseconds.
+#[must_use]
+pub fn epoch_ms_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// Thread-safe monotonic sequence counter for recorder events.
+///
+/// Each pane should have its own counter. The counter is lock-free
+/// using `AtomicU64` with relaxed ordering (sufficient for monotonicity
+/// within a single process).
+#[derive(Debug)]
+pub struct IngressSequence {
+    next: AtomicU64,
+}
+
+impl IngressSequence {
+    /// Create a new sequence counter starting at 0.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            next: AtomicU64::new(0),
+        }
+    }
+
+    /// Advance and return the next sequence number.
+    pub fn next(&self) -> u64 {
+        self.next.fetch_add(1, Ordering::Relaxed)
+    }
+}
+
+impl Default for IngressSequence {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A collecting tap that stores all received events for testing.
+///
+/// Uses `std::sync::Mutex` (not async) because these methods are synchronous.
+#[cfg(any(test, feature = "test-util"))]
+#[derive(Debug, Default)]
+pub struct CollectingTap {
+    events: std::sync::Mutex<Vec<IngressEvent>>,
+}
+
+#[cfg(any(test, feature = "test-util"))]
+impl CollectingTap {
+    /// Create a new empty collecting tap.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Return a snapshot of all collected events.
+    pub fn events(&self) -> Vec<IngressEvent> {
+        self.events.lock().unwrap().clone()
+    }
+
+    /// Return the number of collected events.
+    pub fn len(&self) -> usize {
+        self.events.lock().unwrap().len()
+    }
+
+    /// Return true if no events have been collected.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+#[cfg(any(test, feature = "test-util"))]
+impl IngressTap for CollectingTap {
+    fn on_ingress(&self, event: IngressEvent) {
+        self.events.lock().unwrap().push(event);
+    }
+}
+
+/// No-op tap that discards all events (zero overhead).
+pub struct NoopTap;
+
+impl IngressTap for NoopTap {
+    #[inline]
+    fn on_ingress(&self, _event: IngressEvent) {}
+}
+
+/// Convenience alias for a shared ingress tap.
+pub type SharedIngressTap = Arc<dyn IngressTap>;
 
 #[cfg(test)]
 mod tests {
