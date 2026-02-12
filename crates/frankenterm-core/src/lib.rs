@@ -127,6 +127,7 @@ pub mod process_triage;
 pub mod protocol_recovery;
 pub mod recording;
 pub mod replay;
+pub mod reservoir_sampler;
 pub mod reports;
 pub mod restore_layout;
 pub mod restore_process;
