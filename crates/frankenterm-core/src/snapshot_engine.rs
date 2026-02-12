@@ -301,9 +301,84 @@ impl SnapshotEngine {
             .map_err(|e| SnapshotError::Database(e.to_string()))
     }
 
-    /// Run the periodic snapshot loop.
+    /// Configured value contribution for a trigger type.
+    fn trigger_value(&self, trigger: SnapshotTrigger) -> f64 {
+        let s = &self.config.scheduling;
+        match trigger {
+            SnapshotTrigger::WorkCompleted => s.work_completed_value,
+            SnapshotTrigger::StateTransition => s.state_transition_value,
+            SnapshotTrigger::IdleWindow => s.idle_window_value,
+            SnapshotTrigger::MemoryPressure => s.memory_pressure_value,
+            SnapshotTrigger::HazardThreshold => s.hazard_trigger_value,
+            SnapshotTrigger::Event => s.work_completed_value,
+            SnapshotTrigger::Periodic
+            | SnapshotTrigger::PeriodicFallback
+            | SnapshotTrigger::Manual
+            | SnapshotTrigger::Shutdown
+            | SnapshotTrigger::Startup => 0.0,
+        }
+    }
+
+    /// Whether this trigger should bypass threshold accumulation and fire immediately.
+    fn is_immediate_trigger(&self, trigger: SnapshotTrigger) -> bool {
+        matches!(
+            trigger,
+            SnapshotTrigger::HazardThreshold | SnapshotTrigger::MemoryPressure
+        )
+    }
+
+    /// Attempt a capture via the pane provider, with standard logging.
+    /// Returns `true` if a new checkpoint was persisted.
+    async fn capture_from_provider<F, Fut>(
+        &self,
+        pane_provider: &F,
+        trigger: SnapshotTrigger,
+    ) -> bool
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Option<Vec<PaneInfo>>> + Send,
+    {
+        if let Some(panes) = pane_provider().await {
+            match self.capture(&panes, trigger).await {
+                Ok(result) => {
+                    tracing::info!(
+                        trigger = ?trigger,
+                        pane_count = result.pane_count,
+                        total_bytes = result.total_bytes,
+                        checkpoint_id = result.checkpoint_id,
+                        "snapshot captured"
+                    );
+                    if let Err(e) = self.cleanup().await {
+                        tracing::warn!(error = %e, "snapshot retention cleanup failed");
+                    }
+                    true
+                }
+                Err(SnapshotError::NoChanges) => {
+                    tracing::debug!(trigger = ?trigger, "snapshot skipped: no changes");
+                    false
+                }
+                Err(SnapshotError::InProgress) => {
+                    tracing::debug!(trigger = ?trigger, "snapshot skipped: capture in progress");
+                    false
+                }
+                Err(e) => {
+                    tracing::warn!(trigger = ?trigger, error = %e, "snapshot capture failed");
+                    false
+                }
+            }
+        } else {
+            tracing::debug!(trigger = ?trigger, "snapshot skipped: no panes available");
+            false
+        }
+    }
+
+    /// Run the snapshot scheduling loop.
     ///
-    /// `pane_provider` is called each tick to fetch the current pane list.
+    /// In `Periodic` mode: captures at fixed intervals.
+    /// In `Intelligent` mode: accumulates trigger values and captures when
+    /// the threshold is reached, with a periodic fallback for liveness.
+    ///
+    /// `pane_provider` is called each time to fetch the current pane list.
     /// This decouples the engine from `WeztermClient` for testability.
     pub async fn run_periodic<F, Fut>(
         &self,
@@ -313,53 +388,106 @@ impl SnapshotEngine {
         F: Fn() -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Option<Vec<PaneInfo>>> + Send,
     {
-        let interval_secs = self.config.interval_seconds.max(30);
-        let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
-        // First tick fires immediately — use it for startup snapshot
-        let mut is_first = true;
+        match self.config.scheduling.mode {
+            SnapshotSchedulingMode::Periodic => {
+                let interval_secs = self.config.interval_seconds.max(30);
+                let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+                let mut is_first = true;
 
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    let trigger = if is_first {
-                        is_first = false;
-                        SnapshotTrigger::Startup
-                    } else {
-                        SnapshotTrigger::Periodic
-                    };
-
-                    if let Some(panes) = pane_provider().await {
-                        match self.capture(&panes, trigger).await {
-                            Ok(result) => {
-                                tracing::info!(
-                                    trigger = ?trigger,
-                                    pane_count = result.pane_count,
-                                    total_bytes = result.total_bytes,
-                                    checkpoint_id = result.checkpoint_id,
-                                    "snapshot captured"
-                                );
-                                // Run retention cleanup after successful capture
-                                if let Err(e) = self.cleanup().await {
-                                    tracing::warn!(error = %e, "snapshot retention cleanup failed");
-                                }
-                            }
-                            Err(SnapshotError::NoChanges) => {
-                                tracing::debug!("periodic snapshot skipped: no changes");
-                            }
-                            Err(SnapshotError::InProgress) => {
-                                tracing::debug!("periodic snapshot skipped: capture in progress");
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "snapshot capture failed");
-                            }
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            let trigger = if is_first {
+                                is_first = false;
+                                SnapshotTrigger::Startup
+                            } else {
+                                SnapshotTrigger::Periodic
+                            };
+                            let _ = self.capture_from_provider(&pane_provider, trigger).await;
                         }
-                    } else {
-                        tracing::debug!("periodic snapshot skipped: no panes available");
+                        _ = shutdown.changed() => {
+                            tracing::info!("snapshot engine shutting down");
+                            break;
+                        }
                     }
                 }
-                _ = shutdown.changed() => {
-                    tracing::info!("snapshot engine shutting down");
-                    break;
+            }
+            SnapshotSchedulingMode::Intelligent => {
+                let mut trigger_rx = {
+                    let mut guard = self.trigger_rx.lock().await;
+                    match guard.take() {
+                        Some(rx) => rx,
+                        None => {
+                            tracing::warn!(
+                                "snapshot intelligent scheduler: receiver already taken"
+                            );
+                            return;
+                        }
+                    }
+                };
+
+                // Startup capture (immediate).
+                let _ = self
+                    .capture_from_provider(&pane_provider, SnapshotTrigger::Startup)
+                    .await;
+
+                // Periodic fallback: capture even without triggers for liveness.
+                let fallback_secs = self
+                    .config
+                    .scheduling
+                    .periodic_fallback_minutes
+                    .max(1)
+                    .saturating_mul(60);
+                let mut fallback = tokio::time::interval(Duration::from_secs(fallback_secs));
+                fallback.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let _ = fallback.tick().await; // consume immediate first tick
+
+                let mut accumulated_value = 0.0_f64;
+                let snapshot_threshold = self.config.scheduling.snapshot_threshold.max(0.0);
+
+                loop {
+                    tokio::select! {
+                        maybe_trigger = trigger_rx.recv() => {
+                            let Some(trigger) = maybe_trigger else {
+                                tracing::info!("trigger channel closed; intelligent scheduler stopping");
+                                break;
+                            };
+
+                            let tv = self.trigger_value(trigger);
+                            if tv > 0.0 {
+                                accumulated_value += tv;
+                            }
+
+                            let immediate = self.is_immediate_trigger(trigger);
+                            let should_capture = immediate
+                                || snapshot_threshold <= 0.0
+                                || accumulated_value >= snapshot_threshold;
+
+                            if should_capture {
+                                let captured = self
+                                    .capture_from_provider(&pane_provider, trigger)
+                                    .await;
+                                if captured || immediate || snapshot_threshold <= 0.0 {
+                                    accumulated_value = 0.0;
+                                }
+                            }
+                        }
+                        _ = fallback.tick() => {
+                            let captured = self
+                                .capture_from_provider(
+                                    &pane_provider,
+                                    SnapshotTrigger::PeriodicFallback,
+                                )
+                                .await;
+                            if captured {
+                                accumulated_value = 0.0;
+                            }
+                        }
+                        _ = shutdown.changed() => {
+                            tracing::info!("snapshot engine shutting down");
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -1118,5 +1246,358 @@ mod tests {
         let id = generate_session_id();
         assert!(id.starts_with("sess-"));
         assert!(id.len() > 20);
+    }
+
+    // =========================================================================
+    // Intelligent scheduling tests
+    // =========================================================================
+
+    fn intelligent_config(threshold: f64) -> SnapshotConfig {
+        SnapshotConfig {
+            scheduling: crate::config::SnapshotSchedulingConfig {
+                mode: crate::config::SnapshotSchedulingMode::Intelligent,
+                snapshot_threshold: threshold,
+                work_completed_value: 2.0,
+                state_transition_value: 1.0,
+                idle_window_value: 3.0,
+                memory_pressure_value: 4.0,
+                hazard_trigger_value: 10.0,
+                periodic_fallback_minutes: 60,
+            },
+            ..SnapshotConfig::default()
+        }
+    }
+
+    #[test]
+    fn trigger_value_mapping() {
+        let (_tmp, db_path) = setup_test_db();
+        let engine = SnapshotEngine::new(db_path, intelligent_config(5.0));
+
+        assert!((engine.trigger_value(SnapshotTrigger::WorkCompleted) - 2.0).abs() < f64::EPSILON);
+        assert!(
+            (engine.trigger_value(SnapshotTrigger::StateTransition) - 1.0).abs() < f64::EPSILON
+        );
+        assert!((engine.trigger_value(SnapshotTrigger::IdleWindow) - 3.0).abs() < f64::EPSILON);
+        assert!(
+            (engine.trigger_value(SnapshotTrigger::MemoryPressure) - 4.0).abs() < f64::EPSILON
+        );
+        assert!(
+            (engine.trigger_value(SnapshotTrigger::HazardThreshold) - 10.0).abs() < f64::EPSILON
+        );
+        assert!((engine.trigger_value(SnapshotTrigger::Event) - 2.0).abs() < f64::EPSILON);
+        assert!((engine.trigger_value(SnapshotTrigger::Periodic)).abs() < f64::EPSILON);
+        assert!((engine.trigger_value(SnapshotTrigger::PeriodicFallback)).abs() < f64::EPSILON);
+        assert!((engine.trigger_value(SnapshotTrigger::Manual)).abs() < f64::EPSILON);
+        assert!((engine.trigger_value(SnapshotTrigger::Shutdown)).abs() < f64::EPSILON);
+        assert!((engine.trigger_value(SnapshotTrigger::Startup)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn immediate_trigger_classification() {
+        let (_tmp, db_path) = setup_test_db();
+        let engine = SnapshotEngine::new(db_path, intelligent_config(5.0));
+
+        assert!(engine.is_immediate_trigger(SnapshotTrigger::HazardThreshold));
+        assert!(engine.is_immediate_trigger(SnapshotTrigger::MemoryPressure));
+        assert!(!engine.is_immediate_trigger(SnapshotTrigger::WorkCompleted));
+        assert!(!engine.is_immediate_trigger(SnapshotTrigger::StateTransition));
+        assert!(!engine.is_immediate_trigger(SnapshotTrigger::IdleWindow));
+        assert!(!engine.is_immediate_trigger(SnapshotTrigger::Periodic));
+        assert!(!engine.is_immediate_trigger(SnapshotTrigger::Manual));
+        assert!(!engine.is_immediate_trigger(SnapshotTrigger::Shutdown));
+        assert!(!engine.is_immediate_trigger(SnapshotTrigger::Startup));
+        assert!(!engine.is_immediate_trigger(SnapshotTrigger::Event));
+    }
+
+    #[tokio::test]
+    async fn emit_trigger_sends_to_channel() {
+        let (_tmp, db_path) = setup_test_db();
+        let engine = SnapshotEngine::new(db_path, intelligent_config(5.0));
+
+        assert!(engine.emit_trigger(SnapshotTrigger::WorkCompleted));
+        assert!(engine.emit_trigger(SnapshotTrigger::StateTransition));
+
+        let mut rx = engine.trigger_rx.lock().await.take().unwrap();
+        assert_eq!(rx.recv().await.unwrap(), SnapshotTrigger::WorkCompleted);
+        assert_eq!(rx.recv().await.unwrap(), SnapshotTrigger::StateTransition);
+    }
+
+    fn checkpoint_count(db_path: &str) -> i64 {
+        let conn = Connection::open(db_path).unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM session_checkpoints",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn counting_pane_provider(
+    ) -> impl Fn() -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<Vec<PaneInfo>>> + Send>,
+    > + Send
+           + Sync
+           + 'static {
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        move || {
+            let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move { Some(vec![make_test_pane(n as u64, 24 + n, 80)]) })
+        }
+    }
+
+    #[tokio::test]
+    async fn intelligent_accumulates_below_threshold() {
+        let (_tmp, db_path) = setup_test_db();
+        let engine = Arc::new(SnapshotEngine::new(db_path.clone(), intelligent_config(5.0)));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let e2 = engine.clone();
+        let handle = tokio::spawn(async move {
+            e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let after_startup = checkpoint_count(db_path.as_str());
+        assert_eq!(after_startup, 1, "startup capture");
+
+        // Sum = 4.0 < threshold(5.0)
+        engine.emit_trigger(SnapshotTrigger::WorkCompleted); // +2.0
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        engine.emit_trigger(SnapshotTrigger::StateTransition); // +1.0
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        engine.emit_trigger(SnapshotTrigger::StateTransition); // +1.0 = 4.0
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let after_below = checkpoint_count(db_path.as_str());
+        assert_eq!(after_below, 1, "below threshold: no new capture");
+
+        shutdown_tx.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn intelligent_captures_at_threshold() {
+        let (_tmp, db_path) = setup_test_db();
+        let engine = Arc::new(SnapshotEngine::new(db_path.clone(), intelligent_config(5.0)));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let e2 = engine.clone();
+        let handle = tokio::spawn(async move {
+            e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // 3 x WorkCompleted = 6.0 >= 5.0
+        engine.emit_trigger(SnapshotTrigger::WorkCompleted);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        engine.emit_trigger(SnapshotTrigger::WorkCompleted);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        engine.emit_trigger(SnapshotTrigger::WorkCompleted);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let count = checkpoint_count(db_path.as_str());
+        assert_eq!(count, 2, "startup + threshold capture");
+
+        shutdown_tx.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn intelligent_immediate_bypasses_threshold() {
+        let (_tmp, db_path) = setup_test_db();
+        let engine = Arc::new(SnapshotEngine::new(
+            db_path.clone(),
+            intelligent_config(100.0),
+        ));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let e2 = engine.clone();
+        let handle = tokio::spawn(async move {
+            e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        engine.emit_trigger(SnapshotTrigger::HazardThreshold);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let count = checkpoint_count(db_path.as_str());
+        assert_eq!(count, 2, "startup + immediate HazardThreshold");
+
+        shutdown_tx.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn intelligent_memory_pressure_immediate() {
+        let (_tmp, db_path) = setup_test_db();
+        let engine = Arc::new(SnapshotEngine::new(
+            db_path.clone(),
+            intelligent_config(100.0),
+        ));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let e2 = engine.clone();
+        let handle = tokio::spawn(async move {
+            e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        engine.emit_trigger(SnapshotTrigger::MemoryPressure);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let count = checkpoint_count(db_path.as_str());
+        assert_eq!(count, 2, "startup + immediate MemoryPressure");
+
+        shutdown_tx.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn intelligent_value_resets_after_capture() {
+        let (_tmp, db_path) = setup_test_db();
+        let engine = Arc::new(SnapshotEngine::new(db_path.clone(), intelligent_config(5.0)));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let e2 = engine.clone();
+        let handle = tokio::spawn(async move {
+            e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // First batch: 3 x 2.0 = 6.0 >= 5.0 → capture + reset
+        for _ in 0..3 {
+            engine.emit_trigger(SnapshotTrigger::WorkCompleted);
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            checkpoint_count(db_path.as_str()),
+            2,
+            "startup + first threshold"
+        );
+
+        // Second batch: 2 x 2.0 = 4.0 < 5.0 (reset happened)
+        engine.emit_trigger(SnapshotTrigger::WorkCompleted);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        engine.emit_trigger(SnapshotTrigger::WorkCompleted);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            checkpoint_count(db_path.as_str()),
+            2,
+            "still 2: 4.0 < 5.0 after reset"
+        );
+
+        // Third trigger crosses again: 4.0 + 2.0 = 6.0
+        engine.emit_trigger(SnapshotTrigger::WorkCompleted);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            checkpoint_count(db_path.as_str()),
+            3,
+            "startup + 2 threshold captures"
+        );
+
+        shutdown_tx.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn intelligent_shutdown_stops_loop() {
+        let (_tmp, db_path) = setup_test_db();
+        let engine = Arc::new(SnapshotEngine::new(db_path.clone(), intelligent_config(5.0)));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let e2 = engine.clone();
+        let handle = tokio::spawn(async move {
+            e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        shutdown_tx.send(true).unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        assert!(result.is_ok(), "run_periodic exits on shutdown");
+    }
+
+    #[tokio::test]
+    async fn intelligent_zero_threshold_captures_every_trigger() {
+        let (_tmp, db_path) = setup_test_db();
+        let engine = Arc::new(SnapshotEngine::new(db_path.clone(), intelligent_config(0.0)));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let e2 = engine.clone();
+        let handle = tokio::spawn(async move {
+            e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        engine.emit_trigger(SnapshotTrigger::WorkCompleted);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        engine.emit_trigger(SnapshotTrigger::StateTransition);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let count = checkpoint_count(db_path.as_str());
+        assert_eq!(count, 3, "startup + 2 captures (zero threshold)");
+
+        shutdown_tx.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn periodic_mode_ignores_triggers() {
+        let (_tmp, db_path) = setup_test_db();
+        let config = SnapshotConfig {
+            interval_seconds: 3600,
+            scheduling: crate::config::SnapshotSchedulingConfig {
+                mode: crate::config::SnapshotSchedulingMode::Periodic,
+                ..Default::default()
+            },
+            ..SnapshotConfig::default()
+        };
+        let engine = Arc::new(SnapshotEngine::new(db_path.clone(), config));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let e2 = engine.clone();
+        let handle = tokio::spawn(async move {
+            e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        engine.emit_trigger(SnapshotTrigger::HazardThreshold);
+        engine.emit_trigger(SnapshotTrigger::WorkCompleted);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let count = checkpoint_count(db_path.as_str());
+        assert_eq!(count, 1, "periodic mode: only startup");
+
+        shutdown_tx.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn emit_trigger_returns_false_when_full() {
+        let (_tmp, db_path) = setup_test_db();
+        let (trigger_tx, _trigger_rx) = mpsc::channel::<SnapshotTrigger>(2);
+        let engine = SnapshotEngine {
+            db_path,
+            config: intelligent_config(5.0),
+            session_id: tokio::sync::RwLock::new(None),
+            last_state_hash: tokio::sync::RwLock::new(None),
+            in_progress: AtomicBool::new(false),
+            trigger_tx,
+            trigger_rx: Mutex::new(None),
+        };
+
+        assert!(engine.emit_trigger(SnapshotTrigger::WorkCompleted));
+        assert!(engine.emit_trigger(SnapshotTrigger::WorkCompleted));
+        assert!(
+            !engine.emit_trigger(SnapshotTrigger::WorkCompleted),
+            "channel full: returns false"
+        );
     }
 }
