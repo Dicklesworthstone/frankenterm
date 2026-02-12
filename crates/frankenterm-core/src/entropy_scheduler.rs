@@ -294,27 +294,27 @@ impl EntropyScheduler {
         }
     }
 
-    /// Map entropy density to a capture interval.
-    fn density_to_interval(&self, density: f64) -> u64 {
-        let effective_density = density.max(self.config.density_floor);
-        let interval = self.config.base_interval_ms as f64 / effective_density;
-        (interval as u64).clamp(self.config.min_interval_ms, self.config.max_interval_ms)
-    }
-
     /// Recompute interval for a pane after new data.
     fn recompute_pane(&mut self, pane_id: u64) {
-        if let Some(state) = self.panes.get_mut(&pane_id) {
-            if state.estimator.total_bytes() < self.config.min_samples {
-                state.last_density = self.config.density_floor;
-                state.last_interval_ms = self.config.warmup_interval_ms;
-                return;
-            }
+        let Some(state) = self.panes.get_mut(&pane_id) else {
+            return;
+        };
 
-            let h = state.estimator.entropy();
-            let density = (h / H_MAX).clamp(0.0, 1.0);
-            state.last_density = density;
-            state.last_interval_ms = self.density_to_interval(density);
+        if state.estimator.total_bytes() < self.config.min_samples {
+            state.last_density = self.config.density_floor;
+            state.last_interval_ms = self.config.warmup_interval_ms;
+            return;
         }
+
+        let h = state.estimator.entropy();
+        let density = (h / H_MAX).clamp(0.0, 1.0);
+        state.last_density = density;
+
+        // Compute interval inline to avoid borrowing self while state is borrowed
+        let effective_density = density.max(self.config.density_floor);
+        let interval = self.config.base_interval_ms as f64 / effective_density;
+        state.last_interval_ms =
+            (interval as u64).clamp(self.config.min_interval_ms, self.config.max_interval_ms);
     }
 }
 
