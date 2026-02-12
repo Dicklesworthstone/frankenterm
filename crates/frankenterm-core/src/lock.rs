@@ -293,4 +293,170 @@ mod tests {
         assert!(!meta.wa_version.is_empty());
         assert!(meta.started_at > 0);
     }
+
+    // ── Pure function tests ──
+
+    #[test]
+    fn lock_error_display_already_running() {
+        let err = LockError::AlreadyRunning {
+            pid: 12345,
+            started_at: "unix:1700000000".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("12345"));
+        assert!(msg.contains("unix:1700000000"));
+    }
+
+    #[test]
+    fn lock_error_display_no_meta() {
+        let err = LockError::AlreadyRunningNoMeta;
+        assert!(err.to_string().contains("metadata unavailable"));
+    }
+
+    #[test]
+    fn lock_error_display_io() {
+        let err = LockError::Io(io::Error::new(io::ErrorKind::PermissionDenied, "denied"));
+        assert!(err.to_string().contains("denied"));
+    }
+
+    #[test]
+    fn lock_error_display_metadata() {
+        let json_err = serde_json::from_str::<LockMetadata>("not json").unwrap_err();
+        let err = LockError::Metadata(json_err);
+        assert!(err.to_string().contains("metadata error"));
+    }
+
+    #[test]
+    fn lock_metadata_new_has_valid_fields() {
+        let meta = LockMetadata::new();
+        assert_eq!(meta.pid, std::process::id());
+        assert!(meta.started_at > 0);
+        assert!(meta.started_at_human.starts_with("unix:"));
+        assert!(!meta.wa_version.is_empty());
+    }
+
+    #[test]
+    fn lock_metadata_serde_roundtrip() {
+        let meta = LockMetadata {
+            pid: 999,
+            started_at: 1_700_000_000,
+            started_at_human: "unix:1700000000".to_string(),
+            wa_version: "0.1.0".to_string(),
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let back: LockMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.pid, 999);
+        assert_eq!(back.started_at, 1_700_000_000);
+        assert_eq!(back.wa_version, "0.1.0");
+    }
+
+    #[test]
+    fn chrono_lite_format_output() {
+        assert_eq!(chrono_lite_format(0), "unix:0");
+        assert_eq!(chrono_lite_format(1_700_000_000), "unix:1700000000");
+    }
+
+    #[test]
+    fn metadata_path_appends_meta_json() {
+        let path = PathBuf::from("/tmp/ft.lock");
+        let meta = metadata_path(&path);
+        assert_eq!(meta, PathBuf::from("/tmp/ft.lock.meta.json"));
+    }
+
+    #[test]
+    fn metadata_path_handles_no_extension() {
+        let path = PathBuf::from("/tmp/watcher");
+        let meta = metadata_path(&path);
+        assert_eq!(meta, PathBuf::from("/tmp/watcher.meta.json"));
+    }
+
+    #[test]
+    fn read_existing_lock_error_with_valid_meta() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("test.lock");
+        let meta_path = metadata_path(&lock_path);
+
+        let meta = LockMetadata {
+            pid: 42,
+            started_at: 1234,
+            started_at_human: "unix:1234".to_string(),
+            wa_version: "0.1.0".to_string(),
+        };
+        let json = serde_json::to_string_pretty(&meta).unwrap();
+        fs::write(&meta_path, json).unwrap();
+
+        match read_existing_lock_error(&lock_path) {
+            LockError::AlreadyRunning { pid, started_at } => {
+                assert_eq!(pid, 42);
+                assert_eq!(started_at, "unix:1234");
+            }
+            other => panic!("Expected AlreadyRunning, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn read_existing_lock_error_with_corrupt_meta() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("test.lock");
+        let meta_path = metadata_path(&lock_path);
+
+        fs::write(&meta_path, "not valid json").unwrap();
+
+        assert!(matches!(
+            read_existing_lock_error(&lock_path),
+            LockError::AlreadyRunningNoMeta
+        ));
+    }
+
+    #[test]
+    fn read_existing_lock_error_no_meta_file() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("test.lock");
+
+        assert!(matches!(
+            read_existing_lock_error(&lock_path),
+            LockError::AlreadyRunningNoMeta
+        ));
+    }
+
+    #[test]
+    fn lock_path_and_meta_path_accessors() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("test.lock");
+        let lock = WatcherLock::acquire(&lock_path).unwrap();
+
+        assert_eq!(lock.lock_path(), lock_path);
+        assert_eq!(lock.meta_path(), metadata_path(&lock_path));
+    }
+
+    #[test]
+    fn reacquire_after_release() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("test.lock");
+
+        let lock1 = WatcherLock::acquire(&lock_path).unwrap();
+        drop(lock1);
+
+        // Should be reacquirable
+        let lock2 = WatcherLock::acquire(&lock_path);
+        assert!(lock2.is_ok());
+    }
+
+    #[test]
+    fn check_running_no_file_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("nonexistent.lock");
+        assert!(check_running(&lock_path).is_none());
+    }
+
+    #[test]
+    fn acquire_creates_parent_directories() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("sub").join("dir").join("test.lock");
+        assert!(!tmp.path().join("sub").exists());
+
+        let lock = WatcherLock::acquire(&lock_path).unwrap();
+        assert!(lock_path.exists());
+        drop(lock);
+    }
 }
