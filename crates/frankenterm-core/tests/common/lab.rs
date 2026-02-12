@@ -10,7 +10,7 @@
 
 use asupersync::lab::chaos::ChaosConfig;
 use asupersync::lab::explorer::{ExplorerConfig, ExplorationReport, ScheduleExplorer};
-use asupersync::{Budget, LabConfig, LabRuntime, Time};
+use asupersync::{LabConfig, LabRuntime, Time};
 
 // ---------------------------------------------------------------------------
 // LabTestConfig — ergonomic builder for test-level config
