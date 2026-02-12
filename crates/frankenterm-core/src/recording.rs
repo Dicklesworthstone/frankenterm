@@ -12,7 +12,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use crate::runtime_compat::Mutex;
 
 use crate::Result;
 use crate::ingest::{CapturedSegment, CapturedSegmentKind};
@@ -397,6 +397,167 @@ fn redact_detection(detection: &Detection, redactor: &Redactor) -> Detection {
         }
     }
     redacted
+}
+
+// ---------------------------------------------------------------------------
+// Recorder event schema v1 — versioned canonical events for flight recorder
+// ---------------------------------------------------------------------------
+
+/// Schema version string for the v1 recorder event contract.
+pub const RECORDER_EVENT_SCHEMA_VERSION_V1: &str = "ft.recorder.event.v1";
+
+/// Source subsystem that produced the event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecorderEventSource {
+    WeztermMux,
+    RobotMode,
+    WorkflowEngine,
+    OperatorAction,
+    RecoveryFlow,
+}
+
+/// Text encoding used for ingress/egress payloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecorderTextEncoding {
+    Utf8,
+}
+
+/// Redaction level applied to captured text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecorderRedactionLevel {
+    None,
+    Partial,
+    Full,
+}
+
+/// How ingress text was injected into the mux.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecorderIngressKind {
+    SendText,
+    Paste,
+    WorkflowAction,
+}
+
+/// Kind of egress output segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecorderSegmentKind {
+    Delta,
+    Gap,
+    Snapshot,
+}
+
+/// Type of control marker event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecorderControlMarkerType {
+    PromptBoundary,
+    Resize,
+    PolicyDecision,
+    ApprovalCheckpoint,
+}
+
+/// Lifecycle phase for capture state transitions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecorderLifecyclePhase {
+    CaptureStarted,
+    CaptureStopped,
+    PaneOpened,
+    PaneClosed,
+    ReplayStarted,
+    ReplayFinished,
+}
+
+/// Causal linkage between recorder events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecorderEventCausality {
+    pub parent_event_id: Option<String>,
+    pub trigger_event_id: Option<String>,
+    pub root_event_id: Option<String>,
+}
+
+/// Variant-specific payload for a recorder event.
+///
+/// Serializes with an internally tagged `event_type` discriminant so all
+/// fields appear at the top level when flattened into [`RecorderEvent`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "event_type", rename_all = "snake_case")]
+pub enum RecorderEventPayload {
+    IngressText {
+        text: String,
+        encoding: RecorderTextEncoding,
+        redaction: RecorderRedactionLevel,
+        ingress_kind: RecorderIngressKind,
+    },
+    EgressOutput {
+        text: String,
+        encoding: RecorderTextEncoding,
+        redaction: RecorderRedactionLevel,
+        segment_kind: RecorderSegmentKind,
+        is_gap: bool,
+    },
+    ControlMarker {
+        control_marker_type: RecorderControlMarkerType,
+        details: serde_json::Value,
+    },
+    LifecycleMarker {
+        lifecycle_phase: RecorderLifecyclePhase,
+        reason: Option<String>,
+        details: serde_json::Value,
+    },
+}
+
+/// A versioned recorder event for the flight recorder.
+///
+/// The payload is flattened so all fields appear at the top level in JSON,
+/// matching the `ft-recorder-event-v1.json` schema contract.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecorderEvent {
+    pub schema_version: String,
+    pub event_id: String,
+    pub pane_id: u64,
+    pub session_id: Option<String>,
+    pub workflow_id: Option<String>,
+    pub correlation_id: Option<String>,
+    pub source: RecorderEventSource,
+    pub occurred_at_ms: u64,
+    pub recorded_at_ms: u64,
+    pub sequence: u64,
+    pub causality: RecorderEventCausality,
+    #[serde(flatten)]
+    pub payload: RecorderEventPayload,
+}
+
+/// Parse a JSON string into a [`RecorderEvent`], validating the schema version.
+///
+/// Returns an error if the schema version is not `ft.recorder.event.v1`.
+/// Tolerates unknown additive fields for forward compatibility.
+pub fn parse_recorder_event_json(json: &str) -> crate::Result<RecorderEvent> {
+    // First pass: check schema version before full deserialization.
+    let raw: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| crate::Error::Json(e))?;
+
+    let version = raw
+        .get("schema_version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    if version != RECORDER_EVENT_SCHEMA_VERSION_V1 {
+        return Err(crate::Error::Runtime(format!(
+            "unsupported recorder event schema version: {version:?} \
+             (expected {RECORDER_EVENT_SCHEMA_VERSION_V1:?})"
+        )));
+    }
+
+    // Second pass: deserialize with serde, tolerating unknown fields.
+    let event: RecorderEvent =
+        serde_json::from_value(raw).map_err(|e| crate::Error::Json(e))?;
+    Ok(event)
 }
 
 #[cfg(test)]
