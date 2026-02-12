@@ -693,6 +693,33 @@ impl Default for IngressSequence {
     }
 }
 
+/// Process-wide monotonic sequence counter for cross-pane merge ordering.
+#[derive(Debug)]
+pub struct GlobalSequence {
+    next: AtomicU64,
+}
+
+impl GlobalSequence {
+    /// Create a new global sequence counter starting at 0.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            next: AtomicU64::new(0),
+        }
+    }
+
+    /// Advance and return the next global sequence number.
+    pub fn next(&self) -> u64 {
+        self.next.fetch_add(1, Ordering::Relaxed)
+    }
+}
+
+impl Default for GlobalSequence {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// A collecting tap that stores all received events for testing.
 ///
 /// Uses `std::sync::Mutex` (not async) because these methods are synchronous.
@@ -772,6 +799,8 @@ pub struct EgressEvent {
     pub occurred_at_ms: u64,
     /// Per-pane monotonic sequence number.
     pub sequence: u64,
+    /// Process-wide monotonic sequence used to merge inter-pane streams.
+    pub global_sequence: u64,
 }
 
 /// Observer interface for egress event capture.
