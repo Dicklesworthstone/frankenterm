@@ -129,6 +129,7 @@ pub mod recording;
 pub mod replay;
 pub mod reservoir_sampler;
 pub mod reports;
+pub mod ring_buffer;
 pub mod restore_layout;
 pub mod restore_process;
 pub mod restore_scrollback;
