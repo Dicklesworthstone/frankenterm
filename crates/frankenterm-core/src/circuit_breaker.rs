@@ -563,4 +563,422 @@ mod tests {
         recover(Subsystem::MuxConnection);
         recover(Subsystem::WorkflowEngine);
     }
+
+    // --- Config tests ---
+
+    #[test]
+    fn config_clamps_zero_thresholds_to_one() {
+        let config = CircuitBreakerConfig::new(0, 0, Duration::from_secs(5));
+        assert_eq!(config.failure_threshold, 1);
+        assert_eq!(config.success_threshold, 1);
+        assert_eq!(config.open_cooldown, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn config_preserves_nonzero_thresholds() {
+        let config = CircuitBreakerConfig::new(5, 3, Duration::from_millis(500));
+        assert_eq!(config.failure_threshold, 5);
+        assert_eq!(config.success_threshold, 3);
+        assert_eq!(config.open_cooldown, Duration::from_millis(500));
+    }
+
+    #[test]
+    fn default_config_values() {
+        let config = CircuitBreakerConfig::default();
+        assert_eq!(config.failure_threshold, 3);
+        assert_eq!(config.success_threshold, 1);
+        assert_eq!(config.open_cooldown, Duration::from_secs(10));
+    }
+
+    // --- State machine: closed state ---
+
+    #[test]
+    fn closed_allows_operations() {
+        let mut breaker = CircuitBreaker::new(CircuitBreakerConfig::default());
+        for _ in 0..10 {
+            assert!(breaker.allow());
+        }
+    }
+
+    #[test]
+    fn success_in_closed_resets_failure_counter() {
+        let mut breaker =
+            CircuitBreaker::new(CircuitBreakerConfig::new(3, 1, Duration::from_secs(10)));
+
+        breaker.record_failure();
+        breaker.record_failure();
+        assert_eq!(breaker.status().consecutive_failures, 2);
+
+        breaker.record_success();
+        assert_eq!(breaker.status().consecutive_failures, 0);
+        assert_eq!(breaker.status().state, CircuitStateKind::Closed);
+    }
+
+    #[test]
+    fn failures_below_threshold_stay_closed() {
+        let mut breaker =
+            CircuitBreaker::new(CircuitBreakerConfig::new(5, 1, Duration::from_secs(10)));
+
+        for i in 1..5 {
+            breaker.record_failure();
+            assert_eq!(breaker.status().state, CircuitStateKind::Closed);
+            assert_eq!(breaker.status().consecutive_failures, i);
+        }
+    }
+
+    // --- State machine: open state ---
+
+    #[test]
+    fn open_blocks_operations() {
+        let mut breaker =
+            CircuitBreaker::new(CircuitBreakerConfig::new(1, 1, Duration::from_secs(60)));
+
+        breaker.record_failure();
+        assert_eq!(breaker.status().state, CircuitStateKind::Open);
+        assert!(!breaker.allow());
+        assert!(!breaker.allow());
+    }
+
+    #[test]
+    fn failure_while_open_is_noop() {
+        let mut breaker =
+            CircuitBreaker::new(CircuitBreakerConfig::new(1, 1, Duration::from_secs(60)));
+
+        breaker.record_failure(); // opens
+        let failures_before = breaker.status().consecutive_failures;
+        breaker.record_failure(); // should be ignored
+        assert_eq!(breaker.status().consecutive_failures, failures_before);
+        assert_eq!(breaker.status().state, CircuitStateKind::Open);
+    }
+
+    #[test]
+    fn success_while_open_is_ignored() {
+        let mut breaker =
+            CircuitBreaker::new(CircuitBreakerConfig::new(1, 1, Duration::from_secs(60)));
+
+        breaker.record_failure(); // opens
+        breaker.record_success(); // should be ignored — no operations should run while open
+        assert_eq!(breaker.status().state, CircuitStateKind::Open);
+    }
+
+    // --- State machine: half-open state ---
+
+    #[test]
+    fn multiple_successes_needed_to_close_from_half_open() {
+        let mut breaker =
+            CircuitBreaker::new(CircuitBreakerConfig::new(1, 3, Duration::from_millis(0)));
+
+        breaker.record_failure(); // open
+        assert!(breaker.allow()); // half-open (0ms cooldown)
+        assert_eq!(breaker.status().state, CircuitStateKind::HalfOpen);
+        assert_eq!(breaker.status().half_open_successes, Some(0));
+
+        breaker.record_success();
+        assert_eq!(breaker.status().state, CircuitStateKind::HalfOpen);
+        assert_eq!(breaker.status().half_open_successes, Some(1));
+
+        breaker.record_success();
+        assert_eq!(breaker.status().state, CircuitStateKind::HalfOpen);
+        assert_eq!(breaker.status().half_open_successes, Some(2));
+
+        breaker.record_success();
+        assert_eq!(breaker.status().state, CircuitStateKind::Closed);
+        assert_eq!(breaker.status().consecutive_failures, 0);
+    }
+
+    #[test]
+    fn half_open_allows_operations() {
+        let mut breaker =
+            CircuitBreaker::new(CircuitBreakerConfig::new(1, 2, Duration::from_millis(0)));
+
+        breaker.record_failure();
+        assert!(breaker.allow()); // transitions to half-open
+        assert!(breaker.allow()); // still allowed in half-open
+    }
+
+    // --- Status snapshot tests ---
+
+    #[test]
+    fn closed_status_snapshot() {
+        let mut breaker =
+            CircuitBreaker::new(CircuitBreakerConfig::new(3, 2, Duration::from_secs(10)));
+        breaker.record_failure();
+
+        let status = breaker.status();
+        assert_eq!(status.state, CircuitStateKind::Closed);
+        assert_eq!(status.consecutive_failures, 1);
+        assert_eq!(status.failure_threshold, 3);
+        assert_eq!(status.success_threshold, 2);
+        assert_eq!(status.open_cooldown_ms, 10_000);
+        assert!(status.open_for_ms.is_none());
+        assert!(status.cooldown_remaining_ms.is_none());
+        assert!(status.half_open_successes.is_none());
+    }
+
+    #[test]
+    fn open_status_snapshot_has_timing() {
+        let mut breaker =
+            CircuitBreaker::new(CircuitBreakerConfig::new(1, 1, Duration::from_secs(60)));
+        breaker.record_failure();
+
+        let status = breaker.status();
+        assert_eq!(status.state, CircuitStateKind::Open);
+        assert!(status.open_for_ms.is_some());
+        assert!(status.cooldown_remaining_ms.is_some());
+        assert!(status.half_open_successes.is_none());
+    }
+
+    #[test]
+    fn half_open_status_snapshot() {
+        let mut breaker =
+            CircuitBreaker::new(CircuitBreakerConfig::new(1, 3, Duration::from_millis(0)));
+        breaker.record_failure();
+        breaker.allow(); // transitions to half-open
+
+        let status = breaker.status();
+        assert_eq!(status.state, CircuitStateKind::HalfOpen);
+        assert_eq!(status.half_open_successes, Some(0));
+        assert!(status.open_for_ms.is_none());
+    }
+
+    // --- Serde roundtrip tests ---
+
+    #[test]
+    fn circuit_state_kind_serde_roundtrip() {
+        for kind in [
+            CircuitStateKind::Closed,
+            CircuitStateKind::Open,
+            CircuitStateKind::HalfOpen,
+        ] {
+            let json = serde_json::to_string(&kind).unwrap();
+            let back: CircuitStateKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(kind, back);
+        }
+    }
+
+    #[test]
+    fn circuit_state_kind_rename_all() {
+        assert_eq!(
+            serde_json::to_string(&CircuitStateKind::Closed).unwrap(),
+            "\"closed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CircuitStateKind::Open).unwrap(),
+            "\"open\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CircuitStateKind::HalfOpen).unwrap(),
+            "\"half_open\""
+        );
+    }
+
+    #[test]
+    fn circuit_breaker_status_serde_roundtrip() {
+        let status = CircuitBreakerStatus {
+            state: CircuitStateKind::Open,
+            consecutive_failures: 5,
+            failure_threshold: 3,
+            success_threshold: 2,
+            open_cooldown_ms: 10_000,
+            open_for_ms: Some(3_500),
+            cooldown_remaining_ms: Some(6_500),
+            half_open_successes: None,
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        let back: CircuitBreakerStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.state, status.state);
+        assert_eq!(back.consecutive_failures, status.consecutive_failures);
+        assert_eq!(back.open_for_ms, status.open_for_ms);
+        assert_eq!(back.cooldown_remaining_ms, status.cooldown_remaining_ms);
+    }
+
+    #[test]
+    fn circuit_breaker_status_default() {
+        let status = CircuitBreakerStatus::default();
+        assert_eq!(status.state, CircuitStateKind::Closed);
+        assert_eq!(status.consecutive_failures, 0);
+        assert!(status.open_for_ms.is_none());
+        assert!(status.half_open_successes.is_none());
+    }
+
+    #[test]
+    fn circuit_breaker_snapshot_serde_roundtrip() {
+        let snapshot = CircuitBreakerSnapshot {
+            name: "test_circuit".to_string(),
+            status: CircuitBreakerStatus {
+                state: CircuitStateKind::HalfOpen,
+                consecutive_failures: 2,
+                failure_threshold: 3,
+                success_threshold: 1,
+                open_cooldown_ms: 5000,
+                open_for_ms: None,
+                cooldown_remaining_ms: None,
+                half_open_successes: Some(1),
+            },
+        };
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let back: CircuitBreakerSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.name, "test_circuit");
+        assert_eq!(back.status.state, CircuitStateKind::HalfOpen);
+        assert_eq!(back.status.half_open_successes, Some(1));
+    }
+
+    // --- CascadeTracker tests ---
+
+    #[test]
+    fn cascade_tracker_no_cascade_with_single_subsystem() {
+        let mut tracker = CascadeTracker::default();
+        let result = tracker.record_open("wezterm_cli", Some(Subsystem::WeztermCli));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn cascade_tracker_triggers_on_two_subsystems() {
+        let mut tracker = CascadeTracker::default();
+        tracker.record_open("wezterm_cli", Some(Subsystem::WeztermCli));
+        let result = tracker.record_open("mux_connection", Some(Subsystem::MuxConnection));
+        assert!(result.is_some());
+        let cascade = result.unwrap();
+        assert_eq!(cascade.subsystems.len(), 2);
+        assert_eq!(cascade.circuits.len(), 2);
+    }
+
+    #[test]
+    fn cascade_tracker_no_cascade_without_subsystem() {
+        let mut tracker = CascadeTracker::default();
+        tracker.record_open("custom_a", None);
+        let result = tracker.record_open("custom_b", None);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn cascade_tracker_dedup_within_window() {
+        let mut tracker = CascadeTracker::default();
+        tracker.record_open("wezterm_cli", Some(Subsystem::WeztermCli));
+        let first = tracker.record_open("mux_connection", Some(Subsystem::MuxConnection));
+        assert!(first.is_some());
+
+        // Second cascade in same window should be suppressed
+        let second = tracker.record_open("capture_pipeline", Some(Subsystem::Capture));
+        assert!(second.is_none());
+    }
+
+    #[test]
+    fn cascade_tracker_same_subsystem_twice_no_cascade() {
+        let mut tracker = CascadeTracker::default();
+        tracker.record_open("wezterm_cli", Some(Subsystem::WeztermCli));
+        let result = tracker.record_open("wezterm_cli_2", Some(Subsystem::WeztermCli));
+        assert!(result.is_none()); // same subsystem, not enough distinct subsystems
+    }
+
+    // --- subsystem_for_circuit mapping ---
+
+    #[test]
+    fn subsystem_mapping_covers_known_circuits() {
+        assert_eq!(
+            subsystem_for_circuit("wezterm_cli"),
+            Some(Subsystem::WeztermCli)
+        );
+        assert_eq!(
+            subsystem_for_circuit("mux_connection"),
+            Some(Subsystem::MuxConnection)
+        );
+        assert_eq!(
+            subsystem_for_circuit("capture_pipeline"),
+            Some(Subsystem::Capture)
+        );
+        assert_eq!(
+            subsystem_for_circuit("db_write"),
+            Some(Subsystem::DbWrite)
+        );
+        assert_eq!(
+            subsystem_for_circuit("pattern_engine"),
+            Some(Subsystem::PatternEngine)
+        );
+        assert_eq!(
+            subsystem_for_circuit("workflow_engine"),
+            Some(Subsystem::WorkflowEngine)
+        );
+    }
+
+    #[test]
+    fn subsystem_mapping_returns_none_for_unknown() {
+        assert_eq!(subsystem_for_circuit("unknown_circuit"), None);
+        assert_eq!(subsystem_for_circuit(""), None);
+        assert_eq!(subsystem_for_circuit("caut_cli"), None);
+    }
+
+    // --- Full lifecycle test ---
+
+    #[test]
+    fn full_lifecycle_closed_open_half_open_closed() {
+        let mut breaker =
+            CircuitBreaker::new(CircuitBreakerConfig::new(2, 2, Duration::from_millis(0)));
+
+        // Closed
+        assert_eq!(breaker.status().state, CircuitStateKind::Closed);
+        assert!(breaker.allow());
+
+        // One failure keeps closed
+        breaker.record_failure();
+        assert_eq!(breaker.status().state, CircuitStateKind::Closed);
+        assert_eq!(breaker.status().consecutive_failures, 1);
+
+        // Second failure opens
+        breaker.record_failure();
+        assert_eq!(breaker.status().state, CircuitStateKind::Open);
+        assert_eq!(breaker.status().consecutive_failures, 2);
+
+        // allow() transitions to half-open (0ms cooldown)
+        assert!(breaker.allow());
+        assert_eq!(breaker.status().state, CircuitStateKind::HalfOpen);
+
+        // First success in half-open
+        breaker.record_success();
+        assert_eq!(breaker.status().state, CircuitStateKind::HalfOpen);
+        assert_eq!(breaker.status().half_open_successes, Some(1));
+
+        // Second success closes circuit
+        breaker.record_success();
+        assert_eq!(breaker.status().state, CircuitStateKind::Closed);
+        assert_eq!(breaker.status().consecutive_failures, 0);
+    }
+
+    #[test]
+    fn reopening_from_half_open_then_recovering() {
+        let mut breaker =
+            CircuitBreaker::new(CircuitBreakerConfig::new(1, 2, Duration::from_millis(0)));
+
+        // Open -> half-open
+        breaker.record_failure();
+        assert!(breaker.allow());
+        assert_eq!(breaker.status().state, CircuitStateKind::HalfOpen);
+
+        // Fail in half-open -> back to open
+        breaker.record_failure();
+        assert_eq!(breaker.status().state, CircuitStateKind::Open);
+
+        // Recover: open -> half-open -> closed
+        assert!(breaker.allow());
+        breaker.record_success();
+        breaker.record_success();
+        assert_eq!(breaker.status().state, CircuitStateKind::Closed);
+    }
+
+    // --- with_name constructor ---
+
+    #[test]
+    fn with_name_sets_name() {
+        let breaker = CircuitBreaker::with_name(
+            "my_circuit",
+            CircuitBreakerConfig::default(),
+        );
+        assert_eq!(breaker.name, "my_circuit");
+    }
+
+    #[test]
+    fn unnamed_constructor_uses_default_name() {
+        let breaker = CircuitBreaker::new(CircuitBreakerConfig::default());
+        assert_eq!(breaker.name, "unnamed");
+    }
 }

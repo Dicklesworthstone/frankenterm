@@ -1130,4 +1130,270 @@ mod tests {
             assert!(formatted.contains(def.title));
         }
     }
+
+    // --- ErrorCategory range tests ---
+
+    #[test]
+    fn category_ranges_are_non_overlapping() {
+        let categories = [
+            ErrorCategory::Wezterm,
+            ErrorCategory::Storage,
+            ErrorCategory::Pattern,
+            ErrorCategory::Policy,
+            ErrorCategory::Workflow,
+            ErrorCategory::Network,
+            ErrorCategory::Config,
+            ErrorCategory::Internal,
+        ];
+        for (i, a) in categories.iter().enumerate() {
+            let (a_lo, a_hi) = a.range();
+            assert!(a_lo <= a_hi, "{:?} range inverted", a);
+            for b in &categories[i + 1..] {
+                let (b_lo, b_hi) = b.range();
+                assert!(
+                    a_hi < b_lo || b_hi < a_lo,
+                    "{:?} ({}-{}) overlaps {:?} ({}-{})",
+                    a,
+                    a_lo,
+                    a_hi,
+                    b,
+                    b_lo,
+                    b_hi
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn category_range_boundaries() {
+        assert_eq!(ErrorCategory::Wezterm.range(), (1000, 1999));
+        assert_eq!(ErrorCategory::Storage.range(), (2000, 2999));
+        assert_eq!(ErrorCategory::Internal.range(), (9000, 9999));
+    }
+
+    // --- ErrorCategory serde tests ---
+
+    #[test]
+    fn error_category_serde_roundtrip() {
+        let categories = [
+            ErrorCategory::Wezterm,
+            ErrorCategory::Storage,
+            ErrorCategory::Pattern,
+            ErrorCategory::Policy,
+            ErrorCategory::Workflow,
+            ErrorCategory::Network,
+            ErrorCategory::Config,
+            ErrorCategory::Internal,
+        ];
+        for cat in &categories {
+            let json = serde_json::to_string(cat).unwrap();
+            let back: ErrorCategory = serde_json::from_str(&json).unwrap();
+            assert_eq!(*cat, back);
+        }
+    }
+
+    #[test]
+    fn error_category_rename_all_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&ErrorCategory::Wezterm).unwrap(),
+            "\"wezterm\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ErrorCategory::Internal).unwrap(),
+            "\"internal\""
+        );
+    }
+
+    // --- from_code edge cases ---
+
+    #[test]
+    fn from_code_at_range_boundaries() {
+        assert_eq!(
+            ErrorCategory::from_code("FT-1000"),
+            Some(ErrorCategory::Wezterm)
+        );
+        assert_eq!(
+            ErrorCategory::from_code("FT-1999"),
+            Some(ErrorCategory::Wezterm)
+        );
+        assert_eq!(
+            ErrorCategory::from_code("FT-2000"),
+            Some(ErrorCategory::Storage)
+        );
+        assert_eq!(
+            ErrorCategory::from_code("FT-9999"),
+            Some(ErrorCategory::Internal)
+        );
+    }
+
+    #[test]
+    fn from_code_out_of_range_returns_none() {
+        assert_eq!(ErrorCategory::from_code("FT-0999"), None);
+        assert_eq!(ErrorCategory::from_code("FT-8000"), None);
+    }
+
+    #[test]
+    fn from_code_invalid_prefix_returns_none() {
+        assert_eq!(ErrorCategory::from_code("WA-1001"), None);
+        assert_eq!(ErrorCategory::from_code("1001"), None);
+        assert_eq!(ErrorCategory::from_code("FT-abc"), None);
+        assert_eq!(ErrorCategory::from_code(""), None);
+    }
+
+    // --- RecoveryStep tests ---
+
+    #[test]
+    fn recovery_step_text_has_no_command() {
+        let step = RecoveryStep::text("Check your PATH");
+        assert_eq!(step.description.as_ref(), "Check your PATH");
+        assert!(step.command.is_none());
+    }
+
+    #[test]
+    fn recovery_step_with_command() {
+        let step = RecoveryStep::with_command("Run diagnostics", "ft doctor");
+        assert_eq!(step.description.as_ref(), "Run diagnostics");
+        assert_eq!(step.command.as_deref(), Some("ft doctor"));
+    }
+
+    #[test]
+    fn recovery_step_serde_roundtrip() {
+        let step = RecoveryStep::with_command("Run doctor", "ft doctor");
+        let json = serde_json::to_string(&step).unwrap();
+        let back: RecoveryStep = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.description.as_ref(), "Run doctor");
+        assert_eq!(back.command.as_deref(), Some("ft doctor"));
+    }
+
+    // --- Catalog integrity tests ---
+
+    #[test]
+    fn all_catalog_codes_match_their_key() {
+        for (key, def) in ERROR_CATALOG.iter() {
+            assert_eq!(
+                *key, def.code,
+                "Catalog key {} doesn't match def code {}",
+                key, def.code
+            );
+        }
+    }
+
+    #[test]
+    fn all_catalog_codes_have_matching_category() {
+        for (key, def) in ERROR_CATALOG.iter() {
+            let parsed = ErrorCategory::from_code(key);
+            assert_eq!(
+                parsed,
+                Some(def.category),
+                "Code {} category mismatch: from_code={:?}, def={:?}",
+                key,
+                parsed,
+                def.category
+            );
+        }
+    }
+
+    #[test]
+    fn all_catalog_codes_within_category_range() {
+        for def in ERROR_CATALOG.values() {
+            let num: u16 = def.code.strip_prefix("FT-").unwrap().parse().unwrap();
+            let (lo, hi) = def.category.range();
+            assert!(
+                num >= lo && num <= hi,
+                "Code {} (num={}) outside {:?} range ({}-{})",
+                def.code,
+                num,
+                def.category,
+                lo,
+                hi
+            );
+        }
+    }
+
+    #[test]
+    fn all_catalog_codes_have_causes() {
+        for (code, def) in ERROR_CATALOG.iter() {
+            assert!(
+                !def.causes.is_empty(),
+                "Error code {code} has no causes listed"
+            );
+        }
+    }
+
+    #[test]
+    fn network_category_has_codes() {
+        assert!(!list_codes_by_category(ErrorCategory::Network).is_empty());
+    }
+
+    // --- format_plain detail tests ---
+
+    #[test]
+    fn format_plain_includes_causes() {
+        let def = get_error_code("FT-1001").unwrap();
+        let formatted = def.format_plain();
+        assert!(formatted.contains("Common causes:"));
+        for cause in def.causes {
+            assert!(
+                formatted.contains(cause),
+                "Missing cause '{}' in formatted output",
+                cause
+            );
+        }
+    }
+
+    #[test]
+    fn format_plain_includes_recovery_steps() {
+        let def = get_error_code("FT-1001").unwrap();
+        let formatted = def.format_plain();
+        assert!(formatted.contains("Recovery steps:"));
+        for step in def.recovery_steps {
+            assert!(
+                formatted.contains(step.description.as_ref()),
+                "Missing step '{}' in formatted output",
+                step.description
+            );
+        }
+    }
+
+    #[test]
+    fn format_plain_includes_command_prefix() {
+        // Find a code that has a recovery step with a command
+        for def in ERROR_CATALOG.values() {
+            if def.recovery_steps.iter().any(|s| s.command.is_some()) {
+                let formatted = def.format_plain();
+                assert!(
+                    formatted.contains("$ "),
+                    "Command prefix missing for {}",
+                    def.code
+                );
+                return;
+            }
+        }
+    }
+
+    // --- list functions ---
+
+    #[test]
+    fn list_codes_by_category_returns_correct_category() {
+        for cat in [
+            ErrorCategory::Wezterm,
+            ErrorCategory::Storage,
+            ErrorCategory::Internal,
+        ] {
+            let codes = list_codes_by_category(cat);
+            for def in &codes {
+                assert_eq!(
+                    def.category, cat,
+                    "Code {} has wrong category in list",
+                    def.code
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn list_error_codes_returns_all_catalog_entries() {
+        let codes = list_error_codes();
+        assert_eq!(codes.len(), ERROR_CATALOG.len());
+    }
 }
