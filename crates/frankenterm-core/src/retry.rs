@@ -240,7 +240,7 @@ where
                     "Retrying operation after failure"
                 );
 
-                tokio::time::sleep(delay).await;
+                crate::runtime_compat::sleep(delay).await;
             }
         }
     }
@@ -395,7 +395,7 @@ where
                     "Retrying operation after retryable failure"
                 );
 
-                tokio::time::sleep(delay).await;
+                crate::runtime_compat::sleep(delay).await;
             }
         }
     }
@@ -619,5 +619,549 @@ mod tests {
         let browser = RetryPolicy::browser();
         assert_eq!(browser.max_attempts, Some(2));
         assert_eq!(browser.initial_delay, Duration::from_millis(500));
+    }
+
+    // ── Default trait ──────────────────────────────────────────────
+
+    #[test]
+    fn default_policy_fields() {
+        let p = RetryPolicy::default();
+        assert_eq!(p.initial_delay, Duration::from_millis(100));
+        assert_eq!(p.max_delay, Duration::from_secs(30));
+        assert_eq!(p.backoff_factor, 2.0);
+        assert_eq!(p.jitter_percent, 0.1);
+        assert_eq!(p.max_attempts, Some(3));
+    }
+
+    // ── RetryPolicy::new() clamping ────────────────────────────────
+
+    #[test]
+    fn new_clamps_backoff_factor_to_minimum_one() {
+        let p = RetryPolicy::new(
+            Duration::from_millis(100),
+            Duration::from_secs(10),
+            0.5,
+            0.1,
+            Some(3),
+        );
+        assert_eq!(p.backoff_factor, 1.0);
+    }
+
+    #[test]
+    fn new_clamps_negative_backoff_factor() {
+        let p = RetryPolicy::new(
+            Duration::from_millis(100),
+            Duration::from_secs(10),
+            -2.0,
+            0.1,
+            Some(3),
+        );
+        assert_eq!(p.backoff_factor, 1.0);
+    }
+
+    #[test]
+    fn new_preserves_valid_backoff_factor() {
+        let p = RetryPolicy::new(
+            Duration::from_millis(100),
+            Duration::from_secs(10),
+            3.5,
+            0.1,
+            Some(3),
+        );
+        assert_eq!(p.backoff_factor, 3.5);
+    }
+
+    #[test]
+    fn new_clamps_jitter_percent_above_one() {
+        let p = RetryPolicy::new(
+            Duration::from_millis(100),
+            Duration::from_secs(10),
+            2.0,
+            1.5,
+            Some(3),
+        );
+        assert_eq!(p.jitter_percent, 1.0);
+    }
+
+    #[test]
+    fn new_clamps_negative_jitter_percent() {
+        let p = RetryPolicy::new(
+            Duration::from_millis(100),
+            Duration::from_secs(10),
+            2.0,
+            -0.3,
+            Some(3),
+        );
+        assert_eq!(p.jitter_percent, 0.0);
+    }
+
+    #[test]
+    fn new_preserves_valid_jitter_percent() {
+        let p = RetryPolicy::new(
+            Duration::from_millis(100),
+            Duration::from_secs(10),
+            2.0,
+            0.5,
+            Some(3),
+        );
+        assert_eq!(p.jitter_percent, 0.5);
+    }
+
+    #[test]
+    fn new_accepts_none_max_attempts() {
+        let p = RetryPolicy::new(
+            Duration::from_millis(100),
+            Duration::from_secs(10),
+            2.0,
+            0.1,
+            None,
+        );
+        assert_eq!(p.max_attempts, None);
+    }
+
+    // ── delay_for_attempt edge cases ───────────────────────────────
+
+    #[test]
+    fn delay_for_attempt_zero_initial() {
+        let policy = RetryPolicy {
+            initial_delay: Duration::ZERO,
+            max_delay: Duration::from_secs(10),
+            backoff_factor: 2.0,
+            jitter_percent: 0.0,
+            max_attempts: Some(5),
+        };
+        assert_eq!(policy.delay_for_attempt(0), Duration::ZERO);
+        assert_eq!(policy.delay_for_attempt(5), Duration::ZERO);
+    }
+
+    #[test]
+    fn delay_for_attempt_high_attempt_capped_at_31() {
+        let policy = RetryPolicy {
+            initial_delay: Duration::from_millis(1),
+            max_delay: Duration::from_secs(u64::MAX),
+            backoff_factor: 2.0,
+            jitter_percent: 0.0,
+            max_attempts: None,
+        };
+        let at_31 = policy.delay_for_attempt(31);
+        let at_100 = policy.delay_for_attempt(100);
+        assert_eq!(at_31, at_100);
+    }
+
+    #[test]
+    fn delay_for_attempt_backoff_factor_one_stays_constant() {
+        let policy = RetryPolicy {
+            initial_delay: Duration::from_millis(200),
+            max_delay: Duration::from_secs(10),
+            backoff_factor: 1.0,
+            jitter_percent: 0.0,
+            max_attempts: Some(5),
+        };
+        for attempt in 0..5 {
+            assert_eq!(
+                policy.delay_for_attempt(attempt),
+                Duration::from_millis(200)
+            );
+        }
+    }
+
+    #[test]
+    fn delay_with_zero_jitter_is_deterministic() {
+        let policy = RetryPolicy {
+            initial_delay: Duration::from_millis(100),
+            max_delay: Duration::from_secs(10),
+            backoff_factor: 2.0,
+            jitter_percent: 0.0,
+            max_attempts: Some(5),
+        };
+        for _ in 0..50 {
+            assert_eq!(policy.delay_for_attempt(2), Duration::from_millis(400));
+        }
+    }
+
+    // ── Preset policy completeness ─────────────────────────────────
+
+    #[test]
+    fn preset_wezterm_cli_all_fields() {
+        let p = RetryPolicy::wezterm_cli();
+        assert_eq!(p.initial_delay, Duration::from_millis(100));
+        assert_eq!(p.max_delay, Duration::from_secs(5));
+        assert_eq!(p.backoff_factor, 2.0);
+        assert_eq!(p.jitter_percent, 0.1);
+        assert_eq!(p.max_attempts, Some(3));
+    }
+
+    #[test]
+    fn preset_db_write_all_fields() {
+        let p = RetryPolicy::db_write();
+        assert_eq!(p.initial_delay, Duration::from_millis(50));
+        assert_eq!(p.max_delay, Duration::from_secs(2));
+        assert_eq!(p.backoff_factor, 2.0);
+        assert_eq!(p.jitter_percent, 0.1);
+        assert_eq!(p.max_attempts, Some(5));
+    }
+
+    #[test]
+    fn preset_webhook_all_fields() {
+        let p = RetryPolicy::webhook();
+        assert_eq!(p.initial_delay, Duration::from_secs(1));
+        assert_eq!(p.max_delay, Duration::from_secs(60));
+        assert_eq!(p.backoff_factor, 2.0);
+        assert_eq!(p.jitter_percent, 0.1);
+        assert_eq!(p.max_attempts, Some(5));
+    }
+
+    #[test]
+    fn preset_browser_all_fields() {
+        let p = RetryPolicy::browser();
+        assert_eq!(p.initial_delay, Duration::from_millis(500));
+        assert_eq!(p.max_delay, Duration::from_secs(10));
+        assert_eq!(p.backoff_factor, 2.0);
+        assert_eq!(p.jitter_percent, 0.1);
+        assert_eq!(p.max_attempts, Some(2));
+    }
+
+    // ── is_retryable ───────────────────────────────────────────────
+
+    #[test]
+    fn is_retryable_io_error() {
+        let err = Error::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout"));
+        assert!(is_retryable(&err));
+    }
+
+    #[test]
+    fn is_retryable_wezterm_not_running() {
+        use crate::error::WeztermError;
+        assert!(is_retryable(&Error::Wezterm(WeztermError::NotRunning)));
+    }
+
+    #[test]
+    fn is_retryable_wezterm_timeout() {
+        use crate::error::WeztermError;
+        assert!(is_retryable(&Error::Wezterm(WeztermError::Timeout(30))));
+    }
+
+    #[test]
+    fn is_retryable_wezterm_command_failed() {
+        use crate::error::WeztermError;
+        assert!(is_retryable(&Error::Wezterm(
+            WeztermError::CommandFailed("stderr".into())
+        )));
+    }
+
+    #[test]
+    fn is_retryable_wezterm_socket_not_found() {
+        use crate::error::WeztermError;
+        assert!(is_retryable(&Error::Wezterm(
+            WeztermError::SocketNotFound("/tmp/wez.sock".into())
+        )));
+    }
+
+    #[test]
+    fn not_retryable_wezterm_circuit_open() {
+        use crate::error::WeztermError;
+        assert!(!is_retryable(&Error::Wezterm(WeztermError::CircuitOpen {
+            retry_after_ms: 5000,
+        })));
+    }
+
+    #[test]
+    fn not_retryable_wezterm_cli_not_found() {
+        use crate::error::WeztermError;
+        assert!(!is_retryable(&Error::Wezterm(WeztermError::CliNotFound)));
+    }
+
+    #[test]
+    fn not_retryable_wezterm_pane_not_found() {
+        use crate::error::WeztermError;
+        assert!(!is_retryable(&Error::Wezterm(
+            WeztermError::PaneNotFound(42)
+        )));
+    }
+
+    #[test]
+    fn not_retryable_wezterm_parse_error() {
+        use crate::error::WeztermError;
+        assert!(!is_retryable(&Error::Wezterm(WeztermError::ParseError(
+            "bad json".into()
+        ))));
+    }
+
+    #[test]
+    fn is_retryable_storage_database() {
+        use crate::error::StorageError;
+        assert!(is_retryable(&Error::Storage(StorageError::Database(
+            "SQLITE_BUSY".into()
+        ))));
+    }
+
+    #[test]
+    fn not_retryable_storage_sequence_discontinuity() {
+        use crate::error::StorageError;
+        assert!(!is_retryable(&Error::Storage(
+            StorageError::SequenceDiscontinuity {
+                expected: 5,
+                actual: 7,
+            }
+        )));
+    }
+
+    #[test]
+    fn not_retryable_storage_migration_failed() {
+        use crate::error::StorageError;
+        assert!(!is_retryable(&Error::Storage(
+            StorageError::MigrationFailed("v3 to v4".into())
+        )));
+    }
+
+    #[test]
+    fn not_retryable_storage_schema_too_new() {
+        use crate::error::StorageError;
+        assert!(!is_retryable(&Error::Storage(StorageError::SchemaTooNew {
+            current: 5,
+            supported: 3,
+        })));
+    }
+
+    #[test]
+    fn not_retryable_storage_wa_too_old() {
+        use crate::error::StorageError;
+        assert!(!is_retryable(&Error::Storage(StorageError::WaTooOld {
+            current: "1.0".into(),
+            min_compatible: "2.0".into(),
+        })));
+    }
+
+    #[test]
+    fn not_retryable_storage_fts_query_error() {
+        use crate::error::StorageError;
+        assert!(!is_retryable(&Error::Storage(
+            StorageError::FtsQueryError("bad syntax".into())
+        )));
+    }
+
+    #[test]
+    fn not_retryable_storage_corruption() {
+        use crate::error::StorageError;
+        assert!(!is_retryable(&Error::Storage(StorageError::Corruption {
+            details: "checksum mismatch".into(),
+        })));
+    }
+
+    #[test]
+    fn not_retryable_storage_not_found() {
+        use crate::error::StorageError;
+        assert!(!is_retryable(&Error::Storage(StorageError::NotFound(
+            "session-123".into()
+        ))));
+    }
+
+    #[test]
+    fn not_retryable_pattern_error() {
+        use crate::error::PatternError;
+        assert!(!is_retryable(&Error::Pattern(
+            PatternError::InvalidRule("bad rule".into())
+        )));
+    }
+
+    #[test]
+    fn not_retryable_workflow_error() {
+        use crate::error::WorkflowError;
+        assert!(!is_retryable(&Error::Workflow(WorkflowError::Aborted(
+            "user cancel".into()
+        ))));
+    }
+
+    #[test]
+    fn not_retryable_config_error() {
+        use crate::error::ConfigError;
+        assert!(!is_retryable(&Error::Config(ConfigError::FileNotFound(
+            "ft.toml".into()
+        ))));
+    }
+
+    #[test]
+    fn not_retryable_policy_error() {
+        assert!(!is_retryable(&Error::Policy(
+            "rate limit exceeded".into()
+        )));
+    }
+
+    #[test]
+    fn not_retryable_json_error() {
+        let bad_json = serde_json::from_str::<serde_json::Value>("not json").unwrap_err();
+        assert!(!is_retryable(&Error::Json(bad_json)));
+    }
+
+    #[test]
+    fn is_retryable_runtime_error() {
+        assert!(is_retryable(&Error::Runtime("channel closed".into())));
+    }
+
+    #[test]
+    fn not_retryable_setup_error() {
+        assert!(!is_retryable(&Error::SetupError(
+            "missing config".into()
+        )));
+    }
+
+    #[test]
+    fn not_retryable_cancelled_error() {
+        assert!(!is_retryable(&Error::Cancelled("timeout".into())));
+    }
+
+    #[test]
+    fn not_retryable_panicked_error() {
+        assert!(!is_retryable(&Error::Panicked("thread panic".into())));
+    }
+
+    // ── with_smart_retry ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn smart_retry_stops_on_non_retryable_error() {
+        let policy = RetryPolicy {
+            initial_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(10),
+            backoff_factor: 2.0,
+            jitter_percent: 0.0,
+            max_attempts: Some(5),
+        };
+        let call_count = Arc::new(AtomicU32::new(0));
+        let call_count_clone = Arc::clone(&call_count);
+
+        let result: Result<i32> = with_smart_retry(&policy, || {
+            let count = Arc::clone(&call_count_clone);
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                Err(Error::Policy("forbidden".into()))
+            }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn smart_retry_retries_retryable_errors() {
+        let policy = RetryPolicy {
+            initial_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(10),
+            backoff_factor: 2.0,
+            jitter_percent: 0.0,
+            max_attempts: Some(5),
+        };
+        let call_count = Arc::new(AtomicU32::new(0));
+        let call_count_clone = Arc::clone(&call_count);
+
+        let result = with_smart_retry(&policy, || {
+            let count = Arc::clone(&call_count_clone);
+            async move {
+                let n = count.fetch_add(1, Ordering::SeqCst);
+                if n < 2 {
+                    Err(Error::Runtime("transient".into()))
+                } else {
+                    Ok::<_, Error>(99)
+                }
+            }
+        })
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 99);
+        assert_eq!(call_count.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn smart_retry_exhausts_attempts_on_retryable_errors() {
+        let policy = RetryPolicy {
+            initial_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(10),
+            backoff_factor: 2.0,
+            jitter_percent: 0.0,
+            max_attempts: Some(3),
+        };
+        let call_count = Arc::new(AtomicU32::new(0));
+        let call_count_clone = Arc::clone(&call_count);
+
+        let result: Result<i32> = with_smart_retry(&policy, || {
+            let count = Arc::clone(&call_count_clone);
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                Err(Error::Runtime("always fails".into()))
+            }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(call_count.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn smart_retry_succeeds_immediately() {
+        let policy = RetryPolicy::default();
+        let result = with_smart_retry(&policy, || async { Ok::<_, Error>(42) }).await;
+        assert_eq!(result.unwrap(), 42);
+    }
+
+    // ── with_retry_outcome edge cases ──────────────────────────────
+
+    #[tokio::test]
+    async fn retry_outcome_on_exhaustion_tracks_all_fields() {
+        let policy = RetryPolicy {
+            initial_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(5),
+            backoff_factor: 1.0,
+            jitter_percent: 0.0,
+            max_attempts: Some(2),
+        };
+
+        let outcome: RetryOutcome<i32> = with_retry_outcome(&policy, || async {
+            Err::<i32, Error>(Error::Runtime("fail".into()))
+        })
+        .await;
+
+        assert!(outcome.result.is_err());
+        assert_eq!(outcome.attempts, 2);
+        assert!(outcome.elapsed >= Duration::from_millis(1));
+    }
+
+    #[tokio::test]
+    async fn retry_outcome_immediate_success_has_one_attempt() {
+        let policy = RetryPolicy::default();
+
+        let outcome = with_retry_outcome(&policy, || async { Ok::<_, Error>("hello") }).await;
+
+        assert!(outcome.result.is_ok());
+        assert_eq!(outcome.attempts, 1);
+    }
+
+    // ── with_retry_and_circuit success path ────────────────────────
+
+    #[tokio::test]
+    async fn circuit_records_success_on_retry_success() {
+        use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+
+        let policy = RetryPolicy {
+            initial_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(10),
+            backoff_factor: 2.0,
+            jitter_percent: 0.0,
+            max_attempts: Some(3),
+        };
+
+        let mut circuit = CircuitBreaker::new(CircuitBreakerConfig::new(
+            3,
+            1,
+            Duration::from_secs(60),
+        ));
+
+        let result =
+            with_retry_and_circuit(&policy, &mut circuit, || async { Ok::<_, Error>(42) }).await;
+
+        assert_eq!(result.unwrap(), 42);
+        assert!(circuit.allow());
+        let status = circuit.status();
+        assert_eq!(format!("{:?}", status.state), "Closed");
     }
 }
