@@ -88,3 +88,6 @@ triage.json
 
 # Proptest regression files (auto-generated, machine-specific)
 **/proptest-regressions/
+
+# WezTerm Automata runtime state (backups, locks)
+.wa/
