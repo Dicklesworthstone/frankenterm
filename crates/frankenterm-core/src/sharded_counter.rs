@@ -70,23 +70,24 @@ impl PaddedAtomicU64 {
 
 /// Fast, deterministic shard index for the current thread.
 ///
-/// Uses `thread_id` hashing — zero overhead beyond the ID fetch.
+/// Uses a thread-local cached hash so subsequent calls are zero-cost
+/// (no allocation, no format!, no hashing — just a modulo).
 #[inline]
 fn shard_index(shard_count: usize) -> usize {
-    // ThreadId's as_u64() is nightly-only; use the Debug repr hash instead.
-    // This is a hot path so we use a simple hash.
-    let id = std::thread::current().id();
-    let hash = {
-        let s = format!("{id:?}");
-        // FNV-1a hash of the debug string (fast, no alloc beyond format)
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        for byte in s.bytes() {
-            h ^= u64::from(byte);
-            h = h.wrapping_mul(0x0100_0000_01b3);
-        }
-        h
-    };
-    (hash as usize) % shard_count
+    thread_local! {
+        static THREAD_HASH: u64 = {
+            // ThreadId::as_u64() is nightly-only; hash the Debug repr once.
+            let id = std::thread::current().id();
+            let s = format!("{id:?}");
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a offset basis
+            for byte in s.bytes() {
+                h ^= u64::from(byte);
+                h = h.wrapping_mul(0x0100_0000_01b3);
+            }
+            h
+        };
+    }
+    THREAD_HASH.with(|h| (*h as usize) % shard_count)
 }
 
 // ---------------------------------------------------------------------------
