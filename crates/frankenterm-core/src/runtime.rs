@@ -21,8 +21,10 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use crate::sharded_counter::{ShardedCounter, ShardedGauge, ShardedMax};
 
 use tokio::sync::{RwLock, mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
@@ -269,52 +271,56 @@ impl Default for RuntimeConfig {
 }
 
 /// Runtime metrics for health snapshots and shutdown summaries.
+///
+/// Uses sharded atomics (cache-line-padded per-core counters) to eliminate
+/// false sharing and SeqCst contention. Writes distribute across shards;
+/// reads aggregate infrequently.
 #[derive(Debug)]
 pub struct RuntimeMetrics {
     /// Count of segments persisted
-    segments_persisted: AtomicU64,
+    segments_persisted: ShardedCounter,
     /// Count of events recorded
-    events_recorded: AtomicU64,
+    events_recorded: ShardedCounter,
     /// Timestamp when runtime started (epoch ms)
-    started_at: AtomicU64,
+    started_at: ShardedGauge,
     /// Last DB write timestamp (epoch ms)
-    last_db_write_at: AtomicU64,
+    last_db_write_at: ShardedGauge,
     /// Sum of ingest lag samples (for averaging)
-    ingest_lag_sum_ms: AtomicU64,
+    ingest_lag_sum_ms: ShardedCounter,
     /// Count of ingest lag samples
-    ingest_lag_count: AtomicU64,
+    ingest_lag_count: ShardedCounter,
     /// Maximum ingest lag observed
-    ingest_lag_max_ms: AtomicU64,
+    ingest_lag_max_ms: ShardedMax,
     /// Total native pane output events received (pre-coalesce).
-    native_output_input_events: AtomicU64,
+    native_output_input_events: ShardedCounter,
     /// Total native pane output batches emitted (post-coalesce).
-    native_output_batches_emitted: AtomicU64,
+    native_output_batches_emitted: ShardedCounter,
     /// Total native output bytes received (pre-coalesce).
-    native_output_input_bytes: AtomicU64,
+    native_output_input_bytes: ShardedCounter,
     /// Total native output bytes emitted (post-coalesce).
-    native_output_emitted_bytes: AtomicU64,
+    native_output_emitted_bytes: ShardedCounter,
     /// Maximum number of input events merged into one batch.
-    native_output_max_batch_events: AtomicU64,
+    native_output_max_batch_events: ShardedMax,
     /// Maximum size (bytes) of one emitted batch.
-    native_output_max_batch_bytes: AtomicU64,
+    native_output_max_batch_bytes: ShardedMax,
 }
 
 impl Default for RuntimeMetrics {
     fn default() -> Self {
         Self {
-            segments_persisted: AtomicU64::new(0),
-            events_recorded: AtomicU64::new(0),
-            started_at: AtomicU64::new(0),
-            last_db_write_at: AtomicU64::new(0),
-            ingest_lag_sum_ms: AtomicU64::new(0),
-            ingest_lag_count: AtomicU64::new(0),
-            ingest_lag_max_ms: AtomicU64::new(0),
-            native_output_input_events: AtomicU64::new(0),
-            native_output_batches_emitted: AtomicU64::new(0),
-            native_output_input_bytes: AtomicU64::new(0),
-            native_output_emitted_bytes: AtomicU64::new(0),
-            native_output_max_batch_events: AtomicU64::new(0),
-            native_output_max_batch_bytes: AtomicU64::new(0),
+            segments_persisted: ShardedCounter::new(),
+            events_recorded: ShardedCounter::new(),
+            started_at: ShardedGauge::new(),
+            last_db_write_at: ShardedGauge::new(),
+            ingest_lag_sum_ms: ShardedCounter::new(),
+            ingest_lag_count: ShardedCounter::new(),
+            ingest_lag_max_ms: ShardedMax::new(),
+            native_output_input_events: ShardedCounter::new(),
+            native_output_batches_emitted: ShardedCounter::new(),
+            native_output_input_bytes: ShardedCounter::new(),
+            native_output_emitted_bytes: ShardedCounter::new(),
+            native_output_max_batch_events: ShardedMax::new(),
+            native_output_max_batch_bytes: ShardedMax::new(),
         }
     }
 }
@@ -322,77 +328,35 @@ impl Default for RuntimeMetrics {
 impl RuntimeMetrics {
     /// Record an ingest lag sample.
     pub fn record_ingest_lag(&self, lag_ms: u64) {
-        self.ingest_lag_sum_ms.fetch_add(lag_ms, Ordering::SeqCst);
-        self.ingest_lag_count.fetch_add(1, Ordering::SeqCst);
-
-        // Update max using compare-and-swap loop
-        let mut current_max = self.ingest_lag_max_ms.load(Ordering::SeqCst);
-        while lag_ms > current_max {
-            match self.ingest_lag_max_ms.compare_exchange_weak(
-                current_max,
-                lag_ms,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => break,
-                Err(v) => current_max = v,
-            }
-        }
+        self.ingest_lag_sum_ms.add(lag_ms);
+        self.ingest_lag_count.increment();
+        self.ingest_lag_max_ms.observe(lag_ms);
     }
 
     /// Record a successful DB write.
     pub fn record_db_write(&self) {
-        self.last_db_write_at
-            .store(epoch_ms_u64(), Ordering::SeqCst);
+        self.last_db_write_at.set(epoch_ms_u64());
     }
 
     pub fn record_native_output_input(&self, bytes: usize) {
-        self.native_output_input_events
-            .fetch_add(1, Ordering::SeqCst);
-        self.native_output_input_bytes
-            .fetch_add(bytes as u64, Ordering::SeqCst);
+        self.native_output_input_events.increment();
+        self.native_output_input_bytes.add(bytes as u64);
     }
 
     pub fn record_native_output_batch(&self, input_events: u32, bytes: usize) {
-        self.native_output_batches_emitted
-            .fetch_add(1, Ordering::SeqCst);
-        self.native_output_emitted_bytes
-            .fetch_add(bytes as u64, Ordering::SeqCst);
-
-        let input_events_u64 = u64::from(input_events);
-        let mut current_max = self.native_output_max_batch_events.load(Ordering::SeqCst);
-        while input_events_u64 > current_max {
-            match self.native_output_max_batch_events.compare_exchange_weak(
-                current_max,
-                input_events_u64,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => break,
-                Err(v) => current_max = v,
-            }
-        }
-
-        let bytes_u64 = bytes as u64;
-        let mut current_max = self.native_output_max_batch_bytes.load(Ordering::SeqCst);
-        while bytes_u64 > current_max {
-            match self.native_output_max_batch_bytes.compare_exchange_weak(
-                current_max,
-                bytes_u64,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => break,
-                Err(v) => current_max = v,
-            }
-        }
+        self.native_output_batches_emitted.increment();
+        self.native_output_emitted_bytes.add(bytes as u64);
+        self.native_output_max_batch_events
+            .observe(u64::from(input_events));
+        self.native_output_max_batch_bytes
+            .observe(bytes as u64);
     }
 
     /// Get average ingest lag in milliseconds.
     #[allow(clippy::cast_precision_loss)]
     pub fn avg_ingest_lag_ms(&self) -> f64 {
-        let sum = self.ingest_lag_sum_ms.load(Ordering::SeqCst);
-        let count = self.ingest_lag_count.load(Ordering::SeqCst);
+        let sum = self.ingest_lag_sum_ms.get();
+        let count = self.ingest_lag_count.get();
         if count == 0 {
             0.0
         } else {
@@ -402,57 +366,57 @@ impl RuntimeMetrics {
 
     /// Get total ingest lag sample count.
     pub fn ingest_lag_count(&self) -> u64 {
-        self.ingest_lag_count.load(Ordering::SeqCst)
+        self.ingest_lag_count.get()
     }
 
     /// Get total ingest lag sum in milliseconds.
     pub fn ingest_lag_sum_ms(&self) -> u64 {
-        self.ingest_lag_sum_ms.load(Ordering::SeqCst)
+        self.ingest_lag_sum_ms.get()
     }
 
     /// Get maximum ingest lag in milliseconds.
     pub fn max_ingest_lag_ms(&self) -> u64 {
-        self.ingest_lag_max_ms.load(Ordering::SeqCst)
+        self.ingest_lag_max_ms.get()
     }
 
     /// Get last DB write timestamp (epoch ms), or None if never written.
     pub fn last_db_write(&self) -> Option<u64> {
-        let ts = self.last_db_write_at.load(Ordering::SeqCst);
+        let ts = self.last_db_write_at.get_max();
         if ts == 0 { None } else { Some(ts) }
     }
 
     /// Get total segments persisted.
     pub fn segments_persisted(&self) -> u64 {
-        self.segments_persisted.load(Ordering::SeqCst)
+        self.segments_persisted.get()
     }
 
     /// Get total events recorded.
     pub fn events_recorded(&self) -> u64 {
-        self.events_recorded.load(Ordering::SeqCst)
+        self.events_recorded.get()
     }
 
     pub fn native_output_input_events(&self) -> u64 {
-        self.native_output_input_events.load(Ordering::SeqCst)
+        self.native_output_input_events.get()
     }
 
     pub fn native_output_batches_emitted(&self) -> u64 {
-        self.native_output_batches_emitted.load(Ordering::SeqCst)
+        self.native_output_batches_emitted.get()
     }
 
     pub fn native_output_input_bytes(&self) -> u64 {
-        self.native_output_input_bytes.load(Ordering::SeqCst)
+        self.native_output_input_bytes.get()
     }
 
     pub fn native_output_emitted_bytes(&self) -> u64 {
-        self.native_output_emitted_bytes.load(Ordering::SeqCst)
+        self.native_output_emitted_bytes.get()
     }
 
     pub fn native_output_max_batch_events(&self) -> u64 {
-        self.native_output_max_batch_events.load(Ordering::SeqCst)
+        self.native_output_max_batch_events.get()
     }
 
     pub fn native_output_max_batch_bytes(&self) -> u64 {
-        self.native_output_max_batch_bytes.load(Ordering::SeqCst)
+        self.native_output_max_batch_bytes.get()
     }
 }
 
@@ -516,7 +480,7 @@ impl ObservationRuntime {
     ) -> Self {
         let registry = PaneRegistry::with_filter(config.pane_filter.clone());
         let metrics = Arc::new(RuntimeMetrics::default());
-        metrics.started_at.store(epoch_ms_u64(), Ordering::SeqCst);
+        metrics.started_at.set(epoch_ms_u64());
 
         // Initialize hot-reload config channel with current values
         let hot_config = HotReloadableConfig {
@@ -1455,7 +1419,7 @@ impl ObservationRuntime {
                         }
 
                         // Track metrics
-                        metrics.segments_persisted.fetch_add(1, Ordering::SeqCst);
+                        metrics.segments_persisted.increment();
 
                         // Record ingest lag (time from capture to persistence)
                         let now = epoch_ms();
@@ -1540,7 +1504,7 @@ impl ObservationRuntime {
 
                                 match storage_guard.record_event(stored_event).await {
                                     Ok(event_id) => {
-                                        metrics.events_recorded.fetch_add(1, Ordering::SeqCst);
+                                        metrics.events_recorded.increment();
 
                                         // Publish to event bus for workflow runners (if configured)
                                         if let Some(ref bus) = event_bus {
@@ -1878,8 +1842,8 @@ impl RuntimeHandle {
         };
 
         // Get final metrics
-        let segments_persisted = self.metrics.segments_persisted.load(Ordering::SeqCst);
-        let events_recorded = self.metrics.events_recorded.load(Ordering::SeqCst);
+        let segments_persisted = self.metrics.segments_persisted.get();
+        let events_recorded = self.metrics.events_recorded.get();
 
         // Get last seq per pane
         let last_seq_by_pane: Vec<(u64, i64)> = {
