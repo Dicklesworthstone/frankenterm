@@ -105,6 +105,11 @@ harness = false
 required-features = ["asupersync-runtime"]
 
 [[bench]]
+name = "cx_propagation"
+harness = false
+required-features = ["asupersync-runtime"]
+
+[[bench]]
 name = "sizing_benchmark"
 harness = false
 
@@ -152,6 +157,25 @@ harness = false
 [[bench]]
 name = "scrollback_eviction"
 harness = false
+
+[[bench]]
+name = "outcome_vs_result"
+harness = false
+required-features = ["asupersync-runtime"]
+
+[[bench]]
+name = "differential_snapshot"
+harness = false
+
+[[bench]]
+name = "outcome_adapter"
+harness = false
+required-features = ["asupersync-runtime"]
+
+[[bench]]
+name = "spike_comparison"
+harness = false
+required-features = ["asupersync-runtime"]
 
 [features]
 default = []

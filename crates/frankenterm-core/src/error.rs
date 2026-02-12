@@ -158,6 +158,14 @@ pub enum Error {
     /// Setup/configuration automation errors
     #[error("Setup error: {0}")]
     SetupError(String),
+
+    /// Operation was cancelled (structured cancellation from asupersync)
+    #[error("Operation cancelled: {0}")]
+    Cancelled(String),
+
+    /// Task panicked (panic propagation from asupersync)
+    #[error("Task panicked: {0}")]
+    Panicked(String),
 }
 
 impl Error {
@@ -196,6 +204,16 @@ impl Error {
                     .command("Locate config", "ls -la ~/.config/wezterm/ ~/.wezterm.lua 2>/dev/null || echo 'No config found'")
                     .command("Diagnostics", "ft doctor")
                     .alternative("Create a wezterm.lua config file if it doesn't exist."),
+            ),
+            Self::Cancelled(_) => Some(
+                Remediation::new("Operation was cancelled. Retry if the cancellation was unexpected.")
+                    .command("Status", "ft status")
+                    .alternative("Check whether a timeout or shutdown triggered the cancellation."),
+            ),
+            Self::Panicked(_) => Some(
+                Remediation::new("A task panicked. Check logs for the panic backtrace and retry.")
+                    .command("Diagnostics", "ft doctor")
+                    .alternative("If the panic persists, report the issue with the backtrace."),
             ),
         }
     }
@@ -594,6 +612,9 @@ mod tests {
             Error::Io(std::io::Error::other("io")),
             Error::Json(json_err),
             Error::Runtime("runtime".to_string()),
+            Error::SetupError("setup".to_string()),
+            Error::Cancelled("user cancelled".to_string()),
+            Error::Panicked("task panicked".to_string()),
         ];
 
         for error in errors {
