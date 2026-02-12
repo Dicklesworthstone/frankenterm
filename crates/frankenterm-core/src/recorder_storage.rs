@@ -939,4 +939,593 @@ mod tests {
 
         assert_eq!(err.class(), RecorderStorageErrorClass::TerminalData);
     }
+
+    // ── Config validation ────────────────────────────────────────────
+
+    #[test]
+    fn config_validate_rejects_zero_queue_capacity() {
+        let mut cfg = AppendLogStorageConfig::default();
+        cfg.queue_capacity = 0;
+        let err = cfg.validate().unwrap_err();
+        assert!(matches!(err, RecorderStorageError::InvalidRequest { .. }));
+    }
+
+    #[test]
+    fn config_validate_rejects_zero_max_batch_events() {
+        let mut cfg = AppendLogStorageConfig::default();
+        cfg.max_batch_events = 0;
+        let err = cfg.validate().unwrap_err();
+        assert!(matches!(err, RecorderStorageError::InvalidRequest { .. }));
+    }
+
+    #[test]
+    fn config_validate_rejects_zero_max_batch_bytes() {
+        let mut cfg = AppendLogStorageConfig::default();
+        cfg.max_batch_bytes = 0;
+        let err = cfg.validate().unwrap_err();
+        assert!(matches!(err, RecorderStorageError::InvalidRequest { .. }));
+    }
+
+    #[test]
+    fn config_validate_rejects_zero_idempotency_entries() {
+        let mut cfg = AppendLogStorageConfig::default();
+        cfg.max_idempotency_entries = 0;
+        let err = cfg.validate().unwrap_err();
+        assert!(matches!(err, RecorderStorageError::InvalidRequest { .. }));
+    }
+
+    #[test]
+    fn config_validate_accepts_valid_config() {
+        let cfg = AppendLogStorageConfig::default();
+        assert!(cfg.validate().is_ok());
+    }
+
+    // ── Request validation ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn rejects_empty_batch_id() {
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+
+        let err = storage
+            .append_batch(AppendRequest {
+                batch_id: "  ".to_string(),
+                events: vec![sample_event("e1", 1, 0, "hello")],
+                required_durability: DurabilityLevel::Enqueued,
+                producer_ts_ms: 1,
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, RecorderStorageError::InvalidRequest { .. }));
+    }
+
+    #[tokio::test]
+    async fn rejects_empty_events_list() {
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+
+        let err = storage
+            .append_batch(AppendRequest {
+                batch_id: "b1".to_string(),
+                events: vec![],
+                required_durability: DurabilityLevel::Enqueued,
+                producer_ts_ms: 1,
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, RecorderStorageError::InvalidRequest { .. }));
+    }
+
+    #[tokio::test]
+    async fn rejects_batch_exceeding_event_count_limit() {
+        let dir = tempdir().unwrap();
+        let mut cfg = test_config(dir.path());
+        cfg.max_batch_events = 2;
+        let storage = AppendLogRecorderStorage::open(cfg).unwrap();
+
+        let err = storage
+            .append_batch(AppendRequest {
+                batch_id: "b1".to_string(),
+                events: vec![
+                    sample_event("e1", 1, 0, "a"),
+                    sample_event("e2", 1, 1, "b"),
+                    sample_event("e3", 1, 2, "c"),
+                ],
+                required_durability: DurabilityLevel::Enqueued,
+                producer_ts_ms: 1,
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, RecorderStorageError::InvalidRequest { .. }));
+    }
+
+    // ── Idempotency cache eviction ───────────────────────────────────
+
+    #[tokio::test]
+    async fn idempotency_cache_evicts_oldest_when_full() {
+        let dir = tempdir().unwrap();
+        let mut cfg = test_config(dir.path());
+        cfg.max_idempotency_entries = 3;
+        let storage = AppendLogRecorderStorage::open(cfg).unwrap();
+
+        // Insert 4 batches (cache holds 3)
+        for i in 0..4u64 {
+            let _ = storage
+                .append_batch(AppendRequest {
+                    batch_id: format!("b{i}"),
+                    events: vec![sample_event(&format!("e{i}"), 1, i, "x")],
+                    required_durability: DurabilityLevel::Enqueued,
+                    producer_ts_ms: i,
+                })
+                .await
+                .unwrap();
+        }
+
+        // b0 should have been evicted — replaying it should write new data
+        let data_len_before = std::fs::metadata(dir.path().join("events.log"))
+            .unwrap()
+            .len();
+
+        let resp = storage
+            .append_batch(AppendRequest {
+                batch_id: "b0".to_string(),
+                events: vec![sample_event("e0-replay", 1, 100, "replay")],
+                required_durability: DurabilityLevel::Appended,
+                producer_ts_ms: 100,
+            })
+            .await
+            .unwrap();
+
+        let data_len_after = std::fs::metadata(dir.path().join("events.log"))
+            .unwrap()
+            .len();
+
+        // b0 was evicted from cache, so replay should write new data
+        assert!(data_len_after > data_len_before);
+        assert_eq!(resp.first_offset.ordinal, 4); // ordinal 4 (after 0,1,2,3)
+
+        // b3 should still be cached — replay should be idempotent
+        let data_len_before2 = std::fs::metadata(dir.path().join("events.log"))
+            .unwrap()
+            .len();
+
+        let _ = storage
+            .append_batch(AppendRequest {
+                batch_id: "b3".to_string(),
+                events: vec![sample_event("e3-replay", 1, 200, "replay")],
+                required_durability: DurabilityLevel::Appended,
+                producer_ts_ms: 200,
+            })
+            .await
+            .unwrap();
+
+        let data_len_after2 = std::fs::metadata(dir.path().join("events.log"))
+            .unwrap()
+            .len();
+
+        assert_eq!(data_len_before2, data_len_after2, "b3 should be cached");
+    }
+
+    // ── Health and lag metrics ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn health_reports_correct_state() {
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+
+        // Initial health: no data
+        let h = storage.health().await;
+        assert_eq!(h.backend, RecorderBackendKind::AppendLog);
+        assert!(!h.degraded);
+        assert_eq!(h.queue_depth, 0);
+        assert_eq!(h.queue_capacity, 4);
+        assert!(h.latest_offset.is_none());
+        assert!(h.last_error.is_none());
+
+        // After append: has data
+        let _ = storage
+            .append_batch(AppendRequest {
+                batch_id: "b1".to_string(),
+                events: vec![sample_event("e1", 1, 0, "hi")],
+                required_durability: DurabilityLevel::Appended,
+                producer_ts_ms: 1,
+            })
+            .await
+            .unwrap();
+
+        let h2 = storage.health().await;
+        assert!(h2.latest_offset.is_some());
+        assert_eq!(h2.latest_offset.unwrap().ordinal, 0);
+    }
+
+    #[tokio::test]
+    async fn lag_metrics_track_consumer_offsets() {
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+
+        // Append 5 events
+        for i in 0..5u64 {
+            let _ = storage
+                .append_batch(AppendRequest {
+                    batch_id: format!("b{i}"),
+                    events: vec![sample_event(&format!("e{i}"), 1, i, "data")],
+                    required_durability: DurabilityLevel::Appended,
+                    producer_ts_ms: i,
+                })
+                .await
+                .unwrap();
+        }
+
+        // Register two consumers at different positions
+        let _ = storage
+            .commit_checkpoint(RecorderCheckpoint {
+                consumer: CheckpointConsumerId("indexer".to_string()),
+                upto_offset: RecorderOffset {
+                    segment_id: 0,
+                    byte_offset: 0,
+                    ordinal: 2,
+                },
+                schema_version: "v1".to_string(),
+                committed_at_ms: 100,
+            })
+            .await
+            .unwrap();
+
+        let _ = storage
+            .commit_checkpoint(RecorderCheckpoint {
+                consumer: CheckpointConsumerId("search".to_string()),
+                upto_offset: RecorderOffset {
+                    segment_id: 0,
+                    byte_offset: 0,
+                    ordinal: 4,
+                },
+                schema_version: "v1".to_string(),
+                committed_at_ms: 100,
+            })
+            .await
+            .unwrap();
+
+        let lag = storage.lag_metrics().await.unwrap();
+        assert!(lag.latest_offset.is_some());
+        assert_eq!(lag.latest_offset.unwrap().ordinal, 4);
+        assert_eq!(lag.consumers.len(), 2);
+
+        // Consumers sorted by name
+        assert_eq!(lag.consumers[0].consumer.0, "indexer");
+        assert_eq!(lag.consumers[0].offsets_behind, 2); // 4 - 2
+        assert_eq!(lag.consumers[1].consumer.0, "search");
+        assert_eq!(lag.consumers[1].offsets_behind, 0); // 4 - 4
+    }
+
+    // ── Checkpoint regression ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn checkpoint_regression_returns_error() {
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+
+        // Advance checkpoint to ordinal 5
+        let _ = storage
+            .commit_checkpoint(RecorderCheckpoint {
+                consumer: CheckpointConsumerId("cons".to_string()),
+                upto_offset: RecorderOffset {
+                    segment_id: 0,
+                    byte_offset: 0,
+                    ordinal: 5,
+                },
+                schema_version: "v1".to_string(),
+                committed_at_ms: 100,
+            })
+            .await
+            .unwrap();
+
+        // Try to regress to ordinal 3
+        let err = storage
+            .commit_checkpoint(RecorderCheckpoint {
+                consumer: CheckpointConsumerId("cons".to_string()),
+                upto_offset: RecorderOffset {
+                    segment_id: 0,
+                    byte_offset: 0,
+                    ordinal: 3,
+                },
+                schema_version: "v1".to_string(),
+                committed_at_ms: 200,
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            RecorderStorageError::CheckpointRegression { .. }
+        ));
+        assert_eq!(err.class(), RecorderStorageErrorClass::TerminalData);
+    }
+
+    // ── Read checkpoint for unknown consumer ─────────────────────────
+
+    #[tokio::test]
+    async fn read_checkpoint_unknown_consumer_returns_none() {
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+
+        let result = storage
+            .read_checkpoint(&CheckpointConsumerId("nonexistent".to_string()))
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
+    }
+
+    // ── Flush modes ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn flush_buffered_and_durable() {
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+
+        let _ = storage
+            .append_batch(AppendRequest {
+                batch_id: "b1".to_string(),
+                events: vec![sample_event("e1", 1, 0, "data")],
+                required_durability: DurabilityLevel::Enqueued, // not flushed yet
+                producer_ts_ms: 1,
+            })
+            .await
+            .unwrap();
+
+        // Flush buffered
+        let stats_buf = storage.flush(FlushMode::Buffered).await.unwrap();
+        assert_eq!(stats_buf.backend, RecorderBackendKind::AppendLog);
+        assert!(stats_buf.latest_offset.is_some());
+
+        // Flush durable
+        let stats_dur = storage.flush(FlushMode::Durable).await.unwrap();
+        assert_eq!(stats_dur.backend, RecorderBackendKind::AppendLog);
+    }
+
+    // ── Durability levels ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn enqueued_durability_does_not_fsync() {
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+
+        let resp = storage
+            .append_batch(AppendRequest {
+                batch_id: "b1".to_string(),
+                events: vec![sample_event("e1", 1, 0, "data")],
+                required_durability: DurabilityLevel::Enqueued,
+                producer_ts_ms: 1,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(resp.committed_durability, DurabilityLevel::Enqueued);
+        assert_eq!(resp.accepted_count, 1);
+    }
+
+    #[tokio::test]
+    async fn fsync_durability_committed() {
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+
+        let resp = storage
+            .append_batch(AppendRequest {
+                batch_id: "b1".to_string(),
+                events: vec![sample_event("e1", 1, 0, "data")],
+                required_durability: DurabilityLevel::Fsync,
+                producer_ts_ms: 1,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(resp.committed_durability, DurabilityLevel::Fsync);
+        // State should be persisted (fsync does persist_state)
+        assert!(dir.path().join("state.json").exists());
+    }
+
+    // ── Reopen persistence ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn reopen_continues_ordinals() {
+        let dir = tempdir().unwrap();
+        let cfg = test_config(dir.path());
+
+        {
+            let storage = AppendLogRecorderStorage::open(cfg.clone()).unwrap();
+            let _ = storage
+                .append_batch(AppendRequest {
+                    batch_id: "b1".to_string(),
+                    events: vec![
+                        sample_event("e1", 1, 0, "a"),
+                        sample_event("e2", 1, 1, "b"),
+                        sample_event("e3", 1, 2, "c"),
+                    ],
+                    required_durability: DurabilityLevel::Appended,
+                    producer_ts_ms: 1,
+                })
+                .await
+                .unwrap();
+        }
+
+        // Reopen and verify ordinals continue
+        let storage2 = AppendLogRecorderStorage::open(cfg).unwrap();
+        let resp = storage2
+            .append_batch(AppendRequest {
+                batch_id: "b2".to_string(),
+                events: vec![sample_event("e4", 1, 3, "d")],
+                required_durability: DurabilityLevel::Appended,
+                producer_ts_ms: 2,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(resp.first_offset.ordinal, 3);
+    }
+
+    // ── Error classification ─────────────────────────────────────────
+
+    #[test]
+    fn error_class_mapping() {
+        let err = RecorderStorageError::QueueFull { capacity: 10 };
+        assert_eq!(err.class(), RecorderStorageErrorClass::Overload);
+
+        let err = RecorderStorageError::InvalidRequest {
+            message: "bad".to_string(),
+        };
+        assert_eq!(err.class(), RecorderStorageErrorClass::TerminalData);
+
+        let err = RecorderStorageError::CheckpointRegression {
+            consumer: "c".to_string(),
+            current_ordinal: 5,
+            attempted_ordinal: 3,
+        };
+        assert_eq!(err.class(), RecorderStorageErrorClass::TerminalData);
+
+        let err = RecorderStorageError::CorruptRecord {
+            offset: 100,
+            reason: "bad crc".to_string(),
+        };
+        assert_eq!(err.class(), RecorderStorageErrorClass::Corruption);
+    }
+
+    // ── Backend kind ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn backend_kind_is_append_log() {
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+        assert_eq!(storage.backend_kind(), RecorderBackendKind::AppendLog);
+    }
+
+    // ── Serde roundtrips ─────────────────────────────────────────────
+
+    #[test]
+    fn recorder_offset_serde_roundtrip() {
+        let offset = RecorderOffset {
+            segment_id: 1,
+            byte_offset: 1024,
+            ordinal: 42,
+        };
+        let json = serde_json::to_string(&offset).unwrap();
+        let back: RecorderOffset = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, offset);
+    }
+
+    #[test]
+    fn health_serde_roundtrip() {
+        let health = RecorderStorageHealth {
+            backend: RecorderBackendKind::AppendLog,
+            degraded: false,
+            queue_depth: 2,
+            queue_capacity: 16,
+            latest_offset: Some(RecorderOffset {
+                segment_id: 0,
+                byte_offset: 512,
+                ordinal: 10,
+            }),
+            last_error: None,
+        };
+        let json = serde_json::to_string(&health).unwrap();
+        let back: RecorderStorageHealth = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, health);
+    }
+
+    #[test]
+    fn lag_metrics_serde_roundtrip() {
+        let lag = RecorderStorageLag {
+            latest_offset: Some(RecorderOffset {
+                segment_id: 0,
+                byte_offset: 1000,
+                ordinal: 50,
+            }),
+            consumers: vec![RecorderConsumerLag {
+                consumer: CheckpointConsumerId("idx".to_string()),
+                offsets_behind: 5,
+            }],
+        };
+        let json = serde_json::to_string(&lag).unwrap();
+        let back: RecorderStorageLag = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, lag);
+    }
+
+    #[test]
+    fn flush_stats_serde_roundtrip() {
+        let stats = FlushStats {
+            backend: RecorderBackendKind::FrankenSqlite,
+            flushed_at_ms: 123456,
+            latest_offset: None,
+        };
+        let json = serde_json::to_string(&stats).unwrap();
+        let back: FlushStats = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, stats);
+    }
+
+    // ── Multi-batch ordering ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn multi_batch_accepted_count_correct() {
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+
+        let resp = storage
+            .append_batch(AppendRequest {
+                batch_id: "b1".to_string(),
+                events: vec![
+                    sample_event("e1", 1, 0, "a"),
+                    sample_event("e2", 1, 1, "b"),
+                    sample_event("e3", 1, 2, "c"),
+                    sample_event("e4", 1, 3, "d"),
+                ],
+                required_durability: DurabilityLevel::Appended,
+                producer_ts_ms: 1,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(resp.accepted_count, 4);
+        assert_eq!(resp.first_offset.ordinal, 0);
+        assert_eq!(resp.last_offset.ordinal, 3);
+    }
+
+    // ── Open with empty data file ────────────────────────────────────
+
+    #[tokio::test]
+    async fn open_with_empty_data_file() {
+        let dir = tempdir().unwrap();
+        let cfg = test_config(dir.path());
+
+        // Create empty data file
+        std::fs::create_dir_all(cfg.data_path.parent().unwrap()).unwrap();
+        std::fs::write(&cfg.data_path, &[]).unwrap();
+
+        let storage = AppendLogRecorderStorage::open(cfg).unwrap();
+        let h = storage.health().await;
+        assert!(h.latest_offset.is_none());
+    }
+
+    // ── Lag with no consumers ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn lag_with_no_consumers() {
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+
+        let _ = storage
+            .append_batch(AppendRequest {
+                batch_id: "b1".to_string(),
+                events: vec![sample_event("e1", 1, 0, "data")],
+                required_durability: DurabilityLevel::Appended,
+                producer_ts_ms: 1,
+            })
+            .await
+            .unwrap();
+
+        let lag = storage.lag_metrics().await.unwrap();
+        assert!(lag.consumers.is_empty());
+        assert!(lag.latest_offset.is_some());
+    }
 }

@@ -62,6 +62,15 @@
       "minimum": 0,
       "description": "Monotonic per-pane sequence number for ordering/replay."
     },
+    "global_sequence": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Process-wide monotonic sequence for cross-pane merge ordering. Replay order: (global_sequence, pane_id, sequence)."
+    },
+    "batch_id": {
+      "type": ["string", "null"],
+      "description": "Optional batch identifier grouping atomically-related events for replay."
+    },
     "causality": {
       "type": "object",
       "required": ["parent_event_id", "trigger_event_id", "root_event_id"],
