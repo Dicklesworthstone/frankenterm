@@ -75,6 +75,8 @@ rustls = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
 rustls-pemfile = { workspace = true, optional = true }
 x509-parser = { workspace = true, optional = true }
+# Lexical search (optional, behind feature)
+tantivy = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
@@ -191,6 +193,10 @@ required-features = ["asupersync-runtime"]
 name = "lockfree_contention"
 harness = false
 
+[[bench]]
+name = "tantivy_search"
+harness = false
+
 [features]
 default = []
 # Public feature flags (stable surface)
@@ -212,6 +218,7 @@ distributed = [
 ]
 sync = ["dep:asupersync"]
 asupersync-runtime = ["dep:asupersync"]
+recorder-lexical = ["dep:tantivy"]
 
 # Optional heavy integrations - feature-gated (internal)
 frankenterm-deps = ["dep:codec", "dep:config", "dep:mux", "dep:frankenterm-term"]
