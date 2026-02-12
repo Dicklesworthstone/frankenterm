@@ -613,7 +613,7 @@ mod tests {
         let request = store.issue(&input, None).await.unwrap();
 
         // Wait a tiny bit to ensure time has passed
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
 
         // Try to consume - should fail because token has expired
         let consumed = store
@@ -852,7 +852,7 @@ mod tests {
             .unwrap();
 
         // Wait for expiry
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
 
         let consumed = store
             .consume_for_plan(&request.allow_once_code, &input, plan_hash)

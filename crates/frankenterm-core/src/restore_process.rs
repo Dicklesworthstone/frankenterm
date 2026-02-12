@@ -192,7 +192,7 @@ impl ProcessLauncher {
 
         for (i, plan) in plans.iter().enumerate() {
             if i > 0 && !delay.is_zero() {
-                tokio::time::sleep(delay).await;
+                crate::runtime_compat::sleep(delay).await;
             }
 
             let result = match &plan.action {
@@ -491,7 +491,7 @@ impl ProcessLauncher {
             .map_err(|e| format!("send cd: {e}"))?;
 
         // Small delay to let the cd complete
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        crate::runtime_compat::sleep(Duration::from_millis(50)).await;
 
         // If the shell is different from default, exec it
         let current_shell = default_shell();

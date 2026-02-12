@@ -49,7 +49,7 @@ pub async fn run_orphan_reaper(config: CliConfig, shutdown: Arc<AtomicBool>) {
     );
 
     loop {
-        tokio::time::sleep(interval).await;
+        crate::runtime_compat::sleep(interval).await;
 
         if shutdown.load(Ordering::Relaxed) {
             info!("Orphan reaper shutting down");

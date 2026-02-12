@@ -1566,7 +1566,7 @@ mod tests {
     async fn uptime_increases() {
         let bus = EventBus::new(10);
         let t1 = bus.uptime();
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
         let t2 = bus.uptime();
         assert!(t2 > t1);
     }

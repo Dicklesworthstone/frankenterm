@@ -554,7 +554,7 @@ fn epoch_ms_u64() -> u64 {
 
 async fn wait_for_shutdown(flag: Arc<AtomicBool>) {
     while !flag.load(Ordering::SeqCst) {
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        crate::runtime_compat::sleep(Duration::from_millis(250)).await;
     }
 }
 
