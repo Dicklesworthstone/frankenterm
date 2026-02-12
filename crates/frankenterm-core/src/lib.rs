@@ -135,6 +135,7 @@ pub mod recording;
 pub mod replay;
 pub mod reports;
 pub mod reservoir_sampler;
+pub mod recorder_invariants;
 pub mod recorder_storage;
 pub mod restore_layout;
 pub mod restore_process;
