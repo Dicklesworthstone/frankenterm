@@ -172,6 +172,11 @@ name = "auto_tuning"
 harness = false
 
 [[bench]]
+name = "labruntime_overhead"
+harness = false
+required-features = ["asupersync-runtime"]
+
+[[bench]]
 name = "outcome_adapter"
 harness = false
 required-features = ["asupersync-runtime"]
