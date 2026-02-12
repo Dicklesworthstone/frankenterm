@@ -309,11 +309,7 @@ pub fn spawn_watchdog(
     let check_interval = config.check_interval;
 
     let task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(check_interval);
-
         loop {
-            interval.tick().await;
-
             if shutdown_flag.load(Ordering::SeqCst) || internal_flag.load(Ordering::SeqCst) {
                 info!("Watchdog: shutdown signal received");
                 break;
@@ -353,6 +349,9 @@ pub fn spawn_watchdog(
                     }
                 }
             }
+
+            // Use the dual-runtime sleep helper during the tokio -> asupersync migration.
+            crate::runtime_compat::sleep(check_interval).await;
         }
     });
 
@@ -455,7 +454,8 @@ impl MuxWatchdog {
 
         // Ping: try listing panes with timeout
         let ping_ok = matches!(
-            tokio::time::timeout(self.config.ping_timeout, self.wezterm.list_panes()).await,
+            crate::runtime_compat::timeout(self.config.ping_timeout, self.wezterm.list_panes())
+                .await,
             Ok(Ok(_))
         );
 
@@ -532,13 +532,10 @@ pub fn spawn_mux_watchdog(
 
     tokio::spawn(async move {
         let mut watchdog = MuxWatchdog::new(config, wezterm);
-        let mut interval = tokio::time::interval(check_interval);
 
         info!("Mux watchdog started");
 
         loop {
-            interval.tick().await;
-
             if shutdown_flag.load(Ordering::SeqCst) {
                 info!("Mux watchdog shutting down");
                 break;
@@ -589,6 +586,9 @@ pub fn spawn_mux_watchdog(
                     );
                 }
             }
+
+            // Use the dual-runtime sleep helper during the tokio -> asupersync migration.
+            crate::runtime_compat::sleep(check_interval).await;
         }
     })
 }
@@ -797,7 +797,7 @@ mod tests {
         let handle = spawn_watchdog(Arc::clone(&heartbeats), config, Arc::clone(&shutdown));
 
         // Let it run a few ticks.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        crate::runtime_compat::sleep(Duration::from_millis(50)).await;
 
         shutdown.store(true, Ordering::SeqCst);
         handle.join().await;
@@ -944,5 +944,292 @@ mod tests {
 
         assert_eq!(watchdog.history.len(), 3, "history should be bounded");
         assert_eq!(watchdog.total_checks, 5);
+    }
+
+    // ── HeartbeatRegistry additional tests ─────────────────────────
+
+    #[test]
+    fn heartbeat_registry_default_trait() {
+        let reg = HeartbeatRegistry::default();
+        assert_eq!(reg.last_heartbeat(Component::Discovery), 0);
+        assert!(reg.created_at_ms() > 0);
+    }
+
+    #[test]
+    fn created_at_ms_is_recent() {
+        let before = epoch_ms();
+        let reg = HeartbeatRegistry::new();
+        let after = epoch_ms();
+        assert!(reg.created_at_ms() >= before);
+        assert!(reg.created_at_ms() <= after);
+    }
+
+    #[test]
+    fn record_each_component_independently() {
+        let reg = HeartbeatRegistry::new();
+        reg.record_capture();
+        assert!(reg.last_heartbeat(Component::Capture) > 0);
+        assert_eq!(reg.last_heartbeat(Component::Discovery), 0);
+        assert_eq!(reg.last_heartbeat(Component::Persistence), 0);
+        assert_eq!(reg.last_heartbeat(Component::Maintenance), 0);
+    }
+
+    #[test]
+    fn grace_period_expired_no_heartbeats_is_degraded() {
+        let reg = HeartbeatRegistry::new();
+        // Force created_at far in the past so grace period has expired
+        let past_created = epoch_ms().saturating_sub(120_000);
+        // We can't directly set created_at since it's not pub, but we can
+        // use a config with a very short grace period
+        let config = WatchdogConfig {
+            grace_period_ms: 0, // No grace period
+            ..WatchdogConfig::default()
+        };
+        let _ = past_created; // used conceptually
+        let report = reg.check_health(&config);
+        // With zero grace period, unrecorded heartbeats should be degraded
+        assert!(report.overall >= HealthStatus::Degraded);
+    }
+
+    #[test]
+    fn multiple_components_degraded() {
+        let reg = HeartbeatRegistry::new();
+        let past = epoch_ms().saturating_sub(20_000);
+        reg.discovery.store(past, Ordering::SeqCst);
+        reg.capture.store(past, Ordering::SeqCst);
+        reg.record_persistence();
+        reg.record_maintenance();
+
+        let config = WatchdogConfig::default();
+        let report = reg.check_health(&config);
+        let unhealthy = report.unhealthy_components();
+        assert!(unhealthy.len() >= 2);
+    }
+
+    #[test]
+    fn worst_status_propagates_to_overall() {
+        let reg = HeartbeatRegistry::new();
+        // One component critical, others healthy
+        let far_past = epoch_ms().saturating_sub(60_000);
+        reg.discovery.store(far_past, Ordering::SeqCst);
+        reg.record_capture();
+        reg.record_persistence();
+        reg.record_maintenance();
+
+        let config = WatchdogConfig::default();
+        let report = reg.check_health(&config);
+        assert_eq!(report.overall, HealthStatus::Critical);
+    }
+
+    #[test]
+    fn component_health_fields_populated() {
+        let reg = HeartbeatRegistry::new();
+        reg.record_discovery();
+        let config = WatchdogConfig {
+            grace_period_ms: u64::MAX,
+            ..WatchdogConfig::default()
+        };
+        let report = reg.check_health(&config);
+
+        let discovery = report
+            .components
+            .iter()
+            .find(|c| c.component == Component::Discovery)
+            .unwrap();
+        assert!(discovery.last_heartbeat_ms.is_some());
+        assert!(discovery.age_ms.is_some());
+        assert_eq!(discovery.threshold_ms, config.discovery_stale_ms);
+        assert_eq!(discovery.status, HealthStatus::Healthy);
+
+        // Unrecorded component within grace period
+        let capture = report
+            .components
+            .iter()
+            .find(|c| c.component == Component::Capture)
+            .unwrap();
+        assert!(capture.last_heartbeat_ms.is_none());
+        assert!(capture.age_ms.is_none());
+    }
+
+    #[test]
+    fn health_report_has_four_components() {
+        let reg = HeartbeatRegistry::new();
+        let config = WatchdogConfig::default();
+        let report = reg.check_health(&config);
+        assert_eq!(report.components.len(), 4);
+    }
+
+    #[test]
+    fn health_report_timestamp_is_recent() {
+        let before = epoch_ms();
+        let reg = HeartbeatRegistry::new();
+        let config = WatchdogConfig::default();
+        let report = reg.check_health(&config);
+        assert!(report.timestamp_ms >= before);
+    }
+
+    // ── WatchdogConfig ─────────────────────────────────────────────
+
+    #[test]
+    fn watchdog_config_default_values() {
+        let config = WatchdogConfig::default();
+        assert_eq!(config.check_interval, Duration::from_secs(30));
+        assert_eq!(config.discovery_stale_ms, 15_000);
+        assert_eq!(config.capture_stale_ms, 5_000);
+        assert_eq!(config.persistence_stale_ms, 30_000);
+        assert_eq!(config.maintenance_stale_ms, 120_000);
+        assert_eq!(config.grace_period_ms, 30_000);
+    }
+
+    // ── Component ──────────────────────────────────────────────────
+
+    #[test]
+    fn component_all_has_four_variants() {
+        assert_eq!(Component::ALL.len(), 4);
+        let set: std::collections::HashSet<_> = Component::ALL.iter().collect();
+        assert_eq!(set.len(), 4);
+    }
+
+    #[test]
+    fn component_serde_roundtrip() {
+        for component in &Component::ALL {
+            let json = serde_json::to_string(component).unwrap();
+            let parsed: Component = serde_json::from_str(&json).unwrap();
+            assert_eq!(*component, parsed);
+        }
+    }
+
+    #[test]
+    fn component_serde_uses_snake_case() {
+        let json = serde_json::to_string(&Component::Discovery).unwrap();
+        assert_eq!(json, r#""discovery""#);
+    }
+
+    // ── HealthStatus ───────────────────────────────────────────────
+
+    #[test]
+    fn health_status_display() {
+        assert_eq!(HealthStatus::Healthy.to_string(), "healthy");
+        assert_eq!(HealthStatus::Degraded.to_string(), "degraded");
+        assert_eq!(HealthStatus::Critical.to_string(), "critical");
+        assert_eq!(HealthStatus::Hung.to_string(), "hung");
+    }
+
+    #[test]
+    fn health_status_serde_roundtrip() {
+        let statuses = [
+            HealthStatus::Healthy,
+            HealthStatus::Degraded,
+            HealthStatus::Critical,
+            HealthStatus::Hung,
+        ];
+        for status in &statuses {
+            let json = serde_json::to_string(status).unwrap();
+            let parsed: HealthStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(*status, parsed);
+        }
+    }
+
+    #[test]
+    fn health_status_serde_uses_snake_case() {
+        let json = serde_json::to_string(&HealthStatus::Healthy).unwrap();
+        assert_eq!(json, r#""healthy""#);
+    }
+
+    // ── HealthReport ───────────────────────────────────────────────
+
+    #[test]
+    fn unhealthy_components_returns_empty_when_all_healthy() {
+        let reg = HeartbeatRegistry::new();
+        reg.record_discovery();
+        reg.record_capture();
+        reg.record_persistence();
+        reg.record_maintenance();
+        let config = WatchdogConfig::default();
+        let report = reg.check_health(&config);
+        assert!(report.unhealthy_components().is_empty());
+    }
+
+    // ── WatchdogHandle ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn watchdog_handle_signal_shutdown() {
+        let heartbeats = Arc::new(HeartbeatRegistry::new());
+        heartbeats.record_discovery();
+        heartbeats.record_capture();
+        heartbeats.record_persistence();
+        heartbeats.record_maintenance();
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let config = WatchdogConfig {
+            check_interval: Duration::from_millis(10),
+            ..WatchdogConfig::default()
+        };
+
+        let handle = spawn_watchdog(Arc::clone(&heartbeats), config, Arc::clone(&shutdown));
+
+        crate::runtime_compat::sleep(Duration::from_millis(30)).await;
+
+        // Use handle's own signal_shutdown instead of the external flag
+        handle.signal_shutdown();
+        handle.join().await;
+    }
+
+    // ── MuxWatchdog additional tests ───────────────────────────────
+
+    #[tokio::test]
+    async fn mux_watchdog_report_reflects_latest_check() {
+        let config = MuxWatchdogConfig::default();
+        let wezterm = crate::wezterm::mock_wezterm_handle();
+        let mut watchdog = MuxWatchdog::new(config, wezterm);
+
+        assert!(watchdog.report().latest_sample.is_none());
+
+        watchdog.check().await;
+        let report = watchdog.report();
+        assert!(report.latest_sample.is_some());
+        assert_eq!(report.total_checks, 1);
+    }
+
+    #[tokio::test]
+    async fn mux_watchdog_total_failures_accumulate() {
+        let config = MuxWatchdogConfig {
+            failure_threshold: 10,
+            ..MuxWatchdogConfig::default()
+        };
+        let wezterm = crate::wezterm::mock_wezterm_handle_failing();
+        let mut watchdog = MuxWatchdog::new(config, wezterm);
+
+        for _ in 0..3 {
+            watchdog.check().await;
+        }
+
+        assert_eq!(watchdog.total_failures, 3);
+        assert_eq!(watchdog.total_checks, 3);
+        assert_eq!(watchdog.consecutive_failures, 3);
+    }
+
+    #[test]
+    fn mux_health_report_serde_roundtrip_with_sample() {
+        let sample = MuxHealthSample {
+            timestamp_ms: 1_700_000_000_000,
+            ping_ok: false,
+            ping_latency_ms: None,
+            rss_bytes: Some(1024 * 1024),
+            status: HealthStatus::Degraded,
+        };
+        let report = MuxHealthReport {
+            timestamp_ms: 1_700_000_000_000,
+            status: HealthStatus::Degraded,
+            consecutive_failures: 2,
+            latest_sample: Some(sample),
+            total_checks: 5,
+            total_failures: 2,
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        let parsed: MuxHealthReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.consecutive_failures, 2);
+        assert!(parsed.latest_sample.is_some());
+        assert_eq!(parsed.latest_sample.unwrap().status, HealthStatus::Degraded);
     }
 }
