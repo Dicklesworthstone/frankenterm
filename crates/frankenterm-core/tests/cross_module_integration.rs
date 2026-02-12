@@ -861,3 +861,185 @@ fn e2e_pane_entropy_summaries_for_eviction_ranking() {
         "low-entropy data should have higher compression ratio bound"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// E. Entropy scheduler + VOI composition
+// ═══════════════════════════════════════════════════════════════════
+
+/// Verifies that the entropy scheduler's normalized density feeds correctly
+/// into VOI scheduling decisions. High-entropy panes should get both shorter
+/// capture intervals (from entropy scheduler) AND higher VOI scores.
+#[test]
+fn entropy_scheduler_composes_with_voi_scheduler() {
+    use frankenterm_core::entropy_scheduler::{EntropyScheduler, EntropySchedulerConfig};
+    use frankenterm_core::voi::{VoiConfig, VoiScheduler};
+
+    // Setup: two panes with different entropy profiles
+    let mut entropy_sched = EntropyScheduler::new(EntropySchedulerConfig {
+        min_samples: 10,
+        ..Default::default()
+    });
+    entropy_sched.register_pane(1); // will get low entropy
+    entropy_sched.register_pane(2); // will get high entropy
+
+    // Feed low-entropy data to pane 1 (constant bytes)
+    entropy_sched.feed_bytes(1, &[0u8; 2000]);
+
+    // Feed high-entropy data to pane 2 (all byte values)
+    let mut high_entropy_data = Vec::with_capacity(256 * 10);
+    for _ in 0..10 {
+        for b in 0..=255u8 {
+            high_entropy_data.push(b);
+        }
+    }
+    entropy_sched.feed_bytes(2, &high_entropy_data);
+
+    // Verify entropy densities
+    let d1 = entropy_sched.entropy_density(1).unwrap();
+    let d2 = entropy_sched.entropy_density(2).unwrap();
+    assert!(d2 > d1, "high-entropy pane should have higher density: d1={d1}, d2={d2}");
+
+    // Verify entropy-based intervals
+    let i1 = entropy_sched.interval_ms(1).unwrap();
+    let i2 = entropy_sched.interval_ms(2).unwrap();
+    assert!(i2 < i1, "high-entropy pane should have shorter interval: i1={i1}, i2={i2}");
+
+    // Compose with VOI: use entropy density as importance weight
+    let now_ms = 10_000;
+    let mut voi_sched = VoiScheduler::new(VoiConfig::default());
+    voi_sched.register_pane(1, now_ms);
+    voi_sched.register_pane(2, now_ms);
+
+    // Set importance proportional to entropy density
+    voi_sched.set_importance(1, d1.max(0.01));
+    voi_sched.set_importance(2, d2.max(0.01));
+
+    // After some staleness, high-entropy pane should have higher VOI
+    let result = voi_sched.schedule(now_ms + 5000);
+    assert_eq!(result.schedule.len(), 2);
+    // First entry (highest VOI) should be pane 2 (high entropy)
+    assert_eq!(
+        result.schedule[0].pane_id, 2,
+        "high-entropy pane should have highest VOI"
+    );
+    assert!(
+        result.schedule[0].voi > result.schedule[1].voi,
+        "VOI ordering should reflect entropy-based importance"
+    );
+}
+
+/// Verifies that entropy scheduling decisions are consistent with the
+/// entropy accounting module's batch entropy computation.
+#[test]
+fn entropy_scheduler_consistent_with_batch_entropy() {
+    use frankenterm_core::entropy_accounting::compute_entropy;
+    use frankenterm_core::entropy_scheduler::{EntropyScheduler, EntropySchedulerConfig};
+
+    let cfg = EntropySchedulerConfig {
+        min_samples: 10,
+        window_size: 100_000,
+        ..Default::default()
+    };
+
+    // Test data: English text
+    let text = b"The quick brown fox jumps over the lazy dog. This sentence \
+        contains enough characters to provide reasonable entropy estimation.";
+    let text_repeated: Vec<u8> = text.iter().copied().cycle().take(5000).collect();
+
+    // Batch computation
+    let batch_entropy = compute_entropy(&text_repeated);
+
+    // Streaming computation via scheduler
+    let mut sched = EntropyScheduler::new(cfg);
+    sched.register_pane(1);
+    sched.feed_bytes(1, &text_repeated);
+
+    let streaming_entropy = sched.entropy(1).unwrap();
+
+    // Should be within 0.5 bits (batch vs streaming with same window)
+    assert!(
+        (batch_entropy - streaming_entropy).abs() < 0.5,
+        "batch ({batch_entropy:.3}) and streaming ({streaming_entropy:.3}) entropy should agree"
+    );
+
+    // Density should be consistent: density = entropy / 8.0
+    let density = sched.entropy_density(1).unwrap();
+    let expected_density = batch_entropy / 8.0;
+    assert!(
+        (density - expected_density).abs() < 0.1,
+        "density ({density:.3}) should match batch entropy / 8 ({expected_density:.3})"
+    );
+}
+
+/// Verifies that the full entropy→VOI→schedule pipeline produces
+/// a meaningful capture budget allocation across a mixed workload.
+#[test]
+fn entropy_voi_pipeline_allocates_capture_budget() {
+    use frankenterm_core::entropy_scheduler::{EntropyScheduler, EntropySchedulerConfig};
+    use frankenterm_core::voi::{VoiConfig, VoiScheduler};
+
+    let entropy_cfg = EntropySchedulerConfig {
+        min_samples: 10,
+        ..Default::default()
+    };
+    let mut entropy_sched = EntropyScheduler::new(entropy_cfg);
+
+    // Simulate a realistic swarm: 5 panes with different activity patterns
+    let pane_data: Vec<(u64, Vec<u8>)> = vec![
+        (1, vec![0u8; 2000]),                                            // idle (constant)
+        (2, b"ERROR: connection refused\n".repeat(100).to_vec()),        // error loop (low entropy)
+        (3, (0..2000).map(|i| (i % 256) as u8).collect()),              // binary data (high entropy)
+        (4, b"Processing item 12345... done.\n".repeat(80).to_vec()),    // active work (medium)
+        (5, b"$ ls\nfile1.txt\nfile2.rs\n$ cargo test\n".repeat(60).to_vec()), // shell (medium-high)
+    ];
+
+    for (pane_id, data) in &pane_data {
+        entropy_sched.register_pane(*pane_id);
+        entropy_sched.feed_bytes(*pane_id, data);
+    }
+
+    // Compose with VOI
+    let now_ms = 10_000;
+    let mut voi_sched = VoiScheduler::new(VoiConfig::default());
+
+    for (pane_id, _) in &pane_data {
+        voi_sched.register_pane(*pane_id, now_ms);
+        let density = entropy_sched.entropy_density(*pane_id).unwrap();
+        voi_sched.set_importance(*pane_id, density.max(0.01));
+    }
+
+    // Schedule after 3 seconds of staleness
+    let result = voi_sched.schedule(now_ms + 3000);
+    assert_eq!(result.schedule.len(), 5);
+
+    // The binary-data pane (id=3, highest entropy) should be first or near first
+    let binary_pane_rank = result
+        .schedule
+        .iter()
+        .position(|d| d.pane_id == 3)
+        .unwrap();
+    assert!(
+        binary_pane_rank <= 1,
+        "binary pane should be top-2 priority, got rank {binary_pane_rank}"
+    );
+
+    // The idle pane (id=1, lowest entropy) should be last or near last
+    let idle_pane_rank = result
+        .schedule
+        .iter()
+        .position(|d| d.pane_id == 1)
+        .unwrap();
+    assert!(
+        idle_pane_rank >= 3,
+        "idle pane should be bottom-2 priority, got rank {idle_pane_rank}"
+    );
+
+    // Entropy schedule should also reflect the ordering
+    let entropy_result = entropy_sched.schedule();
+    assert_eq!(entropy_result.decisions.len(), 5);
+    // Shortest interval (first decision) should be high-entropy pane
+    assert_eq!(
+        entropy_result.decisions[0].pane_id, 3,
+        "entropy scheduler should also prioritize high-entropy pane"
+    );
+}
