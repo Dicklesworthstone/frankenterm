@@ -3156,6 +3156,8 @@ pub struct PolicyGatedInjector<C = crate::wezterm::WeztermClient> {
     client: C,
     /// Optional storage handle for audit trail emission
     storage: Option<crate::storage::StorageHandle>,
+    /// Optional ingress tap for flight recorder capture (ft-oegrb.2.2)
+    ingress_tap: Option<crate::recording::SharedIngressTap>,
 }
 
 impl<C> PolicyGatedInjector<C>
@@ -3169,6 +3171,7 @@ where
             engine,
             client,
             storage: None,
+            ingress_tap: None,
         }
     }
 
@@ -3186,12 +3189,18 @@ where
             engine,
             client,
             storage: Some(storage),
+            ingress_tap: None,
         }
     }
 
     /// Set the storage handle for audit trail emission
     pub fn set_storage(&mut self, storage: crate::storage::StorageHandle) {
         self.storage = Some(storage);
+    }
+
+    /// Set the ingress tap for flight recorder capture.
+    pub fn set_ingress_tap(&mut self, tap: crate::recording::SharedIngressTap) {
+        self.ingress_tap = Some(tap);
     }
 
     /// Create with a permissive policy engine (for testing)
@@ -3335,6 +3344,11 @@ where
     ) -> InjectionResult {
         // Create redacted summary for audit
         let summary = self.engine.redact_secrets(text);
+        let tap_summary = if self.ingress_tap.is_some() {
+            Some(summary.clone())
+        } else {
+            None
+        };
 
         // Build policy input
         let mut input = PolicyInput::new(action, actor)
@@ -3409,6 +3423,36 @@ where
                 audit_action_id: None,
             },
         };
+
+        // Notify ingress tap (ft-oegrb.2.2)
+        if let Some(ref tap) = self.ingress_tap {
+            use crate::recording::{
+                IngressEvent, IngressOutcome, action_to_ingress_kind, actor_to_source,
+                epoch_ms_now,
+            };
+            let outcome = match &result {
+                InjectionResult::Allowed { .. } => IngressOutcome::Allowed,
+                InjectionResult::Denied { decision, .. } => IngressOutcome::Denied {
+                    reason: format!("{decision:?}"),
+                },
+                InjectionResult::RequiresApproval { .. } => IngressOutcome::RequiresApproval,
+                InjectionResult::Error { error, .. } => IngressOutcome::Error {
+                    error: error.clone(),
+                },
+            };
+            if let Some(text) = tap_summary {
+                tap.on_ingress(IngressEvent {
+                    pane_id,
+                    text,
+                    source: actor_to_source(actor),
+                    ingress_kind: action_to_ingress_kind(action, actor),
+                    redaction: crate::recording::RecorderRedactionLevel::Partial,
+                    occurred_at_ms: epoch_ms_now(),
+                    outcome,
+                    workflow_id: workflow_id.map(String::from),
+                });
+            }
+        }
 
         let storage_for_summary = self.storage.clone();
         let mut audit_summary = None;
