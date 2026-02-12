@@ -166,7 +166,7 @@ impl<N: Clone + Eq + Hash + std::fmt::Debug> HashRing<N> {
 
         // Walk from hash position forward (with wraparound)
         for (_, (node, _)) in self.ring.range(hash..).chain(self.ring.iter()) {
-            if seen.insert(node as *const N) {
+            if seen.insert(node) {
                 result.push(node);
                 if result.len() >= max {
                     break;
@@ -217,20 +217,24 @@ impl<N: Clone + Eq + Hash + std::fmt::Debug> HashRing<N> {
     /// Hash a virtual node position. We combine the node identity with the
     /// virtual index to get well-distributed positions.
     fn vnode_hash(&self, node: &N, vnode_idx: u32) -> u64 {
-        // Format: "{node_debug_repr}#vnode#{idx}"
-        // Use Debug repr for the node since we need a deterministic byte sequence.
-        let repr = format!("{:?}#vnode#{}", node, vnode_idx);
-        fnv1a_hash(repr.as_bytes())
+        // Hash the node identity, then mix with the vnode index using
+        // multiplicative hashing for better dispersion across the ring.
+        let repr = format!("{:?}", node);
+        let node_hash = fnv1a_hash(repr.as_bytes());
+        // Golden-ratio mixing produces well-spread vnode positions
+        let mixed = node_hash
+            .wrapping_add((vnode_idx as u64).wrapping_mul(0x9e3779b97f4a7c15));
+        fnv1a_hash(&mixed.to_le_bytes())
     }
 
     /// Compute distribution statistics by looking up sample keys.
     fn compute_distribution(&self, sample_count: u64) -> (f64, f64, f64) {
-        let mut counts: HashMap<*const N, u64> = HashMap::new();
+        let mut counts: HashMap<&N, u64> = HashMap::new();
 
         for i in 0..sample_count {
             let key = format!("sample-key-{}", i);
             if let Some(node) = self.get_node(&key) {
-                *counts.entry(node as *const N).or_insert(0) += 1;
+                *counts.entry(node).or_insert(0) += 1;
             }
         }
 

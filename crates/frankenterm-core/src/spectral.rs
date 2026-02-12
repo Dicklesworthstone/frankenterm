@@ -909,10 +909,13 @@ mod proptest_tests {
         #[test]
         fn polling_classified(freq_hz in 0.5f64..4.5, amplitude in 50.0f64..200.0) {
             let signal = generate_sine(freq_hz, amplitude, 0.01, DEFAULT_FFT_SIZE);
-            // Higher SNR threshold to avoid Hann window side lobes being detected as peaks
+            // Higher SNR threshold to avoid Hann window side lobes being detected as peaks.
+            // With very high amplitude/noise ratios (e.g. 200/0.01 = 20000), even -40dB
+            // side lobes exceed the noise floor, so allow up to 6 peaks for polling.
             let config = SpectralConfig {
                 min_peak_quality: 3.0,
                 peak_snr_threshold: 20.0,
+                max_polling_peaks: 6,
                 ..SpectralConfig::default()
             };
             let fp = classify_signal(&signal, &config);
