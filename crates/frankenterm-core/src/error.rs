@@ -629,4 +629,210 @@ mod tests {
             );
         }
     }
+
+    // --- Remediation builder tests ---
+
+    #[test]
+    fn remediation_new_has_empty_fields() {
+        let r = Remediation::new("Fix the thing");
+        assert_eq!(r.summary, "Fix the thing");
+        assert!(r.commands.is_empty());
+        assert!(r.alternatives.is_empty());
+        assert!(r.learn_more.is_none());
+    }
+
+    #[test]
+    fn remediation_builder_chain() {
+        let r = Remediation::new("summary")
+            .command("Run", "ft doctor")
+            .platform_command("Install", "brew install wezterm", "macOS")
+            .alternative("Try something else")
+            .learn_more("https://example.com");
+
+        assert_eq!(r.summary, "summary");
+        assert_eq!(r.commands.len(), 2);
+        assert_eq!(r.commands[0].label, "Run");
+        assert_eq!(r.commands[0].command, "ft doctor");
+        assert!(r.commands[0].platform.is_none());
+        assert_eq!(r.commands[1].label, "Install");
+        assert_eq!(r.commands[1].platform.as_deref(), Some("macOS"));
+        assert_eq!(r.alternatives, vec!["Try something else"]);
+        assert_eq!(r.learn_more.as_deref(), Some("https://example.com"));
+    }
+
+    // --- Remediation render_plain tests ---
+
+    #[test]
+    fn render_plain_includes_summary() {
+        let r = Remediation::new("Check your PATH");
+        let output = r.render_plain();
+        assert!(output.contains("Check your PATH"));
+        assert!(output.contains("To fix:"));
+    }
+
+    #[test]
+    fn render_plain_includes_commands() {
+        let r = Remediation::new("Fix it")
+            .command("Diagnose", "ft doctor");
+        let output = r.render_plain();
+        assert!(output.contains("Commands:"));
+        assert!(output.contains("Diagnose: ft doctor"));
+    }
+
+    #[test]
+    fn render_plain_includes_platform_hint() {
+        let r = Remediation::new("Fix it")
+            .platform_command("Install", "brew install wezterm", "macOS");
+        let output = r.render_plain();
+        assert!(output.contains("Install (macOS): brew install wezterm"));
+    }
+
+    #[test]
+    fn render_plain_includes_alternatives() {
+        let r = Remediation::new("Fix it")
+            .alternative("Try plan B");
+        let output = r.render_plain();
+        assert!(output.contains("Alternatives:"));
+        assert!(output.contains("Try plan B"));
+    }
+
+    #[test]
+    fn render_plain_includes_learn_more() {
+        let r = Remediation::new("Fix it")
+            .learn_more("https://docs.example.com");
+        let output = r.render_plain();
+        assert!(output.contains("Learn more: https://docs.example.com"));
+    }
+
+    #[test]
+    fn render_plain_omits_empty_sections() {
+        let r = Remediation::new("Fix it");
+        let output = r.render_plain();
+        assert!(!output.contains("Commands:"));
+        assert!(!output.contains("Alternatives:"));
+        assert!(!output.contains("Learn more:"));
+    }
+
+    // --- RemediationCommand serde roundtrip ---
+
+    #[test]
+    fn remediation_command_serde_roundtrip() {
+        let cmd = RemediationCommand {
+            label: "Diagnose".to_string(),
+            command: "ft doctor".to_string(),
+            platform: Some("macOS".to_string()),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let back: RemediationCommand = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.label, "Diagnose");
+        assert_eq!(back.command, "ft doctor");
+        assert_eq!(back.platform.as_deref(), Some("macOS"));
+    }
+
+    #[test]
+    fn remediation_serde_roundtrip() {
+        let r = Remediation::new("Fix it")
+            .command("Run", "ft doctor")
+            .alternative("Manual fix")
+            .learn_more("https://example.com");
+        let json = serde_json::to_string(&r).unwrap();
+        let back: Remediation = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.summary, "Fix it");
+        assert_eq!(back.commands.len(), 1);
+        assert_eq!(back.alternatives, vec!["Manual fix"]);
+        assert_eq!(back.learn_more.as_deref(), Some("https://example.com"));
+    }
+
+    // --- Error Display tests ---
+
+    #[test]
+    fn error_display_includes_context() {
+        let err = Error::Wezterm(WeztermError::PaneNotFound(42));
+        assert!(err.to_string().contains("42"));
+
+        let err = Error::Policy("rate limit exceeded".to_string());
+        assert!(err.to_string().contains("rate limit exceeded"));
+
+        let err = Error::Runtime("channel closed".to_string());
+        assert!(err.to_string().contains("channel closed"));
+    }
+
+    #[test]
+    fn wezterm_error_display() {
+        assert!(WeztermError::CliNotFound.to_string().contains("not found"));
+        assert!(WeztermError::NotRunning.to_string().contains("not running"));
+        assert!(WeztermError::Timeout(10).to_string().contains("10"));
+        assert!(
+            WeztermError::CircuitOpen { retry_after_ms: 500 }
+                .to_string()
+                .contains("500")
+        );
+    }
+
+    #[test]
+    fn storage_error_display() {
+        assert!(StorageError::Database("corruption".to_string())
+            .to_string()
+            .contains("corruption"));
+        let seq = StorageError::SequenceDiscontinuity {
+            expected: 5,
+            actual: 8,
+        };
+        let msg = seq.to_string();
+        assert!(msg.contains("5") && msg.contains("8"));
+    }
+
+    // --- From conversions ---
+
+    #[test]
+    fn from_wezterm_error() {
+        let inner = WeztermError::CliNotFound;
+        let err: Error = inner.into();
+        assert!(matches!(err, Error::Wezterm(WeztermError::CliNotFound)));
+    }
+
+    #[test]
+    fn from_storage_error() {
+        let inner = StorageError::Database("test".to_string());
+        let err: Error = inner.into();
+        assert!(matches!(err, Error::Storage(StorageError::Database(_))));
+    }
+
+    #[test]
+    fn from_io_error() {
+        let inner = std::io::Error::other("test");
+        let err: Error = inner.into();
+        assert!(matches!(err, Error::Io(_)));
+    }
+
+    // --- Sub-error remediation tests ---
+
+    #[test]
+    fn wezterm_cli_not_found_remediation_has_install_commands() {
+        let r = WeztermError::CliNotFound.remediation();
+        assert!(r.commands.len() >= 3); // multiple platform installs
+        assert!(r.learn_more.is_some());
+    }
+
+    #[test]
+    fn storage_schema_too_new_remediation_mentions_upgrade() {
+        let r = StorageError::SchemaTooNew {
+            current: 9,
+            supported: 6,
+        }
+        .remediation();
+        let text = r.render_plain();
+        assert!(
+            text.contains("upgrade") || text.contains("install") || text.contains("Update"),
+            "Should mention upgrading: {}",
+            text
+        );
+    }
+
+    #[test]
+    fn workflow_pane_locked_remediation() {
+        let r = WorkflowError::PaneLocked.remediation();
+        assert!(!r.summary.is_empty());
+        assert!(!r.commands.is_empty());
+    }
 }
