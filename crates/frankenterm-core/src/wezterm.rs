@@ -2611,7 +2611,7 @@ impl WeztermInterface for UnifiedClient {
 /// event injection (append output, resize, clear) without a running
 /// WezTerm instance.
 pub struct MockWezterm {
-    panes: tokio::sync::RwLock<std::collections::HashMap<u64, MockPane>>,
+    panes: crate::runtime_compat::RwLock<std::collections::HashMap<u64, MockPane>>,
     next_pane_id: std::sync::atomic::AtomicU64,
 }
 
@@ -2677,7 +2677,7 @@ impl MockWezterm {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            panes: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            panes: crate::runtime_compat::RwLock::new(std::collections::HashMap::new()),
             next_pane_id: std::sync::atomic::AtomicU64::new(0),
         }
     }

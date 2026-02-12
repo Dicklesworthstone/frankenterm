@@ -24,7 +24,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::Semaphore;
+use crate::runtime_compat::Semaphore;
 use tracing::{debug, info, warn};
 
 use crate::wezterm::WeztermHandle;

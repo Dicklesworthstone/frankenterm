@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, Semaphore, TryAcquireError};
+use crate::runtime_compat::{Mutex, Semaphore, TryAcquireError};
 
 /// Configuration for the connection pool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -251,7 +251,7 @@ pub struct PoolAcquireResult<C> {
     /// An idle connection, or `None` if the caller needs to create one.
     pub conn: Option<C>,
     /// Semaphore permit — dropped when the acquire result is dropped.
-    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    permit: Option<crate::runtime_compat::OwnedSemaphorePermit>,
 }
 
 impl<C: std::fmt::Debug> std::fmt::Debug for PoolAcquireResult<C> {
@@ -293,7 +293,7 @@ impl<C> Drop for PoolAcquireResult<C> {
 
 /// Guard that holds a pool permit. Dropping it releases the slot.
 pub struct PoolAcquireGuard {
-    _permit: tokio::sync::OwnedSemaphorePermit,
+    _permit: crate::runtime_compat::OwnedSemaphorePermit,
 }
 
 #[cfg(test)]

@@ -222,7 +222,7 @@ pub struct NotificationOutcome {
 pub struct NotificationPipeline {
     gate: NotificationGate,
     senders: Vec<Box<dyn NotificationSender>>,
-    mute_store: Option<Arc<tokio::sync::Mutex<StorageHandle>>>,
+    mute_store: Option<Arc<crate::runtime_compat::Mutex<StorageHandle>>>,
 }
 
 impl NotificationPipeline {
@@ -241,7 +241,7 @@ impl NotificationPipeline {
     pub fn with_mute_store(
         gate: NotificationGate,
         senders: Vec<Box<dyn NotificationSender>>,
-        storage: Arc<tokio::sync::Mutex<StorageHandle>>,
+        storage: Arc<crate::runtime_compat::Mutex<StorageHandle>>,
     ) -> Self {
         Self {
             gate,
@@ -811,7 +811,7 @@ mod tests {
             NotificationGate::from_config(filter, Duration::from_secs(60), Duration::from_secs(60));
         let sent = Arc::new(Mutex::new(Vec::new()));
         let sender = MockSender::new("mock", Arc::clone(&sent));
-        let storage_arc = Arc::new(tokio::sync::Mutex::new(storage));
+        let storage_arc = Arc::new(crate::runtime_compat::Mutex::new(storage));
         let mut pipeline =
             NotificationPipeline::with_mute_store(gate, vec![Box::new(sender)], storage_arc);
 

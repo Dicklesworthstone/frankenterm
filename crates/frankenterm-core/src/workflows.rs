@@ -33,7 +33,7 @@ use std::time::Duration;
 /// Type alias for a boxed future used in dyn-compatible traits.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 type PolicyInjector = crate::policy::PolicyGatedInjector<crate::wezterm::WeztermHandle>;
-type PolicyInjectorHandle = Arc<tokio::sync::Mutex<PolicyInjector>>;
+type PolicyInjectorHandle = Arc<crate::runtime_compat::Mutex<PolicyInjector>>;
 
 // ============================================================================
 // Codex Usage-Limit Helpers (wa-nu4.1.3.2)
@@ -10924,7 +10924,7 @@ steps:
         let engine = WorkflowEngine::default();
         let lock_manager = Arc::new(PaneWorkflowLockManager::new());
         let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
-        let injector = Arc::new(tokio::sync::Mutex::new(
+        let injector = Arc::new(crate::runtime_compat::Mutex::new(
             crate::policy::PolicyGatedInjector::new(
                 crate::policy::PolicyEngine::strict(),
                 default_wezterm_handle(),
@@ -13617,7 +13617,7 @@ steps:
         let lock_manager = Arc::new(PaneWorkflowLockManager::new());
 
         // Create mock injector (won't be called in this test)
-        let injector = Arc::new(tokio::sync::Mutex::new(
+        let injector = Arc::new(crate::runtime_compat::Mutex::new(
             crate::policy::PolicyGatedInjector::new(
                 crate::policy::PolicyEngine::permissive(),
                 default_wezterm_handle(),
@@ -13707,7 +13707,7 @@ steps:
     fn workflow_runner_lock_prevents_concurrent_runs() {
         let engine = WorkflowEngine::default();
         let lock_manager = Arc::new(PaneWorkflowLockManager::new());
-        let injector = Arc::new(tokio::sync::Mutex::new(
+        let injector = Arc::new(crate::runtime_compat::Mutex::new(
             crate::policy::PolicyGatedInjector::new(
                 crate::policy::PolicyEngine::permissive(),
                 default_wezterm_handle(),
@@ -13792,7 +13792,7 @@ steps:
     fn workflow_runner_find_by_name() {
         let engine = WorkflowEngine::default();
         let lock_manager = Arc::new(PaneWorkflowLockManager::new());
-        let injector = Arc::new(tokio::sync::Mutex::new(
+        let injector = Arc::new(crate::runtime_compat::Mutex::new(
             crate::policy::PolicyGatedInjector::new(
                 crate::policy::PolicyEngine::permissive(),
                 default_wezterm_handle(),
@@ -14002,7 +14002,7 @@ steps:
             // Create context with injector
             let engine = crate::policy::PolicyEngine::permissive();
             let client = default_wezterm_handle();
-            let injector = Arc::new(tokio::sync::Mutex::new(
+            let injector = Arc::new(crate::runtime_compat::Mutex::new(
                 crate::policy::PolicyGatedInjector::new(engine, client),
             ));
 
@@ -15040,7 +15040,7 @@ steps:
         let engine = WorkflowEngine::default();
         let lock_manager = Arc::new(PaneWorkflowLockManager::new());
         let storage = Arc::new(crate::storage::StorageHandle::new(db_path).await.unwrap());
-        let injector = Arc::new(tokio::sync::Mutex::new(
+        let injector = Arc::new(crate::runtime_compat::Mutex::new(
             crate::policy::PolicyGatedInjector::new(
                 crate::policy::PolicyEngine::permissive(),
                 default_wezterm_handle(),
@@ -15321,7 +15321,7 @@ steps:
         let lock_manager = Arc::new(PaneWorkflowLockManager::new());
         let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
         let wezterm: crate::wezterm::WeztermHandle = Arc::new(MockWezterm::default());
-        let injector = Arc::new(tokio::sync::Mutex::new(
+        let injector = Arc::new(crate::runtime_compat::Mutex::new(
             crate::policy::PolicyGatedInjector::with_storage(
                 crate::policy::PolicyEngine::permissive(),
                 wezterm,
@@ -15561,7 +15561,7 @@ steps:
         let wezterm: crate::wezterm::WeztermHandle = Arc::new(
             crate::wezterm::WeztermClient::with_socket("/tmp/wa-test-nonexistent.sock"),
         );
-        let injector = Arc::new(tokio::sync::Mutex::new(
+        let injector = Arc::new(crate::runtime_compat::Mutex::new(
             crate::policy::PolicyGatedInjector::new(
                 crate::policy::PolicyEngine::permissive(),
                 wezterm,

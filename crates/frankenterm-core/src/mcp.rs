@@ -2676,7 +2676,7 @@ impl ToolHandler for WaWorkflowRunTool {
                 let injector_engine =
                     build_policy_engine(&config, config.safety.require_prompt_active);
                 let injector =
-                    Arc::new(tokio::sync::Mutex::new(PolicyGatedInjector::with_storage(
+                    Arc::new(crate::runtime_compat::Mutex::new(PolicyGatedInjector::with_storage(
                         injector_engine,
                         Arc::clone(&wezterm),
                         storage.as_ref().clone(),

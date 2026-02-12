@@ -20,7 +20,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{RwLock, mpsc};
+use crate::runtime_compat::RwLock;
+use tokio::sync::mpsc;
 
 use crate::config::{IpcAuthToken, IpcScope};
 use crate::crash::HealthSnapshot;
@@ -1122,7 +1123,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use tempfile::TempDir;
-    use tokio::sync::RwLock;
+    use crate::runtime_compat::RwLock;
 
     #[test]
     fn ipc_response_ok_serializes() {

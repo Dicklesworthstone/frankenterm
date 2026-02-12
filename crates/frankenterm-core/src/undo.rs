@@ -383,7 +383,7 @@ impl UndoExecutor {
         let engine = WorkflowEngine::new(10);
         let lock_manager = Arc::new(PaneWorkflowLockManager::new());
         let policy = PolicyEngine::permissive();
-        let injector = Arc::new(tokio::sync::Mutex::new(PolicyGatedInjector::with_storage(
+        let injector = Arc::new(crate::runtime_compat::Mutex::new(PolicyGatedInjector::with_storage(
             policy,
             Arc::clone(&self.wezterm),
             self.storage.as_ref().clone(),
