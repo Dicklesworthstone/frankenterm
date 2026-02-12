@@ -425,6 +425,8 @@ where
     supervisor_metrics: SupervisorMetrics,
     /// Optional egress tap for flight recorder capture (ft-oegrb.2.3)
     egress_tap: Option<crate::recording::SharedEgressTap>,
+    /// Process-wide global sequence for cross-pane merge ordering (ft-oegrb.2.4).
+    global_sequence: Arc<crate::recording::GlobalSequence>,
 }
 
 impl<S> TailerSupervisor<S>
@@ -460,6 +462,7 @@ where
             metrics: TailerMetrics::default(),
             supervisor_metrics: SupervisorMetrics::default(),
             egress_tap: None,
+            global_sequence: Arc::new(crate::recording::GlobalSequence::new()),
         }
     }
 
@@ -493,12 +496,18 @@ where
             metrics: TailerMetrics::default(),
             supervisor_metrics: SupervisorMetrics::default(),
             egress_tap: None,
+            global_sequence: Arc::new(crate::recording::GlobalSequence::new()),
         }
     }
 
     /// Set the egress tap for flight recorder capture.
     pub fn set_egress_tap(&mut self, tap: crate::recording::SharedEgressTap) {
         self.egress_tap = Some(tap);
+    }
+
+    /// Set the global sequence counter, sharing it with the ingress tap.
+    pub fn set_global_sequence(&mut self, seq: Arc<crate::recording::GlobalSequence>) {
+        self.global_sequence = seq;
     }
 
     /// Number of active tailers.
@@ -652,6 +661,7 @@ where
             let source = Arc::clone(&self.source);
             let capture_circuit_breaker = Arc::clone(&self.capture_circuit_breaker);
             let egress_tap = self.egress_tap.clone();
+            let global_sequence = Arc::clone(&self.global_sequence);
             let semaphore = Arc::clone(&self.semaphore);
             let overlap_size = self.config.overlap_size;
             let send_timeout = self.config.send_timeout;
@@ -704,6 +714,7 @@ where
                                 redaction: RecorderRedactionLevel::None,
                                 occurred_at_ms: epoch_ms_now(),
                                 sequence: segment.seq,
+                                global_sequence: global_sequence.next(),
                             });
                         }
                         permit.send(CaptureEvent { segment });
@@ -811,6 +822,7 @@ where
                             redaction: RecorderRedactionLevel::None,
                             occurred_at_ms: epoch_ms_now(),
                             sequence: segment.seq,
+                            global_sequence: global_sequence.next(),
                         });
                     }
                     permit.send(CaptureEvent { segment });
