@@ -106,6 +106,7 @@ pub mod kalman_watchdog;
 pub mod learn;
 pub mod lock;
 pub mod logging;
+pub mod lru_cache;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 pub mod memory_budget;
