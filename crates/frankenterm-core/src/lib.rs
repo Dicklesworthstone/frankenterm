@@ -166,6 +166,7 @@ pub mod stream_hash;
 pub mod suggestions;
 pub mod survival;
 pub mod tailer;
+pub mod tantivy_policy;
 pub mod telemetry;
 pub mod token_bucket;
 pub mod undo;
