@@ -4683,7 +4683,8 @@ pub fn run_unstick_scan_text(config: &UnstickConfig) -> UnstickReport {
 
 use crate::ingest::Osc133State;
 use crate::patterns::PatternEngine;
-use tokio::time::{Instant, sleep};
+use crate::runtime_compat::sleep;
+use std::time::Instant;
 
 /// Result of waiting for a condition.
 #[derive(Debug, Clone)]
@@ -4857,7 +4858,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
             WaitCondition::Sleep { duration_ms } => {
                 let dur = Duration::from_millis(*duration_ms);
                 let capped = dur.min(timeout);
-                tokio::time::sleep(capped).await;
+                sleep(capped).await;
                 Ok(WaitConditionResult::Satisfied {
                     elapsed_ms: capped.as_millis() as u64,
                     polls: 0,
@@ -6026,7 +6027,7 @@ impl WorkflowRunner {
                     }
 
                     // Wait before retry
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    sleep(Duration::from_millis(delay_ms)).await;
                 }
                 StepResult::Abort { reason } => {
                     let elapsed_ms = elapsed_ms(start_time);
@@ -6129,26 +6130,26 @@ impl WorkflowRunner {
                         WaitCondition::PaneIdle {
                             idle_threshold_ms, ..
                         } => {
-                            tokio::time::sleep(Duration::from_millis(*idle_threshold_ms)).await;
+                            sleep(Duration::from_millis(*idle_threshold_ms)).await;
                         }
                         WaitCondition::Pattern { .. } => {
                             // Would use WaitConditionExecutor here
-                            tokio::time::sleep(timeout).await;
+                            sleep(timeout).await;
                         }
                         WaitCondition::StableTail { stable_for_ms, .. } => {
                             // Would use WaitConditionExecutor here
-                            tokio::time::sleep(Duration::from_millis(*stable_for_ms)).await;
+                            sleep(Duration::from_millis(*stable_for_ms)).await;
                         }
                         WaitCondition::TextMatch { .. } => {
                             // Would use WaitConditionExecutor here
-                            tokio::time::sleep(timeout).await;
+                            sleep(timeout).await;
                         }
                         WaitCondition::Sleep { duration_ms } => {
-                            tokio::time::sleep(Duration::from_millis(*duration_ms)).await;
+                            sleep(Duration::from_millis(*duration_ms)).await;
                         }
                         WaitCondition::External { .. } => {
                             // Would wait for external signal
-                            tokio::time::sleep(timeout).await;
+                            sleep(timeout).await;
                         }
                     }
 
@@ -6265,27 +6266,27 @@ impl WorkflowRunner {
                                     WaitCondition::PaneIdle {
                                         idle_threshold_ms, ..
                                     } => {
-                                        tokio::time::sleep(Duration::from_millis(
+                                        sleep(Duration::from_millis(
                                             *idle_threshold_ms,
                                         ))
                                         .await;
                                     }
                                     WaitCondition::Pattern { .. } => {
-                                        tokio::time::sleep(timeout).await;
+                                        sleep(timeout).await;
                                     }
                                     WaitCondition::StableTail { stable_for_ms, .. } => {
-                                        tokio::time::sleep(Duration::from_millis(*stable_for_ms))
+                                        sleep(Duration::from_millis(*stable_for_ms))
                                             .await;
                                     }
                                     WaitCondition::TextMatch { .. } => {
-                                        tokio::time::sleep(timeout).await;
+                                        sleep(timeout).await;
                                     }
                                     WaitCondition::Sleep { duration_ms } => {
-                                        tokio::time::sleep(Duration::from_millis(*duration_ms))
+                                        sleep(Duration::from_millis(*duration_ms))
                                             .await;
                                     }
                                     WaitCondition::External { .. } => {
-                                        tokio::time::sleep(timeout).await;
+                                        sleep(timeout).await;
                                     }
                                 }
                             }
@@ -7467,7 +7468,7 @@ impl HandleCompaction {
                 ));
             }
 
-            tokio::time::sleep(interval).await;
+            sleep(interval).await;
             interval = interval.saturating_mul(2);
             if interval > Duration::from_secs(1) {
                 interval = Duration::from_secs(1);

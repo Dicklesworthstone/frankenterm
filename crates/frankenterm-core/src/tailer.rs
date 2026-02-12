@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use crate::runtime_compat::{RwLock, Semaphore};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
-use tokio::time::timeout;
+use crate::runtime_compat::timeout;
 use tracing::{debug, trace, warn};
 
 use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, get_or_register_circuit};
@@ -1192,7 +1192,7 @@ mod tests {
                     }
                 }
 
-                tokio::time::sleep(delay).await;
+                crate::runtime_compat::sleep(delay).await;
                 active.fetch_sub(1, Ordering::SeqCst);
                 Ok(format!("pane-{pane_id}-tick"))
             })
@@ -1316,7 +1316,7 @@ mod tests {
         supervisor.spawn_ready(&mut join_set);
 
         // Wait for a bit to let tasks start
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        crate::runtime_compat::sleep(Duration::from_millis(5)).await;
 
         let max_seen = max.load(Ordering::SeqCst);
         assert!(max_seen <= 2, "max concurrency observed: {max_seen}");
@@ -1363,7 +1363,7 @@ mod tests {
         supervisor.update_pane_priorities(HashMap::from([(1, 100), (2, 10)]));
 
         // Wait for tailers to become ready to poll.
-        tokio::time::sleep(Duration::from_millis(2)).await;
+        crate::runtime_compat::sleep(Duration::from_millis(2)).await;
 
         let mut join_set = JoinSet::new();
         supervisor.spawn_ready(&mut join_set);
@@ -1421,7 +1421,7 @@ mod tests {
         supervisor.sync_tailers(&panes);
 
         // Wait for tailers to become ready to poll (min_interval must elapse)
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        crate::runtime_compat::sleep(Duration::from_millis(5)).await;
 
         let mut join_set = JoinSet::new();
         supervisor.spawn_ready(&mut join_set);
@@ -1663,7 +1663,7 @@ mod tests {
         supervisor.tailers.get_mut(&1).unwrap().overflow_gap_pending = true;
 
         // Wait for min_interval
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        crate::runtime_compat::sleep(Duration::from_millis(5)).await;
 
         let mut join_set = JoinSet::new();
         supervisor.spawn_ready(&mut join_set);
@@ -1728,7 +1728,7 @@ mod tests {
         supervisor.sync_tailers(&panes);
         supervisor.tailers.get_mut(&1).unwrap().overflow_gap_pending = true;
 
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        crate::runtime_compat::sleep(Duration::from_millis(5)).await;
 
         let mut join_set = JoinSet::new();
         supervisor.spawn_ready(&mut join_set);
@@ -1977,7 +1977,7 @@ mod tests {
         supervisor.sync_tailers(&panes);
 
         // Wait for tailers to become ready.
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        crate::runtime_compat::sleep(Duration::from_millis(5)).await;
 
         let mut join_set = JoinSet::new();
         supervisor.spawn_ready(&mut join_set);

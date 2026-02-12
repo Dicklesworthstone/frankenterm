@@ -493,7 +493,7 @@ impl RecoveryEngine {
                     if attempt + 1 < max_attempts {
                         self.counters.total_retries.fetch_add(1, Ordering::Relaxed);
                         let delay = self.config.delay_for_attempt(attempt);
-                        tokio::time::sleep(delay).await;
+                        crate::runtime_compat::sleep(delay).await;
                     }
                 }
             }

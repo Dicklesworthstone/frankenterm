@@ -148,7 +148,7 @@ impl<C: Send + 'static> Pool<C> {
     /// Returns an idle connection if available, or `None` as the connection
     /// value if the caller needs to create a fresh one (a permit is still held).
     pub async fn acquire(&self) -> Result<PoolAcquireResult<C>, PoolError> {
-        let permit = match tokio::time::timeout(
+        let permit = match crate::runtime_compat::timeout(
             self.config.acquire_timeout,
             self.semaphore.clone().acquire_owned(),
         )
@@ -156,7 +156,7 @@ impl<C: Send + 'static> Pool<C> {
         {
             Ok(Ok(permit)) => permit,
             Ok(Err(_closed)) => return Err(PoolError::Closed),
-            Err(_elapsed) => {
+            Err(_timeout_err) => {
                 self.stats_timeouts.fetch_add(1, Ordering::Relaxed);
                 return Err(PoolError::AcquireTimeout);
             }
@@ -374,7 +374,7 @@ mod tests {
         pool.put("stale".to_string()).await;
 
         // Wait for it to expire
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        crate::runtime_compat::sleep(Duration::from_millis(20)).await;
 
         let result = pool.acquire().await.expect("acquire");
         assert!(
@@ -445,12 +445,12 @@ mod tests {
 
         let h1 = tokio::spawn(async move {
             let _r = pool2.acquire().await.expect("acquire 1");
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            crate::runtime_compat::sleep(Duration::from_millis(50)).await;
         });
 
         let h2 = tokio::spawn(async move {
             let _r = pool3.acquire().await.expect("acquire 2");
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            crate::runtime_compat::sleep(Duration::from_millis(50)).await;
         });
 
         // Both should succeed with pool size 2
@@ -469,7 +469,7 @@ mod tests {
         pool.put("a".to_string()).await;
         pool.put("b".to_string()).await;
 
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        crate::runtime_compat::sleep(Duration::from_millis(20)).await;
         let evicted = pool.evict_idle().await;
         assert_eq!(evicted, 2);
     }
