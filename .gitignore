@@ -75,3 +75,16 @@ fuzz/artifacts/
 
 # Compiled binaries
 a.out
+
+# Agent-named target directories (concurrent agent builds)
+target_*/
+
+# bv triage artifacts (auto-generated, ephemeral)
+brief.md
+helpers.md
+insights.json
+meta.json
+triage.json
+
+# Proptest regression files (auto-generated, machine-specific)
+**/proptest-regressions/
