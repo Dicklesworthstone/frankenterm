@@ -63,6 +63,7 @@ pub mod chaos;
 pub mod circuit_breaker;
 pub mod cleanup;
 pub mod command_guard;
+pub mod completion_token;
 pub mod config;
 pub mod config_profiles;
 pub mod conformal;
