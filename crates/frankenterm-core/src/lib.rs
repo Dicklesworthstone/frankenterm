@@ -25,6 +25,7 @@
 //! - `suggestions`: Context-aware suggestion system for actionable errors
 //! - `workflows`: Durable workflow execution
 //! - `config`: Configuration management
+//! - `cx`: Asupersync capability context adapters (feature-gated: `asupersync-runtime`)
 //! - `environment`: Environment detection (WezTerm, shell, agents, system)
 //! - `approval`: Allow-once approvals for RequireApproval decisions
 //! - `policy`: Safety and rate limiting
@@ -47,6 +48,7 @@ pub mod agent_correlator;
 pub mod alerts;
 pub mod api_schema;
 pub mod approval;
+pub mod auto_tune;
 pub mod backpressure;
 pub mod backpressure_severity;
 pub mod backup;
@@ -69,6 +71,8 @@ pub mod continuous_backpressure;
 pub mod cpu_pressure;
 pub mod crash;
 pub mod cross_pane_correlation;
+#[cfg(feature = "asupersync-runtime")]
+pub mod cx;
 pub mod degradation;
 pub mod desktop_notify;
 pub mod diagnostic;
@@ -104,6 +108,8 @@ pub mod memory_pressure;
 pub mod metrics;
 pub mod notifications;
 pub mod orphan_reaper;
+#[cfg(any(feature = "web", feature = "sync", feature = "asupersync-runtime"))]
+pub mod outcome;
 pub mod output;
 pub mod pane_lifecycle;
 pub mod pane_tiers;
@@ -125,6 +131,7 @@ pub mod retry;
 pub mod robot_types;
 pub mod rulesets;
 pub mod runtime;
+pub mod runtime_compat;
 pub mod screen_state;
 pub mod scrollback_eviction;
 pub mod search_explain;

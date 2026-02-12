@@ -555,7 +555,7 @@ impl AutoTuner {
         if delta.abs() <= max_delta {
             target
         } else {
-            current + delta.signum() * max_delta
+            delta.signum().mul_add(max_delta, current)
         }
     }
 }
