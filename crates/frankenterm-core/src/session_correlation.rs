@@ -605,6 +605,324 @@ mod tests {
         assert!((result.confidence - 1.0).abs() < f64::EPSILON);
     }
 
+    // ── Pure function tests ──
+
+    #[test]
+    fn default_correlation_options() {
+        let opts = CassCorrelationOptions::default();
+        assert_eq!(opts.window_before_ms, 10 * 60 * 1_000);
+        assert_eq!(opts.window_after_ms, 10 * 60 * 1_000);
+        assert!(opts.override_session_id.is_none());
+    }
+
+    #[test]
+    fn correlation_options_serde_roundtrip() {
+        let opts = CassCorrelationOptions {
+            window_before_ms: 5000,
+            window_after_ms: 15000,
+            override_session_id: Some("abc".to_string()),
+        };
+        let json = serde_json::to_string(&opts).unwrap();
+        let back: CassCorrelationOptions = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.window_before_ms, 5000);
+        assert_eq!(back.window_after_ms, 15000);
+        assert_eq!(back.override_session_id.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn correlation_status_serde_uses_snake_case() {
+        assert_eq!(serde_json::to_string(&CorrelationStatus::Linked).unwrap(), "\"linked\"");
+        assert_eq!(serde_json::to_string(&CorrelationStatus::Unlinked).unwrap(), "\"unlinked\"");
+        assert_eq!(serde_json::to_string(&CorrelationStatus::Error).unwrap(), "\"error\"");
+    }
+
+    #[test]
+    fn correlation_status_serde_roundtrip() {
+        for s in [CorrelationStatus::Linked, CorrelationStatus::Unlinked, CorrelationStatus::Error] {
+            let json = serde_json::to_string(&s).unwrap();
+            let back: CorrelationStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(s, back);
+        }
+    }
+
+    #[test]
+    fn session_correlation_linked_constructor() {
+        let c = SessionCorrelation::linked(
+            "ext-1".to_string(), 0.9, vec!["reason1".to_string()], 3,
+            1000, 2000, Some(1500),
+        );
+        assert_eq!(c.status, CorrelationStatus::Linked);
+        assert_eq!(c.external_id.as_deref(), Some("ext-1"));
+        assert!((c.confidence - 0.9).abs() < f64::EPSILON);
+        assert_eq!(c.candidates_considered, 3);
+        assert_eq!(c.window_start_ms, 1000);
+        assert_eq!(c.window_end_ms, 2000);
+        assert_eq!(c.selected_started_at_ms, Some(1500));
+        assert_eq!(c.algorithm_version, CASS_CORRELATION_VERSION);
+        assert!(c.error.is_none());
+    }
+
+    #[test]
+    fn session_correlation_unlinked_constructor() {
+        let c = SessionCorrelation::unlinked(
+            vec!["no_match".to_string()], 0, 100, 200,
+        );
+        assert_eq!(c.status, CorrelationStatus::Unlinked);
+        assert!(c.external_id.is_none());
+        assert_eq!(c.confidence, 0.0);
+        assert_eq!(c.candidates_considered, 0);
+        assert!(c.error.is_none());
+    }
+
+    #[test]
+    fn session_correlation_error_constructor() {
+        let c = SessionCorrelation::error(
+            "timeout".to_string(), vec!["cass_fail".to_string()], 100, 200,
+        );
+        assert_eq!(c.status, CorrelationStatus::Error);
+        assert!(c.external_id.is_none());
+        assert_eq!(c.error.as_deref(), Some("timeout"));
+    }
+
+    #[test]
+    fn session_correlation_serde_roundtrip() {
+        let c = SessionCorrelation::linked(
+            "ext-1".to_string(), 0.85, vec!["ok".to_string()], 2,
+            1000, 2000, Some(1500),
+        );
+        let json = serde_json::to_string(&c).unwrap();
+        let back: SessionCorrelation = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.status, CorrelationStatus::Linked);
+        assert_eq!(back.external_id.as_deref(), Some("ext-1"));
+        assert!((back.confidence - 0.85).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn to_external_meta_is_valid_json() {
+        let c = SessionCorrelation::linked(
+            "ext-1".to_string(), 0.9, vec![], 1, 0, 0, None,
+        );
+        let meta = c.to_external_meta();
+        assert!(meta.is_object());
+        assert_eq!(meta["status"], "linked");
+        assert_eq!(meta["external_id"], "ext-1");
+    }
+
+    #[test]
+    fn compute_confidence_single_candidate_close() {
+        // Single candidate, diff=0 → closeness=1.0 → 0.7 + 0.25*1.0 = 0.95
+        let c = compute_confidence(1, 0, None, 1_200_000);
+        assert!((c - 0.95).abs() < 0.01);
+    }
+
+    #[test]
+    fn compute_confidence_single_candidate_far() {
+        // Single candidate, diff=window → closeness=0.0 → 0.7 + 0 = 0.7
+        let c = compute_confidence(1, 1_200_000, None, 1_200_000);
+        assert!((c - 0.7).abs() < 0.01);
+    }
+
+    #[test]
+    fn compute_confidence_multi_candidate_close() {
+        // Multiple candidates, diff=0 → 0.5 + 0.2*1.0 = 0.7
+        let c = compute_confidence(3, 0, Some(200_000), 1_200_000);
+        // gap >= 120000 → +0.1 → 0.8
+        assert!((c - 0.8).abs() < 0.01);
+    }
+
+    #[test]
+    fn compute_confidence_multi_candidate_small_gap() {
+        // Multiple candidates, diff=0, gap=10000 (<120000) → 0.7 - 0.05 = 0.65
+        let c = compute_confidence(2, 0, Some(10_000), 1_200_000);
+        assert!((c - 0.65).abs() < 0.01);
+    }
+
+    #[test]
+    fn compute_confidence_clamped_to_095() {
+        // Even extreme best-case shouldn't exceed 0.95
+        let c = compute_confidence(1, 0, Some(500_000), 1_200_000);
+        assert!(c <= 0.95);
+    }
+
+    #[test]
+    fn compute_confidence_clamped_to_zero() {
+        // Even worst case shouldn't go below 0
+        let c = compute_confidence(100, 1_200_000, Some(0), 1_200_000);
+        assert!(c >= 0.0);
+    }
+
+    #[test]
+    fn correlate_empty_sessions() {
+        let result = correlate_from_sessions(
+            &[], 1_000_000, &CassCorrelationOptions::default(),
+        );
+        assert_eq!(result.status, CorrelationStatus::Unlinked);
+        assert_eq!(result.candidates_considered, 0);
+    }
+
+    #[test]
+    fn correlate_skips_sessions_without_id() {
+        let sessions = vec![CassSession {
+            session_id: None,
+            started_at: Some("2026-01-29T17:00:00Z".to_string()),
+            ..CassSession::default()
+        }];
+        let start_ms = parse_cass_timestamp_ms("2026-01-29T17:00:00Z").unwrap();
+        let result = correlate_from_sessions(&sessions, start_ms, &CassCorrelationOptions::default());
+        assert_eq!(result.status, CorrelationStatus::Unlinked);
+        assert!(result.reasons[0].contains("skipped_missing_id=1"));
+    }
+
+    #[test]
+    fn correlate_skips_sessions_without_timestamp() {
+        let sessions = vec![CassSession {
+            session_id: Some("cass-1".to_string()),
+            started_at: None,
+            ..CassSession::default()
+        }];
+        let start_ms = parse_cass_timestamp_ms("2026-01-29T17:00:00Z").unwrap();
+        let result = correlate_from_sessions(&sessions, start_ms, &CassCorrelationOptions::default());
+        assert_eq!(result.status, CorrelationStatus::Unlinked);
+        assert!(result.reasons[0].contains("skipped_missing_time=1"));
+    }
+
+    #[test]
+    fn correlate_closest_start_time_wins() {
+        let start_ms = parse_cass_timestamp_ms("2026-01-29T17:00:00Z").unwrap();
+        let sessions = vec![
+            make_session("far", "2026-01-29T16:55:00Z"),   // 5 min before
+            make_session("close", "2026-01-29T17:00:30Z"), // 30 sec after
+        ];
+        let result = correlate_from_sessions(&sessions, start_ms, &CassCorrelationOptions::default());
+        assert_eq!(result.external_id.as_deref(), Some("close"));
+    }
+
+    #[test]
+    fn correlate_ambiguous_shows_in_reasons() {
+        let start_ms = parse_cass_timestamp_ms("2026-01-29T17:00:00Z").unwrap();
+        let sessions = vec![
+            make_session("a", "2026-01-29T17:01:00Z"),
+            make_session("b", "2026-01-29T17:02:00Z"),
+        ];
+        let result = correlate_from_sessions(&sessions, start_ms, &CassCorrelationOptions::default());
+        assert_eq!(result.status, CorrelationStatus::Linked);
+        assert!(result.reasons.iter().any(|r| r.contains("ambiguous_candidates")));
+    }
+
+    #[test]
+    fn window_functions_symmetric() {
+        let opts = CassCorrelationOptions::default();
+        let center = 1_000_000i64;
+        let start = window_start(center, &opts);
+        let end = window_end(center, &opts);
+        assert!(start < center);
+        assert!(end > center);
+        assert_eq!(center - start, opts.window_before_ms);
+        assert_eq!(end - center, opts.window_after_ms);
+    }
+
+    #[test]
+    fn window_functions_handle_negative_values() {
+        let opts = CassCorrelationOptions {
+            window_before_ms: -100,
+            window_after_ms: -100,
+            override_session_id: None,
+        };
+        let center = 1_000_000i64;
+        // Negative windows are clamped to 0 via .max(0)
+        assert_eq!(window_start(center, &opts), center);
+        assert_eq!(window_end(center, &opts), center);
+    }
+
+    #[test]
+    fn merge_external_meta_creates_new() {
+        let summary = CassSessionSummary {
+            total_tokens: Some(100),
+            input_tokens: Some(60),
+            output_tokens: Some(40),
+            message_count: 5,
+            ..Default::default()
+        };
+        let meta = merge_external_meta(None, &summary, 12345, "ext-1");
+        assert!(meta.is_object());
+        assert_eq!(meta["cass_refreshed_at_ms"], 12345);
+        assert_eq!(meta["cass_session_id"], "ext-1");
+        assert!(meta.get("cass_summary").is_some());
+    }
+
+    #[test]
+    fn merge_external_meta_preserves_existing_keys() {
+        let existing = serde_json::json!({
+            "custom_field": "keep_me",
+            "cass_refreshed_at_ms": 1000,
+        });
+        let summary = CassSessionSummary::default();
+        let meta = merge_external_meta(Some(existing), &summary, 2000, "ext-2");
+        assert_eq!(meta["custom_field"], "keep_me");
+        assert_eq!(meta["cass_refreshed_at_ms"], 2000); // updated
+        assert_eq!(meta["cass_session_id"], "ext-2");
+    }
+
+    #[test]
+    fn extract_refresh_ms_present() {
+        let meta = serde_json::json!({"cass_refreshed_at_ms": 12345});
+        assert_eq!(extract_refresh_ms(&meta), Some(12345));
+    }
+
+    #[test]
+    fn extract_refresh_ms_missing() {
+        let meta = serde_json::json!({"other": "data"});
+        assert!(extract_refresh_ms(&meta).is_none());
+    }
+
+    #[test]
+    fn extract_summary_valid() {
+        let summary = CassSessionSummary {
+            total_tokens: Some(100),
+            message_count: 3,
+            ..Default::default()
+        };
+        let meta = serde_json::json!({
+            "cass_summary": serde_json::to_value(&summary).unwrap(),
+        });
+        let extracted = extract_summary_from_meta(&meta);
+        assert!(extracted.is_some());
+        assert_eq!(extracted.unwrap().total_tokens, Some(100));
+    }
+
+    #[test]
+    fn extract_summary_missing() {
+        let meta = serde_json::json!({"other": 1});
+        assert!(extract_summary_from_meta(&meta).is_none());
+    }
+
+    #[test]
+    fn default_summary_refresh_options() {
+        let opts = CassSummaryRefreshOptions::default();
+        assert_eq!(opts.min_refresh_interval_ms, 5 * 60 * 1_000);
+        assert!(!opts.force);
+    }
+
+    #[test]
+    fn resolve_project_path_local() {
+        // Tests that a local path is returned (or git root is found)
+        let result = resolve_project_path("/tmp/some/path");
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn resolve_project_path_empty_string() {
+        let result = resolve_project_path("");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn cass_correlation_version_is_v1() {
+        assert_eq!(CASS_CORRELATION_VERSION, "v1");
+    }
+
+    // ── DB-backed tests ──
+
     #[tokio::test]
     async fn correlate_and_persist_override_updates_session() {
         let dir = tempfile::tempdir().unwrap();
