@@ -81,6 +81,7 @@ tokio = { workspace = true, features = ["test-util", "macros"] }
 proptest = "1.8.0"
 tempfile = "3.23.0"
 criterion = { version = "0.7.0", features = ["async_tokio"] }
+loom = "0.7"
 
 # Benchmarks
 [[bench]]
