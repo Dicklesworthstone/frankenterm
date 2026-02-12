@@ -161,7 +161,9 @@ impl NativeEventListener {
                 break;
             }
 
-            match tokio::time::timeout(ACCEPT_POLL_INTERVAL, self.listener.accept()).await {
+            match crate::runtime_compat::timeout(ACCEPT_POLL_INTERVAL, self.listener.accept())
+                .await
+            {
                 Ok(Ok((stream, _addr))) => {
                     let tx = event_tx.clone();
                     tokio::spawn(async move {
@@ -173,9 +175,7 @@ impl NativeEventListener {
                 Ok(Err(err)) => {
                     warn!(error = %err, path = %self.socket_path.display(), "native event accept failed");
                 }
-                Err(_) => {
-                    // timeout, loop to check shutdown flag
-                }
+                Err(_) => {} // timeout, loop to check shutdown flag
             }
         }
     }
@@ -355,6 +355,244 @@ mod tests {
         assert!(event.is_none());
     }
 
+    #[test]
+    fn decode_hello_minimal_is_ignored() {
+        let payload = r#"{"type":"hello"}"#;
+        let event = decode_wire_event(payload).unwrap();
+        assert!(event.is_none());
+    }
+
+    #[test]
+    fn decode_pane_created_event() {
+        let payload = r#"{"type":"pane_created","pane_id":10,"domain":"local","cwd":"/home/user","ts":555}"#;
+        let event = decode_wire_event(payload).unwrap().unwrap();
+        match event {
+            NativeEvent::PaneCreated {
+                pane_id,
+                domain,
+                cwd,
+                timestamp_ms,
+            } => {
+                assert_eq!(pane_id, 10);
+                assert_eq!(domain, "local");
+                assert_eq!(cwd, Some("/home/user".to_string()));
+                assert_eq!(timestamp_ms, 555);
+            }
+            _ => panic!("wrong event type"),
+        }
+    }
+
+    #[test]
+    fn decode_pane_created_without_cwd() {
+        let payload = r#"{"type":"pane_created","pane_id":11,"domain":"remote","ts":600}"#;
+        let event = decode_wire_event(payload).unwrap().unwrap();
+        match event {
+            NativeEvent::PaneCreated { cwd, .. } => {
+                assert!(cwd.is_none());
+            }
+            _ => panic!("wrong event type"),
+        }
+    }
+
+    #[test]
+    fn decode_pane_destroyed_event() {
+        let payload = r#"{"type":"pane_destroyed","pane_id":99,"ts":777}"#;
+        let event = decode_wire_event(payload).unwrap().unwrap();
+        match event {
+            NativeEvent::PaneDestroyed {
+                pane_id,
+                timestamp_ms,
+            } => {
+                assert_eq!(pane_id, 99);
+                assert_eq!(timestamp_ms, 777);
+            }
+            _ => panic!("wrong event type"),
+        }
+    }
+
+    #[test]
+    fn decode_invalid_json_returns_error() {
+        let result = decode_wire_event("not json at all");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn decode_unknown_type_returns_error() {
+        let payload = r#"{"type":"unknown_thing","pane_id":1,"ts":1}"#;
+        let result = decode_wire_event(payload);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn decode_invalid_base64_returns_error() {
+        let payload = r#"{"type":"pane_output","pane_id":1,"data_b64":"!!!invalid!!!","ts":1}"#;
+        let result = decode_wire_event(payload);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err();
+        assert!(err_msg.contains("base64"), "expected base64 error, got: {err_msg}");
+    }
+
+    #[test]
+    fn decode_pane_output_truncates_large_data() {
+        // Create base64 data that decodes to > MAX_OUTPUT_BYTES (64KB)
+        let large_data = vec![b'A'; MAX_OUTPUT_BYTES + 1000];
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&large_data);
+        let payload = format!(
+            r#"{{"type":"pane_output","pane_id":1,"data_b64":"{}","ts":1}}"#,
+            encoded
+        );
+        let event = decode_wire_event(&payload).unwrap().unwrap();
+        match event {
+            NativeEvent::PaneOutput { data, .. } => {
+                assert_eq!(data.len(), MAX_OUTPUT_BYTES);
+            }
+            _ => panic!("wrong event type"),
+        }
+    }
+
+    #[test]
+    fn decode_pane_output_preserves_small_data() {
+        let small_data = vec![b'B'; 100];
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&small_data);
+        let payload = format!(
+            r#"{{"type":"pane_output","pane_id":1,"data_b64":"{}","ts":1}}"#,
+            encoded
+        );
+        let event = decode_wire_event(&payload).unwrap().unwrap();
+        match event {
+            NativeEvent::PaneOutput { data, .. } => {
+                assert_eq!(data.len(), 100);
+                assert!(data.iter().all(|&b| b == b'B'));
+            }
+            _ => panic!("wrong event type"),
+        }
+    }
+
+    #[test]
+    fn decode_timestamp_overflow_clamps_to_i64_max() {
+        let payload = format!(
+            r#"{{"type":"pane_destroyed","pane_id":1,"ts":{}}}"#,
+            u64::MAX
+        );
+        let event = decode_wire_event(&payload).unwrap().unwrap();
+        match event {
+            NativeEvent::PaneDestroyed { timestamp_ms, .. } => {
+                assert_eq!(timestamp_ms, i64::MAX);
+            }
+            _ => panic!("wrong event type"),
+        }
+    }
+
+    #[test]
+    fn decode_state_change_with_defaults() {
+        // All state fields are `serde(default)` so missing fields should produce zeros/defaults
+        let payload = r#"{"type":"state_change","pane_id":5,"state":{},"ts":100}"#;
+        let event = decode_wire_event(payload).unwrap().unwrap();
+        match event {
+            NativeEvent::StateChange { state, .. } => {
+                assert_eq!(state.title, "");
+                assert_eq!(state.rows, 0);
+                assert_eq!(state.cols, 0);
+                assert!(!state.is_alt_screen);
+                assert_eq!(state.cursor_row, 0);
+                assert_eq!(state.cursor_col, 0);
+            }
+            _ => panic!("wrong event type"),
+        }
+    }
+
+    #[test]
+    fn decode_state_change_alt_screen_true() {
+        let payload = r#"{"type":"state_change","pane_id":6,"state":{"is_alt_screen":true,"title":"vim","rows":40,"cols":120,"cursor_row":10,"cursor_col":5},"ts":200}"#;
+        let event = decode_wire_event(payload).unwrap().unwrap();
+        match event {
+            NativeEvent::StateChange { state, .. } => {
+                assert!(state.is_alt_screen);
+                assert_eq!(state.title, "vim");
+                assert_eq!(state.rows, 40);
+                assert_eq!(state.cols, 120);
+            }
+            _ => panic!("wrong event type"),
+        }
+    }
+
+    #[test]
+    fn decode_empty_string_is_error() {
+        assert!(decode_wire_event("").is_err());
+    }
+
+    #[test]
+    fn decode_pane_output_empty_base64() {
+        let payload = r#"{"type":"pane_output","pane_id":1,"data_b64":"","ts":1}"#;
+        let event = decode_wire_event(payload).unwrap().unwrap();
+        match event {
+            NativeEvent::PaneOutput { data, .. } => {
+                assert!(data.is_empty());
+            }
+            _ => panic!("wrong event type"),
+        }
+    }
+
+    // ── NativeEventError ───────────────────────────────────────────
+
+    #[test]
+    fn error_display_empty_socket_path() {
+        let err = NativeEventError::EmptySocketPath;
+        assert_eq!(err.to_string(), "socket path is empty");
+    }
+
+    #[test]
+    fn error_display_socket_already_exists() {
+        let err = NativeEventError::SocketAlreadyExists("/tmp/test.sock".into());
+        assert!(err.to_string().contains("/tmp/test.sock"));
+    }
+
+    #[test]
+    fn error_display_io_error() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        let err = NativeEventError::Io(io_err);
+        assert!(err.to_string().contains("denied"));
+    }
+
+    // ── NativeEventListener ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn bind_empty_path_returns_error() {
+        let result = NativeEventListener::bind(PathBuf::from("")).await;
+        assert!(result.is_err());
+        match result {
+            Err(NativeEventError::EmptySocketPath) => {}
+            Err(other) => panic!("expected EmptySocketPath, got: {other}"),
+            Ok(_) => panic!("expected error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn bind_existing_path_returns_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("exists.sock");
+        // Create the file first
+        std::fs::write(&socket_path, b"").expect("create file");
+
+        let result = NativeEventListener::bind(socket_path).await;
+        assert!(result.is_err());
+        match result {
+            Err(NativeEventError::SocketAlreadyExists(_)) => {}
+            Err(other) => panic!("expected SocketAlreadyExists, got: {other}"),
+            Ok(_) => panic!("expected error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn bind_creates_parent_directories() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("sub").join("dir").join("deep.sock");
+        let result = NativeEventListener::bind(socket_path).await;
+        assert!(result.is_ok());
+    }
+
+    // ── Integration: listener + multiple events ────────────────────
+
     #[tokio::test]
     async fn listener_emits_events() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -374,7 +612,7 @@ mod tests {
             .await
             .expect("write");
 
-        let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+        let event = crate::runtime_compat::timeout(Duration::from_secs(2), event_rx.recv())
             .await
             .expect("timeout")
             .expect("event");
@@ -394,5 +632,114 @@ mod tests {
 
         shutdown.store(true, Ordering::SeqCst);
         let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn listener_handles_multiple_events_on_one_connection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("multi.sock");
+        let listener = NativeEventListener::bind(socket_path.clone())
+            .await
+            .expect("bind listener");
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let handle = tokio::spawn(listener.run(event_tx, Arc::clone(&shutdown)));
+
+        let mut stream = UnixStream::connect(socket_path).await.expect("connect");
+
+        // Send hello (ignored) + two real events
+        let lines = [
+            r#"{"type":"hello","proto":1}"#,
+            r#"{"type":"pane_created","pane_id":1,"domain":"local","ts":100}"#,
+            r#"{"type":"pane_destroyed","pane_id":1,"ts":200}"#,
+        ];
+        for line in &lines {
+            stream
+                .write_all(format!("{line}\n").as_bytes())
+                .await
+                .expect("write");
+        }
+
+        // Should receive exactly 2 events (hello is filtered)
+        let ev1 = crate::runtime_compat::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("timeout")
+            .expect("event 1");
+        assert!(matches!(ev1, NativeEvent::PaneCreated { pane_id: 1, .. }));
+
+        let ev2 = crate::runtime_compat::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("timeout")
+            .expect("event 2");
+        assert!(matches!(ev2, NativeEvent::PaneDestroyed { pane_id: 1, .. }));
+
+        shutdown.store(true, Ordering::SeqCst);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn listener_skips_invalid_json_lines() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("invalid.sock");
+        let listener = NativeEventListener::bind(socket_path.clone())
+            .await
+            .expect("bind listener");
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let handle = tokio::spawn(listener.run(event_tx, Arc::clone(&shutdown)));
+
+        let mut stream = UnixStream::connect(socket_path).await.expect("connect");
+
+        // Send invalid JSON followed by valid event
+        let lines = [
+            "this is not json",
+            r#"{"type":"pane_destroyed","pane_id":42,"ts":999}"#,
+        ];
+        for line in &lines {
+            stream
+                .write_all(format!("{line}\n").as_bytes())
+                .await
+                .expect("write");
+        }
+
+        // Should receive only the valid event
+        let event = crate::runtime_compat::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("timeout")
+            .expect("event");
+        assert!(matches!(
+            event,
+            NativeEvent::PaneDestroyed {
+                pane_id: 42,
+                timestamp_ms: 999
+            }
+        ));
+
+        shutdown.store(true, Ordering::SeqCst);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_flag_stops_listener() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("shutdown.sock");
+        let listener = NativeEventListener::bind(socket_path)
+            .await
+            .expect("bind listener");
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let shutdown_clone = Arc::clone(&shutdown);
+        let handle = tokio::spawn(listener.run(event_tx, shutdown_clone));
+
+        // Set shutdown flag
+        shutdown.store(true, Ordering::SeqCst);
+
+        // Listener should exit within a few poll intervals
+        let result =
+            crate::runtime_compat::timeout(Duration::from_secs(2), handle).await;
+        assert!(result.is_ok(), "listener did not shut down in time");
     }
 }
