@@ -16,6 +16,9 @@ last-touched
 # Local version tracking (prevents upgrade notification spam after git ops)
 .local_version
 
+# Local history snapshots (large, machine-generated)
+.br_history/
+
 # Legacy database files
 db.sqlite
 bd.db
