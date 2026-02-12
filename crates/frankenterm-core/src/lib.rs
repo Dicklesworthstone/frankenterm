@@ -151,6 +151,7 @@ pub mod snapshot_engine;
 pub mod spectral;
 pub mod storage;
 pub mod storage_targets;
+pub mod stream_hash;
 pub mod suggestions;
 pub mod survival;
 pub mod tailer;
