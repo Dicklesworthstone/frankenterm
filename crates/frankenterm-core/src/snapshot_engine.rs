@@ -24,9 +24,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::mpsc;
+use tokio::sync::Mutex;
 
 use crate::agent_correlator::AgentCorrelator;
-use crate::config::SnapshotConfig;
+use crate::config::{SnapshotConfig, SnapshotSchedulingMode};
 use crate::patterns::{AgentType, Detection, Severity};
 use crate::session_pane_state::PaneStateSnapshot;
 use crate::session_topology::TopologySnapshot;
@@ -45,6 +47,8 @@ const STATE_DETECTION_MAX_AGE: Duration = Duration::from_secs(300); // 5 minutes
 pub enum SnapshotTrigger {
     /// Periodic timer-based capture.
     Periodic,
+    /// Reduced-frequency periodic fallback capture in intelligent mode.
+    PeriodicFallback,
     /// Manual user-initiated capture.
     Manual,
     /// Pre-restart capture (blocks until complete).
@@ -53,13 +57,29 @@ pub enum SnapshotTrigger {
     Startup,
     /// Event-driven capture (e.g., agent session change).
     Event,
+    /// Agent completed significant work.
+    WorkCompleted,
+    /// Hazard estimate crossed threshold.
+    HazardThreshold,
+    /// Agent state transition detected.
+    StateTransition,
+    /// Extended idle period before potential restart.
+    IdleWindow,
+    /// Memory pressure increased.
+    MemoryPressure,
 }
 
 impl SnapshotTrigger {
     fn as_db_str(self) -> &'static str {
         match self {
-            Self::Periodic => "periodic",
-            Self::Manual | Self::Event => "event",
+            Self::Periodic | Self::PeriodicFallback => "periodic",
+            Self::Manual
+            | Self::Event
+            | Self::WorkCompleted
+            | Self::HazardThreshold
+            | Self::StateTransition
+            | Self::IdleWindow
+            | Self::MemoryPressure => "event",
             Self::Shutdown => "shutdown",
             Self::Startup => "startup",
         }
@@ -118,18 +138,33 @@ pub struct SnapshotEngine {
     last_state_hash: tokio::sync::RwLock<Option<String>>,
     /// Guard: true while a capture is running.
     in_progress: AtomicBool,
+    /// External trigger ingress sender for intelligent scheduling mode.
+    trigger_tx: mpsc::Sender<SnapshotTrigger>,
+    /// Runtime-owned receiver, taken by `run_periodic`.
+    trigger_rx: Mutex<Option<mpsc::Receiver<SnapshotTrigger>>>,
 }
 
 impl SnapshotEngine {
     /// Create a new snapshot engine.
     pub fn new(db_path: Arc<String>, config: SnapshotConfig) -> Self {
+        let (trigger_tx, trigger_rx) = mpsc::channel(512);
         Self {
             db_path,
             config,
             session_id: tokio::sync::RwLock::new(None),
             last_state_hash: tokio::sync::RwLock::new(None),
             in_progress: AtomicBool::new(false),
+            trigger_tx,
+            trigger_rx: Mutex::new(Some(trigger_rx)),
         }
+    }
+
+    /// Emit an event-driven snapshot trigger.
+    ///
+    /// Returns `false` when the trigger queue is full or no receiver is active.
+    #[must_use]
+    pub fn emit_trigger(&self, trigger: SnapshotTrigger) -> bool {
+        self.trigger_tx.try_send(trigger).is_ok()
     }
 
     /// Capture a full mux state snapshot from the given pane list.
@@ -206,8 +241,11 @@ impl SnapshotEngine {
         // 4. Compute state hash for dedup (from raw pane data, not timestamps)
         let state_hash = compute_state_hash(panes);
 
-        // 5. Skip if periodic and unchanged
-        if trigger == SnapshotTrigger::Periodic {
+        // 5. Skip if periodic-like and unchanged
+        if matches!(
+            trigger,
+            SnapshotTrigger::Periodic | SnapshotTrigger::PeriodicFallback
+        ) {
             let last = self.last_state_hash.read().await;
             if last.as_deref() == Some(&state_hash) {
                 return Err(SnapshotError::NoChanges);
