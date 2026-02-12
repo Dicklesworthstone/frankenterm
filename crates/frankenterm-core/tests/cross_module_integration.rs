@@ -675,9 +675,10 @@ fn completion_tracker_manages_multiple_concurrent_tokens() {
     tracker.advance(&t3, "capture", StepOutcome::Ok, "ok");
     assert_eq!(tracker.state(&t3), Some(CompletionState::InProgress));
 
-    // Summary should show the mix
-    let summary = tracker.active_summary();
-    assert_eq!(summary.len(), 3);
+    // Only t3 is still active (t1=Completed, t2=Failed are terminal)
+    assert_eq!(tracker.active_count(), 1);
+    // But total_count includes all 3 tokens
+    assert_eq!(tracker.total_count(), 3);
 }
 
 // =============================================================================
