@@ -16,6 +16,7 @@ Research inputs:
 - `docs/flight-recorder/cass-two-tier-architecture-dossier.md`
 - `docs/flight-recorder/xf-hybrid-retrieval-dossier.md`
 - `docs/flight-recorder/cross-project-extraction-matrix.md`
+- `docs/flight-recorder/tantivy-schema-v1.md`
 
 ## Decision
 Adopt a four-plane architecture:
@@ -65,6 +66,7 @@ Primary bead mapping:
 ### 4) Projection/search plane
 - Lexical:
   - Tantivy schema versioned and tuned for terminal text.
+  - Schema contract: `docs/flight-recorder/tantivy-schema-v1.md`.
   - Incremental index ingestion from canonical offsets.
   - Deterministic rebuild/backfill tooling from source log.
 - Semantic:

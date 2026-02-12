@@ -6,6 +6,7 @@ Inputs:
 - `docs/flight-recorder/frankensqlite-append-log-dossier.md`
 - `docs/flight-recorder/cass-two-tier-architecture-dossier.md`
 - `docs/flight-recorder/xf-hybrid-retrieval-dossier.md`
+- `docs/flight-recorder/tantivy-schema-v1.md`
 
 ## Goal
 Define a single synthesis plan for FrankenTerm flight-recorder architecture by explicitly choosing what to copy, adapt, or avoid from:
@@ -37,7 +38,7 @@ This document is meant to be implementation-driving and self-contained for downs
 | Append format + crash behavior | Excellent (segment headers, checksums, torn-tail prefix recovery) | Not primary focus | Not primary focus | Adopt FrankenSQLite-style append semantics for recorder segments | `.3.2`, `.3.4`, `.7.3` |
 | Backpressure posture | Strong (`Busy`/drop-first bounded admission) | Moderate | Strong operational overload controls | Explicit bounded ingest queue with configurable overflow policy | `.2.6`, `.3.2`, `.3.6` |
 | Repair strategy | Async repair pipeline + structured fallback | N/A | N/A for raw durability | Phase 1 checksum + deterministic fallback; phase 2 optional sidecar/repair | `.3.4`, `.7.2`, `.8.4` |
-| Lexical indexing | N/A | Tantivy projection + schema-hash rebuild behavior | Tantivy schema/query + operational health checks | Tantivy projection from canonical offsets with non-destructive rebuild generation | `.4.1`..`.4.5` |
+| Lexical indexing | N/A | Tantivy projection + schema-hash rebuild behavior | Tantivy schema/query + operational health checks | Tantivy projection from canonical offsets with non-destructive rebuild generation; contract anchored at `docs/flight-recorder/tantivy-schema-v1.md` | `.4.1`..`.4.5` |
 | Semantic indexing | RaptorQ/object durability concepts | CVVI + optional ANN (HNSW) roadmap | Exact vector artifacts + two-tier fast/quality flow | Start exact semantic retrieval + hybrid fusion; ANN deferred until scale justifies | `.5.1`..`.5.4` |
 | Hybrid ranking | N/A | RRF orchestration | Deterministic RRF + two-tier blend knobs | Standardize deterministic RRF core; optional two-tier mode as gated extension | `.5.4`, `.6.4` |
 | Query mode contract | N/A | lexical/semantic/hybrid | lexical/semantic/hybrid/two-tier | Public API exposes lexical/semantic/hybrid first; two-tier behind feature gate | `.6.1`..`.6.4` |
@@ -100,7 +101,7 @@ This document is meant to be implementation-driving and self-contained for downs
 ## Sequencing Recommendations
 1. Finalize recorder event identity schema (`ft-oegrb.2.1`).
 2. Build canonical append path + deterministic replay/checkpoint (`ft-oegrb.3.2`, `ft-oegrb.3.4`).
-3. Ship lexical index and query first (`ft-oegrb.4.1`..`.4.5`).
+3. Ship lexical index and query first (`ft-oegrb.4.1`..`.4.5`) starting from `docs/flight-recorder/tantivy-schema-v1.md`.
 4. Add semantic exact retrieval + hybrid fusion (`ft-oegrb.5.1`..`.5.4`).
 5. Layer operational daemonization, budgets, and policy gates (`ft-oegrb.5.6`, `.6.5`, `.8.3`).
 6. Prove with load/chaos/recovery suites before broad rollout (`ft-oegrb.7.*`, `.8.1`).

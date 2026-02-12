@@ -1,7 +1,7 @@
 # Capture-Stage Redaction Policy (Recorder v1)
 
 Date: 2026-02-12  
-Bead: `wa-oegrb.2.5`  
+Beads: `wa-oegrb.2.5`, `ft-oegrb.2.5`  
 Status: Accepted policy baseline for implementation tracks
 
 ## Purpose
@@ -9,9 +9,9 @@ Status: Accepted policy baseline for implementation tracks
 Define deterministic, testable redaction behavior for recorder capture so sensitive material is protected without breaking replay/search utility.
 
 This document is the implementation contract for:
-- `wa-oegrb.6.5` (policy-aware access + redaction in interfaces)
-- `wa-oegrb.7.6` (security/privacy validation suite)
-- `wa-oegrb.8.3` (governance policy for privacy and privileged access)
+- `wa-oegrb.6.5` / `ft-oegrb.6.5` (policy-aware access + redaction in interfaces)
+- `wa-oegrb.7.6` / `ft-oegrb.7.6` (security/privacy validation suite)
+- `wa-oegrb.8.3` / `ft-oegrb.8.3` (governance policy for privacy and privileged access)
 
 ## Policy Outcomes
 
@@ -180,7 +180,7 @@ Compatibility rule:
 - Do not build reversible masking in canonical recorder data.
 - Do not couple redaction correctness to external network services.
 
-## Exit Criteria for `wa-oegrb.2.5`
+## Exit Criteria for `wa-oegrb.2.5` / `ft-oegrb.2.5`
 
 1. This policy is accepted as the baseline contract.
 2. Downstream beads have enough detail to implement without rediscovering boundaries.

@@ -12,6 +12,9 @@ filterability, and causal traceability.
 Primary artifact:
 - `docs/flight-recorder/ft-recorder-event-v1.json`
 
+Related policy contracts:
+- `docs/flight-recorder/capture-redaction-policy.md` (capture/projection/response redaction boundaries)
+
 ## Event Families
 
 The v1 contract supports exactly four event families:
