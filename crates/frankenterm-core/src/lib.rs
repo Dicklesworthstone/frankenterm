@@ -53,6 +53,7 @@ pub mod backpressure;
 pub mod backpressure_severity;
 pub mod backup;
 pub mod bayesian_ledger;
+pub mod bloom_filter;
 pub mod bocpd;
 pub mod build_coord;
 pub mod cass;
