@@ -1075,4 +1075,324 @@ mod tests {
         assert_eq!(report.count_by_kind(ViolationKind::DuplicateSequence), 1);
         assert_eq!(report.count_by_kind(ViolationKind::DuplicateEventId), 1);
     }
+
+    // -- Lifecycle and control marker variants --
+
+    fn make_lifecycle(
+        id: &str,
+        pane_id: u64,
+        seq: u64,
+        ts: u64,
+        phase: RecorderLifecyclePhase,
+    ) -> RecorderEvent {
+        RecorderEvent {
+            schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+            event_id: id.to_string(),
+            pane_id,
+            session_id: Some("s1".into()),
+            workflow_id: None,
+            correlation_id: None,
+            source: RecorderEventSource::WeztermMux,
+            occurred_at_ms: ts,
+            recorded_at_ms: ts + 1,
+            sequence: seq,
+            causality: RecorderEventCausality {
+                parent_event_id: None,
+                trigger_event_id: None,
+                root_event_id: None,
+            },
+            payload: RecorderEventPayload::LifecycleMarker {
+                lifecycle_phase: phase,
+                reason: None,
+                details: serde_json::Value::Null,
+            },
+        }
+    }
+
+    fn make_control(
+        id: &str,
+        pane_id: u64,
+        seq: u64,
+        ts: u64,
+        marker: RecorderControlMarkerType,
+    ) -> RecorderEvent {
+        RecorderEvent {
+            schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+            event_id: id.to_string(),
+            pane_id,
+            session_id: Some("s1".into()),
+            workflow_id: None,
+            correlation_id: None,
+            source: RecorderEventSource::WeztermMux,
+            occurred_at_ms: ts,
+            recorded_at_ms: ts + 1,
+            sequence: seq,
+            causality: RecorderEventCausality {
+                parent_event_id: None,
+                trigger_event_id: None,
+                root_event_id: None,
+            },
+            payload: RecorderEventPayload::ControlMarker {
+                control_marker_type: marker,
+                details: serde_json::Value::Null,
+            },
+        }
+    }
+
+    #[test]
+    fn lifecycle_and_control_events_independent_domains() {
+        let config = InvariantCheckerConfig {
+            check_merge_order: false,
+            ..Default::default()
+        };
+        let checker = InvariantChecker::with_config(config);
+        // Same pane, same sequence number, but different stream kinds → no conflict
+        let events = vec![
+            make_lifecycle("lc1", 1, 0, 1000, RecorderLifecyclePhase::CaptureStarted),
+            make_control("ct1", 1, 0, 1001, RecorderControlMarkerType::PromptBoundary),
+            make_event("ig1", 1, 0, 1002, "input"),
+            make_egress_gap("eg1", 1, 0, 1003),
+        ];
+        let report = checker.check(&events);
+        assert!(report.passed);
+        assert_eq!(report.panes_observed, 1);
+        assert_eq!(report.domains_observed, 4); // lifecycle, control, ingress, egress
+        assert_eq!(report.count_by_kind(ViolationKind::DuplicateSequence), 0);
+    }
+
+    #[test]
+    fn lifecycle_sequence_regression_in_same_stream() {
+        let config = InvariantCheckerConfig {
+            check_merge_order: false,
+            ..Default::default()
+        };
+        let checker = InvariantChecker::with_config(config);
+        let events = vec![
+            make_lifecycle("lc1", 1, 5, 1000, RecorderLifecyclePhase::CaptureStarted),
+            make_lifecycle("lc2", 1, 3, 1001, RecorderLifecyclePhase::CaptureStopped),
+        ];
+        let report = checker.check(&events);
+        assert!(!report.passed);
+        assert_eq!(report.count_by_kind(ViolationKind::SequenceRegression), 1);
+    }
+
+    // -- Gap marker in correct stream domain --
+
+    fn make_egress_delta(
+        id: &str,
+        pane_id: u64,
+        seq: u64,
+        ts: u64,
+        text: &str,
+    ) -> RecorderEvent {
+        RecorderEvent {
+            schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+            event_id: id.to_string(),
+            pane_id,
+            session_id: Some("s1".into()),
+            workflow_id: None,
+            correlation_id: None,
+            source: RecorderEventSource::WeztermMux,
+            occurred_at_ms: ts,
+            recorded_at_ms: ts + 1,
+            sequence: seq,
+            causality: RecorderEventCausality {
+                parent_event_id: None,
+                trigger_event_id: None,
+                root_event_id: None,
+            },
+            payload: RecorderEventPayload::EgressOutput {
+                text: text.into(),
+                encoding: RecorderTextEncoding::Utf8,
+                redaction: RecorderRedactionLevel::None,
+                segment_kind: RecorderSegmentKind::Delta,
+                is_gap: false,
+            },
+        }
+    }
+
+    #[test]
+    fn gap_marker_suppresses_in_same_egress_stream() {
+        let config = InvariantCheckerConfig {
+            check_merge_order: false,
+            ..Default::default()
+        };
+        let checker = InvariantChecker::with_config(config);
+        // egress delta seq=0, then gap marker at seq=5 → gap suppressed
+        let events = vec![
+            make_egress_delta("ed1", 1, 0, 1000, "output"),
+            make_egress_gap("eg1", 1, 5, 1001),
+        ];
+        let report = checker.check(&events);
+        assert!(report.passed);
+        assert_eq!(report.count_by_kind(ViolationKind::SequenceGap), 0);
+    }
+
+    #[test]
+    fn gap_in_egress_without_marker_is_warning() {
+        let config = InvariantCheckerConfig {
+            check_merge_order: false,
+            max_sequence_gap: 100,
+            ..Default::default()
+        };
+        let checker = InvariantChecker::with_config(config);
+        // egress delta seq=0, then delta seq=5 (no gap marker) → warning
+        let events = vec![
+            make_egress_delta("ed1", 1, 0, 1000, "first"),
+            make_egress_delta("ed2", 1, 5, 1001, "second"),
+        ];
+        let report = checker.check(&events);
+        assert!(report.passed); // small gap → warning, not error
+        assert_eq!(report.count_by_kind(ViolationKind::SequenceGap), 1);
+    }
+
+    // -- Forward-referencing causality --
+
+    #[test]
+    fn forward_reference_parent_detected_as_dangling() {
+        let config = InvariantCheckerConfig {
+            check_merge_order: false,
+            ..Default::default()
+        };
+        let checker = InvariantChecker::with_config(config);
+        // e1 references e2 as parent, but e2 comes after e1 in the log
+        let mut e1 = make_event("e1", 1, 0, 1000, "a");
+        e1.causality.parent_event_id = Some("e2".into());
+        let events = vec![e1, make_event("e2", 1, 1, 1001, "b")];
+        let report = checker.check(&events);
+        // Forward references are detected as dangling (not yet seen)
+        assert_eq!(report.count_by_kind(ViolationKind::DanglingParentRef), 1);
+    }
+
+    // -- Empty causality strings --
+
+    #[test]
+    fn empty_string_causality_refs_ignored() {
+        let config = InvariantCheckerConfig {
+            check_merge_order: false,
+            ..Default::default()
+        };
+        let checker = InvariantChecker::with_config(config);
+        let mut event = make_event("e1", 1, 0, 1000, "a");
+        event.causality.parent_event_id = Some(String::new());
+        event.causality.trigger_event_id = Some(String::new());
+        event.causality.root_event_id = Some(String::new());
+        let report = checker.check(&[event]);
+        // Empty strings should be ignored, not flagged as dangling
+        assert_eq!(report.count_by_kind(ViolationKind::DanglingParentRef), 0);
+        assert_eq!(report.count_by_kind(ViolationKind::DanglingTriggerRef), 0);
+        assert_eq!(report.count_by_kind(ViolationKind::DanglingRootRef), 0);
+    }
+
+    // -- Violation event_index accuracy --
+
+    #[test]
+    fn violation_event_index_matches_input_position() {
+        let config = InvariantCheckerConfig {
+            check_merge_order: false,
+            ..Default::default()
+        };
+        let checker = InvariantChecker::with_config(config);
+        let events = vec![
+            make_event("e1", 1, 0, 1000, "a"),
+            make_event("e2", 1, 1, 1001, "b"),
+            make_event("e3", 1, 5, 1002, "c"), // gap at index 2
+        ];
+        let report = checker.check(&events);
+        let gap_violations: Vec<&Violation> = report
+            .violations
+            .iter()
+            .filter(|v| v.kind == ViolationKind::SequenceGap)
+            .collect();
+        assert_eq!(gap_violations.len(), 1);
+        assert_eq!(gap_violations[0].event_index, 2);
+        assert_eq!(gap_violations[0].pane_id, 1);
+    }
+
+    // -- Large interleaved multi-pane --
+
+    #[test]
+    fn large_interleaved_multi_pane_passes() {
+        let config = InvariantCheckerConfig {
+            check_merge_order: false,
+            ..Default::default()
+        };
+        let checker = InvariantChecker::with_config(config);
+        let mut events = Vec::new();
+        // 10 panes, 100 events each, interleaved
+        for seq in 0u64..100 {
+            for pane in 0u64..10 {
+                let id = format!("e-p{}-s{}", pane, seq);
+                let ts = 1000 + seq * 10 + pane;
+                events.push(make_event(&id, pane, seq, ts, "data"));
+            }
+        }
+        let report = checker.check(&events);
+        assert!(report.passed);
+        assert_eq!(report.events_checked, 1000);
+        assert_eq!(report.panes_observed, 10);
+        assert!(report.violations.is_empty());
+    }
+
+    // -- Default config smoke test --
+
+    #[test]
+    fn default_config_end_to_end() {
+        let checker = InvariantChecker::default();
+        let events = vec![
+            make_event("e1", 1, 0, 1000, "a"),
+            make_event("e2", 1, 1, 1001, "b"),
+            make_event("e3", 2, 0, 1002, "c"),
+        ];
+        let report = checker.check(&events);
+        assert!(report.passed);
+        assert!(!report.has_critical());
+        assert!(!report.has_errors());
+    }
+
+    // -- All trigger + root causality valid --
+
+    #[test]
+    fn full_causal_chain_with_trigger_and_root() {
+        let config = InvariantCheckerConfig {
+            check_merge_order: false,
+            ..Default::default()
+        };
+        let checker = InvariantChecker::with_config(config);
+        let e1 = make_event("root", 1, 0, 1000, "root event");
+        let mut e2 = make_event("trigger", 1, 1, 1001, "trigger event");
+        e2.causality.root_event_id = Some("root".into());
+        let mut e3 = make_event("child", 1, 2, 1002, "child event");
+        e3.causality.parent_event_id = Some("trigger".into());
+        e3.causality.trigger_event_id = Some("trigger".into());
+        e3.causality.root_event_id = Some("root".into());
+        let report = checker.check(&[e1, e2, e3]);
+        assert!(report.passed);
+        assert!(report.violations.is_empty());
+    }
+
+    // -- Consecutive sequence (no gap) --
+
+    #[test]
+    fn consecutive_sequences_no_gap() {
+        let config = InvariantCheckerConfig {
+            check_merge_order: false,
+            ..Default::default()
+        };
+        let checker = InvariantChecker::with_config(config);
+        let events: Vec<RecorderEvent> = (0u64..50)
+            .map(|i| make_event(&format!("e{}", i), 1, i, 1000 + i, "data"))
+            .collect();
+        let report = checker.check(&events);
+        assert!(report.passed);
+        assert!(report.violations.is_empty());
+    }
+
+    // -- Replay determinism with empty sequences --
+
+    #[test]
+    fn replay_determinism_empty_sequences() {
+        let result = verify_replay_determinism(&[], &[]);
+        assert!(result.deterministic);
+    }
 }

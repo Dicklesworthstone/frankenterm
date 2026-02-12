@@ -15,6 +15,10 @@ use std::sync::Arc;
 use crate::Result;
 use crate::accounts::AccountRecord;
 use crate::approval::ApprovalStore;
+use crate::cass::{
+    CassAgent, CassClient, CassError, CassSearchResult, CassStatus, CassViewResult,
+    SearchOptions as CassSearchOptions, ViewOptions as CassViewOptions,
+};
 use crate::caut::{CautClient, CautError, CautService};
 use crate::config::{Config, PaneFilterConfig};
 use crate::error::{Error, StorageError, WeztermError};
@@ -49,6 +53,7 @@ const MCP_ERR_NOT_IMPLEMENTED: &str = "FT-MCP-0010";
 const MCP_ERR_FTS_QUERY: &str = "FT-MCP-0011";
 const MCP_ERR_RESERVATION_CONFLICT: &str = "FT-MCP-0012";
 const MCP_ERR_CAUT: &str = "FT-MCP-0013";
+const MCP_ERR_CASS: &str = "FT-MCP-0014";
 
 #[derive(Debug, Default, Deserialize)]
 struct StateParams {
@@ -107,6 +112,54 @@ fn default_search_limit() -> usize {
 
 fn default_snippets() -> bool {
     true
+}
+
+#[derive(Debug, Deserialize)]
+struct CassSearchParams {
+    query: String,
+    #[serde(default = "default_cass_limit")]
+    limit: usize,
+    #[serde(default = "default_cass_offset")]
+    offset: usize,
+    agent: Option<String>,
+    workspace: Option<String>,
+    days: Option<u32>,
+    fields: Option<String>,
+    max_tokens: Option<usize>,
+    #[serde(default = "default_cass_timeout_secs")]
+    timeout_secs: u64,
+}
+
+fn default_cass_limit() -> usize {
+    10
+}
+
+fn default_cass_offset() -> usize {
+    0
+}
+
+fn default_cass_timeout_secs() -> u64 {
+    15
+}
+
+#[derive(Debug, Deserialize)]
+struct CassViewParams {
+    source_path: String,
+    line_number: usize,
+    #[serde(default = "default_cass_context_lines")]
+    context_lines: usize,
+    #[serde(default = "default_cass_timeout_secs")]
+    timeout_secs: u64,
+}
+
+fn default_cass_context_lines() -> usize {
+    10
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CassStatusParams {
+    #[serde(default = "default_cass_timeout_secs")]
+    timeout_secs: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -575,6 +628,9 @@ pub fn build_server_with_db(config: &Config, db_path: Option<PathBuf>) -> Result
         .tool(WaWaitForTool)
         .tool(WaRulesListTool)
         .tool(WaRulesTestTool)
+        .tool(WaCassSearchTool)
+        .tool(WaCassViewTool)
+        .tool(WaCassStatusTool)
         .resource(WaPanesResource::new(config.ingest.panes.clone()))
         .resource(WaWorkflowsResource::new(Arc::clone(&config)))
         .resource(WaRulesResource)
@@ -2956,6 +3012,288 @@ impl ToolHandler for WaRulesTestTool {
     }
 }
 
+// wa.cass_search tool
+struct WaCassSearchTool;
+
+impl ToolHandler for WaCassSearchTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "wa.cass_search".to_string(),
+            description: Some("Search coding agent session history via cass".to_string()),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Search query string" },
+                    "limit": { "type": "integer", "minimum": 0, "maximum": 1000, "default": 10, "description": "Maximum results (0 = cass default)" },
+                    "offset": { "type": "integer", "minimum": 0, "default": 0, "description": "Offset into results" },
+                    "agent": { "type": "string", "description": "Agent filter: codex|claude_code|gemini|cursor|aider|chatgpt" },
+                    "workspace": { "type": "string", "description": "Workspace filter (cass-defined)" },
+                    "days": { "type": "integer", "minimum": 0, "description": "Only sessions within the last N days" },
+                    "fields": { "type": "string", "description": "Field selection (cass-defined; e.g. minimal)" },
+                    "max_tokens": { "type": "integer", "minimum": 0, "description": "Max tokens per hit content (cass-defined)" },
+                    "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 600, "default": 15, "description": "cass timeout override (seconds)" }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }),
+            output_schema: None,
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "robot".to_string(), "cass".to_string()],
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        let start = Instant::now();
+
+        let params: CassSearchParams = match serde_json::from_value(arguments) {
+            Ok(p) => p,
+            Err(err) => {
+                let envelope = McpEnvelope::<()>::error(
+                    MCP_ERR_INVALID_ARGS,
+                    format!("Invalid params: {err}"),
+                    Some("Expected object with query (required) and optional limit/offset/agent/workspace/days/fields/max_tokens/timeout_secs".to_string()),
+                    elapsed_ms(start),
+                );
+                return envelope_to_content(envelope);
+            }
+        };
+
+        if params.query.trim().is_empty() {
+            let envelope = McpEnvelope::<()>::error(
+                MCP_ERR_INVALID_ARGS,
+                "query cannot be empty".to_string(),
+                Some("Provide a non-empty search query string".to_string()),
+                elapsed_ms(start),
+            );
+            return envelope_to_content(envelope);
+        }
+
+        let agent: Option<CassAgent> = if let Some(ref agent_str) = params.agent {
+            match parse_cass_agent(agent_str) {
+                Some(agent) => Some(agent),
+                None => {
+                    let envelope = McpEnvelope::<()>::error(
+                        MCP_ERR_INVALID_ARGS,
+                        format!("Invalid agent: {agent_str}"),
+                        Some(
+                            "Supported: codex, claude_code, gemini, cursor, aider, chatgpt"
+                                .to_string(),
+                        ),
+                        elapsed_ms(start),
+                    );
+                    return envelope_to_content(envelope);
+                }
+            }
+        } else {
+            None
+        };
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
+
+        let result: std::result::Result<CassSearchResult, CassError> = runtime.block_on(async {
+            let client = CassClient::new().with_timeout_secs(params.timeout_secs);
+            let options = CassSearchOptions {
+                limit: (params.limit != 0).then_some(params.limit),
+                offset: (params.offset != 0).then_some(params.offset),
+                agent,
+                workspace: params.workspace,
+                days: params.days,
+                fields: params.fields,
+                max_tokens: params.max_tokens,
+            };
+            client.search(&params.query, &options).await
+        });
+
+        match result {
+            Ok(result) => {
+                let envelope = McpEnvelope::success(result, elapsed_ms(start));
+                envelope_to_content(envelope)
+            }
+            Err(err) => {
+                let (code, hint) = map_cass_error(&err);
+                let envelope = McpEnvelope::<()>::error(
+                    code,
+                    format!("cass search failed: {err}"),
+                    hint,
+                    elapsed_ms(start),
+                );
+                envelope_to_content(envelope)
+            }
+        }
+    }
+}
+
+// wa.cass_view tool
+struct WaCassViewTool;
+
+impl ToolHandler for WaCassViewTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "wa.cass_view".to_string(),
+            description: Some("View context for a cass search hit".to_string()),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "source_path": { "type": "string", "description": "Source path returned by cass search" },
+                    "line_number": { "type": "integer", "minimum": 0, "description": "Line number returned by cass search" },
+                    "context_lines": { "type": "integer", "minimum": 0, "default": 10, "description": "Context lines before/after match" },
+                    "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 600, "default": 15, "description": "cass timeout override (seconds)" }
+                },
+                "required": ["source_path", "line_number"],
+                "additionalProperties": false
+            }),
+            output_schema: None,
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "robot".to_string(), "cass".to_string()],
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        let start = Instant::now();
+
+        let params: CassViewParams = match serde_json::from_value(arguments) {
+            Ok(p) => p,
+            Err(err) => {
+                let envelope = McpEnvelope::<()>::error(
+                    MCP_ERR_INVALID_ARGS,
+                    format!("Invalid params: {err}"),
+                    Some(
+                        "Expected object with source_path, line_number, optional context_lines, timeout_secs"
+                            .to_string(),
+                    ),
+                    elapsed_ms(start),
+                );
+                return envelope_to_content(envelope);
+            }
+        };
+
+        if params.source_path.trim().is_empty() {
+            let envelope = McpEnvelope::<()>::error(
+                MCP_ERR_INVALID_ARGS,
+                "source_path cannot be empty".to_string(),
+                Some("Provide a valid source_path returned by cass search".to_string()),
+                elapsed_ms(start),
+            );
+            return envelope_to_content(envelope);
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
+
+        let result: std::result::Result<CassViewResult, CassError> = runtime.block_on(async {
+            let client = CassClient::new().with_timeout_secs(params.timeout_secs);
+            let options = CassViewOptions {
+                context_lines: Some(params.context_lines),
+            };
+            client
+                .query(
+                    std::path::Path::new(&params.source_path),
+                    params.line_number,
+                    &options,
+                )
+                .await
+        });
+
+        match result {
+            Ok(result) => {
+                let envelope = McpEnvelope::success(result, elapsed_ms(start));
+                envelope_to_content(envelope)
+            }
+            Err(err) => {
+                let (code, hint) = map_cass_error(&err);
+                let envelope = McpEnvelope::<()>::error(
+                    code,
+                    format!("cass view failed: {err}"),
+                    hint,
+                    elapsed_ms(start),
+                );
+                envelope_to_content(envelope)
+            }
+        }
+    }
+}
+
+// wa.cass_status tool
+struct WaCassStatusTool;
+
+impl ToolHandler for WaCassStatusTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "wa.cass_status".to_string(),
+            description: Some("Check cass index status".to_string()),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 600, "default": 15, "description": "cass timeout override (seconds)" }
+                },
+                "additionalProperties": false
+            }),
+            output_schema: None,
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "robot".to_string(), "cass".to_string()],
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        let start = Instant::now();
+
+        let params: CassStatusParams = if arguments.is_null() {
+            CassStatusParams::default()
+        } else {
+            match serde_json::from_value(arguments) {
+                Ok(p) => p,
+                Err(err) => {
+                    let envelope = McpEnvelope::<()>::error(
+                        MCP_ERR_INVALID_ARGS,
+                        format!("Invalid params: {err}"),
+                        Some("Expected object with optional timeout_secs".to_string()),
+                        elapsed_ms(start),
+                    );
+                    return envelope_to_content(envelope);
+                }
+            }
+        };
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
+
+        let result: std::result::Result<CassStatus, CassError> = runtime.block_on(async {
+            let client = CassClient::new().with_timeout_secs(params.timeout_secs);
+            client.status().await
+        });
+
+        match result {
+            Ok(result) => {
+                let envelope = McpEnvelope::success(result, elapsed_ms(start));
+                envelope_to_content(envelope)
+            }
+            Err(err) => {
+                let (code, hint) = map_cass_error(&err);
+                let envelope = McpEnvelope::<()>::error(
+                    code,
+                    format!("cass status failed: {err}"),
+                    hint,
+                    elapsed_ms(start),
+                );
+                envelope_to_content(envelope)
+            }
+        }
+    }
+}
+
 // wa.reservations tool - list active pane reservations
 struct WaReservationsTool {
     db_path: Arc<PathBuf>,
@@ -3773,6 +4111,18 @@ fn parse_caut_service(service: &str) -> Option<CautService> {
     }
 }
 
+fn parse_cass_agent(agent: &str) -> Option<CassAgent> {
+    match agent.trim().to_lowercase().as_str() {
+        "codex" => Some(CassAgent::Codex),
+        "claude_code" | "claude-code" | "claude" => Some(CassAgent::ClaudeCode),
+        "gemini" => Some(CassAgent::Gemini),
+        "cursor" => Some(CassAgent::Cursor),
+        "aider" => Some(CassAgent::Aider),
+        "chatgpt" | "chat_gpt" | "chat-gpt" => Some(CassAgent::ChatGpt),
+        _ => None,
+    }
+}
+
 fn check_refresh_cooldown(
     most_recent_refresh_ms: i64,
     now_ms_val: i64,
@@ -3993,6 +4343,20 @@ fn map_caut_error(error: &CautError) -> (&'static str, Option<String>) {
             Some("Retry the refresh or increase caut timeout.".to_string()),
         ),
         _ => (MCP_ERR_CAUT, Some(error.remediation().summary.to_string())),
+    }
+}
+
+fn map_cass_error(error: &CassError) -> (&'static str, Option<String>) {
+    match error {
+        CassError::NotInstalled => (
+            MCP_ERR_CONFIG,
+            Some("Install cass and ensure it is on PATH.".to_string()),
+        ),
+        CassError::Timeout { .. } => (
+            MCP_ERR_TIMEOUT,
+            Some("Retry the query or increase cass timeout.".to_string()),
+        ),
+        _ => (MCP_ERR_CASS, Some(error.remediation().summary.to_string())),
     }
 }
 
@@ -4290,6 +4654,7 @@ mod tests {
             MCP_ERR_FTS_QUERY,
             MCP_ERR_RESERVATION_CONFLICT,
             MCP_ERR_CAUT,
+            MCP_ERR_CASS,
         ];
         for code in &codes {
             assert!(
@@ -4317,6 +4682,7 @@ mod tests {
             MCP_ERR_FTS_QUERY,
             MCP_ERR_RESERVATION_CONFLICT,
             MCP_ERR_CAUT,
+            MCP_ERR_CASS,
         ];
         for code in &codes {
             let suffix = &code["FT-MCP-".len()..];

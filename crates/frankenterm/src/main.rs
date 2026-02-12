@@ -2131,6 +2131,12 @@ enum RobotCommands {
         pane: Option<u64>,
     },
 
+    /// Search and view coding agent session history via cass
+    Cass {
+        #[command(subcommand)]
+        command: RobotCassCommands,
+    },
+
     /// Get recent events
     Events {
         /// Maximum number of events to return
@@ -2435,6 +2441,100 @@ enum RobotAccountsCommands {
         /// Service to refresh (default: "openai")
         #[arg(long, default_value = "openai")]
         service: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum RobotCassAgent {
+    #[value(name = "codex")]
+    Codex,
+    #[value(name = "claude_code", alias = "claude-code", alias = "claude")]
+    ClaudeCode,
+    #[value(name = "gemini")]
+    Gemini,
+    #[value(name = "cursor")]
+    Cursor,
+    #[value(name = "aider")]
+    Aider,
+    #[value(name = "chatgpt", alias = "chat_gpt", alias = "chat-gpt")]
+    ChatGpt,
+}
+
+impl From<RobotCassAgent> for frankenterm_core::cass::CassAgent {
+    fn from(value: RobotCassAgent) -> Self {
+        match value {
+            RobotCassAgent::Codex => Self::Codex,
+            RobotCassAgent::ClaudeCode => Self::ClaudeCode,
+            RobotCassAgent::Gemini => Self::Gemini,
+            RobotCassAgent::Cursor => Self::Cursor,
+            RobotCassAgent::Aider => Self::Aider,
+            RobotCassAgent::ChatGpt => Self::ChatGpt,
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum RobotCassCommands {
+    /// Search cass session history
+    Search {
+        /// Search query string
+        query: String,
+
+        /// Limit number of results (0 = cass default)
+        #[arg(long, default_value = "10")]
+        limit: usize,
+
+        /// Offset into results (0 = start)
+        #[arg(long, default_value = "0")]
+        offset: usize,
+
+        /// Filter by agent type
+        #[arg(long)]
+        agent: Option<RobotCassAgent>,
+
+        /// Filter by workspace path substring
+        #[arg(long)]
+        workspace: Option<String>,
+
+        /// Only consider sessions within the last N days
+        #[arg(long)]
+        days: Option<u32>,
+
+        /// Field selection (cass-specific; e.g. \"minimal\")
+        #[arg(long)]
+        fields: Option<String>,
+
+        /// Maximum tokens per hit content
+        #[arg(long)]
+        max_tokens: Option<usize>,
+
+        /// Override cass command timeout (seconds)
+        #[arg(long, default_value = "15")]
+        timeout_secs: u64,
+    },
+
+    /// View context for a specific cass hit
+    View {
+        /// Source path returned by cass search
+        source_path: String,
+
+        /// Line number returned by cass search
+        line_number: usize,
+
+        /// Context lines before/after match
+        #[arg(long, default_value = "10")]
+        context_lines: usize,
+
+        /// Override cass command timeout (seconds)
+        #[arg(long, default_value = "15")]
+        timeout_secs: u64,
+    },
+
+    /// Check cass index status
+    Status {
+        /// Override cass command timeout (seconds)
+        #[arg(long, default_value = "15")]
+        timeout_secs: u64,
     },
 }
 
@@ -6028,6 +6128,18 @@ fn build_robot_help() -> RobotHelp {
                 description: "Explain why search results may be missing or incomplete",
             },
             RobotCommandInfo {
+                name: "cass search",
+                description: "Search coding agent session history via cass",
+            },
+            RobotCommandInfo {
+                name: "cass view",
+                description: "View context for a cass search hit",
+            },
+            RobotCommandInfo {
+                name: "cass status",
+                description: "Check cass index status",
+            },
+            RobotCommandInfo {
                 name: "events",
                 description: "Fetch recent events (optional workflow preview)",
             },
@@ -6170,6 +6282,27 @@ fn build_robot_quick_start() -> RobotQuickStartData {
                     "ft robot search-explain \"compilation failed\"",
                     "ft robot search-explain \"error\" --pane 3",
                 ],
+            },
+            QuickStartCommand {
+                name: "cass status",
+                args: "",
+                summary: "Check cass index health (session search)",
+                examples: vec!["ft robot cass status"],
+            },
+            QuickStartCommand {
+                name: "cass search",
+                args: "\"<query>\" [--limit N] [--agent <agent>]",
+                summary: "Search coding agent session history via cass",
+                examples: vec![
+                    "ft robot cass search \"wa-2l9kn\" --limit 3",
+                    "ft robot cass search \"compilation failed\" --agent codex --limit 5",
+                ],
+            },
+            QuickStartCommand {
+                name: "cass view",
+                args: "<source_path> <line_number> [--context-lines N]",
+                summary: "View context around a specific cass search hit",
+                examples: vec!["ft robot cass view /path/to/session.jsonl 42 --context-lines 20"],
             },
             QuickStartCommand {
                 name: "events",
@@ -9188,6 +9321,122 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             elapsed_ms(start),
                                         );
                                     print_robot_response(&response, format, stats)?;
+                                }
+                            }
+                        }
+                        RobotCommands::Cass { command } => {
+                            use frankenterm_core::cass::{CassClient, CassError};
+
+                            fn map_cass_error(err: &CassError) -> (&'static str, Option<String>) {
+                                let hint = Some(err.remediation().summary.to_string());
+                                match err {
+                                    CassError::NotInstalled => ("robot.cass_not_installed", hint),
+                                    CassError::Timeout { .. } => ("robot.cass_timeout", hint),
+                                    CassError::OutputTooLarge { .. } => {
+                                        ("robot.cass_output_too_large", hint)
+                                    }
+                                    CassError::InvalidJson { .. } => {
+                                        ("robot.cass_invalid_json", hint)
+                                    }
+                                    _ => ("robot.cass_error", hint),
+                                }
+                            }
+
+                            match command {
+                                RobotCassCommands::Search {
+                                    query,
+                                    limit,
+                                    offset,
+                                    agent,
+                                    workspace,
+                                    days,
+                                    fields,
+                                    max_tokens,
+                                    timeout_secs,
+                                } => {
+                                    let client = CassClient::new().with_timeout_secs(timeout_secs);
+                                    let options = frankenterm_core::cass::SearchOptions {
+                                        limit: (limit != 0).then_some(limit),
+                                        offset: (offset != 0).then_some(offset),
+                                        agent: agent.map(Into::into),
+                                        workspace,
+                                        days,
+                                        fields,
+                                        max_tokens,
+                                    };
+
+                                    match client.search(&query, &options).await {
+                                        Ok(result) => {
+                                            let response =
+                                                RobotResponse::success(result, elapsed_ms(start));
+                                            print_robot_response(&response, format, stats)?;
+                                        }
+                                        Err(e) => {
+                                            let (code, hint) = map_cass_error(&e);
+                                            let response = RobotResponse::<
+                                                frankenterm_core::cass::CassSearchResult,
+                                            >::error_with_code(
+                                                code,
+                                                format!("cass search failed: {e}"),
+                                                hint,
+                                                elapsed_ms(start),
+                                            );
+                                            print_robot_response(&response, format, stats)?;
+                                        }
+                                    }
+                                }
+                                RobotCassCommands::View {
+                                    source_path,
+                                    line_number,
+                                    context_lines,
+                                    timeout_secs,
+                                } => {
+                                    let client = CassClient::new().with_timeout_secs(timeout_secs);
+                                    let options = frankenterm_core::cass::ViewOptions {
+                                        context_lines: Some(context_lines),
+                                    };
+                                    let path = std::path::PathBuf::from(&source_path);
+                                    match client.query(&path, line_number, &options).await {
+                                        Ok(result) => {
+                                            let response =
+                                                RobotResponse::success(result, elapsed_ms(start));
+                                            print_robot_response(&response, format, stats)?;
+                                        }
+                                        Err(e) => {
+                                            let (code, hint) = map_cass_error(&e);
+                                            let response = RobotResponse::<
+                                                frankenterm_core::cass::CassViewResult,
+                                            >::error_with_code(
+                                                code,
+                                                format!("cass view failed: {e}"),
+                                                hint,
+                                                elapsed_ms(start),
+                                            );
+                                            print_robot_response(&response, format, stats)?;
+                                        }
+                                    }
+                                }
+                                RobotCassCommands::Status { timeout_secs } => {
+                                    let client = CassClient::new().with_timeout_secs(timeout_secs);
+                                    match client.status().await {
+                                        Ok(result) => {
+                                            let response =
+                                                RobotResponse::success(result, elapsed_ms(start));
+                                            print_robot_response(&response, format, stats)?;
+                                        }
+                                        Err(e) => {
+                                            let (code, hint) = map_cass_error(&e);
+                                            let response = RobotResponse::<
+                                                frankenterm_core::cass::CassStatus,
+                                            >::error_with_code(
+                                                code,
+                                                format!("cass status failed: {e}"),
+                                                hint,
+                                                elapsed_ms(start),
+                                            );
+                                            print_robot_response(&response, format, stats)?;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -29636,6 +29885,99 @@ log_level = "debug"
                     assert_eq!(pane_id, 3);
                 }
                 _ => panic!("expected Workflow::Run"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    // ========================================================================
+    // CLI Parsing Tests — cass subcommands (wa-2l9kn)
+    // ========================================================================
+
+    #[test]
+    fn cli_robot_cass_search_parses_query_limit_and_agent() {
+        let cli = Cli::try_parse_from([
+            "ft",
+            "robot",
+            "cass",
+            "search",
+            "compilation failed",
+            "--limit",
+            "3",
+            "--agent",
+            "claude_code",
+        ])
+        .expect("robot cass search should parse");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::Cass {
+                    command:
+                        RobotCassCommands::Search {
+                            query,
+                            limit,
+                            agent,
+                            ..
+                        },
+                }) => {
+                    assert_eq!(query, "compilation failed");
+                    assert_eq!(limit, 3);
+                    assert!(matches!(agent, Some(RobotCassAgent::ClaudeCode)));
+                }
+                _ => panic!("expected RobotCommands::Cass::Search"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn cli_robot_cass_view_parses_source_path_and_line_number() {
+        let cli = Cli::try_parse_from([
+            "ft",
+            "robot",
+            "cass",
+            "view",
+            "/tmp/session.jsonl",
+            "42",
+            "--context-lines",
+            "20",
+        ])
+        .expect("robot cass view should parse");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::Cass {
+                    command:
+                        RobotCassCommands::View {
+                            source_path,
+                            line_number,
+                            context_lines,
+                            ..
+                        },
+                }) => {
+                    assert_eq!(source_path, "/tmp/session.jsonl");
+                    assert_eq!(line_number, 42);
+                    assert_eq!(context_lines, 20);
+                }
+                _ => panic!("expected RobotCommands::Cass::View"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn cli_robot_cass_status_parses() {
+        let cli = Cli::try_parse_from(["ft", "robot", "cass", "status"])
+            .expect("robot cass status should parse");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::Cass {
+                    command: RobotCassCommands::Status { timeout_secs },
+                }) => {
+                    assert_eq!(timeout_secs, 15);
+                }
+                _ => panic!("expected RobotCommands::Cass::Status"),
             },
             _ => panic!("expected Robot command"),
         }
