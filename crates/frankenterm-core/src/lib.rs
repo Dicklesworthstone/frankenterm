@@ -132,6 +132,7 @@ pub mod process_tree;
 pub mod process_triage;
 pub mod protocol_recovery;
 pub mod recorder_invariants;
+pub mod recorder_retention;
 pub mod recorder_storage;
 pub mod recording;
 pub mod replay;
@@ -196,6 +197,11 @@ pub mod native_events;
 
 #[cfg(feature = "browser")]
 pub mod browser;
+
+#[cfg(feature = "recorder-lexical")]
+pub mod recorder_lexical_schema;
+#[cfg(feature = "recorder-lexical")]
+pub mod recorder_lexical_ingest;
 
 // tui and ftui are mutually exclusive feature flags (unless `rollout` is active).
 // The legacy `tui` feature uses ratatui/crossterm; the new `ftui` feature uses FrankenTUI.

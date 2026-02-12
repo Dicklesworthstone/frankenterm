@@ -427,4 +427,350 @@ mod tests {
         assert!(!is_valid_profile_name("A")); // uppercase
         assert!(!is_valid_profile_name(" ")); // space
     }
+
+    // ── ConfigProfileManifest tests ──
+
+    #[test]
+    fn manifest_default_has_version_1() {
+        let manifest = ConfigProfileManifest::default();
+        assert_eq!(manifest.version, 1);
+        assert!(manifest.profiles.is_empty());
+        assert!(manifest.last_applied_profile.is_none());
+        assert!(manifest.last_applied_at.is_none());
+    }
+
+    #[test]
+    fn manifest_serde_roundtrip() {
+        let manifest = ConfigProfileManifest {
+            version: 1,
+            profiles: vec![ConfigProfileManifestEntry {
+                name: "dev".to_string(),
+                path: "dev.toml".to_string(),
+                description: Some("Development".to_string()),
+                created_at: Some(1000),
+                updated_at: Some(2000),
+                last_applied_at: Some(3000),
+            }],
+            last_applied_profile: Some("dev".to_string()),
+            last_applied_at: Some(3000),
+        };
+
+        let json = serde_json::to_string(&manifest).unwrap();
+        let back: ConfigProfileManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.version, 1);
+        assert_eq!(back.profiles.len(), 1);
+        assert_eq!(back.profiles[0].name, "dev");
+        assert_eq!(back.last_applied_profile.as_deref(), Some("dev"));
+    }
+
+    #[test]
+    fn manifest_serde_defaults_from_empty_json() {
+        let manifest: ConfigProfileManifest = serde_json::from_str("{}").unwrap();
+        assert_eq!(manifest.version, 1);
+        assert!(manifest.profiles.is_empty());
+    }
+
+    #[test]
+    fn manifest_skip_serializing_none_fields() {
+        let manifest = ConfigProfileManifest::default();
+        let json = serde_json::to_string(&manifest).unwrap();
+        assert!(!json.contains("last_applied_profile"));
+        assert!(!json.contains("last_applied_at"));
+    }
+
+    // ── ConfigProfileManifestEntry tests ──
+
+    #[test]
+    fn manifest_entry_default() {
+        let entry = ConfigProfileManifestEntry::default();
+        assert!(entry.name.is_empty());
+        assert!(entry.path.is_empty());
+        assert!(entry.description.is_none());
+        assert!(entry.created_at.is_none());
+        assert!(entry.updated_at.is_none());
+        assert!(entry.last_applied_at.is_none());
+    }
+
+    #[test]
+    fn manifest_entry_serde_roundtrip() {
+        let entry = ConfigProfileManifestEntry {
+            name: "prod".to_string(),
+            path: "prod.toml".to_string(),
+            description: Some("Production profile".to_string()),
+            created_at: Some(100),
+            updated_at: Some(200),
+            last_applied_at: None,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: ConfigProfileManifestEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.name, "prod");
+        assert_eq!(back.description.as_deref(), Some("Production profile"));
+        assert!(back.last_applied_at.is_none());
+    }
+
+    #[test]
+    fn manifest_entry_serde_defaults_from_empty_json() {
+        let entry: ConfigProfileManifestEntry = serde_json::from_str("{}").unwrap();
+        assert!(entry.name.is_empty());
+        assert!(entry.path.is_empty());
+    }
+
+    // ── ConfigProfileSummary tests ──
+
+    #[test]
+    fn profile_summary_serialize() {
+        let summary = ConfigProfileSummary {
+            name: "dev".to_string(),
+            description: Some("Dev profile".to_string()),
+            path: Some("dev.toml".to_string()),
+            last_applied_at: Some(500),
+            implicit: false,
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["name"], "dev");
+        assert_eq!(parsed["implicit"], false);
+        assert_eq!(parsed["last_applied_at"], 500);
+    }
+
+    #[test]
+    fn profile_summary_implicit() {
+        let summary = ConfigProfileSummary {
+            name: "default".to_string(),
+            description: Some("Base config".to_string()),
+            path: None,
+            last_applied_at: None,
+            implicit: true,
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["implicit"], true);
+        assert!(parsed["path"].is_null());
+    }
+
+    // ── Helper function tests ──
+
+    #[test]
+    fn system_time_to_ms_works() {
+        let time = UNIX_EPOCH + std::time::Duration::from_millis(1_700_000_000_000);
+        assert_eq!(system_time_to_ms(time), Some(1_700_000_000_000));
+    }
+
+    #[test]
+    fn timestamps_for_nonexistent_returns_none() {
+        let (created, updated) = timestamps_for(Path::new("/nonexistent/path/foo.toml"));
+        assert!(created.is_none());
+        assert!(updated.is_none());
+    }
+
+    #[test]
+    fn timestamps_for_real_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("test.toml");
+        std::fs::write(&path, "# test").unwrap();
+        let (created, updated) = timestamps_for(&path);
+        // Both should be Some on macOS/Linux
+        assert!(created.is_some() || updated.is_some());
+    }
+
+    // ── File-based tests ──
+
+    #[test]
+    fn write_and_load_manifest_roundtrip() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let profiles_dir = tmp.path();
+
+        let manifest = ConfigProfileManifest {
+            version: 1,
+            profiles: vec![ConfigProfileManifestEntry {
+                name: "test".to_string(),
+                path: "test.toml".to_string(),
+                description: Some("Test".to_string()),
+                created_at: Some(100),
+                updated_at: Some(200),
+                last_applied_at: None,
+            }],
+            last_applied_profile: None,
+            last_applied_at: None,
+        };
+
+        write_manifest(profiles_dir, &manifest).unwrap();
+        let loaded = load_manifest(profiles_dir).unwrap().unwrap();
+        assert_eq!(loaded.profiles.len(), 1);
+        assert_eq!(loaded.profiles[0].name, "test");
+    }
+
+    #[test]
+    fn load_manifest_returns_none_when_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let result = load_manifest(tmp.path()).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn scan_profiles_empty_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let manifest = scan_profiles(tmp.path()).unwrap();
+        assert!(manifest.profiles.is_empty());
+    }
+
+    #[test]
+    fn scan_profiles_nonexistent_dir() {
+        let manifest = scan_profiles(Path::new("/nonexistent/profiles")).unwrap();
+        assert!(manifest.profiles.is_empty());
+    }
+
+    #[test]
+    fn scan_profiles_finds_toml_files() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("dev.toml"), "# dev").unwrap();
+        std::fs::write(tmp.path().join("staging.toml"), "# staging").unwrap();
+        std::fs::write(tmp.path().join("readme.md"), "# not a profile").unwrap();
+
+        let manifest = scan_profiles(tmp.path()).unwrap();
+        assert_eq!(manifest.profiles.len(), 2);
+        let names: Vec<_> = manifest.profiles.iter().map(|p| p.name.as_str()).collect();
+        assert!(names.contains(&"dev"));
+        assert!(names.contains(&"staging"));
+    }
+
+    #[test]
+    fn scan_profiles_skips_default_name() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("default.toml"), "# default").unwrap();
+        std::fs::write(tmp.path().join("dev.toml"), "# dev").unwrap();
+
+        let manifest = scan_profiles(tmp.path()).unwrap();
+        assert_eq!(manifest.profiles.len(), 1);
+        assert_eq!(manifest.profiles[0].name, "dev");
+    }
+
+    #[test]
+    fn scan_profiles_sorts_alphabetically() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("zebra.toml"), "").unwrap();
+        std::fs::write(tmp.path().join("alpha.toml"), "").unwrap();
+        std::fs::write(tmp.path().join("mid.toml"), "").unwrap();
+
+        let manifest = scan_profiles(tmp.path()).unwrap();
+        let names: Vec<_> = manifest.profiles.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "mid", "zebra"]);
+    }
+
+    // ── resolve_profile_path tests ──
+
+    #[test]
+    fn resolve_profile_path_rejects_default() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let result = resolve_profile_path(tmp.path(), None, "default");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_profile_path_without_manifest() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (canonical, path, rel) = resolve_profile_path(tmp.path(), None, "dev").unwrap();
+        assert_eq!(canonical, "dev");
+        assert_eq!(path, tmp.path().join("dev.toml"));
+        assert_eq!(rel, "dev.toml");
+    }
+
+    #[test]
+    fn resolve_profile_path_with_manifest_entry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let manifest = ConfigProfileManifest {
+            version: 1,
+            profiles: vec![ConfigProfileManifestEntry {
+                name: "prod".to_string(),
+                path: "production.toml".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let (canonical, path, rel) =
+            resolve_profile_path(tmp.path(), Some(&manifest), "prod").unwrap();
+        assert_eq!(canonical, "prod");
+        assert_eq!(path, tmp.path().join("production.toml"));
+        assert_eq!(rel, "production.toml");
+    }
+
+    #[test]
+    fn resolve_profile_path_normalizes_name() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (canonical, _path, _rel) = resolve_profile_path(tmp.path(), None, "  DEV  ").unwrap();
+        assert_eq!(canonical, "dev");
+    }
+
+    // ── list_profiles tests ──
+
+    #[test]
+    fn list_profiles_always_includes_default() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let profiles = list_profiles(tmp.path()).unwrap();
+        assert!(!profiles.is_empty());
+        assert_eq!(profiles[0].name, "default");
+        assert!(profiles[0].implicit);
+    }
+
+    #[test]
+    fn list_profiles_includes_scanned_profiles() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("dev.toml"), "# dev").unwrap();
+
+        let profiles = list_profiles(tmp.path()).unwrap();
+        assert!(profiles.len() >= 2);
+        assert_eq!(profiles[0].name, "default");
+        assert!(profiles.iter().any(|p| p.name == "dev"));
+    }
+
+    // ── resolve_profiles_dir tests ──
+
+    #[test]
+    fn resolve_profiles_dir_with_config_path() {
+        let dir = resolve_profiles_dir(Some(Path::new("/etc/ft/ft.toml")));
+        assert_eq!(dir, PathBuf::from("/etc/ft/profiles"));
+    }
+
+    #[test]
+    fn resolve_profiles_dir_with_bare_config_path() {
+        let dir = resolve_profiles_dir(Some(Path::new("ft.toml")));
+        // "ft.toml" parent is "" which is empty, so unwrap_or uses "."
+        // Path::new(".").join("profiles") = "profiles" (no leading ./)
+        assert!(dir.ends_with("profiles"));
+    }
+
+    // ── touch_last_applied edge cases ──
+
+    #[test]
+    fn touch_last_applied_multiple_entries_updates_correct_one() {
+        let mut manifest = ConfigProfileManifest {
+            version: 1,
+            profiles: vec![
+                ConfigProfileManifestEntry {
+                    name: "dev".to_string(),
+                    path: "dev.toml".to_string(),
+                    created_at: Some(100),
+                    updated_at: Some(100),
+                    last_applied_at: Some(100),
+                    ..Default::default()
+                },
+                ConfigProfileManifestEntry {
+                    name: "prod".to_string(),
+                    path: "prod.toml".to_string(),
+                    created_at: Some(200),
+                    updated_at: Some(200),
+                    last_applied_at: Some(200),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        touch_last_applied(&mut manifest, "prod", "prod.toml", 999);
+
+        assert_eq!(manifest.profiles[0].last_applied_at, Some(100)); // dev unchanged
+        assert_eq!(manifest.profiles[1].last_applied_at, Some(999)); // prod updated
+        assert_eq!(manifest.last_applied_profile.as_deref(), Some("prod"));
+    }
 }
