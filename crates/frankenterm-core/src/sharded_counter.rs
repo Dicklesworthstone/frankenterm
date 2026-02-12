@@ -171,6 +171,23 @@ impl ShardedCounter {
             .map(|s| s.value.load(Ordering::Relaxed))
             .collect()
     }
+
+    // -- AtomicU64-compatible shims for drop-in replacement -----------------
+
+    /// AtomicU64-compatible: read aggregate value (ignores ordering parameter).
+    #[inline]
+    #[must_use]
+    pub fn load(&self, _ordering: Ordering) -> u64 {
+        self.get()
+    }
+
+    /// AtomicU64-compatible: add and return previous aggregate (approximate).
+    #[inline]
+    pub fn fetch_add(&self, value: u64, _ordering: Ordering) -> u64 {
+        let prev = self.get();
+        self.add(value);
+        prev
+    }
 }
 
 impl Default for ShardedCounter {
@@ -313,6 +330,21 @@ impl ShardedGauge {
         for shard in self.shards.iter() {
             shard.value.store(0, Ordering::Relaxed);
         }
+    }
+
+    // -- AtomicU64-compatible shims for drop-in replacement -----------------
+
+    /// AtomicU64-compatible: set gauge value (ignores ordering parameter).
+    #[inline]
+    pub fn store(&self, value: u64, _ordering: Ordering) {
+        self.set(value);
+    }
+
+    /// AtomicU64-compatible: read max value (ignores ordering parameter).
+    #[inline]
+    #[must_use]
+    pub fn load(&self, _ordering: Ordering) -> u64 {
+        self.get_max()
     }
 }
 

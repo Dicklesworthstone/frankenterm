@@ -158,6 +158,7 @@ pub mod suggestions;
 pub mod survival;
 pub mod tailer;
 pub mod telemetry;
+pub mod token_bucket;
 pub mod undo;
 pub mod user_preferences;
 pub mod voi;
