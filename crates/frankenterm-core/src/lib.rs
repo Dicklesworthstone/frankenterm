@@ -91,6 +91,7 @@ pub mod error_clustering;
 pub mod error_codes;
 pub mod event_templates;
 pub mod events;
+pub mod ewma;
 pub mod exp_histogram;
 pub mod explanations;
 pub mod export;
@@ -193,7 +194,7 @@ pub mod browser;
 compile_error!(
     "Features `tui` and `ftui` are mutually exclusive. \
      Use `--features tui` for the legacy ratatui backend or \
-     `--features ftui` for the FrankenTUI backend, not both. \
+     Use `--features ftui` for the FrankenTUI backend, not both. \
      Use `--features rollout` for runtime backend selection during migration."
 );
 
