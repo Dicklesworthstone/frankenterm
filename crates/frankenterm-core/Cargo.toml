@@ -186,6 +186,10 @@ name = "spike_comparison"
 harness = false
 required-features = ["asupersync-runtime"]
 
+[[bench]]
+name = "lockfree_contention"
+harness = false
+
 [features]
 default = []
 # Public feature flags (stable surface)
