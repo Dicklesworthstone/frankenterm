@@ -168,6 +168,10 @@ name = "differential_snapshot"
 harness = false
 
 [[bench]]
+name = "auto_tuning"
+harness = false
+
+[[bench]]
 name = "outcome_adapter"
 harness = false
 required-features = ["asupersync-runtime"]

@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 3df387d8f89fd38f0094c43e5098e126d4e2c60c5a37ecda1bf0873f97453ee5 # shrinks to rss = 0.0, latency = 9.289741172740648, cpu = 0.44364171271834313
+cc f7ce6b03c54ad86ae601cea6e9b3edaaaf03ebce9d483d60dd7f7aed79c322b4 # shrinks to rss = 0.0, latency = 9.125951908523605, cpu = 0.6603742507193981
