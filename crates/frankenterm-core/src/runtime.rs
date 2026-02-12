@@ -26,7 +26,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::sharded_counter::{ShardedCounter, ShardedGauge, ShardedMax};
 
-use tokio::sync::{RwLock, mpsc, watch};
+use tokio::sync::RwLock;
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, error, info, instrument, warn};
 
@@ -44,6 +44,7 @@ use crate::ingest::{PaneCursor, PaneRegistry, persist_captured_segment};
 use crate::native_events::{NativeEvent, NativeEventListener};
 use crate::patterns::{Detection, DetectionContext, PatternEngine};
 use crate::recording::RecordingManager;
+use crate::runtime_compat::{mpsc, watch};
 #[cfg(feature = "native-wezterm")]
 use crate::storage::PaneRecord;
 use crate::storage::{StorageHandle, StoredEvent};
