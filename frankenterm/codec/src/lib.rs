@@ -14,7 +14,7 @@
 // Both async-smol and async-asupersync may be enabled simultaneously due to Cargo
 // workspace feature unification. When both are active, asupersync takes priority.
 
-use anyhow::{Context as _, Error, bail};
+use anyhow::{bail, Context as _, Error};
 use config::keyassignment::{PaneDirection, ScrollbackEraseMode};
 use frankenterm_term::color::ColorPalette;
 use frankenterm_term::{Alert, ClipboardSelection, StableRowIndex, TerminalSize};

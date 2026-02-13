@@ -58,8 +58,8 @@ use proptest::prelude::*;
 use std::collections::HashMap;
 
 use frankenterm_core::session_pane_state::{
-    AgentMetadata, CapturedEnv, PaneStateSnapshot, ProcessInfo, ScrollbackRef, TerminalState,
-    PANE_STATE_SCHEMA_VERSION, PANE_STATE_SIZE_BUDGET,
+    AgentMetadata, CapturedEnv, PANE_STATE_SCHEMA_VERSION, PANE_STATE_SIZE_BUDGET,
+    PaneStateSnapshot, ProcessInfo, ScrollbackRef, TerminalState,
 };
 
 // =============================================================================
@@ -132,16 +132,16 @@ fn arb_terminal_state() -> impl Strategy<Value = TerminalState> {
         any::<bool>(),
         arb_short_string(),
     )
-        .prop_map(|(rows, cols, cursor_row, cursor_col, is_alt_screen, title)| {
-            TerminalState {
+        .prop_map(
+            |(rows, cols, cursor_row, cursor_col, is_alt_screen, title)| TerminalState {
                 rows,
                 cols,
                 cursor_row: cursor_row.min(rows.saturating_sub(1)),
                 cursor_col: cursor_col.min(cols.saturating_sub(1)),
                 is_alt_screen,
                 title,
-            }
-        })
+            },
+        )
 }
 
 /// Arbitrary ProcessInfo with all fields populated.
@@ -221,10 +221,9 @@ fn arb_captured_env() -> impl Strategy<Value = CapturedEnv> {
 
 /// Arbitrary PaneStateSnapshot with only required fields (minimal).
 fn arb_snapshot_minimal() -> impl Strategy<Value = PaneStateSnapshot> {
-    (arb_pane_id(), arb_timestamp(), arb_terminal_state())
-        .prop_map(|(pane_id, captured_at, terminal)| {
-            PaneStateSnapshot::new(pane_id, captured_at, terminal)
-        })
+    (arb_pane_id(), arb_timestamp(), arb_terminal_state()).prop_map(
+        |(pane_id, captured_at, terminal)| PaneStateSnapshot::new(pane_id, captured_at, terminal),
+    )
 }
 
 /// Arbitrary PaneStateSnapshot with all fields populated.
