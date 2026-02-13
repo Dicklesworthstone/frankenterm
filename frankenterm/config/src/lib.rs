@@ -36,6 +36,7 @@ mod cell;
 mod color;
 mod config;
 mod daemon;
+pub mod detection;
 mod exec_domain;
 mod font;
 mod frontend;
@@ -53,7 +54,6 @@ pub(crate) mod toml_config;
 mod units;
 mod unix;
 mod version;
-#[allow(dead_code)] // wired in by wa-3dfxb.6 (config format auto-detection)
 pub(crate) mod wasm_config;
 pub mod window;
 mod wsl;
