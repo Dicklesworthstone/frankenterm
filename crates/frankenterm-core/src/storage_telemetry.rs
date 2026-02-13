@@ -11,17 +11,16 @@
 //! - Instrumented storage wrapper (`InstrumentedStorage<S>`) via decorator pattern
 //! - Snapshot export for diagnostics and SLO dashboards
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
 use crate::ewma::Ewma;
 use crate::recorder_storage::{
-    AppendRequest, AppendResponse, CheckpointCommitOutcome, CheckpointConsumerId, FlushMode,
-    FlushStats, RecorderCheckpoint, RecorderStorageError, RecorderStorageErrorClass,
-    RecorderStorageHealth, RecorderStorageLag,
+    AppendRequest, AppendResponse, CheckpointCommitOutcome, FlushStats, RecorderStorageError,
+    RecorderStorageErrorClass, RecorderStorageHealth, RecorderStorageLag,
 };
 use crate::telemetry::{HistogramSummary, MetricRegistry};
 
@@ -56,8 +55,8 @@ impl Default for StorageTelemetryConfig {
             histogram_max_samples: 1024,
             tier_thresholds: [0.5, 0.8, 0.95],
             rate_ewma_half_life_ms: 5000.0,
-            slo_append_p95_us: 10_000.0,  // 10ms target
-            slo_flush_p95_us: 100_000.0,  // 100ms target
+            slo_append_p95_us: 10_000.0, // 10ms target
+            slo_flush_p95_us: 100_000.0, // 100ms target
         }
     }
 }
@@ -251,7 +250,8 @@ impl StorageTelemetry {
         registry.register_histogram(METRIC_CHECKPOINT_LATENCY_US, max);
         registry.register_histogram(METRIC_BATCH_SIZE, max);
 
-        let rate_ewma = std::sync::Mutex::new(Ewma::with_half_life_ms(config.rate_ewma_half_life_ms));
+        let rate_ewma =
+            std::sync::Mutex::new(Ewma::with_half_life_ms(config.rate_ewma_half_life_ms));
 
         Self {
             config,
@@ -284,12 +284,17 @@ impl StorageTelemetry {
         estimated_bytes: u64,
         was_idempotent_replay: bool,
     ) {
-        self.registry.record_histogram(METRIC_APPEND_LATENCY_US, elapsed_us);
-        self.registry.record_histogram(METRIC_BATCH_SIZE, event_count as f64);
-        self.registry.add_counter(COUNTER_EVENTS_APPENDED, event_count as u64);
+        self.registry
+            .record_histogram(METRIC_APPEND_LATENCY_US, elapsed_us);
+        self.registry
+            .record_histogram(METRIC_BATCH_SIZE, event_count as f64);
+        self.registry
+            .add_counter(COUNTER_EVENTS_APPENDED, event_count as u64);
         self.registry.increment_counter(COUNTER_BATCHES_PROCESSED);
-        self.estimated_bytes.fetch_add(estimated_bytes, Ordering::Relaxed);
-        self.registry.add_counter(COUNTER_BYTES_WRITTEN, estimated_bytes);
+        self.estimated_bytes
+            .fetch_add(estimated_bytes, Ordering::Relaxed);
+        self.registry
+            .add_counter(COUNTER_BYTES_WRITTEN, estimated_bytes);
 
         if was_idempotent_replay {
             self.registry.increment_counter(COUNTER_IDEMPOTENT_REPLAYS);
@@ -304,13 +309,15 @@ impl StorageTelemetry {
 
     /// Record a flush operation.
     pub fn record_flush(&self, elapsed_us: f64) {
-        self.registry.record_histogram(METRIC_FLUSH_LATENCY_US, elapsed_us);
+        self.registry
+            .record_histogram(METRIC_FLUSH_LATENCY_US, elapsed_us);
         self.registry.increment_counter(COUNTER_FLUSHES);
     }
 
     /// Record a checkpoint commit operation.
     pub fn record_checkpoint(&self, elapsed_us: f64, outcome: CheckpointCommitOutcome) {
-        self.registry.record_histogram(METRIC_CHECKPOINT_LATENCY_US, elapsed_us);
+        self.registry
+            .record_histogram(METRIC_CHECKPOINT_LATENCY_US, elapsed_us);
         self.registry.increment_counter(COUNTER_CHECKPOINTS);
         match outcome {
             CheckpointCommitOutcome::Advanced => {
@@ -380,11 +387,7 @@ impl StorageTelemetry {
     /// Current EWMA-smoothed append rate (events per second).
     #[must_use]
     pub fn append_rate(&self) -> f64 {
-        self.rate_ewma
-            .lock()
-            .ok()
-            .map(|e| e.value())
-            .unwrap_or(0.0)
+        self.rate_ewma.lock().ok().map(|e| e.value()).unwrap_or(0.0)
     }
 
     /// Produce a full diagnostic snapshot.
@@ -604,8 +607,12 @@ pub fn diagnose(snapshot: &StoragePipelineSnapshot) -> StorageDiagnosticSummary 
 
     let recommendation = match snapshot.health_tier {
         StorageHealthTier::Green => None,
-        StorageHealthTier::Yellow => Some("Monitor queue depth; may resolve on its own".to_string()),
-        StorageHealthTier::Red => Some("Reduce ingest rate or increase flush frequency".to_string()),
+        StorageHealthTier::Yellow => {
+            Some("Monitor queue depth; may resolve on its own".to_string())
+        }
+        StorageHealthTier::Red => {
+            Some("Reduce ingest rate or increase flush frequency".to_string())
+        }
         StorageHealthTier::Black => {
             Some("Investigate backend errors; may need manual intervention".to_string())
         }
@@ -1021,7 +1028,11 @@ mod tests {
         ];
         for class in &classes {
             let msg = remediation_for_error(*class);
-            assert!(!msg.is_empty(), "remediation should be non-empty for {:?}", class);
+            assert!(
+                !msg.is_empty(),
+                "remediation should be non-empty for {:?}",
+                class
+            );
         }
     }
 
@@ -1109,7 +1120,10 @@ mod tests {
         instrumented.checkpoint_instrumented(&result, start);
 
         assert_eq!(telem.registry().counter_value(COUNTER_CHECKPOINTS), 1);
-        assert_eq!(telem.registry().counter_value(COUNTER_CHECKPOINT_ADVANCED), 1);
+        assert_eq!(
+            telem.registry().counter_value(COUNTER_CHECKPOINT_ADVANCED),
+            1
+        );
     }
 
     #[test]
