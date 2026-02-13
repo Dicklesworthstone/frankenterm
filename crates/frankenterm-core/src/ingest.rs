@@ -1144,7 +1144,12 @@ pub fn extract_delta(previous: &str, current: &str, overlap_size: usize) -> Delt
 
     // Limit overlap search to a bounded suffix/prefix window.
     let max_overlap = overlap_size.min(previous.len()).min(current.len());
-    let search_start = previous.len() - max_overlap;
+    let mut search_start = previous.len() - max_overlap;
+    // Snap forward to the next valid UTF-8 char boundary to avoid panicking
+    // on multi-byte characters (Cyrillic=2B, box-drawing=3B, emoji=4B).
+    while search_start < previous.len() && !previous.is_char_boundary(search_start) {
+        search_start += 1;
+    }
     let search_window = &previous[search_start..];
 
     // Safety: current is known not to be empty from check above
@@ -1153,9 +1158,11 @@ pub fn extract_delta(previous: &str, current: &str, overlap_size: usize) -> Delt
     // Find all occurrences of first_char in search_window using memchr (SIMD-optimized)
     // We iterate from left to right (smallest pos -> largest overlap)
     for pos in memchr::memchr_iter(first_char, search_window.as_bytes()) {
-        // search_window[pos] == first_char
+        // memchr returns byte offsets — skip if not on a char boundary
+        if !search_window.is_char_boundary(pos) {
+            continue;
+        }
         // Candidate overlap starts at pos relative to search_window
-        // Note: search_window.len() == max_overlap (since search_start = previous.len() - max_overlap)
         let overlap_len = search_window.len() - pos;
 
         if !current.is_char_boundary(overlap_len) {
@@ -2203,6 +2210,44 @@ mod tests {
         let cur = "hello\nthere\n";
         let result = extract_delta(prev, cur, 1024);
         assert!(matches!(result, DeltaResult::Gap { .. }));
+    }
+
+    #[test]
+    fn extract_delta_sliding_window_cyrillic() {
+        // Cyrillic chars are 2 bytes each — overlap boundary can land mid-codepoint
+        let prev = "строка1\nстрока2\n";
+        let cur = "строка2\nстрока3\n";
+        let result = extract_delta(prev, cur, 1024);
+        assert!(matches!(result, DeltaResult::Content(ref s) if s == "строка3\n"));
+    }
+
+    #[test]
+    fn extract_delta_sliding_window_box_drawing() {
+        // Box-drawing chars like ─ (U+2500) are 3 bytes — tests 3-byte boundary
+        let prev = "┌──────┐\n│ test │\n";
+        let cur = "│ test │\n└──────┘\n";
+        let result = extract_delta(prev, cur, 1024);
+        assert!(matches!(result, DeltaResult::Content(ref s) if s == "└──────┘\n"));
+    }
+
+    #[test]
+    fn extract_delta_sliding_window_emoji() {
+        // Emoji like 🌍 are 4 bytes — tests 4-byte boundary
+        let prev = "line🌍\nline🌎\n";
+        let cur = "line🌎\nline🌏\n";
+        let result = extract_delta(prev, cur, 1024);
+        assert!(matches!(result, DeltaResult::Content(ref s) if s == "line🌏\n"));
+    }
+
+    #[test]
+    fn extract_delta_small_overlap_mid_codepoint() {
+        // When overlap_size is small enough to land inside a multi-byte char
+        let prev = "abc🌍def";
+        let cur = "def";
+        // overlap_size=4 would try to slice at byte 4 inside the emoji
+        let result = extract_delta(prev, cur, 4);
+        // Should not panic — may return Gap or Content depending on match
+        assert!(!matches!(result, DeltaResult::NoChange));
     }
 
     #[test]
