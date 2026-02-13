@@ -17,8 +17,7 @@ use std::os::unix::net::UnixStream as StdUnixStream;
 
 use base64::Engine as _;
 use serde::Deserialize;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::net::UnixListener;
+use crate::runtime_compat::unix::{self as compat_unix, UnixListener, UnixStream};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
@@ -149,7 +148,7 @@ impl NativeEventListener {
             std::fs::create_dir_all(parent)?;
         }
 
-        let listener = UnixListener::bind(&socket_path)?;
+        let listener = compat_unix::bind(&socket_path).await?;
         Ok(Self {
             socket_path,
             listener,
@@ -243,13 +242,12 @@ fn maybe_cleanup_stale_socket(socket_path: &PathBuf) -> Result<(), NativeEventEr
 }
 
 async fn handle_connection(
-    stream: tokio::net::UnixStream,
+    stream: UnixStream,
     event_tx: mpsc::Sender<NativeEvent>,
 ) -> Result<(), std::io::Error> {
-    let reader = BufReader::new(stream);
-    let mut lines = reader.lines();
+    let mut lines = compat_unix::lines(compat_unix::buffered(stream));
 
-    while let Some(line) = lines.next_line().await? {
+    while let Some(line) = compat_unix::next_line(&mut lines).await? {
         if line.len() > MAX_EVENT_LINE_BYTES {
             warn!(len = line.len(), "native event line too large; dropping");
             continue;
@@ -345,8 +343,7 @@ fn decode_wire_event(line: &str) -> Result<Option<NativeEvent>, String> {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
-    use tokio::io::AsyncWriteExt;
-    use tokio::net::UnixStream;
+    use crate::runtime_compat::unix::{self as compat_unix, AsyncWriteExt};
 
     #[test]
     fn decode_pane_output_event() {
@@ -724,7 +721,7 @@ mod tests {
 
         let handle = tokio::spawn(listener.run(event_tx, Arc::clone(&shutdown)));
 
-        let mut stream = UnixStream::connect(socket_path).await.expect("connect");
+        let mut stream = compat_unix::connect(socket_path).await.expect("connect");
         let payload = r#"{"type":"pane_output","pane_id":7,"data_b64":"aGV5","ts":42}"#;
         stream
             .write_all(format!("{payload}\n").as_bytes())
@@ -765,7 +762,7 @@ mod tests {
 
         let handle = tokio::spawn(listener.run(event_tx, Arc::clone(&shutdown)));
 
-        let mut stream = UnixStream::connect(socket_path).await.expect("connect");
+        let mut stream = compat_unix::connect(socket_path).await.expect("connect");
 
         // Send hello (ignored) + two real events
         let lines = [
@@ -809,7 +806,7 @@ mod tests {
 
         let handle = tokio::spawn(listener.run(event_tx, Arc::clone(&shutdown)));
 
-        let mut stream = UnixStream::connect(socket_path).await.expect("connect");
+        let mut stream = compat_unix::connect(socket_path).await.expect("connect");
 
         // Send invalid JSON followed by valid event
         let lines = [
