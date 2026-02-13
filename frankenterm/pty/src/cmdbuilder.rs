@@ -836,4 +836,214 @@ mod tests {
         cmd.env_remove("cARGO_pKG_aUTHORS");
         assert!(cmd.get_env("CARGO_PKG_AUTHORS").is_none());
     }
+
+    // ── CommandBuilder: construction ────────────────────────
+
+    #[test]
+    fn new_sets_program_as_argv0() {
+        let cmd = CommandBuilder::new("myapp");
+        assert_eq!(cmd.get_argv().len(), 1);
+        assert_eq!(cmd.get_argv()[0], OsStr::new("myapp"));
+    }
+
+    #[test]
+    fn from_argv_preserves_args() {
+        let args = vec![
+            OsString::from("myapp"),
+            OsString::from("--flag"),
+            OsString::from("value"),
+        ];
+        let cmd = CommandBuilder::from_argv(args.clone());
+        assert_eq!(*cmd.get_argv(), args);
+    }
+
+    #[test]
+    fn new_default_prog_is_empty() {
+        let cmd = CommandBuilder::new_default_prog();
+        assert!(cmd.is_default_prog());
+        assert!(cmd.get_argv().is_empty());
+    }
+
+    #[test]
+    fn new_is_not_default_prog() {
+        let cmd = CommandBuilder::new("bash");
+        assert!(!cmd.is_default_prog());
+    }
+
+    // ── CommandBuilder: arg / args ──────────────────────────
+
+    #[test]
+    fn arg_appends() {
+        let mut cmd = CommandBuilder::new("git");
+        cmd.arg("status");
+        cmd.arg("--short");
+        assert_eq!(cmd.get_argv().len(), 3);
+        assert_eq!(cmd.get_argv()[1], OsStr::new("status"));
+        assert_eq!(cmd.get_argv()[2], OsStr::new("--short"));
+    }
+
+    #[test]
+    fn args_appends_multiple() {
+        let mut cmd = CommandBuilder::new("ls");
+        cmd.args(&["-l", "-a", "/tmp"]);
+        assert_eq!(cmd.get_argv().len(), 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "attempted to add args to a default_prog builder")]
+    fn arg_panics_on_default_prog() {
+        let mut cmd = CommandBuilder::new_default_prog();
+        cmd.arg("boom");
+    }
+
+    // ── CommandBuilder: replace_default_prog ─────────────────
+
+    #[test]
+    fn replace_default_prog_works() {
+        let mut cmd = CommandBuilder::new_default_prog();
+        assert!(cmd.is_default_prog());
+        cmd.replace_default_prog(["zsh", "-l"]);
+        assert!(!cmd.is_default_prog());
+        assert_eq!(cmd.get_argv()[0], OsStr::new("zsh"));
+        assert_eq!(cmd.get_argv()[1], OsStr::new("-l"));
+    }
+
+    #[test]
+    #[should_panic(expected = "attempted to replace_default_prog on a non-default_prog builder")]
+    fn replace_default_prog_panics_on_non_default() {
+        let mut cmd = CommandBuilder::new("bash");
+        cmd.replace_default_prog(["zsh"]);
+    }
+
+    // ── CommandBuilder: controlling_tty ──────────────────────
+
+    #[test]
+    fn controlling_tty_default_true() {
+        let cmd = CommandBuilder::new("bash");
+        assert!(cmd.get_controlling_tty());
+    }
+
+    #[test]
+    fn controlling_tty_set_false() {
+        let mut cmd = CommandBuilder::new("bash");
+        cmd.set_controlling_tty(false);
+        assert!(!cmd.get_controlling_tty());
+    }
+
+    // ── CommandBuilder: cwd ─────────────────────────────────
+
+    #[test]
+    fn cwd_none_by_default() {
+        let cmd = CommandBuilder::new("bash");
+        assert!(cmd.get_cwd().is_none());
+    }
+
+    #[test]
+    fn cwd_set_and_get() {
+        let mut cmd = CommandBuilder::new("bash");
+        cmd.cwd("/tmp");
+        assert_eq!(cmd.get_cwd(), Some(&OsString::from("/tmp")));
+    }
+
+    #[test]
+    fn cwd_clear() {
+        let mut cmd = CommandBuilder::new("bash");
+        cmd.cwd("/tmp");
+        cmd.clear_cwd();
+        assert!(cmd.get_cwd().is_none());
+    }
+
+    // ── CommandBuilder: get_argv_mut ─────────────────────────
+
+    #[test]
+    fn get_argv_mut_allows_modification() {
+        let mut cmd = CommandBuilder::new("bash");
+        cmd.get_argv_mut().push(OsString::from("-c"));
+        assert_eq!(cmd.get_argv().len(), 2);
+        assert_eq!(cmd.get_argv()[1], OsStr::new("-c"));
+    }
+
+    // ── CommandBuilder: as_unix_command_line ──────────────────
+
+    #[test]
+    fn as_unix_command_line_simple() {
+        let cmd = CommandBuilder::new("echo");
+        let cl = cmd.as_unix_command_line().unwrap();
+        assert_eq!(cl, "echo");
+    }
+
+    #[test]
+    fn as_unix_command_line_with_args() {
+        let mut cmd = CommandBuilder::new("ls");
+        cmd.arg("-la");
+        cmd.arg("/tmp");
+        let cl = cmd.as_unix_command_line().unwrap();
+        assert_eq!(cl, "ls -la /tmp");
+    }
+
+    #[test]
+    fn as_unix_command_line_quotes_spaces() {
+        let mut cmd = CommandBuilder::new("echo");
+        cmd.arg("hello world");
+        let cl = cmd.as_unix_command_line().unwrap();
+        assert!(cl.contains("'hello world'") || cl.contains("\"hello world\""));
+    }
+
+    // ── CommandBuilder: Clone / Debug / PartialEq ────────────
+
+    #[test]
+    fn command_builder_clone_eq() {
+        let mut cmd = CommandBuilder::new("test");
+        cmd.arg("--flag");
+        cmd.env("MY_VAR", "my_value");
+        let cloned = cmd.clone();
+        assert_eq!(cmd, cloned);
+    }
+
+    #[test]
+    fn command_builder_debug() {
+        let cmd = CommandBuilder::new("test");
+        let dbg = format!("{cmd:?}");
+        assert!(dbg.contains("CommandBuilder"));
+        assert!(dbg.contains("test"));
+    }
+
+    // ── CommandBuilder: iter_full_env_as_str ──────────────────
+
+    #[test]
+    fn iter_full_env_includes_base_and_extra() {
+        let mut cmd = CommandBuilder::new("test");
+        cmd.env("CUSTOM_KEY", "custom_value");
+        let full: Vec<_> = cmd.iter_full_env_as_str().collect();
+        // Should include base env vars (like PATH) plus our custom one
+        assert!(full
+            .iter()
+            .any(|(k, v)| *k == "CUSTOM_KEY" && *v == "custom_value"));
+        // Should have more than just our one custom var
+        assert!(full.len() > 1);
+    }
+
+    // ── EnvEntry::map_key ────────────────────────────────────
+
+    #[test]
+    fn env_entry_map_key_unix_identity() {
+        // On unix, map_key is identity
+        let key = OsString::from("MyKey");
+        let mapped = EnvEntry::map_key(key.clone());
+        if cfg!(unix) {
+            assert_eq!(mapped, key);
+        }
+    }
+
+    // ── CommandBuilder: get_shell ────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn get_shell_returns_nonempty() {
+        let cmd = CommandBuilder::new("test");
+        let shell = cmd.get_shell();
+        assert!(!shell.is_empty());
+        // Should be an absolute path on unix
+        assert!(shell.starts_with('/'));
+    }
 }

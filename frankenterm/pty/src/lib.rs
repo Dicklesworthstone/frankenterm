@@ -405,3 +405,126 @@ pub fn native_pty_system() -> Box<dyn PtySystem + Send> {
 pub type NativePtySystem = unix::UnixPtySystem;
 #[cfg(windows)]
 pub type NativePtySystem = win::conpty::ConPtySystem;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── PtySize ─────────────────────────────────────────────
+
+    #[test]
+    fn pty_size_default() {
+        let s = PtySize::default();
+        assert_eq!(s.rows, 24);
+        assert_eq!(s.cols, 80);
+        assert_eq!(s.pixel_width, 0);
+        assert_eq!(s.pixel_height, 0);
+    }
+
+    #[test]
+    fn pty_size_clone_eq() {
+        let a = PtySize {
+            rows: 50,
+            cols: 132,
+            pixel_width: 800,
+            pixel_height: 600,
+        };
+        let b = a;
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn pty_size_debug() {
+        let s = PtySize::default();
+        let dbg = format!("{s:?}");
+        assert!(dbg.contains("PtySize"));
+        assert!(dbg.contains("24"));
+    }
+
+    #[test]
+    fn pty_size_ne() {
+        let a = PtySize::default();
+        let b = PtySize {
+            rows: 25,
+            ..PtySize::default()
+        };
+        assert_ne!(a, b);
+    }
+
+    // ── ExitStatus: with_exit_code ──────────────────────────
+
+    #[test]
+    fn exit_status_success_zero() {
+        let s = ExitStatus::with_exit_code(0);
+        assert!(s.success());
+        assert_eq!(s.exit_code(), 0);
+        assert!(s.signal().is_none());
+    }
+
+    #[test]
+    fn exit_status_failure_nonzero() {
+        let s = ExitStatus::with_exit_code(1);
+        assert!(!s.success());
+        assert_eq!(s.exit_code(), 1);
+    }
+
+    #[test]
+    fn exit_status_arbitrary_code() {
+        let s = ExitStatus::with_exit_code(127);
+        assert!(!s.success());
+        assert_eq!(s.exit_code(), 127);
+    }
+
+    // ── ExitStatus: with_signal ─────────────────────────────
+
+    #[test]
+    fn exit_status_with_signal() {
+        let s = ExitStatus::with_signal("SIGTERM");
+        assert!(!s.success());
+        assert_eq!(s.exit_code(), 1);
+        assert_eq!(s.signal(), Some("SIGTERM"));
+    }
+
+    #[test]
+    fn exit_status_signal_is_never_success() {
+        let s = ExitStatus::with_signal("SIGHUP");
+        assert!(!s.success());
+    }
+
+    // ── ExitStatus: Display ─────────────────────────────────
+
+    #[test]
+    fn exit_status_display_success() {
+        let s = ExitStatus::with_exit_code(0);
+        assert_eq!(format!("{s}"), "Success");
+    }
+
+    #[test]
+    fn exit_status_display_exit_code() {
+        let s = ExitStatus::with_exit_code(42);
+        assert_eq!(format!("{s}"), "Exited with code 42");
+    }
+
+    #[test]
+    fn exit_status_display_signal() {
+        let s = ExitStatus::with_signal("SIGKILL");
+        assert_eq!(format!("{s}"), "Terminated by SIGKILL");
+    }
+
+    // ── ExitStatus: Clone / Debug ───────────────────────────
+
+    #[test]
+    fn exit_status_clone() {
+        let a = ExitStatus::with_exit_code(5);
+        let b = a.clone();
+        assert_eq!(a.exit_code(), b.exit_code());
+        assert_eq!(a.signal(), b.signal());
+    }
+
+    #[test]
+    fn exit_status_debug() {
+        let s = ExitStatus::with_signal("SIGINT");
+        let dbg = format!("{s:?}");
+        assert!(dbg.contains("SIGINT"));
+    }
+}
