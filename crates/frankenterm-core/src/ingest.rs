@@ -2241,13 +2241,28 @@ mod tests {
 
     #[test]
     fn extract_delta_small_overlap_mid_codepoint() {
-        // When overlap_size is small enough to land inside a multi-byte char
+        // prev = "abc🌍def" (10 bytes), cur = "def" (3 bytes), overlap_size = 4
+        // max_overlap = min(4, 10, 3) = 3  (clamped by cur.len())
+        // search_start = 10 - 3 = 7 ('d') — lands on a valid boundary here,
+        // but verifies no panic with emoji in the overlap region.
         let prev = "abc🌍def";
         let cur = "def";
-        // overlap_size=4 would try to slice at byte 4 inside the emoji
         let result = extract_delta(prev, cur, 4);
         // Should not panic — may return Gap or Content depending on match
         assert!(!matches!(result, DeltaResult::NoChange));
+    }
+
+    #[test]
+    fn extract_delta_search_start_snaps_past_emoji() {
+        // prev = "a🌍bcdef" (10 bytes: a=0, 🌍=1..4, b=5, c=6, d=7, e=8, f=9)
+        // overlap_size=7, cur.len()=8 → max_overlap=7, search_start=10-7=3
+        // Byte 3 is inside the 4-byte emoji — the snapping logic must advance
+        // search_start forward to byte 5 ('b') to avoid a char boundary panic.
+        let prev = "a\u{1F30D}bcdef";
+        let cur = "bcdefXYZ";
+        let result = extract_delta(prev, cur, 7);
+        // After snapping, search_window="bcdef" matches cur[..5], delta="XYZ"
+        assert!(matches!(result, DeltaResult::Content(ref s) if s == "XYZ"));
     }
 
     #[test]
