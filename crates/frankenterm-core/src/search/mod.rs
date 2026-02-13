@@ -1,0 +1,38 @@
+//! 2-Tier Semantic Search for FrankenTerm
+//!
+//! Progressive search system combining lexical (BM25) and semantic (embedding)
+//! retrieval with Reciprocal Rank Fusion and two-tier blending.
+
+mod embedder;
+mod hash_embedder;
+mod hybrid_search;
+mod reranker;
+mod vector_index;
+
+#[cfg(feature = "semantic-search")]
+mod fastembed_embedder;
+#[cfg(feature = "semantic-search")]
+mod model2vec_embedder;
+#[cfg(feature = "semantic-search")]
+mod model_registry;
+
+#[cfg(feature = "semantic-search")]
+pub mod daemon;
+
+pub use embedder::{EmbedError, Embedder, EmbedderInfo, EmbedderTier};
+pub use hash_embedder::HashEmbedder;
+pub use hybrid_search::{
+    blend_two_tier, kendall_tau, rrf_fuse, FusedResult, HybridSearchService, SearchMode,
+    TwoTierMetrics,
+};
+pub use reranker::{RerankError, Reranker};
+pub use vector_index::{FtviIndex, FtviRecord, FtviWriter};
+
+#[cfg(feature = "semantic-search")]
+pub use fastembed_embedder::FastEmbedEmbedder;
+#[cfg(feature = "semantic-search")]
+pub use model2vec_embedder::Model2VecEmbedder;
+#[cfg(feature = "semantic-search")]
+pub use model_registry::{ModelInfo, ModelRegistry};
+#[cfg(feature = "semantic-search")]
+pub use reranker::CrossEncoderReranker;
