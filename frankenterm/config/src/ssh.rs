@@ -185,3 +185,104 @@ impl FromStr for SshParameters {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_are_stable() {
+        assert!(matches!(SshBackend::default(), SshBackend::LibSsh));
+        assert!(matches!(
+            SshMultiplexing::default(),
+            SshMultiplexing::WezTerm
+        ));
+        assert!(matches!(Shell::default(), Shell::Unknown));
+    }
+
+    #[test]
+    fn ssh_parameters_parse_with_username() {
+        let params: SshParameters = "alice@example.com:2222".parse().expect("parse");
+        assert_eq!(params.username.as_deref(), Some("alice"));
+        assert_eq!(params.host_and_port, "example.com:2222");
+        assert_eq!(params.to_string(), "alice@example.com:2222");
+    }
+
+    #[test]
+    fn ssh_parameters_parse_without_username() {
+        let params: SshParameters = "example.com".parse().expect("parse");
+        assert_eq!(params.username, None);
+        assert_eq!(params.host_and_port, "example.com");
+        assert_eq!(params.to_string(), "example.com");
+    }
+
+    #[test]
+    fn ssh_parameters_reject_invalid_format() {
+        let err = "a@b@c".parse::<SshParameters>().expect_err("should fail");
+        assert!(
+            err.to_string().contains("failed to parse ssh parameters"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn ssh_parameters_display_with_username() {
+        let params = SshParameters {
+            username: Some("admin".to_string()),
+            host_and_port: "server.local:22".to_string(),
+        };
+        assert_eq!(params.to_string(), "admin@server.local:22");
+    }
+
+    #[test]
+    fn ssh_parameters_display_without_username() {
+        let params = SshParameters {
+            username: None,
+            host_and_port: "server.local".to_string(),
+        };
+        assert_eq!(params.to_string(), "server.local");
+    }
+
+    #[test]
+    fn ssh_parameters_parse_host_only() {
+        let params: SshParameters = "192.168.1.1".parse().unwrap();
+        assert_eq!(params.username, None);
+        assert_eq!(params.host_and_port, "192.168.1.1");
+    }
+
+    #[test]
+    fn ssh_parameters_parse_with_port() {
+        let params: SshParameters = "root@10.0.0.1:2222".parse().unwrap();
+        assert_eq!(params.username.as_deref(), Some("root"));
+        assert_eq!(params.host_and_port, "10.0.0.1:2222");
+    }
+
+    #[test]
+    fn ssh_domain_default_values() {
+        let domain = SshDomain::default();
+        assert_eq!(domain.name, "");
+        assert_eq!(domain.remote_address, "");
+        assert!(!domain.no_agent_auth);
+        assert!(domain.username.is_none());
+        assert!(!domain.connect_automatically);
+        assert!(matches!(domain.multiplexing, SshMultiplexing::WezTerm));
+        assert!(matches!(domain.assume_shell, Shell::Unknown));
+    }
+
+    #[test]
+    fn ssh_multiplexing_equality() {
+        assert_eq!(SshMultiplexing::WezTerm, SshMultiplexing::WezTerm);
+        assert_ne!(SshMultiplexing::WezTerm, SshMultiplexing::None);
+    }
+
+    #[test]
+    fn ssh_parameters_clone() {
+        let params = SshParameters {
+            username: Some("user".to_string()),
+            host_and_port: "host:22".to_string(),
+        };
+        let cloned = params.clone();
+        assert_eq!(cloned.username, params.username);
+        assert_eq!(cloned.host_and_port, params.host_and_port);
+    }
+}

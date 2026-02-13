@@ -81,3 +81,126 @@ impl Default for AudibleBell {
         Self::SystemBeep
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn easing_defaults_and_bezier_arrays() {
+        assert_eq!(EasingFunction::default(), EasingFunction::Ease);
+        assert_eq!(
+            EasingFunction::Constant.as_bezier_array(),
+            [0.0, 0.0, 0.0, 0.0]
+        );
+        assert_eq!(
+            EasingFunction::Linear.as_bezier_array(),
+            [0.0, 0.0, 1.0, 1.0]
+        );
+        assert_eq!(
+            EasingFunction::CubicBezier(0.1, 0.2, 0.3, 0.4).as_bezier_array(),
+            [0.1, 0.2, 0.3, 0.4]
+        );
+    }
+
+    #[test]
+    fn easing_linear_tracks_position() {
+        let x = 0.37;
+        let y = EasingFunction::Linear.evaluate_at_position(x);
+        assert!((y - x).abs() < 1e-6, "expected near identity, got {y}");
+    }
+
+    #[test]
+    fn visual_and_audible_defaults_are_stable() {
+        let visual = VisualBell::default();
+        assert_eq!(visual.fade_in_duration_ms, 0);
+        assert_eq!(visual.fade_out_duration_ms, 0);
+        assert_eq!(visual.fade_in_function, EasingFunction::Ease);
+        assert_eq!(visual.fade_out_function, EasingFunction::Ease);
+        assert_eq!(visual.target, VisualBellTarget::BackgroundColor);
+
+        match AudibleBell::default() {
+            AudibleBell::SystemBeep => {}
+            AudibleBell::Disabled => panic!("unexpected audible bell default"),
+        }
+    }
+
+    #[test]
+    fn easing_constant_always_zero() {
+        let f = EasingFunction::Constant;
+        assert_eq!(f.evaluate_at_position(0.0), 0.0);
+        assert_eq!(f.evaluate_at_position(0.5), 0.0);
+        assert_eq!(f.evaluate_at_position(1.0), 0.0);
+    }
+
+    #[test]
+    fn easing_linear_boundaries() {
+        let f = EasingFunction::Linear;
+        assert_eq!(f.evaluate_at_position(0.0), 0.0);
+        assert_eq!(f.evaluate_at_position(1.0), 1.0);
+    }
+
+    #[test]
+    fn easing_ease_in_monotonic() {
+        let f = EasingFunction::EaseIn;
+        let v1 = f.evaluate_at_position(0.25);
+        let v2 = f.evaluate_at_position(0.5);
+        let v3 = f.evaluate_at_position(0.75);
+        assert!(v1 < v2, "EaseIn not monotonic: {v1} >= {v2}");
+        assert!(v2 < v3, "EaseIn not monotonic: {v2} >= {v3}");
+    }
+
+    #[test]
+    fn easing_ease_out_monotonic() {
+        let f = EasingFunction::EaseOut;
+        let v1 = f.evaluate_at_position(0.25);
+        let v2 = f.evaluate_at_position(0.5);
+        let v3 = f.evaluate_at_position(0.75);
+        assert!(v1 < v2, "EaseOut not monotonic: {v1} >= {v2}");
+        assert!(v2 < v3, "EaseOut not monotonic: {v2} >= {v3}");
+    }
+
+    #[test]
+    fn easing_ease_in_out_boundaries() {
+        let f = EasingFunction::EaseInOut;
+        let start = f.evaluate_at_position(0.0);
+        let end = f.evaluate_at_position(1.0);
+        assert!((start).abs() < 0.01, "start: {start}");
+        assert!((end - 1.0).abs() < 0.01, "end: {end}");
+    }
+
+    #[test]
+    fn easing_named_bezier_values() {
+        assert_eq!(
+            EasingFunction::Ease.as_bezier_array(),
+            [0.25, 0.1, 0.25, 1.0]
+        );
+        assert_eq!(
+            EasingFunction::EaseIn.as_bezier_array(),
+            [0.42, 0.0, 1.0, 1.0]
+        );
+        assert_eq!(
+            EasingFunction::EaseInOut.as_bezier_array(),
+            [0.42, 0., 0.58, 1.0]
+        );
+        assert_eq!(
+            EasingFunction::EaseOut.as_bezier_array(),
+            [0., 0., 0.58, 1.0]
+        );
+    }
+
+    #[test]
+    fn easing_copy_preserves_value() {
+        let f = EasingFunction::CubicBezier(0.1, 0.2, 0.3, 0.4);
+        let copied = f;
+        assert_eq!(f, copied);
+    }
+
+    #[test]
+    fn visual_bell_target_variants_differ() {
+        assert_ne!(
+            VisualBellTarget::BackgroundColor,
+            VisualBellTarget::CursorColor
+        );
+    }
+}

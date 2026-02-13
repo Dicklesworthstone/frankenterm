@@ -103,3 +103,46 @@ impl TlsDomainClient {
             .map(|user_at_host_and_port| user_at_host_and_port.parse())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ssh_parameters_returns_none_when_unset() {
+        let client = TlsDomainClient::default();
+        assert!(client.ssh_parameters().is_none());
+    }
+
+    #[test]
+    fn ssh_parameters_parses_valid_bootstrap_value() {
+        let client = TlsDomainClient {
+            bootstrap_via_ssh: Some("alice@example.com:2222".to_string()),
+            ..TlsDomainClient::default()
+        };
+
+        let parsed = client
+            .ssh_parameters()
+            .expect("ssh bootstrap should be present")
+            .expect("ssh bootstrap should parse");
+        assert_eq!(parsed.username.as_deref(), Some("alice"));
+        assert_eq!(parsed.host_and_port, "example.com:2222");
+    }
+
+    #[test]
+    fn ssh_parameters_surfaces_parse_errors() {
+        let client = TlsDomainClient {
+            bootstrap_via_ssh: Some("a@b@c".to_string()),
+            ..TlsDomainClient::default()
+        };
+
+        let err = client
+            .ssh_parameters()
+            .expect("ssh bootstrap should be present")
+            .expect_err("invalid ssh bootstrap should fail");
+        assert!(
+            err.to_string().contains("failed to parse ssh parameters"),
+            "unexpected error: {err}"
+        );
+    }
+}

@@ -723,4 +723,270 @@ mod test {
             assert_eq!(style.font[0].family, "Inconsolata");
         }
     }
+
+    #[test]
+    fn font_weight_named_constants() {
+        assert_eq!(FontWeight::THIN.to_opentype_weight(), 100);
+        assert_eq!(FontWeight::EXTRALIGHT.to_opentype_weight(), 200);
+        assert_eq!(FontWeight::LIGHT.to_opentype_weight(), 300);
+        assert_eq!(FontWeight::DEMILIGHT.to_opentype_weight(), 350);
+        assert_eq!(FontWeight::BOOK.to_opentype_weight(), 380);
+        assert_eq!(FontWeight::REGULAR.to_opentype_weight(), 400);
+        assert_eq!(FontWeight::MEDIUM.to_opentype_weight(), 500);
+        assert_eq!(FontWeight::DEMIBOLD.to_opentype_weight(), 600);
+        assert_eq!(FontWeight::BOLD.to_opentype_weight(), 700);
+        assert_eq!(FontWeight::EXTRABOLD.to_opentype_weight(), 800);
+        assert_eq!(FontWeight::BLACK.to_opentype_weight(), 900);
+        assert_eq!(FontWeight::EXTRABLACK.to_opentype_weight(), 1000);
+    }
+
+    #[test]
+    fn font_weight_default_is_regular() {
+        assert_eq!(FontWeight::default(), FontWeight::REGULAR);
+    }
+
+    #[test]
+    fn font_weight_from_opentype_roundtrip() {
+        for w in [100, 200, 300, 400, 500, 600, 700, 800, 900] {
+            let fw = FontWeight::from_opentype_weight(w);
+            assert_eq!(fw.to_opentype_weight(), w);
+        }
+    }
+
+    #[test]
+    fn font_weight_bolder() {
+        let w = FontWeight::REGULAR.bolder();
+        assert_eq!(w.to_opentype_weight(), 600);
+    }
+
+    #[test]
+    fn font_weight_lighter() {
+        let w = FontWeight::REGULAR.lighter();
+        assert_eq!(w.to_opentype_weight(), 200);
+    }
+
+    #[test]
+    fn font_weight_lighter_saturates_at_zero() {
+        let w = FontWeight::THIN.lighter();
+        assert_eq!(w.to_opentype_weight(), 0);
+    }
+
+    #[test]
+    fn font_weight_display_named() {
+        assert_eq!(format!("{}", FontWeight::BOLD), "\"Bold\"");
+        assert_eq!(format!("{}", FontWeight::REGULAR), "\"Regular\"");
+    }
+
+    #[test]
+    fn font_weight_display_numeric() {
+        let w = FontWeight::from_opentype_weight(450);
+        assert_eq!(format!("{}", w), "450");
+    }
+
+    #[test]
+    fn font_weight_from_dynamic_string() {
+        let v = Value::String("Bold".to_string());
+        let w = FontWeight::from_dynamic(&v, Default::default()).unwrap();
+        assert_eq!(w, FontWeight::BOLD);
+    }
+
+    #[test]
+    fn font_weight_from_dynamic_numeric() {
+        let v = Value::U64(500);
+        let w = FontWeight::from_dynamic(&v, Default::default()).unwrap();
+        assert_eq!(w, FontWeight::MEDIUM);
+    }
+
+    #[test]
+    fn font_weight_from_dynamic_invalid_string() {
+        let v = Value::String("NotAWeight".to_string());
+        assert!(FontWeight::from_dynamic(&v, Default::default()).is_err());
+    }
+
+    #[test]
+    fn font_weight_to_dynamic_named() {
+        let d = FontWeight::BOLD.to_dynamic();
+        assert_eq!(d, Value::String("Bold".to_string()));
+    }
+
+    #[test]
+    fn font_weight_to_dynamic_numeric() {
+        let d = FontWeight::from_opentype_weight(450).to_dynamic();
+        assert_eq!(d, Value::U64(450));
+    }
+
+    #[test]
+    fn font_stretch_opentype_roundtrip() {
+        for w in 1..=9 {
+            let fs = FontStretch::from_opentype_stretch(w);
+            assert_eq!(fs.to_opentype_stretch(), w);
+        }
+    }
+
+    #[test]
+    fn font_stretch_clamps_out_of_range() {
+        assert_eq!(FontStretch::from_opentype_stretch(0), FontStretch::UltraCondensed);
+        assert_eq!(FontStretch::from_opentype_stretch(100), FontStretch::UltraExpanded);
+    }
+
+    #[test]
+    fn font_stretch_default_is_normal() {
+        assert_eq!(FontStretch::default(), FontStretch::Normal);
+    }
+
+    #[test]
+    fn font_style_default_is_normal() {
+        assert_eq!(FontStyle::default(), FontStyle::Normal);
+    }
+
+    #[test]
+    fn font_attributes_new() {
+        let fa = FontAttributes::new("Fira Code");
+        assert_eq!(fa.family, "Fira Code");
+        assert_eq!(fa.weight, FontWeight::REGULAR);
+        assert_eq!(fa.stretch, FontStretch::Normal);
+        assert_eq!(fa.style, FontStyle::Normal);
+        assert!(!fa.is_fallback);
+        assert!(!fa.is_synthetic);
+    }
+
+    #[test]
+    fn font_attributes_new_fallback() {
+        let fa = FontAttributes::new_fallback("Noto Sans");
+        assert_eq!(fa.family, "Noto Sans");
+        assert!(fa.is_fallback);
+        assert!(!fa.is_synthetic);
+    }
+
+    #[test]
+    fn font_attributes_default_family() {
+        let fa = FontAttributes::default();
+        assert_eq!(fa.family, "JetBrains Mono");
+    }
+
+    #[test]
+    fn text_style_make_bold() {
+        let style = TextStyle::default();
+        let bold = style.make_bold();
+        assert_eq!(bold.font[0].weight, FontWeight::DEMIBOLD);
+        assert!(bold.font[0].is_synthetic);
+    }
+
+    #[test]
+    fn text_style_make_half_bright() {
+        let style = TextStyle::default();
+        let half = style.make_half_bright();
+        assert_eq!(half.font[0].weight, FontWeight::EXTRALIGHT);
+        assert!(half.font[0].is_synthetic);
+    }
+
+    #[test]
+    fn text_style_make_italic() {
+        let style = TextStyle::default();
+        let italic = style.make_italic();
+        assert_eq!(italic.font[0].style, FontStyle::Italic);
+        assert!(italic.font[0].is_synthetic);
+    }
+
+    #[test]
+    fn text_style_font_with_fallback_includes_defaults() {
+        let style = TextStyle::default();
+        let fonts = style.font_with_fallback();
+        assert!(fonts.len() >= 3);
+        assert!(fonts.iter().any(|f| f.family == "Noto Color Emoji"));
+        assert!(fonts.iter().any(|f| f.family == "Symbols Nerd Font Mono"));
+    }
+
+    #[test]
+    fn freetype_load_flags_default_is_empty() {
+        assert_eq!(FreeTypeLoadFlags::default(), FreeTypeLoadFlags::DEFAULT);
+    }
+
+    #[test]
+    fn freetype_load_flags_to_string_default() {
+        assert_eq!(FreeTypeLoadFlags::DEFAULT.to_string(), "DEFAULT");
+    }
+
+    #[test]
+    fn freetype_load_flags_to_string_combined() {
+        let flags = FreeTypeLoadFlags::NO_HINTING | FreeTypeLoadFlags::NO_BITMAP;
+        let s = flags.to_string();
+        assert!(s.contains("NO_HINTING"));
+        assert!(s.contains("NO_BITMAP"));
+    }
+
+    #[test]
+    fn freetype_load_flags_try_from_string_roundtrip() {
+        let original = FreeTypeLoadFlags::NO_HINTING | FreeTypeLoadFlags::FORCE_AUTOHINT;
+        let s = original.to_string();
+        let parsed = FreeTypeLoadFlags::try_from(s).unwrap();
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn freetype_load_flags_try_from_invalid() {
+        let result = FreeTypeLoadFlags::try_from("INVALID_FLAG".to_string());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn freetype_load_flags_hidpi_default() {
+        assert_eq!(FreeTypeLoadFlags::default_hidpi(), FreeTypeLoadFlags::NO_HINTING);
+    }
+
+    #[test]
+    fn allow_square_glyph_overflow_default() {
+        assert_eq!(
+            AllowSquareGlyphOverflow::default(),
+            AllowSquareGlyphOverflow::WhenFollowedBySpace
+        );
+    }
+
+    #[test]
+    fn font_rasterizer_default() {
+        assert!(matches!(
+            FontRasterizerSelection::default(),
+            FontRasterizerSelection::FreeType
+        ));
+    }
+
+    #[test]
+    fn font_shaper_default() {
+        assert!(matches!(
+            FontShaperSelection::default(),
+            FontShaperSelection::Harfbuzz
+        ));
+    }
+
+    #[test]
+    fn display_pixel_geometry_default() {
+        assert_eq!(DisplayPixelGeometry::default(), DisplayPixelGeometry::RGB);
+    }
+
+    #[test]
+    fn freetype_load_target_default() {
+        assert_eq!(FreeTypeLoadTarget::default(), FreeTypeLoadTarget::Normal);
+    }
+
+    #[test]
+    fn reduce_preserves_non_first_fonts() {
+        let style = TextStyle {
+            font: vec![
+                FontAttributes::new("Fira Code Bold"),
+                FontAttributes::new("Noto Sans Bold"),
+            ],
+            foreground: None,
+        };
+        let reduced = style.reduce_first_font_to_family();
+        assert_eq!(reduced.font[0].family, "Fira Code");
+        assert_eq!(reduced.font[1].family, "Noto Sans Bold");
+    }
+
+    #[test]
+    fn font_attributes_display() {
+        let fa = FontAttributes::new("Fira Code");
+        let s = format!("{}", fa);
+        assert!(s.contains("Fira Code"));
+        assert!(s.contains("Regular"));
+    }
 }

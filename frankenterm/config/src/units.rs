@@ -310,4 +310,239 @@ mod test {
             }
         );
     }
+
+    #[test]
+    fn dimension_default_is_zero_pixels() {
+        assert_eq!(Dimension::default(), Dimension::Pixels(0.));
+    }
+
+    #[test]
+    fn dimension_is_zero() {
+        assert!(Dimension::Pixels(0.).is_zero());
+        assert!(Dimension::Points(0.).is_zero());
+        assert!(Dimension::Percent(0.).is_zero());
+        assert!(Dimension::Cells(0.).is_zero());
+        assert!(!Dimension::Pixels(1.).is_zero());
+    }
+
+    #[test]
+    fn dimension_to_dynamic_roundtrip_format() {
+        assert_eq!(
+            Dimension::Pixels(10.).to_dynamic(),
+            Value::String("10px".to_string())
+        );
+        assert_eq!(
+            Dimension::Points(12.).to_dynamic(),
+            Value::String("12pt".to_string())
+        );
+        assert_eq!(
+            Dimension::Percent(0.5).to_dynamic(),
+            Value::String("50%".to_string())
+        );
+        assert_eq!(
+            Dimension::Cells(2.).to_dynamic(),
+            Value::String("2cell".to_string())
+        );
+    }
+
+    #[test]
+    fn dimension_evaluate_pixels() {
+        let ctx = DimensionContext {
+            dpi: 96.0,
+            pixel_max: 1920.0,
+            pixel_cell: 10.0,
+        };
+        assert_eq!(Dimension::Pixels(100.5).evaluate_as_pixels(ctx), 100.0);
+    }
+
+    #[test]
+    fn dimension_evaluate_points() {
+        let ctx = DimensionContext {
+            dpi: 72.0,
+            pixel_max: 1920.0,
+            pixel_cell: 10.0,
+        };
+        // 12pt at 72 DPI = 12 pixels
+        assert_eq!(Dimension::Points(12.).evaluate_as_pixels(ctx), 12.0);
+    }
+
+    #[test]
+    fn dimension_evaluate_points_high_dpi() {
+        let ctx = DimensionContext {
+            dpi: 144.0,
+            pixel_max: 1920.0,
+            pixel_cell: 10.0,
+        };
+        // 12pt at 144 DPI = 24 pixels
+        assert_eq!(Dimension::Points(12.).evaluate_as_pixels(ctx), 24.0);
+    }
+
+    #[test]
+    fn dimension_evaluate_percent() {
+        let ctx = DimensionContext {
+            dpi: 96.0,
+            pixel_max: 1000.0,
+            pixel_cell: 10.0,
+        };
+        // 50% of 1000 = 500
+        assert_eq!(Dimension::Percent(0.5).evaluate_as_pixels(ctx), 500.0);
+    }
+
+    #[test]
+    fn dimension_evaluate_cells() {
+        let ctx = DimensionContext {
+            dpi: 96.0,
+            pixel_max: 1920.0,
+            pixel_cell: 15.0,
+        };
+        // 3 cells at 15px each = 45
+        assert_eq!(Dimension::Cells(3.).evaluate_as_pixels(ctx), 45.0);
+    }
+
+    #[test]
+    fn default_unit_to_dimension() {
+        assert_eq!(
+            DefaultUnit::Points.to_dimension(10.0),
+            Dimension::Points(10.0)
+        );
+        assert_eq!(
+            DefaultUnit::Pixels.to_dimension(10.0),
+            Dimension::Pixels(10.0)
+        );
+        assert_eq!(
+            DefaultUnit::Percent.to_dimension(50.0),
+            Dimension::Percent(0.5)
+        );
+        assert_eq!(
+            DefaultUnit::Cells.to_dimension(3.0),
+            Dimension::Cells(3.0)
+        );
+    }
+
+    #[test]
+    fn from_dynamic_integer_uses_default_unit() {
+        let dim = DefaultUnit::Pixels
+            .from_dynamic_impl(&Value::I64(42))
+            .unwrap();
+        assert_eq!(dim, Dimension::Pixels(42.0));
+    }
+
+    #[test]
+    fn from_dynamic_unsigned_uses_default_unit() {
+        let dim = DefaultUnit::Points
+            .from_dynamic_impl(&Value::U64(12))
+            .unwrap();
+        assert_eq!(dim, Dimension::Points(12.0));
+    }
+
+    #[test]
+    fn from_dynamic_string_with_px_suffix() {
+        let dim = DefaultUnit::Points
+            .from_dynamic_impl(&Value::String("100px".to_string()))
+            .unwrap();
+        assert_eq!(dim, Dimension::Pixels(100.0));
+    }
+
+    #[test]
+    fn from_dynamic_string_with_pt_suffix() {
+        let dim = DefaultUnit::Pixels
+            .from_dynamic_impl(&Value::String("14pt".to_string()))
+            .unwrap();
+        assert_eq!(dim, Dimension::Points(14.0));
+    }
+
+    #[test]
+    fn from_dynamic_string_with_percent_suffix() {
+        let dim = DefaultUnit::Pixels
+            .from_dynamic_impl(&Value::String("50%".to_string()))
+            .unwrap();
+        assert_eq!(dim, Dimension::Percent(0.5));
+    }
+
+    #[test]
+    fn from_dynamic_string_with_cell_suffix() {
+        let dim = DefaultUnit::Pixels
+            .from_dynamic_impl(&Value::String("3cell".to_string()))
+            .unwrap();
+        assert_eq!(dim, Dimension::Cells(3.0));
+    }
+
+    #[test]
+    fn from_dynamic_plain_numeric_string() {
+        let dim = DefaultUnit::Pixels
+            .from_dynamic_impl(&Value::String("42".to_string()))
+            .unwrap();
+        assert_eq!(dim, Dimension::Pixels(42.0));
+    }
+
+    #[test]
+    fn from_dynamic_invalid_string() {
+        let result = DefaultUnit::Pixels
+            .from_dynamic_impl(&Value::String("not-a-number".to_string()));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn from_dynamic_invalid_type() {
+        let result = DefaultUnit::Pixels.from_dynamic_impl(&Value::Bool(true));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn geometry_origin_default() {
+        assert_eq!(
+            GeometryOrigin::default(),
+            GeometryOrigin::ScreenCoordinateSystem
+        );
+    }
+
+    #[test]
+    fn gui_position_with_percent_dimensions() {
+        let pos = GuiPosition::from_str("50%,75%").unwrap();
+        assert_eq!(pos.x, Dimension::Percent(0.5));
+        assert_eq!(pos.y, Dimension::Percent(0.75));
+    }
+
+    #[test]
+    fn gui_position_with_px_suffix() {
+        let pos = GuiPosition::from_str("100px,200px").unwrap();
+        assert_eq!(pos.x, Dimension::Pixels(100.));
+        assert_eq!(pos.y, Dimension::Pixels(200.));
+    }
+
+    #[test]
+    fn gui_position_invalid_format() {
+        assert!(GuiPosition::from_str("a:b:c").is_err());
+    }
+
+    #[test]
+    fn gui_position_invalid_coordinates() {
+        assert!(GuiPosition::from_str("notanumber,200").is_err());
+    }
+
+    #[test]
+    fn gui_position_missing_y() {
+        assert!(GuiPosition::from_str("100").is_err());
+    }
+
+    #[test]
+    fn opt_pixel_unit_from_null() {
+        let opu = OptPixelUnit::from_dynamic(&Value::Null, Default::default()).unwrap();
+        let dim: Option<Dimension> = opu.into();
+        assert!(dim.is_none());
+    }
+
+    #[test]
+    fn opt_pixel_unit_from_value() {
+        let opu = OptPixelUnit::from_dynamic(&Value::U64(42), Default::default()).unwrap();
+        let dim: Option<Dimension> = opu.into();
+        assert_eq!(dim, Some(Dimension::Pixels(42.0)));
+    }
+
+    #[test]
+    fn pixel_unit_from_dynamic() {
+        let pu = PixelUnit::from_dynamic(&Value::U64(10), Default::default()).unwrap();
+        let dim: Dimension = pu.into();
+        assert_eq!(dim, Dimension::Pixels(10.0));
+    }
 }

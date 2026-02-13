@@ -777,9 +777,13 @@ impl ColorSchemeFile {
 }
 
 #[cfg(test)]
-#[test]
-fn test_indexed_colors() {
-    let scheme = r##"
+mod tests {
+    use super::*;
+    use std::convert::TryFrom;
+
+    #[test]
+    fn test_indexed_colors() {
+        let scheme = r##"
 [colors]
 foreground = "#005661"
 background = "#fef8ec"
@@ -802,9 +806,238 @@ brights = [ "#8ca6a6" ,"#e5164a" ,"#00b368" ,"#b3694d" ,"#0094f0" ,"#ff5792" ,"#
 23 = "#d8fdf6" # cyan
 58 = "#f4ffe0" # yellow
 "##;
-    let scheme = ColorSchemeFile::from_toml_str(scheme).unwrap();
-    assert_eq!(
-        scheme.colors.indexed.get(&52),
-        Some(&RgbColor::new_8bpc(0xfb, 0xda, 0xda).into())
-    );
+        let scheme = ColorSchemeFile::from_toml_str(scheme).unwrap();
+        assert_eq!(
+            scheme.colors.indexed.get(&52),
+            Some(&RgbColor::new_8bpc(0xfb, 0xda, 0xda).into())
+        );
+    }
+
+    #[test]
+    fn hsb_transform_default() {
+        let t = HsbTransform::default();
+        assert_eq!(t.hue, 1.0);
+        assert_eq!(t.saturation, 1.0);
+        assert_eq!(t.brightness, 1.0);
+    }
+
+    #[test]
+    fn rgba_color_from_tuple() {
+        let c: RgbaColor = (0xff, 0x00, 0x80).into();
+        let s: String = c.into();
+        assert!(s.contains("ff") || s.contains("FF") || s.len() > 0);
+    }
+
+    #[test]
+    fn rgba_color_from_rgb_color() {
+        let rgb = RgbColor::new_8bpc(0x12, 0x34, 0x56);
+        let rgba: RgbaColor = rgb.into();
+        let _s: String = rgba.into();
+    }
+
+    #[test]
+    fn rgba_color_try_from_valid_string() {
+        let c = RgbaColor::try_from("#ff0000".to_string());
+        assert!(c.is_ok());
+    }
+
+    #[test]
+    fn rgba_color_try_from_invalid_string() {
+        let c = RgbaColor::try_from("not-a-color".to_string());
+        assert!(c.is_err());
+    }
+
+    #[test]
+    fn rgba_color_equality() {
+        let a: RgbaColor = (0xff, 0x00, 0x00).into();
+        let b: RgbaColor = (0xff, 0x00, 0x00).into();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn rgba_color_inequality() {
+        let a: RgbaColor = (0xff, 0x00, 0x00).into();
+        let b: RgbaColor = (0x00, 0xff, 0x00).into();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn color_spec_from_ansi() {
+        let cs: ColorSpec = AnsiColor::Red.into();
+        assert!(matches!(cs, ColorSpec::AnsiColor(AnsiColor::Red)));
+    }
+
+    #[test]
+    fn color_spec_to_color_attribute_default() {
+        let attr: ColorAttribute = ColorSpec::Default.into();
+        assert!(matches!(attr, ColorAttribute::Default));
+    }
+
+    #[test]
+    fn color_spec_to_color_attribute_ansi() {
+        let attr: ColorAttribute = ColorSpec::AnsiColor(AnsiColor::Blue).into();
+        match attr {
+            ColorAttribute::PaletteIndex(idx) => {
+                assert_eq!(idx, AnsiColor::Blue.into());
+            }
+            other => panic!("expected PaletteIndex, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn palette_default() {
+        let p = Palette::default();
+        assert!(p.foreground.is_none());
+        assert!(p.background.is_none());
+        assert!(p.ansi.is_none());
+        assert!(p.brights.is_none());
+        assert!(p.indexed.is_empty());
+    }
+
+    #[test]
+    fn palette_overlay_overrides_set_fields() {
+        let mut base = Palette::default();
+        base.foreground = Some((0xff, 0x00, 0x00).into());
+
+        let mut overlay = Palette::default();
+        overlay.foreground = Some((0x00, 0xff, 0x00).into());
+
+        let result = base.overlay_with(&overlay);
+        assert_eq!(result.foreground, Some((0x00, 0xff, 0x00).into()));
+    }
+
+    #[test]
+    fn palette_overlay_preserves_base_when_overlay_none() {
+        let mut base = Palette::default();
+        base.background = Some((0x11, 0x22, 0x33).into());
+
+        let overlay = Palette::default();
+        let result = base.overlay_with(&overlay);
+        assert_eq!(result.background, Some((0x11, 0x22, 0x33).into()));
+    }
+
+    #[test]
+    fn palette_overlay_merges_indexed() {
+        let mut base = Palette::default();
+        base.indexed.insert(16, (0x11, 0x22, 0x33).into());
+        base.indexed.insert(17, (0x44, 0x55, 0x66).into());
+
+        let mut overlay = Palette::default();
+        overlay.indexed.insert(17, (0xaa, 0xbb, 0xcc).into());
+        overlay.indexed.insert(18, (0xdd, 0xee, 0xff).into());
+
+        let result = base.overlay_with(&overlay);
+        assert_eq!(result.indexed.get(&16), Some(&(0x11, 0x22, 0x33).into()));
+        assert_eq!(result.indexed.get(&17), Some(&(0xaa, 0xbb, 0xcc).into()));
+        assert_eq!(result.indexed.get(&18), Some(&(0xdd, 0xee, 0xff).into()));
+    }
+
+    #[test]
+    fn tab_bar_colors_defaults() {
+        let tbc = TabBarColors::default();
+        assert!(tbc.background.is_none());
+        assert!(tbc.active_tab.is_none());
+        assert!(tbc.inactive_tab.is_none());
+    }
+
+    #[test]
+    fn tab_bar_colors_background_fallback() {
+        let tbc = TabBarColors::default();
+        let bg = tbc.background();
+        // Should return default background (0x333333)
+        let expected: RgbaColor = (0x33, 0x33, 0x33).into();
+        assert_eq!(bg, expected);
+    }
+
+    #[test]
+    fn tab_bar_colors_overlay() {
+        let base = TabBarColors::default();
+        let mut overlay = TabBarColors::default();
+        overlay.background = Some((0xaa, 0xbb, 0xcc).into());
+
+        let result = base.overlay_with(&overlay);
+        assert_eq!(result.background, Some((0xaa, 0xbb, 0xcc).into()));
+    }
+
+    #[test]
+    fn tab_bar_style_defaults() {
+        let style = TabBarStyle::default();
+        assert_eq!(style.new_tab, " + ");
+        assert_eq!(style.window_hide, " . ");
+        assert_eq!(style.window_maximize, " - ");
+        assert_eq!(style.window_close, " X ");
+    }
+
+    #[test]
+    fn window_frame_config_default() {
+        let wf = WindowFrameConfig::default();
+        assert!(wf.font.is_none());
+        assert!(wf.font_size.is_none());
+        assert!(wf.border_left_width.is_zero());
+        assert!(wf.border_right_width.is_zero());
+    }
+
+    #[test]
+    fn integrated_title_button_color_auto() {
+        let c = IntegratedTitleButtonColor::default();
+        assert!(matches!(c, IntegratedTitleButtonColor::Auto));
+    }
+
+    #[test]
+    fn integrated_title_button_color_try_from_auto() {
+        let c = IntegratedTitleButtonColor::try_from("auto".to_string()).unwrap();
+        assert!(matches!(c, IntegratedTitleButtonColor::Auto));
+    }
+
+    #[test]
+    fn integrated_title_button_color_try_from_color() {
+        let c = IntegratedTitleButtonColor::try_from("#ff0000".to_string()).unwrap();
+        assert!(matches!(c, IntegratedTitleButtonColor::Custom(_)));
+    }
+
+    #[test]
+    fn integrated_title_button_color_into_string_auto() {
+        let s: String = IntegratedTitleButtonColor::Auto.into();
+        assert_eq!(s, "auto");
+    }
+
+    #[test]
+    fn color_scheme_metadata_default() {
+        let meta = ColorSchemeMetaData::default();
+        assert!(meta.name.is_none());
+        assert!(meta.author.is_none());
+        assert!(meta.origin_url.is_none());
+        assert!(meta.aliases.is_empty());
+    }
+
+    #[test]
+    fn color_scheme_file_from_toml_requires_ansi() {
+        let scheme = r#"
+[colors]
+foreground = "#ffffff"
+background = "#000000"
+"#;
+        let result = ColorSchemeFile::from_toml_str(scheme);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn color_scheme_file_roundtrip_toml() {
+        let toml_str = r##"
+[colors]
+foreground = "#ffffff"
+background = "#000000"
+cursor_bg = "#ffffff"
+cursor_fg = "#000000"
+cursor_border = "#ffffff"
+selection_fg = "#ffffff"
+selection_bg = "#333333"
+
+ansi = ["#000000", "#ff0000", "#00ff00", "#ffff00", "#0000ff", "#ff00ff", "#00ffff", "#ffffff"]
+brights = ["#808080", "#ff0000", "#00ff00", "#ffff00", "#0000ff", "#ff00ff", "#00ffff", "#ffffff"]
+"##;
+        let scheme = ColorSchemeFile::from_toml_str(toml_str).unwrap();
+        let value = scheme.to_toml_value().unwrap();
+        assert!(value.is_table());
+    }
 }

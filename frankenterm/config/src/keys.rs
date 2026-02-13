@@ -192,3 +192,151 @@ pub struct MouseEventTriggerMods {
     #[dynamic(default)]
     pub alt_screen: MouseEventAltScreen,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_map_preference_default_is_mapped() {
+        assert_eq!(KeyMapPreference::default(), KeyMapPreference::Mapped);
+    }
+
+    #[test]
+    fn deferred_keycode_from_raw_prefix() {
+        let dk = DeferredKeyCode::try_from("raw:42").unwrap();
+        match dk {
+            DeferredKeyCode::KeyCode(KeyCode::RawCode(42)) => {}
+            other => panic!("expected RawCode(42), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn deferred_keycode_raw_invalid_number() {
+        assert!(DeferredKeyCode::try_from("raw:notanumber").is_err());
+    }
+
+    #[test]
+    fn deferred_keycode_resolve_keycode_mapped() {
+        let dk = DeferredKeyCode::KeyCode(KeyCode::Char('a'));
+        let resolved = dk.resolve(KeyMapPreference::Mapped);
+        assert_eq!(resolved, KeyCode::Char('a'));
+    }
+
+    #[test]
+    fn deferred_keycode_resolve_either_mapped() {
+        let dk = DeferredKeyCode::Either {
+            physical: KeyCode::Physical(PhysKeyCode::KeyA),
+            mapped: KeyCode::Char('a'),
+            original: "a".to_string(),
+        };
+        let resolved = dk.resolve(KeyMapPreference::Mapped);
+        assert_eq!(resolved, KeyCode::Char('a'));
+    }
+
+    #[test]
+    fn deferred_keycode_resolve_either_physical() {
+        let dk = DeferredKeyCode::Either {
+            physical: KeyCode::Physical(PhysKeyCode::KeyA),
+            mapped: KeyCode::Char('a'),
+            original: "a".to_string(),
+        };
+        let resolved = dk.resolve(KeyMapPreference::Physical);
+        assert_eq!(resolved, KeyCode::Physical(PhysKeyCode::KeyA));
+    }
+
+    #[test]
+    fn deferred_keycode_to_string_keycode() {
+        let dk = DeferredKeyCode::KeyCode(KeyCode::Char('x'));
+        let s: String = dk.into();
+        assert_eq!(s, "x");
+    }
+
+    #[test]
+    fn deferred_keycode_to_string_either() {
+        let dk = DeferredKeyCode::Either {
+            physical: KeyCode::Physical(PhysKeyCode::KeyA),
+            mapped: KeyCode::Char('a'),
+            original: "a".to_string(),
+        };
+        let s: String = (&dk).into();
+        assert_eq!(s, "a");
+    }
+
+    #[test]
+    fn deferred_keycode_try_from_string() {
+        let dk = DeferredKeyCode::try_from("raw:99".to_string()).unwrap();
+        match dk {
+            DeferredKeyCode::KeyCode(KeyCode::RawCode(99)) => {}
+            other => panic!("expected RawCode(99), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn mouse_event_alt_screen_default_is_any() {
+        assert_eq!(MouseEventAltScreen::default(), MouseEventAltScreen::Any);
+    }
+
+    #[test]
+    fn mouse_event_alt_screen_from_dynamic_true() {
+        let v = Value::Bool(true);
+        let result =
+            MouseEventAltScreen::from_dynamic(&v, FromDynamicOptions::default()).unwrap();
+        assert_eq!(result, MouseEventAltScreen::True);
+    }
+
+    #[test]
+    fn mouse_event_alt_screen_from_dynamic_false() {
+        let v = Value::Bool(false);
+        let result =
+            MouseEventAltScreen::from_dynamic(&v, FromDynamicOptions::default()).unwrap();
+        assert_eq!(result, MouseEventAltScreen::False);
+    }
+
+    #[test]
+    fn mouse_event_alt_screen_from_dynamic_any_string() {
+        let v = Value::String("Any".to_string());
+        let result =
+            MouseEventAltScreen::from_dynamic(&v, FromDynamicOptions::default()).unwrap();
+        assert_eq!(result, MouseEventAltScreen::Any);
+    }
+
+    #[test]
+    fn mouse_event_alt_screen_from_dynamic_invalid() {
+        let v = Value::String("invalid".to_string());
+        assert!(MouseEventAltScreen::from_dynamic(&v, FromDynamicOptions::default()).is_err());
+    }
+
+    #[test]
+    fn mouse_event_alt_screen_to_dynamic_roundtrip() {
+        for variant in [
+            MouseEventAltScreen::True,
+            MouseEventAltScreen::False,
+            MouseEventAltScreen::Any,
+        ] {
+            let dynamic = variant.to_dynamic();
+            let back =
+                MouseEventAltScreen::from_dynamic(&dynamic, FromDynamicOptions::default())
+                    .unwrap();
+            assert_eq!(variant, back);
+        }
+    }
+
+    #[test]
+    fn mouse_event_alt_screen_ordering() {
+        assert!(MouseEventAltScreen::True < MouseEventAltScreen::False);
+        assert!(MouseEventAltScreen::False < MouseEventAltScreen::Any);
+    }
+
+    #[test]
+    fn mouse_event_trigger_mods_default() {
+        let mods = MouseEventTriggerMods::default();
+        assert!(!mods.mouse_reporting);
+        assert_eq!(mods.alt_screen, MouseEventAltScreen::Any);
+    }
+
+    #[test]
+    fn default_leader_timeout_value() {
+        assert_eq!(default_leader_timeout(), 1000);
+    }
+}

@@ -57,3 +57,63 @@ impl Default for WebGpuPowerPreference {
         Self::LowPower
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frontend_selection_default_is_opengl() {
+        assert_eq!(FrontEndSelection::default(), FrontEndSelection::OpenGL);
+    }
+
+    #[test]
+    fn webgpu_power_preference_default_is_low_power() {
+        assert_eq!(
+            WebGpuPowerPreference::default(),
+            WebGpuPowerPreference::LowPower
+        );
+    }
+
+    #[test]
+    fn gpu_info_to_string_includes_optional_fields_when_present() {
+        let info = GpuInfo {
+            name: "MyGPU".to_string(),
+            device_type: "discrete".to_string(),
+            backend: "vulkan".to_string(),
+            driver: Some("driver-x".to_string()),
+            driver_info: Some("driver-info".to_string()),
+            vendor: Some(1234),
+            device: Some(5678),
+        };
+
+        let s = info.to_string();
+        assert!(s.contains("name=MyGPU"));
+        assert!(s.contains("device_type=discrete"));
+        assert!(s.contains("backend=vulkan"));
+        assert!(s.contains("driver=driver-x"));
+        assert!(s.contains("driver_info=driver-info"));
+        assert!(s.contains("vendor=1234"));
+        assert!(s.contains("device=5678"));
+    }
+
+    #[test]
+    fn gpu_info_to_string_omits_optional_fields_when_absent() {
+        let info = GpuInfo {
+            name: "MyGPU".to_string(),
+            device_type: "integrated".to_string(),
+            backend: "metal".to_string(),
+            driver: None,
+            driver_info: None,
+            vendor: None,
+            device: None,
+        };
+
+        let s = info.to_string();
+        assert!(s.contains("name=MyGPU"));
+        assert!(!s.contains("driver="));
+        assert!(!s.contains("driver_info="));
+        assert!(!s.contains("vendor="));
+        assert!(!s.contains("device="));
+    }
+}

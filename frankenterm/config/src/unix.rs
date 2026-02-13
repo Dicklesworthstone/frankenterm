@@ -129,3 +129,62 @@ impl UnixDomain {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_target_is_runtime_socket() {
+        let domain = UnixDomain::default();
+        match domain.target() {
+            UnixTarget::Socket(path) => assert_eq!(path, RUNTIME_DIR.join("sock")),
+            UnixTarget::Proxy(_) => panic!("expected socket target"),
+        }
+    }
+
+    #[test]
+    fn proxy_command_takes_precedence_in_target() {
+        let mut domain = UnixDomain::default();
+        domain.proxy_command = Some(vec!["ssh".to_string(), "host".to_string()]);
+        match domain.target() {
+            UnixTarget::Proxy(cmd) => {
+                assert_eq!(cmd, vec!["ssh".to_string(), "host".to_string()]);
+            }
+            UnixTarget::Socket(_) => panic!("expected proxy target"),
+        }
+    }
+
+    #[test]
+    fn default_unix_domains_contains_expected_entry() {
+        let domains = UnixDomain::default_unix_domains();
+        assert_eq!(domains.len(), 1);
+        assert_eq!(domains[0].name, "unix");
+        assert_eq!(domains[0].read_timeout, default_read_timeout());
+        assert_eq!(domains[0].write_timeout, default_read_timeout());
+    }
+
+    #[test]
+    fn serve_command_uses_override_when_configured() {
+        let mut domain = UnixDomain::default();
+        domain.serve_command = Some(vec!["custom-mux".to_string(), "--daemonize".to_string()]);
+
+        let command = domain.serve_command().expect("serve command");
+        assert_eq!(
+            command,
+            vec![OsString::from("custom-mux"), OsString::from("--daemonize")]
+        );
+    }
+
+    #[test]
+    fn serve_command_default_appends_daemonize_flag() {
+        let domain = UnixDomain::default();
+        let command = domain.serve_command().expect("serve command");
+
+        assert!(
+            command.len() >= 2,
+            "default command should include executable and --daemonize"
+        );
+        assert_eq!(command[1], OsString::from("--daemonize"));
+    }
+}
