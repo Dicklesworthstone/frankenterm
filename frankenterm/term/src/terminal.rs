@@ -184,3 +184,203 @@ impl Terminal {
         self.trigger_unseen_output_notif();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clipboard_selection_equality() {
+        assert_eq!(ClipboardSelection::Clipboard, ClipboardSelection::Clipboard);
+        assert_eq!(
+            ClipboardSelection::PrimarySelection,
+            ClipboardSelection::PrimarySelection
+        );
+        assert_ne!(
+            ClipboardSelection::Clipboard,
+            ClipboardSelection::PrimarySelection
+        );
+    }
+
+    #[test]
+    fn clipboard_selection_debug() {
+        let dbg = format!("{:?}", ClipboardSelection::Clipboard);
+        assert_eq!(dbg, "Clipboard");
+    }
+
+    #[test]
+    fn clipboard_selection_clone() {
+        let sel = ClipboardSelection::PrimarySelection;
+        let cloned = sel;
+        assert_eq!(sel, cloned);
+    }
+
+    #[test]
+    fn progress_default_is_none() {
+        assert_eq!(Progress::default(), Progress::None);
+    }
+
+    #[test]
+    fn progress_equality() {
+        assert_eq!(Progress::None, Progress::None);
+        assert_eq!(Progress::Percentage(50), Progress::Percentage(50));
+        assert_ne!(Progress::Percentage(50), Progress::Percentage(75));
+        assert_eq!(Progress::Error(1), Progress::Error(1));
+        assert_ne!(Progress::Error(1), Progress::Error(2));
+        assert_eq!(Progress::Indeterminate, Progress::Indeterminate);
+        assert_ne!(Progress::None, Progress::Indeterminate);
+    }
+
+    #[test]
+    fn progress_clone() {
+        let p = Progress::Percentage(42);
+        let cloned = p.clone();
+        assert_eq!(p, cloned);
+    }
+
+    #[test]
+    fn progress_debug() {
+        assert!(format!("{:?}", Progress::None).contains("None"));
+        assert!(format!("{:?}", Progress::Percentage(50)).contains("50"));
+        assert!(format!("{:?}", Progress::Error(1)).contains("Error"));
+        assert!(format!("{:?}", Progress::Indeterminate).contains("Indeterminate"));
+    }
+
+    #[test]
+    fn alert_bell() {
+        let a = Alert::Bell;
+        let b = Alert::Bell;
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn alert_toast_notification() {
+        let alert = Alert::ToastNotification {
+            title: Some("Title".to_string()),
+            body: "Body text".to_string(),
+            focus: true,
+        };
+        let alert2 = alert.clone();
+        assert_eq!(alert, alert2);
+    }
+
+    #[test]
+    fn alert_toast_notification_no_title() {
+        let alert = Alert::ToastNotification {
+            title: None,
+            body: "message".to_string(),
+            focus: false,
+        };
+        match &alert {
+            Alert::ToastNotification { title, body, focus } => {
+                assert!(title.is_none());
+                assert_eq!(body, "message");
+                assert!(!focus);
+            }
+            _ => panic!("expected ToastNotification"),
+        }
+    }
+
+    #[test]
+    fn alert_variants_inequality() {
+        assert_ne!(Alert::Bell, Alert::PaletteChanged);
+        assert_ne!(
+            Alert::CurrentWorkingDirectoryChanged,
+            Alert::OutputSinceFocusLost
+        );
+    }
+
+    #[test]
+    fn alert_set_user_var() {
+        let a = Alert::SetUserVar {
+            name: "foo".to_string(),
+            value: "bar".to_string(),
+        };
+        let b = Alert::SetUserVar {
+            name: "foo".to_string(),
+            value: "bar".to_string(),
+        };
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn alert_progress() {
+        let a = Alert::Progress(Progress::Percentage(75));
+        let b = Alert::Progress(Progress::Percentage(75));
+        assert_eq!(a, b);
+        assert_ne!(a, Alert::Progress(Progress::None));
+    }
+
+    #[test]
+    fn alert_window_title_changed() {
+        let a = Alert::WindowTitleChanged("hello".to_string());
+        let b = Alert::WindowTitleChanged("hello".to_string());
+        assert_eq!(a, b);
+        assert_ne!(a, Alert::WindowTitleChanged("world".to_string()));
+    }
+
+    #[test]
+    fn alert_icon_title_changed() {
+        let a = Alert::IconTitleChanged(Some("icon".to_string()));
+        let b = Alert::IconTitleChanged(None);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn alert_tab_title_changed() {
+        let a = Alert::TabTitleChanged(Some("tab".to_string()));
+        let b = Alert::TabTitleChanged(Some("tab".to_string()));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn terminal_size_default() {
+        let size = TerminalSize::default();
+        assert_eq!(size.rows, 24);
+        assert_eq!(size.cols, 80);
+        assert_eq!(size.pixel_width, 0);
+        assert_eq!(size.pixel_height, 0);
+        assert_eq!(size.dpi, 0);
+    }
+
+    #[test]
+    fn terminal_size_equality() {
+        let a = TerminalSize::default();
+        let b = TerminalSize::default();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn terminal_size_inequality() {
+        let a = TerminalSize::default();
+        let b = TerminalSize {
+            rows: 25,
+            ..TerminalSize::default()
+        };
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn terminal_size_clone_and_copy() {
+        let a = TerminalSize {
+            rows: 40,
+            cols: 120,
+            pixel_width: 960,
+            pixel_height: 640,
+            dpi: 96,
+        };
+        let b = a; // Copy
+        let c = a.clone(); // Clone
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+    }
+
+    #[test]
+    fn terminal_size_debug() {
+        let size = TerminalSize::default();
+        let dbg = format!("{:?}", size);
+        assert!(dbg.contains("TerminalSize"));
+        assert!(dbg.contains("24"));
+        assert!(dbg.contains("80"));
+    }
+}
