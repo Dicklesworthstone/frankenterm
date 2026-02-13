@@ -402,6 +402,192 @@ mod tests {
     }
 
     #[test]
+    fn load_extension_missing_entrypoint_errors() {
+        let engine = WasmEngine::with_defaults().unwrap();
+        let manifest = ExtensionManifest {
+            id: "test-ext".to_string(),
+            version: "1.0.0".to_string(),
+            entrypoint: None,
+            metadata: frankenterm_dynamic::Value::Null,
+        };
+        let result = engine.load_extension(&manifest);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("entrypoint"));
+    }
+
+    #[test]
+    fn load_extension_nonexistent_file_errors() {
+        let engine = WasmEngine::with_defaults().unwrap();
+        let manifest = ExtensionManifest {
+            id: "missing".to_string(),
+            version: "1.0.0".to_string(),
+            entrypoint: Some("/tmp/nonexistent_wasm_ext_99999.wasm".to_string()),
+            metadata: frankenterm_dynamic::Value::Null,
+        };
+        let result = engine.load_extension(&manifest);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_extension_invalid_wasm_binary_errors() {
+        let engine = WasmEngine::with_defaults().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let wasm_path = dir.path().join("bad.wasm");
+        std::fs::write(&wasm_path, b"not valid wasm bytes").unwrap();
+
+        let manifest = ExtensionManifest {
+            id: "bad-wasm".to_string(),
+            version: "1.0.0".to_string(),
+            entrypoint: Some(wasm_path.to_string_lossy().into_owned()),
+            metadata: frankenterm_dynamic::Value::Null,
+        };
+        let result = engine.load_extension(&manifest);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn eval_config_invalid_wasm_binary_errors() {
+        let engine = WasmEngine::with_defaults().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let wasm_path = dir.path().join("bad_config.wasm");
+        std::fs::write(&wasm_path, b"not a wasm module").unwrap();
+
+        let result = engine.eval_config(&wasm_path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn unload_nonexistent_extension_errors() {
+        let engine = WasmEngine::with_defaults().unwrap();
+        let result = engine.unload_extension(9999);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unknown extension")
+        );
+    }
+
+    #[test]
+    fn multiple_hooks_fire_in_priority_order() {
+        let engine = WasmEngine::with_defaults().unwrap();
+
+        let handler_high = HookHandler::new(10, Some("evt".to_string()), |_, _| {
+            Ok(vec![Action::Custom {
+                name: "high".to_string(),
+                payload: frankenterm_dynamic::Value::Null,
+            }])
+        });
+        let handler_low = HookHandler::new(-5, Some("evt".to_string()), |_, _| {
+            Ok(vec![Action::Custom {
+                name: "low".to_string(),
+                payload: frankenterm_dynamic::Value::Null,
+            }])
+        });
+
+        engine.register_hook("evt", handler_high).unwrap();
+        engine.register_hook("evt", handler_low).unwrap();
+
+        let actions = engine
+            .fire_event("evt", &frankenterm_dynamic::Value::Null)
+            .unwrap();
+        assert_eq!(actions.len(), 2);
+        // Low priority (-5) fires before high priority (10)
+        match &actions[0] {
+            Action::Custom { name, .. } => assert_eq!(name, "low"),
+            other => panic!("expected Custom, got {other:?}"),
+        }
+        match &actions[1] {
+            Action::Custom { name, .. } => assert_eq!(name, "high"),
+            other => panic!("expected Custom, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hook_filter_prevents_non_matching_events() {
+        let engine = WasmEngine::with_defaults().unwrap();
+        let handler = HookHandler::new(0, Some("resize".to_string()), |_, _| {
+            Ok(vec![Action::Custom {
+                name: "fired".to_string(),
+                payload: frankenterm_dynamic::Value::Null,
+            }])
+        });
+        engine.register_hook("resize", handler).unwrap();
+
+        let actions = engine
+            .fire_event("pane-output", &frankenterm_dynamic::Value::Null)
+            .unwrap();
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn json_to_dynamic_negative_integer() {
+        let json: serde_json::Value = serde_json::json!(-42);
+        let dynamic = json_to_dynamic(&json).unwrap();
+        assert_eq!(dynamic, frankenterm_dynamic::Value::I64(-42));
+    }
+
+    #[test]
+    fn json_to_dynamic_nested_objects() {
+        let json: serde_json::Value = serde_json::json!({
+            "outer": {
+                "inner": [1, 2]
+            }
+        });
+        let dynamic = json_to_dynamic(&json).unwrap();
+        match dynamic {
+            frankenterm_dynamic::Value::Object(map) => {
+                let outer = map
+                    .get(&frankenterm_dynamic::Value::String("outer".to_string()))
+                    .unwrap();
+                match outer {
+                    frankenterm_dynamic::Value::Object(inner_map) => {
+                        assert!(
+                            inner_map
+                                .get(&frankenterm_dynamic::Value::String("inner".to_string()))
+                                .is_some()
+                        );
+                    }
+                    other => panic!("expected Object, got {other:?}"),
+                }
+            }
+            other => panic!("expected Object, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_to_dynamic_null_and_bool() {
+        assert_eq!(
+            json_to_dynamic(&serde_json::Value::Null).unwrap(),
+            frankenterm_dynamic::Value::Null
+        );
+        assert_eq!(
+            json_to_dynamic(&serde_json::json!(true)).unwrap(),
+            frankenterm_dynamic::Value::Bool(true)
+        );
+        assert_eq!(
+            json_to_dynamic(&serde_json::json!(false)).unwrap(),
+            frankenterm_dynamic::Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn json_to_dynamic_empty_array_and_object() {
+        let arr = json_to_dynamic(&serde_json::json!([])).unwrap();
+        match arr {
+            frankenterm_dynamic::Value::Array(a) => assert!(a.is_empty()),
+            other => panic!("expected Array, got {other:?}"),
+        }
+
+        let obj = json_to_dynamic(&serde_json::json!({})).unwrap();
+        match obj {
+            frankenterm_dynamic::Value::Object(m) => assert!(m.is_empty()),
+            other => panic!("expected Object, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn json_to_dynamic_converts_basic_types() {
         let json: serde_json::Value = serde_json::json!({
             "string_field": "hello",
