@@ -7,16 +7,22 @@
 use anyhow::Result;
 use std::path::Path;
 
+pub mod audit;
 mod dispatcher;
 #[cfg(feature = "lua")]
 mod lua_engine;
+pub mod manifest;
+pub mod sandbox;
 mod types;
 #[cfg(feature = "wasm")]
 mod wasm_engine;
 
+pub use audit::{AuditOutcome, AuditTrail};
 pub use dispatcher::ScriptingDispatcher;
 #[cfg(feature = "lua")]
 pub use lua_engine::LuaEngine;
+pub use manifest::{ExtensionPermissions, ParsedManifest};
+pub use sandbox::{ResourceLimits, SandboxConfig, SandboxEnforcer};
 pub use types::{
     Action, ConfigValue, EngineCapabilities, ExtensionId, ExtensionManifest, HookHandler, HookId,
     LogLevel,

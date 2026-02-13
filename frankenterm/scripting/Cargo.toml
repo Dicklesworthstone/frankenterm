@@ -15,6 +15,7 @@ config = { workspace = true, optional = true }
 frankenterm-dynamic.workspace = true
 log = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
+toml.workspace = true
 luahelper = { workspace = true, optional = true }
 mlua = { workspace = true, optional = true, features = ["vendored", "lua54", "async", "send", "serialize"] }
 smol = { workspace = true, optional = true }
