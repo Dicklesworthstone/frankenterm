@@ -50,7 +50,7 @@ use crate::policy::Redactor;
 /// This is the target version that new databases will be initialized to,
 /// and existing databases will be migrated to.
 /// Uses SQLite's PRAGMA user_version for atomic version tracking.
-pub const SCHEMA_VERSION: i32 = 21;
+pub const SCHEMA_VERSION: i32 = 22;
 
 /// Schema initialization SQL
 ///
@@ -1293,6 +1293,28 @@ static MIGRATIONS: &[Migration] = &[
         ",
         ),
     },
+    Migration {
+        version: 22,
+        description: "Add segment embeddings table for semantic search",
+        up_sql: r"
+            CREATE TABLE IF NOT EXISTS segment_embeddings (
+                segment_id INTEGER PRIMARY KEY REFERENCES segments(id) ON DELETE CASCADE,
+                embedder_id TEXT NOT NULL,
+                dimension INTEGER NOT NULL,
+                vector BLOB NOT NULL,
+                embedded_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_segment_embeddings_embedder
+                ON segment_embeddings(embedder_id);
+        ",
+        down_sql: Some(
+            r"
+            DROP INDEX IF EXISTS idx_segment_embeddings_embedder;
+            DROP TABLE IF EXISTS segment_embeddings;
+        ",
+        ),
+    },
 ];
 
 // =============================================================================
@@ -1378,6 +1400,21 @@ pub struct IndexingHealthReport {
     pub inconsistent_panes: u64,
     /// Overall health: all panes consistent and no errors
     pub healthy: bool,
+}
+
+/// Statistics for a single embedder in the embeddings table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingStats {
+    /// Embedder identifier.
+    pub embedder_id: String,
+    /// Vector dimension.
+    pub dimension: i32,
+    /// Number of embedded segments.
+    pub count: i64,
+    /// Earliest embedding timestamp (epoch seconds).
+    pub earliest_at: i64,
+    /// Latest embedding timestamp (epoch seconds).
+    pub latest_at: i64,
 }
 
 /// FTS index state for incremental sync
@@ -6086,6 +6123,143 @@ impl StorageHandle {
             })?;
 
             search_fts_with_snippets(&conn, &query, &options)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+    }
+
+    // =========================================================================
+    // Embedding storage (semantic search)
+    // =========================================================================
+
+    /// Store an embedding vector for a segment.
+    pub async fn store_embedding(
+        &self,
+        segment_id: i64,
+        embedder_id: &str,
+        dimension: i32,
+        vector: &[u8],
+    ) -> Result<()> {
+        let db_path = Arc::clone(&self.db_path);
+        let embedder_id = embedder_id.to_string();
+        let vector = vector.to_vec();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open connection: {e}"))
+            })?;
+
+            conn.execute(
+                "INSERT OR REPLACE INTO segment_embeddings (segment_id, embedder_id, dimension, vector, embedded_at)
+                 VALUES (?1, ?2, ?3, ?4, strftime('%s', 'now'))",
+                rusqlite::params![segment_id, embedder_id, dimension, vector],
+            )
+            .map_err(|e| StorageError::Database(format!("store_embedding: {e}")))?;
+
+            Ok(())
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+    }
+
+    /// Get segment IDs that have no embedding for the given embedder.
+    pub async fn get_unembedded_segments(
+        &self,
+        embedder_id: &str,
+        limit: usize,
+    ) -> Result<Vec<i64>> {
+        let db_path = Arc::clone(&self.db_path);
+        let embedder_id = embedder_id.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open connection: {e}"))
+            })?;
+
+            let mut stmt = conn
+                .prepare(
+                    "SELECT s.id FROM segments s
+                     LEFT JOIN segment_embeddings se ON s.id = se.segment_id AND se.embedder_id = ?1
+                     WHERE se.segment_id IS NULL
+                     ORDER BY s.id ASC
+                     LIMIT ?2",
+                )
+                .map_err(|e| StorageError::Database(format!("get_unembedded_segments: {e}")))?;
+
+            let ids: Vec<i64> = stmt
+                .query_map(rusqlite::params![embedder_id, limit as i64], |row| row.get(0))
+                .map_err(|e| StorageError::Database(format!("get_unembedded_segments: {e}")))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            Ok(ids)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+    }
+
+    /// Get the embedding for a specific segment.
+    pub async fn get_embedding(
+        &self,
+        segment_id: i64,
+        embedder_id: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let db_path = Arc::clone(&self.db_path);
+        let embedder_id = embedder_id.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open connection: {e}"))
+            })?;
+
+            let result: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT vector FROM segment_embeddings WHERE segment_id = ?1 AND embedder_id = ?2",
+                    rusqlite::params![segment_id, embedder_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| StorageError::Database(format!("get_embedding: {e}")))?;
+
+            Ok(result)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+    }
+
+    /// Get embedding statistics per embedder.
+    pub async fn embedding_stats(&self) -> Result<Vec<EmbeddingStats>> {
+        let db_path = Arc::clone(&self.db_path);
+
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open connection: {e}"))
+            })?;
+
+            let mut stmt = conn
+                .prepare(
+                    "SELECT embedder_id, dimension, COUNT(*) as count,
+                            MIN(embedded_at) as earliest, MAX(embedded_at) as latest
+                     FROM segment_embeddings
+                     GROUP BY embedder_id, dimension",
+                )
+                .map_err(|e| StorageError::Database(format!("embedding_stats: {e}")))?;
+
+            let stats: Vec<EmbeddingStats> = stmt
+                .query_map([], |row| {
+                    Ok(EmbeddingStats {
+                        embedder_id: row.get(0)?,
+                        dimension: row.get(1)?,
+                        count: row.get(2)?,
+                        earliest_at: row.get(3)?,
+                        latest_at: row.get(4)?,
+                    })
+                })
+                .map_err(|e| StorageError::Database(format!("embedding_stats: {e}")))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            Ok(stats)
         })
         .await
         .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
