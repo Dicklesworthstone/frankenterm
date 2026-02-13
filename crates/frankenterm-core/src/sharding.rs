@@ -855,6 +855,10 @@ impl WeztermInterface for ShardedWeztermClient {
         }
         combined
     }
+
+    fn watchdog_warnings(&self) -> WeztermFuture<'_, Vec<String>> {
+        Box::pin(async move { Ok(self.shard_watchdog_warnings().await) })
+    }
 }
 
 fn circuit_state_rank(state: CircuitStateKind) -> u8 {
@@ -1091,5 +1095,9 @@ mod tests {
         let warnings = report.watchdog_warnings();
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("Shard 1 (failing)"));
+
+        let trait_warnings = client.watchdog_warnings().await.unwrap();
+        assert_eq!(trait_warnings.len(), 1);
+        assert!(trait_warnings[0].contains("Shard 1 (failing)"));
     }
 }

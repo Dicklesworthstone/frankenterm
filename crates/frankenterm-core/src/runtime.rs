@@ -935,6 +935,7 @@ impl ObservationRuntime {
     fn spawn_maintenance_task(&self, capture_tx: mpsc::Sender<CaptureEvent>) -> JoinHandle<()> {
         let storage = Arc::clone(&self.storage);
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
+        let wezterm_handle = self.wezterm_handle.clone();
         let mut config_rx = self.config_rx.clone();
         let heartbeats = Arc::clone(&self.heartbeats);
         let registry = Arc::clone(&self.registry);
@@ -1234,6 +1235,12 @@ impl ObservationRuntime {
                             bytes_to_mib(cursor_snapshot_bytes),
                             bytes_to_mib(metrics.cursor_snapshot_bytes_max()),
                         ));
+                    }
+                    match wezterm_handle.watchdog_warnings().await {
+                        Ok(wezterm_warnings) => warnings.extend(wezterm_warnings),
+                        Err(err) => {
+                            warnings.push(format!("WezTerm health warning probe failed: {err}"))
+                        }
                     }
 
                     let snapshot = HealthSnapshot {
@@ -2512,6 +2519,10 @@ impl RuntimeHandle {
                 bytes_to_mib(cursor_snapshot_bytes),
                 bytes_to_mib(self.metrics.cursor_snapshot_bytes_max()),
             ));
+        }
+        match self.wezterm_handle.watchdog_warnings().await {
+            Ok(wezterm_warnings) => warnings.extend(wezterm_warnings),
+            Err(err) => warnings.push(format!("WezTerm health warning probe failed: {err}")),
         }
 
         let snapshot = HealthSnapshot {

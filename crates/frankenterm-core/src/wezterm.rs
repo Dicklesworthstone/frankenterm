@@ -14,7 +14,8 @@ use serde_json::Value;
 
 use crate::Result;
 use crate::circuit_breaker::{
-    CircuitBreaker, CircuitBreakerConfig, CircuitBreakerStatus, get_or_register_circuit,
+    CircuitBreaker, CircuitBreakerConfig, CircuitBreakerStatus, CircuitStateKind,
+    get_or_register_circuit,
 };
 use crate::error::WeztermError;
 use crate::runtime_compat::{sleep, timeout};
@@ -83,6 +84,12 @@ pub trait WeztermInterface: Send + Sync {
     fn zoom_pane(&self, pane_id: u64, zoom: bool) -> WeztermFuture<'_, ()>;
     /// Get current circuit breaker status.
     fn circuit_status(&self) -> CircuitBreakerStatus;
+    /// Emit health warnings suitable for watchdog snapshots.
+    ///
+    /// Implementations may provide backend-specific warnings; default is empty.
+    fn watchdog_warnings(&self) -> WeztermFuture<'_, Vec<String>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
 }
 
 /// Create a default WezTerm interface handle.
@@ -1427,6 +1434,29 @@ impl WeztermInterface for WeztermClient {
     fn circuit_status(&self) -> CircuitBreakerStatus {
         WeztermClient::circuit_status(self)
     }
+
+    fn watchdog_warnings(&self) -> WeztermFuture<'_, Vec<String>> {
+        Box::pin(async move {
+            let status = WeztermClient::circuit_status(self);
+            let mut warnings = Vec::new();
+            match status.state {
+                CircuitStateKind::Closed => {}
+                CircuitStateKind::HalfOpen => {
+                    warnings.push(format!(
+                        "WezTerm circuit half-open (failures: {}/{})",
+                        status.consecutive_failures, status.failure_threshold
+                    ));
+                }
+                CircuitStateKind::Open => {
+                    warnings.push(format!(
+                        "WezTerm circuit open (failures: {}/{})",
+                        status.consecutive_failures, status.failure_threshold
+                    ));
+                }
+            }
+            Ok(warnings)
+        })
+    }
 }
 
 impl WeztermInterface for Arc<dyn WeztermInterface> {
@@ -1509,6 +1539,10 @@ impl WeztermInterface for Arc<dyn WeztermInterface> {
 
     fn circuit_status(&self) -> CircuitBreakerStatus {
         self.as_ref().circuit_status()
+    }
+
+    fn watchdog_warnings(&self) -> WeztermFuture<'_, Vec<String>> {
+        self.as_ref().watchdog_warnings()
     }
 }
 
@@ -2602,6 +2636,10 @@ impl WeztermInterface for UnifiedClient {
 
     fn circuit_status(&self) -> CircuitBreakerStatus {
         self.inner.circuit_status()
+    }
+
+    fn watchdog_warnings(&self) -> WeztermFuture<'_, Vec<String>> {
+        self.inner.watchdog_warnings()
     }
 }
 
