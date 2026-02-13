@@ -72,12 +72,22 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 ## What ft Does
 
-**ft (FrankenTerm)** is a terminal hypervisor for AI agent swarms. It:
+**ft (FrankenTerm)** is a swarm-native terminal platform and control plane for large AI agent fleets. It:
 
-1. **Observes** all WezTerm panes in real-time via delta extraction
-2. **Detects** agent state transitions through pattern matching (rate limits, errors, prompts)
-3. **Automates** workflows in response to detected events
-4. **Exposes** a machine-optimized Robot Mode API for AI-to-AI orchestration
+1. **Runs** a replacement-class terminal runtime focused on massive agent orchestration
+2. **Observes** pane/session activity in real-time via delta extraction
+3. **Detects** agent state transitions through pattern matching (rate limits, errors, prompts)
+4. **Automates** workflows in response to detected events
+5. **Enforces** policy-gated actions with auditability and approvals
+6. **Exposes** machine-optimized control surfaces (Robot Mode + MCP) for AI-to-AI orchestration
+
+### Strategic Direction
+
+`ft` is not defined by WezTerm integration. The project direction is:
+
+- Replacement of legacy terminal workflows for swarm operations
+- Selective design inspiration from Ghostty and Zellij
+- Ground-up ft subsystems plus integration/adaptation from `/dp/asupersync`, `/dp/frankensqlite`, and `/dp/frankentui`
 
 ### Core Architecture
 
@@ -88,10 +98,10 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 │  Robot Mode API    │  Human CLI      │  Watch Daemon       │
 │  (ft robot ...)    │  (ft status)    │  (ft watch)         │
 ├────────────────────────────────────────────────────────────┤
-│                     frankenterm-core                                │
-│  Pattern Engine │ Capture │ Workflows │ Policy │ Search   │
+│                     frankenterm-core                      │
+│  Pattern Engine │ Capture │ Workflows │ Policy │ Search    │
 ├────────────────────────────────────────────────────────────┤
-│                     WezTerm IPC                            │
+│      Backend Adapters (incl. current WezTerm bridge)      │
 └────────────────────────────────────────────────────────────┘
 ```
 
@@ -421,7 +431,7 @@ Robot mode returns structured errors:
 Error codes:
 - `robot.pane_not_found` - Invalid pane ID
 - `robot.timeout` - Wait-for pattern not matched in time
-- `robot.wezterm_not_running` - WezTerm not detected
+- `robot.wezterm_not_running` - Current compatibility backend is unavailable
 - `robot.policy_denied` - Action blocked by safety policy
 - `robot.require_approval` - Action requires human approval
 - `robot.storage_error` - Database operation failed
@@ -465,7 +475,7 @@ block_alt_screen = true
 ```
 frankenterm/
 ├── crates/
-│   ├── frankenterm/  # CLI binary (main.rs ~6000 lines)
+│   ├── frankenterm/  # CLI binary (main.rs ~31k lines)
 │   └── frankenterm-core/      # Core library
 │       └── src/
 │           ├── config.rs      # Configuration parsing
@@ -474,7 +484,7 @@ frankenterm/
 │           ├── workflows.rs   # Workflow execution
 │           ├── policy.rs      # Safety/access control
 │           ├── storage.rs     # SQLite + FTS5
-│           └── wezterm.rs     # WezTerm IPC
+│           └── wezterm.rs     # Terminal backend adapter (current compatibility bridge)
 ├── fuzz/             # Fuzzing targets
 ├── docs/             # Documentation
 └── fixtures/         # Test fixtures
@@ -486,7 +496,7 @@ frankenterm/
 
 | Tool | Relationship |
 |------|--------------|
-| `ntm` | Tmux equivalent (ft is for WezTerm) |
+| `ntm` | Adjacent orchestration tooling; ft is the swarm-native terminal platform |
 | `slb` | Simultaneous Launch Button (may integrate with ft workflows) |
 | `caam` | Account manager (provides auth for AI agents ft orchestrates) |
 

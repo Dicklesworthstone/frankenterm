@@ -1,6 +1,6 @@
 [package]
 name = "frankenterm"
-description = "FrankenTerm CLI - terminal hypervisor for AI agent swarms"
+description = "FrankenTerm CLI - swarm-native terminal platform for AI agent fleets"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

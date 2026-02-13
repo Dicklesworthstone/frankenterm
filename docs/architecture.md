@@ -5,9 +5,9 @@ This document captures the ft core architecture for operators and contributors.
 ## High-level pipeline
 
 ```
-WezTerm panes
-  -> discovery (wezterm cli list)
-  -> capture (wezterm cli get-text)
+ft runtime backends (current compatibility bridge includes WezTerm CLI)
+  -> discovery (backend adapter inventory)
+  -> capture (backend stream snapshots/events)
   -> delta extraction (overlap matching + gap detection)
   -> storage (SQLite + FTS5)
   -> pattern engine (rule packs)
@@ -80,6 +80,7 @@ pretend the stream is continuous.
 - Human CLI is optimized for operator use and safety.
 - Robot Mode provides stable, machine-parseable JSON (or TOON) envelopes.
 - MCP mirrors Robot Mode for tool and schema parity (feature-gated).
+- WezTerm integration is treated as a compatibility bridge, not the product boundary.
 
 ## Library integration map (Appendix F)
 

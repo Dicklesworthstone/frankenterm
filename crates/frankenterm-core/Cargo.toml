@@ -1,6 +1,6 @@
 [package]
 name = "frankenterm-core"
-description = "Core library for FrankenTerm - terminal hypervisor for AI agent swarms"
+description = "Core library for FrankenTerm - swarm-native terminal platform for AI agent fleets"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

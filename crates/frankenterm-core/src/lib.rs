@@ -1,12 +1,12 @@
 //! frankenterm-core: Core library for FrankenTerm
 //!
-//! This crate provides the core functionality for `wa`, a terminal hypervisor
-//! for AI agent swarms running in WezTerm.
+//! This crate provides the core functionality for `ft`, a swarm-native terminal
+//! platform for AI agent fleets.
 //!
 //! # Architecture
 //!
 //! ```text
-//! WezTerm CLI → Ingest Pipeline → Storage (SQLite/FTS5)
+//! Backend Adapters → Ingest Pipeline → Storage (SQLite/FTS5)
 //!                    ↓
 //!            Pattern Engine → Event Bus → Workflows
 //!                                   ↓
