@@ -296,4 +296,88 @@ mod test {
             "Non-terminating parentheses should not impact matching the entire URL - Terminated with a valid character",
         );
     }
+
+    #[test]
+    fn rule_new_valid_regex() {
+        let rule = Rule::new(r"\d+", "$0");
+        assert!(rule.is_ok());
+    }
+
+    #[test]
+    fn rule_new_invalid_regex() {
+        let rule = Rule::new(r"[invalid", "$0");
+        assert!(rule.is_err());
+    }
+
+    #[test]
+    fn rule_with_highlight() {
+        let rule = Rule::with_highlight(r"(\w+)://(\S+)", "link:$2", 1).unwrap();
+        assert_eq!(rule.highlight, 1);
+        assert_eq!(rule.format, "link:$2");
+    }
+
+    #[test]
+    fn match_hyperlinks_no_rules() {
+        let matches = Rule::match_hyperlinks("http://example.com", &[]);
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn match_hyperlinks_no_match() {
+        let rules = vec![Rule::new(r"\b\w+://(?:[\w.-]+)\.[a-z]{2,15}\S*\b", "$0").unwrap()];
+        let matches = Rule::match_hyperlinks("just plain text", &rules);
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn match_hyperlinks_multiple_urls() {
+        let rules = vec![Rule::new(r"\b\w+://(?:[\w.-]+)\.[a-z]{2,15}\S*\b", "$0").unwrap()];
+        let matches = Rule::match_hyperlinks("http://foo.com and http://bar.com", &rules);
+        assert_eq!(matches.len(), 2);
+    }
+
+    #[test]
+    fn match_hyperlinks_sorted_by_length_desc() {
+        let rules = vec![Rule::new(r"\b\w+://(?:[\w.-]+)\.[a-z]{2,15}\S*\b", "$0").unwrap()];
+        let matches =
+            Rule::match_hyperlinks("http://short.co http://muchlonger.example.com", &rules);
+        assert!(matches.len() == 2);
+        // Longest match should be first
+        let first_len = matches[0].range.end - matches[0].range.start;
+        let second_len = matches[1].range.end - matches[1].range.start;
+        assert!(first_len >= second_len);
+    }
+
+    #[test]
+    fn rule_format_substitution() {
+        let rules = vec![Rule::new(r"\b(\w+)@([\w.]+)\b", "mailto:$0").unwrap()];
+        let matches = Rule::match_hyperlinks("user@example.com", &rules);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].link.uri(), "mailto:user@example.com");
+    }
+
+    #[test]
+    fn rule_debug_impl() {
+        let rule = Rule::new(r"\d+", "$0").unwrap();
+        let dbg = format!("{:?}", rule);
+        assert!(dbg.contains("Rule"));
+    }
+
+    #[test]
+    fn rule_match_range_is_byte_offset() {
+        let rules = vec![Rule::new(r"\b\w+://(?:[\w.-]+)\.[a-z]{2,15}\S*\b", "$0").unwrap()];
+        let text = "  http://x.co";
+        let matches = Rule::match_hyperlinks(text, &rules);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].range.start, 2);
+        assert_eq!(&text[matches[0].range.clone()], "http://x.co");
+    }
+
+    #[test]
+    fn rule_match_is_implicit_hyperlink() {
+        let rules = vec![Rule::new(r"\b\w+://(?:[\w.-]+)\.[a-z]{2,15}\S*\b", "$0").unwrap()];
+        let matches = Rule::match_hyperlinks("http://example.com", &rules);
+        assert_eq!(matches.len(), 1);
+        assert!(matches[0].link.is_implicit());
+    }
 }

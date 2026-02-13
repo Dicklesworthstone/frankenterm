@@ -284,6 +284,340 @@ impl ChangeSequence {
     }
 }
 
+#[cfg(test)]
+mod test {
+    use super::*;
+    use frankenterm_cell::color::AnsiColor;
+
+    // === LineAttribute tests ===
+
+    #[test]
+    fn line_attribute_variants_are_distinct() {
+        let variants = [
+            LineAttribute::DoubleHeightTopHalfLine,
+            LineAttribute::DoubleHeightBottomHalfLine,
+            LineAttribute::DoubleWidthLine,
+            LineAttribute::SingleWidthLine,
+        ];
+        for (i, a) in variants.iter().enumerate() {
+            for (j, b) in variants.iter().enumerate() {
+                if i == j {
+                    assert_eq!(a, b);
+                } else {
+                    assert_ne!(a, b);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn line_attribute_clone_eq() {
+        let attr = LineAttribute::DoubleWidthLine;
+        let cloned = attr.clone();
+        assert_eq!(attr, cloned);
+    }
+
+    #[test]
+    fn line_attribute_debug() {
+        let attr = LineAttribute::SingleWidthLine;
+        let dbg = format!("{:?}", attr);
+        assert!(dbg.contains("SingleWidthLine"));
+    }
+
+    // === Change type tests ===
+
+    #[test]
+    fn change_is_text_true_for_text() {
+        let c = Change::Text("hello".into());
+        assert!(c.is_text());
+    }
+
+    #[test]
+    fn change_is_text_false_for_non_text() {
+        assert!(!Change::ClearScreen(Default::default()).is_text());
+        assert!(!Change::Title("t".into()).is_text());
+        assert!(!Change::CursorShape(CursorShape::Default).is_text());
+        assert!(!Change::CursorVisibility(CursorVisibility::Visible).is_text());
+    }
+
+    #[test]
+    fn change_text_returns_content() {
+        let c = Change::Text("hello world".into());
+        assert_eq!(c.text(), "hello world");
+    }
+
+    #[test]
+    #[should_panic(expected = "you must use Change::is_text()")]
+    fn change_text_panics_on_non_text() {
+        let c = Change::ClearScreen(Default::default());
+        let _ = c.text();
+    }
+
+    #[test]
+    fn change_from_string() {
+        let c: Change = String::from("hello").into();
+        assert!(c.is_text());
+        assert_eq!(c.text(), "hello");
+    }
+
+    #[test]
+    fn change_from_str() {
+        let c: Change = "world".into();
+        assert!(c.is_text());
+        assert_eq!(c.text(), "world");
+    }
+
+    #[test]
+    fn change_from_attribute_change() {
+        let attr = AttributeChange::Intensity(frankenterm_cell::Intensity::Bold);
+        let c: Change = attr.into();
+        assert!(matches!(c, Change::Attribute(_)));
+    }
+
+    #[test]
+    fn change_from_line_attribute() {
+        let la = LineAttribute::DoubleWidthLine;
+        let c: Change = la.into();
+        assert!(matches!(
+            c,
+            Change::LineAttribute(LineAttribute::DoubleWidthLine)
+        ));
+    }
+
+    #[test]
+    fn change_clone_eq() {
+        let c = Change::Text("abc".into());
+        let cloned = c.clone();
+        assert_eq!(c, cloned);
+    }
+
+    #[test]
+    fn change_debug() {
+        let c = Change::ClearScreen(Default::default());
+        let dbg = format!("{:?}", c);
+        assert!(dbg.contains("ClearScreen"));
+    }
+
+    #[test]
+    fn change_cursor_position_eq() {
+        let c1 = Change::CursorPosition {
+            x: Position::Absolute(5),
+            y: Position::Relative(-1),
+        };
+        let c2 = c1.clone();
+        assert_eq!(c1, c2);
+    }
+
+    #[test]
+    fn change_scroll_region_up_fields() {
+        let c = Change::ScrollRegionUp {
+            first_row: 2,
+            region_size: 10,
+            scroll_count: 3,
+        };
+        assert!(matches!(
+            c,
+            Change::ScrollRegionUp {
+                first_row: 2,
+                region_size: 10,
+                scroll_count: 3,
+            }
+        ));
+    }
+
+    #[test]
+    fn change_scroll_region_down_fields() {
+        let c = Change::ScrollRegionDown {
+            first_row: 0,
+            region_size: 5,
+            scroll_count: 1,
+        };
+        assert!(matches!(
+            c,
+            Change::ScrollRegionDown {
+                first_row: 0,
+                region_size: 5,
+                scroll_count: 1,
+            }
+        ));
+    }
+
+    #[test]
+    fn change_title() {
+        let c = Change::Title("My Terminal".into());
+        assert!(matches!(c, Change::Title(ref s) if s == "My Terminal"));
+    }
+
+    #[test]
+    fn change_cursor_color() {
+        let c = Change::CursorColor(AnsiColor::Blue.into());
+        assert!(matches!(c, Change::CursorColor(_)));
+    }
+
+    // === ChangeSequence tests ===
+
+    #[test]
+    fn change_sequence_new_starts_at_origin() {
+        let cs = ChangeSequence::new(24, 80);
+        assert_eq!(cs.current_cursor_position(), (0, 0));
+    }
+
+    #[test]
+    fn change_sequence_render_height_initially_zero() {
+        let cs = ChangeSequence::new(24, 80);
+        assert_eq!(cs.render_height(), 0);
+    }
+
+    #[test]
+    fn change_sequence_text_advances_cursor() {
+        let mut cs = ChangeSequence::new(24, 80);
+        cs.add("Hello");
+        assert_eq!(cs.current_cursor_position(), (5, 0));
+    }
+
+    #[test]
+    fn change_sequence_text_wraps_at_screen_width() {
+        let mut cs = ChangeSequence::new(24, 4);
+        cs.add("abcde");
+        // 'a','b','c','d' fills row, 'e' wraps to next row
+        assert_eq!(cs.current_cursor_position(), (1, 1));
+    }
+
+    #[test]
+    fn change_sequence_newline_advances_y() {
+        let mut cs = ChangeSequence::new(24, 80);
+        cs.add("abc\ndef");
+        assert_eq!(cs.current_cursor_position(), (3, 1));
+    }
+
+    #[test]
+    fn change_sequence_cr_resets_x() {
+        let mut cs = ChangeSequence::new(24, 80);
+        cs.add("abc\rxy");
+        assert_eq!(cs.current_cursor_position(), (2, 0));
+    }
+
+    #[test]
+    fn change_sequence_crlf_moves_to_next_line_start() {
+        let mut cs = ChangeSequence::new(24, 80);
+        cs.add("abc\r\nxy");
+        assert_eq!(cs.current_cursor_position(), (2, 1));
+    }
+
+    #[test]
+    fn change_sequence_clear_screen_resets_to_origin() {
+        let mut cs = ChangeSequence::new(24, 80);
+        cs.add("Hello");
+        cs.add(Change::ClearScreen(Default::default()));
+        assert_eq!(cs.current_cursor_position(), (0, 0));
+    }
+
+    #[test]
+    fn change_sequence_cursor_position_absolute() {
+        let mut cs = ChangeSequence::new(24, 80);
+        cs.add(Change::CursorPosition {
+            x: Position::Absolute(10),
+            y: Position::Absolute(5),
+        });
+        assert_eq!(cs.current_cursor_position(), (10, 5));
+    }
+
+    #[test]
+    fn change_sequence_cursor_position_relative() {
+        let mut cs = ChangeSequence::new(24, 80);
+        cs.add("Hello");
+        cs.add(Change::CursorPosition {
+            x: Position::Relative(-3),
+            y: Position::Relative(2),
+        });
+        assert_eq!(cs.current_cursor_position(), (2, 2));
+    }
+
+    #[test]
+    fn change_sequence_cursor_position_end_relative() {
+        let mut cs = ChangeSequence::new(24, 80);
+        cs.add(Change::CursorPosition {
+            x: Position::EndRelative(5),
+            y: Position::EndRelative(3),
+        });
+        assert_eq!(cs.current_cursor_position(), (75, 21));
+    }
+
+    #[test]
+    fn change_sequence_scroll_resets_cursor() {
+        let mut cs = ChangeSequence::new(24, 80);
+        cs.add("Hello World");
+        cs.add(Change::ScrollRegionUp {
+            first_row: 0,
+            region_size: 24,
+            scroll_count: 1,
+        });
+        assert_eq!(cs.current_cursor_position(), (0, 0));
+    }
+
+    #[test]
+    fn change_sequence_scroll_down_resets_cursor() {
+        let mut cs = ChangeSequence::new(24, 80);
+        cs.add("Hello World");
+        cs.add(Change::ScrollRegionDown {
+            first_row: 0,
+            region_size: 24,
+            scroll_count: 1,
+        });
+        assert_eq!(cs.current_cursor_position(), (0, 0));
+    }
+
+    #[test]
+    fn change_sequence_consume_returns_changes() {
+        let mut cs = ChangeSequence::new(24, 80);
+        cs.add("Hello");
+        cs.add(Change::ClearScreen(Default::default()));
+        let changes = cs.consume();
+        assert_eq!(changes.len(), 2);
+        assert!(changes[0].is_text());
+    }
+
+    #[test]
+    fn change_sequence_move_to() {
+        let mut cs = ChangeSequence::new(24, 80);
+        cs.add("Hello");
+        cs.move_to((10, 5));
+        assert_eq!(cs.current_cursor_position(), (10, 5));
+    }
+
+    #[test]
+    fn change_sequence_render_height_tracks_cursor() {
+        let mut cs = ChangeSequence::new(24, 80);
+        cs.add("abc\ndef\nghi");
+        assert_eq!(cs.render_height(), 2);
+    }
+
+    #[test]
+    fn change_sequence_add_changes_bulk() {
+        let mut cs = ChangeSequence::new(24, 80);
+        cs.add_changes(vec![
+            Change::Text("abc".into()),
+            Change::ClearScreen(Default::default()),
+            Change::Text("xyz".into()),
+        ]);
+        let changes = cs.consume();
+        assert_eq!(changes.len(), 3);
+    }
+
+    #[test]
+    fn change_sequence_attribute_changes_dont_move_cursor() {
+        let mut cs = ChangeSequence::new(24, 80);
+        cs.add("abc");
+        let pos = cs.current_cursor_position();
+        cs.add(Change::CursorShape(CursorShape::BlinkingBar));
+        assert_eq!(cs.current_cursor_position(), pos);
+        cs.add(Change::CursorVisibility(CursorVisibility::Hidden));
+        assert_eq!(cs.current_cursor_position(), pos);
+        cs.add(Change::Title("test".into()));
+        assert_eq!(cs.current_cursor_position(), pos);
+    }
+}
+
 /// The `Image` `Change` needs to support adding an image that spans multiple
 /// rows and columns, as well as model the content for just one of those cells.
 /// For instance, if some of the cells inside an image are replaced by textual

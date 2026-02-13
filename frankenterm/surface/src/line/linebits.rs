@@ -51,3 +51,130 @@ bitflags! {
         const AUTO_DETECT_DIRECTION = 1<<8;
     }
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn none_is_empty() {
+        let bits = LineBits::NONE;
+        assert!(bits.is_empty());
+        assert_eq!(bits.bits(), 0);
+    }
+
+    #[test]
+    fn individual_flags_are_distinct() {
+        let flags = [
+            LineBits::HAS_HYPERLINK,
+            LineBits::SCANNED_IMPLICIT_HYPERLINKS,
+            LineBits::HAS_IMPLICIT_HYPERLINKS,
+            LineBits::DOUBLE_WIDTH,
+            LineBits::DOUBLE_HEIGHT_TOP,
+            LineBits::DOUBLE_HEIGHT_BOTTOM,
+            LineBits::BIDI_ENABLED,
+            LineBits::RTL,
+            LineBits::AUTO_DETECT_DIRECTION,
+        ];
+        for (i, a) in flags.iter().enumerate() {
+            for (j, b) in flags.iter().enumerate() {
+                if i != j {
+                    // No two individual flags should be equal
+                    assert_ne!(a, b, "flags[{}] should differ from flags[{}]", i, j);
+                    // Individual flags should not overlap
+                    assert!(
+                        (*a & *b).is_empty(),
+                        "flags[{}] and flags[{}] should not overlap",
+                        i,
+                        j
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn double_width_height_mask_covers_three_flags() {
+        let mask = LineBits::DOUBLE_WIDTH_HEIGHT_MASK;
+        assert!(mask.contains(LineBits::DOUBLE_WIDTH));
+        assert!(mask.contains(LineBits::DOUBLE_HEIGHT_TOP));
+        assert!(mask.contains(LineBits::DOUBLE_HEIGHT_BOTTOM));
+        // Should not contain unrelated flags
+        assert!(!mask.contains(LineBits::HAS_HYPERLINK));
+        assert!(!mask.contains(LineBits::BIDI_ENABLED));
+        assert!(!mask.contains(LineBits::RTL));
+    }
+
+    #[test]
+    fn bitwise_or_combines_flags() {
+        let bits = LineBits::HAS_HYPERLINK | LineBits::RTL;
+        assert!(bits.contains(LineBits::HAS_HYPERLINK));
+        assert!(bits.contains(LineBits::RTL));
+        assert!(!bits.contains(LineBits::DOUBLE_WIDTH));
+    }
+
+    #[test]
+    fn bitwise_and_intersects_flags() {
+        let a = LineBits::HAS_HYPERLINK | LineBits::RTL | LineBits::BIDI_ENABLED;
+        let b = LineBits::RTL | LineBits::DOUBLE_WIDTH;
+        let c = a & b;
+        assert!(c.contains(LineBits::RTL));
+        assert!(!c.contains(LineBits::HAS_HYPERLINK));
+        assert!(!c.contains(LineBits::DOUBLE_WIDTH));
+    }
+
+    #[test]
+    fn flag_insert_and_remove() {
+        let mut bits = LineBits::NONE;
+        bits.insert(LineBits::HAS_HYPERLINK);
+        assert!(bits.contains(LineBits::HAS_HYPERLINK));
+        bits.remove(LineBits::HAS_HYPERLINK);
+        assert!(!bits.contains(LineBits::HAS_HYPERLINK));
+        assert!(bits.is_empty());
+    }
+
+    #[test]
+    fn flag_toggle() {
+        let mut bits = LineBits::NONE;
+        bits.toggle(LineBits::BIDI_ENABLED);
+        assert!(bits.contains(LineBits::BIDI_ENABLED));
+        bits.toggle(LineBits::BIDI_ENABLED);
+        assert!(!bits.contains(LineBits::BIDI_ENABLED));
+    }
+
+    #[test]
+    fn clone_and_eq() {
+        let bits = LineBits::HAS_HYPERLINK | LineBits::DOUBLE_WIDTH;
+        let cloned = bits;
+        assert_eq!(bits, cloned);
+    }
+
+    #[test]
+    fn debug_format() {
+        let bits = LineBits::RTL | LineBits::BIDI_ENABLED;
+        let dbg = format!("{:?}", bits);
+        assert!(dbg.contains("RTL"));
+        assert!(dbg.contains("BIDI_ENABLED"));
+    }
+
+    #[test]
+    fn bidi_combination() {
+        let bidi_rtl = LineBits::BIDI_ENABLED | LineBits::RTL | LineBits::AUTO_DETECT_DIRECTION;
+        assert!(bidi_rtl.contains(LineBits::BIDI_ENABLED));
+        assert!(bidi_rtl.contains(LineBits::RTL));
+        assert!(bidi_rtl.contains(LineBits::AUTO_DETECT_DIRECTION));
+    }
+
+    #[test]
+    fn hyperlink_scanning_flags() {
+        let mut bits = LineBits::NONE;
+        // Simulate scanning: set scanned flag, then found flag
+        bits.insert(LineBits::SCANNED_IMPLICIT_HYPERLINKS);
+        assert!(bits.contains(LineBits::SCANNED_IMPLICIT_HYPERLINKS));
+        assert!(!bits.contains(LineBits::HAS_IMPLICIT_HYPERLINKS));
+
+        bits.insert(LineBits::HAS_IMPLICIT_HYPERLINKS);
+        assert!(bits.contains(LineBits::SCANNED_IMPLICIT_HYPERLINKS));
+        assert!(bits.contains(LineBits::HAS_IMPLICIT_HYPERLINKS));
+    }
+}

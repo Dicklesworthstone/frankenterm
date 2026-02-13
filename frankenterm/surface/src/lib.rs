@@ -1782,4 +1782,450 @@ mod test {
             ),]]
         );
     }
+
+    // === Position tests ===
+
+    #[test]
+    fn position_relative_zero() {
+        let p = Position::Relative(0);
+        assert_eq!(p, Position::Relative(0));
+    }
+
+    #[test]
+    fn position_absolute_zero() {
+        let p = Position::Absolute(0);
+        assert_eq!(p, Position::Absolute(0));
+    }
+
+    #[test]
+    fn position_end_relative_zero() {
+        let p = Position::EndRelative(0);
+        assert_eq!(p, Position::EndRelative(0));
+    }
+
+    #[test]
+    fn position_clone_eq() {
+        let p = Position::Relative(-3);
+        let p2 = p;
+        assert_eq!(p, p2);
+    }
+
+    #[test]
+    fn position_variants_not_equal() {
+        assert_ne!(Position::Relative(0), Position::Absolute(0));
+        assert_ne!(Position::Absolute(0), Position::EndRelative(0));
+        assert_ne!(Position::Relative(0), Position::EndRelative(0));
+    }
+
+    #[test]
+    fn position_debug_format() {
+        let dbg = format!("{:?}", Position::Absolute(5));
+        assert!(dbg.contains("Absolute"));
+        assert!(dbg.contains("5"));
+    }
+
+    // === CursorShape tests ===
+
+    #[test]
+    fn cursor_shape_default() {
+        assert_eq!(CursorShape::default(), CursorShape::Default);
+    }
+
+    #[test]
+    fn cursor_shape_blinking_block() {
+        assert!(CursorShape::BlinkingBlock.is_blinking());
+    }
+
+    #[test]
+    fn cursor_shape_steady_block_not_blinking() {
+        assert!(!CursorShape::SteadyBlock.is_blinking());
+    }
+
+    #[test]
+    fn cursor_shape_blinking_underline() {
+        assert!(CursorShape::BlinkingUnderline.is_blinking());
+    }
+
+    #[test]
+    fn cursor_shape_steady_underline_not_blinking() {
+        assert!(!CursorShape::SteadyUnderline.is_blinking());
+    }
+
+    #[test]
+    fn cursor_shape_blinking_bar() {
+        assert!(CursorShape::BlinkingBar.is_blinking());
+    }
+
+    #[test]
+    fn cursor_shape_steady_bar_not_blinking() {
+        assert!(!CursorShape::SteadyBar.is_blinking());
+    }
+
+    #[test]
+    fn cursor_shape_default_not_blinking() {
+        assert!(!CursorShape::Default.is_blinking());
+    }
+
+    #[test]
+    fn cursor_shape_clone_eq() {
+        let s = CursorShape::BlinkingBlock;
+        let s2 = s;
+        assert_eq!(s, s2);
+    }
+
+    // === CursorVisibility tests ===
+
+    #[test]
+    fn cursor_visibility_default_is_visible() {
+        assert_eq!(CursorVisibility::default(), CursorVisibility::Visible);
+    }
+
+    #[test]
+    fn cursor_visibility_hidden_not_default() {
+        assert_ne!(CursorVisibility::Hidden, CursorVisibility::default());
+    }
+
+    #[test]
+    fn cursor_visibility_clone_eq() {
+        let v = CursorVisibility::Hidden;
+        let v2 = v;
+        assert_eq!(v, v2);
+    }
+
+    // === compute_position_change tests ===
+
+    #[test]
+    fn compute_position_relative_positive() {
+        let result = compute_position_change(2, &Position::Relative(3), 10);
+        assert_eq!(result, 5);
+    }
+
+    #[test]
+    fn compute_position_relative_negative() {
+        let result = compute_position_change(5, &Position::Relative(-2), 10);
+        assert_eq!(result, 3);
+    }
+
+    #[test]
+    fn compute_position_relative_clamps_to_limit() {
+        let result = compute_position_change(8, &Position::Relative(5), 10);
+        assert_eq!(result, 9); // clamped to limit - 1
+    }
+
+    #[test]
+    fn compute_position_relative_negative_saturates_at_zero() {
+        let result = compute_position_change(2, &Position::Relative(-5), 10);
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn compute_position_absolute() {
+        let result = compute_position_change(0, &Position::Absolute(7), 10);
+        assert_eq!(result, 7);
+    }
+
+    #[test]
+    fn compute_position_absolute_clamps() {
+        let result = compute_position_change(0, &Position::Absolute(15), 10);
+        assert_eq!(result, 9); // clamped to limit - 1
+    }
+
+    #[test]
+    fn compute_position_end_relative() {
+        let result = compute_position_change(0, &Position::EndRelative(2), 10);
+        assert_eq!(result, 8); // limit - delta
+    }
+
+    #[test]
+    fn compute_position_end_relative_zero() {
+        let result = compute_position_change(0, &Position::EndRelative(0), 10);
+        assert_eq!(result, 10); // limit - 0
+    }
+
+    // === Surface constructor and accessor tests ===
+
+    #[test]
+    fn surface_new_dimensions() {
+        let s = Surface::new(80, 24);
+        assert_eq!(s.dimensions(), (80, 24));
+    }
+
+    #[test]
+    fn surface_cursor_starts_at_origin() {
+        let s = Surface::new(10, 5);
+        assert_eq!(s.cursor_position(), (0, 0));
+    }
+
+    #[test]
+    fn surface_cursor_shape_initially_none() {
+        let s = Surface::new(10, 5);
+        assert!(s.cursor_shape().is_none());
+    }
+
+    #[test]
+    fn surface_cursor_visibility_initially_visible() {
+        let s = Surface::new(10, 5);
+        assert_eq!(s.cursor_visibility(), CursorVisibility::Visible);
+    }
+
+    #[test]
+    fn surface_title_initially_empty() {
+        let s = Surface::new(10, 5);
+        assert_eq!(s.title(), "");
+    }
+
+    #[test]
+    fn surface_set_title() {
+        let mut s = Surface::new(10, 5);
+        s.add_change(Change::Title("hello".to_string()));
+        assert_eq!(s.title(), "hello");
+    }
+
+    #[test]
+    fn surface_set_cursor_shape() {
+        let mut s = Surface::new(10, 5);
+        s.add_change(Change::CursorShape(CursorShape::BlinkingBar));
+        assert_eq!(s.cursor_shape(), Some(CursorShape::BlinkingBar));
+    }
+
+    #[test]
+    fn surface_set_cursor_visibility_hidden() {
+        let mut s = Surface::new(10, 5);
+        s.add_change(Change::CursorVisibility(CursorVisibility::Hidden));
+        assert_eq!(s.cursor_visibility(), CursorVisibility::Hidden);
+    }
+
+    #[test]
+    fn surface_set_cursor_color() {
+        let mut s = Surface::new(10, 5);
+        s.add_change(Change::CursorColor(AnsiColor::Red.into()));
+        // Cursor color is applied, no panic
+    }
+
+    #[test]
+    fn surface_has_changes_false_initially() {
+        let s = Surface::new(10, 5);
+        assert!(!s.has_changes(0));
+    }
+
+    #[test]
+    fn surface_has_changes_true_after_add() {
+        let mut s = Surface::new(10, 5);
+        s.add_change("hello");
+        assert!(s.has_changes(0));
+    }
+
+    #[test]
+    fn surface_current_seqno_advances() {
+        let mut s = Surface::new(10, 5);
+        let seq0 = s.current_seqno();
+        s.add_change("a");
+        let seq1 = s.current_seqno();
+        assert!(seq1 > seq0);
+    }
+
+    #[test]
+    fn surface_screen_lines_count() {
+        let s = Surface::new(4, 3);
+        assert_eq!(s.screen_lines().len(), 3);
+    }
+
+    // === Scroll region tests ===
+
+    #[test]
+    fn scroll_region_up() {
+        let mut s = Surface::new(3, 4);
+        s.add_change("aaabbbcccddd");
+        assert_eq!(s.screen_chars_to_string(), "aaa\nbbb\nccc\nddd\n");
+        s.add_change(Change::ScrollRegionUp {
+            first_row: 1,
+            region_size: 2,
+            scroll_count: 1,
+        });
+        assert_eq!(s.screen_chars_to_string(), "aaa\nccc\n   \nddd\n");
+    }
+
+    #[test]
+    fn scroll_region_down() {
+        let mut s = Surface::new(3, 4);
+        s.add_change("aaabbbcccddd");
+        assert_eq!(s.screen_chars_to_string(), "aaa\nbbb\nccc\nddd\n");
+        s.add_change(Change::ScrollRegionDown {
+            first_row: 1,
+            region_size: 2,
+            scroll_count: 1,
+        });
+        assert_eq!(s.screen_chars_to_string(), "aaa\n   \nbbb\nddd\n");
+    }
+
+    // === Line attribute tests ===
+
+    #[test]
+    fn surface_line_attribute_double_width() {
+        let mut s = Surface::new(4, 2);
+        s.add_change("test");
+        s.add_change(Change::CursorPosition {
+            x: Position::Absolute(0),
+            y: Position::Absolute(0),
+        });
+        s.add_change(Change::LineAttribute(LineAttribute::DoubleWidthLine));
+        // No panic - line attribute applied
+    }
+
+    // === diff_screens test ===
+
+    #[test]
+    fn diff_screens_identical_is_empty() {
+        let mut s1 = Surface::new(3, 2);
+        let mut s2 = Surface::new(3, 2);
+        s1.add_change("abcdef");
+        s2.add_change("abcdef");
+        let changes = s1.diff_screens(&s2);
+        assert!(changes.is_empty());
+    }
+
+    // === text wrapping at screen edge ===
+
+    #[test]
+    fn text_wrapping_at_edge() {
+        let mut s = Surface::new(3, 2);
+        s.add_change("abcdef");
+        assert_eq!(s.screen_chars_to_string(), "abc\ndef\n");
+    }
+
+    #[test]
+    fn text_scrolls_when_overflow() {
+        let mut s = Surface::new(3, 2);
+        s.add_change("abcdefghi");
+        // "abc" on row 0, "def" on row 1, "ghi" scrolls: row0=def, row1=ghi
+        assert_eq!(s.screen_chars_to_string(), "def\nghi\n");
+    }
+
+    // === CR handling ===
+
+    #[test]
+    fn carriage_return_resets_x() {
+        let mut s = Surface::new(5, 1);
+        s.add_change("abc\rXY");
+        assert_eq!(s.screen_chars_to_string(), "XYc  \n");
+    }
+
+    // === resize edge cases ===
+
+    #[test]
+    fn resize_larger() {
+        let mut s = Surface::new(2, 2);
+        s.add_change("abcd");
+        s.resize(4, 4);
+        assert_eq!(s.dimensions(), (4, 4));
+        // Content preserved, padded with spaces
+        assert_eq!(s.screen_chars_to_string(), "ab  \ncd  \n    \n    \n");
+    }
+
+    #[test]
+    fn resize_smaller_truncates() {
+        let mut s = Surface::new(4, 4);
+        s.add_change("abcdefghijklmnop");
+        s.resize(2, 2);
+        assert_eq!(s.dimensions(), (2, 2));
+        // Truncated to 2x2
+        assert_eq!(s.screen_chars_to_string(), "ab\nef\n");
+    }
+
+    // === Surface clone ===
+
+    #[test]
+    fn surface_clone() {
+        let mut s = Surface::new(3, 2);
+        s.add_change("hello!");
+        let s2 = s.clone();
+        assert_eq!(s2.dimensions(), (3, 2));
+        assert_eq!(s2.screen_chars_to_string(), "hel\nlo!\n");
+    }
+
+    // === Default Surface ===
+
+    #[test]
+    fn surface_default() {
+        let s = Surface::default();
+        assert_eq!(s.dimensions(), (0, 0));
+    }
+
+    // === flush_changes_older_than ===
+
+    #[test]
+    fn flush_changes_noop_on_empty() {
+        let mut s = Surface::new(2, 2);
+        s.flush_changes_older_than(0);
+        // No panic
+    }
+
+    #[test]
+    fn flush_changes_invalid_seq() {
+        let mut s = Surface::new(2, 2);
+        s.add_change("a");
+        s.flush_changes_older_than(999);
+        // No panic
+    }
+
+    // === repaint includes title ===
+
+    #[test]
+    fn repaint_includes_title() {
+        let mut s = Surface::new(3, 1);
+        s.add_change(Change::Title("myterm".to_string()));
+        let (_seq, changes) = s.get_changes(0);
+        assert!(changes
+            .iter()
+            .any(|c| matches!(c, Change::Title(t) if t == "myterm")));
+    }
+
+    // === repaint includes cursor shape ===
+
+    #[test]
+    fn repaint_includes_cursor_shape() {
+        let mut s = Surface::new(3, 1);
+        s.add_change(Change::CursorShape(CursorShape::SteadyUnderline));
+        let (_seq, changes) = s.get_changes(0);
+        assert!(changes
+            .iter()
+            .any(|c| matches!(c, Change::CursorShape(CursorShape::SteadyUnderline))));
+    }
+
+    // === hidden cursor not shown in repaint ===
+
+    #[test]
+    fn repaint_hidden_cursor() {
+        let mut s = Surface::new(3, 1);
+        s.add_change(Change::CursorVisibility(CursorVisibility::Hidden));
+        let (_seq, changes) = s.get_changes(0);
+        // Should not contain CursorVisibility::Visible at the end
+        let last = changes.last().unwrap();
+        assert!(!matches!(
+            last,
+            Change::CursorVisibility(CursorVisibility::Visible)
+        ));
+    }
+
+    // === draw_from_screen preserves cursor ===
+
+    #[test]
+    fn draw_from_screen_preserves_cursor() {
+        let mut dest = Surface::new(4, 4);
+        dest.add_change("ABCD");
+        let cursor_before = dest.cursor_position();
+        let src = Surface::new(2, 2);
+        dest.draw_from_screen(&src, 0, 0);
+        assert_eq!(dest.cursor_position(), cursor_before);
+    }
+
+    // === diff_against_numbered_line ===
+
+    #[test]
+    fn diff_against_numbered_line_out_of_bounds() {
+        let s = Surface::new(3, 2);
+        let line = Line::with_width(3, 0);
+        let changes = s.diff_against_numbered_line(99, &line);
+        assert!(changes.is_empty());
+    }
 }
