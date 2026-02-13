@@ -166,48 +166,169 @@ fn parse_wsl_distro_list(output: &str) -> Vec<WslDistro> {
 }
 
 #[cfg(test)]
-#[test]
-fn test_parse_wsl_distro_list() {
-    let data = "  NAME                   STATE           VERSION
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_wsl_distro_list() {
+        let data = "  NAME                   STATE           VERSION
 * Arch                   Running         2
   docker-desktop-data    Stopped         2
   docker-desktop         Stopped         2
   Ubuntu                 Stopped         2
   nvim                   Stopped         2";
 
-    assert_eq!(
-        parse_wsl_distro_list(data),
-        vec![
-            WslDistro {
-                name: "Arch".to_string(),
-                state: "Running".to_string(),
-                version: "2".to_string(),
-                is_default: true
-            },
-            WslDistro {
-                name: "docker-desktop-data".to_string(),
-                state: "Stopped".to_string(),
-                version: "2".to_string(),
-                is_default: false
-            },
-            WslDistro {
-                name: "docker-desktop".to_string(),
-                state: "Stopped".to_string(),
-                version: "2".to_string(),
-                is_default: false
-            },
-            WslDistro {
-                name: "Ubuntu".to_string(),
-                state: "Stopped".to_string(),
-                version: "2".to_string(),
-                is_default: false
-            },
-            WslDistro {
-                name: "nvim".to_string(),
-                state: "Stopped".to_string(),
-                version: "2".to_string(),
-                is_default: false
-            },
-        ]
-    );
+        assert_eq!(
+            parse_wsl_distro_list(data),
+            vec![
+                WslDistro {
+                    name: "Arch".to_string(),
+                    state: "Running".to_string(),
+                    version: "2".to_string(),
+                    is_default: true
+                },
+                WslDistro {
+                    name: "docker-desktop-data".to_string(),
+                    state: "Stopped".to_string(),
+                    version: "2".to_string(),
+                    is_default: false
+                },
+                WslDistro {
+                    name: "docker-desktop".to_string(),
+                    state: "Stopped".to_string(),
+                    version: "2".to_string(),
+                    is_default: false
+                },
+                WslDistro {
+                    name: "Ubuntu".to_string(),
+                    state: "Stopped".to_string(),
+                    version: "2".to_string(),
+                    is_default: false
+                },
+                WslDistro {
+                    name: "nvim".to_string(),
+                    state: "Stopped".to_string(),
+                    version: "2".to_string(),
+                    is_default: false
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_wsl_single_distro() {
+        let data = "  NAME      STATE      VERSION
+  Ubuntu    Running    2";
+        let distros = parse_wsl_distro_list(data);
+        assert_eq!(distros.len(), 1);
+        assert_eq!(distros[0].name, "Ubuntu");
+        assert!(!distros[0].is_default);
+    }
+
+    #[test]
+    fn parse_wsl_single_default_distro() {
+        let data = "  NAME      STATE      VERSION
+* Ubuntu    Running    2";
+        let distros = parse_wsl_distro_list(data);
+        assert_eq!(distros.len(), 1);
+        assert!(distros[0].is_default);
+    }
+
+    #[test]
+    fn parse_wsl_empty_lines_skipped() {
+        let data = "  NAME      STATE      VERSION
+
+  Ubuntu    Running    2
+
+  Debian    Stopped    1
+";
+        let distros = parse_wsl_distro_list(data);
+        assert_eq!(distros.len(), 2);
+        assert_eq!(distros[0].name, "Ubuntu");
+        assert_eq!(distros[1].name, "Debian");
+    }
+
+    #[test]
+    fn wsl_domain_default() {
+        let domain = WslDomain::default();
+        assert_eq!(domain.name, "");
+        assert!(domain.distribution.is_none());
+        assert!(domain.username.is_none());
+        assert!(domain.default_cwd.is_none());
+        assert!(domain.default_prog.is_none());
+    }
+
+    #[test]
+    fn wsl_domain_clone() {
+        let domain = WslDomain {
+            name: "WSL:Ubuntu".to_string(),
+            distribution: Some("Ubuntu".to_string()),
+            username: Some("user".to_string()),
+            default_cwd: Some("~".into()),
+            default_prog: None,
+        };
+        let cloned = domain.clone();
+        assert_eq!(cloned.name, "WSL:Ubuntu");
+        assert_eq!(cloned.distribution.as_deref(), Some("Ubuntu"));
+        assert_eq!(cloned.username.as_deref(), Some("user"));
+    }
+
+    #[test]
+    fn wsl_domain_debug() {
+        let domain = WslDomain::default();
+        let dbg = format!("{:?}", domain);
+        assert!(dbg.contains("WslDomain"));
+    }
+
+    #[test]
+    fn wsl_domain_default_domains_is_empty_on_non_windows() {
+        // On non-windows, default_domains returns empty
+        let domains = WslDomain::default_domains();
+        #[cfg(not(windows))]
+        assert!(domains.is_empty());
+        // On windows, it may or may not be empty depending on WSL state
+        let _ = domains;
+    }
+
+    #[test]
+    fn wsl_distro_equality() {
+        let a = WslDistro {
+            name: "Ubuntu".to_string(),
+            state: "Running".to_string(),
+            version: "2".to_string(),
+            is_default: true,
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn wsl_distro_inequality() {
+        let a = WslDistro {
+            name: "Ubuntu".to_string(),
+            state: "Running".to_string(),
+            version: "2".to_string(),
+            is_default: true,
+        };
+        let b = WslDistro {
+            name: "Debian".to_string(),
+            state: "Stopped".to_string(),
+            version: "1".to_string(),
+            is_default: false,
+        };
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn wsl_distro_debug() {
+        let d = WslDistro {
+            name: "Test".to_string(),
+            state: "Running".to_string(),
+            version: "2".to_string(),
+            is_default: false,
+        };
+        let dbg = format!("{:?}", d);
+        assert!(dbg.contains("Test"));
+        assert!(dbg.contains("Running"));
+    }
 }

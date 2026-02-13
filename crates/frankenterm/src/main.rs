@@ -1407,6 +1407,8 @@ SEE ALSO:
     #[command(after_help = r#"EXAMPLES:
     ft simulate run scenario.yaml        Run a scenario file
     ft simulate run scenario.yaml -s 4   Run at 4x speed
+    ft simulate run scenario.yaml --json --resize-timeline-json
+                                        Emit a single resize timeline artifact JSON envelope
     ft simulate list                     List built-in scenarios
     ft simulate validate scenario.yaml   Check scenario syntax
 
@@ -1526,6 +1528,13 @@ enum SimulateCommands {
         /// Output as JSON (events and state changes)
         #[arg(long)]
         json: bool,
+
+        /// Emit a single JSON envelope containing resize timeline probes,
+        /// stage summaries, and flamegraph rows.
+        ///
+        /// This is intended for baseline/SLO artifact generation.
+        #[arg(long)]
+        resize_timeline_json: bool,
     },
     /// List available built-in scenarios
     List,
@@ -22076,6 +22085,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 scenario,
                 speed,
                 json,
+                resize_timeline_json,
             } => {
                 use frankenterm_core::simulation::Scenario;
                 use frankenterm_core::wezterm::{MockWezterm, WeztermInterface};
@@ -22084,7 +22094,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 let mock = MockWezterm::new();
                 scenario.setup(&mock).await?;
 
-                if json {
+                if resize_timeline_json && !json {
+                    return Err(frankenterm_core::Error::Runtime(
+                        "--resize-timeline-json requires --json".to_string(),
+                    ));
+                }
+
+                if json && !resize_timeline_json {
                     // Output scenario metadata
                     let meta = serde_json::json!({
                         "name": scenario.name,
@@ -22097,7 +22113,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         "reproducibility_key": scenario.reproducibility_key(),
                     });
                     println!("{}", serde_json::to_string_pretty(&meta)?);
-                } else {
+                } else if !json {
                     println!("Simulation: {}", scenario.name);
                     if !scenario.description.is_empty() {
                         println!("  {}", scenario.description);
@@ -22116,6 +22132,61 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         }
                     }
                     println!();
+                }
+
+                if resize_timeline_json {
+                    let (executed, timeline) =
+                        scenario.execute_all_with_resize_timeline(&mock).await?;
+                    let stage_summary = timeline.stage_summary();
+                    let flame_samples = timeline.flame_samples();
+
+                    let mut pass_count = 0;
+                    let mut fail_count = 0;
+                    for exp in &scenario.expectations {
+                        match &exp.kind {
+                            frankenterm_core::simulation::ExpectationKind::Contains {
+                                pane,
+                                text,
+                            } => {
+                                let content = mock.get_text(*pane, false).await.unwrap_or_default();
+                                if content.contains(text) {
+                                    pass_count += 1;
+                                } else {
+                                    fail_count += 1;
+                                }
+                            }
+                            _ => {
+                                // Event/Workflow expectations need pattern engine integration
+                            }
+                        }
+                    }
+
+                    let artifact = serde_json::json!({
+                        "completed": fail_count == 0,
+                        "mode": "resize_timeline_json",
+                        "scenario": {
+                            "name": scenario.name,
+                            "description": scenario.description,
+                            "duration_ms": scenario.duration.as_millis() as u64,
+                            "pane_count": scenario.panes.len(),
+                            "event_count": scenario.events.len(),
+                            "expectation_count": scenario.expectations.len(),
+                            "metadata": &scenario.metadata,
+                            "reproducibility_key": scenario.reproducibility_key(),
+                        },
+                        "events_executed": executed,
+                        "expectations_passed": pass_count,
+                        "expectations_failed": fail_count,
+                        "timeline": timeline,
+                        "stage_summary": stage_summary,
+                        "flame_samples": flame_samples,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&artifact)?);
+
+                    if fail_count > 0 {
+                        std::process::exit(1);
+                    }
+                    return Ok(());
                 }
 
                 // Execute events with timing

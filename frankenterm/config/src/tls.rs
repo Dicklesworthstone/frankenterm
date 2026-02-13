@@ -145,4 +145,69 @@ mod tests {
             "unexpected error: {err}"
         );
     }
+
+    #[test]
+    fn tls_domain_server_default() {
+        let server = TlsDomainServer::default();
+        assert_eq!(server.bind_address, "");
+        assert!(server.pem_private_key.is_none());
+        assert!(server.pem_cert.is_none());
+        assert!(server.pem_ca.is_none());
+        assert!(server.pem_root_certs.is_empty());
+    }
+
+    #[test]
+    fn tls_domain_server_clone() {
+        let server = TlsDomainServer {
+            bind_address: "127.0.0.1:8080".to_string(),
+            pem_private_key: Some("/tmp/key.pem".into()),
+            pem_cert: None,
+            pem_ca: None,
+            pem_root_certs: vec![],
+        };
+        let cloned = server.clone();
+        assert_eq!(cloned.bind_address, "127.0.0.1:8080");
+        assert!(cloned.pem_private_key.is_some());
+    }
+
+    #[test]
+    fn tls_domain_server_debug() {
+        let server = TlsDomainServer::default();
+        let dbg = format!("{:?}", server);
+        assert!(dbg.contains("TlsDomainServer"));
+    }
+
+    #[test]
+    fn tls_domain_client_default() {
+        let client = TlsDomainClient::default();
+        assert_eq!(client.name, "");
+        assert_eq!(client.remote_address, "");
+        assert!(!client.accept_invalid_hostnames);
+        assert!(!client.connect_automatically);
+        assert!(!client.overlay_lag_indicator);
+        assert!(client.bootstrap_via_ssh.is_none());
+        assert!(client.expected_cn.is_none());
+        assert!(client.remote_wezterm_path.is_none());
+    }
+
+    #[test]
+    fn tls_domain_client_clone() {
+        let client = TlsDomainClient {
+            name: "remote".to_string(),
+            remote_address: "host:1234".to_string(),
+            connect_automatically: true,
+            ..TlsDomainClient::default()
+        };
+        let cloned = client.clone();
+        assert_eq!(cloned.name, "remote");
+        assert_eq!(cloned.remote_address, "host:1234");
+        assert!(cloned.connect_automatically);
+    }
+
+    #[test]
+    fn tls_domain_client_debug() {
+        let client = TlsDomainClient::default();
+        let dbg = format!("{:?}", client);
+        assert!(dbg.contains("TlsDomainClient"));
+    }
 }
