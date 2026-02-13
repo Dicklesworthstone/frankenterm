@@ -198,6 +198,7 @@ implicit_clone = "allow"
 # Core dependencies
 serde = { version = "1.0.228", default-features = false, features = ["derive"] }
 serde_json = "1.0.149"
+tantivy = "0.25"
 tokio = { version = "1.49.0", features = ["full"] }
 thiserror = "2.0.18"
 anyhow = "1.0.100"
