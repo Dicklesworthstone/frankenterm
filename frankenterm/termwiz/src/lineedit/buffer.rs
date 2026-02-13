@@ -22,15 +22,15 @@ impl LineEditBuffer {
     pub fn new(line: &str, cursor: usize) -> Self {
         let mut buffer = Self::default();
         buffer.set_line_and_cursor(line, cursor);
-        return buffer;
+        buffer
     }
 
     pub fn get_line(&self) -> &str {
-        return &self.line;
+        &self.line
     }
 
     pub fn get_cursor(&self) -> usize {
-        return self.cursor;
+        self.cursor
     }
 
     pub fn insert_char(&mut self, c: char) {
@@ -185,5 +185,292 @@ impl LineEditBuffer {
             }
             Movement::None => self.cursor,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Construction ────────────────────────────────────────
+
+    #[test]
+    fn default_is_empty() {
+        let buf = LineEditBuffer::default();
+        assert_eq!(buf.get_line(), "");
+        assert_eq!(buf.get_cursor(), 0);
+    }
+
+    #[test]
+    fn new_sets_line_and_cursor() {
+        let buf = LineEditBuffer::new("hello", 3);
+        assert_eq!(buf.get_line(), "hello");
+        assert_eq!(buf.get_cursor(), 3);
+    }
+
+    #[test]
+    fn new_cursor_at_end() {
+        let buf = LineEditBuffer::new("abc", 3);
+        assert_eq!(buf.get_cursor(), 3);
+    }
+
+    #[test]
+    fn new_cursor_at_start() {
+        let buf = LineEditBuffer::new("abc", 0);
+        assert_eq!(buf.get_cursor(), 0);
+    }
+
+    // ── set_line_and_cursor ─────────────────────────────────
+
+    #[test]
+    fn set_line_and_cursor_replaces_content() {
+        let mut buf = LineEditBuffer::new("old", 1);
+        buf.set_line_and_cursor("new text", 4);
+        assert_eq!(buf.get_line(), "new text");
+        assert_eq!(buf.get_cursor(), 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "cursor")]
+    fn set_line_and_cursor_panics_on_non_boundary() {
+        let mut buf = LineEditBuffer::default();
+        // "é" is 2 bytes, so byte index 1 is mid-char
+        buf.set_line_and_cursor("é", 1);
+    }
+
+    // ── insert_char ─────────────────────────────────────────
+
+    #[test]
+    fn insert_char_at_start() {
+        let mut buf = LineEditBuffer::new("bc", 0);
+        buf.insert_char('a');
+        assert_eq!(buf.get_line(), "abc");
+        assert_eq!(buf.get_cursor(), 1);
+    }
+
+    #[test]
+    fn insert_char_at_end() {
+        let mut buf = LineEditBuffer::new("ab", 2);
+        buf.insert_char('c');
+        assert_eq!(buf.get_line(), "abc");
+        assert_eq!(buf.get_cursor(), 3);
+    }
+
+    #[test]
+    fn insert_char_in_middle() {
+        let mut buf = LineEditBuffer::new("ac", 1);
+        buf.insert_char('b');
+        assert_eq!(buf.get_line(), "abc");
+        assert_eq!(buf.get_cursor(), 2);
+    }
+
+    #[test]
+    fn insert_multibyte_char() {
+        let mut buf = LineEditBuffer::new("", 0);
+        buf.insert_char('é');
+        assert_eq!(buf.get_line(), "é");
+        assert_eq!(buf.get_cursor(), 2); // é is 2 bytes in UTF-8
+    }
+
+    // ── insert_text ─────────────────────────────────────────
+
+    #[test]
+    fn insert_text_at_start() {
+        let mut buf = LineEditBuffer::new("world", 0);
+        buf.insert_text("hello ");
+        assert_eq!(buf.get_line(), "hello world");
+        assert_eq!(buf.get_cursor(), 6);
+    }
+
+    #[test]
+    fn insert_text_at_end() {
+        let mut buf = LineEditBuffer::new("hello", 5);
+        buf.insert_text(" world");
+        assert_eq!(buf.get_line(), "hello world");
+        assert_eq!(buf.get_cursor(), 11);
+    }
+
+    #[test]
+    fn insert_empty_text() {
+        let mut buf = LineEditBuffer::new("hello", 3);
+        buf.insert_text("");
+        assert_eq!(buf.get_line(), "hello");
+        assert_eq!(buf.get_cursor(), 3);
+    }
+
+    // ── clear ───────────────────────────────────────────────
+
+    #[test]
+    fn clear_empties_buffer() {
+        let mut buf = LineEditBuffer::new("hello world", 5);
+        buf.clear();
+        assert_eq!(buf.get_line(), "");
+        assert_eq!(buf.get_cursor(), 0);
+    }
+
+    // ── Movement: ForwardChar / BackwardChar ────────────────
+
+    #[test]
+    fn forward_char_moves_one() {
+        let mut buf = LineEditBuffer::new("abc", 0);
+        buf.exec_movement(Movement::ForwardChar(1));
+        assert_eq!(buf.get_cursor(), 1);
+    }
+
+    #[test]
+    fn forward_char_moves_multiple() {
+        let mut buf = LineEditBuffer::new("abcdef", 0);
+        buf.exec_movement(Movement::ForwardChar(3));
+        assert_eq!(buf.get_cursor(), 3);
+    }
+
+    #[test]
+    fn forward_char_stops_at_end() {
+        let mut buf = LineEditBuffer::new("ab", 1);
+        buf.exec_movement(Movement::ForwardChar(5));
+        assert_eq!(buf.get_cursor(), 2);
+    }
+
+    #[test]
+    fn backward_char_moves_one() {
+        let mut buf = LineEditBuffer::new("abc", 2);
+        buf.exec_movement(Movement::BackwardChar(1));
+        assert_eq!(buf.get_cursor(), 1);
+    }
+
+    #[test]
+    fn backward_char_stops_at_start() {
+        let mut buf = LineEditBuffer::new("abc", 1);
+        buf.exec_movement(Movement::BackwardChar(5));
+        assert_eq!(buf.get_cursor(), 0);
+    }
+
+    // ── Movement: StartOfLine / EndOfLine ───────────────────
+
+    #[test]
+    fn start_of_line_moves_to_zero() {
+        let mut buf = LineEditBuffer::new("hello", 3);
+        buf.exec_movement(Movement::StartOfLine);
+        assert_eq!(buf.get_cursor(), 0);
+    }
+
+    #[test]
+    fn end_of_line_moves_to_end() {
+        let mut buf = LineEditBuffer::new("hello", 0);
+        buf.exec_movement(Movement::EndOfLine);
+        assert_eq!(buf.get_cursor(), 5);
+    }
+
+    // ── Movement: ForwardWord / BackwardWord ────────────────
+
+    #[test]
+    fn forward_word_skips_to_next_word() {
+        let mut buf = LineEditBuffer::new("hello world", 0);
+        buf.exec_movement(Movement::ForwardWord(1));
+        assert_eq!(buf.get_cursor(), 6); // start of "world"
+    }
+
+    #[test]
+    fn forward_word_at_end_stays() {
+        let mut buf = LineEditBuffer::new("hello", 5);
+        buf.exec_movement(Movement::ForwardWord(1));
+        assert_eq!(buf.get_cursor(), 5);
+    }
+
+    #[test]
+    fn backward_word_skips_to_prev_word() {
+        let mut buf = LineEditBuffer::new("hello world", 6);
+        buf.exec_movement(Movement::BackwardWord(1));
+        assert_eq!(buf.get_cursor(), 0); // start of "hello"
+    }
+
+    #[test]
+    fn backward_word_at_start_stays() {
+        let mut buf = LineEditBuffer::new("hello world", 0);
+        buf.exec_movement(Movement::BackwardWord(1));
+        assert_eq!(buf.get_cursor(), 0);
+    }
+
+    // ── Movement: None ──────────────────────────────────────
+
+    #[test]
+    fn movement_none_does_not_move() {
+        let mut buf = LineEditBuffer::new("hello", 3);
+        buf.exec_movement(Movement::None);
+        assert_eq!(buf.get_cursor(), 3);
+    }
+
+    // ── kill_text ───────────────────────────────────────────
+
+    #[test]
+    fn kill_to_end_of_line() {
+        let mut buf = LineEditBuffer::new("hello world", 5);
+        buf.kill_text(Movement::EndOfLine, Movement::None);
+        assert_eq!(buf.get_line(), "hello");
+        assert_eq!(buf.get_cursor(), 5);
+    }
+
+    #[test]
+    fn kill_to_start_of_line() {
+        let mut buf = LineEditBuffer::new("hello world", 5);
+        buf.kill_text(Movement::StartOfLine, Movement::StartOfLine);
+        assert_eq!(buf.get_line(), " world");
+        assert_eq!(buf.get_cursor(), 0);
+    }
+
+    #[test]
+    fn kill_backward_char() {
+        let mut buf = LineEditBuffer::new("abc", 2);
+        buf.kill_text(Movement::BackwardChar(1), Movement::BackwardChar(1));
+        assert_eq!(buf.get_line(), "ac");
+        assert_eq!(buf.get_cursor(), 1);
+    }
+
+    #[test]
+    fn kill_forward_char() {
+        let mut buf = LineEditBuffer::new("abc", 1);
+        buf.kill_text(Movement::ForwardChar(1), Movement::None);
+        assert_eq!(buf.get_line(), "ac");
+        assert_eq!(buf.get_cursor(), 1);
+    }
+
+    // ── Unicode / multibyte ─────────────────────────────────
+
+    #[test]
+    fn movement_with_multibyte_chars() {
+        // "café" has é at byte offset 3-4
+        let mut buf = LineEditBuffer::new("café", 0);
+        buf.exec_movement(Movement::ForwardChar(4));
+        assert_eq!(buf.get_cursor(), 5); // past "café" (5 bytes)
+    }
+
+    #[test]
+    fn insert_char_into_multibyte_string() {
+        let mut buf = LineEditBuffer::new("café", 5);
+        buf.insert_char('!');
+        assert_eq!(buf.get_line(), "café!");
+    }
+
+    // ── empty line edge cases ───────────────────────────────
+
+    #[test]
+    fn forward_word_on_empty_line() {
+        let mut buf = LineEditBuffer::new("", 0);
+        buf.exec_movement(Movement::ForwardWord(1));
+        assert_eq!(buf.get_cursor(), 0);
+    }
+
+    #[test]
+    fn backward_word_on_empty_line() {
+        let mut buf = LineEditBuffer::new("", 0);
+        buf.exec_movement(Movement::BackwardWord(1));
+        assert_eq!(buf.get_cursor(), 0);
+    }
+
+    #[test]
+    fn kill_on_empty_line() {
+        let mut buf = LineEditBuffer::new("", 0);
+        buf.kill_text(Movement::EndOfLine, Movement::None);
+        assert_eq!(buf.get_line(), "");
     }
 }

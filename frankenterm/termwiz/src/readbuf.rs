@@ -48,3 +48,106 @@ impl ReadBuffer {
         needle.search_in(haystack).map(|x| x + offset)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_is_empty() {
+        let buf = ReadBuffer::new();
+        assert!(buf.is_empty());
+        assert_eq!(buf.len(), 0);
+        assert_eq!(buf.as_slice(), &[]);
+    }
+
+    #[test]
+    fn extend_with_adds_data() {
+        let mut buf = ReadBuffer::new();
+        buf.extend_with(b"hello");
+        assert!(!buf.is_empty());
+        assert_eq!(buf.len(), 5);
+        assert_eq!(buf.as_slice(), b"hello");
+    }
+
+    #[test]
+    fn extend_with_appends() {
+        let mut buf = ReadBuffer::new();
+        buf.extend_with(b"hel");
+        buf.extend_with(b"lo");
+        assert_eq!(buf.as_slice(), b"hello");
+    }
+
+    #[test]
+    fn advance_discards_prefix() {
+        let mut buf = ReadBuffer::new();
+        buf.extend_with(b"hello world");
+        buf.advance(6);
+        assert_eq!(buf.as_slice(), b"world");
+        assert_eq!(buf.len(), 5);
+    }
+
+    #[test]
+    fn advance_entire_buffer() {
+        let mut buf = ReadBuffer::new();
+        buf.extend_with(b"abc");
+        buf.advance(3);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn advance_zero_is_noop() {
+        let mut buf = ReadBuffer::new();
+        buf.extend_with(b"data");
+        buf.advance(0);
+        assert_eq!(buf.as_slice(), b"data");
+    }
+
+    #[test]
+    fn find_subsequence_at_start() {
+        let mut buf = ReadBuffer::new();
+        buf.extend_with(b"hello world");
+        assert_eq!(buf.find_subsequence(0, b"hello"), Some(0));
+    }
+
+    #[test]
+    fn find_subsequence_in_middle() {
+        let mut buf = ReadBuffer::new();
+        buf.extend_with(b"hello world");
+        assert_eq!(buf.find_subsequence(0, b"world"), Some(6));
+    }
+
+    #[test]
+    fn find_subsequence_not_found() {
+        let mut buf = ReadBuffer::new();
+        buf.extend_with(b"hello world");
+        assert_eq!(buf.find_subsequence(0, b"xyz"), None);
+    }
+
+    #[test]
+    fn find_subsequence_with_offset() {
+        let mut buf = ReadBuffer::new();
+        buf.extend_with(b"abcabc");
+        // Starting at offset 1 should find the second "abc" at position 3
+        assert_eq!(buf.find_subsequence(1, b"abc"), Some(3));
+    }
+
+    #[test]
+    fn find_subsequence_offset_past_match() {
+        let mut buf = ReadBuffer::new();
+        buf.extend_with(b"abc");
+        // Start searching after the only occurrence
+        assert_eq!(buf.find_subsequence(1, b"abc"), None);
+    }
+
+    #[test]
+    fn advance_then_extend_then_find() {
+        let mut buf = ReadBuffer::new();
+        buf.extend_with(b"prefix:data");
+        buf.advance(7);
+        assert_eq!(buf.as_slice(), b"data");
+        buf.extend_with(b":more");
+        assert_eq!(buf.as_slice(), b"data:more");
+        assert_eq!(buf.find_subsequence(0, b"more"), Some(5));
+    }
+}

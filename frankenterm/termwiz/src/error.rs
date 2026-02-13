@@ -186,3 +186,174 @@ where
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error as StdError;
+
+    // ── StringWrap ──────────────────────────────────────────
+
+    #[test]
+    fn string_wrap_displays_inner_string() {
+        let sw = StringWrap("test error".to_string());
+        assert_eq!(format!("{sw}"), "test error");
+    }
+
+    #[test]
+    fn string_wrap_debug() {
+        let sw = StringWrap("msg".to_string());
+        let debug = format!("{sw:?}");
+        assert!(debug.contains("msg"));
+    }
+
+    // ── InternalError ───────────────────────────────────────
+
+    #[test]
+    fn internal_error_from_string() {
+        let err: InternalError = "something failed".to_string().into();
+        assert_eq!(format!("{err}"), "something failed");
+    }
+
+    #[test]
+    fn internal_error_from_io_error() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "not found");
+        let err: InternalError = io_err.into();
+        assert!(format!("{err}").contains("not found"));
+    }
+
+    #[test]
+    fn internal_error_from_fmt_error() {
+        let fmt_err = std::fmt::Error;
+        let err: InternalError = fmt_err.into();
+        let display = format!("{err}");
+        assert!(!display.is_empty());
+    }
+
+    #[test]
+    fn internal_error_context_displays_context() {
+        let ctx_err = InternalError::Context {
+            context: "while doing X".to_string(),
+            source: Box::new(std::io::Error::new(std::io::ErrorKind::Other, "inner")),
+        };
+        assert_eq!(format!("{ctx_err}"), "while doing X");
+    }
+
+    // ── Error wrapper ───────────────────────────────────────
+
+    #[test]
+    fn error_from_internal_is_transparent() {
+        let internal: InternalError = "custom msg".to_string().into();
+        let err = Error(internal);
+        assert_eq!(format!("{err}"), "custom msg");
+    }
+
+    #[test]
+    fn error_from_io_error() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken");
+        let err: Error = io_err.into();
+        assert!(format!("{err}").contains("broken"));
+    }
+
+    #[test]
+    fn error_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Error>();
+    }
+
+    #[test]
+    fn error_debug_is_not_empty() {
+        let err: Error = std::io::Error::new(std::io::ErrorKind::Other, "test").into();
+        let debug = format!("{err:?}");
+        assert!(!debug.is_empty());
+    }
+
+    #[test]
+    fn error_transparent_delegates_display() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "root cause");
+        let err: Error = io_err.into();
+        // Error is transparent, so Display delegates to InternalError
+        assert!(format!("{err}").contains("root cause"));
+    }
+
+    // ── Context trait ───────────────────────────────────────
+
+    #[test]
+    fn context_wraps_error() {
+        let result: std::result::Result<(), std::io::Error> =
+            Err(std::io::Error::new(std::io::ErrorKind::Other, "inner"));
+        let contexted = result.context("outer context");
+        let err = contexted.unwrap_err();
+        assert_eq!(format!("{err}"), "outer context");
+    }
+
+    #[test]
+    fn with_context_wraps_error_lazily() {
+        let result: std::result::Result<(), std::io::Error> =
+            Err(std::io::Error::new(std::io::ErrorKind::Other, "inner"));
+        let contexted = result.with_context(|| format!("lazy {}", "context"));
+        let err = contexted.unwrap_err();
+        assert_eq!(format!("{err}"), "lazy context");
+    }
+
+    #[test]
+    fn context_preserves_ok() {
+        let result: std::result::Result<i32, std::io::Error> = Ok(42);
+        let contexted = result.context("should not appear");
+        assert_eq!(contexted.unwrap(), 42);
+    }
+
+    #[test]
+    fn with_context_does_not_call_closure_on_ok() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static CALLED: AtomicBool = AtomicBool::new(false);
+        let result: std::result::Result<i32, std::io::Error> = Ok(42);
+        let contexted = result.with_context(|| {
+            CALLED.store(true, Ordering::SeqCst);
+            "should not appear"
+        });
+        assert_eq!(contexted.unwrap(), 42);
+        assert!(!CALLED.load(Ordering::SeqCst));
+    }
+
+    // ── bail! macro ─────────────────────────────────────────
+
+    fn bail_literal() -> Result<()> {
+        bail!("literal error");
+    }
+
+    fn bail_expr() -> Result<()> {
+        let msg = "dynamic";
+        bail!("{} error", msg);
+    }
+
+    #[test]
+    fn bail_returns_error_with_literal() {
+        let err = bail_literal().unwrap_err();
+        assert_eq!(format!("{err}"), "literal error");
+    }
+
+    #[test]
+    fn bail_returns_error_with_format() {
+        let err = bail_expr().unwrap_err();
+        assert_eq!(format!("{err}"), "dynamic error");
+    }
+
+    // ── ensure! macro ───────────────────────────────────────
+
+    fn ensure_passes(val: bool) -> Result<()> {
+        ensure!(val, "condition failed");
+        Ok(())
+    }
+
+    #[test]
+    fn ensure_true_is_ok() {
+        assert!(ensure_passes(true).is_ok());
+    }
+
+    #[test]
+    fn ensure_false_returns_error() {
+        let err = ensure_passes(false).unwrap_err();
+        assert_eq!(format!("{err}"), "condition failed");
+    }
+}

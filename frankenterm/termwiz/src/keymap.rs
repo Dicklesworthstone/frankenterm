@@ -257,4 +257,90 @@ mod test {
         assert_eq!(km.lookup("\x03foo", MAYBE_MORE), Found::Exact(1, true),);
         assert_eq!(km.lookup("\x03X", MAYBE_MORE), Found::Ambiguous(1, true),);
     }
+
+    // ── Additional tests ────────────────────────────────────
+
+    #[test]
+    fn default_creates_empty_keymap() {
+        let km: KeyMap<bool> = KeyMap::default();
+        assert_eq!(km.lookup("anything", MAYBE_MORE), Found::None);
+    }
+
+    #[test]
+    fn single_byte_key_exact() {
+        let mut km = KeyMap::new();
+        km.insert("a", 42);
+        assert_eq!(km.lookup("a", NO_MORE), Found::Exact(1, 42));
+        assert_eq!(km.lookup("a", MAYBE_MORE), Found::Exact(1, 42));
+    }
+
+    #[test]
+    fn lookup_no_more_resolves_ambiguity() {
+        let mut km = KeyMap::new();
+        km.insert("ab", 1);
+        km.insert("abc", 2);
+        // With NO_MORE, "ab" should resolve to the shorter match
+        assert_eq!(km.lookup("ab", NO_MORE), Found::Exact(2, 1));
+        // With MAYBE_MORE, it's ambiguous
+        assert_eq!(km.lookup("ab", MAYBE_MORE), Found::Ambiguous(2, 1));
+    }
+
+    #[test]
+    fn overwrite_existing_key() {
+        let mut km = KeyMap::new();
+        km.insert("key", 1);
+        km.insert("key", 2);
+        assert_eq!(km.lookup("key", NO_MORE), Found::Exact(3, 2));
+    }
+
+    #[test]
+    fn lookup_prefix_only_needs_data() {
+        let mut km = KeyMap::new();
+        km.insert("abc", true);
+        assert_eq!(km.lookup("a", MAYBE_MORE), Found::NeedData);
+        assert_eq!(km.lookup("ab", MAYBE_MORE), Found::NeedData);
+    }
+
+    #[test]
+    fn lookup_longer_than_any_key_returns_exact() {
+        let mut km = KeyMap::new();
+        km.insert("ab", 99);
+        assert_eq!(km.lookup("abcdef", MAYBE_MORE), Found::Exact(2, 99));
+    }
+
+    #[test]
+    fn lookup_unrelated_prefix_is_none() {
+        let mut km = KeyMap::new();
+        km.insert("abc", true);
+        assert_eq!(km.lookup("xyz", MAYBE_MORE), Found::None);
+    }
+
+    #[test]
+    fn multiple_keys_different_first_bytes() {
+        let mut km = KeyMap::new();
+        km.insert("alpha", 1);
+        km.insert("beta", 2);
+        km.insert("gamma", 3);
+        assert_eq!(km.lookup("alpha", NO_MORE), Found::Exact(5, 1));
+        assert_eq!(km.lookup("beta", NO_MORE), Found::Exact(4, 2));
+        assert_eq!(km.lookup("gamma", NO_MORE), Found::Exact(5, 3));
+    }
+
+    #[test]
+    fn found_enum_equality() {
+        assert_eq!(Found::<i32>::None, Found::None);
+        assert_eq!(Found::Exact(1, 42), Found::Exact(1, 42));
+        assert_ne!(Found::Exact(1, 42), Found::Exact(2, 42));
+        assert_ne!(Found::Exact(1, 42), Found::Exact(1, 43));
+        assert_eq!(Found::NeedData::<bool>, Found::NeedData);
+        assert_eq!(Found::Ambiguous(3, true), Found::Ambiguous(3, true));
+    }
+
+    #[test]
+    fn keymap_clone() {
+        let mut km = KeyMap::new();
+        km.insert("abc", 1);
+        let km2 = km.clone();
+        assert_eq!(km2.lookup("abc", NO_MORE), Found::Exact(3, 1));
+    }
 }

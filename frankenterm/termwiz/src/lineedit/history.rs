@@ -135,3 +135,207 @@ impl History for BasicHistory {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── SearchStyle ─────────────────────────────────────────
+
+    #[test]
+    fn search_style_substring_finds_match() {
+        assert_eq!(SearchStyle::Substring.match_against("ll", "hello"), Some(2));
+    }
+
+    #[test]
+    fn search_style_substring_no_match() {
+        assert_eq!(SearchStyle::Substring.match_against("xyz", "hello"), None);
+    }
+
+    #[test]
+    fn search_style_substring_at_start() {
+        assert_eq!(
+            SearchStyle::Substring.match_against("hel", "hello"),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn search_style_substring_empty_pattern() {
+        assert_eq!(SearchStyle::Substring.match_against("", "hello"), Some(0));
+    }
+
+    #[test]
+    fn search_style_clone_and_eq() {
+        let a = SearchStyle::Substring;
+        let b = a;
+        assert_eq!(a, b);
+    }
+
+    // ── SearchDirection ─────────────────────────────────────
+
+    #[test]
+    fn search_direction_backwards_decrements() {
+        assert_eq!(SearchDirection::Backwards.next(5), Some(4));
+        assert_eq!(SearchDirection::Backwards.next(1), Some(0));
+    }
+
+    #[test]
+    fn search_direction_backwards_at_zero_is_none() {
+        assert_eq!(SearchDirection::Backwards.next(0), None);
+    }
+
+    #[test]
+    fn search_direction_forwards_increments() {
+        assert_eq!(SearchDirection::Forwards.next(0), Some(1));
+        assert_eq!(SearchDirection::Forwards.next(5), Some(6));
+    }
+
+    #[test]
+    fn search_direction_forwards_at_max_is_none() {
+        assert_eq!(SearchDirection::Forwards.next(usize::MAX), None);
+    }
+
+    #[test]
+    fn search_direction_clone_and_eq() {
+        let a = SearchDirection::Backwards;
+        let b = a;
+        assert_eq!(a, b);
+        assert_ne!(SearchDirection::Backwards, SearchDirection::Forwards);
+    }
+
+    // ── BasicHistory ────────────────────────────────────────
+
+    #[test]
+    fn empty_history_last_is_none() {
+        let hist = BasicHistory::default();
+        assert_eq!(hist.last(), None);
+    }
+
+    #[test]
+    fn empty_history_get_is_none() {
+        let hist = BasicHistory::default();
+        assert_eq!(hist.get(0), None);
+    }
+
+    #[test]
+    fn add_and_get() {
+        let mut hist = BasicHistory::default();
+        hist.add("first");
+        hist.add("second");
+        assert_eq!(hist.get(0).unwrap(), "first");
+        assert_eq!(hist.get(1).unwrap(), "second");
+        assert_eq!(hist.get(2), None);
+    }
+
+    #[test]
+    fn last_returns_most_recent_index() {
+        let mut hist = BasicHistory::default();
+        hist.add("a");
+        assert_eq!(hist.last(), Some(0));
+        hist.add("b");
+        assert_eq!(hist.last(), Some(1));
+        hist.add("c");
+        assert_eq!(hist.last(), Some(2));
+    }
+
+    #[test]
+    fn add_deduplicates_consecutive() {
+        let mut hist = BasicHistory::default();
+        hist.add("same");
+        hist.add("same");
+        hist.add("same");
+        assert_eq!(hist.last(), Some(0));
+        assert_eq!(hist.get(1), None);
+    }
+
+    #[test]
+    fn add_allows_non_consecutive_duplicates() {
+        let mut hist = BasicHistory::default();
+        hist.add("a");
+        hist.add("b");
+        hist.add("a");
+        assert_eq!(hist.last(), Some(2));
+        assert_eq!(hist.get(0).unwrap(), "a");
+        assert_eq!(hist.get(2).unwrap(), "a");
+    }
+
+    // ── BasicHistory search ─────────────────────────────────
+
+    #[test]
+    fn search_backwards_finds_match() {
+        let mut hist = BasicHistory::default();
+        hist.add("apple");
+        hist.add("banana");
+        hist.add("apricot");
+
+        let result = hist
+            .search(2, SearchStyle::Substring, SearchDirection::Backwards, "ap")
+            .unwrap();
+        assert_eq!(result.idx, 2);
+        assert_eq!(result.line, "apricot");
+        assert_eq!(result.cursor, 0);
+    }
+
+    #[test]
+    fn search_backwards_skips_non_matches() {
+        let mut hist = BasicHistory::default();
+        hist.add("apple");
+        hist.add("banana");
+        hist.add("cherry");
+
+        let result = hist
+            .search(2, SearchStyle::Substring, SearchDirection::Backwards, "app")
+            .unwrap();
+        assert_eq!(result.idx, 0);
+        assert_eq!(result.line, "apple");
+    }
+
+    #[test]
+    fn search_backwards_no_match_returns_none() {
+        let mut hist = BasicHistory::default();
+        hist.add("hello");
+        hist.add("world");
+
+        assert!(hist
+            .search(1, SearchStyle::Substring, SearchDirection::Backwards, "xyz")
+            .is_none());
+    }
+
+    #[test]
+    fn search_forwards_finds_match() {
+        let mut hist = BasicHistory::default();
+        hist.add("alpha");
+        hist.add("beta");
+        hist.add("gamma");
+
+        let result = hist
+            .search(0, SearchStyle::Substring, SearchDirection::Forwards, "bet")
+            .unwrap();
+        assert_eq!(result.idx, 1);
+        assert_eq!(result.line, "beta");
+    }
+
+    #[test]
+    fn search_from_out_of_bounds_returns_none() {
+        let mut hist = BasicHistory::default();
+        hist.add("hello");
+
+        assert!(hist
+            .search(5, SearchStyle::Substring, SearchDirection::Forwards, "hel")
+            .is_none());
+    }
+
+    // ── SearchResult ────────────────────────────────────────
+
+    #[test]
+    fn search_result_clone_and_eq() {
+        let a = SearchResult {
+            line: Cow::Borrowed("test"),
+            idx: 0,
+            cursor: 2,
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+}

@@ -560,4 +560,172 @@ mod test {
         .unwrap();
         assert_eq!(caps.iterm2_image(), true);
     }
+
+    // ── Additional version_ge tests ─────────────────────────
+
+    #[test]
+    fn version_ge_equal_versions() {
+        assert!(version_ge("1.0.0", "1.0.0"));
+        assert!(version_ge("0", "0"));
+    }
+
+    #[test]
+    fn version_ge_longer_a_is_greater() {
+        assert!(version_ge("1.0.1", "1.0"));
+    }
+
+    #[test]
+    fn version_ge_longer_b_is_less() {
+        assert!(!version_ge("1.0", "1.0.1"));
+    }
+
+    #[test]
+    fn version_ge_major_difference() {
+        assert!(version_ge("2.0.0", "1.9.9"));
+        assert!(!version_ge("1.9.9", "2.0.0"));
+    }
+
+    // ── Capabilities defaults ───────────────────────────────
+
+    #[test]
+    fn defaults_hyperlinks_true() {
+        let caps = Capabilities::new_with_hints(ProbeHints::default()).unwrap();
+        assert!(caps.hyperlinks());
+    }
+
+    #[test]
+    fn defaults_bracketed_paste_true() {
+        let caps = Capabilities::new_with_hints(ProbeHints::default()).unwrap();
+        assert!(caps.bracketed_paste());
+    }
+
+    #[test]
+    fn defaults_mouse_reporting_true() {
+        let caps = Capabilities::new_with_hints(ProbeHints::default()).unwrap();
+        assert!(caps.mouse_reporting());
+    }
+
+    #[test]
+    fn defaults_force_ansi_sgr_false() {
+        let caps = Capabilities::new_with_hints(ProbeHints::default()).unwrap();
+        assert!(!caps.force_terminfo_render_to_use_ansi_sgr());
+    }
+
+    // ── Hint overrides ──────────────────────────────────────
+
+    #[test]
+    fn sixel_override() {
+        let caps = Capabilities::new_with_hints(ProbeHints::default().sixel(Some(true))).unwrap();
+        assert!(caps.sixel());
+    }
+
+    #[test]
+    fn hyperlinks_override_false() {
+        let caps =
+            Capabilities::new_with_hints(ProbeHints::default().hyperlinks(Some(false))).unwrap();
+        assert!(!caps.hyperlinks());
+    }
+
+    #[test]
+    fn bracketed_paste_override_false() {
+        let caps = Capabilities::new_with_hints(ProbeHints::default().bracketed_paste(Some(false)))
+            .unwrap();
+        assert!(!caps.bracketed_paste());
+    }
+
+    #[test]
+    fn mouse_reporting_override_false() {
+        let caps = Capabilities::new_with_hints(ProbeHints::default().mouse_reporting(Some(false)))
+            .unwrap();
+        assert!(!caps.mouse_reporting());
+    }
+
+    #[test]
+    fn force_ansi_sgr_override() {
+        let caps = Capabilities::new_with_hints(
+            ProbeHints::default().force_terminfo_render_to_use_ansi_sgr(Some(true)),
+        )
+        .unwrap();
+        assert!(caps.force_terminfo_render_to_use_ansi_sgr());
+    }
+
+    #[test]
+    fn color_level_override() {
+        let caps = Capabilities::new_with_hints(
+            ProbeHints::default().color_level(Some(ColorLevel::MonoChrome)),
+        )
+        .unwrap();
+        assert_eq!(caps.color_level(), ColorLevel::MonoChrome);
+    }
+
+    #[test]
+    fn wezterm_has_iterm2_image() {
+        let caps = Capabilities::new_with_hints(
+            ProbeHints::default().term_program(Some("WezTerm".into())),
+        )
+        .unwrap();
+        assert!(caps.iterm2_image());
+    }
+
+    #[test]
+    fn unknown_term_program_no_iterm2_image() {
+        let caps = Capabilities::new_with_hints(
+            ProbeHints::default().term_program(Some("UnknownTerm".into())),
+        )
+        .unwrap();
+        assert!(!caps.iterm2_image());
+    }
+
+    #[test]
+    fn terminfo_db_accessor() {
+        let caps = Capabilities::new_with_hints(ProbeHints::default()).unwrap();
+        // Without loading terminfo, db should be None in test mode
+        assert!(caps.terminfo_db().is_none());
+    }
+
+    #[test]
+    fn terminfo_db_with_loaded_db() {
+        let caps =
+            Capabilities::new_with_hints(ProbeHints::default().terminfo_db(Some(load_terminfo())))
+                .unwrap();
+        assert!(caps.terminfo_db().is_some());
+    }
+
+    // ── ProbeHints ──────────────────────────────────────────
+
+    #[test]
+    fn probe_hints_default_has_no_overrides() {
+        let hints = ProbeHints::default();
+        // All fields should be None
+        let debug = format!("{hints:?}");
+        assert!(debug.contains("None"));
+    }
+
+    #[test]
+    fn probe_hints_clone() {
+        let hints = ProbeHints::default()
+            .term(Some("xterm".into()))
+            .color_level(Some(ColorLevel::TrueColor));
+        let cloned = hints.clone();
+        let caps = Capabilities::new_with_hints(cloned).unwrap();
+        assert_eq!(caps.color_level(), ColorLevel::TrueColor);
+    }
+
+    // ── ColorLevel enum ─────────────────────────────────────
+
+    #[test]
+    fn color_level_eq() {
+        assert_eq!(ColorLevel::Sixteen, ColorLevel::Sixteen);
+        assert_eq!(ColorLevel::TwoFiftySix, ColorLevel::TwoFiftySix);
+        assert_eq!(ColorLevel::TrueColor, ColorLevel::TrueColor);
+        assert_eq!(ColorLevel::MonoChrome, ColorLevel::MonoChrome);
+        assert_ne!(ColorLevel::Sixteen, ColorLevel::TrueColor);
+    }
+
+    #[test]
+    fn color_level_clone_and_copy() {
+        let a = ColorLevel::TrueColor;
+        let b = a;
+        assert_eq!(a, b);
+    }
 }
