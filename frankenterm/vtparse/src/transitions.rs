@@ -351,6 +351,15 @@ pub(crate) static EXIT: [Action; 17] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unpack(v: u16) -> (Action, State) {
+        (Action::from_u16(v >> 8), State::from_u16(v & 0xff))
+    }
+
+    fn lookup(state: State, byte: u8) -> (Action, State) {
+        unpack(TRANSITIONS[state as usize][byte as usize])
+    }
+
     #[test]
     fn test_transitions() {
         let v = format!("{:?}", TRANSITIONS).as_bytes().to_vec();
@@ -368,5 +377,513 @@ mod tests {
     fn hash(v: &[u8], init: u64, mul: u64) -> u64 {
         v.iter()
             .fold(init, |a, &b| a.wrapping_mul(mul).wrapping_add(b as u64))
+    }
+
+    // --- Table dimension tests ---
+
+    #[test]
+    fn transitions_table_has_15_states() {
+        assert_eq!(TRANSITIONS.len(), 15);
+    }
+
+    #[test]
+    fn transitions_table_each_state_has_256_entries() {
+        for (i, table) in TRANSITIONS.iter().enumerate() {
+            assert_eq!(table.len(), 256, "state index {i} has wrong entry count");
+        }
+    }
+
+    #[test]
+    fn entry_table_has_17_entries() {
+        assert_eq!(ENTRY.len(), 17);
+    }
+
+    #[test]
+    fn exit_table_has_17_entries() {
+        assert_eq!(EXIT.len(), 17);
+    }
+
+    // --- Entry actions ---
+
+    #[test]
+    fn entry_action_escape_is_clear() {
+        assert_eq!(ENTRY[State::Escape as usize], Action::Clear);
+    }
+
+    #[test]
+    fn entry_action_csi_entry_is_clear() {
+        assert_eq!(ENTRY[State::CsiEntry as usize], Action::Clear);
+    }
+
+    #[test]
+    fn entry_action_dcs_entry_is_clear() {
+        assert_eq!(ENTRY[State::DcsEntry as usize], Action::Clear);
+    }
+
+    #[test]
+    fn entry_action_osc_string_is_osc_start() {
+        assert_eq!(ENTRY[State::OscString as usize], Action::OscStart);
+    }
+
+    #[test]
+    fn entry_action_dcs_passthrough_is_hook() {
+        assert_eq!(ENTRY[State::DcsPassthrough as usize], Action::Hook);
+    }
+
+    #[test]
+    fn entry_action_apc_string_is_apc_start() {
+        assert_eq!(ENTRY[State::ApcString as usize], Action::ApcStart);
+    }
+
+    #[test]
+    fn entry_action_ground_is_none() {
+        assert_eq!(ENTRY[State::Ground as usize], Action::None);
+    }
+
+    // --- Exit actions ---
+
+    #[test]
+    fn exit_action_dcs_passthrough_is_unhook() {
+        assert_eq!(EXIT[State::DcsPassthrough as usize], Action::Unhook);
+    }
+
+    #[test]
+    fn exit_action_osc_string_is_osc_end() {
+        assert_eq!(EXIT[State::OscString as usize], Action::OscEnd);
+    }
+
+    #[test]
+    fn exit_action_apc_string_is_apc_end() {
+        assert_eq!(EXIT[State::ApcString as usize], Action::ApcEnd);
+    }
+
+    #[test]
+    fn exit_action_ground_is_none() {
+        assert_eq!(EXIT[State::Ground as usize], Action::None);
+    }
+
+    #[test]
+    fn exit_action_escape_is_none() {
+        assert_eq!(EXIT[State::Escape as usize], Action::None);
+    }
+
+    // --- Ground state transitions ---
+
+    #[test]
+    fn ground_printable_chars_produce_print() {
+        for b in 0x20..=0x7fu8 {
+            let (action, state) = lookup(State::Ground, b);
+            assert_eq!(
+                (action, state),
+                (Action::Print, State::Ground),
+                "byte 0x{b:02x}"
+            );
+        }
+    }
+
+    #[test]
+    fn ground_c0_controls_execute() {
+        // 0x00-0x17 (except 0x18, 0x1a which are "anywhere")
+        for b in 0x00..=0x17u8 {
+            let (action, state) = lookup(State::Ground, b);
+            assert_eq!(
+                (action, state),
+                (Action::Execute, State::Ground),
+                "byte 0x{b:02x}"
+            );
+        }
+        // 0x19
+        assert_eq!(
+            lookup(State::Ground, 0x19),
+            (Action::Execute, State::Ground)
+        );
+        // 0x1c-0x1f
+        for b in 0x1c..=0x1fu8 {
+            let (action, state) = lookup(State::Ground, b);
+            assert_eq!(
+                (action, state),
+                (Action::Execute, State::Ground),
+                "byte 0x{b:02x}"
+            );
+        }
+    }
+
+    #[test]
+    fn ground_esc_transitions_to_escape() {
+        assert_eq!(lookup(State::Ground, 0x1b), (Action::None, State::Escape));
+    }
+
+    #[test]
+    fn ground_utf8_two_byte_lead() {
+        // 0xc2-0xdf → Utf8 + Utf8Sequence
+        for b in 0xc2..=0xdfu8 {
+            let (action, state) = lookup(State::Ground, b);
+            assert_eq!(
+                (action, state),
+                (Action::Utf8, State::Utf8Sequence),
+                "byte 0x{b:02x}"
+            );
+        }
+    }
+
+    #[test]
+    fn ground_utf8_three_byte_lead() {
+        for b in 0xe0..=0xefu8 {
+            assert_eq!(
+                lookup(State::Ground, b),
+                (Action::Utf8, State::Utf8Sequence),
+                "byte 0x{b:02x}"
+            );
+        }
+    }
+
+    #[test]
+    fn ground_utf8_four_byte_lead() {
+        for b in 0xf0..=0xf4u8 {
+            assert_eq!(
+                lookup(State::Ground, b),
+                (Action::Utf8, State::Utf8Sequence),
+                "byte 0x{b:02x}"
+            );
+        }
+    }
+
+    // --- Anywhere transitions (from ground) ---
+
+    #[test]
+    fn ground_can_cancel_0x18() {
+        assert_eq!(
+            lookup(State::Ground, 0x18),
+            (Action::Execute, State::Ground)
+        );
+    }
+
+    #[test]
+    fn ground_can_cancel_0x1a() {
+        assert_eq!(
+            lookup(State::Ground, 0x1a),
+            (Action::Execute, State::Ground)
+        );
+    }
+
+    #[test]
+    fn ground_c1_0x9b_enters_csi() {
+        assert_eq!(lookup(State::Ground, 0x9b), (Action::None, State::CsiEntry));
+    }
+
+    #[test]
+    fn ground_c1_0x9d_enters_osc() {
+        assert_eq!(
+            lookup(State::Ground, 0x9d),
+            (Action::None, State::OscString)
+        );
+    }
+
+    #[test]
+    fn ground_c1_0x90_enters_dcs() {
+        assert_eq!(lookup(State::Ground, 0x90), (Action::None, State::DcsEntry));
+    }
+
+    #[test]
+    fn ground_c1_0x9c_returns_ground() {
+        assert_eq!(lookup(State::Ground, 0x9c), (Action::None, State::Ground));
+    }
+
+    // --- Escape state transitions ---
+
+    #[test]
+    fn escape_open_bracket_to_csi_entry() {
+        assert_eq!(lookup(State::Escape, 0x5b), (Action::None, State::CsiEntry));
+    }
+
+    #[test]
+    fn escape_close_bracket_to_osc_string() {
+        assert_eq!(
+            lookup(State::Escape, 0x5d),
+            (Action::None, State::OscString)
+        );
+    }
+
+    #[test]
+    fn escape_p_to_dcs_entry() {
+        assert_eq!(lookup(State::Escape, 0x50), (Action::None, State::DcsEntry));
+    }
+
+    #[test]
+    fn escape_underscore_to_apc_string() {
+        assert_eq!(
+            lookup(State::Escape, 0x5f),
+            (Action::None, State::ApcString)
+        );
+    }
+
+    #[test]
+    fn escape_final_bytes_dispatch_to_ground() {
+        // 0x30-0x4f → EscDispatch + Ground
+        for b in 0x30..=0x4fu8 {
+            let (action, state) = lookup(State::Escape, b);
+            assert_eq!(
+                (action, state),
+                (Action::EscDispatch, State::Ground),
+                "byte 0x{b:02x}"
+            );
+        }
+        // 0x60-0x7e → EscDispatch + Ground
+        for b in 0x60..=0x7eu8 {
+            let (action, state) = lookup(State::Escape, b);
+            assert_eq!(
+                (action, state),
+                (Action::EscDispatch, State::Ground),
+                "byte 0x{b:02x}"
+            );
+        }
+    }
+
+    #[test]
+    fn escape_intermediates_collect() {
+        for b in 0x20..=0x2fu8 {
+            let (action, state) = lookup(State::Escape, b);
+            assert_eq!(
+                (action, state),
+                (Action::Collect, State::EscapeIntermediate),
+                "byte 0x{b:02x}"
+            );
+        }
+    }
+
+    #[test]
+    fn escape_del_is_ignored() {
+        assert_eq!(lookup(State::Escape, 0x7f), (Action::Ignore, State::Escape));
+    }
+
+    // --- CSI Entry state transitions ---
+
+    #[test]
+    fn csi_entry_digits_to_param() {
+        for b in 0x30..=0x39u8 {
+            let (action, state) = lookup(State::CsiEntry, b);
+            assert_eq!(
+                (action, state),
+                (Action::Param, State::CsiParam),
+                "byte 0x{b:02x}"
+            );
+        }
+    }
+
+    #[test]
+    fn csi_entry_semicolon_to_param() {
+        assert_eq!(
+            lookup(State::CsiEntry, 0x3b),
+            (Action::Param, State::CsiParam)
+        );
+    }
+
+    #[test]
+    fn csi_entry_colon_to_ignore() {
+        assert_eq!(
+            lookup(State::CsiEntry, 0x3a),
+            (Action::None, State::CsiIgnore)
+        );
+    }
+
+    #[test]
+    fn csi_entry_private_markers_collect() {
+        // 0x3c-0x3f: <, =, >, ?
+        for b in 0x3c..=0x3fu8 {
+            let (action, state) = lookup(State::CsiEntry, b);
+            assert_eq!(
+                (action, state),
+                (Action::Collect, State::CsiParam),
+                "byte 0x{b:02x}"
+            );
+        }
+    }
+
+    #[test]
+    fn csi_entry_final_bytes_dispatch() {
+        for b in 0x40..=0x7eu8 {
+            let (action, state) = lookup(State::CsiEntry, b);
+            assert_eq!(
+                (action, state),
+                (Action::CsiDispatch, State::Ground),
+                "byte 0x{b:02x}"
+            );
+        }
+    }
+
+    // --- CSI Param state transitions ---
+
+    #[test]
+    fn csi_param_digits_stay() {
+        for b in 0x30..=0x3bu8 {
+            let (action, state) = lookup(State::CsiParam, b);
+            assert_eq!(
+                (action, state),
+                (Action::Param, State::CsiParam),
+                "byte 0x{b:02x}"
+            );
+        }
+    }
+
+    #[test]
+    fn csi_param_final_dispatch() {
+        for b in 0x40..=0x7eu8 {
+            assert_eq!(
+                lookup(State::CsiParam, b),
+                (Action::CsiDispatch, State::Ground),
+                "byte 0x{b:02x}"
+            );
+        }
+    }
+
+    #[test]
+    fn csi_param_intermediate_collect() {
+        for b in 0x20..=0x2fu8 {
+            assert_eq!(
+                lookup(State::CsiParam, b),
+                (Action::Collect, State::CsiIntermediate),
+                "byte 0x{b:02x}"
+            );
+        }
+    }
+
+    // --- OSC String state transitions ---
+
+    #[test]
+    fn osc_string_bel_returns_ground() {
+        assert_eq!(
+            lookup(State::OscString, 0x07),
+            (Action::Ignore, State::Ground)
+        );
+    }
+
+    #[test]
+    fn osc_string_printable_osc_put() {
+        for b in 0x20..=0x7fu8 {
+            assert_eq!(
+                lookup(State::OscString, b),
+                (Action::OscPut, State::OscString),
+                "byte 0x{b:02x}"
+            );
+        }
+    }
+
+    #[test]
+    fn osc_string_esc_transitions_to_escape() {
+        assert_eq!(
+            lookup(State::OscString, 0x1b),
+            (Action::None, State::Escape)
+        );
+    }
+
+    #[test]
+    fn osc_string_utf8_lead_bytes() {
+        for b in 0xc2..=0xdfu8 {
+            assert_eq!(
+                lookup(State::OscString, b),
+                (Action::Utf8, State::Utf8Sequence),
+                "byte 0x{b:02x}"
+            );
+        }
+    }
+
+    // --- DCS state transitions ---
+
+    #[test]
+    fn dcs_entry_final_to_passthrough() {
+        for b in 0x40..=0x7eu8 {
+            assert_eq!(
+                lookup(State::DcsEntry, b),
+                (Action::None, State::DcsPassthrough),
+                "byte 0x{b:02x}"
+            );
+        }
+    }
+
+    #[test]
+    fn dcs_passthrough_data_put() {
+        for b in 0x20..=0x7eu8 {
+            assert_eq!(
+                lookup(State::DcsPassthrough, b),
+                (Action::Put, State::DcsPassthrough),
+                "byte 0x{b:02x}"
+            );
+        }
+    }
+
+    #[test]
+    fn dcs_passthrough_del_ignored() {
+        assert_eq!(
+            lookup(State::DcsPassthrough, 0x7f),
+            (Action::Ignore, State::DcsPassthrough)
+        );
+    }
+
+    // --- APC String state transitions ---
+
+    #[test]
+    fn apc_string_data_apc_put() {
+        for b in 0x20..=0x7fu8 {
+            assert_eq!(
+                lookup(State::ApcString, b),
+                (Action::ApcPut, State::ApcString),
+                "byte 0x{b:02x}"
+            );
+        }
+    }
+
+    #[test]
+    fn apc_string_esc_transitions_to_escape() {
+        assert_eq!(
+            lookup(State::ApcString, 0x1b),
+            (Action::None, State::Escape)
+        );
+    }
+
+    // --- Pack/unpack roundtrip ---
+
+    #[test]
+    fn pack_unpack_roundtrip() {
+        let actions = [
+            Action::None,
+            Action::Print,
+            Action::Execute,
+            Action::CsiDispatch,
+            Action::EscDispatch,
+        ];
+        let states = [
+            State::Ground,
+            State::Escape,
+            State::CsiEntry,
+            State::OscString,
+        ];
+        for &action in &actions {
+            for &state in &states {
+                let packed = pack(action, state);
+                let (a, s) = unpack(packed);
+                assert_eq!((a, s), (action, state));
+            }
+        }
+    }
+
+    // --- SOS/PM String ---
+
+    #[test]
+    fn sos_pm_string_ignores_printable() {
+        for b in 0x20..=0x7fu8 {
+            assert_eq!(
+                lookup(State::SosPmString, b),
+                (Action::Ignore, State::SosPmString),
+                "byte 0x{b:02x}"
+            );
+        }
+    }
+
+    #[test]
+    fn sos_pm_string_esc_to_escape() {
+        assert_eq!(
+            lookup(State::SosPmString, 0x1b),
+            (Action::None, State::Escape)
+        );
     }
 }
