@@ -143,3 +143,143 @@ pub fn terminal_get_dimensions(term: &mut Terminal) -> RenderableDimensions {
         reverse_video: term.get_reverse_video(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stable_cursor_position_default() {
+        let pos = StableCursorPosition::default();
+        assert_eq!(pos.x, 0);
+        assert_eq!(pos.y, 0);
+    }
+
+    #[test]
+    fn stable_cursor_position_equality() {
+        let a = StableCursorPosition::default();
+        let b = StableCursorPosition::default();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn stable_cursor_position_inequality() {
+        let a = StableCursorPosition::default();
+        let b = StableCursorPosition {
+            x: 5,
+            ..Default::default()
+        };
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn stable_cursor_position_clone_copy() {
+        let a = StableCursorPosition {
+            x: 10,
+            y: 20,
+            ..Default::default()
+        };
+        let b = a; // Copy
+        let c = a.clone(); // Clone
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+    }
+
+    #[test]
+    fn stable_cursor_position_debug() {
+        let pos = StableCursorPosition {
+            x: 5,
+            y: 10,
+            ..Default::default()
+        };
+        let dbg = format!("{:?}", pos);
+        assert!(dbg.contains("StableCursorPosition"));
+        assert!(dbg.contains("5"));
+        assert!(dbg.contains("10"));
+    }
+
+    #[test]
+    fn stable_cursor_position_hash() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(StableCursorPosition::default());
+        set.insert(StableCursorPosition {
+            x: 1,
+            ..Default::default()
+        });
+        set.insert(StableCursorPosition::default()); // duplicate
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn renderable_dimensions_default() {
+        let dims = RenderableDimensions::default();
+        assert_eq!(dims.cols, 0);
+        assert_eq!(dims.viewport_rows, 0);
+        assert_eq!(dims.scrollback_rows, 0);
+        assert_eq!(dims.physical_top, 0);
+        assert_eq!(dims.scrollback_top, 0);
+        assert_eq!(dims.dpi, 0);
+        assert!(!dims.reverse_video);
+    }
+
+    #[test]
+    fn renderable_dimensions_equality() {
+        let a = RenderableDimensions::default();
+        let b = RenderableDimensions::default();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn renderable_dimensions_inequality() {
+        let a = RenderableDimensions::default();
+        let b = RenderableDimensions {
+            cols: 80,
+            viewport_rows: 24,
+            ..Default::default()
+        };
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn renderable_dimensions_clone_copy() {
+        let a = RenderableDimensions {
+            cols: 120,
+            viewport_rows: 40,
+            scrollback_rows: 10000,
+            physical_top: 9960,
+            scrollback_top: 0,
+            dpi: 96,
+            pixel_width: 960,
+            pixel_height: 640,
+            reverse_video: false,
+        };
+        let b = a; // Copy
+        let c = a.clone(); // Clone
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+    }
+
+    #[test]
+    fn renderable_dimensions_debug() {
+        let dims = RenderableDimensions {
+            cols: 80,
+            viewport_rows: 24,
+            ..Default::default()
+        };
+        let dbg = format!("{:?}", dims);
+        assert!(dbg.contains("RenderableDimensions"));
+        assert!(dbg.contains("80"));
+        assert!(dbg.contains("24"));
+    }
+
+    #[test]
+    fn renderable_dimensions_with_reverse_video() {
+        let dims = RenderableDimensions {
+            reverse_video: true,
+            ..Default::default()
+        };
+        assert!(dims.reverse_video);
+        assert_ne!(dims, RenderableDimensions::default());
+    }
+}
