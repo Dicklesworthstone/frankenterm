@@ -223,4 +223,130 @@ mod tests {
         assert_eq!(trail.len(), 0);
         assert!(trail.recent(10).is_empty());
     }
+
+    // ===================================================================
+    // Property-based tests
+    // ===================================================================
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(50))]
+
+        /// len is always bounded by capacity.
+        #[test]
+        fn prop_len_bounded_by_capacity(
+            capacity in 1_usize..64,
+            n_records in 0_usize..200,
+        ) {
+            let trail = AuditTrail::new(capacity);
+            for i in 0..n_records {
+                trail.record(&format!("ext-{i}"), "fn", "", AuditOutcome::Ok);
+            }
+            prop_assert!(trail.len() <= capacity);
+        }
+
+        /// is_empty is consistent with len.
+        #[test]
+        fn prop_is_empty_consistent(n_records in 0_usize..20) {
+            let trail = AuditTrail::new(100);
+            for i in 0..n_records {
+                trail.record(&format!("ext-{i}"), "fn", "", AuditOutcome::Ok);
+            }
+            prop_assert_eq!(trail.is_empty(), n_records == 0);
+        }
+
+        /// recent respects limit.
+        #[test]
+        fn prop_recent_respects_limit(
+            n_records in 1_usize..50,
+            limit in 1_usize..100,
+        ) {
+            let trail = AuditTrail::new(200);
+            for i in 0..n_records {
+                trail.record(&format!("ext-{i}"), "fn", "", AuditOutcome::Ok);
+            }
+            let recent = trail.recent(limit);
+            prop_assert!(recent.len() <= limit);
+            prop_assert!(recent.len() <= n_records);
+        }
+
+        /// After eviction, newest entries are preserved.
+        #[test]
+        fn prop_eviction_preserves_newest(
+            capacity in 1_usize..20,
+            n_records in 1_usize..100,
+        ) {
+            let trail = AuditTrail::new(capacity);
+            for i in 0..n_records {
+                trail.record(&format!("ext-{i}"), "fn", "", AuditOutcome::Ok);
+            }
+            let recent = trail.recent(capacity);
+            if n_records > 0 && !recent.is_empty() {
+                let last = &recent[recent.len() - 1];
+                let expected_id = format!("ext-{}", n_records - 1);
+                prop_assert_eq!(&last.extension_id, &expected_id);
+            }
+        }
+
+        /// count_for_extension is bounded by len.
+        #[test]
+        fn prop_count_for_extension(
+            n_a in 0_usize..20,
+            n_b in 0_usize..20,
+        ) {
+            let trail = AuditTrail::new(200);
+            for _ in 0..n_a {
+                trail.record("ext-a", "fn", "", AuditOutcome::Ok);
+            }
+            for _ in 0..n_b {
+                trail.record("ext-b", "fn", "", AuditOutcome::Ok);
+            }
+            prop_assert!(trail.count_for_extension("ext-a") <= trail.len());
+            prop_assert!(trail.count_for_extension("ext-b") <= trail.len());
+            prop_assert_eq!(
+                trail.count_for_extension("ext-a") + trail.count_for_extension("ext-b"),
+                trail.len()
+            );
+        }
+
+        /// denied_count is bounded by len.
+        #[test]
+        fn prop_denied_count_bounded(
+            n_ok in 0_usize..20,
+            n_denied in 0_usize..20,
+        ) {
+            let trail = AuditTrail::new(200);
+            for _ in 0..n_ok {
+                trail.record("ext", "fn", "", AuditOutcome::Ok);
+            }
+            for _ in 0..n_denied {
+                trail.record("ext", "fn", "", AuditOutcome::Denied("no".to_string()));
+            }
+            prop_assert!(trail.denied_count() <= trail.len());
+        }
+
+        /// Truncation keeps args_summary bounded.
+        #[test]
+        fn prop_args_truncation_bounded(len in 0_usize..1000) {
+            let trail = AuditTrail::new(10);
+            let args = "x".repeat(len);
+            trail.record("ext", "fn", &args, AuditOutcome::Ok);
+            let recent = trail.recent(1);
+            prop_assert!(recent[0].args_summary.len() <= 259); // 256 + "..."
+        }
+
+        /// Elapsed timestamps are monotonically non-decreasing.
+        #[test]
+        fn prop_elapsed_monotonic(n in 2_usize..30) {
+            let trail = AuditTrail::new(100);
+            for i in 0..n {
+                trail.record(&format!("ext-{i}"), "fn", "", AuditOutcome::Ok);
+            }
+            let recent = trail.recent(n);
+            for pair in recent.windows(2) {
+                prop_assert!(pair[0].elapsed <= pair[1].elapsed);
+            }
+        }
+    }
 }

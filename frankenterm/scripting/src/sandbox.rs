@@ -290,4 +290,156 @@ mod tests {
         assert_eq!(config.limits.max_memory_bytes, 128 * 1024 * 1024);
         assert_eq!(config.limits.fuel_per_call, 500_000_000);
     }
+
+    // ===================================================================
+    // Property-based tests
+    // ===================================================================
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(50))]
+
+        /// check_read succeeds when prefix matches, fails otherwise.
+        #[test]
+        fn prop_check_read_consistent(
+            allowed_prefix in "/[a-z]{3,10}/",
+            file_name in "[a-z.]{3,15}",
+            denied_prefix in "/denied_[a-z]{3,10}/",
+        ) {
+            let perms = ExtensionPermissions {
+                filesystem_read: vec![allowed_prefix.clone()],
+                ..Default::default()
+            };
+            let enforcer = test_enforcer(perms);
+
+            let allowed_path = format!("{allowed_prefix}{file_name}");
+            prop_assert!(enforcer.check_read(&allowed_path).is_ok());
+
+            let denied_path = format!("{denied_prefix}{file_name}");
+            prop_assert!(enforcer.check_read(&denied_path).is_err());
+        }
+
+        /// check_write succeeds when prefix matches, fails otherwise.
+        #[test]
+        fn prop_check_write_consistent(
+            allowed_prefix in "/[a-z]{3,10}/",
+            file_name in "[a-z.]{3,15}",
+        ) {
+            let perms = ExtensionPermissions {
+                filesystem_write: vec![allowed_prefix.clone()],
+                ..Default::default()
+            };
+            let enforcer = test_enforcer(perms);
+
+            let allowed_path = format!("{allowed_prefix}{file_name}");
+            prop_assert!(enforcer.check_write(&allowed_path).is_ok());
+            // Empty write list should deny.
+            let strict = test_enforcer(ExtensionPermissions::default());
+            prop_assert!(strict.check_write(&allowed_path).is_err());
+        }
+
+        /// check_env_var follows allows_env_var exactly.
+        #[test]
+        fn prop_check_env_var_consistent(
+            pattern in "[A-Z]{3,8}_*",
+            matching in "[A-Z]{3,8}_[A-Z]{3,8}",
+        ) {
+            let perms = ExtensionPermissions {
+                environment: vec![pattern.clone()],
+                ..Default::default()
+            };
+            let enforcer = test_enforcer(perms.clone());
+            let expected = perms.allows_env_var(&matching);
+            let result = enforcer.check_env_var(&matching);
+            prop_assert_eq!(result.is_ok(), expected);
+        }
+
+        /// check_network follows network permission.
+        #[test]
+        fn prop_check_network_follows_permission(network in any::<bool>()) {
+            let perms = ExtensionPermissions {
+                network,
+                ..Default::default()
+            };
+            let enforcer = test_enforcer(perms);
+            prop_assert_eq!(enforcer.check_network().is_ok(), network);
+        }
+
+        /// check_pane_access follows pane_access permission.
+        #[test]
+        fn prop_check_pane_access_follows_permission(
+            pane_access in any::<bool>(),
+            pane_id in 0_u64..1000,
+        ) {
+            let perms = ExtensionPermissions {
+                pane_access,
+                ..Default::default()
+            };
+            let enforcer = test_enforcer(perms);
+            prop_assert_eq!(enforcer.check_pane_access(pane_id).is_ok(), pane_access);
+        }
+
+        /// Every check call records an audit entry.
+        #[test]
+        fn prop_audit_counts_all_checks(
+            n_read in 0_usize..5,
+            n_write in 0_usize..5,
+            n_env in 0_usize..5,
+            n_network in 0_usize..5,
+            n_pane in 0_usize..5,
+        ) {
+            let enforcer = test_enforcer(ExtensionPermissions::default());
+            for _ in 0..n_read {
+                let _ = enforcer.check_read("/some/path");
+            }
+            for _ in 0..n_write {
+                let _ = enforcer.check_write("/some/path");
+            }
+            for _ in 0..n_env {
+                let _ = enforcer.check_env_var("SOME_VAR");
+            }
+            for _ in 0..n_network {
+                let _ = enforcer.check_network();
+            }
+            for _ in 0..n_pane {
+                let _ = enforcer.check_pane_access(42);
+            }
+
+            let total = n_read + n_write + n_env + n_network + n_pane;
+            prop_assert_eq!(enforcer.audit_trail().len(), total);
+        }
+
+        /// ResourceLimits default values are sane.
+        #[test]
+        fn prop_resource_limits_default_sane(_dummy in 0..1_u8) {
+            let limits = ResourceLimits::default();
+            prop_assert!(limits.max_memory_bytes > 0);
+            prop_assert!(limits.fuel_per_call > 0);
+            prop_assert!(limits.max_wall_time.as_secs() > 0);
+        }
+
+        /// with_limits replaces limits correctly.
+        #[test]
+        fn prop_with_limits_replaces(
+            mem in 1_usize..1_000_000_000,
+            fuel in 1_u64..10_000_000_000,
+            secs in 1_u64..3600,
+        ) {
+            let limits = ResourceLimits {
+                max_memory_bytes: mem,
+                fuel_per_call: fuel,
+                max_wall_time: Duration::from_secs(secs),
+            };
+            let config = SandboxConfig::from_permissions(
+                "ext".to_string(),
+                ExtensionPermissions::default(),
+            )
+            .with_limits(limits.clone());
+
+            prop_assert_eq!(config.limits.max_memory_bytes, mem);
+            prop_assert_eq!(config.limits.fuel_per_call, fuel);
+            prop_assert_eq!(config.limits.max_wall_time, Duration::from_secs(secs));
+        }
+    }
 }

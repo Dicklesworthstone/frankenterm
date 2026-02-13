@@ -423,4 +423,169 @@ key = "value"
         assert!(perms.allows_write("~/.local/share/frankenterm/cache.db"));
         assert!(!perms.allows_write("~/.config/frankenterm/theme.toml"));
     }
+
+    // ===================================================================
+    // Property-based tests
+    // ===================================================================
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(50))]
+
+        /// EngineType::needs_wasm and needs_lua are complementary.
+        #[test]
+        fn prop_engine_type_needs(variant in 0_u8..3) {
+            let et = match variant {
+                0 => EngineType::Wasm,
+                1 => EngineType::Lua,
+                _ => EngineType::Both,
+            };
+            match et {
+                EngineType::Wasm => {
+                    prop_assert!(et.needs_wasm());
+                    prop_assert!(!et.needs_lua());
+                }
+                EngineType::Lua => {
+                    prop_assert!(!et.needs_wasm());
+                    prop_assert!(et.needs_lua());
+                }
+                EngineType::Both => {
+                    prop_assert!(et.needs_wasm());
+                    prop_assert!(et.needs_lua());
+                }
+            }
+        }
+
+        /// Exact env var match always succeeds.
+        #[test]
+        fn prop_env_exact_match(name in "[A-Z]{3,10}") {
+            let perms = ExtensionPermissions {
+                environment: vec![name.clone()],
+                ..Default::default()
+            };
+            prop_assert!(perms.allows_env_var(&name));
+        }
+
+        /// Glob prefix match works for trailing-star patterns.
+        #[test]
+        fn prop_env_glob_prefix_match(
+            prefix in "[A-Z]{3,8}_",
+            suffix in "[A-Z]{1,8}",
+        ) {
+            let pattern = format!("{prefix}*");
+            let name = format!("{prefix}{suffix}");
+            let perms = ExtensionPermissions {
+                environment: vec![pattern],
+                ..Default::default()
+            };
+            prop_assert!(perms.allows_env_var(&name));
+        }
+
+        /// Non-matching env var is denied.
+        #[test]
+        fn prop_env_no_match(
+            allowed in "[A-Z]{3,6}",
+            other in "[a-z]{3,6}",
+        ) {
+            let perms = ExtensionPermissions {
+                environment: vec![allowed],
+                ..Default::default()
+            };
+            // lowercase vs uppercase means no match
+            prop_assert!(!perms.allows_env_var(&other));
+        }
+
+        /// Read prefix match works.
+        #[test]
+        fn prop_read_prefix_match(
+            prefix in "/[a-z]{3,10}/",
+            file in "[a-z.]{3,15}",
+        ) {
+            let perms = ExtensionPermissions {
+                filesystem_read: vec![prefix.clone()],
+                ..Default::default()
+            };
+            let path = format!("{prefix}{file}");
+            prop_assert!(perms.allows_read(&path));
+        }
+
+        /// Read with different prefix is denied.
+        #[test]
+        fn prop_read_different_prefix_denied(
+            allowed in "/allowed_[a-z]{3,8}/",
+            denied in "/denied_[a-z]{3,8}/",
+            file in "[a-z]{3,10}",
+        ) {
+            let perms = ExtensionPermissions {
+                filesystem_read: vec![allowed],
+                ..Default::default()
+            };
+            let path = format!("{denied}{file}");
+            prop_assert!(!perms.allows_read(&path));
+        }
+
+        /// Write prefix match works.
+        #[test]
+        fn prop_write_prefix_match(
+            prefix in "/[a-z]{3,10}/",
+            file in "[a-z.]{3,15}",
+        ) {
+            let perms = ExtensionPermissions {
+                filesystem_write: vec![prefix.clone()],
+                ..Default::default()
+            };
+            let path = format!("{prefix}{file}");
+            prop_assert!(perms.allows_write(&path));
+        }
+
+        /// Default permissions deny everything.
+        #[test]
+        fn prop_default_denies_all(
+            path in "/[a-z]{3,10}/[a-z]{3,10}",
+            env in "[A-Z]{3,10}",
+        ) {
+            let perms = ExtensionPermissions::default();
+            prop_assert!(!perms.allows_read(&path));
+            prop_assert!(!perms.allows_write(&path));
+            prop_assert!(!perms.allows_env_var(&env));
+            prop_assert!(!perms.network);
+            prop_assert!(!perms.pane_access);
+        }
+
+        /// Minimal manifest parses with generated names.
+        #[test]
+        fn prop_minimal_manifest(name in "[a-z][a-z0-9_-]{2,20}") {
+            let toml_str = format!(
+                "[extension]\nname = \"{name}\"\n"
+            );
+            let manifest = ParsedManifest::from_toml_str(&toml_str).unwrap();
+            prop_assert_eq!(&manifest.name, &name);
+            prop_assert_eq!(&manifest.version, "0.0.0");
+        }
+
+        /// Manifest preserves version strings.
+        #[test]
+        fn prop_manifest_version(
+            major in 0_u32..100,
+            minor in 0_u32..100,
+            patch in 0_u32..100,
+        ) {
+            let version = format!("{major}.{minor}.{patch}");
+            let toml_str = format!(
+                "[extension]\nname = \"test\"\nversion = \"{version}\"\n"
+            );
+            let manifest = ParsedManifest::from_toml_str(&toml_str).unwrap();
+            prop_assert_eq!(&manifest.version, &version);
+        }
+
+        /// Missing [extension] table always errors.
+        #[test]
+        fn prop_missing_extension_errors(key in "[a-z]{3,10}") {
+            let toml_str = format!("[{key}]\nval = \"x\"\n");
+            if key != "extension" {
+                prop_assert!(ParsedManifest::from_toml_str(&toml_str).is_err());
+            }
+        }
+    }
 }
