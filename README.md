@@ -1,7 +1,7 @@
 # ft — FrankenTerm
 
 <div align="center">
-  <img src="ft_illustration.webp" alt="ft - Swarm-Native Terminal Platform for AI Agent Fleets">
+  <img src="frankenterm_illustration.webp" alt="ft - Swarm-Native Terminal Platform for AI Agent Fleets">
 </div>
 
 <div align="center">
@@ -418,6 +418,26 @@ max_bytes_per_sec = 0
 writer_queue_size = 100
 # How long to retain captured output
 retention_days = 30
+
+[vendored]
+# Optional explicit socket for single-backend mux access
+mux_socket_path = "~/.local/share/wezterm/default.sock"
+
+[vendored.mux_pool]
+# Connection pool tuning for direct mux RPC
+max_connections = 64
+idle_timeout_seconds = 60
+acquire_timeout_seconds = 10
+pipeline_depth = 32
+pipeline_timeout_ms = 5000
+compression = "auto"
+
+[vendored.sharding]
+# Multi-socket sharding mode (requires 2+ socket_paths when enabled)
+enabled = false
+socket_paths = ["/tmp/ft-shard-0.sock", "/tmp/ft-shard-1.sock"]
+# Assignment strategy tag: round_robin | by_domain | by_agent_type | manual | consistent_hash
+assignment = { strategy = "round_robin" }
 
 [backup.scheduled]
 # Enable scheduled backups

@@ -3,6 +3,8 @@
 //! Progressive search system combining lexical (BM25) and semantic (embedding)
 //! retrieval with Reciprocal Rank Fusion and two-tier blending.
 
+mod chunk_vector_store;
+mod chunking;
 mod embedder;
 mod hash_embedder;
 mod hybrid_search;
@@ -19,6 +21,14 @@ mod model_registry;
 #[cfg(feature = "semantic-search")]
 pub mod daemon;
 
+pub use chunk_vector_store::{
+    ChunkEmbeddingUpsert, ChunkEmbeddingUpsertOutcome, ChunkVectorDriftReport, ChunkVectorHit,
+    ChunkVectorStore, ChunkVectorStoreError, SemanticGeneration, SemanticGenerationStatus,
+};
+pub use chunking::{
+    ChunkDirection, ChunkInputEvent, ChunkOverlap, ChunkPolicyConfig, ChunkSourceOffset,
+    RECORDER_CHUNKING_POLICY_V1, SemanticChunk, build_semantic_chunks,
+};
 pub use embedder::{EmbedError, Embedder, EmbedderInfo, EmbedderTier};
 pub use hash_embedder::HashEmbedder;
 pub use hybrid_search::{

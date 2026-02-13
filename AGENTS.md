@@ -456,6 +456,14 @@ max_concurrent_captures = 10
 db_path = "ft.db"
 retention_days = 30
 
+[vendored]
+mux_socket_path = "/tmp/wezterm.sock"
+
+[vendored.sharding]
+enabled = false
+socket_paths = ["/tmp/ft-shard-0.sock", "/tmp/ft-shard-1.sock"]
+assignment = { strategy = "round_robin" }
+
 [patterns]
 enabled_packs = ["builtin:core"]
 
