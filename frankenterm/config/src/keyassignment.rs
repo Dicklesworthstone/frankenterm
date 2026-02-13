@@ -738,3 +738,529 @@ pub struct KeyTables {
 pub struct KeyTableEntry {
     pub action: KeyAssignment,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::convert::TryFrom;
+
+    // --- LauncherFlags ---
+
+    #[test]
+    fn launcher_flags_default_is_zero() {
+        let flags = LauncherFlags::default();
+        assert_eq!(flags, LauncherFlags::ZERO);
+    }
+
+    #[test]
+    fn launcher_flags_to_string_empty() {
+        let flags = LauncherFlags::ZERO;
+        assert_eq!(flags.to_string(), "");
+    }
+
+    #[test]
+    fn launcher_flags_to_string_single() {
+        assert_eq!(LauncherFlags::FUZZY.to_string(), "FUZZY");
+        assert_eq!(LauncherFlags::TABS.to_string(), "TABS");
+        assert_eq!(LauncherFlags::DOMAINS.to_string(), "DOMAINS");
+        assert_eq!(LauncherFlags::COMMANDS.to_string(), "COMMANDS");
+    }
+
+    #[test]
+    fn launcher_flags_to_string_combined() {
+        let flags = LauncherFlags::FUZZY | LauncherFlags::TABS;
+        assert_eq!(flags.to_string(), "FUZZY|TABS");
+    }
+
+    #[test]
+    fn launcher_flags_try_from_string_single() {
+        let flags = LauncherFlags::try_from("FUZZY".to_string()).unwrap();
+        assert_eq!(flags, LauncherFlags::FUZZY);
+    }
+
+    #[test]
+    fn launcher_flags_try_from_string_combined() {
+        let flags = LauncherFlags::try_from("FUZZY|TABS|DOMAINS".to_string()).unwrap();
+        assert!(flags.contains(LauncherFlags::FUZZY));
+        assert!(flags.contains(LauncherFlags::TABS));
+        assert!(flags.contains(LauncherFlags::DOMAINS));
+    }
+
+    #[test]
+    fn launcher_flags_try_from_invalid() {
+        let result = LauncherFlags::try_from("INVALID".to_string());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn launcher_flags_roundtrip() {
+        let flags = LauncherFlags::WORKSPACES | LauncherFlags::KEY_ASSIGNMENTS;
+        let s = flags.to_string();
+        let parsed = LauncherFlags::try_from(s).unwrap();
+        assert_eq!(flags, parsed);
+    }
+
+    // --- LauncherActionArgs ---
+
+    #[test]
+    fn launcher_action_args_default() {
+        let args = LauncherActionArgs::default();
+        assert_eq!(args.flags, LauncherFlags::ZERO);
+        assert!(args.title.is_none());
+        assert!(args.help_text.is_none());
+        assert!(args.fuzzy_help_text.is_none());
+        assert!(args.alphabet.is_none());
+    }
+
+    // --- SelectionMode ---
+
+    #[test]
+    fn selection_mode_equality() {
+        assert_eq!(SelectionMode::Cell, SelectionMode::Cell);
+        assert_ne!(SelectionMode::Cell, SelectionMode::Word);
+        assert_ne!(SelectionMode::Word, SelectionMode::Line);
+        assert_ne!(SelectionMode::Line, SelectionMode::SemanticZone);
+        assert_ne!(SelectionMode::SemanticZone, SelectionMode::Block);
+    }
+
+    #[test]
+    fn selection_mode_clone_copy() {
+        let a = SelectionMode::Word;
+        let b = a;
+        let c = a.clone();
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+    }
+
+    #[test]
+    fn selection_mode_debug() {
+        let dbg = format!("{:?}", SelectionMode::SemanticZone);
+        assert!(dbg.contains("SemanticZone"));
+    }
+
+    // --- Pattern ---
+
+    #[test]
+    fn pattern_default() {
+        assert_eq!(Pattern::default(), Pattern::CurrentSelectionOrEmptyString);
+    }
+
+    #[test]
+    fn pattern_is_empty_current_selection() {
+        assert!(Pattern::CurrentSelectionOrEmptyString.is_empty());
+    }
+
+    #[test]
+    fn pattern_is_empty_empty_string() {
+        assert!(Pattern::CaseSensitiveString(String::new()).is_empty());
+        assert!(Pattern::CaseInSensitiveString(String::new()).is_empty());
+        assert!(Pattern::Regex(String::new()).is_empty());
+    }
+
+    #[test]
+    fn pattern_is_empty_non_empty() {
+        assert!(!Pattern::CaseSensitiveString("foo".to_string()).is_empty());
+        assert!(!Pattern::CaseInSensitiveString("bar".to_string()).is_empty());
+        assert!(!Pattern::Regex(".*".to_string()).is_empty());
+    }
+
+    #[test]
+    fn pattern_equality() {
+        assert_eq!(
+            Pattern::CaseSensitiveString("a".to_string()),
+            Pattern::CaseSensitiveString("a".to_string())
+        );
+        assert_ne!(
+            Pattern::CaseSensitiveString("a".to_string()),
+            Pattern::CaseInSensitiveString("a".to_string())
+        );
+    }
+
+    // --- SpawnTabDomain ---
+
+    #[test]
+    fn spawn_tab_domain_default() {
+        assert_eq!(SpawnTabDomain::default(), SpawnTabDomain::CurrentPaneDomain);
+    }
+
+    #[test]
+    fn spawn_tab_domain_equality() {
+        assert_eq!(SpawnTabDomain::DefaultDomain, SpawnTabDomain::DefaultDomain);
+        assert_ne!(
+            SpawnTabDomain::DefaultDomain,
+            SpawnTabDomain::CurrentPaneDomain
+        );
+        assert_eq!(
+            SpawnTabDomain::DomainName("foo".to_string()),
+            SpawnTabDomain::DomainName("foo".to_string())
+        );
+        assert_ne!(
+            SpawnTabDomain::DomainName("foo".to_string()),
+            SpawnTabDomain::DomainName("bar".to_string())
+        );
+        assert_eq!(SpawnTabDomain::DomainId(1), SpawnTabDomain::DomainId(1));
+        assert_ne!(SpawnTabDomain::DomainId(1), SpawnTabDomain::DomainId(2));
+    }
+
+    // --- PaneDirection ---
+
+    #[test]
+    fn pane_direction_equality() {
+        assert_eq!(PaneDirection::Up, PaneDirection::Up);
+        assert_ne!(PaneDirection::Up, PaneDirection::Down);
+        assert_ne!(PaneDirection::Left, PaneDirection::Right);
+        assert_ne!(PaneDirection::Next, PaneDirection::Prev);
+    }
+
+    #[test]
+    fn pane_direction_clone_copy() {
+        let a = PaneDirection::Left;
+        let b = a;
+        let c = a.clone();
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+    }
+
+    #[test]
+    fn pane_direction_from_str() {
+        assert_eq!(
+            PaneDirection::direction_from_str("Up").unwrap(),
+            PaneDirection::Up
+        );
+        assert_eq!(
+            PaneDirection::direction_from_str("down").unwrap(),
+            PaneDirection::Down
+        );
+        assert_eq!(
+            PaneDirection::direction_from_str("LEFT").unwrap(),
+            PaneDirection::Left
+        );
+    }
+
+    #[test]
+    fn pane_direction_from_str_invalid() {
+        assert!(PaneDirection::direction_from_str("diagonal").is_err());
+    }
+
+    // --- ScrollbackEraseMode ---
+
+    #[test]
+    fn scrollback_erase_mode_default() {
+        assert_eq!(
+            ScrollbackEraseMode::default(),
+            ScrollbackEraseMode::ScrollbackOnly
+        );
+    }
+
+    #[test]
+    fn scrollback_erase_mode_equality() {
+        assert_eq!(
+            ScrollbackEraseMode::ScrollbackOnly,
+            ScrollbackEraseMode::ScrollbackOnly
+        );
+        assert_ne!(
+            ScrollbackEraseMode::ScrollbackOnly,
+            ScrollbackEraseMode::ScrollbackAndViewport
+        );
+    }
+
+    // --- ClipboardCopyDestination ---
+
+    #[test]
+    fn clipboard_copy_destination_default() {
+        assert_eq!(
+            ClipboardCopyDestination::default(),
+            ClipboardCopyDestination::ClipboardAndPrimarySelection
+        );
+    }
+
+    #[test]
+    fn clipboard_copy_destination_equality() {
+        assert_eq!(
+            ClipboardCopyDestination::Clipboard,
+            ClipboardCopyDestination::Clipboard
+        );
+        assert_ne!(
+            ClipboardCopyDestination::Clipboard,
+            ClipboardCopyDestination::PrimarySelection
+        );
+    }
+
+    // --- ClipboardPasteSource ---
+
+    #[test]
+    fn clipboard_paste_source_default() {
+        assert_eq!(
+            ClipboardPasteSource::default(),
+            ClipboardPasteSource::Clipboard
+        );
+    }
+
+    #[test]
+    fn clipboard_paste_source_equality() {
+        assert_eq!(
+            ClipboardPasteSource::Clipboard,
+            ClipboardPasteSource::Clipboard
+        );
+        assert_ne!(
+            ClipboardPasteSource::Clipboard,
+            ClipboardPasteSource::PrimarySelection
+        );
+    }
+
+    // --- PaneSelectMode ---
+
+    #[test]
+    fn pane_select_mode_default() {
+        assert_eq!(PaneSelectMode::default(), PaneSelectMode::Activate);
+    }
+
+    #[test]
+    fn pane_select_mode_equality() {
+        assert_eq!(PaneSelectMode::Activate, PaneSelectMode::Activate);
+        assert_ne!(PaneSelectMode::Activate, PaneSelectMode::SwapWithActive);
+        assert_ne!(
+            PaneSelectMode::SwapWithActive,
+            PaneSelectMode::SwapWithActiveKeepFocus
+        );
+        assert_ne!(
+            PaneSelectMode::MoveToNewTab,
+            PaneSelectMode::MoveToNewWindow
+        );
+    }
+
+    // --- PaneSelectArguments ---
+
+    #[test]
+    fn pane_select_arguments_default() {
+        let args = PaneSelectArguments::default();
+        assert_eq!(args.alphabet, "");
+        assert_eq!(args.mode, PaneSelectMode::Activate);
+        assert!(!args.show_pane_ids);
+    }
+
+    // --- CharSelectGroup ---
+
+    #[test]
+    fn char_select_group_default() {
+        assert_eq!(
+            CharSelectGroup::default(),
+            CharSelectGroup::SmileysAndEmotion
+        );
+    }
+
+    #[test]
+    fn char_select_group_next_wraps() {
+        let g = CharSelectGroup::ShortCodes;
+        assert_eq!(g.next(), CharSelectGroup::RecentlyUsed);
+    }
+
+    #[test]
+    fn char_select_group_previous_wraps() {
+        let g = CharSelectGroup::RecentlyUsed;
+        assert_eq!(g.previous(), CharSelectGroup::ShortCodes);
+    }
+
+    #[test]
+    fn char_select_group_next_chain() {
+        let start = CharSelectGroup::RecentlyUsed;
+        assert_eq!(start.next(), CharSelectGroup::SmileysAndEmotion);
+        assert_eq!(start.next().next(), CharSelectGroup::PeopleAndBody);
+        assert_eq!(
+            start.next().next().next(),
+            CharSelectGroup::AnimalsAndNature
+        );
+    }
+
+    #[test]
+    fn char_select_group_next_previous_inverse() {
+        let groups = [
+            CharSelectGroup::RecentlyUsed,
+            CharSelectGroup::SmileysAndEmotion,
+            CharSelectGroup::PeopleAndBody,
+            CharSelectGroup::AnimalsAndNature,
+            CharSelectGroup::FoodAndDrink,
+            CharSelectGroup::TravelAndPlaces,
+            CharSelectGroup::Activities,
+            CharSelectGroup::Objects,
+            CharSelectGroup::Symbols,
+            CharSelectGroup::Flags,
+            CharSelectGroup::NerdFonts,
+            CharSelectGroup::UnicodeNames,
+            CharSelectGroup::ShortCodes,
+        ];
+        for g in &groups {
+            assert_eq!(g.next().previous(), *g);
+            assert_eq!(g.previous().next(), *g);
+        }
+    }
+
+    #[test]
+    fn char_select_group_full_cycle() {
+        let start = CharSelectGroup::RecentlyUsed;
+        let mut current = start;
+        for _ in 0..13 {
+            current = current.next();
+        }
+        assert_eq!(current, start);
+    }
+
+    // --- CharSelectArguments ---
+
+    #[test]
+    fn char_select_arguments_default() {
+        let args = CharSelectArguments::default();
+        assert!(args.group.is_none());
+        assert!(args.copy_on_select);
+        assert_eq!(
+            args.copy_to,
+            ClipboardCopyDestination::ClipboardAndPrimarySelection
+        );
+    }
+
+    // --- SplitSize ---
+
+    #[test]
+    fn split_size_default() {
+        assert_eq!(SplitSize::default(), SplitSize::Percent(50));
+    }
+
+    #[test]
+    fn split_size_equality() {
+        assert_eq!(SplitSize::Cells(10), SplitSize::Cells(10));
+        assert_ne!(SplitSize::Cells(10), SplitSize::Cells(20));
+        assert_eq!(SplitSize::Percent(50), SplitSize::Percent(50));
+        assert_ne!(SplitSize::Cells(50), SplitSize::Percent(50));
+    }
+
+    // --- RotationDirection ---
+
+    #[test]
+    fn rotation_direction_equality() {
+        assert_eq!(RotationDirection::Clockwise, RotationDirection::Clockwise);
+        assert_ne!(
+            RotationDirection::Clockwise,
+            RotationDirection::CounterClockwise
+        );
+    }
+
+    // --- SpawnCommand ---
+
+    #[test]
+    fn spawn_command_default() {
+        let cmd = SpawnCommand::default();
+        assert!(cmd.label.is_none());
+        assert!(cmd.args.is_none());
+        assert!(cmd.cwd.is_none());
+        assert!(cmd.set_environment_variables.is_empty());
+        assert_eq!(cmd.domain, SpawnTabDomain::CurrentPaneDomain);
+        assert!(cmd.position.is_none());
+    }
+
+    #[test]
+    fn spawn_command_display_minimal() {
+        let cmd = SpawnCommand::default();
+        let s = format!("{}", cmd);
+        assert!(s.contains("SpawnCommand"));
+        assert!(s.contains("CurrentPaneDomain"));
+    }
+
+    #[test]
+    fn spawn_command_display_with_label() {
+        let cmd = SpawnCommand {
+            label: Some("my shell".to_string()),
+            ..SpawnCommand::default()
+        };
+        let s = format!("{}", cmd);
+        assert!(s.contains("my shell"));
+    }
+
+    #[test]
+    fn spawn_command_label_for_palette_from_label() {
+        let cmd = SpawnCommand {
+            label: Some("my label".to_string()),
+            ..SpawnCommand::default()
+        };
+        assert_eq!(cmd.label_for_palette(), Some("my label".to_string()));
+    }
+
+    #[test]
+    fn spawn_command_label_for_palette_from_args() {
+        let cmd = SpawnCommand {
+            args: Some(vec![
+                "bash".to_string(),
+                "-c".to_string(),
+                "echo hi".to_string(),
+            ]),
+            ..SpawnCommand::default()
+        };
+        let label = cmd.label_for_palette().unwrap();
+        assert!(label.contains("bash"));
+    }
+
+    #[test]
+    fn spawn_command_label_for_palette_none() {
+        let cmd = SpawnCommand::default();
+        assert!(cmd.label_for_palette().is_none());
+    }
+
+    // --- InputSelectorEntry ---
+
+    #[test]
+    fn input_selector_entry_basic() {
+        let entry = InputSelectorEntry {
+            label: "test".to_string(),
+            id: Some("id1".to_string()),
+        };
+        assert_eq!(entry.label, "test");
+        assert_eq!(entry.id, Some("id1".to_string()));
+    }
+
+    // --- KeyTableEntry ---
+
+    #[test]
+    fn key_table_entry_clone() {
+        let entry = KeyTableEntry {
+            action: KeyAssignment::Nop,
+        };
+        let cloned = entry.clone();
+        assert_eq!(entry, cloned);
+    }
+
+    #[test]
+    fn key_assignment_nop_equality() {
+        assert_eq!(KeyAssignment::Nop, KeyAssignment::Nop);
+        assert_ne!(KeyAssignment::Nop, KeyAssignment::SpawnWindow);
+    }
+
+    #[test]
+    fn key_assignment_send_string() {
+        let a = KeyAssignment::SendString("hello".to_string());
+        let b = KeyAssignment::SendString("hello".to_string());
+        let c = KeyAssignment::SendString("world".to_string());
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    // --- CopyModeAssignment ---
+
+    #[test]
+    fn copy_mode_assignment_equality() {
+        assert_eq!(CopyModeAssignment::Close, CopyModeAssignment::Close);
+        assert_ne!(CopyModeAssignment::Close, CopyModeAssignment::PageUp);
+        assert_ne!(CopyModeAssignment::MoveLeft, CopyModeAssignment::MoveRight);
+    }
+
+    // --- MouseEventTrigger ---
+
+    #[test]
+    fn mouse_event_trigger_debug() {
+        let trigger = MouseEventTrigger::Down {
+            streak: 1,
+            button: MouseButton::Left,
+        };
+        let dbg = format!("{:?}", trigger);
+        assert!(dbg.contains("Down"));
+        assert!(dbg.contains("Left"));
+    }
+}

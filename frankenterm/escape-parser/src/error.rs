@@ -181,3 +181,144 @@ where
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn string_wrap_display() {
+        let sw = StringWrap("hello world".to_string());
+        assert_eq!(format!("{}", sw), "hello world");
+    }
+
+    #[test]
+    fn string_wrap_debug() {
+        let sw = StringWrap("test".to_string());
+        let dbg = format!("{:?}", sw);
+        assert!(dbg.contains("test"));
+    }
+
+    #[test]
+    fn internal_error_from_string() {
+        let err: InternalError = "something went wrong".to_string().into();
+        let msg = format!("{}", err);
+        assert_eq!(msg, "something went wrong");
+    }
+
+    #[test]
+    fn internal_error_from_fmt_error() {
+        let fmt_err = core::fmt::Error;
+        let err: InternalError = fmt_err.into();
+        let msg = format!("{}", err);
+        assert!(!msg.is_empty());
+    }
+
+    #[test]
+    fn internal_error_from_utf8_error() {
+        let bad_bytes = vec![0xff, 0xfe];
+        let utf8_err = alloc::string::String::from_utf8(bad_bytes).unwrap_err();
+        let err: InternalError = utf8_err.into();
+        let msg = format!("{}", err);
+        assert!(msg.contains("invalid"));
+    }
+
+    #[test]
+    fn internal_error_from_parse_float() {
+        let pf_err: core::num::ParseFloatError = "notfloat".parse::<f64>().unwrap_err();
+        let err: InternalError = pf_err.into();
+        let msg = format!("{}", err);
+        assert!(!msg.is_empty());
+    }
+
+    #[test]
+    fn internal_error_from_parse_int() {
+        let pi_err: core::num::ParseIntError = "notint".parse::<i32>().unwrap_err();
+        let err: InternalError = pi_err.into();
+        let msg = format!("{}", err);
+        assert!(!msg.is_empty());
+    }
+
+    #[test]
+    fn error_from_internal_error() {
+        let internal = InternalError::from("test error".to_string());
+        let err = Error(internal);
+        let msg = format!("{}", err);
+        assert_eq!(msg, "test error");
+    }
+
+    #[test]
+    fn error_debug() {
+        let err = Error(InternalError::from("debug test".to_string()));
+        let dbg = format!("{:?}", err);
+        assert!(dbg.contains("debug test"));
+    }
+
+    #[test]
+    fn error_from_string_wrap() {
+        let sw = StringWrap("wrapped".to_string());
+        let err: Error = sw.into();
+        let msg = format!("{}", err);
+        assert_eq!(msg, "wrapped");
+    }
+
+    #[test]
+    fn error_from_fmt_error() {
+        let fmt_err = core::fmt::Error;
+        let err: Error = fmt_err.into();
+        let msg = format!("{}", err);
+        assert!(!msg.is_empty());
+    }
+
+    #[test]
+    fn context_on_err_result() {
+        let result: core::result::Result<(), core::fmt::Error> = Err(core::fmt::Error);
+        let contexted = result.context("failed to format");
+        assert!(contexted.is_err());
+        let err = contexted.unwrap_err();
+        let msg = format!("{}", err);
+        assert_eq!(msg, "failed to format");
+    }
+
+    #[test]
+    fn context_on_ok_result() {
+        let result: core::result::Result<i32, core::fmt::Error> = Ok(42);
+        let contexted = result.context("should not appear");
+        assert_eq!(contexted.unwrap(), 42);
+    }
+
+    #[test]
+    fn with_context_on_err_result() {
+        let result: core::result::Result<(), core::fmt::Error> = Err(core::fmt::Error);
+        let contexted = result.with_context(|| "lazy context message");
+        assert!(contexted.is_err());
+        let err = contexted.unwrap_err();
+        let msg = format!("{}", err);
+        assert_eq!(msg, "lazy context message");
+    }
+
+    #[test]
+    fn with_context_on_ok_result() {
+        let result: core::result::Result<i32, core::fmt::Error> = Ok(99);
+        let contexted = result.with_context(|| "should not evaluate");
+        assert_eq!(contexted.unwrap(), 99);
+    }
+
+    #[test]
+    fn internal_error_context_variant() {
+        let source_err = core::fmt::Error;
+        let err = InternalError::Context {
+            context: "outer context".to_string(),
+            source: Box::new(source_err),
+        };
+        let msg = format!("{}", err);
+        assert_eq!(msg, "outer context");
+    }
+
+    #[test]
+    fn internal_error_debug() {
+        let err = InternalError::from("debug variant".to_string());
+        let dbg = format!("{:?}", err);
+        assert!(dbg.contains("StringErr"));
+    }
+}
