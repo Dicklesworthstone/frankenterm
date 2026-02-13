@@ -98,6 +98,7 @@ impl<'a> FieldInfo<'a> {
         }
     }
 
+    #[allow(clippy::wrong_self_convention)]
     pub fn from_dynamic(&self, struct_name: &str) -> TokenStream {
         let name = &self.name;
         let ident = &self.field.ident;

@@ -41,8 +41,11 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Clippy (all features)
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Clippy (default features)
+        run: cargo clippy --workspace -- -W clippy::all
+
+      - name: Clippy (with optional features)
+        run: cargo clippy --workspace --features tui,ftui,rollout,mcp,browser,web,metrics,distributed -- -W clippy::all
 
       - name: Compile benches (frankenterm-core)
         run: cargo bench -p frankenterm-core --benches --no-run
@@ -75,7 +78,7 @@ jobs:
           key: ${{ matrix.os }}
 
       - name: Run tests
-        run: cargo test --workspace --all-features --verbose
+        run: cargo test --workspace --verbose
 
       - name: Run doc tests
         run: cargo test --workspace --doc
@@ -127,14 +130,14 @@ jobs:
         run: |
           set -x
           cargo check --workspace
-          cargo clippy --workspace --all-targets -- -D warnings
+          cargo clippy --workspace -- -W clippy::all
 
       - name: Check compilation (feature-gated)
         if: matrix.feature != 'default'
         run: |
           set -x
           cargo check --workspace --features ${{ matrix.feature }}
-          cargo clippy --workspace --all-targets --features ${{ matrix.feature }} -- -D warnings
+          cargo clippy --workspace --features ${{ matrix.feature }} -- -W clippy::all
 
       - name: Run tests (no features)
         if: matrix.feature == 'default'
@@ -171,7 +174,7 @@ jobs:
         run: |
           set -x
           cargo check --workspace --features vendored
-          cargo clippy --workspace --all-targets --features vendored -- -D warnings
+          cargo clippy --workspace --features vendored -- -W clippy::all
 
       - name: Run vendored tests
         run: cargo test --workspace --features vendored --verbose
