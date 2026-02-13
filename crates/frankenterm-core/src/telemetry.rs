@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::runtime_compat::sleep;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info_span, warn};
@@ -752,10 +753,13 @@ impl TelemetryCollector {
     /// Samples resource metrics at `config.sample_interval`.
     pub async fn run(&self) {
         let interval = self.config.sample_interval.max(Duration::from_secs(1));
-        let mut ticker = tokio::time::interval(interval);
+        let mut first_tick = true;
 
         loop {
-            ticker.tick().await;
+            if !first_tick {
+                sleep(interval).await;
+            }
+            first_tick = false;
 
             if self.shutdown.load(Ordering::SeqCst) {
                 debug!("Telemetry collector shutting down");

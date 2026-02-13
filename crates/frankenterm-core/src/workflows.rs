@@ -4691,7 +4691,7 @@ pub fn run_unstick_scan_text(config: &UnstickConfig) -> UnstickReport {
 use crate::ingest::Osc133State;
 use crate::patterns::PatternEngine;
 use crate::runtime_compat::sleep;
-use tokio::time::Instant;
+use std::time::Instant;
 
 /// Result of waiting for a condition.
 #[derive(Debug, Clone)]

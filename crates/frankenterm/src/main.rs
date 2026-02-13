@@ -8510,46 +8510,56 @@ async fn distributed_agent_stream_session(
     }
 
     let mut subscriber = event_bus.subscribe();
-    let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
-    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let heartbeat_interval = Duration::from_secs(30);
+    let mut next_heartbeat = Instant::now() + heartbeat_interval;
 
     loop {
         if shutdown_flag.load(Ordering::SeqCst) {
             return Ok(());
         }
 
-        tokio::select! {
-            event_result = subscriber.recv() => {
-                match event_result {
-                    Ok(event) => {
-                        distributed_agent_stream_event(
-                            event,
-                            streamer,
-                            storage,
-                            segment_cursors,
-                            &mut stream,
-                        )
-                        .await?;
-                    }
-                    Err(frankenterm_core::events::RecvError::Lagged { missed_count }) => {
-                        tracing::warn!(missed = missed_count, "Distributed agent subscriber lagged; repairing via segment scan");
-                        let repaired = distributed_agent_flush_all_panes(
-                            streamer,
-                            storage,
-                            segment_cursors,
-                            &mut stream,
-                        )
-                        .await?;
-                        tracing::debug!(repaired, "Distributed lag repair flushed pending deltas");
-                    }
-                    Err(frankenterm_core::events::RecvError::Closed) => {
-                        anyhow::bail!("Distributed agent event bus closed");
-                    }
+        let now = Instant::now();
+        let wait_duration = next_heartbeat.saturating_duration_since(now);
+        match frankenterm_core::runtime_compat::timeout(wait_duration, subscriber.recv()).await {
+            Ok(event_result) => match event_result {
+                Ok(event) => {
+                    distributed_agent_stream_event(
+                        event,
+                        streamer,
+                        storage,
+                        segment_cursors,
+                        &mut stream,
+                    )
+                    .await?;
                 }
-            }
-            _ = heartbeat.tick() => {
+                Err(frankenterm_core::events::RecvError::Lagged { missed_count }) => {
+                    tracing::warn!(
+                        missed = missed_count,
+                        "Distributed agent subscriber lagged; repairing via segment scan"
+                    );
+                    let repaired = distributed_agent_flush_all_panes(
+                        streamer,
+                        storage,
+                        segment_cursors,
+                        &mut stream,
+                    )
+                    .await?;
+                    tracing::debug!(repaired, "Distributed lag repair flushed pending deltas");
+                }
+                Err(frankenterm_core::events::RecvError::Closed) => {
+                    anyhow::bail!("Distributed agent event bus closed");
+                }
+            },
+            Err(_) => {
                 distributed_agent_send_pane_snapshot(streamer, storage, &mut stream).await?;
+                next_heartbeat = Instant::now() + heartbeat_interval;
+                continue;
             }
+        }
+
+        if Instant::now() >= next_heartbeat {
+            distributed_agent_send_pane_snapshot(streamer, storage, &mut stream).await?;
+            next_heartbeat = Instant::now() + heartbeat_interval;
         }
     }
 }

@@ -435,6 +435,7 @@ impl MuxPool {
 mod tests {
     use super::*;
     use crate::runtime_compat::timeout;
+    use crate::runtime_compat::unix::{self as compat_unix, AsyncReadExt, AsyncWriteExt};
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -445,14 +446,14 @@ mod tests {
         CODEC_VERSION, GetCodecVersionResponse, GetPaneRenderChangesResponse, ListPanesResponse,
         Pdu, UnitResponse,
     };
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// Spawn a mock mux server that handles handshake + ListPanes.
     /// Returns the socket path.
     async fn spawn_mock_server(temp_dir: &tempfile::TempDir) -> PathBuf {
         let socket_path = temp_dir.path().join("mux-pool-test.sock");
-        let listener =
-            tokio::net::UnixListener::bind(&socket_path).expect("bind mock mux listener");
+        let listener = compat_unix::bind(&socket_path)
+            .await
+            .expect("bind mock mux listener");
 
         tokio::spawn(async move {
             loop {
@@ -537,8 +538,9 @@ mod tests {
     /// Spawn a mock mux server that returns an unexpected response for the first ListPanes.
     async fn spawn_mock_server_unexpected_list_panes_once(temp_dir: &tempfile::TempDir) -> PathBuf {
         let socket_path = temp_dir.path().join("mux-pool-test-unexpected.sock");
-        let listener =
-            tokio::net::UnixListener::bind(&socket_path).expect("bind mock mux listener");
+        let listener = compat_unix::bind(&socket_path)
+            .await
+            .expect("bind mock mux listener");
 
         let first_bad = Arc::new(AtomicBool::new(true));
 

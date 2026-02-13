@@ -9,9 +9,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::runtime_compat::mpsc;
 use crate::runtime_compat::timeout;
 use crate::runtime_compat::{RwLock, Semaphore};
-use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tracing::{debug, trace, warn};
 

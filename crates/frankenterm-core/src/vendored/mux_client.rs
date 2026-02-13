@@ -793,6 +793,7 @@ pub fn subscribe_pane_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_compat::unix as compat_unix;
     use proptest::prelude::*;
     use std::collections::{HashMap, HashSet};
 
@@ -851,7 +852,9 @@ mod tests {
     async fn list_panes_roundtrip() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let socket_path = temp_dir.path().join("mux.sock");
-        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind listener");
+        let listener = compat_unix::bind(&socket_path)
+            .await
+            .expect("bind listener");
 
         tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
@@ -1235,7 +1238,9 @@ mod tests {
     async fn fallback_via_always_override_when_server_rejects_uncompressed() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let socket_path = temp_dir.path().join("compression-fallback.sock");
-        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind listener");
+        let listener = compat_unix::bind(&socket_path)
+            .await
+            .expect("bind listener");
 
         let server = tokio::spawn(async move {
             for attempt in 0..2 {
@@ -1443,7 +1448,7 @@ mod tests {
     async fn incompatible_codec_version_rejected() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let socket_path = temp_dir.path().join("mux-incompat.sock");
-        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let listener = compat_unix::bind(&socket_path).await.expect("bind");
 
         tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
@@ -1542,7 +1547,7 @@ mod tests {
         // The poller should shut down when cancelled via the handle.
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let socket_path = temp_dir.path().join("cancel-test.sock");
-        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let listener = compat_unix::bind(&socket_path).await.expect("bind");
 
         // Server: accept, do codec handshake, then respond to GetPaneRenderChanges
         // with empty dirty_lines (no deltas to emit).

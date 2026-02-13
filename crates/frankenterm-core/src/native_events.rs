@@ -15,10 +15,10 @@ use std::os::unix::fs::FileTypeExt;
 #[cfg(unix)]
 use std::os::unix::net::UnixStream as StdUnixStream;
 
+use crate::runtime_compat::mpsc;
+use crate::runtime_compat::unix::{self as compat_unix, UnixListener, UnixStream};
 use base64::Engine as _;
 use serde::Deserialize;
-use crate::runtime_compat::unix::{self as compat_unix, UnixListener, UnixStream};
-use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 const MAX_EVENT_LINE_BYTES: usize = 512 * 1024;
@@ -342,8 +342,8 @@ fn decode_wire_event(line: &str) -> Result<Option<NativeEvent>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicBool;
     use crate::runtime_compat::unix::{self as compat_unix, AsyncWriteExt};
+    use std::sync::atomic::AtomicBool;
 
     #[test]
     fn decode_pane_output_event() {

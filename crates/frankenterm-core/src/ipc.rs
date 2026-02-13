@@ -11,6 +11,7 @@
 //! - Server responds: `{"ok":true}\n` or `{"ok":false,"error":"..."}\n`
 
 use crate::runtime_compat::RwLock;
+use crate::runtime_compat::mpsc;
 #[cfg(unix)]
 use crate::runtime_compat::unix::{self as compat_unix, AsyncWriteExt, UnixListener, UnixStream};
 use serde::{Deserialize, Serialize};
@@ -19,7 +20,6 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::mpsc;
 
 use crate::config::{IpcAuthToken, IpcScope};
 use crate::crash::HealthSnapshot;

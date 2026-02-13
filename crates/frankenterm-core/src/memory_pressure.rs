@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::runtime_compat::sleep;
 use serde::{Deserialize, Serialize};
 
 // =============================================================================
@@ -222,10 +223,14 @@ impl MemoryPressureMonitor {
     /// Run the monitoring loop until the shutdown flag is set.
     pub async fn run(&self, shutdown: Arc<std::sync::atomic::AtomicBool>) {
         let interval = Duration::from_millis(self.config.sample_interval_ms.max(1000));
-        let mut ticker = tokio::time::interval(interval);
+        let mut first_tick = true;
 
         loop {
-            ticker.tick().await;
+            if !first_tick {
+                sleep(interval).await;
+            }
+            first_tick = false;
+
             if shutdown.load(Ordering::SeqCst) {
                 break;
             }

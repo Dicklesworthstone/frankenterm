@@ -26,6 +26,7 @@ use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
+use crate::runtime_compat::sleep;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
@@ -527,10 +528,14 @@ impl SurvivalModel {
     /// Run the model update loop (call from async context).
     pub async fn run(&self) {
         let interval = self.config.update_interval.max(Duration::from_secs(1));
-        let mut ticker = tokio::time::interval(interval);
+        let mut first_tick = true;
 
         loop {
-            ticker.tick().await;
+            if !first_tick {
+                sleep(interval).await;
+            }
+            first_tick = false;
+
             if self.shutdown.load(Ordering::SeqCst) {
                 debug!("Survival model shutting down");
                 break;
