@@ -1,6 +1,6 @@
 //! FrankenTerm CLI
 //!
-//! Terminal hypervisor for AI agent swarms running in WezTerm.
+//! Swarm-native terminal platform CLI for large AI agent fleets.
 
 #![forbid(unsafe_code)]
 
@@ -55,7 +55,7 @@ mod mcp;
 
 static CLAP_VERSION: LazyLock<String> = LazyLock::new(build_meta::short_version);
 
-/// FrankenTerm - Terminal hypervisor for AI agents
+/// FrankenTerm - swarm-native terminal platform for AI agents
 #[derive(Parser)]
 #[command(name = "ft")]
 #[command(author, version = CLAP_VERSION.as_str(), about, long_about = None)]
@@ -19852,6 +19852,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         "pane_count": scenario.panes.len(),
                         "event_count": scenario.events.len(),
                         "expectation_count": scenario.expectations.len(),
+                        "metadata": &scenario.metadata,
+                        "reproducibility_key": scenario.reproducibility_key(),
                     });
                     println!("{}", serde_json::to_string_pretty(&meta)?);
                 } else {
@@ -19865,6 +19867,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         scenario.events.len(),
                         scenario.duration.as_secs_f64(),
                     );
+                    println!("  Reproducibility: {}", scenario.reproducibility_key());
+                    if !scenario.metadata.is_empty() {
+                        println!("  Metadata:");
+                        for (key, value) in &scenario.metadata {
+                            println!("    {key}={value}");
+                        }
+                    }
                     println!();
                 }
 
@@ -19898,6 +19907,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             frankenterm_core::simulation::EventAction::Clear => "clear",
                             frankenterm_core::simulation::EventAction::SetTitle => "set_title",
                             frankenterm_core::simulation::EventAction::Resize => "resize",
+                            frankenterm_core::simulation::EventAction::SetFontSize => {
+                                "set_font_size"
+                            }
+                            frankenterm_core::simulation::EventAction::GenerateScrollback => {
+                                "generate_scrollback"
+                            }
                             frankenterm_core::simulation::EventAction::Marker => "marker",
                         };
                         println!(
@@ -19963,24 +19978,54 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             SimulateCommands::List => {
                 println!("Built-in scenarios:");
                 println!();
-                println!("  (none yet — use 'ft simulate run <file.yaml>' with custom scenarios)");
+                println!(
+                    "  resize_single_pane_scrollback   fixtures/simulations/resize_baseline/resize_single_pane_scrollback.yaml"
+                );
+                println!(
+                    "  resize_multi_tab_storm          fixtures/simulations/resize_baseline/resize_multi_tab_storm.yaml"
+                );
+                println!(
+                    "  font_churn_multi_pane           fixtures/simulations/resize_baseline/font_churn_multi_pane.yaml"
+                );
+                println!(
+                    "  mixed_scale_soak                fixtures/simulations/resize_baseline/mixed_scale_soak.yaml"
+                );
+                println!();
+                println!(
+                    "Run one: ft simulate run fixtures/simulations/resize_baseline/<scenario>.yaml"
+                );
                 println!();
                 println!("Scenario YAML format:");
                 println!("  name: my_scenario");
                 println!("  description: \"What this scenario tests\"");
                 println!("  duration: \"30s\"");
+                println!("  metadata:");
+                println!("    suite: resize_baseline");
+                println!("    suite_version: \"YYYY-MM-DD\"");
+                println!("    seed: \"424242\"");
                 println!("  panes:");
                 println!("    - id: 0");
                 println!("      title: \"Agent\"");
+                println!("      window_id: 0");
+                println!("      tab_id: 0");
                 println!("      initial_content: \"$ \"");
                 println!("  events:");
                 println!("    - at: \"2s\"");
                 println!("      pane: 0");
                 println!("      action: append");
                 println!("      content: \"output text\"");
+                println!("    - at: \"3s\"");
+                println!("      pane: 0");
+                println!("      action: set_font_size");
+                println!("      content: \"1.10\"");
+                println!("    - at: \"4s\"");
+                println!("      pane: 0");
+                println!("      action: generate_scrollback");
+                println!("      content: \"20000x120\"");
                 println!("  expectations:");
-                println!("    - pane: 0");
-                println!("      text: \"output text\"");
+                println!("    - contains:");
+                println!("        pane: 0");
+                println!("        text: \"output text\"");
             }
             SimulateCommands::Validate { scenario, json } => {
                 use frankenterm_core::simulation::Scenario;
@@ -19996,6 +20041,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 "pane_count": s.panes.len(),
                                 "event_count": s.events.len(),
                                 "expectation_count": s.expectations.len(),
+                                "metadata": &s.metadata,
+                                "reproducibility_key": s.reproducibility_key(),
                             });
                             println!("{}", serde_json::to_string_pretty(&info)?);
                         } else {
@@ -20005,6 +20052,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             println!("  Panes:       {}", s.panes.len());
                             println!("  Events:      {}", s.events.len());
                             println!("  Expectations: {}", s.expectations.len());
+                            println!("  Reproducibility: {}", s.reproducibility_key());
+                            if !s.metadata.is_empty() {
+                                println!("  Metadata:");
+                                for (key, value) in &s.metadata {
+                                    println!("    {key}={value}");
+                                }
+                            }
                         }
                     }
                     Err(e) => {
@@ -20097,7 +20151,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
         None => {
             println!("ft - FrankenTerm");
             println!();
-            println!("Terminal hypervisor for AI agent swarms.");
+            println!("Swarm-native terminal platform for AI agent fleets.");
             println!();
             println!("Use --help to see available commands.");
         }

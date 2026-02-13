@@ -277,11 +277,7 @@ impl Scenario {
             .get("suite_version")
             .map(String::as_str)
             .unwrap_or("v1");
-        let seed = self
-            .metadata
-            .get("seed")
-            .map(String::as_str)
-            .unwrap_or("0");
+        let seed = self.metadata.get("seed").map(String::as_str).unwrap_or("0");
         format!("{suite}:{suite_version}:{}:{seed}", self.name)
     }
 
@@ -679,13 +675,12 @@ fn parse_scrollback_spec(spec: &str) -> Result<(usize, usize)> {
         ));
     }
 
-    let (lines_raw, width_raw_opt) = if let Some((l, w)) =
-        trimmed.split_once('x').or_else(|| trimmed.split_once('X'))
-    {
-        (l.trim(), Some(w.trim()))
-    } else {
-        (trimmed, None)
-    };
+    let (lines_raw, width_raw_opt) =
+        if let Some((l, w)) = trimmed.split_once('x').or_else(|| trimmed.split_once('X')) {
+            (l.trim(), Some(w.trim()))
+        } else {
+            (trimmed, None)
+        };
 
     let lines: usize = lines_raw.parse().map_err(|_| {
         crate::Error::Runtime(format!(
@@ -892,16 +887,26 @@ events:
     content: "120x40"
   - at: "5s"
     pane: 0
+    action: set_font_size
+    content: "1.15"
+  - at: "6s"
+    pane: 0
+    action: generate_scrollback
+    content: "8x64"
+  - at: "7s"
+    pane: 0
     action: marker
     name: checkpoint
 "#;
         let scenario = Scenario::from_yaml(yaml).unwrap();
-        assert_eq!(scenario.events.len(), 5);
+        assert_eq!(scenario.events.len(), 7);
         assert_eq!(scenario.events[0].action, EventAction::Append);
         assert_eq!(scenario.events[1].action, EventAction::Clear);
         assert_eq!(scenario.events[2].action, EventAction::SetTitle);
         assert_eq!(scenario.events[3].action, EventAction::Resize);
-        assert_eq!(scenario.events[4].action, EventAction::Marker);
+        assert_eq!(scenario.events[4].action, EventAction::SetFontSize);
+        assert_eq!(scenario.events[5].action, EventAction::GenerateScrollback);
+        assert_eq!(scenario.events[6].action, EventAction::Marker);
     }
 
     #[test]
@@ -943,6 +948,42 @@ events:
             comment: None,
         };
         assert!(Scenario::to_mock_event(&event).is_err());
+    }
+
+    #[test]
+    fn to_mock_event_set_font_size_marker() {
+        let event = ScenarioEvent {
+            at: Duration::from_secs(1),
+            pane: 0,
+            action: EventAction::SetFontSize,
+            content: "1.25".to_string(),
+            name: String::new(),
+            comment: None,
+        };
+        let mock_event = Scenario::to_mock_event(&event).unwrap();
+        assert!(matches!(mock_event, MockEvent::AppendOutput(ref s) if s == "[FONT_SIZE:1.25]"));
+    }
+
+    #[test]
+    fn to_mock_event_generate_scrollback() {
+        let event = ScenarioEvent {
+            at: Duration::from_secs(1),
+            pane: 0,
+            action: EventAction::GenerateScrollback,
+            content: "3x40".to_string(),
+            name: String::new(),
+            comment: None,
+        };
+        let mock_event = Scenario::to_mock_event(&event).unwrap();
+        match mock_event {
+            MockEvent::AppendOutput(text) => {
+                let lines: Vec<&str> = text.lines().collect();
+                assert_eq!(lines.len(), 3);
+                assert!(lines.iter().all(|line| line.len() == 40));
+                assert!(lines[0].contains("[scrollback:000000]"));
+            }
+            _ => panic!("expected generated scrollback append output"),
+        }
     }
 
     #[tokio::test]
@@ -1103,9 +1144,67 @@ events: []
         assert_eq!(pane.title, "pane");
         assert_eq!(pane.domain, "local");
         assert_eq!(pane.cwd, "/home/user");
+        assert_eq!(pane.window_id, 0);
+        assert_eq!(pane.tab_id, 0);
         assert_eq!(pane.cols, 80);
         assert_eq!(pane.rows, 24);
         assert!(pane.initial_content.is_empty());
+        assert!(scenario.metadata.is_empty());
+    }
+
+    #[test]
+    fn parse_metadata_and_reproducibility_key() {
+        let yaml = r#"
+name: metadata_case
+duration: "5s"
+metadata:
+  suite: resize_baseline
+  suite_version: "2026-02-13"
+  seed: "424242"
+  scale_profile: multi_tab_storm
+panes:
+  - id: 0
+events: []
+"#;
+        let scenario = Scenario::from_yaml(yaml).unwrap();
+        assert_eq!(
+            scenario.reproducibility_key(),
+            "resize_baseline:2026-02-13:metadata_case:424242"
+        );
+        assert_eq!(
+            scenario.metadata.get("scale_profile"),
+            Some(&"multi_tab_storm".to_string())
+        );
+    }
+
+    #[test]
+    fn metadata_empty_values_are_rejected() {
+        let yaml = r#"
+name: bad_meta
+duration: "5s"
+metadata:
+  suite: ""
+panes:
+  - id: 0
+events: []
+"#;
+        assert!(Scenario::from_yaml(yaml).is_err());
+    }
+
+    #[test]
+    fn generate_scrollback_validation_rejects_bad_specs() {
+        let yaml = r#"
+name: bad_scrollback
+duration: "5s"
+panes:
+  - id: 0
+events:
+  - at: "1s"
+    pane: 0
+    action: generate_scrollback
+    content: "0x80"
+"#;
+        assert!(Scenario::from_yaml(yaml).is_err());
     }
 
     #[tokio::test]
