@@ -196,3 +196,59 @@ pub struct ExecResult {
     pub stderr: FileDescriptor,
     pub child: SshChildProcess,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dead_session_display() {
+        let err = DeadSession;
+        assert_eq!(format!("{}", err), "SSH session is dead");
+    }
+
+    #[test]
+    fn dead_session_debug() {
+        let err = DeadSession;
+        let dbg = format!("{:?}", err);
+        assert!(dbg.contains("DeadSession"));
+    }
+
+    #[test]
+    fn dead_session_is_error() {
+        let err = DeadSession;
+        let error: &dyn std::error::Error = &err;
+        assert_eq!(error.to_string(), "SSH session is dead");
+    }
+
+    #[test]
+    fn session_event_banner_debug() {
+        let event = SessionEvent::Banner(Some("Welcome".to_string()));
+        let dbg = format!("{:?}", event);
+        assert!(dbg.contains("Banner"));
+        assert!(dbg.contains("Welcome"));
+    }
+
+    #[test]
+    fn session_event_banner_none() {
+        let event = SessionEvent::Banner(None);
+        let dbg = format!("{:?}", event);
+        assert!(dbg.contains("Banner"));
+        assert!(dbg.contains("None"));
+    }
+
+    #[test]
+    fn session_event_error() {
+        let event = SessionEvent::Error("connection failed".to_string());
+        let dbg = format!("{:?}", event);
+        assert!(dbg.contains("Error"));
+        assert!(dbg.contains("connection failed"));
+    }
+
+    #[test]
+    fn session_event_authenticated() {
+        let event = SessionEvent::Authenticated;
+        let dbg = format!("{:?}", event);
+        assert!(dbg.contains("Authenticated"));
+    }
+}

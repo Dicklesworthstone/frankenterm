@@ -26,6 +26,140 @@ impl AuthenticationEvent {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn authentication_prompt_debug() {
+        let prompt = AuthenticationPrompt {
+            prompt: "Password: ".to_string(),
+            echo: false,
+        };
+        let dbg = format!("{:?}", prompt);
+        assert!(dbg.contains("AuthenticationPrompt"));
+        assert!(dbg.contains("Password"));
+        assert!(dbg.contains("false"));
+    }
+
+    #[test]
+    fn authentication_prompt_echo_true() {
+        let prompt = AuthenticationPrompt {
+            prompt: "Username: ".to_string(),
+            echo: true,
+        };
+        assert!(prompt.echo);
+        assert_eq!(prompt.prompt, "Username: ");
+    }
+
+    #[test]
+    fn authentication_prompt_echo_false() {
+        let prompt = AuthenticationPrompt {
+            prompt: "Password: ".to_string(),
+            echo: false,
+        };
+        assert!(!prompt.echo);
+    }
+
+    #[test]
+    fn authentication_event_debug() {
+        let (tx, _rx) = bounded(1);
+        let event = AuthenticationEvent {
+            username: "user".to_string(),
+            instructions: "Please enter credentials".to_string(),
+            prompts: vec![AuthenticationPrompt {
+                prompt: "Password: ".to_string(),
+                echo: false,
+            }],
+            reply: tx,
+        };
+        let dbg = format!("{:?}", event);
+        assert!(dbg.contains("AuthenticationEvent"));
+        assert!(dbg.contains("user"));
+    }
+
+    #[test]
+    fn authentication_event_try_answer() {
+        let (tx, rx) = bounded(1);
+        let event = AuthenticationEvent {
+            username: "testuser".to_string(),
+            instructions: "".to_string(),
+            prompts: vec![],
+            reply: tx,
+        };
+        event.try_answer(vec!["secret".to_string()]).unwrap();
+        let result = smol::block_on(rx.recv()).unwrap();
+        assert_eq!(result, vec!["secret".to_string()]);
+    }
+
+    #[test]
+    fn authentication_event_async_answer() {
+        let (tx, rx) = bounded(1);
+        let event = AuthenticationEvent {
+            username: "admin".to_string(),
+            instructions: "Enter your credentials".to_string(),
+            prompts: vec![
+                AuthenticationPrompt {
+                    prompt: "Password: ".to_string(),
+                    echo: false,
+                },
+                AuthenticationPrompt {
+                    prompt: "OTP: ".to_string(),
+                    echo: true,
+                },
+            ],
+            reply: tx,
+        };
+        smol::block_on(async {
+            event
+                .answer(vec!["pass123".to_string(), "123456".to_string()])
+                .await
+                .unwrap();
+            let result = rx.recv().await.unwrap();
+            assert_eq!(result.len(), 2);
+            assert_eq!(result[0], "pass123");
+            assert_eq!(result[1], "123456");
+        });
+    }
+
+    #[test]
+    fn authentication_event_multiple_prompts() {
+        let (tx, _rx) = bounded(1);
+        let event = AuthenticationEvent {
+            username: "user".to_string(),
+            instructions: "Multi-factor auth".to_string(),
+            prompts: vec![
+                AuthenticationPrompt {
+                    prompt: "Password: ".to_string(),
+                    echo: false,
+                },
+                AuthenticationPrompt {
+                    prompt: "Token: ".to_string(),
+                    echo: true,
+                },
+            ],
+            reply: tx,
+        };
+        assert_eq!(event.prompts.len(), 2);
+        assert!(!event.prompts[0].echo);
+        assert!(event.prompts[1].echo);
+    }
+
+    #[test]
+    fn authentication_event_empty_prompts() {
+        let (tx, _rx) = bounded(1);
+        let event = AuthenticationEvent {
+            username: "".to_string(),
+            instructions: "".to_string(),
+            prompts: vec![],
+            reply: tx,
+        };
+        assert!(event.prompts.is_empty());
+        assert!(event.username.is_empty());
+        assert!(event.instructions.is_empty());
+    }
+}
+
 impl crate::sessioninner::SessionInner {
     #[cfg(feature = "ssh2")]
     fn agent_auth(&mut self, sess: &ssh2::Session, user: &str) -> anyhow::Result<bool> {
