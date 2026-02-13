@@ -10,6 +10,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+#[cfg(unix)]
+use std::os::unix::fs::FileTypeExt;
+#[cfg(unix)]
+use std::os::unix::net::UnixStream as StdUnixStream;
+
 use base64::Engine as _;
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -138,11 +143,7 @@ impl NativeEventListener {
             return Err(NativeEventError::EmptySocketPath);
         }
 
-        if socket_path.exists() {
-            return Err(NativeEventError::SocketAlreadyExists(
-                socket_path.display().to_string(),
-            ));
-        }
+        maybe_cleanup_stale_socket(&socket_path)?;
 
         if let Some(parent) = socket_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -177,6 +178,67 @@ impl NativeEventListener {
                 Err(_) => {} // timeout, loop to check shutdown flag
             }
         }
+    }
+}
+
+impl Drop for NativeEventListener {
+    fn drop(&mut self) {
+        if let Err(err) = std::fs::remove_file(&self.socket_path) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                debug!(
+                    error = %err,
+                    path = %self.socket_path.display(),
+                    "failed to remove native event socket path on drop"
+                );
+            }
+        }
+    }
+}
+
+fn maybe_cleanup_stale_socket(socket_path: &PathBuf) -> Result<(), NativeEventError> {
+    let metadata = match std::fs::symlink_metadata(socket_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(NativeEventError::Io(err)),
+    };
+
+    #[cfg(unix)]
+    let is_socket = metadata.file_type().is_socket();
+    #[cfg(not(unix))]
+    let is_socket = false;
+
+    if !is_socket {
+        return Err(NativeEventError::SocketAlreadyExists(
+            socket_path.display().to_string(),
+        ));
+    }
+
+    #[cfg(unix)]
+    match StdUnixStream::connect(socket_path) {
+        Ok(_stream) => Err(NativeEventError::SocketAlreadyExists(
+            socket_path.display().to_string(),
+        )),
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            ) =>
+        {
+            std::fs::remove_file(socket_path)?;
+            debug!(
+                path = %socket_path.display(),
+                "removed stale native event socket path before bind"
+            );
+            Ok(())
+        }
+        Err(err) => Err(NativeEventError::Io(err)),
+    }
+
+    #[cfg(not(unix))]
+    {
+        Err(NativeEventError::SocketAlreadyExists(
+            socket_path.display().to_string(),
+        ))
     }
 }
 
@@ -571,7 +633,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bind_existing_path_returns_error() {
+    async fn bind_existing_regular_file_returns_error() {
         let dir = tempfile::tempdir().expect("tempdir");
         let socket_path = dir.path().join("exists.sock");
         // Create the file first
@@ -584,6 +646,60 @@ mod tests {
             Err(other) => panic!("expected SocketAlreadyExists, got: {other}"),
             Ok(_) => panic!("expected error"),
         }
+    }
+
+    #[tokio::test]
+    async fn bind_active_socket_returns_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("active.sock");
+        let _active_listener = UnixListener::bind(&socket_path).expect("bind active socket");
+
+        let result = NativeEventListener::bind(socket_path).await;
+        assert!(result.is_err());
+        match result {
+            Err(NativeEventError::SocketAlreadyExists(_)) => {}
+            Err(other) => panic!("expected SocketAlreadyExists, got: {other}"),
+            Ok(_) => panic!("expected error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn bind_replaces_stale_socket_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("stale.sock");
+        let stale_listener = UnixListener::bind(&socket_path).expect("bind stale socket");
+        drop(stale_listener);
+        assert!(
+            socket_path.exists(),
+            "socket path should persist after listener drop"
+        );
+
+        let listener = NativeEventListener::bind(socket_path.clone())
+            .await
+            .expect("bind replaces stale socket path");
+        assert!(
+            socket_path.exists(),
+            "rebound listener should recreate socket"
+        );
+
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn listener_drop_removes_socket_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("drop-cleanup.sock");
+        let listener = NativeEventListener::bind(socket_path.clone())
+            .await
+            .expect("bind listener");
+        assert!(socket_path.exists(), "socket should exist after bind");
+
+        drop(listener);
+
+        assert!(
+            !socket_path.exists(),
+            "socket path should be cleaned up on drop"
+        );
     }
 
     #[tokio::test]
@@ -728,7 +844,7 @@ mod tests {
     async fn shutdown_flag_stops_listener() {
         let dir = tempfile::tempdir().expect("tempdir");
         let socket_path = dir.path().join("shutdown.sock");
-        let listener = NativeEventListener::bind(socket_path)
+        let listener = NativeEventListener::bind(socket_path.clone())
             .await
             .expect("bind listener");
         let (event_tx, _event_rx) = mpsc::channel(8);
@@ -743,5 +859,9 @@ mod tests {
         // Listener should exit within a few poll intervals
         let result = crate::runtime_compat::timeout(Duration::from_secs(2), handle).await;
         assert!(result.is_ok(), "listener did not shut down in time");
+        assert!(
+            !socket_path.exists(),
+            "socket path should be removed after listener shutdown"
+        );
     }
 }

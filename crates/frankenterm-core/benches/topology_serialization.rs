@@ -6,10 +6,13 @@
 //! - JSON roundtrip: **< 50µs** per snapshot
 //! - Pane matching: **< 200µs** for 50-pane topology
 
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use frankenterm_core::session_topology::TopologySnapshot;
 use frankenterm_core::wezterm::{PaneInfo, PaneSize};
 use std::collections::HashMap;
+
+#[cfg(feature = "mcp-server")]
+use serde_json::{Value, json};
 
 mod bench_common;
 
@@ -29,6 +32,18 @@ const BUDGETS: &[bench_common::BenchBudget] = &[
     bench_common::BenchBudget {
         name: "pane_matching",
         budget: "p50 < 200us (50-pane matching)",
+    },
+    bench_common::BenchBudget {
+        name: "toon_vs_json_encode",
+        budget: "p50 < 50ms for representative MCP envelopes",
+    },
+    bench_common::BenchBudget {
+        name: "toon_vs_json_decode",
+        budget: "p50 < 50ms for representative MCP envelopes",
+    },
+    bench_common::BenchBudget {
+        name: "toon_stream_decode_10mb",
+        budget: "p50 < 200ms for ~10MB TOON line stream",
     },
 ];
 
@@ -80,6 +95,139 @@ fn generate_topology(pane_count: usize) -> TopologySnapshot {
     let now_ms = 1700000000000u64;
     let (snapshot, _report) = TopologySnapshot::from_panes(&panes, now_ms);
     snapshot
+}
+
+#[cfg(feature = "mcp-server")]
+#[derive(Clone)]
+struct SerializationPayload {
+    name: &'static str,
+    value: Value,
+    json: String,
+    toon: String,
+}
+
+#[cfg(feature = "mcp-server")]
+fn estimate_tokens(s: &str) -> usize {
+    let chars = s.len();
+    let words = s.split_whitespace().count();
+    std::cmp::max(chars / 4, words)
+}
+
+#[cfg(feature = "mcp-server")]
+fn make_payload(name: &'static str, value: Value) -> SerializationPayload {
+    let json = serde_json::to_string(&value).expect("serialize benchmark payload to json");
+    let toon = toon_rust::encode(value.clone(), None);
+    SerializationPayload {
+        name,
+        value,
+        json,
+        toon,
+    }
+}
+
+#[cfg(feature = "mcp-server")]
+fn representative_payloads() -> Vec<SerializationPayload> {
+    let state_payload = make_payload(
+        "state_12_panes",
+        json!({
+            "ok": true,
+            "data": {
+                "panes": (0..12)
+                    .map(|pane_id| json!({
+                        "pane_id": pane_id,
+                        "domain": "local",
+                        "title": format!("agent-{pane_id}"),
+                        "cwd": format!("/workspace/project-{pane_id}")
+                    }))
+                    .collect::<Vec<_>>()
+            },
+            "elapsed_ms": 3,
+            "version": "0.1.0",
+            "now": 1_700_000_000_000_u64,
+            "mcp_version": "v1"
+        }),
+    );
+
+    let search_payload = make_payload(
+        "search_100_hits",
+        json!({
+            "ok": true,
+            "data": {
+                "query": "error OR warning",
+                "results": (0..100)
+                    .map(|i| json!({
+                        "segment_id": i + 10_000,
+                        "pane_id": i % 16,
+                        "seq": i * 5,
+                        "captured_at": 1_700_000_000_000_i64 + i,
+                        "score": 0.99_f64 - (i as f64 * 0.001),
+                        "snippet": format!("build-{i}: warning: retry budget nearly exhausted"),
+                    }))
+                    .collect::<Vec<_>>()
+            },
+            "elapsed_ms": 12,
+            "version": "0.1.0",
+            "now": 1_700_000_000_000_u64,
+            "mcp_version": "v1"
+        }),
+    );
+
+    let pane_text = (0..8_000)
+        .map(|i| format!("line-{i:05}: compilation unit {i} completed"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let get_text_payload = make_payload(
+        "get_text_large",
+        json!({
+            "ok": true,
+            "data": {
+                "pane_id": 7,
+                "text": pane_text,
+                "tail_lines": 8_000,
+                "escapes_included": false,
+                "truncated": false
+            },
+            "elapsed_ms": 21,
+            "version": "0.1.0",
+            "now": 1_700_000_000_000_u64,
+            "mcp_version": "v1"
+        }),
+    );
+
+    vec![state_payload, search_payload, get_text_payload]
+}
+
+#[cfg(feature = "mcp-server")]
+fn large_stream_input() -> (Vec<String>, usize) {
+    let message = "x".repeat(256);
+    let records = (0..32_000)
+        .map(|i| {
+            json!({
+                "seq": i,
+                "pane_id": i % 32,
+                "rule_id": "core.codex:usage_reached",
+                "event_type": "usage_reached",
+                "message": message.clone()
+            })
+        })
+        .collect::<Vec<_>>();
+    let value = json!({
+        "ok": true,
+        "data": {
+            "events": records
+        },
+        "elapsed_ms": 150,
+        "version": "0.1.0",
+        "now": 1_700_000_000_000_u64,
+        "mcp_version": "v1"
+    });
+    let toon = toon_rust::encode(value, None);
+    let size_bytes = toon.len();
+    let lines = toon
+        .lines()
+        .map(std::string::ToString::to_string)
+        .collect::<Vec<_>>();
+    (lines, size_bytes)
 }
 
 fn bench_from_panes(c: &mut Criterion) {
@@ -178,6 +326,106 @@ fn bench_pane_matching(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(feature = "mcp-server")]
+fn bench_toon_vs_json_serialization(c: &mut Criterion) {
+    let payloads = representative_payloads();
+
+    let mut encode_group = c.benchmark_group("toon_serialization/encode");
+    for payload in &payloads {
+        encode_group.throughput(Throughput::Bytes(payload.json.len() as u64));
+        encode_group.bench_with_input(
+            BenchmarkId::new("json", payload.name),
+            payload,
+            |b, payload| {
+                b.iter(|| {
+                    let value = payload.value.clone();
+                    black_box(serde_json::to_string(&value).expect("json encode"));
+                });
+            },
+        );
+        encode_group.bench_with_input(
+            BenchmarkId::new("toon", payload.name),
+            payload,
+            |b, payload| {
+                b.iter(|| {
+                    let value = payload.value.clone();
+                    black_box(toon_rust::encode(value, None));
+                });
+            },
+        );
+    }
+    encode_group.finish();
+
+    let mut decode_group = c.benchmark_group("toon_serialization/decode");
+    for payload in &payloads {
+        decode_group.throughput(Throughput::Bytes(payload.json.len() as u64));
+        decode_group.bench_with_input(
+            BenchmarkId::new("json", payload.name),
+            payload,
+            |b, payload| {
+                b.iter(|| {
+                    black_box(
+                        serde_json::from_str::<serde_json::Value>(&payload.json)
+                            .expect("json decode"),
+                    );
+                });
+            },
+        );
+        decode_group.bench_with_input(
+            BenchmarkId::new("toon", payload.name),
+            payload,
+            |b, payload| {
+                b.iter(|| {
+                    black_box(toon_rust::try_decode(&payload.toon, None).expect("toon decode"));
+                });
+            },
+        );
+    }
+    decode_group.finish();
+
+    let mut token_group = c.benchmark_group("toon_serialization/token_estimate");
+    for payload in &payloads {
+        token_group.bench_with_input(
+            BenchmarkId::new("compare", payload.name),
+            payload,
+            |b, p| {
+                b.iter(|| {
+                    let json_tokens = estimate_tokens(&p.json);
+                    let toon_tokens = estimate_tokens(&p.toon);
+                    let savings_pct = if json_tokens > 0 {
+                        100_i64 - ((toon_tokens as i64) * 100 / (json_tokens as i64))
+                    } else {
+                        0
+                    };
+                    black_box((json_tokens, toon_tokens, savings_pct));
+                });
+            },
+        );
+    }
+    token_group.finish();
+}
+
+#[cfg(not(feature = "mcp-server"))]
+fn bench_toon_vs_json_serialization(_c: &mut Criterion) {}
+
+#[cfg(feature = "mcp-server")]
+fn bench_toon_stream_decode(c: &mut Criterion) {
+    let (lines, size_bytes) = large_stream_input();
+    let mut group = c.benchmark_group("toon_serialization/stream_decode");
+    group.throughput(Throughput::Bytes(size_bytes as u64));
+    group.bench_function("toon_stream_sync_approx_10mb", |b| {
+        b.iter(|| {
+            let events = toon_rust::try_decode_stream_sync(lines.iter().cloned(), None)
+                .expect("toon stream decode");
+            black_box(events.len());
+        });
+    });
+    group.finish();
+}
+
+#[cfg(not(feature = "mcp-server"))]
+fn bench_toon_stream_decode(_c: &mut Criterion) {}
+
 fn bench_config() -> Criterion {
     bench_common::emit_bench_artifacts("topology_serialization", BUDGETS);
     Criterion::default().configure_from_args()
@@ -190,6 +438,8 @@ criterion_group!(
         bench_json_roundtrip,
         bench_pane_count,
         bench_pane_ids,
-        bench_pane_matching
+        bench_pane_matching,
+        bench_toon_vs_json_serialization,
+        bench_toon_stream_decode
 );
 criterion_main!(benches);

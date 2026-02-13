@@ -24,7 +24,7 @@ ft mcp serve
 
 ## Response Envelope (v1)
 
-All MCP tool calls return the same envelope:
+By default (`format=json`), MCP tool calls return this JSON envelope:
 
 ```json
 {
@@ -44,6 +44,9 @@ Notes:
 - When `ok=false`, `data` is omitted and `error` is populated.
 - `data` MUST match the corresponding robot JSON schema under `docs/json-schema/`.
 - `now` is epoch milliseconds.
+- Tools also accept optional `format: "json" | "toon"` in params:
+  - `format=json` (default): response text is JSON envelope as shown above.
+  - `format=toon`: response text is TOON-encoded envelope with the same logical fields.
 
 ## Tool List (v1)
 
@@ -82,6 +85,7 @@ legacy `wa://...` scheme for backward compatibility.
 ### Tool Params (v1)
 
 Parameter types use JSON primitives; `u64` fields are JSON numbers.
+All tools accept an optional `format?: "json" | "toon"` parameter (default: `json`).
 
 - `wa.state`
   - Params: `{ domain?: string, agent?: string, pane_id?: u64 }`

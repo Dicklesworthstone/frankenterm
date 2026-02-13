@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::pool::{Pool, PoolAcquireGuard, PoolConfig, PoolError, PoolStats};
 use crate::retry::RetryPolicy;
-use crate::runtime_compat::{sleep, timeout};
+use crate::runtime_compat::sleep;
 
 use super::mux_client::{
     DirectMuxClient, DirectMuxClientConfig, DirectMuxError, ProtocolErrorKind,
@@ -434,6 +434,7 @@ impl MuxPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_compat::timeout;
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Arc;

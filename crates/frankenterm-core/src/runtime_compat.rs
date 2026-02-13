@@ -308,6 +308,96 @@ pub mod watch {
     };
 }
 
+/// Unix socket aliases/helpers for the active runtime.
+#[cfg(feature = "asupersync-runtime")]
+pub mod unix {
+    use std::io;
+    use std::path::Path;
+
+    pub use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+    pub use asupersync::net::{UnixListener, UnixStream};
+
+    pub type LineReader<T> = asupersync::io::Lines<BufReader<T>>;
+
+    pub async fn bind<P: AsRef<Path>>(path: P) -> io::Result<UnixListener> {
+        let path = path.as_ref();
+        let _ = std::fs::remove_file(path);
+        UnixListener::bind(path).await
+    }
+
+    pub async fn connect<P: AsRef<Path>>(path: P) -> io::Result<UnixStream> {
+        UnixStream::connect(path).await
+    }
+
+    #[must_use]
+    pub fn buffered<T: AsyncRead>(stream: T) -> BufReader<T> {
+        BufReader::new(stream)
+    }
+
+    #[must_use]
+    pub fn lines<T>(reader: BufReader<T>) -> LineReader<T>
+    where
+        T: AsyncRead + Unpin,
+    {
+        asupersync::io::Lines::new(reader)
+    }
+
+    pub async fn next_line<T>(lines: &mut LineReader<T>) -> io::Result<Option<String>>
+    where
+        T: AsyncRead + Unpin,
+    {
+        use asupersync::stream::StreamExt;
+
+        match lines.next().await {
+            Some(Ok(line)) => Ok(Some(line)),
+            Some(Err(err)) => Err(err),
+            None => Ok(None),
+        }
+    }
+}
+
+/// Unix socket aliases/helpers for the active runtime.
+#[cfg(not(feature = "asupersync-runtime"))]
+pub mod unix {
+    use std::io;
+    use std::path::Path;
+
+    pub use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+    pub use tokio::net::{UnixListener, UnixStream};
+
+    pub type LineReader<T> = tokio::io::Lines<BufReader<T>>;
+
+    pub async fn bind<P: AsRef<Path>>(path: P) -> io::Result<UnixListener> {
+        let path = path.as_ref();
+        let _ = std::fs::remove_file(path);
+        UnixListener::bind(path)
+    }
+
+    pub async fn connect<P: AsRef<Path>>(path: P) -> io::Result<UnixStream> {
+        UnixStream::connect(path).await
+    }
+
+    #[must_use]
+    pub fn buffered<T: AsyncRead>(stream: T) -> BufReader<T> {
+        BufReader::new(stream)
+    }
+
+    pub fn lines<T>(reader: BufReader<T>) -> LineReader<T>
+    where
+        T: AsyncRead + Unpin,
+    {
+        use tokio::io::AsyncBufReadExt;
+        reader.lines()
+    }
+
+    pub async fn next_line<T>(lines: &mut LineReader<T>) -> io::Result<Option<String>>
+    where
+        T: AsyncRead + Unpin,
+    {
+        lines.next_line().await
+    }
+}
+
 /// Unified runtime trait used during migration.
 pub trait CompatRuntime {
     /// Runs a future to completion.

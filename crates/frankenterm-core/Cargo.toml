@@ -66,6 +66,7 @@ ftui = { workspace = true, optional = true }
 
 # MCP server (optional, behind feature)
 fastmcp = { workspace = true, optional = true }
+toon_rust = { workspace = true, optional = true }
 # Web server (optional, behind feature)
 fastapi = { workspace = true, optional = true }
 fastapi-core = { workspace = true, optional = true }
@@ -161,6 +162,15 @@ harness = false
 name = "pdu_pipelining"
 harness = false
 required-features = ["vendored"]
+
+[[bench]]
+name = "compression_bypass"
+harness = false
+required-features = ["vendored"]
+
+[[bench]]
+name = "shard_routing"
+harness = false
 
 [[bench]]
 name = "bocpd"
@@ -264,4 +274,4 @@ semantic-search = ["dep:tokenizers", "dep:safetensors", "dep:half", "dep:fastemb
 frankenterm-deps = ["dep:codec", "dep:config", "dep:mux", "dep:frankenterm-term"]
 vendored-wezterm = ["frankenterm-deps"]  # backward compat alias
 browser-automation = []
-mcp-server = ["dep:fastmcp"]
+mcp-server = ["dep:fastmcp", "dep:toon_rust"]

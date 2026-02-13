@@ -8,8 +8,16 @@
 //! - **FTS search p95 < 15ms** (common query, DB ~100K segments)
 //! - **upsert_pane p95 < 1ms** (metadata write)
 
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use frankenterm_core::storage::{PaneRecord, SearchOptions, StorageHandle};
+#[cfg(feature = "distributed")]
+use frankenterm_core::wire_protocol::{
+    Aggregator, IngestResult, PaneDelta, WireEnvelope, WirePayload,
+};
+#[cfg(feature = "distributed")]
+use std::sync::Mutex;
+#[cfg(feature = "distributed")]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 
@@ -31,6 +39,22 @@ const BUDGETS: &[bench_common::BenchBudget] = &[
     bench_common::BenchBudget {
         name: "upsert_pane_p95",
         budget: "p95 < 1ms (metadata write)",
+    },
+    bench_common::BenchBudget {
+        name: "aggregator_merge_single_agent/bench_aggregator_merge_single_agent",
+        budget: "> 10K events/sec for small payloads (single sender merge lane)",
+    },
+    bench_common::BenchBudget {
+        name: "aggregator_merge_multi_agent/bench_aggregator_merge_multi_agent",
+        budget: "scales across 1/5/20 agents with deterministic merge throughput",
+    },
+    bench_common::BenchBudget {
+        name: "aggregator_persist_latency/bench_aggregator_persist_latency",
+        budget: "p95 receipt->SQLite commit latency < 10ms (single-agent workload)",
+    },
+    bench_common::BenchBudget {
+        name: "aggregator_query_under_load/bench_aggregator_query_under_load",
+        budget: "query remains responsive while ingest is active",
     },
 ];
 
@@ -94,6 +118,11 @@ fn gen_content(i: usize) -> String {
             1000 + i * 10
         ),
     }
+}
+
+#[cfg(feature = "distributed")]
+fn delta_payload(size_bytes: usize) -> String {
+    "x".repeat(size_bytes)
 }
 
 fn runtime() -> tokio::runtime::Runtime {
@@ -364,6 +393,239 @@ fn bench_append_scaling(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// Group 6: Aggregator merge/persist/query benchmarks (distributed feature)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "distributed")]
+fn bench_aggregator_merge_single_agent(c: &mut Criterion) {
+    let mut group = c.benchmark_group("aggregator_merge_single_agent");
+    group.sample_size(30);
+    let events_per_iter = 1024_u64;
+
+    for size in [256_usize, 4 * 1024, 64 * 1024] {
+        group.throughput(Throughput::Bytes((size as u64) * events_per_iter));
+        group.bench_with_input(
+            BenchmarkId::new("bench_aggregator_merge_single_agent", size),
+            &size,
+            |b, size| {
+                let payload = delta_payload(*size);
+                b.iter(|| {
+                    let mut aggregator = Aggregator::new(16);
+                    for seq in 1..=events_per_iter {
+                        let envelope = WireEnvelope::new(
+                            seq,
+                            "agent-single",
+                            WirePayload::PaneDelta(PaneDelta {
+                                pane_id: 1,
+                                seq,
+                                content: payload.clone(),
+                                content_len: payload.len(),
+                                captured_at_ms: now_ms(),
+                            }),
+                        );
+                        let result = aggregator.ingest_envelope(envelope).expect("ingest");
+                        black_box(result);
+                    }
+                    black_box(aggregator.total_accepted());
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+#[cfg(not(feature = "distributed"))]
+fn bench_aggregator_merge_single_agent(_c: &mut Criterion) {}
+
+#[cfg(feature = "distributed")]
+fn bench_aggregator_merge_multi_agent(c: &mut Criterion) {
+    let mut group = c.benchmark_group("aggregator_merge_multi_agent");
+    group.sample_size(20);
+    let payload = delta_payload(1024);
+    let events_per_agent = 512_u64;
+
+    for agent_count in [1_usize, 5, 20] {
+        group.throughput(Throughput::Elements(
+            (agent_count as u64) * events_per_agent,
+        ));
+        group.bench_with_input(
+            BenchmarkId::new("bench_aggregator_merge_multi_agent", agent_count),
+            &agent_count,
+            |b, agent_count| {
+                b.iter(|| {
+                    let mut aggregator = Aggregator::new(agent_count.saturating_mul(4));
+                    for seq in 1..=events_per_agent {
+                        for agent_ix in 0..*agent_count {
+                            let sender = format!("agent-{agent_ix}");
+                            let pane_id = (agent_ix as u64) + 1;
+                            let envelope = WireEnvelope::new(
+                                seq,
+                                &sender,
+                                WirePayload::PaneDelta(PaneDelta {
+                                    pane_id,
+                                    seq,
+                                    content: payload.clone(),
+                                    content_len: payload.len(),
+                                    captured_at_ms: now_ms(),
+                                }),
+                            );
+                            let result = aggregator.ingest_envelope(envelope).expect("ingest");
+                            black_box(result);
+                        }
+                    }
+                    black_box(aggregator.total_accepted());
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+#[cfg(not(feature = "distributed"))]
+fn bench_aggregator_merge_multi_agent(_c: &mut Criterion) {}
+
+#[cfg(feature = "distributed")]
+fn bench_aggregator_persist_latency(c: &mut Criterion) {
+    let rt = runtime();
+    let mut group = c.benchmark_group("aggregator_persist_latency");
+    group.sample_size(50);
+
+    let (_dir, db_path) = temp_db();
+    let storage = rt.block_on(async {
+        let handle = StorageHandle::new(&db_path).await.expect("create storage");
+        handle.upsert_pane(test_pane(1)).await.expect("upsert pane");
+        handle
+    });
+    let aggregator = Mutex::new(Aggregator::new(16));
+    let seq_counter = AtomicU64::new(1);
+    let payload = delta_payload(512);
+
+    group.bench_function("bench_aggregator_persist_latency", |b| {
+        b.to_async(&rt).iter(|| async {
+            let seq = seq_counter.fetch_add(1, Ordering::Relaxed);
+            let started = std::time::Instant::now();
+
+            let envelope = WireEnvelope::new(
+                seq,
+                "agent-latency",
+                WirePayload::PaneDelta(PaneDelta {
+                    pane_id: 1,
+                    seq,
+                    content: payload.clone(),
+                    content_len: payload.len(),
+                    captured_at_ms: now_ms(),
+                }),
+            );
+
+            let ingest = {
+                let mut guard = aggregator.lock().expect("lock aggregator");
+                guard.ingest_envelope(envelope).expect("ingest")
+            };
+
+            if let IngestResult::Accepted(WirePayload::PaneDelta(delta)) = ingest {
+                storage
+                    .append_segment(
+                        delta.pane_id,
+                        &delta.content,
+                        Some(format!("remote_seq:{}", delta.seq)),
+                    )
+                    .await
+                    .expect("append");
+            }
+
+            black_box(started.elapsed());
+        });
+    });
+
+    rt.block_on(storage.shutdown()).expect("shutdown");
+    group.finish();
+}
+
+#[cfg(not(feature = "distributed"))]
+fn bench_aggregator_persist_latency(_c: &mut Criterion) {}
+
+#[cfg(feature = "distributed")]
+fn bench_aggregator_query_under_load(c: &mut Criterion) {
+    let rt = runtime();
+    let mut group = c.benchmark_group("aggregator_query_under_load");
+    group.sample_size(20);
+    group.measurement_time(Duration::from_secs(12));
+
+    let (_dir, db_path) = temp_db();
+    let storage = rt.block_on(async {
+        let handle = StorageHandle::new(&db_path).await.expect("create storage");
+        for pane_id in 1..=5_u64 {
+            handle
+                .upsert_pane(test_pane(pane_id))
+                .await
+                .expect("upsert pane");
+        }
+        handle
+    });
+    let aggregator = Mutex::new(Aggregator::new(64));
+    let round_counter = AtomicU64::new(1);
+    let opts = SearchOptions {
+        limit: Some(20),
+        ..Default::default()
+    };
+
+    group.bench_function("bench_aggregator_query_under_load", |b| {
+        b.to_async(&rt).iter(|| async {
+            let round = round_counter.fetch_add(1, Ordering::Relaxed);
+            let payload = format!("LOAD_QUERY_MARKER round={round}");
+
+            for agent_ix in 0..5_u64 {
+                let sender = format!("agent-q-{agent_ix}");
+                let pane_id = agent_ix + 1;
+                let envelope = WireEnvelope::new(
+                    round,
+                    &sender,
+                    WirePayload::PaneDelta(PaneDelta {
+                        pane_id,
+                        seq: round,
+                        content: payload.clone(),
+                        content_len: payload.len(),
+                        captured_at_ms: now_ms(),
+                    }),
+                );
+
+                let ingest = {
+                    let mut guard = aggregator.lock().expect("lock aggregator");
+                    guard.ingest_envelope(envelope).expect("ingest")
+                };
+
+                if let IngestResult::Accepted(WirePayload::PaneDelta(delta)) = ingest {
+                    storage
+                        .append_segment(
+                            delta.pane_id,
+                            &delta.content,
+                            Some(format!("remote_seq:{}", delta.seq)),
+                        )
+                        .await
+                        .expect("append");
+                }
+            }
+
+            let query_started = std::time::Instant::now();
+            let hits = storage
+                .search_with_options("LOAD_QUERY_MARKER", opts.clone())
+                .await
+                .expect("search");
+            black_box(query_started.elapsed());
+            black_box(hits.len());
+        });
+    });
+
+    rt.block_on(storage.shutdown()).expect("shutdown");
+    group.finish();
+}
+
+#[cfg(not(feature = "distributed"))]
+fn bench_aggregator_query_under_load(_c: &mut Criterion) {}
+
 fn bench_config() -> Criterion {
     bench_common::emit_bench_artifacts("storage_regression", BUDGETS);
     Criterion::default()
@@ -378,6 +640,10 @@ criterion_group!(
         bench_append_batch,
         bench_fts_regression,
         bench_upsert_pane,
-        bench_append_scaling
+        bench_append_scaling,
+        bench_aggregator_merge_single_agent,
+        bench_aggregator_merge_multi_agent,
+        bench_aggregator_persist_latency,
+        bench_aggregator_query_under_load
 );
 criterion_main!(benches);

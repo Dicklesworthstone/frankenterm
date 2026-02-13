@@ -55,6 +55,88 @@ const MCP_ERR_RESERVATION_CONFLICT: &str = "FT-MCP-0012";
 const MCP_ERR_CAUT: &str = "FT-MCP-0013";
 const MCP_ERR_CASS: &str = "FT-MCP-0014";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum McpOutputFormat {
+    #[default]
+    Json,
+    Toon,
+}
+
+fn parse_mcp_output_format(raw: &str) -> Option<McpOutputFormat> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "json" => Some(McpOutputFormat::Json),
+        "toon" => Some(McpOutputFormat::Toon),
+        _ => None,
+    }
+}
+
+fn extract_mcp_output_format(
+    arguments: &mut serde_json::Value,
+) -> std::result::Result<McpOutputFormat, String> {
+    let Some(object) = arguments.as_object_mut() else {
+        return Ok(McpOutputFormat::Json);
+    };
+
+    let Some(raw_value) = object.remove("format") else {
+        return Ok(McpOutputFormat::Json);
+    };
+
+    let Some(raw_format) = raw_value.as_str() else {
+        return Err("Invalid format: expected string 'json' or 'toon'".to_string());
+    };
+
+    parse_mcp_output_format(raw_format)
+        .ok_or_else(|| format!("Invalid format '{raw_format}': expected one of ['json', 'toon']"))
+}
+
+fn augment_tool_schema_with_format(input_schema: &mut serde_json::Value) {
+    let Some(schema_obj) = input_schema.as_object_mut() else {
+        return;
+    };
+    if schema_obj.get("type").and_then(serde_json::Value::as_str) != Some("object") {
+        return;
+    }
+
+    let properties = schema_obj
+        .entry("properties")
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(properties_obj) = properties.as_object_mut() else {
+        return;
+    };
+
+    properties_obj
+        .entry("format".to_string())
+        .or_insert_with(|| {
+            serde_json::json!({
+                "type": "string",
+                "enum": ["json", "toon"],
+                "description": "Optional output format override for this call"
+            })
+        });
+}
+
+fn encode_mcp_contents(contents: Vec<Content>, format: McpOutputFormat) -> McpResult<Vec<Content>> {
+    match format {
+        McpOutputFormat::Json => Ok(contents),
+        McpOutputFormat::Toon => contents
+            .into_iter()
+            .map(|content| match content {
+                Content::Text { text } => {
+                    let value = serde_json::from_str::<serde_json::Value>(&text).map_err(|e| {
+                        McpError::internal_error(format!(
+                            "Unable to transcode MCP payload to TOON: {e}"
+                        ))
+                    })?;
+                    Ok(Content::Text {
+                        text: toon_rust::encode(value, None),
+                    })
+                }
+                other => Ok(other),
+            })
+            .collect(),
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct StateParams {
     domain: Option<String>,
@@ -547,6 +629,47 @@ impl<T> McpEnvelope<T> {
     }
 }
 
+/// Wrapper that allows per-call MCP output format negotiation (`json` or `toon`).
+///
+/// Each wrapped tool accepts an optional `format` argument in its input schema.
+/// The argument is stripped before forwarding to the inner handler so existing
+/// tool parameter structs do not need to change.
+struct FormatAwareToolHandler<T: ToolHandler> {
+    inner: T,
+}
+
+impl<T: ToolHandler> FormatAwareToolHandler<T> {
+    fn new(inner: T) -> Self {
+        Self { inner }
+    }
+}
+
+impl<T: ToolHandler> ToolHandler for FormatAwareToolHandler<T> {
+    fn definition(&self) -> Tool {
+        let mut definition = self.inner.definition();
+        augment_tool_schema_with_format(&mut definition.input_schema);
+        definition
+    }
+
+    fn call(&self, ctx: &McpContext, mut arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        let start = Instant::now();
+        let format = match extract_mcp_output_format(&mut arguments) {
+            Ok(format) => format,
+            Err(message) => {
+                let envelope = McpEnvelope::<()>::error(
+                    MCP_ERR_INVALID_ARGS,
+                    message,
+                    Some("Set format to either 'json' or 'toon'.".to_string()),
+                    elapsed_ms(start),
+                );
+                return envelope_to_content(envelope);
+            }
+        };
+        let contents = self.inner.call(ctx, arguments)?;
+        encode_mcp_contents(contents, format)
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct McpPaneState {
     pane_id: u64,
@@ -623,14 +746,14 @@ pub fn build_server_with_db(config: &Config, db_path: Option<PathBuf>) -> Result
         .on_shutdown(|| {
             tracing::info!("MCP server shutting down");
         })
-        .tool(WaStateTool::new(filter))
-        .tool(WaGetTextTool)
-        .tool(WaWaitForTool)
-        .tool(WaRulesListTool)
-        .tool(WaRulesTestTool)
-        .tool(WaCassSearchTool)
-        .tool(WaCassViewTool)
-        .tool(WaCassStatusTool)
+        .tool(FormatAwareToolHandler::new(WaStateTool::new(filter)))
+        .tool(FormatAwareToolHandler::new(WaGetTextTool))
+        .tool(FormatAwareToolHandler::new(WaWaitForTool))
+        .tool(FormatAwareToolHandler::new(WaRulesListTool))
+        .tool(FormatAwareToolHandler::new(WaRulesTestTool))
+        .tool(FormatAwareToolHandler::new(WaCassSearchTool))
+        .tool(FormatAwareToolHandler::new(WaCassViewTool))
+        .tool(FormatAwareToolHandler::new(WaCassStatusTool))
         .resource(WaPanesResource::new(config.ingest.panes.clone()))
         .resource(WaWorkflowsResource::new(Arc::clone(&config)))
         .resource(WaRulesResource)
@@ -638,66 +761,66 @@ pub fn build_server_with_db(config: &Config, db_path: Option<PathBuf>) -> Result
 
     if let Some(ref db_path) = db_path {
         builder = builder
-            .tool(AuditedToolHandler::new(
+            .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
                 WaSearchTool::new(Arc::clone(db_path)),
                 "wa.search",
                 Arc::clone(db_path),
-            ))
-            .tool(AuditedToolHandler::new(
+            )))
+            .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
                 WaEventsTool::new(Arc::clone(db_path)),
                 "wa.events",
                 Arc::clone(db_path),
-            ))
-            .tool(AuditedToolHandler::new(
+            )))
+            .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
                 WaEventsAnnotateTool::new(Arc::clone(db_path)),
                 "wa.events_annotate",
                 Arc::clone(db_path),
-            ))
-            .tool(AuditedToolHandler::new(
+            )))
+            .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
                 WaEventsTriageTool::new(Arc::clone(db_path)),
                 "wa.events_triage",
                 Arc::clone(db_path),
-            ))
-            .tool(AuditedToolHandler::new(
+            )))
+            .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
                 WaEventsLabelTool::new(Arc::clone(db_path)),
                 "wa.events_label",
                 Arc::clone(db_path),
-            ))
-            .tool(AuditedToolHandler::new(
+            )))
+            .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
                 WaReservationsTool::new(Arc::clone(db_path)),
                 "wa.reservations",
                 Arc::clone(db_path),
-            ))
-            .tool(AuditedToolHandler::new(
+            )))
+            .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
                 WaReserveTool::new(Arc::clone(&config), Arc::clone(db_path)),
                 "wa.reserve",
                 Arc::clone(db_path),
-            ))
-            .tool(AuditedToolHandler::new(
+            )))
+            .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
                 WaReleaseTool::new(Arc::clone(&config), Arc::clone(db_path)),
                 "wa.release",
                 Arc::clone(db_path),
-            ))
-            .tool(AuditedToolHandler::new(
+            )))
+            .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
                 WaSendTool::new(Arc::clone(&config), Arc::clone(db_path)),
                 "wa.send",
                 Arc::clone(db_path),
-            ))
-            .tool(AuditedToolHandler::new(
+            )))
+            .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
                 WaWorkflowRunTool::new(Arc::clone(&config), Arc::clone(db_path)),
                 "wa.workflow_run",
                 Arc::clone(db_path),
-            ))
-            .tool(AuditedToolHandler::new(
+            )))
+            .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
                 WaAccountsTool::new(Arc::clone(db_path)),
                 "wa.accounts",
                 Arc::clone(db_path),
-            ))
-            .tool(AuditedToolHandler::new(
+            )))
+            .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
                 WaAccountsRefreshTool::new(Arc::clone(&config), Arc::clone(db_path)),
                 "wa.accounts_refresh",
                 Arc::clone(db_path),
-            ))
+            )))
             .resource(WaEventsResource::new(Arc::clone(db_path)))
             .resource(WaEventsTemplateResource::new(Arc::clone(db_path)))
             .resource(WaEventsUnhandledTemplateResource::new(Arc::clone(db_path)))
@@ -4584,10 +4707,147 @@ fn record_mcp_audit_sync(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::collections::BTreeSet;
 
     fn uri_set(values: impl IntoIterator<Item = String>) -> BTreeSet<String> {
         values.into_iter().collect()
+    }
+
+    fn json_value_strategy() -> impl Strategy<Value = serde_json::Value> {
+        let leaf = proptest::prop_oneof![
+            Just(serde_json::Value::Null),
+            any::<bool>().prop_map(serde_json::Value::Bool),
+            any::<i64>().prop_map(|n| serde_json::Value::Number(n.into())),
+            ".*".prop_map(serde_json::Value::String),
+        ];
+
+        leaf.prop_recursive(4, 64, 8, |inner| {
+            proptest::prop_oneof![
+                proptest::collection::vec(inner.clone(), 0..8).prop_map(serde_json::Value::Array),
+                proptest::collection::btree_map("[a-zA-Z0-9_]{1,16}", inner, 0..8).prop_map(
+                    |map| {
+                        let object = map
+                            .into_iter()
+                            .collect::<serde_json::Map<String, serde_json::Value>>();
+                        serde_json::Value::Object(object)
+                    }
+                ),
+            ]
+        })
+    }
+
+    #[test]
+    fn parse_mcp_output_format_supports_json_and_toon() {
+        assert_eq!(parse_mcp_output_format("json"), Some(McpOutputFormat::Json));
+        assert_eq!(parse_mcp_output_format("toon"), Some(McpOutputFormat::Toon));
+        assert_eq!(
+            parse_mcp_output_format(" TOON "),
+            Some(McpOutputFormat::Toon)
+        );
+        assert_eq!(parse_mcp_output_format("yaml"), None);
+    }
+
+    #[test]
+    fn extract_mcp_output_format_defaults_to_json_and_strips_param() {
+        let mut args = serde_json::json!({
+            "pane_id": 42,
+            "format": "toon"
+        });
+        let format = extract_mcp_output_format(&mut args).expect("format should parse");
+        assert_eq!(format, McpOutputFormat::Toon);
+        assert!(args.get("format").is_none());
+        assert_eq!(args["pane_id"], 42);
+
+        let mut no_format = serde_json::json!({
+            "pane_id": 1
+        });
+        let default = extract_mcp_output_format(&mut no_format).expect("default format");
+        assert_eq!(default, McpOutputFormat::Json);
+    }
+
+    #[test]
+    fn augment_tool_schema_with_format_adds_format_property() {
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pane_id": {"type": "integer"}
+            },
+            "required": ["pane_id"],
+            "additionalProperties": false
+        });
+
+        augment_tool_schema_with_format(&mut schema);
+
+        assert_eq!(schema["properties"]["format"]["type"], "string");
+        assert_eq!(schema["properties"]["format"]["enum"][0], "json");
+        assert_eq!(schema["properties"]["format"]["enum"][1], "toon");
+    }
+
+    #[test]
+    fn encode_mcp_contents_toon_transcodes_json_text_payload() {
+        let contents = vec![Content::Text {
+            text: r#"{"ok":true,"data":{"pane_id":7},"elapsed_ms":1}"#.to_string(),
+        }];
+
+        let encoded =
+            encode_mcp_contents(contents, McpOutputFormat::Toon).expect("TOON transcode works");
+        let text = match &encoded[0] {
+            Content::Text { text } => text.clone(),
+            _ => panic!("expected text content"),
+        };
+
+        // TOON output should not remain raw JSON and should still be decodable.
+        assert!(!text.trim_start().starts_with('{'));
+        let _decoded = toon_rust::try_decode(&text, None).expect("TOON decode should succeed");
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn proptest_toon_roundtrip_preserves_json_semantics(value in json_value_strategy()) {
+            let toon = toon_rust::encode(value.clone(), None);
+            let decoded = toon_rust::try_decode(&toon, None).expect("decode should succeed");
+            prop_assert_eq!(decoded, value);
+        }
+
+        #[test]
+        fn proptest_toon_decode_from_lines_matches_single_pass(value in json_value_strategy()) {
+            let toon = toon_rust::encode(value.clone(), None);
+            let lines = toon
+                .lines()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>();
+
+            let decoded_from_lines =
+                toon_rust::try_decode_from_lines(lines, None).expect("line decode should succeed");
+            prop_assert_eq!(decoded_from_lines, value);
+        }
+
+        #[test]
+        fn proptest_toon_stream_events_stable_under_chunked_line_iteration(
+            value in json_value_strategy(),
+            chunk_size in 1usize..8
+        ) {
+            let toon = toon_rust::encode(value, None);
+            let lines = toon
+                .lines()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>();
+
+            let full_events =
+                toon_rust::try_decode_stream_sync(lines.iter().cloned(), None)
+                    .expect("stream decode should succeed");
+
+            let chunked_lines = lines
+                .chunks(chunk_size)
+                .flat_map(|chunk| chunk.iter().cloned())
+                .collect::<Vec<_>>();
+            let chunked_events =
+                toon_rust::try_decode_stream_sync(chunked_lines, None)
+                    .expect("chunked stream decode should succeed");
+
+            prop_assert_eq!(chunked_events, full_events);
+        }
     }
 
     #[test]

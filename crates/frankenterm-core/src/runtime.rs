@@ -32,18 +32,16 @@ use tracing::{debug, error, info, instrument, warn};
 
 use crate::config::{
     CaptureBudgetConfig, HotReloadableConfig, PaneFilterConfig, PanePriorityConfig, PatternsConfig,
-    SnapshotConfig,
+    SnapshotConfig, SnapshotSchedulingMode,
 };
 use crate::crash::{HealthSnapshot, ShutdownSummary};
 use crate::error::Result;
-#[cfg(feature = "native-wezterm")]
-use crate::events::{Event, UserVarPayload};
-use crate::events::{EventBus, event_identity_key};
+use crate::events::{Event, EventBus, UserVarPayload, event_identity_key};
 use crate::gc::{CacheGcSettings, compact_u64_map, should_vacuum};
 use crate::ingest::{PaneCursor, PaneRegistry, persist_captured_segment};
 #[cfg(feature = "native-wezterm")]
 use crate::native_events::{NativeEvent, NativeEventListener};
-use crate::patterns::{Detection, DetectionContext, PatternEngine};
+use crate::patterns::{Detection, DetectionContext, PatternEngine, Severity};
 use crate::recording::RecordingManager;
 use crate::runtime_compat::{mpsc, sleep, timeout, watch};
 use crate::spsc_ring_buffer::{SpscConsumer, SpscProducer, channel as spsc_channel};
@@ -739,7 +737,7 @@ impl ObservationRuntime {
         let maintenance_handle = self.spawn_maintenance_task(capture_tx_probe.clone());
 
         // Spawn snapshot engine task (session persistence) if configured
-        let (snapshot_handle, snapshot_shutdown_tx) =
+        let (snapshot_handle, snapshot_shutdown_tx, snapshot_triggers) =
             if let Some(ref snap_config) = self.snapshot_config {
                 if snap_config.enabled {
                     let db_path = {
@@ -757,6 +755,17 @@ impl ObservationRuntime {
                     ));
                     let (shutdown_tx, shutdown_rx) = watch::channel(false);
                     let wezterm = self.wezterm_handle.clone();
+                    let snapshot_triggers = if matches!(
+                        snap_config.scheduling.mode,
+                        SnapshotSchedulingMode::Intelligent
+                    ) {
+                        Some(self.spawn_snapshot_trigger_task(
+                            Arc::clone(&engine),
+                            self.event_bus.clone(),
+                        ))
+                    } else {
+                        None
+                    };
 
                     let handle = tokio::spawn(async move {
                         engine
@@ -778,12 +787,12 @@ impl ObservationRuntime {
                             .await;
                     });
                     info!("Snapshot engine started");
-                    (Some(handle), Some(shutdown_tx))
+                    (Some(handle), Some(shutdown_tx), snapshot_triggers)
                 } else {
-                    (None, None)
+                    (None, None, None)
                 }
             } else {
-                (None, None)
+                (None, None, None)
             };
 
         info!("Observation runtime started");
@@ -795,6 +804,7 @@ impl ObservationRuntime {
             persistence: persistence_handle,
             maintenance: Some(maintenance_handle),
             snapshot: snapshot_handle,
+            snapshot_triggers,
             snapshot_shutdown: snapshot_shutdown_tx,
             shutdown_flag: Arc::clone(&self.shutdown_flag),
             storage: Arc::clone(&self.storage),
@@ -808,6 +818,116 @@ impl ObservationRuntime {
             capture_tx: capture_tx_probe,
             native_events: native_handle,
             scheduler_snapshot: Arc::clone(&self.scheduler_snapshot),
+        })
+    }
+
+    /// Spawn a bridge that turns runtime events/health signals into snapshot triggers.
+    fn spawn_snapshot_trigger_task(
+        &self,
+        snapshot_engine: Arc<crate::snapshot_engine::SnapshotEngine>,
+        event_bus: Option<Arc<EventBus>>,
+    ) -> JoinHandle<()> {
+        let shutdown_flag = Arc::clone(&self.shutdown_flag);
+        let registry = Arc::clone(&self.registry);
+        let metrics = Arc::clone(&self.metrics);
+
+        tokio::spawn(async move {
+            let mut subscriber = event_bus.as_ref().map(|bus| bus.subscribe());
+            let idle_enabled = subscriber.is_some();
+            let mut last_activity = Instant::now();
+            let mut last_idle_trigger = Instant::now();
+            let mut last_memory_trigger = Instant::now()
+                .checked_sub(Duration::from_secs(SNAPSHOT_MEMORY_TRIGGER_COOLDOWN_SECS))
+                .unwrap_or_else(Instant::now);
+
+            loop {
+                if shutdown_flag.load(Ordering::SeqCst) {
+                    break;
+                }
+
+                let mut subscriber_closed = false;
+                let mut tick_only = true;
+
+                if let Some(sub) = subscriber.as_mut() {
+                    tokio::select! {
+                        recv = sub.recv() => {
+                            tick_only = false;
+                            match recv {
+                                Ok(event) => {
+                                    if event_counts_as_activity(&event) {
+                                        last_activity = Instant::now();
+                                    }
+                                    if let Some(trigger) = snapshot_trigger_from_event(&event)
+                                        && !snapshot_engine.emit_trigger(trigger)
+                                    {
+                                        debug!(
+                                            trigger = ?trigger,
+                                            event_type = event.type_name(),
+                                            "snapshot trigger dropped (queue full or inactive)"
+                                        );
+                                    }
+                                }
+                                Err(crate::events::RecvError::Lagged { missed_count }) => {
+                                    last_activity = Instant::now();
+                                    warn!(
+                                        missed = missed_count,
+                                        "snapshot trigger bridge lagged on event bus"
+                                    );
+                                }
+                                Err(crate::events::RecvError::Closed) => {
+                                    subscriber_closed = true;
+                                }
+                            }
+                        }
+                        () = sleep(Duration::from_secs(SNAPSHOT_TRIGGER_BRIDGE_TICK_SECS)) => {}
+                    }
+                } else {
+                    sleep(Duration::from_secs(SNAPSHOT_TRIGGER_BRIDGE_TICK_SECS)).await;
+                }
+
+                if subscriber_closed {
+                    subscriber = None;
+                }
+
+                if !tick_only {
+                    continue;
+                }
+
+                let now = Instant::now();
+
+                if idle_enabled
+                    && now.duration_since(last_activity)
+                        >= Duration::from_secs(SNAPSHOT_IDLE_WINDOW_SECS)
+                    && now.duration_since(last_idle_trigger)
+                        >= Duration::from_secs(SNAPSHOT_IDLE_WINDOW_SECS)
+                {
+                    let observed_panes = {
+                        let reg = registry.read().await;
+                        reg.observed_pane_ids().len()
+                    };
+                    if observed_panes > 0 {
+                        if !snapshot_engine
+                            .emit_trigger(crate::snapshot_engine::SnapshotTrigger::IdleWindow)
+                        {
+                            debug!("snapshot idle-window trigger dropped (queue full or inactive)");
+                        }
+                        last_idle_trigger = now;
+                    }
+                }
+
+                let cursor_snapshot_bytes = metrics.cursor_snapshot_bytes_last();
+                if cursor_snapshot_bytes >= CURSOR_SNAPSHOT_MEMORY_WARN_BYTES
+                    && now.duration_since(last_memory_trigger)
+                        >= Duration::from_secs(SNAPSHOT_MEMORY_TRIGGER_COOLDOWN_SECS)
+                {
+                    if !snapshot_engine
+                        .emit_trigger(crate::snapshot_engine::SnapshotTrigger::MemoryPressure)
+                    {
+                        debug!("snapshot memory-pressure trigger dropped (queue full or inactive)");
+                    }
+                    last_memory_trigger = now;
+                }
+            }
         })
     }
 
@@ -2100,6 +2220,8 @@ pub struct RuntimeHandle {
     pub maintenance: Option<JoinHandle<()>>,
     /// Snapshot engine task handle (session persistence)
     pub snapshot: Option<JoinHandle<()>>,
+    /// Snapshot trigger bridge task handle (event/health → snapshot trigger)
+    pub snapshot_triggers: Option<JoinHandle<()>>,
     /// Snapshot engine shutdown sender (bridges AtomicBool → watch channel)
     snapshot_shutdown: Option<watch::Sender<bool>>,
     /// Shutdown flag for signaling tasks
@@ -2139,6 +2261,12 @@ const STORAGE_LOCK_WAIT_WARN_MS: f64 = 15.0;
 const STORAGE_LOCK_HOLD_WARN_MS: f64 = 75.0;
 /// Memory warning threshold for retained pane snapshots.
 const CURSOR_SNAPSHOT_MEMORY_WARN_BYTES: u64 = 64 * 1024 * 1024;
+/// Poll interval for snapshot trigger bridge maintenance checks.
+const SNAPSHOT_TRIGGER_BRIDGE_TICK_SECS: u64 = 30;
+/// Idle duration before emitting `IdleWindow` trigger.
+const SNAPSHOT_IDLE_WINDOW_SECS: u64 = 5 * 60;
+/// Minimum interval between `MemoryPressure` trigger emissions.
+const SNAPSHOT_MEMORY_TRIGGER_COOLDOWN_SECS: u64 = 2 * 60;
 
 impl RuntimeHandle {
     /// Current capture channel queue depth (pending items waiting for persistence).
@@ -2179,6 +2307,9 @@ impl RuntimeHandle {
         if let Some(snapshot) = self.snapshot {
             let _ = snapshot.await;
         }
+        if let Some(snapshot_triggers) = self.snapshot_triggers {
+            let _ = snapshot_triggers.await;
+        }
     }
 
     /// Request graceful shutdown and collect a summary.
@@ -2211,6 +2342,9 @@ impl RuntimeHandle {
             let _ = self.persistence.await;
             if let Some(snapshot) = self.snapshot {
                 let _ = snapshot.await;
+            }
+            if let Some(snapshot_triggers) = self.snapshot_triggers {
+                let _ = snapshot_triggers.await;
             }
         })
         .await;
@@ -2486,6 +2620,104 @@ fn duration_ms_u64(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+fn event_counts_as_activity(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::SegmentCaptured { .. }
+            | Event::GapDetected { .. }
+            | Event::PatternDetected { .. }
+            | Event::PaneDiscovered { .. }
+            | Event::PaneDisappeared { .. }
+            | Event::WorkflowStarted { .. }
+            | Event::WorkflowStep { .. }
+            | Event::WorkflowCompleted { .. }
+            | Event::UserVarReceived { .. }
+    )
+}
+
+fn snapshot_trigger_from_event(event: &Event) -> Option<crate::snapshot_engine::SnapshotTrigger> {
+    use crate::snapshot_engine::SnapshotTrigger;
+
+    match event {
+        Event::PatternDetected { detection, .. } => snapshot_trigger_from_detection(detection),
+        Event::WorkflowCompleted { success, .. } => {
+            if *success {
+                Some(SnapshotTrigger::WorkCompleted)
+            } else {
+                Some(SnapshotTrigger::HazardThreshold)
+            }
+        }
+        Event::UserVarReceived { payload, .. } => snapshot_trigger_from_user_var(payload),
+        Event::PaneDiscovered { .. } | Event::PaneDisappeared { .. } => {
+            Some(SnapshotTrigger::StateTransition)
+        }
+        Event::SegmentCaptured { .. }
+        | Event::GapDetected { .. }
+        | Event::WorkflowStarted { .. }
+        | Event::WorkflowStep { .. } => None,
+    }
+}
+
+fn snapshot_trigger_from_detection(
+    detection: &Detection,
+) -> Option<crate::snapshot_engine::SnapshotTrigger> {
+    use crate::snapshot_engine::SnapshotTrigger;
+
+    let event_type = detection.event_type.as_str();
+
+    if detection.severity == Severity::Critical
+        || matches!(
+            event_type,
+            "usage.reached"
+                | "error.network"
+                | "error.timeout"
+                | "error.overloaded"
+                | "mux.error"
+                | "auth.error"
+                | "auth.login_required"
+                | "auth.oauth_required"
+        )
+    {
+        return Some(SnapshotTrigger::HazardThreshold);
+    }
+
+    if matches!(
+        event_type,
+        "session.tool_use"
+            | "session.compaction_complete"
+            | "session.summary"
+            | "session.end"
+            | "saved_search.alert"
+    ) {
+        return Some(SnapshotTrigger::WorkCompleted);
+    }
+
+    if matches!(
+        event_type,
+        "session.start"
+            | "session.resume_hint"
+            | "session.model"
+            | "session.thinking"
+            | "session.approval_needed"
+    ) {
+        return Some(SnapshotTrigger::StateTransition);
+    }
+
+    None
+}
+
+fn snapshot_trigger_from_user_var(
+    payload: &UserVarPayload,
+) -> Option<crate::snapshot_engine::SnapshotTrigger> {
+    use crate::snapshot_engine::SnapshotTrigger;
+
+    match payload.event_type.as_deref() {
+        Some("command_start" | "cmd_start" | "preexec") => Some(SnapshotTrigger::StateTransition),
+        Some("command_end" | "cmd_end" | "postexec") => Some(SnapshotTrigger::WorkCompleted),
+        _ => None,
+    }
+}
+
 /// Convert a Detection to a StoredEvent for persistence.
 fn detection_to_stored_event(
     pane_id: u64,
@@ -2580,6 +2812,95 @@ mod tests {
         assert!(event.dedupe_key.is_some());
         assert_eq!(event.segment_id, Some(123));
         assert!(event.handled_at.is_none());
+    }
+
+    fn test_detection(event_type: &str, severity: Severity) -> Detection {
+        Detection {
+            rule_id: "test.rule".to_string(),
+            agent_type: crate::patterns::AgentType::ClaudeCode,
+            event_type: event_type.to_string(),
+            severity,
+            confidence: 1.0,
+            extracted: serde_json::json!({}),
+            matched_text: String::new(),
+            span: (0, 0),
+        }
+    }
+
+    #[test]
+    fn snapshot_trigger_from_detection_maps_work_completed() {
+        let detection = test_detection("session.tool_use", Severity::Info);
+        let trigger = snapshot_trigger_from_detection(&detection);
+        assert_eq!(
+            trigger,
+            Some(crate::snapshot_engine::SnapshotTrigger::WorkCompleted)
+        );
+    }
+
+    #[test]
+    fn snapshot_trigger_from_detection_maps_state_transition() {
+        let detection = test_detection("session.start", Severity::Info);
+        let trigger = snapshot_trigger_from_detection(&detection);
+        assert_eq!(
+            trigger,
+            Some(crate::snapshot_engine::SnapshotTrigger::StateTransition)
+        );
+    }
+
+    #[test]
+    fn snapshot_trigger_from_detection_maps_hazard() {
+        let detection = test_detection("error.timeout", Severity::Warning);
+        let trigger = snapshot_trigger_from_detection(&detection);
+        assert_eq!(
+            trigger,
+            Some(crate::snapshot_engine::SnapshotTrigger::HazardThreshold)
+        );
+    }
+
+    #[test]
+    fn snapshot_trigger_from_user_var_maps_command_events() {
+        let start = UserVarPayload {
+            value: "raw".to_string(),
+            event_type: Some("command_start".to_string()),
+            event_data: None,
+        };
+        let end = UserVarPayload {
+            value: "raw".to_string(),
+            event_type: Some("command_end".to_string()),
+            event_data: None,
+        };
+
+        assert_eq!(
+            snapshot_trigger_from_user_var(&start),
+            Some(crate::snapshot_engine::SnapshotTrigger::StateTransition)
+        );
+        assert_eq!(
+            snapshot_trigger_from_user_var(&end),
+            Some(crate::snapshot_engine::SnapshotTrigger::WorkCompleted)
+        );
+    }
+
+    #[test]
+    fn snapshot_trigger_from_event_maps_workflow_outcome() {
+        let ok_event = Event::WorkflowCompleted {
+            workflow_id: "wf-1".to_string(),
+            success: true,
+            reason: None,
+        };
+        let fail_event = Event::WorkflowCompleted {
+            workflow_id: "wf-2".to_string(),
+            success: false,
+            reason: Some("failed".to_string()),
+        };
+
+        assert_eq!(
+            snapshot_trigger_from_event(&ok_event),
+            Some(crate::snapshot_engine::SnapshotTrigger::WorkCompleted)
+        );
+        assert_eq!(
+            snapshot_trigger_from_event(&fail_event),
+            Some(crate::snapshot_engine::SnapshotTrigger::HazardThreshold)
+        );
     }
 
     #[tokio::test]

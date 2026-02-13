@@ -2338,7 +2338,6 @@ mod tests {
     #[cfg(feature = "vendored")]
     #[test]
     fn streaming_bridge_process_gap_emits_gap_segment() {
-        use crate::ingest::CapturedSegmentKind;
         use crate::vendored::PaneDelta;
 
         let mut bridge = StreamingBridge::new();

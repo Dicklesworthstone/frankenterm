@@ -570,11 +570,18 @@ fn resolve_compression_mode(
     mode: wa_config::VendoredCompressionMode,
     socket_path: &Path,
 ) -> CompressionMode {
+    resolve_compression_mode_for_locality(mode, is_local_unix_socket(socket_path))
+}
+
+fn resolve_compression_mode_for_locality(
+    mode: wa_config::VendoredCompressionMode,
+    is_local_socket: bool,
+) -> CompressionMode {
     match mode {
         wa_config::VendoredCompressionMode::Always => CompressionMode::Always,
         wa_config::VendoredCompressionMode::Never => CompressionMode::Never,
         wa_config::VendoredCompressionMode::Auto => {
-            if is_local_unix_socket(socket_path) {
+            if is_local_socket {
                 CompressionMode::Never
             } else {
                 CompressionMode::Auto
@@ -790,6 +797,30 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
     use std::collections::{HashMap, HashSet};
+
+    const COMPRESSED_MASK: u64 = 1 << 63;
+
+    fn decode_u64_leb128_prefix(bytes: &[u8]) -> Option<u64> {
+        let mut value = 0u64;
+        let mut shift = 0u32;
+
+        for (idx, byte) in bytes.iter().copied().enumerate() {
+            if idx >= 10 {
+                return None;
+            }
+            value |= u64::from(byte & 0x7f) << shift;
+            if (byte & 0x80) == 0 {
+                return Some(value);
+            }
+            shift += 7;
+        }
+
+        None
+    }
+
+    fn frame_marked_compressed(bytes: &[u8]) -> Option<bool> {
+        decode_u64_leb128_prefix(bytes).map(|length| (length & COMPRESSED_MASK) != 0)
+    }
 
     #[test]
     fn decode_from_buffer_roundtrip() {
@@ -1035,6 +1066,73 @@ mod tests {
         }
     }
 
+    proptest! {
+        #[test]
+        fn prop_resolve_compression_mode_for_locality_invariants(is_local in any::<bool>()) {
+            use crate::config::VendoredCompressionMode::{Always, Auto, Never};
+
+            prop_assert_eq!(
+                resolve_compression_mode_for_locality(Always, is_local),
+                CompressionMode::Always
+            );
+            prop_assert_eq!(
+                resolve_compression_mode_for_locality(Never, is_local),
+                CompressionMode::Never
+            );
+            prop_assert_eq!(
+                resolve_compression_mode_for_locality(Auto, is_local),
+                if is_local {
+                    CompressionMode::Never
+                } else {
+                    CompressionMode::Auto
+                }
+            );
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn prop_write_to_pane_roundtrips_for_explicit_modes(
+            pane_id in 0usize..128,
+            serial in 1u64..10_000,
+            payload in prop::collection::vec(any::<u8>(), 0..2048)
+        ) {
+            let expected_payload = payload.clone();
+            let pdu = Pdu::WriteToPane(WriteToPane {
+                pane_id,
+                data: payload,
+            });
+
+            for mode in [CompressionMode::Never, CompressionMode::Always] {
+                let mut encoded = Vec::new();
+                pdu.encode_with_mode(&mut encoded, serial, mode)
+                    .expect("encode_with_mode");
+                let decoded = Pdu::decode(encoded.as_slice()).expect("decode");
+                prop_assert_eq!(decoded.serial, serial);
+                match decoded.pdu {
+                    Pdu::WriteToPane(write) => {
+                        prop_assert_eq!(write.pane_id, pane_id);
+                        prop_assert_eq!(write.data.as_slice(), expected_payload.as_slice());
+                    }
+                    other => {
+                        panic!("unexpected decoded pdu: {}", other.pdu_name());
+                    }
+                }
+            }
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn prop_is_local_unix_socket_rejects_regular_files(
+            payload in prop::collection::vec(any::<u8>(), 0..1024)
+        ) {
+            let file = tempfile::NamedTempFile::new().expect("temp file");
+            std::fs::write(file.path(), payload).expect("write temp file");
+            prop_assert!(!is_local_unix_socket(file.path()));
+        }
+    }
+
     #[test]
     fn default_config_has_sane_timeouts() {
         let config = DirectMuxClientConfig::default();
@@ -1127,6 +1225,81 @@ mod tests {
             resolve_compression_mode(crate::config::VendoredCompressionMode::Auto, &socket_path),
             CompressionMode::Never
         );
+    }
+
+    #[test]
+    fn is_local_unix_socket_rejects_directory_paths() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        assert!(!is_local_unix_socket(tmp.path()));
+    }
+
+    #[tokio::test]
+    async fn fallback_via_always_override_when_server_rejects_uncompressed() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = temp_dir.path().join("compression-fallback.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind listener");
+
+        let server = tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let reject_uncompressed = attempt == 0;
+                let mut read_buf = Vec::new();
+                let mut first_frame_checked = false;
+
+                loop {
+                    let mut temp = vec![0u8; 4096];
+                    let read = stream.read(&mut temp).await.expect("read");
+                    if read == 0 {
+                        break;
+                    }
+                    read_buf.extend_from_slice(&temp[..read]);
+
+                    if !first_frame_checked {
+                        if let Some(is_compressed) = frame_marked_compressed(&read_buf) {
+                            first_frame_checked = true;
+                            if reject_uncompressed && !is_compressed {
+                                break;
+                            }
+                        }
+                    }
+
+                    while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                        let response = match decoded.pdu {
+                            Pdu::GetCodecVersion(_) => {
+                                Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                    codec_vers: CODEC_VERSION,
+                                    version_string: "compression-fallback-test".to_string(),
+                                    executable_path: PathBuf::from("/bin/wezterm"),
+                                    config_file_path: None,
+                                })
+                            }
+                            Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
+                            _ => continue,
+                        };
+                        let mut out = Vec::new();
+                        response
+                            .encode(&mut out, decoded.serial)
+                            .expect("encode response");
+                        stream.write_all(&out).await.expect("write response");
+                    }
+                }
+            }
+        });
+
+        let auto_config = DirectMuxClientConfig::default().with_socket_path(socket_path.clone());
+        let err = DirectMuxClient::connect(auto_config)
+            .await
+            .expect_err("auto mode should fail when uncompressed PDUs are rejected");
+        assert_eq!(err.protocol_error_kind(), ProtocolErrorKind::Recoverable);
+
+        let mut fallback = DirectMuxClientConfig::default().with_socket_path(socket_path);
+        fallback.compression_mode = crate::config::VendoredCompressionMode::Always;
+        let client = DirectMuxClient::connect(fallback)
+            .await
+            .expect("explicit always mode should recover compatibility");
+        drop(client);
+
+        server.await.expect("server task");
     }
 
     #[test]

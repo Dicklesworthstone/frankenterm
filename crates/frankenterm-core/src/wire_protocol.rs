@@ -409,7 +409,13 @@ impl Aggregator {
 
     /// Process a raw JSON wire message. Returns the payload if accepted.
     pub fn ingest(&mut self, bytes: &[u8]) -> Result<IngestResult, WireProtocolError> {
-        let envelope = WireEnvelope::from_json(bytes)?;
+        let envelope = match WireEnvelope::from_json(bytes) {
+            Ok(envelope) => envelope,
+            Err(err) => {
+                self.total_rejected = self.total_rejected.saturating_add(1);
+                return Err(err);
+            }
+        };
         self.ingest_envelope(envelope)
     }
 
@@ -1125,6 +1131,7 @@ mod tests {
         let mut agg = Aggregator::new(10);
         let result = agg.ingest(b"not json");
         assert!(result.is_err());
+        assert_eq!(agg.total_rejected(), 1);
     }
 
     #[test]
@@ -1136,6 +1143,30 @@ mod tests {
             result,
             Err(WireProtocolError::MessageTooLarge { .. })
         ));
+        assert_eq!(agg.total_rejected(), 1);
+    }
+
+    #[test]
+    fn aggregator_rejected_counter_tracks_multiple_failures() {
+        let mut agg = Aggregator::new(10);
+
+        assert!(agg.ingest(b"not json").is_err());
+        let huge = vec![b'{'; MAX_MESSAGE_SIZE + 1];
+        assert!(matches!(
+            agg.ingest(&huge),
+            Err(WireProtocolError::MessageTooLarge { .. })
+        ));
+
+        assert_eq!(
+            agg.total_rejected(),
+            2,
+            "total_rejected should accumulate malformed/oversize failures"
+        );
+        assert_eq!(
+            agg.total_accepted(),
+            0,
+            "rejected inputs must not inflate accepted counters"
+        );
     }
 
     #[test]
