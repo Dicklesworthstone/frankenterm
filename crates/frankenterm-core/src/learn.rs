@@ -1953,7 +1953,7 @@ mod tests {
 
         let ex = engine.current_exercise().unwrap();
         assert_eq!(ex.id, "basics.1");
-        assert_eq!(ex.title, "What is wa?");
+        assert_eq!(ex.title, "What is ft?");
     }
 
     #[test]

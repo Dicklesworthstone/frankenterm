@@ -1669,7 +1669,7 @@ impl ObservationRuntime {
                             None => break,
                         }
                     }
-                    _ = sleep(Duration::from_millis(25)) => {
+                    () = sleep(Duration::from_millis(25)) => {
                         if shutdown_flag.load(Ordering::SeqCst) && capture_ingress_rx.is_empty() {
                             break;
                         }
@@ -2871,7 +2871,7 @@ mod tests {
     #[test]
     fn storage_lock_hold_warning_threshold_fires() {
         let metrics = RuntimeMetrics::default();
-        metrics.record_storage_lock_hold(Duration::from_millis(60));
+        metrics.record_storage_lock_hold(Duration::from_millis(80));
 
         assert!(metrics.max_storage_lock_hold_ms() >= STORAGE_LOCK_HOLD_WARN_MS);
 

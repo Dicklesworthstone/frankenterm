@@ -463,7 +463,7 @@ fn strip_ansi_sequences(input: &str) -> String {
         match chars.peek().copied() {
             Some('[') => {
                 chars.next();
-                while let Some(next) = chars.next() {
+                for next in chars.by_ref() {
                     if ('@'..='~').contains(&next) {
                         break;
                     }
@@ -1230,7 +1230,7 @@ mod tests {
     #[test]
     fn important_lines_outlive_low_value_lines() {
         let config = ImportanceRetentionConfig {
-            byte_budget_per_pane: 60,
+            byte_budget_per_pane: 40,
             min_lines: 1,
             max_lines: 100,
             importance_threshold: 0.8,
