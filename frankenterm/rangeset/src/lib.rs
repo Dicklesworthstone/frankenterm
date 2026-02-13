@@ -419,4 +419,314 @@ mod tests {
         let diff = set.difference(&set);
         assert_eq!(collect(&diff), vec![]);
     }
+
+    // ── Free functions ─────────────────────────────────────────
+
+    #[test]
+    fn range_is_empty_on_empty_range() {
+        assert!(range_is_empty(&(5..5)));
+    }
+
+    #[test]
+    fn range_is_empty_on_nonempty_range() {
+        assert!(!range_is_empty(&(1..5)));
+    }
+
+    #[test]
+    fn intersects_overlapping() {
+        assert!(intersects_range(&(1..5), &(3..7)));
+    }
+
+    #[test]
+    fn intersects_nonoverlapping() {
+        assert!(!intersects_range(&(1..3), &(5..7)));
+    }
+
+    #[test]
+    fn intersects_adjacent_are_not_intersecting() {
+        assert!(!intersects_range(&(1..3), &(3..5)));
+    }
+
+    #[test]
+    fn intersects_contained() {
+        assert!(intersects_range(&(1..10), &(3..5)));
+    }
+
+    #[test]
+    fn range_intersection_overlapping() {
+        assert_eq!(range_intersection(&(1..5), &(3..7)), Some(3..5));
+    }
+
+    #[test]
+    fn range_intersection_nonoverlapping() {
+        assert_eq!(range_intersection(&(1..3), &(5..7)), None);
+    }
+
+    #[test]
+    fn range_intersection_contained() {
+        assert_eq!(range_intersection(&(1..10), &(3..5)), Some(3..5));
+    }
+
+    #[test]
+    fn range_subtract_no_overlap() {
+        assert_eq!(range_subtract(&(1..5), &(7..10)), (Some(1..5), None));
+    }
+
+    #[test]
+    fn range_subtract_full_overlap() {
+        assert_eq!(range_subtract(&(3..5), &(1..10)), (None, None));
+    }
+
+    #[test]
+    fn range_subtract_left_overlap() {
+        // Subtracting the left portion: intersection starts at r1.start,
+        // so the first result is None, remainder is in second position
+        assert_eq!(range_subtract(&(1..5), &(1..3)), (None, Some(3..5)));
+    }
+
+    #[test]
+    fn range_subtract_right_overlap() {
+        assert_eq!(range_subtract(&(1..5), &(3..5)), (Some(1..3), None));
+    }
+
+    #[test]
+    fn range_subtract_middle() {
+        assert_eq!(range_subtract(&(1..10), &(3..7)), (Some(1..3), Some(7..10)));
+    }
+
+    #[test]
+    fn range_union_basic() {
+        assert_eq!(range_union(1..5, 3..7), 1..7);
+    }
+
+    #[test]
+    fn range_union_with_empty_first() {
+        assert_eq!(range_union(5..5, 3..7), 3..7);
+    }
+
+    #[test]
+    fn range_union_with_empty_second() {
+        assert_eq!(range_union(1..5, 3..3), 1..5);
+    }
+
+    // ── RangeSet construction ──────────────────────────────────
+
+    #[test]
+    fn new_is_empty() {
+        let set: RangeSet<i32> = RangeSet::new();
+        assert!(set.is_empty());
+        assert_eq!(set.len(), 0);
+    }
+
+    #[test]
+    fn default_is_empty() {
+        let set: RangeSet<i32> = RangeSet::default();
+        assert!(set.is_empty());
+    }
+
+    // ── contains ───────────────────────────────────────────────
+
+    #[test]
+    fn contains_added_value() {
+        let mut set = RangeSet::new();
+        set.add(5);
+        assert!(set.contains(5));
+    }
+
+    #[test]
+    fn does_not_contain_missing_value() {
+        let mut set = RangeSet::new();
+        set.add(5);
+        assert!(!set.contains(4));
+        assert!(!set.contains(6));
+    }
+
+    #[test]
+    fn contains_values_in_range() {
+        let mut set = RangeSet::new();
+        set.add_range(10..20);
+        assert!(set.contains(10));
+        assert!(set.contains(15));
+        assert!(set.contains(19));
+        assert!(!set.contains(9));
+        assert!(!set.contains(20));
+    }
+
+    // ── len ────────────────────────────────────────────────────
+
+    #[test]
+    fn len_single_value() {
+        let mut set = RangeSet::new();
+        set.add(1);
+        assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn len_range() {
+        let mut set = RangeSet::new();
+        set.add_range(5..10);
+        assert_eq!(set.len(), 5);
+    }
+
+    #[test]
+    fn len_multiple_ranges() {
+        let mut set = RangeSet::new();
+        set.add_range(1..3);
+        set.add_range(10..15);
+        assert_eq!(set.len(), 7);
+    }
+
+    // ── add_range_unchecked ────────────────────────────────────
+
+    #[test]
+    fn add_range_unchecked_then_sort() {
+        let mut set = RangeSet::new();
+        set.add_range_unchecked(10..15);
+        set.add_range_unchecked(1..5);
+        set.sort_if_needed();
+        let ranges = collect(&set);
+        assert_eq!(ranges, vec![1..5, 10..15]);
+    }
+
+    // ── add_set / remove_set ───────────────────────────────────
+
+    #[test]
+    fn add_set_merges() {
+        let mut set1 = RangeSet::new();
+        set1.add_range(1..5);
+
+        let mut set2 = RangeSet::new();
+        set2.add_range(3..8);
+
+        set1.add_set(&set2);
+        assert_eq!(collect(&set1), vec![1..8]);
+    }
+
+    #[test]
+    fn remove_set_subtracts() {
+        let mut set1 = RangeSet::new();
+        set1.add_range(1..10);
+
+        let mut set2 = RangeSet::new();
+        set2.add_range(3..7);
+
+        set1.remove_set(&set2);
+        assert_eq!(collect(&set1), vec![1..3, 7..10]);
+    }
+
+    // ── intersection ───────────────────────────────────────────
+
+    #[test]
+    fn intersection_overlapping_sets() {
+        let mut set1 = RangeSet::new();
+        set1.add_range(1..10);
+
+        let mut set2 = RangeSet::new();
+        set2.add_range(5..15);
+
+        let inter = set1.intersection(&set2);
+        assert_eq!(collect(&inter), vec![5..10]);
+    }
+
+    #[test]
+    fn intersection_disjoint_sets() {
+        let mut set1 = RangeSet::new();
+        set1.add_range(1..5);
+
+        let mut set2 = RangeSet::new();
+        set2.add_range(10..15);
+
+        let inter = set1.intersection(&set2);
+        assert!(inter.is_empty());
+    }
+
+    #[test]
+    fn intersection_with_range_method() {
+        let mut set = RangeSet::new();
+        set.add_range(1..10);
+        set.add_range(20..30);
+
+        let inter = set.intersection_with_range(5..25);
+        assert_eq!(collect(&inter), vec![5..10, 20..25]);
+    }
+
+    // ── iter_values ────────────────────────────────────────────
+
+    #[test]
+    fn iter_values_returns_all_integers() {
+        let mut set = RangeSet::new();
+        set.add_range(1..4);
+        set.add_range(7..9);
+        let values: Vec<i32> = set.iter_values().collect();
+        assert_eq!(values, vec![1, 2, 3, 7, 8]);
+    }
+
+    #[test]
+    fn iter_values_empty_set() {
+        let set: RangeSet<i32> = RangeSet::new();
+        let values: Vec<i32> = set.iter_values().collect();
+        assert!(values.is_empty());
+    }
+
+    // ── From<RangeSet> for Vec ─────────────────────────────────
+
+    #[test]
+    fn into_vec_conversion() {
+        let mut set = RangeSet::new();
+        set.add_range(1..5);
+        set.add_range(10..15);
+        let v: Vec<Range<i32>> = set.into();
+        assert_eq!(v, vec![1..5, 10..15]);
+    }
+
+    // ── Clone / PartialEq / Eq ─────────────────────────────────
+
+    #[test]
+    fn clone_produces_equal_set() {
+        let mut set = RangeSet::new();
+        set.add_range(1..10);
+        let cloned = set.clone();
+        assert_eq!(set, cloned);
+    }
+
+    // ── Edge cases ─────────────────────────────────────────────
+
+    #[test]
+    fn add_empty_range_is_noop() {
+        let mut set = RangeSet::new();
+        set.add_range(5..5);
+        assert!(set.is_empty());
+    }
+
+    #[test]
+    fn add_adjacent_ranges_merge() {
+        let mut set = RangeSet::new();
+        set.add_range(1..5);
+        set.add_range(5..10);
+        assert_eq!(collect(&set), vec![1..10]);
+    }
+
+    #[test]
+    fn add_overlapping_ranges_merge() {
+        let mut set = RangeSet::new();
+        set.add_range(1..7);
+        set.add_range(5..10);
+        assert_eq!(collect(&set), vec![1..10]);
+    }
+
+    #[test]
+    fn remove_from_middle_splits() {
+        let mut set = RangeSet::new();
+        set.add_range(1..10);
+        set.remove(5);
+        assert_eq!(collect(&set), vec![1..5, 6..10]);
+    }
+
+    #[test]
+    fn remove_nonexistent_is_noop() {
+        let mut set = RangeSet::new();
+        set.add_range(1..5);
+        set.remove(10);
+        assert_eq!(collect(&set), vec![1..5]);
+    }
 }
