@@ -131,6 +131,7 @@ pub mod priority;
 pub mod process_tree;
 pub mod process_triage;
 pub mod protocol_recovery;
+pub mod recorder_audit;
 pub mod recorder_invariants;
 pub mod recorder_retention;
 pub mod recorder_storage;
