@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "captured_at": 1700000001234,
+  "workspace_id": "default",
+  "windows": [
+    {
+      "window_id": 7,
+      "title": "swarm-window",
+      "position": [100, 80],
+      "size": [2200, 1400],
+      "tabs": [
+        {
+          "tab_id": 10,
+          "title": "tab-build",
+          "pane_tree": {
+            "type": "VSplit",
+            "children": [
+              [
+                0.5,
+                {
+                  "type": "Leaf",
+                  "pane_id": 1,
+                  "rows": 42,
+                  "cols": 120,
+                  "cwd": "file:///tmp/build",
+                  "title": "build-log",
+                  "is_active": false
+                }
+              ],
+              [
+                0.5,
+                {
+                  "type": "HSplit",
+                  "children": [
+                    [
+                      0.6,
+                      {
+                        "type": "Leaf",
+                        "pane_id": 2,
+                        "rows": 24,
+                        "cols": 120,
+                        "cwd": "file:///tmp/editor",
+                        "title": "editor",
+                        "is_active": true
+                      }
+                    ],
+                    [
+                      0.4,
+                      {
+                        "type": "Leaf",
+                        "pane_id": 3,
+                        "rows": 18,
+                        "cols": 120,
+                        "cwd": "file:///tmp/tests",
+                        "title": "tests",
+                        "is_active": false
+                      }
+                    ]
+                  ]
+                }
+              ]
+            ]
+          },
+          "active_pane_id": 2
+        },
+        {
+          "tab_id": 11,
+          "title": "tab-monitor",
+          "pane_tree": {
+            "type": "Leaf",
+            "pane_id": 4,
+            "rows": 50,
+            "cols": 160,
+            "cwd": "file:///tmp/monitor",
+            "title": "monitor",
+            "is_active": true
+          },
+          "active_pane_id": 4
+        }
+      ],
+      "active_tab_index": 0
+    }
+  ]
+}

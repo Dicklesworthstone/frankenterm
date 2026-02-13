@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "captured_at": 1700000000000,
+  "workspace_id": "default",
+  "windows": [
+    {
+      "window_id": 0,
+      "title": "main",
+      "position": [0, 0],
+      "size": [1920, 1080],
+      "tabs": [
+        {
+          "tab_id": 0,
+          "title": "agents",
+          "pane_tree": {
+            "type": "Leaf",
+            "pane_id": 1,
+            "rows": 24,
+            "cols": 80,
+            "cwd": "file:///tmp/agent-a",
+            "title": "agent-a",
+            "is_active": true
+          },
+          "active_pane_id": 1
+        }
+      ],
+      "active_tab_index": 0
+    }
+  ]
+}
