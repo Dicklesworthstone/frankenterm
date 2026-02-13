@@ -154,6 +154,8 @@ pub enum WireProtocolError {
     MessageTooLarge { size: usize, max: usize },
     #[error("protocol version mismatch: expected {expected}, got {got}")]
     VersionMismatch { expected: u32, got: u32 },
+    #[error("aggregator capacity exceeded: max tracked agents {max}, rejected sender '{sender}'")]
+    TooManyAgents { max: usize, sender: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -426,11 +428,11 @@ impl Aggregator {
     ) -> Result<IngestResult, WireProtocolError> {
         let is_new = !self.agents.contains_key(&envelope.sender);
         if is_new && self.agents.len() >= self.max_agents {
-            tracing::warn!(
-                "aggregator: max agents ({}) reached, allowing new agent '{}'",
-                self.max_agents,
-                envelope.sender
-            );
+            self.total_rejected = self.total_rejected.saturating_add(1);
+            return Err(WireProtocolError::TooManyAgents {
+                max: self.max_agents,
+                sender: envelope.sender,
+            });
         }
 
         let session = self
@@ -1220,5 +1222,48 @@ mod tests {
         let e3 = WireEnvelope::new(6, "agent", WirePayload::Gap(sample_gap()));
         let result = agg.ingest_envelope(e3).unwrap();
         assert!(matches!(result, IngestResult::Accepted(_)));
+    }
+
+    #[test]
+    fn aggregator_rejects_new_sender_over_capacity() {
+        let mut agg = Aggregator::new(1);
+
+        let first = WireEnvelope::new(1, "agent-a", WirePayload::Gap(sample_gap()));
+        assert!(matches!(
+            agg.ingest_envelope(first).unwrap(),
+            IngestResult::Accepted(_)
+        ));
+
+        let second = WireEnvelope::new(1, "agent-b", WirePayload::Gap(sample_gap()));
+        let err = agg
+            .ingest_envelope(second)
+            .expect_err("new sender over capacity");
+        assert!(matches!(
+            err,
+            WireProtocolError::TooManyAgents { max: 1, sender: _ }
+        ));
+        assert_eq!(agg.agent_count(), 1);
+        assert_eq!(agg.total_accepted(), 1);
+        assert_eq!(agg.total_rejected(), 1);
+    }
+
+    #[test]
+    fn aggregator_accepts_existing_sender_at_capacity() {
+        let mut agg = Aggregator::new(1);
+
+        let e1 = WireEnvelope::new(1, "agent-a", WirePayload::Gap(sample_gap()));
+        let e2 = WireEnvelope::new(2, "agent-a", WirePayload::Gap(sample_gap()));
+        assert!(matches!(
+            agg.ingest_envelope(e1).unwrap(),
+            IngestResult::Accepted(_)
+        ));
+        assert!(matches!(
+            agg.ingest_envelope(e2).unwrap(),
+            IngestResult::Accepted(_)
+        ));
+
+        assert_eq!(agg.agent_count(), 1);
+        assert_eq!(agg.total_accepted(), 2);
+        assert_eq!(agg.total_rejected(), 0);
     }
 }

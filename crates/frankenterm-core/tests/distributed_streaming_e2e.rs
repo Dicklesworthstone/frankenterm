@@ -51,6 +51,10 @@ impl DistributedBridge {
         envelope: WireEnvelope,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let raw = envelope.to_json()?;
+        self.ingest_raw(&raw).await
+    }
+
+    async fn ingest_raw(&mut self, raw: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
         match self.aggregator.ingest(&raw)? {
             IngestResult::Accepted(payload) => self.persist_payload(payload).await,
             IngestResult::Duplicate { sender: _, seq: _ } => {
@@ -460,6 +464,11 @@ async fn distributed_streaming_e2e_preserves_gap_and_handles_duplicate_out_of_or
     assert_eq!(bridge.diagnostics.duplicates, 1);
     assert_eq!(bridge.diagnostics.pane_reorder_drops, 1);
     assert_eq!(bridge.diagnostics.pane_seq_gap_repairs, 1);
+    assert_eq!(
+        bridge.diagnostics.replay_event_codes,
+        vec!["dist.replay_detected".to_string()],
+        "out-of-order payload should emit deterministic replay code"
+    );
 
     emit_artifact(
         "aggregator_log",
@@ -491,6 +500,59 @@ async fn distributed_streaming_e2e_preserves_gap_and_handles_duplicate_out_of_or
             "gaps": gaps.len(),
             "search_hits": search_hits.len()
         }),
+    );
+}
+
+#[tokio::test]
+async fn distributed_streaming_e2e_rejects_malformed_wire_without_persisting() {
+    use frankenterm_core::wire_protocol::WireProtocolError;
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let db_path = temp_dir.path().join("distributed_streaming_malformed.db");
+    let mut bridge = DistributedBridge::new(db_path.to_str().expect("db path"))
+        .await
+        .expect("bridge");
+
+    let malformed = br#"{"seq":"oops","payload":{"type":"gap"}}"#;
+    let err = bridge
+        .ingest_raw(malformed)
+        .await
+        .expect_err("malformed payload should fail with structured error");
+    let wire_err = err
+        .downcast_ref::<WireProtocolError>()
+        .expect("expected WireProtocolError");
+    assert!(
+        matches!(wire_err, WireProtocolError::InvalidJson(_)),
+        "expected InvalidJson error for malformed wire payload"
+    );
+    assert_eq!(bridge.aggregator.total_rejected(), 1);
+    assert_eq!(bridge.aggregator.total_accepted(), 0);
+
+    let panes = bridge.storage.get_panes().await.expect("panes");
+    let hits = bridge
+        .storage
+        .search("MALFORMED_MARKER")
+        .await
+        .expect("search");
+    let gaps = bridge.storage.get_gaps().await.expect("gaps");
+    let events = bridge
+        .storage
+        .get_events(EventQuery::default())
+        .await
+        .expect("events");
+
+    assert!(
+        panes.is_empty(),
+        "malformed payload should not create panes"
+    );
+    assert!(
+        hits.is_empty(),
+        "malformed payload should not persist searchable segments"
+    );
+    assert!(gaps.is_empty(), "malformed payload should not persist gaps");
+    assert!(
+        events.is_empty(),
+        "malformed payload should not persist events"
     );
 }
 
