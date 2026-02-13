@@ -28,8 +28,7 @@ use frankenterm_core::voi::{BackpressureTierInput, VoiConfig, VoiScheduler};
 
 fn arb_pane_ids(count: usize) -> impl Strategy<Value = Vec<u64>> {
     // Unique pane IDs.
-    proptest::collection::hash_set(1_u64..1000, count)
-        .prop_map(|s| s.into_iter().collect())
+    proptest::collection::hash_set(1_u64..1000, count).prop_map(|s| s.into_iter().collect())
 }
 
 fn arb_time_ms() -> impl Strategy<Value = u64> {
@@ -44,10 +43,10 @@ fn arb_config() -> impl Strategy<Value = VoiConfig> {
     (
         0.001_f64..1.0,   // min_voi_threshold
         0.01_f64..1.0,    // entropy_drift_rate
-        10_u64..200,       // min_poll_interval_ms
-        5000_u64..60_000,  // max_poll_interval_ms
-        0.5_f64..10.0,     // default_cost_ms
-        0.5_f64..5.0,      // default_importance
+        10_u64..200,      // min_poll_interval_ms
+        5000_u64..60_000, // max_poll_interval_ms
+        0.5_f64..10.0,    // default_cost_ms
+        0.5_f64..5.0,     // default_importance
     )
         .prop_map(
             |(threshold, drift, min_poll, max_poll, cost, importance)| VoiConfig {

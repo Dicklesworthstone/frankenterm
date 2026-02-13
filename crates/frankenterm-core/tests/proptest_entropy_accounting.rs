@@ -17,8 +17,8 @@
 use proptest::prelude::*;
 
 use frankenterm_core::entropy_accounting::{
-    compute_entropy, eviction_order, eviction_score, information_cost, EntropyEstimator,
-    EvictionConfig, InformationBudget,
+    EntropyEstimator, EvictionConfig, InformationBudget, compute_entropy, eviction_order,
+    eviction_score, information_cost,
 };
 
 // =============================================================================
