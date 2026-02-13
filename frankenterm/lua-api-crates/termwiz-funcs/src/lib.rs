@@ -8,11 +8,11 @@ use frankenterm_dynamic::{FromDynamic, ToDynamic};
 use luahelper::impl_lua_conversion_dynamic;
 use std::str::FromStr;
 use termwiz::caps::{Capabilities, ColorLevel, ProbeHints};
-use termwiz::cell::{AttributeChange, CellAttributes, grapheme_column_width, unicode_column_width};
+use termwiz::cell::{grapheme_column_width, unicode_column_width, AttributeChange, CellAttributes};
 use termwiz::color::{AnsiColor, ColorAttribute, ColorSpec, SrgbaTuple};
 use termwiz::render::terminfo::TerminfoRenderer;
-use termwiz::surface::Line;
 use termwiz::surface::change::Change;
+use termwiz::surface::Line;
 
 #[cfg(feature = "lua")]
 pub fn register(lua: &Lua) -> anyhow::Result<()> {

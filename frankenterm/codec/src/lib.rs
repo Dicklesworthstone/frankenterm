@@ -1992,4 +1992,138 @@ mod test {
         assert_eq!(decoded.serial, 42);
         assert_eq!(decoded.pdu, pdu);
     }
+
+    // --- Additional codec edge and async coverage (wa-2mina) ---
+
+    #[test]
+    fn encode_raw_as_vec_sets_compressed_length_bit() {
+        let uncompressed = encode_raw_as_vec(7, 9, b"abc", false).unwrap();
+        let compressed = encode_raw_as_vec(7, 9, b"abc", true).unwrap();
+
+        let uncompressed_len = read_u64(uncompressed.as_slice()).unwrap();
+        let compressed_len = read_u64(compressed.as_slice()).unwrap();
+
+        assert_eq!(uncompressed_len & COMPRESSED_MASK, 0);
+        assert_eq!(compressed_len & COMPRESSED_MASK, COMPRESSED_MASK);
+        assert_eq!(
+            compressed_len & !COMPRESSED_MASK,
+            uncompressed_len & !COMPRESSED_MASK
+        );
+    }
+
+    #[test]
+    fn decode_raw_errors_on_header_length_underflow() {
+        // len=1, serial=1, ident=1 => encoded(serial)+encoded(ident)=2, impossible frame
+        let malformed = vec![1u8, 1u8, 1u8];
+        let err = decode_raw(malformed.as_slice()).expect_err("expected malformed frame to fail");
+        let message = err.to_string();
+        assert!(
+            message.contains("sizes don't make sense"),
+            "unexpected error message: {}",
+            message
+        );
+    }
+
+    #[test]
+    fn deserialize_invalid_compressed_payload_errors() {
+        let err =
+            deserialize::<u64, _>(b"not-zstd".as_slice(), true).expect_err("expected zstd error");
+        assert!(
+            !err.to_string().is_empty(),
+            "deserialize should surface a non-empty error"
+        );
+    }
+
+    #[test]
+    fn serialize_with_mode_always_compresses_small_payload() {
+        let (payload, is_compressed) =
+            serialize_with_mode(&7u8, CompressionMode::Always).expect("serialize");
+        assert!(is_compressed);
+        let roundtrip: u8 = deserialize(payload.as_slice(), true).expect("deserialize");
+        assert_eq!(roundtrip, 7u8);
+    }
+
+    #[test]
+    fn encode_raw_async_roundtrip_uncompressed() {
+        smol::block_on(async {
+            let mut writer = smol::io::Cursor::new(Vec::<u8>::new());
+            encode_raw_async(17, 23, b"async-raw", false, &mut writer)
+                .await
+                .expect("encode_raw_async");
+            let encoded = writer.into_inner();
+
+            let decoded = decode_raw(encoded.as_slice()).expect("decode_raw");
+            assert_eq!(decoded.ident, 17);
+            assert_eq!(decoded.serial, 23);
+            assert_eq!(decoded.data, b"async-raw");
+            assert!(!decoded.is_compressed);
+        });
+    }
+
+    #[test]
+    fn decode_raw_async_roundtrip_uncompressed() {
+        smol::block_on(async {
+            let mut encoded = Vec::new();
+            encode_raw(11, 13, b"decode-async", false, &mut encoded).expect("encode_raw");
+
+            let mut reader = smol::io::Cursor::new(encoded);
+            let decoded = decode_raw_async(&mut reader, None)
+                .await
+                .expect("decode_raw_async");
+            assert_eq!(decoded.ident, 11);
+            assert_eq!(decoded.serial, 13);
+            assert_eq!(decoded.data, b"decode-async");
+            assert!(!decoded.is_compressed);
+        });
+    }
+
+    #[test]
+    fn decode_raw_async_roundtrip_compressed_flag() {
+        smol::block_on(async {
+            let mut encoded = Vec::new();
+            encode_raw(31, 9, b"decode-async-compressed", true, &mut encoded).expect("encode_raw");
+
+            let mut reader = smol::io::Cursor::new(encoded);
+            let decoded = decode_raw_async(&mut reader, None)
+                .await
+                .expect("decode_raw_async");
+            assert_eq!(decoded.ident, 31);
+            assert_eq!(decoded.serial, 9);
+            assert_eq!(decoded.data, b"decode-async-compressed");
+            assert!(decoded.is_compressed);
+        });
+    }
+
+    #[test]
+    fn decode_raw_async_rejects_serial_over_max() {
+        smol::block_on(async {
+            let mut encoded = Vec::new();
+            encode_raw(3, 99, b"x", false, &mut encoded).expect("encode_raw");
+
+            let mut reader = smol::io::Cursor::new(encoded);
+            let err = decode_raw_async(&mut reader, Some(10))
+                .await
+                .expect_err("serial should be rejected");
+            let message = err.to_string();
+            assert!(
+                message.contains("implausibly large"),
+                "unexpected error message: {}",
+                message
+            );
+        });
+    }
+
+    #[test]
+    fn read_u64_async_returns_eof_on_empty_input() {
+        smol::block_on(async {
+            let mut reader = smol::io::Cursor::new(Vec::<u8>::new());
+            let err = read_u64_async(&mut reader)
+                .await
+                .expect_err("empty stream should error");
+            let io_err = err
+                .downcast_ref::<std::io::Error>()
+                .expect("expected io::Error");
+            assert_eq!(io_err.kind(), std::io::ErrorKind::UnexpectedEof);
+        });
+    }
 }

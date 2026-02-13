@@ -4,10 +4,10 @@
 //! required by wa-3dfxb.13.
 
 use criterion::{criterion_group, criterion_main, Criterion};
-use std::hint::black_box;
 use mux::events::{
     Event, EventAction, EventBus, EventPayload, EventType, HandlerFn, HandlerPriority,
 };
+use std::hint::black_box;
 use std::sync::Arc;
 
 /// Benchmark: fire a single native handler (no filter).

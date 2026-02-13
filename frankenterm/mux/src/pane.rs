@@ -1,9 +1,9 @@
+use crate::ExitBehavior;
 use crate::domain::DomainId;
 use crate::renderable::*;
-use crate::ExitBehavior;
 use async_trait::async_trait;
 use config::keyassignment::{KeyAssignment, ScrollbackEraseMode};
-use downcast_rs::{impl_downcast, Downcast};
+use downcast_rs::{Downcast, impl_downcast};
 use frankenterm_dynamic::Value;
 use frankenterm_term::color::ColorPalette;
 use frankenterm_term::{
@@ -26,6 +26,45 @@ pub type PaneId = usize;
 
 pub fn alloc_pane_id() -> PaneId {
     PANE_ID.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed)
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PaneConstraints {
+    pub min_width: usize,
+    pub min_height: usize,
+    pub max_width: Option<usize>,
+    pub max_height: Option<usize>,
+    pub preferred_width: Option<usize>,
+    pub preferred_height: Option<usize>,
+    pub fixed: bool,
+}
+
+impl Default for PaneConstraints {
+    fn default() -> Self {
+        Self {
+            min_width: 5,
+            min_height: 3,
+            max_width: None,
+            max_height: None,
+            preferred_width: None,
+            preferred_height: None,
+            fixed: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+pub enum CollapsePriority {
+    Never,
+    Low,
+    Normal,
+    High,
+}
+
+impl Default for CollapsePriority {
+    fn default() -> Self {
+        Self::Normal
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -230,6 +269,14 @@ pub trait Pane: Downcast + Send + Sync {
 
     /// Returns render related dimensions
     fn get_dimensions(&self) -> RenderableDimensions;
+
+    fn pane_constraints(&self) -> PaneConstraints {
+        PaneConstraints::default()
+    }
+
+    fn collapse_priority(&self) -> CollapsePriority {
+        CollapsePriority::default()
+    }
 
     fn get_title(&self) -> String;
     fn get_progress(&self) -> Progress {

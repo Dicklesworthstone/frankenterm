@@ -316,7 +316,7 @@ where
 
 /// Computes the minimum (x, y) size based on the panes in this portion
 /// of the tree.
-fn compute_min_size(tree: &mut Tree) -> (usize, usize) {
+fn compute_min_size(tree: &Tree) -> (usize, usize) {
     match tree {
         Tree::Node { data: None, .. } | Tree::Empty => (1, 1),
         Tree::Node {
@@ -324,15 +324,41 @@ fn compute_min_size(tree: &mut Tree) -> (usize, usize) {
             right,
             data: Some(data),
         } => {
-            let (left_x, left_y) = compute_min_size(&mut *left);
-            let (right_x, right_y) = compute_min_size(&mut *right);
+            let (left_x, left_y) = compute_min_size(&*left);
+            let (right_x, right_y) = compute_min_size(&*right);
             match data.direction {
                 SplitDirection::Vertical => (left_x.max(right_x), left_y + right_y + 1),
                 SplitDirection::Horizontal => (left_x + right_x + 1, left_y.max(right_y)),
             }
         }
-        Tree::Leaf(_) => (1, 1),
+        Tree::Leaf(pane) => {
+            let constraints = pane.pane_constraints();
+            let min_width = constraints.min_width.max(1);
+            let min_height = constraints.min_height.max(1);
+            if constraints.fixed {
+                let dims = pane.get_dimensions();
+                (min_width.max(dims.cols), min_height.max(dims.viewport_rows))
+            } else {
+                (min_width, min_height)
+            }
+        }
     }
+}
+
+fn split_allocation(
+    total: usize,
+    min_first: usize,
+    min_second: usize,
+    preferred_first: usize,
+) -> Option<(usize, usize)> {
+    let available = total.checked_sub(1)?;
+    if min_first.saturating_add(min_second) > available {
+        return None;
+    }
+    let max_first = available.saturating_sub(min_second);
+    let first = preferred_first.clamp(min_first, max_first);
+    let second = available.saturating_sub(first);
+    Some((first, second))
 }
 
 fn adjust_x_size(tree: &mut Tree, mut x_adjust: isize, cell_dimensions: &TerminalSize) {
@@ -384,14 +410,16 @@ fn adjust_x_size(tree: &mut Tree, mut x_adjust: isize, cell_dimensions: &Termina
                     }
                     SplitDirection::Horizontal => {
                         // x_adjust is negative
-                        if data.first.cols > 1 {
+                        let (left_min_x, _) = compute_min_size(&*left);
+                        let (right_min_x, _) = compute_min_size(&*right);
+                        if data.first.cols > left_min_x {
                             adjust_x_size(&mut *left, -1, cell_dimensions);
                             data.first.cols -= 1;
                             data.first.pixel_width =
                                 data.first.cols.saturating_mul(cell_dimensions.pixel_width);
                             x_adjust += 1;
                         }
-                        if x_adjust < 0 && data.second.cols > 1 {
+                        if x_adjust < 0 && data.second.cols > right_min_x {
                             adjust_x_size(&mut *right, -1, cell_dimensions);
                             data.second.cols -= 1;
                             data.second.pixel_width =
@@ -455,14 +483,16 @@ fn adjust_y_size(tree: &mut Tree, mut y_adjust: isize, cell_dimensions: &Termina
                     }
                     SplitDirection::Vertical => {
                         // y_adjust is negative
-                        if data.first.rows > 1 {
+                        let (_, left_min_y) = compute_min_size(&*left);
+                        let (_, right_min_y) = compute_min_size(&*right);
+                        if data.first.rows > left_min_y {
                             adjust_y_size(&mut *left, -1, cell_dimensions);
                             data.first.rows -= 1;
                             data.first.pixel_height =
                                 data.first.rows.saturating_mul(cell_dimensions.pixel_height);
                             y_adjust += 1;
                         }
-                        if y_adjust < 0 && data.second.rows > 1 {
+                        if y_adjust < 0 && data.second.rows > right_min_y {
                             adjust_y_size(&mut *right, -1, cell_dimensions);
                             data.second.rows -= 1;
                             data.second.pixel_height = data
@@ -1235,6 +1265,18 @@ impl TabInner {
             .pixel_height
             .checked_div(pane_size.rows)
             .unwrap_or(1);
+        let (left_min_x, left_min_y, right_min_x, right_min_y) = match cursor.subtree() {
+            Tree::Node {
+                left,
+                right,
+                data: Some(_),
+            } => {
+                let (left_min_x, left_min_y) = compute_min_size(&**left);
+                let (right_min_x, right_min_y) = compute_min_size(&**right);
+                (left_min_x, left_min_y, right_min_x, right_min_y)
+            }
+            _ => return,
+        };
         if let Ok(Some(node)) = cursor.node_mut() {
             // Adjust the size of the node; we preserve the size of the first
             // child and adjust the second, so if we are split down the middle
@@ -1244,12 +1286,26 @@ impl TabInner {
                 node.first.rows = pane_size.rows;
                 node.second.rows = pane_size.rows;
 
-                node.second.cols = pane_size.cols.saturating_sub(1 + node.first.cols);
+                if let Some((first_cols, second_cols)) =
+                    split_allocation(pane_size.cols, left_min_x, right_min_x, node.first.cols)
+                {
+                    node.first.cols = first_cols;
+                    node.second.cols = second_cols;
+                } else {
+                    return;
+                }
             } else {
                 node.first.cols = pane_size.cols;
                 node.second.cols = pane_size.cols;
 
-                node.second.rows = pane_size.rows.saturating_sub(1 + node.first.rows);
+                if let Some((first_rows, second_rows)) =
+                    split_allocation(pane_size.rows, left_min_y, right_min_y, node.first.rows)
+                {
+                    node.first.rows = first_rows;
+                    node.second.rows = second_rows;
+                } else {
+                    return;
+                }
             }
             node.first.pixel_width = node.first.cols * cell_width;
             node.first.pixel_height = node.first.rows * cell_height;
@@ -1337,41 +1393,57 @@ impl TabInner {
 
     fn adjust_node_at_cursor(&mut self, cursor: &mut Cursor, delta: isize) {
         let cell_dimensions = self.cell_dimensions();
+        let (left_min_x, left_min_y, right_min_x, right_min_y) = match cursor.subtree() {
+            Tree::Node {
+                left,
+                right,
+                data: Some(_),
+            } => {
+                let (left_min_x, left_min_y) = compute_min_size(&**left);
+                let (right_min_x, right_min_y) = compute_min_size(&**right);
+                (left_min_x, left_min_y, right_min_x, right_min_y)
+            }
+            _ => return,
+        };
         if let Ok(Some(node)) = cursor.node_mut() {
             match node.direction {
                 SplitDirection::Horizontal => {
                     let width = node.width();
-
-                    let mut cols = node.first.cols as isize;
-                    cols = cols
-                        .saturating_add(delta)
-                        .max(1)
-                        .min((width as isize).saturating_sub(2));
-                    node.first.cols = cols as usize;
-                    node.first.pixel_width =
-                        node.first.cols.saturating_mul(cell_dimensions.pixel_width);
-
-                    node.second.cols = width.saturating_sub(node.first.cols.saturating_add(1));
-                    node.second.pixel_width =
-                        node.second.cols.saturating_mul(cell_dimensions.pixel_width);
+                    let preferred_cols = if delta >= 0 {
+                        node.first.cols.saturating_add(delta as usize)
+                    } else {
+                        node.first.cols.saturating_sub((-delta) as usize)
+                    };
+                    if let Some((first_cols, second_cols)) =
+                        split_allocation(width, left_min_x, right_min_x, preferred_cols)
+                    {
+                        node.first.cols = first_cols;
+                        node.second.cols = second_cols;
+                        node.first.pixel_width =
+                            node.first.cols.saturating_mul(cell_dimensions.pixel_width);
+                        node.second.pixel_width =
+                            node.second.cols.saturating_mul(cell_dimensions.pixel_width);
+                    }
                 }
                 SplitDirection::Vertical => {
                     let height = node.height();
-
-                    let mut rows = node.first.rows as isize;
-                    rows = rows
-                        .saturating_add(delta)
-                        .max(1)
-                        .min((height as isize).saturating_sub(2));
-                    node.first.rows = rows as usize;
-                    node.first.pixel_height =
-                        node.first.rows.saturating_mul(cell_dimensions.pixel_height);
-
-                    node.second.rows = height.saturating_sub(node.first.rows.saturating_add(1));
-                    node.second.pixel_height = node
-                        .second
-                        .rows
-                        .saturating_mul(cell_dimensions.pixel_height);
+                    let preferred_rows = if delta >= 0 {
+                        node.first.rows.saturating_add(delta as usize)
+                    } else {
+                        node.first.rows.saturating_sub((-delta) as usize)
+                    };
+                    if let Some((first_rows, second_rows)) =
+                        split_allocation(height, left_min_y, right_min_y, preferred_rows)
+                    {
+                        node.first.rows = first_rows;
+                        node.second.rows = second_rows;
+                        node.first.pixel_height =
+                            node.first.rows.saturating_mul(cell_dimensions.pixel_height);
+                        node.second.pixel_height = node
+                            .second
+                            .rows
+                            .saturating_mul(cell_dimensions.pixel_height);
+                    }
                 }
             }
         }
@@ -2251,6 +2323,7 @@ mod test {
     struct FakePane {
         id: PaneId,
         size: Mutex<TerminalSize>,
+        constraints: PaneConstraints,
     }
 
     impl FakePane {
@@ -2258,6 +2331,19 @@ mod test {
             Arc::new(Self {
                 id,
                 size: Mutex::new(size),
+                constraints: PaneConstraints::default(),
+            })
+        }
+
+        fn new_with_constraints(
+            id: PaneId,
+            size: TerminalSize,
+            constraints: PaneConstraints,
+        ) -> Arc<dyn Pane> {
+            Arc::new(Self {
+                id,
+                size: Mutex::new(size),
+                constraints,
             })
         }
     }
@@ -2308,7 +2394,22 @@ mod test {
         }
 
         fn get_dimensions(&self) -> RenderableDimensions {
-            unimplemented!();
+            let size = *self.size.lock();
+            RenderableDimensions {
+                cols: size.cols,
+                viewport_rows: size.rows,
+                scrollback_rows: size.rows,
+                physical_top: 0,
+                scrollback_top: 0,
+                dpi: size.dpi,
+                pixel_width: size.pixel_width,
+                pixel_height: size.pixel_height,
+                reverse_video: false,
+            }
+        }
+
+        fn pane_constraints(&self) -> PaneConstraints {
+            self.constraints
         }
 
         fn get_title(&self) -> String {
@@ -2379,15 +2480,16 @@ mod test {
         assert_eq!(80, panes[0].width);
         assert_eq!(24, panes[0].height);
 
-        assert!(tab
-            .compute_split_size(
+        assert!(
+            tab.compute_split_size(
                 1,
                 SplitRequest {
                     direction: SplitDirection::Horizontal,
                     ..Default::default()
                 }
             )
-            .is_none());
+            .is_none()
+        );
 
         let horz_size = tab
             .compute_split_size(
@@ -2556,6 +2658,180 @@ mod test {
         assert_eq!(24, panes[2].height);
         assert_eq!(400, panes[2].pixel_width);
         assert_eq!(600, panes[2].pixel_height);
+    }
+
+    #[test]
+    fn resize_split_by_clamps_to_horizontal_constraints() {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new_with_constraints(
+            1,
+            size,
+            PaneConstraints {
+                min_width: 5,
+                ..PaneConstraints::default()
+            },
+        ));
+
+        let split = tab
+            .compute_split_size(
+                0,
+                SplitRequest {
+                    direction: SplitDirection::Horizontal,
+                    ..Default::default()
+                },
+            )
+            .expect("split to compute");
+        tab.split_and_insert(
+            0,
+            SplitRequest {
+                direction: SplitDirection::Horizontal,
+                ..Default::default()
+            },
+            FakePane::new_with_constraints(
+                2,
+                split.second,
+                PaneConstraints {
+                    min_width: 30,
+                    ..PaneConstraints::default()
+                },
+            ),
+        )
+        .expect("split insertion to succeed");
+
+        tab.resize_split_by(0, -200);
+        let panes = tab.iter_panes();
+        assert_eq!(5, panes[0].width);
+        assert_eq!(74, panes[1].width);
+
+        tab.resize_split_by(0, 200);
+        let panes = tab.iter_panes();
+        assert_eq!(49, panes[0].width);
+        assert_eq!(30, panes[1].width);
+    }
+
+    #[test]
+    fn resize_split_by_clamps_to_vertical_constraints() {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new_with_constraints(
+            1,
+            size,
+            PaneConstraints {
+                min_height: 10,
+                ..PaneConstraints::default()
+            },
+        ));
+
+        let split = tab
+            .compute_split_size(
+                0,
+                SplitRequest {
+                    direction: SplitDirection::Vertical,
+                    ..Default::default()
+                },
+            )
+            .expect("split to compute");
+        tab.split_and_insert(
+            0,
+            SplitRequest {
+                direction: SplitDirection::Vertical,
+                ..Default::default()
+            },
+            FakePane::new_with_constraints(
+                2,
+                split.second,
+                PaneConstraints {
+                    min_height: 7,
+                    ..PaneConstraints::default()
+                },
+            ),
+        )
+        .expect("split insertion to succeed");
+
+        tab.resize_split_by(0, -200);
+        let panes = tab.iter_panes();
+        assert_eq!(10, panes[0].height);
+        assert_eq!(13, panes[1].height);
+
+        tab.resize_split_by(0, 200);
+        let panes = tab.iter_panes();
+        assert_eq!(16, panes[0].height);
+        assert_eq!(7, panes[1].height);
+    }
+
+    #[test]
+    fn resize_clamps_to_tree_constraint_minimum() {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new_with_constraints(
+            1,
+            size,
+            PaneConstraints {
+                min_width: 30,
+                ..PaneConstraints::default()
+            },
+        ));
+
+        let split = tab
+            .compute_split_size(
+                0,
+                SplitRequest {
+                    direction: SplitDirection::Horizontal,
+                    ..Default::default()
+                },
+            )
+            .expect("split to compute");
+        tab.split_and_insert(
+            0,
+            SplitRequest {
+                direction: SplitDirection::Horizontal,
+                ..Default::default()
+            },
+            FakePane::new_with_constraints(
+                2,
+                split.second,
+                PaneConstraints {
+                    min_width: 20,
+                    ..PaneConstraints::default()
+                },
+            ),
+        )
+        .expect("split insertion to succeed");
+
+        tab.resize(TerminalSize {
+            rows: 24,
+            cols: 10,
+            pixel_width: 100,
+            pixel_height: 600,
+            dpi: 96,
+        });
+
+        let resized = tab.get_size();
+        assert_eq!(51, resized.cols);
+        assert_eq!(24, resized.rows);
+
+        let panes = tab.iter_panes();
+        assert_eq!(30, panes[0].width);
+        assert_eq!(20, panes[1].width);
     }
 
     fn is_send_and_sync<T: Send + Sync>() -> bool {

@@ -1396,42 +1396,27 @@ mod test {
 
     #[test]
     fn c0_newline() {
-        assert_eq!(
-            parse_as_vec(b"\n"),
-            vec![VTAction::ExecuteC0orC1(0x0a)]
-        );
+        assert_eq!(parse_as_vec(b"\n"), vec![VTAction::ExecuteC0orC1(0x0a)]);
     }
 
     #[test]
     fn c0_carriage_return() {
-        assert_eq!(
-            parse_as_vec(b"\r"),
-            vec![VTAction::ExecuteC0orC1(0x0d)]
-        );
+        assert_eq!(parse_as_vec(b"\r"), vec![VTAction::ExecuteC0orC1(0x0d)]);
     }
 
     #[test]
     fn c0_tab() {
-        assert_eq!(
-            parse_as_vec(b"\t"),
-            vec![VTAction::ExecuteC0orC1(0x09)]
-        );
+        assert_eq!(parse_as_vec(b"\t"), vec![VTAction::ExecuteC0orC1(0x09)]);
     }
 
     #[test]
     fn c0_backspace() {
-        assert_eq!(
-            parse_as_vec(b"\x08"),
-            vec![VTAction::ExecuteC0orC1(0x08)]
-        );
+        assert_eq!(parse_as_vec(b"\x08"), vec![VTAction::ExecuteC0orC1(0x08)]);
     }
 
     #[test]
     fn c0_bell() {
-        assert_eq!(
-            parse_as_vec(b"\x07"),
-            vec![VTAction::ExecuteC0orC1(0x07)]
-        );
+        assert_eq!(parse_as_vec(b"\x07"), vec![VTAction::ExecuteC0orC1(0x07)]);
     }
 
     #[test]
@@ -1611,17 +1596,11 @@ mod test {
     #[test]
     fn utf8_emoji() {
         // 😀 = U+1F600
-        assert_eq!(
-            parse_as_vec("😀".as_bytes()),
-            vec![VTAction::Print('😀')]
-        );
+        assert_eq!(parse_as_vec("😀".as_bytes()), vec![VTAction::Print('😀')]);
     }
 
     #[test]
     fn utf8_cjk() {
-        assert_eq!(
-            parse_as_vec("中".as_bytes()),
-            vec![VTAction::Print('中')]
-        );
+        assert_eq!(parse_as_vec("中".as_bytes()), vec![VTAction::Print('中')]);
     }
 }
