@@ -9,7 +9,7 @@ This document specifies the end-to-end test harness for `ft`. The harness valida
 ## Design Goals
 
 1. **Deterministic** - No real AI credentials; uses dummy agent panes with scripted output
-2. **Local** - Runs on any dev machine with WezTerm installed
+2. **Local** - Runs on any dev machine with the active compatibility backend bridge installed (current: WezTerm)
 3. **Excellent diagnostics** - Verbose logging and comprehensive artifacts on failure
 4. **Self-documenting** - Clear exit codes and structured output
 
@@ -133,8 +133,8 @@ Before running scenarios, the harness validates prerequisites:
 
 ### Checks Performed
 
-1. **WezTerm installed** - `wezterm --version` succeeds
-2. **WezTerm mux available** - Can spawn and list panes
+1. **Compatibility backend bridge installed (current: WezTerm)** - `wezterm --version` succeeds
+2. **Compatibility backend bridge mux available** - Can spawn and list panes
 3. **ft binary built** - `cargo build --release` or binary exists
 4. **Artifacts writable** - Can create artifacts directory
 5. **Temp space available** - At least 100MB free in temp
@@ -145,8 +145,8 @@ Before running scenarios, the harness validates prerequisites:
 ```
 E2E Harness Self-Check
 ======================
-[PASS] WezTerm installed: 20250101-120000-abc123
-[PASS] WezTerm mux operational: spawned test pane
+[PASS] Backend bridge installed (WezTerm): 20250101-120000-abc123
+[PASS] Backend bridge mux operational: spawned test pane
 [PASS] ft binary: ./target/release/ft (0.1.0)
 [PASS] Artifacts directory: writable
 [PASS] Temp space: 50GB available
@@ -160,9 +160,9 @@ On failure:
 ```
 E2E Harness Self-Check
 ======================
-[PASS] WezTerm installed: 20250101-120000-abc123
-[FAIL] WezTerm mux operational: cannot connect to mux server
-       Hint: Start WezTerm with `wezterm start --mux`
+[PASS] Backend bridge installed (WezTerm): 20250101-120000-abc123
+[FAIL] Backend bridge mux operational: cannot connect to mux server
+       Hint: Start the active compatibility backend bridge (WezTerm) with `wezterm start --mux`
 [PASS] ft binary: ./target/release/ft (0.1.0)
 
 Self-check failed. Fix issues above before running E2E tests.

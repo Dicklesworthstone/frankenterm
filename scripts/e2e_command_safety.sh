@@ -232,8 +232,8 @@ test_dryrun_report_structure() {
         local error_check
         error_check=$(echo "$output" | jq -r '.error.code // empty' 2>/dev/null || echo "")
         if [[ "$error_check" == "robot.wezterm_not_running" ]] || [[ -z "$output" ]]; then
-            log_info "WezTerm not running in test env (expected in CI)"
-            log_pass "Dry-run unavailable without WezTerm (expected in CI)"
+            log_info "Compatibility backend bridge not running in test env (expected in CI)"
+            log_pass "Dry-run unavailable without compatibility backend bridge (expected in CI)"
             return
         fi
         log_fail "Output is not valid JSON: $output"
@@ -290,7 +290,7 @@ test_dryrun_redacts_sensitive_text() {
         local error_check
         error_check=$(echo "$output" | jq -r '.error.code // empty' 2>/dev/null || echo "")
         if [[ "$error_check" == "robot.wezterm_not_running" ]] || [[ -z "$output" ]]; then
-            log_info "WezTerm not running -- checking redaction via unit tests"
+            log_info "Compatibility backend bridge not running -- checking redaction via unit tests"
             local fallback_output
             fallback_output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm redact -- --nocapture 2>&1 || true)
             if echo "$fallback_output" | grep -q "test result: ok\|0 tests"; then

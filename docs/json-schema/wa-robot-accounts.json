@@ -82,7 +82,7 @@
     "account_pick_preview": {
       "type": "object",
       "description": "Preview of automatic account selection",
-      "required": ["selection_reason", "threshold_percent", "candidates_count", "filtered_count"],
+      "required": ["selection_reason", "threshold_percent", "candidates_count", "filtered_count", "quota_advisory"],
       "properties": {
         "selected_account_id": {
           "type": "string",
@@ -110,6 +110,41 @@
           "type": "integer",
           "minimum": 0,
           "description": "Number of accounts after filtering"
+        },
+        "quota_advisory": {
+          "$ref": "#/$defs/account_quota_advisory",
+          "description": "Quota advisory derived from the selection result"
+        }
+      },
+      "additionalProperties": false
+    },
+    "account_quota_advisory": {
+      "type": "object",
+      "required": ["availability", "low_quota_threshold_percent", "blocking"],
+      "properties": {
+        "availability": {
+          "type": "string",
+          "enum": ["available", "low", "exhausted"],
+          "description": "Availability classification for launch/scheduling decisions"
+        },
+        "low_quota_threshold_percent": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Threshold used to classify low quota"
+        },
+        "selected_percent_remaining": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100,
+          "description": "Selected account percent remaining, if an account was selected"
+        },
+        "warning": {
+          "type": "string",
+          "description": "Optional warning message for low/exhausted quota states"
+        },
+        "blocking": {
+          "type": "boolean",
+          "description": "True when no eligible account is available"
         }
       },
       "additionalProperties": false

@@ -176,7 +176,7 @@ All MCP errors use stable codes prefixed with `WA-MCP-`:
 | `WA-MCP-0001` | Invalid arguments | `robot.invalid_args` |
 | `WA-MCP-0002` | Unknown tool/resource | `robot.unknown_subcommand` |
 | `WA-MCP-0003` | Config error | `robot.config_error` |
-| `WA-MCP-0004` | WezTerm CLI error | `robot.wezterm_error` |
+| `WA-MCP-0004` | Backend bridge CLI error (current: WezTerm) | `robot.wezterm_error` |
 | `WA-MCP-0005` | Storage error | `robot.storage_error` |
 | `WA-MCP-0006` | Policy denied | `robot.policy_denied` |
 | `WA-MCP-0007` | Pane not found | `robot.pane_not_found` |

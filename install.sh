@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# ft (frankenterm) installer - Terminal hypervisor for AI agent swarms
+# ft (frankenterm) installer - swarm-native terminal platform for AI agent fleets
 #
 # One-liner install:
 #   curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/frankenterm/main/install.sh | bash

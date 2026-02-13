@@ -198,7 +198,7 @@ fn contract_status_populated_plain() {
         assert!(
             stderr.contains("Failed to list panes")
                 || stderr.contains("WezTerm circuit breaker open")
-                || stderr.contains("Is WezTerm running"),
+                || stderr.contains("Is the active backend bridge (current: WezTerm) running"),
             "ft status failure should be actionable, stderr: {stderr}"
         );
     }

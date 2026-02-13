@@ -4,7 +4,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -83,7 +83,7 @@ enum Commands {
     ft watch                          Start daemon (backgrounds by default)
     ft watch --foreground             Stay in foreground for debugging
     ft watch --auto-handle            Enable automatic workflow execution
-    ft watch --poll-interval 2000     Poll WezTerm every 2 seconds
+    ft watch --poll-interval 2000     Poll terminal backend adapter every 2 seconds (current bridge: WezTerm)
 
 SEE ALSO:
     ft stop       Stop the running watcher
@@ -137,6 +137,21 @@ SEE ALSO:
         /// Allow metrics endpoint to bind on non-localhost addresses (DANGEROUS)
         #[arg(long)]
         dangerous_bind_any: bool,
+    },
+
+    /// Distributed mode commands (requires --features distributed)
+    #[cfg(feature = "distributed")]
+    #[command(after_help = r#"EXAMPLES:
+    ft distributed agent                        Run local capture agent and stream to aggregator
+    ft distributed agent --connect 10.0.0.5:4141 --agent-id host-a
+                                                Override upstream and explicit agent identity
+
+NOTES:
+    Uses distributed auth settings from config (`distributed.token*`).
+    Aggregator endpoint defaults to `distributed.bind_addr` unless --connect is set."#)]
+    Distributed {
+        #[command(subcommand)]
+        command: DistributedCommands,
     },
 
     /// Show version and build metadata
@@ -1465,6 +1480,21 @@ SEE ALSO:
     },
 }
 
+#[cfg(feature = "distributed")]
+#[derive(Subcommand)]
+enum DistributedCommands {
+    /// Run local capture and stream deltas/events to an aggregator
+    Agent {
+        /// Aggregator address (`host:port`). Defaults to distributed.bind_addr.
+        #[arg(long)]
+        connect: Option<String>,
+
+        /// Sender identity for wire protocol and allowlist checks.
+        #[arg(long)]
+        agent_id: Option<String>,
+    },
+}
+
 #[derive(Subcommand)]
 enum AnalyticsCommands {
     /// Daily metrics breakdown
@@ -2037,12 +2067,32 @@ enum RobotCommands {
     QuickStart,
 
     /// Get all panes as JSON
-    State,
+    State {
+        /// Include pane text for each pane in the response
+        #[arg(long)]
+        include_text: bool,
+
+        /// Number of lines to return from the end (tail) when --include-text is set
+        #[arg(long, default_value = "50")]
+        tail: usize,
+
+        /// Include ANSI escape sequences when --include-text is set
+        #[arg(long)]
+        escapes: bool,
+    },
 
     /// Get text from a pane
     GetText {
-        /// Pane ID
-        pane_id: u64,
+        /// Pane ID (single-pane mode)
+        pane_id: Option<u64>,
+
+        /// Comma-separated pane IDs (batch mode)
+        #[arg(long, value_delimiter = ',')]
+        panes: Option<Vec<u64>>,
+
+        /// Query all panes (batch mode)
+        #[arg(long)]
+        all: bool,
 
         /// Number of lines to return from the end (tail)
         #[arg(long, default_value = "50")]
@@ -3485,6 +3535,7 @@ const ROBOT_ERR_UNKNOWN_SUBCOMMAND: &str = "robot.unknown_subcommand";
 const ROBOT_ERR_CONFIG: &str = "robot.config_error";
 const ROBOT_ERR_FTS_QUERY: &str = "robot.fts_query_error";
 const ROBOT_ERR_STORAGE: &str = "robot.storage_error";
+const ROBOT_BATCH_GET_TEXT_MAX_CONCURRENT: usize = 16;
 /// Cooldown period between account refreshes (milliseconds)
 const ROBOT_REFRESH_COOLDOWN_MS: i64 = 30_000;
 
@@ -3869,6 +3920,43 @@ struct RobotGetTextData {
     truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     truncation_info: Option<TruncationInfo>,
+}
+
+/// Robot get-text response data for batch mode.
+#[derive(serde::Serialize)]
+struct RobotBatchGetTextData {
+    pane_ids: Vec<u64>,
+    tail_lines: usize,
+    escapes_included: bool,
+    results: BTreeMap<u64, RobotPaneTextResult>,
+}
+
+/// Robot state response data with optional pane text payloads.
+#[derive(serde::Serialize)]
+struct RobotStateWithTextData {
+    panes: Vec<PaneState>,
+    tail_lines: usize,
+    escapes_included: bool,
+    pane_text: BTreeMap<u64, RobotPaneTextResult>,
+}
+
+/// Per-pane get-text result for batch operations.
+#[derive(serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum RobotPaneTextResult {
+    Ok {
+        text: String,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        truncated: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        truncation_info: Option<TruncationInfo>,
+    },
+    Error {
+        code: String,
+        message: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hint: Option<String>,
+    },
 }
 
 #[derive(serde::Serialize)]
@@ -4504,6 +4592,19 @@ struct RobotAccountPickPreview {
     threshold_percent: f64,
     candidates_count: usize,
     filtered_count: usize,
+    quota_advisory: RobotQuotaAdvisory,
+}
+
+/// Quota advisory derived from account selection.
+#[derive(serde::Serialize)]
+struct RobotQuotaAdvisory {
+    availability: frankenterm_core::accounts::QuotaAvailability,
+    low_quota_threshold_percent: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selected_percent_remaining: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<String>,
+    blocking: bool,
 }
 
 /// Robot accounts refresh response data
@@ -5085,7 +5186,9 @@ fn build_send_dry_run_report(
         ctx.set_target(target);
     } else {
         ctx.set_target(TargetResolution::new(pane_id, "unknown"));
-        ctx.add_warning("Pane metadata unavailable; ensure WezTerm is running and pane exists.");
+        ctx.add_warning(
+            "Pane metadata unavailable; ensure the active terminal backend is running and pane exists.",
+        );
     }
 
     // Policy evaluation (best-effort; uses config defaults + assumed prompt state)
@@ -5424,6 +5527,161 @@ fn resolve_prepare_output_format(format: &str) -> frankenterm_core::output::Outp
             std::process::exit(1);
         }
     }
+}
+
+fn resolve_checkpoint_id(db_path: &str, snapshot_id: &str) -> anyhow::Result<i64> {
+    if snapshot_id.eq_ignore_ascii_case("latest") {
+        let conn = rusqlite::Connection::open(db_path)?;
+        let latest_id: i64 = conn
+            .query_row(
+                "SELECT id FROM session_checkpoints ORDER BY checkpoint_at DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    anyhow::anyhow!(
+                        "No snapshots found. Capture one first with `ft snapshot save`."
+                    )
+                }
+                other => anyhow::anyhow!("Failed to query latest snapshot: {other}"),
+            })?;
+        return Ok(latest_id);
+    }
+
+    snapshot_id
+        .parse::<i64>()
+        .map_err(|_| anyhow::anyhow!("Invalid snapshot ID: {snapshot_id}"))
+}
+
+async fn restore_snapshot_checkpoint(
+    db_path: &str,
+    checkpoint_id: i64,
+    wezterm_timeout_secs: u64,
+    _layout_only: bool,
+) -> anyhow::Result<frankenterm_core::session_restore::RestoreSummary> {
+    use frankenterm_core::session_restore::{
+        SessionRestoreConfig, SessionRestorer, load_checkpoint_by_id, show_session,
+    };
+
+    let checkpoint = load_checkpoint_by_id(db_path, checkpoint_id)?
+        .ok_or_else(|| anyhow::anyhow!("Snapshot {checkpoint_id} not found"))?;
+    let (session, _) = show_session(db_path, &checkpoint.session_id)?;
+    let wezterm = frankenterm_core::wezterm::wezterm_handle_with_timeout(wezterm_timeout_secs);
+    let restorer = SessionRestorer::new(
+        Arc::new(db_path.to_string()),
+        SessionRestoreConfig::default(),
+    );
+
+    restorer
+        .restore(&session, &checkpoint, wezterm)
+        .await
+        .map_err(|e| anyhow::anyhow!("Restore failed: {e}"))
+}
+
+#[cfg(unix)]
+fn mux_server_pids() -> anyhow::Result<Vec<i32>> {
+    let output = std::process::Command::new("pgrep")
+        .args(["-f", "wezterm-mux-server"])
+        .output()?;
+
+    // pgrep returns 1 when no processes matched.
+    if output.status.code() == Some(1) {
+        return Ok(Vec::new());
+    }
+    if !output.status.success() {
+        return Err(anyhow::anyhow!(
+            "pgrep failed with status {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    let mut pids: Vec<i32> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse::<i32>().ok())
+        .collect();
+    pids.sort_unstable();
+    pids.dedup();
+    Ok(pids)
+}
+
+#[cfg(unix)]
+async fn stop_mux_server_processes(stop_timeout: Duration) -> anyhow::Result<Vec<i32>> {
+    let initial_pids = mux_server_pids()?;
+    if initial_pids.is_empty() {
+        return Err(anyhow::anyhow!(
+            "No running `wezterm-mux-server` process found"
+        ));
+    }
+
+    for pid in &initial_pids {
+        let status = std::process::Command::new("kill")
+            .args(["-s", "TERM", &pid.to_string()])
+            .status();
+        if let Ok(s) = status {
+            if !s.success() {
+                tracing::warn!(pid = *pid, "SIGTERM returned non-zero status");
+            }
+        } else if let Err(e) = status {
+            tracing::warn!(pid = *pid, error = %e, "failed to send SIGTERM");
+        }
+    }
+
+    let deadline = Instant::now() + stop_timeout;
+    loop {
+        let remaining = mux_server_pids()?;
+        if remaining.is_empty() {
+            return Ok(initial_pids);
+        }
+        if Instant::now() >= deadline {
+            return Err(anyhow::anyhow!(
+                "Timed out waiting for mux server shutdown; still running: {:?}",
+                remaining
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_mux_ready(timeout: Duration, wezterm_timeout_secs: u64) -> anyhow::Result<()> {
+    let deadline = Instant::now() + timeout;
+    let wezterm = frankenterm_core::wezterm::wezterm_handle_with_timeout(wezterm_timeout_secs);
+
+    loop {
+        match wezterm.list_panes().await {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                if Instant::now() >= deadline {
+                    return Err(anyhow::anyhow!(
+                        "Timed out waiting for WezTerm mux readiness; last error: {e}"
+                    ));
+                }
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+#[cfg(unix)]
+async fn start_mux_server_process(
+    start_timeout: Duration,
+    wezterm_timeout_secs: u64,
+) -> anyhow::Result<Vec<i32>> {
+    let status = std::process::Command::new("wezterm-mux-server")
+        .arg("--daemonize")
+        .status()?;
+    if !status.success() {
+        return Err(anyhow::anyhow!(
+            "Failed to start `wezterm-mux-server --daemonize` (exit: {:?})",
+            status.code()
+        ));
+    }
+
+    wait_for_mux_ready(start_timeout, wezterm_timeout_secs).await?;
+    mux_server_pids()
 }
 
 fn build_prepare_output(
@@ -6105,11 +6363,11 @@ fn build_robot_help() -> RobotHelp {
             },
             RobotCommandInfo {
                 name: "state",
-                description: "List panes with metadata",
+                description: "List panes with metadata (optionally include pane text)",
             },
             RobotCommandInfo {
                 name: "get-text",
-                description: "Fetch recent pane output",
+                description: "Fetch recent pane output (single pane or batch)",
             },
             RobotCommandInfo {
                 name: "send",
@@ -6184,7 +6442,7 @@ fn build_robot_help() -> RobotHelp {
 
 fn build_robot_quick_start() -> RobotQuickStartData {
     RobotQuickStartData {
-        description: "ft robot mode: JSON API for AI agents to observe and control WezTerm panes",
+        description: "ft robot mode: JSON API for AI agents to observe and control terminal backend panes (current bridge: WezTerm)",
         global_flags: vec![
             QuickStartGlobalFlag {
                 flag: "--workspace <path>",
@@ -6237,15 +6495,19 @@ fn build_robot_quick_start() -> RobotQuickStartData {
         commands: vec![
             QuickStartCommand {
                 name: "state",
-                args: "",
-                summary: "List all panes with metadata (pane_id, title, cwd, observed)",
-                examples: vec!["ft robot state"],
+                args: "[--include-text] [--tail N] [--escapes]",
+                summary: "List panes with metadata; optionally include per-pane tail output",
+                examples: vec!["ft robot state", "ft robot state --include-text --tail 20"],
             },
             QuickStartCommand {
                 name: "get-text",
-                args: "<pane_id> [--tail N] [--escapes]",
-                summary: "Fetch recent output from a pane",
-                examples: vec!["ft robot get-text 0", "ft robot get-text 0 --tail 200"],
+                args: "<pane_id>|--panes <id,id,...>|--all [--tail N] [--escapes]",
+                summary: "Fetch recent output from one pane or many panes in a batch",
+                examples: vec![
+                    "ft robot get-text 0",
+                    "ft robot get-text --panes 0,1,2 --tail 20",
+                    "ft robot get-text --all --tail 10",
+                ],
             },
             QuickStartCommand {
                 name: "send",
@@ -6379,7 +6641,7 @@ fn build_robot_quick_start() -> RobotQuickStartData {
             "The 'ok' field in responses indicates success (true) or failure (false)",
             "Check 'error_code' field for programmatic error handling",
             "Use 'now' timestamp in responses to track freshness",
-            "Pane IDs are stable within a WezTerm session but may change across restarts",
+            "Pane IDs are stable within a backend session (current bridge: WezTerm) but may change across restarts",
             "Use --format toon for compact output when piping robot results between agents",
         ],
         error_handling: QuickStartErrorHandling {
@@ -6391,8 +6653,8 @@ fn build_robot_quick_start() -> RobotQuickStartData {
                 },
                 QuickStartErrorCode {
                     code: "robot.wezterm_not_running",
-                    meaning: "WezTerm is not running or not accessible",
-                    recovery: "Start WezTerm before running wa commands",
+                    meaning: "Current terminal backend is not running or not accessible",
+                    recovery: "Start the active backend (current bridge: WezTerm) before running ft commands",
                 },
                 QuickStartErrorCode {
                     code: "robot.policy_denied",
@@ -6509,6 +6771,150 @@ fn apply_tail_truncation(text: &str, tail_lines: usize) -> (String, bool, Option
     )
 }
 
+fn dedupe_pane_ids(pane_ids: Vec<u64>) -> Vec<u64> {
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::with_capacity(pane_ids.len());
+    for pane_id in pane_ids {
+        if seen.insert(pane_id) {
+            deduped.push(pane_id);
+        }
+    }
+    deduped
+}
+
+fn pane_matches_agent_filter(agent_filter: &str, pane_title: &str) -> bool {
+    let title_lower = pane_title.to_lowercase();
+    let filter_lower = agent_filter.to_lowercase();
+    match filter_lower.as_str() {
+        "codex" => title_lower.contains("codex") || title_lower.contains("openai"),
+        "claude_code" | "claude" => title_lower.contains("claude"),
+        "gemini" => title_lower.contains("gemini"),
+        _ => title_lower.contains(&filter_lower),
+    }
+}
+
+fn is_distributed_remote_domain(domain: &str) -> bool {
+    domain.starts_with("distributed:")
+}
+
+fn merge_distributed_remote_records(
+    records: &mut Vec<frankenterm_core::storage::PaneRecord>,
+    remote_records: Vec<frankenterm_core::storage::PaneRecord>,
+    pane_id_filter: Option<u64>,
+    domain_filter: Option<&str>,
+    agent_filter: Option<&str>,
+    bookmark_pane_ids: Option<&HashSet<u64>>,
+) {
+    let mut existing_pane_ids: HashSet<u64> = records.iter().map(|r| r.pane_id).collect();
+    for record in remote_records {
+        if existing_pane_ids.contains(&record.pane_id) {
+            continue;
+        }
+        if let Some(filter_pane_id) = pane_id_filter {
+            if record.pane_id != filter_pane_id {
+                continue;
+            }
+        }
+        if let Some(domain_filter) = domain_filter {
+            if !glob_match(domain_filter, &record.domain) {
+                continue;
+            }
+        }
+        if let Some(bookmark_filters) = bookmark_pane_ids {
+            if !bookmark_filters.contains(&record.pane_id) {
+                continue;
+            }
+        }
+        if let Some(agent_filter) = agent_filter {
+            let title = record.title.as_deref().unwrap_or("");
+            if !pane_matches_agent_filter(agent_filter, title) {
+                continue;
+            }
+        }
+        existing_pane_ids.insert(record.pane_id);
+        records.push(record);
+    }
+
+    records.sort_by_key(|r| r.pane_id);
+}
+
+async fn load_distributed_remote_panes(
+    db_path: &Path,
+) -> Result<Vec<frankenterm_core::storage::PaneRecord>, frankenterm_core::Error> {
+    let db_path = db_path.to_string_lossy();
+    let storage = frankenterm_core::storage::StorageHandle::new(&db_path).await?;
+    let panes = storage.get_panes().await?;
+    if let Err(err) = storage.shutdown().await {
+        tracing::warn!(error = %err, "Failed to shutdown storage cleanly after distributed pane query");
+    }
+
+    Ok(panes
+        .into_iter()
+        .filter(|pane| is_distributed_remote_domain(&pane.domain))
+        .collect())
+}
+
+async fn batch_get_pane_text(
+    wezterm: frankenterm_core::wezterm::WeztermHandle,
+    pane_ids: &[u64],
+    escapes: bool,
+    tail_lines: usize,
+) -> BTreeMap<u64, RobotPaneTextResult> {
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(
+        ROBOT_BATCH_GET_TEXT_MAX_CONCURRENT,
+    ));
+    let mut tasks = Vec::with_capacity(pane_ids.len());
+
+    for pane_id in pane_ids.iter().copied() {
+        let wezterm = wezterm.clone();
+        let semaphore = semaphore.clone();
+        let task = tokio::spawn(async move {
+            let _permit = semaphore
+                .acquire_owned()
+                .await
+                .map_err(|err| frankenterm_core::Error::Runtime(err.to_string()))?;
+            wezterm.get_text(pane_id, escapes).await
+        });
+        tasks.push((pane_id, task));
+    }
+
+    let mut results = BTreeMap::new();
+    for (pane_id, task) in tasks {
+        let result = match task.await {
+            Ok(result) => result,
+            Err(err) => Err(frankenterm_core::Error::Runtime(err.to_string())),
+        };
+
+        match result {
+            Ok(full_text) => {
+                let (text, truncated, truncation_info) =
+                    apply_tail_truncation(&full_text, tail_lines);
+                results.insert(
+                    pane_id,
+                    RobotPaneTextResult::Ok {
+                        text,
+                        truncated,
+                        truncation_info,
+                    },
+                );
+            }
+            Err(error) => {
+                let (code, hint) = map_wezterm_error_to_robot(&error);
+                results.insert(
+                    pane_id,
+                    RobotPaneTextResult::Error {
+                        code: code.to_string(),
+                        message: format!("{error}"),
+                        hint,
+                    },
+                );
+            }
+        }
+    }
+
+    results
+}
+
 /// Map frankenterm_core errors to stable robot error codes
 fn map_wezterm_error_to_robot(error: &frankenterm_core::Error) -> (&'static str, Option<String>) {
     use frankenterm_core::error::WeztermError;
@@ -6517,11 +6923,17 @@ fn map_wezterm_error_to_robot(error: &frankenterm_core::Error) -> (&'static str,
         frankenterm_core::Error::Wezterm(wezterm_err) => match wezterm_err {
             WeztermError::CliNotFound => (
                 "robot.wezterm_not_found",
-                Some("Install WezTerm or ensure 'wezterm' is in PATH.".to_string()),
+                Some(
+                    "Install/configure the active backend bridge (current: WezTerm) or ensure 'wezterm' is in PATH."
+                        .to_string(),
+                ),
             ),
             WeztermError::NotRunning => (
                 "robot.wezterm_not_running",
-                Some("Start WezTerm before running wa commands.".to_string()),
+                Some(
+                    "Start the active backend bridge (current: WezTerm) before running ft commands."
+                        .to_string(),
+                ),
             ),
             WeztermError::PaneNotFound(pane_id) => (
                 "robot.pane_not_found",
@@ -6531,11 +6943,17 @@ fn map_wezterm_error_to_robot(error: &frankenterm_core::Error) -> (&'static str,
             ),
             WeztermError::SocketNotFound(_) => (
                 "robot.wezterm_socket_not_found",
-                Some("WezTerm socket not found. Is WezTerm running?".to_string()),
+                Some(
+                    "Backend socket not found. Is the active backend bridge (WezTerm) running?"
+                        .to_string(),
+                ),
             ),
             WeztermError::CommandFailed(_) => (
                 "robot.wezterm_command_failed",
-                Some("The WezTerm CLI command failed. Check WezTerm logs for details.".to_string()),
+                Some(
+                    "Backend CLI command failed. Check backend logs (including WezTerm bridge logs) for details."
+                        .to_string(),
+                ),
             ),
             WeztermError::ParseError(_) => (
                 "robot.wezterm_parse_error",
@@ -6984,6 +7402,1379 @@ fn watcher_error_is_non_retryable(err: &anyhow::Error) -> bool {
     let message = err.to_string();
     message.contains("Another watcher is already running")
         || message.contains("Failed to acquire watcher lock")
+}
+
+#[cfg(feature = "distributed")]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct DistributedHandshake {
+    token: Option<String>,
+    agent_id: Option<String>,
+    session_id: Option<String>,
+}
+
+#[cfg(feature = "distributed")]
+struct DistributedIngestState {
+    aggregator: tokio::sync::Mutex<frankenterm_core::wire_protocol::Aggregator>,
+    replay_guard: tokio::sync::Mutex<frankenterm_core::distributed::SessionReplayGuard>,
+    pane_seq_by_sender: tokio::sync::Mutex<std::collections::HashMap<(String, u64), u64>>,
+}
+
+#[cfg(feature = "distributed")]
+impl DistributedIngestState {
+    fn new() -> Self {
+        Self {
+            aggregator: tokio::sync::Mutex::new(frankenterm_core::wire_protocol::Aggregator::new(
+                4096,
+            )),
+            replay_guard: tokio::sync::Mutex::new(
+                frankenterm_core::distributed::SessionReplayGuard::new(8192),
+            ),
+            pane_seq_by_sender: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+}
+
+#[cfg(feature = "distributed")]
+fn distributed_normalize_identity(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+#[cfg(feature = "distributed")]
+fn distributed_sender_hash(sender: &str) -> u64 {
+    // Deterministic FNV-1a 64-bit hash for stable remote pane ID mapping.
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in sender.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+#[cfg(feature = "distributed")]
+fn distributed_remote_pane_id(sender: &str, pane_id: u64) -> u64 {
+    // Reserve bit 62 for distributed panes while staying within signed i64 range.
+    const DISTRIBUTED_PANE_FLAG: u64 = 1 << 62;
+    let sender_bits = distributed_sender_hash(sender) & 0x3fff_ffff;
+    DISTRIBUTED_PANE_FLAG | (sender_bits << 32) | (pane_id & 0xffff_ffff)
+}
+
+#[cfg(feature = "distributed")]
+fn distributed_remote_domain(sender: &str, domain: &str) -> String {
+    format!("distributed:{sender}:{domain}")
+}
+
+#[cfg(feature = "distributed")]
+fn distributed_remote_pane_uuid(
+    sender: &str,
+    pane_id: u64,
+    pane_uuid: Option<&str>,
+) -> Option<String> {
+    let raw = pane_uuid.unwrap_or("unknown");
+    Some(format!("distributed:{sender}:{pane_id}:{raw}"))
+}
+
+#[cfg(feature = "distributed")]
+fn distributed_detection_to_stored_event(
+    pane_id: u64,
+    pane_uuid: Option<&str>,
+    detection: &frankenterm_core::patterns::Detection,
+    segment_id: Option<i64>,
+    detected_at: i64,
+) -> frankenterm_core::storage::StoredEvent {
+    const EVENT_DEDUPE_BUCKET_MS: i64 = 5 * 60 * 1000;
+    let identity_key = frankenterm_core::events::event_identity_key(detection, pane_id, pane_uuid);
+    let bucket = if EVENT_DEDUPE_BUCKET_MS > 0 {
+        detected_at / EVENT_DEDUPE_BUCKET_MS
+    } else {
+        0
+    };
+    let dedupe_key = format!("{identity_key}:{bucket}");
+
+    frankenterm_core::storage::StoredEvent {
+        id: 0,
+        pane_id,
+        rule_id: detection.rule_id.clone(),
+        agent_type: detection.agent_type.to_string(),
+        event_type: detection.event_type.clone(),
+        severity: match detection.severity {
+            frankenterm_core::patterns::Severity::Info => "info".to_string(),
+            frankenterm_core::patterns::Severity::Warning => "warning".to_string(),
+            frankenterm_core::patterns::Severity::Critical => "critical".to_string(),
+        },
+        confidence: detection.confidence,
+        extracted: Some(detection.extracted.clone()),
+        matched_text: Some(detection.matched_text.clone()),
+        segment_id,
+        detected_at,
+        dedupe_key: Some(dedupe_key),
+        handled_at: None,
+        handled_by_workflow_id: None,
+        handled_status: None,
+    }
+}
+
+#[cfg(feature = "distributed")]
+async fn distributed_upsert_pane(
+    storage: &frankenterm_core::storage::StorageHandle,
+    pane_id: u64,
+    pane_uuid: Option<String>,
+    domain: String,
+    title: Option<String>,
+    cwd: Option<String>,
+    observed: bool,
+    timestamp_ms: i64,
+) -> anyhow::Result<()> {
+    storage
+        .upsert_pane(frankenterm_core::storage::PaneRecord {
+            pane_id,
+            pane_uuid,
+            domain,
+            window_id: None,
+            tab_id: None,
+            title,
+            cwd,
+            tty_name: None,
+            first_seen_at: timestamp_ms,
+            last_seen_at: timestamp_ms,
+            observed,
+            ignore_reason: None,
+            last_decision_at: Some(timestamp_ms),
+        })
+        .await?;
+    Ok(())
+}
+
+#[cfg(feature = "distributed")]
+async fn distributed_publish_security_error<S>(
+    reader: &mut tokio::io::BufReader<S>,
+    err: frankenterm_core::distributed::DistributedSecurityError,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+
+    let payload = serde_json::json!({
+        "ok": false,
+        "error": {
+            "code": err.code(),
+            "message": err.to_string()
+        }
+    });
+    if let Ok(encoded) = serde_json::to_string(&payload) {
+        let _ = reader.get_mut().write_all(encoded.as_bytes()).await;
+        let _ = reader.get_mut().write_all(b"\n").await;
+        let _ = reader.get_mut().flush().await;
+    }
+}
+
+#[cfg(feature = "distributed")]
+async fn distributed_persist_payload(
+    sender: &str,
+    payload: frankenterm_core::wire_protocol::WirePayload,
+    storage: &Arc<tokio::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
+    event_bus: &Arc<frankenterm_core::events::EventBus>,
+    pane_seq_by_sender: &tokio::sync::Mutex<std::collections::HashMap<(String, u64), u64>>,
+) -> anyhow::Result<()> {
+    use frankenterm_core::events::Event;
+    use frankenterm_core::wire_protocol::WirePayload;
+
+    match payload {
+        WirePayload::PaneMeta(meta) => {
+            distributed_persist_pane_meta(sender, meta, storage, event_bus).await?;
+        }
+        WirePayload::PaneDelta(delta) => {
+            let remote_pane_id = distributed_remote_pane_id(sender, delta.pane_id);
+            let seq_key = (sender.to_string(), delta.pane_id);
+            let mut drop_due_to_reorder = false;
+            let mut gap_reason: Option<String> = None;
+
+            {
+                let mut seq_guard = pane_seq_by_sender.lock().await;
+                let expected = seq_guard
+                    .get(&seq_key)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(1);
+
+                if delta.seq < expected {
+                    drop_due_to_reorder = true;
+                    gap_reason = Some(format!(
+                        "distributed_out_of_order:sender={sender}:expected={expected}:actual={}",
+                        delta.seq
+                    ));
+                } else {
+                    if delta.seq > expected {
+                        gap_reason = Some(format!(
+                            "distributed_seq_gap:sender={sender}:expected={expected}:actual={}",
+                            delta.seq
+                        ));
+                    }
+                    seq_guard.insert(seq_key, delta.seq);
+                }
+            }
+
+            let storage_guard = storage.lock().await;
+            if storage_guard.get_pane(remote_pane_id).await?.is_none() {
+                let ts = now_ms_i64();
+                distributed_upsert_pane(
+                    &storage_guard,
+                    remote_pane_id,
+                    distributed_remote_pane_uuid(sender, delta.pane_id, None),
+                    distributed_remote_domain(sender, "unknown"),
+                    Some(format!("remote:{sender}:{}", delta.pane_id)),
+                    Some("/remote".to_string()),
+                    true,
+                    ts,
+                )
+                .await?;
+            }
+
+            if let Some(reason) = gap_reason {
+                if let Some(gap) = storage_guard.record_gap(remote_pane_id, &reason).await? {
+                    let _ = event_bus.publish(Event::GapDetected {
+                        pane_id: gap.pane_id,
+                        reason: gap.reason,
+                    });
+                }
+            }
+
+            if drop_due_to_reorder {
+                return Ok(());
+            }
+
+            let segment = storage_guard
+                .append_segment(
+                    remote_pane_id,
+                    &delta.content,
+                    Some(format!("remote_sender={sender};remote_seq={}", delta.seq)),
+                )
+                .await?;
+            drop(storage_guard);
+
+            let _ = event_bus.publish(Event::SegmentCaptured {
+                pane_id: remote_pane_id,
+                seq: segment.seq,
+                content_len: segment.content_len,
+            });
+        }
+        WirePayload::Gap(gap) => {
+            let remote_pane_id = distributed_remote_pane_id(sender, gap.pane_id);
+            let storage_guard = storage.lock().await;
+            if storage_guard.get_pane(remote_pane_id).await?.is_none() {
+                let ts = now_ms_i64();
+                distributed_upsert_pane(
+                    &storage_guard,
+                    remote_pane_id,
+                    distributed_remote_pane_uuid(sender, gap.pane_id, None),
+                    distributed_remote_domain(sender, "unknown"),
+                    Some(format!("remote:{sender}:{}", gap.pane_id)),
+                    Some("/remote".to_string()),
+                    true,
+                    ts,
+                )
+                .await?;
+            }
+            let reason = format!(
+                "distributed_gap:{}:{}:{}",
+                gap.reason, gap.seq_before, gap.seq_after
+            );
+            if let Some(stored_gap) = storage_guard.record_gap(remote_pane_id, &reason).await? {
+                let _ = event_bus.publish(Event::GapDetected {
+                    pane_id: stored_gap.pane_id,
+                    reason: stored_gap.reason,
+                });
+            }
+        }
+        WirePayload::Detection(detection_notice) => {
+            let remote_pane_id = distributed_remote_pane_id(sender, detection_notice.pane_id);
+            let pane_uuid = distributed_remote_pane_uuid(
+                sender,
+                detection_notice.pane_id,
+                detection_notice.pane_uuid.as_deref(),
+            );
+            let detection = frankenterm_core::patterns::Detection {
+                rule_id: detection_notice.rule_id,
+                agent_type: detection_notice.agent_type,
+                event_type: detection_notice.event_type,
+                severity: detection_notice.severity,
+                confidence: detection_notice.confidence,
+                extracted: detection_notice.extracted,
+                matched_text: detection_notice.matched_text,
+                span: (0, 0),
+            };
+            let detected_at = if detection_notice.detected_at_ms > 0 {
+                detection_notice.detected_at_ms
+            } else {
+                now_ms_i64()
+            };
+
+            let storage_guard = storage.lock().await;
+            if storage_guard.get_pane(remote_pane_id).await?.is_none() {
+                distributed_upsert_pane(
+                    &storage_guard,
+                    remote_pane_id,
+                    pane_uuid.clone(),
+                    distributed_remote_domain(sender, "unknown"),
+                    Some(format!("remote:{sender}:{}", detection_notice.pane_id)),
+                    Some("/remote".to_string()),
+                    true,
+                    detected_at,
+                )
+                .await?;
+            }
+            let stored_event = distributed_detection_to_stored_event(
+                remote_pane_id,
+                pane_uuid.as_deref(),
+                &detection,
+                None,
+                detected_at,
+            );
+            let event_id = storage_guard.record_event(stored_event).await?;
+            drop(storage_guard);
+
+            let _ = event_bus.publish(Event::PatternDetected {
+                pane_id: remote_pane_id,
+                pane_uuid,
+                detection,
+                event_id: Some(event_id),
+            });
+        }
+        WirePayload::PanesMeta(panes_meta) => {
+            for pane in panes_meta.panes {
+                distributed_persist_pane_meta(sender, pane, storage, event_bus).await?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "distributed")]
+async fn distributed_persist_pane_meta(
+    sender: &str,
+    meta: frankenterm_core::wire_protocol::PaneMeta,
+    storage: &Arc<tokio::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
+    event_bus: &Arc<frankenterm_core::events::EventBus>,
+) -> anyhow::Result<()> {
+    use frankenterm_core::events::Event;
+
+    let remote_pane_id = distributed_remote_pane_id(sender, meta.pane_id);
+    let pane_uuid = distributed_remote_pane_uuid(sender, meta.pane_id, meta.pane_uuid.as_deref());
+    let domain = distributed_remote_domain(sender, &meta.domain);
+    let title = meta
+        .title
+        .clone()
+        .or_else(|| Some(format!("remote:{sender}:{}", meta.pane_id)));
+
+    let storage_guard = storage.lock().await;
+    let is_new = storage_guard.get_pane(remote_pane_id).await?.is_none();
+    distributed_upsert_pane(
+        &storage_guard,
+        remote_pane_id,
+        pane_uuid,
+        domain.clone(),
+        title.clone(),
+        meta.cwd.clone(),
+        meta.observed,
+        meta.timestamp_ms,
+    )
+    .await?;
+    drop(storage_guard);
+
+    if is_new {
+        let _ = event_bus.publish(Event::PaneDiscovered {
+            pane_id: remote_pane_id,
+            domain,
+            title: title.unwrap_or_else(|| format!("remote:{sender}:{}", meta.pane_id)),
+        });
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "distributed")]
+async fn distributed_handle_connection<S>(
+    stream: S,
+    peer_addr: std::net::SocketAddr,
+    distributed_config: frankenterm_core::config::DistributedConfig,
+    expected_token: Option<String>,
+    allow_agent_ids: Arc<HashSet<String>>,
+    ingest_state: Arc<DistributedIngestState>,
+    storage: Arc<tokio::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
+    event_bus: Arc<frankenterm_core::events::EventBus>,
+    shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncBufReadExt;
+
+    let handshake_timeout = Duration::from_secs(10);
+    let message_timeout = Duration::from_secs(30);
+    let mut reader = tokio::io::BufReader::new(stream);
+    let mut handshake_line = String::new();
+
+    let handshake_size = match tokio::time::timeout(
+        handshake_timeout,
+        reader.read_line(&mut handshake_line),
+    )
+    .await
+    {
+        Ok(Ok(size)) => size,
+        Ok(Err(err)) => {
+            tracing::warn!(peer = %peer_addr, error = %err, "Distributed handshake read failed");
+            return;
+        }
+        Err(_) => {
+            distributed_publish_security_error(
+                &mut reader,
+                frankenterm_core::distributed::DistributedSecurityError::HandshakeTimeout,
+            )
+            .await;
+            return;
+        }
+    };
+
+    if handshake_size == 0 {
+        return;
+    }
+    if handshake_line.len() > frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE {
+        distributed_publish_security_error(
+            &mut reader,
+            frankenterm_core::distributed::DistributedSecurityError::MessageTooLarge,
+        )
+        .await;
+        return;
+    }
+
+    let handshake = match serde_json::from_str::<DistributedHandshake>(handshake_line.trim()) {
+        Ok(handshake) => handshake,
+        Err(err) => {
+            tracing::warn!(peer = %peer_addr, error = %err, "Invalid distributed handshake payload");
+            distributed_publish_security_error(
+                &mut reader,
+                frankenterm_core::distributed::DistributedSecurityError::AuthFailed,
+            )
+            .await;
+            return;
+        }
+    };
+
+    if !allow_agent_ids.is_empty() {
+        let Some(agent_id) = handshake.agent_id.as_deref() else {
+            distributed_publish_security_error(
+                &mut reader,
+                frankenterm_core::distributed::DistributedSecurityError::AuthFailed,
+            )
+            .await;
+            return;
+        };
+        let normalized = distributed_normalize_identity(agent_id);
+        if !allow_agent_ids.contains(&normalized) {
+            distributed_publish_security_error(
+                &mut reader,
+                frankenterm_core::distributed::DistributedSecurityError::AuthFailed,
+            )
+            .await;
+            return;
+        }
+    }
+
+    if let Err(err) = frankenterm_core::distributed::validate_token(
+        distributed_config.auth_mode,
+        expected_token.as_deref(),
+        handshake.token.as_deref(),
+        handshake.agent_id.as_deref(),
+    ) {
+        distributed_publish_security_error(&mut reader, err).await;
+        return;
+    }
+
+    let normalized_handshake_agent = handshake
+        .agent_id
+        .as_deref()
+        .map(distributed_normalize_identity);
+    let session_id = handshake
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            handshake
+                .agent_id
+                .clone()
+                .unwrap_or_else(|| format!("peer-{peer_addr}"))
+        });
+
+    let mut rate_limiter = frankenterm_core::distributed::FixedWindowRateLimiter::new(8_000, 1000);
+    let message_size_limit = frankenterm_core::distributed::MessageSizeLimit {
+        max_bytes: frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE,
+    };
+
+    loop {
+        use std::sync::atomic::Ordering;
+
+        if shutdown_flag.load(Ordering::SeqCst) {
+            break;
+        }
+
+        let mut line = String::new();
+        let read_size = match tokio::time::timeout(message_timeout, reader.read_line(&mut line))
+            .await
+        {
+            Ok(Ok(size)) => size,
+            Ok(Err(err)) => {
+                tracing::warn!(peer = %peer_addr, error = %err, "Distributed stream read failed");
+                break;
+            }
+            Err(_) => {
+                distributed_publish_security_error(
+                    &mut reader,
+                    frankenterm_core::distributed::DistributedSecurityError::MessageTimeout,
+                )
+                .await;
+                break;
+            }
+        };
+
+        if read_size == 0 {
+            break;
+        }
+
+        let trimmed = line.trim_end_matches(['\n', '\r']);
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if let Err(err) = message_size_limit.check(trimmed.len()) {
+            distributed_publish_security_error(&mut reader, err).await;
+            continue;
+        }
+        if let Err(err) = rate_limiter.allow(now_ms()) {
+            distributed_publish_security_error(&mut reader, err).await;
+            continue;
+        }
+
+        let envelope = match frankenterm_core::wire_protocol::WireEnvelope::from_json(
+            trimmed.as_bytes(),
+        ) {
+            Ok(envelope) => envelope,
+            Err(err) => {
+                tracing::warn!(peer = %peer_addr, error = %err, "Invalid distributed wire envelope");
+                continue;
+            }
+        };
+
+        if let Some(agent_id) = normalized_handshake_agent.as_deref() {
+            if distributed_normalize_identity(&envelope.sender) != *agent_id {
+                distributed_publish_security_error(
+                    &mut reader,
+                    frankenterm_core::distributed::DistributedSecurityError::AuthFailed,
+                )
+                .await;
+                break;
+            }
+        }
+
+        {
+            let replay_id = format!("{session_id}:{}", envelope.sender);
+            let mut replay_guard = ingest_state.replay_guard.lock().await;
+            if let Err(err) = replay_guard.validate(&replay_id, envelope.seq) {
+                distributed_publish_security_error(&mut reader, err).await;
+                continue;
+            }
+        }
+
+        let sender = envelope.sender.clone();
+        let ingest_result = {
+            let mut aggregator = ingest_state.aggregator.lock().await;
+            aggregator.ingest_envelope(envelope)
+        };
+
+        match ingest_result {
+            Ok(frankenterm_core::wire_protocol::IngestResult::Duplicate { sender, seq }) => {
+                tracing::debug!(peer = %peer_addr, sender = %sender, seq, "Duplicate distributed envelope skipped");
+            }
+            Ok(frankenterm_core::wire_protocol::IngestResult::Accepted(payload)) => {
+                if let Err(err) = distributed_persist_payload(
+                    &sender,
+                    payload,
+                    &storage,
+                    &event_bus,
+                    &ingest_state.pane_seq_by_sender,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        peer = %peer_addr,
+                        sender = %sender,
+                        error = %err,
+                        "Failed to persist distributed payload"
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::warn!(peer = %peer_addr, error = %err, "Distributed ingest rejected envelope");
+            }
+        }
+    }
+}
+
+#[cfg(feature = "distributed")]
+async fn spawn_distributed_listener(
+    distributed_config: frankenterm_core::config::DistributedConfig,
+    storage: Arc<tokio::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
+    event_bus: Arc<frankenterm_core::events::EventBus>,
+    shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
+) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+    use std::sync::atomic::Ordering;
+    use tokio::net::TcpListener;
+
+    let expected_token =
+        match frankenterm_core::distributed::resolve_expected_token(&distributed_config) {
+            Ok(token) => token,
+            Err(err) => anyhow::bail!("Failed to resolve distributed token: {err}"),
+        };
+    let allow_agent_ids: HashSet<String> = distributed_config
+        .allow_agent_ids
+        .iter()
+        .map(|agent| distributed_normalize_identity(agent))
+        .filter(|agent| !agent.is_empty())
+        .collect();
+    let allow_agent_ids = Arc::new(allow_agent_ids);
+
+    let listener = TcpListener::bind(&distributed_config.bind_addr).await?;
+    tracing::info!(bind = %distributed_config.bind_addr, "Distributed listener started");
+
+    let ingest_state = Arc::new(DistributedIngestState::new());
+    let connection_limiter = frankenterm_core::distributed::ConnectionLimiter::new(256);
+    let tls_acceptor = if distributed_config.tls.enabled {
+        let bundle = frankenterm_core::distributed::build_tls_bundle(&distributed_config, None)?;
+        Some(tokio_rustls::TlsAcceptor::from(bundle.server))
+    } else {
+        None
+    };
+
+    let task = tokio::spawn(async move {
+        loop {
+            if shutdown_flag.load(Ordering::SeqCst) {
+                break;
+            }
+
+            let accept_result =
+                tokio::time::timeout(Duration::from_millis(500), listener.accept()).await;
+            let Ok(accept_result) = accept_result else {
+                continue;
+            };
+
+            let (stream, peer_addr) = match accept_result {
+                Ok(result) => result,
+                Err(err) => {
+                    tracing::warn!(error = %err, "Distributed accept failed");
+                    continue;
+                }
+            };
+
+            let permit = match connection_limiter.try_acquire() {
+                Ok(permit) => permit,
+                Err(err) => {
+                    tracing::warn!(peer = %peer_addr, code = err.code(), "Distributed connection rejected");
+                    continue;
+                }
+            };
+
+            let distributed_config = distributed_config.clone();
+            let expected_token = expected_token.clone();
+            let allow_agent_ids = Arc::clone(&allow_agent_ids);
+            let ingest_state = Arc::clone(&ingest_state);
+            let storage = Arc::clone(&storage);
+            let event_bus = Arc::clone(&event_bus);
+            let shutdown_flag = Arc::clone(&shutdown_flag);
+            let tls_acceptor = tls_acceptor.clone();
+
+            tokio::spawn(async move {
+                let _permit = permit;
+                if let Some(acceptor) = tls_acceptor {
+                    match acceptor.accept(stream).await {
+                        Ok(tls_stream) => {
+                            distributed_handle_connection(
+                                tls_stream,
+                                peer_addr,
+                                distributed_config,
+                                expected_token,
+                                allow_agent_ids,
+                                ingest_state,
+                                storage,
+                                event_bus,
+                                shutdown_flag,
+                            )
+                            .await;
+                        }
+                        Err(err) => {
+                            tracing::warn!(peer = %peer_addr, error = %err, "Distributed TLS handshake failed");
+                        }
+                    }
+                } else {
+                    distributed_handle_connection(
+                        stream,
+                        peer_addr,
+                        distributed_config,
+                        expected_token,
+                        allow_agent_ids,
+                        ingest_state,
+                        storage,
+                        event_bus,
+                        shutdown_flag,
+                    )
+                    .await;
+                }
+            });
+        }
+
+        tracing::info!("Distributed listener stopped");
+    });
+
+    Ok(task)
+}
+
+#[cfg(feature = "distributed")]
+trait DistributedIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+
+#[cfg(feature = "distributed")]
+impl<T> DistributedIo for T where T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+
+#[cfg(feature = "distributed")]
+type DistributedIoStream = Box<dyn DistributedIo>;
+
+#[cfg(feature = "distributed")]
+fn distributed_agent_default_id() -> String {
+    let from_env = std::env::var("FT_AGENT_ID")
+        .ok()
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .or_else(|| std::env::var("COMPUTERNAME").ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    from_env.unwrap_or_else(|| format!("agent-{}", std::process::id()))
+}
+
+#[cfg(feature = "distributed")]
+async fn distributed_agent_connect(
+    connect_addr: &str,
+    distributed_config: &frankenterm_core::config::DistributedConfig,
+) -> anyhow::Result<DistributedIoStream> {
+    use tokio::net::TcpStream;
+
+    let tcp = TcpStream::connect(connect_addr).await?;
+    if let Err(err) = tcp.set_nodelay(true) {
+        tracing::debug!(error = %err, "Failed to set TCP_NODELAY for distributed agent stream");
+    }
+
+    if distributed_config.tls.enabled {
+        let tls_bundle = frankenterm_core::distributed::build_tls_bundle(distributed_config, None)?;
+        let connector = tokio_rustls::TlsConnector::from(tls_bundle.client);
+        let server_name = frankenterm_core::distributed::build_tls_server_name(connect_addr)?;
+        let tls_stream = connector.connect(server_name, tcp).await?;
+        Ok(Box::new(tls_stream))
+    } else {
+        Ok(Box::new(tcp))
+    }
+}
+
+#[cfg(feature = "distributed")]
+fn distributed_agent_local_pane(record: &frankenterm_core::storage::PaneRecord) -> bool {
+    !record.domain.starts_with("distributed:")
+}
+
+#[cfg(feature = "distributed")]
+fn distributed_agent_pane_meta(
+    record: &frankenterm_core::storage::PaneRecord,
+) -> frankenterm_core::wire_protocol::PaneMeta {
+    frankenterm_core::wire_protocol::PaneMeta {
+        pane_id: record.pane_id,
+        pane_uuid: record.pane_uuid.clone(),
+        domain: record.domain.clone(),
+        title: record.title.clone(),
+        cwd: record.cwd.clone(),
+        rows: None,
+        cols: None,
+        observed: record.observed,
+        timestamp_ms: record.last_seen_at,
+    }
+}
+
+#[cfg(feature = "distributed")]
+async fn distributed_agent_send_envelope(
+    stream: &mut tokio::io::BufReader<DistributedIoStream>,
+    envelope: &frankenterm_core::wire_protocol::WireEnvelope,
+) -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let bytes = envelope.to_json()?;
+    if bytes.len() > frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE {
+        tracing::warn!(
+            sender = %envelope.sender,
+            seq = envelope.seq,
+            size = bytes.len(),
+            max = frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE,
+            "Skipping oversized distributed envelope"
+        );
+        return Ok(());
+    }
+
+    stream.get_mut().write_all(&bytes).await?;
+    stream.get_mut().write_all(b"\n").await?;
+    stream.get_mut().flush().await?;
+    Ok(())
+}
+
+#[cfg(feature = "distributed")]
+async fn distributed_agent_seed_segment_cursors(
+    storage: &Arc<tokio::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
+    cursors: &mut std::collections::HashMap<u64, i64>,
+) -> anyhow::Result<()> {
+    let storage_guard = storage.lock().await;
+    let panes = storage_guard.get_panes().await?;
+    for pane in panes {
+        if !distributed_agent_local_pane(&pane) || cursors.contains_key(&pane.pane_id) {
+            continue;
+        }
+        if let Some(segment) = storage_guard
+            .get_segments(pane.pane_id, 1)
+            .await?
+            .into_iter()
+            .next()
+        {
+            cursors.insert(pane.pane_id, segment.id);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "distributed")]
+async fn distributed_agent_send_pane_snapshot(
+    streamer: &mut frankenterm_core::wire_protocol::AgentStreamer,
+    storage: &Arc<tokio::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
+    stream: &mut tokio::io::BufReader<DistributedIoStream>,
+) -> anyhow::Result<()> {
+    use frankenterm_core::events::Event;
+    use frankenterm_core::wire_protocol::WirePayload;
+
+    let panes = {
+        let storage_guard = storage.lock().await;
+        storage_guard.get_panes().await?
+    };
+
+    for pane in panes {
+        if !distributed_agent_local_pane(&pane) {
+            continue;
+        }
+
+        let title = pane
+            .title
+            .clone()
+            .unwrap_or_else(|| format!("pane-{}", pane.pane_id));
+        if let Some(mut envelope) = streamer.event_to_envelope(&Event::PaneDiscovered {
+            pane_id: pane.pane_id,
+            domain: pane.domain.clone(),
+            title,
+        }) {
+            if let WirePayload::PaneMeta(meta) = &mut envelope.payload {
+                *meta = distributed_agent_pane_meta(&pane);
+            }
+            distributed_agent_send_envelope(stream, &envelope).await?;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "distributed")]
+async fn distributed_agent_flush_pane_deltas(
+    pane_id: u64,
+    streamer: &mut frankenterm_core::wire_protocol::AgentStreamer,
+    storage: &Arc<tokio::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
+    segment_cursors: &mut std::collections::HashMap<u64, i64>,
+    stream: &mut tokio::io::BufReader<DistributedIoStream>,
+) -> anyhow::Result<usize> {
+    use frankenterm_core::events::Event;
+    use frankenterm_core::storage::SegmentScanQuery;
+    use frankenterm_core::wire_protocol::WirePayload;
+
+    const BATCH_LIMIT: usize = 256;
+    let mut total_sent = 0usize;
+    let mut after_id = segment_cursors.get(&pane_id).copied();
+
+    loop {
+        let segments = {
+            let storage_guard = storage.lock().await;
+            storage_guard
+                .scan_segments(SegmentScanQuery {
+                    after_id,
+                    pane_id: Some(pane_id),
+                    since: None,
+                    until: None,
+                    limit: BATCH_LIMIT,
+                })
+                .await?
+        };
+
+        if segments.is_empty() {
+            break;
+        }
+        let batch_len = segments.len();
+
+        for segment in segments {
+            let Some(mut envelope) = streamer.event_to_envelope(&Event::SegmentCaptured {
+                pane_id: segment.pane_id,
+                seq: segment.seq,
+                content_len: segment.content_len,
+            }) else {
+                continue;
+            };
+
+            if let WirePayload::PaneDelta(delta) = &mut envelope.payload {
+                delta.seq = segment.seq;
+                delta.content = segment.content;
+                delta.content_len = segment.content_len;
+                delta.captured_at_ms = segment.captured_at;
+            }
+            distributed_agent_send_envelope(stream, &envelope).await?;
+
+            total_sent += 1;
+            after_id = Some(segment.id);
+            segment_cursors.insert(pane_id, segment.id);
+        }
+
+        if batch_len < BATCH_LIMIT {
+            break;
+        }
+    }
+
+    Ok(total_sent)
+}
+
+#[cfg(feature = "distributed")]
+async fn distributed_agent_flush_all_panes(
+    streamer: &mut frankenterm_core::wire_protocol::AgentStreamer,
+    storage: &Arc<tokio::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
+    segment_cursors: &mut std::collections::HashMap<u64, i64>,
+    stream: &mut tokio::io::BufReader<DistributedIoStream>,
+) -> anyhow::Result<usize> {
+    let pane_ids = {
+        let storage_guard = storage.lock().await;
+        storage_guard
+            .get_panes()
+            .await?
+            .into_iter()
+            .filter(distributed_agent_local_pane)
+            .map(|pane| pane.pane_id)
+            .collect::<Vec<_>>()
+    };
+
+    let mut sent = 0usize;
+    for pane_id in pane_ids {
+        sent += distributed_agent_flush_pane_deltas(
+            pane_id,
+            streamer,
+            storage,
+            segment_cursors,
+            stream,
+        )
+        .await?;
+    }
+
+    Ok(sent)
+}
+
+#[cfg(feature = "distributed")]
+async fn distributed_agent_stream_event(
+    event: frankenterm_core::events::Event,
+    streamer: &mut frankenterm_core::wire_protocol::AgentStreamer,
+    storage: &Arc<tokio::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
+    segment_cursors: &mut std::collections::HashMap<u64, i64>,
+    stream: &mut tokio::io::BufReader<DistributedIoStream>,
+) -> anyhow::Result<()> {
+    use frankenterm_core::events::Event;
+    use frankenterm_core::wire_protocol::WirePayload;
+
+    match event {
+        Event::SegmentCaptured { pane_id, .. } => {
+            let _ = distributed_agent_flush_pane_deltas(
+                pane_id,
+                streamer,
+                storage,
+                segment_cursors,
+                stream,
+            )
+            .await?;
+            Ok(())
+        }
+        other => {
+            if let Some(mut envelope) = streamer.event_to_envelope(&other) {
+                if let WirePayload::PaneMeta(meta) = &mut envelope.payload {
+                    let pane_record = {
+                        let storage_guard = storage.lock().await;
+                        storage_guard.get_pane(meta.pane_id).await?
+                    };
+                    if let Some(record) = pane_record {
+                        *meta = distributed_agent_pane_meta(&record);
+                    }
+                }
+                distributed_agent_send_envelope(stream, &envelope).await?;
+            }
+            Ok(())
+        }
+    }
+}
+
+#[cfg(feature = "distributed")]
+async fn distributed_agent_stream_session(
+    io: DistributedIoStream,
+    streamer: &mut frankenterm_core::wire_protocol::AgentStreamer,
+    storage: &Arc<tokio::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
+    event_bus: &Arc<frankenterm_core::events::EventBus>,
+    token: Option<&str>,
+    agent_id: &str,
+    session_id: &str,
+    segment_cursors: &mut std::collections::HashMap<u64, i64>,
+    shutdown_flag: &Arc<std::sync::atomic::AtomicBool>,
+) -> anyhow::Result<()> {
+    use std::sync::atomic::Ordering;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let mut stream = tokio::io::BufReader::new(io);
+    let handshake = DistributedHandshake {
+        token: token.map(ToOwned::to_owned),
+        agent_id: Some(agent_id.to_string()),
+        session_id: Some(session_id.to_string()),
+    };
+    let handshake_json = serde_json::to_string(&handshake)?;
+    stream
+        .get_mut()
+        .write_all(handshake_json.as_bytes())
+        .await?;
+    stream.get_mut().write_all(b"\n").await?;
+    stream.get_mut().flush().await?;
+
+    let mut handshake_response = String::new();
+    match tokio::time::timeout(
+        Duration::from_millis(250),
+        stream.read_line(&mut handshake_response),
+    )
+    .await
+    {
+        Ok(Ok(size)) if size == 0 => {
+            anyhow::bail!("Distributed aggregator closed connection during handshake")
+        }
+        Ok(Ok(_)) => {
+            let trimmed = handshake_response.trim();
+            if !trimmed.is_empty() {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                    let ok = value.get("ok").and_then(serde_json::Value::as_bool);
+                    if ok == Some(false) {
+                        let message = value
+                            .get("error")
+                            .and_then(|err| err.get("message"))
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("distributed handshake rejected");
+                        anyhow::bail!("{message}");
+                    }
+                }
+            }
+        }
+        Ok(Err(err)) => anyhow::bail!("Distributed handshake response read failed: {err}"),
+        Err(_) => {}
+    }
+
+    distributed_agent_send_pane_snapshot(streamer, storage, &mut stream).await?;
+    let recovered =
+        distributed_agent_flush_all_panes(streamer, storage, segment_cursors, &mut stream).await?;
+    if recovered > 0 {
+        tracing::debug!(recovered, "Flushed pending pane deltas after connect");
+    }
+
+    let mut subscriber = event_bus.subscribe();
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        if shutdown_flag.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        tokio::select! {
+            event_result = subscriber.recv() => {
+                match event_result {
+                    Ok(event) => {
+                        distributed_agent_stream_event(
+                            event,
+                            streamer,
+                            storage,
+                            segment_cursors,
+                            &mut stream,
+                        )
+                        .await?;
+                    }
+                    Err(frankenterm_core::events::RecvError::Lagged { missed_count }) => {
+                        tracing::warn!(missed = missed_count, "Distributed agent subscriber lagged; repairing via segment scan");
+                        let repaired = distributed_agent_flush_all_panes(
+                            streamer,
+                            storage,
+                            segment_cursors,
+                            &mut stream,
+                        )
+                        .await?;
+                        tracing::debug!(repaired, "Distributed lag repair flushed pending deltas");
+                    }
+                    Err(frankenterm_core::events::RecvError::Closed) => {
+                        anyhow::bail!("Distributed agent event bus closed");
+                    }
+                }
+            }
+            _ = heartbeat.tick() => {
+                distributed_agent_send_pane_snapshot(streamer, storage, &mut stream).await?;
+            }
+        }
+    }
+}
+
+#[cfg(feature = "distributed")]
+async fn distributed_agent_sleep_with_shutdown(
+    shutdown_flag: &Arc<std::sync::atomic::AtomicBool>,
+    duration: Duration,
+) -> bool {
+    use std::sync::atomic::Ordering;
+
+    let started = Instant::now();
+    while started.elapsed() < duration {
+        if shutdown_flag.load(Ordering::SeqCst) {
+            return true;
+        }
+        let remaining = duration.saturating_sub(started.elapsed());
+        tokio::time::sleep(remaining.min(Duration::from_millis(250))).await;
+    }
+    shutdown_flag.load(Ordering::SeqCst)
+}
+
+#[cfg(feature = "distributed")]
+async fn distributed_agent_stream_forever(
+    connect_addr: String,
+    distributed_config: frankenterm_core::config::DistributedConfig,
+    storage: Arc<tokio::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
+    event_bus: Arc<frankenterm_core::events::EventBus>,
+    shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
+    agent_id: String,
+    session_id: String,
+    token: Option<String>,
+) -> anyhow::Result<()> {
+    use std::sync::atomic::Ordering;
+
+    let mut streamer = frankenterm_core::wire_protocol::AgentStreamer::new(agent_id.clone());
+    let mut segment_cursors: std::collections::HashMap<u64, i64> = std::collections::HashMap::new();
+    distributed_agent_seed_segment_cursors(&storage, &mut segment_cursors).await?;
+
+    loop {
+        if shutdown_flag.load(Ordering::SeqCst) {
+            break;
+        }
+
+        match distributed_agent_connect(&connect_addr, &distributed_config).await {
+            Ok(io) => {
+                tracing::info!(connect = %connect_addr, agent_id = %agent_id, "Distributed agent connected");
+                streamer.mark_connected();
+                if let Err(err) = distributed_agent_stream_session(
+                    io,
+                    &mut streamer,
+                    &storage,
+                    &event_bus,
+                    token.as_deref(),
+                    &agent_id,
+                    &session_id,
+                    &mut segment_cursors,
+                    &shutdown_flag,
+                )
+                .await
+                {
+                    if shutdown_flag.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    tracing::warn!(connect = %connect_addr, error = %err, "Distributed stream session ended");
+                }
+            }
+            Err(err) => {
+                if shutdown_flag.load(Ordering::SeqCst) {
+                    break;
+                }
+                tracing::warn!(connect = %connect_addr, error = %err, "Distributed agent connect failed");
+            }
+        }
+
+        if shutdown_flag.load(Ordering::SeqCst) {
+            break;
+        }
+        streamer.mark_disconnected();
+        let backoff_ms = streamer.mark_reconnecting();
+        if distributed_agent_sleep_with_shutdown(&shutdown_flag, Duration::from_millis(backoff_ms))
+            .await
+        {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "distributed")]
+async fn run_distributed_agent(
+    layout: &frankenterm_core::config::WorkspaceLayout,
+    config: &frankenterm_core::config::Config,
+    config_path: Option<&Path>,
+    connect: Option<String>,
+    explicit_agent_id: Option<String>,
+) -> anyhow::Result<()> {
+    use frankenterm_core::events::EventBus;
+    use frankenterm_core::lock::WatcherLock;
+    use frankenterm_core::patterns::PatternEngine;
+    use frankenterm_core::runtime::{ObservationRuntime, RuntimeConfig};
+    use frankenterm_core::storage::StorageHandle;
+
+    if !config.distributed.enabled {
+        tracing::warn!(
+            "distributed.enabled is false; proceeding because `ft distributed agent` was explicitly requested"
+        );
+    }
+
+    let _lock_guard = match WatcherLock::acquire(&layout.lock_path) {
+        Ok(lock) => {
+            tracing::info!(
+                lock_path = %layout.lock_path.display(),
+                "Acquired single-instance lock for distributed agent"
+            );
+            Some(lock)
+        }
+        Err(frankenterm_core::lock::LockError::AlreadyRunning { pid, started_at }) => {
+            anyhow::bail!(
+                "Another watcher/agent is already running (pid: {pid}, started: {started_at})"
+            );
+        }
+        Err(frankenterm_core::lock::LockError::AlreadyRunningNoMeta) => {
+            anyhow::bail!("Another watcher/agent is already running (metadata unavailable)");
+        }
+        Err(err) => anyhow::bail!("Failed to acquire watcher lock: {err}"),
+    };
+
+    let db_path = layout.db_path.to_string_lossy();
+    let storage_config = frankenterm_core::storage::StorageConfig {
+        write_queue_size: config.storage.writer_queue_size as usize,
+    };
+    let storage = StorageHandle::with_config(&db_path, storage_config).await?;
+    tracing::info!(db_path = %db_path, "Distributed agent storage initialized");
+
+    let patterns_root = config_path
+        .and_then(|path| path.parent())
+        .map(PathBuf::from);
+    let pattern_engine =
+        PatternEngine::from_config_with_root(&config.patterns, patterns_root.as_deref())
+            .map_err(|e| anyhow::anyhow!("Failed to load pattern packs: {e}"))?;
+    let pattern_engine = Arc::new(tokio::sync::RwLock::new(pattern_engine));
+
+    let event_bus = Arc::new(EventBus::new(1000));
+    let wezterm_handle = frankenterm_core::wezterm::wezterm_handle_from_config(config);
+
+    let native_event_socket = if config.native.enabled {
+        let env_socket = std::env::var("WEZTERM_FT_SOCKET").ok();
+        let socket = env_socket.unwrap_or_else(|| config.native.socket_path.clone());
+        Some(PathBuf::from(socket))
+    } else {
+        None
+    };
+
+    let runtime_config = RuntimeConfig {
+        discovery_interval: Duration::from_millis(5_000),
+        capture_interval: Duration::from_millis(config.ingest.poll_interval_ms),
+        min_capture_interval: Duration::from_millis(config.ingest.min_poll_interval_ms),
+        overlap_size: 4096,
+        pane_filter: config.ingest.panes.clone(),
+        pane_priorities: config.ingest.priorities.clone(),
+        capture_budgets: config.ingest.budgets.clone(),
+        patterns: config.patterns.clone(),
+        patterns_root,
+        channel_buffer: 1024,
+        max_concurrent_captures: config.ingest.max_concurrent_captures as usize,
+        retention_days: config.storage.retention_days,
+        retention_max_mb: config.storage.retention_max_mb,
+        checkpoint_interval_secs: config.storage.checkpoint_interval_secs,
+        native_event_socket,
+    };
+
+    let mut runtime = ObservationRuntime::new(runtime_config, storage, pattern_engine)
+        .with_event_bus(Arc::clone(&event_bus))
+        .with_wezterm_handle(wezterm_handle);
+    let handle = Arc::new(runtime.start().await?);
+    tracing::info!("Distributed agent observation runtime started");
+
+    let connect_addr = connect.unwrap_or_else(|| config.distributed.bind_addr.clone());
+    let agent_id = explicit_agent_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(distributed_agent_default_id);
+    let session_id = format!("{agent_id}-{}-{}", std::process::id(), now_ms());
+    let token = frankenterm_core::distributed::resolve_expected_token(&config.distributed)
+        .map_err(|err| anyhow::anyhow!("Failed to resolve distributed token: {err}"))?;
+
+    let distributed_task = tokio::spawn(distributed_agent_stream_forever(
+        connect_addr.clone(),
+        config.distributed.clone(),
+        Arc::clone(&handle.storage),
+        Arc::clone(&event_bus),
+        Arc::clone(&handle.shutdown_flag),
+        agent_id.clone(),
+        session_id,
+        token,
+    ));
+
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigint = signal(SignalKind::interrupt())?;
+        let mut sigterm = signal(SignalKind::terminate())?;
+
+        tokio::select! {
+            _ = sigint.recv() => {
+                tracing::info!("Received SIGINT, shutting down distributed agent");
+            }
+            _ = sigterm.recv() => {
+                tracing::info!("Received SIGTERM, shutting down distributed agent");
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await?;
+        tracing::info!("Received Ctrl+C, shutting down distributed agent");
+    }
+
+    tracing::info!("Distributed agent stopping");
+    handle.signal_shutdown();
+
+    if let Err(err) = distributed_task.await {
+        tracing::warn!(error = %err, "Distributed agent streaming task join failed");
+    }
+
+    match Arc::try_unwrap(handle) {
+        Ok(handle) => handle.shutdown().await,
+        Err(handle) => {
+            tracing::warn!(
+                strong_count = Arc::strong_count(&handle),
+                "Distributed runtime handle still has outstanding references; skipping join"
+            );
+        }
+    }
+
+    tracing::info!(connect = %connect_addr, agent_id = %agent_id, "Distributed agent stopped");
+    Ok(())
 }
 
 /// Run the observation watcher daemon with crash-loop backoff.
@@ -7475,6 +9266,34 @@ async fn run_watcher(
     let handle = Arc::new(runtime.start().await?);
     tracing::info!("Observation runtime started");
 
+    #[cfg(feature = "distributed")]
+    let distributed_listener_handle = if config.distributed.enabled {
+        Some(
+            spawn_distributed_listener(
+                config.distributed.clone(),
+                Arc::clone(&handle.storage),
+                Arc::clone(&event_bus),
+                Arc::clone(&handle.shutdown_flag),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
+    #[cfg(not(feature = "distributed"))]
+    let distributed_listener_handle: Option<tokio::task::JoinHandle<()>> = if config
+        .distributed
+        .enabled
+    {
+        tracing::warn!(
+            "Distributed mode enabled in config, but ft was built without the distributed feature"
+        );
+        None
+    } else {
+        None
+    };
+
     // Background scheduler for saved searches (scheduled alerts).
     //
     // Runs inside the watcher process and publishes synthetic PatternDetected
@@ -7801,6 +9620,11 @@ async fn run_watcher(
             );
         }
     }
+
+    if let Some(distributed_listener_handle) = distributed_listener_handle {
+        let _ = distributed_listener_handle.await;
+    }
+
     tracing::info!("Watcher shutdown complete");
 
     if let Some(backup_handle) = scheduled_backup_handle {
@@ -8609,6 +10433,20 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             .await?;
         }
 
+        #[cfg(feature = "distributed")]
+        Some(Commands::Distributed { command }) => match command {
+            DistributedCommands::Agent { connect, agent_id } => {
+                run_distributed_agent(
+                    &layout,
+                    &config,
+                    resolved_config_path.as_deref(),
+                    connect,
+                    agent_id,
+                )
+                .await?;
+            }
+        },
+
         Some(Commands::Robot {
             format,
             stats,
@@ -8644,7 +10482,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     };
 
                     match other {
-                        RobotCommands::State => {
+                        RobotCommands::State {
+                            include_text,
+                            tail,
+                            escapes,
+                        } => {
                             let wezterm = frankenterm_core::wezterm::default_wezterm_handle();
                             match wezterm.list_panes().await {
                                 Ok(panes) => {
@@ -8653,56 +10495,173 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         .iter()
                                         .map(|p| PaneState::from_pane_info(p, filter))
                                         .collect();
-                                    let response =
-                                        RobotResponse::success(states, elapsed_ms(start));
-                                    print_robot_response(&response, format, stats)?;
+
+                                    if include_text {
+                                        let pane_ids: Vec<u64> =
+                                            states.iter().map(|state| state.pane_id).collect();
+                                        let pane_text = batch_get_pane_text(
+                                            wezterm.clone(),
+                                            &pane_ids,
+                                            escapes,
+                                            tail,
+                                        )
+                                        .await;
+                                        let data = RobotStateWithTextData {
+                                            panes: states,
+                                            tail_lines: tail,
+                                            escapes_included: escapes,
+                                            pane_text,
+                                        };
+                                        let response =
+                                            RobotResponse::success(data, elapsed_ms(start));
+                                        print_robot_response(&response, format, stats)?;
+                                    } else {
+                                        let response =
+                                            RobotResponse::success(states, elapsed_ms(start));
+                                        print_robot_response(&response, format, stats)?;
+                                    }
                                 }
                                 Err(e) => {
-                                    let response = RobotResponse::<Vec<PaneState>>::error_with_code(
-                                        "robot.wezterm_error",
-                                        format!("Failed to list panes: {e}"),
-                                        Some("Is WezTerm running?".to_string()),
-                                        elapsed_ms(start),
-                                    );
-                                    print_robot_response(&response, format, stats)?;
+                                    if include_text {
+                                        let response =
+                                            RobotResponse::<RobotStateWithTextData>::error_with_code(
+                                                "robot.wezterm_error",
+                                                format!("Failed to list panes: {e}"),
+                                                Some(
+                                                    "Is the active backend bridge (current: WezTerm) running?"
+                                                        .to_string(),
+                                                ),
+                                                elapsed_ms(start),
+                                            );
+                                        print_robot_response(&response, format, stats)?;
+                                    } else {
+                                        let response =
+                                            RobotResponse::<Vec<PaneState>>::error_with_code(
+                                                "robot.wezterm_error",
+                                                format!("Failed to list panes: {e}"),
+                                                Some(
+                                                    "Is the active backend bridge (current: WezTerm) running?"
+                                                        .to_string(),
+                                                ),
+                                                elapsed_ms(start),
+                                            );
+                                        print_robot_response(&response, format, stats)?;
+                                    }
                                 }
                             }
                         }
                         RobotCommands::GetText {
                             pane_id,
+                            panes,
+                            all,
                             tail,
                             escapes,
                         } => {
                             let wezterm = frankenterm_core::wezterm::default_wezterm_handle();
-                            match wezterm.get_text(pane_id, escapes).await {
-                                Ok(full_text) => {
-                                    // Apply tail truncation
-                                    let (text, truncated, truncation_info) =
-                                        apply_tail_truncation(&full_text, tail);
+                            let panes_specified = panes.is_some();
+                            let selector_count = usize::from(pane_id.is_some())
+                                + usize::from(panes_specified)
+                                + usize::from(all);
 
-                                    let data = RobotGetTextData {
-                                        pane_id,
-                                        text,
-                                        tail_lines: tail,
-                                        escapes_included: escapes,
-                                        truncated,
-                                        truncation_info,
-                                    };
-                                    let response = RobotResponse::success(data, elapsed_ms(start));
-                                    print_robot_response(&response, format, stats)?;
-                                }
-                                Err(e) => {
-                                    // Map errors to stable codes
-                                    let (code, hint) = map_wezterm_error_to_robot(&e);
-                                    let response =
-                                        RobotResponse::<RobotGetTextData>::error_with_code(
-                                            code,
-                                            format!("{e}"),
-                                            hint,
+                            if selector_count != 1 {
+                                let response = RobotResponse::<RobotBatchGetTextData>::error_with_code(
+                                    ROBOT_ERR_INVALID_ARGS,
+                                    "Specify exactly one target selector: <pane_id>, --panes, or --all",
+                                    Some(
+                                        "Examples: `ft robot get-text 0`, `ft robot get-text --panes 0,1,2`, or `ft robot get-text --all`"
+                                            .to_string(),
+                                    ),
+                                    elapsed_ms(start),
+                                );
+                                print_robot_response(&response, format, stats)?;
+                                return Ok(());
+                            }
+
+                            let mut pane_ids = if all {
+                                match wezterm.list_panes().await {
+                                    Ok(panes) => panes.iter().map(|pane| pane.pane_id).collect(),
+                                    Err(e) => {
+                                        let response = RobotResponse::<RobotBatchGetTextData>::error_with_code(
+                                            "robot.wezterm_error",
+                                            format!("Failed to list panes for --all: {e}"),
+                                            Some(
+                                                "Is the active backend bridge (current: WezTerm) running?"
+                                                    .to_string(),
+                                            ),
                                             elapsed_ms(start),
                                         );
-                                    print_robot_response(&response, format, stats)?;
+                                        print_robot_response(&response, format, stats)?;
+                                        return Ok(());
+                                    }
                                 }
+                            } else if let Some(panes) = panes.clone() {
+                                dedupe_pane_ids(panes)
+                            } else if let Some(pane_id) = pane_id {
+                                vec![pane_id]
+                            } else {
+                                Vec::new()
+                            };
+
+                            pane_ids = dedupe_pane_ids(pane_ids);
+
+                            if pane_ids.is_empty() && !all {
+                                let response =
+                                    RobotResponse::<RobotBatchGetTextData>::error_with_code(
+                                        ROBOT_ERR_INVALID_ARGS,
+                                        "No pane IDs resolved for get-text",
+                                        Some(
+                                            "Provide one pane ID, --panes <id,id,...>, or --all"
+                                                .to_string(),
+                                        ),
+                                        elapsed_ms(start),
+                                    );
+                                print_robot_response(&response, format, stats)?;
+                                return Ok(());
+                            }
+
+                            let is_single_pane_mode = pane_id.is_some() && !panes_specified && !all;
+                            if is_single_pane_mode {
+                                let pane_id = pane_ids[0];
+                                match wezterm.get_text(pane_id, escapes).await {
+                                    Ok(full_text) => {
+                                        let (text, truncated, truncation_info) =
+                                            apply_tail_truncation(&full_text, tail);
+                                        let data = RobotGetTextData {
+                                            pane_id,
+                                            text,
+                                            tail_lines: tail,
+                                            escapes_included: escapes,
+                                            truncated,
+                                            truncation_info,
+                                        };
+                                        let response =
+                                            RobotResponse::success(data, elapsed_ms(start));
+                                        print_robot_response(&response, format, stats)?;
+                                    }
+                                    Err(e) => {
+                                        let (code, hint) = map_wezterm_error_to_robot(&e);
+                                        let response =
+                                            RobotResponse::<RobotGetTextData>::error_with_code(
+                                                code,
+                                                format!("{e}"),
+                                                hint,
+                                                elapsed_ms(start),
+                                            );
+                                        print_robot_response(&response, format, stats)?;
+                                    }
+                                }
+                            } else {
+                                let results =
+                                    batch_get_pane_text(wezterm.clone(), &pane_ids, escapes, tail)
+                                        .await;
+                                let data = RobotBatchGetTextData {
+                                    pane_ids,
+                                    tail_lines: tail,
+                                    escapes_included: escapes,
+                                    results,
+                                };
+                                let response = RobotResponse::success(data, elapsed_ms(start));
+                                print_robot_response(&response, format, stats)?;
                             }
                         }
                         RobotCommands::Send {
@@ -11364,6 +13323,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             &accounts,
                                             &sel_config,
                                         );
+                                        let quota_advisory =
+                                            frankenterm_core::accounts::build_quota_advisory(
+                                                &result,
+                                                frankenterm_core::accounts::DEFAULT_LOW_QUOTA_THRESHOLD_PERCENT,
+                                            );
+                                        let quota_blocking = quota_advisory.is_blocking();
                                         Some(RobotAccountPickPreview {
                                             selected_account_id: result
                                                 .selected
@@ -11377,6 +13342,15 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             threshold_percent: sel_config.threshold_percent,
                                             candidates_count: result.explanation.candidates.len(),
                                             filtered_count: result.explanation.filtered_out.len(),
+                                            quota_advisory: RobotQuotaAdvisory {
+                                                availability: quota_advisory.availability,
+                                                low_quota_threshold_percent: quota_advisory
+                                                    .low_quota_threshold_percent,
+                                                selected_percent_remaining: quota_advisory
+                                                    .selected_percent_remaining,
+                                                warning: quota_advisory.warning,
+                                                blocking: quota_blocking,
+                                            },
                                         })
                                     } else {
                                         None
@@ -13673,9 +15647,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 }
                             }
                             Err(e) => {
-                                eprintln!("Error: Failed to query WezTerm panes: {e}");
+                                eprintln!("Error: Failed to query backend panes: {e}");
                                 eprintln!(
-                                    "Hint: Ensure WezTerm is running and wezterm CLI is in PATH."
+                                    "Hint: Ensure the active backend bridge (current: WezTerm) is running and wezterm CLI is in PATH."
                                 );
                                 std::process::exit(1);
                             }
@@ -14127,18 +16101,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 }
 
                                 if let Some(ref agent_filter) = agent {
-                                    let title_lower = pane_title.to_lowercase();
-                                    let filter_lower = agent_filter.to_lowercase();
-                                    let matches = match filter_lower.as_str() {
-                                        "codex" => {
-                                            title_lower.contains("codex")
-                                                || title_lower.contains("openai")
-                                        }
-                                        "claude_code" | "claude" => title_lower.contains("claude"),
-                                        "gemini" => title_lower.contains("gemini"),
-                                        _ => title_lower.contains(&filter_lower),
-                                    };
-                                    if !matches {
+                                    if !pane_matches_agent_filter(agent_filter, pane_title) {
                                         return None;
                                     }
                                 }
@@ -14166,6 +16129,28 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                         // Sort by pane_id for deterministic output
                         records.sort_by_key(|r| r.pane_id);
+
+                        // Merge remote panes persisted by distributed aggregator mode.
+                        if config.distributed.enabled {
+                            match load_distributed_remote_panes(&layout.db_path).await {
+                                Ok(remote_records) => {
+                                    merge_distributed_remote_records(
+                                        &mut records,
+                                        remote_records,
+                                        pane_id,
+                                        domain.as_deref(),
+                                        agent.as_deref(),
+                                        bookmark_pane_ids.as_ref(),
+                                    );
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        error = %err,
+                                        "Failed to load distributed remote panes for status output"
+                                    );
+                                }
+                            }
+                        }
 
                         let ctx = RenderContext::new(output_format).verbose(cli.verbose);
                         let output = PaneTableRenderer::render(&records, &ctx);
@@ -14262,7 +16247,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 let payload = serde_json::json!({
                                     "ok": false,
                                     "error": format!(
-                                        "WezTerm circuit breaker open; retry in {retry_after_ms} ms"
+                                        "Compatibility backend (WezTerm bridge) circuit breaker open; retry in {retry_after_ms} ms"
                                     ),
                                     "circuit": wezterm.circuit_status(),
                                     "version": frankenterm_core::VERSION,
@@ -14274,9 +16259,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 );
                             } else {
                                 eprintln!(
-                                    "Error: WezTerm circuit breaker open; retry in {retry_after_ms} ms."
+                                    "Error: Compatibility backend (WezTerm bridge) circuit breaker open; retry in {retry_after_ms} ms."
                                 );
-                                eprintln!("Is WezTerm running and responsive?");
+                                eprintln!(
+                                    "Is the active backend bridge (current: WezTerm) running and responsive?"
+                                );
                             }
                             std::process::exit(1);
                         }
@@ -14288,7 +16275,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             );
                         } else {
                             eprintln!("Error: Failed to list panes: {e}");
-                            eprintln!("Is WezTerm running?");
+                            eprintln!("Is the active backend bridge (current: WezTerm) running?");
                             std::process::exit(1);
                         }
                     }
@@ -15045,43 +17032,278 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             format,
         }) => {
             let output_format = resolve_prepare_output_format(&format);
-            let emit_json = matches!(output_format, frankenterm_core::output::OutputFormat::Json)
-                || (matches!(output_format, frankenterm_core::output::OutputFormat::Auto)
-                    && frankenterm_core::output::detect_format()
-                        == frankenterm_core::output::OutputFormat::Json);
+            let emit_json = matches!(output_format, frankenterm_core::output::OutputFormat::Json);
 
-            if emit_json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "ok": false,
-                        "error": "ft restart is not yet fully wired",
-                        "planned": {
-                            "snapshot_trigger": "pre_restart",
-                            "stop_timeout_secs": stop_timeout,
-                            "start_timeout_secs": start_timeout,
-                            "skip_restore": skip_restore,
-                            "layout_only": layout_only,
-                            "dry_run": dry_run,
-                        },
-                        "hint": "Use `ft snapshot save --trigger pre_restart` + `ft stop` (watcher) for now. Full mux restart + restore wiring is pending.",
-                        "version": frankenterm_core::VERSION,
-                    })
-                );
-            } else {
-                eprintln!("ft restart is not yet fully wired.");
-                eprintln!(
-                    "Planned: snapshot(save trigger=pre_restart) → stop mux (timeout {stop_timeout}s) → start mux (timeout {start_timeout}s) → restore (skip_restore={skip_restore}, layout_only={layout_only})."
-                );
-                if dry_run {
-                    eprintln!("Dry-run requested; no actions were executed.");
+            if dry_run {
+                if emit_json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "ok": true,
+                            "dry_run": true,
+                            "planned": {
+                                "snapshot_trigger": "pre_restart",
+                                "stop_timeout_secs": stop_timeout,
+                                "start_timeout_secs": start_timeout,
+                                "skip_restore": skip_restore,
+                                "layout_only": layout_only,
+                            },
+                            "version": frankenterm_core::VERSION,
+                        }))?
+                    );
+                } else {
+                    println!("Restart plan:");
+                    println!("  1. Capture pre-restart snapshot");
+                    println!("  2. Stop `wezterm-mux-server` (timeout: {stop_timeout}s)");
+                    println!(
+                        "  3. Start `wezterm-mux-server` (readiness timeout: {start_timeout}s)"
+                    );
+                    if skip_restore {
+                        println!("  4. Skip restore phase (--skip-restore)");
+                    } else {
+                        println!("  4. Restore from captured snapshot (layout_only={layout_only})");
+                    }
+                    println!("Dry-run requested; no actions were executed.");
                 }
-                eprintln!(
-                    "Hint: use `ft snapshot save --trigger pre_restart` + `ft stop` (watcher) for now. Full mux restart + restore wiring is pending."
-                );
+                return Ok(());
             }
 
-            std::process::exit(1);
+            #[cfg(not(unix))]
+            {
+                let _ = (
+                    stop_timeout,
+                    start_timeout,
+                    skip_restore,
+                    layout_only,
+                    emit_json,
+                );
+                eprintln!("ft restart is currently supported only on Unix platforms.");
+                std::process::exit(1);
+            }
+
+            #[cfg(unix)]
+            {
+                use frankenterm_core::snapshot_engine::{SnapshotEngine, SnapshotTrigger};
+
+                let db_path = Arc::new(layout.db_path.to_string_lossy().to_string());
+                let snapshot_engine =
+                    SnapshotEngine::new(Arc::clone(&db_path), config.snapshots.clone());
+                let wezterm = frankenterm_core::wezterm::wezterm_handle_with_timeout(
+                    config.cli.timeout_seconds,
+                );
+
+                let panes = match wezterm.list_panes().await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        if emit_json {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&serde_json::json!({
+                                    "ok": false,
+                                    "phase": "snapshot",
+                                    "error": format!("Failed to list panes: {e}"),
+                                }))?
+                            );
+                        } else {
+                            eprintln!("Restart aborted: failed to list panes: {e}");
+                        }
+                        std::process::exit(1);
+                    }
+                };
+
+                if panes.is_empty() {
+                    if emit_json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "ok": false,
+                                "phase": "snapshot",
+                                "error": "No panes found; refusing restart without a restorable snapshot",
+                            }))?
+                        );
+                    } else {
+                        eprintln!(
+                            "Restart aborted: no panes found; refusing restart without a restorable snapshot."
+                        );
+                    }
+                    std::process::exit(1);
+                }
+
+                let snapshot = match snapshot_engine
+                    .capture(&panes, SnapshotTrigger::Shutdown)
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(e) => {
+                        if emit_json {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&serde_json::json!({
+                                    "ok": false,
+                                    "phase": "snapshot",
+                                    "error": format!("{e}"),
+                                }))?
+                            );
+                        } else {
+                            eprintln!("Restart aborted: snapshot capture failed: {e}");
+                        }
+                        std::process::exit(1);
+                    }
+                };
+
+                let stop_result =
+                    stop_mux_server_processes(Duration::from_secs(stop_timeout)).await;
+                let stopped_pids = match stop_result {
+                    Ok(pids) => pids,
+                    Err(e) => {
+                        if emit_json {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&serde_json::json!({
+                                    "ok": false,
+                                    "phase": "stop",
+                                    "error": format!("{e}"),
+                                    "snapshot": {
+                                        "session_id": snapshot.session_id,
+                                        "checkpoint_id": snapshot.checkpoint_id,
+                                    },
+                                    "hint": "Snapshot captured successfully; restart after fixing mux shutdown issue.",
+                                }))?
+                            );
+                        } else {
+                            eprintln!("Restart aborted during mux shutdown: {e}");
+                            eprintln!(
+                                "Snapshot saved for recovery: session={} checkpoint={}",
+                                snapshot.session_id, snapshot.checkpoint_id
+                            );
+                        }
+                        std::process::exit(1);
+                    }
+                };
+
+                if let Err(e) = start_mux_server_process(
+                    Duration::from_secs(start_timeout),
+                    config.cli.timeout_seconds,
+                )
+                .await
+                {
+                    if emit_json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "ok": false,
+                                "phase": "start",
+                                "error": format!("{e}"),
+                                "snapshot": {
+                                    "session_id": snapshot.session_id,
+                                    "checkpoint_id": snapshot.checkpoint_id,
+                                },
+                                "stopped_mux_pids": stopped_pids,
+                                "hint": "Mux restart failed after stop. Use `ft snapshot restore` with the checkpoint once mux is healthy.",
+                            }))?
+                        );
+                    } else {
+                        eprintln!("Restart failed while starting mux server: {e}");
+                        eprintln!(
+                            "Snapshot preserved for manual recovery: session={} checkpoint={}",
+                            snapshot.session_id, snapshot.checkpoint_id
+                        );
+                    }
+                    std::process::exit(1);
+                }
+
+                if skip_restore {
+                    if emit_json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "ok": true,
+                                "phase": "complete",
+                                "restored": false,
+                                "skip_restore": true,
+                                "layout_only": layout_only,
+                                "snapshot": {
+                                    "session_id": snapshot.session_id,
+                                    "checkpoint_id": snapshot.checkpoint_id,
+                                    "pane_count": snapshot.pane_count,
+                                },
+                            }))?
+                        );
+                    } else {
+                        println!(
+                            "Restart complete (restore skipped). Snapshot: session={} checkpoint={}",
+                            snapshot.session_id, snapshot.checkpoint_id
+                        );
+                    }
+                    return Ok(());
+                }
+
+                match restore_snapshot_checkpoint(
+                    db_path.as_str(),
+                    snapshot.checkpoint_id,
+                    config.cli.timeout_seconds,
+                    layout_only,
+                )
+                .await
+                {
+                    Ok(summary) => {
+                        if emit_json {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&serde_json::json!({
+                                    "ok": true,
+                                    "phase": "complete",
+                                    "restored": true,
+                                    "layout_only": layout_only,
+                                    "snapshot": {
+                                        "session_id": snapshot.session_id,
+                                        "checkpoint_id": snapshot.checkpoint_id,
+                                        "pane_count": snapshot.pane_count,
+                                    },
+                                    "restore": {
+                                        "session_id": summary.session_id,
+                                        "checkpoint_id": summary.checkpoint_id,
+                                        "restored_panes": summary.restored_count(),
+                                        "failed_panes": summary.failed_count(),
+                                        "elapsed_ms": summary.elapsed_ms,
+                                    },
+                                }))?
+                            );
+                        } else {
+                            println!(
+                                "Restart complete: restored {}/{} panes in {}ms (checkpoint #{})",
+                                summary.restored_count(),
+                                summary.total_count(),
+                                summary.elapsed_ms,
+                                summary.checkpoint_id
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        // Keep restart successful even if restore fails; snapshot is preserved.
+                        if emit_json {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&serde_json::json!({
+                                    "ok": true,
+                                    "phase": "restore_failed",
+                                    "restored": false,
+                                    "layout_only": layout_only,
+                                    "error": e.to_string(),
+                                    "snapshot": {
+                                        "session_id": snapshot.session_id,
+                                        "checkpoint_id": snapshot.checkpoint_id,
+                                    },
+                                    "hint": "Mux restarted. Run `ft snapshot restore <checkpoint_id>` to retry restore.",
+                                }))?
+                            );
+                        } else {
+                            eprintln!("Mux restarted, but restore failed: {e}");
+                            eprintln!("Retry with: ft snapshot restore {}", snapshot.checkpoint_id);
+                        }
+                    }
+                }
+            }
         }
 
         Some(Commands::Prepare { command }) => match command {
@@ -17574,9 +19796,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             } else if let Some(command) = command {
                 match command {
                     SetupCommands::Local => {
-                        println!("ft setup local - WezTerm Configuration Guide\n");
-                        println!("ft requires WezTerm to be configured with adequate scrollback.");
-                        println!("Without sufficient scrollback, wa may miss terminal output.\n");
+                        println!(
+                            "ft setup local - Compatibility Backend (WezTerm Bridge) Configuration Guide\n"
+                        );
+                        println!(
+                            "ft currently relies on the WezTerm compatibility bridge being configured with adequate scrollback."
+                        );
+                        println!("Without sufficient scrollback, ft may miss terminal output.\n");
 
                         // Check current state
                         if let Ok((lines, path)) = check_wezterm_scrollback() {
@@ -19593,7 +21819,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
         #[cfg(feature = "web")]
         Some(Commands::Web { port }) => {
-            let config = frankenterm_core::web::WebServerConfig::new(port);
+            let db_path = layout.db_path.to_string_lossy();
+            let storage = frankenterm_core::storage::StorageHandle::new(&db_path).await?;
+            let event_bus = Arc::new(frankenterm_core::events::EventBus::new(1024));
+            let config = frankenterm_core::web::WebServerConfig::new(port)
+                .with_storage(storage)
+                .with_event_bus(event_bus);
             frankenterm_core::web::run_web_server(config).await?;
         }
 
@@ -23671,7 +25902,9 @@ async fn handle_snapshot_command(
                         serde_json::json!({"ok": false, "error": "No panes found"})
                     );
                 } else {
-                    eprintln!("No panes found. Is WezTerm running?");
+                    eprintln!(
+                        "No panes found. Is the active backend bridge (current: WezTerm) running?"
+                    );
                 }
                 std::process::exit(1);
             }
@@ -24040,30 +26273,133 @@ async fn handle_snapshot_command(
         }
 
         SnapshotCommands::Restore {
-            snapshot_id: _,
-            layout_only: _,
-            dry_run: _,
+            snapshot_id,
+            layout_only,
+            dry_run,
             format,
         } => {
-            // Restore is complex and depends on the restore_layout module.
-            // For now, show a helpful message pointing to the existing restore machinery.
-            if format == "json" {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "ok": false,
-                        "error": "Snapshot restore via CLI is not yet fully wired. Use the watcher's automatic restore-on-startup feature.",
-                        "hint": "ft watch will automatically detect and offer to restore from the latest unclean shutdown snapshot."
-                    })
-                );
-            } else {
-                eprintln!(
-                    "Snapshot restore via CLI is not yet fully wired.\n\
-                     The watcher automatically detects and offers to restore from unclean shutdown snapshots.\n\
-                     Use: ft watch"
-                );
+            let output_format = resolve_prepare_output_format(&format);
+            let emit_json = matches!(output_format, frankenterm_core::output::OutputFormat::Json);
+
+            let checkpoint_id = match resolve_checkpoint_id(db_path.as_str(), &snapshot_id) {
+                Ok(id) => id,
+                Err(e) => {
+                    if emit_json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "ok": false,
+                                "error": e.to_string(),
+                            }))?
+                        );
+                    } else {
+                        eprintln!("Snapshot restore failed: {e}");
+                    }
+                    std::process::exit(1);
+                }
+            };
+
+            let checkpoint = match frankenterm_core::session_restore::load_checkpoint_by_id(
+                db_path.as_str(),
+                checkpoint_id,
+            )? {
+                Some(cp) => cp,
+                None => {
+                    if emit_json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "ok": false,
+                                "error": format!("Snapshot {checkpoint_id} not found"),
+                            }))?
+                        );
+                    } else {
+                        eprintln!("Snapshot {checkpoint_id} not found");
+                    }
+                    std::process::exit(1);
+                }
+            };
+
+            if dry_run {
+                if emit_json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "ok": true,
+                            "dry_run": true,
+                            "snapshot": {
+                                "checkpoint_id": checkpoint.checkpoint_id,
+                                "session_id": checkpoint.session_id,
+                                "checkpoint_at": checkpoint.checkpoint_at,
+                                "checkpoint_type": checkpoint.checkpoint_type,
+                                "pane_count": checkpoint.pane_count,
+                            },
+                            "layout_only": layout_only,
+                        }))?
+                    );
+                } else {
+                    println!("Restore plan for snapshot #{}:", checkpoint.checkpoint_id);
+                    println!("  Session:    {}", checkpoint.session_id);
+                    println!(
+                        "  Captured:   {}",
+                        format_epoch_display(checkpoint.checkpoint_at)
+                    );
+                    println!("  Pane count: {}", checkpoint.pane_count);
+                    println!("  layout_only={layout_only}");
+                    println!("Dry-run requested; no actions were executed.");
+                }
+                return Ok(());
             }
-            std::process::exit(1);
+
+            match restore_snapshot_checkpoint(
+                db_path.as_str(),
+                checkpoint.checkpoint_id,
+                config.cli.timeout_seconds,
+                layout_only,
+            )
+            .await
+            {
+                Ok(summary) => {
+                    if emit_json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "ok": true,
+                                "checkpoint_id": summary.checkpoint_id,
+                                "session_id": summary.session_id,
+                                "layout_only": layout_only,
+                                "restored_panes": summary.restored_count(),
+                                "failed_panes": summary.failed_count(),
+                                "total_panes": summary.total_count(),
+                                "elapsed_ms": summary.elapsed_ms,
+                            }))?
+                        );
+                    } else {
+                        println!(
+                            "Snapshot restore complete: {}/{} panes in {}ms (checkpoint #{})",
+                            summary.restored_count(),
+                            summary.total_count(),
+                            summary.elapsed_ms,
+                            summary.checkpoint_id
+                        );
+                    }
+                }
+                Err(e) => {
+                    if emit_json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "ok": false,
+                                "checkpoint_id": checkpoint.checkpoint_id,
+                                "error": e.to_string(),
+                            }))?
+                        );
+                    } else {
+                        eprintln!("Snapshot restore failed: {e}");
+                    }
+                    std::process::exit(1);
+                }
+            }
         }
     }
     Ok(())
@@ -26114,14 +28450,14 @@ fn run_diagnostics(
             checks.push(DiagnosticCheck::error(
                 "WezTerm CLI",
                 "wezterm command failed",
-                "Ensure WezTerm is installed and in PATH",
+                "Ensure the active backend bridge (current: WezTerm) is installed and in PATH",
             ));
         }
         Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
             checks.push(DiagnosticCheck::error(
                 "WezTerm CLI",
                 "wezterm --version timed out",
-                "WezTerm may be unresponsive; try restarting it",
+                "Backend bridge may be unresponsive; try restarting WezTerm",
             ));
         }
         Err(_) => {
@@ -26251,7 +28587,7 @@ fn run_diagnostics(
                     checks.push(DiagnosticCheck::warning(
                         "WezTerm connection",
                         "Could not parse pane list",
-                        "Check WezTerm version compatibility",
+                        "Check backend bridge version compatibility (WezTerm)",
                     ));
                 }
             }
@@ -26261,21 +28597,21 @@ fn run_diagnostics(
             checks.push(DiagnosticCheck::error(
                 "WezTerm connection",
                 format!("CLI failed: {}", stderr.trim()),
-                "Ensure WezTerm GUI is running",
+                "Ensure the active backend bridge (current: WezTerm GUI/mux) is running",
             ));
         }
         Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
             checks.push(DiagnosticCheck::error(
                 "WezTerm connection",
                 "wezterm cli list timed out",
-                "WezTerm mux server may not be running; start the WezTerm GUI",
+                "Backend mux may not be running; start the WezTerm bridge",
             ));
         }
         Err(e) => {
             checks.push(DiagnosticCheck::error(
                 "WezTerm connection",
                 format!("CLI error: {e}"),
-                "Ensure WezTerm is installed and running",
+                "Ensure the active backend bridge (current: WezTerm) is installed and running",
             ));
         }
     }
@@ -26462,6 +28798,73 @@ mod tests {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis() as i64)
+    }
+
+    fn make_pane_record(
+        pane_id: u64,
+        domain: &str,
+        title: Option<&str>,
+    ) -> frankenterm_core::storage::PaneRecord {
+        frankenterm_core::storage::PaneRecord {
+            pane_id,
+            pane_uuid: None,
+            domain: domain.to_string(),
+            window_id: None,
+            tab_id: None,
+            title: title.map(ToOwned::to_owned),
+            cwd: None,
+            tty_name: None,
+            first_seen_at: 1,
+            last_seen_at: 1,
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        }
+    }
+
+    #[test]
+    fn pane_matches_agent_filter_aliases() {
+        assert!(pane_matches_agent_filter("codex", "OpenAI Codex"));
+        assert!(pane_matches_agent_filter("claude", "Claude Code Session"));
+        assert!(pane_matches_agent_filter("gemini", "Gemini CLI"));
+        assert!(pane_matches_agent_filter("build", "nightly-build-pane"));
+        assert!(!pane_matches_agent_filter("codex", "gemini only"));
+    }
+
+    #[test]
+    fn merge_distributed_remote_records_filters_and_dedupes() {
+        let mut records = vec![make_pane_record(1, "local", Some("local-pane"))];
+        let remote = vec![
+            make_pane_record(2, "distributed:agent-a:local", Some("codex-agent")),
+            make_pane_record(2, "distributed:agent-a:local", Some("codex-agent-dup")),
+            make_pane_record(3, "distributed:agent-b:local", Some("gemini-agent")),
+        ];
+
+        merge_distributed_remote_records(
+            &mut records,
+            remote,
+            None,
+            Some("distributed:agent-a:*"),
+            Some("codex"),
+            None,
+        );
+
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().any(|r| r.pane_id == 1));
+        assert!(records.iter().any(|r| r.pane_id == 2));
+        assert!(!records.iter().any(|r| r.pane_id == 3));
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_remote_pane_id_is_namespaced_and_stable() {
+        let a1 = distributed_remote_pane_id("agent-a", 7);
+        let a2 = distributed_remote_pane_id("agent-a", 7);
+        let b1 = distributed_remote_pane_id("agent-b", 7);
+
+        assert_eq!(a1, a2);
+        assert_ne!(a1, b1);
+        assert!(a1 >= (1_u64 << 62));
     }
 
     async fn setup_storage(label: &str) -> (StorageHandle, String) {
@@ -28484,6 +30887,13 @@ log_level = "debug"
             threshold_percent: 5.0,
             candidates_count: 2,
             filtered_count: 1,
+            quota_advisory: RobotQuotaAdvisory {
+                availability: frankenterm_core::accounts::QuotaAvailability::Available,
+                low_quota_threshold_percent: 10.0,
+                selected_percent_remaining: Some(90.0),
+                warning: None,
+                blocking: false,
+            },
         };
         let json = serde_json::to_value(&preview).unwrap();
 
@@ -28498,6 +30908,11 @@ log_level = "debug"
         assert!((json["threshold_percent"].as_f64().unwrap() - 5.0).abs() < 0.001);
         assert_eq!(json["candidates_count"].as_u64().unwrap(), 2);
         assert_eq!(json["filtered_count"].as_u64().unwrap(), 1);
+        assert_eq!(
+            json["quota_advisory"]["availability"].as_str().unwrap(),
+            "available"
+        );
+        assert_eq!(json["quota_advisory"]["blocking"].as_bool().unwrap(), false);
     }
 
     #[test]
@@ -28509,6 +30924,13 @@ log_level = "debug"
             threshold_percent: 5.0,
             candidates_count: 0,
             filtered_count: 3,
+            quota_advisory: RobotQuotaAdvisory {
+                availability: frankenterm_core::accounts::QuotaAvailability::Exhausted,
+                low_quota_threshold_percent: 10.0,
+                selected_percent_remaining: None,
+                warning: Some("All 3 accounts below threshold (5.0%)".to_string()),
+                blocking: true,
+            },
         };
         let json = serde_json::to_value(&preview).unwrap();
 
@@ -28516,6 +30938,11 @@ log_level = "debug"
         assert!(json.get("selected_name").is_none());
         assert_eq!(json["candidates_count"].as_u64().unwrap(), 0);
         assert_eq!(json["filtered_count"].as_u64().unwrap(), 3);
+        assert_eq!(
+            json["quota_advisory"]["availability"].as_str().unwrap(),
+            "exhausted"
+        );
+        assert!(json["quota_advisory"]["blocking"].as_bool().unwrap());
     }
 
     #[test]
@@ -28535,6 +30962,13 @@ log_level = "debug"
                 threshold_percent: 5.0,
                 candidates_count: 2,
                 filtered_count: 1,
+                quota_advisory: RobotQuotaAdvisory {
+                    availability: frankenterm_core::accounts::QuotaAvailability::Available,
+                    low_quota_threshold_percent: 10.0,
+                    selected_percent_remaining: Some(90.0),
+                    warning: None,
+                    blocking: false,
+                },
             }),
         };
         let json = serde_json::to_value(&data).unwrap();
@@ -28544,6 +30978,10 @@ log_level = "debug"
         let pp = &json["pick_preview"];
         assert_eq!(pp["selected_account_id"].as_str().unwrap(), "best");
         assert_eq!(pp["candidates_count"].as_u64().unwrap(), 2);
+        assert_eq!(
+            pp["quota_advisory"]["availability"].as_str().unwrap(),
+            "available"
+        );
     }
 
     #[test]
@@ -28657,6 +31095,20 @@ log_level = "debug"
             threshold_percent: config.threshold_percent,
             candidates_count: result.explanation.candidates.len(),
             filtered_count: result.explanation.filtered_out.len(),
+            quota_advisory: {
+                let qa = frankenterm_core::accounts::build_quota_advisory(
+                    &result,
+                    frankenterm_core::accounts::DEFAULT_LOW_QUOTA_THRESHOLD_PERCENT,
+                );
+                let qa_blocking = qa.is_blocking();
+                RobotQuotaAdvisory {
+                    availability: qa.availability,
+                    low_quota_threshold_percent: qa.low_quota_threshold_percent,
+                    selected_percent_remaining: qa.selected_percent_remaining,
+                    warning: qa.warning,
+                    blocking: qa_blocking,
+                }
+            },
         };
 
         // Verify pick matches expected behavior
@@ -28664,6 +31116,11 @@ log_level = "debug"
         assert_eq!(preview.selected_name.as_deref(), Some("Best"));
         assert_eq!(preview.candidates_count, 2); // best + mid
         assert_eq!(preview.filtered_count, 1); // depleted below 5%
+        assert_eq!(
+            preview.quota_advisory.availability,
+            frankenterm_core::accounts::QuotaAvailability::Available
+        );
+        assert!(!preview.quota_advisory.blocking);
         assert!(
             preview
                 .selection_reason
@@ -29941,6 +32398,31 @@ log_level = "debug"
                 _ => panic!("expected Workflow::Run"),
             },
             _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn cli_distributed_agent_parses_connect_and_agent_id() {
+        let cli = Cli::try_parse_from([
+            "ft",
+            "distributed",
+            "agent",
+            "--connect",
+            "127.0.0.1:4141",
+            "--agent-id",
+            "agent-alpha",
+        ])
+        .expect("distributed agent command should parse");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Distributed { command }) => match command {
+                DistributedCommands::Agent { connect, agent_id } => {
+                    assert_eq!(connect.as_deref(), Some("127.0.0.1:4141"));
+                    assert_eq!(agent_id.as_deref(), Some("agent-alpha"));
+                }
+            },
+            _ => panic!("expected Distributed command"),
         }
     }
 
@@ -31543,7 +34025,7 @@ log_level = "debug"
             );
         }
 
-        // No errors in healthy workspace (except WezTerm checks which depend on runtime)
+        // No errors in healthy workspace (except compatibility-backend checks which depend on runtime)
         let wezterm_check_names = ["WezTerm CLI", "WezTerm connection"];
         let error_names: Vec<&str> = checks
             .iter()
@@ -31553,7 +34035,7 @@ log_level = "debug"
             .collect();
         assert!(
             error_names.is_empty(),
-            "healthy workspace should have no non-WezTerm errors: {error_names:?}"
+            "healthy workspace should have no non-backend errors: {error_names:?}"
         );
 
         // Cleanup

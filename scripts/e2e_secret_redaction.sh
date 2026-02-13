@@ -394,7 +394,7 @@ test_dryrun_redacts_openai_key() {
         local error_check
         error_check=$(echo "$output" | jq -r '.error.code // empty' 2>/dev/null || echo "")
         if [[ "$error_check" == "robot.wezterm_not_running" ]] || [[ -z "$output" ]]; then
-            log_info "WezTerm not running -- checking redaction via unit tests"
+            log_info "Compatibility backend bridge not running -- checking redaction via unit tests"
             local fallback_output
             fallback_output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core redactor_redacts_openai -- --nocapture 2>&1 || true)
             if echo "$fallback_output" | grep -q "ok"; then
@@ -434,7 +434,7 @@ test_dryrun_redacts_github_pat() {
         local error_check
         error_check=$(echo "$output" | jq -r '.error.code // empty' 2>/dev/null || echo "")
         if [[ "$error_check" == "robot.wezterm_not_running" ]] || [[ -z "$output" ]]; then
-            log_info "WezTerm not running -- checking redaction via unit test"
+            log_info "Compatibility backend bridge not running -- checking redaction via unit test"
             local fallback_output
             fallback_output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core redactor_redacts_github -- --nocapture 2>&1 || true)
             if echo "$fallback_output" | grep -q "ok"; then
@@ -474,7 +474,7 @@ test_dryrun_redacts_db_url() {
         local error_check
         error_check=$(echo "$output" | jq -r '.error.code // empty' 2>/dev/null || echo "")
         if [[ "$error_check" == "robot.wezterm_not_running" ]] || [[ -z "$output" ]]; then
-            log_info "WezTerm not running -- checking redaction via unit test"
+            log_info "Compatibility backend bridge not running -- checking redaction via unit test"
             local fallback_output
             fallback_output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core redactor_redacts_database -- --nocapture 2>&1 || true)
             if echo "$fallback_output" | grep -q "ok"; then

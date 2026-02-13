@@ -172,11 +172,11 @@ test_low_risk_allows() {
     if [[ "$is_ok" == "true" ]]; then
         log_pass "Read-only state command allowed (low risk)"
     else
-        # Check if it's a WezTerm not running error (expected in test env)
+        # Check if it's a backend bridge not running error (expected in test env)
         local error_code
         error_code=$(echo "$output" | jq -r '.error.code // empty' 2>/dev/null || echo "")
         if [[ "$error_code" == "robot.wezterm_not_running" ]]; then
-            log_pass "Command attempted (WezTerm not running in test env, but policy didn't block)"
+            log_pass "Command attempted (backend bridge not running in test env, but policy didn't block)"
         else
             log_fail "Low-risk command was blocked: $output"
             return 1

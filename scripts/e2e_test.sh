@@ -267,7 +267,7 @@ run_self_check() {
         check_pass "WezTerm mux operational"
     else
         check_fail "WezTerm mux not operational"
-        echo "       Hint: Start WezTerm with 'wezterm start' or check if it's running"
+        echo "       Hint: Start the active backend bridge (current: WezTerm) with 'wezterm start' or check if it's running"
         all_passed=false
     fi
 
@@ -398,6 +398,7 @@ SCENARIO_REGISTRY=(
     "flake_guard|Repeat-run representative test suites to detect timing flakiness|false|cargo,jq|Catches timing regressions early"
     "reliability_hardening|Validate circuit breaker, retry, degradation, chaos, watchdog|true|cargo,jq|Protects resilience and fault tolerance"
     "perf_regression|Perf regression smoke: patterns, delta, cache, benchmarks with budget validation|true|cargo,jq|Protects performance budgets"
+    "distributed_streaming|Validate distributed agent->aggregator streaming, persistence, and query/auth robustness|false|cargo,jq|Protects optional distributed mode end-to-end"
     "timeline_correlation|Validate timeline cross-pane correlation (aggregation, failover, temporal)|true|cargo,jq,sqlite3|Protects event correlation determinism"
 )
 
@@ -7699,6 +7700,137 @@ SUMEOF
     return $result
 }
 
+run_scenario_distributed_streaming() {
+    local scenario_dir="$1"
+    local result=0
+    local case_name="distributed_streaming"
+    local test_log="$scenario_dir/distributed_streaming_test.log"
+    local case_started
+    case_started=$(date +%s)
+
+    extract_distributed_artifact() {
+        local label="$1"
+        local out_file="$2"
+        local raw_json
+
+        raw_json=$(grep -E "^\\[ARTIFACT\\]\\[distributed-streaming-e2e\\] ${label}=" "$test_log" \
+            | tail -1 \
+            | sed -E "s/^\\[ARTIFACT\\]\\[distributed-streaming-e2e\\] ${label}=//")
+        if [[ -z "$raw_json" ]]; then
+            return 1
+        fi
+        if ! echo "$raw_json" | jq . > "$out_file" 2>/dev/null; then
+            echo "$raw_json" > "$out_file"
+        fi
+        return 0
+    }
+
+    log_info "[$case_name] Step 1: feature gate check (FT_E2E_ENABLE_DISTRIBUTED)"
+    if [[ "${FT_E2E_ENABLE_DISTRIBUTED:-0}" != "1" ]]; then
+        log_warn "[$case_name] Skipping: set FT_E2E_ENABLE_DISTRIBUTED=1 to enable this non-default case"
+        cat > "$scenario_dir/skip_reason.txt" <<'EOF'
+distributed_streaming is intentionally non-default.
+Enable by setting FT_E2E_ENABLE_DISTRIBUTED=1 and rerunning this scenario.
+EOF
+        return 0
+    fi
+
+    log_info "[$case_name] Step 2: running distributed streaming cargo test suite"
+    local test_started
+    test_started=$(date +%s)
+    local cargo_status=0
+    set +e
+    timeout "$TIMEOUT" cargo test -p frankenterm-core --features distributed \
+        --test distributed_streaming_e2e -- --nocapture >"$test_log" 2>&1
+    cargo_status=$?
+    set -e
+    local test_duration=$(( $(date +%s) - test_started ))
+
+    if [[ "$cargo_status" -eq 124 ]]; then
+        log_fail "[$case_name] timeout after ${test_duration}s running cargo test"
+        result=4
+    elif [[ "$cargo_status" -ne 0 ]]; then
+        log_fail "[$case_name] cargo test failed (exit=$cargo_status, duration=${test_duration}s)"
+        result=1
+    else
+        log_pass "[$case_name] cargo test passed (${test_duration}s)"
+    fi
+
+    log_info "[$case_name] Step 3: extracting required artifacts from test output"
+    local required_labels=(
+        "aggregator_log"
+        "agent_log"
+        "db_snapshot"
+        "query_visibility"
+        "security_log"
+    )
+    local missing_artifacts=0
+    local label=""
+    for label in "${required_labels[@]}"; do
+        if extract_distributed_artifact "$label" "$scenario_dir/${label}.json"; then
+            log_pass "[$case_name] artifact extracted: ${label}.json"
+        else
+            log_fail "[$case_name] missing artifact marker for ${label}"
+            missing_artifacts=1
+        fi
+    done
+    if [[ "$missing_artifacts" -ne 0 ]]; then
+        result=1
+    fi
+
+    log_info "[$case_name] Step 4: validating DB snapshot + auth redaction evidence"
+    local snapshot_path=""
+    snapshot_path=$(jq -r '.path // empty' "$scenario_dir/db_snapshot.json" 2>/dev/null || true)
+    if [[ -n "$snapshot_path" && -f "$snapshot_path" ]]; then
+        cp "$snapshot_path" "$scenario_dir/db_snapshot.sqlite" 2>/dev/null || true
+        log_pass "[$case_name] db snapshot path exists: $snapshot_path"
+    else
+        local snapshot_segments snapshot_events snapshot_gaps snapshot_bytes
+        snapshot_segments=$(jq -r '.segment_count // .segments // 0' "$scenario_dir/db_snapshot.json" 2>/dev/null || echo 0)
+        snapshot_events=$(jq -r '.event_count // 0' "$scenario_dir/db_snapshot.json" 2>/dev/null || echo 0)
+        snapshot_gaps=$(jq -r '.gaps // 0' "$scenario_dir/db_snapshot.json" 2>/dev/null || echo 0)
+        snapshot_bytes=$(jq -r '.size_bytes // 0' "$scenario_dir/db_snapshot.json" 2>/dev/null || echo 0)
+
+        if sqlite3 "$scenario_dir/db_snapshot.sqlite" <<EOF
+CREATE TABLE IF NOT EXISTS snapshot_summary (
+    segments INTEGER NOT NULL,
+    events INTEGER NOT NULL,
+    gaps INTEGER NOT NULL,
+    reported_size_bytes INTEGER NOT NULL
+);
+DELETE FROM snapshot_summary;
+INSERT INTO snapshot_summary (segments, events, gaps, reported_size_bytes)
+VALUES ($snapshot_segments, $snapshot_events, $snapshot_gaps, $snapshot_bytes);
+EOF
+        then
+            log_warn "[$case_name] source db path not reusable; synthesized db_snapshot.sqlite from metadata"
+        else
+            log_fail "[$case_name] db snapshot path missing and fallback snapshot synthesis failed"
+            result=1
+        fi
+    fi
+
+    if jq -e '.missing_token_error_code == "dist.auth_failed" and .invalid_token_error_code == "dist.auth_failed"' \
+        "$scenario_dir/security_log.json" >/dev/null 2>&1; then
+        log_pass "[$case_name] stable auth error codes validated"
+    else
+        log_fail "[$case_name] security artifact missing stable auth error codes"
+        result=1
+    fi
+
+    if grep -Eiq "expected-secret|wrong-secret|token-v1|token-v2" \
+        "$test_log" "$scenario_dir"/*.json 2>/dev/null; then
+        log_fail "[$case_name] secret-like token content leaked in logs/artifacts"
+        result=1
+    else
+        log_pass "[$case_name] logs/artifacts remained redacted"
+    fi
+
+    local case_duration=$(( $(date +%s) - case_started ))
+    log_info "[$case_name] completed in ${case_duration}s"
+    return $result
+}
+
 run_scenario() {
     local name="$1"
     local scenario_num="$2"
@@ -7807,6 +7939,9 @@ run_scenario() {
             ;;
         environment_detection)
             run_scenario_environment_detection "$scenario_dir" || result=$?
+            ;;
+        distributed_streaming)
+            run_scenario_distributed_streaming "$scenario_dir" || result=$?
             ;;
         timeline_correlation)
             "$SCRIPT_DIR/e2e_timeline_correlation.sh" ${VERBOSE:+--verbose} || result=$?

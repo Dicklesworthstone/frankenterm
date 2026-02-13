@@ -1,11 +1,11 @@
 # Remote Setup Spec (ft setup remote)
 
 ## Summary
-A guided, idempotent, non-destructive workflow to bootstrap a remote host for WezTerm mux usage:
+A guided, idempotent, non-destructive workflow to bootstrap a remote host for compatibility-backend mux usage (current bridge: WezTerm):
 - verify SSH connectivity
 - detect OS + package manager
-- install WezTerm if missing
-- install and enable `wezterm-mux-server` as a systemd user service
+- install WezTerm bridge components if missing
+- install and enable `wezterm-mux-server` as a systemd user service (current bridge path)
 - enable linger so the mux survives logout
 - optionally install `ft` on the remote
 
@@ -14,7 +14,7 @@ Default behavior is dry-run with a full plan preview. No destructive actions are
 ---
 
 ## Goals
-- Make remote WezTerm domains reliable and repeatable.
+- Make remote compatibility-backend domains reliable and repeatable.
 - Provide a single command to bootstrap a host safely.
 - Keep output clear, auditable, and deterministic.
 

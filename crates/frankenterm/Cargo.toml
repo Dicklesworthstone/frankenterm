@@ -36,6 +36,7 @@ rusqlite.workspace = true
 reqwest.workspace = true
 dirs = "6.0.0"
 fastmcp = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
 
 [features]
 default = []
@@ -49,7 +50,7 @@ ftui = ["frankenterm-core/ftui"]
 rollout = ["frankenterm-core/rollout", "tui", "ftui"]
 metrics = ["frankenterm-core/metrics"]
 native-wezterm = ["frankenterm-core/native-wezterm"]
-distributed = ["frankenterm-core/distributed"]
+distributed = ["frankenterm-core/distributed", "dep:tokio-rustls"]
 sync = ["frankenterm-core/sync"]
 asupersync-runtime = ["frankenterm-core/asupersync-runtime"]
 

@@ -230,7 +230,7 @@ toml_edit = "0.24.0"
 serde_yaml = "0.9.34"
 
 # Serialization
-toon_rust = { git = "https://github.com/Dicklesworthstone/toon_rust", branch = "master" }
+toon_rust = { git = "https://github.com/Dicklesworthstone/toon_rust", branch = "master", package = "toon" }
 
 # FrankenTerm crates (in-tree, ex-WezTerm)
 async_ossl = { path = "frankenterm/async_ossl" }
