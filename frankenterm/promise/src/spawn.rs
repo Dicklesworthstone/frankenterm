@@ -274,3 +274,147 @@ impl Drop for ScopedExecutor {
         SCOPED_EXECUTOR.lock().unwrap().take();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    // Serialize spawn tests that touch global scheduler state
+    static TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    #[test]
+    fn block_on_ready_future() {
+        let result = block_on(async { 42 });
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn block_on_with_async_computation() {
+        let result = block_on(async {
+            let a = 10;
+            let b = 20;
+            a + b
+        });
+        assert_eq!(result, 30);
+    }
+
+    #[test]
+    fn block_on_with_result_type() {
+        let result: anyhow::Result<i32> = block_on(async { Ok(99) });
+        assert_eq!(result.unwrap(), 99);
+    }
+
+    #[test]
+    fn block_on_with_string() {
+        let result = block_on(async { String::from("hello async") });
+        assert_eq!(result, "hello async");
+    }
+
+    #[test]
+    fn scoped_executor_creates_and_drops() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        {
+            let _exec = ScopedExecutor::new();
+            assert!(get_scoped().is_some());
+        }
+        // After drop, scoped executor is removed
+        assert!(get_scoped().is_none());
+    }
+
+    #[test]
+    fn scoped_executor_default() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        {
+            let _exec = ScopedExecutor::default();
+            assert!(get_scoped().is_some());
+        }
+        assert!(get_scoped().is_none());
+    }
+
+    #[test]
+    fn scoped_executor_runs_future() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let exec = ScopedExecutor::new();
+        let result = block_on(exec.run(async { 123 }));
+        assert_eq!(result, 123);
+        drop(exec);
+    }
+
+    #[test]
+    fn scoped_executor_spawn_into_main_thread() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let exec = ScopedExecutor::new();
+        let task = spawn_into_main_thread(async { 456 });
+        let result = block_on(exec.run(task));
+        assert_eq!(result, 456);
+        drop(exec);
+    }
+
+    #[test]
+    fn scoped_executor_spawn_low_priority() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let exec = ScopedExecutor::new();
+        let task = spawn_into_main_thread_with_low_priority(async { 789 });
+        let result = block_on(exec.run(task));
+        assert_eq!(result, 789);
+        drop(exec);
+    }
+
+    #[test]
+    fn simple_executor_configures_scheduler() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let _exec = SimpleExecutor::new();
+        assert!(is_scheduler_configured());
+    }
+
+    #[test]
+    fn simple_executor_default() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let _exec = SimpleExecutor::default();
+        assert!(is_scheduler_configured());
+    }
+
+    #[test]
+    fn set_schedulers_marks_configured() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        set_schedulers(Box::new(|_| {}), Box::new(|_| {}));
+        assert!(is_scheduler_configured());
+    }
+
+    #[test]
+    fn spawn_into_new_thread_completes() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let exec = ScopedExecutor::new();
+        let task = spawn_into_new_thread(|| Ok(42i32));
+        let result = block_on(exec.run(task));
+        assert_eq!(result.unwrap(), 42);
+        drop(exec);
+    }
+
+    #[test]
+    fn spawn_into_new_thread_with_error() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let exec = ScopedExecutor::new();
+        let task = spawn_into_new_thread(|| -> anyhow::Result<i32> {
+            Err(anyhow::anyhow!("thread error"))
+        });
+        let result = block_on(exec.run(task));
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().to_string(), "thread error");
+        drop(exec);
+    }
+
+    #[test]
+    fn spawn_into_new_thread_with_computation() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let exec = ScopedExecutor::new();
+        let task = spawn_into_new_thread(|| {
+            let sum: i32 = (1..=10).sum();
+            Ok(sum)
+        });
+        let result = block_on(exec.run(task));
+        assert_eq!(result.unwrap(), 55);
+        drop(exec);
+    }
+}
