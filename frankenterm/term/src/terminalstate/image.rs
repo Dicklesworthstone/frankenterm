@@ -317,3 +317,157 @@ fn one_or_zero<T: Zero + One>(b: bool) -> T {
         T::zero()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── PlacementInfo ──────────────────────────────────────
+
+    #[test]
+    fn placement_info_construction() {
+        let info = PlacementInfo {
+            first_row: 0,
+            rows: 3,
+            cols: 4,
+        };
+        assert_eq!(info.first_row, 0);
+        assert_eq!(info.rows, 3);
+        assert_eq!(info.cols, 4);
+    }
+
+    #[test]
+    fn placement_info_clone_copy() {
+        let info = PlacementInfo {
+            first_row: 5,
+            rows: 10,
+            cols: 20,
+        };
+        let copied = info;
+        assert_eq!(info, copied);
+    }
+
+    #[test]
+    fn placement_info_debug() {
+        let info = PlacementInfo {
+            first_row: 0,
+            rows: 1,
+            cols: 1,
+        };
+        let dbg = format!("{:?}", info);
+        assert!(dbg.contains("PlacementInfo"));
+    }
+
+    #[test]
+    fn placement_info_eq_ne() {
+        let a = PlacementInfo {
+            first_row: 0,
+            rows: 1,
+            cols: 1,
+        };
+        let b = PlacementInfo {
+            first_row: 0,
+            rows: 1,
+            cols: 2,
+        };
+        assert_eq!(a, a);
+        assert_ne!(a, b);
+    }
+
+    // ── ImageAttachStyle ───────────────────────────────────
+
+    #[test]
+    fn image_attach_style_eq() {
+        assert_eq!(ImageAttachStyle::Sixel, ImageAttachStyle::Sixel);
+        assert_eq!(ImageAttachStyle::Iterm, ImageAttachStyle::Iterm);
+        assert_eq!(ImageAttachStyle::Kitty, ImageAttachStyle::Kitty);
+    }
+
+    #[test]
+    fn image_attach_style_ne() {
+        assert_ne!(ImageAttachStyle::Sixel, ImageAttachStyle::Iterm);
+        assert_ne!(ImageAttachStyle::Iterm, ImageAttachStyle::Kitty);
+        assert_ne!(ImageAttachStyle::Kitty, ImageAttachStyle::Sixel);
+    }
+
+    #[test]
+    fn image_attach_style_clone_copy() {
+        let style = ImageAttachStyle::Kitty;
+        let copied = style;
+        assert_eq!(style, copied);
+    }
+
+    #[test]
+    fn image_attach_style_debug() {
+        assert!(format!("{:?}", ImageAttachStyle::Sixel).contains("Sixel"));
+        assert!(format!("{:?}", ImageAttachStyle::Iterm).contains("Iterm"));
+        assert!(format!("{:?}", ImageAttachStyle::Kitty).contains("Kitty"));
+    }
+
+    // ── check_image_dimensions ─────────────────────────────
+
+    #[test]
+    fn check_image_dimensions_valid() {
+        assert!(check_image_dimensions(100, 100).is_ok());
+    }
+
+    #[test]
+    fn check_image_dimensions_zero_width() {
+        let err = check_image_dimensions(0, 100).unwrap_err();
+        assert!(err.to_string().contains("0x0"));
+    }
+
+    #[test]
+    fn check_image_dimensions_zero_height() {
+        let err = check_image_dimensions(100, 0).unwrap_err();
+        assert!(err.to_string().contains("0x0"));
+    }
+
+    #[test]
+    fn check_image_dimensions_too_large() {
+        // 10000 * 10000 * 4 = 400_000_000 > 100_000_000
+        let err = check_image_dimensions(10000, 10000).unwrap_err();
+        assert!(err.to_string().contains("Ignoring image data"));
+    }
+
+    #[test]
+    fn check_image_dimensions_at_limit() {
+        // 5000 * 5000 * 4 = 100_000_000 == MAX_IMAGE_SIZE, so this should fail
+        let result = check_image_dimensions(5000, 5000);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn check_image_dimensions_just_under_limit() {
+        // 4999 * 5000 * 4 = 99_980_000 < 100_000_000
+        assert!(check_image_dimensions(4999, 5000).is_ok());
+    }
+
+    #[test]
+    fn check_image_dimensions_one_by_one() {
+        assert!(check_image_dimensions(1, 1).is_ok());
+    }
+
+    #[test]
+    fn check_image_dimensions_overflow_saturates() {
+        // u32::MAX * u32::MAX would overflow, but saturating_mul caps it
+        let err = check_image_dimensions(u32::MAX, u32::MAX).unwrap_err();
+        assert!(err.to_string().contains("Ignoring image data"));
+    }
+
+    // ── one_or_zero ────────────────────────────────────────
+
+    #[test]
+    fn one_or_zero_true() {
+        assert_eq!(one_or_zero::<usize>(true), 1);
+        assert_eq!(one_or_zero::<i32>(true), 1);
+        assert_eq!(one_or_zero::<i64>(true), 1);
+    }
+
+    #[test]
+    fn one_or_zero_false() {
+        assert_eq!(one_or_zero::<usize>(false), 0);
+        assert_eq!(one_or_zero::<i32>(false), 0);
+        assert_eq!(one_or_zero::<i64>(false), 0);
+    }
+}

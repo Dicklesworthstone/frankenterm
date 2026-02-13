@@ -586,3 +586,278 @@ impl ImageData {
         self.hash
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── TextureCoordinate ──────────────────────────────────
+
+    #[test]
+    fn texture_coordinate_new() {
+        let x = NotNan::new(0.5f32).unwrap();
+        let y = NotNan::new(0.75f32).unwrap();
+        let tc = TextureCoordinate::new(x, y);
+        assert_eq!(tc.x, x);
+        assert_eq!(tc.y, y);
+    }
+
+    #[test]
+    fn texture_coordinate_new_f32() {
+        let tc = TextureCoordinate::new_f32(0.25, 0.5);
+        assert_eq!(tc.x.into_inner(), 0.25);
+        assert_eq!(tc.y.into_inner(), 0.5);
+    }
+
+    #[test]
+    fn texture_coordinate_clone_copy() {
+        let tc = TextureCoordinate::new_f32(0.1, 0.2);
+        let copied = tc;
+        assert_eq!(tc, copied);
+    }
+
+    #[test]
+    fn texture_coordinate_eq_ne() {
+        let a = TextureCoordinate::new_f32(0.0, 0.0);
+        let b = TextureCoordinate::new_f32(1.0, 1.0);
+        assert_eq!(a, a);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn texture_coordinate_hash() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(TextureCoordinate::new_f32(0.0, 0.0));
+        set.insert(TextureCoordinate::new_f32(1.0, 1.0));
+        set.insert(TextureCoordinate::new_f32(0.0, 0.0)); // duplicate
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn texture_coordinate_debug() {
+        let tc = TextureCoordinate::new_f32(0.5, 0.5);
+        let dbg = format!("{:?}", tc);
+        assert!(dbg.contains("TextureCoordinate"));
+    }
+
+    // ── ImageDataType ──────────────────────────────────────
+
+    #[test]
+    fn image_data_type_new_single_frame() {
+        let data = vec![0u8; 4 * 2 * 2]; // 2x2 RGBA
+        let idt = ImageDataType::new_single_frame(2, 2, data);
+        match &idt {
+            ImageDataType::Rgba8 {
+                width,
+                height,
+                data,
+                hash,
+            } => {
+                assert_eq!(*width, 2);
+                assert_eq!(*height, 2);
+                assert_eq!(data.len(), 16);
+                assert_ne!(*hash, [0u8; 32]); // hash should be computed
+            }
+            other => panic!("expected Rgba8, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn image_data_type_placeholder() {
+        let placeholder = ImageDataType::placeholder();
+        match &placeholder {
+            ImageDataType::Rgba8 { width, height, .. } => {
+                assert_eq!(*width, 8);
+                assert_eq!(*height, 8);
+            }
+            other => panic!("expected Rgba8, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn image_data_type_hash_bytes_deterministic() {
+        let data = b"hello world";
+        let h1 = ImageDataType::hash_bytes(data);
+        let h2 = ImageDataType::hash_bytes(data);
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn image_data_type_hash_bytes_different_inputs() {
+        let h1 = ImageDataType::hash_bytes(b"hello");
+        let h2 = ImageDataType::hash_bytes(b"world");
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn image_data_type_compute_hash_encoded_file() {
+        let idt = ImageDataType::EncodedFile(vec![1, 2, 3]);
+        let hash = idt.compute_hash();
+        assert_ne!(hash, [0u8; 32]);
+    }
+
+    #[test]
+    fn image_data_type_compute_hash_rgba8() {
+        let data = vec![0u8; 16];
+        let idt = ImageDataType::new_single_frame(2, 2, data);
+        let hash = idt.compute_hash();
+        assert_ne!(hash, [0u8; 32]);
+    }
+
+    #[test]
+    fn image_data_type_clone_eq() {
+        let a = ImageDataType::EncodedFile(vec![10, 20, 30]);
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn image_data_type_debug_encoded_file() {
+        let idt = ImageDataType::EncodedFile(vec![1, 2, 3]);
+        let dbg = format!("{:?}", idt);
+        assert!(dbg.contains("EncodedFile"));
+        assert!(dbg.contains("data_of_len"));
+    }
+
+    #[test]
+    fn image_data_type_debug_rgba8() {
+        let idt = ImageDataType::new_single_frame(1, 1, vec![0; 4]);
+        let dbg = format!("{:?}", idt);
+        assert!(dbg.contains("Rgba8"));
+        assert!(dbg.contains("width"));
+        assert!(dbg.contains("height"));
+    }
+
+    #[test]
+    fn image_data_type_adjust_speed_on_non_anim_is_noop() {
+        let mut idt = ImageDataType::EncodedFile(vec![1, 2, 3]);
+        idt.adjust_speed(2.0); // should not panic
+        assert_eq!(idt, ImageDataType::EncodedFile(vec![1, 2, 3]));
+    }
+
+    // ── ImageData ──────────────────────────────────────────
+
+    #[test]
+    fn image_data_with_data() {
+        let idt = ImageDataType::new_single_frame(2, 2, vec![0u8; 16]);
+        let id = ImageData::with_data(idt);
+        assert_ne!(id.hash(), [0u8; 32]);
+    }
+
+    #[test]
+    fn image_data_len() {
+        let idt = ImageDataType::new_single_frame(2, 2, vec![0u8; 16]);
+        let id = ImageData::with_data(idt);
+        assert_eq!(id.len(), 16);
+    }
+
+    #[test]
+    fn image_data_len_encoded_file() {
+        let idt = ImageDataType::EncodedFile(vec![1, 2, 3, 4, 5]);
+        let id = ImageData::with_data(idt);
+        assert_eq!(id.len(), 5);
+    }
+
+    #[test]
+    fn image_data_eq_same_hash() {
+        let data = vec![0u8; 16];
+        let id1 = ImageData::with_data(ImageDataType::new_single_frame(2, 2, data.clone()));
+        let id2 = ImageData::with_data(ImageDataType::new_single_frame(2, 2, data));
+        assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn image_data_ne_different_hash() {
+        let id1 = ImageData::with_data(ImageDataType::new_single_frame(1, 1, vec![0, 0, 0, 255]));
+        let id2 = ImageData::with_data(ImageDataType::new_single_frame(1, 1, vec![255, 0, 0, 255]));
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn image_data_debug() {
+        let idt = ImageDataType::new_single_frame(1, 1, vec![0; 4]);
+        let id = ImageData::with_data(idt);
+        let dbg = format!("{:?}", id);
+        assert!(dbg.contains("ImageData"));
+        assert!(dbg.contains("hash"));
+    }
+
+    // ── ImageCell ──────────────────────────────────────────
+
+    #[test]
+    fn image_cell_new() {
+        let tl = TextureCoordinate::new_f32(0.0, 0.0);
+        let br = TextureCoordinate::new_f32(1.0, 1.0);
+        let data = Arc::new(ImageData::with_data(ImageDataType::placeholder()));
+        let cell = ImageCell::new(tl, br, data);
+        assert_eq!(cell.top_left(), tl);
+        assert_eq!(cell.bottom_right(), br);
+        assert_eq!(cell.z_index(), 0);
+        assert_eq!(cell.padding(), (0, 0, 0, 0));
+        assert_eq!(cell.image_id(), None);
+        assert_eq!(cell.placement_id(), None);
+        assert!(!cell.has_placement_id());
+    }
+
+    #[test]
+    fn image_cell_with_z_index() {
+        let tl = TextureCoordinate::new_f32(0.0, 0.0);
+        let br = TextureCoordinate::new_f32(0.5, 0.5);
+        let data = Arc::new(ImageData::with_data(ImageDataType::placeholder()));
+        let cell = ImageCell::with_z_index(tl, br, data, -1, 2, 3, 4, 5, Some(42), Some(7));
+        assert_eq!(cell.z_index(), -1);
+        assert_eq!(cell.padding(), (2, 3, 4, 5));
+        assert_eq!(cell.image_id(), Some(42));
+        assert_eq!(cell.placement_id(), Some(7));
+        assert!(cell.has_placement_id());
+    }
+
+    #[test]
+    fn image_cell_matches_placement() {
+        let tl = TextureCoordinate::new_f32(0.0, 0.0);
+        let br = TextureCoordinate::new_f32(1.0, 1.0);
+        let data = Arc::new(ImageData::with_data(ImageDataType::placeholder()));
+        let cell = ImageCell::with_z_index(tl, br, data, 0, 0, 0, 0, 0, Some(10), Some(20));
+        assert!(cell.matches_placement(10, Some(20)));
+        assert!(!cell.matches_placement(10, Some(99)));
+        assert!(!cell.matches_placement(99, Some(20)));
+        assert!(!cell.matches_placement(10, None));
+    }
+
+    #[test]
+    fn image_cell_clone_eq() {
+        let tl = TextureCoordinate::new_f32(0.0, 0.0);
+        let br = TextureCoordinate::new_f32(1.0, 1.0);
+        let data = Arc::new(ImageData::with_data(ImageDataType::placeholder()));
+        let cell = ImageCell::new(tl, br, data);
+        let cloned = cell.clone();
+        assert_eq!(cell, cloned);
+    }
+
+    #[test]
+    fn image_cell_debug() {
+        let tl = TextureCoordinate::new_f32(0.0, 0.0);
+        let br = TextureCoordinate::new_f32(1.0, 1.0);
+        let data = Arc::new(ImageData::with_data(ImageDataType::placeholder()));
+        let cell = ImageCell::new(tl, br, data);
+        let dbg = format!("{:?}", cell);
+        assert!(dbg.contains("ImageCell"));
+    }
+
+    // ── ImageCellError ─────────────────────────────────────
+
+    #[test]
+    fn image_cell_error_debug() {
+        let err = ImageCellError::Io(std::io::Error::new(std::io::ErrorKind::Other, "test"));
+        let dbg = format!("{:?}", err);
+        assert!(dbg.contains("Io"));
+    }
+
+    #[test]
+    fn image_cell_error_display() {
+        let err = ImageCellError::Io(std::io::Error::new(std::io::ErrorKind::Other, "test error"));
+        let msg = format!("{}", err);
+        assert!(msg.contains("test error"));
+    }
+}
