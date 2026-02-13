@@ -221,4 +221,68 @@ mod tests {
         drop(cache);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // ===================================================================
+    // Property-based tests
+    // ===================================================================
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(50))]
+
+        /// sha256 is deterministic for any input.
+        #[test]
+        fn prop_sha256_deterministic(data in prop::collection::vec(any::<u8>(), 0..200)) {
+            let h1 = sha256(&data);
+            let h2 = sha256(&data);
+            prop_assert_eq!(h1, h2);
+        }
+
+        /// sha256 produces a 32-byte output.
+        #[test]
+        fn prop_sha256_output_length(data in prop::collection::vec(any::<u8>(), 0..200)) {
+            let hash = sha256(&data);
+            prop_assert_eq!(hash.len(), 32);
+        }
+
+        /// Different inputs produce different hashes (probabilistic, but extremely unlikely to collide).
+        #[test]
+        fn prop_sha256_different_inputs(
+            a in prop::collection::vec(any::<u8>(), 1..100),
+            b in prop::collection::vec(any::<u8>(), 1..100),
+        ) {
+            prop_assume!(a != b);
+            let ha = sha256(&a);
+            let hb = sha256(&b);
+            prop_assert_ne!(ha, hb);
+        }
+
+        /// hex_encode produces a string of length 2 * input.len().
+        #[test]
+        fn prop_hex_encode_length(data in prop::collection::vec(any::<u8>(), 0..50)) {
+            let hex = hex_encode(&data);
+            prop_assert_eq!(hex.len(), data.len() * 2);
+        }
+
+        /// hex_encode produces only lowercase hex characters.
+        #[test]
+        fn prop_hex_encode_valid_chars(data in prop::collection::vec(any::<u8>(), 0..50)) {
+            let hex = hex_encode(&data);
+            for ch in hex.chars() {
+                prop_assert!(
+                    ch.is_ascii_hexdigit() && (ch.is_ascii_digit() || ch.is_ascii_lowercase()),
+                    "unexpected char '{}' in hex output", ch
+                );
+            }
+        }
+
+        /// hex_encode is deterministic.
+        #[test]
+        fn prop_hex_encode_deterministic(data in prop::collection::vec(any::<u8>(), 0..50)) {
+            let h1 = hex_encode(&data);
+            let h2 = hex_encode(&data);
+            prop_assert_eq!(h1, h2);
+        }
+    }
 }

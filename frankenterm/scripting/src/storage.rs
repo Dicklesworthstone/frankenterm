@@ -379,4 +379,113 @@ mod tests {
             assert_eq!(&decoded, key, "roundtrip failed for '{key}'");
         }
     }
+
+    // ===================================================================
+    // Property-based tests
+    // ===================================================================
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(50))]
+
+        /// encode_filename → decode_filename is a perfect roundtrip.
+        #[test]
+        fn prop_encode_decode_roundtrip(key in "[a-zA-Z0-9_./ =-]{1,50}") {
+            let encoded = encode_filename(&key);
+            let decoded = decode_filename(&encoded).unwrap();
+            prop_assert_eq!(&decoded, &key);
+        }
+
+        /// Encoded filenames always end with ".dat".
+        #[test]
+        fn prop_encoded_ends_with_dat(key in ".{1,50}") {
+            let encoded = encode_filename(&key);
+            prop_assert!(encoded.ends_with(".dat"));
+        }
+
+        /// Encoded filenames contain only safe characters (alphanumeric, -, _, %, .).
+        #[test]
+        fn prop_encoded_safe_chars(key in ".{1,50}") {
+            let encoded = encode_filename(&key);
+            // Strip the .dat suffix and check the rest
+            let stem = encoded.strip_suffix(".dat").unwrap();
+            for ch in stem.chars() {
+                prop_assert!(
+                    ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '%',
+                    "unexpected char '{}' in encoded filename", ch
+                );
+            }
+        }
+
+        /// validate_key rejects empty keys.
+        #[test]
+        fn prop_validate_key_rejects_empty(_dummy in 0..1_u8) {
+            prop_assert!(validate_key("").is_err());
+        }
+
+        /// validate_key rejects keys longer than 256 bytes.
+        #[test]
+        fn prop_validate_key_rejects_long(extra in 1_usize..200) {
+            let key = "x".repeat(256 + extra);
+            prop_assert!(validate_key(&key).is_err());
+        }
+
+        /// validate_key accepts keys within 1..=256 bytes.
+        #[test]
+        fn prop_validate_key_accepts_valid(len in 1_usize..=256) {
+            let key = "k".repeat(len);
+            prop_assert!(validate_key(&key).is_ok());
+        }
+
+        /// safe_dirname produces only safe characters.
+        #[test]
+        fn prop_safe_dirname_safe_chars(input in ".{1,50}") {
+            let dirname = safe_dirname(&input);
+            for ch in dirname.chars() {
+                prop_assert!(
+                    ch.is_ascii_alphanumeric() || ch == '-' || ch == '_',
+                    "unsafe char '{}' in dirname", ch
+                );
+            }
+        }
+
+        /// safe_dirname preserves alphanumeric, dash, and underscore.
+        #[test]
+        fn prop_safe_dirname_preserves_safe(input in "[a-zA-Z0-9_-]{1,30}") {
+            let dirname = safe_dirname(&input);
+            prop_assert_eq!(&dirname, &input);
+        }
+
+        /// Set then get roundtrip through filesystem.
+        #[test]
+        fn prop_set_get_roundtrip(
+            key in "[a-zA-Z0-9_]{1,20}",
+            value in prop::collection::vec(any::<u8>(), 0..100),
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let storage = ExtensionStorage::new(dir.path().to_path_buf()).unwrap();
+            storage.set("ext", &key, &value).unwrap();
+            let got = storage.get("ext", &key).unwrap().unwrap();
+            prop_assert_eq!(got, value);
+        }
+
+        /// Extensions are isolated — set in one, absent in another.
+        #[test]
+        fn prop_extension_isolation(
+            key in "[a-zA-Z]{3,10}",
+            val_a in prop::collection::vec(any::<u8>(), 1..20),
+            val_b in prop::collection::vec(any::<u8>(), 1..20),
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let storage = ExtensionStorage::new(dir.path().to_path_buf()).unwrap();
+            storage.set("ext-a", &key, &val_a).unwrap();
+            storage.set("ext-b", &key, &val_b).unwrap();
+
+            let got_a = storage.get("ext-a", &key).unwrap().unwrap();
+            let got_b = storage.get("ext-b", &key).unwrap().unwrap();
+            prop_assert_eq!(got_a, val_a);
+            prop_assert_eq!(got_b, val_b);
+        }
+    }
 }
