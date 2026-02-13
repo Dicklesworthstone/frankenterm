@@ -254,4 +254,217 @@ mod test {
             assert_eq!(decoded, bin);
         }
     }
+
+    // ── Empty input ────────────────────────────────────────────
+
+    #[test]
+    fn encode_empty() {
+        assert_eq!(encode(b""), b"");
+    }
+
+    #[test]
+    fn decode_empty() {
+        assert_eq!(decode(b""), b"");
+    }
+
+    // ── Single byte ────────────────────────────────────────────
+
+    #[test]
+    fn roundtrip_single_byte() {
+        for b in 0..=255u8 {
+            let encoded = encode(&[b]);
+            let decoded = decode(&encoded);
+            assert_eq!(decoded, vec![b], "failed roundtrip for byte {b}");
+        }
+    }
+
+    // ── Various lengths ────────────────────────────────────────
+
+    #[test]
+    fn roundtrip_two_bytes() {
+        let data = b"AB";
+        assert_eq!(decode(&encode(data)), data);
+    }
+
+    #[test]
+    fn roundtrip_three_bytes() {
+        let data = b"XYZ";
+        assert_eq!(decode(&encode(data)), data);
+    }
+
+    #[test]
+    fn roundtrip_various_lengths() {
+        for len in 0..=64 {
+            let data: Vec<u8> = (0..len).map(|i| (i * 7 + 13) as u8).collect();
+            let encoded = encode(&data);
+            let decoded = decode(&encoded);
+            assert_eq!(decoded, data, "failed roundtrip for length {len}");
+        }
+    }
+
+    // ── Efficiency ─────────────────────────────────────────────
+
+    #[test]
+    fn encoding_overhead_within_spec() {
+        // basE91 overhead is at most 23%
+        let data: Vec<u8> = (0..1000).map(|i| (i % 256) as u8).collect();
+        let encoded = encode(&data);
+        let overhead = (encoded.len() as f64 / data.len() as f64 - 1.0) * 100.0;
+        assert!(overhead <= 23.5, "overhead exceeds spec limit of 23%");
+    }
+
+    #[test]
+    fn encoded_is_ascii() {
+        let data: Vec<u8> = (0..256).map(|i| i as u8).collect();
+        let encoded = encode(&data);
+        for &b in &encoded {
+            assert!(b.is_ascii(), "non-ASCII byte in encoded output");
+        }
+    }
+
+    // ── Streaming encode ───────────────────────────────────────
+
+    #[test]
+    fn streaming_encode_matches_bulk() {
+        let data = b"Hello, World! This is a test of streaming base91 encoding.";
+        let bulk = encode(data);
+
+        // Write in chunks of various sizes
+        let mut result = Vec::new();
+        {
+            let mut encoder = Base91Encoder::new(&mut result);
+            encoder.write_all(&data[..5]).unwrap();
+            encoder.write_all(&data[5..20]).unwrap();
+            encoder.write_all(&data[20..]).unwrap();
+            encoder.flush().unwrap();
+        }
+        assert_eq!(result, bulk);
+    }
+
+    #[test]
+    fn streaming_decode_matches_bulk() {
+        let encoded = encode(b"streaming decode test data");
+        let bulk = decode(&encoded);
+
+        let mut result = Vec::new();
+        {
+            let mut decoder = Base91Decoder::new(&mut result);
+            decoder.write_all(&encoded[..3]).unwrap();
+            decoder.write_all(&encoded[3..10]).unwrap();
+            decoder.write_all(&encoded[10..]).unwrap();
+            decoder.flush().unwrap();
+        }
+        assert_eq!(result, bulk);
+    }
+
+    // ── Decoder skips invalid chars ────────────────────────────
+
+    #[test]
+    fn decode_skips_whitespace() {
+        let encoded = encode(b"test");
+        let encoded_str = String::from_utf8(encoded.clone()).unwrap();
+
+        // Insert spaces and newlines
+        let with_spaces: String = encoded_str.chars().map(|c| format!("{c} ")).collect();
+        let decoded = decode(with_spaces.as_bytes());
+        assert_eq!(decoded, b"test");
+    }
+
+    #[test]
+    fn decode_skips_newlines() {
+        let encoded = encode(b"newline test");
+        let encoded_str = String::from_utf8(encoded).unwrap();
+
+        // Split into lines
+        let mid = encoded_str.len() / 2;
+        let with_newline = format!("{}\n{}", &encoded_str[..mid], &encoded_str[mid..]);
+        let decoded = decode(with_newline.as_bytes());
+        assert_eq!(decoded, b"newline test");
+    }
+
+    // ── Flush behavior ─────────────────────────────────────────
+
+    #[test]
+    fn double_flush_is_safe() {
+        let data = b"flush test";
+        let mut result = Vec::new();
+        {
+            let mut encoder = Base91Encoder::new(&mut result);
+            encoder.write_all(data).unwrap();
+            encoder.flush().unwrap();
+            encoder.flush().unwrap(); // Second flush should be a no-op
+        }
+        assert_eq!(decode(&result), data);
+    }
+
+    #[test]
+    fn drop_flushes_encoder() {
+        let data = b"drop test";
+        let mut result = Vec::new();
+        {
+            let mut encoder = Base91Encoder::new(&mut result);
+            encoder.write_all(data).unwrap();
+            // Don't explicitly flush — Drop should handle it
+        }
+        assert_eq!(decode(&result), data);
+    }
+
+    #[test]
+    fn drop_flushes_decoder() {
+        let encoded = encode(b"drop decode");
+        let mut result = Vec::new();
+        {
+            let mut decoder = Base91Decoder::new(&mut result);
+            decoder.write_all(&encoded).unwrap();
+            // Don't explicitly flush — Drop should handle it
+        }
+        assert_eq!(result, b"drop decode");
+    }
+
+    // ── Known values ───────────────────────────────────────────
+
+    #[test]
+    fn encode_known_hello() {
+        assert_eq!(encode(b"hello\n"), b"TPwJh>UA");
+    }
+
+    #[test]
+    fn decode_known_hello() {
+        assert_eq!(decode(b"TPwJh>UA"), b"hello\n");
+    }
+
+    // ── All zeros / all ones ───────────────────────────────────
+
+    #[test]
+    fn roundtrip_all_zeros() {
+        let data = vec![0u8; 100];
+        assert_eq!(decode(&encode(&data)), data);
+    }
+
+    #[test]
+    fn roundtrip_all_ones() {
+        let data = vec![0xFFu8; 100];
+        assert_eq!(decode(&encode(&data)), data);
+    }
+
+    // ── Write returns correct count ────────────────────────────
+
+    #[test]
+    fn encoder_write_returns_input_length() {
+        let mut result = Vec::new();
+        let mut encoder = Base91Encoder::new(&mut result);
+        assert_eq!(encoder.write(b"12345").unwrap(), 5);
+        assert_eq!(encoder.write(b"").unwrap(), 0);
+        assert_eq!(encoder.write(b"x").unwrap(), 1);
+        encoder.flush().unwrap();
+    }
+
+    #[test]
+    fn decoder_write_returns_input_length() {
+        let mut result = Vec::new();
+        let mut decoder = Base91Decoder::new(&mut result);
+        assert_eq!(decoder.write(b"TPwJh>UA").unwrap(), 8);
+        assert_eq!(decoder.write(b"").unwrap(), 0);
+        decoder.flush().unwrap();
+    }
 }
