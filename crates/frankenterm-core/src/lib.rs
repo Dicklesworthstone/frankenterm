@@ -35,6 +35,7 @@
 //! - `browser`: Browser automation scaffolding (feature-gated: `browser`)
 //! - `sync`: Optional sync scaffolding (feature-gated: `sync`)
 //! - `web`: Optional HTTP server scaffolding (feature-gated: `web`)
+//! - `search`: 2-tier semantic search (embedding + lexical + fusion)
 //!
 //! # Safety
 //!
