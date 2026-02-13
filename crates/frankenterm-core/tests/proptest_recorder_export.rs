@@ -28,8 +28,8 @@ fn arb_export_request() -> impl Strategy<Value = ExportRequest> {
         any::<bool>(),
         proptest::option::of("[a-z ]{3,20}"),
     )
-        .prop_map(|(format, pane_ids, max_events, include_text, label)| {
-            ExportRequest {
+        .prop_map(
+            |(format, pane_ids, max_events, include_text, label)| ExportRequest {
                 format,
                 time_range: None,
                 pane_ids,
@@ -38,8 +38,8 @@ fn arb_export_request() -> impl Strategy<Value = ExportRequest> {
                 include_text,
                 max_sensitivity: None,
                 label,
-            }
-        })
+            },
+        )
 }
 
 // =========================================================================

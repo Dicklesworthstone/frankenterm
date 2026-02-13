@@ -78,11 +78,11 @@ fn bench_single_update(c: &mut Criterion) {
             });
             // Stable regime (low values)
             for i in 0..30 {
-                model.update(10.0 + (i as f64) * 0.01);
+                model.update((i as f64).mul_add(0.01, 10.0));
             }
             // Spike regime (high values)
             for i in 0..20 {
-                model.update(500.0 + (i as f64) * 0.1);
+                model.update((i as f64).mul_add(0.1, 500.0));
             }
         });
     });
@@ -137,8 +137,8 @@ fn bench_batch_100_panes(c: &mut Criterion) {
         for pane_id in 0..100 {
             for i in 0..10 {
                 let features = OutputFeatures {
-                    output_rate: 10.0 + (i as f64) * 0.1,
-                    byte_rate: 500.0 + (i as f64) * 5.0,
+                    output_rate: (i as f64).mul_add(0.1, 10.0),
+                    byte_rate: (i as f64).mul_add(5.0, 500.0),
                     entropy: 4.5,
                     unique_line_ratio: 0.8,
                     ansi_density: 0.05,
@@ -152,8 +152,8 @@ fn bench_batch_100_panes(c: &mut Criterion) {
             counter += 0.1;
             for pane_id in 0..100 {
                 let features = OutputFeatures {
-                    output_rate: 10.0 + counter + (pane_id as f64) * 0.01,
-                    byte_rate: 500.0 + counter * 5.0,
+                    output_rate: (pane_id as f64).mul_add(0.01, 10.0 + counter),
+                    byte_rate: counter.mul_add(5.0, 500.0),
                     entropy: 4.5,
                     unique_line_ratio: 0.8,
                     ansi_density: 0.05,
@@ -171,7 +171,7 @@ fn bench_batch_100_panes(c: &mut Criterion) {
             manager.register_pane(pane_id);
             for i in 0..25 {
                 let features = OutputFeatures {
-                    output_rate: 10.0 + (i as f64) * 0.5,
+                    output_rate: (i as f64).mul_add(0.5, 10.0),
                     byte_rate: 500.0,
                     entropy: 4.0,
                     unique_line_ratio: 0.7,

@@ -32,10 +32,6 @@ fn arb_value() -> impl Strategy<Value = f64> {
     -1000.0_f64..1000.0
 }
 
-fn arb_positive_value() -> impl Strategy<Value = f64> {
-    0.0_f64..1000.0
-}
-
 // =============================================================================
 // Property: First observation sets value exactly
 // =============================================================================
@@ -237,8 +233,8 @@ proptest! {
         }
 
         let mean = tracker.mean();
-        let above = mean + 10.0 * spread;
-        let below = mean - 10.0 * spread;
+        let above = 10.0f64.mul_add(spread, mean);
+        let below = 10.0f64.mul_add(-spread, mean);
 
         let z_above = tracker.z_score(above);
         let z_below = tracker.z_score(below);

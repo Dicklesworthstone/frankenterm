@@ -633,7 +633,12 @@ mod tests {
             tuner.tick(&calm_metrics());
         }
 
-        assert_eq!(tuner.params(), &initial);
+        let p = tuner.params();
+        assert!((p.poll_interval_ms - initial.poll_interval_ms).abs() < f64::EPSILON);
+        assert!((p.scrollback_lines - initial.scrollback_lines).abs() < f64::EPSILON);
+        assert!((p.snapshot_interval_secs - initial.snapshot_interval_secs).abs() < f64::EPSILON);
+        assert!((p.pool_size - initial.pool_size).abs() < f64::EPSILON);
+        assert!((p.backpressure_threshold - initial.backpressure_threshold).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -647,13 +652,30 @@ mod tests {
         };
         params.clamp_to_ranges();
 
-        assert_eq!(params.poll_interval_ms, POLL_INTERVAL_RANGE.min);
-        assert_eq!(params.scrollback_lines, SCROLLBACK_LINES_RANGE.max);
-        assert_eq!(params.snapshot_interval_secs, SNAPSHOT_INTERVAL_RANGE.min);
-        assert_eq!(params.pool_size, POOL_SIZE_RANGE.max);
-        assert_eq!(
-            params.backpressure_threshold,
-            BACKPRESSURE_THRESHOLD_RANGE.min
+        assert!(
+            (params.poll_interval_ms - POLL_INTERVAL_RANGE.min).abs() < f64::EPSILON,
+            "poll_interval_ms: {}",
+            params.poll_interval_ms
+        );
+        assert!(
+            (params.scrollback_lines - SCROLLBACK_LINES_RANGE.max).abs() < f64::EPSILON,
+            "scrollback_lines: {}",
+            params.scrollback_lines
+        );
+        assert!(
+            (params.snapshot_interval_secs - SNAPSHOT_INTERVAL_RANGE.min).abs() < f64::EPSILON,
+            "snapshot_interval_secs: {}",
+            params.snapshot_interval_secs
+        );
+        assert!(
+            (params.pool_size - POOL_SIZE_RANGE.max).abs() < f64::EPSILON,
+            "pool_size: {}",
+            params.pool_size
+        );
+        assert!(
+            (params.backpressure_threshold - BACKPRESSURE_THRESHOLD_RANGE.min).abs() < f64::EPSILON,
+            "backpressure_threshold: {}",
+            params.backpressure_threshold
         );
     }
 
@@ -681,7 +703,12 @@ mod tests {
         tuner.tick(&high_memory_metrics());
         tuner.tick(&high_memory_metrics());
 
-        assert_eq!(tuner.params(), &initial);
+        let p = tuner.params();
+        assert!((p.poll_interval_ms - initial.poll_interval_ms).abs() < f64::EPSILON);
+        assert!((p.scrollback_lines - initial.scrollback_lines).abs() < f64::EPSILON);
+        assert!((p.snapshot_interval_secs - initial.snapshot_interval_secs).abs() < f64::EPSILON);
+        assert!((p.pool_size - initial.pool_size).abs() < f64::EPSILON);
+        assert!((p.backpressure_threshold - initial.backpressure_threshold).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -717,7 +744,7 @@ mod tests {
         tuner.tick(&high_memory_metrics());
 
         // Should not have changed (hysteresis reset)
-        assert_eq!(tuner.params().scrollback_lines, initial.scrollback_lines);
+        assert!((tuner.params().scrollback_lines - initial.scrollback_lines).abs() < f64::EPSILON);
     }
 
     // ---- Gradual change tests ----
@@ -835,7 +862,7 @@ mod tests {
             tuner.tick(&high_memory_metrics());
         }
 
-        assert_eq!(tuner.params().scrollback_lines, initial);
+        assert!((tuner.params().scrollback_lines - initial).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -855,7 +882,7 @@ mod tests {
             tuner.tick(&high_latency_metrics());
         }
 
-        assert_eq!(tuner.params().poll_interval_ms, initial);
+        assert!((tuner.params().poll_interval_ms - initial).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -875,7 +902,7 @@ mod tests {
             tuner.tick(&high_cpu_metrics());
         }
 
-        assert_eq!(tuner.params().pool_size, initial);
+        assert!((tuner.params().pool_size - initial).abs() < f64::EPSILON);
     }
 
     // ---- Adjustment log tests ----
@@ -1047,7 +1074,7 @@ mod tests {
                 // Apply sustained pressure with increasing RSS
                 let mut prev_scrollback = tuner.params().scrollback_lines;
                 for i in 0..20 {
-                    let rss = base_rss + (i as f64 * 0.005);
+                    let rss = (i as f64).mul_add(0.005, base_rss);
                     let metrics = TunerMetrics {
                         rss_fraction: rss.min(1.0),
                         mux_latency_ms: 5.0,
@@ -1084,11 +1111,16 @@ mod tests {
 
                 for m in &metrics {
                     tuner.tick(m);
-                    prop_assert_eq!(tuner.params().poll_interval_ms, initial.poll_interval_ms);
-                    prop_assert_eq!(tuner.params().scrollback_lines, initial.scrollback_lines);
-                    prop_assert_eq!(tuner.params().snapshot_interval_secs, initial.snapshot_interval_secs);
-                    prop_assert_eq!(tuner.params().pool_size, initial.pool_size);
-                    prop_assert_eq!(tuner.params().backpressure_threshold, initial.backpressure_threshold);
+                    prop_assert!((tuner.params().poll_interval_ms - initial.poll_interval_ms).abs() < f64::EPSILON,
+                        "poll_interval_ms changed: {} vs {}", tuner.params().poll_interval_ms, initial.poll_interval_ms);
+                    prop_assert!((tuner.params().scrollback_lines - initial.scrollback_lines).abs() < f64::EPSILON,
+                        "scrollback_lines changed: {} vs {}", tuner.params().scrollback_lines, initial.scrollback_lines);
+                    prop_assert!((tuner.params().snapshot_interval_secs - initial.snapshot_interval_secs).abs() < f64::EPSILON,
+                        "snapshot_interval_secs changed: {} vs {}", tuner.params().snapshot_interval_secs, initial.snapshot_interval_secs);
+                    prop_assert!((tuner.params().pool_size - initial.pool_size).abs() < f64::EPSILON,
+                        "pool_size changed: {} vs {}", tuner.params().pool_size, initial.pool_size);
+                    prop_assert!((tuner.params().backpressure_threshold - initial.backpressure_threshold).abs() < f64::EPSILON,
+                        "backpressure_threshold changed: {} vs {}", tuner.params().backpressure_threshold, initial.backpressure_threshold);
                 }
             }
         }

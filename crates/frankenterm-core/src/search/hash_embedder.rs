@@ -19,6 +19,7 @@ impl HashEmbedder {
         }
     }
 
+    #[must_use]
     pub fn with_ngram_range(mut self, min: usize, max: usize) -> Self {
         assert!(min > 0 && min <= max);
         self.ngram_range = (min, max);

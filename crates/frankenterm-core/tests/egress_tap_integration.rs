@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -147,7 +147,7 @@ async fn egress_tap_fires_on_delta_capture() {
         let (pid, out) = r.unwrap();
         tailer.handle_poll_result(pid, out);
     }
-    while let Ok(_) = rx.try_recv() {}
+    while rx.try_recv().is_ok() {}
 
     if tap.len() >= 1 {
         let e = &tap.events()[0];
@@ -167,7 +167,7 @@ async fn egress_tap_fires_on_delta_capture() {
         let (pid, out) = r.unwrap();
         tailer.handle_poll_result(pid, out);
     }
-    while let Ok(_) = rx.try_recv() {}
+    while rx.try_recv().is_ok() {}
 
     let all = tap.events();
     if all.len() >= 2 {
@@ -211,7 +211,7 @@ async fn egress_tap_captures_gap_segments() {
         let (pid, out) = r.unwrap();
         tailer.handle_poll_result(pid, out);
     }
-    while let Ok(_) = rx.try_recv() {}
+    while rx.try_recv().is_ok() {}
 
     source
         .set_text(1, "completely different text that shares no overlap")
@@ -224,7 +224,7 @@ async fn egress_tap_captures_gap_segments() {
         let (pid, out) = r.unwrap();
         tailer.handle_poll_result(pid, out);
     }
-    while let Ok(_) = rx.try_recv() {}
+    while rx.try_recv().is_ok() {}
 
     for gap in tap.events().iter().filter(|e| e.is_gap) {
         assert_eq!(gap.pane_id, 1);
@@ -272,7 +272,7 @@ async fn egress_tap_multi_pane() {
         let (pid, out) = r.unwrap();
         tailer.handle_poll_result(pid, out);
     }
-    while let Ok(_) = rx.try_recv() {}
+    while rx.try_recv().is_ok() {}
 
     for ev in &tap.events() {
         assert!(ev.pane_id == 10 || ev.pane_id == 20);
@@ -310,7 +310,7 @@ async fn egress_tap_not_set_still_works() {
     }
 
     let mut count = 0;
-    while let Ok(_) = rx.try_recv() {
+    while rx.try_recv().is_ok() {
         count += 1;
     }
     // Primary assertion: no panic without a tap set.
@@ -354,7 +354,7 @@ async fn egress_monotonic_sequence() {
             let (pid, out) = r.unwrap();
             tailer.handle_poll_result(pid, out);
         }
-        while let Ok(_) = rx.try_recv() {}
+        while rx.try_recv().is_ok() {}
     }
 
     let all = tap.events();

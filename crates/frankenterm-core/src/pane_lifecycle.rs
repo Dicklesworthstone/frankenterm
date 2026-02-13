@@ -341,7 +341,8 @@ impl PaneLifecycleEngine {
             .collect();
 
         // Convert to the expected slice-of-tuples format.
-        let refs: Vec<(ProcessTree, Option<u64>, &dyn Fn(u32) -> ProcessContext)> = inputs
+        type PlanInput<'a> = (ProcessTree, Option<u64>, &'a dyn Fn(u32) -> ProcessContext);
+        let refs: Vec<PlanInput<'_>> = inputs
             .iter()
             .map(|(tree, pane_id, ctx_fn)| (tree.clone(), *pane_id, ctx_fn.as_ref()))
             .collect();
@@ -874,7 +875,7 @@ mod tests {
     fn renice_sorts_oldest_first() {
         let config = LifecycleConfig::default();
         let healths = vec![
-            (1, PaneHealth::Thinking, Duration::from_secs(1 * 3600)),
+            (1, PaneHealth::Thinking, Duration::from_secs(3600)),
             (2, PaneHealth::Thinking, Duration::from_secs(3 * 3600)),
             (3, PaneHealth::Thinking, Duration::from_secs(2 * 3600)),
         ];

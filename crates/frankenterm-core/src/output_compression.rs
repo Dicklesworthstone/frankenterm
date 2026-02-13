@@ -153,7 +153,7 @@ pub fn edit_distance(a: &[u8], b: &[u8]) -> usize {
     for i in 1..=m {
         curr[0] = i;
         for j in 1..=n {
-            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            let cost = usize::from(a[i - 1] != b[j - 1]);
             curr[j] = (prev[j] + 1) // deletion
                 .min(curr[j - 1] + 1) // insertion
                 .min(prev[j - 1] + cost); // substitution
@@ -301,11 +301,11 @@ fn mark_variable_regions(anchor: &[u8], other: &[u8], stable: &mut [bool]) {
     }
 
     // Mark everything outside the LCS match as variable.
-    for i in 0..start_a {
-        stable[i] = false;
+    for s in &mut stable[..start_a] {
+        *s = false;
     }
-    for i in (start_a + len)..anchor.len() {
-        stable[i] = false;
+    for s in &mut stable[(start_a + len)..] {
+        *s = false;
     }
 }
 
@@ -679,7 +679,7 @@ mod tests {
         let template = extract_template(&lines);
 
         // Template should have variable positions where numbers differ.
-        assert!(template.variable_positions.len() >= 1);
+        assert!(!template.variable_positions.is_empty());
         assert_eq!(template.instance_count, 3);
     }
 
@@ -839,11 +839,8 @@ Done.";
 
     #[test]
     fn group_mixed() {
-        let mut lines: Vec<&str> = Vec::new();
-        lines.push("preamble text here");
-        for _ in 0..5 {
-            lines.push("Processing file 1/100");
-        }
+        let mut lines: Vec<&str> = vec!["preamble text here"];
+        lines.extend(std::iter::repeat_n("Processing file 1/100", 5));
         lines.push("epilogue text here");
 
         let groups = group_similar_lines(&lines, 0.3, 3);

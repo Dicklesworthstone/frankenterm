@@ -216,6 +216,7 @@ impl<N: Clone + Eq + Hash + std::fmt::Debug> HashRing<N> {
 
     /// Hash a virtual node position. We combine the node identity with the
     /// virtual index to get well-distributed positions.
+    #[allow(clippy::unused_self)]
     fn vnode_hash(&self, node: &N, vnode_idx: u32) -> u64 {
         // Hash the node identity, then mix with the vnode index using
         // multiplicative hashing for better dispersion across the ring.
@@ -344,8 +345,8 @@ mod tests {
         ring.add_node("C");
 
         // Same key should always map to the same node
-        let node1 = ring.get_node("pane-42").unwrap().clone();
-        let node2 = ring.get_node("pane-42").unwrap().clone();
+        let node1 = *ring.get_node("pane-42").unwrap();
+        let node2 = *ring.get_node("pane-42").unwrap();
         assert_eq!(node1, node2);
     }
 
@@ -560,7 +561,7 @@ mod tests {
         let ring: HashRing<&str> = HashRing::new(100);
         let stats = ring.stats();
         assert_eq!(stats.node_count, 0);
-        assert_eq!(stats.distribution_stddev, 0.0);
+        assert!(stats.distribution_stddev.abs() < f64::EPSILON);
     }
 
     #[test]

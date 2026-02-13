@@ -68,18 +68,16 @@ fn arb_cass_session_summary() -> impl Strategy<Value = CassSessionSummary> {
         proptest::option::of(0_i64..500_000),
         0_usize..100,
     )
-        .prop_map(
-            |(total, input, output, message_count)| CassSessionSummary {
-                total_tokens: total,
-                input_tokens: input,
-                output_tokens: output,
-                message_count,
-                session_started_at_ms: None,
-                session_ended_at_ms: None,
-                first_message_at_ms: None,
-                last_message_at_ms: None,
-            },
-        )
+        .prop_map(|(total, input, output, message_count)| CassSessionSummary {
+            total_tokens: total,
+            input_tokens: input,
+            output_tokens: output,
+            message_count,
+            session_started_at_ms: None,
+            session_ended_at_ms: None,
+            first_message_at_ms: None,
+            last_message_at_ms: None,
+        })
 }
 
 // =========================================================================
@@ -350,7 +348,11 @@ fn agent_all_variants_distinct() {
     ];
     let names: Vec<&str> = agents.iter().map(|a| a.as_str()).collect();
     let unique: std::collections::HashSet<&str> = names.iter().copied().collect();
-    assert_eq!(names.len(), unique.len(), "all agent names should be unique");
+    assert_eq!(
+        names.len(),
+        unique.len(),
+        "all agent names should be unique"
+    );
 }
 
 #[test]

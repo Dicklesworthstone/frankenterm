@@ -424,7 +424,7 @@ proptest! {
         }
 
         // Snapshot expected order before drain
-        let expected: Vec<i32> = rb.iter().cloned().collect();
+        let expected: Vec<i32> = rb.iter().copied().collect();
         let drained = rb.drain();
 
         prop_assert_eq!(drained, expected, "Drain order mismatch");
@@ -510,7 +510,7 @@ proptest! {
             rb.push(item);
         }
 
-        let iter_vec: Vec<i32> = rb.iter().cloned().collect();
+        let iter_vec: Vec<i32> = rb.iter().copied().collect();
         let owned = rb.to_owned_vec();
         prop_assert_eq!(owned, iter_vec);
     }

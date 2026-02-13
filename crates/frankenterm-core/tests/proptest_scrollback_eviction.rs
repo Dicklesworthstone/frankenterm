@@ -516,7 +516,7 @@ proptest! {
         segments in 1usize..20_000,
     ) {
         let store = PropStore {
-            segments: [(42u64, segments)].into_iter().collect(),
+            segments: std::iter::once((42u64, segments)).collect(),
         };
         // Empty tier source — pane 42 is unknown
         let tier_source = PropTierSource {

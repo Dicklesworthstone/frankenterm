@@ -7,9 +7,7 @@
 use std::collections::HashMap;
 
 use frankenterm_core::notifications::NotificationPayload;
-use frankenterm_core::webhook::{
-    WebhookEndpointConfig, WebhookTemplate, render_template,
-};
+use frankenterm_core::webhook::{WebhookEndpointConfig, WebhookTemplate, render_template};
 use proptest::prelude::*;
 
 // =========================================================================
@@ -30,16 +28,18 @@ fn arb_endpoint_config() -> impl Strategy<Value = WebhookEndpointConfig> {
         "https://[a-z]{3,10}\\.example\\.com/[a-z]{3,10}", // url
         arb_webhook_template(),
         proptest::collection::vec("[a-z.*:]{3,20}", 0..3), // events
-        any::<bool>(),                                      // enabled
+        any::<bool>(),                                     // enabled
     )
-        .prop_map(|(name, url, template, events, enabled)| WebhookEndpointConfig {
-            name,
-            url,
-            template,
-            events,
-            headers: HashMap::new(),
-            enabled,
-        })
+        .prop_map(
+            |(name, url, template, events, enabled)| WebhookEndpointConfig {
+                name,
+                url,
+                template,
+                events,
+                headers: HashMap::new(),
+                enabled,
+            },
+        )
 }
 
 fn arb_payload() -> impl Strategy<Value = NotificationPayload> {
@@ -53,8 +53,8 @@ fn arb_payload() -> impl Strategy<Value = NotificationPayload> {
         "[a-z]{3,10}",
         0.0_f64..1.0,
     )
-        .prop_map(|(event_type, pane_id, timestamp, summary, description, severity, agent_type, confidence)| {
-            NotificationPayload {
+        .prop_map(
+            |(
                 event_type,
                 pane_id,
                 timestamp,
@@ -63,10 +63,21 @@ fn arb_payload() -> impl Strategy<Value = NotificationPayload> {
                 severity,
                 agent_type,
                 confidence,
-                quick_fix: None,
-                suppressed_since_last: 0,
-            }
-        })
+            )| {
+                NotificationPayload {
+                    event_type,
+                    pane_id,
+                    timestamp,
+                    summary,
+                    description,
+                    severity,
+                    agent_type,
+                    confidence,
+                    quick_fix: None,
+                    suppressed_since_last: 0,
+                }
+            },
+        )
 }
 
 // =========================================================================

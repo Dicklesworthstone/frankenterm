@@ -441,7 +441,9 @@ fn canonical_registry_invariants() {
             "endpoint schema_file must not be empty"
         );
         assert!(
-            ep.schema_file.ends_with(".json"),
+            std::path::Path::new(&ep.schema_file)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("json")),
             "schema_file must end with .json, got: {}",
             ep.schema_file,
         );
@@ -894,8 +896,7 @@ fn schema_registry_default_is_empty() {
 #[test]
 fn canonical_ids_count_matches_endpoints() {
     let reg = SchemaRegistry::canonical();
-    let ids: Vec<&str> = reg.ids().collect();
-    assert_eq!(ids.len(), reg.endpoints.len());
+    assert_eq!(reg.ids().count(), reg.endpoints.len());
 }
 
 proptest! {

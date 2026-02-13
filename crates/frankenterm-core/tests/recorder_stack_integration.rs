@@ -605,7 +605,7 @@ fn telemetry_snapshot_produces_diagnostic_summary() {
 
     // Record some operations.
     for i in 0..20 {
-        telemetry.record_append(100.0 + i as f64 * 10.0, 5, 500, false);
+        telemetry.record_append((i as f64).mul_add(10.0, 100.0), 5, 500, false);
     }
     telemetry.record_flush(50.0);
     telemetry.record_flush(75.0);

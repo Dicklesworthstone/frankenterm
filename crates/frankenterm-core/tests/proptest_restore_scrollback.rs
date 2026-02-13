@@ -14,22 +14,14 @@ use proptest::prelude::*;
 // =========================================================================
 
 fn arb_injection_config() -> impl Strategy<Value = InjectionConfig> {
-    (
-        1_usize..100_000,
-        256_usize..65536,
-        0_u64..100,
-        1_usize..20,
+    (1_usize..100_000, 256_usize..65536, 0_u64..100, 1_usize..20).prop_map(
+        |(max_lines, chunk_size, inter_chunk_delay_ms, concurrent_injections)| InjectionConfig {
+            max_lines,
+            chunk_size,
+            inter_chunk_delay_ms,
+            concurrent_injections,
+        },
     )
-        .prop_map(
-            |(max_lines, chunk_size, inter_chunk_delay_ms, concurrent_injections)| {
-                InjectionConfig {
-                    max_lines,
-                    chunk_size,
-                    inter_chunk_delay_ms,
-                    concurrent_injections,
-                }
-            },
-        )
 }
 
 fn arb_segments() -> impl Strategy<Value = Vec<String>> {

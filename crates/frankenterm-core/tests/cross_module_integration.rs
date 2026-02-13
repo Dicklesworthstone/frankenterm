@@ -135,7 +135,7 @@ impl ContentStore for MockContentStore {
 
     fn stats(&self) -> Result<frankenterm_core::content_dedup::DedupStats, String> {
         let mut stats = frankenterm_core::content_dedup::DedupStats::default();
-        for (_, (content, rc, _)) in &self.blocks {
+        for (content, rc, _) in self.blocks.values() {
             stats.unique_blocks += 1;
             stats.unique_bytes += content.len() as u64;
             stats.total_references += rc;
@@ -805,7 +805,7 @@ fn e2e_pane_entropy_summaries_for_eviction_ranking() {
     let binary_ent = compute_entropy(&binary_data);
     let binary_cost = information_cost(binary_data.len(), binary_ent);
 
-    let summaries = vec![
+    let summaries = [
         PaneEntropySummary {
             pane_id: 1,
             raw_bytes: text_data.len() as u64,

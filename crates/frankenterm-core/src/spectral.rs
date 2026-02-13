@@ -147,8 +147,8 @@ impl SampleBuffer {
         let cap = self.data.len();
         let mut result = vec![0.0; cap];
         if self.count == cap {
-            for i in 0..cap {
-                result[i] = self.data[(self.write_pos + i) % cap];
+            for (i, r) in result.iter_mut().enumerate() {
+                *r = self.data[(self.write_pos + i) % cap];
             }
         } else {
             result[..self.count].copy_from_slice(&self.data[..self.count]);
@@ -367,6 +367,7 @@ fn median_of(data: &[f64]) -> f64 {
     }
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let mid = sorted.len() / 2;
+    #[allow(clippy::manual_midpoint)]
     if sorted.len() % 2 == 0 {
         (sorted[mid - 1] + sorted[mid]) / 2.0
     } else {
@@ -439,11 +440,7 @@ pub fn detect_peaks(psd: &[f64], snr_threshold: f64, sample_rate_hz: f64) -> Vec
         // Mark nearby weaker peaks as used
         for j in (i + 1)..peaks.len() {
             if !used[j] {
-                let dist = if peaks[i].bin > peaks[j].bin {
-                    peaks[i].bin - peaks[j].bin
-                } else {
-                    peaks[j].bin - peaks[i].bin
-                };
+                let dist = peaks[i].bin.abs_diff(peaks[j].bin);
                 if dist <= 16 {
                     used[j] = true;
                 }
@@ -529,8 +526,10 @@ pub fn generate_sine(freq_hz: f64, amplitude: f64, noise_level: f64, n: usize) -
     (0..n)
         .map(|i| {
             let t = i as f64 / sr;
-            amplitude * (2.0 * PI * freq_hz * t).sin()
-                + (xorshift64(&mut rng) * 2.0 - 1.0) * noise_level
+            amplitude.mul_add(
+                (2.0 * PI * freq_hz * t).sin(),
+                (xorshift64(&mut rng) * 2.0 - 1.0) * noise_level,
+            )
         })
         .collect()
 }
@@ -601,7 +600,7 @@ mod tests {
 
     #[test]
     fn fft_psd_non_negative() {
-        for &v in power_spectral_density(&generate_sine(2.0, 5.0, 1.0, 1024)).iter() {
+        for &v in &power_spectral_density(&generate_sine(2.0, 5.0, 1.0, 1024)) {
             assert!(v >= 0.0);
         }
     }
@@ -646,11 +645,11 @@ mod tests {
 
     #[test]
     fn flatness_empty() {
-        assert_eq!(spectral_flatness(&[]), 0.0);
+        assert!(spectral_flatness(&[]).abs() < f64::EPSILON);
     }
     #[test]
     fn flatness_zero() {
-        assert_eq!(spectral_flatness(&[0.0; 50]), 0.0);
+        assert!(spectral_flatness(&[0.0; 50]).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -667,7 +666,7 @@ mod tests {
 
     #[test]
     fn centroid_zero() {
-        assert_eq!(spectral_centroid(&[0.0; 100], 10.0), 0.0);
+        assert!(spectral_centroid(&[0.0; 100], 10.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -830,11 +829,11 @@ mod tests {
 
     #[test]
     fn sim_zero() {
-        assert_eq!(psd_similarity(&[0.0; 10], &[0.0; 10]), 0.0);
+        assert!(psd_similarity(&[0.0; 10], &[0.0; 10]).abs() < f64::EPSILON);
     }
     #[test]
     fn sim_mismatch() {
-        assert_eq!(psd_similarity(&[1.0, 2.0], &[1.0]), 0.0);
+        assert!(psd_similarity(&[1.0, 2.0], &[1.0]).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -941,7 +940,7 @@ mod proptest_tests {
         fn flatness_bounded(values in proptest::collection::vec(-100.0f64..100.0, DEFAULT_FFT_SIZE)) {
             let psd = power_spectral_density(&hann_window(&values));
             let f = spectral_flatness(&psd);
-            prop_assert!(f >= 0.0 && f <= 1.0, "flatness={}", f);
+            prop_assert!((0.0..=1.0).contains(&f), "flatness={}", f);
         }
 
         #[test]

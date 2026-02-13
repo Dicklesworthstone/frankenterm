@@ -641,7 +641,7 @@ mod tests {
         {
             let mut panes = clf.panes.write().unwrap();
             let state = panes.get_mut(&1).unwrap();
-            state.last_output = Instant::now() - Duration::from_secs(1);
+            state.last_output = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
         }
 
         assert_eq!(clf.classify(1), PaneTier::Idle);
@@ -660,7 +660,9 @@ mod tests {
         {
             let mut panes = clf.panes.write().unwrap();
             let state = panes.get_mut(&1).unwrap();
-            state.last_output = Instant::now() - Duration::from_secs(120);
+            state.last_output = Instant::now()
+                .checked_sub(Duration::from_secs(120))
+                .unwrap();
         }
 
         assert_eq!(clf.classify(1), PaneTier::Dormant);
@@ -678,7 +680,7 @@ mod tests {
             let mut panes = clf.panes.write().unwrap();
             let state = panes.get_mut(&1).unwrap();
             state.tier = PaneTier::Idle;
-            state.last_output = Instant::now() - Duration::from_secs(60);
+            state.last_output = Instant::now().checked_sub(Duration::from_secs(60)).unwrap();
         }
         assert_eq!(clf.current_tier(1), PaneTier::Idle);
 

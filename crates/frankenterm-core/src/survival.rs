@@ -708,8 +708,8 @@ mod tests {
         let s3 = params.survival_probability(100.0, &cov);
         assert!(s1 > s2, "s1={s1} > s2={s2}");
         assert!(s2 > s3, "s2={s2} > s3={s3}");
-        assert!(s1 <= 1.0 && s1 >= 0.0);
-        assert!(s3 <= 1.0 && s3 >= 0.0);
+        assert!((0.0..=1.0).contains(&s1));
+        assert!((0.0..=1.0).contains(&s3));
     }
 
     #[test]
@@ -787,7 +787,7 @@ mod tests {
     #[test]
     fn covariates_serde_roundtrip() {
         let cov = Covariates {
-            rss_gb: 3.14,
+            rss_gb: 3.25,
             pane_count: 42.0,
             output_rate_mbps: 2.71,
             uptime_hours: 100.0,
@@ -795,7 +795,7 @@ mod tests {
         };
         let json = serde_json::to_string(&cov).unwrap();
         let back: Covariates = serde_json::from_str(&json).unwrap();
-        assert!((back.rss_gb - 3.14).abs() < 1e-10);
+        assert!((back.rss_gb - 3.25).abs() < 1e-10);
     }
 
     // -- Log-likelihood -------------------------------------------------------

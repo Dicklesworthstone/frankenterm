@@ -27,32 +27,30 @@ fn arb_valid_email() -> impl Strategy<Value = String> {
 
 fn arb_valid_config() -> impl Strategy<Value = EmailNotifyConfig> {
     (
-        "[a-z]{3,15}\\.[a-z]{2,5}",    // smtp_host
-        1_u16..65535,                    // smtp_port
+        "[a-z]{3,15}\\.[a-z]{2,5}", // smtp_host
+        1_u16..65535,               // smtp_port
         arb_tls_mode(),
-        arb_valid_email(),               // from
+        arb_valid_email(),                                  // from
         proptest::collection::vec(arb_valid_email(), 1..4), // to
-        "[a-z]{3,10}",                   // subject_prefix
-        proptest::option::of("[a-z]{3,10}"), // username
-        1_u64..3600,                     // timeout_secs
+        "[a-z]{3,10}",                                      // subject_prefix
+        proptest::option::of("[a-z]{3,10}"),                // username
+        1_u64..3600,                                        // timeout_secs
     )
-        .prop_map(
-            |(host, port, tls, from, to, prefix, username, timeout)| {
-                let password = username.as_ref().map(|_| "secret123".to_string());
-                EmailNotifyConfig {
-                    enabled: true,
-                    smtp_host: host,
-                    smtp_port: port,
-                    username,
-                    password,
-                    from,
-                    to,
-                    subject_prefix: prefix,
-                    tls,
-                    timeout_secs: timeout,
-                }
-            },
-        )
+        .prop_map(|(host, port, tls, from, to, prefix, username, timeout)| {
+            let password = username.as_ref().map(|_| "secret123".to_string());
+            EmailNotifyConfig {
+                enabled: true,
+                smtp_host: host,
+                smtp_port: port,
+                username,
+                password,
+                from,
+                to,
+                subject_prefix: prefix,
+                tls,
+                timeout_secs: timeout,
+            }
+        })
 }
 
 // =========================================================================
@@ -336,7 +334,11 @@ fn default_config_has_subject_prefix() {
 
 #[test]
 fn tls_modes_are_distinct() {
-    let modes = [EmailTlsMode::None, EmailTlsMode::StartTls, EmailTlsMode::Tls];
+    let modes = [
+        EmailTlsMode::None,
+        EmailTlsMode::StartTls,
+        EmailTlsMode::Tls,
+    ];
     for (i, a) in modes.iter().enumerate() {
         for (j, b) in modes.iter().enumerate() {
             if i != j {

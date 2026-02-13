@@ -764,7 +764,7 @@ proptest! {
     fn prop_filter_not_permissive_with_include(
         pattern in "[a-z]{1,10}\\.[a-z]{1,10}",
     ) {
-        let f = EventFilter::from_config(&[pattern.clone()], &[], None, &[]);
+        let f = EventFilter::from_config(std::slice::from_ref(&pattern), &[], None, &[]);
         prop_assert!(!f.is_permissive(),
             "filter with include should not be permissive");
     }

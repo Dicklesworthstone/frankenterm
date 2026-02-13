@@ -222,7 +222,7 @@ proptest! {
     fn caut_service_copy_clone_eq(_seed in 0u32..1000) {
         let svc = CautService::OpenAI;
         let copied = svc;     // Copy
-        let cloned = svc.clone();  // Clone
+        let cloned = svc;  // Clone
         prop_assert_eq!(svc, copied, "Copy must preserve equality");
         prop_assert_eq!(svc, cloned, "Clone must preserve equality");
         prop_assert_eq!(copied, cloned, "Copy and Clone must be equal");

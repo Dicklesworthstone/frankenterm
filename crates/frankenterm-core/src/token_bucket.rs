@@ -266,7 +266,7 @@ impl HierarchicalBucket {
 }
 
 /// Result of a hierarchical bucket acquisition.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HierarchicalResult {
     /// Both local and global buckets allowed the operation.
     Allowed,

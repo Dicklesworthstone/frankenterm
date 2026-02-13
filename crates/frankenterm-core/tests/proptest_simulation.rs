@@ -52,14 +52,14 @@ fn arb_stage_sample() -> impl Strategy<Value = ResizeTimelineStageSample> {
         0_u64..1_000_000,
         proptest::option::of(arb_queue_metrics()),
     )
-        .prop_map(
-            |(stage, start_offset_ns, duration_ns, queue_metrics)| ResizeTimelineStageSample {
+        .prop_map(|(stage, start_offset_ns, duration_ns, queue_metrics)| {
+            ResizeTimelineStageSample {
                 stage,
                 start_offset_ns,
                 duration_ns,
                 queue_metrics,
-            },
-        )
+            }
+        })
 }
 
 fn arb_timeline_event() -> impl Strategy<Value = ResizeTimelineEvent> {
@@ -73,7 +73,15 @@ fn arb_timeline_event() -> impl Strategy<Value = ResizeTimelineEvent> {
         proptest::collection::vec(arb_stage_sample(), 0..6),
     )
         .prop_map(
-            |(event_index, pane_id, action, scheduled_at_ns, dispatch_offset_ns, total_duration_ns, stages)| {
+            |(
+                event_index,
+                pane_id,
+                action,
+                scheduled_at_ns,
+                dispatch_offset_ns,
+                total_duration_ns,
+                stages,
+            )| {
                 ResizeTimelineEvent {
                     event_index,
                     pane_id,
@@ -94,12 +102,14 @@ fn arb_flame_sample() -> impl Strategy<Value = ResizeTimelineFlameSample> {
         0_usize..100,
         0_u64..100,
     )
-        .prop_map(|(stack, duration_ns, event_index, pane_id)| ResizeTimelineFlameSample {
-            stack,
-            duration_ns,
-            event_index,
-            pane_id,
-        })
+        .prop_map(
+            |(stack, duration_ns, event_index, pane_id)| ResizeTimelineFlameSample {
+                stack,
+                duration_ns,
+                event_index,
+                pane_id,
+            },
+        )
 }
 
 fn arb_resize_timeline() -> impl Strategy<Value = ResizeTimeline> {

@@ -244,7 +244,7 @@ proptest! {
     /// SnapshotTrigger Clone produces an equal value.
     #[test]
     fn trigger_clone_eq(trigger in arb_trigger()) {
-        let cloned = trigger.clone();
+        let cloned = trigger;
         prop_assert_eq!(trigger, cloned, "Clone should produce equal value");
     }
 }

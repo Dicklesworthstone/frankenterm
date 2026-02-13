@@ -8,7 +8,7 @@
 use std::time::Duration;
 
 use frankenterm_core::tantivy_quality::{
-    AssertionResult, LatencyBudget, QueryClass, QueryTestResult, QualityReport,
+    AssertionResult, LatencyBudget, QualityReport, QueryClass, QueryTestResult,
     default_latency_budgets,
 };
 use proptest::prelude::*;
@@ -53,8 +53,17 @@ fn arb_query_test_result() -> impl Strategy<Value = QueryTestResult> {
         proptest::option::of("[a-z ]{5,20}"),
     )
         .prop_map(
-            |(name, passed, assertion_results, latency_ok, duration_us,
-              budget_us, hits_returned, total_hits, error)| {
+            |(
+                name,
+                passed,
+                assertion_results,
+                latency_ok,
+                duration_us,
+                budget_us,
+                hits_returned,
+                total_hits,
+                error,
+            )| {
                 QueryTestResult {
                     name,
                     passed,
@@ -260,7 +269,10 @@ fn all_query_classes_distinct_json() {
         QueryClass::Forensic,
         QueryClass::HighCardinality,
     ];
-    let jsons: Vec<_> = classes.iter().map(|c| serde_json::to_string(c).unwrap()).collect();
+    let jsons: Vec<_> = classes
+        .iter()
+        .map(|c| serde_json::to_string(c).unwrap())
+        .collect();
     for i in 0..jsons.len() {
         for j in (i + 1)..jsons.len() {
             assert_ne!(jsons[i], jsons[j]);

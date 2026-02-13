@@ -200,7 +200,7 @@ proptest! {
     fn prop_max_shard_count_clamped(n in arb_shard_count()) {
         let max_tracker = ShardedMax::with_shards(n);
         let sc = max_tracker.shard_count();
-        prop_assert!(sc >= 1 && sc <= 64);
+        prop_assert!((1..=64).contains(&sc));
     }
 }
 

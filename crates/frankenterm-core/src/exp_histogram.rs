@@ -548,7 +548,7 @@ mod tests {
         h.record(50.0);
         h.clear();
         assert_eq!(h.count(), 0);
-        assert_eq!(h.sum(), 0.0);
+        assert!(h.sum().abs() < f64::EPSILON);
         assert_eq!(h.min(), None);
     }
 

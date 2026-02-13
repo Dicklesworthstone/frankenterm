@@ -685,7 +685,7 @@ mod tests {
         let c = SessionCorrelation::unlinked(vec!["no_match".to_string()], 0, 100, 200);
         assert_eq!(c.status, CorrelationStatus::Unlinked);
         assert!(c.external_id.is_none());
-        assert_eq!(c.confidence, 0.0);
+        assert!(c.confidence.abs() < f64::EPSILON);
         assert_eq!(c.candidates_considered, 0);
         assert!(c.error.is_none());
     }

@@ -12,16 +12,17 @@ use proptest::prelude::*;
 
 fn arb_backfill_range() -> impl Strategy<Value = BackfillRange> {
     prop_oneof![
-        (0_u64..100_000, 0_u64..100_000)
-            .prop_map(|(a, b)| {
-                let (start, end) = if a <= b { (a, b) } else { (b, a) };
-                BackfillRange::OrdinalRange { start, end }
-            }),
-        (0_u64..2_000_000_000_000, 0_u64..2_000_000_000_000)
-            .prop_map(|(a, b)| {
-                let (start, end) = if a <= b { (a, b) } else { (b, a) };
-                BackfillRange::TimeRange { start_ms: start, end_ms: end }
-            }),
+        (0_u64..100_000, 0_u64..100_000).prop_map(|(a, b)| {
+            let (start, end) = if a <= b { (a, b) } else { (b, a) };
+            BackfillRange::OrdinalRange { start, end }
+        }),
+        (0_u64..2_000_000_000_000, 0_u64..2_000_000_000_000).prop_map(|(a, b)| {
+            let (start, end) = if a <= b { (a, b) } else { (b, a) };
+            BackfillRange::TimeRange {
+                start_ms: start,
+                end_ms: end,
+            }
+        }),
         Just(BackfillRange::All),
     ]
 }
@@ -38,8 +39,16 @@ fn arb_reindex_progress() -> impl Strategy<Value = ReindexProgress> {
         0_u64..10_000,
     )
         .prop_map(
-            |(events_read, events_indexed, events_skipped, events_filtered,
-              batches_committed, current_ordinal, caught_up, docs_cleared)| {
+            |(
+                events_read,
+                events_indexed,
+                events_skipped,
+                events_filtered,
+                batches_committed,
+                current_ordinal,
+                caught_up,
+                docs_cleared,
+            )| {
                 ReindexProgress {
                     events_read,
                     events_indexed,

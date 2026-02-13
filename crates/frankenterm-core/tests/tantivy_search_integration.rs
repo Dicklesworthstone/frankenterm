@@ -606,7 +606,11 @@ fn empty_query_with_filter_returns_all_matching() {
     let results = svc.search(&query).unwrap();
     assert_eq!(results.total_hits, 1);
     assert_eq!(results.hits[0].doc.pane_id, 1);
-    assert_eq!(results.hits[0].score, 0.0);
+    assert!(
+        (results.hits[0].score - 0.0).abs() < f32::EPSILON,
+        "score should be 0.0, got {}",
+        results.hits[0].score
+    );
 }
 
 #[test]
@@ -1090,7 +1094,12 @@ fn text_symbols_boost_affects_ranking() {
     let results = svc.search(&SearchQuery::simple("path")).unwrap();
     assert_eq!(results.total_hits, 2);
     // Both have same TF, so scores should be equal
-    assert_eq!(results.hits[0].score, results.hits[1].score);
+    assert!(
+        (results.hits[0].score - results.hits[1].score).abs() < f32::EPSILON,
+        "scores should be equal: {} vs {}",
+        results.hits[0].score,
+        results.hits[1].score
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -10,86 +10,130 @@ use proptest::prelude::*;
 // Strategy — split into two groups to stay within 12-tuple limit
 // =========================================================================
 
+/// Identity fields tuple: (schema_version, lexical_schema_version, event_id,
+/// pane_id, session_id, workflow_id, correlation_id, parent_event_id,
+/// trigger_event_id, root_event_id).
+type IdentityFields = (
+    String,
+    String,
+    String,
+    u64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+/// Content fields tuple: (source, event_type, ingress_kind, segment_kind,
+/// control_marker_type, lifecycle_phase, is_gap, redaction, occurred_at_ms,
+/// recorded_at_ms, sequence, log_offset).
+type ContentFields = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    bool,
+    Option<String>,
+    i64,
+    i64,
+    u64,
+    u64,
+);
+
 /// First half of the document fields.
-fn arb_identity_fields() -> impl Strategy<Value = (
-    String, String, String, u64,
-    Option<String>, Option<String>, Option<String>,
-    Option<String>, Option<String>, Option<String>,
-)> {
+fn arb_identity_fields() -> impl Strategy<Value = IdentityFields> {
     (
-        "[a-z.]{3,10}",         // schema_version
-        "[a-z.]{3,10}",         // lexical_schema_version
-        "[a-f0-9]{8,16}",       // event_id
-        0_u64..100_000,         // pane_id
-        proptest::option::of("[a-f0-9]{8,16}"),  // session_id
-        proptest::option::of("[a-f0-9]{8,16}"),  // workflow_id
-        proptest::option::of("[a-f0-9]{8,16}"),  // correlation_id
-        proptest::option::of("[a-f0-9]{8,16}"),  // parent_event_id
-        proptest::option::of("[a-f0-9]{8,16}"),  // trigger_event_id
-        proptest::option::of("[a-f0-9]{8,16}"),  // root_event_id
+        "[a-z.]{3,10}",                         // schema_version
+        "[a-z.]{3,10}",                         // lexical_schema_version
+        "[a-f0-9]{8,16}",                       // event_id
+        0_u64..100_000,                         // pane_id
+        proptest::option::of("[a-f0-9]{8,16}"), // session_id
+        proptest::option::of("[a-f0-9]{8,16}"), // workflow_id
+        proptest::option::of("[a-f0-9]{8,16}"), // correlation_id
+        proptest::option::of("[a-f0-9]{8,16}"), // parent_event_id
+        proptest::option::of("[a-f0-9]{8,16}"), // trigger_event_id
+        proptest::option::of("[a-f0-9]{8,16}"), // root_event_id
     )
 }
 
 /// Second half of the document fields.
-fn arb_content_fields() -> impl Strategy<Value = (
-    String, String,
-    Option<String>, Option<String>, Option<String>, Option<String>,
-    bool, Option<String>,
-    i64, i64, u64, u64,
-)> {
+fn arb_content_fields() -> impl Strategy<Value = ContentFields> {
     (
-        "[a-z_]{3,15}",         // source
-        "[a-z_]{3,15}",         // event_type
-        proptest::option::of("[a-z_]{3,10}"),  // ingress_kind
-        proptest::option::of("[a-z_]{3,10}"),  // segment_kind
-        proptest::option::of("[a-z_]{3,10}"),  // control_marker_type
-        proptest::option::of("[a-z_]{3,10}"),  // lifecycle_phase
-        any::<bool>(),          // is_gap
-        proptest::option::of("[a-z_]{3,10}"),  // redaction
-        0_i64..2_000_000_000_000,  // occurred_at_ms
-        0_i64..2_000_000_000_000,  // recorded_at_ms
-        0_u64..100_000,         // sequence
-        0_u64..100_000,         // log_offset
+        "[a-z_]{3,15}",                       // source
+        "[a-z_]{3,15}",                       // event_type
+        proptest::option::of("[a-z_]{3,10}"), // ingress_kind
+        proptest::option::of("[a-z_]{3,10}"), // segment_kind
+        proptest::option::of("[a-z_]{3,10}"), // control_marker_type
+        proptest::option::of("[a-z_]{3,10}"), // lifecycle_phase
+        any::<bool>(),                        // is_gap
+        proptest::option::of("[a-z_]{3,10}"), // redaction
+        0_i64..2_000_000_000_000,             // occurred_at_ms
+        0_i64..2_000_000_000_000,             // recorded_at_ms
+        0_u64..100_000,                       // sequence
+        0_u64..100_000,                       // log_offset
     )
 }
 
 fn arb_index_document() -> impl Strategy<Value = IndexDocumentFields> {
-    (arb_identity_fields(), arb_content_fields())
-        .prop_map(|(identity, content)| {
-            let (schema_version, lexical_schema_version, event_id, pane_id,
-                 session_id, workflow_id, correlation_id,
-                 parent_event_id, trigger_event_id, root_event_id) = identity;
-            let (source, event_type, ingress_kind, segment_kind,
-                 control_marker_type, lifecycle_phase, is_gap, redaction,
-                 occurred_at_ms, recorded_at_ms, sequence, log_offset) = content;
-            IndexDocumentFields {
-                schema_version,
-                lexical_schema_version,
-                event_id,
-                pane_id,
-                session_id,
-                workflow_id,
-                correlation_id,
-                parent_event_id,
-                trigger_event_id,
-                root_event_id,
-                source,
-                event_type,
-                ingress_kind,
-                segment_kind,
-                control_marker_type,
-                lifecycle_phase,
-                is_gap,
-                redaction,
-                occurred_at_ms,
-                recorded_at_ms,
-                sequence,
-                log_offset,
-                text: String::new(),
-                text_symbols: String::new(),
-                details_json: "{}".to_string(),
-            }
-        })
+    (arb_identity_fields(), arb_content_fields()).prop_map(|(identity, content)| {
+        let (
+            schema_version,
+            lexical_schema_version,
+            event_id,
+            pane_id,
+            session_id,
+            workflow_id,
+            correlation_id,
+            parent_event_id,
+            trigger_event_id,
+            root_event_id,
+        ) = identity;
+        let (
+            source,
+            event_type,
+            ingress_kind,
+            segment_kind,
+            control_marker_type,
+            lifecycle_phase,
+            is_gap,
+            redaction,
+            occurred_at_ms,
+            recorded_at_ms,
+            sequence,
+            log_offset,
+        ) = content;
+        IndexDocumentFields {
+            schema_version,
+            lexical_schema_version,
+            event_id,
+            pane_id,
+            session_id,
+            workflow_id,
+            correlation_id,
+            parent_event_id,
+            trigger_event_id,
+            root_event_id,
+            source,
+            event_type,
+            ingress_kind,
+            segment_kind,
+            control_marker_type,
+            lifecycle_phase,
+            is_gap,
+            redaction,
+            occurred_at_ms,
+            recorded_at_ms,
+            sequence,
+            log_offset,
+            text: String::new(),
+            text_symbols: String::new(),
+            details_json: "{}".to_string(),
+        }
+    })
 }
 
 // =========================================================================

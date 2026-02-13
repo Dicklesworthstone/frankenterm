@@ -208,8 +208,8 @@ impl RecoveryConfig {
             self.initial_delay.as_millis() as f64 * self.backoff_factor.powi(attempt as i32);
         let capped_ms = base_ms.min(self.max_delay.as_millis() as f64);
         let jitter_range = capped_ms * self.jitter_fraction;
-        let jitter_seed = ((attempt as f64 * 7.13).sin().abs()) * 2.0 - 1.0;
-        let jittered_ms = (capped_ms + jitter_range * jitter_seed).max(1.0);
+        let jitter_seed = ((attempt as f64 * 7.13).sin().abs()).mul_add(2.0, -1.0);
+        let jittered_ms = jitter_range.mul_add(jitter_seed, capped_ms).max(1.0);
         Duration::from_millis(jittered_ms as u64)
     }
 }

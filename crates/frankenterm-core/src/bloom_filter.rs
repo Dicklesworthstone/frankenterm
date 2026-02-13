@@ -98,7 +98,7 @@ impl BloomFilter {
 
         let num_bits = optimal_num_bits(capacity, fp_rate);
         let num_hashes = optimal_num_hashes(num_bits, capacity);
-        let words = (num_bits + 63) / 64;
+        let words = num_bits.div_ceil(64);
 
         Self {
             bits: vec![0u64; words],
@@ -113,7 +113,7 @@ impl BloomFilter {
     pub fn with_params(num_bits: usize, num_hashes: u32) -> Self {
         assert!(num_bits > 0, "num_bits must be > 0");
         assert!(num_hashes > 0, "num_hashes must be > 0");
-        let words = (num_bits + 63) / 64;
+        let words = num_bits.div_ceil(64);
         Self {
             bits: vec![0u64; words],
             num_bits,
@@ -257,7 +257,7 @@ impl CountingBloomFilter {
         let num_buckets = optimal_num_bits(capacity, fp_rate);
         let num_hashes = optimal_num_hashes(num_buckets, capacity);
         // 16 counters per u64 (4 bits each).
-        let words = (num_buckets + 15) / 16;
+        let words = num_buckets.div_ceil(16);
 
         Self {
             counters: vec![0u64; words],
@@ -463,7 +463,7 @@ mod tests {
         let bits = optimal_num_bits(1000, 0.01);
         let k = optimal_num_hashes(bits, 1000);
         // Should be ~7 hash functions.
-        assert!(k >= 6 && k <= 8, "k = {k}");
+        assert!((6..=8).contains(&k), "k = {k}");
     }
 
     #[test]

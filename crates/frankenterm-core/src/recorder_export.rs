@@ -274,6 +274,7 @@ impl<R: RecorderEventReader> RecorderExporter<R> {
     }
 
     /// Set the maximum export size.
+    #[must_use]
     pub fn with_max_events(mut self, max: usize) -> Self {
         self.max_export_events = max;
         self
@@ -289,7 +290,7 @@ impl<R: RecorderEventReader> RecorderExporter<R> {
         // 1. Build a query request from the export request.
         let mut query = RecorderQueryRequest::default();
         query.time_range = request.time_range;
-        query.pane_ids = request.pane_ids.clone();
+        query.pane_ids.clone_from(&request.pane_ids);
         query.include_text = request.include_text;
         query.max_sensitivity = request.max_sensitivity;
 
@@ -462,9 +463,9 @@ fn format_csv(events: &[crate::recorder_query::QueryResultEvent]) -> Result<Stri
         let text_escaped = row.text.as_deref().unwrap_or("").replace('"', "\"\"");
         let session = row.session_id.as_deref().unwrap_or("");
 
-        write!(
+        writeln!(
             output,
-            "{},{},{},{},{},{},{},{},{},\"{}\"\n",
+            "{},{},{},{},{},{},{},{},{},\"{}\"",
             row.event_id,
             row.pane_id,
             row.source,
@@ -489,9 +490,9 @@ fn format_transcript(
     output.push_str("#\n");
 
     if let (Some(first), Some(last)) = (events.first(), events.last()) {
-        write!(
+        writeln!(
             output,
-            "# Time range: {} — {}\n",
+            "# Time range: {} — {}",
             first.occurred_at_ms, last.occurred_at_ms
         )
         .map_err(|e| ExportError::FormatError(e.to_string()))?;
@@ -500,9 +501,9 @@ fn format_transcript(
     let mut panes: Vec<u64> = events.iter().map(|e| e.pane_id).collect();
     panes.sort();
     panes.dedup();
-    write!(output, "# Panes: {:?}\n", panes)
+    writeln!(output, "# Panes: {:?}", panes)
         .map_err(|e| ExportError::FormatError(e.to_string()))?;
-    write!(output, "# Events: {}\n", events.len())
+    writeln!(output, "# Events: {}", events.len())
         .map_err(|e| ExportError::FormatError(e.to_string()))?;
     output.push_str("#\n\n");
 
@@ -549,8 +550,7 @@ mod tests {
     use super::*;
     use crate::policy::ActorKind;
     use crate::recorder_audit::AuditLogConfig;
-    use crate::recorder_query::{InMemoryEventStore, QueryResultEvent};
-    use crate::recording::RecorderEventSource;
+    use crate::recorder_query::InMemoryEventStore;
 
     // -----------------------------------------------------------------------
     // Helpers
@@ -644,8 +644,7 @@ mod tests {
         let req = ExportRequest::jsonl(0, 5000);
 
         let result = exporter.export(&human(), &req, NOW).unwrap();
-        let lines: Vec<_> = result.data.lines().collect();
-        assert_eq!(lines.len(), 4);
+        assert_eq!(result.data.lines().count(), 4);
     }
 
     // -----------------------------------------------------------------------

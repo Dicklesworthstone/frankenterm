@@ -153,12 +153,10 @@ proptest! {
         let vals = [AlertLevel::Info, AlertLevel::Warning, AlertLevel::Critical, AlertLevel::Exceeded];
         let idx1 = vals.iter().position(|&v| v == l1).unwrap();
         let idx2 = vals.iter().position(|&v| v == l2).unwrap();
-        if idx1 < idx2 {
-            prop_assert!(l1 < l2);
-        } else if idx1 == idx2 {
-            prop_assert_eq!(l1, l2);
-        } else {
-            prop_assert!(l1 > l2);
+        match idx1.cmp(&idx2) {
+            std::cmp::Ordering::Less => prop_assert!(l1 < l2),
+            std::cmp::Ordering::Equal => prop_assert_eq!(l1, l2),
+            std::cmp::Ordering::Greater => prop_assert!(l1 > l2),
         }
     }
 

@@ -328,7 +328,10 @@ fn all_regimes_distinct_json() {
         LoadRegime::Burst,
         LoadRegime::Overload,
     ];
-    let jsons: Vec<_> = regimes.iter().map(|r| serde_json::to_string(r).unwrap()).collect();
+    let jsons: Vec<_> = regimes
+        .iter()
+        .map(|r| serde_json::to_string(r).unwrap())
+        .collect();
     for i in 0..jsons.len() {
         for j in (i + 1)..jsons.len() {
             assert_ne!(jsons[i], jsons[j]);
@@ -344,7 +347,10 @@ fn all_strategies_distinct_json() {
         MergeStrategy::Conservative,
         MergeStrategy::NoMerge,
     ];
-    let jsons: Vec<_> = strategies.iter().map(|s| serde_json::to_string(s).unwrap()).collect();
+    let jsons: Vec<_> = strategies
+        .iter()
+        .map(|s| serde_json::to_string(s).unwrap())
+        .collect();
     for i in 0..jsons.len() {
         for j in (i + 1)..jsons.len() {
             assert_ne!(jsons[i], jsons[j]);

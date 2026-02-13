@@ -83,9 +83,9 @@ impl RefModel {
     }
 
     fn put(&mut self, key: u16, value: i32) -> Option<(u16, i32)> {
-        if self.map.contains_key(&key) {
+        if let std::collections::hash_map::Entry::Occupied(mut e) = self.map.entry(key) {
             // Update existing
-            self.map.insert(key, value);
+            e.insert(value);
             self.promote(key);
             return None;
         }
@@ -636,8 +636,8 @@ proptest! {
 
         prop_assert!(cache.len() <= capacity);
         // Verify entries2 items are present (those not evicted)
-        let present: Vec<(u16, i32)> = cache.iter_mru().map(|(&k, &v)| (k, v)).collect();
-        prop_assert!(present.len() <= capacity);
+        let present_count = cache.iter_mru().count();
+        prop_assert!(present_count <= capacity);
     }
 }
 

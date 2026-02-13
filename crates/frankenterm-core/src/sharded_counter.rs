@@ -38,7 +38,7 @@ const MAX_SHARDS: usize = 64;
 fn shard_count() -> usize {
     // Use available parallelism as a proxy for core count.
     std::thread::available_parallelism()
-        .map(|n| n.get().min(MAX_SHARDS).max(1))
+        .map(|n| n.get().clamp(1, MAX_SHARDS))
         .unwrap_or(4)
 }
 
@@ -152,7 +152,7 @@ impl ShardedCounter {
 
     /// Reset all shards to zero.
     pub fn reset(&self) {
-        for shard in self.shards.iter() {
+        for shard in &*self.shards {
             shard.value.store(0, Ordering::Relaxed);
         }
     }
@@ -257,7 +257,7 @@ impl ShardedMax {
 
     /// Reset all shards to zero.
     pub fn reset(&self) {
-        for shard in self.shards.iter() {
+        for shard in &*self.shards {
             shard.value.store(0, Ordering::Relaxed);
         }
     }
@@ -327,7 +327,7 @@ impl ShardedGauge {
 
     /// Reset all shards to zero.
     pub fn reset(&self) {
-        for shard in self.shards.iter() {
+        for shard in &*self.shards {
             shard.value.store(0, Ordering::Relaxed);
         }
     }
@@ -606,7 +606,7 @@ mod tests {
     #[test]
     fn shards_are_on_separate_cache_lines() {
         let c = ShardedCounter::with_shards(4);
-        let ptrs: Vec<*const PaddedAtomicU64> = c.shards.iter().map(|s| s as *const _).collect();
+        let ptrs: Vec<*const PaddedAtomicU64> = c.shards.iter().map(std::ptr::from_ref).collect();
         for i in 1..ptrs.len() {
             let distance = (ptrs[i] as usize) - (ptrs[i - 1] as usize);
             assert!(

@@ -21,8 +21,7 @@
 use proptest::prelude::*;
 
 use frankenterm_core::drift::{
-    AdwinWindow, DriftConfig, DriftEvent, DriftInfo, DriftMonitor, DriftSummary, DriftType,
-    RuleMonitor, RuleSummary,
+    AdwinWindow, DriftConfig, DriftInfo, DriftMonitor, DriftSummary, DriftType, RuleMonitor,
 };
 
 // ────────────────────────────────────────────────────────────────────
@@ -30,11 +29,11 @@ use frankenterm_core::drift::{
 // ────────────────────────────────────────────────────────────────────
 
 fn arb_delta() -> impl Strategy<Value = f64> {
-    (0.001..=0.5_f64) // valid confidence range
+    0.001..=0.5_f64 // valid confidence range
 }
 
 fn arb_observation() -> impl Strategy<Value = f64> {
-    (-100.0..=100.0_f64)
+    -100.0..=100.0_f64
 }
 
 fn arb_observations(max_len: usize) -> impl Strategy<Value = Vec<f64>> {
@@ -97,7 +96,7 @@ proptest! {
         for &v in &observations {
             w.push(v);
             prop_assert!(
-                w.len() >= 1,
+                !w.is_empty(),
                 "window must not be empty after push, len={}", w.len()
             );
         }
@@ -128,8 +127,8 @@ proptest! {
         observations in prop::collection::vec(0.0..=100.0_f64, 1..200),
     ) {
         let mut w = AdwinWindow::new(delta);
-        let global_min = observations.iter().cloned().fold(f64::INFINITY, f64::min);
-        let global_max = observations.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let global_min = observations.iter().copied().fold(f64::INFINITY, f64::min);
+        let global_max = observations.iter().copied().fold(f64::NEG_INFINITY, f64::max);
 
         for &v in &observations {
             w.push(v);

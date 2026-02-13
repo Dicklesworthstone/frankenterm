@@ -127,8 +127,8 @@ proptest! {
         }
 
         let quantile = h.quantile(q).unwrap();
-        let min_val = values.iter().cloned().fold(f64::INFINITY, f64::min);
-        let max_val = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let min_val = values.iter().copied().fold(f64::INFINITY, f64::min);
+        let max_val = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
 
         prop_assert!(quantile >= min_val - 1e-10,
             "quantile {} should be >= min {}", quantile, min_val);

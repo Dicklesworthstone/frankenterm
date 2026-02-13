@@ -45,7 +45,7 @@ pub const LEXICAL_INDEXER_CONSUMER: &str = "tantivy-lexical-v1";
 ///
 /// Field names and semantics are 1:1 with `docs/flight-recorder/tantivy-schema-v1.md`.
 /// String fields use `Option<String>` where the source event field is optional.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexDocumentFields {
     // --- identity ---
     pub schema_version: String,
@@ -215,7 +215,9 @@ fn redacted_text(text: &str, level: RecorderRedactionLevel) -> String {
 }
 
 fn format_source(s: crate::recording::RecorderEventSource) -> String {
-    use crate::recording::RecorderEventSource::*;
+    use crate::recording::RecorderEventSource::{
+        OperatorAction, RecoveryFlow, RobotMode, WeztermMux, WorkflowEngine,
+    };
     match s {
         WeztermMux => "wezterm_mux",
         RobotMode => "robot_mode",
@@ -227,7 +229,7 @@ fn format_source(s: crate::recording::RecorderEventSource) -> String {
 }
 
 fn format_ingress_kind(k: crate::recording::RecorderIngressKind) -> String {
-    use crate::recording::RecorderIngressKind::*;
+    use crate::recording::RecorderIngressKind::{Paste, SendText, WorkflowAction};
     match k {
         SendText => "send_text",
         Paste => "paste",
@@ -237,7 +239,7 @@ fn format_ingress_kind(k: crate::recording::RecorderIngressKind) -> String {
 }
 
 fn format_segment_kind(k: crate::recording::RecorderSegmentKind) -> String {
-    use crate::recording::RecorderSegmentKind::*;
+    use crate::recording::RecorderSegmentKind::{Delta, Gap, Snapshot};
     match k {
         Delta => "delta",
         Gap => "gap",
@@ -247,7 +249,9 @@ fn format_segment_kind(k: crate::recording::RecorderSegmentKind) -> String {
 }
 
 fn format_control_marker(t: crate::recording::RecorderControlMarkerType) -> String {
-    use crate::recording::RecorderControlMarkerType::*;
+    use crate::recording::RecorderControlMarkerType::{
+        ApprovalCheckpoint, PolicyDecision, PromptBoundary, Resize,
+    };
     match t {
         PromptBoundary => "prompt_boundary",
         Resize => "resize",
@@ -258,7 +262,9 @@ fn format_control_marker(t: crate::recording::RecorderControlMarkerType) -> Stri
 }
 
 fn format_lifecycle_phase(p: crate::recording::RecorderLifecyclePhase) -> String {
-    use crate::recording::RecorderLifecyclePhase::*;
+    use crate::recording::RecorderLifecyclePhase::{
+        CaptureStarted, CaptureStopped, PaneClosed, PaneOpened, ReplayFinished, ReplayStarted,
+    };
     match p {
         CaptureStarted => "capture_started",
         CaptureStopped => "capture_stopped",
@@ -737,7 +743,7 @@ impl<W: IndexWriter> IncrementalIndexer<W> {
 
                 // Dedup: delete existing doc with same event_id before re-adding
                 if self.config.dedup_on_replay {
-                    if let Err(_) = self.writer.delete_by_event_id(&doc.event_id) {
+                    if self.writer.delete_by_event_id(&doc.event_id).is_err() {
                         // Deletion failure on a non-existent doc is fine; only
                         // propagate genuine failures on commit.
                     }

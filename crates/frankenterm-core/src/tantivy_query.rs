@@ -61,18 +61,21 @@ impl SearchQuery {
     }
 
     /// Add a filter to the query.
+    #[must_use]
     pub fn with_filter(mut self, filter: SearchFilter) -> Self {
         self.filters.push(filter);
         self
     }
 
     /// Set the page size.
+    #[must_use]
     pub fn with_limit(mut self, limit: usize) -> Self {
         self.pagination.limit = limit;
         self
     }
 
     /// Set a cursor for pagination.
+    #[must_use]
     pub fn with_cursor(mut self, cursor: PaginationCursor) -> Self {
         self.pagination.after = Some(cursor);
         self
@@ -94,7 +97,7 @@ impl SearchQuery {
 // ---------------------------------------------------------------------------
 
 /// A filter that narrows search results by an indexed field.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SearchFilter {
     /// Filter by pane ID (exact match or set membership).
@@ -418,8 +421,20 @@ pub fn extract_snippets(
             let end = (pos + term.len() + half_window).min(text.len());
 
             // Ensure we're at valid char boundaries
-            let start = text.floor_char_boundary(start);
-            let end = text.ceil_char_boundary(end);
+            let start = {
+                let mut j = start;
+                while j > 0 && !text.is_char_boundary(j) {
+                    j -= 1;
+                }
+                j
+            };
+            let end = {
+                let mut j = end.min(text.len());
+                while j < text.len() && !text.is_char_boundary(j) {
+                    j += 1;
+                }
+                j
+            };
 
             let raw_fragment = &text[start..end];
 

@@ -193,16 +193,20 @@ impl UnionFind {
         if rx == ry {
             return rx;
         }
-        if self.rank[rx] < self.rank[ry] {
-            self.parent[rx] = ry;
-            ry
-        } else if self.rank[rx] > self.rank[ry] {
-            self.parent[ry] = rx;
-            rx
-        } else {
-            self.parent[ry] = rx;
-            self.rank[rx] += 1;
-            rx
+        match self.rank[rx].cmp(&self.rank[ry]) {
+            std::cmp::Ordering::Less => {
+                self.parent[rx] = ry;
+                ry
+            }
+            std::cmp::Ordering::Greater => {
+                self.parent[ry] = rx;
+                rx
+            }
+            std::cmp::Ordering::Equal => {
+                self.parent[ry] = rx;
+                self.rank[rx] += 1;
+                rx
+            }
         }
     }
 

@@ -1269,7 +1269,7 @@ proptest! {
             ..Default::default()
         };
         let created_at_ms = 0u64;
-        let sealed_at_ms = 1 * MS_PER_HOUR; // sealed very quickly
+        let sealed_at_ms = MS_PER_HOUR; // sealed very quickly
 
         let mut seg = make_active_segment("t3_seg", SensitivityTier::T3Restricted, created_at_ms, 100, 10);
         seg.transition(SegmentPhase::Sealed, sealed_at_ms).unwrap();
@@ -1295,7 +1295,7 @@ proptest! {
             ..Default::default()
         };
         let created_at_ms = 0u64;
-        let sealed_at_ms = 1 * MS_PER_HOUR;
+        let sealed_at_ms = MS_PER_HOUR;
         let archived_at_ms = 2 * MS_PER_HOUR;
 
         let mut seg = make_active_segment("t3_seg", SensitivityTier::T3Restricted, created_at_ms, 100, 10);
@@ -1400,7 +1400,7 @@ proptest! {
     ) {
         let mut mgr = RetentionManager::with_defaults();
 
-        let mut s_active = make_active_segment("a1", SensitivityTier::T1Standard, 0, active_size, 10);
+        let s_active = make_active_segment("a1", SensitivityTier::T1Standard, 0, active_size, 10);
         mgr.add_segment(s_active);
 
         let mut s_sealed = make_segment_at_phase("s1", SensitivityTier::T1Standard, SegmentPhase::Sealed, 0);

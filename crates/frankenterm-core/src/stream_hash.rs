@@ -361,7 +361,7 @@ mod tests {
         batch.update(data);
 
         let mut inc = StreamHash::new();
-        for &b in data.iter() {
+        for &b in data {
             inc.update_byte(b);
         }
 

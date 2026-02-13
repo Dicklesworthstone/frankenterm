@@ -55,7 +55,7 @@ fn make_pane(id: u64, seed: u64) -> PaneState {
         has_new_output: r > 0.5,
         time_since_focus_s: r * 60.0,
         output_rate: r * 10.0,
-        error_count: if r > 0.8 { 1 } else { 0 },
+        error_count: u32::from(r > 0.8),
         process_active: r > 0.3,
         scroll_depth: r,
         interaction_count: (r * 20.0) as u32,

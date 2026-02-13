@@ -644,8 +644,15 @@ proptest! {
 
 #[test]
 fn all_db_check_statuses_distinct_json() {
-    let statuses = [DbCheckStatus::Ok, DbCheckStatus::Warning, DbCheckStatus::Error];
-    let jsons: Vec<_> = statuses.iter().map(|s| serde_json::to_string(s).unwrap()).collect();
+    let statuses = [
+        DbCheckStatus::Ok,
+        DbCheckStatus::Warning,
+        DbCheckStatus::Error,
+    ];
+    let jsons: Vec<_> = statuses
+        .iter()
+        .map(|s| serde_json::to_string(s).unwrap())
+        .collect();
     for i in 0..jsons.len() {
         for j in (i + 1)..jsons.len() {
             assert_ne!(jsons[i], jsons[j]);
@@ -685,7 +692,8 @@ fn approval_token_boundary_exact_expiry() {
 #[test]
 fn pane_reservation_boundary_exact_expiry() {
     let r = PaneReservation {
-        id: 1, pane_id: 42,
+        id: 1,
+        pane_id: 42,
         owner_kind: "workflow".into(),
         owner_id: "wf1".into(),
         reason: None,

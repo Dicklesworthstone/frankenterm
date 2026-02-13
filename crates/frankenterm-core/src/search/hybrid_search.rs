@@ -1,6 +1,6 @@
 //! Reciprocal Rank Fusion, two-tier blending, and hybrid search orchestration.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Search mode selector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,7 +80,7 @@ pub fn blend_two_tier(
 ) -> (Vec<FusedResult>, TwoTierMetrics) {
     let alpha = alpha.clamp(0.0, 1.0);
 
-    let mut seen: HashMap<u64, ()> = HashMap::new();
+    let mut seen: HashSet<u64> = HashSet::new();
     let mut results = Vec::with_capacity(top_k);
     let mut metrics = TwoTierMetrics::default();
 
@@ -94,10 +94,10 @@ pub fn blend_two_tier(
         if results.len() >= top_k {
             break;
         }
-        if seen.contains_key(&r.id) {
+        if seen.contains(&r.id) {
             continue;
         }
-        seen.insert(r.id, ());
+        seen.insert(r.id);
         results.push(FusedResult {
             id: r.id,
             score: r.score * alpha,
@@ -112,10 +112,10 @@ pub fn blend_two_tier(
         if results.len() >= top_k {
             break;
         }
-        if seen.contains_key(&r.id) {
+        if seen.contains(&r.id) {
             continue;
         }
-        seen.insert(r.id, ());
+        seen.insert(r.id);
         results.push(FusedResult {
             id: r.id,
             score: r.score * (1.0 - alpha),
@@ -204,16 +204,19 @@ impl HybridSearchService {
         }
     }
 
+    #[must_use]
     pub fn with_rrf_k(mut self, k: u32) -> Self {
         self.rrf_k = k;
         self
     }
 
+    #[must_use]
     pub fn with_alpha(mut self, alpha: f32) -> Self {
         self.alpha = alpha.clamp(0.0, 1.0);
         self
     }
 
+    #[must_use]
     pub fn with_mode(mut self, mode: SearchMode) -> Self {
         self.mode = mode;
         self
@@ -394,8 +397,8 @@ mod tests {
         }];
         let (results, _) = blend_two_tier(&tier1, &tier2, 10, 0.0);
         // alpha=0 means tier1 scores are zeroed, tier2 scores are full
-        assert_eq!(results[0].score, 0.0); // 1.0 * 0.0
-        assert_eq!(results[1].score, 0.5); // 0.5 * 1.0
+        assert!(results[0].score.abs() < f32::EPSILON); // 1.0 * 0.0
+        assert!((results[1].score - 0.5).abs() < f32::EPSILON); // 0.5 * 1.0
     }
 
     #[test]
@@ -416,8 +419,8 @@ mod tests {
 
     #[test]
     fn kendall_tau_empty() {
-        assert_eq!(kendall_tau(&[], &[1, 2, 3]), 0.0);
-        assert_eq!(kendall_tau(&[1], &[]), 0.0);
+        assert!(kendall_tau(&[], &[1, 2, 3]).abs() < f32::EPSILON);
+        assert!(kendall_tau(&[1], &[]).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -434,7 +437,7 @@ mod tests {
         let a = vec![1, 2];
         let b = vec![3, 4];
         let tau = kendall_tau(&a, &b);
-        assert_eq!(tau, 0.0);
+        assert!(tau.abs() < f32::EPSILON);
     }
 
     #[test]

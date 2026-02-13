@@ -415,7 +415,7 @@ impl<W: IndexWriter> ReindexPipeline<W> {
                 }
 
                 // Range filter
-                if !range.includes(ordinal, record.event.occurred_at_ms as u64) {
+                if !range.includes(ordinal, record.event.occurred_at_ms) {
                     progress.events_filtered += 1;
                     last_offset = Some(record.offset.clone());
                     continue;

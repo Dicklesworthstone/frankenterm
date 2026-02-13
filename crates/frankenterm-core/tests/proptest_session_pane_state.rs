@@ -681,13 +681,12 @@ proptest! {
         terminal in arb_terminal_state(),
     ) {
         // All safe env vars should be captured when present
-        let vars: Vec<(String, String)> = SAFE_ENV_VARS
-            .iter()
-            .map(|&name| (name.to_string(), value.clone()))
-            .collect();
-
         let snap = PaneStateSnapshot::new(pane_id, captured_at, terminal)
-            .with_env_from_iter(vars.into_iter());
+            .with_env_from_iter(
+                SAFE_ENV_VARS
+                    .iter()
+                    .map(|&name| (name.to_string(), value.clone())),
+            );
 
         let env = snap.env.as_ref().expect("env should be Some");
         for &safe_name in SAFE_ENV_VARS {
@@ -1025,8 +1024,8 @@ proptest! {
         let mut vars: Vec<(String, String)> = Vec::new();
 
         // Add some safe vars
-        for i in 0..num_safe.min(SAFE_ENV_VARS.len()) {
-            vars.push((SAFE_ENV_VARS[i].to_string(), format!("val_{}", i)));
+        for (i, &name) in SAFE_ENV_VARS.iter().enumerate().take(num_safe) {
+            vars.push((name.to_string(), format!("val_{}", i)));
         }
 
         // Add sensitive vars

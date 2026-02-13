@@ -122,12 +122,10 @@ proptest! {
         t1 in arb_tier(),
         t2 in arb_tier(),
     ) {
-        if t1 < t2 {
-            prop_assert!(t1.as_u8() < t2.as_u8());
-        } else if t1 == t2 {
-            prop_assert_eq!(t1.as_u8(), t2.as_u8());
-        } else {
-            prop_assert!(t1.as_u8() > t2.as_u8());
+        match t1.cmp(&t2) {
+            std::cmp::Ordering::Less => prop_assert!(t1.as_u8() < t2.as_u8()),
+            std::cmp::Ordering::Equal => prop_assert_eq!(t1.as_u8(), t2.as_u8()),
+            std::cmp::Ordering::Greater => prop_assert!(t1.as_u8() > t2.as_u8()),
         }
     }
 
@@ -176,8 +174,8 @@ proptest! {
     fn prop_ratios_bounded(d in arb_queue_depths()) {
         let cr = d.capture_ratio();
         let wr = d.write_ratio();
-        prop_assert!(cr >= 0.0 && cr <= 1.0, "capture_ratio {} out of bounds", cr);
-        prop_assert!(wr >= 0.0 && wr <= 1.0, "write_ratio {} out of bounds", wr);
+        prop_assert!((0.0..=1.0).contains(&cr), "capture_ratio {} out of bounds", cr);
+        prop_assert!((0.0..=1.0).contains(&wr), "write_ratio {} out of bounds", wr);
     }
 
     /// Zero capacity always gives ratio 0.0.

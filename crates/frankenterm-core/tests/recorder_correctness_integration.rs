@@ -557,23 +557,11 @@ fn stream_kind_from_payload_matches_event_type() {
 
 #[test]
 fn merge_keys_sort_by_recorded_at_then_pane_then_stream_then_sequence() {
-    let mut events = Vec::new();
-
     // Two events at same recorded_at_ms, different panes
-    events.push(build_event(
-        1,
-        0,
-        1000,
-        ingress_payload("p1"),
-        empty_causality(),
-    ));
-    events.push(build_event(
-        0,
-        0,
-        1000,
-        ingress_payload("p0"),
-        empty_causality(),
-    ));
+    let events = [
+        build_event(1, 0, 1000, ingress_payload("p1"), empty_causality()),
+        build_event(0, 0, 1000, ingress_payload("p0"), empty_causality()),
+    ];
 
     let mut keys: Vec<RecorderMergeKey> = events.iter().map(RecorderMergeKey::from_event).collect();
     keys.sort();

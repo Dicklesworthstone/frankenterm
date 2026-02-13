@@ -6,10 +6,10 @@
 //! - Decompression throughput: **> 200K lines/sec**
 //! - Edit distance (50-char lines): **< 5μs**
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use frankenterm_core::output_compression::{
-    compress, compression_stats, decompress, edit_distance, extract_template, lines_similar,
-    CompressionConfig,
+    CompressionConfig, compress, compression_stats, decompress, edit_distance, extract_template,
+    lines_similar,
 };
 use std::hint::black_box;
 

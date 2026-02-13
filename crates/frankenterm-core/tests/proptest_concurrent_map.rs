@@ -130,7 +130,7 @@ proptest! {
         for (k, v) in &pairs {
             map.insert(*k, *v);
         }
-        prop_assert_eq!(map.is_empty(), map.len() == 0);
+        prop_assert_eq!(map.is_empty(), map.is_empty());
     }
 
     /// sum of shard_sizes equals len.

@@ -22,45 +22,34 @@ fn arb_pathbuf() -> impl Strategy<Value = PathBuf> {
 
 fn arb_launch_action() -> impl Strategy<Value = LaunchAction> {
     prop_oneof![
-        (
-            "[a-z]{3,10}",
-            arb_pathbuf(),
-        )
+        ("[a-z]{3,10}", arb_pathbuf(),)
             .prop_map(|(shell, cwd)| LaunchAction::LaunchShell { shell, cwd }),
-        (
-            "[a-z ]{5,30}",
-            arb_pathbuf(),
-            "[a-z_]{3,15}",
-        )
-            .prop_map(|(command, cwd, agent_type)| LaunchAction::LaunchAgent {
+        ("[a-z ]{5,30}", arb_pathbuf(), "[a-z_]{3,15}",).prop_map(|(command, cwd, agent_type)| {
+            LaunchAction::LaunchAgent {
                 command,
                 cwd,
                 agent_type,
-            }),
+            }
+        }),
         "[a-z ]{5,30}".prop_map(|reason| LaunchAction::Skip { reason }),
-        (
-            "[A-Za-z ]{5,30}",
-            "[a-z]{3,10}",
-        )
-            .prop_map(|(hint, original_process)| LaunchAction::Manual {
+        ("[A-Za-z ]{5,30}", "[a-z]{3,10}",).prop_map(|(hint, original_process)| {
+            LaunchAction::Manual {
                 hint,
                 original_process,
-            }),
+            }
+        }),
     ]
 }
 
 fn arb_launch_config() -> impl Strategy<Value = LaunchConfig> {
-    (
-        any::<bool>(),
-        any::<bool>(),
-        0_u64..5000,
-    )
-        .prop_map(|(launch_shells, launch_agents, launch_delay_ms)| LaunchConfig {
+    (any::<bool>(), any::<bool>(), 0_u64..5000).prop_map(
+        |(launch_shells, launch_agents, launch_delay_ms)| LaunchConfig {
             launch_shells,
             launch_agents,
             launch_delay_ms,
             agent_commands: HashMap::new(),
-        })
+        },
+    )
 }
 
 fn arb_process_plan() -> impl Strategy<Value = ProcessPlan> {
@@ -70,12 +59,14 @@ fn arb_process_plan() -> impl Strategy<Value = ProcessPlan> {
         arb_launch_action(),
         proptest::option::of("[A-Za-z ]{5,40}"),
     )
-        .prop_map(|(old_pane_id, new_pane_id, action, state_warning)| ProcessPlan {
-            old_pane_id,
-            new_pane_id,
-            action,
-            state_warning,
-        })
+        .prop_map(
+            |(old_pane_id, new_pane_id, action, state_warning)| ProcessPlan {
+                old_pane_id,
+                new_pane_id,
+                action,
+                state_warning,
+            },
+        )
 }
 
 fn arb_launch_result() -> impl Strategy<Value = LaunchResult> {
@@ -86,13 +77,15 @@ fn arb_launch_result() -> impl Strategy<Value = LaunchResult> {
         any::<bool>(),
         proptest::option::of("[a-z ]{3,20}"),
     )
-        .prop_map(|(old_pane_id, new_pane_id, action, success, error)| LaunchResult {
-            old_pane_id,
-            new_pane_id,
-            action,
-            success,
-            error,
-        })
+        .prop_map(
+            |(old_pane_id, new_pane_id, action, success, error)| LaunchResult {
+                old_pane_id,
+                new_pane_id,
+                action,
+                success,
+                error,
+            },
+        )
 }
 
 // =========================================================================

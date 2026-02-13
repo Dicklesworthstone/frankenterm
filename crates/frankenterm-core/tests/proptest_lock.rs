@@ -16,12 +16,14 @@ fn arb_lock_metadata() -> impl Strategy<Value = LockMetadata> {
         "[a-z:0-9 ]{5,25}",
         "[0-9.]{3,10}",
     )
-        .prop_map(|(pid, started_at, started_at_human, wa_version)| LockMetadata {
-            pid,
-            started_at,
-            started_at_human,
-            wa_version,
-        })
+        .prop_map(
+            |(pid, started_at, started_at_human, wa_version)| LockMetadata {
+                pid,
+                started_at,
+                started_at_human,
+                wa_version,
+            },
+        )
 }
 
 // =========================================================================

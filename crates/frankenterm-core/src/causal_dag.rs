@@ -626,7 +626,7 @@ mod tests {
     fn te_too_short_returns_zero() {
         let x = vec![1.0, 2.0];
         let y = vec![3.0, 4.0];
-        assert_eq!(transfer_entropy(&x, &y, 1, 1, 4), 0.0);
+        assert!(transfer_entropy(&x, &y, 1, 1, 4).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -641,7 +641,7 @@ mod tests {
     #[test]
     fn te_non_negative() {
         let x: Vec<f64> = (0..50).map(|i| (i as f64) * 0.1).collect();
-        let y: Vec<f64> = (0..50).map(|i| (i as f64) * 0.2 + 1.0).collect();
+        let y: Vec<f64> = (0..50).map(|i| (i as f64).mul_add(0.2, 1.0)).collect();
         let te = transfer_entropy(&x, &y, 1, 1, 4);
         assert!(te >= 0.0, "TE must be non-negative: {te}");
     }
@@ -686,7 +686,7 @@ mod tests {
     fn permutation_test_zero_permutations() {
         let x = vec![1.0, 2.0, 3.0, 4.0, 5.0];
         let y = vec![2.0, 3.0, 4.0, 5.0, 6.0];
-        assert_eq!(permutation_test(&x, &y, 1, 1, 4, 0, 0.5), 1.0);
+        assert!((permutation_test(&x, &y, 1, 1, 4, 0, 0.5) - 1.0).abs() < f64::EPSILON);
     }
 
     // ── Causal DAG ───────────────────────────────────────────────────────

@@ -167,7 +167,7 @@ proptest! {
         items in arb_items(50),
     ) {
         let mut rs = ReservoirSampler::with_seed(capacity, seed);
-        let observed: HashSet<i32> = items.iter().cloned().collect();
+        let observed: HashSet<i32> = items.iter().copied().collect();
 
         for &item in &items {
             rs.observe(item);
@@ -413,7 +413,7 @@ proptest! {
             wr.observe(item, weight);
         }
 
-        for &item in wr.sample().iter() {
+        for &item in &wr.sample() {
             prop_assert!(
                 observed.contains(item),
                 "Weighted sample contains {} not in observed set", item

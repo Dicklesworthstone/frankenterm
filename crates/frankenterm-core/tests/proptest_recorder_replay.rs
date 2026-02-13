@@ -294,6 +294,7 @@ proptest! {
         }
 
         // Seek to middle of the time range.
+        #[allow(clippy::manual_midpoint)]
         let mid = min_ts + (max_ts - min_ts) / 2;
         let idx = session.seek(mid).unwrap();
 
@@ -304,10 +305,10 @@ proptest! {
             e
         };
 
-        for i in 0..idx {
-            prop_assert!(sorted_events[i].occurred_at_ms < mid,
+        for (i, event) in sorted_events.iter().enumerate().take(idx) {
+            prop_assert!(event.occurred_at_ms < mid,
                 "event at idx {} (ts={}) should be < seek target {}",
-                i, sorted_events[i].occurred_at_ms, mid);
+                i, event.occurred_at_ms, mid);
         }
 
         // Event at idx should have ts >= mid.

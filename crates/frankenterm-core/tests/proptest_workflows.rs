@@ -38,12 +38,12 @@ fn arb_text_match() -> impl Strategy<Value = TextMatch> {
 
 fn arb_wait_condition() -> impl Strategy<Value = WaitCondition> {
     prop_oneof![
-        "[a-z_]{1,32}".prop_map(|rule| WaitCondition::pattern(rule)),
+        "[a-z_]{1,32}".prop_map(WaitCondition::pattern),
         (1u64..=60_000).prop_map(WaitCondition::pane_idle),
         (1u64..=60_000).prop_map(WaitCondition::stable_tail),
         arb_text_match().prop_map(WaitCondition::text_match),
         (1u64..=30_000).prop_map(WaitCondition::sleep),
-        "[a-z_]{1,16}".prop_map(|key| WaitCondition::external(key)),
+        "[a-z_]{1,16}".prop_map(WaitCondition::external),
     ]
 }
 
@@ -52,9 +52,9 @@ fn arb_step_result() -> impl Strategy<Value = StepResult> {
         Just(StepResult::cont()),
         Just(StepResult::done_empty()),
         (1u64..=10_000).prop_map(StepResult::retry),
-        "[a-zA-Z0-9 ]{1,64}".prop_map(|r| StepResult::abort(r)),
+        "[a-zA-Z0-9 ]{1,64}".prop_map(StepResult::abort),
         arb_wait_condition().prop_map(StepResult::wait_for),
-        "[a-zA-Z0-9 ]{1,64}".prop_map(|t| StepResult::send_text(t)),
+        "[a-zA-Z0-9 ]{1,64}".prop_map(StepResult::send_text),
     ]
 }
 
@@ -654,14 +654,14 @@ proptest! {
 
     #[test]
     fn descriptor_rejects_wrong_schema_version(version in 2u32..=100) {
-        let yaml = format!(r#"
+        let yaml = format!(r"
 workflow_schema_version: {}
 name: test
 steps:
   - type: sleep
     id: step1
     duration_ms: 1000
-"#, version);
+", version);
         let result = WorkflowDescriptor::from_yaml_str(&yaml);
         prop_assert!(result.is_err(),
             "Descriptor with wrong schema version should be rejected");
@@ -669,11 +669,11 @@ steps:
 
     #[test]
     fn descriptor_rejects_empty_steps(_dummy in 0..1u8) {
-        let yaml = r#"
+        let yaml = r"
 workflow_schema_version: 1
 name: test
 steps: []
-"#;
+";
         let result = WorkflowDescriptor::from_yaml_str(yaml);
         prop_assert!(result.is_err(),
             "Descriptor with empty steps should be rejected");
@@ -695,14 +695,14 @@ steps: []
 
     #[test]
     fn descriptor_valid_single_sleep_step(duration_ms in 1u64..=30_000) {
-        let yaml = format!(r#"
+        let yaml = format!(r"
 workflow_schema_version: 1
 name: test_workflow
 steps:
   - type: sleep
     id: step1
     duration_ms: {}
-"#, duration_ms);
+", duration_ms);
         let result = WorkflowDescriptor::from_yaml_str(&yaml);
         prop_assert!(result.is_ok(),
             "Valid single-sleep descriptor should parse: {:?}", result.err());
@@ -710,14 +710,14 @@ steps:
 
     #[test]
     fn descriptor_rejects_sleep_too_long(duration_ms in 30_001u64..=100_000) {
-        let yaml = format!(r#"
+        let yaml = format!(r"
 workflow_schema_version: 1
 name: test
 steps:
   - type: sleep
     id: step1
     duration_ms: {}
-"#, duration_ms);
+", duration_ms);
         let result = WorkflowDescriptor::from_yaml_str(&yaml);
         prop_assert!(result.is_err(),
             "Sleep duration {} should exceed max (30000)", duration_ms);
@@ -725,7 +725,7 @@ steps:
 
     #[test]
     fn descriptor_rejects_duplicate_step_ids(id in "[a-z]{3,10}") {
-        let yaml = format!(r#"
+        let yaml = format!(r"
 workflow_schema_version: 1
 name: test
 steps:
@@ -735,7 +735,7 @@ steps:
   - type: sleep
     id: {}
     duration_ms: 200
-"#, id, id);
+", id, id);
         let result = WorkflowDescriptor::from_yaml_str(&yaml);
         prop_assert!(result.is_err(),
             "Descriptor with duplicate step ids should be rejected");

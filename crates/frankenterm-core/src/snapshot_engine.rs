@@ -321,6 +321,7 @@ impl SnapshotEngine {
     }
 
     /// Whether this trigger should bypass threshold accumulation and fire immediately.
+    #[allow(clippy::unused_self)]
     fn is_immediate_trigger(&self, trigger: SnapshotTrigger) -> bool {
         matches!(
             trigger,
@@ -1365,11 +1366,11 @@ mod tests {
         assert_eq!(after_startup, 1, "startup capture");
 
         // Sum = 4.0 < threshold(5.0)
-        engine.emit_trigger(SnapshotTrigger::WorkCompleted); // +2.0
+        let _ = engine.emit_trigger(SnapshotTrigger::WorkCompleted); // +2.0
         sleep(Duration::from_millis(50)).await;
-        engine.emit_trigger(SnapshotTrigger::StateTransition); // +1.0
+        let _ = engine.emit_trigger(SnapshotTrigger::StateTransition); // +1.0
         sleep(Duration::from_millis(50)).await;
-        engine.emit_trigger(SnapshotTrigger::StateTransition); // +1.0 = 4.0
+        let _ = engine.emit_trigger(SnapshotTrigger::StateTransition); // +1.0 = 4.0
         sleep(Duration::from_millis(100)).await;
 
         let after_below = checkpoint_count(db_path.as_str());
@@ -1396,11 +1397,11 @@ mod tests {
         sleep(Duration::from_millis(100)).await;
 
         // 3 x WorkCompleted = 6.0 >= 5.0
-        engine.emit_trigger(SnapshotTrigger::WorkCompleted);
+        let _ = engine.emit_trigger(SnapshotTrigger::WorkCompleted);
         sleep(Duration::from_millis(30)).await;
-        engine.emit_trigger(SnapshotTrigger::WorkCompleted);
+        let _ = engine.emit_trigger(SnapshotTrigger::WorkCompleted);
         sleep(Duration::from_millis(30)).await;
-        engine.emit_trigger(SnapshotTrigger::WorkCompleted);
+        let _ = engine.emit_trigger(SnapshotTrigger::WorkCompleted);
         sleep(Duration::from_millis(200)).await;
 
         let count = checkpoint_count(db_path.as_str());
@@ -1426,7 +1427,7 @@ mod tests {
 
         sleep(Duration::from_millis(100)).await;
 
-        engine.emit_trigger(SnapshotTrigger::HazardThreshold);
+        let _ = engine.emit_trigger(SnapshotTrigger::HazardThreshold);
         sleep(Duration::from_millis(200)).await;
 
         let count = checkpoint_count(db_path.as_str());
@@ -1452,7 +1453,7 @@ mod tests {
 
         sleep(Duration::from_millis(100)).await;
 
-        engine.emit_trigger(SnapshotTrigger::MemoryPressure);
+        let _ = engine.emit_trigger(SnapshotTrigger::MemoryPressure);
         sleep(Duration::from_millis(200)).await;
 
         let count = checkpoint_count(db_path.as_str());
@@ -1480,7 +1481,7 @@ mod tests {
 
         // First batch: 3 x 2.0 = 6.0 >= 5.0 → capture + reset
         for _ in 0..3 {
-            engine.emit_trigger(SnapshotTrigger::WorkCompleted);
+            let _ = engine.emit_trigger(SnapshotTrigger::WorkCompleted);
             sleep(Duration::from_millis(30)).await;
         }
         sleep(Duration::from_millis(150)).await;
@@ -1491,9 +1492,9 @@ mod tests {
         );
 
         // Second batch: 2 x 2.0 = 4.0 < 5.0 (reset happened)
-        engine.emit_trigger(SnapshotTrigger::WorkCompleted);
+        let _ = engine.emit_trigger(SnapshotTrigger::WorkCompleted);
         sleep(Duration::from_millis(30)).await;
-        engine.emit_trigger(SnapshotTrigger::WorkCompleted);
+        let _ = engine.emit_trigger(SnapshotTrigger::WorkCompleted);
         sleep(Duration::from_millis(150)).await;
         assert_eq!(
             checkpoint_count(db_path.as_str()),
@@ -1502,7 +1503,7 @@ mod tests {
         );
 
         // Third trigger crosses again: 4.0 + 2.0 = 6.0
-        engine.emit_trigger(SnapshotTrigger::WorkCompleted);
+        let _ = engine.emit_trigger(SnapshotTrigger::WorkCompleted);
         sleep(Duration::from_millis(200)).await;
         assert_eq!(
             checkpoint_count(db_path.as_str()),
@@ -1551,9 +1552,9 @@ mod tests {
 
         sleep(Duration::from_millis(100)).await;
 
-        engine.emit_trigger(SnapshotTrigger::WorkCompleted);
+        let _ = engine.emit_trigger(SnapshotTrigger::WorkCompleted);
         sleep(Duration::from_millis(100)).await;
-        engine.emit_trigger(SnapshotTrigger::StateTransition);
+        let _ = engine.emit_trigger(SnapshotTrigger::StateTransition);
         sleep(Duration::from_millis(100)).await;
 
         let count = checkpoint_count(db_path.as_str());
@@ -1584,8 +1585,8 @@ mod tests {
 
         sleep(Duration::from_millis(100)).await;
 
-        engine.emit_trigger(SnapshotTrigger::HazardThreshold);
-        engine.emit_trigger(SnapshotTrigger::WorkCompleted);
+        let _ = engine.emit_trigger(SnapshotTrigger::HazardThreshold);
+        let _ = engine.emit_trigger(SnapshotTrigger::WorkCompleted);
         sleep(Duration::from_millis(200)).await;
 
         let count = checkpoint_count(db_path.as_str());
@@ -1643,11 +1644,11 @@ mod tests {
         assert_eq!(after_startup, 1, "startup capture");
 
         // Accumulate 2.0 < 5.0 threshold
-        engine.emit_trigger(SnapshotTrigger::WorkCompleted); // +2.0
+        let _ = engine.emit_trigger(SnapshotTrigger::WorkCompleted); // +2.0
         sleep(Duration::from_millis(50)).await;
 
         // HazardThreshold is immediate — captures + resets accumulator
-        engine.emit_trigger(SnapshotTrigger::HazardThreshold);
+        let _ = engine.emit_trigger(SnapshotTrigger::HazardThreshold);
         sleep(Duration::from_millis(200)).await;
         assert_eq!(
             checkpoint_count(db_path.as_str()),
@@ -1656,9 +1657,9 @@ mod tests {
         );
 
         // After reset: 2 x WorkCompleted = 4.0 < 5.0 — no capture
-        engine.emit_trigger(SnapshotTrigger::WorkCompleted); // +2.0
+        let _ = engine.emit_trigger(SnapshotTrigger::WorkCompleted); // +2.0
         sleep(Duration::from_millis(30)).await;
-        engine.emit_trigger(SnapshotTrigger::WorkCompleted); // +2.0 = 4.0
+        let _ = engine.emit_trigger(SnapshotTrigger::WorkCompleted); // +2.0 = 4.0
         sleep(Duration::from_millis(200)).await;
         assert_eq!(
             checkpoint_count(db_path.as_str()),
@@ -1667,7 +1668,7 @@ mod tests {
         );
 
         // One more pushes over: 4.0 + 2.0 = 6.0 >= 5.0
-        engine.emit_trigger(SnapshotTrigger::WorkCompleted);
+        let _ = engine.emit_trigger(SnapshotTrigger::WorkCompleted);
         sleep(Duration::from_millis(200)).await;
         assert_eq!(
             checkpoint_count(db_path.as_str()),
@@ -1700,13 +1701,13 @@ mod tests {
         assert_eq!(checkpoint_count(db_path.as_str()), 1, "startup only");
 
         // Send non-accumulating triggers
-        engine.emit_trigger(SnapshotTrigger::Manual);
+        let _ = engine.emit_trigger(SnapshotTrigger::Manual);
         sleep(Duration::from_millis(30)).await;
-        engine.emit_trigger(SnapshotTrigger::Periodic);
+        let _ = engine.emit_trigger(SnapshotTrigger::Periodic);
         sleep(Duration::from_millis(30)).await;
-        engine.emit_trigger(SnapshotTrigger::PeriodicFallback);
+        let _ = engine.emit_trigger(SnapshotTrigger::PeriodicFallback);
         sleep(Duration::from_millis(30)).await;
-        engine.emit_trigger(SnapshotTrigger::Startup);
+        let _ = engine.emit_trigger(SnapshotTrigger::Startup);
         sleep(Duration::from_millis(200)).await;
 
         assert_eq!(
@@ -1737,9 +1738,9 @@ mod tests {
         sleep(Duration::from_millis(100)).await;
         assert_eq!(checkpoint_count(db_path.as_str()), 1, "startup");
 
-        engine.emit_trigger(SnapshotTrigger::WorkCompleted); // +2.0
+        let _ = engine.emit_trigger(SnapshotTrigger::WorkCompleted); // +2.0
         sleep(Duration::from_millis(50)).await;
-        engine.emit_trigger(SnapshotTrigger::IdleWindow); // +3.0 = 5.0
+        let _ = engine.emit_trigger(SnapshotTrigger::IdleWindow); // +3.0 = 5.0
         sleep(Duration::from_millis(200)).await;
 
         assert_eq!(
@@ -1769,11 +1770,11 @@ mod tests {
 
         sleep(Duration::from_millis(100)).await;
 
-        engine.emit_trigger(SnapshotTrigger::IdleWindow); // +3.0
+        let _ = engine.emit_trigger(SnapshotTrigger::IdleWindow); // +3.0
         sleep(Duration::from_millis(50)).await;
         assert_eq!(checkpoint_count(db_path.as_str()), 1, "3.0 < 5.0");
 
-        engine.emit_trigger(SnapshotTrigger::IdleWindow); // +3.0 = 6.0
+        let _ = engine.emit_trigger(SnapshotTrigger::IdleWindow); // +3.0 = 6.0
         sleep(Duration::from_millis(200)).await;
         assert_eq!(
             checkpoint_count(db_path.as_str()),
@@ -1803,9 +1804,9 @@ mod tests {
         sleep(Duration::from_millis(100)).await;
         assert_eq!(checkpoint_count(db_path.as_str()), 1, "startup");
 
-        engine.emit_trigger(SnapshotTrigger::HazardThreshold);
+        let _ = engine.emit_trigger(SnapshotTrigger::HazardThreshold);
         sleep(Duration::from_millis(100)).await;
-        engine.emit_trigger(SnapshotTrigger::MemoryPressure);
+        let _ = engine.emit_trigger(SnapshotTrigger::MemoryPressure);
         sleep(Duration::from_millis(200)).await;
 
         assert_eq!(
@@ -1879,7 +1880,7 @@ mod tests {
         sleep(Duration::from_millis(100)).await;
 
         // One WorkCompleted = 6.0 >= 5.0
-        engine.emit_trigger(SnapshotTrigger::WorkCompleted);
+        let _ = engine.emit_trigger(SnapshotTrigger::WorkCompleted);
         sleep(Duration::from_millis(200)).await;
         assert_eq!(
             checkpoint_count(db_path.as_str()),
@@ -1888,7 +1889,7 @@ mod tests {
         );
 
         // StateTransition = 0.5 < 5.0 — no additional capture
-        engine.emit_trigger(SnapshotTrigger::StateTransition);
+        let _ = engine.emit_trigger(SnapshotTrigger::StateTransition);
         sleep(Duration::from_millis(200)).await;
         assert_eq!(
             checkpoint_count(db_path.as_str()),
@@ -1919,7 +1920,7 @@ mod tests {
 
         // Fire 5 WorkCompleted triggers (5 x 2.0 = 10.0) as fast as possible
         for _ in 0..5 {
-            engine.emit_trigger(SnapshotTrigger::WorkCompleted);
+            let _ = engine.emit_trigger(SnapshotTrigger::WorkCompleted);
         }
         sleep(Duration::from_millis(300)).await;
 

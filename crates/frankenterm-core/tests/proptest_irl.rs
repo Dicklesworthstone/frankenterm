@@ -87,7 +87,7 @@ proptest! {
         let scaled: [f64; NUM_FEATURES] = std::array::from_fn(|i| features[i] * alpha);
         let r2 = rf.reward(&scaled);
 
-        let diff = (r2 - alpha * r1).abs();
+        let diff = alpha.mul_add(-r1, r2).abs();
         prop_assert!(diff < 1e-8, "Linearity violated: {} vs {} * {}", r2, alpha, r1);
     }
 
@@ -142,7 +142,7 @@ proptest! {
         b in prop::array::uniform8(-10.0..10.0f64),
     ) {
         let sim = cosine_similarity(&a, &b);
-        prop_assert!(sim >= -1.0 - 1e-10 && sim <= 1.0 + 1e-10,
+        prop_assert!((-1.0 - 1e-10..=1.0 + 1e-10).contains(&sim),
             "Cosine similarity {} out of bounds", sim);
     }
 

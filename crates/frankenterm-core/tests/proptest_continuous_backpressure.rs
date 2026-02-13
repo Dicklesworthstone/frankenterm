@@ -253,8 +253,8 @@ proptest! {
         values in proptest::collection::vec(0.0_f64..100.0, 1..50),
     ) {
         let mut ema = EmaSmoother::new(window);
-        let min_val = values.iter().cloned().fold(f64::INFINITY, f64::min);
-        let max_val = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let min_val = values.iter().copied().fold(f64::INFINITY, f64::min);
+        let max_val = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
 
         for &v in &values {
             let smoothed = ema.update(v);

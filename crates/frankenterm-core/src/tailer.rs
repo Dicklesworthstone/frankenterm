@@ -810,7 +810,7 @@ where
                             crate::ingest::CapturedSegmentKind::Gap { reason } => {
                                 Some(reason.clone())
                             }
-                            _ => None,
+                            crate::ingest::CapturedSegmentKind::Delta => None,
                         };
                         tap.on_egress(EgressEvent {
                             pane_id,

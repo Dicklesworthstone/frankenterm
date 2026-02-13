@@ -200,13 +200,13 @@ fn arb_policy_decision() -> impl Strategy<Value = PolicyDecision> {
     prop_oneof![
         // Allow variants
         Just(PolicyDecision::allow()),
-        "[a-z._]{3,20}".prop_map(|rule| PolicyDecision::allow_with_rule(rule)),
+        "[a-z._]{3,20}".prop_map(PolicyDecision::allow_with_rule),
         // Deny variants
-        "[a-zA-Z ]{5,50}".prop_map(|reason| PolicyDecision::deny(reason)),
+        "[a-zA-Z ]{5,50}".prop_map(PolicyDecision::deny),
         ("[a-zA-Z ]{5,50}", "[a-z._]{3,20}")
             .prop_map(|(reason, rule)| PolicyDecision::deny_with_rule(reason, rule)),
         // RequireApproval variants
-        "[a-zA-Z ]{5,50}".prop_map(|reason| PolicyDecision::require_approval(reason)),
+        "[a-zA-Z ]{5,50}".prop_map(PolicyDecision::require_approval),
         ("[a-zA-Z ]{5,50}", "[a-z._]{3,20}")
             .prop_map(|(reason, rule)| PolicyDecision::require_approval_with_rule(reason, rule)),
     ]

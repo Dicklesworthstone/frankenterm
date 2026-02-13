@@ -16,7 +16,6 @@
 //! 13. OnFailure/Verification factory methods produce expected variants
 
 use proptest::prelude::*;
-use serde_json;
 
 use frankenterm_core::plan::*;
 

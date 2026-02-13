@@ -148,11 +148,15 @@ fn loom_spsc_produced_equals_consumed_plus_depth() {
             consumed
         });
 
-        let produced = producer.join().unwrap();
-        let consumed = consumer.join().unwrap();
+        let result_produced = producer.join().unwrap();
+        let result_consumed = consumer.join().unwrap();
 
         let (head, tail, _) = q.snapshot();
         let depth = head - tail;
-        assert_eq!(produced, consumed + depth, "lost or duplicated elements");
+        assert_eq!(
+            result_produced,
+            result_consumed + depth,
+            "lost or duplicated elements"
+        );
     });
 }

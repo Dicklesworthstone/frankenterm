@@ -120,7 +120,7 @@ proptest! {
         for pane_id in 0..n_panes as u64 {
             dag.register_pane(pane_id);
             for i in 0..n_obs {
-                dag.observe(pane_id, (i as f64) * 0.5 + (pane_id as f64));
+                dag.observe(pane_id, (i as f64).mul_add(0.5, pane_id as f64));
             }
         }
 

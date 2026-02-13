@@ -182,14 +182,14 @@ proptest! {
     #[test]
     fn prop_free_ratio_zero_pages(free_pages in 0_i64..1000) {
         let stats = DatabasePageStats { page_count: 0, free_pages };
-        prop_assert_eq!(stats.free_ratio(), 0.0);
+        prop_assert!(stats.free_ratio().abs() < f64::EPSILON);
     }
 
     /// free_ratio is 0.0 when free_pages is 0.
     #[test]
     fn prop_free_ratio_zero_free(page_count in 1_i64..1_000_000) {
         let stats = DatabasePageStats { page_count, free_pages: 0 };
-        prop_assert_eq!(stats.free_ratio(), 0.0);
+        prop_assert!(stats.free_ratio().abs() < f64::EPSILON);
     }
 
     /// free_ratio equals 1.0 when all pages are free.
@@ -422,10 +422,13 @@ fn all_correlation_types_distinct_json() {
         CorrelationType::WorkflowGroup,
         CorrelationType::DedupeGroup,
     ];
-    let jsons: Vec<_> = types.iter().map(|t| serde_json::to_string(t).unwrap()).collect();
-    for i in 0..jsons.len() {
-        for j in (i + 1)..jsons.len() {
-            assert_ne!(jsons[i], jsons[j]);
+    let jsons: Vec<_> = types
+        .iter()
+        .map(|t| serde_json::to_string(t).unwrap())
+        .collect();
+    for (i, json_i) in jsons.iter().enumerate() {
+        for json_j in &jsons[i + 1..] {
+            assert_ne!(json_i, json_j);
         }
     }
 }
@@ -440,10 +443,13 @@ fn all_metric_types_distinct_json() {
         MetricType::WorkflowCost,
         MetricType::SessionDuration,
     ];
-    let jsons: Vec<_> = types.iter().map(|t| serde_json::to_string(t).unwrap()).collect();
-    for i in 0..jsons.len() {
-        for j in (i + 1)..jsons.len() {
-            assert_ne!(jsons[i], jsons[j]);
+    let jsons: Vec<_> = types
+        .iter()
+        .map(|t| serde_json::to_string(t).unwrap())
+        .collect();
+    for (i, json_i) in jsons.iter().enumerate() {
+        for json_j in &jsons[i + 1..] {
+            assert_ne!(json_i, json_j);
         }
     }
 }
@@ -456,10 +462,13 @@ fn all_notification_statuses_distinct_json() {
         NotificationStatus::Failed,
         NotificationStatus::Throttled,
     ];
-    let jsons: Vec<_> = statuses.iter().map(|s| serde_json::to_string(s).unwrap()).collect();
-    for i in 0..jsons.len() {
-        for j in (i + 1)..jsons.len() {
-            assert_ne!(jsons[i], jsons[j]);
+    let jsons: Vec<_> = statuses
+        .iter()
+        .map(|s| serde_json::to_string(s).unwrap())
+        .collect();
+    for (i, json_i) in jsons.iter().enumerate() {
+        for json_j in &jsons[i + 1..] {
+            assert_ne!(json_i, json_j);
         }
     }
 }
@@ -476,8 +485,14 @@ fn notification_status_from_str_rejects_unknown() {
 
 #[test]
 fn free_ratio_negative_values() {
-    let stats = DatabasePageStats { page_count: -10, free_pages: 5 };
-    assert_eq!(stats.free_ratio(), 0.0);
-    let stats2 = DatabasePageStats { page_count: 10, free_pages: -5 };
-    assert_eq!(stats2.free_ratio(), 0.0);
+    let stats = DatabasePageStats {
+        page_count: -10,
+        free_pages: 5,
+    };
+    assert!(stats.free_ratio().abs() < f64::EPSILON);
+    let stats2 = DatabasePageStats {
+        page_count: 10,
+        free_pages: -5,
+    };
+    assert!(stats2.free_ratio().abs() < f64::EPSILON);
 }

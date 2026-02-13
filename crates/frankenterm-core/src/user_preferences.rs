@@ -374,7 +374,7 @@ impl MaxEntIrl {
             .zip(mu_policy.iter())
             .zip(self.reward.theta.iter_mut())
         {
-            let grad = d - p - lambda * *t;
+            let grad = (-lambda).mul_add(*t, d - p);
             *t = alpha.mul_add(grad, *t);
         }
     }
@@ -441,7 +441,7 @@ impl MaxEntIrl {
                 .zip(mu_policy.iter())
                 .zip(self.reward.theta.iter_mut())
             {
-                let grad = d - p - lambda * *t;
+                let grad = (-lambda).mul_add(*t, d - p);
                 *t = alpha.mul_add(grad, *t);
                 sq_sum = grad.mul_add(grad, sq_sum);
             }
@@ -489,7 +489,7 @@ impl MaxEntIrl {
             .zip(phi_policy.iter())
             .zip(self.reward.theta.iter_mut())
         {
-            let grad = d - p - lambda * *t;
+            let grad = (-lambda).mul_add(*t, d - p);
             *t = alpha.mul_add(grad, *t);
         }
     }

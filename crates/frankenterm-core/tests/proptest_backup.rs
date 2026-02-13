@@ -7,7 +7,6 @@
 
 use chrono::{Datelike, Local, TimeZone, Timelike, Weekday};
 use proptest::prelude::*;
-use serde_json;
 
 use frankenterm_core::backup::{
     BackupManifest, BackupSchedule, BackupStats, ExportOptions, ExportResult, ImportOptions,

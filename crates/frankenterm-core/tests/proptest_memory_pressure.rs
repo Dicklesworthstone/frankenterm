@@ -89,12 +89,10 @@ proptest! {
     /// as_u8() preserves tier ordering.
     #[test]
     fn prop_tier_as_u8_monotonic(t1 in arb_tier(), t2 in arb_tier()) {
-        if t1 < t2 {
-            prop_assert!(t1.as_u8() < t2.as_u8());
-        } else if t1 == t2 {
-            prop_assert_eq!(t1.as_u8(), t2.as_u8());
-        } else {
-            prop_assert!(t1.as_u8() > t2.as_u8());
+        match t1.cmp(&t2) {
+            std::cmp::Ordering::Less => prop_assert!(t1.as_u8() < t2.as_u8()),
+            std::cmp::Ordering::Equal => prop_assert_eq!(t1.as_u8(), t2.as_u8()),
+            std::cmp::Ordering::Greater => prop_assert!(t1.as_u8() > t2.as_u8()),
         }
     }
 

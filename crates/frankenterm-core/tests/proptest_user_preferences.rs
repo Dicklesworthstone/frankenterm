@@ -189,7 +189,7 @@ proptest! {
         b in arb_nonzero_vec(8),
     ) {
         let cs = cosine_similarity(&a, &b);
-        prop_assert!(cs >= -1.0 - 1e-10 && cs <= 1.0 + 1e-10,
+        prop_assert!((-1.0 - 1e-10..=1.0 + 1e-10).contains(&cs),
                     "cosine = {} should be in [-1, 1]", cs);
     }
 
@@ -252,7 +252,7 @@ proptest! {
         b in arb_f64_vec(5),
     ) {
         let rc = rank_correlation(&a, &b);
-        prop_assert!(rc >= -1.0 - 1e-10 && rc <= 1.0 + 1e-10,
+        prop_assert!((-1.0 - 1e-10..=1.0 + 1e-10).contains(&rc),
                     "rank_correlation = {} should be in [-1, 1]", rc);
     }
 
@@ -415,9 +415,9 @@ proptest! {
     fn prop_features_deterministic(obs in arb_observation()) {
         let f1 = extract_features(&obs, &obs.action);
         let f2 = extract_features(&obs, &obs.action);
-        for i in 0..NUM_FEATURES {
-            prop_assert!((f1[i] - f2[i]).abs() < 1e-15,
-                        "feature {} differs: {} vs {}", i, f1[i], f2[i]);
+        for (i, (a, b)) in f1.iter().zip(f2.iter()).enumerate() {
+            prop_assert!((a - b).abs() < 1e-15,
+                        "feature {} differs: {} vs {}", i, a, b);
         }
     }
 
@@ -786,9 +786,9 @@ proptest! {
         let json = serde_json::to_string(&rf).unwrap();
         let back: RewardFunction = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(back.observation_count, count, "observation_count mismatch");
-        for i in 0..NUM_FEATURES {
-            prop_assert!((back.theta[i] - theta[i]).abs() < 1e-10,
-                        "theta[{}] mismatch: {} vs {}", i, back.theta[i], theta[i]);
+        for (i, (back_t, &orig_t)) in back.theta.iter().zip(theta.iter()).enumerate() {
+            prop_assert!((back_t - orig_t).abs() < 1e-10,
+                        "theta[{}] mismatch: {} vs {}", i, back_t, orig_t);
         }
     }
 

@@ -256,13 +256,13 @@ mod tests {
 
     #[test]
     fn sigmoid_nan_returns_half() {
-        assert_eq!(sigmoid(f64::NAN), 0.5);
+        assert!((sigmoid(f64::NAN) - 0.5).abs() < f64::EPSILON);
     }
 
     #[test]
     fn sigmoid_extreme_values() {
-        assert_eq!(sigmoid(100.0), 1.0);
-        assert_eq!(sigmoid(-100.0), 0.0);
+        assert!((sigmoid(100.0) - 1.0).abs() < f64::EPSILON);
+        assert!(sigmoid(-100.0).abs() < f64::EPSILON);
     }
 
     // -- SeverityConfig tests --
@@ -417,7 +417,7 @@ mod tests {
         // Spike to 1.0
         m.observe_ratio(1.0);
         let alpha = config.ema_alpha();
-        let expected = alpha * 1.0 + (1.0 - alpha) * 0.0;
+        let expected = alpha.mul_add(1.0, (1.0 - alpha) * 0.0);
         assert!(
             (m.smoothed_ratio() - expected).abs() < 1e-10,
             "smoothed={} expected={}",
@@ -507,7 +507,10 @@ mod tests {
         // sigmoid(8*(0.60-0.50)) = sigmoid(0.8) ≈ 0.69 → Red (0.60..0.85)
         m.observe_ratio(0.60);
         let s = m.severity();
-        assert!(s >= 0.60 && s < 0.85, "severity={s} should be in Red range");
+        assert!(
+            (0.60..0.85).contains(&s),
+            "severity={s} should be in Red range"
+        );
         assert_eq!(m.equivalent_tier(), BackpressureTier::Red);
     }
 
@@ -631,7 +634,7 @@ mod tests {
                 let mut m = ContinuousBackpressure::new(config);
                 m.observe_ratio(q);
                 let s = m.severity();
-                prop_assert!(s >= 0.0 && s <= 1.0, "severity={s} out of range");
+                prop_assert!((0.0..=1.0).contains(&s), "severity={s} out of range");
             }
 
             /// Severity continuity (Lipschitz bound).

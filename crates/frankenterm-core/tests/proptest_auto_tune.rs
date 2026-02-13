@@ -160,10 +160,10 @@ proptest! {
         for range in &ranges {
             let once = range.clamp(v);
             let twice = range.clamp(once);
-            prop_assert_eq!(
-                once, twice,
-                "clamping must be idempotent for value {}",
-                v
+            prop_assert!(
+                (once - twice).abs() < f64::EPSILON,
+                "clamping must be idempotent for value {}: {} != {}",
+                v, once, twice
             );
         }
     }
@@ -314,7 +314,7 @@ proptest! {
             // since clamp_to_ranges() may also shift the value.
             if prev.poll_interval_ms > 0.0 {
                 let delta = (current.poll_interval_ms - prev.poll_interval_ms).abs();
-                let bound = prev.poll_interval_ms * max_change * 3.0 + tolerance;
+                let bound = (prev.poll_interval_ms * max_change).mul_add(3.0, tolerance);
                 prop_assert!(
                     delta <= bound,
                     "poll_interval delta {} exceeds bound {}",
@@ -325,7 +325,7 @@ proptest! {
             // scrollback_lines: affected by memory pressure only → 1x bound
             if prev.scrollback_lines > 0.0 {
                 let delta = (current.scrollback_lines - prev.scrollback_lines).abs();
-                let bound = prev.scrollback_lines * max_change + tolerance;
+                let bound = prev.scrollback_lines.mul_add(max_change, tolerance);
                 prop_assert!(
                     delta <= bound,
                     "scrollback delta {} exceeds bound {}",
@@ -336,7 +336,7 @@ proptest! {
             // pool_size: affected by CPU pressure only → 1x bound
             if prev.pool_size > 0.0 {
                 let delta = (current.pool_size - prev.pool_size).abs();
-                let bound = prev.pool_size * max_change + tolerance;
+                let bound = prev.pool_size.mul_add(max_change, tolerance);
                 prop_assert!(
                     delta <= bound,
                     "pool_size delta {} exceeds bound {}",
@@ -348,7 +348,7 @@ proptest! {
             if prev.snapshot_interval_secs > 0.0 {
                 let delta =
                     (current.snapshot_interval_secs - prev.snapshot_interval_secs).abs();
-                let bound = prev.snapshot_interval_secs * max_change + tolerance;
+                let bound = prev.snapshot_interval_secs.mul_add(max_change, tolerance);
                 prop_assert!(
                     delta <= bound,
                     "snapshot_interval delta {} exceeds bound {}",
@@ -391,10 +391,10 @@ proptest! {
             tuner.tick(&metrics);
         }
 
-        prop_assert_eq!(
-            tuner.params().scrollback_lines,
-            initial.scrollback_lines,
-            "scrollback should not change before hysteresis threshold"
+        prop_assert!(
+            (tuner.params().scrollback_lines - initial.scrollback_lines).abs() < f64::EPSILON,
+            "scrollback should not change before hysteresis threshold: {} != {}",
+            tuner.params().scrollback_lines, initial.scrollback_lines
         );
     }
 }
@@ -422,21 +422,25 @@ proptest! {
             tuner.tick(m);
         }
 
-        prop_assert_eq!(
-            tuner.params().poll_interval_ms, initial.poll_interval_ms,
-            "poll_interval should not change in deadband"
+        prop_assert!(
+            (tuner.params().poll_interval_ms - initial.poll_interval_ms).abs() < f64::EPSILON,
+            "poll_interval should not change in deadband: {} != {}",
+            tuner.params().poll_interval_ms, initial.poll_interval_ms
         );
-        prop_assert_eq!(
-            tuner.params().scrollback_lines, initial.scrollback_lines,
-            "scrollback should not change in deadband"
+        prop_assert!(
+            (tuner.params().scrollback_lines - initial.scrollback_lines).abs() < f64::EPSILON,
+            "scrollback should not change in deadband: {} != {}",
+            tuner.params().scrollback_lines, initial.scrollback_lines
         );
-        prop_assert_eq!(
-            tuner.params().snapshot_interval_secs, initial.snapshot_interval_secs,
-            "snapshot_interval should not change in deadband"
+        prop_assert!(
+            (tuner.params().snapshot_interval_secs - initial.snapshot_interval_secs).abs() < f64::EPSILON,
+            "snapshot_interval should not change in deadband: {} != {}",
+            tuner.params().snapshot_interval_secs, initial.snapshot_interval_secs
         );
-        prop_assert_eq!(
-            tuner.params().pool_size, initial.pool_size,
-            "pool_size should not change in deadband"
+        prop_assert!(
+            (tuner.params().pool_size - initial.pool_size).abs() < f64::EPSILON,
+            "pool_size should not change in deadband: {} != {}",
+            tuner.params().pool_size, initial.pool_size
         );
     }
 }
@@ -466,33 +470,38 @@ proptest! {
             tuner.tick(m);
             let current = tuner.params();
             if pinned.poll_interval_ms {
-                prop_assert_eq!(
-                    current.poll_interval_ms, initial.poll_interval_ms,
-                    "pinned poll_interval_ms must not change"
+                prop_assert!(
+                    (current.poll_interval_ms - initial.poll_interval_ms).abs() < f64::EPSILON,
+                    "pinned poll_interval_ms must not change: {} != {}",
+                    current.poll_interval_ms, initial.poll_interval_ms
                 );
             }
             if pinned.scrollback_lines {
-                prop_assert_eq!(
-                    current.scrollback_lines, initial.scrollback_lines,
-                    "pinned scrollback_lines must not change"
+                prop_assert!(
+                    (current.scrollback_lines - initial.scrollback_lines).abs() < f64::EPSILON,
+                    "pinned scrollback_lines must not change: {} != {}",
+                    current.scrollback_lines, initial.scrollback_lines
                 );
             }
             if pinned.snapshot_interval_secs {
-                prop_assert_eq!(
-                    current.snapshot_interval_secs, initial.snapshot_interval_secs,
-                    "pinned snapshot_interval_secs must not change"
+                prop_assert!(
+                    (current.snapshot_interval_secs - initial.snapshot_interval_secs).abs() < f64::EPSILON,
+                    "pinned snapshot_interval_secs must not change: {} != {}",
+                    current.snapshot_interval_secs, initial.snapshot_interval_secs
                 );
             }
             if pinned.pool_size {
-                prop_assert_eq!(
-                    current.pool_size, initial.pool_size,
-                    "pinned pool_size must not change"
+                prop_assert!(
+                    (current.pool_size - initial.pool_size).abs() < f64::EPSILON,
+                    "pinned pool_size must not change: {} != {}",
+                    current.pool_size, initial.pool_size
                 );
             }
             if pinned.backpressure_threshold {
-                prop_assert_eq!(
-                    current.backpressure_threshold, initial.backpressure_threshold,
-                    "pinned backpressure_threshold must not change"
+                prop_assert!(
+                    (current.backpressure_threshold - initial.backpressure_threshold).abs() < f64::EPSILON,
+                    "pinned backpressure_threshold must not change: {} != {}",
+                    current.backpressure_threshold, initial.backpressure_threshold
                 );
             }
         }
@@ -795,7 +804,7 @@ proptest! {
         let mut prev_scrollback = tuner.params().scrollback_lines;
 
         for i in 0..20 {
-            let rss = (base_rss + (i as f64 * 0.005)).min(1.0);
+            let rss = (i as f64).mul_add(0.005, base_rss).min(1.0);
             let metrics = TunerMetrics {
                 rss_fraction: rss,
                 mux_latency_ms: 5.0,

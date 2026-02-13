@@ -631,7 +631,7 @@ mod tests {
         // Ramp up gradually
         let mut severity_values = Vec::new();
         for i in 0..20 {
-            let ratio = 0.1 + (i as f64) * 0.04;
+            let ratio = (i as f64).mul_add(0.04, 0.1);
             bp.update(ratio, ratio);
             severity_values.push(bp.severity());
         }

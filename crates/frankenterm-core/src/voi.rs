@@ -135,8 +135,8 @@ impl PaneBelief {
     ///
     /// `log_likelihoods[s]` = log₂ P(observation | state=s).
     fn update(&mut self, log_likelihoods: &[f64; PaneState::COUNT], now_ms: u64) {
-        for i in 0..PaneState::COUNT {
-            self.log_probs[i] += log_likelihoods[i];
+        for (lp, ll) in self.log_probs.iter_mut().zip(log_likelihoods.iter()) {
+            *lp += ll;
         }
         // Normalize to prevent drift.
         let max_lp = self
@@ -337,7 +337,7 @@ impl VoiScheduler {
         // After observing, entropy drops roughly to the conditional entropy
         // of the distribution. We approximate as: H_after ≈ H_current × decay.
         // With more observations, the decay is stronger.
-        let decay = 1.0 / (1.0 + belief.observation_count as f64).ln().max(0.5);
+        let decay = 1.0 / (belief.observation_count as f64).ln_1p().max(0.5);
         let expected_h_after = current_h * decay.min(0.9);
 
         let entropy_reduction = (current_h - expected_h_after).max(0.0);

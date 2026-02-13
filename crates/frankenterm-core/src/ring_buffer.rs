@@ -169,16 +169,12 @@ impl<T> RingBuffer<T> {
     /// Total items that were overwritten.
     #[must_use]
     pub fn total_evicted(&self) -> u64 {
-        if self.total > self.capacity as u64 {
-            self.total - self.capacity as u64
-        } else {
-            0
-        }
+        self.total.saturating_sub(self.capacity as u64)
     }
 
     /// Clear all items.
     pub fn clear(&mut self) {
-        for slot in self.buf.iter_mut() {
+        for slot in &mut self.buf {
             *slot = None;
         }
         self.head = 0;
@@ -259,7 +255,16 @@ impl<'a, T> Iterator for RingBufferIter<'a, T> {
     }
 }
 
-impl<'a, T> ExactSizeIterator for RingBufferIter<'a, T> {}
+impl<T> ExactSizeIterator for RingBufferIter<'_, T> {}
+
+impl<'a, T> IntoIterator for &'a RingBuffer<T> {
+    type Item = &'a T;
+    type IntoIter = RingBufferIter<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
 
 // =============================================================================
 // RingBufferStats (serializable)
@@ -417,8 +422,7 @@ mod tests {
     #[test]
     fn iter_empty() {
         let rb: RingBuffer<i32> = RingBuffer::new(3);
-        let v: Vec<&i32> = rb.iter().collect();
-        assert!(v.is_empty());
+        assert_eq!(rb.iter().count(), 0);
     }
 
     #[test]

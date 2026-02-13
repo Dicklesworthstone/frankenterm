@@ -15,15 +15,17 @@ use proptest::prelude::*;
 
 fn arb_severity_config() -> impl Strategy<Value = SeverityConfig> {
     (
-        0.01_f64..0.99,   // center_threshold
-        0.1_f64..50.0,    // steepness
-        1_usize..100,     // smoothing_window
+        0.01_f64..0.99, // center_threshold
+        0.1_f64..50.0,  // steepness
+        1_usize..100,   // smoothing_window
     )
-        .prop_map(|(center_threshold, steepness, smoothing_window)| SeverityConfig {
-            center_threshold,
-            steepness,
-            smoothing_window,
-        })
+        .prop_map(
+            |(center_threshold, steepness, smoothing_window)| SeverityConfig {
+                center_threshold,
+                steepness,
+                smoothing_window,
+            },
+        )
 }
 
 // =========================================================================

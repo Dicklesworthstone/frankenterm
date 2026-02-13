@@ -70,10 +70,10 @@ fn arb_triage_action() -> impl Strategy<Value = TriageAction> {
     ]
 }
 
-fn make_node(pid: u32, ppid: u32, name: &str, state: ProcessState) -> ProcessNode {
+fn make_node(pid: u32, parent_pid: u32, name: &str, state: ProcessState) -> ProcessNode {
     ProcessNode {
         pid,
-        ppid,
+        ppid: parent_pid,
         name: name.into(),
         argv: vec![],
         state,
@@ -148,12 +148,10 @@ proptest! {
         a in arb_triage_category(),
         b in arb_triage_category(),
     ) {
-        if a.priority() < b.priority() {
-            prop_assert!(a < b, "{:?} (p={}) should be < {:?} (p={})", a, a.priority(), b, b.priority());
-        } else if a.priority() > b.priority() {
-            prop_assert!(a > b, "{:?} (p={}) should be > {:?} (p={})", a, a.priority(), b, b.priority());
-        } else {
-            prop_assert_eq!(a, b);
+        match a.priority().cmp(&b.priority()) {
+            std::cmp::Ordering::Less => prop_assert!(a < b, "{:?} (p={}) should be < {:?} (p={})", a, a.priority(), b, b.priority()),
+            std::cmp::Ordering::Greater => prop_assert!(a > b, "{:?} (p={}) should be > {:?} (p={})", a, a.priority(), b, b.priority()),
+            std::cmp::Ordering::Equal => prop_assert_eq!(a, b),
         }
     }
 }
@@ -170,7 +168,7 @@ proptest! {
         cat in arb_triage_category(),
     ) {
         let p = cat.priority();
-        prop_assert!(p >= 1 && p <= 9,
+        prop_assert!((1..=9).contains(&p),
             "{:?} priority {} not in [1,9]", cat, p);
     }
 }

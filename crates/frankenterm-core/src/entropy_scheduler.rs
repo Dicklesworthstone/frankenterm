@@ -661,7 +661,7 @@ mod tests {
         let sched = EntropyScheduler::new(EntropySchedulerConfig::default());
         let result = sched.schedule();
         assert!(result.decisions.is_empty());
-        assert_eq!(result.mean_density, 0.0);
+        assert!(result.mean_density.abs() < f64::EPSILON);
         assert_eq!(result.warmup_count, 0);
     }
 
@@ -793,9 +793,9 @@ mod tests {
         ] {
             sched.feed_bytes(1, &pattern);
             let h = sched.entropy(1).unwrap();
-            assert!(h >= 0.0 && h <= 8.0, "entropy {h} out of range [0, 8]");
+            assert!((0.0..=8.0).contains(&h), "entropy {h} out of range [0, 8]");
             let d = sched.entropy_density(1).unwrap();
-            assert!(d >= 0.0 && d <= 1.0, "density {d} out of range [0, 1]");
+            assert!((0.0..=1.0).contains(&d), "density {d} out of range [0, 1]");
         }
     }
 

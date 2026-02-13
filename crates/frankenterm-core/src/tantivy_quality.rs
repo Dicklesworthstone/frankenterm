@@ -256,7 +256,7 @@ impl QualityHarness {
                     .collect();
 
                 let all_assertions_pass = assertion_results.iter().all(|r| r.passed);
-                let latency_ok = budget.map_or(true, |b| duration <= b);
+                let latency_ok = budget.is_none_or(|b| duration <= b);
 
                 QueryTestResult {
                     name: gq.name.clone(),
@@ -364,7 +364,7 @@ fn evaluate_assertion(assertion: &RelevanceAssertion, results: &SearchResults) -
                 .hits
                 .iter()
                 .position(|h| h.doc.event_id == *event_id);
-            let ok = pos.map_or(false, |p| p < *n);
+            let ok = pos.is_some_and(|p| p < *n);
             AssertionResult {
                 description: format!("event_id={event_id} in top {n}"),
                 passed: ok,
@@ -1185,14 +1185,13 @@ mod tests {
         for r in &report.results {
             if !r.passed {
                 for a in &r.assertion_results {
-                    if !a.passed {
-                        panic!(
-                            "Query '{}' failed assertion '{}': {}",
-                            r.name,
-                            a.description,
-                            a.message.as_deref().unwrap_or("no message")
-                        );
-                    }
+                    assert!(
+                        a.passed,
+                        "Query '{}' failed assertion '{}': {}",
+                        r.name,
+                        a.description,
+                        a.message.as_deref().unwrap_or("no message")
+                    );
                 }
             }
         }

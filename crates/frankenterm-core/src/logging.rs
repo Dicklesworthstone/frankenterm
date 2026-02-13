@@ -581,7 +581,7 @@ mod tests {
     #[test]
     fn log_level_clone_and_copy() {
         let level = LogLevel::Info;
-        let cloned = level.clone();
+        let cloned = level;
         let copied = level;
         assert_eq!(level, cloned);
         assert_eq!(level, copied);

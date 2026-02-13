@@ -652,9 +652,9 @@ mod tests {
         assert_eq!(holt.observation_count(), 0);
         holt.update(50.0);
         assert_eq!(holt.observation_count(), 1);
-        assert_eq!(holt.level(), 50.0);
-        assert_eq!(holt.trend(), 0.0);
-        assert_eq!(holt.forecast(5.0), 50.0);
+        assert!((holt.level() - 50.0).abs() < f64::EPSILON);
+        assert!(holt.trend().abs() < f64::EPSILON);
+        assert!((holt.forecast(5.0) - 50.0).abs() < f64::EPSILON);
     }
 
     // -- CalibrationSet --
@@ -772,8 +772,8 @@ mod tests {
         };
         let mut forecaster = ConformalForecaster::new(config);
         for i in 0..200 {
-            forecaster.observe("rss_bytes", 1_000_000.0 + i as f64 * 100.0);
-            forecaster.observe("cpu_percent", 50.0 + (i as f64 * 0.1).sin() * 10.0);
+            forecaster.observe("rss_bytes", (i as f64).mul_add(100.0, 1_000_000.0));
+            forecaster.observe("cpu_percent", (i as f64 * 0.1).sin().mul_add(10.0, 50.0));
         }
         assert_eq!(forecaster.metric_count(), 2);
         let all = forecaster.forecast_all();
@@ -792,7 +792,7 @@ mod tests {
         let mut forecaster = ConformalForecaster::new(config);
         forecaster.set_available_memory(1_000_000);
         for i in 0..200 {
-            forecaster.observe("rss_bytes", 500_000.0 + i as f64 * 5000.0);
+            forecaster.observe("rss_bytes", (i as f64).mul_add(5000.0, 500_000.0));
         }
         let forecasts = forecaster.forecast_metric("rss_bytes");
         let has_alert = forecasts.iter().any(|f| f.alert.is_some());
@@ -813,7 +813,7 @@ mod tests {
         };
         let mut forecaster = ConformalForecaster::new(config);
         for i in 0..200 {
-            forecaster.observe("cpu_percent", 80.0 + i as f64 * 0.1);
+            forecaster.observe("cpu_percent", (i as f64).mul_add(0.1, 80.0));
         }
         let forecasts = forecaster.forecast_metric("cpu_percent");
         let has_alert = forecasts.iter().any(|f| f.alert.is_some());
@@ -896,7 +896,7 @@ mod tests {
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1);
             let u = (*state >> 33) as f64 / (1u64 << 31) as f64;
-            1000.0 + (u - 0.5) * 200.0
+            (u - 0.5).mul_add(200.0, 1000.0)
         };
 
         // Warm up

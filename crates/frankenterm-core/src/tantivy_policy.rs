@@ -85,7 +85,7 @@ pub enum MergeStrategy {
 /// A commit makes recently indexed documents visible to readers. Commits
 /// are expensive (fsync + segment finalization), so the policy must balance
 /// document freshness against write amplification.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitPolicy {
     /// Maximum documents to buffer before forcing a commit.
     /// Lower values = fresher results, higher write amplification.
@@ -148,7 +148,7 @@ impl CommitPolicy {
 // ---------------------------------------------------------------------------
 
 /// Configuration for the segment merge policy.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MergePolicyConfig {
     /// Active merge strategy.
     pub strategy: MergeStrategy,
@@ -229,7 +229,7 @@ impl MergePolicyConfig {
 // ---------------------------------------------------------------------------
 
 /// Complete index tuning configuration combining commit and merge policies.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexTuningConfig {
     /// Commit trigger policy.
     pub commit: CommitPolicy,
@@ -271,7 +271,7 @@ impl Default for IndexTuningConfig {
 // ---------------------------------------------------------------------------
 
 /// Point-in-time snapshot of Tantivy index segment health.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentHealthSnapshot {
     /// Current number of live segments.
     pub segment_count: u32,
@@ -813,7 +813,7 @@ mod tests {
             merges_in_progress: 0,
             needs_merge: false,
         };
-        assert_eq!(h.deleted_ratio(), 0.0);
+        assert!(h.deleted_ratio().abs() < f64::EPSILON);
     }
 
     #[test]
@@ -858,7 +858,7 @@ mod tests {
             merges_in_progress: 0,
             needs_merge: false,
         };
-        assert_eq!(h.size_skew_ratio(), 0.0);
+        assert!(h.size_skew_ratio().abs() < f64::EPSILON);
     }
 
     // -- CommitTracker tests --

@@ -502,6 +502,7 @@ impl<S> InstrumentedStorage<S> {
 
 impl<S> InstrumentedStorage<S> {
     /// Time an append_batch call and record telemetry.
+    #[allow(clippy::future_not_send)]
     pub async fn append_batch_instrumented(
         &self,
         _req: AppendRequest,
@@ -938,7 +939,7 @@ mod tests {
     #[test]
     fn append_rate_zero_initially() {
         let telem = StorageTelemetry::with_defaults();
-        assert_eq!(telem.append_rate(), 0.0);
+        assert!(telem.append_rate().abs() < f64::EPSILON);
     }
 
     // -----------------------------------------------------------------------

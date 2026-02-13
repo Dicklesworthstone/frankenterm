@@ -234,12 +234,21 @@ impl SessionDnaBuilder {
             let total = self.dna.total_lines as f32;
             let prev = (total - lines as f32).max(0.0);
             if total > 0.0 {
-                self.dna.output_entropy =
-                    (self.dna.output_entropy * prev + entropy * lines as f32) / total;
-                self.dna.unique_line_ratio =
-                    (self.dna.unique_line_ratio * prev + unique_ratio * lines as f32) / total;
-                self.dna.ansi_density =
-                    (self.dna.ansi_density * prev + ansi_density * lines as f32) / total;
+                self.dna.output_entropy = self
+                    .dna
+                    .output_entropy
+                    .mul_add(prev, entropy * lines as f32)
+                    / total;
+                self.dna.unique_line_ratio = self
+                    .dna
+                    .unique_line_ratio
+                    .mul_add(prev, unique_ratio * lines as f32)
+                    / total;
+                self.dna.ansi_density = self
+                    .dna
+                    .ansi_density
+                    .mul_add(prev, ansi_density * lines as f32)
+                    / total;
             }
 
             if !self.in_burst {
@@ -369,10 +378,10 @@ impl FeatureNormalizer {
     pub fn update(&mut self, features: &[f64]) {
         self.count += 1;
         let n = self.count as f64;
-        for i in 0..self.mean.len().min(features.len()) {
-            let delta = features[i] - self.mean[i];
+        for (i, &feat) in features.iter().enumerate().take(self.mean.len()) {
+            let delta = feat - self.mean[i];
             self.mean[i] += delta / n;
-            let delta2 = features[i] - self.mean[i];
+            let delta2 = feat - self.mean[i];
             self.m2[i] += delta * delta2;
         }
     }
@@ -489,6 +498,7 @@ pub fn knn_predict(
     let mut durations: Vec<f64> = top_k.iter().map(|(_, d)| *d).collect();
     durations.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
+    #[allow(clippy::manual_midpoint)]
     let median = if durations.len() % 2 == 0 {
         let mid = durations.len() / 2;
         (durations[mid - 1] + durations[mid]) / 2.0
@@ -580,7 +590,7 @@ impl SessionStore {
     #[must_use]
     pub fn predict(&self, query_dna: &SessionDna) -> Option<KnnPrediction> {
         let raw = query_dna.to_raw_features();
-        let embedding = self.normalizer.normalize(&raw.to_vec());
+        let embedding = self.normalizer.normalize(&raw);
 
         let session_data: Vec<(Vec<f64>, f64)> = self
             .sessions
@@ -595,7 +605,7 @@ impl SessionStore {
     #[must_use]
     pub fn find_similar(&self, query_dna: &SessionDna) -> Vec<(&StoredSession, f64)> {
         let raw = query_dna.to_raw_features();
-        let embedding = self.normalizer.normalize(&raw.to_vec());
+        let embedding = self.normalizer.normalize(&raw);
 
         let mut results: Vec<(&StoredSession, f64)> = self
             .sessions
@@ -627,7 +637,7 @@ impl SessionStore {
     fn renormalize_all(&mut self) {
         for session in &mut self.sessions {
             let raw = session.dna.to_raw_features();
-            session.embedding = self.normalizer.normalize(&raw.to_vec());
+            session.embedding = self.normalizer.normalize(&raw);
         }
     }
 }
@@ -671,7 +681,7 @@ impl PcaModel {
                 means[i] += v;
             }
         }
-        for m in means.iter_mut() {
+        for m in &mut means {
             *m /= n as f64;
         }
 
@@ -686,9 +696,16 @@ impl PcaModel {
             }
         }
         let denom = (n - 1) as f64;
+        for (i, cov_row) in cov.iter_mut().enumerate().take(RAW_FEATURE_DIM) {
+            for val in cov_row.iter_mut().skip(i).take(RAW_FEATURE_DIM - i) {
+                *val /= denom;
+            }
+        }
+        // Fill the lower triangle (symmetric matrix).
+        // Needs index-based access: cov[j][i] = cov[i][j] requires two rows.
+        #[allow(clippy::needless_range_loop)]
         for i in 0..RAW_FEATURE_DIM {
-            for j in i..RAW_FEATURE_DIM {
-                cov[i][j] /= denom;
+            for j in (i + 1)..RAW_FEATURE_DIM {
                 cov[j][i] = cov[i][j];
             }
         }
@@ -746,8 +763,8 @@ impl PcaModel {
         }
         for (k, &coeff) in embedding.iter().enumerate() {
             if k < self.components.len() {
-                for i in 0..RAW_FEATURE_DIM {
-                    result[i] += coeff * self.components[k][i];
+                for (r, c) in result.iter_mut().zip(self.components[k].iter()) {
+                    *r += coeff * c;
                 }
             }
         }
@@ -1116,7 +1133,7 @@ mod tests {
 
         for i in 0..20 {
             let mut dna = sample_dna();
-            dna.duration_hours = 1.0 + (i as f32) * 0.5;
+            dna.duration_hours = (i as f32).mul_add(0.5, 1.0);
             dna.total_lines = 1000 + i * 500;
             store.add_session(format!("s{i}"), dna, i % 3 != 0);
         }
@@ -1246,7 +1263,7 @@ mod tests {
                 b in proptest::collection::vec(-100.0f64..100.0, 8),
             ) {
                 let sim = cosine_similarity(&a, &b);
-                prop_assert!(sim >= -1.0 - 1e-10 && sim <= 1.0 + 1e-10,
+                prop_assert!((-1.0 - 1e-10..=1.0 + 1e-10).contains(&sim),
                     "cosine sim {sim} out of bounds");
             }
 
@@ -1280,8 +1297,8 @@ mod tests {
                 let mut data = Vec::new();
                 for i in 0..10 {
                     let mut row = [0.0; RAW_FEATURE_DIM];
-                    for j in 0..RAW_FEATURE_DIM {
-                        row[j] = (i * RAW_FEATURE_DIM + j) as f64;
+                    for (j, slot) in row.iter_mut().enumerate().take(RAW_FEATURE_DIM) {
+                        *slot = (i * RAW_FEATURE_DIM + j) as f64;
                     }
                     data.push(row);
                 }

@@ -344,7 +344,7 @@ mod tests {
 
     #[test]
     fn entropy_empty_is_zero() {
-        assert_eq!(compute_entropy(&[]), 0.0);
+        assert!(compute_entropy(&[]).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -443,7 +443,7 @@ mod tests {
     #[test]
     fn estimator_empty_is_zero() {
         let mut est = EntropyEstimator::new(1024);
-        assert_eq!(est.entropy(), 0.0);
+        assert!(est.entropy().abs() < f64::EPSILON);
         assert_eq!(est.total_bytes(), 0);
     }
 
@@ -517,13 +517,13 @@ mod tests {
         }
         est.reset();
         assert_eq!(est.total_bytes(), 0);
-        assert_eq!(est.entropy(), 0.0);
+        assert!(est.entropy().abs() < f64::EPSILON);
     }
 
     #[test]
     fn estimator_fill_ratio() {
         let mut est = EntropyEstimator::new(1000);
-        assert_eq!(est.fill_ratio(), 0.0);
+        assert!(est.fill_ratio().abs() < f64::EPSILON);
         for _ in 0..500 {
             est.update(0);
         }
@@ -619,7 +619,7 @@ mod tests {
         let mut budget = InformationBudget::new(10_000.0);
         assert!(!budget.is_exceeded());
         assert_eq!(budget.pane_count, 0);
-        assert_eq!(budget.utilization(), 0.0);
+        assert!(budget.utilization().abs() < f64::EPSILON);
 
         budget.add(3000.0);
         budget.add(5000.0);
@@ -653,7 +653,7 @@ mod tests {
     #[test]
     fn budget_utilization_zero_budget() {
         let budget = InformationBudget::new(0.0);
-        assert_eq!(budget.utilization(), 0.0);
+        assert!(budget.utilization().abs() < f64::EPSILON);
 
         let mut budget2 = InformationBudget::new(0.0);
         budget2.add(100.0);
@@ -684,7 +684,7 @@ mod tests {
     fn eviction_config_defaults() {
         let config = EvictionConfig::default();
         assert_eq!(config.recency_half_life_ms, 300_000);
-        assert_eq!(config.min_cost_threshold, 1024.0);
+        assert!((config.min_cost_threshold - 1024.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -702,27 +702,27 @@ mod tests {
 
     #[test]
     fn e2e_evict_low_entropy_first() {
-        // Pane A: 100KB of constant data (low entropy → low cost).
-        let pane_a_data = vec![0u8; 100_000];
-        let pane_a_h = compute_entropy(&pane_a_data);
-        let pane_a_cost = information_cost(pane_a_data.len(), pane_a_h);
+        // Pane A: 100KB of constant data (low entropy -> low cost).
+        let constant_data = vec![0u8; 100_000];
+        let constant_h = compute_entropy(&constant_data);
+        let constant_cost = information_cost(constant_data.len(), constant_h);
 
-        // Pane B: 10KB of "random" data (high entropy → high cost).
-        let pane_b_data: Vec<u8> = (0..10_000).map(|i| (i % 256) as u8).collect();
-        let pane_b_h = compute_entropy(&pane_b_data);
-        let pane_b_cost = information_cost(pane_b_data.len(), pane_b_h);
+        // Pane B: 10KB of "random" data (high entropy -> high cost).
+        let varied_data: Vec<u8> = (0..10_000).map(|i| (i % 256) as u8).collect();
+        let varied_h = compute_entropy(&varied_data);
+        let varied_cost = information_cost(varied_data.len(), varied_h);
 
-        // Despite being 10× smaller in raw bytes, pane B has higher info cost.
+        // Despite being 10x smaller in raw bytes, pane B has higher info cost.
         assert!(
-            pane_b_cost > pane_a_cost,
-            "high-entropy 10KB ({pane_b_cost:.0}) should cost more than low-entropy 100KB ({pane_a_cost:.0})"
+            varied_cost > constant_cost,
+            "high-entropy 10KB ({varied_cost:.0}) should cost more than low-entropy 100KB ({constant_cost:.0})"
         );
 
         // Eviction should target pane A first.
         let config = EvictionConfig::default();
         let scores = vec![
-            (0, eviction_score(pane_a_cost, 0, &config)),
-            (1, eviction_score(pane_b_cost, 0, &config)),
+            (0, eviction_score(constant_cost, 0, &config)),
+            (1, eviction_score(varied_cost, 0, &config)),
         ];
         let order = eviction_order(&scores);
         assert_eq!(order[0], 0, "low-entropy pane A should be evicted first");

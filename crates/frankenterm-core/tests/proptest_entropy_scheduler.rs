@@ -352,10 +352,10 @@ proptest! {
         let mut sched = EntropyScheduler::new(cfg);
 
         let count = n_panes.min(data_sizes.len());
-        for i in 0..count {
+        for (i, &size) in data_sizes.iter().enumerate().take(count) {
             let pid = (i + 1) as u64;
             sched.register_pane(pid);
-            let data: Vec<u8> = (0..data_sizes[i]).map(|j| (j % 256) as u8).collect();
+            let data: Vec<u8> = (0..size).map(|j| (j % 256) as u8).collect();
             sched.feed_bytes(pid, &data);
         }
 
@@ -402,7 +402,7 @@ proptest! {
 
         let result = sched.schedule();
         prop_assert!(
-            result.mean_density >= 0.0 && result.mean_density <= 1.0,
+            (0.0..=1.0).contains(&result.mean_density),
             "mean_density {} out of [0,1]", result.mean_density
         );
     }
@@ -561,7 +561,7 @@ proptest! {
 
         let result = sched.schedule();
         let decision_panes: HashSet<u64> = result.decisions.iter().map(|d| d.pane_id).collect();
-        let expected_panes: HashSet<u64> = pane_ids.iter().cloned().collect();
+        let expected_panes: HashSet<u64> = pane_ids.iter().copied().collect();
 
         prop_assert_eq!(decision_panes, expected_panes);
     }

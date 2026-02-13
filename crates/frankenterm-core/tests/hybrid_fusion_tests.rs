@@ -4,8 +4,7 @@
 //! verifies that the fusion pipeline produces correct rankings.
 
 use frankenterm_core::search::{
-    FusedResult, HybridSearchService, SearchMode, TwoTierMetrics, blend_two_tier, kendall_tau,
-    rrf_fuse,
+    FusedResult, HybridSearchService, SearchMode, blend_two_tier, kendall_tau, rrf_fuse,
 };
 
 // =============================================================================
@@ -70,9 +69,11 @@ fn rrf_empty_inputs() {
 
 #[test]
 fn rrf_score_monotonically_decreases() {
-    let lexical: Vec<(u64, f32)> = (0..20).map(|i| (i as u64, 1.0 - i as f32 * 0.05)).collect();
+    let lexical: Vec<(u64, f32)> = (0..20)
+        .map(|i| (i as u64, (i as f32).mul_add(-0.05, 1.0)))
+        .collect();
     let semantic: Vec<(u64, f32)> = (10..30)
-        .map(|i| (i as u64, 1.0 - (i - 10) as f32 * 0.05))
+        .map(|i| (i as u64, ((i - 10) as f32).mul_add(-0.05, 1.0)))
         .collect();
 
     let fused = rrf_fuse(&lexical, &semantic, 60);
@@ -125,7 +126,7 @@ fn blend_top_k_limits_output() {
     let tier1: Vec<FusedResult> = (0..100)
         .map(|i| FusedResult {
             id: i,
-            score: 1.0 - i as f32 * 0.01,
+            score: (i as f32).mul_add(-0.01, 1.0),
             lexical_rank: Some(i as usize),
             semantic_rank: None,
         })

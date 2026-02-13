@@ -226,7 +226,7 @@ proptest! {
     fn prop_classify_abandoned(cpu in arb_cpu()) {
         let config = LifecycleConfig::default();
         let engine = PaneLifecycleEngine::new(config.clone());
-        let age = Duration::from_secs_f64(config.kill_age_hours * 3600.0 + 1.0);
+        let age = Duration::from_secs_f64(config.kill_age_hours.mul_add(3600.0, 1.0));
         let health = engine.classify_health(age, cpu);
         prop_assert_eq!(health, PaneHealth::Abandoned,
                        "age > kill_age should always be Abandoned, got {:?}", health);
@@ -237,7 +237,7 @@ proptest! {
     fn prop_classify_likely_stuck(cpu in arb_cpu()) {
         let config = LifecycleConfig::default();
         let engine = PaneLifecycleEngine::new(config.clone());
-        let mid = (config.warn_age_hours + config.kill_age_hours) / 2.0;
+        let mid = f64::midpoint(config.warn_age_hours, config.kill_age_hours);
         let age = Duration::from_secs_f64(mid * 3600.0);
         let health = engine.classify_health(age, cpu);
         prop_assert_eq!(health, PaneHealth::LikelyStuck,

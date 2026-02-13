@@ -29,10 +29,6 @@ use frankenterm_core::watcher_client::{
 // Strategies
 // =============================================================================
 
-fn arb_role() -> impl Strategy<Value = ClientRole> {
-    prop_oneof![Just(ClientRole::Interactive), Just(ClientRole::Watcher),]
-}
-
 fn arb_mutating_action() -> impl Strategy<Value = ActionKind> {
     prop_oneof![
         Just(ActionKind::SendText),
@@ -45,13 +41,6 @@ fn arb_mutating_action() -> impl Strategy<Value = ActionKind> {
 
 fn arb_read_action() -> impl Strategy<Value = ActionKind> {
     prop_oneof![Just(ActionKind::ReadOutput), Just(ActionKind::SearchOutput),]
-}
-
-fn arb_config() -> impl Strategy<Value = ClientRegistryConfig> {
-    (2_usize..50, 1_usize..30).prop_map(|(max_clients, max_watchers)| ClientRegistryConfig {
-        max_clients,
-        max_watchers: max_watchers.min(max_clients),
-    })
 }
 
 fn arb_tab() -> impl Strategy<Value = u64> {

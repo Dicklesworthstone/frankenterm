@@ -6,7 +6,6 @@
 //! format_json, format_human, and cross-module interactions.
 
 use proptest::prelude::*;
-use serde_json;
 
 use frankenterm_core::dry_run::{
     ActionType, CommandContext, DryRunContext, DryRunReport, PlannedAction, PolicyCheck,

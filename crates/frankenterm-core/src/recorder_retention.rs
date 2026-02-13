@@ -526,13 +526,11 @@ impl RetentionManager {
                 if seg.transition(target, now_ms).is_ok() {
                     result.purged.push(seg_id);
                 }
-            } else {
-                if seg.transition(target, now_ms).is_ok() {
-                    match target {
-                        SegmentPhase::Sealed => result.sealed.push(seg_id),
-                        SegmentPhase::Archived => result.archived.push(seg_id),
-                        _ => {}
-                    }
+            } else if seg.transition(target, now_ms).is_ok() {
+                match target {
+                    SegmentPhase::Sealed => result.sealed.push(seg_id),
+                    SegmentPhase::Archived => result.archived.push(seg_id),
+                    _ => {}
                 }
             }
         }

@@ -211,7 +211,7 @@ proptest! {
         let jittered = jitter_policy.delay_for_attempt(attempt).as_millis() as f64;
 
         // Jitter should be within ±jitter_percent of base (plus rounding margin)
-        let margin = base * jitter + 2.0; // +2ms for rounding
+        let margin = base.mul_add(jitter, 2.0); // +2ms for rounding
         prop_assert!(jittered >= (base - margin).max(0.0),
             "jittered {} below base-margin {} (base={}, jitter={})",
             jittered, (base - margin).max(0.0), base, jitter);
@@ -418,11 +418,7 @@ proptest! {
         let expected = Duration::from_millis(expected_ms as u64);
 
         // Allow 1ms tolerance for f64→u64 truncation
-        let diff = if delay > expected {
-            delay - expected
-        } else {
-            expected - delay
-        };
+        let diff = delay.abs_diff(expected);
         prop_assert!(diff <= Duration::from_millis(1),
             "delay {:?} ≠ expected {:?} (diff {:?}) for init={}, factor={}, attempt={}",
             delay, expected, diff, init_ms, factor, attempt);

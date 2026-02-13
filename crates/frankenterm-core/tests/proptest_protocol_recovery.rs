@@ -406,7 +406,7 @@ proptest! {
         };
         let delay = config.delay_for_attempt(attempt);
         // Jitter can add up to jitter_fraction of max_delay
-        let upper_bound_ms = max_ms as f64 * (1.0 + jitter) + 2.0;
+        let upper_bound_ms = (max_ms as f64).mul_add(1.0 + jitter, 2.0);
         prop_assert!(delay.as_millis() as f64 <= upper_bound_ms,
             "delay {:?} exceeds approx cap {} for attempt {} (max={}, jitter={})",
             delay, upper_bound_ms, attempt, max_ms, jitter);

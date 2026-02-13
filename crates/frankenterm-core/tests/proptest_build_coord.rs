@@ -16,16 +16,24 @@ use proptest::prelude::*;
 
 fn arb_build_coord_config() -> impl Strategy<Value = BuildCoordConfig> {
     (
-        any::<bool>(),                               // enabled
-        0_u64..3600,                                 // wait_timeout secs
-        1_u64..5000,                                 // poll_interval ms
-        any::<bool>(),                               // shared_target_dir
-        proptest::option::of("[a-z/]{3,20}"),        // target_dir_override
-        any::<bool>(),                               // auto_sccache
-        proptest::option::of("[a-z/]{3,20}"),        // lock_dir_override
+        any::<bool>(),                        // enabled
+        0_u64..3600,                          // wait_timeout secs
+        1_u64..5000,                          // poll_interval ms
+        any::<bool>(),                        // shared_target_dir
+        proptest::option::of("[a-z/]{3,20}"), // target_dir_override
+        any::<bool>(),                        // auto_sccache
+        proptest::option::of("[a-z/]{3,20}"), // lock_dir_override
     )
         .prop_map(
-            |(enabled, timeout_s, poll_ms, shared, target_override, auto_sccache, lock_override)| {
+            |(
+                enabled,
+                timeout_s,
+                poll_ms,
+                shared,
+                target_override,
+                auto_sccache,
+                lock_override,
+            )| {
                 BuildCoordConfig {
                     enabled,
                     wait_timeout: Duration::from_secs(timeout_s),
@@ -41,14 +49,14 @@ fn arb_build_coord_config() -> impl Strategy<Value = BuildCoordConfig> {
 
 fn arb_build_lock_metadata() -> impl Strategy<Value = BuildLockMetadata> {
     (
-        1_u32..100_000,                            // pid
-        "[a-z]{3,10}",                             // cargo_command
-        "[a-z/]{5,30}",                            // project_root
-        0_u64..10_000_000_000,                     // started_at
-        "[a-z:0-9 ]{5,20}",                       // started_at_human
-        "[0-9.]{3,10}",                            // ft_version
-        proptest::option::of("[A-Za-z]{3,15}"),    // agent_name
-        proptest::option::of(0_u64..1000),         // pane_id
+        1_u32..100_000,                         // pid
+        "[a-z]{3,10}",                          // cargo_command
+        "[a-z/]{5,30}",                         // project_root
+        0_u64..10_000_000_000,                  // started_at
+        "[a-z:0-9 ]{5,20}",                     // started_at_human
+        "[0-9.]{3,10}",                         // ft_version
+        proptest::option::of("[A-Za-z]{3,15}"), // agent_name
+        proptest::option::of(0_u64..1000),      // pane_id
     )
         .prop_map(
             |(pid, cmd, root, started, human, version, agent, pane)| BuildLockMetadata {

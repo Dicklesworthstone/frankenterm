@@ -137,7 +137,7 @@ mod tests {
         let text = b"hello world";
         let scan = scan_newlines_and_ansi(text);
         assert_eq!(scan.ansi_byte_count, 0);
-        assert_eq!(scan.ansi_density(text.len()), 0.0);
+        assert!(scan.ansi_density(text.len()).abs() < f64::EPSILON);
     }
 
     #[test]

@@ -487,7 +487,7 @@ pub struct RecorderEventCausality {
 ///
 /// Serializes with an internally tagged `event_type` discriminant so all
 /// fields appear at the top level when flattened into [`RecorderEvent`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event_type", rename_all = "snake_case")]
 pub enum RecorderEventPayload {
     IngressText {
@@ -518,7 +518,7 @@ pub enum RecorderEventPayload {
 ///
 /// The payload is flattened so all fields appear at the top level in JSON,
 /// matching the `ft-recorder-event-v1.json` schema contract.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecorderEvent {
     pub schema_version: String,
     pub event_id: String,
@@ -541,7 +541,7 @@ pub struct RecorderEvent {
 /// Tolerates unknown additive fields for forward compatibility.
 pub fn parse_recorder_event_json(json: &str) -> crate::Result<RecorderEvent> {
     // First pass: check schema version before full deserialization.
-    let raw: serde_json::Value = serde_json::from_str(json).map_err(|e| crate::Error::Json(e))?;
+    let raw: serde_json::Value = serde_json::from_str(json).map_err(crate::Error::Json)?;
 
     let version = raw
         .get("schema_version")
@@ -556,7 +556,7 @@ pub fn parse_recorder_event_json(json: &str) -> crate::Result<RecorderEvent> {
     }
 
     // Second pass: deserialize with serde, tolerating unknown fields.
-    let event: RecorderEvent = serde_json::from_value(raw).map_err(|e| crate::Error::Json(e))?;
+    let event: RecorderEvent = serde_json::from_value(raw).map_err(crate::Error::Json)?;
     Ok(event)
 }
 

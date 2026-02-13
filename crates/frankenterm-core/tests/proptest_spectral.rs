@@ -147,9 +147,10 @@ proptest! {
         // Compute median
         let mut sorted = psd.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        #[allow(clippy::manual_midpoint)]
         let mid = sorted.len() / 2;
         let median = if sorted.len() % 2 == 0 {
-            (sorted[mid - 1] + sorted[mid]) / 2.0
+            f64::midpoint(sorted[mid - 1], sorted[mid])
         } else {
             sorted[mid]
         };
@@ -215,7 +216,7 @@ proptest! {
             AgentClass::Polling | AgentClass::Burst |
             AgentClass::Steady | AgentClass::Idle => {}
         }
-        prop_assert!(fp.total_power >= 0.0 || fp.total_power < 0.0 || fp.total_power.is_nan() == false);
+        prop_assert!(fp.total_power >= 0.0 || fp.total_power < 0.0 || !fp.total_power.is_nan());
         prop_assert!(fp.fft_size > 0 || fp.classification == AgentClass::Idle);
     }
 }

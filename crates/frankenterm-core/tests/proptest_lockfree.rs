@@ -124,13 +124,7 @@ fn sequential_map(ops: &[MapOp]) -> Vec<Option<u64>> {
                 map.remove(k);
                 None
             }
-            MapOp::Contains(k) => {
-                if map.contains_key(k) {
-                    Some(1)
-                } else {
-                    Some(0)
-                }
-            }
+            MapOp::Contains(k) => Some(u64::from(map.contains_key(k))),
         })
         .collect()
 }
@@ -230,8 +224,7 @@ proptest! {
                     actual.push(None);
                 }
                 MapOp::Contains(k) => {
-                    let v = if map.contains(*k) { 1 } else { 0 };
-                    actual.push(Some(v));
+                    actual.push(Some(u64::from(map.contains(*k))));
                 }
             }
         }

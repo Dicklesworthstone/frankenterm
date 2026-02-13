@@ -33,10 +33,7 @@ fn arb_durability_level() -> impl Strategy<Value = DurabilityLevel> {
 }
 
 fn arb_flush_mode() -> impl Strategy<Value = FlushMode> {
-    prop_oneof![
-        Just(FlushMode::Buffered),
-        Just(FlushMode::Durable),
-    ]
+    prop_oneof![Just(FlushMode::Buffered), Just(FlushMode::Durable),]
 }
 
 fn arb_offset() -> impl Strategy<Value = RecorderOffset> {
@@ -373,7 +370,10 @@ fn all_durability_levels_distinct_json() {
         DurabilityLevel::Appended,
         DurabilityLevel::Fsync,
     ];
-    let jsons: Vec<_> = levels.iter().map(|l| serde_json::to_string(l).unwrap()).collect();
+    let jsons: Vec<_> = levels
+        .iter()
+        .map(|l| serde_json::to_string(l).unwrap())
+        .collect();
     for i in 0..jsons.len() {
         for j in (i + 1)..jsons.len() {
             assert_ne!(jsons[i], jsons[j]);
@@ -391,7 +391,10 @@ fn all_error_classes_distinct_json() {
         RecorderStorageErrorClass::Corruption,
         RecorderStorageErrorClass::DependencyUnavailable,
     ];
-    let jsons: Vec<_> = classes.iter().map(|c| serde_json::to_string(c).unwrap()).collect();
+    let jsons: Vec<_> = classes
+        .iter()
+        .map(|c| serde_json::to_string(c).unwrap())
+        .collect();
     for i in 0..jsons.len() {
         for j in (i + 1)..jsons.len() {
             assert_ne!(jsons[i], jsons[j]);

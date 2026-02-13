@@ -703,7 +703,7 @@ mod tests {
     #[test]
     fn hit_rate_zero_lookups() {
         let stats = CacheStats::default();
-        assert_eq!(stats.hit_rate(), 0.0);
+        assert!(stats.hit_rate().abs() < f64::EPSILON);
     }
 
     #[test]

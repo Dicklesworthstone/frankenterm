@@ -334,7 +334,6 @@ impl AppendLogRecorderStorage {
         let mut file = OpenOptions::new()
             .create(true)
             .read(true)
-            .write(true)
             .append(true)
             .open(&config.data_path)?;
 
@@ -388,7 +387,7 @@ impl AppendLogRecorderStorage {
 
     fn persist_state(
         &self,
-        inner: &mut AppendLogInner,
+        inner: &AppendLogInner,
     ) -> std::result::Result<(), RecorderStorageError> {
         let persisted = PersistedState {
             segment_id: inner.segment_id,
@@ -510,12 +509,12 @@ impl RecorderStorage for AppendLogRecorderStorage {
             DurabilityLevel::Enqueued => {}
             DurabilityLevel::Appended => {
                 inner.writer.flush()?;
-                self.persist_state(&mut inner)?;
+                self.persist_state(&inner)?;
             }
             DurabilityLevel::Fsync => {
                 inner.writer.flush()?;
                 inner.writer.get_ref().sync_data()?;
-                self.persist_state(&mut inner)?;
+                self.persist_state(&inner)?;
             }
         }
 
@@ -553,7 +552,7 @@ impl RecorderStorage for AppendLogRecorderStorage {
         if mode == FlushMode::Durable {
             inner.writer.get_ref().sync_data()?;
         }
-        self.persist_state(&mut inner)?;
+        self.persist_state(&inner)?;
         Ok(FlushStats {
             backend: RecorderBackendKind::AppendLog,
             flushed_at_ms: crate::recording::epoch_ms_now(),
@@ -591,7 +590,7 @@ impl RecorderStorage for AppendLogRecorderStorage {
 
         if outcome == CheckpointCommitOutcome::Advanced {
             inner.checkpoints.insert(key, checkpoint);
-            self.persist_state(&mut inner)?;
+            self.persist_state(&inner)?;
         }
 
         Ok(outcome)
@@ -1501,7 +1500,7 @@ mod tests {
 
         // Create empty data file
         std::fs::create_dir_all(cfg.data_path.parent().unwrap()).unwrap();
-        std::fs::write(&cfg.data_path, &[]).unwrap();
+        std::fs::write(&cfg.data_path, []).unwrap();
 
         let storage = AppendLogRecorderStorage::open(cfg).unwrap();
         let h = storage.health().await;

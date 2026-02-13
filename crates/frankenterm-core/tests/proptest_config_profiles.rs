@@ -27,7 +27,7 @@ fn arb_valid_name() -> impl Strategy<Value = String> {
 fn arb_invalid_name() -> impl Strategy<Value = String> {
     prop_oneof![
         // Empty after trim
-        Just("".to_string()),
+        Just(String::new()),
         Just("   ".to_string()),
         // Too long
         "[a-z]{33,40}",
@@ -124,7 +124,7 @@ proptest! {
     #[test]
     fn prop_canonicalize_length(name in arb_valid_name()) {
         let result = canonicalize_profile_name(&name).unwrap();
-        prop_assert!(result.len() >= 1 && result.len() <= 32,
+        prop_assert!(!result.is_empty() && result.len() <= 32,
             "length {} out of range", result.len());
     }
 

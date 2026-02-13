@@ -6,9 +6,7 @@
 
 use std::collections::HashMap;
 
-use frankenterm_core::event_templates::{
-    ContextKey, EventTemplate, Suggestion, TemplateRegistry,
-};
+use frankenterm_core::event_templates::{ContextKey, EventTemplate, Suggestion, TemplateRegistry};
 use frankenterm_core::patterns::Severity;
 use frankenterm_core::storage::StoredEvent;
 use proptest::prelude::*;
@@ -27,20 +25,32 @@ fn arb_severity() -> impl Strategy<Value = Severity> {
 
 fn arb_stored_event() -> impl Strategy<Value = StoredEvent> {
     (
-        1_i64..10_000,                 // id
-        1_u64..1000,                   // pane_id
-        "[a-z.]{3,15}",               // rule_id
-        "[a-z_]{3,10}",               // agent_type
-        "[a-z.]{3,15}",               // event_type
-        "info|warning|critical",      // severity
-        0.0_f64..1.0,                 // confidence
-        proptest::option::of(
-            proptest::collection::hash_map("[a-z_]{3,10}", "[a-z0-9 ]{1,20}", 0..5)
-        ),                             // extracted
-        0_i64..100_000_000,           // detected_at
+        1_i64..10_000,           // id
+        1_u64..1000,             // pane_id
+        "[a-z.]{3,15}",          // rule_id
+        "[a-z_]{3,10}",          // agent_type
+        "[a-z.]{3,15}",          // event_type
+        "info|warning|critical", // severity
+        0.0_f64..1.0,            // confidence
+        proptest::option::of(proptest::collection::hash_map(
+            "[a-z_]{3,10}",
+            "[a-z0-9 ]{1,20}",
+            0..5,
+        )), // extracted
+        0_i64..100_000_000,      // detected_at
     )
         .prop_map(
-            |(id, pane_id, rule_id, agent_type, event_type, severity, confidence, extracted, detected_at)| {
+            |(
+                id,
+                pane_id,
+                rule_id,
+                agent_type,
+                event_type,
+                severity,
+                confidence,
+                extracted,
+                detected_at,
+            )| {
                 let extracted_json = extracted.map(|map| {
                     let obj: serde_json::Map<String, serde_json::Value> = map
                         .into_iter()

@@ -26,35 +26,39 @@ fn arb_extension_info() -> impl Strategy<Value = ExtensionInfo> {
         "[a-z_]{3,15}",                         // name
         "[0-9]{1,2}\\.[0-9]{1,2}\\.[0-9]{1,2}", // version
         arb_extension_source(),
-        0_usize..50,                            // rule_count
-        proptest::option::of("[a-z/]{5,20}"),   // path
-        any::<bool>(),                          // active
+        0_usize..50,                          // rule_count
+        proptest::option::of("[a-z/]{5,20}"), // path
+        any::<bool>(),                        // active
     )
-        .prop_map(|(name, version, source, rule_count, path, active)| ExtensionInfo {
-            name,
-            version,
-            source,
-            rule_count,
-            path,
-            active,
-        })
+        .prop_map(
+            |(name, version, source, rule_count, path, active)| ExtensionInfo {
+                name,
+                version,
+                source,
+                rule_count,
+                path,
+                active,
+            },
+        )
 }
 
 fn arb_extension_rule_info() -> impl Strategy<Value = ExtensionRuleInfo> {
     (
-        "[a-z.]{3,15}",   // id
-        "[a-z]{3,10}",     // agent_type
-        "[a-z.]{3,15}",   // event_type
+        "[a-z.]{3,15}",          // id
+        "[a-z]{3,10}",           // agent_type
+        "[a-z.]{3,15}",          // event_type
         "info|warning|critical", // severity
-        "[A-Za-z ]{5,30}", // description
+        "[A-Za-z ]{5,30}",       // description
     )
-        .prop_map(|(id, agent_type, event_type, severity, description)| ExtensionRuleInfo {
-            id,
-            agent_type,
-            event_type,
-            severity,
-            description,
-        })
+        .prop_map(
+            |(id, agent_type, event_type, severity, description)| ExtensionRuleInfo {
+                id,
+                agent_type,
+                event_type,
+                severity,
+                description,
+            },
+        )
 }
 
 fn arb_extension_detail() -> impl Strategy<Value = ExtensionDetail> {

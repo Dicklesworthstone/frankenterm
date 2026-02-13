@@ -771,7 +771,7 @@ mod tests {
     #[test]
     fn value_to_string_number() {
         assert_eq!(value_to_string(&serde_json::json!(42)), "42");
-        assert_eq!(value_to_string(&serde_json::json!(3.14)), "3.14");
+        assert_eq!(value_to_string(&serde_json::json!(1.23)), "1.23");
     }
 
     #[test]

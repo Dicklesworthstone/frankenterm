@@ -267,8 +267,7 @@ fn chi_squared_survival(x: f64, dof: f64) -> f64 {
     if (dof - 1.0).abs() < 0.01 {
         erfc((x / 2.0).sqrt())
     } else {
-        let z =
-            ((x / dof).powf(1.0 / 3.0) - (1.0 - 2.0 / (9.0 * dof))) / (2.0 / (9.0 * dof)).sqrt();
+        let z = ((x / dof).cbrt() - (1.0 - 2.0 / (9.0 * dof))) / (2.0 / (9.0 * dof)).sqrt();
         0.5 * erfc(z / std::f64::consts::SQRT_2)
     }
 }
@@ -278,7 +277,7 @@ fn erfc(x: f64) -> f64 {
     if x < 0.0 {
         return 2.0 - erfc(-x);
     }
-    let t = 1.0 / (1.0 + 0.327_591_1 * x);
+    let t = 1.0 / 0.327_591_1f64.mul_add(x, 1.0);
     let poly = t
         * (0.254_829_592
             + t * (-0.284_496_736
@@ -776,7 +775,7 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: CorrelationConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.window_ms, 60_000);
-        assert_eq!(deserialized.p_value_threshold, 0.001);
+        assert!((deserialized.p_value_threshold - 0.001).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -806,7 +805,7 @@ mod tests {
         };
         let json = serde_json::to_string(&corr).unwrap();
         let deserialized: Correlation = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.p_value, 0.001);
+        assert!((deserialized.p_value - 0.001).abs() < f64::EPSILON);
         assert_eq!(deserialized.participating_panes.len(), 3);
     }
 }

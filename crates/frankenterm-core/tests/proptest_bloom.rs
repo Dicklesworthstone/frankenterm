@@ -150,7 +150,7 @@ proptest! {
         let observed = false_positives as f64 / test_count as f64;
         // Allow 5× theoretical as generous bound.
         prop_assert!(
-            observed < fp_rate * 5.0 + 0.01, // +0.01 floor for very low rates
+            observed < fp_rate.mul_add(5.0, 0.01), // +0.01 floor for very low rates
             "FP rate {} exceeds 5x target {} (observed {}/{})",
             observed, fp_rate, false_positives, test_count
         );
@@ -169,7 +169,7 @@ proptest! {
             bf.insert(item);
         }
         let est = bf.estimated_fp_rate();
-        prop_assert!(est >= 0.0 && est <= 1.0, "estimated_fp_rate out of [0,1]: {}", est);
+        prop_assert!((0.0..=1.0).contains(&est), "estimated_fp_rate out of [0,1]: {}", est);
     }
 }
 
@@ -267,7 +267,7 @@ proptest! {
         for item in &items {
             bf.insert(item);
             let ratio = bf.stats().fill_ratio;
-            prop_assert!(ratio >= 0.0 && ratio <= 1.0, "fill_ratio out of [0,1]: {}", ratio);
+            prop_assert!((0.0..=1.0).contains(&ratio), "fill_ratio out of [0,1]: {}", ratio);
             prop_assert!(ratio >= prev_ratio, "fill_ratio decreased: {} -> {}", prev_ratio, ratio);
             prev_ratio = ratio;
         }
@@ -524,7 +524,7 @@ proptest! {
         let k = optimal_num_hashes(bits, capacity);
         let count = (capacity as f64 * fill_frac) as usize;
         let fp = theoretical_fp_rate(bits, k, count);
-        prop_assert!(fp >= 0.0 && fp <= 1.0, "theoretical FP rate out of [0,1]: {}", fp);
+        prop_assert!((0.0..=1.0).contains(&fp), "theoretical FP rate out of [0,1]: {}", fp);
     }
 
     /// theoretical_fp_rate(bits, k, 0) == 0 (empty filter has no false positives).
@@ -582,8 +582,8 @@ proptest! {
         let first = bf.contains(&item);
         bf.insert(&item);
         let second = bf.contains(&item);
-        prop_assert_eq!(first, true);
-        prop_assert_eq!(second, true);
+        prop_assert!(first);
+        prop_assert!(second);
     }
 
     /// Insertion order doesn't affect membership queries.

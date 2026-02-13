@@ -203,8 +203,8 @@ proptest! {
     /// Property 11: Secret achievements exist in catalog
     #[test]
     fn prop_secret_achievements_exist(_dummy in Just(())) {
-        let secrets: Vec<_> = BUILTIN_ACHIEVEMENTS.iter().filter(|d| d.secret).collect();
-        prop_assert!(secrets.len() >= 2, "Should have at least 2 secret achievements");
+        let secret_count = BUILTIN_ACHIEVEMENTS.iter().filter(|d| d.secret).count();
+        prop_assert!(secret_count >= 2, "Should have at least 2 secret achievements");
     }
 
     /// Property 12: Rarity distribution covers all tiers

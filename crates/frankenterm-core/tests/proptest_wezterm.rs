@@ -48,8 +48,7 @@ fn arb_pane_info() -> impl Strategy<Value = PaneInfo> {
         proptest::option::of(0_u32..500),
     )
         .prop_map(
-            |(pane_id, tab_id, window_id, domain_id, domain_name,
-              workspace, size, rows, cols)| {
+            |(pane_id, tab_id, window_id, domain_id, domain_name, workspace, size, rows, cols)| {
                 PaneInfo {
                     pane_id,
                     tab_id,

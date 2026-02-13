@@ -182,8 +182,8 @@ fn survival_hazard_drives_scheduling_priority() {
     let mut sched = VoiScheduler::new(VoiConfig::default());
     sched.register_pane(1, 1000);
     sched.register_pane(2, 1000);
-    sched.set_importance(1, 1.0 + report_short.failure_probability * 10.0);
-    sched.set_importance(2, 1.0 + report_long.failure_probability * 10.0);
+    sched.set_importance(1, report_short.failure_probability.mul_add(10.0, 1.0));
+    sched.set_importance(2, report_long.failure_probability.mul_add(10.0, 1.0));
 
     let result = sched.schedule(5000);
     let voi_short = result.schedule.iter().find(|d| d.pane_id == 1).unwrap().voi;
@@ -206,7 +206,7 @@ fn conformal_coverage_holds_statistically() {
     // Feed a linear trend with noise.
     let n = 200;
     for i in 0..n {
-        let val = 100.0 + i as f64 * 0.5 + ((i * 7) % 13) as f64 * 0.1;
+        let val = (((i * 7) % 13) as f64).mul_add(0.1, (i as f64).mul_add(0.5, 100.0));
         forecaster.observe("rss_bytes", val);
     }
 
@@ -301,11 +301,11 @@ fn causal_dag_detects_direction() {
         .collect();
 
     if !edges_1_to_2.is_empty() {
-        let te_fwd = edges_1_to_2[0].transfer_entropy;
-        let te_bwd = edges_2_to_1.first().map_or(0.0, |e| e.transfer_entropy);
+        let te_forward = edges_1_to_2[0].transfer_entropy;
+        let te_backward = edges_2_to_1.first().map_or(0.0, |e| e.transfer_entropy);
         assert!(
-            te_fwd >= te_bwd,
-            "Forward TE ({te_fwd}) should be >= backward ({te_bwd})"
+            te_forward >= te_backward,
+            "Forward TE ({te_forward}) should be >= backward ({te_backward})"
         );
     }
 }

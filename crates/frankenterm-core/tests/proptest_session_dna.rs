@@ -366,7 +366,7 @@ proptest! {
     fn prop_cosine_bounded(a in arb_vec(8), b in arb_vec(8)) {
         let sim = cosine_similarity(&a, &b);
         prop_assert!(
-            sim >= -1.0 - 1e-10 && sim <= 1.0 + 1e-10,
+            (-1.0 - 1e-10..=1.0 + 1e-10).contains(&sim),
             "cosine sim {} out of [-1,1]", sim
         );
     }

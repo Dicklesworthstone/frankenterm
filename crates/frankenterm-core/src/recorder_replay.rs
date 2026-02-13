@@ -473,8 +473,7 @@ impl ReplaySession {
                 let prev_ts = if frame_index > 0 {
                     self.events[..frame_index]
                         .iter()
-                        .rev()
-                        .next()
+                        .next_back()
                         .map(|e| e.occurred_at_ms)
                         .unwrap_or(event.occurred_at_ms)
                 } else {

@@ -1013,7 +1013,7 @@ mod tests {
         for i in 0..500 {
             let val = if i < 200 { 5.0 } else { 50.0 };
             w.push(val);
-            assert!(w.len() >= 1, "window should never be empty after push");
+            assert!(!w.is_empty(), "window should never be empty after push");
         }
     }
 
@@ -1027,7 +1027,7 @@ mod tests {
             // After any drift-induced shrink, the remaining window's mean
             // should still be within the global observation range
             assert!(
-                mean >= 1.0 - f64::EPSILON && mean <= 8.0 + f64::EPSILON,
+                (1.0 - f64::EPSILON..=8.0 + f64::EPSILON).contains(&mean),
                 "mean {} out of bounds",
                 mean
             );
@@ -1043,7 +1043,7 @@ mod tests {
             let mut drifts = 0;
             // Gradual shift
             for i in 0..200 {
-                let val = 5.0 + (i as f64) * 0.05;
+                let val = (i as f64).mul_add(0.05, 5.0);
                 if w.push(val).is_some() {
                     drifts += 1;
                 }

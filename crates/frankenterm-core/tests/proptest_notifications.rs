@@ -12,19 +12,30 @@ use proptest::prelude::*;
 
 fn arb_notification_payload() -> impl Strategy<Value = NotificationPayload> {
     (
-        "[a-z.]{3,20}",                          // event_type
-        0_u64..10_000,                            // pane_id
+        "[a-z.]{3,20}",                                          // event_type
+        0_u64..10_000,                                           // pane_id
         "[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}", // timestamp
-        "[A-Za-z ]{3,30}",                       // summary
-        "[A-Za-z ]{5,50}",                       // description
-        "info|warning|critical",                  // severity
-        "[a-z]{3,10}",                            // agent_type
-        0.0_f64..1.0,                             // confidence
-        proptest::option::of("[a-z ]{3,20}"),     // quick_fix
-        0_u64..100,                               // suppressed_since_last
+        "[A-Za-z ]{3,30}",                                       // summary
+        "[A-Za-z ]{5,50}",                                       // description
+        "info|warning|critical",                                 // severity
+        "[a-z]{3,10}",                                           // agent_type
+        0.0_f64..1.0,                                            // confidence
+        proptest::option::of("[a-z ]{3,20}"),                    // quick_fix
+        0_u64..100,                                              // suppressed_since_last
     )
         .prop_map(
-            |(event_type, pane_id, timestamp, summary, description, severity, agent_type, confidence, quick_fix, suppressed)| {
+            |(
+                event_type,
+                pane_id,
+                timestamp,
+                summary,
+                description,
+                severity,
+                agent_type,
+                confidence,
+                quick_fix,
+                suppressed,
+            )| {
                 NotificationPayload {
                     event_type,
                     pane_id,

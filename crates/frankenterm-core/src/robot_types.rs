@@ -1178,11 +1178,11 @@ mod tests {
         assert_eq!(data.pane_ids, vec![0, 1]);
         match data.results.get(&0).unwrap() {
             PaneTextResult::Ok { text, .. } => assert_eq!(text, "ready"),
-            other => panic!("expected ok variant, got {other:?}"),
+            other @ PaneTextResult::Error { .. } => panic!("expected ok variant, got {other:?}"),
         }
         match data.results.get(&1).unwrap() {
             PaneTextResult::Error { code, .. } => assert_eq!(code, "robot.pane_not_found"),
-            other => panic!("expected error variant, got {other:?}"),
+            other @ PaneTextResult::Ok { .. } => panic!("expected error variant, got {other:?}"),
         }
     }
 
@@ -1228,7 +1228,7 @@ mod tests {
         assert_eq!(data.tail_lines, 10);
         match data.pane_text.get(&2).unwrap() {
             PaneTextResult::Ok { truncated, .. } => assert!(*truncated),
-            other => panic!("expected ok variant, got {other:?}"),
+            other @ PaneTextResult::Error { .. } => panic!("expected ok variant, got {other:?}"),
         }
     }
 

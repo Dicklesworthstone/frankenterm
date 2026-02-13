@@ -8,10 +8,9 @@
 //! - Plan computation (100 panes): **< 2ms**
 //! - Config max_segments_for lookup: **< 50ns**
 
-use criterion::{
-    BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
-};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::collections::{HashMap, VecDeque};
+use std::hint::black_box;
 
 use frankenterm_core::memory_pressure::MemoryPressureTier;
 use frankenterm_core::pane_tiers::PaneTier;

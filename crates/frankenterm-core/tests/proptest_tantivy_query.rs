@@ -529,7 +529,7 @@ proptest! {
     fn prop_snippets_contain_markers(term in "[a-z]{3,10}") {
         let text = format!("prefix {} suffix", term);
         let config = SnippetConfig::default();
-        let snippets = extract_snippets(&text, &[term.clone()], &config);
+        let snippets = extract_snippets(&text, std::slice::from_ref(&term), &config);
         if !snippets.is_empty() {
             prop_assert!(
                 snippets[0].fragment.contains(&config.highlight_pre),

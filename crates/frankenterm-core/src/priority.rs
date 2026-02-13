@@ -571,7 +571,7 @@ mod tests {
     fn rate_tracker_starts_at_zero() {
         let now = Instant::now();
         let tracker = OutputRateTracker::with_start(Duration::from_secs(10), now);
-        assert_eq!(tracker.lines_per_second(now), 0.0);
+        assert!(tracker.lines_per_second(now).abs() < f64::EPSILON);
         assert_eq!(tracker.total_lines(), 0);
     }
 

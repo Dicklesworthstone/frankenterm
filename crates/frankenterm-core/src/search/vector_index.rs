@@ -61,7 +61,7 @@ fn f16_to_f32(half: u16) -> f32 {
         let bits = sign | 0x7F800000 | (mantissa << 13);
         return f32::from_bits(bits);
     }
-    let exp = ((exponent as u32) + 127 - 15) << 23;
+    let exp = (exponent + 127 - 15) << 23;
     let man = mantissa << 13;
     f32::from_bits(sign | exp | man)
 }
@@ -298,8 +298,8 @@ mod tests {
         assert_eq!(idx.len(), 2);
         assert_eq!(idx.dimension(), 4);
         // f16 roundtrip preserves 1.0 and 0.0 exactly
-        assert_eq!(idx.vectors[0][0], 1.0);
-        assert_eq!(idx.vectors[0][1], 0.0);
+        assert!((idx.vectors[0][0] - 1.0).abs() < f32::EPSILON);
+        assert!(idx.vectors[0][1].abs() < f32::EPSILON);
     }
 
     #[test]
@@ -339,7 +339,7 @@ mod tests {
     #[test]
     fn f16_special_values() {
         // zero
-        assert_eq!(f16_to_f32(f32_to_f16(0.0)), 0.0);
+        assert!(f16_to_f32(f32_to_f16(0.0)).abs() < f32::EPSILON);
         // negative zero
         assert_eq!(f16_to_f32(f32_to_f16(-0.0)).to_bits(), (-0.0f32).to_bits());
         // infinity

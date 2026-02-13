@@ -3,7 +3,7 @@
 //! Tests read/write roundtrips, search accuracy, f16 precision,
 //! and edge cases for the binary vector index.
 
-use frankenterm_core::search::{FtviIndex, FtviRecord, FtviWriter};
+use frankenterm_core::search::{FtviIndex, FtviWriter};
 
 /// Helper: build an FTVI index from (id, vector) pairs using write_ftvi_vec.
 fn build_index(dimension: u16, records: &[(u64, &[f32])]) -> FtviIndex {

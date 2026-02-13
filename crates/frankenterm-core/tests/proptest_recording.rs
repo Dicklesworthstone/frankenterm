@@ -6,7 +6,6 @@
 //! Pure logic only -- no filesystem I/O, no async, no tempfiles.
 
 use proptest::prelude::*;
-use serde_json;
 
 use frankenterm_core::ingest::CapturedSegmentKind;
 use frankenterm_core::policy::{ActionKind, ActorKind};
@@ -211,6 +210,7 @@ fn arb_recorder_event() -> impl Strategy<Value = RecorderEvent> {
         )
 }
 
+#[allow(dead_code)]
 fn arb_frame_header() -> impl Strategy<Value = FrameHeader> {
     (any::<u64>(), arb_frame_type(), any::<u8>(), 0u32..10_000).prop_map(|(ts, ft, flags, plen)| {
         FrameHeader {
@@ -248,6 +248,7 @@ fn arb_actor_kind() -> impl Strategy<Value = ActorKind> {
     ]
 }
 
+#[allow(dead_code)]
 fn arb_action_kind() -> impl Strategy<Value = ActionKind> {
     prop_oneof![
         Just(ActionKind::SendText),

@@ -856,20 +856,44 @@ mod tests {
     #[test]
     fn features_from_empty_text() {
         let features = OutputFeatures::compute("", std::time::Duration::from_secs(1));
-        assert_eq!(features.output_rate, 0.0);
-        assert_eq!(features.byte_rate, 0.0);
-        assert_eq!(features.entropy, 0.0);
-        assert_eq!(features.unique_line_ratio, 1.0);
+        assert!(
+            features.output_rate.abs() < f64::EPSILON,
+            "output_rate: {}",
+            features.output_rate
+        );
+        assert!(
+            features.byte_rate.abs() < f64::EPSILON,
+            "byte_rate: {}",
+            features.byte_rate
+        );
+        assert!(
+            features.entropy.abs() < f64::EPSILON,
+            "entropy: {}",
+            features.entropy
+        );
+        assert!(
+            (features.unique_line_ratio - 1.0).abs() < f64::EPSILON,
+            "unique_line_ratio: {}",
+            features.unique_line_ratio
+        );
     }
 
     #[test]
     fn features_from_normal_output() {
         let text = "line 1\nline 2\nline 3\nline 4\nline 5\n";
         let features = OutputFeatures::compute(text, std::time::Duration::from_secs(1));
-        assert_eq!(features.output_rate, 5.0);
+        assert!(
+            (features.output_rate - 5.0).abs() < f64::EPSILON,
+            "output_rate: {}",
+            features.output_rate
+        );
         assert!(features.byte_rate > 0.0);
         assert!(features.entropy > 0.0);
-        assert_eq!(features.unique_line_ratio, 1.0);
+        assert!(
+            (features.unique_line_ratio - 1.0).abs() < f64::EPSILON,
+            "unique_line_ratio: {}",
+            features.unique_line_ratio
+        );
     }
 
     #[test]
@@ -1015,7 +1039,11 @@ mod tests {
 
     #[test]
     fn log_sum_exp_empty() {
-        assert_eq!(log_sum_exp(&[]), f64::NEG_INFINITY);
+        let result = log_sum_exp(&[]);
+        assert!(
+            result.is_infinite() && result.is_sign_negative(),
+            "expected NEG_INFINITY, got {result}"
+        );
     }
 
     #[test]
@@ -1065,7 +1093,7 @@ mod tests {
         let text = b"hello world";
         let scan = crate::simd_scan::scan_newlines_and_ansi(text);
         let d = scan.ansi_density(text.len());
-        assert_eq!(d, 0.0);
+        assert!(d.abs() < f64::EPSILON, "ansi_density: {d}");
     }
 
     // -- Config ---------------------------------------------------------------

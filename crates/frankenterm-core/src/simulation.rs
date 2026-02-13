@@ -272,7 +272,7 @@ pub struct ResizeTimelineStageSummary {
 }
 
 /// Resize timeline artifact for one scenario execution.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResizeTimeline {
     /// Scenario name.
     pub scenario: String,

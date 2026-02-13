@@ -15,24 +15,28 @@ use proptest::prelude::*;
 
 fn arb_ipc_request() -> impl Strategy<Value = IpcRequest> {
     prop_oneof![
-        (0_u64..100_000, "[A-Z_]{3,15}", "[a-zA-Z0-9+/=]{5,40}")
-            .prop_map(|(pane_id, name, value)| IpcRequest::UserVar {
+        (0_u64..100_000, "[A-Z_]{3,15}", "[a-zA-Z0-9+/=]{5,40}").prop_map(
+            |(pane_id, name, value)| IpcRequest::UserVar {
                 pane_id,
                 name,
                 value,
-            }),
+            }
+        ),
         Just(IpcRequest::Ping),
         Just(IpcRequest::Status),
         (0_u64..100_000).prop_map(|pane_id| IpcRequest::PaneState { pane_id }),
-        (0_u64..100_000, 0_u32..100, proptest::option::of(0_u64..60_000))
+        (
+            0_u64..100_000,
+            0_u32..100,
+            proptest::option::of(0_u64..60_000)
+        )
             .prop_map(|(pane_id, priority, ttl_ms)| IpcRequest::SetPanePriority {
                 pane_id,
                 priority,
                 ttl_ms,
             }),
         (0_u64..100_000).prop_map(|pane_id| IpcRequest::ClearPanePriority { pane_id }),
-        proptest::collection::vec("[a-z_]{2,10}", 0..5)
-            .prop_map(|args| IpcRequest::Rpc { args }),
+        proptest::collection::vec("[a-z_]{2,10}", 0..5).prop_map(|args| IpcRequest::Rpc { args }),
     ]
 }
 

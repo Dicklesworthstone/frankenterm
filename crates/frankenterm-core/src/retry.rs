@@ -628,8 +628,16 @@ mod tests {
         let p = RetryPolicy::default();
         assert_eq!(p.initial_delay, Duration::from_millis(100));
         assert_eq!(p.max_delay, Duration::from_secs(30));
-        assert_eq!(p.backoff_factor, 2.0);
-        assert_eq!(p.jitter_percent, 0.1);
+        assert!(
+            (p.backoff_factor - 2.0).abs() < f64::EPSILON,
+            "backoff_factor: {}",
+            p.backoff_factor
+        );
+        assert!(
+            (p.jitter_percent - 0.1).abs() < f64::EPSILON,
+            "jitter_percent: {}",
+            p.jitter_percent
+        );
         assert_eq!(p.max_attempts, Some(3));
     }
 
@@ -644,7 +652,11 @@ mod tests {
             0.1,
             Some(3),
         );
-        assert_eq!(p.backoff_factor, 1.0);
+        assert!(
+            (p.backoff_factor - 1.0).abs() < f64::EPSILON,
+            "backoff_factor: {}",
+            p.backoff_factor
+        );
     }
 
     #[test]
@@ -656,7 +668,11 @@ mod tests {
             0.1,
             Some(3),
         );
-        assert_eq!(p.backoff_factor, 1.0);
+        assert!(
+            (p.backoff_factor - 1.0).abs() < f64::EPSILON,
+            "backoff_factor: {}",
+            p.backoff_factor
+        );
     }
 
     #[test]
@@ -668,7 +684,11 @@ mod tests {
             0.1,
             Some(3),
         );
-        assert_eq!(p.backoff_factor, 3.5);
+        assert!(
+            (p.backoff_factor - 3.5).abs() < f64::EPSILON,
+            "backoff_factor: {}",
+            p.backoff_factor
+        );
     }
 
     #[test]
@@ -680,7 +700,11 @@ mod tests {
             1.5,
             Some(3),
         );
-        assert_eq!(p.jitter_percent, 1.0);
+        assert!(
+            (p.jitter_percent - 1.0).abs() < f64::EPSILON,
+            "jitter_percent: {}",
+            p.jitter_percent
+        );
     }
 
     #[test]
@@ -692,7 +716,11 @@ mod tests {
             -0.3,
             Some(3),
         );
-        assert_eq!(p.jitter_percent, 0.0);
+        assert!(
+            p.jitter_percent.abs() < f64::EPSILON,
+            "jitter_percent: {}",
+            p.jitter_percent
+        );
     }
 
     #[test]
@@ -704,7 +732,11 @@ mod tests {
             0.5,
             Some(3),
         );
-        assert_eq!(p.jitter_percent, 0.5);
+        assert!(
+            (p.jitter_percent - 0.5).abs() < f64::EPSILON,
+            "jitter_percent: {}",
+            p.jitter_percent
+        );
     }
 
     #[test]
@@ -786,8 +818,16 @@ mod tests {
         let p = RetryPolicy::wezterm_cli();
         assert_eq!(p.initial_delay, Duration::from_millis(100));
         assert_eq!(p.max_delay, Duration::from_secs(5));
-        assert_eq!(p.backoff_factor, 2.0);
-        assert_eq!(p.jitter_percent, 0.1);
+        assert!(
+            (p.backoff_factor - 2.0).abs() < f64::EPSILON,
+            "backoff_factor: {}",
+            p.backoff_factor
+        );
+        assert!(
+            (p.jitter_percent - 0.1).abs() < f64::EPSILON,
+            "jitter_percent: {}",
+            p.jitter_percent
+        );
         assert_eq!(p.max_attempts, Some(3));
     }
 
@@ -796,8 +836,16 @@ mod tests {
         let p = RetryPolicy::db_write();
         assert_eq!(p.initial_delay, Duration::from_millis(50));
         assert_eq!(p.max_delay, Duration::from_secs(2));
-        assert_eq!(p.backoff_factor, 2.0);
-        assert_eq!(p.jitter_percent, 0.1);
+        assert!(
+            (p.backoff_factor - 2.0).abs() < f64::EPSILON,
+            "backoff_factor: {}",
+            p.backoff_factor
+        );
+        assert!(
+            (p.jitter_percent - 0.1).abs() < f64::EPSILON,
+            "jitter_percent: {}",
+            p.jitter_percent
+        );
         assert_eq!(p.max_attempts, Some(5));
     }
 
@@ -806,8 +854,16 @@ mod tests {
         let p = RetryPolicy::webhook();
         assert_eq!(p.initial_delay, Duration::from_secs(1));
         assert_eq!(p.max_delay, Duration::from_secs(60));
-        assert_eq!(p.backoff_factor, 2.0);
-        assert_eq!(p.jitter_percent, 0.1);
+        assert!(
+            (p.backoff_factor - 2.0).abs() < f64::EPSILON,
+            "backoff_factor: {}",
+            p.backoff_factor
+        );
+        assert!(
+            (p.jitter_percent - 0.1).abs() < f64::EPSILON,
+            "jitter_percent: {}",
+            p.jitter_percent
+        );
         assert_eq!(p.max_attempts, Some(5));
     }
 
@@ -816,8 +872,16 @@ mod tests {
         let p = RetryPolicy::browser();
         assert_eq!(p.initial_delay, Duration::from_millis(500));
         assert_eq!(p.max_delay, Duration::from_secs(10));
-        assert_eq!(p.backoff_factor, 2.0);
-        assert_eq!(p.jitter_percent, 0.1);
+        assert!(
+            (p.backoff_factor - 2.0).abs() < f64::EPSILON,
+            "backoff_factor: {}",
+            p.backoff_factor
+        );
+        assert!(
+            (p.jitter_percent - 0.1).abs() < f64::EPSILON,
+            "jitter_percent: {}",
+            p.jitter_percent
+        );
         assert_eq!(p.max_attempts, Some(2));
     }
 

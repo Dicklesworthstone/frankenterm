@@ -93,7 +93,14 @@ fn arb_mux_health_report() -> impl Strategy<Value = MuxHealthReport> {
         0_u64..10_000,
     )
         .prop_map(
-            |(timestamp_ms, status, consecutive_failures, latest_sample, total_checks, total_failures)| {
+            |(
+                timestamp_ms,
+                status,
+                consecutive_failures,
+                latest_sample,
+                total_checks,
+                total_failures,
+            )| {
                 MuxHealthReport {
                     timestamp_ms,
                     status,

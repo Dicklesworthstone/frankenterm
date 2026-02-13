@@ -40,7 +40,7 @@ fn bench_kalman_scalar_update(c: &mut Criterion) {
         let mut kf = KalmanFilter::new(100.0, 2500.0);
         // Warm up with 20 observations
         for i in 0..20 {
-            kf.update(1000.0 + (i as f64) * 0.1);
+            kf.update((i as f64).mul_add(0.1, 1000.0));
         }
 
         b.iter(|| {

@@ -189,8 +189,8 @@ proptest! {
             h.record(v);
         }
 
-        let expected_min = values.iter().cloned().fold(f64::INFINITY, f64::min);
-        let expected_max = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let expected_min = values.iter().copied().fold(f64::INFINITY, f64::min);
+        let expected_max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
 
         prop_assert_eq!(h.min(), Some(expected_min));
         prop_assert_eq!(h.max(), Some(expected_max));

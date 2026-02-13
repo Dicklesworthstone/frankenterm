@@ -35,7 +35,7 @@ proptest! {
 
         // Feed 40 observations at varying offsets
         for i in 0..40 {
-            let x = offset + (i as f64) * 0.3;
+            let x = (i as f64).mul_add(0.3, offset);
             let _cp = model.update(x);
         }
 
@@ -169,15 +169,19 @@ proptest! {
         // Ranges
         prop_assert!(features.output_rate >= 0.0, "output_rate negative");
         prop_assert!(features.byte_rate >= 0.0, "byte_rate negative");
-        prop_assert!(features.entropy >= 0.0 && features.entropy <= 8.0,
+        prop_assert!((0.0..=8.0).contains(&features.entropy),
             "entropy {} out of [0, 8]", features.entropy);
-        prop_assert!(features.unique_line_ratio >= 0.0 && features.unique_line_ratio <= 1.0,
+        prop_assert!((0.0..=1.0).contains(&features.unique_line_ratio),
             "unique_line_ratio {} out of [0, 1]", features.unique_line_ratio);
-        prop_assert!(features.ansi_density >= 0.0 && features.ansi_density <= 1.0,
+        prop_assert!((0.0..=1.0).contains(&features.ansi_density),
             "ansi_density {} out of [0, 1]", features.ansi_density);
 
         // primary_metric must be the output_rate
-        prop_assert_eq!(features.primary_metric(), features.output_rate);
+        prop_assert!(
+            (features.primary_metric() - features.output_rate).abs() < f64::EPSILON,
+            "primary_metric {} != output_rate {}",
+            features.primary_metric(), features.output_rate,
+        );
     }
 
     // =========================================================================
@@ -197,8 +201,8 @@ proptest! {
             manager.register_pane(pane_id);
             for i in 0..obs_per_pane {
                 let features = OutputFeatures {
-                    output_rate: 10.0 + (i as f64) * 0.5,
-                    byte_rate: 500.0 + (i as f64) * 10.0,
+                    output_rate: (i as f64).mul_add(0.5, 10.0),
+                    byte_rate: (i as f64).mul_add(10.0, 500.0),
                     entropy: 4.0,
                     unique_line_ratio: 0.8,
                     ansi_density: 0.05,

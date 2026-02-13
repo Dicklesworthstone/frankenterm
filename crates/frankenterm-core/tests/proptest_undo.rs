@@ -21,17 +21,26 @@ fn arb_undo_outcome() -> impl Strategy<Value = UndoOutcome> {
 
 fn arb_undo_execution_result() -> impl Strategy<Value = UndoExecutionResult> {
     (
-        0_i64..100_000,                            // action_id
-        "[a-z_]{3,15}",                            // strategy
+        0_i64..100_000, // action_id
+        "[a-z_]{3,15}", // strategy
         arb_undo_outcome(),
-        "[A-Za-z ]{5,30}",                         // message
-        proptest::option::of("[A-Za-z ]{5,30}"),    // guidance
-        proptest::option::of("[a-z0-9-]{5,15}"),   // target_workflow_id
-        proptest::option::of(0_u64..10_000),       // target_pane_id
+        "[A-Za-z ]{5,30}",                           // message
+        proptest::option::of("[A-Za-z ]{5,30}"),     // guidance
+        proptest::option::of("[a-z0-9-]{5,15}"),     // target_workflow_id
+        proptest::option::of(0_u64..10_000),         // target_pane_id
         proptest::option::of(0_i64..10_000_000_000), // undone_at
     )
         .prop_map(
-            |(action_id, strategy, outcome, message, guidance, target_workflow_id, target_pane_id, undone_at)| {
+            |(
+                action_id,
+                strategy,
+                outcome,
+                message,
+                guidance,
+                target_workflow_id,
+                target_pane_id,
+                undone_at,
+            )| {
                 UndoExecutionResult {
                     action_id,
                     strategy,

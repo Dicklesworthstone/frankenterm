@@ -509,7 +509,7 @@ mod tests {
     fn kalman_uninitialized() {
         let kf = KalmanFilter::new(1.0, 1.0);
         assert!(!kf.is_initialized());
-        assert_eq!(kf.estimate(), 0.0);
+        assert!(kf.estimate().abs() < f64::EPSILON);
         assert!(kf.z_score(10.0).is_none());
     }
 
@@ -544,7 +544,7 @@ mod tests {
     fn kalman_variance_stays_positive() {
         let mut kf = KalmanFilter::new(0.01, 0.01);
         for i in 0..1000 {
-            kf.update(10.0 + (i as f64) * 0.001);
+            kf.update((i as f64).mul_add(0.001, 10.0));
             assert!(kf.variance() > 0.0, "P must stay positive at step {i}");
         }
     }
@@ -599,7 +599,7 @@ mod tests {
 
         kf.reset();
         assert!(!kf.is_initialized());
-        assert_eq!(kf.estimate(), 0.0);
+        assert!(kf.estimate().abs() < f64::EPSILON);
     }
 
     #[test]

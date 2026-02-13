@@ -39,14 +39,6 @@ use frankenterm_core::conformal::{
 // Strategies
 // =============================================================================
 
-fn arb_alpha() -> impl Strategy<Value = f64> {
-    -1.0_f64..2.0
-}
-
-fn arb_beta() -> impl Strategy<Value = f64> {
-    -1.0_f64..2.0
-}
-
 fn arb_finite_value() -> impl Strategy<Value = f64> {
     -1e10_f64..1e10
 }
@@ -178,10 +170,10 @@ proptest! {
         for &v in &values {
             holt.update(v);
         }
-        let expected = holt.level() + steps * holt.trend();
+        let expected = steps.mul_add(holt.trend(), holt.level());
         let actual = holt.forecast(steps);
         // mul_add may differ from separate multiply+add by a few ULP at large magnitudes
-        let tolerance = expected.abs() * 1e-10 + 1e-6;
+        let tolerance = expected.abs().mul_add(1e-10, 1e-6);
         prop_assert!((actual - expected).abs() < tolerance,
             "forecast({}) = {} should equal level + h*trend = {} (tolerance={})",
             steps, actual, expected, tolerance);
@@ -324,7 +316,7 @@ proptest! {
         prop_assert_eq!(back.metric_name, fc.metric_name);
         prop_assert_eq!(back.horizon_steps, fc.horizon_steps);
         // Use relative tolerance for f64 JSON roundtrip (large values lose precision)
-        let tol = |a: f64, b: f64| (a - b).abs() <= a.abs().max(b.abs()) * 1e-10 + 1e-10;
+        let tol = |a: f64, b: f64| (a - b).abs() <= a.abs().max(b.abs()).mul_add(1e-10, 1e-10);
         prop_assert!(tol(back.point_estimate, fc.point_estimate),
             "point_estimate mismatch: {} vs {}", back.point_estimate, fc.point_estimate);
         prop_assert!(tol(back.lower_bound, fc.lower_bound),
@@ -445,7 +437,7 @@ proptest! {
             threshold_bytes: threshold,
             horizon_steps: horizon,
         };
-        let tol = |a: f64, b: f64| (a - b).abs() <= a.abs().max(b.abs()) * 1e-10 + 1e-10;
+        let tol = |a: f64, b: f64| (a - b).abs() <= a.abs().max(b.abs()).mul_add(1e-10, 1e-10);
 
         let json = serde_json::to_string(&rss_alert).unwrap();
         let back: ForecastAlert = serde_json::from_str(&json).unwrap();
@@ -461,7 +453,7 @@ proptest! {
                     "rss threshold mismatch: {} vs {}", threshold_bytes, threshold);
                 prop_assert_eq!(horizon_steps, horizon);
             }
-            _ => prop_assert!(false, "expected RssThreshold variant"),
+            ForecastAlert::CpuThreshold { .. } => prop_assert!(false, "expected RssThreshold variant"),
         }
 
         let cpu_alert = ForecastAlert::CpuThreshold {
@@ -483,7 +475,7 @@ proptest! {
                     "cpu threshold mismatch: {} vs {}", threshold_percent, threshold);
                 prop_assert_eq!(horizon_steps, horizon);
             }
-            _ => prop_assert!(false, "expected CpuThreshold variant"),
+            ForecastAlert::RssThreshold { .. } => prop_assert!(false, "expected CpuThreshold variant"),
         }
     }
 }

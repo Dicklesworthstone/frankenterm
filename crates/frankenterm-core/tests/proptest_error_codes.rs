@@ -69,7 +69,9 @@ proptest! {
     fn prop_from_code_roundtrip_within_range(cat in arb_error_category()) {
         let (lo, hi) = cat.range();
         // Test at boundaries and middle
-        for num in [lo, (lo + hi) / 2, hi] {
+        #[allow(clippy::manual_midpoint)]
+        let mid = (lo + hi) / 2;
+        for num in [lo, mid, hi] {
             let code = format!("FT-{}", num);
             let parsed = ErrorCategory::from_code(&code);
             prop_assert_eq!(parsed, Some(cat), "Code {} should parse to {:?}", code, cat);
@@ -99,7 +101,7 @@ proptest! {
     #[test]
     fn prop_from_code_rejects_gap_codes(num in prop::num::u16::ANY) {
         // Codes in gaps (0-999, 8000-8999) should return None
-        if (num < 1000) || (num >= 8000 && num <= 8999) {
+        if (num < 1000) || (8000..=8999).contains(&num) {
             let code = format!("FT-{}", num);
             let parsed = ErrorCategory::from_code(&code);
             prop_assert_eq!(parsed, None, "Code {} in gap should return None", code);

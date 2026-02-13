@@ -157,11 +157,11 @@ proptest! {
 
         // Generate observations at increasing distances above the estimate
         let est = kf.estimate();
-        let distances = [0.5, 1.0, 2.0, 5.0, 10.0, 20.0];
+        let distances: [f64; 6] = [0.5, 1.0, 2.0, 5.0, 10.0, 20.0];
 
         let mut prev_z = f64::NEG_INFINITY;
         for &d in &distances {
-            let obs = est + d * kf.std_dev();
+            let obs = d.mul_add(kf.std_dev(), est);
             if let Some(z) = kf.z_score(obs) {
                 prop_assert!(
                     z >= prev_z - 1e-10, // Small tolerance for float
@@ -237,7 +237,7 @@ proptest! {
         let mut tracker = ComponentTracker::new(&config, fallback_ms);
 
         // Feed fewer observations than min_obs
-        for i in 0..(n_obs + 1) {
+        for i in 0..=n_obs {
             tracker.observe((i as u64) * 1000);
         }
 

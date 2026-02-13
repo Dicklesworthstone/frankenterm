@@ -6,8 +6,8 @@
 
 use frankenterm_core::cass::CassSession;
 use frankenterm_core::session_correlation::{
-    CassCorrelationOptions, CorrelationStatus, SessionCorrelation, correlate_from_sessions,
-    CASS_CORRELATION_VERSION,
+    CASS_CORRELATION_VERSION, CassCorrelationOptions, CorrelationStatus, SessionCorrelation,
+    correlate_from_sessions,
 };
 use proptest::prelude::*;
 
@@ -123,7 +123,8 @@ proptest! {
         let result = correlate_from_sessions(&[], base_ms, &CassCorrelationOptions::default());
         prop_assert_eq!(result.status, CorrelationStatus::Unlinked);
         prop_assert_eq!(result.candidates_considered, 0);
-        prop_assert_eq!(result.confidence, 0.0);
+        prop_assert!((result.confidence - 0.0).abs() < f64::EPSILON,
+            "confidence should be 0.0, got {}", result.confidence);
     }
 
     /// Sessions missing session_id are skipped (never selected).
@@ -368,5 +369,9 @@ fn unlinked_result_has_no_external_id() {
     let result = correlate_from_sessions(&[], 1_000_000, &CassCorrelationOptions::default());
     assert_eq!(result.status, CorrelationStatus::Unlinked);
     assert!(result.external_id.is_none());
-    assert_eq!(result.confidence, 0.0);
+    assert!(
+        (result.confidence - 0.0).abs() < f64::EPSILON,
+        "confidence should be 0.0, got {}",
+        result.confidence
+    );
 }

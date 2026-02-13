@@ -708,14 +708,13 @@ async fn custom_golden_queries_on_ingested_data() {
     for r in &report.results {
         if !r.passed {
             for a in &r.assertion_results {
-                if !a.passed {
-                    panic!(
-                        "Query '{}' assertion '{}' failed: {}",
-                        r.name,
-                        a.description,
-                        a.message.as_deref().unwrap_or("no message")
-                    );
-                }
+                assert!(
+                    a.passed,
+                    "Query '{}' assertion '{}' failed: {}",
+                    r.name,
+                    a.description,
+                    a.message.as_deref().unwrap_or("no message")
+                );
             }
         }
     }
@@ -1123,14 +1122,13 @@ async fn full_pipeline_reindex_query_quality() {
     for r in &report.results {
         if !r.passed {
             for a in &r.assertion_results {
-                if !a.passed {
-                    panic!(
-                        "Query '{}' failed: {} — {}",
-                        r.name,
-                        a.description,
-                        a.message.as_deref().unwrap_or("no detail")
-                    );
-                }
+                assert!(
+                    a.passed,
+                    "Query '{}' failed: {} — {}",
+                    r.name,
+                    a.description,
+                    a.message.as_deref().unwrap_or("no detail")
+                );
             }
         }
     }

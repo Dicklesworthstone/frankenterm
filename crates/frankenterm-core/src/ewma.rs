@@ -371,7 +371,7 @@ mod tests {
         let ewma = Ewma::with_half_life_ms(1000.0);
         assert!(!ewma.is_initialized());
         assert_eq!(ewma.count(), 0);
-        assert_eq!(ewma.value(), 0.0);
+        assert!(ewma.value().abs() < f64::EPSILON);
     }
 
     #[test]
@@ -379,7 +379,7 @@ mod tests {
         let mut ewma = Ewma::with_half_life_ms(1000.0);
         ewma.observe(42.0, 0);
         assert!(ewma.is_initialized());
-        assert_eq!(ewma.value(), 42.0);
+        assert!((ewma.value() - 42.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -412,7 +412,11 @@ mod tests {
     #[test]
     fn from_seconds() {
         let ewma = Ewma::with_half_life_secs(1.0);
-        assert!((ewma.half_life_ms() - 1000.0).abs() < f64::EPSILON);
+        assert!(
+            (ewma.half_life_ms() - 1000.0).abs() < f64::EPSILON,
+            "half_life_ms: {}",
+            ewma.half_life_ms()
+        );
     }
 
     #[test]
@@ -440,7 +444,7 @@ mod tests {
     fn variance_needs_two_observations() {
         let mut t = EwmaWithVariance::with_half_life_ms(1000.0);
         t.observe(10.0, 0);
-        assert!((t.variance() - 0.0).abs() < f64::EPSILON);
+        assert!(t.variance().abs() < f64::EPSILON);
     }
 
     #[test]
@@ -456,7 +460,7 @@ mod tests {
     fn z_score_zero_when_no_variance() {
         let mut t = EwmaWithVariance::with_half_life_ms(1000.0);
         t.observe(10.0, 0);
-        assert_eq!(t.z_score(20.0), 0.0);
+        assert!(t.z_score(20.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -489,7 +493,7 @@ mod tests {
         t.observe(20.0, 100);
         t.reset();
         assert_eq!(t.count(), 0);
-        assert!((t.variance() - 0.0).abs() < f64::EPSILON);
+        assert!(t.variance().abs() < f64::EPSILON);
     }
 
     // -- RateEstimator ----------------------------------------------------------
@@ -497,7 +501,7 @@ mod tests {
     #[test]
     fn rate_empty() {
         let r = RateEstimator::with_half_life_ms(1000.0);
-        assert_eq!(r.rate_per_sec(), 0.0);
+        assert!(r.rate_per_sec().abs() < f64::EPSILON);
         assert_eq!(r.total_events(), 0);
     }
 
@@ -505,7 +509,7 @@ mod tests {
     fn rate_single_event() {
         let mut r = RateEstimator::with_half_life_ms(1000.0);
         r.tick(0);
-        assert_eq!(r.rate_per_sec(), 0.0); // need at least 2
+        assert!(r.rate_per_sec().abs() < f64::EPSILON); // need at least 2
     }
 
     #[test]
@@ -545,7 +549,7 @@ mod tests {
         r.tick(100);
         r.reset();
         assert_eq!(r.total_events(), 0);
-        assert_eq!(r.rate_per_sec(), 0.0);
+        assert!(r.rate_per_sec().abs() < f64::EPSILON);
     }
 
     // -- Panics -----------------------------------------------------------------
