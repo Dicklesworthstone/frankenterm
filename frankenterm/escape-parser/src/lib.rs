@@ -609,3 +609,402 @@ impl Display for OneBased {
         self.value.fmt(f)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── OneBased ──────────────────────────────────────────────
+
+    #[test]
+    fn one_based_new() {
+        let ob = OneBased::new(5);
+        assert_eq!(ob.as_one_based(), 5);
+        assert_eq!(ob.as_zero_based(), 4);
+    }
+
+    #[test]
+    fn one_based_from_zero_based() {
+        let ob = OneBased::from_zero_based(0);
+        assert_eq!(ob.as_one_based(), 1);
+        assert_eq!(ob.as_zero_based(), 0);
+    }
+
+    #[test]
+    fn one_based_from_zero_based_large() {
+        let ob = OneBased::from_zero_based(99);
+        assert_eq!(ob.as_one_based(), 100);
+        assert_eq!(ob.as_zero_based(), 99);
+    }
+
+    #[test]
+    fn one_based_display() {
+        let ob = OneBased::new(42);
+        assert_eq!(format!("{ob}"), "42");
+    }
+
+    #[test]
+    fn one_based_from_esc_param_zero_defaults_to_one() {
+        let param = CsiParam::Integer(0);
+        let ob = OneBased::from_esc_param(&param).unwrap();
+        assert_eq!(ob.as_one_based(), 1);
+    }
+
+    #[test]
+    fn one_based_from_esc_param_positive() {
+        let param = CsiParam::Integer(10);
+        let ob = OneBased::from_esc_param(&param).unwrap();
+        assert_eq!(ob.as_one_based(), 10);
+    }
+
+    #[test]
+    fn one_based_from_esc_param_negative_fails() {
+        let param = CsiParam::Integer(-1);
+        assert!(OneBased::from_esc_param(&param).is_err());
+    }
+
+    #[test]
+    fn one_based_from_esc_param_with_big_default_zero() {
+        let param = CsiParam::Integer(0);
+        let ob = OneBased::from_esc_param_with_big_default(&param).unwrap();
+        assert_eq!(ob.as_one_based(), u32::MAX);
+    }
+
+    #[test]
+    fn one_based_from_esc_param_with_big_default_positive() {
+        let param = CsiParam::Integer(5);
+        let ob = OneBased::from_esc_param_with_big_default(&param).unwrap();
+        assert_eq!(ob.as_one_based(), 5);
+    }
+
+    #[test]
+    fn one_based_from_optional_none_defaults_to_one() {
+        let ob = OneBased::from_optional_esc_param(None).unwrap();
+        assert_eq!(ob.as_one_based(), 1);
+    }
+
+    #[test]
+    fn one_based_from_optional_some() {
+        let param = CsiParam::Integer(7);
+        let ob = OneBased::from_optional_esc_param(Some(&param)).unwrap();
+        assert_eq!(ob.as_one_based(), 7);
+    }
+
+    #[test]
+    fn one_based_as_zero_based_saturates_at_zero() {
+        // OneBased::new(1) should give zero_based = 0
+        let ob = OneBased::new(1);
+        assert_eq!(ob.as_zero_based(), 0);
+    }
+
+    #[test]
+    fn one_based_debug() {
+        let ob = OneBased::new(3);
+        let debug = format!("{ob:?}");
+        assert!(debug.contains("3"));
+    }
+
+    #[test]
+    fn one_based_clone_eq() {
+        let a = OneBased::new(5);
+        let b = a;
+        assert_eq!(a, b);
+    }
+
+    // ── Action::append_to ─────────────────────────────────────
+
+    #[test]
+    fn append_print_to_empty_vec() {
+        let mut dest = Vec::new();
+        Action::Print('a').append_to(&mut dest);
+        assert_eq!(dest.len(), 1);
+        assert!(matches!(&dest[0], Action::Print('a')));
+    }
+
+    #[test]
+    fn append_two_prints_coalesces_to_print_string() {
+        let mut dest = Vec::new();
+        Action::Print('a').append_to(&mut dest);
+        Action::Print('b').append_to(&mut dest);
+        assert_eq!(dest.len(), 1);
+        match &dest[0] {
+            Action::PrintString(s) => assert_eq!(s, "ab"),
+            other => panic!("expected PrintString, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn append_print_to_existing_print_string() {
+        let mut dest = vec![Action::PrintString("hello".to_string())];
+        Action::Print('!').append_to(&mut dest);
+        assert_eq!(dest.len(), 1);
+        match &dest[0] {
+            Action::PrintString(s) => assert_eq!(s, "hello!"),
+            other => panic!("expected PrintString, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn append_non_print_does_not_coalesce() {
+        let mut dest = vec![Action::Print('a')];
+        Action::Control(ControlCode::LineFeed).append_to(&mut dest);
+        assert_eq!(dest.len(), 2);
+    }
+
+    #[test]
+    fn append_print_after_non_print_stays_separate() {
+        let mut dest = vec![Action::Control(ControlCode::Bell)];
+        Action::Print('x').append_to(&mut dest);
+        assert_eq!(dest.len(), 2);
+        assert!(matches!(&dest[1], Action::Print('x')));
+    }
+
+    // ── ControlCode ───────────────────────────────────────────
+
+    #[test]
+    fn control_code_values() {
+        assert_eq!(ControlCode::Null as u8, 0);
+        assert_eq!(ControlCode::Bell as u8, 7);
+        assert_eq!(ControlCode::Backspace as u8, 8);
+        assert_eq!(ControlCode::HorizontalTab as u8, b'\t');
+        assert_eq!(ControlCode::LineFeed as u8, b'\n');
+        assert_eq!(ControlCode::CarriageReturn as u8, b'\r');
+        assert_eq!(ControlCode::Escape as u8, 0x1b);
+    }
+
+    #[test]
+    fn control_code_c1_values() {
+        assert_eq!(ControlCode::CSI as u8, 0x9b);
+        assert_eq!(ControlCode::OSC as u8, 0x9d);
+        assert_eq!(ControlCode::DCS as u8, 0x90);
+        assert_eq!(ControlCode::ST as u8, 0x9c);
+    }
+
+    #[test]
+    fn control_code_debug() {
+        let cc = ControlCode::Bell;
+        assert_eq!(format!("{cc:?}"), "Bell");
+    }
+
+    #[test]
+    fn control_code_clone_eq() {
+        let a = ControlCode::Escape;
+        let b = a;
+        assert_eq!(a, b);
+    }
+
+    // ── Action Display ────────────────────────────────────────
+
+    #[test]
+    fn action_print_display() {
+        let action = Action::Print('A');
+        assert_eq!(format!("{action}"), "A");
+    }
+
+    #[test]
+    fn action_print_string_display() {
+        let action = Action::PrintString("hello".to_string());
+        assert_eq!(format!("{action}"), "hello");
+    }
+
+    #[test]
+    fn action_control_display() {
+        let action = Action::Control(ControlCode::LineFeed);
+        let s = format!("{action}");
+        assert_eq!(s, "\n");
+    }
+
+    // ── Sixel dimensions ──────────────────────────────────────
+
+    #[test]
+    fn sixel_explicit_dimensions() {
+        let sixel = Sixel {
+            pan: 2,
+            pad: 1,
+            pixel_width: Some(80),
+            pixel_height: Some(40),
+            background_is_transparent: false,
+            horizontal_grid_size: None,
+            data: vec![],
+        };
+        assert_eq!(sixel.dimensions(), (80, 40));
+    }
+
+    #[test]
+    fn sixel_computed_dimensions_empty() {
+        let sixel = Sixel {
+            pan: 2,
+            pad: 1,
+            pixel_width: None,
+            pixel_height: None,
+            background_is_transparent: false,
+            horizontal_grid_size: None,
+            data: vec![],
+        };
+        assert_eq!(sixel.dimensions(), (0, 0));
+    }
+
+    #[test]
+    fn sixel_computed_dimensions_with_data() {
+        let sixel = Sixel {
+            pan: 2,
+            pad: 1,
+            pixel_width: None,
+            pixel_height: None,
+            background_is_transparent: false,
+            horizontal_grid_size: None,
+            data: vec![
+                SixelData::Data(0),
+                SixelData::Data(0),
+                SixelData::Data(0),
+                SixelData::NewLine,
+                SixelData::Data(0),
+            ],
+        };
+        let (w, h) = sixel.dimensions();
+        assert_eq!(w, 3); // max of 3 in first row and 1 in second
+        assert_eq!(h, 12); // 2 rows * 6 pixels each
+    }
+
+    #[test]
+    fn sixel_computed_dimensions_with_repeat() {
+        let sixel = Sixel {
+            pan: 2,
+            pad: 1,
+            pixel_width: None,
+            pixel_height: None,
+            background_is_transparent: false,
+            horizontal_grid_size: None,
+            data: vec![SixelData::Repeat {
+                repeat_count: 10,
+                data: 0,
+            }],
+        };
+        let (w, h) = sixel.dimensions();
+        assert_eq!(w, 10);
+        assert_eq!(h, 6); // 1 row * 6
+    }
+
+    #[test]
+    fn sixel_carriage_return_resets_x() {
+        let sixel = Sixel {
+            pan: 2,
+            pad: 1,
+            pixel_width: None,
+            pixel_height: None,
+            background_is_transparent: false,
+            horizontal_grid_size: None,
+            data: vec![
+                SixelData::Data(0),
+                SixelData::Data(0),
+                SixelData::CarriageReturn,
+                SixelData::Data(0),
+            ],
+        };
+        let (w, _h) = sixel.dimensions();
+        assert_eq!(w, 2); // CR resets x, so max was 2
+    }
+
+    // ── SixelData Display ─────────────────────────────────────
+
+    #[test]
+    fn sixel_data_display() {
+        assert_eq!(format!("{}", SixelData::Data(0)), "?"); // 0 + 0x3f = '?'
+        assert_eq!(format!("{}", SixelData::CarriageReturn), "$");
+        assert_eq!(format!("{}", SixelData::NewLine), "-");
+        assert_eq!(format!("{}", SixelData::SelectColorMapEntry(5)), "#5");
+    }
+
+    #[test]
+    fn sixel_data_repeat_display() {
+        let rd = SixelData::Repeat {
+            repeat_count: 3,
+            data: 0,
+        };
+        assert_eq!(format!("{rd}"), "!3?");
+    }
+
+    // ── ShortDeviceControl ────────────────────────────────────
+
+    #[test]
+    fn short_device_control_display() {
+        let sdc = ShortDeviceControl {
+            params: vec![1, 2],
+            intermediates: vec![],
+            byte: b'q',
+            data: vec![b'A', b'B'],
+        };
+        let s = format!("{sdc}");
+        assert!(s.starts_with("\x1bP"));
+        assert!(s.contains("1;2"));
+        assert!(s.contains("q"));
+        assert!(s.ends_with("\x1b\\"));
+    }
+
+    #[test]
+    fn short_device_control_debug() {
+        let sdc = ShortDeviceControl {
+            params: vec![],
+            intermediates: vec![],
+            byte: b'p',
+            data: vec![],
+        };
+        let debug = format!("{sdc:?}");
+        assert!(debug.contains("ShortDeviceControl"));
+    }
+
+    #[test]
+    fn short_device_control_clone_eq() {
+        let a = ShortDeviceControl {
+            params: vec![1],
+            intermediates: vec![],
+            byte: b'q',
+            data: vec![],
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    // ── DeviceControlMode ─────────────────────────────────────
+
+    #[test]
+    fn device_control_mode_exit_display_is_empty() {
+        let dcm = DeviceControlMode::Exit;
+        assert_eq!(format!("{dcm}"), "");
+    }
+
+    #[test]
+    fn device_control_mode_data_display() {
+        let dcm = DeviceControlMode::Data(b'A');
+        assert_eq!(format!("{dcm}"), "A");
+    }
+
+    #[test]
+    fn device_control_mode_debug_variants() {
+        assert!(format!("{:?}", DeviceControlMode::Exit).contains("Exit"));
+        assert!(format!("{:?}", DeviceControlMode::Data(b'x')).contains("Data"));
+    }
+
+    // ── Action clone/eq ───────────────────────────────────────
+
+    #[test]
+    fn action_print_clone_eq() {
+        let a = Action::Print('Z');
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn action_control_clone_eq() {
+        let a = Action::Control(ControlCode::Bell);
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn action_debug() {
+        let a = Action::Print('X');
+        let debug = format!("{a:?}");
+        assert!(debug.contains("Print"));
+    }
+}
