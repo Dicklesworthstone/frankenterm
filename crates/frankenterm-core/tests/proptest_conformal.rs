@@ -29,7 +29,6 @@
 //! 24. ConformalForecaster: forecasts non-empty after warmup
 
 use proptest::prelude::*;
-use std::time::Duration;
 
 use frankenterm_core::conformal::{
     ConformalConfig, ConformalForecaster, ForecastAlert, HoltPredictor, MetricForecaster,
@@ -54,10 +53,6 @@ fn arb_finite_value() -> impl Strategy<Value = f64> {
 
 fn arb_positive_value() -> impl Strategy<Value = f64> {
     0.0_f64..1e8
-}
-
-fn arb_horizon_steps() -> impl Strategy<Value = Vec<usize>> {
-    proptest::collection::vec(1_usize..500, 1..5)
 }
 
 fn arb_coverage() -> impl Strategy<Value = f64> {
