@@ -737,6 +737,49 @@ mod test {
         );
     }
 
+    #[test]
+    fn parse_first_streaming_incomplete_then_complete_osc() {
+        let mut p = Parser::new();
+
+        assert_eq!(None, p.parse_first(b"\x1b]0;hel"));
+
+        let chunk = b"lo\x07X";
+        let (action, consumed) = p
+            .parse_first(chunk)
+            .expect("expected OSC action once BEL terminator is seen");
+        assert_eq!(
+            Action::OperatingSystemCommand(Box::new(
+                OperatingSystemCommand::SetIconNameAndWindowTitle("hello".to_owned()),
+            )),
+            action
+        );
+        assert_eq!(3, consumed);
+
+        assert_eq!(
+            Some((Action::Print('X'), 1)),
+            p.parse_first(&chunk[consumed..])
+        );
+    }
+
+    #[test]
+    fn parse_first_as_vec_stops_at_ground_boundary() {
+        let mut p = Parser::new();
+        let data = b"\x1b[1mB";
+        let (actions, consumed) = p
+            .parse_first_as_vec(data)
+            .expect("expected first completed sequence");
+
+        assert_eq!(
+            vec![Action::CSI(CSI::Sgr(Sgr::Intensity(Intensity::Bold)))],
+            actions
+        );
+        assert_eq!(4, consumed);
+        assert_eq!(
+            Some((vec![Action::Print('B')], 1)),
+            p.parse_first_as_vec(&data[consumed..])
+        );
+    }
+
     fn round_trip_parse(s: &str) -> Vec<Action> {
         let mut p = Parser::new();
         let actions = p.parse_as_vec(s.as_bytes());
@@ -760,6 +803,68 @@ mod test {
                 Action::Esc(Esc::Code(EscCode::StringTerminator)),
             ]
         );
+    }
+
+    #[test]
+    fn xtgettcap_multiple_names_and_raw_fallback() {
+        let mut p = Parser::new();
+        let actions = p.parse_as_vec(b"\x1bP+q544e;XYZ\x1b\\");
+
+        assert_eq!(
+            vec![
+                Action::XtGetTcap(vec!["TN".to_string(), "XYZ".to_string()]),
+                Action::Esc(Esc::Code(EscCode::StringTerminator)),
+            ],
+            actions
+        );
+        // Raw names are normalized to hex in the formatter.
+        assert_eq!(encode(&actions), "\x1bP+q544e;58595a\x1b\\");
+    }
+
+    #[test]
+    fn short_dcs_round_trip() {
+        let mut p = Parser::new();
+        let actions = p.parse_as_vec(b"\x1bP$qm\x1b\\");
+
+        assert_eq!(
+            vec![
+                Action::DeviceControl(DeviceControlMode::ShortDeviceControl(Box::new(
+                    ShortDeviceControl {
+                        params: vec![],
+                        intermediates: vec![b'$'],
+                        byte: b'q',
+                        data: b"m".to_vec(),
+                    },
+                ))),
+                Action::Esc(Esc::Code(EscCode::StringTerminator)),
+            ],
+            actions
+        );
+        assert_eq!(encode(&actions), "\x1bP$qm\x1b\\");
+    }
+
+    #[test]
+    fn generic_dcs_emits_enter_data_exit() {
+        let mut p = Parser::new();
+        let actions = p.parse_as_vec(b"\x1bP1;2zABC\x1b\\");
+
+        assert_eq!(
+            vec![
+                Action::DeviceControl(DeviceControlMode::Enter(Box::new(EnterDeviceControlMode {
+                    params: vec![1, 2],
+                    intermediates: vec![],
+                    byte: b'z',
+                    ignored_extra_intermediates: false,
+                }))),
+                Action::DeviceControl(DeviceControlMode::Data(b'A')),
+                Action::DeviceControl(DeviceControlMode::Data(b'B')),
+                Action::DeviceControl(DeviceControlMode::Data(b'C')),
+                Action::DeviceControl(DeviceControlMode::Exit),
+                Action::Esc(Esc::Code(EscCode::StringTerminator)),
+            ],
+            actions
+        );
+        assert_eq!(encode(&actions), "\x1bP1;2zABC\x1b\\");
     }
 
     #[test]

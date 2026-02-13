@@ -3392,4 +3392,1089 @@ mod test {
         );
         assert_eq!(encode(&res), "\x1b[?63;1;2;4;6;9;15;22c");
     }
+
+    // ── Blink ─────────────────────────────────────────────
+    #[test]
+    fn blink_into_bool() {
+        let b: bool = Blink::None.into();
+        assert!(!b);
+        let b: bool = Blink::Slow.into();
+        assert!(b);
+        let b: bool = Blink::Rapid.into();
+        assert!(b);
+    }
+
+    #[test]
+    fn blink_clone_eq() {
+        let a = Blink::Slow;
+        let b = a;
+        assert_eq!(a, b);
+        assert_ne!(Blink::Slow, Blink::Rapid);
+        assert_ne!(Blink::None, Blink::Slow);
+    }
+
+    #[test]
+    fn blink_debug() {
+        assert_eq!(format!("{:?}", Blink::Slow), "Slow");
+        assert_eq!(format!("{:?}", Blink::Rapid), "Rapid");
+        assert_eq!(format!("{:?}", Blink::None), "None");
+    }
+
+    // ── Intensity ─────────────────────────────────────────
+    #[test]
+    fn intensity_default_is_normal() {
+        assert_eq!(Intensity::default(), Intensity::Normal);
+    }
+
+    #[test]
+    fn intensity_clone_eq() {
+        let a = Intensity::Bold;
+        let b = a;
+        assert_eq!(a, b);
+        assert_ne!(Intensity::Normal, Intensity::Bold);
+        assert_ne!(Intensity::Bold, Intensity::Half);
+    }
+
+    // ── Underline ─────────────────────────────────────────
+    #[test]
+    fn underline_default_is_none() {
+        assert_eq!(Underline::default(), Underline::None);
+    }
+
+    #[test]
+    fn underline_into_bool() {
+        let b: bool = Underline::None.into();
+        assert!(!b);
+        let b: bool = Underline::Single.into();
+        assert!(b);
+        let b: bool = Underline::Double.into();
+        assert!(b);
+        let b: bool = Underline::Curly.into();
+        assert!(b);
+    }
+
+    #[test]
+    fn underline_all_variants() {
+        let variants = [
+            Underline::None,
+            Underline::Single,
+            Underline::Double,
+            Underline::Curly,
+            Underline::Dotted,
+            Underline::Dashed,
+        ];
+        for (i, v) in variants.iter().enumerate() {
+            assert_eq!(*v as u8, i as u8);
+        }
+    }
+
+    // ── VerticalAlign ─────────────────────────────────────
+    #[test]
+    fn vertical_align_variants() {
+        assert_eq!(VerticalAlign::BaseLine as u8, 0);
+        assert_eq!(VerticalAlign::SuperScript as u8, 1);
+        assert_eq!(VerticalAlign::SubScript as u8, 2);
+    }
+
+    #[test]
+    fn vertical_align_clone_eq() {
+        let a = VerticalAlign::SuperScript;
+        let b = a;
+        assert_eq!(a, b);
+        assert_ne!(VerticalAlign::BaseLine, VerticalAlign::SubScript);
+    }
+
+    // ── CursorStyle ───────────────────────────────────────
+    #[test]
+    fn cursor_style_default() {
+        assert_eq!(CursorStyle::default(), CursorStyle::Default);
+    }
+
+    #[test]
+    fn cursor_style_values() {
+        assert_eq!(CursorStyle::Default as u8, 0);
+        assert_eq!(CursorStyle::BlinkingBlock as u8, 1);
+        assert_eq!(CursorStyle::SteadyBlock as u8, 2);
+        assert_eq!(CursorStyle::BlinkingUnderline as u8, 3);
+        assert_eq!(CursorStyle::SteadyUnderline as u8, 4);
+        assert_eq!(CursorStyle::BlinkingBar as u8, 5);
+        assert_eq!(CursorStyle::SteadyBar as u8, 6);
+    }
+
+    // ── MouseButtons bitflags ─────────────────────────────
+    #[test]
+    fn mouse_buttons_default_is_none() {
+        assert_eq!(MouseButtons::default(), MouseButtons::NONE);
+    }
+
+    #[test]
+    fn mouse_buttons_from_button_variants() {
+        assert_eq!(
+            MouseButtons::from(MouseButton::Button1Press),
+            MouseButtons::LEFT
+        );
+        assert_eq!(
+            MouseButtons::from(MouseButton::Button2Press),
+            MouseButtons::MIDDLE
+        );
+        assert_eq!(
+            MouseButtons::from(MouseButton::Button3Press),
+            MouseButtons::RIGHT
+        );
+        assert_eq!(
+            MouseButtons::from(MouseButton::Button4Press),
+            MouseButtons::VERT_WHEEL | MouseButtons::WHEEL_POSITIVE
+        );
+        assert_eq!(
+            MouseButtons::from(MouseButton::Button5Press),
+            MouseButtons::VERT_WHEEL
+        );
+        assert_eq!(
+            MouseButtons::from(MouseButton::Button6Press),
+            MouseButtons::HORZ_WHEEL | MouseButtons::WHEEL_POSITIVE
+        );
+        assert_eq!(
+            MouseButtons::from(MouseButton::Button7Press),
+            MouseButtons::HORZ_WHEEL
+        );
+        assert_eq!(MouseButtons::from(MouseButton::None), MouseButtons::NONE);
+        assert_eq!(
+            MouseButtons::from(MouseButton::Button1Release),
+            MouseButtons::NONE
+        );
+    }
+
+    #[test]
+    fn mouse_buttons_drag_maps_to_button() {
+        assert_eq!(
+            MouseButtons::from(MouseButton::Button1Drag),
+            MouseButtons::LEFT
+        );
+        assert_eq!(
+            MouseButtons::from(MouseButton::Button2Drag),
+            MouseButtons::MIDDLE
+        );
+        assert_eq!(
+            MouseButtons::from(MouseButton::Button3Drag),
+            MouseButtons::RIGHT
+        );
+    }
+
+    // ── CSI enum Display ──────────────────────────────────
+    #[test]
+    fn csi_sgr_reset_display() {
+        assert_eq!(format!("{}", CSI::Sgr(Sgr::Reset)), "\x1b[0m");
+    }
+
+    #[test]
+    fn csi_sgr_bold_display() {
+        assert_eq!(
+            format!("{}", CSI::Sgr(Sgr::Intensity(Intensity::Bold))),
+            "\x1b[1m"
+        );
+    }
+
+    #[test]
+    fn csi_sgr_italic_display() {
+        assert_eq!(format!("{}", CSI::Sgr(Sgr::Italic(true))), "\x1b[3m");
+        assert_eq!(format!("{}", CSI::Sgr(Sgr::Italic(false))), "\x1b[23m");
+    }
+
+    #[test]
+    fn csi_sgr_inverse_display() {
+        assert_eq!(format!("{}", CSI::Sgr(Sgr::Inverse(true))), "\x1b[7m");
+        assert_eq!(format!("{}", CSI::Sgr(Sgr::Inverse(false))), "\x1b[27m");
+    }
+
+    #[test]
+    fn csi_sgr_invisible_display() {
+        assert_eq!(format!("{}", CSI::Sgr(Sgr::Invisible(true))), "\x1b[8m");
+        assert_eq!(format!("{}", CSI::Sgr(Sgr::Invisible(false))), "\x1b[28m");
+    }
+
+    #[test]
+    fn csi_sgr_strikethrough_display() {
+        assert_eq!(format!("{}", CSI::Sgr(Sgr::StrikeThrough(true))), "\x1b[9m");
+        assert_eq!(
+            format!("{}", CSI::Sgr(Sgr::StrikeThrough(false))),
+            "\x1b[29m"
+        );
+    }
+
+    #[test]
+    fn csi_sgr_overline_display() {
+        assert_eq!(format!("{}", CSI::Sgr(Sgr::Overline(true))), "\x1b[53m");
+        assert_eq!(format!("{}", CSI::Sgr(Sgr::Overline(false))), "\x1b[55m");
+    }
+
+    #[test]
+    fn csi_sgr_underline_variants_display() {
+        assert_eq!(
+            format!("{}", CSI::Sgr(Sgr::Underline(Underline::Single))),
+            "\x1b[4m"
+        );
+        assert_eq!(
+            format!("{}", CSI::Sgr(Sgr::Underline(Underline::Double))),
+            "\x1b[21m"
+        );
+        assert_eq!(
+            format!("{}", CSI::Sgr(Sgr::Underline(Underline::Curly))),
+            "\x1b[4:3m"
+        );
+        assert_eq!(
+            format!("{}", CSI::Sgr(Sgr::Underline(Underline::Dotted))),
+            "\x1b[4:4m"
+        );
+        assert_eq!(
+            format!("{}", CSI::Sgr(Sgr::Underline(Underline::Dashed))),
+            "\x1b[4:5m"
+        );
+        assert_eq!(
+            format!("{}", CSI::Sgr(Sgr::Underline(Underline::None))),
+            "\x1b[24m"
+        );
+    }
+
+    #[test]
+    fn csi_sgr_foreground_default_display() {
+        assert_eq!(
+            format!("{}", CSI::Sgr(Sgr::Foreground(ColorSpec::Default))),
+            "\x1b[39m"
+        );
+    }
+
+    #[test]
+    fn csi_sgr_background_default_display() {
+        assert_eq!(
+            format!("{}", CSI::Sgr(Sgr::Background(ColorSpec::Default))),
+            "\x1b[49m"
+        );
+    }
+
+    // ── Edit Display ──────────────────────────────────────
+    #[test]
+    fn edit_display_variants() {
+        assert_eq!(format!("{}", CSI::Edit(Edit::DeleteCharacter(1))), "\x1b[P");
+        assert_eq!(
+            format!("{}", CSI::Edit(Edit::DeleteCharacter(5))),
+            "\x1b[5P"
+        );
+        assert_eq!(format!("{}", CSI::Edit(Edit::DeleteLine(1))), "\x1b[M");
+        assert_eq!(format!("{}", CSI::Edit(Edit::DeleteLine(3))), "\x1b[3M");
+        assert_eq!(format!("{}", CSI::Edit(Edit::EraseCharacter(1))), "\x1b[X");
+        assert_eq!(format!("{}", CSI::Edit(Edit::InsertCharacter(1))), "\x1b[@");
+        assert_eq!(format!("{}", CSI::Edit(Edit::InsertLine(1))), "\x1b[L");
+        assert_eq!(format!("{}", CSI::Edit(Edit::ScrollDown(1))), "\x1b[T");
+        assert_eq!(format!("{}", CSI::Edit(Edit::ScrollUp(1))), "\x1b[S");
+        assert_eq!(format!("{}", CSI::Edit(Edit::Repeat(3))), "\x1b[3b");
+    }
+
+    #[test]
+    fn edit_erase_in_line_display() {
+        assert_eq!(
+            format!(
+                "{}",
+                CSI::Edit(Edit::EraseInLine(EraseInLine::EraseToEndOfLine))
+            ),
+            "\x1b[K"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                CSI::Edit(Edit::EraseInLine(EraseInLine::EraseToStartOfLine))
+            ),
+            "\x1b[1K"
+        );
+        assert_eq!(
+            format!("{}", CSI::Edit(Edit::EraseInLine(EraseInLine::EraseLine))),
+            "\x1b[2K"
+        );
+    }
+
+    #[test]
+    fn edit_erase_in_display_variants() {
+        assert_eq!(
+            format!(
+                "{}",
+                CSI::Edit(Edit::EraseInDisplay(EraseInDisplay::EraseToEndOfDisplay))
+            ),
+            "\x1b[J"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                CSI::Edit(Edit::EraseInDisplay(EraseInDisplay::EraseToStartOfDisplay))
+            ),
+            "\x1b[1J"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                CSI::Edit(Edit::EraseInDisplay(EraseInDisplay::EraseDisplay))
+            ),
+            "\x1b[2J"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                CSI::Edit(Edit::EraseInDisplay(EraseInDisplay::EraseScrollback))
+            ),
+            "\x1b[3J"
+        );
+    }
+
+    // ── Cursor Display ────────────────────────────────────
+    #[test]
+    fn cursor_display_movements() {
+        assert_eq!(format!("{}", CSI::Cursor(Cursor::Up(1))), "\x1b[A");
+        assert_eq!(format!("{}", CSI::Cursor(Cursor::Up(5))), "\x1b[5A");
+        assert_eq!(format!("{}", CSI::Cursor(Cursor::Down(1))), "\x1b[B");
+        assert_eq!(format!("{}", CSI::Cursor(Cursor::Left(1))), "\x1b[D");
+        assert_eq!(format!("{}", CSI::Cursor(Cursor::Right(1))), "\x1b[C");
+        assert_eq!(format!("{}", CSI::Cursor(Cursor::NextLine(1))), "\x1b[E");
+        assert_eq!(
+            format!("{}", CSI::Cursor(Cursor::PrecedingLine(1))),
+            "\x1b[F"
+        );
+    }
+
+    #[test]
+    fn cursor_display_save_restore() {
+        assert_eq!(format!("{}", CSI::Cursor(Cursor::SaveCursor)), "\x1b[s");
+        assert_eq!(format!("{}", CSI::Cursor(Cursor::RestoreCursor)), "\x1b[u");
+    }
+
+    #[test]
+    fn cursor_display_active_position_report() {
+        assert_eq!(
+            format!(
+                "{}",
+                CSI::Cursor(Cursor::ActivePositionReport {
+                    line: OneBased::new(5),
+                    col: OneBased::new(10),
+                })
+            ),
+            "\x1b[5;10R"
+        );
+    }
+
+    #[test]
+    fn cursor_display_request_active_position() {
+        assert_eq!(
+            format!("{}", CSI::Cursor(Cursor::RequestActivePositionReport)),
+            "\x1b[6n"
+        );
+    }
+
+    #[test]
+    fn cursor_display_character_absolute() {
+        assert_eq!(
+            format!(
+                "{}",
+                CSI::Cursor(Cursor::CharacterAbsolute(OneBased::new(1)))
+            ),
+            "\x1b[G"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                CSI::Cursor(Cursor::CharacterAbsolute(OneBased::new(10)))
+            ),
+            "\x1b[10G"
+        );
+    }
+
+    #[test]
+    fn cursor_display_position() {
+        assert_eq!(
+            format!(
+                "{}",
+                CSI::Cursor(Cursor::Position {
+                    line: OneBased::new(5),
+                    col: OneBased::new(3),
+                })
+            ),
+            "\x1b[5;3H"
+        );
+    }
+
+    #[test]
+    fn cursor_display_cursor_style() {
+        assert_eq!(
+            format!(
+                "{}",
+                CSI::Cursor(Cursor::CursorStyle(CursorStyle::SteadyBar))
+            ),
+            "\x1b[6 q"
+        );
+        assert_eq!(
+            format!("{}", CSI::Cursor(Cursor::CursorStyle(CursorStyle::Default))),
+            "\x1b[0 q"
+        );
+    }
+
+    #[test]
+    fn cursor_display_tabulation() {
+        assert_eq!(
+            format!("{}", CSI::Cursor(Cursor::ForwardTabulation(1))),
+            "\x1b[I"
+        );
+        assert_eq!(
+            format!("{}", CSI::Cursor(Cursor::BackwardTabulation(1))),
+            "\x1b[Z"
+        );
+    }
+
+    #[test]
+    fn cursor_display_set_margins() {
+        // Default margins (1, max) should produce just "r"
+        assert_eq!(
+            format!(
+                "{}",
+                CSI::Cursor(Cursor::SetTopAndBottomMargins {
+                    top: OneBased::new(1),
+                    bottom: OneBased::new(u32::MAX),
+                })
+            ),
+            "\x1b[r"
+        );
+        // Non-default margins should include values
+        assert_eq!(
+            format!(
+                "{}",
+                CSI::Cursor(Cursor::SetTopAndBottomMargins {
+                    top: OneBased::new(5),
+                    bottom: OneBased::new(20),
+                })
+            ),
+            "\x1b[5;20r"
+        );
+    }
+
+    // ── Window Display ────────────────────────────────────
+    #[test]
+    fn window_display_variants() {
+        assert_eq!(
+            format!("{}", CSI::Window(Box::new(Window::DeIconify))),
+            "\x1b[1t"
+        );
+        assert_eq!(
+            format!("{}", CSI::Window(Box::new(Window::Iconify))),
+            "\x1b[2t"
+        );
+        assert_eq!(
+            format!("{}", CSI::Window(Box::new(Window::RaiseWindow))),
+            "\x1b[5t"
+        );
+        assert_eq!(
+            format!("{}", CSI::Window(Box::new(Window::RefreshWindow))),
+            "\x1b[7t"
+        );
+        assert_eq!(
+            format!("{}", CSI::Window(Box::new(Window::ReportWindowState))),
+            "\x1b[11t"
+        );
+        assert_eq!(
+            format!("{}", CSI::Window(Box::new(Window::ReportWindowTitle))),
+            "\x1b[21t"
+        );
+    }
+
+    #[test]
+    fn window_display_move() {
+        assert_eq!(
+            format!(
+                "{}",
+                CSI::Window(Box::new(Window::MoveWindow { x: 100, y: 200 }))
+            ),
+            "\x1b[3;100;200t"
+        );
+    }
+
+    #[test]
+    fn window_display_maximize_variants() {
+        assert_eq!(
+            format!("{}", CSI::Window(Box::new(Window::RestoreMaximizedWindow))),
+            "\x1b[9;0t"
+        );
+        assert_eq!(
+            format!("{}", CSI::Window(Box::new(Window::MaximizeWindow))),
+            "\x1b[9;1t"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                CSI::Window(Box::new(Window::MaximizeWindowVertically))
+            ),
+            "\x1b[9;2t"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                CSI::Window(Box::new(Window::MaximizeWindowHorizontally))
+            ),
+            "\x1b[9;3t"
+        );
+    }
+
+    #[test]
+    fn window_display_fullscreen_variants() {
+        assert_eq!(
+            format!("{}", CSI::Window(Box::new(Window::UndoFullScreenMode))),
+            "\x1b[10;0t"
+        );
+        assert_eq!(
+            format!("{}", CSI::Window(Box::new(Window::ChangeToFullScreenMode))),
+            "\x1b[10;1t"
+        );
+        assert_eq!(
+            format!("{}", CSI::Window(Box::new(Window::ToggleFullScreen))),
+            "\x1b[10;2t"
+        );
+    }
+
+    #[test]
+    fn window_display_push_pop_title() {
+        assert_eq!(
+            format!("{}", CSI::Window(Box::new(Window::PushIconAndWindowTitle))),
+            "\x1b[22;0t"
+        );
+        assert_eq!(
+            format!("{}", CSI::Window(Box::new(Window::PopIconAndWindowTitle))),
+            "\x1b[23;0t"
+        );
+        assert_eq!(
+            format!("{}", CSI::Window(Box::new(Window::PushWindowTitle))),
+            "\x1b[22;2t"
+        );
+        assert_eq!(
+            format!("{}", CSI::Window(Box::new(Window::PopWindowTitle))),
+            "\x1b[23;2t"
+        );
+    }
+
+    // ── Device Display ────────────────────────────────────
+    #[test]
+    fn device_display_requests() {
+        assert_eq!(
+            format!(
+                "{}",
+                CSI::Device(Box::new(Device::RequestPrimaryDeviceAttributes))
+            ),
+            "\x1b[c"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                CSI::Device(Box::new(Device::RequestSecondaryDeviceAttributes))
+            ),
+            "\x1b[>c"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                CSI::Device(Box::new(Device::RequestTertiaryDeviceAttributes))
+            ),
+            "\x1b[=c"
+        );
+        assert_eq!(
+            format!("{}", CSI::Device(Box::new(Device::StatusReport))),
+            "\x1b[5n"
+        );
+        assert_eq!(
+            format!("{}", CSI::Device(Box::new(Device::SoftReset))),
+            "\x1b[!p"
+        );
+    }
+
+    #[test]
+    fn device_display_terminal_name_version() {
+        assert_eq!(
+            format!(
+                "{}",
+                CSI::Device(Box::new(Device::RequestTerminalNameAndVersion))
+            ),
+            "\x1b[>q"
+        );
+    }
+
+    // ── Mode Display ──────────────────────────────────────
+    #[test]
+    fn mode_display_set_dec_private() {
+        assert_eq!(
+            format!(
+                "{}",
+                CSI::Mode(Mode::SetDecPrivateMode(DecPrivateMode::Code(
+                    DecPrivateModeCode::AutoWrap
+                )))
+            ),
+            "\x1b[?7h"
+        );
+    }
+
+    #[test]
+    fn mode_display_reset_dec_private() {
+        assert_eq!(
+            format!(
+                "{}",
+                CSI::Mode(Mode::ResetDecPrivateMode(DecPrivateMode::Code(
+                    DecPrivateModeCode::AutoWrap
+                )))
+            ),
+            "\x1b[?7l"
+        );
+    }
+
+    #[test]
+    fn mode_display_bracketed_paste() {
+        assert_eq!(
+            format!(
+                "{}",
+                CSI::Mode(Mode::SetDecPrivateMode(DecPrivateMode::Code(
+                    DecPrivateModeCode::BracketedPaste
+                )))
+            ),
+            "\x1b[?2004h"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                CSI::Mode(Mode::ResetDecPrivateMode(DecPrivateMode::Code(
+                    DecPrivateModeCode::BracketedPaste
+                )))
+            ),
+            "\x1b[?2004l"
+        );
+    }
+
+    #[test]
+    fn mode_display_unspecified() {
+        assert_eq!(
+            format!(
+                "{}",
+                CSI::Mode(Mode::SetDecPrivateMode(DecPrivateMode::Unspecified(9999)))
+            ),
+            "\x1b[?9999h"
+        );
+    }
+
+    // ── Keyboard Display ──────────────────────────────────
+    #[test]
+    fn keyboard_display_query_kitty() {
+        assert_eq!(
+            format!("{}", CSI::Keyboard(Keyboard::QueryKittySupport)),
+            "\x1b[?u"
+        );
+    }
+
+    #[test]
+    fn keyboard_display_pop_kitty() {
+        assert_eq!(
+            format!("{}", CSI::Keyboard(Keyboard::PopKittyState(1))),
+            "\x1b[<1u"
+        );
+    }
+
+    // ── XtSmGraphics methods ──────────────────────────────
+    #[test]
+    fn xt_sm_graphics_action() {
+        let g = XtSmGraphics {
+            item: XtSmGraphicsItem::NumberOfColorRegisters,
+            action_or_status: 1,
+            value: vec![],
+        };
+        assert_eq!(g.action(), Some(XtSmGraphicsAction::ReadAttribute));
+        assert_eq!(g.status(), Some(XtSmGraphicsStatus::InvalidItem));
+
+        let g2 = XtSmGraphics {
+            item: XtSmGraphicsItem::SixelGraphicsGeometry,
+            action_or_status: 4,
+            value: vec![],
+        };
+        assert_eq!(
+            g2.action(),
+            Some(XtSmGraphicsAction::ReadMaximumAllowedValue)
+        );
+
+        let g3 = XtSmGraphics {
+            item: XtSmGraphicsItem::RegisGraphicsGeometry,
+            action_or_status: 99,
+            value: vec![],
+        };
+        assert_eq!(g3.action(), None);
+        assert_eq!(g3.status(), None);
+    }
+
+    #[test]
+    fn xt_sm_graphics_status() {
+        let g = XtSmGraphics {
+            item: XtSmGraphicsItem::NumberOfColorRegisters,
+            action_or_status: 0,
+            value: vec![],
+        };
+        assert_eq!(g.status(), Some(XtSmGraphicsStatus::Success));
+
+        let g2 = XtSmGraphics {
+            item: XtSmGraphicsItem::NumberOfColorRegisters,
+            action_or_status: 3,
+            value: vec![],
+        };
+        assert_eq!(g2.status(), Some(XtSmGraphicsStatus::Failure));
+    }
+
+    #[test]
+    fn xt_sm_graphics_item_display() {
+        assert_eq!(format!("{}", XtSmGraphicsItem::NumberOfColorRegisters), "1");
+        assert_eq!(format!("{}", XtSmGraphicsItem::SixelGraphicsGeometry), "2");
+        assert_eq!(format!("{}", XtSmGraphicsItem::RegisGraphicsGeometry), "3");
+        assert_eq!(format!("{}", XtSmGraphicsItem::Unspecified(42)), "42");
+    }
+
+    #[test]
+    fn xt_sm_graphics_action_to_i64() {
+        assert_eq!(XtSmGraphicsAction::ReadAttribute.to_i64(), 1);
+        assert_eq!(XtSmGraphicsAction::ResetToDefault.to_i64(), 2);
+        assert_eq!(XtSmGraphicsAction::SetToValue.to_i64(), 3);
+        assert_eq!(XtSmGraphicsAction::ReadMaximumAllowedValue.to_i64(), 4);
+    }
+
+    #[test]
+    fn xt_sm_graphics_status_to_i64() {
+        assert_eq!(XtSmGraphicsStatus::Success.to_i64(), 0);
+        assert_eq!(XtSmGraphicsStatus::InvalidItem.to_i64(), 1);
+        assert_eq!(XtSmGraphicsStatus::InvalidAction.to_i64(), 2);
+        assert_eq!(XtSmGraphicsStatus::Failure.to_i64(), 3);
+    }
+
+    // ── XtermKeyModifierResource ──────────────────────────
+    #[test]
+    fn xterm_key_modifier_resource_parse() {
+        assert_eq!(
+            XtermKeyModifierResource::parse(0),
+            Some(XtermKeyModifierResource::Keyboard)
+        );
+        assert_eq!(
+            XtermKeyModifierResource::parse(1),
+            Some(XtermKeyModifierResource::CursorKeys)
+        );
+        assert_eq!(
+            XtermKeyModifierResource::parse(2),
+            Some(XtermKeyModifierResource::FunctionKeys)
+        );
+        assert_eq!(
+            XtermKeyModifierResource::parse(4),
+            Some(XtermKeyModifierResource::OtherKeys)
+        );
+        assert_eq!(XtermKeyModifierResource::parse(3), None);
+        assert_eq!(XtermKeyModifierResource::parse(5), None);
+        assert_eq!(XtermKeyModifierResource::parse(-1), None);
+    }
+
+    // ── CharacterPath ─────────────────────────────────────
+    #[test]
+    fn character_path_clone_eq() {
+        let a = CharacterPath::LeftToRightOrTopToBottom;
+        let b = a.clone();
+        assert_eq!(a, b);
+        assert_ne!(
+            CharacterPath::LeftToRightOrTopToBottom,
+            CharacterPath::RightToLeftOrBottomToTop
+        );
+    }
+
+    #[test]
+    fn character_path_display() {
+        assert_eq!(
+            format!(
+                "{}",
+                CSI::SelectCharacterPath(CharacterPath::ImplementationDefault, 0)
+            ),
+            "\x1b[ k"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                CSI::SelectCharacterPath(CharacterPath::LeftToRightOrTopToBottom, 0)
+            ),
+            "\x1b[1 k"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                CSI::SelectCharacterPath(CharacterPath::RightToLeftOrBottomToTop, 0)
+            ),
+            "\x1b[2 k"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                CSI::SelectCharacterPath(CharacterPath::LeftToRightOrTopToBottom, 5)
+            ),
+            "\x1b[1;5 k"
+        );
+    }
+
+    // ── Unspecified Display ───────────────────────────────
+    #[test]
+    fn unspecified_display() {
+        let u = Unspecified {
+            params: vec![CsiParam::Integer(42)],
+            parameters_truncated: false,
+            control: 'z',
+        };
+        assert_eq!(format!("{u}"), "42z");
+    }
+
+    // ── KittyKeyboardMode ─────────────────────────────────
+    #[test]
+    fn kitty_keyboard_mode_values() {
+        assert_eq!(KittyKeyboardMode::AssignAll as u16, 1);
+        assert_eq!(KittyKeyboardMode::SetSpecified as u16, 2);
+        assert_eq!(KittyKeyboardMode::ClearSpecified as u16, 3);
+    }
+
+    // ── DecPrivateModeCode values ─────────────────────────
+    #[test]
+    fn dec_private_mode_code_values() {
+        assert_eq!(DecPrivateModeCode::ApplicationCursorKeys as u16, 1);
+        assert_eq!(DecPrivateModeCode::AutoWrap as u16, 7);
+        assert_eq!(DecPrivateModeCode::ShowCursor as u16, 25);
+        assert_eq!(DecPrivateModeCode::MouseTracking as u16, 1000);
+        assert_eq!(DecPrivateModeCode::SGRMouse as u16, 1006);
+        assert_eq!(DecPrivateModeCode::BracketedPaste as u16, 2004);
+        assert_eq!(DecPrivateModeCode::SynchronizedOutput as u16, 2026);
+    }
+
+    // ── TerminalModeCode values ───────────────────────────
+    #[test]
+    fn terminal_mode_code_values() {
+        assert_eq!(TerminalModeCode::KeyboardAction as u16, 2);
+        assert_eq!(TerminalModeCode::Insert as u16, 4);
+        assert_eq!(TerminalModeCode::BiDirectionalSupportMode as u16, 8);
+        assert_eq!(TerminalModeCode::AutomaticNewline as u16, 20);
+    }
+
+    // ── Sgr clone/eq ──────────────────────────────────────
+    #[test]
+    fn sgr_clone_eq() {
+        let a = Sgr::Reset;
+        let b = a.clone();
+        assert_eq!(a, b);
+
+        assert_ne!(Sgr::Reset, Sgr::Italic(true));
+        assert_ne!(Sgr::Italic(true), Sgr::Italic(false));
+    }
+
+    // ── CSI parse: more SGR sequences ─────────────────────
+    #[test]
+    fn sgr_intensity_dim() {
+        assert_eq!(
+            parse('m', &[2], "\x1b[2m"),
+            vec![CSI::Sgr(Sgr::Intensity(Intensity::Half))]
+        );
+    }
+
+    #[test]
+    fn sgr_intensity_normal() {
+        assert_eq!(
+            parse('m', &[22], "\x1b[22m"),
+            vec![CSI::Sgr(Sgr::Intensity(Intensity::Normal))]
+        );
+    }
+
+    #[test]
+    fn sgr_italic() {
+        assert_eq!(
+            parse('m', &[3], "\x1b[3m"),
+            vec![CSI::Sgr(Sgr::Italic(true))]
+        );
+        assert_eq!(
+            parse('m', &[23], "\x1b[23m"),
+            vec![CSI::Sgr(Sgr::Italic(false))]
+        );
+    }
+
+    #[test]
+    fn sgr_inverse() {
+        assert_eq!(
+            parse('m', &[7], "\x1b[7m"),
+            vec![CSI::Sgr(Sgr::Inverse(true))]
+        );
+        assert_eq!(
+            parse('m', &[27], "\x1b[27m"),
+            vec![CSI::Sgr(Sgr::Inverse(false))]
+        );
+    }
+
+    #[test]
+    fn sgr_invisible() {
+        assert_eq!(
+            parse('m', &[8], "\x1b[8m"),
+            vec![CSI::Sgr(Sgr::Invisible(true))]
+        );
+        assert_eq!(
+            parse('m', &[28], "\x1b[28m"),
+            vec![CSI::Sgr(Sgr::Invisible(false))]
+        );
+    }
+
+    #[test]
+    fn sgr_strikethrough() {
+        assert_eq!(
+            parse('m', &[9], "\x1b[9m"),
+            vec![CSI::Sgr(Sgr::StrikeThrough(true))]
+        );
+        assert_eq!(
+            parse('m', &[29], "\x1b[29m"),
+            vec![CSI::Sgr(Sgr::StrikeThrough(false))]
+        );
+    }
+
+    #[test]
+    fn sgr_foreground_ansi_colors() {
+        assert_eq!(
+            parse('m', &[30], "\x1b[30m"),
+            vec![CSI::Sgr(Sgr::Foreground(ColorSpec::PaletteIndex(0)))]
+        );
+        assert_eq!(
+            parse('m', &[37], "\x1b[37m"),
+            vec![CSI::Sgr(Sgr::Foreground(ColorSpec::PaletteIndex(7)))]
+        );
+        assert_eq!(
+            parse('m', &[39], "\x1b[39m"),
+            vec![CSI::Sgr(Sgr::Foreground(ColorSpec::Default))]
+        );
+    }
+
+    #[test]
+    fn sgr_background_ansi_colors() {
+        assert_eq!(
+            parse('m', &[40], "\x1b[40m"),
+            vec![CSI::Sgr(Sgr::Background(ColorSpec::PaletteIndex(0)))]
+        );
+        assert_eq!(
+            parse('m', &[47], "\x1b[47m"),
+            vec![CSI::Sgr(Sgr::Background(ColorSpec::PaletteIndex(7)))]
+        );
+        assert_eq!(
+            parse('m', &[49], "\x1b[49m"),
+            vec![CSI::Sgr(Sgr::Background(ColorSpec::Default))]
+        );
+    }
+
+    // ── CSI parse: edit sequences ─────────────────────────
+    #[test]
+    fn parse_erase_in_display_all_variants() {
+        assert_eq!(
+            parse('J', &[2], "\x1b[2J"),
+            vec![CSI::Edit(Edit::EraseInDisplay(
+                EraseInDisplay::EraseDisplay
+            ))]
+        );
+        assert_eq!(
+            parse('J', &[3], "\x1b[3J"),
+            vec![CSI::Edit(Edit::EraseInDisplay(
+                EraseInDisplay::EraseScrollback
+            ))]
+        );
+    }
+
+    #[test]
+    fn parse_erase_in_line() {
+        assert_eq!(
+            parse('K', &[], "\x1b[K"),
+            vec![CSI::Edit(Edit::EraseInLine(EraseInLine::EraseToEndOfLine))]
+        );
+        assert_eq!(
+            parse('K', &[1], "\x1b[1K"),
+            vec![CSI::Edit(Edit::EraseInLine(
+                EraseInLine::EraseToStartOfLine
+            ))]
+        );
+        assert_eq!(
+            parse('K', &[2], "\x1b[2K"),
+            vec![CSI::Edit(Edit::EraseInLine(EraseInLine::EraseLine))]
+        );
+    }
+
+    #[test]
+    fn parse_scroll_commands() {
+        assert_eq!(
+            parse('S', &[5], "\x1b[5S"),
+            vec![CSI::Edit(Edit::ScrollUp(5))]
+        );
+        assert_eq!(
+            parse('T', &[3], "\x1b[3T"),
+            vec![CSI::Edit(Edit::ScrollDown(3))]
+        );
+    }
+
+    #[test]
+    fn parse_insert_delete_lines() {
+        assert_eq!(
+            parse('L', &[2], "\x1b[2L"),
+            vec![CSI::Edit(Edit::InsertLine(2))]
+        );
+        assert_eq!(
+            parse('M', &[3], "\x1b[3M"),
+            vec![CSI::Edit(Edit::DeleteLine(3))]
+        );
+    }
+
+    // ── CSI parse: cursor sequences ───────────────────────
+    #[test]
+    fn parse_cursor_up_down() {
+        assert_eq!(
+            parse('A', &[3], "\x1b[3A"),
+            vec![CSI::Cursor(Cursor::Up(3))]
+        );
+        assert_eq!(
+            parse('B', &[2], "\x1b[2B"),
+            vec![CSI::Cursor(Cursor::Down(2))]
+        );
+    }
+
+    #[test]
+    fn parse_cursor_left() {
+        assert_eq!(
+            parse('D', &[4], "\x1b[4D"),
+            vec![CSI::Cursor(Cursor::Left(4))]
+        );
+    }
+
+    // ── MouseReport Display ───────────────────────────────
+    #[test]
+    fn mouse_report_sgr1006_display() {
+        let mr = CSI::Mouse(MouseReport::SGR1006 {
+            x: 10,
+            y: 20,
+            button: MouseButton::Button1Press,
+            modifiers: Modifiers::NONE,
+        });
+        assert_eq!(format!("{mr}"), "\x1b[<0;10;20M");
+    }
+
+    #[test]
+    fn mouse_report_sgr1006_release_display() {
+        let mr = CSI::Mouse(MouseReport::SGR1006 {
+            x: 5,
+            y: 15,
+            button: MouseButton::Button1Release,
+            modifiers: Modifiers::NONE,
+        });
+        assert_eq!(format!("{mr}"), "\x1b[<0;5;15m");
+    }
+
+    #[test]
+    fn mouse_report_sgr1006_with_modifiers() {
+        let mr = CSI::Mouse(MouseReport::SGR1006 {
+            x: 1,
+            y: 1,
+            button: MouseButton::Button1Press,
+            modifiers: Modifiers::SHIFT | Modifiers::CTRL,
+        });
+        let s = format!("{mr}");
+        assert!(s.starts_with("\x1b[<"));
+        assert!(s.ends_with("M"));
+    }
 }
