@@ -4974,6 +4974,7 @@ dependencies = [
  "frankenterm-dynamic",
  "log",
  "mlua",
+ "ordered-float 4.6.0",
 ]
 
 [[package]]

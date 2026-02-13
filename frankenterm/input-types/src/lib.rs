@@ -3208,4 +3208,356 @@ mod test {
             "\u{1b}[102;14u".to_string()
         );
     }
+
+    // ── KeyCode: is_modifier ────────────────────────────────
+
+    #[test]
+    fn keycode_modifier_keys() {
+        assert!(KeyCode::Shift.is_modifier());
+        assert!(KeyCode::Control.is_modifier());
+        assert!(KeyCode::Alt.is_modifier());
+        assert!(KeyCode::Super.is_modifier());
+        assert!(KeyCode::Meta.is_modifier());
+        assert!(KeyCode::Hyper.is_modifier());
+        assert!(KeyCode::LeftShift.is_modifier());
+        assert!(KeyCode::RightShift.is_modifier());
+        assert!(KeyCode::LeftControl.is_modifier());
+        assert!(KeyCode::RightControl.is_modifier());
+        assert!(KeyCode::LeftAlt.is_modifier());
+        assert!(KeyCode::RightAlt.is_modifier());
+        assert!(KeyCode::CapsLock.is_modifier());
+    }
+
+    #[test]
+    fn keycode_non_modifier_keys() {
+        assert!(!KeyCode::Char('a').is_modifier());
+        assert!(!KeyCode::Function(1).is_modifier());
+        assert!(!KeyCode::LeftArrow.is_modifier());
+        assert!(!KeyCode::PageUp.is_modifier());
+        assert!(!KeyCode::Numpad(5).is_modifier());
+    }
+
+    // ── KeyCode: composed ───────────────────────────────────
+
+    #[test]
+    fn keycode_composed_single_char() {
+        // Single char input should produce Char, not Composed
+        assert_eq!(KeyCode::composed("a"), KeyCode::Char('a'));
+    }
+
+    #[test]
+    fn keycode_composed_multi_char() {
+        assert_eq!(
+            KeyCode::composed("abc"),
+            KeyCode::Composed("abc".to_string())
+        );
+    }
+
+    #[test]
+    fn keycode_composed_empty() {
+        // Empty string goes through the multi-char path
+        assert_eq!(KeyCode::composed(""), KeyCode::Composed("".to_string()));
+    }
+
+    // ── KeyCode: TryFrom<&str> ──────────────────────────────
+
+    #[test]
+    fn keycode_try_from_named() {
+        assert_eq!(KeyCode::try_from("Shift"), Ok(KeyCode::Shift));
+        assert_eq!(KeyCode::try_from("PageUp"), Ok(KeyCode::PageUp));
+        assert_eq!(KeyCode::try_from("Home"), Ok(KeyCode::Home));
+    }
+
+    #[test]
+    fn keycode_try_from_special() {
+        assert_eq!(KeyCode::try_from("Backspace"), Ok(KeyCode::Char('\u{8}')));
+        assert_eq!(KeyCode::try_from("Tab"), Ok(KeyCode::Char('\t')));
+        assert_eq!(KeyCode::try_from("Return"), Ok(KeyCode::Char('\r')));
+        assert_eq!(KeyCode::try_from("Enter"), Ok(KeyCode::Char('\r')));
+        assert_eq!(KeyCode::try_from("Escape"), Ok(KeyCode::Char('\u{1b}')));
+        assert_eq!(KeyCode::try_from("Delete"), Ok(KeyCode::Char('\u{7f}')));
+    }
+
+    #[test]
+    fn keycode_try_from_function() {
+        assert_eq!(KeyCode::try_from("F1"), Ok(KeyCode::Function(1)));
+        assert_eq!(KeyCode::try_from("F12"), Ok(KeyCode::Function(12)));
+        assert_eq!(KeyCode::try_from("F24"), Ok(KeyCode::Function(24)));
+    }
+
+    #[test]
+    fn keycode_try_from_function_invalid() {
+        assert!(KeyCode::try_from("F0").is_err());
+        assert!(KeyCode::try_from("F25").is_err());
+    }
+
+    #[test]
+    fn keycode_try_from_numpad() {
+        assert_eq!(KeyCode::try_from("Numpad0"), Ok(KeyCode::Numpad(0)));
+        assert_eq!(KeyCode::try_from("Numpad9"), Ok(KeyCode::Numpad(9)));
+    }
+
+    #[test]
+    fn keycode_try_from_numpad_invalid() {
+        assert!(KeyCode::try_from("Numpad10").is_err());
+    }
+
+    #[test]
+    fn keycode_try_from_single_char() {
+        assert_eq!(KeyCode::try_from("a"), Ok(KeyCode::Char('a')));
+        assert_eq!(KeyCode::try_from("Z"), Ok(KeyCode::Char('Z')));
+    }
+
+    #[test]
+    fn keycode_try_from_invalid() {
+        assert!(KeyCode::try_from("NotAKey").is_err());
+    }
+
+    // ── KeyCode: ToString ───────────────────────────────────
+
+    #[test]
+    fn keycode_to_string_char() {
+        assert_eq!(KeyCode::Char('x').to_string(), "mapped:x");
+    }
+
+    #[test]
+    fn keycode_to_string_function() {
+        assert_eq!(KeyCode::Function(5).to_string(), "F5");
+    }
+
+    #[test]
+    fn keycode_to_string_numpad() {
+        assert_eq!(KeyCode::Numpad(3).to_string(), "Numpad3");
+    }
+
+    #[test]
+    fn keycode_to_string_raw() {
+        assert_eq!(KeyCode::RawCode(42).to_string(), "raw:42");
+    }
+
+    // ── KeyCode: to_phys ────────────────────────────────────
+
+    #[test]
+    fn keycode_to_phys_letters() {
+        assert_eq!(KeyCode::Char('a').to_phys(), Some(PhysKeyCode::A));
+        assert_eq!(KeyCode::Char('A').to_phys(), Some(PhysKeyCode::A));
+        assert_eq!(KeyCode::Char('z').to_phys(), Some(PhysKeyCode::Z));
+    }
+
+    #[test]
+    fn keycode_to_phys_digits() {
+        assert_eq!(KeyCode::Char('0').to_phys(), Some(PhysKeyCode::K0));
+        assert_eq!(KeyCode::Char('9').to_phys(), Some(PhysKeyCode::K9));
+    }
+
+    #[test]
+    fn keycode_to_phys_special() {
+        assert_eq!(KeyCode::Char(' ').to_phys(), Some(PhysKeyCode::Space));
+        assert_eq!(KeyCode::Char('\r').to_phys(), Some(PhysKeyCode::Return));
+        assert_eq!(KeyCode::Char('\t').to_phys(), Some(PhysKeyCode::Tab));
+    }
+
+    #[test]
+    fn keycode_to_phys_arrows() {
+        assert_eq!(KeyCode::LeftArrow.to_phys(), Some(PhysKeyCode::LeftArrow));
+        assert_eq!(KeyCode::UpArrow.to_phys(), Some(PhysKeyCode::UpArrow));
+    }
+
+    // ── Modifiers ───────────────────────────────────────────
+
+    #[test]
+    fn modifiers_default_is_none() {
+        assert_eq!(Modifiers::default(), Modifiers::NONE);
+    }
+
+    #[test]
+    fn modifiers_encode_xterm() {
+        assert_eq!(Modifiers::NONE.encode_xterm(), 0);
+        assert_eq!(Modifiers::SHIFT.encode_xterm(), 1);
+        assert_eq!(Modifiers::ALT.encode_xterm(), 2);
+        assert_eq!(Modifiers::CTRL.encode_xterm(), 4);
+        assert_eq!((Modifiers::SHIFT | Modifiers::ALT).encode_xterm(), 3);
+        assert_eq!(
+            (Modifiers::SHIFT | Modifiers::ALT | Modifiers::CTRL).encode_xterm(),
+            7
+        );
+    }
+
+    #[test]
+    fn modifiers_try_from_string() {
+        assert_eq!(
+            Modifiers::try_from("SHIFT".to_string()),
+            Ok(Modifiers::SHIFT)
+        );
+        assert_eq!(Modifiers::try_from("CTRL".to_string()), Ok(Modifiers::CTRL));
+        assert_eq!(Modifiers::try_from("ALT".to_string()), Ok(Modifiers::ALT));
+        assert_eq!(
+            Modifiers::try_from("SUPER".to_string()),
+            Ok(Modifiers::SUPER)
+        );
+    }
+
+    #[test]
+    fn modifiers_try_from_string_aliases() {
+        assert_eq!(Modifiers::try_from("OPT".to_string()), Ok(Modifiers::ALT));
+        assert_eq!(Modifiers::try_from("META".to_string()), Ok(Modifiers::ALT));
+        assert_eq!(Modifiers::try_from("CMD".to_string()), Ok(Modifiers::SUPER));
+        assert_eq!(Modifiers::try_from("WIN".to_string()), Ok(Modifiers::SUPER));
+    }
+
+    #[test]
+    fn modifiers_try_from_string_combined() {
+        assert_eq!(
+            Modifiers::try_from("SHIFT|CTRL".to_string()),
+            Ok(Modifiers::SHIFT | Modifiers::CTRL)
+        );
+    }
+
+    #[test]
+    fn modifiers_try_from_string_none() {
+        assert_eq!(Modifiers::try_from("NONE".to_string()), Ok(Modifiers::NONE));
+        assert_eq!(Modifiers::try_from("".to_string()), Ok(Modifiers::NONE));
+    }
+
+    #[test]
+    fn modifiers_try_from_string_invalid() {
+        assert!(Modifiers::try_from("BOGUS".to_string()).is_err());
+    }
+
+    // ── KeyboardLedStatus ───────────────────────────────────
+
+    #[test]
+    fn keyboard_led_status_empty_to_string() {
+        assert_eq!(KeyboardLedStatus::empty().to_string(), "");
+    }
+
+    #[test]
+    fn keyboard_led_status_caps_lock() {
+        assert_eq!(KeyboardLedStatus::CAPS_LOCK.to_string(), "CAPS_LOCK");
+    }
+
+    #[test]
+    fn keyboard_led_status_num_lock() {
+        assert_eq!(KeyboardLedStatus::NUM_LOCK.to_string(), "NUM_LOCK");
+    }
+
+    #[test]
+    fn keyboard_led_status_both() {
+        let both = KeyboardLedStatus::CAPS_LOCK | KeyboardLedStatus::NUM_LOCK;
+        assert_eq!(both.to_string(), "CAPS_LOCK|NUM_LOCK");
+    }
+
+    // ── PhysKeyCode ─────────────────────────────────────────
+
+    #[test]
+    fn phys_key_code_is_modifier() {
+        assert!(PhysKeyCode::LeftShift.is_modifier());
+        assert!(PhysKeyCode::LeftControl.is_modifier());
+        assert!(PhysKeyCode::LeftAlt.is_modifier());
+        assert!(!PhysKeyCode::A.is_modifier());
+        assert!(!PhysKeyCode::Return.is_modifier());
+    }
+
+    #[test]
+    fn phys_key_code_to_key_code_letters() {
+        assert_eq!(PhysKeyCode::A.to_key_code(), KeyCode::Char('a'));
+        assert_eq!(PhysKeyCode::Z.to_key_code(), KeyCode::Char('z'));
+    }
+
+    #[test]
+    fn phys_key_code_to_key_code_special() {
+        assert_eq!(PhysKeyCode::Return.to_key_code(), KeyCode::Char('\r'));
+        assert_eq!(PhysKeyCode::Space.to_key_code(), KeyCode::Char(' '));
+        assert_eq!(PhysKeyCode::Tab.to_key_code(), KeyCode::Char('\t'));
+    }
+
+    #[test]
+    fn phys_key_code_try_from_str() {
+        assert_eq!(PhysKeyCode::try_from("A"), Ok(PhysKeyCode::A));
+        assert_eq!(PhysKeyCode::try_from("Return"), Ok(PhysKeyCode::Return));
+    }
+
+    #[test]
+    fn phys_key_code_try_from_str_invalid() {
+        assert!(PhysKeyCode::try_from("NotAKey").is_err());
+    }
+
+    // ── is_ascii_control ────────────────────────────────────
+
+    #[test]
+    fn is_ascii_control_ctrl_a() {
+        // Ctrl-A is char 0x01
+        assert_eq!(is_ascii_control('\x01'), Some('a'));
+    }
+
+    #[test]
+    fn is_ascii_control_ctrl_z() {
+        // Ctrl-Z is char 0x1a
+        assert_eq!(is_ascii_control('\x1a'), Some('z'));
+    }
+
+    #[test]
+    fn is_ascii_control_null() {
+        // NUL (0x00): (0x00 | 0x40) = '@', '@'.to_ascii_lowercase() = '@'
+        assert_eq!(is_ascii_control('\x00'), Some('@'));
+    }
+
+    #[test]
+    fn is_ascii_control_not_control() {
+        assert_eq!(is_ascii_control('a'), None);
+        assert_eq!(is_ascii_control(' '), None); // 0x20 is not < 0x20
+    }
+
+    // ── Handled ─────────────────────────────────────────────
+
+    #[test]
+    fn handled_new_is_not_handled() {
+        let h = Handled::new();
+        assert!(!h.is_handled());
+    }
+
+    #[test]
+    fn handled_set_handled() {
+        let h = Handled::new();
+        h.set_handled();
+        assert!(h.is_handled());
+    }
+
+    #[test]
+    fn handled_eq_always_true() {
+        let a = Handled::new();
+        let b = Handled::new();
+        a.set_handled();
+        // Even though a is handled and b is not, they are always equal
+        assert_eq!(a, b);
+    }
+
+    // ── KeyCode: Clone / Debug / Eq / Hash / Ord ────────────
+
+    #[test]
+    fn keycode_clone_eq() {
+        let a = KeyCode::Char('x');
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn keycode_ord() {
+        assert!(KeyCode::Char('a') < KeyCode::Char('b'));
+    }
+
+    // ── MouseButtons bitflags ───────────────────────────────
+
+    #[test]
+    fn mouse_buttons_default_empty() {
+        assert_eq!(MouseButtons::default(), MouseButtons::NONE);
+    }
+
+    #[test]
+    fn mouse_buttons_combine() {
+        let both = MouseButtons::LEFT | MouseButtons::RIGHT;
+        assert!(both.contains(MouseButtons::LEFT));
+        assert!(both.contains(MouseButtons::RIGHT));
+        assert!(!both.contains(MouseButtons::MIDDLE));
+    }
 }
