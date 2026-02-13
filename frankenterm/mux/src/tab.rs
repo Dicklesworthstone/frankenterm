@@ -345,27 +345,195 @@ fn compute_min_size(tree: &Tree) -> (usize, usize) {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Axis {
+    Width,
+    Height,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AxisConstraints {
+    min: usize,
+    max: Option<usize>,
+    preferred: Option<usize>,
+}
+
+impl AxisConstraints {
+    fn normalized(self) -> Self {
+        let min = self.min.max(1);
+        let max = self.max.map(|value| value.max(min));
+        let preferred = self.preferred.map(|value| {
+            let clamped = value.max(min);
+            max.map_or(clamped, |max_value| clamped.min(max_value))
+        });
+
+        Self {
+            min,
+            max,
+            preferred,
+        }
+    }
+}
+
+fn axis_constraints_from_pane_constraints(
+    constraints: PaneConstraints,
+    axis: Axis,
+    fixed_size: Option<usize>,
+) -> AxisConstraints {
+    let (mut min, mut max, mut preferred) = match axis {
+        Axis::Width => (
+            constraints.min_width.max(1),
+            constraints.max_width,
+            constraints.preferred_width,
+        ),
+        Axis::Height => (
+            constraints.min_height.max(1),
+            constraints.max_height,
+            constraints.preferred_height,
+        ),
+    };
+
+    if constraints.fixed {
+        if let Some(size) = fixed_size {
+            min = min.max(size);
+            max = Some(size);
+            preferred = Some(size);
+        }
+    }
+
+    AxisConstraints {
+        min,
+        max,
+        preferred,
+    }
+    .normalized()
+}
+
+fn pane_axis_constraints(pane: &Arc<dyn Pane>, axis: Axis) -> AxisConstraints {
+    let constraints = pane.pane_constraints();
+    let dims = pane.get_dimensions();
+    let fixed_size = match axis {
+        Axis::Width => Some(dims.cols),
+        Axis::Height => Some(dims.viewport_rows),
+    };
+    axis_constraints_from_pane_constraints(constraints, axis, fixed_size)
+}
+
+fn shared_axis_constraints(left: AxisConstraints, right: AxisConstraints) -> AxisConstraints {
+    let min = left.min.max(right.min);
+    let max = match (left.max, right.max) {
+        (Some(left_max), Some(right_max)) => Some(left_max.min(right_max)),
+        (Some(left_max), None) => Some(left_max),
+        (None, Some(right_max)) => Some(right_max),
+        (None, None) => None,
+    };
+    let preferred = match (left.preferred, right.preferred) {
+        (Some(left_pref), Some(right_pref)) => Some(left_pref.max(right_pref)),
+        (Some(left_pref), None) => Some(left_pref),
+        (None, Some(right_pref)) => Some(right_pref),
+        (None, None) => None,
+    };
+
+    AxisConstraints {
+        min,
+        max,
+        preferred,
+    }
+    .normalized()
+}
+
+fn additive_axis_constraints(left: AxisConstraints, right: AxisConstraints) -> AxisConstraints {
+    let min = left.min.saturating_add(right.min).saturating_add(1);
+    let max = match (left.max, right.max) {
+        (Some(left_max), Some(right_max)) => {
+            Some(left_max.saturating_add(right_max).saturating_add(1))
+        }
+        _ => None,
+    };
+    let preferred = match (left.preferred, right.preferred) {
+        (Some(left_pref), Some(right_pref)) => {
+            Some(left_pref.saturating_add(right_pref).saturating_add(1))
+        }
+        _ => None,
+    };
+
+    AxisConstraints {
+        min,
+        max,
+        preferred,
+    }
+    .normalized()
+}
+
+fn compute_axis_constraints(tree: &Tree, axis: Axis) -> AxisConstraints {
+    match tree {
+        Tree::Empty | Tree::Node { data: None, .. } => AxisConstraints {
+            min: 1,
+            max: None,
+            preferred: None,
+        },
+        Tree::Leaf(pane) => pane_axis_constraints(pane, axis),
+        Tree::Node {
+            left,
+            right,
+            data: Some(data),
+        } => {
+            let left_constraints = compute_axis_constraints(&*left, axis);
+            let right_constraints = compute_axis_constraints(&*right, axis);
+            match (data.direction, axis) {
+                (SplitDirection::Horizontal, Axis::Width)
+                | (SplitDirection::Vertical, Axis::Height) => {
+                    additive_axis_constraints(left_constraints, right_constraints)
+                }
+                _ => shared_axis_constraints(left_constraints, right_constraints),
+            }
+        }
+    }
+}
+
 fn split_allocation(
     total: usize,
-    min_first: usize,
-    min_second: usize,
-    preferred_first: usize,
+    first: AxisConstraints,
+    second: AxisConstraints,
+    preferred_first: Option<usize>,
 ) -> Option<(usize, usize)> {
     let available = total.checked_sub(1)?;
-    if min_first.saturating_add(min_second) > available {
+    if first.min.saturating_add(second.min) > available {
         return None;
     }
-    let max_first = available.saturating_sub(min_second);
-    let first = preferred_first.clamp(min_first, max_first);
-    let second = available.saturating_sub(first);
-    Some((first, second))
+
+    let first_min = second.max.map_or(first.min, |second_max| {
+        first.min.max(available.saturating_sub(second_max))
+    });
+    let first_max = first
+        .max
+        .unwrap_or(available)
+        .min(available.saturating_sub(second.min));
+    if first_min > first_max {
+        return None;
+    }
+
+    let preferred =
+        preferred_first
+            .or(first.preferred)
+            .or_else(|| {
+                second
+                    .preferred
+                    .map(|value| available.saturating_sub(value))
+            })
+            .unwrap_or(first.min.saturating_add(
+                available.saturating_sub(first.min.saturating_add(second.min)) / 2,
+            ));
+    let first_size = preferred.clamp(first_min, first_max);
+    let second_size = available.saturating_sub(first_size);
+    Some((first_size, second_size))
 }
 
 fn split_dimension_for_request(
     dim: usize,
     request: SplitRequest,
-    min_first: usize,
-    min_second: usize,
+    first: AxisConstraints,
+    second: AxisConstraints,
 ) -> Option<(usize, usize)> {
     let requested = match request.size {
         SplitSize::Cells(n) => n,
@@ -375,24 +543,26 @@ fn split_dimension_for_request(
 
     if request.target_is_second {
         let preferred_first = dim.saturating_sub(1).saturating_sub(requested);
-        split_allocation(dim, min_first, min_second, preferred_first)
+        split_allocation(dim, first, second, Some(preferred_first))
     } else {
-        split_allocation(dim, min_first, min_second, requested)
+        split_allocation(dim, first, second, Some(requested))
     }
 }
 
-fn pane_size_satisfies_constraints(size: &TerminalSize, constraints: PaneConstraints) -> bool {
-    let min_width = constraints.min_width.max(1);
-    let min_height = constraints.min_height.max(1);
-    if size.cols < min_width || size.rows < min_height {
+fn pane_size_satisfies_constraints(
+    size: &TerminalSize,
+    width: AxisConstraints,
+    height: AxisConstraints,
+) -> bool {
+    if size.cols < width.min || size.rows < height.min {
         return false;
     }
-    if let Some(max_width) = constraints.max_width {
+    if let Some(max_width) = width.max {
         if size.cols > max_width {
             return false;
         }
     }
-    if let Some(max_height) = constraints.max_height {
+    if let Some(max_height) = height.max {
         if size.rows > max_height {
             return false;
         }
@@ -401,7 +571,9 @@ fn pane_size_satisfies_constraints(size: &TerminalSize, constraints: PaneConstra
 }
 
 fn adjust_x_size(tree: &mut Tree, mut x_adjust: isize, cell_dimensions: &TerminalSize) {
-    let (min_x, _) = compute_min_size(tree);
+    let x_constraints = compute_axis_constraints(tree, Axis::Width);
+    let min_x = x_constraints.min;
+    let max_x = x_constraints.max;
     while x_adjust != 0 {
         match tree {
             Tree::Empty | Tree::Leaf(_) => return,
@@ -415,9 +587,12 @@ fn adjust_x_size(tree: &mut Tree, mut x_adjust: isize, cell_dimensions: &Termina
                 data.second.dpi = cell_dimensions.dpi;
                 match data.direction {
                     SplitDirection::Vertical => {
-                        let new_cols = (data.first.cols as isize)
+                        let mut new_cols = (data.first.cols as isize)
                             .saturating_add(x_adjust)
                             .max(min_x as isize);
+                        if let Some(max_cols) = max_x {
+                            new_cols = new_cols.min(max_cols as isize);
+                        }
                         x_adjust = new_cols.saturating_sub(data.first.cols as isize);
 
                         if x_adjust != 0 {
@@ -433,18 +608,26 @@ fn adjust_x_size(tree: &mut Tree, mut x_adjust: isize, cell_dimensions: &Termina
                         return;
                     }
                     SplitDirection::Horizontal if x_adjust > 0 => {
-                        adjust_x_size(&mut *left, 1, cell_dimensions);
-                        data.first.cols += 1;
-                        data.first.pixel_width =
-                            data.first.cols.saturating_mul(cell_dimensions.pixel_width);
-                        x_adjust -= 1;
+                        let left_max_x = compute_axis_constraints(&*left, Axis::Width).max;
+                        if left_max_x.map_or(true, |max_cols| data.first.cols < max_cols) {
+                            adjust_x_size(&mut *left, 1, cell_dimensions);
+                            data.first.cols += 1;
+                            data.first.pixel_width =
+                                data.first.cols.saturating_mul(cell_dimensions.pixel_width);
+                            x_adjust -= 1;
+                        }
 
                         if x_adjust > 0 {
-                            adjust_x_size(&mut *right, 1, cell_dimensions);
-                            data.second.cols += 1;
-                            data.second.pixel_width =
-                                data.second.cols.saturating_mul(cell_dimensions.pixel_width);
-                            x_adjust -= 1;
+                            let right_max_x = compute_axis_constraints(&*right, Axis::Width).max;
+                            if right_max_x.map_or(true, |max_cols| data.second.cols < max_cols) {
+                                adjust_x_size(&mut *right, 1, cell_dimensions);
+                                data.second.cols += 1;
+                                data.second.pixel_width =
+                                    data.second.cols.saturating_mul(cell_dimensions.pixel_width);
+                                x_adjust -= 1;
+                            } else {
+                                return;
+                            }
                         }
                     }
                     SplitDirection::Horizontal => {
@@ -473,7 +656,9 @@ fn adjust_x_size(tree: &mut Tree, mut x_adjust: isize, cell_dimensions: &Termina
 }
 
 fn adjust_y_size(tree: &mut Tree, mut y_adjust: isize, cell_dimensions: &TerminalSize) {
-    let (_, min_y) = compute_min_size(tree);
+    let y_constraints = compute_axis_constraints(tree, Axis::Height);
+    let min_y = y_constraints.min;
+    let max_y = y_constraints.max;
     while y_adjust != 0 {
         match tree {
             Tree::Empty | Tree::Leaf(_) => return,
@@ -487,9 +672,12 @@ fn adjust_y_size(tree: &mut Tree, mut y_adjust: isize, cell_dimensions: &Termina
                 data.second.dpi = cell_dimensions.dpi;
                 match data.direction {
                     SplitDirection::Horizontal => {
-                        let new_rows = (data.first.rows as isize)
+                        let mut new_rows = (data.first.rows as isize)
                             .saturating_add(y_adjust)
                             .max(min_y as isize);
+                        if let Some(max_rows) = max_y {
+                            new_rows = new_rows.min(max_rows as isize);
+                        }
                         y_adjust = new_rows.saturating_sub(data.first.rows as isize);
 
                         if y_adjust != 0 {
@@ -505,19 +693,27 @@ fn adjust_y_size(tree: &mut Tree, mut y_adjust: isize, cell_dimensions: &Termina
                         return;
                     }
                     SplitDirection::Vertical if y_adjust > 0 => {
-                        adjust_y_size(&mut *left, 1, cell_dimensions);
-                        data.first.rows += 1;
-                        data.first.pixel_height =
-                            data.first.rows.saturating_mul(cell_dimensions.pixel_height);
-                        y_adjust -= 1;
-                        if y_adjust > 0 {
-                            adjust_y_size(&mut *right, 1, cell_dimensions);
-                            data.second.rows += 1;
-                            data.second.pixel_height = data
-                                .second
-                                .rows
-                                .saturating_mul(cell_dimensions.pixel_height);
+                        let left_max_y = compute_axis_constraints(&*left, Axis::Height).max;
+                        if left_max_y.map_or(true, |max_rows| data.first.rows < max_rows) {
+                            adjust_y_size(&mut *left, 1, cell_dimensions);
+                            data.first.rows += 1;
+                            data.first.pixel_height =
+                                data.first.rows.saturating_mul(cell_dimensions.pixel_height);
                             y_adjust -= 1;
+                        }
+                        if y_adjust > 0 {
+                            let right_max_y = compute_axis_constraints(&*right, Axis::Height).max;
+                            if right_max_y.map_or(true, |max_rows| data.second.rows < max_rows) {
+                                adjust_y_size(&mut *right, 1, cell_dimensions);
+                                data.second.rows += 1;
+                                data.second.pixel_height = data
+                                    .second
+                                    .rows
+                                    .saturating_mul(cell_dimensions.pixel_height);
+                                y_adjust -= 1;
+                            } else {
+                                return;
+                            }
                         }
                     }
                     SplitDirection::Vertical => {
@@ -1260,12 +1456,23 @@ impl TabInner {
             zoomed.resize(size).ok();
         } else {
             let dims = cell_dimensions(&size);
-            let (min_x, min_y) = compute_min_size(self.pane.as_mut().unwrap());
+            let width_constraints =
+                compute_axis_constraints(self.pane.as_ref().unwrap(), Axis::Width);
+            let height_constraints =
+                compute_axis_constraints(self.pane.as_ref().unwrap(), Axis::Height);
             let current_size = self.size;
 
             // Constrain the new size to the minimum possible dimensions
-            let cols = size.cols.max(min_x);
-            let rows = size.rows.max(min_y);
+            let cols = width_constraints
+                .max
+                .map_or(size.cols.max(width_constraints.min), |max_cols| {
+                    size.cols.max(width_constraints.min).min(max_cols)
+                });
+            let rows = height_constraints
+                .max
+                .map_or(size.rows.max(height_constraints.min), |max_rows| {
+                    size.rows.max(height_constraints.min).min(max_rows)
+                });
             let size = TerminalSize {
                 rows,
                 cols,
@@ -1304,15 +1511,27 @@ impl TabInner {
             .pixel_height
             .checked_div(pane_size.rows)
             .unwrap_or(1);
-        let (left_min_x, left_min_y, right_min_x, right_min_y) = match cursor.subtree() {
+        let (
+            left_width_constraints,
+            left_height_constraints,
+            right_width_constraints,
+            right_height_constraints,
+        ) = match cursor.subtree() {
             Tree::Node {
                 left,
                 right,
                 data: Some(_),
             } => {
-                let (left_min_x, left_min_y) = compute_min_size(&**left);
-                let (right_min_x, right_min_y) = compute_min_size(&**right);
-                (left_min_x, left_min_y, right_min_x, right_min_y)
+                let left_width_constraints = compute_axis_constraints(&**left, Axis::Width);
+                let left_height_constraints = compute_axis_constraints(&**left, Axis::Height);
+                let right_width_constraints = compute_axis_constraints(&**right, Axis::Width);
+                let right_height_constraints = compute_axis_constraints(&**right, Axis::Height);
+                (
+                    left_width_constraints,
+                    left_height_constraints,
+                    right_width_constraints,
+                    right_height_constraints,
+                )
             }
             _ => return,
         };
@@ -1325,9 +1544,12 @@ impl TabInner {
                 node.first.rows = pane_size.rows;
                 node.second.rows = pane_size.rows;
 
-                if let Some((first_cols, second_cols)) =
-                    split_allocation(pane_size.cols, left_min_x, right_min_x, node.first.cols)
-                {
+                if let Some((first_cols, second_cols)) = split_allocation(
+                    pane_size.cols,
+                    left_width_constraints,
+                    right_width_constraints,
+                    Some(node.first.cols),
+                ) {
                     node.first.cols = first_cols;
                     node.second.cols = second_cols;
                 } else {
@@ -1337,9 +1559,12 @@ impl TabInner {
                 node.first.cols = pane_size.cols;
                 node.second.cols = pane_size.cols;
 
-                if let Some((first_rows, second_rows)) =
-                    split_allocation(pane_size.rows, left_min_y, right_min_y, node.first.rows)
-                {
+                if let Some((first_rows, second_rows)) = split_allocation(
+                    pane_size.rows,
+                    left_height_constraints,
+                    right_height_constraints,
+                    Some(node.first.rows),
+                ) {
                     node.first.rows = first_rows;
                     node.second.rows = second_rows;
                 } else {
@@ -1432,15 +1657,27 @@ impl TabInner {
 
     fn adjust_node_at_cursor(&mut self, cursor: &mut Cursor, delta: isize) {
         let cell_dimensions = self.cell_dimensions();
-        let (left_min_x, left_min_y, right_min_x, right_min_y) = match cursor.subtree() {
+        let (
+            left_width_constraints,
+            left_height_constraints,
+            right_width_constraints,
+            right_height_constraints,
+        ) = match cursor.subtree() {
             Tree::Node {
                 left,
                 right,
                 data: Some(_),
             } => {
-                let (left_min_x, left_min_y) = compute_min_size(&**left);
-                let (right_min_x, right_min_y) = compute_min_size(&**right);
-                (left_min_x, left_min_y, right_min_x, right_min_y)
+                let left_width_constraints = compute_axis_constraints(&**left, Axis::Width);
+                let left_height_constraints = compute_axis_constraints(&**left, Axis::Height);
+                let right_width_constraints = compute_axis_constraints(&**right, Axis::Width);
+                let right_height_constraints = compute_axis_constraints(&**right, Axis::Height);
+                (
+                    left_width_constraints,
+                    left_height_constraints,
+                    right_width_constraints,
+                    right_height_constraints,
+                )
             }
             _ => return,
         };
@@ -1453,9 +1690,12 @@ impl TabInner {
                     } else {
                         node.first.cols.saturating_sub((-delta) as usize)
                     };
-                    if let Some((first_cols, second_cols)) =
-                        split_allocation(width, left_min_x, right_min_x, preferred_cols)
-                    {
+                    if let Some((first_cols, second_cols)) = split_allocation(
+                        width,
+                        left_width_constraints,
+                        right_width_constraints,
+                        Some(preferred_cols),
+                    ) {
                         node.first.cols = first_cols;
                         node.second.cols = second_cols;
                         node.first.pixel_width =
@@ -1471,9 +1711,12 @@ impl TabInner {
                     } else {
                         node.first.rows.saturating_sub((-delta) as usize)
                     };
-                    if let Some((first_rows, second_rows)) =
-                        split_allocation(height, left_min_y, right_min_y, preferred_rows)
-                    {
+                    if let Some((first_rows, second_rows)) = split_allocation(
+                        height,
+                        left_height_constraints,
+                        right_height_constraints,
+                        Some(preferred_rows),
+                    ) {
                         node.first.rows = first_rows;
                         node.second.rows = second_rows;
                         node.first.pixel_height =
@@ -2025,48 +2268,54 @@ impl TabInner {
     ) -> Option<SplitDirectionAndSize> {
         let cell_dims = self.cell_dimensions();
         let default_new_constraints = PaneConstraints::default();
+        let default_width_constraints =
+            axis_constraints_from_pane_constraints(default_new_constraints, Axis::Width, None);
+        let default_height_constraints =
+            axis_constraints_from_pane_constraints(default_new_constraints, Axis::Height, None);
 
         if request.top_level {
             let size = self.size;
-            let (tree_min_x, tree_min_y) =
-                compute_min_size(self.pane.as_ref().unwrap_or(&Tree::Empty));
+            let tree_width_constraints =
+                compute_axis_constraints(self.pane.as_ref().unwrap_or(&Tree::Empty), Axis::Width);
+            let tree_height_constraints =
+                compute_axis_constraints(self.pane.as_ref().unwrap_or(&Tree::Empty), Axis::Height);
 
             let ((width1, width2), (height1, height2)) = match request.direction {
                 SplitDirection::Horizontal => {
-                    let min_first = if request.target_is_second {
-                        tree_min_x
+                    let first_constraints = if request.target_is_second {
+                        tree_width_constraints
                     } else {
-                        default_new_constraints.min_width
+                        default_width_constraints
                     };
-                    let min_second = if request.target_is_second {
-                        default_new_constraints.min_width
+                    let second_constraints = if request.target_is_second {
+                        default_width_constraints
                     } else {
-                        tree_min_x
+                        tree_width_constraints
                     };
                     let widths = split_dimension_for_request(
                         size.cols as usize,
                         request,
-                        min_first.max(1),
-                        min_second.max(1),
+                        first_constraints,
+                        second_constraints,
                     )?;
                     (widths, (size.rows as usize, size.rows as usize))
                 }
                 SplitDirection::Vertical => {
-                    let min_first = if request.target_is_second {
-                        tree_min_y
+                    let first_constraints = if request.target_is_second {
+                        tree_height_constraints
                     } else {
-                        default_new_constraints.min_height
+                        default_height_constraints
                     };
-                    let min_second = if request.target_is_second {
-                        default_new_constraints.min_height
+                    let second_constraints = if request.target_is_second {
+                        default_height_constraints
                     } else {
-                        tree_min_y
+                        tree_height_constraints
                     };
                     let heights = split_dimension_for_request(
                         size.rows as usize,
                         request,
-                        min_first.max(1),
-                        min_second.max(1),
+                        first_constraints,
+                        second_constraints,
                     )?;
                     ((size.cols as usize, size.cols as usize), heights)
                 }
@@ -2097,42 +2346,52 @@ impl TabInner {
 
         self.iter_panes().iter().nth(pane_index).and_then(|pos| {
             let existing_constraints = pos.pane.pane_constraints();
+            let existing_width_constraints = axis_constraints_from_pane_constraints(
+                existing_constraints,
+                Axis::Width,
+                Some(pos.width),
+            );
+            let existing_height_constraints = axis_constraints_from_pane_constraints(
+                existing_constraints,
+                Axis::Height,
+                Some(pos.height),
+            );
             let ((width1, width2), (height1, height2)) = match request.direction {
                 SplitDirection::Horizontal => {
-                    let min_first = if request.target_is_second {
-                        existing_constraints.min_width
+                    let first_constraints = if request.target_is_second {
+                        existing_width_constraints
                     } else {
-                        default_new_constraints.min_width
+                        default_width_constraints
                     };
-                    let min_second = if request.target_is_second {
-                        default_new_constraints.min_width
+                    let second_constraints = if request.target_is_second {
+                        default_width_constraints
                     } else {
-                        existing_constraints.min_width
+                        existing_width_constraints
                     };
                     let widths = split_dimension_for_request(
                         pos.width,
                         request,
-                        min_first.max(1),
-                        min_second.max(1),
+                        first_constraints,
+                        second_constraints,
                     )?;
                     (widths, (pos.height, pos.height))
                 }
                 SplitDirection::Vertical => {
-                    let min_first = if request.target_is_second {
-                        existing_constraints.min_height
+                    let first_constraints = if request.target_is_second {
+                        existing_height_constraints
                     } else {
-                        default_new_constraints.min_height
+                        default_height_constraints
                     };
-                    let min_second = if request.target_is_second {
-                        default_new_constraints.min_height
+                    let second_constraints = if request.target_is_second {
+                        default_height_constraints
                     } else {
-                        existing_constraints.min_height
+                        existing_height_constraints
                     };
                     let heights = split_dimension_for_request(
                         pos.height,
                         request,
-                        min_first.max(1),
-                        min_second.max(1),
+                        first_constraints,
+                        second_constraints,
                     )?;
                     ((pos.width, pos.width), heights)
                 }
@@ -2258,11 +2517,19 @@ impl TabInner {
                 (pane, existing_pane)
             };
 
-            let pane1_constraints = pane1.pane_constraints();
-            let pane2_constraints = pane2.pane_constraints();
-            if !pane_size_satisfies_constraints(&split_info.first, pane1_constraints)
-                || !pane_size_satisfies_constraints(&split_info.second, pane2_constraints)
-            {
+            let pane1_width_constraints = pane_axis_constraints(&pane1, Axis::Width);
+            let pane1_height_constraints = pane_axis_constraints(&pane1, Axis::Height);
+            let pane2_width_constraints = pane_axis_constraints(&pane2, Axis::Width);
+            let pane2_height_constraints = pane_axis_constraints(&pane2, Axis::Height);
+            if !pane_size_satisfies_constraints(
+                &split_info.first,
+                pane1_width_constraints,
+                pane1_height_constraints,
+            ) || !pane_size_satisfies_constraints(
+                &split_info.second,
+                pane2_width_constraints,
+                pane2_height_constraints,
+            ) {
                 anyhow::bail!(
                     "No space for split constraints: first={:?} second={:?}",
                     split_info.first,
@@ -2580,15 +2847,16 @@ mod test {
         assert_eq!(80, panes[0].width);
         assert_eq!(24, panes[0].height);
 
-        assert!(tab
-            .compute_split_size(
+        assert!(
+            tab.compute_split_size(
                 1,
                 SplitRequest {
                     direction: SplitDirection::Horizontal,
                     ..Default::default()
                 }
             )
-            .is_none());
+            .is_none()
+        );
 
         let horz_size = tab
             .compute_split_size(
@@ -3006,6 +3274,117 @@ mod test {
         );
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn compute_split_size_respects_existing_max_constraints() {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new_with_constraints(
+            1,
+            size,
+            PaneConstraints {
+                max_width: Some(35),
+                ..PaneConstraints::default()
+            },
+        ));
+
+        let split = tab
+            .compute_split_size(
+                0,
+                SplitRequest {
+                    direction: SplitDirection::Horizontal,
+                    target_is_second: false,
+                    size: SplitSize::Cells(10),
+                    ..Default::default()
+                },
+            )
+            .expect("split to compute");
+
+        assert_eq!(35, split.second.cols);
+        assert_eq!(44, split.first.cols);
+    }
+
+    #[test]
+    fn resize_clamps_to_fixed_pane_size() {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new_with_constraints(
+            1,
+            size,
+            PaneConstraints {
+                fixed: true,
+                ..PaneConstraints::default()
+            },
+        ));
+
+        tab.resize(TerminalSize {
+            rows: 40,
+            cols: 120,
+            pixel_width: 1200,
+            pixel_height: 1000,
+            dpi: 96,
+        });
+
+        let resized = tab.get_size();
+        assert_eq!(80, resized.cols);
+        assert_eq!(24, resized.rows);
+    }
+
+    #[test]
+    fn resize_split_by_respects_max_constraints() {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new_with_constraints(
+            1,
+            size,
+            PaneConstraints {
+                max_width: Some(35),
+                ..PaneConstraints::default()
+            },
+        ));
+
+        let split = tab
+            .compute_split_size(
+                0,
+                SplitRequest {
+                    direction: SplitDirection::Horizontal,
+                    ..Default::default()
+                },
+            )
+            .expect("split to compute");
+        tab.split_and_insert(
+            0,
+            SplitRequest {
+                direction: SplitDirection::Horizontal,
+                ..Default::default()
+            },
+            FakePane::new(2, split.second),
+        )
+        .expect("split insertion to succeed");
+
+        tab.resize_split_by(0, 200);
+        let panes = tab.iter_panes();
+        assert_eq!(35, panes[0].width);
+        assert_eq!(44, panes[1].width);
     }
 
     fn is_send_and_sync<T: Send + Sync>() -> bool {
