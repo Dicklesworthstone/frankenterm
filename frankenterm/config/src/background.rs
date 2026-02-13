@@ -459,6 +459,232 @@ pub struct Gradient {
 #[cfg(feature = "lua")]
 impl_lua_conversion_dynamic!(Gradient);
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- BackgroundSize ---
+
+    #[test]
+    fn background_size_default_is_cover() {
+        match BackgroundSize::default() {
+            BackgroundSize::Cover => {}
+            other => panic!("expected Cover, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn background_size_debug() {
+        let s = format!("{:?}", BackgroundSize::Contain);
+        assert!(s.contains("Contain"));
+        let s = format!("{:?}", BackgroundSize::Cover);
+        assert!(s.contains("Cover"));
+    }
+
+    #[test]
+    fn background_size_clone() {
+        let a = BackgroundSize::Contain;
+        let b = a;
+        let _ = format!("{:?}", b);
+    }
+
+    // --- BackgroundHorizontalAlignment ---
+
+    #[test]
+    fn bg_horizontal_default_is_left() {
+        match BackgroundHorizontalAlignment::default() {
+            BackgroundHorizontalAlignment::Left => {}
+            other => panic!("expected Left, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn bg_horizontal_debug() {
+        assert!(format!("{:?}", BackgroundHorizontalAlignment::Center).contains("Center"));
+        assert!(format!("{:?}", BackgroundHorizontalAlignment::Right).contains("Right"));
+    }
+
+    // --- BackgroundVerticalAlignment ---
+
+    #[test]
+    fn bg_vertical_default_is_top() {
+        match BackgroundVerticalAlignment::default() {
+            BackgroundVerticalAlignment::Top => {}
+            other => panic!("expected Top, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn bg_vertical_debug() {
+        assert!(format!("{:?}", BackgroundVerticalAlignment::Middle).contains("Middle"));
+        assert!(format!("{:?}", BackgroundVerticalAlignment::Bottom).contains("Bottom"));
+    }
+
+    // --- BackgroundRepeat ---
+
+    #[test]
+    fn bg_repeat_default_is_repeat() {
+        assert_eq!(BackgroundRepeat::default(), BackgroundRepeat::Repeat);
+    }
+
+    #[test]
+    fn bg_repeat_equality() {
+        assert_eq!(BackgroundRepeat::Repeat, BackgroundRepeat::Repeat);
+        assert_ne!(BackgroundRepeat::Repeat, BackgroundRepeat::Mirror);
+        assert_ne!(BackgroundRepeat::Mirror, BackgroundRepeat::NoRepeat);
+    }
+
+    // --- BackgroundAttachment ---
+
+    #[test]
+    fn bg_attachment_default_is_fixed() {
+        match BackgroundAttachment::default() {
+            BackgroundAttachment::Fixed => {}
+            other => panic!("expected Fixed, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn bg_attachment_scroll_factor_fixed() {
+        assert_eq!(BackgroundAttachment::Fixed.scroll_factor(), None);
+    }
+
+    #[test]
+    fn bg_attachment_scroll_factor_scroll() {
+        assert_eq!(BackgroundAttachment::Scroll.scroll_factor(), Some(1.0));
+    }
+
+    #[test]
+    fn bg_attachment_scroll_factor_parallax() {
+        assert_eq!(
+            BackgroundAttachment::Parallax(0.5).scroll_factor(),
+            Some(0.5)
+        );
+    }
+
+    // --- BackgroundOrigin ---
+
+    #[test]
+    fn bg_origin_default_is_border_box() {
+        match BackgroundOrigin::default() {
+            BackgroundOrigin::BorderBox => {}
+            other => panic!("expected BorderBox, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn bg_origin_debug() {
+        assert!(format!("{:?}", BackgroundOrigin::PaddingBox).contains("PaddingBox"));
+    }
+
+    // --- SystemBackdrop ---
+
+    #[test]
+    fn system_backdrop_default_is_auto() {
+        assert_eq!(SystemBackdrop::default(), SystemBackdrop::Auto);
+    }
+
+    #[test]
+    fn system_backdrop_equality() {
+        assert_eq!(SystemBackdrop::Auto, SystemBackdrop::Auto);
+        assert_ne!(SystemBackdrop::Auto, SystemBackdrop::Disable);
+        assert_ne!(SystemBackdrop::Acrylic, SystemBackdrop::Mica);
+        assert_ne!(SystemBackdrop::Mica, SystemBackdrop::Tabbed);
+    }
+
+    // --- Interpolation ---
+
+    #[test]
+    fn interpolation_default_is_linear() {
+        assert_eq!(Interpolation::default(), Interpolation::Linear);
+    }
+
+    #[test]
+    fn interpolation_equality() {
+        assert_eq!(Interpolation::Linear, Interpolation::Linear);
+        assert_ne!(Interpolation::Linear, Interpolation::Basis);
+        assert_ne!(Interpolation::Basis, Interpolation::CatmullRom);
+    }
+
+    // --- BlendMode ---
+
+    #[test]
+    fn blend_mode_default_is_rgb() {
+        assert_eq!(BlendMode::default(), BlendMode::Rgb);
+    }
+
+    #[test]
+    fn blend_mode_equality() {
+        assert_eq!(BlendMode::Rgb, BlendMode::Rgb);
+        assert_ne!(BlendMode::Rgb, BlendMode::LinearRgb);
+        assert_ne!(BlendMode::Hsv, BlendMode::Oklab);
+    }
+
+    // --- GradientOrientation ---
+
+    #[test]
+    fn gradient_orientation_default_is_horizontal() {
+        assert_eq!(
+            GradientOrientation::default(),
+            GradientOrientation::Horizontal
+        );
+    }
+
+    #[test]
+    fn gradient_orientation_equality() {
+        assert_eq!(
+            GradientOrientation::Horizontal,
+            GradientOrientation::Horizontal
+        );
+        assert_ne!(
+            GradientOrientation::Horizontal,
+            GradientOrientation::Vertical
+        );
+    }
+
+    #[test]
+    fn gradient_orientation_linear_with_angle() {
+        let a = GradientOrientation::Linear { angle: Some(45.0) };
+        let b = GradientOrientation::Linear { angle: Some(45.0) };
+        let c = GradientOrientation::Linear { angle: Some(90.0) };
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn gradient_orientation_radial() {
+        let a = GradientOrientation::Radial {
+            radius: Some(1.0),
+            cx: Some(0.5),
+            cy: Some(0.5),
+        };
+        let b = GradientOrientation::Radial {
+            radius: Some(1.0),
+            cx: Some(0.5),
+            cy: Some(0.5),
+        };
+        assert_eq!(a, b);
+    }
+
+    // --- GradientPreset ---
+
+    #[test]
+    fn gradient_preset_equality() {
+        assert_eq!(GradientPreset::Blues, GradientPreset::Blues);
+        assert_ne!(GradientPreset::Blues, GradientPreset::Reds);
+        assert_ne!(GradientPreset::Viridis, GradientPreset::Plasma);
+    }
+
+    #[test]
+    fn gradient_preset_clone_copy() {
+        let a = GradientPreset::Rainbow;
+        let b = a;
+        let c = a.clone();
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+    }
+}
+
 impl Gradient {
     pub fn build(&self) -> anyhow::Result<colorgrad::Gradient> {
         use colorgrad::{BlendMode as CGMode, Interpolation as CGInterp};

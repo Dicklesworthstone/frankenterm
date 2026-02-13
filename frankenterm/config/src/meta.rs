@@ -31,3 +31,51 @@ pub struct ConfigOption {
     /// TODO: For struct types, the fields in the child struct
     pub fields: &'static [ConfigOption],
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_container_none_equality() {
+        assert_eq!(ConfigContainer::None, ConfigContainer::None);
+    }
+
+    #[test]
+    fn config_container_inequality() {
+        assert_ne!(ConfigContainer::None, ConfigContainer::Option);
+        assert_ne!(ConfigContainer::Option, ConfigContainer::Vec);
+        assert_ne!(ConfigContainer::Vec, ConfigContainer::Map);
+        assert_ne!(ConfigContainer::Map, ConfigContainer::None);
+    }
+
+    #[test]
+    fn config_container_clone_copy() {
+        let a = ConfigContainer::Vec;
+        let b = a;
+        let c = a.clone();
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+    }
+
+    #[test]
+    fn config_option_basic() {
+        let opt = ConfigOption {
+            name: "test_field",
+            doc: "A test field",
+            tags: &["test"],
+            container: ConfigContainer::None,
+            type_name: "String",
+            default_value: None,
+            possible_values: &[],
+            fields: &[],
+        };
+        assert_eq!(opt.name, "test_field");
+        assert_eq!(opt.doc, "A test field");
+        assert_eq!(opt.container, ConfigContainer::None);
+        assert_eq!(opt.type_name, "String");
+        assert!(opt.default_value.is_none());
+        assert!(opt.possible_values.is_empty());
+        assert!(opt.fields.is_empty());
+    }
+}
