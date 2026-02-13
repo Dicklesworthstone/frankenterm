@@ -1000,6 +1000,7 @@ pub enum AttributeChange {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::color::SrgbaTuple;
 
     #[test]
     fn teeny_string() {
@@ -1223,5 +1224,735 @@ mod test {
         // due to <https://github.com/wezterm/wezterm/issues/1422>.
         // It is Non-Printing, non-White_Space
         assert!(!is_white_space_char('\u{2068}'));
+    }
+
+    // ── SmallColor ──────────────────────────────────────────
+
+    #[test]
+    fn small_color_default() {
+        let c = SmallColor::default();
+        assert_eq!(c, SmallColor::Default);
+    }
+
+    #[test]
+    fn small_color_into_color_attribute_default() {
+        let attr: ColorAttribute = SmallColor::Default.into();
+        assert_eq!(attr, ColorAttribute::Default);
+    }
+
+    #[test]
+    fn small_color_into_color_attribute_palette() {
+        let attr: ColorAttribute = SmallColor::PaletteIndex(42).into();
+        assert_eq!(attr, ColorAttribute::PaletteIndex(42));
+    }
+
+    #[test]
+    fn small_color_clone_eq_hash() {
+        let a = SmallColor::PaletteIndex(7);
+        let b = a;
+        assert_eq!(a, b);
+        // Hash consistency
+        use core::hash::{Hash, Hasher};
+        use std::collections::hash_map::DefaultHasher;
+        let mut h1 = DefaultHasher::new();
+        let mut h2 = DefaultHasher::new();
+        a.hash(&mut h1);
+        b.hash(&mut h2);
+        assert_eq!(h1.finish(), h2.finish());
+    }
+
+    // ── SemanticType ────────────────────────────────────────
+
+    #[test]
+    fn semantic_type_default_is_output() {
+        assert_eq!(SemanticType::default(), SemanticType::Output);
+    }
+
+    #[test]
+    fn semantic_type_ordering() {
+        assert!(SemanticType::Output < SemanticType::Input);
+        assert!(SemanticType::Input < SemanticType::Prompt);
+    }
+
+    #[test]
+    fn semantic_type_debug_clone() {
+        let s = SemanticType::Prompt;
+        let c = s.clone();
+        assert_eq!(s, c);
+        assert_eq!(format!("{s:?}"), "Prompt");
+    }
+
+    // ── CellAttributes: blank / default ─────────────────────
+
+    #[test]
+    fn cell_attributes_blank_is_default() {
+        assert_eq!(CellAttributes::blank(), CellAttributes::default());
+    }
+
+    #[test]
+    fn cell_attributes_blank_all_false() {
+        let a = CellAttributes::blank();
+        assert_eq!(a.intensity(), Intensity::Normal);
+        assert_eq!(a.underline(), Underline::None);
+        assert_eq!(a.blink(), Blink::None);
+        assert!(!a.italic());
+        assert!(!a.reverse());
+        assert!(!a.strikethrough());
+        assert!(!a.invisible());
+        assert!(!a.wrapped());
+        assert!(!a.overline());
+        assert_eq!(a.semantic_type(), SemanticType::Output);
+        assert_eq!(a.vertical_align(), VerticalAlign::BaseLine);
+        assert_eq!(a.foreground(), ColorAttribute::Default);
+        assert_eq!(a.background(), ColorAttribute::Default);
+    }
+
+    // ── CellAttributes: boolean bitfields ───────────────────
+
+    #[test]
+    fn bitfield_italic_roundtrip() {
+        let mut a = CellAttributes::blank();
+        assert!(!a.italic());
+        a.set_italic(true);
+        assert!(a.italic());
+        a.set_italic(false);
+        assert!(!a.italic());
+    }
+
+    #[test]
+    fn bitfield_reverse_roundtrip() {
+        let mut a = CellAttributes::blank();
+        a.set_reverse(true);
+        assert!(a.reverse());
+        a.set_reverse(false);
+        assert!(!a.reverse());
+    }
+
+    #[test]
+    fn bitfield_strikethrough_roundtrip() {
+        let mut a = CellAttributes::blank();
+        a.set_strikethrough(true);
+        assert!(a.strikethrough());
+    }
+
+    #[test]
+    fn bitfield_invisible_roundtrip() {
+        let mut a = CellAttributes::blank();
+        a.set_invisible(true);
+        assert!(a.invisible());
+    }
+
+    #[test]
+    fn bitfield_wrapped_roundtrip() {
+        let mut a = CellAttributes::blank();
+        a.set_wrapped(true);
+        assert!(a.wrapped());
+    }
+
+    #[test]
+    fn bitfield_overline_roundtrip() {
+        let mut a = CellAttributes::blank();
+        a.set_overline(true);
+        assert!(a.overline());
+    }
+
+    // ── CellAttributes: enum bitfields ──────────────────────
+
+    #[test]
+    fn bitfield_intensity_values() {
+        let mut a = CellAttributes::blank();
+        a.set_intensity(Intensity::Bold);
+        assert_eq!(a.intensity(), Intensity::Bold);
+        a.set_intensity(Intensity::Half);
+        assert_eq!(a.intensity(), Intensity::Half);
+        a.set_intensity(Intensity::Normal);
+        assert_eq!(a.intensity(), Intensity::Normal);
+    }
+
+    #[test]
+    fn bitfield_underline_values() {
+        let mut a = CellAttributes::blank();
+        for val in [
+            Underline::Single,
+            Underline::Double,
+            Underline::Curly,
+            Underline::Dotted,
+            Underline::Dashed,
+            Underline::None,
+        ] {
+            a.set_underline(val);
+            assert_eq!(a.underline(), val);
+        }
+    }
+
+    #[test]
+    fn bitfield_blink_values() {
+        let mut a = CellAttributes::blank();
+        a.set_blink(Blink::Slow);
+        assert_eq!(a.blink(), Blink::Slow);
+        a.set_blink(Blink::Rapid);
+        assert_eq!(a.blink(), Blink::Rapid);
+        a.set_blink(Blink::None);
+        assert_eq!(a.blink(), Blink::None);
+    }
+
+    #[test]
+    fn bitfield_semantic_type_values() {
+        let mut a = CellAttributes::blank();
+        a.set_semantic_type(SemanticType::Input);
+        assert_eq!(a.semantic_type(), SemanticType::Input);
+        a.set_semantic_type(SemanticType::Prompt);
+        assert_eq!(a.semantic_type(), SemanticType::Prompt);
+        a.set_semantic_type(SemanticType::Output);
+        assert_eq!(a.semantic_type(), SemanticType::Output);
+    }
+
+    #[test]
+    fn bitfield_vertical_align_values() {
+        let mut a = CellAttributes::blank();
+        a.set_vertical_align(VerticalAlign::SuperScript);
+        assert_eq!(a.vertical_align(), VerticalAlign::SuperScript);
+        a.set_vertical_align(VerticalAlign::SubScript);
+        assert_eq!(a.vertical_align(), VerticalAlign::SubScript);
+        a.set_vertical_align(VerticalAlign::BaseLine);
+        assert_eq!(a.vertical_align(), VerticalAlign::BaseLine);
+    }
+
+    // ── CellAttributes: setter chaining ─────────────────────
+
+    #[test]
+    fn setter_chaining() {
+        let mut a = CellAttributes::blank();
+        a.set_italic(true).set_reverse(true).set_overline(true);
+        assert!(a.italic());
+        assert!(a.reverse());
+        assert!(a.overline());
+    }
+
+    // ── CellAttributes: attribute_bits_equal ────────────────
+
+    #[test]
+    fn attribute_bits_equal_identical() {
+        let a = CellAttributes::blank();
+        let b = CellAttributes::blank();
+        assert!(a.attribute_bits_equal(&b));
+    }
+
+    #[test]
+    fn attribute_bits_equal_differ() {
+        let a = CellAttributes::blank();
+        let mut b = CellAttributes::blank();
+        b.set_italic(true);
+        assert!(!a.attribute_bits_equal(&b));
+    }
+
+    // ── CellAttributes: foreground / background ─────────────
+
+    #[test]
+    fn foreground_default() {
+        let a = CellAttributes::blank();
+        assert_eq!(a.foreground(), ColorAttribute::Default);
+    }
+
+    #[test]
+    fn foreground_palette_index() {
+        let mut a = CellAttributes::blank();
+        a.set_foreground(ColorAttribute::PaletteIndex(196));
+        assert_eq!(a.foreground(), ColorAttribute::PaletteIndex(196));
+    }
+
+    #[test]
+    fn foreground_truecolor() {
+        let mut a = CellAttributes::blank();
+        let tc = ColorAttribute::TrueColorWithDefaultFallback(SrgbaTuple(1.0, 0.0, 0.0, 1.0));
+        a.set_foreground(tc);
+        assert_eq!(a.foreground(), tc);
+    }
+
+    #[test]
+    fn foreground_reset_to_default() {
+        let mut a = CellAttributes::blank();
+        a.set_foreground(ColorAttribute::PaletteIndex(1));
+        a.set_foreground(ColorAttribute::Default);
+        assert_eq!(a.foreground(), ColorAttribute::Default);
+    }
+
+    #[test]
+    fn background_palette_index() {
+        let mut a = CellAttributes::blank();
+        a.set_background(ColorAttribute::PaletteIndex(42));
+        assert_eq!(a.background(), ColorAttribute::PaletteIndex(42));
+    }
+
+    #[test]
+    fn background_truecolor() {
+        let mut a = CellAttributes::blank();
+        let tc = ColorAttribute::TrueColorWithDefaultFallback(SrgbaTuple(0.0, 1.0, 0.0, 1.0));
+        a.set_background(tc);
+        assert_eq!(a.background(), tc);
+    }
+
+    #[test]
+    fn background_reset_to_default() {
+        let mut a = CellAttributes::blank();
+        a.set_background(ColorAttribute::PaletteIndex(1));
+        a.set_background(ColorAttribute::Default);
+        assert_eq!(a.background(), ColorAttribute::Default);
+    }
+
+    // ── CellAttributes: underline_color ─────────────────────
+
+    #[test]
+    fn underline_color_default() {
+        let a = CellAttributes::blank();
+        assert_eq!(a.underline_color(), ColorAttribute::Default);
+    }
+
+    #[test]
+    fn underline_color_set_and_get() {
+        let mut a = CellAttributes::blank();
+        a.set_underline_color(ColorAttribute::PaletteIndex(9));
+        assert_eq!(a.underline_color(), ColorAttribute::PaletteIndex(9));
+    }
+
+    #[test]
+    fn underline_color_reset_deallocates_fat() {
+        let mut a = CellAttributes::blank();
+        a.set_underline_color(ColorAttribute::PaletteIndex(9));
+        a.set_underline_color(ColorAttribute::Default);
+        assert_eq!(a.underline_color(), ColorAttribute::Default);
+        // Fat should be deallocated when all fat fields are default
+        assert_eq!(a, CellAttributes::blank());
+    }
+
+    // ── CellAttributes: hyperlink ───────────────────────────
+
+    #[test]
+    fn hyperlink_none_by_default() {
+        let a = CellAttributes::blank();
+        assert!(a.hyperlink().is_none());
+    }
+
+    #[test]
+    fn hyperlink_set_and_get() {
+        let mut a = CellAttributes::blank();
+        let link = Arc::new(Hyperlink::new("https://example.com"));
+        a.set_hyperlink(Some(link.clone()));
+        assert!(a.hyperlink().is_some());
+        assert_eq!(a.hyperlink().unwrap().uri(), link.uri());
+    }
+
+    #[test]
+    fn hyperlink_clear() {
+        let mut a = CellAttributes::blank();
+        let link = Arc::new(Hyperlink::new("https://example.com"));
+        a.set_hyperlink(Some(link));
+        a.set_hyperlink(None);
+        assert!(a.hyperlink().is_none());
+        // Should deallocate fat attrs
+        assert_eq!(a, CellAttributes::blank());
+    }
+
+    // ── CellAttributes: clear ───────────────────────────────
+
+    #[test]
+    fn clear_resets_to_blank() {
+        let mut a = CellAttributes::blank();
+        a.set_italic(true);
+        a.set_foreground(ColorAttribute::PaletteIndex(1));
+        a.set_intensity(Intensity::Bold);
+        a.clear();
+        assert_eq!(a, CellAttributes::blank());
+    }
+
+    // ── CellAttributes: clone_sgr_only ──────────────────────
+
+    #[test]
+    fn clone_sgr_only_preserves_colors() {
+        let mut a = CellAttributes::blank();
+        a.set_foreground(ColorAttribute::PaletteIndex(196));
+        a.set_background(ColorAttribute::PaletteIndex(21));
+        let cloned = a.clone_sgr_only();
+        assert_eq!(cloned.foreground(), a.foreground());
+        assert_eq!(cloned.background(), a.background());
+    }
+
+    #[test]
+    fn clone_sgr_only_strips_hyperlink() {
+        let mut a = CellAttributes::blank();
+        let link = Arc::new(Hyperlink::new("https://example.com"));
+        a.set_hyperlink(Some(link));
+        let cloned = a.clone_sgr_only();
+        assert!(cloned.hyperlink().is_none());
+    }
+
+    #[test]
+    fn clone_sgr_only_resets_semantic_type() {
+        let mut a = CellAttributes::blank();
+        a.set_semantic_type(SemanticType::Prompt);
+        let cloned = a.clone_sgr_only();
+        assert_eq!(cloned.semantic_type(), SemanticType::Output);
+    }
+
+    #[test]
+    fn clone_sgr_only_clears_underline() {
+        let mut a = CellAttributes::blank();
+        a.set_underline(Underline::Double);
+        let cloned = a.clone_sgr_only();
+        assert_eq!(cloned.underline(), Underline::None);
+    }
+
+    #[test]
+    fn clone_sgr_only_clears_overline_and_strikethrough() {
+        let mut a = CellAttributes::blank();
+        a.set_overline(true);
+        a.set_strikethrough(true);
+        let cloned = a.clone_sgr_only();
+        assert!(!cloned.overline());
+        assert!(!cloned.strikethrough());
+    }
+
+    // ── CellAttributes: apply_change ────────────────────────
+
+    #[test]
+    fn apply_change_intensity() {
+        let mut a = CellAttributes::blank();
+        a.apply_change(&AttributeChange::Intensity(Intensity::Bold));
+        assert_eq!(a.intensity(), Intensity::Bold);
+    }
+
+    #[test]
+    fn apply_change_underline() {
+        let mut a = CellAttributes::blank();
+        a.apply_change(&AttributeChange::Underline(Underline::Curly));
+        assert_eq!(a.underline(), Underline::Curly);
+    }
+
+    #[test]
+    fn apply_change_italic() {
+        let mut a = CellAttributes::blank();
+        a.apply_change(&AttributeChange::Italic(true));
+        assert!(a.italic());
+    }
+
+    #[test]
+    fn apply_change_blink() {
+        let mut a = CellAttributes::blank();
+        a.apply_change(&AttributeChange::Blink(Blink::Slow));
+        assert_eq!(a.blink(), Blink::Slow);
+    }
+
+    #[test]
+    fn apply_change_reverse() {
+        let mut a = CellAttributes::blank();
+        a.apply_change(&AttributeChange::Reverse(true));
+        assert!(a.reverse());
+    }
+
+    #[test]
+    fn apply_change_strikethrough() {
+        let mut a = CellAttributes::blank();
+        a.apply_change(&AttributeChange::StrikeThrough(true));
+        assert!(a.strikethrough());
+    }
+
+    #[test]
+    fn apply_change_invisible() {
+        let mut a = CellAttributes::blank();
+        a.apply_change(&AttributeChange::Invisible(true));
+        assert!(a.invisible());
+    }
+
+    #[test]
+    fn apply_change_foreground() {
+        let mut a = CellAttributes::blank();
+        a.apply_change(&AttributeChange::Foreground(ColorAttribute::PaletteIndex(
+            1,
+        )));
+        assert_eq!(a.foreground(), ColorAttribute::PaletteIndex(1));
+    }
+
+    #[test]
+    fn apply_change_background() {
+        let mut a = CellAttributes::blank();
+        a.apply_change(&AttributeChange::Background(ColorAttribute::PaletteIndex(
+            2,
+        )));
+        assert_eq!(a.background(), ColorAttribute::PaletteIndex(2));
+    }
+
+    #[test]
+    fn apply_change_hyperlink() {
+        let mut a = CellAttributes::blank();
+        let link = Arc::new(Hyperlink::new("https://example.com"));
+        a.apply_change(&AttributeChange::Hyperlink(Some(link)));
+        assert!(a.hyperlink().is_some());
+    }
+
+    // ── CellAttributes: Debug / Clone / Eq ──────────────────
+
+    #[test]
+    fn cell_attributes_debug() {
+        let mut a = CellAttributes::blank();
+        a.set_italic(true);
+        let dbg = format!("{a:?}");
+        assert!(dbg.contains("italic"));
+        assert!(dbg.contains("true"));
+    }
+
+    #[test]
+    fn cell_attributes_clone_eq() {
+        let mut a = CellAttributes::blank();
+        a.set_intensity(Intensity::Bold);
+        a.set_foreground(ColorAttribute::PaletteIndex(3));
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    // ── CellAttributes: compute_shape_hash ──────────────────
+
+    #[test]
+    fn compute_shape_hash_differs_for_different_attrs() {
+        use std::collections::hash_map::DefaultHasher;
+        let a = CellAttributes::blank();
+        let mut b = CellAttributes::blank();
+        b.set_italic(true);
+
+        let mut h1 = DefaultHasher::new();
+        let mut h2 = DefaultHasher::new();
+        a.compute_shape_hash(&mut h1);
+        b.compute_shape_hash(&mut h2);
+        assert_ne!(h1.finish(), h2.finish());
+    }
+
+    // ── TeenyString extras ──────────────────────────────────
+
+    #[test]
+    fn teeny_string_clone_inline() {
+        let s = TeenyString::from_char('Z');
+        let c = s.clone();
+        assert_eq!(s.str(), c.str());
+    }
+
+    #[test]
+    fn teeny_string_clone_heap() {
+        let s = TeenyString::from_str("a long string that goes on heap", None, None);
+        let c = s.clone();
+        assert_eq!(s.str(), c.str());
+    }
+
+    #[test]
+    fn teeny_string_eq() {
+        let a = TeenyString::from_char('Q');
+        let b = TeenyString::from_char('Q');
+        assert!(a == b);
+    }
+
+    #[test]
+    fn teeny_string_ne() {
+        let a = TeenyString::from_char('A');
+        let b = TeenyString::from_char('B');
+        assert!(a != b);
+    }
+
+    #[test]
+    fn teeny_string_width_single_byte_ascii() {
+        let s = TeenyString::from_char('A');
+        assert_eq!(s.width(), 1);
+    }
+
+    #[test]
+    fn teeny_string_control_char_becomes_space() {
+        let s = TeenyString::from_char('\n');
+        assert_eq!(s.str(), " ");
+    }
+
+    #[test]
+    fn teeny_string_str_roundtrip() {
+        let s = TeenyString::from_str("hello", None, None);
+        assert_eq!(s.str(), "hello");
+    }
+
+    // ── Cell ────────────────────────────────────────────────
+
+    #[test]
+    fn cell_blank_is_space() {
+        let c = Cell::blank();
+        assert_eq!(c.str(), " ");
+        assert_eq!(c.width(), 1);
+    }
+
+    #[test]
+    fn cell_default_is_blank() {
+        assert_eq!(Cell::default(), Cell::blank());
+    }
+
+    #[test]
+    fn cell_new_ascii() {
+        let c = Cell::new('X', CellAttributes::blank());
+        assert_eq!(c.str(), "X");
+        assert_eq!(c.width(), 1);
+    }
+
+    #[test]
+    fn cell_new_grapheme_with_width() {
+        let c = Cell::new_grapheme_with_width("AB", 2, CellAttributes::blank());
+        assert_eq!(c.str(), "AB");
+        assert_eq!(c.width(), 2);
+    }
+
+    #[test]
+    fn cell_blank_with_attrs() {
+        let mut attrs = CellAttributes::blank();
+        attrs.set_italic(true);
+        let c = Cell::blank_with_attrs(attrs.clone());
+        assert_eq!(c.str(), " ");
+        assert!(c.attrs().italic());
+    }
+
+    #[test]
+    fn cell_attrs_mut() {
+        let mut c = Cell::blank();
+        c.attrs_mut().set_reverse(true);
+        assert!(c.attrs().reverse());
+    }
+
+    #[test]
+    fn cell_debug() {
+        let c = Cell::new('A', CellAttributes::blank());
+        let dbg = format!("{c:?}");
+        assert!(dbg.contains("Cell"));
+        assert!(dbg.contains("A"));
+    }
+
+    #[test]
+    fn cell_clone_eq() {
+        let c = Cell::new('Z', CellAttributes::blank());
+        let c2 = c.clone();
+        assert_eq!(c, c2);
+    }
+
+    #[test]
+    fn cell_presentation_text() {
+        let c = Cell::new('A', CellAttributes::blank());
+        assert_eq!(c.presentation(), Presentation::Text);
+    }
+
+    #[test]
+    fn cell_presentation_emoji() {
+        let c = Cell::new('\u{1F600}', CellAttributes::blank());
+        assert_eq!(c.presentation(), Presentation::Emoji);
+    }
+
+    // ── UnicodeVersion ──────────────────────────────────────
+
+    #[test]
+    fn unicode_version_new() {
+        let v = UnicodeVersion::new(14);
+        assert_eq!(v.version, 14);
+        assert!(!v.ambiguous_are_wide);
+    }
+
+    #[test]
+    fn unicode_version_idx() {
+        // version <= 9, not ambiguous wide => 0
+        assert_eq!(UnicodeVersion::new(9).idx(), 0);
+        // version > 9, not ambiguous wide => 2
+        assert_eq!(UnicodeVersion::new(14).idx(), 2);
+        // version > 9, ambiguous wide => 3
+        let mut v = UnicodeVersion::new(14);
+        v.ambiguous_are_wide = true;
+        assert_eq!(v.idx(), 3);
+    }
+
+    #[test]
+    fn unicode_version_clone_eq() {
+        let a = UnicodeVersion::new(9);
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    // ── AttributeChange ─────────────────────────────────────
+
+    #[test]
+    fn attribute_change_debug() {
+        let c = AttributeChange::Italic(true);
+        let dbg = format!("{c:?}");
+        assert!(dbg.contains("Italic"));
+    }
+
+    #[test]
+    fn attribute_change_clone_eq() {
+        let a = AttributeChange::Reverse(true);
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    // ── is_white_space utilities ─────────────────────────────
+
+    #[test]
+    fn white_space_tab_is_white_space() {
+        assert!(is_white_space_char('\t'));
+    }
+
+    #[test]
+    fn white_space_grapheme_all_spaces() {
+        assert!(is_white_space_grapheme("   "));
+    }
+
+    #[test]
+    fn white_space_grapheme_mixed() {
+        assert!(!is_white_space_grapheme("a "));
+    }
+
+    #[test]
+    fn white_space_grapheme_empty() {
+        assert!(is_white_space_grapheme(""));
+    }
+
+    // ── ColorAttribute ──────────────────────────────────────
+
+    #[test]
+    fn color_attribute_default() {
+        assert_eq!(ColorAttribute::default(), ColorAttribute::Default);
+    }
+
+    #[test]
+    fn color_attribute_from_ansi_color() {
+        use crate::color::AnsiColor;
+        let attr: ColorAttribute = AnsiColor::Red.into();
+        // AnsiColor::Red is index 1
+        assert_eq!(attr, ColorAttribute::PaletteIndex(AnsiColor::Red as u8));
+    }
+
+    // ── Multiple bitfields don't interfere ──────────────────
+
+    #[test]
+    fn bitfields_independent() {
+        let mut a = CellAttributes::blank();
+        a.set_italic(true);
+        a.set_reverse(true);
+        a.set_intensity(Intensity::Bold);
+        a.set_underline(Underline::Curly);
+        a.set_blink(Blink::Rapid);
+        a.set_strikethrough(true);
+        a.set_invisible(true);
+        a.set_wrapped(true);
+        a.set_overline(true);
+        a.set_semantic_type(SemanticType::Prompt);
+        a.set_vertical_align(VerticalAlign::SuperScript);
+
+        // Verify all values survived
+        assert!(a.italic());
+        assert!(a.reverse());
+        assert_eq!(a.intensity(), Intensity::Bold);
+        assert_eq!(a.underline(), Underline::Curly);
+        assert_eq!(a.blink(), Blink::Rapid);
+        assert!(a.strikethrough());
+        assert!(a.invisible());
+        assert!(a.wrapped());
+        assert!(a.overline());
+        assert_eq!(a.semantic_type(), SemanticType::Prompt);
+        assert_eq!(a.vertical_align(), VerticalAlign::SuperScript);
     }
 }
