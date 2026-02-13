@@ -458,10 +458,8 @@ pub fn tokenize_query(query: &str) -> Vec<String> {
     for ch in query.chars() {
         if ch.is_alphanumeric() || ch == '_' || ch == '.' || ch == '/' || ch == ':' || ch == '-' {
             current.push(ch);
-        } else {
-            if !current.is_empty() {
-                terms.push(std::mem::take(&mut current));
-            }
+        } else if !current.is_empty() {
+            terms.push(std::mem::take(&mut current));
         }
     }
     if !current.is_empty() {
@@ -580,10 +578,16 @@ pub struct InMemorySearchService {
     docs: Vec<IndexDocumentFields>,
 }
 
+impl Default for InMemorySearchService {
+    fn default() -> Self {
+        Self { docs: Vec::new() }
+    }
+}
+
 impl InMemorySearchService {
     /// Create an empty service.
     pub fn new() -> Self {
-        Self { docs: Vec::new() }
+        Self::default()
     }
 
     /// Create from a pre-existing document set.
@@ -621,11 +625,11 @@ impl InMemorySearchService {
             let term_lower = term.to_lowercase();
             // Count occurrences in text field
             let text_count = text_lower.matches(&term_lower).count() as f32;
-            score += text_count * text_boost;
+            score = text_count.mul_add(text_boost, score);
 
             // Count occurrences in text_symbols field
             let sym_count = symbols_lower.matches(&term_lower).count() as f32;
-            score += sym_count * symbols_boost;
+            score = sym_count.mul_add(symbols_boost, score);
         }
 
         score
@@ -678,7 +682,7 @@ impl LexicalSearchService for InMemorySearchService {
                 };
 
                 // For text queries, require at least one term match
-                if !terms.is_empty() && score == 0.0 {
+                if !terms.is_empty() && score.abs() < f32::EPSILON {
                     return None;
                 }
 
@@ -822,9 +826,9 @@ mod tests {
     use crate::recording::{
         RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderControlMarkerType, RecorderEvent,
         RecorderEventCausality, RecorderEventPayload, RecorderEventSource, RecorderIngressKind,
-        RecorderLifecyclePhase, RecorderRedactionLevel, RecorderSegmentKind, RecorderTextEncoding,
+        RecorderRedactionLevel, RecorderSegmentKind, RecorderTextEncoding,
     };
-    use crate::tantivy_ingest::{LEXICAL_SCHEMA_VERSION, map_event_to_document};
+    use crate::tantivy_ingest::map_event_to_document;
 
     fn make_ingress(id: &str, pane: u64, seq: u64, text: &str) -> IndexDocumentFields {
         let event = RecorderEvent {

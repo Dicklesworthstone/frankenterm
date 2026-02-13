@@ -213,8 +213,8 @@ pub fn load_latest_checkpoint(
 
     match checkpoint_id {
         Ok(id) => load_checkpoint_by_id(db_path, id),
-        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
-        Err(e) => return Err(RestoreError::Database(e.to_string())),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(RestoreError::Database(e.to_string())),
     }
 }
 

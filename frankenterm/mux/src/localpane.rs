@@ -565,21 +565,30 @@ impl Pane for LocalPane {
                 info.root
             );
 
-            let hook_result = config::run_immediate_with_lua_config(|lua| {
-                let lua = match lua {
-                    Some(lua) => lua,
-                    None => return Ok(None),
-                };
-                let v = config::lua::emit_sync_callback(
-                    &*lua,
-                    ("mux-is-process-stateful".to_string(), (info.root.clone())),
-                )?;
-                match v {
-                    mlua::Value::Nil => Ok(None),
-                    mlua::Value::Boolean(v) => Ok(Some(v)),
-                    _ => Ok(None),
+            let hook_result = {
+                #[cfg(feature = "lua")]
+                {
+                    config::run_immediate_with_lua_config(|lua| {
+                        let lua = match lua {
+                            Some(lua) => lua,
+                            None => return Ok(None),
+                        };
+                        let v = config::lua::emit_sync_callback(
+                            &*lua,
+                            ("mux-is-process-stateful".to_string(), (info.root.clone())),
+                        )?;
+                        match v {
+                            mlua::Value::Nil => Ok(None),
+                            mlua::Value::Boolean(v) => Ok(Some(v)),
+                            _ => Ok(None),
+                        }
+                    })
                 }
-            });
+                #[cfg(not(feature = "lua"))]
+                {
+                    Ok::<Option<bool>, Error>(None)
+                }
+            };
 
             fn default_stateful_check(proc_list: &LocalProcessInfo) -> bool {
                 // Fig uses `figterm` a pseudo terminal for a lot of functionality, it runs between

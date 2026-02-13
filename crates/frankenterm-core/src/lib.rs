@@ -102,6 +102,7 @@ pub mod export;
 pub mod extensions;
 #[cfg(unix)]
 pub mod fd_budget;
+pub mod gc;
 pub mod incident_bundle;
 pub mod ingest;
 #[cfg(unix)]
@@ -122,6 +123,7 @@ pub mod orphan_reaper;
 #[cfg(any(feature = "web", feature = "sync", feature = "asupersync-runtime"))]
 pub mod outcome;
 pub mod output;
+pub mod output_compression;
 pub mod pane_lifecycle;
 pub mod pane_tiers;
 pub mod patterns;
@@ -166,6 +168,7 @@ pub mod session_retention;
 pub mod session_topology;
 pub mod setup;
 pub mod sharded_counter;
+pub mod simd_scan;
 pub mod snapshot_engine;
 pub mod spectral;
 pub mod spsc_ring_buffer;

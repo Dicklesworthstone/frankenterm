@@ -381,6 +381,7 @@ SCENARIO_REGISTRY=(
     "pane_exclude_filter|Validate pane selection filters protect privacy (ignored pane absent from search)|true|wezterm,jq,sqlite3|Protects pane exclusion behavior"
     "workspace_isolation|Validate workspace isolation (no cross-project DB leakage)|true|wezterm,jq,sqlite3|Protects workspace separation"
     "setup_idempotency|Validate wa setup idempotent patching (temp home, no leaks)|true|wezterm,jq|Protects setup idempotency"
+    "setup_remote_docker|Validate ft setup remote against dockerized sshd (dry-run/apply/idempotent + failure injection)|false|docker,ssh,ssh-keygen,jq|Protects remote setup safety and rollback diagnostics"
     "search_linting_rebuild|Validate search linting + FTS verify/rebuild commands|true|wezterm,jq,sqlite3|Protects search maintenance commands"
     "uservar_forwarding|Validate user-var forwarding lane (wezterm.lua -> wa event -> watcher)|true|wezterm,jq,sqlite3|Protects user-var IPC lane"
     "alt_screen_detection|Validate alt-screen detection via escape sequences (no Lua status hook)|true|wezterm,jq,sqlite3|Protects alt-screen detection"
@@ -5451,6 +5452,63 @@ EOF
     return $result
 }
 
+run_scenario_setup_remote_docker() {
+    local scenario_dir="$1"
+    local case_name="setup_remote_docker"
+    local helper="$SCRIPT_DIR/e2e_setup_remote_docker.sh"
+    local result=0
+
+    log_info "[$case_name] Step 1: gating check (FT_E2E_ENABLE_SETUP_REMOTE)"
+    if [[ "${FT_E2E_ENABLE_SETUP_REMOTE:-0}" != "1" ]]; then
+        log_warn "[$case_name] Skipping: set FT_E2E_ENABLE_SETUP_REMOTE=1 to enable this non-default case"
+        cat > "$scenario_dir/skip_reason.txt" <<'EOF'
+setup_remote_docker is intentionally non-default because it requires Docker + SSH.
+Enable by setting FT_E2E_ENABLE_SETUP_REMOTE=1 and rerunning this scenario.
+EOF
+        return 0
+    fi
+
+    log_info "[$case_name] Step 2: prerequisite check (docker + ssh + ssh-keygen)"
+    local missing=()
+    for cmd in docker ssh ssh-keygen jq; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            missing+=("$cmd")
+        fi
+    done
+    if [[ "${#missing[@]}" -gt 0 ]]; then
+        log_warn "[$case_name] Skipping: missing prerequisites: ${missing[*]}"
+        printf '%s\n' "${missing[@]}" > "$scenario_dir/missing_prerequisites.txt"
+        return 0
+    fi
+
+    if [[ ! -x "$helper" ]]; then
+        log_fail "[$case_name] helper script missing or not executable: $helper"
+        return 1
+    fi
+
+    log_info "[$case_name] Step 3: execute dockerized remote setup harness"
+    local helper_log="$scenario_dir/setup_remote_driver.log"
+    local -a cmd=(
+        "$helper"
+        --scenario-dir "$scenario_dir"
+        --ft-binary "$FT_BINARY"
+        --timeout-secs "$TIMEOUT"
+    )
+    if [[ "$VERBOSE" == "true" ]]; then
+        cmd+=(--verbose)
+    fi
+
+    if "${cmd[@]}" >"$helper_log" 2>&1; then
+        log_pass "[$case_name] Harness completed successfully"
+    else
+        result=1
+        log_fail "[$case_name] Harness failed"
+        tail -n 120 "$helper_log" > "$scenario_dir/setup_remote_driver_tail.log" 2>/dev/null || true
+    fi
+
+    return $result
+}
+
 run_scenario_uservar_forwarding() {
     local scenario_dir="$1"
     local temp_workspace
@@ -7912,6 +7970,9 @@ run_scenario() {
             ;;
         setup_idempotency)
             run_scenario_setup_idempotency "$scenario_dir" || result=$?
+            ;;
+        setup_remote_docker)
+            run_scenario_setup_remote_docker "$scenario_dir" || result=$?
             ;;
         uservar_forwarding)
             run_scenario_uservar_forwarding "$scenario_dir" || result=$?

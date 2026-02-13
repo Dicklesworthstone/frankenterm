@@ -7,8 +7,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
-use tokio::time::{Duration, Instant, sleep};
+use crate::runtime_compat::sleep;
 
 /// Backoff configuration for wait loops.
 #[derive(Debug, Clone)]

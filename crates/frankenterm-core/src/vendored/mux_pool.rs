@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::pool::{Pool, PoolAcquireGuard, PoolConfig, PoolError, PoolStats};
 use crate::retry::RetryPolicy;
+use crate::runtime_compat::{sleep, timeout};
 
 use super::mux_client::{
     DirectMuxClient, DirectMuxClientConfig, DirectMuxError, ProtocolErrorKind,
@@ -260,7 +261,7 @@ impl MuxPool {
                             .retry_policy
                             .delay_for_attempt(attempt.saturating_sub(1));
                         if !delay.is_zero() {
-                            tokio::time::sleep(delay).await;
+                            sleep(delay).await;
                         }
                         continue;
                     }
@@ -823,7 +824,7 @@ mod tests {
         assert_eq!(stats.pool.idle_count, 1);
 
         // Wait for idle timeout
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(100)).await;
 
         let evicted = pool.evict_idle().await;
         assert_eq!(evicted, 1, "stale connection should be evicted");
@@ -877,7 +878,7 @@ mod tests {
 
         // Second acquire should timeout
         let pool2 = pool.clone();
-        let result = tokio::time::timeout(Duration::from_millis(200), pool2.list_panes()).await;
+        let result = timeout(Duration::from_millis(200), pool2.list_panes()).await;
 
         match result {
             Ok(Err(MuxPoolError::Pool(PoolError::AcquireTimeout))) => {} // expected

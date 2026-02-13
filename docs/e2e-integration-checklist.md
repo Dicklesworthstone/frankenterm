@@ -43,6 +43,7 @@ Registry lives in `scripts/e2e_test.sh` (SCENARIO_REGISTRY). Current entries:
 - pane_exclude_filter
 - workspace_isolation
 - setup_idempotency
+- setup_remote_docker
 - uservar_forwarding
 - alt_screen_detection
 - no_lua_status_hook

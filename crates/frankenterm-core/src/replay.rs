@@ -12,6 +12,7 @@ use tokio::sync::watch;
 
 use crate::Result;
 use crate::recording::{FrameHeader, FrameType, RecordingFrame};
+use crate::runtime_compat::sleep;
 
 // ---------------------------------------------------------------------------
 // Frame parsing
@@ -549,7 +550,7 @@ impl Player {
                 let raw_delay_ms = frame_ts - self.position.timestamp_ms;
                 let scaled_delay = (raw_delay_ms as f64) / (self.speed.as_f32() as f64);
                 if scaled_delay > 0.5 {
-                    tokio::time::sleep(Duration::from_micros((scaled_delay * 1000.0) as u64)).await;
+                    sleep(Duration::from_micros((scaled_delay * 1000.0) as u64)).await;
                 }
 
                 // Re-check controls after sleep (signal may have arrived during delay).
@@ -1292,7 +1293,7 @@ mod tests {
         let tx2 = tx.clone();
         tokio::spawn(async move {
             // Stop fires at t=1s, before frame B at t=5s.
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            sleep(Duration::from_secs(1)).await;
             let _ = tx2.send(PlayerControl::Stop);
         });
 
@@ -1956,9 +1957,9 @@ mod tests {
         let tx2 = tx.clone();
         tokio::spawn(async move {
             // Pause at 1s, resume at 2s
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            sleep(Duration::from_secs(1)).await;
             let _ = tx2.send(PlayerControl::Pause);
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            sleep(Duration::from_secs(1)).await;
             let _ = tx2.send(PlayerControl::Play);
         });
 

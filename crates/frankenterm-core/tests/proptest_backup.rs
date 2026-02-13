@@ -48,7 +48,15 @@ fn arb_backup_manifest() -> impl Strategy<Value = BackupManifest> {
         arb_backup_stats(),
     )
         .prop_map(
-            |(wa_version, schema_version, created_at, workspace, db_size_bytes, db_checksum, stats)| {
+            |(
+                wa_version,
+                schema_version,
+                created_at,
+                workspace,
+                db_size_bytes,
+                db_checksum,
+                stats,
+            )| {
                 BackupManifest {
                     wa_version,
                     schema_version,

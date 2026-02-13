@@ -250,18 +250,20 @@ where
             .map
             .write()
             .unwrap_or_else(|e| e.into_inner());
-        if guard.contains_key(&key) {
-            false
-        } else {
-            guard.insert(key, value);
-            true
+        use std::collections::hash_map::Entry;
+        match guard.entry(key) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(e) => {
+                e.insert(value);
+                true
+            }
         }
     }
 
     /// Collect all keys (snapshot).
     pub fn keys(&self) -> Vec<K> {
         let mut result = Vec::new();
-        for shard in self.shards.iter() {
+        for shard in &self.shards {
             let guard = shard.map.read().unwrap_or_else(|e| e.into_inner());
             result.extend(guard.keys().cloned());
         }
@@ -274,7 +276,7 @@ where
         V: Clone,
     {
         let mut result = Vec::new();
-        for shard in self.shards.iter() {
+        for shard in &self.shards {
             let guard = shard.map.read().unwrap_or_else(|e| e.into_inner());
             result.extend(guard.values().cloned());
         }
@@ -287,7 +289,7 @@ where
         V: Clone,
     {
         let mut result = Vec::new();
-        for shard in self.shards.iter() {
+        for shard in &self.shards {
             let guard = shard.map.read().unwrap_or_else(|e| e.into_inner());
             for (k, v) in guard.iter() {
                 result.push((k.clone(), v.clone()));
@@ -301,7 +303,7 @@ where
     where
         F: FnMut(&K, &V) -> bool,
     {
-        for shard in self.shards.iter() {
+        for shard in &self.shards {
             let mut guard = shard.map.write().unwrap_or_else(|e| e.into_inner());
             guard.retain(|k, v| f(k, v));
         }
@@ -317,7 +319,7 @@ where
 
     /// Clear all entries.
     pub fn clear(&self) {
-        for shard in self.shards.iter() {
+        for shard in &self.shards {
             let mut guard = shard.map.write().unwrap_or_else(|e| e.into_inner());
             guard.clear();
         }
@@ -460,7 +462,7 @@ impl<V> PaneMap<V> {
     /// All pane IDs.
     pub fn pane_ids(&self) -> Vec<u64> {
         let mut result = Vec::new();
-        for shard in self.shards.iter() {
+        for shard in &self.shards {
             let guard = shard.map.read().unwrap_or_else(|e| e.into_inner());
             result.extend(guard.keys());
         }
@@ -472,7 +474,7 @@ impl<V> PaneMap<V> {
     where
         F: FnMut(u64, &V) -> bool,
     {
-        for shard in self.shards.iter() {
+        for shard in &self.shards {
             let mut guard = shard.map.write().unwrap_or_else(|e| e.into_inner());
             guard.retain(|k, v| f(*k, v));
         }
@@ -492,7 +494,7 @@ impl<V> PaneMap<V> {
         V: Clone,
     {
         let mut result = Vec::new();
-        for shard in self.shards.iter() {
+        for shard in &self.shards {
             let guard = shard.map.read().unwrap_or_else(|e| e.into_inner());
             result.extend(guard.values().cloned());
         }
@@ -505,7 +507,7 @@ impl<V> PaneMap<V> {
         V: Clone,
     {
         let mut result = Vec::new();
-        for shard in self.shards.iter() {
+        for shard in &self.shards {
             let guard = shard.map.read().unwrap_or_else(|e| e.into_inner());
             for (&k, v) in guard.iter() {
                 result.push((k, v.clone()));
@@ -521,11 +523,13 @@ impl<V> PaneMap<V> {
             .map
             .write()
             .unwrap_or_else(|e| e.into_inner());
-        if guard.contains_key(&pane_id) {
-            false
-        } else {
-            guard.insert(pane_id, value);
-            true
+        use std::collections::hash_map::Entry;
+        match guard.entry(pane_id) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(e) => {
+                e.insert(value);
+                true
+            }
         }
     }
 
@@ -534,7 +538,7 @@ impl<V> PaneMap<V> {
     where
         F: FnMut(u64, &mut V),
     {
-        for shard in self.shards.iter() {
+        for shard in &self.shards {
             let mut guard = shard.map.write().unwrap_or_else(|e| e.into_inner());
             for (&pane_id, value) in guard.iter_mut() {
                 f(pane_id, value);
@@ -548,7 +552,7 @@ impl<V> PaneMap<V> {
         F: FnMut(u64, &mut V) -> R,
     {
         let mut result = Vec::new();
-        for shard in self.shards.iter() {
+        for shard in &self.shards {
             let mut guard = shard.map.write().unwrap_or_else(|e| e.into_inner());
             for (&pane_id, value) in guard.iter_mut() {
                 result.push((pane_id, f(pane_id, value)));
@@ -559,7 +563,7 @@ impl<V> PaneMap<V> {
 
     /// Clear all entries.
     pub fn clear(&self) {
-        for shard in self.shards.iter() {
+        for shard in &self.shards {
             let mut guard = shard.map.write().unwrap_or_else(|e| e.into_inner());
             guard.clear();
         }

@@ -13,12 +13,13 @@
 //! 8. Unknown panes default to dormant tier
 
 use proptest::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use frankenterm_core::memory_pressure::MemoryPressureTier;
 use frankenterm_core::pane_tiers::PaneTier;
 use frankenterm_core::scrollback_eviction::{
-    EvictionConfig, PaneTierSource, ScrollbackEvictor, SegmentStore,
+    EvictionConfig, ImportanceRetentionConfig, LineImportanceScorer, PaneTierSource,
+    ScrollbackEvictor, ScrollbackLine, SegmentStore, enforce_importance_budget,
 };
 
 // ── Test helpers ─────────────────────────────────────────────────────
@@ -107,6 +108,18 @@ fn arb_tier() -> impl Strategy<Value = PaneTier> {
     ]
 }
 
+fn arb_importance_retention_config() -> impl Strategy<Value = ImportanceRetentionConfig> {
+    (1usize..2048, 1usize..32, 1usize..128, 0.1_f64..0.95).prop_map(
+        |(budget, min_lines, extra_lines, threshold)| ImportanceRetentionConfig {
+            byte_budget_per_pane: budget,
+            min_lines,
+            max_lines: min_lines + extra_lines,
+            importance_threshold: threshold,
+            oldest_window_fraction: 1.0,
+        },
+    )
+}
+
 const ALL_PRESSURES: [MemoryPressureTier; 4] = [
     MemoryPressureTier::Green,
     MemoryPressureTier::Yellow,
@@ -148,6 +161,151 @@ proptest! {
             "idle({}) >= background({}) at {:?}", idle, background, pressure);
         prop_assert!(background >= dormant,
             "background({}) >= dormant({}) at {:?}", background, dormant, pressure);
+    }
+}
+
+// =============================================================================
+// 9. Importance scoring range invariant
+// =============================================================================
+
+proptest! {
+    /// For any UTF-8 input line, score_line() must stay in [0, 1].
+    #[test]
+    fn proptest_importance_score_range(
+        line in ".*",
+        prev in prop::option::of(".*"),
+    ) {
+        let scorer = LineImportanceScorer::default();
+        let score = scorer.score_line(&line, prev.as_deref());
+        prop_assert!(
+            (0.0..=1.0).contains(&score),
+            "score out of range: {score} for line={line:?} prev={prev:?}"
+        );
+    }
+}
+
+// =============================================================================
+// 10. Importance scoring monotonicity
+// =============================================================================
+
+proptest! {
+    /// Adding high-value signals (and no extra low-value signals) must not decrease score.
+    #[test]
+    fn proptest_importance_monotonicity(
+        include_warning in any::<bool>(),
+        include_tool in any::<bool>(),
+        include_compile in any::<bool>(),
+        include_test in any::<bool>(),
+    ) {
+        let scorer = LineImportanceScorer::default();
+        let mut base = String::from("status update");
+        if include_warning {
+            base.push_str(" warning:");
+        }
+        if include_tool {
+            base.push_str(" Using tool");
+        }
+        if include_compile {
+            base.push_str(" Compiling crate");
+        }
+        if include_test {
+            base.push_str(" test result:");
+        }
+
+        let boosted = format!("{base} error: failed");
+        let base_score = scorer.score_line(&base, None);
+        let boosted_score = scorer.score_line(&boosted, None);
+
+        prop_assert!(
+            boosted_score >= base_score,
+            "boosted score must be >= base score (base={base_score}, boosted={boosted_score}, base_line={base:?}, boosted_line={boosted:?})"
+        );
+    }
+}
+
+// =============================================================================
+// 11. Threshold floor ordering
+// =============================================================================
+
+proptest! {
+    /// While low-importance lines exist, high-importance lines at/above threshold
+    /// should not be evicted first.
+    #[test]
+    fn proptest_threshold_floor_ordering(
+        config in arb_importance_retention_config(),
+        low_importance in 0.0_f64..0.79,
+        high_importance in 0.8_f64..1.0,
+    ) {
+        let mut lines = VecDeque::new();
+        for idx in 0..config.max_lines.max(4) {
+            let text = format!("line-{idx}");
+            let importance = if idx % 2 == 0 {
+                low_importance.min(config.importance_threshold - f64::EPSILON)
+            } else {
+                high_importance.max(config.importance_threshold)
+            };
+            lines.push_back(ScrollbackLine::new(text, importance, idx as u64));
+        }
+
+        let mut overfull = lines.clone();
+        overfull.push_back(ScrollbackLine::new(
+            "extra-low",
+            0.01_f64.min(config.importance_threshold - f64::EPSILON),
+            99_999,
+        ));
+
+        let report = enforce_importance_budget(&mut overfull, &config);
+        if report.lines_removed > 0 {
+            let has_low = overfull
+                .iter()
+                .any(|line| line.importance < config.importance_threshold);
+            if has_low {
+                prop_assert!(
+                    overfull.iter().any(|line| line.importance >= config.importance_threshold),
+                    "high-importance lines should still be present while low lines remain"
+                );
+            }
+        }
+    }
+}
+
+// =============================================================================
+// 12. Byte budget compliance
+// =============================================================================
+
+proptest! {
+    /// After budget enforcement, bytes and line counts remain within limits,
+    /// unless min_lines prevents further trimming.
+    #[test]
+    fn proptest_importance_budget_compliance(
+        config in arb_importance_retention_config(),
+        texts in prop::collection::vec("[ -~]{1,40}", 1..120),
+        importances in prop::collection::vec(0.0_f64..1.0, 1..120),
+    ) {
+        let mut lines = VecDeque::new();
+        let n = texts.len().min(importances.len());
+        for i in 0..n {
+            lines.push_back(ScrollbackLine::new(
+                texts[i].clone(),
+                importances[i],
+                i as u64,
+            ));
+        }
+
+        let report = enforce_importance_budget(&mut lines, &config);
+
+        let remaining_bytes: usize = lines.iter().map(|line| line.bytes).sum();
+        prop_assert_eq!(remaining_bytes, report.remaining_bytes);
+        prop_assert_eq!(lines.len(), report.remaining_lines);
+        prop_assert!(lines.len() <= config.max_lines || lines.len() == config.min_lines);
+        if lines.len() > config.min_lines {
+            prop_assert!(
+                remaining_bytes <= config.byte_budget_per_pane,
+                "remaining bytes {} exceed budget {}",
+                remaining_bytes,
+                config.byte_budget_per_pane
+            );
+        }
     }
 }
 

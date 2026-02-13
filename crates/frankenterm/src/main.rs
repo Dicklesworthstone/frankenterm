@@ -5640,7 +5640,7 @@ async fn stop_mux_server_processes(stop_timeout: Duration) -> anyhow::Result<Vec
                 remaining
             ));
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        frankenterm_core::runtime_compat::sleep(Duration::from_millis(200)).await;
     }
 }
 
@@ -5661,7 +5661,7 @@ async fn wait_for_mux_ready(timeout: Duration, wezterm_timeout_secs: u64) -> any
             }
         }
 
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        frankenterm_core::runtime_compat::sleep(Duration::from_millis(250)).await;
     }
 }
 
@@ -7813,7 +7813,7 @@ async fn distributed_handle_connection<S>(
     let mut reader = tokio::io::BufReader::new(stream);
     let mut handshake_line = String::new();
 
-    let handshake_size = match tokio::time::timeout(
+    let handshake_size = match frankenterm_core::runtime_compat::timeout(
         handshake_timeout,
         reader.read_line(&mut handshake_line),
     )
@@ -7919,8 +7919,11 @@ async fn distributed_handle_connection<S>(
         }
 
         let mut line = String::new();
-        let read_size = match tokio::time::timeout(message_timeout, reader.read_line(&mut line))
-            .await
+        let read_size = match frankenterm_core::runtime_compat::timeout(
+            message_timeout,
+            reader.read_line(&mut line),
+        )
+        .await
         {
             Ok(Ok(size)) => size,
             Ok(Err(err)) => {
@@ -8061,8 +8064,11 @@ async fn spawn_distributed_listener(
                 break;
             }
 
-            let accept_result =
-                tokio::time::timeout(Duration::from_millis(500), listener.accept()).await;
+            let accept_result = frankenterm_core::runtime_compat::timeout(
+                Duration::from_millis(500),
+                listener.accept(),
+            )
+            .await;
             let Ok(accept_result) = accept_result else {
                 continue;
             };
@@ -8458,7 +8464,7 @@ async fn distributed_agent_stream_session(
     stream.get_mut().flush().await?;
 
     let mut handshake_response = String::new();
-    match tokio::time::timeout(
+    match frankenterm_core::runtime_compat::timeout(
         Duration::from_millis(250),
         stream.read_line(&mut handshake_response),
     )
@@ -8552,7 +8558,7 @@ async fn distributed_agent_sleep_with_shutdown(
             return true;
         }
         let remaining = duration.saturating_sub(started.elapsed());
-        tokio::time::sleep(remaining.min(Duration::from_millis(250))).await;
+        frankenterm_core::runtime_compat::sleep(remaining.min(Duration::from_millis(250))).await;
     }
     shutdown_flag.load(Ordering::SeqCst)
 }
@@ -8844,7 +8850,7 @@ async fn run_watcher_with_backoff(
                 }
 
                 tokio::select! {
-                    () = tokio::time::sleep(backoff) => {}
+                    () = frankenterm_core::runtime_compat::sleep(backoff) => {}
                     _ = tokio::signal::ctrl_c() => {
                         tracing::info!("Watcher restart cancelled by Ctrl-C");
                         return Ok(());
@@ -9467,7 +9473,7 @@ async fn run_watcher(
                         let _ = snap_shutdown_tx.send(true);
                         break;
                     }
-                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    frankenterm_core::runtime_compat::sleep(Duration::from_millis(500)).await;
                 }
             });
             tokio::spawn(async move {
@@ -9758,7 +9764,7 @@ async fn run_saved_search_scheduler(
             Err(err) => {
                 tracing::warn!(error = %err, "Saved search scheduler: failed to list searches");
                 tokio::select! {
-                    () = tokio::time::sleep(Duration::from_secs(1)) => {}
+                    () = frankenterm_core::runtime_compat::sleep(Duration::from_secs(1)) => {}
                     () = wait_for_shutdown(Arc::clone(&shutdown_flag)) => break,
                 }
                 continue;
@@ -9991,7 +9997,7 @@ async fn run_saved_search_scheduler(
         let sleep_ms_u64 = u64::try_from(sleep_ms).unwrap_or(1_000);
 
         tokio::select! {
-            () = tokio::time::sleep(Duration::from_millis(sleep_ms_u64)) => {}
+            () = frankenterm_core::runtime_compat::sleep(Duration::from_millis(sleep_ms_u64)) => {}
             () = wait_for_shutdown(Arc::clone(&shutdown_flag)) => break,
         }
     }
@@ -10040,7 +10046,7 @@ async fn run_scheduled_backups(
             Err(err) => {
                 tracing::warn!(error = %err, "Failed to compute next backup schedule; retrying");
                 tokio::select! {
-                    () = tokio::time::sleep(Duration::from_secs(60)) => {}
+                    () = frankenterm_core::runtime_compat::sleep(Duration::from_secs(60)) => {}
                     () = wait_for_shutdown(shutdown_flag.clone()) => break,
                 }
                 continue;
@@ -10059,7 +10065,7 @@ async fn run_scheduled_backups(
         );
 
         tokio::select! {
-            () = tokio::time::sleep(sleep_duration) => {}
+            () = frankenterm_core::runtime_compat::sleep(sleep_duration) => {}
             () = wait_for_shutdown(shutdown_flag.clone()) => break,
         }
 
@@ -10108,7 +10114,7 @@ async fn run_scheduled_backups(
                     if attempt < 3 {
                         let backoff = Duration::from_secs(2_u64.pow(attempt - 1));
                         tokio::select! {
-                            () = tokio::time::sleep(backoff) => {}
+                            () = frankenterm_core::runtime_compat::sleep(backoff) => {}
                             () = wait_for_shutdown(shutdown_flag.clone()) => break,
                         }
                     }
@@ -10199,7 +10205,7 @@ async fn wait_for_shutdown(flag: Arc<std::sync::atomic::AtomicBool>) {
     use std::time::Duration;
 
     while !flag.load(Ordering::SeqCst) {
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        frankenterm_core::runtime_compat::sleep(Duration::from_millis(250)).await;
     }
 }
 
@@ -16978,7 +16984,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         stopped = true;
                         break;
                     }
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    frankenterm_core::runtime_compat::sleep(Duration::from_millis(200)).await;
                 }
 
                 if stopped {
@@ -16998,7 +17004,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     }
 
                     // Wait briefly for SIGKILL to take effect.
-                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    frankenterm_core::runtime_compat::sleep(Duration::from_millis(500)).await;
                     if check_running(lock_path).is_none() {
                         println!("Watcher killed (pid {pid}).");
                     } else {
@@ -18657,7 +18663,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     }
 
                     if record_count < page_limit {
-                        tokio::time::sleep(Duration::from_millis(poll_interval_ms)).await;
+                        frankenterm_core::runtime_compat::sleep(Duration::from_millis(
+                            poll_interval_ms,
+                        ))
+                        .await;
                     }
                 }
             } else {
@@ -20410,7 +20419,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         }
                     }
 
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    frankenterm_core::runtime_compat::sleep(std::time::Duration::from_millis(200))
+                        .await;
                 }
 
                 recorder.stop()?;
@@ -22118,7 +22128,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         std::time::Duration::from_secs_f64(event.at.as_secs_f64() / speed_factor);
                     let actual_elapsed = start.elapsed();
                     if let Some(wait) = target_elapsed.checked_sub(actual_elapsed) {
-                        tokio::time::sleep(wait).await;
+                        frankenterm_core::runtime_compat::sleep(wait).await;
                     }
 
                     let mock_event = Scenario::to_mock_event(event)?;
@@ -33187,7 +33197,7 @@ log_level = "debug"
             if record.last_error.is_some() {
                 return record;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            frankenterm_core::runtime_compat::sleep(std::time::Duration::from_millis(50)).await;
         }
     }
 
@@ -33247,10 +33257,13 @@ log_level = "debug"
         ));
 
         let mut sub = bus.subscribe_detections();
-        let event = tokio::time::timeout(std::time::Duration::from_secs(5), sub.recv())
-            .await
-            .expect("timeout waiting for saved_search.alert")
-            .unwrap();
+        let event = frankenterm_core::runtime_compat::timeout(
+            std::time::Duration::from_secs(5),
+            sub.recv(),
+        )
+        .await
+        .expect("timeout waiting for saved_search.alert")
+        .unwrap();
 
         let Event::PatternDetected { detection, .. } = event else {
             panic!("unexpected event variant");
@@ -33291,7 +33304,7 @@ log_level = "debug"
             .unwrap();
 
         // Give the scheduler a chance to tick and update last_run_at.
-        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        frankenterm_core::runtime_compat::sleep(std::time::Duration::from_millis(600)).await;
         let updated = storage
             .get_saved_search_by_name("errors")
             .await
@@ -33300,7 +33313,11 @@ log_level = "debug"
         assert!(updated.last_run_at.is_some_and(|v| v >= force_due_at));
 
         // No second alert within the cooldown window.
-        let second = tokio::time::timeout(std::time::Duration::from_secs(1), sub.recv()).await;
+        let second = frankenterm_core::runtime_compat::timeout(
+            std::time::Duration::from_secs(1),
+            sub.recv(),
+        )
+        .await;
         assert!(
             second.is_err(),
             "expected cooldown to suppress second alert"
@@ -33348,7 +33365,7 @@ log_level = "debug"
 
         // Interval would make it due again quickly, but backoff should prevent
         // repeated executions for a short window.
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        frankenterm_core::runtime_compat::sleep(std::time::Duration::from_secs(2)).await;
         let second = storage
             .get_saved_search_by_name("invalid")
             .await
@@ -33392,7 +33409,7 @@ log_level = "debug"
             Arc::clone(&shutdown_flag),
         ));
 
-        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        frankenterm_core::runtime_compat::sleep(std::time::Duration::from_millis(600)).await;
         let fetched = storage
             .get_saved_search_by_name("not_due")
             .await

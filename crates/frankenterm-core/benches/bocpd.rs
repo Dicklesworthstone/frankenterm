@@ -8,6 +8,8 @@
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use frankenterm_core::bocpd::{BocpdConfig, BocpdManager, BocpdModel, OutputFeatures};
+use frankenterm_core::simd_scan::scan_newlines_and_ansi;
+use std::hint::black_box;
 use std::time::Duration;
 
 mod bench_common;
@@ -28,6 +30,10 @@ const BUDGETS: &[bench_common::BenchBudget] = &[
     bench_common::BenchBudget {
         name: "bocpd_snapshot",
         budget: "p50 < 500us (snapshot serialization)",
+    },
+    bench_common::BenchBudget {
+        name: "bocpd_scan_primitives",
+        budget: "simd_scan throughput should exceed scalar baseline for larger buffers",
     },
 ];
 
@@ -202,6 +208,49 @@ fn bench_batch_100_panes(c: &mut Criterion) {
 }
 
 // =============================================================================
+// Scan primitive benchmarks
+// =============================================================================
+
+fn bench_scan_primitives(c: &mut Criterion) {
+    let mut group = c.benchmark_group("bocpd_scan_primitives");
+
+    for size in [1024usize, 64 * 1024, 1024 * 1024, 16 * 1024 * 1024] {
+        let datasets = vec![
+            ("plain", generate_terminal_output(size).into_bytes()),
+            ("ansi_heavy", generate_ansi_heavy_output(size).into_bytes()),
+        ];
+
+        for (dataset_name, bytes) in datasets {
+            group.throughput(Throughput::Bytes(bytes.len() as u64));
+
+            group.bench_with_input(
+                BenchmarkId::new(format!("{dataset_name}/simd_scan"), size),
+                &bytes,
+                |b, data| {
+                    b.iter(|| {
+                        let metrics = scan_newlines_and_ansi(black_box(data));
+                        black_box(metrics);
+                    });
+                },
+            );
+
+            group.bench_with_input(
+                BenchmarkId::new(format!("{dataset_name}/scalar_baseline"), size),
+                &bytes,
+                |b, data| {
+                    b.iter(|| {
+                        let metrics = scalar_scan_baseline(black_box(data));
+                        black_box(metrics);
+                    });
+                },
+            );
+        }
+    }
+
+    group.finish();
+}
+
+// =============================================================================
 // Helpers
 // =============================================================================
 
@@ -229,6 +278,47 @@ fn generate_terminal_output(approx_bytes: usize) -> String {
     output
 }
 
+fn generate_ansi_heavy_output(approx_bytes: usize) -> String {
+    let lines = [
+        "\x1b[2K\x1b[1G\x1b[32mOK\x1b[0m \x1b[90mstatus\x1b[0m\n",
+        "\x1b[2K\x1b[1G\x1b[31mERR\x1b[0m \x1b[1mcompile failed\x1b[0m\n",
+        "\x1b[2K\x1b[1G\x1b[33mWARN\x1b[0m \x1b[4mretrying\x1b[0m\n",
+        "\x1b[2K\x1b[1G\x1b[34mINFO\x1b[0m \x1b[7mprogress\x1b[0m\n",
+    ];
+
+    let mut output = String::with_capacity(approx_bytes + 128);
+    let mut idx = 0;
+    while output.len() < approx_bytes {
+        output.push_str(lines[idx % lines.len()]);
+        idx += 1;
+    }
+    output.truncate(approx_bytes);
+    output
+}
+
+fn scalar_scan_baseline(bytes: &[u8]) -> (usize, usize) {
+    let mut newline_count = 0usize;
+    let mut ansi_byte_count = 0usize;
+    let mut in_escape = false;
+
+    for &b in bytes {
+        if b == b'\n' {
+            newline_count += 1;
+        }
+        if b == 0x1b {
+            in_escape = true;
+            ansi_byte_count += 1;
+        } else if in_escape {
+            ansi_byte_count += 1;
+            if (0x40..=0x7E).contains(&b) && b != b'[' {
+                in_escape = false;
+            }
+        }
+    }
+
+    (newline_count, ansi_byte_count)
+}
+
 // =============================================================================
 // Criterion groups and main
 // =============================================================================
@@ -243,6 +333,7 @@ criterion_group!(
     config = bench_config();
     targets = bench_single_update,
         bench_feature_vector,
-        bench_batch_100_panes
+        bench_batch_100_panes,
+        bench_scan_primitives
 );
 criterion_main!(benches);

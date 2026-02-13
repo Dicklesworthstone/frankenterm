@@ -2391,6 +2391,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "frankenterm-scripting"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "config",
+ "criterion 0.5.1",
+ "frankenterm-dynamic",
+ "luahelper",
+ "mlua",
+ "proptest",
+ "smol",
+]
+
+[[package]]
 name = "frankenterm-ssh"
 version = "0.4.0"
 dependencies = [
@@ -4936,7 +4950,6 @@ dependencies = [
  "smol",
  "terminfo",
  "termwiz 0.24.0",
- "termwiz-funcs",
  "textwrap",
  "thiserror 2.0.18",
  "url",

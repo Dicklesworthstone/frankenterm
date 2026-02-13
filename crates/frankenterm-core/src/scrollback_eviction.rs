@@ -16,10 +16,13 @@
 //! The module computes per-pane segment limits from pane tier + memory pressure,
 //! then delegates actual deletion to a [`SegmentStore`] trait implementor.
 
+use std::collections::VecDeque;
+
 use serde::{Deserialize, Serialize};
 
 use crate::memory_pressure::MemoryPressureTier;
 use crate::pane_tiers::PaneTier;
+use crate::patterns::{PatternEngine, Severity};
 
 // =============================================================================
 // Configuration
@@ -80,6 +83,409 @@ impl EvictionConfig {
 
         effective.max(self.min_segments)
     }
+}
+
+// =============================================================================
+// Importance-Weighted Line Retention
+// =============================================================================
+
+/// Configuration for line importance scoring.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportanceScoringConfig {
+    /// Baseline score before bonuses/penalties.
+    pub baseline: f64,
+    /// Bonus for critical/error-like content.
+    pub critical_bonus: f64,
+    /// Bonus for warning-like content.
+    pub warning_bonus: f64,
+    /// Bonus for tool boundary markers.
+    pub tool_boundary_bonus: f64,
+    /// Bonus for compilation/build output.
+    pub compilation_bonus: f64,
+    /// Bonus for test output/results.
+    pub test_result_bonus: f64,
+    /// Penalty for blank lines.
+    pub blank_line_penalty: f64,
+    /// Penalty for progress-bar/status update lines.
+    pub progress_line_penalty: f64,
+    /// Penalty for ANSI-only lines.
+    pub ansi_only_penalty: f64,
+    /// Penalty for exact repeated lines.
+    pub repeated_line_penalty: f64,
+}
+
+impl Default for ImportanceScoringConfig {
+    fn default() -> Self {
+        Self {
+            baseline: 0.3,
+            critical_bonus: 0.35,
+            warning_bonus: 0.2,
+            tool_boundary_bonus: 0.25,
+            compilation_bonus: 0.15,
+            test_result_bonus: 0.25,
+            blank_line_penalty: 0.2,
+            progress_line_penalty: 0.25,
+            ansi_only_penalty: 0.3,
+            repeated_line_penalty: 0.1,
+        }
+    }
+}
+
+/// Budget + policy for importance-weighted line eviction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportanceRetentionConfig {
+    /// Maximum bytes retained per pane.
+    pub byte_budget_per_pane: usize,
+    /// Always keep at least this many lines.
+    pub min_lines: usize,
+    /// Never keep more than this many lines.
+    pub max_lines: usize,
+    /// Prefer to never evict lines at/above this threshold while lower-value lines exist.
+    pub importance_threshold: f64,
+    /// Fraction (0.0-1.0] of oldest lines scanned to pick a victim.
+    pub oldest_window_fraction: f64,
+}
+
+impl Default for ImportanceRetentionConfig {
+    fn default() -> Self {
+        Self {
+            byte_budget_per_pane: 2 * 1024 * 1024, // 2 MB
+            min_lines: 500,
+            max_lines: 10_000,
+            importance_threshold: 0.8,
+            oldest_window_fraction: 0.25,
+        }
+    }
+}
+
+impl ImportanceRetentionConfig {
+    /// Validate basic invariant constraints.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.min_lines == 0 {
+            return Err("min_lines must be > 0".to_string());
+        }
+        if self.max_lines < self.min_lines {
+            return Err("max_lines must be >= min_lines".to_string());
+        }
+        if self.importance_threshold.is_nan() {
+            return Err("importance_threshold must be a number".to_string());
+        }
+        if !(0.0..=1.0).contains(&self.importance_threshold) {
+            return Err("importance_threshold must be within [0.0, 1.0]".to_string());
+        }
+        if self.oldest_window_fraction.is_nan() || self.oldest_window_fraction <= 0.0 {
+            return Err("oldest_window_fraction must be > 0".to_string());
+        }
+        if self.oldest_window_fraction > 1.0 {
+            return Err("oldest_window_fraction must be <= 1".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// A scored scrollback line used by weighted eviction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScrollbackLine {
+    /// Line content.
+    pub text: String,
+    /// UTF-8 byte length of `text`.
+    pub bytes: usize,
+    /// Importance score in [0.0, 1.0].
+    pub importance: f64,
+    /// Capture timestamp in epoch-millis.
+    pub timestamp_ms: u64,
+}
+
+impl ScrollbackLine {
+    /// Construct a scored line.
+    #[must_use]
+    pub fn new(text: impl Into<String>, importance: f64, timestamp_ms: u64) -> Self {
+        let text = text.into();
+        Self {
+            bytes: text.len(),
+            text,
+            importance: importance.clamp(0.0, 1.0),
+            timestamp_ms,
+        }
+    }
+}
+
+/// Summary of an importance-budget enforcement pass.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ImportanceBudgetReport {
+    /// Number of evicted lines.
+    pub lines_removed: usize,
+    /// Bytes removed by eviction.
+    pub bytes_removed: usize,
+    /// Remaining line count.
+    pub remaining_lines: usize,
+    /// Remaining total bytes.
+    pub remaining_bytes: usize,
+}
+
+/// Importance scorer that layers pattern-detection signals over cheap heuristics.
+pub struct LineImportanceScorer {
+    config: ImportanceScoringConfig,
+    pattern_engine: PatternEngine,
+}
+
+impl Default for LineImportanceScorer {
+    fn default() -> Self {
+        Self::new(ImportanceScoringConfig::default())
+    }
+}
+
+impl LineImportanceScorer {
+    /// Create a scorer with custom settings.
+    #[must_use]
+    pub fn new(config: ImportanceScoringConfig) -> Self {
+        Self {
+            config,
+            pattern_engine: PatternEngine::new(),
+        }
+    }
+
+    /// Access scoring config.
+    #[must_use]
+    pub fn config(&self) -> &ImportanceScoringConfig {
+        &self.config
+    }
+
+    /// Compute [0,1] importance for one line.
+    #[must_use]
+    pub fn score_line(&self, line: &str, previous_line: Option<&str>) -> f64 {
+        let mut score = self.config.baseline;
+        let lower = line.to_ascii_lowercase();
+
+        if line.trim().is_empty() {
+            score -= self.config.blank_line_penalty;
+        }
+        if is_ansi_only_line(line) {
+            score -= self.config.ansi_only_penalty;
+        }
+        if is_progress_line(&lower) {
+            score -= self.config.progress_line_penalty;
+        }
+        if previous_line.is_some_and(|prev| prev == line) {
+            score -= self.config.repeated_line_penalty;
+        }
+
+        if line_contains_error_signal(&lower) {
+            score += self.config.critical_bonus;
+        }
+        if line_contains_warning_signal(&lower) {
+            score += self.config.warning_bonus;
+        }
+        if line_contains_tool_boundary_signal(&lower) {
+            score += self.config.tool_boundary_bonus;
+        }
+        if line_contains_compilation_signal(&lower) {
+            score += self.config.compilation_bonus;
+        }
+        if line_contains_test_signal(&lower) {
+            score += self.config.test_result_bonus;
+        }
+
+        // Reuse existing pattern rules as an extra signal layer.
+        for detection in self.pattern_engine.detect(line) {
+            match detection.severity {
+                Severity::Critical => score += self.config.critical_bonus,
+                Severity::Warning => score += self.config.warning_bonus,
+                Severity::Info => score += 0.05,
+            }
+            let event_lower = detection.event_type.to_ascii_lowercase();
+            let rule_lower = detection.rule_id.to_ascii_lowercase();
+            if event_lower.contains("tool") || rule_lower.contains("tool") {
+                score += self.config.tool_boundary_bonus;
+            }
+        }
+
+        score.clamp(0.0, 1.0)
+    }
+}
+
+/// Insert a line with computed importance, then enforce budget constraints.
+///
+/// Returns `(importance, budget_report)`.
+pub fn push_scrollback_line(
+    lines: &mut VecDeque<ScrollbackLine>,
+    line_text: impl Into<String>,
+    timestamp_ms: u64,
+    scorer: &LineImportanceScorer,
+    config: &ImportanceRetentionConfig,
+) -> (f64, ImportanceBudgetReport) {
+    let line_text = line_text.into();
+    let previous = lines.back().map(|line| line.text.as_str());
+    let importance = scorer.score_line(&line_text, previous);
+    lines.push_back(ScrollbackLine::new(line_text, importance, timestamp_ms));
+    let report = enforce_importance_budget(lines, config);
+    (importance, report)
+}
+
+/// Total bytes represented by all lines in the deque.
+#[must_use]
+pub fn total_line_bytes(lines: &VecDeque<ScrollbackLine>) -> usize {
+    lines.iter().map(|line| line.bytes).sum()
+}
+
+/// Pick an eviction candidate index from the oldest window.
+///
+/// Lines below `importance_threshold` are always preferred when available.
+#[must_use]
+pub fn select_importance_eviction_index(
+    lines: &VecDeque<ScrollbackLine>,
+    config: &ImportanceRetentionConfig,
+) -> Option<usize> {
+    if lines.len() <= config.min_lines {
+        return None;
+    }
+    if lines.is_empty() {
+        return None;
+    }
+
+    let len = lines.len();
+    let window_len = ((len as f64) * config.oldest_window_fraction)
+        .ceil()
+        .max(1.0) as usize;
+    let window_len = window_len.min(len);
+
+    let mut best_below_threshold: Option<(usize, f64)> = None;
+    let mut best_any: Option<(usize, f64)> = None;
+
+    for (idx, line) in lines.iter().take(window_len).enumerate() {
+        if best_any.is_none_or(|(_, best)| line.importance < best) {
+            best_any = Some((idx, line.importance));
+        }
+        if line.importance < config.importance_threshold
+            && best_below_threshold.is_none_or(|(_, best)| line.importance < best)
+        {
+            best_below_threshold = Some((idx, line.importance));
+        }
+    }
+
+    best_below_threshold.or(best_any).map(|(idx, _)| idx)
+}
+
+/// Enforce byte and line limits using low-importance-first eviction.
+pub fn enforce_importance_budget(
+    lines: &mut VecDeque<ScrollbackLine>,
+    config: &ImportanceRetentionConfig,
+) -> ImportanceBudgetReport {
+    let mut total_bytes = total_line_bytes(lines);
+    let mut report = ImportanceBudgetReport::default();
+
+    while (total_bytes > config.byte_budget_per_pane || lines.len() > config.max_lines)
+        && lines.len() > config.min_lines
+    {
+        let Some(idx) = select_importance_eviction_index(lines, config) else {
+            break;
+        };
+
+        let Some(evicted) = lines.remove(idx) else {
+            break;
+        };
+
+        report.lines_removed += 1;
+        report.bytes_removed += evicted.bytes;
+        total_bytes = total_bytes.saturating_sub(evicted.bytes);
+    }
+
+    report.remaining_lines = lines.len();
+    report.remaining_bytes = total_bytes;
+    report
+}
+
+fn line_contains_error_signal(line: &str) -> bool {
+    line.contains("error:")
+        || line.contains(" panic")
+        || line.starts_with("panic")
+        || line.contains("exception")
+        || line.contains("fatal")
+        || line.contains("failed")
+        || line.contains("traceback")
+}
+
+fn line_contains_warning_signal(line: &str) -> bool {
+    line.contains("warning:") || line.contains("[warn]") || line.contains("deprecation")
+}
+
+fn line_contains_tool_boundary_signal(line: &str) -> bool {
+    line.contains("using tool")
+        || line.contains("tool call")
+        || line.contains("executing tool")
+        || line.contains("tool_use")
+}
+
+fn line_contains_compilation_signal(line: &str) -> bool {
+    line.starts_with("compiling ")
+        || line.contains(" finished ")
+        || line.contains(" linking ")
+        || line.contains("building ")
+        || line.contains(" cargo ")
+}
+
+fn line_contains_test_signal(line: &str) -> bool {
+    line.contains("test result:")
+        || line.contains("running ")
+        || line.contains("assertion failed")
+        || line.contains(" tests passed")
+        || line.contains(" tests failed")
+}
+
+fn is_progress_line(line: &str) -> bool {
+    (line.contains('%') && (line.contains('[') && line.contains(']')))
+        || line.contains(" eta ")
+        || line.contains(" it/s")
+        || line.contains(" bytes/s")
+        || line.contains("⠋")
+        || line.contains("⠙")
+        || line.contains("⠹")
+        || line.contains("⠸")
+}
+
+fn is_ansi_only_line(line: &str) -> bool {
+    if !line.contains('\u{1b}') {
+        return false;
+    }
+    !line.trim().is_empty() && strip_ansi_sequences(line).trim().is_empty()
+}
+
+fn strip_ansi_sequences(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            out.push(ch);
+            continue;
+        }
+
+        match chars.peek().copied() {
+            Some('[') => {
+                chars.next();
+                while let Some(next) = chars.next() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                chars.next();
+                while let Some(next) = chars.next() {
+                    if next == '\u{7}' {
+                        break;
+                    }
+                    if next == '\u{1b}' && chars.peek().copied() == Some('\\') {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    out
 }
 
 // =============================================================================
@@ -262,7 +668,7 @@ impl<S: SegmentStore, T: PaneTierSource> ScrollbackEvictor<S, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
 
     // ── Mock implementations ──────────────────────────────────────────
 
@@ -796,5 +1202,131 @@ mod tests {
                 total_segments,
             );
         }
+    }
+
+    // ── Importance-scoring tests ─────────────────────────────────────
+
+    #[test]
+    fn line_scoring_stays_in_range() {
+        let scorer = LineImportanceScorer::default();
+        let cases = [
+            "",
+            "\u{1b}[2K\u{1b}[1A",
+            "[##########] 100%",
+            "error: failed to compile crate",
+            "Using tool: Bash",
+            "test result: FAILED. 12 passed; 1 failed",
+        ];
+
+        for case in cases {
+            let score = scorer.score_line(case, None);
+            assert!(
+                (0.0..=1.0).contains(&score),
+                "score must be in [0,1], got {score} for case: {case:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn important_lines_outlive_low_value_lines() {
+        let config = ImportanceRetentionConfig {
+            byte_budget_per_pane: 60,
+            min_lines: 1,
+            max_lines: 100,
+            importance_threshold: 0.8,
+            oldest_window_fraction: 1.0,
+        };
+
+        let mut lines = VecDeque::from(vec![
+            ScrollbackLine::new("progress 10%", 0.10, 1),
+            ScrollbackLine::new("error: build failed", 0.95, 2),
+            ScrollbackLine::new("progress 20%", 0.15, 3),
+            ScrollbackLine::new("warning: unstable API", 0.85, 4),
+        ]);
+        let initial_bytes = total_line_bytes(&lines);
+        assert!(initial_bytes > config.byte_budget_per_pane);
+
+        let report = enforce_importance_budget(&mut lines, &config);
+        assert!(report.lines_removed > 0);
+
+        let has_error_line = lines.iter().any(|line| line.text.contains("error"));
+        let has_low_progress_line = lines
+            .iter()
+            .any(|line| line.text.contains("progress") && line.importance < 0.8);
+
+        assert!(has_error_line, "critical line should remain under pressure");
+        assert!(
+            !has_low_progress_line,
+            "low-value progress lines should be evicted first"
+        );
+    }
+
+    #[test]
+    fn threshold_floor_prefers_low_importance_victims() {
+        let config = ImportanceRetentionConfig {
+            byte_budget_per_pane: 32,
+            min_lines: 1,
+            max_lines: 100,
+            importance_threshold: 0.8,
+            oldest_window_fraction: 1.0,
+        };
+
+        let mut lines = VecDeque::from(vec![
+            ScrollbackLine::new("critical diagnostics", 0.95, 1),
+            ScrollbackLine::new("blank-ish", 0.05, 2),
+            ScrollbackLine::new("important summary", 0.9, 3),
+        ]);
+
+        let report = enforce_importance_budget(&mut lines, &config);
+        assert!(report.lines_removed >= 1);
+        assert!(
+            lines.iter().all(|line| line.importance >= 0.8),
+            "remaining lines should be high-importance once low lines are available to evict"
+        );
+    }
+
+    #[test]
+    fn select_eviction_scans_oldest_window() {
+        let config = ImportanceRetentionConfig {
+            byte_budget_per_pane: usize::MAX,
+            min_lines: 1,
+            max_lines: 100,
+            importance_threshold: 0.8,
+            oldest_window_fraction: 0.5,
+        };
+
+        let lines = VecDeque::from(vec![
+            ScrollbackLine::new("old/high", 0.9, 1),
+            ScrollbackLine::new("old/low", 0.1, 2),
+            ScrollbackLine::new("new/very-low", 0.01, 3),
+            ScrollbackLine::new("new/high", 0.95, 4),
+        ]);
+
+        let idx = select_importance_eviction_index(&lines, &config).unwrap();
+        assert_eq!(idx, 1, "victim should come from oldest half only");
+    }
+
+    #[test]
+    fn push_scrollback_line_scores_and_enforces() {
+        let scorer = LineImportanceScorer::default();
+        let config = ImportanceRetentionConfig {
+            byte_budget_per_pane: 24,
+            min_lines: 1,
+            max_lines: 2,
+            importance_threshold: 0.8,
+            oldest_window_fraction: 1.0,
+        };
+
+        let mut lines = VecDeque::new();
+        let (_s1, _r1) = push_scrollback_line(&mut lines, "progress 10%", 1, &scorer, &config);
+        let (_s2, _r2) = push_scrollback_line(&mut lines, "error: failed", 2, &scorer, &config);
+        let (_s3, report) = push_scrollback_line(&mut lines, "progress 20%", 3, &scorer, &config);
+
+        assert!(report.lines_removed >= 1);
+        assert!(lines.len() <= config.max_lines);
+        assert!(
+            lines.iter().any(|line| line.text.contains("error")),
+            "high-value line should be retained"
+        );
     }
 }

@@ -40,6 +40,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::error::{Result, StorageError};
 use crate::events::event_identity_key;
 use crate::policy::Redactor;
+use crate::search::{HybridSearchService, SearchMode};
 
 // =============================================================================
 // Schema Definition
@@ -50,7 +51,7 @@ use crate::policy::Redactor;
 /// This is the target version that new databases will be initialized to,
 /// and existing databases will be migrated to.
 /// Uses SQLite's PRAGMA user_version for atomic version tracking.
-pub const SCHEMA_VERSION: i32 = 22;
+pub const SCHEMA_VERSION: i32 = 23;
 
 /// Schema initialization SQL
 ///
@@ -116,6 +117,19 @@ CREATE TABLE IF NOT EXISTS output_segments (
 
 CREATE INDEX IF NOT EXISTS idx_segments_pane_seq ON output_segments(pane_id, seq);
 CREATE INDEX IF NOT EXISTS idx_segments_captured ON output_segments(captured_at);
+
+-- Segment embeddings for semantic search
+CREATE TABLE IF NOT EXISTS segment_embeddings (
+    segment_id INTEGER NOT NULL REFERENCES output_segments(id) ON DELETE CASCADE,
+    embedder_id TEXT NOT NULL,
+    dimension INTEGER NOT NULL,
+    vector BLOB NOT NULL,
+    embedded_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+    PRIMARY KEY (segment_id, embedder_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_segment_embeddings_embedder
+    ON segment_embeddings(embedder_id);
 
 -- Output gaps: explicit discontinuities in capture
 CREATE TABLE IF NOT EXISTS output_gaps (
@@ -1315,6 +1329,12 @@ static MIGRATIONS: &[Migration] = &[
         ",
         ),
     },
+    Migration {
+        version: 23,
+        description: "Repair segment embeddings schema for semantic retrieval",
+        up_sql: "",
+        down_sql: Some(""),
+    },
 ];
 
 // =============================================================================
@@ -1349,6 +1369,28 @@ pub struct CheckpointResult {
     pub optimized: bool,
 }
 
+/// SQLite page-level space usage, used for vacuum decisions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatabasePageStats {
+    /// Total number of pages in the database file.
+    pub page_count: i64,
+    /// Number of free pages currently on the freelist.
+    pub free_pages: i64,
+}
+
+impl DatabasePageStats {
+    /// Ratio of free pages to total pages, bounded to [0.0, 1.0].
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn free_ratio(&self) -> f64 {
+        if self.page_count <= 0 || self.free_pages <= 0 {
+            return 0.0;
+        }
+        let bounded_free = self.free_pages.min(self.page_count);
+        bounded_free as f64 / self.page_count as f64
+    }
+}
+
 /// Result of an FTS search query
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
@@ -1360,6 +1402,50 @@ pub struct SearchResult {
     pub highlight: Option<String>,
     /// BM25 relevance score (lower is more relevant)
     pub score: f64,
+}
+
+/// Semantic retrieval hit keyed by segment id.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SemanticSearchHit {
+    /// Matching segment id.
+    pub segment_id: i64,
+    /// Similarity score in [-1.0, 1.0] (cosine).
+    pub score: f64,
+}
+
+/// Hybrid retrieval hit with explainable ranking metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HybridSearchResult {
+    /// Segment result payload.
+    pub result: SearchResult,
+    /// Similarity score from semantic retrieval, when available.
+    #[serde(default)]
+    pub semantic_score: Option<f64>,
+    /// Lexical rank position (0-based), when available.
+    #[serde(default)]
+    pub lexical_rank: Option<usize>,
+    /// Semantic rank position (0-based), when available.
+    #[serde(default)]
+    pub semantic_rank: Option<usize>,
+    /// Fused rank position (0-based).
+    pub fusion_rank: usize,
+    /// Fused ranking score used for ordering.
+    pub fusion_score: f64,
+}
+
+/// Bundle returned by storage-level hybrid search.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HybridSearchBundle {
+    /// Search mode used for fusion.
+    pub mode: String,
+    /// RRF parameter used for fusion.
+    pub rrf_k: u32,
+    /// Number of lexical candidates considered.
+    pub lexical_candidates: usize,
+    /// Number of semantic candidates considered.
+    pub semantic_candidates: usize,
+    /// Final ranked results.
+    pub results: Vec<HybridSearchResult>,
 }
 
 /// Per-pane indexing statistics for observability.
@@ -3555,6 +3641,180 @@ fn ensure_workflow_step_log_columns(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn create_segment_embeddings_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r"
+        CREATE TABLE IF NOT EXISTS segment_embeddings (
+            segment_id INTEGER NOT NULL REFERENCES output_segments(id) ON DELETE CASCADE,
+            embedder_id TEXT NOT NULL,
+            dimension INTEGER NOT NULL,
+            vector BLOB NOT NULL,
+            embedded_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+            PRIMARY KEY (segment_id, embedder_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_segment_embeddings_embedder
+            ON segment_embeddings(embedder_id);
+        ",
+    )
+    .map_err(|e| {
+        StorageError::MigrationFailed(format!("Failed to create segment_embeddings table: {e}"))
+            .into()
+    })
+}
+
+fn segment_embeddings_table_is_canonical(conn: &Connection) -> Result<bool> {
+    if !table_exists(conn, "segment_embeddings")? {
+        return Ok(false);
+    }
+
+    let mut has_segment_id = false;
+    let mut has_embedder_id = false;
+    let mut has_dimension = false;
+    let mut has_vector = false;
+    let mut has_embedded_at = false;
+    let mut segment_pk: Option<i64> = None;
+    let mut embedder_pk: Option<i64> = None;
+
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(segment_embeddings)")
+        .map_err(|e| StorageError::MigrationFailed(format!("PRAGMA table_info failed: {e}")))?;
+    let mut rows = stmt
+        .query([])
+        .map_err(|e| StorageError::MigrationFailed(format!("Failed to query table_info: {e}")))?;
+
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| StorageError::MigrationFailed(format!("Failed to read table_info row: {e}")))?
+    {
+        let name: String = row.get(1).map_err(|e| {
+            StorageError::MigrationFailed(format!("table_info name read failed: {e}"))
+        })?;
+        let pk_pos: i64 = row.get(5).map_err(|e| {
+            StorageError::MigrationFailed(format!("table_info pk read failed: {e}"))
+        })?;
+
+        match name.as_str() {
+            "segment_id" => {
+                has_segment_id = true;
+                segment_pk = Some(pk_pos);
+            }
+            "embedder_id" => {
+                has_embedder_id = true;
+                embedder_pk = Some(pk_pos);
+            }
+            "dimension" => has_dimension = true,
+            "vector" => has_vector = true,
+            "embedded_at" => has_embedded_at = true,
+            _ => {}
+        }
+    }
+
+    let has_expected_columns =
+        has_segment_id && has_embedder_id && has_dimension && has_vector && has_embedded_at;
+    let has_expected_pk = segment_pk == Some(1) && embedder_pk == Some(2);
+    if !has_expected_columns || !has_expected_pk {
+        return Ok(false);
+    }
+
+    let mut fk_stmt = conn
+        .prepare("PRAGMA foreign_key_list(segment_embeddings)")
+        .map_err(|e| {
+            StorageError::MigrationFailed(format!("PRAGMA foreign_key_list failed: {e}"))
+        })?;
+    let mut fk_rows = fk_stmt.query([]).map_err(|e| {
+        StorageError::MigrationFailed(format!("Failed to query foreign_key_list: {e}"))
+    })?;
+
+    while let Some(row) = fk_rows.next().map_err(|e| {
+        StorageError::MigrationFailed(format!("Failed to read foreign_key_list row: {e}"))
+    })? {
+        let table: String = row.get(2).map_err(|e| {
+            StorageError::MigrationFailed(format!("foreign_key_list table read failed: {e}"))
+        })?;
+        let from_col: String = row.get(3).map_err(|e| {
+            StorageError::MigrationFailed(format!("foreign_key_list from read failed: {e}"))
+        })?;
+        let to_col: String = row.get(4).map_err(|e| {
+            StorageError::MigrationFailed(format!("foreign_key_list to read failed: {e}"))
+        })?;
+        let on_delete: String = row.get(6).map_err(|e| {
+            StorageError::MigrationFailed(format!("foreign_key_list on_delete read failed: {e}"))
+        })?;
+
+        if table == "output_segments"
+            && from_col == "segment_id"
+            && to_col == "id"
+            && on_delete.eq_ignore_ascii_case("CASCADE")
+        {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+fn ensure_segment_embeddings_schema(conn: &Connection) -> Result<()> {
+    if !table_exists(conn, "segment_embeddings")? {
+        return create_segment_embeddings_table(conn);
+    }
+
+    if segment_embeddings_table_is_canonical(conn)? {
+        return conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_segment_embeddings_embedder ON segment_embeddings(embedder_id);",
+        )
+        .map_err(|e| {
+            StorageError::MigrationFailed(format!(
+                "Failed to ensure segment_embeddings index exists: {e}"
+            ))
+            .into()
+        });
+    }
+
+    conn.execute_batch(
+        r"
+        DROP TABLE IF EXISTS segment_embeddings_legacy;
+        ALTER TABLE segment_embeddings RENAME TO segment_embeddings_legacy;
+        ",
+    )
+    .map_err(|e| {
+        StorageError::MigrationFailed(format!(
+            "Failed to stage legacy segment_embeddings table for rebuild: {e}"
+        ))
+    })?;
+
+    create_segment_embeddings_table(conn)?;
+
+    conn.execute(
+        r"
+        INSERT OR REPLACE INTO segment_embeddings (segment_id, embedder_id, dimension, vector, embedded_at)
+        SELECT legacy.segment_id,
+               legacy.embedder_id,
+               legacy.dimension,
+               legacy.vector,
+               COALESCE(legacy.embedded_at, strftime('%s', 'now'))
+        FROM segment_embeddings_legacy legacy
+        INNER JOIN output_segments seg ON seg.id = legacy.segment_id
+        WHERE legacy.embedder_id IS NOT NULL
+        ",
+        [],
+    )
+    .map_err(|e| {
+        StorageError::MigrationFailed(format!(
+            "Failed to migrate legacy segment_embeddings rows: {e}"
+        ))
+    })?;
+
+    conn.execute_batch("DROP TABLE IF EXISTS segment_embeddings_legacy;")
+        .map_err(|e| {
+            StorageError::MigrationFailed(format!(
+                "Failed to drop legacy segment_embeddings table: {e}"
+            ))
+        })?;
+
+    Ok(())
+}
+
 fn migration_for_version(version: i32) -> Option<&'static Migration> {
     MIGRATIONS.iter().find(|m| m.version == version)
 }
@@ -3669,6 +3929,9 @@ fn apply_migration_step(conn: &Connection, step: &MigrationStep) -> Result<()> {
             }
             if migration.version == 7 {
                 ensure_workflow_step_log_columns(conn)?;
+            }
+            if migration.version == 23 {
+                ensure_segment_embeddings_schema(conn)?;
             }
             if !migration.up_sql.is_empty() {
                 conn.execute_batch(migration.up_sql).map_err(|e| {
@@ -5624,6 +5887,19 @@ impl StorageHandle {
             .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
     }
 
+    /// Read SQLite page statistics used to decide whether VACUUM is worthwhile.
+    pub async fn database_page_stats(&self) -> Result<DatabasePageStats> {
+        let db_path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            database_page_stats_sync(&conn)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+    }
+
     /// Get per-pane indexing statistics (read-only, uses read connection).
     pub async fn get_pane_indexing_stats(&self) -> Result<Vec<PaneIndexingStats>> {
         let db_path = Arc::clone(&self.db_path);
@@ -6177,7 +6453,7 @@ impl StorageHandle {
 
             let mut stmt = conn
                 .prepare(
-                    "SELECT s.id FROM segments s
+                    "SELECT s.id FROM output_segments s
                      LEFT JOIN segment_embeddings se ON s.id = se.segment_id AND se.embedder_id = ?1
                      WHERE se.segment_id IS NULL
                      ORDER BY s.id ASC
@@ -6260,6 +6536,85 @@ impl StorageHandle {
                 .collect();
 
             Ok(stats)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+    }
+
+    /// Store an f32 embedding vector (little-endian packed) for a segment.
+    pub async fn store_embedding_f32(
+        &self,
+        segment_id: i64,
+        embedder_id: &str,
+        vector: &[f32],
+    ) -> Result<()> {
+        if vector.is_empty() {
+            return Err(
+                StorageError::Database("store_embedding_f32: vector is empty".to_string()).into(),
+            );
+        }
+        let bytes = encode_f32_embedding_blob(vector)?;
+        let dimension = i32::try_from(vector.len()).map_err(|_| {
+            StorageError::Database("store_embedding_f32: vector dimension exceeds i32".to_string())
+        })?;
+        self.store_embedding(segment_id, embedder_id, dimension, &bytes)
+            .await
+    }
+
+    /// Semantic retrieval over stored embeddings for a single embedder.
+    ///
+    /// Returns segment ids ranked by cosine similarity against `query_vector`.
+    pub async fn semantic_search(
+        &self,
+        embedder_id: &str,
+        query_vector: &[f32],
+        options: SearchOptions,
+    ) -> Result<Vec<SemanticSearchHit>> {
+        let db_path = Arc::clone(&self.db_path);
+        let embedder_id = embedder_id.to_string();
+        let query_vector = query_vector.to_vec();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            search_semantic_sync(&conn, &embedder_id, &query_vector, &options)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+    }
+
+    /// Hybrid lexical+semantic retrieval using deterministic fusion.
+    ///
+    /// This is a storage-level bridge between FTS lexical results and the
+    /// semantic retrieval lane, suitable for CLI/robot/MCP integration.
+    pub async fn hybrid_search_with_results(
+        &self,
+        query: &str,
+        options: SearchOptions,
+        embedder_id: &str,
+        query_vector: &[f32],
+        mode: SearchMode,
+        rrf_k: u32,
+    ) -> Result<HybridSearchBundle> {
+        let db_path = Arc::clone(&self.db_path);
+        let query = query.to_string();
+        let embedder_id = embedder_id.to_string();
+        let query_vector = query_vector.to_vec();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            hybrid_search_with_results_sync(
+                &conn,
+                &query,
+                &options,
+                &embedder_id,
+                &query_vector,
+                mode,
+                rrf_k,
+            )
         })
         .await
         .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
@@ -9406,6 +9761,20 @@ fn checkpoint_sync(conn: &Connection) -> Result<CheckpointResult> {
     })
 }
 
+fn database_page_stats_sync(conn: &Connection) -> Result<DatabasePageStats> {
+    let page_count: i64 = conn
+        .query_row("PRAGMA page_count", [], |row| row.get(0))
+        .map_err(|e| StorageError::Database(format!("PRAGMA page_count failed: {e}")))?;
+    let free_pages: i64 = conn
+        .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+        .map_err(|e| StorageError::Database(format!("PRAGMA freelist_count failed: {e}")))?;
+
+    Ok(DatabasePageStats {
+        page_count,
+        free_pages,
+    })
+}
+
 // =============================================================================
 // Usage Metrics Operations (Synchronous)
 // =============================================================================
@@ -10876,6 +11245,278 @@ fn search_fts_with_snippets(
     }
 
     Ok(results)
+}
+
+fn search_mode_label(mode: SearchMode) -> &'static str {
+    match mode {
+        SearchMode::Lexical => "lexical",
+        SearchMode::Semantic => "semantic",
+        SearchMode::Hybrid => "hybrid",
+    }
+}
+
+fn reciprocal_rank_score(rank: usize) -> f32 {
+    1.0 / (rank as f32 + 1.0)
+}
+
+fn encode_f32_embedding_blob(vector: &[f32]) -> Result<Vec<u8>> {
+    if vector.iter().any(|v| !v.is_finite()) {
+        return Err(StorageError::Database(
+            "Embedding vector contains non-finite values".to_string(),
+        )
+        .into());
+    }
+
+    let mut out = Vec::with_capacity(vector.len() * 4);
+    for value in vector {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    Ok(out)
+}
+
+fn decode_f32_embedding_blob(blob: &[u8], dimension: usize) -> Result<Vec<f32>> {
+    let expected_len = dimension
+        .checked_mul(4)
+        .ok_or_else(|| StorageError::Database("Embedding dimension overflow".to_string()))?;
+    if blob.len() != expected_len {
+        return Err(StorageError::Database(format!(
+            "Invalid embedding byte length: expected {expected_len}, got {}",
+            blob.len()
+        ))
+        .into());
+    }
+
+    let mut values = Vec::with_capacity(dimension);
+    for chunk in blob.chunks_exact(4) {
+        let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        if !value.is_finite() {
+            return Err(StorageError::Database(
+                "Embedding row contains non-finite values".to_string(),
+            )
+            .into());
+        }
+        values.push(value);
+    }
+    Ok(values)
+}
+
+fn cosine_similarity_f32(a: &[f32], b: &[f32]) -> Option<f32> {
+    if a.len() != b.len() || a.is_empty() {
+        return None;
+    }
+
+    let mut dot = 0.0f32;
+    let mut norm_a = 0.0f32;
+    let mut norm_b = 0.0f32;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+        norm_a += x * x;
+        norm_b += y * y;
+    }
+
+    let denom = norm_a.sqrt() * norm_b.sqrt();
+    if denom <= f32::EPSILON {
+        return None;
+    }
+    Some(dot / denom)
+}
+
+fn search_semantic_sync(
+    conn: &Connection,
+    embedder_id: &str,
+    query_vector: &[f32],
+    options: &SearchOptions,
+) -> Result<Vec<SemanticSearchHit>> {
+    if query_vector.is_empty() {
+        return Ok(Vec::new());
+    }
+    if query_vector.iter().any(|v| !v.is_finite()) {
+        return Err(
+            StorageError::Database("Query vector contains non-finite values".to_string()).into(),
+        );
+    }
+
+    let dimension = usize_to_i64(query_vector.len(), "query_vector dimension")?;
+    let limit = options.limit.unwrap_or(100);
+
+    let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> =
+        vec![Box::new(embedder_id.to_string()), Box::new(dimension)];
+    let mut sql = String::from(
+        "SELECT se.segment_id, se.vector
+         FROM segment_embeddings se
+         JOIN output_segments s ON s.id = se.segment_id
+         WHERE se.embedder_id = ?1
+           AND se.dimension = ?2",
+    );
+
+    if let Some(pane_id) = options.pane_id {
+        sql.push_str(" AND s.pane_id = ?");
+        params_vec.push(Box::new(u64_to_i64(pane_id, "pane_id")?));
+    }
+    if let Some(since) = options.since {
+        sql.push_str(" AND s.captured_at >= ?");
+        params_vec.push(Box::new(since));
+    }
+    if let Some(until) = options.until {
+        sql.push_str(" AND s.captured_at <= ?");
+        params_vec.push(Box::new(until));
+    }
+
+    // Stable base order before similarity sort.
+    sql.push_str(" ORDER BY s.id ASC");
+
+    let params_refs: Vec<&dyn rusqlite::ToSql> =
+        params_vec.iter().map(std::convert::AsRef::as_ref).collect();
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| StorageError::Database(format!("semantic_search prepare failed: {e}")))?;
+
+    let rows = stmt
+        .query_map(params_refs.as_slice(), |row| {
+            let segment_id: i64 = row.get(0)?;
+            let vector_blob: Vec<u8> = row.get(1)?;
+            Ok((segment_id, vector_blob))
+        })
+        .map_err(|e| StorageError::Database(format!("semantic_search query failed: {e}")))?;
+
+    let mut hits = Vec::new();
+    for row in rows {
+        let (segment_id, vector_blob) =
+            row.map_err(|e| StorageError::Database(format!("semantic_search row error: {e}")))?;
+        let candidate = decode_f32_embedding_blob(&vector_blob, query_vector.len())?;
+        let Some(score) = cosine_similarity_f32(query_vector, &candidate) else {
+            continue;
+        };
+        hits.push(SemanticSearchHit {
+            segment_id,
+            score: f64::from(score),
+        });
+    }
+
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.segment_id.cmp(&b.segment_id))
+    });
+    hits.truncate(limit);
+    Ok(hits)
+}
+
+fn hybrid_search_with_results_sync(
+    conn: &Connection,
+    query: &str,
+    options: &SearchOptions,
+    embedder_id: &str,
+    query_vector: &[f32],
+    mode: SearchMode,
+    rrf_k: u32,
+) -> Result<HybridSearchBundle> {
+    let top_k = options.limit.unwrap_or(100);
+
+    let semantic_hits = if query_vector.is_empty() || query_vector.iter().any(|v| !v.is_finite()) {
+        Vec::new()
+    } else {
+        search_semantic_sync(conn, embedder_id, query_vector, options)?
+    };
+    let effective_mode = if semantic_hits.is_empty() && matches!(mode, SearchMode::Hybrid) {
+        SearchMode::Lexical
+    } else {
+        mode
+    };
+
+    let mut lexical_options = options.clone();
+    lexical_options.limit = Some(top_k.saturating_mul(4).max(top_k));
+    let lexical_results = if matches!(effective_mode, SearchMode::Semantic) {
+        Vec::new()
+    } else {
+        search_fts_with_snippets(conn, query, &lexical_options)?
+    };
+
+    let lexical_ranked: Vec<(u64, f32)> = lexical_results
+        .iter()
+        .enumerate()
+        .filter_map(|(rank, row)| {
+            u64::try_from(row.segment.id)
+                .ok()
+                .map(|id| (id, reciprocal_rank_score(rank)))
+        })
+        .collect();
+    let semantic_ranked: Vec<(u64, f32)> = semantic_hits
+        .iter()
+        .enumerate()
+        .filter_map(|(rank, hit)| {
+            u64::try_from(hit.segment_id)
+                .ok()
+                .map(|id| (id, reciprocal_rank_score(rank)))
+        })
+        .collect();
+
+    let mut fused = HybridSearchService::new()
+        .with_mode(effective_mode)
+        .with_rrf_k(rrf_k)
+        .fuse(&lexical_ranked, &semantic_ranked, top_k);
+    // Make tie behavior deterministic despite internal HashMap aggregation.
+    fused.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+
+    let mut lexical_by_id: std::collections::HashMap<i64, (usize, SearchResult)> =
+        std::collections::HashMap::with_capacity(lexical_results.len());
+    for (rank, row) in lexical_results.into_iter().enumerate() {
+        lexical_by_id.insert(row.segment.id, (rank, row));
+    }
+
+    let mut semantic_by_id: std::collections::HashMap<i64, (usize, f64)> =
+        std::collections::HashMap::with_capacity(semantic_hits.len());
+    for (rank, hit) in semantic_hits.into_iter().enumerate() {
+        semantic_by_id.insert(hit.segment_id, (rank, hit.score));
+    }
+
+    let mut results = Vec::with_capacity(fused.len());
+    for (fusion_rank, item) in fused.into_iter().enumerate() {
+        let segment_id = match i64::try_from(item.id) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let search_result = if let Some((_, row)) = lexical_by_id.get(&segment_id) {
+            row.clone()
+        } else if let Some(segment) = query_segment_by_id(conn, segment_id)? {
+            SearchResult {
+                segment,
+                snippet: None,
+                highlight: None,
+                score: 0.0,
+            }
+        } else {
+            continue;
+        };
+
+        let semantic_score = semantic_by_id.get(&segment_id).map(|(_, score)| *score);
+        let lexical_rank = lexical_by_id.get(&segment_id).map(|(rank, _)| *rank);
+        let semantic_rank = semantic_by_id.get(&segment_id).map(|(rank, _)| *rank);
+
+        results.push(HybridSearchResult {
+            result: search_result,
+            semantic_score,
+            lexical_rank,
+            semantic_rank,
+            fusion_rank,
+            fusion_score: f64::from(item.score),
+        });
+    }
+
+    Ok(HybridSearchBundle {
+        mode: search_mode_label(effective_mode).to_string(),
+        rrf_k,
+        lexical_candidates: lexical_ranked.len(),
+        semantic_candidates: semantic_ranked.len(),
+        results,
+    })
 }
 
 // =============================================================================
@@ -12775,6 +13416,44 @@ fn query_segments(conn: &Connection, pane_id: u64, limit: usize) -> Result<Vec<S
     Ok(results)
 }
 
+#[allow(clippy::cast_sign_loss)]
+fn query_segment_by_id(conn: &Connection, segment_id: i64) -> Result<Option<Segment>> {
+    conn.query_row(
+        "SELECT id, pane_id, seq, content, content_len, content_hash, captured_at
+         FROM output_segments
+         WHERE id = ?1",
+        [segment_id],
+        |row| {
+            Ok(Segment {
+                id: row.get(0)?,
+                pane_id: {
+                    let val: i64 = row.get(1)?;
+                    #[allow(clippy::cast_sign_loss)]
+                    {
+                        val as u64
+                    }
+                },
+                seq: {
+                    let val: i64 = row.get(2)?;
+                    #[allow(clippy::cast_sign_loss)]
+                    {
+                        val as u64
+                    }
+                },
+                content: row.get(3)?,
+                content_len: {
+                    let val: i64 = row.get(4)?;
+                    i64_to_usize(val)?
+                },
+                content_hash: row.get(5)?,
+                captured_at: row.get(6)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|e| StorageError::Database(format!("query_segment_by_id failed: {e}")).into())
+}
+
 /// Query workflow by ID
 #[allow(clippy::cast_sign_loss)]
 fn query_workflow(conn: &Connection, workflow_id: &str) -> Result<Option<WorkflowRecord>> {
@@ -13553,6 +14232,7 @@ mod tests {
             "schema_version",
             "panes",
             "output_segments",
+            "segment_embeddings",
             "output_gaps",
             "events",
             "event_labels",
@@ -13578,6 +14258,45 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 1, "Table {table} should exist");
         }
+    }
+
+    #[test]
+    fn segment_embeddings_schema_is_canonical_after_init() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        assert!(segment_embeddings_table_is_canonical(&conn).unwrap());
+
+        conn.execute(
+            "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![1i64, "local", 1_700_000_000_000i64, 1_700_000_000_000i64, 1],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO output_segments (id, pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![1i64, 1i64, 0i64, "segment", 7i64, 1_700_000_000_000i64],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO segment_embeddings (segment_id, embedder_id, dimension, vector, embedded_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![1i64, "hash", 8i64, vec![1u8, 2u8], 1_700_000_000i64],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO segment_embeddings (segment_id, embedder_id, dimension, vector, embedded_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![1i64, "quality", 8i64, vec![3u8, 4u8], 1_700_000_001i64],
+        )
+        .unwrap();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM segment_embeddings WHERE segment_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
     }
 
     // =========================================================================
@@ -17788,6 +18507,200 @@ mod storage_handle_tests {
     }
 
     #[tokio::test]
+    async fn storage_handle_embedding_roundtrip_and_unembedded_query() {
+        let db_path = temp_db_path();
+        let handle: StorageHandle = StorageHandle::new(&db_path).await.unwrap();
+
+        handle.upsert_pane(test_pane(1)).await.unwrap();
+
+        let seg1 = handle.append_segment(1, "first", None).await.unwrap();
+        let seg2 = handle.append_segment(1, "second", None).await.unwrap();
+
+        handle
+            .store_embedding(seg1.id, "hash", 2, &[1u8, 2u8])
+            .await
+            .unwrap();
+        handle
+            .store_embedding(seg1.id, "quality", 2, &[3u8, 4u8])
+            .await
+            .unwrap();
+
+        let hash_vec = handle
+            .get_embedding(seg1.id, "hash")
+            .await
+            .unwrap()
+            .unwrap();
+        let quality_vec = handle
+            .get_embedding(seg1.id, "quality")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(hash_vec, vec![1u8, 2u8]);
+        assert_eq!(quality_vec, vec![3u8, 4u8]);
+
+        let unembedded_hash = handle.get_unembedded_segments("hash", 10).await.unwrap();
+        assert!(unembedded_hash.contains(&seg2.id));
+        assert!(!unembedded_hash.contains(&seg1.id));
+
+        let stats = handle.embedding_stats().await.unwrap();
+        assert!(
+            stats
+                .iter()
+                .any(|s| s.embedder_id == "hash" && s.count == 1 && s.dimension == 2)
+        );
+        assert!(
+            stats
+                .iter()
+                .any(|s| s.embedder_id == "quality" && s.count == 1 && s.dimension == 2)
+        );
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn storage_handle_semantic_search_ranks_and_respects_filters() {
+        let db_path = temp_db_path();
+        let handle: StorageHandle = StorageHandle::new(&db_path).await.unwrap();
+
+        handle.upsert_pane(test_pane(1)).await.unwrap();
+        handle.upsert_pane(test_pane(2)).await.unwrap();
+
+        let seg_a = handle
+            .append_segment(1, "alpha output", None)
+            .await
+            .unwrap();
+        let seg_b = handle.append_segment(1, "beta output", None).await.unwrap();
+        let seg_c = handle
+            .append_segment(2, "gamma output", None)
+            .await
+            .unwrap();
+
+        handle
+            .store_embedding_f32(seg_a.id, "hash", &[1.0, 0.0])
+            .await
+            .unwrap();
+        handle
+            .store_embedding_f32(seg_b.id, "hash", &[0.9, 0.1])
+            .await
+            .unwrap();
+        handle
+            .store_embedding_f32(seg_c.id, "hash", &[-1.0, 0.0])
+            .await
+            .unwrap();
+
+        let options = SearchOptions {
+            limit: Some(10),
+            ..SearchOptions::default()
+        };
+        let hits = handle
+            .semantic_search("hash", &[1.0, 0.0], options.clone())
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0].segment_id, seg_a.id);
+        assert!(hits[0].score >= hits[1].score);
+        assert!(hits[1].score >= hits[2].score);
+
+        let pane_hits = handle
+            .semantic_search(
+                "hash",
+                &[1.0, 0.0],
+                SearchOptions {
+                    pane_id: Some(1),
+                    ..options
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(pane_hits.len(), 2);
+        assert!(pane_hits.iter().all(|hit| hit.segment_id != seg_c.id));
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn storage_handle_hybrid_search_blends_lexical_and_semantic() {
+        let db_path = temp_db_path();
+        let handle: StorageHandle = StorageHandle::new(&db_path).await.unwrap();
+
+        handle.upsert_pane(test_pane(1)).await.unwrap();
+
+        let seg_lexical_only = handle
+            .append_segment(1, "needle appears in lexical lane", None)
+            .await
+            .unwrap();
+        let seg_both = handle
+            .append_segment(1, "needle appears in both lanes", None)
+            .await
+            .unwrap();
+        let seg_semantic_only = handle
+            .append_segment(1, "totally different wording", None)
+            .await
+            .unwrap();
+
+        // Keep one lexical-only segment unembedded to verify fallback behavior.
+        handle
+            .store_embedding_f32(seg_both.id, "hash", &[0.9, 0.1])
+            .await
+            .unwrap();
+        handle
+            .store_embedding_f32(seg_semantic_only.id, "hash", &[1.0, 0.0])
+            .await
+            .unwrap();
+
+        let bundle = handle
+            .hybrid_search_with_results(
+                "needle",
+                SearchOptions {
+                    limit: Some(3),
+                    include_snippets: Some(false),
+                    ..SearchOptions::default()
+                },
+                "hash",
+                &[1.0, 0.0],
+                crate::search::SearchMode::Hybrid,
+                60,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(bundle.mode, "hybrid");
+        assert_eq!(bundle.rrf_k, 60);
+        assert!(bundle.lexical_candidates >= 2);
+        assert!(bundle.semantic_candidates >= 2);
+        assert!(!bundle.results.is_empty());
+
+        for (idx, hit) in bundle.results.iter().enumerate() {
+            assert_eq!(hit.fusion_rank, idx);
+        }
+
+        let ids: Vec<i64> = bundle.results.iter().map(|h| h.result.segment.id).collect();
+        assert!(ids.contains(&seg_lexical_only.id));
+        assert!(ids.contains(&seg_semantic_only.id));
+
+        let lexical_only_hit = bundle
+            .results
+            .iter()
+            .find(|h| h.result.segment.id == seg_lexical_only.id)
+            .unwrap();
+        assert!(lexical_only_hit.lexical_rank.is_some());
+        assert!(lexical_only_hit.semantic_score.is_none());
+
+        let semantic_only_hit = bundle
+            .results
+            .iter()
+            .find(|h| h.result.segment.id == seg_semantic_only.id)
+            .unwrap();
+        assert!(semantic_only_hit.semantic_score.is_some());
+        assert!(semantic_only_hit.lexical_rank.is_none());
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
     async fn storage_handle_records_usage_metrics_batch() {
         let db_path = temp_db_path();
         let handle: StorageHandle = StorageHandle::new(&db_path).await.unwrap();
@@ -18852,7 +19765,7 @@ mod queue_depth_tests {
 
         // After all writes complete, depth should return to 0
         // (give writer a moment to drain)
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        crate::runtime_compat::sleep(std::time::Duration::from_millis(50)).await;
         let final_depth = handle.write_queue_depth();
         assert_eq!(
             final_depth, 0,
@@ -18911,7 +19824,7 @@ mod queue_depth_tests {
                 depth <= cap,
                 "Queue depth ({depth}) exceeded capacity ({cap})"
             );
-            tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+            crate::runtime_compat::sleep(std::time::Duration::from_millis(5)).await;
         }
 
         // Wait for all writes
@@ -18989,7 +19902,7 @@ mod backpressure_integration_tests {
         // - Create a tiny channel (capacity 2)
         // - Fill it up
         // - Verify send times out (reserve with timeout)
-        use tokio::time::{Duration, timeout};
+        use std::time::Duration;
 
         let (tx, _rx) = mpsc::channel::<u8>(2);
 
@@ -18998,7 +19911,7 @@ mod backpressure_integration_tests {
         tx.send(2).await.unwrap();
 
         // Channel is full — reserve should time out
-        let result = timeout(Duration::from_millis(50), tx.reserve()).await;
+        let result = crate::runtime_compat::timeout(Duration::from_millis(50), tx.reserve()).await;
         assert!(result.is_err(), "Should timeout when channel is full");
 
         // Verify depth
@@ -19008,7 +19921,7 @@ mod backpressure_integration_tests {
 
     #[tokio::test]
     async fn capture_channel_drains_when_consumer_resumes() {
-        use tokio::time::Duration;
+        use std::time::Duration;
 
         let (tx, mut rx) = mpsc::channel::<u8>(4);
 
@@ -19026,7 +19939,7 @@ mod backpressure_integration_tests {
         rx.recv().await.unwrap();
 
         // Small yield for channel state to update
-        tokio::time::sleep(Duration::from_millis(1)).await;
+        crate::runtime_compat::sleep(Duration::from_millis(1)).await;
 
         let depth_after = tx.max_capacity() - tx.capacity();
         assert_eq!(depth_after, 0, "Queue should drain when consumer resumes");
@@ -19072,7 +19985,7 @@ mod backpressure_integration_tests {
         }
 
         // Use a timeout to detect deadlocks
-        let result = tokio::time::timeout(tokio::time::Duration::from_secs(10), async {
+        let result = crate::runtime_compat::timeout(std::time::Duration::from_secs(10), async {
             for jh in handles {
                 jh.await.unwrap();
             }
@@ -21377,6 +22290,122 @@ mod timeline_correlation_tests {
         assert!(!table_exists(&conn, "mux_pane_state").unwrap());
 
         assert_eq!(get_user_version(&conn).unwrap(), 20);
+    }
+
+    /// Helper: create a v22 database with the legacy segment_embeddings schema.
+    fn create_v22_database_with_legacy_embeddings() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")
+            .unwrap();
+
+        conn.execute_batch(
+            r"
+            CREATE TABLE schema_version (
+                version INTEGER NOT NULL,
+                applied_at INTEGER NOT NULL,
+                description TEXT
+            );
+            CREATE TABLE ft_meta (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                schema_version INTEGER NOT NULL,
+                min_compatible_ft TEXT NOT NULL,
+                created_by_ft TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE TABLE panes (
+                pane_id INTEGER PRIMARY KEY,
+                domain TEXT NOT NULL DEFAULT 'local',
+                first_seen_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL,
+                observed INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE output_segments (
+                id INTEGER PRIMARY KEY,
+                pane_id INTEGER NOT NULL REFERENCES panes(pane_id) ON DELETE CASCADE,
+                seq INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                content_len INTEGER NOT NULL,
+                captured_at INTEGER NOT NULL
+            );
+            -- Legacy parent table referenced by migration v22
+            CREATE TABLE segments (
+                id INTEGER PRIMARY KEY
+            );
+            CREATE TABLE segment_embeddings (
+                segment_id INTEGER PRIMARY KEY REFERENCES segments(id) ON DELETE CASCADE,
+                embedder_id TEXT NOT NULL,
+                dimension INTEGER NOT NULL,
+                vector BLOB NOT NULL,
+                embedded_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+            );
+            CREATE INDEX idx_segment_embeddings_embedder ON segment_embeddings(embedder_id);
+
+            INSERT INTO schema_version (version, applied_at, description)
+                VALUES (22, 1700000000000, 'test v22');
+            INSERT INTO ft_meta (id, schema_version, min_compatible_ft, created_by_ft, created_at)
+                VALUES (1, 22, '0.1.0', '0.1.0', 1700000000000);
+            INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed)
+                VALUES (1, 'local', 1700000000000, 1700000000000, 1);
+            INSERT INTO output_segments (id, pane_id, seq, content, content_len, captured_at)
+                VALUES (1, 1, 0, 'legacy segment', 14, 1700000000000);
+            INSERT INTO segments (id) VALUES (1);
+            INSERT INTO segment_embeddings (segment_id, embedder_id, dimension, vector, embedded_at)
+                VALUES (1, 'hash', 8, X'0102', 1700000000);
+            PRAGMA user_version = 22;
+            ",
+        )
+        .unwrap();
+
+        conn
+    }
+
+    #[test]
+    fn migrate_v22_to_v23_repairs_segment_embeddings_schema() {
+        let conn = create_v22_database_with_legacy_embeddings();
+        let plan = build_migration_plan(22, 23).unwrap();
+        assert_eq!(plan.steps.len(), 1);
+        assert_eq!(plan.steps[0].migration_version, 23);
+
+        apply_migration_plan(&conn, &plan).unwrap();
+
+        assert_eq!(get_user_version(&conn).unwrap(), 23);
+        assert!(segment_embeddings_table_is_canonical(&conn).unwrap());
+
+        let migrated_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM segment_embeddings", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(migrated_count, 1);
+
+        let (embedder_id, vector): (String, Vec<u8>) = conn
+            .query_row(
+                "SELECT embedder_id, vector FROM segment_embeddings WHERE segment_id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(embedder_id, "hash");
+        assert_eq!(vector, vec![1u8, 2u8]);
+    }
+
+    #[test]
+    fn migrate_v22_to_v23_creates_embeddings_table_when_missing() {
+        let conn = create_v22_database_with_legacy_embeddings();
+        conn.execute_batch(
+            r"
+            DROP INDEX IF EXISTS idx_segment_embeddings_embedder;
+            DROP TABLE IF EXISTS segment_embeddings;
+            ",
+        )
+        .unwrap();
+
+        let plan = build_migration_plan(22, 23).unwrap();
+        apply_migration_plan(&conn, &plan).unwrap();
+
+        assert_eq!(get_user_version(&conn).unwrap(), 23);
+        assert!(table_exists(&conn, "segment_embeddings").unwrap());
+        assert!(segment_embeddings_table_is_canonical(&conn).unwrap());
     }
 }
 

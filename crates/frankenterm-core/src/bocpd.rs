@@ -353,30 +353,31 @@ impl OutputFeatures {
     #[must_use]
     pub fn compute(text: &str, elapsed: std::time::Duration) -> Self {
         let elapsed_secs = elapsed.as_secs_f64().max(0.001);
-        let lines: Vec<&str> = text.lines().collect();
-        let line_count = lines.len();
-        let byte_count = text.len();
+        let bytes = text.as_bytes();
+        let byte_count = bytes.len();
+        let scan = crate::simd_scan::scan_newlines_and_ansi(bytes);
+        let line_count = scan.logical_line_count(bytes);
 
         // Output and byte rates
         let output_rate = line_count as f64 / elapsed_secs;
         let byte_rate = byte_count as f64 / elapsed_secs;
 
         // Shannon entropy of byte distribution
-        let entropy = compute_entropy(text.as_bytes());
+        let entropy = compute_entropy(bytes);
 
         // Unique line ratio
         let unique_line_ratio = if line_count == 0 {
             1.0
         } else {
             let mut unique = std::collections::HashSet::new();
-            for line in &lines {
-                unique.insert(*line);
+            for line in text.lines() {
+                unique.insert(line);
             }
             unique.len() as f64 / line_count as f64
         };
 
         // ANSI escape sequence density
-        let ansi_density = compute_ansi_density(text.as_bytes());
+        let ansi_density = scan.ansi_density(byte_count);
 
         OutputFeatures {
             output_rate,
@@ -658,31 +659,6 @@ fn compute_entropy(data: &[u8]) -> f64 {
         }
     }
     entropy
-}
-
-/// Fraction of bytes that are part of ANSI escape sequences.
-fn compute_ansi_density(data: &[u8]) -> f64 {
-    if data.is_empty() {
-        return 0.0;
-    }
-
-    let mut ansi_bytes = 0usize;
-    let mut in_escape = false;
-
-    for &b in data {
-        if b == 0x1b {
-            in_escape = true;
-            ansi_bytes += 1;
-        } else if in_escape {
-            ansi_bytes += 1;
-            // CSI sequences end with a letter (0x40–0x7E)
-            if (0x40..=0x7E).contains(&b) && b != b'[' {
-                in_escape = false;
-            }
-        }
-    }
-
-    ansi_bytes as f64 / data.len() as f64
 }
 
 // =============================================================================
@@ -1086,7 +1062,9 @@ mod tests {
 
     #[test]
     fn ansi_density_zero_for_plain() {
-        let d = compute_ansi_density(b"hello world");
+        let text = b"hello world";
+        let scan = crate::simd_scan::scan_newlines_and_ansi(text);
+        let d = scan.ansi_density(text.len());
         assert_eq!(d, 0.0);
     }
 

@@ -43,6 +43,7 @@ pub mod renderable;
 pub mod ssh;
 pub mod ssh_agent;
 pub mod tab;
+mod terminfo_renderer;
 pub mod termwiztermtab;
 pub mod tmux;
 pub mod tmux_commands;

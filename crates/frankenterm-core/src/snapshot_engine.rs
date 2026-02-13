@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -30,6 +30,7 @@ use tokio::sync::mpsc;
 use crate::agent_correlator::AgentCorrelator;
 use crate::config::{SnapshotConfig, SnapshotSchedulingMode};
 use crate::patterns::{AgentType, Detection, Severity};
+use crate::runtime_compat::sleep;
 use crate::session_pane_state::PaneStateSnapshot;
 use crate::session_topology::TopologySnapshot;
 use crate::wezterm::PaneInfo;
@@ -391,25 +392,27 @@ impl SnapshotEngine {
         match self.config.scheduling.mode {
             SnapshotSchedulingMode::Periodic => {
                 let interval_secs = self.config.interval_seconds.max(30);
-                let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+                let interval = Duration::from_secs(interval_secs);
                 let mut is_first = true;
 
                 loop {
-                    tokio::select! {
-                        _ = interval.tick() => {
-                            let trigger = if is_first {
-                                is_first = false;
-                                SnapshotTrigger::Startup
-                            } else {
-                                SnapshotTrigger::Periodic
-                            };
-                            let _ = self.capture_from_provider(&pane_provider, trigger).await;
-                        }
-                        _ = shutdown.changed() => {
-                            tracing::info!("snapshot engine shutting down");
-                            break;
+                    if !is_first {
+                        tokio::select! {
+                            () = sleep(interval) => {}
+                            _ = shutdown.changed() => {
+                                tracing::info!("snapshot engine shutting down");
+                                break;
+                            }
                         }
                     }
+
+                    let trigger = if is_first {
+                        is_first = false;
+                        SnapshotTrigger::Startup
+                    } else {
+                        SnapshotTrigger::Periodic
+                    };
+                    let _ = self.capture_from_provider(&pane_provider, trigger).await;
                 }
             }
             SnapshotSchedulingMode::Intelligent => {
@@ -438,14 +441,14 @@ impl SnapshotEngine {
                     .periodic_fallback_minutes
                     .max(1)
                     .saturating_mul(60);
-                let mut fallback = tokio::time::interval(Duration::from_secs(fallback_secs));
-                fallback.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                let _ = fallback.tick().await; // consume immediate first tick
+                let fallback_interval = Duration::from_secs(fallback_secs);
+                let mut next_fallback_at = Instant::now() + fallback_interval;
 
                 let mut accumulated_value = 0.0_f64;
                 let snapshot_threshold = self.config.scheduling.snapshot_threshold.max(0.0);
 
                 loop {
+                    let fallback_wait = next_fallback_at.saturating_duration_since(Instant::now());
                     tokio::select! {
                         maybe_trigger = trigger_rx.recv() => {
                             let Some(trigger) = maybe_trigger else {
@@ -472,7 +475,7 @@ impl SnapshotEngine {
                                 }
                             }
                         }
-                        _ = fallback.tick() => {
+                        () = sleep(fallback_wait) => {
                             let captured = self
                                 .capture_from_provider(
                                     &pane_provider,
@@ -482,6 +485,7 @@ impl SnapshotEngine {
                             if captured {
                                 accumulated_value = 0.0;
                             }
+                            next_fallback_at = Instant::now() + fallback_interval;
                         }
                         _ = shutdown.changed() => {
                             tracing::info!("snapshot engine shutting down");
@@ -541,7 +545,7 @@ impl SnapshotEngine {
         panes: &[PaneInfo],
         timeout: Duration,
     ) -> std::result::Result<Option<SnapshotResult>, SnapshotError> {
-        let result = tokio::time::timeout(timeout, async {
+        let result = crate::runtime_compat::timeout(timeout, async {
             let capture_result = self.capture(panes, SnapshotTrigger::Shutdown).await;
             if let Err(e) = self.mark_shutdown().await {
                 tracing::warn!(error = %e, "Failed to mark session as clean shutdown");
@@ -941,6 +945,7 @@ fn cleanup_sync(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_compat::{sleep, timeout};
     use crate::wezterm::PaneSize;
 
     fn make_test_pane(id: u64, rows: u32, cols: u32) -> PaneInfo {
@@ -1355,17 +1360,17 @@ mod tests {
             e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
         });
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(100)).await;
         let after_startup = checkpoint_count(db_path.as_str());
         assert_eq!(after_startup, 1, "startup capture");
 
         // Sum = 4.0 < threshold(5.0)
         engine.emit_trigger(SnapshotTrigger::WorkCompleted); // +2.0
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(50)).await;
         engine.emit_trigger(SnapshotTrigger::StateTransition); // +1.0
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(50)).await;
         engine.emit_trigger(SnapshotTrigger::StateTransition); // +1.0 = 4.0
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(100)).await;
 
         let after_below = checkpoint_count(db_path.as_str());
         assert_eq!(after_below, 1, "below threshold: no new capture");
@@ -1388,15 +1393,15 @@ mod tests {
             e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
         });
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(100)).await;
 
         // 3 x WorkCompleted = 6.0 >= 5.0
         engine.emit_trigger(SnapshotTrigger::WorkCompleted);
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        sleep(Duration::from_millis(30)).await;
         engine.emit_trigger(SnapshotTrigger::WorkCompleted);
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        sleep(Duration::from_millis(30)).await;
         engine.emit_trigger(SnapshotTrigger::WorkCompleted);
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        sleep(Duration::from_millis(200)).await;
 
         let count = checkpoint_count(db_path.as_str());
         assert_eq!(count, 2, "startup + threshold capture");
@@ -1419,10 +1424,10 @@ mod tests {
             e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
         });
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(100)).await;
 
         engine.emit_trigger(SnapshotTrigger::HazardThreshold);
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        sleep(Duration::from_millis(200)).await;
 
         let count = checkpoint_count(db_path.as_str());
         assert_eq!(count, 2, "startup + immediate HazardThreshold");
@@ -1445,10 +1450,10 @@ mod tests {
             e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
         });
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(100)).await;
 
         engine.emit_trigger(SnapshotTrigger::MemoryPressure);
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        sleep(Duration::from_millis(200)).await;
 
         let count = checkpoint_count(db_path.as_str());
         assert_eq!(count, 2, "startup + immediate MemoryPressure");
@@ -1471,14 +1476,14 @@ mod tests {
             e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
         });
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(100)).await;
 
         // First batch: 3 x 2.0 = 6.0 >= 5.0 → capture + reset
         for _ in 0..3 {
             engine.emit_trigger(SnapshotTrigger::WorkCompleted);
-            tokio::time::sleep(Duration::from_millis(30)).await;
+            sleep(Duration::from_millis(30)).await;
         }
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        sleep(Duration::from_millis(150)).await;
         assert_eq!(
             checkpoint_count(db_path.as_str()),
             2,
@@ -1487,9 +1492,9 @@ mod tests {
 
         // Second batch: 2 x 2.0 = 4.0 < 5.0 (reset happened)
         engine.emit_trigger(SnapshotTrigger::WorkCompleted);
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        sleep(Duration::from_millis(30)).await;
         engine.emit_trigger(SnapshotTrigger::WorkCompleted);
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        sleep(Duration::from_millis(150)).await;
         assert_eq!(
             checkpoint_count(db_path.as_str()),
             2,
@@ -1498,7 +1503,7 @@ mod tests {
 
         // Third trigger crosses again: 4.0 + 2.0 = 6.0
         engine.emit_trigger(SnapshotTrigger::WorkCompleted);
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        sleep(Duration::from_millis(200)).await;
         assert_eq!(
             checkpoint_count(db_path.as_str()),
             3,
@@ -1523,10 +1528,10 @@ mod tests {
             e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
         });
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(100)).await;
         shutdown_tx.send(true).unwrap();
 
-        let result = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        let result = timeout(Duration::from_secs(5), handle).await;
         assert!(result.is_ok(), "run_periodic exits on shutdown");
     }
 
@@ -1544,12 +1549,12 @@ mod tests {
             e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
         });
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(100)).await;
 
         engine.emit_trigger(SnapshotTrigger::WorkCompleted);
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(100)).await;
         engine.emit_trigger(SnapshotTrigger::StateTransition);
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(100)).await;
 
         let count = checkpoint_count(db_path.as_str());
         assert_eq!(count, 3, "startup + 2 captures (zero threshold)");
@@ -1577,11 +1582,11 @@ mod tests {
             e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
         });
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(100)).await;
 
         engine.emit_trigger(SnapshotTrigger::HazardThreshold);
         engine.emit_trigger(SnapshotTrigger::WorkCompleted);
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        sleep(Duration::from_millis(200)).await;
 
         let count = checkpoint_count(db_path.as_str());
         assert_eq!(count, 1, "periodic mode: only startup");
@@ -1633,17 +1638,17 @@ mod tests {
             e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
         });
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(100)).await;
         let after_startup = checkpoint_count(db_path.as_str());
         assert_eq!(after_startup, 1, "startup capture");
 
         // Accumulate 2.0 < 5.0 threshold
         engine.emit_trigger(SnapshotTrigger::WorkCompleted); // +2.0
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(50)).await;
 
         // HazardThreshold is immediate — captures + resets accumulator
         engine.emit_trigger(SnapshotTrigger::HazardThreshold);
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        sleep(Duration::from_millis(200)).await;
         assert_eq!(
             checkpoint_count(db_path.as_str()),
             2,
@@ -1652,9 +1657,9 @@ mod tests {
 
         // After reset: 2 x WorkCompleted = 4.0 < 5.0 — no capture
         engine.emit_trigger(SnapshotTrigger::WorkCompleted); // +2.0
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        sleep(Duration::from_millis(30)).await;
         engine.emit_trigger(SnapshotTrigger::WorkCompleted); // +2.0 = 4.0
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        sleep(Duration::from_millis(200)).await;
         assert_eq!(
             checkpoint_count(db_path.as_str()),
             2,
@@ -1663,7 +1668,7 @@ mod tests {
 
         // One more pushes over: 4.0 + 2.0 = 6.0 >= 5.0
         engine.emit_trigger(SnapshotTrigger::WorkCompleted);
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        sleep(Duration::from_millis(200)).await;
         assert_eq!(
             checkpoint_count(db_path.as_str()),
             3,
@@ -1691,18 +1696,18 @@ mod tests {
             e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
         });
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(100)).await;
         assert_eq!(checkpoint_count(db_path.as_str()), 1, "startup only");
 
         // Send non-accumulating triggers
         engine.emit_trigger(SnapshotTrigger::Manual);
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        sleep(Duration::from_millis(30)).await;
         engine.emit_trigger(SnapshotTrigger::Periodic);
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        sleep(Duration::from_millis(30)).await;
         engine.emit_trigger(SnapshotTrigger::PeriodicFallback);
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        sleep(Duration::from_millis(30)).await;
         engine.emit_trigger(SnapshotTrigger::Startup);
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        sleep(Duration::from_millis(200)).await;
 
         assert_eq!(
             checkpoint_count(db_path.as_str()),
@@ -1729,13 +1734,13 @@ mod tests {
             e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
         });
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(100)).await;
         assert_eq!(checkpoint_count(db_path.as_str()), 1, "startup");
 
         engine.emit_trigger(SnapshotTrigger::WorkCompleted); // +2.0
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(50)).await;
         engine.emit_trigger(SnapshotTrigger::IdleWindow); // +3.0 = 5.0
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        sleep(Duration::from_millis(200)).await;
 
         assert_eq!(
             checkpoint_count(db_path.as_str()),
@@ -1762,14 +1767,14 @@ mod tests {
             e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
         });
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(100)).await;
 
         engine.emit_trigger(SnapshotTrigger::IdleWindow); // +3.0
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(50)).await;
         assert_eq!(checkpoint_count(db_path.as_str()), 1, "3.0 < 5.0");
 
         engine.emit_trigger(SnapshotTrigger::IdleWindow); // +3.0 = 6.0
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        sleep(Duration::from_millis(200)).await;
         assert_eq!(
             checkpoint_count(db_path.as_str()),
             2,
@@ -1795,13 +1800,13 @@ mod tests {
             e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
         });
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(100)).await;
         assert_eq!(checkpoint_count(db_path.as_str()), 1, "startup");
 
         engine.emit_trigger(SnapshotTrigger::HazardThreshold);
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(100)).await;
         engine.emit_trigger(SnapshotTrigger::MemoryPressure);
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        sleep(Duration::from_millis(200)).await;
 
         assert_eq!(
             checkpoint_count(db_path.as_str()),
@@ -1829,12 +1834,12 @@ mod tests {
         let handle = tokio::spawn(async move {
             e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
         });
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(100)).await;
 
         // Second call should return immediately (receiver already taken)
         let (_shutdown_tx2, shutdown_rx2) = tokio::sync::watch::channel(false);
         let e3 = engine.clone();
-        let result = tokio::time::timeout(Duration::from_secs(2), async move {
+        let result = timeout(Duration::from_secs(2), async move {
             e3.run_periodic(shutdown_rx2, counting_pane_provider())
                 .await;
         })
@@ -1871,11 +1876,11 @@ mod tests {
             e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
         });
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(100)).await;
 
         // One WorkCompleted = 6.0 >= 5.0
         engine.emit_trigger(SnapshotTrigger::WorkCompleted);
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        sleep(Duration::from_millis(200)).await;
         assert_eq!(
             checkpoint_count(db_path.as_str()),
             2,
@@ -1884,7 +1889,7 @@ mod tests {
 
         // StateTransition = 0.5 < 5.0 — no additional capture
         engine.emit_trigger(SnapshotTrigger::StateTransition);
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        sleep(Duration::from_millis(200)).await;
         assert_eq!(
             checkpoint_count(db_path.as_str()),
             2,
@@ -1910,13 +1915,13 @@ mod tests {
             e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
         });
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(100)).await;
 
         // Fire 5 WorkCompleted triggers (5 x 2.0 = 10.0) as fast as possible
         for _ in 0..5 {
             engine.emit_trigger(SnapshotTrigger::WorkCompleted);
         }
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        sleep(Duration::from_millis(300)).await;
 
         // Should have captured at least twice (startup + when >= 5.0)
         let count = checkpoint_count(db_path.as_str());

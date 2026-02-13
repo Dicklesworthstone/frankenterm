@@ -212,13 +212,19 @@ fn bench_reward_ranking(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_config() -> Criterion {
+    bench_common::emit_bench_artifacts("irl", BUDGETS);
+    Criterion::default().configure_from_args()
+}
+
 criterion_group!(
-    benches,
-    bench_feature_extraction,
-    bench_gradient_step,
-    bench_full_iteration,
-    bench_online_update,
-    bench_policy_query,
-    bench_reward_ranking,
+    name = benches;
+    config = bench_config();
+    targets = bench_feature_extraction,
+        bench_gradient_step,
+        bench_full_iteration,
+        bench_online_update,
+        bench_policy_query,
+        bench_reward_ranking
 );
 criterion_main!(benches);

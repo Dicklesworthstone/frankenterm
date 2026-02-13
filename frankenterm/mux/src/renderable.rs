@@ -1,6 +1,7 @@
 use crate::pane::{ForEachPaneLogicalLine, WithPaneLines};
 use frankenterm_dynamic::{FromDynamic, ToDynamic};
 use frankenterm_term::{Line, StableRowIndex, Terminal};
+#[cfg(feature = "lua")]
 use luahelper::impl_lua_conversion_dynamic;
 use rangeset::RangeSet;
 use serde::{Deserialize, Serialize};
@@ -17,6 +18,7 @@ pub struct StableCursorPosition {
     pub shape: termwiz::surface::CursorShape,
     pub visibility: termwiz::surface::CursorVisibility,
 }
+#[cfg(feature = "lua")]
 impl_lua_conversion_dynamic!(StableCursorPosition);
 
 #[derive(
@@ -45,6 +47,7 @@ pub struct RenderableDimensions {
     /// True if the lines should be rendered reversed
     pub reverse_video: bool,
 }
+#[cfg(feature = "lua")]
 impl_lua_conversion_dynamic!(RenderableDimensions);
 
 /// Implements Pane::get_cursor_position for Terminal

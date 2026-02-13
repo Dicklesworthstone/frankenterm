@@ -1190,7 +1190,7 @@ mod tests {
             m.run().await;
         });
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        crate::runtime_compat::sleep(Duration::from_millis(200)).await;
         model.shutdown();
         handle.await.unwrap();
     }

@@ -133,6 +133,14 @@ name = "backpressure_performance"
 harness = false
 
 [[bench]]
+name = "caut_quota_scheduling"
+harness = false
+
+[[bench]]
+name = "cache_gc"
+harness = false
+
+[[bench]]
 name = "tui_rendering"
 harness = false
 required-features = ["ftui"]
@@ -217,6 +225,10 @@ required-features = ["streaming"]
 
 [[bench]]
 name = "tantivy_search"
+harness = false
+
+[[bench]]
+name = "semantic_compression"
 harness = false
 
 [features]

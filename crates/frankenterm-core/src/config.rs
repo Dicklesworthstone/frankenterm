@@ -2027,6 +2027,19 @@ impl Default for NativeEventsConfig {
 // Vendored Config
 // =============================================================================
 
+/// Compression mode for vendored direct-mux traffic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum VendoredCompressionMode {
+    /// Skip compression for local direct-mux paths, keep codec default elsewhere.
+    #[default]
+    Auto,
+    /// Always compress outgoing mux PDUs.
+    Always,
+    /// Never compress outgoing mux PDUs.
+    Never,
+}
+
 /// Vendored mux connection pool settings.
 ///
 /// These settings control how many persistent Unix socket connections to the
@@ -2045,6 +2058,8 @@ pub struct VendoredMuxPoolConfig {
     pub pipeline_depth: usize,
     /// Timeout for a full pipelined mux batch operation.
     pub pipeline_timeout_ms: u64,
+    /// Compression mode for direct mux transport.
+    pub compression: VendoredCompressionMode,
 }
 
 impl Default for VendoredMuxPoolConfig {
@@ -2055,6 +2070,7 @@ impl Default for VendoredMuxPoolConfig {
             acquire_timeout_seconds: 10,
             pipeline_depth: 32,
             pipeline_timeout_ms: 5_000,
+            compression: VendoredCompressionMode::Auto,
         }
     }
 }

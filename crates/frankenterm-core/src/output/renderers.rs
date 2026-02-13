@@ -1872,12 +1872,23 @@ impl AccountListRenderer {
                 "service": service,
             });
             if let Some(pick_result) = pick {
+                let quota_advisory = crate::accounts::build_quota_advisory(
+                    pick_result,
+                    crate::accounts::DEFAULT_LOW_QUOTA_THRESHOLD_PERCENT,
+                );
                 payload["pick_preview"] = serde_json::json!({
                     "selected_account_id": pick_result.selected.as_ref().map(|a| &a.account_id),
                     "selected_name": pick_result.selected.as_ref().and_then(|a| a.name.as_ref()),
                     "selection_reason": &pick_result.explanation.selection_reason,
                     "candidates_count": pick_result.explanation.candidates.len(),
                     "filtered_count": pick_result.explanation.filtered_out.len(),
+                    "quota_advisory": {
+                        "availability": quota_advisory.availability,
+                        "low_quota_threshold_percent": quota_advisory.low_quota_threshold_percent,
+                        "selected_percent_remaining": quota_advisory.selected_percent_remaining,
+                        "warning": quota_advisory.warning,
+                        "blocking": quota_advisory.is_blocking(),
+                    },
                 });
             }
             return serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string());
@@ -1932,6 +1943,10 @@ impl AccountListRenderer {
 
         // Pick preview
         if let Some(pick_result) = pick {
+            let quota_advisory = crate::accounts::build_quota_advisory(
+                pick_result,
+                crate::accounts::DEFAULT_LOW_QUOTA_THRESHOLD_PERCENT,
+            );
             output.push('\n');
             if let Some(ref selected) = pick_result.selected {
                 let display_name = selected.name.as_deref().unwrap_or(&selected.account_id);
@@ -1953,6 +1968,26 @@ impl AccountListRenderer {
                     "  {} account(s) filtered (below threshold)\n",
                     pick_result.explanation.filtered_out.len()
                 )));
+            }
+
+            let advisory_status = match quota_advisory.availability {
+                crate::accounts::QuotaAvailability::Available => "available",
+                crate::accounts::QuotaAvailability::Low => "low",
+                crate::accounts::QuotaAvailability::Exhausted => "exhausted",
+            };
+            let advisory_line = format!(
+                "  Quota advisory: {} (threshold {:.1}%)\n",
+                advisory_status, quota_advisory.low_quota_threshold_percent
+            );
+            let advisory_colored = match quota_advisory.availability {
+                crate::accounts::QuotaAvailability::Available => style.green(&advisory_line),
+                crate::accounts::QuotaAvailability::Low => style.yellow(&advisory_line),
+                crate::accounts::QuotaAvailability::Exhausted => style.red(&advisory_line),
+            };
+            output.push_str(&advisory_colored);
+
+            if let Some(warning) = &quota_advisory.warning {
+                output.push_str(&style.dim(&format!("  {warning}\n")));
             }
         }
 
@@ -4098,6 +4133,11 @@ mod tests {
             "should have pick_preview"
         );
         assert_eq!(parsed["pick_preview"]["selected_account_id"], "acct-alpha");
+        assert_eq!(
+            parsed["pick_preview"]["quota_advisory"]["availability"],
+            "available"
+        );
+        assert_eq!(parsed["pick_preview"]["quota_advisory"]["blocking"], false);
     }
 
     #[test]
@@ -4123,6 +4163,7 @@ mod tests {
         let output = AccountListRenderer::render(&accounts, Some(&pick), "openai", &ctx);
         assert!(output.contains("Pick: none"), "{output}");
         assert!(output.contains("filtered"), "{output}");
+        assert!(output.contains("Quota advisory: exhausted"), "{output}");
     }
 
     #[test]

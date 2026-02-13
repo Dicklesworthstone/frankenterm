@@ -571,7 +571,7 @@ fn connect_ssh_session(
         }
     }
 
-    let renderer = termwiz_funcs::new_frankenterm_terminfo_renderer();
+    let renderer = crate::terminfo_renderer::new_frankenterm_terminfo_renderer();
     let mut shim = TerminalShim {
         stdout: &mut StdoutShim {
             stdout: stdout_write,

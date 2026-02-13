@@ -222,7 +222,7 @@ mod tests {
 
         let sender = tokio::spawn(async move { tx.send(2).await });
 
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        crate::runtime_compat::sleep(Duration::from_millis(20)).await;
         assert!(!sender.is_finished());
 
         assert_eq!(rx.recv().await, Some(1));

@@ -33,6 +33,7 @@ members = [
     "frankenterm/escape-parser",
     "frankenterm/input-types",
     "frankenterm/ssh",
+    "frankenterm/scripting",
     "frankenterm/surface",
     "frankenterm/uds",
 ]
@@ -260,6 +261,7 @@ frankenterm-dynamic-derive = { version = "0.1.1", path = "frankenterm/dynamic/de
 frankenterm-escape-parser = { version = "0.1.0", path = "frankenterm/escape-parser" }
 frankenterm-input-types = { version = "0.1", path = "frankenterm/input-types", default-features = false }
 frankenterm-ssh = { path = "frankenterm/ssh" }
+frankenterm-scripting = { path = "frankenterm/scripting" }
 frankenterm-surface = { path = "frankenterm/surface" }
 frankenterm-term = { path = "frankenterm/term" }
 frankenterm-uds = { path = "frankenterm/uds" }

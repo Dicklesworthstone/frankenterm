@@ -1578,7 +1578,7 @@ mod tests {
         });
 
         // Let it collect a few samples (macOS subprocess sampling is slow)
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        crate::runtime_compat::sleep(Duration::from_millis(500)).await;
         collector.shutdown();
         handle.await.unwrap();
 

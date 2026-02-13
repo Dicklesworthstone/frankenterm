@@ -17,11 +17,12 @@ use crate::circuit_breaker::{
     CircuitBreaker, CircuitBreakerConfig, CircuitBreakerStatus, get_or_register_circuit,
 };
 use crate::error::WeztermError;
+use crate::runtime_compat::{sleep, timeout};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::time::{Instant, sleep};
+use tokio::time::Instant;
 
 /// Boxed future for WezTerm interface operations.
 pub type WeztermFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
@@ -1149,7 +1150,6 @@ impl WeztermClient {
     /// future is dropped (e.g., on timeout), preventing orphan process accumulation.
     async fn run_cli(&self, args: &[&str]) -> Result<String> {
         use tokio::process::Command;
-        use tokio::time::{Duration, timeout};
 
         if let Some(ref socket) = self.socket_path {
             if !std::path::Path::new(socket).exists() {
@@ -1319,7 +1319,7 @@ impl WeztermClient {
                         return Err(err);
                     }
                     if self.retry_delay_ms > 0 {
-                        tokio::time::sleep(Duration::from_millis(self.retry_delay_ms)).await;
+                        sleep(Duration::from_millis(self.retry_delay_ms)).await;
                     }
                 }
             }

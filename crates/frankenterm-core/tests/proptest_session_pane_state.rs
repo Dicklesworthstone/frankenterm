@@ -1084,7 +1084,7 @@ proptest! {
         pane_id in arb_pane_id(),
         captured_at in arb_timestamp(),
         terminal in arb_terminal_state(),
-        num_vars in 500usize..1000,
+        num_vars in 800usize..1200,
     ) {
         let mut vars = HashMap::new();
         for i in 0..num_vars {
@@ -1096,6 +1096,14 @@ proptest! {
             vars,
             redacted_count: 0,
         });
+
+        let full_json = snap
+            .to_json()
+            .expect("full serialization should succeed");
+        prop_assume!(
+            full_json.len() > PANE_STATE_SIZE_BUDGET,
+            "test input must exceed size budget to assert truncation"
+        );
 
         let (json, truncated) = snap.to_json_budgeted().expect("budgeted serialization should succeed");
         prop_assert!(truncated, "large env should trigger truncation");

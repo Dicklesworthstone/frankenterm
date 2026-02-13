@@ -6,8 +6,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
 use crate::config as wa_config;
+use crate::runtime_compat::{sleep, timeout};
 use codec::{
-    CODEC_VERSION, DecodedPdu, GetCodecVersion, GetCodecVersionResponse, GetLines,
+    CODEC_VERSION, CompressionMode, DecodedPdu, GetCodecVersion, GetCodecVersionResponse, GetLines,
     GetLinesResponse, GetPaneRenderChanges, GetPaneRenderChangesResponse, ListPanes,
     ListPanesResponse, Pdu, SendPaste, SetClientId, UnitResponse, WriteToPane,
 };
@@ -26,6 +27,7 @@ pub struct DirectMuxClientConfig {
     pub read_timeout: Duration,
     pub write_timeout: Duration,
     pub max_frame_bytes: usize,
+    pub compression_mode: wa_config::VendoredCompressionMode,
 }
 
 impl DirectMuxClientConfig {
@@ -36,6 +38,7 @@ impl DirectMuxClientConfig {
                 cfg.socket_path = Some(PathBuf::from(path));
             }
         }
+        cfg.compression_mode = config.vendored.mux_pool.compression;
         cfg
     }
 
@@ -54,6 +57,7 @@ impl Default for DirectMuxClientConfig {
             read_timeout: Duration::from_millis(DEFAULT_READ_TIMEOUT_MS),
             write_timeout: Duration::from_millis(DEFAULT_WRITE_TIMEOUT_MS),
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
+            compression_mode: wa_config::VendoredCompressionMode::Auto,
         }
     }
 }
@@ -143,6 +147,7 @@ pub struct DirectMuxClient {
     serial: u64,
     pending_responses: HashMap<u64, Pdu>,
     config: DirectMuxClientConfig,
+    compression_mode: CompressionMode,
 }
 
 impl std::fmt::Debug for DirectMuxClient {
@@ -151,6 +156,7 @@ impl std::fmt::Debug for DirectMuxClient {
             .field("socket_path", &self.socket_path)
             .field("serial", &self.serial)
             .field("pending_responses", &self.pending_responses.len())
+            .field("compression_mode", &self.compression_mode)
             .finish_non_exhaustive()
     }
 }
@@ -162,13 +168,13 @@ impl DirectMuxClient {
             return Err(DirectMuxError::SocketNotFound(socket_path));
         }
 
-        let stream =
-            tokio::time::timeout(config.connect_timeout, UnixStream::connect(&socket_path))
-                .await
-                .map_err(|_| DirectMuxError::ConnectTimeout(socket_path.clone()))??;
+        let stream = timeout(config.connect_timeout, UnixStream::connect(&socket_path))
+            .await
+            .map_err(|_| DirectMuxError::ConnectTimeout(socket_path.clone()))??;
 
         let mut client = Self {
             stream,
+            compression_mode: resolve_compression_mode(config.compression_mode, &socket_path),
             socket_path,
             read_buf: Vec::new(),
             serial: 0,
@@ -371,7 +377,7 @@ impl DirectMuxClient {
         pipeline_timeout: Duration,
     ) -> Result<Vec<Pdu>, DirectMuxError> {
         let timeout_ms = duration_to_ms_u64(pipeline_timeout);
-        tokio::time::timeout(
+        timeout(
             pipeline_timeout,
             self.batch_inner(requests, max_pipeline_depth.max(1)),
         )
@@ -439,9 +445,9 @@ impl DirectMuxClient {
     async fn send_request_only(&mut self, pdu: Pdu) -> Result<u64, DirectMuxError> {
         let serial = next_request_serial(&mut self.serial)?;
         let mut buf = Vec::new();
-        pdu.encode(&mut buf, serial)
+        pdu.encode_with_mode(&mut buf, serial, self.compression_mode)
             .map_err(|err| DirectMuxError::Codec(err.to_string()))?;
-        tokio::time::timeout(self.config.write_timeout, self.stream.write_all(&buf))
+        timeout(self.config.write_timeout, self.stream.write_all(&buf))
             .await
             .map_err(|_| DirectMuxError::WriteTimeout)??;
         Ok(serial)
@@ -486,7 +492,7 @@ impl DirectMuxClient {
             }
 
             let mut temp = vec![0u8; 4096];
-            let read = tokio::time::timeout(self.config.read_timeout, self.stream.read(&mut temp))
+            let read = timeout(self.config.read_timeout, self.stream.read(&mut temp))
                 .await
                 .map_err(|_| DirectMuxError::ReadTimeout)??;
             if read == 0 {
@@ -558,6 +564,32 @@ fn resolve_socket_path(config: &DirectMuxClientConfig) -> Result<PathBuf, Direct
     }
 
     Err(DirectMuxError::SocketPathMissing)
+}
+
+fn resolve_compression_mode(
+    mode: wa_config::VendoredCompressionMode,
+    socket_path: &Path,
+) -> CompressionMode {
+    match mode {
+        wa_config::VendoredCompressionMode::Always => CompressionMode::Always,
+        wa_config::VendoredCompressionMode::Never => CompressionMode::Never,
+        wa_config::VendoredCompressionMode::Auto => {
+            if is_local_unix_socket(socket_path) {
+                CompressionMode::Never
+            } else {
+                CompressionMode::Auto
+            }
+        }
+    }
+}
+
+fn is_local_unix_socket(path: &Path) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+
+    std::fs::metadata(path)
+        .map(|meta| meta.file_type().is_socket())
+        // If metadata is unavailable, keep `auto` in the safe local-fast path.
+        .unwrap_or(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -733,7 +765,7 @@ pub fn subscribe_pane_output(
 
             // Wait for the next poll interval or cancellation
             tokio::select! {
-                () = tokio::time::sleep(config.poll_interval) => {}
+                () = sleep(config.poll_interval) => {}
                 _ = cancel_rx.changed() => {
                     if *cancel_rx.borrow() {
                         let _ = tx.send(PaneDelta::Ended {
@@ -1011,6 +1043,10 @@ mod tests {
         assert!(config.write_timeout.as_secs() > 0);
         assert!(config.max_frame_bytes > 0);
         assert!(config.socket_path.is_none());
+        assert_eq!(
+            config.compression_mode,
+            crate::config::VendoredCompressionMode::Auto
+        );
     }
 
     #[test]
@@ -1022,6 +1058,10 @@ mod tests {
             config.socket_path.as_ref().map(|p| p.to_str().unwrap()),
             Some("/tmp/test.sock")
         );
+        assert_eq!(
+            config.compression_mode,
+            crate::config::VendoredCompressionMode::Auto
+        );
     }
 
     #[test]
@@ -1029,6 +1069,10 @@ mod tests {
         let wa_cfg = crate::config::Config::default();
         let config = DirectMuxClientConfig::from_wa_config(&wa_cfg);
         assert!(config.socket_path.is_none());
+        assert_eq!(
+            config.compression_mode,
+            crate::config::VendoredCompressionMode::Auto
+        );
     }
 
     #[test]
@@ -1040,11 +1084,48 @@ mod tests {
     }
 
     #[test]
+    fn config_from_wa_config_with_compression_mode() {
+        let mut wa_cfg = crate::config::Config::default();
+        wa_cfg.vendored.mux_pool.compression = crate::config::VendoredCompressionMode::Never;
+        let config = DirectMuxClientConfig::from_wa_config(&wa_cfg);
+        assert_eq!(
+            config.compression_mode,
+            crate::config::VendoredCompressionMode::Never
+        );
+    }
+
+    #[test]
     fn config_with_socket_path_builder() {
         let config = DirectMuxClientConfig::default().with_socket_path("/tmp/mux.sock");
         assert_eq!(
             config.socket_path.unwrap().to_str().unwrap(),
             "/tmp/mux.sock"
+        );
+    }
+
+    #[test]
+    fn resolve_compression_mode_respects_explicit_overrides() {
+        let missing = Path::new("/tmp/ft-nonexistent-socket-for-test.sock");
+        assert_eq!(
+            resolve_compression_mode(crate::config::VendoredCompressionMode::Always, missing),
+            CompressionMode::Always
+        );
+        assert_eq!(
+            resolve_compression_mode(crate::config::VendoredCompressionMode::Never, missing),
+            CompressionMode::Never
+        );
+    }
+
+    #[test]
+    fn resolve_compression_mode_auto_local_socket_bypasses_compression() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let socket_path = tmp.path().join("mux.sock");
+        let _listener =
+            std::os::unix::net::UnixListener::bind(&socket_path).expect("bind unix socket");
+
+        assert_eq!(
+            resolve_compression_mode(crate::config::VendoredCompressionMode::Auto, &socket_path),
+            CompressionMode::Never
         );
     }
 
@@ -1364,13 +1445,13 @@ mod tests {
         );
 
         // Give the poller time to start
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(50)).await;
 
         // Cancel and verify it terminates
         sub.cancel();
 
         // next() should return an Ended delta or None eventually
-        let timeout = tokio::time::timeout(Duration::from_secs(2), sub.next()).await;
+        let timeout = timeout(Duration::from_secs(2), sub.next()).await;
         match timeout {
             Ok(Some(PaneDelta::Ended { reason, .. })) => {
                 assert!(reason.contains("cancelled"));

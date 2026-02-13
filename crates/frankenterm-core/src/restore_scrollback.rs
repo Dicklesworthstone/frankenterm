@@ -22,8 +22,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
-use crate::runtime_compat::Semaphore;
+use crate::runtime_compat::{Semaphore, sleep};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
@@ -318,10 +319,7 @@ impl ScrollbackInjector {
 
             // Inter-chunk delay to prevent parser overload.
             if i < chunks.len() - 1 && self.config.inter_chunk_delay_ms > 0 {
-                tokio::time::sleep(tokio::time::Duration::from_millis(
-                    self.config.inter_chunk_delay_ms,
-                ))
-                .await;
+                sleep(Duration::from_millis(self.config.inter_chunk_delay_ms)).await;
             }
         }
 

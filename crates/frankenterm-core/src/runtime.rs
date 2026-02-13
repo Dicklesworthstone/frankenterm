@@ -18,7 +18,7 @@
 //! The runtime explicitly enforces that the observation loop never calls any
 //! send/act APIs - it is purely passive.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -39,16 +39,17 @@ use crate::error::Result;
 #[cfg(feature = "native-wezterm")]
 use crate::events::{Event, UserVarPayload};
 use crate::events::{EventBus, event_identity_key};
+use crate::gc::{CacheGcSettings, compact_u64_map, should_vacuum};
 use crate::ingest::{PaneCursor, PaneRegistry, persist_captured_segment};
 #[cfg(feature = "native-wezterm")]
 use crate::native_events::{NativeEvent, NativeEventListener};
 use crate::patterns::{Detection, DetectionContext, PatternEngine};
 use crate::recording::RecordingManager;
-use crate::runtime_compat::{mpsc, watch};
+use crate::runtime_compat::{mpsc, sleep, timeout, watch};
 use crate::spsc_ring_buffer::{SpscConsumer, SpscProducer, channel as spsc_channel};
 #[cfg(feature = "native-wezterm")]
 use crate::storage::PaneRecord;
-use crate::storage::{StorageHandle, StoredEvent};
+use crate::storage::{MaintenanceRecord, StorageHandle, StoredEvent};
 use crate::tailer::{CaptureEvent, TailerConfig, TailerSupervisor};
 use crate::watchdog::HeartbeatRegistry;
 use crate::wezterm::{
@@ -818,11 +819,13 @@ impl ObservationRuntime {
         let heartbeats = Arc::clone(&self.heartbeats);
         let registry = Arc::clone(&self.registry);
         let cursors = Arc::clone(&self.cursors);
+        let detection_contexts = Arc::clone(&self.detection_contexts);
         let metrics = Arc::clone(&self.metrics);
         let scheduler_snapshot = Arc::clone(&self.scheduler_snapshot);
 
         let initial_retention_days = self.config.retention_days;
         let initial_checkpoint_secs = self.config.checkpoint_interval_secs;
+        let cache_gc_settings = CacheGcSettings::default();
 
         tokio::spawn(async move {
             let mut retention_days = initial_retention_days;
@@ -832,223 +835,329 @@ impl ObservationRuntime {
                 .unwrap_or_else(Instant::now);
             let health_interval = Duration::from_secs(30);
 
-            // Run maintenance every minute, but only do expensive ops when needed
-            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            // Run maintenance every minute, but only do expensive ops when needed.
+            // Keep first tick immediate to preserve prior interval behavior.
+            let maintenance_interval = Duration::from_secs(60);
+            let mut first_tick = true;
             let mut last_retention_check = Instant::now();
             let mut last_checkpoint = Instant::now();
+            let mut last_cache_gc = Instant::now();
 
             loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        heartbeats.record_maintenance();
+                if !first_tick {
+                    sleep(maintenance_interval).await;
+                }
+                first_tick = false;
+                heartbeats.record_maintenance();
 
-                        if shutdown_flag.load(Ordering::SeqCst) {
-                            break;
+                if shutdown_flag.load(Ordering::SeqCst) {
+                    break;
+                }
+
+                // Check for config updates
+                if config_rx.has_changed().unwrap_or(false) {
+                    let new_config = config_rx.borrow_and_update().clone();
+                    if new_config.retention_days != retention_days {
+                        info!(
+                            old = retention_days,
+                            new = new_config.retention_days,
+                            "Retention policy updated"
+                        );
+                        retention_days = new_config.retention_days;
+                    }
+                    if new_config.checkpoint_interval_secs != checkpoint_secs {
+                        info!(
+                            old = checkpoint_secs,
+                            new = new_config.checkpoint_interval_secs,
+                            "Checkpoint interval updated"
+                        );
+                        checkpoint_secs = new_config.checkpoint_interval_secs;
+                    }
+                }
+
+                let now = Instant::now();
+
+                // Run retention cleanup every hour (or if just started/updated)
+                if now.duration_since(last_retention_check) >= Duration::from_secs(3600) {
+                    if retention_days > 0 {
+                        let cutoff_days = u64::from(retention_days);
+                        let cutoff_window_ms = cutoff_days.saturating_mul(24 * 60 * 60 * 1000);
+                        let cutoff_ms = epoch_ms()
+                            .saturating_sub(i64::try_from(cutoff_window_ms).unwrap_or(i64::MAX));
+                        let (storage_guard, lock_held_since) =
+                            lock_storage_with_profile(&storage, &metrics).await;
+                        if let Err(e) = storage_guard.retention_cleanup(cutoff_ms).await {
+                            error!(error = %e, "Retention cleanup failed");
+                        } else {
+                            debug!("Retention cleanup completed");
                         }
+                        // Also purge old audit actions
+                        if let Err(e) = storage_guard.purge_audit_actions_before(cutoff_ms).await {
+                            error!(error = %e, "Audit purge failed");
+                        }
+                        drop(storage_guard);
+                        metrics.record_storage_lock_hold(lock_held_since.elapsed());
+                    }
+                    last_retention_check = now;
+                }
 
-                        // Check for config updates
-                        if config_rx.has_changed().unwrap_or(false) {
-                            let new_config = config_rx.borrow_and_update().clone();
-                            if new_config.retention_days != retention_days {
-                                info!(old = retention_days, new = new_config.retention_days, "Retention policy updated");
-                                retention_days = new_config.retention_days;
-                            }
-                            if new_config.checkpoint_interval_secs != checkpoint_secs {
-                                info!(old = checkpoint_secs, new = new_config.checkpoint_interval_secs, "Checkpoint interval updated");
-                                checkpoint_secs = new_config.checkpoint_interval_secs;
+                // Run WAL checkpoint + PRAGMA optimize (lightweight)
+                if checkpoint_secs > 0
+                    && now.duration_since(last_checkpoint)
+                        >= Duration::from_secs(u64::from(checkpoint_secs))
+                {
+                    let (storage_guard, lock_held_since) =
+                        lock_storage_with_profile(&storage, &metrics).await;
+                    match storage_guard.checkpoint().await {
+                        Ok(result) => {
+                            debug!(
+                                wal_pages = result.wal_pages,
+                                optimized = result.optimized,
+                                "WAL checkpoint completed"
+                            );
+                        }
+                        Err(e) => {
+                            error!(error = %e, "WAL checkpoint failed");
+                        }
+                    }
+                    drop(storage_guard);
+                    metrics.record_storage_lock_hold(lock_held_since.elapsed());
+                    last_checkpoint = now;
+                }
+
+                if cache_gc_settings.enabled
+                    && cache_gc_settings.interval_secs > 0
+                    && now.duration_since(last_cache_gc)
+                        >= Duration::from_secs(cache_gc_settings.interval_secs)
+                {
+                    let active_panes: HashSet<u64> = {
+                        let reg = registry.read().await;
+                        reg.observed_pane_ids().into_iter().collect()
+                    };
+
+                    let cursor_gc = {
+                        let mut cursors_guard = cursors.write().await;
+                        compact_u64_map(&mut cursors_guard, &active_panes)
+                    };
+
+                    let context_gc = {
+                        let mut contexts_guard = detection_contexts.write().await;
+                        compact_u64_map(&mut contexts_guard, &active_panes)
+                    };
+
+                    let mut page_count = 0_i64;
+                    let mut free_pages = 0_i64;
+                    let mut free_ratio = 0.0_f64;
+                    let mut vacuumed = false;
+                    let mut vacuum_error = None::<String>;
+
+                    let (storage_guard, lock_held_since) =
+                        lock_storage_with_profile(&storage, &metrics).await;
+                    match storage_guard.database_page_stats().await {
+                        Ok(stats) => {
+                            page_count = stats.page_count;
+                            free_pages = stats.free_pages;
+                            free_ratio = stats.free_ratio();
+
+                            if should_vacuum(
+                                stats.page_count,
+                                stats.free_pages,
+                                cache_gc_settings.vacuum_threshold,
+                            ) {
+                                match storage_guard.vacuum().await {
+                                    Ok(()) => {
+                                        vacuumed = true;
+                                    }
+                                    Err(err) => {
+                                        vacuum_error = Some(err.to_string());
+                                        error!(error = %err, "Cache GC vacuum failed");
+                                    }
+                                }
                             }
                         }
+                        Err(err) => {
+                            vacuum_error = Some(err.to_string());
+                            error!(error = %err, "Cache GC failed to read database page stats");
+                        }
+                    }
 
-                        let now = Instant::now();
+                    let metadata = serde_json::json!({
+                        "active_panes": active_panes.len(),
+                        "cursor_removed": cursor_gc.removed_entries,
+                        "cursor_freed_slots": cursor_gc.freed_slots(),
+                        "context_removed": context_gc.removed_entries,
+                        "context_freed_slots": context_gc.freed_slots(),
+                        "page_count": page_count,
+                        "free_pages": free_pages,
+                        "free_ratio": free_ratio,
+                        "vacuumed": vacuumed,
+                        "vacuum_threshold": cache_gc_settings.vacuum_threshold,
+                        "vacuum_error": vacuum_error,
+                    });
+                    let _ = storage_guard
+                        .record_maintenance(MaintenanceRecord {
+                            id: 0,
+                            event_type: "cache_gc".to_string(),
+                            message: Some("Periodic cache GC cycle".to_string()),
+                            metadata: Some(metadata.to_string()),
+                            timestamp: epoch_ms(),
+                        })
+                        .await;
 
-                        // Run retention cleanup every hour (or if just started/updated)
-                        if now.duration_since(last_retention_check) >= Duration::from_secs(3600) {
-                            if retention_days > 0 {
-                                let cutoff_days = u64::from(retention_days);
-                                let cutoff_window_ms = cutoff_days.saturating_mul(24 * 60 * 60 * 1000);
-                                let cutoff_ms = epoch_ms().saturating_sub(
-                                    i64::try_from(cutoff_window_ms).unwrap_or(i64::MAX),
+                    drop(storage_guard);
+                    metrics.record_storage_lock_hold(lock_held_since.elapsed());
+
+                    info!(
+                        active_panes = active_panes.len(),
+                        cursor_removed = cursor_gc.removed_entries,
+                        context_removed = context_gc.removed_entries,
+                        cursor_freed_slots = cursor_gc.freed_slots(),
+                        context_freed_slots = context_gc.freed_slots(),
+                        free_ratio,
+                        vacuumed,
+                        "Cache GC cycle completed"
+                    );
+
+                    last_cache_gc = now;
+                }
+
+                if now.duration_since(last_health_snapshot) >= health_interval {
+                    let (observed_panes, last_activity_by_pane) = {
+                        let reg = registry.read().await;
+                        let ids = reg.observed_pane_ids();
+                        let activity: Vec<(u64, u64)> = reg
+                            .entries()
+                            .filter(|(_, e)| e.should_observe())
+                            .map(|(id, e)| {
+                                #[allow(clippy::cast_sign_loss)]
+                                (*id, e.last_seen_at as u64)
+                            })
+                            .collect();
+                        (ids.len(), activity)
+                    };
+
+                    let (last_seq_by_pane, cursor_snapshot_bytes): (Vec<(u64, i64)>, u64) = {
+                        let cursors = cursors.read().await;
+                        let mut total_bytes = 0u64;
+                        let seqs = cursors
+                            .iter()
+                            .map(|(pane_id, cursor)| {
+                                total_bytes = total_bytes.saturating_add(
+                                    u64::try_from(cursor.last_snapshot.len()).unwrap_or(u64::MAX),
                                 );
-                                let (storage_guard, lock_held_since) =
-                                    lock_storage_with_profile(&storage, &metrics).await;
-                                if let Err(e) = storage_guard.retention_cleanup(cutoff_ms).await {
-                                    error!(error = %e, "Retention cleanup failed");
-                                } else {
-                                    debug!("Retention cleanup completed");
-                                }
-                                // Also purge old audit actions
-                                if let Err(e) = storage_guard.purge_audit_actions_before(cutoff_ms).await {
-                                    error!(error = %e, "Audit purge failed");
-                                }
-                                drop(storage_guard);
-                                metrics.record_storage_lock_hold(lock_held_since.elapsed());
-                            }
-                            last_retention_check = now;
-                        }
+                                (*pane_id, cursor.last_seq())
+                            })
+                            .collect();
+                        (seqs, total_bytes)
+                    };
+                    metrics.record_cursor_snapshot_memory(cursor_snapshot_bytes);
 
-                        // Run WAL checkpoint + PRAGMA optimize (lightweight)
-                        if checkpoint_secs > 0
-                            && now.duration_since(last_checkpoint)
-                                >= Duration::from_secs(u64::from(checkpoint_secs))
-                        {
-                            let (storage_guard, lock_held_since) =
-                                lock_storage_with_profile(&storage, &metrics).await;
-                            match storage_guard.checkpoint().await {
-                                Ok(result) => {
-                                    debug!(
-                                        wal_pages = result.wal_pages,
-                                        optimized = result.optimized,
-                                        "WAL checkpoint completed"
-                                    );
-                                }
-                                Err(e) => {
-                                    error!(error = %e, "WAL checkpoint failed");
-                                }
-                            }
-                            drop(storage_guard);
-                            metrics.record_storage_lock_hold(lock_held_since.elapsed());
-                            last_checkpoint = now;
-                        }
+                    let capture_cap = capture_tx.max_capacity();
+                    let capture_depth = capture_cap.saturating_sub(capture_tx.capacity());
 
-                        if now.duration_since(last_health_snapshot) >= health_interval {
-                            let (observed_panes, last_activity_by_pane) = {
-                                let reg = registry.read().await;
-                                let ids = reg.observed_pane_ids();
-                                let activity: Vec<(u64, u64)> = reg
-                                    .entries()
-                                    .filter(|(_, e)| e.should_observe())
-                                    .map(|(id, e)| {
-                                        #[allow(clippy::cast_sign_loss)]
-                                        (*id, e.last_seen_at as u64)
-                                    })
-                                    .collect();
-                                (ids.len(), activity)
-                            };
+                    let (write_depth, write_cap, db_writable) = {
+                        let (storage_guard, lock_held_since) =
+                            lock_storage_with_profile(&storage, &metrics).await;
+                        let wd = storage_guard.write_queue_depth();
+                        let wc = storage_guard.write_queue_capacity();
+                        let writable = storage_guard.is_writable().await;
+                        drop(storage_guard);
+                        metrics.record_storage_lock_hold(lock_held_since.elapsed());
+                        (wd, wc, writable)
+                    };
 
-                            let (last_seq_by_pane, cursor_snapshot_bytes): (Vec<(u64, i64)>, u64) = {
-                                let cursors = cursors.read().await;
-                                let mut total_bytes = 0u64;
-                                let seqs = cursors
-                                    .iter()
-                                    .map(|(pane_id, cursor)| {
-                                        total_bytes = total_bytes
-                                            .saturating_add(
-                                                u64::try_from(cursor.last_snapshot.len())
-                                                    .unwrap_or(u64::MAX),
-                                            );
-                                        (*pane_id, cursor.last_seq())
-                                    })
-                                    .collect();
-                                (seqs, total_bytes)
-                            };
-                            metrics.record_cursor_snapshot_memory(cursor_snapshot_bytes);
+                    let mut warnings = Vec::new();
 
-                            let capture_cap = capture_tx.max_capacity();
-                            let capture_depth = capture_cap.saturating_sub(capture_tx.capacity());
-
-                            let (write_depth, write_cap, db_writable) = {
-                                let (storage_guard, lock_held_since) =
-                                    lock_storage_with_profile(&storage, &metrics).await;
-                                let wd = storage_guard.write_queue_depth();
-                                let wc = storage_guard.write_queue_capacity();
-                                let writable = storage_guard.is_writable().await;
-                                drop(storage_guard);
-                                metrics.record_storage_lock_hold(lock_held_since.elapsed());
-                                (wd, wc, writable)
-                            };
-
-                            let mut warnings = Vec::new();
-
-                            #[allow(clippy::cast_precision_loss)]
-                            if capture_cap > 0 {
-                                let ratio = capture_depth as f64 / capture_cap as f64;
-                                if ratio >= BACKPRESSURE_WARN_RATIO {
-                                    warnings.push(format!(
+                    #[allow(clippy::cast_precision_loss)]
+                    if capture_cap > 0 {
+                        let ratio = capture_depth as f64 / capture_cap as f64;
+                        if ratio >= BACKPRESSURE_WARN_RATIO {
+                            warnings.push(format!(
                                         "Capture queue backpressure: {capture_depth}/{capture_cap} ({:.0}%)",
                                         ratio * 100.0
                                     ));
-                                }
-                            }
-
-                            #[allow(clippy::cast_precision_loss)]
-                            if write_cap > 0 {
-                                let ratio = write_depth as f64 / write_cap as f64;
-                                if ratio >= BACKPRESSURE_WARN_RATIO {
-                                    warnings.push(format!(
-                                        "Write queue backpressure: {write_depth}/{write_cap} ({:.0}%)",
-                                        ratio * 100.0
-                                    ));
-                                }
-                            }
-
-                            if !db_writable {
-                                warnings.push("Database is not writable".to_string());
-                            }
-                            if metrics.max_storage_lock_wait_ms() >= STORAGE_LOCK_WAIT_WARN_MS {
-                                warnings.push(format!(
-                                    "Storage lock contention: wait max {:.2} ms, avg {:.2} ms, events {}",
-                                    metrics.max_storage_lock_wait_ms(),
-                                    metrics.avg_storage_lock_wait_ms(),
-                                    metrics.storage_lock_contention_events()
-                                ));
-                            }
-                            if metrics.max_storage_lock_hold_ms() >= STORAGE_LOCK_HOLD_WARN_MS {
-                                warnings.push(format!(
-                                    "Storage lock hold high: max {:.2} ms, avg {:.2} ms",
-                                    metrics.max_storage_lock_hold_ms(),
-                                    metrics.avg_storage_lock_hold_ms(),
-                                ));
-                            }
-                            if cursor_snapshot_bytes >= CURSOR_SNAPSHOT_MEMORY_WARN_BYTES {
-                                warnings.push(format!(
-                                    "Cursor snapshot memory high: {:.1} MiB (peak {:.1} MiB)",
-                                    bytes_to_mib(cursor_snapshot_bytes),
-                                    bytes_to_mib(metrics.cursor_snapshot_bytes_max()),
-                                ));
-                            }
-
-                            let snapshot = HealthSnapshot {
-                                timestamp: epoch_ms_u64(),
-                                observed_panes,
-                                capture_queue_depth: capture_depth,
-                                write_queue_depth: write_depth,
-                                last_seq_by_pane,
-                                warnings,
-                                ingest_lag_avg_ms: metrics.avg_ingest_lag_ms(),
-                                ingest_lag_max_ms: metrics.max_ingest_lag_ms(),
-                                db_writable,
-                                db_last_write_at: metrics.last_db_write(),
-                                pane_priority_overrides: {
-                                    let now = epoch_ms();
-                                    let reg = registry.read().await;
-                                    reg.list_active_priority_overrides(now)
-                                        .into_iter()
-                                        .map(|(pane_id, ov)| crate::crash::PanePriorityOverrideSnapshot {
-                                            pane_id,
-                                            priority: ov.priority,
-                                            expires_at: ov
-                                                .expires_at
-                                                .and_then(|e| u64::try_from(e).ok()),
-                                        })
-                                        .collect()
-                                },
-                                scheduler: {
-                                    let snap = scheduler_snapshot.read().await;
-                                    if snap.budget_active { Some(snap.clone()) } else { None }
-                                },
-                                backpressure_tier: None,
-                                last_activity_by_pane,
-                                restart_count: 0,
-                                last_crash_at: None,
-                                consecutive_crashes: 0,
-                                current_backoff_ms: 0,
-                                in_crash_loop: false,
-                            };
-
-                            HealthSnapshot::update_global(snapshot);
-                            last_health_snapshot = now;
                         }
                     }
+
+                    #[allow(clippy::cast_precision_loss)]
+                    if write_cap > 0 {
+                        let ratio = write_depth as f64 / write_cap as f64;
+                        if ratio >= BACKPRESSURE_WARN_RATIO {
+                            warnings.push(format!(
+                                "Write queue backpressure: {write_depth}/{write_cap} ({:.0}%)",
+                                ratio * 100.0
+                            ));
+                        }
+                    }
+
+                    if !db_writable {
+                        warnings.push("Database is not writable".to_string());
+                    }
+                    if metrics.max_storage_lock_wait_ms() >= STORAGE_LOCK_WAIT_WARN_MS {
+                        warnings.push(format!(
+                            "Storage lock contention: wait max {:.2} ms, avg {:.2} ms, events {}",
+                            metrics.max_storage_lock_wait_ms(),
+                            metrics.avg_storage_lock_wait_ms(),
+                            metrics.storage_lock_contention_events()
+                        ));
+                    }
+                    if metrics.max_storage_lock_hold_ms() >= STORAGE_LOCK_HOLD_WARN_MS {
+                        warnings.push(format!(
+                            "Storage lock hold high: max {:.2} ms, avg {:.2} ms",
+                            metrics.max_storage_lock_hold_ms(),
+                            metrics.avg_storage_lock_hold_ms(),
+                        ));
+                    }
+                    if cursor_snapshot_bytes >= CURSOR_SNAPSHOT_MEMORY_WARN_BYTES {
+                        warnings.push(format!(
+                            "Cursor snapshot memory high: {:.1} MiB (peak {:.1} MiB)",
+                            bytes_to_mib(cursor_snapshot_bytes),
+                            bytes_to_mib(metrics.cursor_snapshot_bytes_max()),
+                        ));
+                    }
+
+                    let snapshot = HealthSnapshot {
+                        timestamp: epoch_ms_u64(),
+                        observed_panes,
+                        capture_queue_depth: capture_depth,
+                        write_queue_depth: write_depth,
+                        last_seq_by_pane,
+                        warnings,
+                        ingest_lag_avg_ms: metrics.avg_ingest_lag_ms(),
+                        ingest_lag_max_ms: metrics.max_ingest_lag_ms(),
+                        db_writable,
+                        db_last_write_at: metrics.last_db_write(),
+                        pane_priority_overrides: {
+                            let now = epoch_ms();
+                            let reg = registry.read().await;
+                            reg.list_active_priority_overrides(now)
+                                .into_iter()
+                                .map(|(pane_id, ov)| crate::crash::PanePriorityOverrideSnapshot {
+                                    pane_id,
+                                    priority: ov.priority,
+                                    expires_at: ov.expires_at.and_then(|e| u64::try_from(e).ok()),
+                                })
+                                .collect()
+                        },
+                        scheduler: {
+                            let snap = scheduler_snapshot.read().await;
+                            if snap.budget_active {
+                                Some(snap.clone())
+                            } else {
+                                None
+                            }
+                        },
+                        backpressure_tier: None,
+                        last_activity_by_pane,
+                        restart_count: 0,
+                        last_crash_at: None,
+                        consecutive_crashes: 0,
+                        current_backoff_ms: 0,
+                        in_crash_loop: false,
+                    };
+
+                    HealthSnapshot::update_global(snapshot);
+                    last_health_snapshot = now;
                 }
             }
         })
@@ -1072,16 +1181,16 @@ impl ObservationRuntime {
 
             loop {
                 // Wait for interval, checking shutdown periodically to ensure responsiveness
-                let deadline = tokio::time::Instant::now() + current_interval;
+                let deadline = Instant::now() + current_interval;
                 loop {
                     if shutdown_flag.load(Ordering::SeqCst) {
                         break;
                     }
-                    if tokio::time::Instant::now() >= deadline {
+                    if Instant::now() >= deadline {
                         break;
                     }
                     // Sleep in short bursts to remain responsive to shutdown signals
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    sleep(Duration::from_millis(100)).await;
                 }
 
                 // Check shutdown flag
@@ -1257,8 +1366,9 @@ impl ObservationRuntime {
             // Cache hot-reloadable pane priority config for scheduling.
             let mut pane_priorities = config_rx.borrow().pane_priorities.clone();
 
-            // Sync tailers periodically with discovery interval
-            let mut sync_tick = tokio::time::interval(discovery_interval);
+            // Sync tailers periodically with discovery interval.
+            // Keep the first sync immediate to preserve prior interval behavior.
+            let mut next_sync_tick = Instant::now();
             let mut join_set = JoinSet::new();
 
             loop {
@@ -1268,8 +1378,11 @@ impl ObservationRuntime {
                 // A fixed tick is fine, supervisor filters ready tasks.
                 let tick_duration = Duration::from_millis(10);
 
+                let sync_wait = next_sync_tick.saturating_duration_since(Instant::now());
+
                 tokio::select! {
-                    _ = sync_tick.tick() => {
+                    () = sleep(sync_wait) => {
+                        next_sync_tick = Instant::now() + discovery_interval;
                         heartbeats.record_capture();
 
                         if shutdown_flag.load(Ordering::SeqCst) {
@@ -1358,7 +1471,7 @@ impl ObservationRuntime {
                         }
                     }
                     // Spawn new captures if slots available
-                    () = tokio::time::sleep(tick_duration) => {
+                    () = sleep(tick_duration) => {
                          if shutdown_flag.load(Ordering::SeqCst) {
                             break;
                         }
@@ -1377,12 +1490,12 @@ impl ObservationRuntime {
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
 
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(500));
+            let idle_capture_interval = Duration::from_millis(500);
             loop {
-                interval.tick().await;
                 if shutdown_flag.load(Ordering::SeqCst) {
                     break;
                 }
+                sleep(idle_capture_interval).await;
             }
         })
     }
@@ -1420,15 +1533,16 @@ impl ObservationRuntime {
                 NATIVE_OUTPUT_COALESCE_MAX_DELAY_MS,
                 NATIVE_OUTPUT_COALESCE_MAX_BYTES,
             );
-            let start = tokio::time::Instant::now();
+            let start = Instant::now();
             let flush_interval = Duration::from_millis(NATIVE_OUTPUT_COALESCE_WINDOW_MS / 2)
                 .max(Duration::from_millis(5));
-            let mut flush_tick = tokio::time::interval(flush_interval);
-            flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut next_flush = Instant::now() + flush_interval;
 
             loop {
+                let flush_wait = next_flush.saturating_duration_since(Instant::now());
                 tokio::select! {
-                    _ = flush_tick.tick() => {
+                    () = sleep(flush_wait) => {
+                        next_flush = Instant::now() + flush_interval;
                         let now_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
                         for item in coalescer.drain_due(now_ms) {
                             metrics.record_native_output_batch(item.input_events, item.bytes.len());
@@ -1555,7 +1669,7 @@ impl ObservationRuntime {
                             None => break,
                         }
                     }
-                    _ = tokio::time::sleep(Duration::from_millis(25)) => {
+                    _ = sleep(Duration::from_millis(25)) => {
                         if shutdown_flag.load(Ordering::SeqCst) && capture_ingress_rx.is_empty() {
                             break;
                         }
@@ -2086,8 +2200,8 @@ impl RuntimeHandle {
         info!("Shutdown signal sent");
 
         // Wait for tasks with timeout
-        let timeout = Duration::from_secs(5);
-        let join_result = tokio::time::timeout(timeout, async {
+        let shutdown_timeout = Duration::from_secs(5);
+        let join_result = timeout(shutdown_timeout, async {
             let _ = self.discovery.await;
             let _ = self.capture.await;
             let _ = self.relay.await;

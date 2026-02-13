@@ -8,13 +8,17 @@
 //! - Plan computation (100 panes): **< 2ms**
 //! - Config max_segments_for lookup: **< 50ns**
 
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use std::collections::HashMap;
+use criterion::{
+    BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
+};
+use std::collections::{HashMap, VecDeque};
 
 use frankenterm_core::memory_pressure::MemoryPressureTier;
 use frankenterm_core::pane_tiers::PaneTier;
 use frankenterm_core::scrollback_eviction::{
-    EvictionConfig, PaneTierSource, ScrollbackEvictor, SegmentStore,
+    EvictionConfig, ImportanceRetentionConfig, LineImportanceScorer, PaneTierSource,
+    ScrollbackEvictor, ScrollbackLine, SegmentStore, enforce_importance_budget,
+    select_importance_eviction_index, total_line_bytes,
 };
 
 mod bench_common;
@@ -35,6 +39,22 @@ const BUDGETS: &[bench_common::BenchBudget] = &[
     bench_common::BenchBudget {
         name: "config_lookup",
         budget: "p50 < 50ns (max_segments_for)",
+    },
+    bench_common::BenchBudget {
+        name: "score_line_latency",
+        budget: "p50 < 1us (importance score for one line)",
+    },
+    bench_common::BenchBudget {
+        name: "score_batch_throughput",
+        budget: "> 1M lines/sec (10k mixed-content batch)",
+    },
+    bench_common::BenchBudget {
+        name: "eviction_selection",
+        budget: "p50 < 50us (select victim from 10k lines, oldest 25%)",
+    },
+    bench_common::BenchBudget {
+        name: "byte_budget_enforcement",
+        budget: "< 5% overhead vs line-count-only trim baseline",
     },
 ];
 
@@ -238,6 +258,128 @@ fn bench_pressure_escalation(c: &mut Criterion) {
     group.finish();
 }
 
+fn synthesize_scored_lines(n: usize) -> VecDeque<ScrollbackLine> {
+    let mut lines = VecDeque::with_capacity(n);
+    for i in 0..n {
+        let text = match i % 7 {
+            0 => format!("error: compilation failed in crate module_{i}"),
+            1 => format!("[#####-----] {}% complete", i % 100),
+            2 => format!("Using tool: Bash (step {i})"),
+            3 => format!("test result: {} passed; {} failed", i % 20, i % 3),
+            4 => format!("Compiling crate_{i} v0.1.0"),
+            5 => "\u{1b}[2K\u{1b}[1A".to_string(),
+            _ => format!("regular output line {i}"),
+        };
+        let importance = match i % 6 {
+            0 => 0.95,
+            1 => 0.10,
+            2 => 0.85,
+            3 => 0.75,
+            4 => 0.55,
+            _ => 0.30,
+        };
+        lines.push_back(ScrollbackLine::new(text, importance, i as u64));
+    }
+    lines
+}
+
+// ── Benchmarks: wa-1c2u importance-weighted retention ────────────────
+
+fn bench_importance_score_line_latency(c: &mut Criterion) {
+    let mut group = c.benchmark_group("scrollback_eviction/importance_score_line_latency");
+    let scorer = LineImportanceScorer::default();
+    let line = "error: failed to compile crate foo; Using tool: Bash";
+
+    group.bench_function("score_line_latency", |b| {
+        b.iter(|| scorer.score_line(black_box(line), None));
+    });
+    group.finish();
+}
+
+fn bench_importance_score_batch_throughput(c: &mut Criterion) {
+    let mut group = c.benchmark_group("scrollback_eviction/importance_score_batch_throughput");
+    let scorer = LineImportanceScorer::default();
+    let lines: Vec<String> = (0..10_000)
+        .map(|i| match i % 6 {
+            0 => format!("error: compile failed for module_{i}"),
+            1 => format!("Compiling crate_{i}"),
+            2 => format!("Using tool: Bash #{i}"),
+            3 => format!("test result: {} passed; 0 failed", i % 50),
+            4 => format!("[######----] {}% complete", i % 100),
+            _ => format!("normal output line {i}"),
+        })
+        .collect();
+
+    group.throughput(Throughput::Elements(lines.len() as u64));
+    group.bench_function("score_batch_throughput", |b| {
+        b.iter(|| {
+            let mut prev: Option<&str> = None;
+            let mut total = 0.0;
+            for line in &lines {
+                total += scorer.score_line(line, prev);
+                prev = Some(line);
+            }
+            black_box(total);
+        });
+    });
+    group.finish();
+}
+
+fn bench_importance_eviction_selection(c: &mut Criterion) {
+    let mut group = c.benchmark_group("scrollback_eviction/importance_eviction_selection");
+    let lines = synthesize_scored_lines(10_000);
+    let config = ImportanceRetentionConfig {
+        min_lines: 1,
+        max_lines: 10_000,
+        oldest_window_fraction: 0.25,
+        ..Default::default()
+    };
+
+    group.bench_function("eviction_selection", |b| {
+        b.iter(|| select_importance_eviction_index(black_box(&lines), black_box(&config)));
+    });
+    group.finish();
+}
+
+fn bench_importance_budget_enforcement(c: &mut Criterion) {
+    let mut group = c.benchmark_group("scrollback_eviction/importance_byte_budget_enforcement");
+    let seed = synthesize_scored_lines(10_000);
+    let total = total_line_bytes(&seed);
+    let config = ImportanceRetentionConfig {
+        byte_budget_per_pane: total / 2,
+        min_lines: 500,
+        max_lines: 10_000,
+        importance_threshold: 0.8,
+        oldest_window_fraction: 0.25,
+    };
+    let baseline_target_len = seed.len() / 2;
+
+    group.bench_function("line_count_only_trim_baseline", |b| {
+        b.iter_batched(
+            || seed.clone(),
+            |mut lines| {
+                while lines.len() > baseline_target_len && lines.len() > config.min_lines {
+                    let _ = lines.pop_front();
+                }
+                black_box(lines.len());
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.bench_function("byte_budget_enforcement", |b| {
+        b.iter_batched(
+            || seed.clone(),
+            |mut lines| {
+                let report = enforce_importance_budget(&mut lines, &config);
+                black_box(report.remaining_lines);
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    group.finish();
+}
+
 fn bench_config() -> Criterion {
     bench_common::emit_bench_artifacts("scrollback_eviction", BUDGETS);
     Criterion::default().configure_from_args()
@@ -250,6 +392,10 @@ criterion_group!(
         bench_plan_computation,
         bench_evict_cycle,
         bench_per_pane_trim,
-        bench_pressure_escalation
+        bench_pressure_escalation,
+        bench_importance_score_line_latency,
+        bench_importance_score_batch_throughput,
+        bench_importance_eviction_selection,
+        bench_importance_budget_enforcement
 );
 criterion_main!(benches);

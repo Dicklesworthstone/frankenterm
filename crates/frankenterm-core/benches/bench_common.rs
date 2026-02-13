@@ -125,6 +125,18 @@ pub const CI_BUDGETS: &[CiBudgetEntry] = &[
         max_median_ns: 5_000_000,
         note: "watcher loop: ceiling 5ms",
     },
+    // Quota selection warm path: target <10ms p99, observed in µs range → ceiling 10ms
+    CiBudgetEntry {
+        group_prefix: "caut_quota_scheduling/quota_lookup_warm_cache",
+        max_median_ns: 10_000_000,
+        note: "quota warm path: target <10ms p99, ceiling 10ms",
+    },
+    // Quota selection cold path: account materialization + selection → ceiling 50ms
+    CiBudgetEntry {
+        group_prefix: "caut_quota_scheduling/quota_lookup_cold_path",
+        max_median_ns: 50_000_000,
+        note: "quota cold path: materialization + selection, ceiling 50ms",
+    },
     // Backpressure tier classify: design < 100ns → ceiling 10µs
     CiBudgetEntry {
         group_prefix: "backpressure_tier",

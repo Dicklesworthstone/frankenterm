@@ -7,6 +7,11 @@ publish = false
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+default = ["lua"]
+lua = ["dep:luahelper", "dep:mlua", "config/lua", "procinfo/lua"]
+no-lua = ["config/no-lua"]
+
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
@@ -14,7 +19,7 @@ base64.workspace = true
 bintree.workspace = true
 bitflags.workspace = true
 chrono.workspace = true
-config.workspace = true
+config = { path = "../config", default-features = false }
 crossbeam.workspace = true
 downcast-rs.workspace = true
 fancy-regex.workspace = true
@@ -24,15 +29,15 @@ hostname.workspace = true
 lazy_static.workspace = true
 libc.workspace = true
 log.workspace = true
-luahelper.workspace = true
+luahelper = { workspace=true, optional = true }
 metrics.workspace = true
-mlua.workspace = true
+mlua = { workspace=true, optional = true }
 names.workspace = true
 nix = {workspace=true, features=["term"]}
 parking_lot.workspace = true
 percent-encoding.workspace = true
 portable-pty = { workspace=true, features = ["serde_support"]}
-procinfo.workspace = true
+procinfo = { path = "../procinfo", default-features = false }
 promise.workspace = true
 rangeset.workspace = true
 serde = {workspace=true, features = ["rc", "derive"]}
@@ -40,7 +45,6 @@ serial2.workspace = true
 shell-words.workspace = true
 smol.workspace = true
 terminfo.workspace = true
-termwiz-funcs.workspace = true
 termwiz.workspace = true
 textwrap.workspace = true
 thiserror.workspace = true

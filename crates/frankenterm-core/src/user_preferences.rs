@@ -106,8 +106,8 @@ pub fn extract_features(obs: &Observation, action: &UserAction) -> [f64; NUM_FEA
     let (has_output, tsf, rate, err, proc_active) = match target {
         Some(p) => (
             if p.has_new_output { 1.0 } else { 0.0 },
-            (1.0 + p.time_since_focus_s).ln(),
-            (1.0 + p.output_rate).ln(),
+            p.time_since_focus_s.ln_1p(),
+            p.output_rate.ln_1p(),
             if p.error_count > 0 { 1.0 } else { 0.0 },
             if p.process_active { 1.0 } else { 0.0 },
         ),
@@ -116,7 +116,7 @@ pub fn extract_features(obs: &Observation, action: &UserAction) -> [f64; NUM_FEA
 
     let scroll_depth = current.map(|p| p.scroll_depth).unwrap_or(0.0);
     let interaction = current
-        .map(|p| (1.0 + p.interaction_count as f64).ln())
+        .map(|p| (p.interaction_count as f64).ln_1p())
         .unwrap_or(0.0);
     let is_switch = match action {
         UserAction::FocusPane(id) if *id != obs.current_pane_id => 1.0,
@@ -256,8 +256,8 @@ impl RewardFunction {
         }
         let n = self.observation_count as f64;
         let mut mean = [0.0; NUM_FEATURES];
-        for i in 0..NUM_FEATURES {
-            mean[i] = self.demo_feature_sum[i] / n;
+        for (m, &s) in mean.iter_mut().zip(self.demo_feature_sum.iter()) {
+            *m = s / n;
         }
         mean
     }
@@ -333,8 +333,8 @@ impl MaxEntIrl {
     pub fn observe(&mut self, obs: Observation) -> bool {
         // Accumulate demonstrated feature expectations
         let features = extract_features(&obs, &obs.action);
-        for i in 0..NUM_FEATURES {
-            self.reward.demo_feature_sum[i] += features[i];
+        for (s, &f) in self.reward.demo_feature_sum.iter_mut().zip(features.iter()) {
+            *s += f;
         }
         self.reward.observation_count += 1;
 
@@ -369,9 +369,13 @@ impl MaxEntIrl {
         let alpha = self.config.learning_rate;
         let lambda = self.config.l2_regularization;
 
-        for i in 0..NUM_FEATURES {
-            let grad = mu_demo[i] - mu_policy[i] - lambda * self.reward.theta[i];
-            self.reward.theta[i] += alpha * grad;
+        for ((&d, &p), t) in mu_demo
+            .iter()
+            .zip(mu_policy.iter())
+            .zip(self.reward.theta.iter_mut())
+        {
+            let grad = d - p - lambda * *t;
+            *t = alpha.mul_add(grad, *t);
         }
     }
 
@@ -432,10 +436,14 @@ impl MaxEntIrl {
             let lambda = self.config.l2_regularization;
 
             let mut sq_sum = 0.0;
-            for i in 0..NUM_FEATURES {
-                let grad = mu_demo[i] - mu_policy[i] - lambda * self.reward.theta[i];
-                self.reward.theta[i] += alpha * grad;
-                sq_sum += grad * grad;
+            for ((&d, &p), t) in mu_demo
+                .iter()
+                .zip(mu_policy.iter())
+                .zip(self.reward.theta.iter_mut())
+            {
+                let grad = d - p - lambda * *t;
+                *t = alpha.mul_add(grad, *t);
+                sq_sum = grad.mul_add(grad, sq_sum);
             }
             grad_norm = sq_sum.sqrt();
             iterations += 1;
@@ -476,9 +484,13 @@ impl MaxEntIrl {
 
         let alpha = self.config.learning_rate;
         let lambda = self.config.l2_regularization;
-        for i in 0..NUM_FEATURES {
-            let grad = phi_demo[i] - phi_policy[i] - lambda * self.reward.theta[i];
-            self.reward.theta[i] += alpha * grad;
+        for ((&d, &p), t) in phi_demo
+            .iter()
+            .zip(phi_policy.iter())
+            .zip(self.reward.theta.iter_mut())
+        {
+            let grad = d - p - lambda * *t;
+            *t = alpha.mul_add(grad, *t);
         }
     }
 

@@ -336,6 +336,7 @@ impl LocalDomain {
                 position: None,
             };
 
+            #[cfg(feature = "lua")]
             let spawn_command = config::with_lua_config_on_main_thread(|lua| async {
                 let lua = lua.ok_or_else(|| anyhow::anyhow!("missing lua context"))?;
                 let value = config::lua::emit_async_callback(
@@ -354,6 +355,8 @@ impl LocalDomain {
             })
             .await
             .with_context(|| format!("calling ExecDomain {} function", ed.name))?;
+            #[cfg(not(feature = "lua"))]
+            let spawn_command = spawn_command;
 
             // Reinterpret the SpawnCommand into the builder
 
@@ -677,32 +680,40 @@ impl Domain for LocalDomain {
             match &ed.label {
                 Some(ValueOrFunc::Value(frankenterm_dynamic::Value::String(s))) => s.to_string(),
                 Some(ValueOrFunc::Func(label_func)) => {
-                    let label = config::with_lua_config_on_main_thread(|lua| async {
-                        let lua = lua.ok_or_else(|| anyhow::anyhow!("missing lua context"))?;
-                        let value = config::lua::emit_async_callback(
-                            &*lua,
-                            (label_func.clone(), (self.name.clone())),
-                        )
-                        .await?;
-                        let label: String =
-                            luahelper::from_lua_value_dynamic(value).with_context(|| {
-                                format!(
-                                    "interpreting SpawnCommand result from ExecDomain {}",
-                                    ed.name
-                                )
-                            })?;
-                        Ok(label)
-                    })
-                    .await;
-                    match label {
-                        Ok(label) => label,
-                        Err(err) => {
-                            log::error!(
-                                "Error while calling label function for ExecDomain `{}`: {err:#}",
-                                self.name
-                            );
-                            self.name.to_string()
+                    #[cfg(feature = "lua")]
+                    {
+                        let label = config::with_lua_config_on_main_thread(|lua| async {
+                            let lua = lua.ok_or_else(|| anyhow::anyhow!("missing lua context"))?;
+                            let value = config::lua::emit_async_callback(
+                                &*lua,
+                                (label_func.clone(), (self.name.clone())),
+                            )
+                            .await?;
+                            let label: String = luahelper::from_lua_value_dynamic(value)
+                                .with_context(|| {
+                                    format!(
+                                        "interpreting SpawnCommand result from ExecDomain {}",
+                                        ed.name
+                                    )
+                                })?;
+                            Ok(label)
+                        })
+                        .await;
+                        match label {
+                            Ok(label) => label,
+                            Err(err) => {
+                                log::error!(
+                                    "Error while calling label function for ExecDomain `{}`: {err:#}",
+                                    self.name
+                                );
+                                self.name.to_string()
+                            }
                         }
+                    }
+                    #[cfg(not(feature = "lua"))]
+                    {
+                        let _ = label_func;
+                        self.name.to_string()
                     }
                 }
                 _ => self.name.to_string(),

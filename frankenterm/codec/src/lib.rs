@@ -301,12 +301,34 @@ pub struct DecodedPdu {
 /// If the serialized size is larger than this, then we'll consider compressing it
 const COMPRESS_THRESH: usize = 32;
 
+/// Wire compression policy for PDU encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompressionMode {
+    /// Preserve legacy behavior: compress only when beneficial.
+    Auto,
+    /// Always compress payload bytes before framing.
+    Always,
+    /// Never compress payload bytes before framing.
+    Never,
+}
+
 fn serialize<T: serde::Serialize>(t: &T) -> Result<(Vec<u8>, bool), Error> {
+    serialize_with_mode(t, CompressionMode::Auto)
+}
+
+fn serialize_with_mode<T: serde::Serialize>(
+    t: &T,
+    compression_mode: CompressionMode,
+) -> Result<(Vec<u8>, bool), Error> {
     let mut uncompressed = Vec::new();
     let mut encode = varbincode::Serializer::new(&mut uncompressed);
     t.serialize(&mut encode)?;
 
-    if uncompressed.len() <= COMPRESS_THRESH {
+    if compression_mode == CompressionMode::Never {
+        return Ok((uncompressed, false));
+    }
+
+    if compression_mode == CompressionMode::Auto && uncompressed.len() <= COMPRESS_THRESH {
         return Ok((uncompressed, false));
     }
     // It's a little heavy; let's try compressing it
@@ -321,6 +343,10 @@ fn serialize<T: serde::Serialize>(t: &T) -> Result<(Vec<u8>, bool), Error> {
         compressed.len(),
         uncompressed.len()
     );
+
+    if compression_mode == CompressionMode::Always {
+        return Ok((compressed, true));
+    }
 
     if compressed.len() < uncompressed.len() {
         Ok((compressed, true))
@@ -356,11 +382,21 @@ macro_rules! pdu {
 
         impl Pdu {
             pub fn encode<W: std::io::Write>(&self, w: W, serial: u64) -> Result<(), Error> {
+                self.encode_with_mode(w, serial, CompressionMode::Auto)
+            }
+
+            pub fn encode_with_mode<W: std::io::Write>(
+                &self,
+                w: W,
+                serial: u64,
+                compression_mode: CompressionMode,
+            ) -> Result<(), Error> {
                 match self {
                     Pdu::Invalid{..} => bail!("attempted to serialize Pdu::Invalid"),
                     $(
                         Pdu::$name(s) => {
-                            let (data, is_compressed) = serialize(s)?;
+                            let (data, is_compressed) =
+                                serialize_with_mode(s, compression_mode)?;
                             let encoded_size = encode_raw($vers, serial, &data, is_compressed, w)?;
                             log::debug!("encode {} size={encoded_size}", stringify!($name));
                             metrics::histogram!("pdu.size", "pdu" => stringify!($name)).record(encoded_size as f64);
@@ -372,11 +408,21 @@ macro_rules! pdu {
             }
 
             pub async fn encode_async<W: Unpin + AsyncWriteExt>(&self, w: &mut W, serial: u64) -> Result<(), Error> {
+                self.encode_async_with_mode(w, serial, CompressionMode::Auto).await
+            }
+
+            pub async fn encode_async_with_mode<W: Unpin + AsyncWriteExt>(
+                &self,
+                w: &mut W,
+                serial: u64,
+                compression_mode: CompressionMode,
+            ) -> Result<(), Error> {
                 match self {
                     Pdu::Invalid{..} => bail!("attempted to serialize Pdu::Invalid"),
                     $(
                         Pdu::$name(s) => {
-                            let (data, is_compressed) = serialize(s)?;
+                            let (data, is_compressed) =
+                                serialize_with_mode(s, compression_mode)?;
                             let encoded_size = encode_raw_async($vers, serial, &data, is_compressed, w).await?;
                             log::debug!("encode_async {} size={encoded_size}", stringify!($name));
                             metrics::histogram!("pdu.size", "pdu" => stringify!($name)).record(encoded_size as f64);
@@ -1198,6 +1244,34 @@ mod test {
             },
             Pdu::decode(encoded.as_slice()).unwrap()
         );
+    }
+
+    #[test]
+    fn test_pdu_encode_with_mode_never_disables_compression() {
+        let mut encoded = Vec::new();
+        let payload = Pdu::WriteToPane(WriteToPane {
+            pane_id: 1,
+            data: vec![b'x'; 512],
+        });
+        payload
+            .encode_with_mode(&mut encoded, 0x51, CompressionMode::Never)
+            .unwrap();
+        let decoded = decode_raw(encoded.as_slice()).unwrap();
+        assert!(!decoded.is_compressed);
+    }
+
+    #[test]
+    fn test_pdu_encode_with_mode_always_forces_compression() {
+        let mut encoded = Vec::new();
+        let payload = Pdu::WriteToPane(WriteToPane {
+            pane_id: 1,
+            data: vec![b'x'; 512],
+        });
+        payload
+            .encode_with_mode(&mut encoded, 0x52, CompressionMode::Always)
+            .unwrap();
+        let decoded = decode_raw(encoded.as_slice()).unwrap();
+        assert!(decoded.is_compressed);
     }
 
     #[test]

@@ -6,6 +6,7 @@
 
 use crate::events::{Event, EventBus, RecvError};
 use crate::policy::Redactor;
+use crate::runtime_compat::{sleep, timeout};
 use crate::storage::{
     EventQuery, PaneRecord, SearchOptions, SearchResult, SegmentScanQuery, StorageHandle,
 };
@@ -532,7 +533,7 @@ async fn send_rate_limited_sse(
 ) -> bool {
     let now = Instant::now();
     if *next_emit_at > now {
-        tokio::time::sleep(*next_emit_at - now).await;
+        sleep(*next_emit_at - now).await;
     }
     *next_emit_at = Instant::now() + min_interval;
 
@@ -702,7 +703,7 @@ fn handle_stream_events(
             loop {
                 let recv_result = tokio::select! {
                     () = tx.closed() => break,
-                    recv = tokio::time::timeout(
+                    recv = timeout(
                         Duration::from_secs(STREAM_KEEPALIVE_SECS),
                         subscriber.recv(),
                     ) => recv,
@@ -830,7 +831,7 @@ fn handle_stream_deltas(
             loop {
                 let recv_result = tokio::select! {
                     () = tx.closed() => break,
-                    recv = tokio::time::timeout(
+                    recv = timeout(
                         Duration::from_secs(STREAM_KEEPALIVE_SECS),
                         subscriber.recv(),
                     ) => recv,
