@@ -1668,19 +1668,237 @@ impl WcLookupTable {
 
 #[cfg(test)]
 mod test {
+    use super::*;
+
     #[test]
     fn basics() {
-        assert_eq!(super::WcWidth::from_char('w'), super::WcWidth::One);
-        assert_eq!(super::WcWidth::from_char('\x1f'), super::WcWidth::NonPrint);
-        assert_eq!(
-            super::WcWidth::from_char('\u{e001}'),
-            super::WcWidth::PrivateUse
-        );
-        assert_eq!(super::WcWidth::from_char('\u{2716}'), super::WcWidth::One);
-        assert_eq!(
-            super::WcWidth::from_char('\u{270a}'),
-            super::WcWidth::WidenedIn9
-        );
-        assert_eq!(super::WcWidth::from_char('\u{3fffd}'), super::WcWidth::Two);
+        assert_eq!(WcWidth::from_char('w'), WcWidth::One);
+        assert_eq!(WcWidth::from_char('\x1f'), WcWidth::NonPrint);
+        assert_eq!(WcWidth::from_char('\u{e001}'), WcWidth::PrivateUse);
+        assert_eq!(WcWidth::from_char('\u{2716}'), WcWidth::One);
+        assert_eq!(WcWidth::from_char('\u{270a}'), WcWidth::WidenedIn9);
+        assert_eq!(WcWidth::from_char('\u{3fffd}'), WcWidth::Two);
+    }
+
+    // ── WcWidth::from_char ─────────────────────────────────
+
+    #[test]
+    fn ascii_printable_is_one() {
+        assert_eq!(WcWidth::from_char(' '), WcWidth::One);
+        assert_eq!(WcWidth::from_char('A'), WcWidth::One);
+        assert_eq!(WcWidth::from_char('z'), WcWidth::One);
+        assert_eq!(WcWidth::from_char('~'), WcWidth::One);
+    }
+
+    #[test]
+    fn c0_controls_are_nonprint() {
+        assert_eq!(WcWidth::from_char('\x00'), WcWidth::NonPrint);
+        assert_eq!(WcWidth::from_char('\x07'), WcWidth::NonPrint); // BEL
+        assert_eq!(WcWidth::from_char('\x0a'), WcWidth::NonPrint); // LF
+        assert_eq!(WcWidth::from_char('\x1b'), WcWidth::NonPrint); // ESC
+        assert_eq!(WcWidth::from_char('\x1f'), WcWidth::NonPrint);
+    }
+
+    #[test]
+    fn del_and_c1_are_nonprint() {
+        assert_eq!(WcWidth::from_char('\x7f'), WcWidth::NonPrint); // DEL
+        assert_eq!(WcWidth::from_char('\u{0080}'), WcWidth::NonPrint);
+        assert_eq!(WcWidth::from_char('\u{009f}'), WcWidth::NonPrint);
+    }
+
+    #[test]
+    fn cjk_ideographs_are_double_width() {
+        // CJK Unified Ideographs block
+        assert_eq!(WcWidth::from_char('\u{4e00}'), WcWidth::Two); // 一
+        assert_eq!(WcWidth::from_char('\u{9fff}'), WcWidth::Two);
+    }
+
+    #[test]
+    fn fullwidth_forms_are_double_width() {
+        // Fullwidth Latin A
+        assert_eq!(WcWidth::from_char('\u{ff21}'), WcWidth::Two);
+    }
+
+    #[test]
+    fn hangul_syllables_are_double_width() {
+        // Hangul Syllables block
+        assert_eq!(WcWidth::from_char('\u{ac00}'), WcWidth::Two); // 가
+    }
+
+    #[test]
+    fn combining_marks_are_combining() {
+        // Combining Diacritical Marks
+        assert_eq!(WcWidth::from_char('\u{0300}'), WcWidth::Combining); // Combining grave
+        assert_eq!(WcWidth::from_char('\u{0301}'), WcWidth::Combining); // Combining acute
+    }
+
+    #[test]
+    fn private_use_area() {
+        assert_eq!(WcWidth::from_char('\u{e000}'), WcWidth::PrivateUse);
+        assert_eq!(WcWidth::from_char('\u{f8ff}'), WcWidth::PrivateUse);
+    }
+
+    #[test]
+    fn supplementary_private_use_area() {
+        assert_eq!(WcWidth::from_char('\u{f0000}'), WcWidth::PrivateUse);
+        assert_eq!(WcWidth::from_char('\u{100000}'), WcWidth::PrivateUse);
+    }
+
+    #[test]
+    fn bom_is_nonprint() {
+        assert_eq!(WcWidth::from_char('\u{feff}'), WcWidth::NonPrint);
+    }
+
+    #[test]
+    fn soft_hyphen_is_nonprint() {
+        assert_eq!(WcWidth::from_char('\u{00ad}'), WcWidth::NonPrint);
+    }
+
+    #[test]
+    fn zero_width_space_is_nonprint() {
+        assert_eq!(WcWidth::from_char('\u{200b}'), WcWidth::NonPrint);
+    }
+
+    // ── width_unicode_8_or_earlier ─────────────────────────
+
+    #[test]
+    fn width_u8_one_is_1() {
+        assert_eq!(WcWidth::One.width_unicode_8_or_earlier(), 1);
+    }
+
+    #[test]
+    fn width_u8_two_is_2() {
+        assert_eq!(WcWidth::Two.width_unicode_8_or_earlier(), 2);
+    }
+
+    #[test]
+    fn width_u8_nonprint_is_0() {
+        assert_eq!(WcWidth::NonPrint.width_unicode_8_or_earlier(), 0);
+    }
+
+    #[test]
+    fn width_u8_combining_is_0() {
+        assert_eq!(WcWidth::Combining.width_unicode_8_or_earlier(), 0);
+    }
+
+    #[test]
+    fn width_u8_ambiguous_is_1() {
+        assert_eq!(WcWidth::Ambiguous.width_unicode_8_or_earlier(), 1);
+    }
+
+    #[test]
+    fn width_u8_private_use_is_1() {
+        assert_eq!(WcWidth::PrivateUse.width_unicode_8_or_earlier(), 1);
+    }
+
+    #[test]
+    fn width_u8_widened_in_9_is_1() {
+        assert_eq!(WcWidth::WidenedIn9.width_unicode_8_or_earlier(), 1);
+    }
+
+    #[test]
+    fn width_u8_unassigned_is_0() {
+        assert_eq!(WcWidth::Unassigned.width_unicode_8_or_earlier(), 0);
+    }
+
+    #[test]
+    fn width_u8_noncharacter_is_0() {
+        assert_eq!(WcWidth::NonCharacter.width_unicode_8_or_earlier(), 0);
+    }
+
+    // ── width_unicode_9_or_later ───────────────────────────
+
+    #[test]
+    fn width_u9_widened_in_9_is_2() {
+        assert_eq!(WcWidth::WidenedIn9.width_unicode_9_or_later(), 2);
+    }
+
+    #[test]
+    fn width_u9_one_is_1() {
+        assert_eq!(WcWidth::One.width_unicode_9_or_later(), 1);
+    }
+
+    #[test]
+    fn width_u9_two_is_2() {
+        assert_eq!(WcWidth::Two.width_unicode_9_or_later(), 2);
+    }
+
+    #[test]
+    fn width_u9_combining_is_0() {
+        assert_eq!(WcWidth::Combining.width_unicode_9_or_later(), 0);
+    }
+
+    // ── WcWidth derive traits ──────────────────────────────
+
+    #[test]
+    fn wc_width_clone_copy() {
+        let w = WcWidth::Two;
+        let copied = w;
+        assert_eq!(w, copied);
+    }
+
+    #[test]
+    fn wc_width_debug() {
+        assert_eq!(format!("{:?}", WcWidth::One), "One");
+        assert_eq!(format!("{:?}", WcWidth::Two), "Two");
+        assert_eq!(format!("{:?}", WcWidth::NonPrint), "NonPrint");
+    }
+
+    #[test]
+    fn wc_width_all_variants_distinct() {
+        let variants = [
+            WcWidth::One,
+            WcWidth::Two,
+            WcWidth::NonPrint,
+            WcWidth::Combining,
+            WcWidth::Ambiguous,
+            WcWidth::PrivateUse,
+            WcWidth::Unassigned,
+            WcWidth::WidenedIn9,
+            WcWidth::NonCharacter,
+        ];
+        for (i, a) in variants.iter().enumerate() {
+            for (j, b) in variants.iter().enumerate() {
+                if i == j {
+                    assert_eq!(a, b);
+                } else {
+                    assert_ne!(a, b, "{:?} should != {:?}", a, b);
+                }
+            }
+        }
+    }
+
+    // ── WcLookupTable ──────────────────────────────────────
+
+    #[test]
+    fn lookup_table_agrees_with_from_char_for_bmp() {
+        let table = WcLookupTable::new();
+        // Spot-check a selection of BMP codepoints
+        for c in [
+            'A', 'z', ' ', '\x00', '\x1b', '\u{0300}', '\u{4e00}', '\u{ac00}', '\u{e000}',
+            '\u{feff}',
+        ] {
+            assert_eq!(
+                table.classify(c),
+                WcWidth::from_char(c),
+                "mismatch for U+{:04X}",
+                c as u32
+            );
+        }
+    }
+
+    #[test]
+    fn lookup_table_supplementary_delegates() {
+        let table = WcLookupTable::new();
+        // Supplementary codepoints (> 0xFFFF) should delegate to from_char
+        let c = '\u{1f600}'; // emoji
+        assert_eq!(table.classify(c), WcWidth::from_char(c));
+    }
+
+    #[test]
+    fn lookup_table_cjk_extension_b() {
+        let table = WcLookupTable::new();
+        let c = '\u{20000}'; // CJK Extension B
+        assert_eq!(table.classify(c), WcWidth::Two);
     }
 }

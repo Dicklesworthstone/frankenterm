@@ -120,3 +120,93 @@ impl LineEditorHost for NopLineEditorHost {
         &mut self.history
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── CompletionCandidate ───────────────────────────
+
+    #[test]
+    fn completion_candidate_construction() {
+        let c = CompletionCandidate {
+            range: 4..6,
+            text: "hello".to_string(),
+        };
+        assert_eq!(c.range, 4..6);
+        assert_eq!(c.text, "hello");
+    }
+
+    #[test]
+    fn completion_candidate_empty_range() {
+        let c = CompletionCandidate {
+            range: 0..0,
+            text: String::new(),
+        };
+        assert!(c.range.is_empty());
+        assert!(c.text.is_empty());
+    }
+
+    // ── NopLineEditorHost ─────────────────────────────
+
+    #[test]
+    fn nop_host_default() {
+        let _host = NopLineEditorHost::default();
+    }
+
+    #[test]
+    fn nop_host_render_prompt_returns_text() {
+        let host = NopLineEditorHost::default();
+        let elements = host.render_prompt(">> ");
+        assert_eq!(elements.len(), 1);
+        match &elements[0] {
+            OutputElement::Text(t) => assert_eq!(t, ">> "),
+            _ => panic!("expected Text element"),
+        }
+    }
+
+    #[test]
+    fn nop_host_render_preview_empty() {
+        let host = NopLineEditorHost::default();
+        let elements = host.render_preview("some input");
+        assert!(elements.is_empty());
+    }
+
+    #[test]
+    fn nop_host_complete_returns_empty() {
+        let host = NopLineEditorHost::default();
+        let completions = host.complete("he", 2);
+        assert!(completions.is_empty());
+    }
+
+    #[test]
+    fn nop_host_history() {
+        let mut host = NopLineEditorHost::default();
+        let history = host.history();
+        // BasicHistory starts empty
+        assert!(history.last().is_none());
+    }
+
+    // ── OutputElement -> Change ───────────────────────
+
+    #[test]
+    fn output_element_text_to_change() {
+        let elem = OutputElement::Text("hello".to_string());
+        let change: Change = elem.into();
+        match change {
+            Change::Text(t) => assert_eq!(t, "hello"),
+            _ => panic!("expected Change::Text"),
+        }
+    }
+
+    #[test]
+    fn output_element_all_attributes_to_change() {
+        let attrs = CellAttributes::default();
+        let elem = OutputElement::AllAttributes(attrs.clone());
+        let change: Change = elem.into();
+        match change {
+            Change::AllAttributes(a) => assert_eq!(a, attrs),
+            _ => panic!("expected Change::AllAttributes"),
+        }
+    }
+}

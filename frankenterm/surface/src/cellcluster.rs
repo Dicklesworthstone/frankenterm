@@ -308,3 +308,187 @@ impl CellCluster {
         self.text.push_str(text);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use frankenterm_bidi::Direction;
+    use frankenterm_cell::CellAttributes;
+    use frankenterm_char_props::emoji::Presentation;
+
+    fn make_cluster(text: &str, cell_idx: usize, width: usize) -> CellCluster {
+        CellCluster::new(
+            64,
+            Presentation::Text,
+            CellAttributes::default(),
+            text,
+            cell_idx,
+            width,
+        )
+    }
+
+    // ── CellCluster::new ──────────────────────────────
+
+    #[test]
+    fn new_single_byte_text() {
+        let c = make_cluster("a", 0, 1);
+        assert_eq!(c.text, "a");
+        assert_eq!(c.width, 1);
+        assert_eq!(c.first_cell_idx, 0);
+        assert_eq!(c.direction, Direction::LeftToRight);
+        assert!(c.byte_to_cell_idx.is_empty());
+        assert!(c.byte_to_cell_width.is_empty());
+    }
+
+    #[test]
+    fn new_multi_byte_text_populates_byte_to_cell_idx() {
+        // Multi-byte char like "é" (2 bytes in UTF-8)
+        let c = make_cluster("é", 5, 1);
+        assert_eq!(c.text, "é");
+        assert_eq!(c.first_cell_idx, 5);
+        // text.len() > 1, so byte_to_cell_idx should be populated
+        assert_eq!(c.byte_to_cell_idx.len(), "é".len());
+        for &idx in &c.byte_to_cell_idx {
+            assert_eq!(idx, 5);
+        }
+    }
+
+    #[test]
+    fn new_double_width_populates_byte_to_cell_width() {
+        let c = make_cluster("A", 0, 2);
+        assert_eq!(c.width, 2);
+        assert_eq!(c.byte_to_cell_width.len(), 1);
+        assert_eq!(c.byte_to_cell_width[0], 2);
+    }
+
+    #[test]
+    fn new_single_width_no_cell_width_map() {
+        let c = make_cluster("x", 0, 1);
+        assert!(c.byte_to_cell_width.is_empty());
+    }
+
+    // ── byte_to_cell_idx ──────────────────────────────
+
+    #[test]
+    fn byte_to_cell_idx_empty_map_returns_offset() {
+        let c = make_cluster("a", 3, 1);
+        // empty byte_to_cell_idx: returns first_cell_idx + byte_idx
+        assert_eq!(c.byte_to_cell_idx(0), 3);
+    }
+
+    #[test]
+    fn byte_to_cell_idx_populated_map() {
+        let c = make_cluster("é", 10, 1);
+        // "é" is 2 bytes, map populated
+        assert_eq!(c.byte_to_cell_idx(0), 10);
+        assert_eq!(c.byte_to_cell_idx(1), 10);
+    }
+
+    // ── byte_to_cell_width ────────────────────────────
+
+    #[test]
+    fn byte_to_cell_width_empty_map_returns_one() {
+        let c = make_cluster("a", 0, 1);
+        assert_eq!(c.byte_to_cell_width(0), 1);
+    }
+
+    #[test]
+    fn byte_to_cell_width_populated_map() {
+        let c = make_cluster("X", 0, 2);
+        assert_eq!(c.byte_to_cell_width(0), 2);
+    }
+
+    // ── CellCluster::add ──────────────────────────────
+
+    #[test]
+    fn add_single_byte_to_single_byte() {
+        let mut c = make_cluster("a", 0, 1);
+        c.add("b", 1, 1);
+        assert_eq!(c.text, "ab");
+        assert_eq!(c.width, 2);
+        // Both single byte, no idx map
+        assert!(c.byte_to_cell_idx.is_empty());
+    }
+
+    #[test]
+    fn add_multi_byte_to_single_byte_extrapolates() {
+        let mut c = make_cluster("a", 0, 1);
+        c.add("é", 1, 1);
+        assert_eq!(c.text, "aé");
+        // After adding multi-byte, idx map should be extrapolated
+        assert_eq!(c.byte_to_cell_idx.len(), "aé".len());
+        assert_eq!(c.byte_to_cell_idx[0], 0); // "a" -> cell 0
+                                              // "é" bytes -> cell 1
+        for i in 1..c.byte_to_cell_idx.len() {
+            assert_eq!(c.byte_to_cell_idx[i], 1);
+        }
+    }
+
+    #[test]
+    fn add_to_multi_byte_extends_map() {
+        let mut c = make_cluster("é", 0, 1);
+        c.add("x", 1, 1);
+        assert_eq!(c.text, "éx");
+        // Map was already populated from multi-byte start
+        assert_eq!(c.byte_to_cell_idx.len(), "éx".len());
+    }
+
+    #[test]
+    fn add_double_width_to_single_width_extrapolates_widths() {
+        let mut c = make_cluster("a", 0, 1);
+        c.add("W", 1, 2);
+        assert_eq!(c.width, 3);
+        assert_eq!(c.byte_to_cell_width.len(), "aW".len());
+        assert_eq!(c.byte_to_cell_width[0], 1);
+        assert_eq!(c.byte_to_cell_width[1], 2);
+    }
+
+    #[test]
+    fn add_updates_total_width() {
+        let mut c = make_cluster("a", 0, 1);
+        c.add("b", 1, 1);
+        c.add("c", 2, 1);
+        assert_eq!(c.width, 3);
+        assert_eq!(c.text, "abc");
+    }
+
+    // ── Debug / Clone ─────────────────────────────────
+
+    #[test]
+    fn cluster_debug() {
+        let c = make_cluster("test", 0, 1);
+        let dbg = format!("{:?}", c);
+        assert!(dbg.contains("CellCluster"));
+        assert!(dbg.contains("test"));
+    }
+
+    #[test]
+    fn cluster_clone() {
+        let c = make_cluster("hello", 0, 1);
+        let cloned = c.clone();
+        assert_eq!(c.text, cloned.text);
+        assert_eq!(c.width, cloned.width);
+        assert_eq!(c.first_cell_idx, cloned.first_cell_idx);
+    }
+
+    // ── Presentation / Direction ──────────────────────
+
+    #[test]
+    fn new_sets_text_presentation() {
+        let c = CellCluster::new(
+            64,
+            Presentation::Emoji,
+            CellAttributes::default(),
+            "😀",
+            0,
+            2,
+        );
+        assert_eq!(c.presentation, Presentation::Emoji);
+    }
+
+    #[test]
+    fn new_sets_ltr_direction() {
+        let c = make_cluster("a", 0, 1);
+        assert_eq!(c.direction, Direction::LeftToRight);
+    }
+}

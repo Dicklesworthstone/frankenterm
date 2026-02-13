@@ -133,3 +133,207 @@ pub fn new_terminal(caps: Capabilities) -> Result<impl Terminal> {
 pub(crate) fn cast<T: NumCast + Display + Copy, U: NumCast>(n: T) -> Result<U> {
     num_traits::cast(n).ok_or_else(|| format_err!("{} is out of bounds for this system", n))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── ScreenSize ────────────────────────────────────
+
+    #[test]
+    fn screen_size_construction() {
+        let s = ScreenSize {
+            rows: 24,
+            cols: 80,
+            xpixel: 8,
+            ypixel: 16,
+        };
+        assert_eq!(s.rows, 24);
+        assert_eq!(s.cols, 80);
+        assert_eq!(s.xpixel, 8);
+        assert_eq!(s.ypixel, 16);
+    }
+
+    #[test]
+    fn screen_size_eq() {
+        let a = ScreenSize {
+            rows: 24,
+            cols: 80,
+            xpixel: 0,
+            ypixel: 0,
+        };
+        let b = ScreenSize {
+            rows: 24,
+            cols: 80,
+            xpixel: 0,
+            ypixel: 0,
+        };
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn screen_size_ne_rows() {
+        let a = ScreenSize {
+            rows: 24,
+            cols: 80,
+            xpixel: 0,
+            ypixel: 0,
+        };
+        let b = ScreenSize {
+            rows: 25,
+            cols: 80,
+            xpixel: 0,
+            ypixel: 0,
+        };
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn screen_size_ne_cols() {
+        let a = ScreenSize {
+            rows: 24,
+            cols: 80,
+            xpixel: 0,
+            ypixel: 0,
+        };
+        let b = ScreenSize {
+            rows: 24,
+            cols: 132,
+            xpixel: 0,
+            ypixel: 0,
+        };
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn screen_size_ne_pixels() {
+        let a = ScreenSize {
+            rows: 24,
+            cols: 80,
+            xpixel: 8,
+            ypixel: 16,
+        };
+        let b = ScreenSize {
+            rows: 24,
+            cols: 80,
+            xpixel: 0,
+            ypixel: 0,
+        };
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn screen_size_clone_copy() {
+        let a = ScreenSize {
+            rows: 24,
+            cols: 80,
+            xpixel: 0,
+            ypixel: 0,
+        };
+        let b = a;
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn screen_size_debug() {
+        let s = ScreenSize {
+            rows: 24,
+            cols: 80,
+            xpixel: 0,
+            ypixel: 0,
+        };
+        let dbg = format!("{:?}", s);
+        assert!(dbg.contains("ScreenSize"));
+        assert!(dbg.contains("24"));
+        assert!(dbg.contains("80"));
+    }
+
+    #[test]
+    fn screen_size_zero() {
+        let s = ScreenSize {
+            rows: 0,
+            cols: 0,
+            xpixel: 0,
+            ypixel: 0,
+        };
+        assert_eq!(s.rows, 0);
+        assert_eq!(s.cols, 0);
+    }
+
+    // ── Blocking ──────────────────────────────────────
+
+    #[test]
+    fn blocking_do_not_wait() {
+        let b = Blocking::DoNotWait;
+        assert!(format!("{:?}", b).contains("DoNotWait"));
+    }
+
+    #[test]
+    fn blocking_wait() {
+        let b = Blocking::Wait;
+        assert!(format!("{:?}", b).contains("Wait"));
+    }
+
+    #[test]
+    fn blocking_eq() {
+        assert_eq!(Blocking::Wait, Blocking::Wait);
+        assert_eq!(Blocking::DoNotWait, Blocking::DoNotWait);
+    }
+
+    #[test]
+    fn blocking_ne() {
+        assert_ne!(Blocking::Wait, Blocking::DoNotWait);
+    }
+
+    #[test]
+    fn blocking_clone_copy() {
+        let b = Blocking::Wait;
+        let c = b;
+        assert_eq!(b, c);
+    }
+
+    // ── cast ──────────────────────────────────────────
+
+    #[test]
+    fn cast_u32_to_usize() {
+        let result: usize = cast(42u32).unwrap();
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn cast_i32_to_u32() {
+        let result: u32 = cast(100i32).unwrap();
+        assert_eq!(result, 100);
+    }
+
+    #[test]
+    fn cast_negative_to_unsigned_fails() {
+        let result: Result<u32> = cast(-1i32);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cast_zero() {
+        let result: u8 = cast(0u32).unwrap();
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn cast_overflow_fails() {
+        let result: Result<u8> = cast(256u32);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cast_max_u8() {
+        let result: u8 = cast(255u32).unwrap();
+        assert_eq!(result, 255);
+    }
+
+    #[test]
+    fn cast_error_message_contains_value() {
+        let result: Result<u8> = cast(999u32);
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("999"));
+    }
+}
