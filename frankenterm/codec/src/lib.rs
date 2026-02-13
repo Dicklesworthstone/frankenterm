@@ -11,13 +11,10 @@
 #![allow(dead_code)]
 #![allow(clippy::range_plus_one)]
 
-#[cfg(all(feature = "async-smol", feature = "async-asupersync"))]
-compile_error!("Features `async-smol` and `async-asupersync` are mutually exclusive.");
+// Both async-smol and async-asupersync may be enabled simultaneously due to Cargo
+// workspace feature unification. When both are active, asupersync takes priority.
 
-#[cfg(not(any(feature = "async-smol", feature = "async-asupersync")))]
-compile_error!("Enable either `async-smol` (default) or `async-asupersync`.");
-
-use anyhow::{bail, Context as _, Error};
+use anyhow::{Context as _, Error, bail};
 use config::keyassignment::{PaneDirection, ScrollbackEraseMode};
 use frankenterm_term::color::ColorPalette;
 use frankenterm_term::{Alert, ClipboardSelection, StableRowIndex, TerminalSize};

@@ -1,11 +1,9 @@
 use openssl::ssl::SslStream;
 use std::net::TcpStream;
 
-#[cfg(all(feature = "async-io", feature = "async-asupersync"))]
-compile_error!("Features `async-io` and `async-asupersync` are mutually exclusive.");
-
-#[cfg(not(any(feature = "async-io", feature = "async-asupersync")))]
-compile_error!("Enable either `async-io` (default) or `async-asupersync`.");
+// Both async-io and async-asupersync may be enabled simultaneously due to Cargo
+// workspace feature unification. When both are active, asupersync takes priority
+// but the async-io IoSafe impl is kept since it's harmless.
 
 #[cfg(feature = "async-asupersync")]
 #[allow(dead_code)]
