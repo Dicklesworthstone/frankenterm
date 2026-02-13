@@ -6,6 +6,7 @@ This document defines the canonical deterministic scenario pack for worst-case r
 
 Related contract:
 - `docs/resize-performance-slos.md` (authoritative SLO thresholds + CI/soak/go-no-go gates)
+- `docs/resize-baseline-bottleneck-dossier.md` (ranked interventions and sequencing plan for `wa-1u90p.1.5`)
 
 ## Location
 

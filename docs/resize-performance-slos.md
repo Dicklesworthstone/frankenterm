@@ -145,7 +145,7 @@ Required outputs for each gate:
 ## Current Gaps and Near-Term Closure
 
 - Full timeline artifacts are now available via `ft simulate run --json --resize-timeline-json`; plain `--json` mode remains metadata/event playback oriented.
-- Numeric p50/p99 reduction and artifact incidence rollups are expected deliverables of `wa-1u90p.1.5` (baseline dossier synthesis).
+- Numeric p50/p99 reduction and artifact incidence rollups are expected deliverables of `wa-1u90p.1.5` (see `docs/resize-baseline-bottleneck-dossier.md`).
 - Until `wa-1u90p.1.5` lands, this document remains the normative threshold contract and the artifact schema baseline.
 
 ## Degradation and Rollback Policy
