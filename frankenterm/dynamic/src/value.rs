@@ -14,8 +14,9 @@ use alloc::string::String;
 /// Value is intended to be convertible to the same set
 /// of types as Lua and is a superset of the types possible
 /// in TOML and JSON.
-#[derive(Clone, PartialEq, Hash, Eq, Ord, PartialOrd)]
+#[derive(Clone, Default, PartialEq, Hash, Eq, Ord, PartialOrd)]
 pub enum Value {
+    #[default]
     Null,
     Bool(bool),
     String(String),
@@ -24,12 +25,6 @@ pub enum Value {
     U64(u64),
     I64(i64),
     F64(OrderedFloat<f64>),
-}
-
-impl Default for Value {
-    fn default() -> Self {
-        Self::Null
-    }
 }
 
 impl core::fmt::Debug for Value {
@@ -157,7 +152,7 @@ mod tests {
             Value::String("test".to_string()),
             Value::U64(999),
             Value::I64(-42),
-            Value::F64(OrderedFloat(3.14)),
+            Value::F64(OrderedFloat(2.72)),
         ];
         for v in values {
             assert_eq!(v.clone(), v);
@@ -193,7 +188,7 @@ mod tests {
 
     #[test]
     fn coerce_unsigned_from_fractional_f64_is_none() {
-        assert_eq!(Value::F64(OrderedFloat(3.14)).coerce_unsigned(), None);
+        assert_eq!(Value::F64(OrderedFloat(2.72)).coerce_unsigned(), None);
         assert_eq!(Value::F64(OrderedFloat(0.5)).coerce_unsigned(), None);
     }
 
@@ -251,7 +246,7 @@ mod tests {
 
     #[test]
     fn coerce_float_from_f64() {
-        assert_eq!(Value::F64(OrderedFloat(3.14)).coerce_float(), Some(3.14));
+        assert_eq!(Value::F64(OrderedFloat(2.72)).coerce_float(), Some(2.72));
     }
 
     #[test]
@@ -268,7 +263,7 @@ mod tests {
     fn coerce_float_from_non_numeric_is_none() {
         assert_eq!(Value::Null.coerce_float(), None);
         assert_eq!(Value::Bool(true).coerce_float(), None);
-        assert_eq!(Value::String("3.14".to_string()).coerce_float(), None);
+        assert_eq!(Value::String("2.72".to_string()).coerce_float(), None);
     }
 
     // ── Debug formatting ─────────────────────────────────────

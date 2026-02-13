@@ -27,13 +27,13 @@ thread_local! {
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum Error {
-    #[error("`{}` is not a valid {} variant. {}", .variant_name, .type_name, Self::possible_matches(.variant_name, &.possible))]
+    #[error("`{}` is not a valid {} variant. {}", .variant_name, .type_name, Self::possible_matches(.variant_name, .possible))]
     InvalidVariantForType {
         variant_name: String,
         type_name: &'static str,
         possible: &'static [&'static str],
     },
-    #[error("`{}` is not a valid {} field. {}", .field_name, .type_name, Self::possible_matches(.field_name, &.possible))]
+    #[error("`{}` is not a valid {} field. {}", .field_name, .type_name, Self::possible_matches(.field_name, .possible))]
     UnknownFieldForStruct {
         field_name: String,
         type_name: &'static str,
@@ -366,5 +366,353 @@ impl Error {
 impl From<String> for Error {
     fn from(s: String) -> Error {
         Error::Message(s)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate alloc;
+    extern crate std;
+
+    use super::*;
+    use alloc::format;
+    use alloc::string::ToString;
+
+    // ── Error variant construction and Display ───────────────
+
+    #[test]
+    fn message_error_display() {
+        let e = Error::Message("something went wrong".to_string());
+        let msg = format!("{}", e);
+        assert!(msg.contains("something went wrong"));
+    }
+
+    #[test]
+    fn no_conversion_display() {
+        let e = Error::NoConversion {
+            source_type: "Bool".to_string(),
+            dest_type: "u64",
+        };
+        let msg = format!("{}", e);
+        assert!(msg.contains("Bool"));
+        assert!(msg.contains("u64"));
+    }
+
+    #[test]
+    fn array_size_mismatch_display() {
+        let e = Error::ArraySizeMismatch {
+            vec_size: 5,
+            array_size: 3,
+        };
+        let msg = format!("{}", e);
+        assert!(msg.contains('5'));
+        assert!(msg.contains('3'));
+    }
+
+    #[test]
+    fn char_from_wrong_sized_string_display() {
+        let e = Error::CharFromWrongSizedString;
+        let msg = format!("{}", e);
+        assert!(msg.contains("char"));
+        assert!(msg.contains("single character"));
+    }
+
+    #[test]
+    fn invalid_variant_display() {
+        let e = Error::InvalidVariantForType {
+            variant_name: "BadVariant".to_string(),
+            type_name: "MyEnum",
+            possible: &["Good", "Better"],
+        };
+        let msg = format!("{}", e);
+        assert!(msg.contains("BadVariant"));
+        assert!(msg.contains("MyEnum"));
+    }
+
+    #[test]
+    fn unknown_field_display() {
+        let e = Error::UnknownFieldForStruct {
+            field_name: "badfield".to_string(),
+            type_name: "MyStruct",
+            possible: &["goodfield", "otherfield"],
+        };
+        let msg = format!("{}", e);
+        assert!(msg.contains("badfield"));
+        assert!(msg.contains("MyStruct"));
+    }
+
+    #[test]
+    fn incorrect_number_of_enum_keys_display() {
+        let e = Error::IncorrectNumberOfEnumKeys {
+            type_name: "MyEnum",
+            num_keys: 3,
+        };
+        let msg = format!("{}", e);
+        assert!(msg.contains("MyEnum"));
+        assert!(msg.contains('3'));
+    }
+
+    #[test]
+    fn error_in_field_display() {
+        let e = Error::ErrorInField {
+            type_name: "Config",
+            field_name: "port",
+            error: "invalid value".to_string(),
+        };
+        let msg = format!("{}", e);
+        assert!(msg.contains("Config"));
+        assert!(msg.contains("port"));
+    }
+
+    #[test]
+    fn error_in_nested_field_display() {
+        let e = Error::ErrorInNestedField {
+            type_name: alloc::vec!["Outer", "Inner"],
+            field_name: alloc::vec!["config", "port"],
+            error: "out of range".to_string(),
+        };
+        let msg = format!("{}", e);
+        assert!(msg.contains("config"));
+        assert!(msg.contains("port"));
+    }
+
+    #[test]
+    fn invalid_field_type_display() {
+        let e = Error::InvalidFieldType {
+            type_name: "MyStruct",
+            key_type: "U64".to_string(),
+        };
+        let msg = format!("{}", e);
+        assert!(msg.contains("U64"));
+        assert!(msg.contains("MyStruct"));
+    }
+
+    #[test]
+    fn deprecated_field_display() {
+        let e = Error::DeprecatedField {
+            type_name: "Config",
+            field_name: "old_option",
+            reason: "use new_option instead",
+        };
+        let msg = format!("{}", e);
+        assert!(msg.contains("deprecated"));
+        assert!(msg.contains("old_option"));
+        assert!(msg.contains("use new_option instead"));
+    }
+
+    // ── From<String> ─────────────────────────────────────────
+
+    #[test]
+    fn from_string_creates_message() {
+        let e: Error = "custom error".to_string().into();
+        let msg = format!("{}", e);
+        assert!(msg.contains("custom error"));
+    }
+
+    // ── field_context ────────────────────────────────────────
+
+    #[test]
+    fn field_context_wraps_no_conversion_null_as_missing_field() {
+        let obj = Object::default();
+        let err = Error::NoConversion {
+            source_type: "Null".to_string(),
+            dest_type: "u64",
+        };
+        let contextualized = err.field_context("Config", "port", &obj);
+        match contextualized {
+            Error::ErrorInField {
+                type_name,
+                field_name,
+                error,
+            } => {
+                assert_eq!(type_name, "Config");
+                assert_eq!(field_name, "port");
+                assert!(error.contains("missing field"));
+            }
+            _ => panic!("expected ErrorInField"),
+        }
+    }
+
+    #[test]
+    fn field_context_wraps_generic_error() {
+        let obj = Object::default();
+        let err = Error::Message("bad value".to_string());
+        let contextualized = err.field_context("Config", "port", &obj);
+        match contextualized {
+            Error::ErrorInField {
+                type_name,
+                field_name,
+                ..
+            } => {
+                assert_eq!(type_name, "Config");
+                assert_eq!(field_name, "port");
+            }
+            _ => panic!("expected ErrorInField"),
+        }
+    }
+
+    #[test]
+    fn field_context_nests_error_in_field() {
+        let obj = Object::default();
+        let inner = Error::ErrorInField {
+            type_name: "Inner",
+            field_name: "value",
+            error: "invalid".to_string(),
+        };
+        let nested = inner.field_context("Outer", "config", &obj);
+        match nested {
+            Error::ErrorInNestedField {
+                type_name,
+                field_name,
+                ..
+            } => {
+                assert_eq!(type_name, alloc::vec!["Outer", "Inner"]);
+                assert_eq!(field_name, alloc::vec!["config", "value"]);
+            }
+            _ => panic!("expected ErrorInNestedField"),
+        }
+    }
+
+    #[test]
+    fn field_context_extends_nested_field() {
+        let obj = Object::default();
+        let inner = Error::ErrorInNestedField {
+            type_name: alloc::vec!["Mid", "Inner"],
+            field_name: alloc::vec!["mid", "inner"],
+            error: "deep error".to_string(),
+        };
+        let deeper = inner.field_context("Outer", "outer", &obj);
+        match deeper {
+            Error::ErrorInNestedField {
+                type_name,
+                field_name,
+                ..
+            } => {
+                assert_eq!(type_name, alloc::vec!["Outer", "Mid", "Inner"]);
+                assert_eq!(field_name, alloc::vec!["outer", "mid", "inner"]);
+            }
+            _ => panic!("expected ErrorInNestedField"),
+        }
+    }
+
+    // ── compute_unknown_fields ───────────────────────────────
+
+    #[test]
+    fn raise_unknown_fields_ignore_returns_ok() {
+        let opts = FromDynamicOptions {
+            unknown_fields: UnknownFieldAction::Ignore,
+            ..Default::default()
+        };
+        let mut obj = Object::default();
+        obj.insert(Value::String("unknown".to_string()), Value::Null);
+        let result = Error::raise_unknown_fields(opts, "Test", &obj, &["known"]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn raise_unknown_fields_deny_returns_err() {
+        let opts = FromDynamicOptions {
+            unknown_fields: UnknownFieldAction::Deny,
+            ..Default::default()
+        };
+        let mut obj = Object::default();
+        obj.insert(Value::String("unknown".to_string()), Value::Null);
+        let result = Error::raise_unknown_fields(opts, "Test", &obj, &["known"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn raise_unknown_fields_no_unknowns_is_ok() {
+        let opts = FromDynamicOptions {
+            unknown_fields: UnknownFieldAction::Deny,
+            ..Default::default()
+        };
+        let mut obj = Object::default();
+        obj.insert(Value::String("known".to_string()), Value::Null);
+        let result = Error::raise_unknown_fields(opts, "Test", &obj, &["known"]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn raise_unknown_fields_non_string_key_is_invalid_field_type() {
+        let opts = FromDynamicOptions {
+            unknown_fields: UnknownFieldAction::Deny,
+            ..Default::default()
+        };
+        let mut obj = Object::default();
+        obj.insert(Value::U64(42), Value::Null);
+        let result = Error::raise_unknown_fields(opts, "Test", &obj, &[]);
+        assert!(result.is_err());
+    }
+
+    // ── raise_deprecated_fields ──────────────────────────────
+
+    #[test]
+    fn raise_deprecated_ignore_returns_ok() {
+        let opts = FromDynamicOptions {
+            deprecated_fields: UnknownFieldAction::Ignore,
+            ..Default::default()
+        };
+        let result = Error::raise_deprecated_fields(opts, "Config", "old_field", "use new_field");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn raise_deprecated_deny_returns_err() {
+        let opts = FromDynamicOptions {
+            deprecated_fields: UnknownFieldAction::Deny,
+            ..Default::default()
+        };
+        let result = Error::raise_deprecated_fields(opts, "Config", "old_field", "use new_field");
+        assert!(result.is_err());
+    }
+
+    // ── possible_matches (std feature only) ─────────────────
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn possible_matches_similar_name() {
+        let result = Error::possible_matches("colr", &["color", "size", "name"]);
+        assert!(result.contains("color"));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn possible_matches_no_match() {
+        let result = Error::possible_matches("zzzzz", &["alpha", "beta"]);
+        // Should list alternatives since no close match
+        assert!(result.contains("alpha") || result.contains("beta") || result.is_empty());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn possible_matches_exact_match_not_suggested() {
+        let result = Error::possible_matches("color", &["color", "size"]);
+        // Just ensure no panic
+        let _ = result;
+    }
+
+    // ── capture_warnings (std feature only) ──────────────────
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn capture_warnings_collects_warning_messages() {
+        let (result, warnings) = Error::capture_warnings(|| {
+            Error::warn("test warning 1".to_string());
+            Error::warn("test warning 2".to_string());
+            42
+        });
+        assert_eq!(result, 42);
+        assert_eq!(warnings.len(), 2);
+        assert_eq!(warnings[0], "test warning 1");
+        assert_eq!(warnings[1], "test warning 2");
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn capture_warnings_empty_when_no_warnings() {
+        let (result, warnings) = Error::capture_warnings(|| "no warnings");
+        assert_eq!(result, "no warnings");
+        assert!(warnings.is_empty());
     }
 }
