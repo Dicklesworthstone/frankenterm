@@ -10,9 +10,9 @@
 use proptest::prelude::*;
 
 use frankenterm_core::output_compression::{
-    CompressedEntry, CompressionConfig, CompressionStats, OutputTemplate, compress,
-    compression_stats, decompress, edit_distance, extract_template, extract_variables,
-    lines_similar, reconstruct_line,
+    compress, compression_stats, decompress, edit_distance, extract_template, extract_variables,
+    lines_similar, reconstruct_line, CompressedEntry, CompressionConfig, CompressionStats,
+    OutputTemplate,
 };
 
 // ============================================================================
