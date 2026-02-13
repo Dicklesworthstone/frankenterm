@@ -217,29 +217,32 @@ impl Line {
             cells.truncate(end_idx + 1);
 
             let mut lines: Vec<Self> = vec![];
-            let mut delta = 0;
+            let mut current_cells: Vec<Cell> = Vec::with_capacity(width.max(1));
+            let mut current_width = 0usize;
+
             for cell in cells {
-                let need_new_line = lines
-                    .last_mut()
-                    .map(|line| line.len() + cell.width() > width)
-                    .unwrap_or(true);
+                let cell_width = cell.width();
+                let need_new_line =
+                    !current_cells.is_empty() && current_width.saturating_add(cell_width) > width;
                 if need_new_line {
-                    lines
-                        .last_mut()
-                        .map(|line| line.set_last_cell_was_wrapped(true, seqno));
-                    lines.push(Line::new(seqno));
-                    delta = cell.cell_index();
+                    let mut prior = Line::from_cells(core::mem::take(&mut current_cells), seqno);
+                    prior.set_last_cell_was_wrapped(true, seqno);
+                    lines.push(prior);
+                    current_width = 0;
                 }
-                let line = lines.last_mut().unwrap();
-                line.set_cell_grapheme(
-                    cell.cell_index() - delta,
-                    cell.str(),
-                    cell.width(),
-                    (*cell.attrs()).clone(),
-                    seqno,
-                );
+
+                let grapheme = cell.as_cell();
+                let fill_count = grapheme.width().saturating_sub(1);
+                current_width = current_width.saturating_add(grapheme.width());
+                let fill_attr = grapheme.attrs().clone();
+                current_cells.push(grapheme);
+
+                for _ in 0..fill_count {
+                    current_cells.push(Cell::blank_with_attrs(fill_attr.clone()));
+                }
             }
 
+            lines.push(Line::from_cells(current_cells, seqno));
             lines
         } else {
             vec![self]

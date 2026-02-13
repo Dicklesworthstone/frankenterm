@@ -1,10 +1,12 @@
 #![allow(clippy::range_plus_one)]
 use super::*;
 use crate::config::BidiMode;
+use crossbeam::thread;
 use frankenterm_surface::SequenceNo;
 use log::debug;
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Instant;
 use termwiz::input::KeyboardEncoding;
 
 /// Holds the model of a screen.  This can either be the primary screen
@@ -97,6 +99,96 @@ impl Screen {
         scrollback_size(&self.config, self.allow_scrollback)
     }
 
+    fn mark_visible_lines_dirty(&mut self, seqno: SequenceNo) {
+        let start = self.lines.len().saturating_sub(self.physical_rows);
+        for idx in start..self.lines.len() {
+            self.lines[idx].update_last_change_seqno(seqno);
+        }
+    }
+
+    fn needs_rewrap_for_width_change(&self, physical_cols: usize) -> bool {
+        if physical_cols == self.physical_cols {
+            return false;
+        }
+
+        if physical_cols > self.physical_cols {
+            // Growing wider only needs reflow when we have soft-wrapped
+            // logical lines to merge.
+            self.lines.iter().any(Line::last_cell_was_wrapped)
+        } else {
+            // Shrinking may require adding wraps to long lines, and we
+            // still need to preserve existing wrapped logical lines.
+            self.lines
+                .iter()
+                .any(|line| line.last_cell_was_wrapped() || line.len() > physical_cols)
+        }
+    }
+
+    fn wrap_logical_lines_for_resize(
+        logical_lines: Vec<Line>,
+        physical_cols: usize,
+        seqno: SequenceNo,
+    ) -> Vec<Vec<Line>> {
+        let logical_count = logical_lines.len();
+        if logical_count == 0 {
+            return vec![];
+        }
+
+        let worker_count = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(logical_count);
+
+        // For small histories, avoid thread management overhead.
+        if worker_count <= 1 || logical_count < worker_count.saturating_mul(8) {
+            return logical_lines
+                .into_iter()
+                .map(|line| {
+                    if line.len() <= physical_cols {
+                        vec![line]
+                    } else {
+                        line.wrap(physical_cols, seqno)
+                    }
+                })
+                .collect();
+        }
+
+        let mut buckets: Vec<Vec<(usize, Line)>> = (0..worker_count).map(|_| Vec::new()).collect();
+        for (idx, line) in logical_lines.into_iter().enumerate() {
+            buckets[idx % worker_count].push((idx, line));
+        }
+
+        let mut wrapped_by_index: Vec<Option<Vec<Line>>> = vec![None; logical_count];
+        let _ = thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(worker_count);
+            for bucket in buckets {
+                handles.push(scope.spawn(move |_| {
+                    let mut wrapped = Vec::with_capacity(bucket.len());
+                    for (idx, line) in bucket {
+                        let lines = if line.len() <= physical_cols {
+                            vec![line]
+                        } else {
+                            line.wrap(physical_cols, seqno)
+                        };
+                        wrapped.push((idx, lines));
+                    }
+                    wrapped
+                }));
+            }
+
+            for handle in handles {
+                for (idx, lines) in handle.join().unwrap() {
+                    wrapped_by_index[idx] = Some(lines);
+                }
+            }
+        });
+
+        wrapped_by_index
+            .into_iter()
+            .map(|lines| lines.expect("missing wrapped line result"))
+            .collect()
+    }
+
     fn rewrap_lines(
         &mut self,
         physical_cols: usize,
@@ -105,9 +197,21 @@ impl Screen {
         cursor_y: PhysRowIndex,
         seqno: SequenceNo,
     ) -> (usize, PhysRowIndex) {
-        let mut rewrapped = VecDeque::new();
+        let started = Instant::now();
+        let old_cols = self.physical_cols;
+        let original_len = self.lines.len();
+        let estimated_capacity = if physical_cols >= self.physical_cols {
+            original_len
+        } else {
+            original_len
+                .saturating_mul(self.physical_cols.max(1))
+                .checked_div(physical_cols.max(1))
+                .unwrap_or(original_len)
+                .max(original_len)
+        };
+        let mut logical_lines: Vec<Line> = Vec::with_capacity(original_len);
         let mut logical_line: Option<Line> = None;
-        let mut logical_cursor_x: Option<usize> = None;
+        let mut logical_cursor: Option<(usize, usize)> = None;
         let mut adjusted_cursor = (cursor_x, cursor_y);
 
         for (phys_idx, mut line) in self.lines.drain(..).enumerate() {
@@ -121,13 +225,13 @@ impl Screen {
             let line = match logical_line.take() {
                 None => {
                     if phys_idx == cursor_y {
-                        logical_cursor_x = Some(cursor_x);
+                        logical_cursor = Some((logical_lines.len(), cursor_x));
                     }
                     line
                 }
                 Some(mut prior) => {
                     if phys_idx == cursor_y {
-                        logical_cursor_x = Some(cursor_x + prior.len());
+                        logical_cursor = Some((logical_lines.len(), cursor_x + prior.len()));
                     }
                     prior.append_line(line, seqno);
                     prior
@@ -139,40 +243,63 @@ impl Screen {
                 continue;
             }
 
-            if let Some(x) = logical_cursor_x.take() {
-                let num_lines = x / physical_cols;
-                let last_x = x - (num_lines * physical_cols);
-                adjusted_cursor = (last_x, rewrapped.len() + num_lines);
+            logical_lines.push(line);
+        }
 
-                // Special case: if the cursor lands in column zero, we'll
-                // lose track of its logical association with the wrapped
-                // line and it won't resize with the line correctly.
-                // Put it back on the prior line. The cursor is now
-                // technically outside of the viewport width.
-                if adjusted_cursor.0 == 0 && adjusted_cursor.1 > 0 {
-                    if physical_cols < self.physical_cols {
-                        // getting smaller: preserve its original position
-                        // on the prior line
-                        adjusted_cursor.0 = cursor_x;
-                    } else {
-                        // getting larger; we were most likely in column 1
-                        // or somewhere close. Jump to the end of the
-                        // prior line.
-                        adjusted_cursor.0 = physical_cols;
-                    }
-                    adjusted_cursor.1 -= 1;
+        if let Some(line) = logical_line.take() {
+            logical_lines.push(line);
+        }
+
+        let logical_count = logical_lines.len();
+        let wrapped = Self::wrap_logical_lines_for_resize(logical_lines, physical_cols, seqno);
+        let wrapped_count: usize = wrapped.iter().map(Vec::len).sum();
+        if let Some((logical_idx, logical_x)) = logical_cursor.take() {
+            let num_lines = logical_x / physical_cols;
+            let last_x = logical_x - (num_lines * physical_cols);
+            let row_base = wrapped
+                .iter()
+                .take(logical_idx)
+                .map(Vec::len)
+                .sum::<usize>();
+            adjusted_cursor = (last_x, row_base + num_lines);
+
+            // Special case: if the cursor lands in column zero, we'll
+            // lose track of its logical association with the wrapped
+            // line and it won't resize with the line correctly.
+            // Put it back on the prior line. The cursor is now
+            // technically outside of the viewport width.
+            if adjusted_cursor.0 == 0 && adjusted_cursor.1 > 0 {
+                if physical_cols < self.physical_cols {
+                    // getting smaller: preserve its original position
+                    // on the prior line
+                    adjusted_cursor.0 = cursor_x;
+                } else {
+                    // getting larger; we were most likely in column 1
+                    // or somewhere close. Jump to the end of the
+                    // prior line.
+                    adjusted_cursor.0 = physical_cols;
                 }
+                adjusted_cursor.1 -= 1;
             }
+        }
 
-            if line.len() <= physical_cols {
+        let mut rewrapped = VecDeque::with_capacity(estimated_capacity.max(physical_rows));
+        for lines in wrapped {
+            for line in lines {
                 rewrapped.push_back(line);
-            } else {
-                for line in line.wrap(physical_cols, seqno) {
-                    rewrapped.push_back(line);
-                }
             }
         }
         self.lines = rewrapped;
+
+        debug!(
+            "rewrap_lines cols={}→{} physical_lines={} logical_lines={} rewrapped_lines={} elapsed_ms={}",
+            old_cols,
+            physical_cols,
+            original_len,
+            logical_count,
+            wrapped_count,
+            started.elapsed().as_millis()
+        );
 
         // If we resized narrower and generated additional lines,
         // we may need to scroll the lines to make room.  However,
@@ -231,7 +358,14 @@ impl Screen {
             // screen (hence the check for allow_scrollback), to avoid
             // conflicting screen updates with full screen apps.
             if self.allow_scrollback {
-                self.rewrap_lines(physical_cols, physical_rows, cursor.x, cursor_phys, seqno)
+                if self.needs_rewrap_for_width_change(physical_cols) {
+                    self.rewrap_lines(physical_cols, physical_rows, cursor.x, cursor_phys, seqno)
+                } else {
+                    // Keep resize responsive for large scrollback histories
+                    // when there is no logical wrapping work to perform.
+                    self.mark_visible_lines_dirty(seqno);
+                    (cursor.x, cursor_phys)
+                }
             } else {
                 for line in &mut self.lines {
                     if physical_cols < self.physical_cols {

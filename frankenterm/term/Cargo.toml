@@ -17,6 +17,7 @@ use_serde = ["termwiz/use_serde", "frankenterm-cell/use_serde", "frankenterm-esc
 [dependencies]
 anyhow.workspace = true
 bitflags.workspace = true
+crossbeam.workspace = true
 csscolorparser.workspace = true
 downcast-rs.workspace = true
 finl_unicode.workspace = true

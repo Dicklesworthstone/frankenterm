@@ -478,22 +478,66 @@ fn adjust_y_size(tree: &mut Tree, mut y_adjust: isize, cell_dimensions: &Termina
     }
 }
 
-fn apply_sizes_from_splits(tree: &Tree, size: &TerminalSize) {
+fn collect_pane_resize_work(
+    tree: &Tree,
+    size: &TerminalSize,
+    work: &mut Vec<(Arc<dyn Pane>, TerminalSize)>,
+) {
     match tree {
-        Tree::Empty => return,
-        Tree::Node { data: None, .. } => return,
+        Tree::Empty => {}
+        Tree::Node { data: None, .. } => {}
         Tree::Node {
             left,
             right,
             data: Some(data),
         } => {
-            apply_sizes_from_splits(&*left, &data.first);
-            apply_sizes_from_splits(&*right, &data.second);
+            collect_pane_resize_work(&*left, &data.first, work);
+            collect_pane_resize_work(&*right, &data.second, work);
         }
         Tree::Leaf(pane) => {
-            pane.resize(*size).ok();
+            work.push((Arc::clone(pane), *size));
         }
     }
+}
+
+fn apply_sizes_from_splits(tree: &Tree, size: &TerminalSize) {
+    let mut work = Vec::new();
+    collect_pane_resize_work(tree, size, &mut work);
+
+    if work.len() <= 1 {
+        for (pane, pane_size) in work {
+            pane.resize(pane_size).ok();
+        }
+        return;
+    }
+
+    let worker_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(work.len());
+
+    if worker_count <= 1 {
+        for (pane, pane_size) in work {
+            pane.resize(pane_size).ok();
+        }
+        return;
+    }
+
+    let mut buckets: Vec<Vec<(Arc<dyn Pane>, TerminalSize)>> =
+        (0..worker_count).map(|_| Vec::new()).collect();
+    for (idx, item) in work.into_iter().enumerate() {
+        buckets[idx % worker_count].push(item);
+    }
+
+    let _ = crossbeam::thread::scope(|scope| {
+        for bucket in buckets {
+            scope.spawn(move |_| {
+                for (pane, pane_size) in bucket {
+                    pane.resize(pane_size).ok();
+                }
+            });
+        }
+    });
 }
 
 fn cell_dimensions(size: &TerminalSize) -> TerminalSize {
