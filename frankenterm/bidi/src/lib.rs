@@ -2091,4 +2091,377 @@ mod tests {
         ];
         assert_eq!(reordered, explicit_ltr);
     }
+
+    // ── Direction ───────────────────────────────────────────
+
+    #[test]
+    fn direction_with_level_even_is_ltr() {
+        assert_eq!(Direction::with_level(0), Direction::LeftToRight);
+        assert_eq!(Direction::with_level(2), Direction::LeftToRight);
+        assert_eq!(Direction::with_level(4), Direction::LeftToRight);
+    }
+
+    #[test]
+    fn direction_with_level_odd_is_rtl() {
+        assert_eq!(Direction::with_level(1), Direction::RightToLeft);
+        assert_eq!(Direction::with_level(3), Direction::RightToLeft);
+        assert_eq!(Direction::with_level(5), Direction::RightToLeft);
+    }
+
+    #[test]
+    fn direction_opposite() {
+        assert_eq!(Direction::LeftToRight.opposite(), Direction::RightToLeft);
+        assert_eq!(Direction::RightToLeft.opposite(), Direction::LeftToRight);
+    }
+
+    #[test]
+    fn direction_as_bidi_class() {
+        assert_eq!(
+            Direction::LeftToRight.as_bidi_class(),
+            BidiClass::LeftToRight
+        );
+        assert_eq!(
+            Direction::RightToLeft.as_bidi_class(),
+            BidiClass::RightToLeft
+        );
+    }
+
+    #[test]
+    fn direction_iter_ltr() {
+        let items: Vec<_> = Direction::LeftToRight
+            .iter(vec![1, 2, 3].into_iter())
+            .collect();
+        assert_eq!(items, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn direction_iter_rtl() {
+        let items: Vec<_> = Direction::RightToLeft
+            .iter(vec![1, 2, 3].into_iter())
+            .collect();
+        assert_eq!(items, vec![3, 2, 1]);
+    }
+
+    #[test]
+    fn direction_clone_eq() {
+        let a = Direction::LeftToRight;
+        let b = a;
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn direction_debug() {
+        let d = Direction::RightToLeft;
+        let dbg = format!("{d:?}");
+        assert!(dbg.contains("RightToLeft"));
+    }
+
+    // ── Level ───────────────────────────────────────────────
+
+    #[test]
+    fn level_default_is_zero() {
+        let l = Level::default();
+        assert_eq!(l.0, 0);
+    }
+
+    #[test]
+    fn level_direction_even() {
+        assert_eq!(Level(0).direction(), Direction::LeftToRight);
+        assert_eq!(Level(2).direction(), Direction::LeftToRight);
+    }
+
+    #[test]
+    fn level_direction_odd() {
+        assert_eq!(Level(1).direction(), Direction::RightToLeft);
+        assert_eq!(Level(3).direction(), Direction::RightToLeft);
+    }
+
+    #[test]
+    fn level_as_bidi_class() {
+        assert_eq!(Level(0).as_bidi_class(), BidiClass::LeftToRight);
+        assert_eq!(Level(1).as_bidi_class(), BidiClass::RightToLeft);
+    }
+
+    #[test]
+    fn level_removed_by_x9() {
+        assert!(Level(NO_LEVEL).removed_by_x9());
+        assert!(!Level(0).removed_by_x9());
+        assert!(!Level(1).removed_by_x9());
+    }
+
+    #[test]
+    fn level_max() {
+        assert_eq!(Level(3).max(Level(5)), Level(5));
+        assert_eq!(Level(5).max(Level(3)), Level(5));
+        assert_eq!(Level(4).max(Level(4)), Level(4));
+    }
+
+    #[test]
+    fn level_ord() {
+        assert!(Level(0) < Level(1));
+        assert!(Level(1) > Level(0));
+        assert!(Level(2) == Level(2));
+    }
+
+    #[test]
+    fn level_hash_consistent() {
+        use core::hash::{Hash, Hasher};
+        struct SimpleHasher(u64);
+        impl Hasher for SimpleHasher {
+            fn finish(&self) -> u64 {
+                self.0
+            }
+            fn write(&mut self, bytes: &[u8]) {
+                for b in bytes {
+                    self.0 = self.0.wrapping_mul(31).wrapping_add(*b as u64);
+                }
+            }
+        }
+        let mut h1 = SimpleHasher(0);
+        let mut h2 = SimpleHasher(0);
+        Level(5).hash(&mut h1);
+        Level(5).hash(&mut h2);
+        assert_eq!(h1.finish(), h2.finish());
+    }
+
+    // ── ParagraphDirectionHint ──────────────────────────────
+
+    #[test]
+    fn paragraph_direction_hint_default_is_ltr() {
+        assert_eq!(
+            ParagraphDirectionHint::default(),
+            ParagraphDirectionHint::LeftToRight
+        );
+    }
+
+    #[test]
+    fn paragraph_direction_hint_direction() {
+        assert_eq!(
+            ParagraphDirectionHint::LeftToRight.direction(),
+            Direction::LeftToRight
+        );
+        assert_eq!(
+            ParagraphDirectionHint::RightToLeft.direction(),
+            Direction::RightToLeft
+        );
+        assert_eq!(
+            ParagraphDirectionHint::AutoLeftToRight.direction(),
+            Direction::LeftToRight
+        );
+        assert_eq!(
+            ParagraphDirectionHint::AutoRightToLeft.direction(),
+            Direction::RightToLeft
+        );
+    }
+
+    #[test]
+    fn paragraph_direction_hint_clone_eq() {
+        let a = ParagraphDirectionHint::AutoRightToLeft;
+        let b = a;
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn paragraph_direction_hint_debug() {
+        let h = ParagraphDirectionHint::RightToLeft;
+        let dbg = format!("{h:?}");
+        assert!(dbg.contains("RightToLeft"));
+    }
+
+    // ── BidiRun::indices ────────────────────────────────────
+
+    #[test]
+    fn bidi_run_indices_no_removals() {
+        let run = BidiRun {
+            direction: Direction::LeftToRight,
+            level: Level(0),
+            range: 0..5,
+            removed_by_x9: vec![],
+        };
+        let indices: Vec<_> = run.indices().collect();
+        assert_eq!(indices, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn bidi_run_indices_with_removals() {
+        let run = BidiRun {
+            direction: Direction::RightToLeft,
+            level: Level(1),
+            range: 0..5,
+            removed_by_x9: vec![1, 3],
+        };
+        let indices: Vec<_> = run.indices().collect();
+        assert_eq!(indices, vec![0, 2, 4]);
+    }
+
+    #[test]
+    fn bidi_run_indices_empty_range() {
+        let run = BidiRun {
+            direction: Direction::LeftToRight,
+            level: Level(0),
+            range: 0..0,
+            removed_by_x9: vec![],
+        };
+        let indices: Vec<_> = run.indices().collect();
+        assert!(indices.is_empty());
+    }
+
+    #[test]
+    fn bidi_run_clone_eq() {
+        let a = BidiRun {
+            direction: Direction::LeftToRight,
+            level: Level(0),
+            range: 0..3,
+            removed_by_x9: vec![],
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    // ── BidiContext: pure LTR ───────────────────────────────
+
+    #[test]
+    fn pure_ltr_text_single_run() {
+        let text: Vec<char> = "hello world".chars().collect();
+        let mut ctx = BidiContext::new();
+        ctx.resolve_paragraph(&text, ParagraphDirectionHint::LeftToRight);
+        assert_eq!(ctx.base_level(), Level(0));
+        let runs: Vec<_> = ctx.runs().collect();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].direction, Direction::LeftToRight);
+        assert_eq!(runs[0].range, 0..text.len());
+    }
+
+    #[test]
+    fn pure_ltr_reorder_is_identity() {
+        let text: Vec<char> = "abc".chars().collect();
+        let mut ctx = BidiContext::new();
+        ctx.resolve_paragraph(&text, ParagraphDirectionHint::LeftToRight);
+        let (_, reordered) = ctx.reorder_line(0..text.len());
+        assert_eq!(reordered, vec![0, 1, 2]);
+    }
+
+    // ── BidiContext: pure RTL ───────────────────────────────
+
+    #[test]
+    fn pure_rtl_text_single_run() {
+        let text: Vec<char> = vec!['\u{5d0}', '\u{5d1}', '\u{5d2}']; // alef bet gimel
+        let mut ctx = BidiContext::new();
+        ctx.resolve_paragraph(&text, ParagraphDirectionHint::RightToLeft);
+        assert_eq!(ctx.base_level(), Level(1));
+        let runs: Vec<_> = ctx.runs().collect();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].direction, Direction::RightToLeft);
+    }
+
+    #[test]
+    fn pure_rtl_reorder_reverses() {
+        let text: Vec<char> = vec!['\u{5d0}', '\u{5d1}', '\u{5d2}'];
+        let mut ctx = BidiContext::new();
+        ctx.resolve_paragraph(&text, ParagraphDirectionHint::RightToLeft);
+        let (_, reordered) = ctx.reorder_line(0..text.len());
+        assert_eq!(reordered, vec![2, 1, 0]);
+    }
+
+    // ── BidiContext: mixed text ──────────────────────────────
+
+    #[test]
+    fn mixed_text_multiple_runs() {
+        // Hebrew then Latin
+        let text: Vec<char> = vec!['\u{5d0}', '\u{5d1}', 'a', 'b'];
+        let mut ctx = BidiContext::new();
+        ctx.resolve_paragraph(&text, ParagraphDirectionHint::AutoLeftToRight);
+        let runs: Vec<_> = ctx.runs().collect();
+        assert!(runs.len() >= 2);
+    }
+
+    // ── BidiContext: auto-detect ─────────────────────────────
+
+    #[test]
+    fn auto_detect_ltr_for_latin() {
+        let text: Vec<char> = "abc".chars().collect();
+        let mut ctx = BidiContext::new();
+        ctx.resolve_paragraph(&text, ParagraphDirectionHint::AutoLeftToRight);
+        assert_eq!(ctx.base_level(), Level(0));
+    }
+
+    #[test]
+    fn auto_detect_rtl_for_hebrew() {
+        let text: Vec<char> = vec!['\u{5d0}', '\u{5d1}'];
+        let mut ctx = BidiContext::new();
+        ctx.resolve_paragraph(&text, ParagraphDirectionHint::AutoRightToLeft);
+        assert_eq!(ctx.base_level(), Level(1));
+    }
+
+    // ── bidi_class_for_char: more coverage ──────────────────
+
+    #[test]
+    fn bidi_class_digits_are_european_number() {
+        assert_eq!(bidi_class_for_char('0'), BidiClass::EuropeanNumber);
+        assert_eq!(bidi_class_for_char('9'), BidiClass::EuropeanNumber);
+    }
+
+    #[test]
+    fn bidi_class_arabic_chars() {
+        // U+0600 is Arabic number sign (ArabicNumber class)
+        // U+0627 is Alef (ArabicLetter class)
+        assert_eq!(bidi_class_for_char('\u{0627}'), BidiClass::ArabicLetter);
+    }
+
+    #[test]
+    fn bidi_class_punctuation_is_other_neutral() {
+        assert_eq!(bidi_class_for_char('!'), BidiClass::OtherNeutral);
+        assert_eq!(bidi_class_for_char('('), BidiClass::OtherNeutral);
+    }
+
+    // ── ReorderedRun ────────────────────────────────────────
+
+    #[test]
+    fn reordered_run_debug_clone_eq() {
+        let a = ReorderedRun {
+            direction: Direction::LeftToRight,
+            level: Level(0),
+            range: 0..3,
+            indices: vec![0, 1, 2],
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
+        let dbg = format!("{a:?}");
+        assert!(dbg.contains("ReorderedRun"));
+    }
+
+    // ── BidiContext: line_runs ───────────────────────────────
+
+    #[test]
+    fn line_runs_subset() {
+        let text: Vec<char> = "hello world".chars().collect();
+        let mut ctx = BidiContext::new();
+        ctx.resolve_paragraph(&text, ParagraphDirectionHint::LeftToRight);
+        let runs: Vec<_> = ctx.line_runs(0..5).collect();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].range, 0..5);
+    }
+
+    // ── BidiContext: reordered_runs ──────────────────────────
+
+    #[test]
+    fn reordered_runs_ltr_identity() {
+        let text: Vec<char> = "abc".chars().collect();
+        let mut ctx = BidiContext::new();
+        ctx.resolve_paragraph(&text, ParagraphDirectionHint::LeftToRight);
+        let runs = ctx.reordered_runs(0..text.len());
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].direction, Direction::LeftToRight);
+        assert_eq!(runs[0].indices, vec![0, 1, 2]);
+    }
+
+    // ── BidiContext: set_reorder_non_spacing_marks ────────────
+
+    #[test]
+    fn set_reorder_nsm_toggles() {
+        let mut ctx = BidiContext::new();
+        // Default is false - just verify it doesn't panic
+        ctx.set_reorder_non_spacing_marks(true);
+        ctx.set_reorder_non_spacing_marks(false);
+    }
 }
