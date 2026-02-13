@@ -1,0 +1,30 @@
+[package]
+name = "frankenterm-scripting"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+default = []
+lua = ["dep:config", "dep:luahelper", "dep:mlua", "dep:smol", "config/lua"]
+wasm = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:log", "dep:serde_json"]
+
+[dependencies]
+anyhow.workspace = true
+config = { workspace = true, optional = true }
+frankenterm-dynamic.workspace = true
+log = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+luahelper = { workspace = true, optional = true }
+mlua = { workspace = true, optional = true, features = ["vendored", "lua54", "async", "send", "serialize"] }
+smol = { workspace = true, optional = true }
+wasmtime = { workspace = true, optional = true }
+wasmtime-wasi = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion.workspace = true
+proptest = "1.8.0"
+
+[[bench]]
+name = "dispatch_overhead"
+harness = false

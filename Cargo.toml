@@ -370,6 +370,10 @@ crossterm = "0.29.0"
 # Git dep; use .cargo/config.toml for local path overrides during development.
 ftui = { git = "https://github.com/Dicklesworthstone/frankentui", default-features = false, features = ["runtime"] }
 
+# WASM runtime (optional, for scripting/extensions)
+wasmtime = { version = "41", default-features = false, features = ["cranelift", "async", "component-model", "runtime", "std"] }
+wasmtime-wasi = { version = "41", default-features = false, features = ["p1"] }
+
 # Benchmarking
 criterion = { version = "0.5", features = ["async_tokio"] }
 
