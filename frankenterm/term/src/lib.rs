@@ -133,3 +133,157 @@ pub const OSC: &str = "\x1b]";
 pub const ST: &str = "\x1b\\";
 pub const SS3: &str = "\x1bO";
 pub const DCS: &str = "\x1bP";
+
+#[cfg(test)]
+mod lib_tests {
+    use super::*;
+
+    // ── intersects_range ────────────────────────────────────
+
+    #[test]
+    fn overlapping_ranges_intersect() {
+        assert!(intersects_range(0..5, 3..8));
+    }
+
+    #[test]
+    fn identical_ranges_intersect() {
+        assert!(intersects_range(0..5, 0..5));
+    }
+
+    #[test]
+    fn contained_range_intersects() {
+        assert!(intersects_range(0..10, 3..7));
+    }
+
+    #[test]
+    fn disjoint_ranges_do_not_intersect() {
+        assert!(!intersects_range(0..5, 5..10));
+    }
+
+    #[test]
+    fn adjacent_ranges_do_not_intersect() {
+        assert!(!intersects_range(0..3, 3..6));
+    }
+
+    #[test]
+    fn reversed_order_intersects() {
+        assert!(intersects_range(3..8, 0..5));
+    }
+
+    #[test]
+    fn empty_range_does_not_intersect() {
+        assert!(!intersects_range(5..5, 0..10));
+    }
+
+    #[test]
+    fn single_element_range_intersects() {
+        assert!(intersects_range(3..4, 0..10));
+    }
+
+    // ── CursorPosition ─────────────────────────────────────
+
+    #[test]
+    fn cursor_position_default() {
+        let pos = CursorPosition::default();
+        assert_eq!(pos.x, 0);
+        assert_eq!(pos.y, 0);
+    }
+
+    #[test]
+    fn cursor_position_eq() {
+        let a = CursorPosition::default();
+        let b = CursorPosition::default();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn cursor_position_clone_copy() {
+        let a = CursorPosition {
+            x: 5,
+            y: 10,
+            ..Default::default()
+        };
+        let b = a;
+        assert_eq!(a.x, b.x);
+        assert_eq!(a.y, b.y);
+    }
+
+    // ── Position enum ───────────────────────────────────────
+
+    #[test]
+    fn position_absolute_debug() {
+        let p = Position::Absolute(42);
+        let debug = format!("{p:?}");
+        assert!(debug.contains("Absolute"));
+        assert!(debug.contains("42"));
+    }
+
+    #[test]
+    fn position_relative_debug() {
+        let p = Position::Relative(-3);
+        let debug = format!("{p:?}");
+        assert!(debug.contains("Relative"));
+        assert!(debug.contains("-3"));
+    }
+
+    // ── SemanticZone ────────────────────────────────────────
+
+    #[test]
+    fn semantic_zone_eq() {
+        let a = SemanticZone {
+            start_y: 0,
+            start_x: 0,
+            end_y: 10,
+            end_x: 80,
+            semantic_type: SemanticType::default(),
+        };
+        let b = a;
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn semantic_zone_ord() {
+        let a = SemanticZone {
+            start_y: 0,
+            start_x: 0,
+            end_y: 5,
+            end_x: 10,
+            semantic_type: SemanticType::default(),
+        };
+        let b = SemanticZone {
+            start_y: 1,
+            start_x: 0,
+            end_y: 5,
+            end_x: 10,
+            semantic_type: SemanticType::default(),
+        };
+        assert!(a < b);
+    }
+
+    // ── escape sequence constants ───────────────────────────
+
+    #[test]
+    fn csi_constant() {
+        assert_eq!(CSI, "\x1b[");
+    }
+
+    #[test]
+    fn osc_constant() {
+        assert_eq!(OSC, "\x1b]");
+    }
+
+    #[test]
+    fn st_constant() {
+        assert_eq!(ST, "\x1b\\");
+    }
+
+    #[test]
+    fn ss3_constant() {
+        assert_eq!(SS3, "\x1bO");
+    }
+
+    #[test]
+    fn dcs_constant() {
+        assert_eq!(DCS, "\x1bP");
+    }
+}

@@ -49,52 +49,189 @@ impl NewlineCanon {
 }
 
 #[cfg(test)]
-#[test]
-fn test_canon() {
-    assert_eq!(
-        "hello\nthere",
-        NewlineCanon::None.canonicalize("hello\nthere")
-    );
-    assert_eq!(
-        "hello\r\nthere",
-        NewlineCanon::CarriageReturnAndLineFeed.canonicalize("hello\nthere")
-    );
-    assert_eq!(
-        "hello\rthere",
-        NewlineCanon::CarriageReturn.canonicalize("hello\nthere")
-    );
-    assert_eq!(
-        "hello\nthere",
-        NewlineCanon::LineFeed.canonicalize("hello\nthere")
-    );
-    assert_eq!(
-        "hello\nthere",
-        NewlineCanon::LineFeed.canonicalize("hello\r\nthere")
-    );
-    assert_eq!(
-        "hello\nthere",
-        NewlineCanon::LineFeed.canonicalize("hello\rthere")
-    );
-    assert_eq!(
-        "hello\n\nthere",
-        NewlineCanon::LineFeed.canonicalize("hello\r\rthere")
-    );
-    assert_eq!(
-        "hello\n\nthere",
-        NewlineCanon::LineFeed.canonicalize("hello\r\n\rthere")
-    );
-    assert_eq!(
-        "hello\n\nthere",
-        NewlineCanon::LineFeed.canonicalize("hello\r\n\nthere")
-    );
-    assert_eq!(
-        "hello\n\nthere",
-        NewlineCanon::LineFeed.canonicalize("hello\r\n\r\nthere")
-    );
-    assert_eq!(
-        "hello\n\n\nthere",
-        NewlineCanon::LineFeed.canonicalize("hello\r\r\n\nthere")
-    );
+mod tests {
+    use super::*;
+
+    #[test]
+    fn newline_canon_eq() {
+        assert_eq!(NewlineCanon::None, NewlineCanon::None);
+        assert_ne!(NewlineCanon::None, NewlineCanon::LineFeed);
+        assert_ne!(NewlineCanon::LineFeed, NewlineCanon::CarriageReturn);
+    }
+
+    #[test]
+    fn newline_canon_clone_copy() {
+        let a = NewlineCanon::LineFeed;
+        let b = a;
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn newline_canon_debug() {
+        let debug = format!("{:?}", NewlineCanon::CarriageReturnAndLineFeed);
+        assert!(debug.contains("CarriageReturnAndLineFeed"));
+    }
+
+    #[test]
+    fn newline_canon_default_on_unix() {
+        if !cfg!(windows) {
+            assert_eq!(NewlineCanon::default(), NewlineCanon::CarriageReturn);
+        }
+    }
+
+    #[test]
+    fn canon_none_preserves_all() {
+        assert_eq!(
+            NewlineCanon::None.canonicalize("a\nb\rc\r\nd"),
+            "a\nb\rc\r\nd"
+        );
+    }
+
+    #[test]
+    fn canon_none_empty_string() {
+        assert_eq!(NewlineCanon::None.canonicalize(""), "");
+    }
+
+    #[test]
+    fn canon_lf_converts_cr_to_lf() {
+        assert_eq!(NewlineCanon::LineFeed.canonicalize("a\rb"), "a\nb");
+    }
+
+    #[test]
+    fn canon_lf_converts_crlf_to_lf() {
+        assert_eq!(NewlineCanon::LineFeed.canonicalize("a\r\nb"), "a\nb");
+    }
+
+    #[test]
+    fn canon_cr_converts_lf_to_cr() {
+        assert_eq!(NewlineCanon::CarriageReturn.canonicalize("a\nb"), "a\rb");
+    }
+
+    #[test]
+    fn canon_cr_converts_crlf_to_cr() {
+        assert_eq!(NewlineCanon::CarriageReturn.canonicalize("a\r\nb"), "a\rb");
+    }
+
+    #[test]
+    fn canon_crlf_converts_lf_to_crlf() {
+        assert_eq!(
+            NewlineCanon::CarriageReturnAndLineFeed.canonicalize("a\nb"),
+            "a\r\nb"
+        );
+    }
+
+    #[test]
+    fn canon_crlf_converts_cr_to_crlf() {
+        assert_eq!(
+            NewlineCanon::CarriageReturnAndLineFeed.canonicalize("a\rb"),
+            "a\r\nb"
+        );
+    }
+
+    #[test]
+    fn canon_no_newlines_unchanged() {
+        assert_eq!(
+            NewlineCanon::LineFeed.canonicalize("hello world"),
+            "hello world"
+        );
+    }
+
+    // Original comprehensive test
+    #[test]
+    fn test_canon() {
+        assert_eq!(
+            "hello\nthere",
+            NewlineCanon::None.canonicalize("hello\nthere")
+        );
+        assert_eq!(
+            "hello\r\nthere",
+            NewlineCanon::CarriageReturnAndLineFeed.canonicalize("hello\nthere")
+        );
+        assert_eq!(
+            "hello\rthere",
+            NewlineCanon::CarriageReturn.canonicalize("hello\nthere")
+        );
+        assert_eq!(
+            "hello\nthere",
+            NewlineCanon::LineFeed.canonicalize("hello\nthere")
+        );
+        assert_eq!(
+            "hello\nthere",
+            NewlineCanon::LineFeed.canonicalize("hello\r\nthere")
+        );
+        assert_eq!(
+            "hello\nthere",
+            NewlineCanon::LineFeed.canonicalize("hello\rthere")
+        );
+        assert_eq!(
+            "hello\n\nthere",
+            NewlineCanon::LineFeed.canonicalize("hello\r\rthere")
+        );
+        assert_eq!(
+            "hello\n\nthere",
+            NewlineCanon::LineFeed.canonicalize("hello\r\n\rthere")
+        );
+        assert_eq!(
+            "hello\n\nthere",
+            NewlineCanon::LineFeed.canonicalize("hello\r\n\nthere")
+        );
+        assert_eq!(
+            "hello\n\nthere",
+            NewlineCanon::LineFeed.canonicalize("hello\r\n\r\nthere")
+        );
+        assert_eq!(
+            "hello\n\n\nthere",
+            NewlineCanon::LineFeed.canonicalize("hello\r\r\n\nthere")
+        );
+    }
+
+    // ── BidiMode ────────────────────────────────────────────
+
+    #[test]
+    fn bidi_mode_eq() {
+        let a = BidiMode {
+            enabled: true,
+            hint: ParagraphDirectionHint::LeftToRight,
+        };
+        let b = BidiMode {
+            enabled: true,
+            hint: ParagraphDirectionHint::LeftToRight,
+        };
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn bidi_mode_ne() {
+        let a = BidiMode {
+            enabled: true,
+            hint: ParagraphDirectionHint::LeftToRight,
+        };
+        let b = BidiMode {
+            enabled: false,
+            hint: ParagraphDirectionHint::LeftToRight,
+        };
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn bidi_mode_clone_copy() {
+        let a = BidiMode {
+            enabled: true,
+            hint: ParagraphDirectionHint::LeftToRight,
+        };
+        let b = a;
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn bidi_mode_debug() {
+        let mode = BidiMode {
+            enabled: true,
+            hint: ParagraphDirectionHint::LeftToRight,
+        };
+        let debug = format!("{mode:?}");
+        assert!(debug.contains("enabled"));
+    }
 }
 
 impl Default for NewlineCanon {

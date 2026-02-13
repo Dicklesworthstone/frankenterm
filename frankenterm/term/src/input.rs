@@ -96,3 +96,174 @@ impl LastMouseClick {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pos(col: usize, row: i64) -> ClickPosition {
+        ClickPosition {
+            column: col,
+            row,
+            x_pixel_offset: 0,
+            y_pixel_offset: 0,
+        }
+    }
+
+    // ── MouseButton ─────────────────────────────────────────
+
+    #[test]
+    fn mouse_button_eq() {
+        assert_eq!(MouseButton::Left, MouseButton::Left);
+        assert_ne!(MouseButton::Left, MouseButton::Right);
+        assert_ne!(MouseButton::Left, MouseButton::Middle);
+    }
+
+    #[test]
+    fn mouse_button_wheel_variants() {
+        assert_eq!(MouseButton::WheelUp(1), MouseButton::WheelUp(1));
+        assert_ne!(MouseButton::WheelUp(1), MouseButton::WheelUp(2));
+        assert_ne!(MouseButton::WheelUp(1), MouseButton::WheelDown(1));
+    }
+
+    #[test]
+    fn mouse_button_clone_copy() {
+        let b = MouseButton::Left;
+        let c = b;
+        assert_eq!(b, c);
+    }
+
+    #[test]
+    fn mouse_button_debug() {
+        let debug = format!("{:?}", MouseButton::Left);
+        assert_eq!(debug, "Left");
+    }
+
+    #[test]
+    fn mouse_button_ord() {
+        // Just verify it doesn't panic
+        let _ = MouseButton::Left.cmp(&MouseButton::Right);
+    }
+
+    #[test]
+    fn mouse_button_hash() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(MouseButton::Left);
+        set.insert(MouseButton::Right);
+        set.insert(MouseButton::Left); // duplicate
+        assert_eq!(set.len(), 2);
+    }
+
+    // ── MouseEventKind ──────────────────────────────────────
+
+    #[test]
+    fn mouse_event_kind_eq() {
+        assert_eq!(MouseEventKind::Press, MouseEventKind::Press);
+        assert_ne!(MouseEventKind::Press, MouseEventKind::Release);
+        assert_ne!(MouseEventKind::Release, MouseEventKind::Move);
+    }
+
+    #[test]
+    fn mouse_event_kind_clone_copy() {
+        let k = MouseEventKind::Move;
+        let k2 = k;
+        assert_eq!(k, k2);
+    }
+
+    // ── MouseEvent ──────────────────────────────────────────
+
+    #[test]
+    fn mouse_event_construction() {
+        let evt = MouseEvent {
+            kind: MouseEventKind::Press,
+            x: 10,
+            y: 5,
+            x_pixel_offset: 2,
+            y_pixel_offset: 3,
+            button: MouseButton::Left,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(evt.kind, MouseEventKind::Press);
+        assert_eq!(evt.x, 10);
+        assert_eq!(evt.y, 5);
+        assert_eq!(evt.button, MouseButton::Left);
+    }
+
+    #[test]
+    fn mouse_event_eq() {
+        let evt1 = MouseEvent {
+            kind: MouseEventKind::Press,
+            x: 0,
+            y: 0,
+            x_pixel_offset: 0,
+            y_pixel_offset: 0,
+            button: MouseButton::Left,
+            modifiers: KeyModifiers::NONE,
+        };
+        let evt2 = evt1;
+        assert_eq!(evt1, evt2);
+    }
+
+    // ── ClickPosition ───────────────────────────────────────
+
+    #[test]
+    fn click_position_eq() {
+        let a = pos(5, 10);
+        let b = pos(5, 10);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn click_position_ne() {
+        assert_ne!(pos(5, 10), pos(6, 10));
+        assert_ne!(pos(5, 10), pos(5, 11));
+    }
+
+    // ── LastMouseClick ──────────────────────────────────────
+
+    #[test]
+    fn new_click_has_streak_1() {
+        let click = LastMouseClick::new(MouseButton::Left, pos(0, 0));
+        assert_eq!(click.streak, 1);
+        assert_eq!(click.button, MouseButton::Left);
+    }
+
+    #[test]
+    fn same_button_same_position_increments_streak() {
+        let click1 = LastMouseClick::new(MouseButton::Left, pos(5, 3));
+        let click2 = click1.add(MouseButton::Left, pos(5, 3));
+        assert_eq!(click2.streak, 2);
+        let click3 = click2.add(MouseButton::Left, pos(5, 3));
+        assert_eq!(click3.streak, 3);
+    }
+
+    #[test]
+    fn different_button_resets_streak() {
+        let click1 = LastMouseClick::new(MouseButton::Left, pos(5, 3));
+        let click2 = click1.add(MouseButton::Right, pos(5, 3));
+        assert_eq!(click2.streak, 1);
+    }
+
+    #[test]
+    fn different_position_resets_streak() {
+        let click1 = LastMouseClick::new(MouseButton::Left, pos(5, 3));
+        let click2 = click1.add(MouseButton::Left, pos(6, 3));
+        assert_eq!(click2.streak, 1);
+    }
+
+    #[test]
+    fn different_row_resets_streak() {
+        let click1 = LastMouseClick::new(MouseButton::Left, pos(5, 3));
+        let click2 = click1.add(MouseButton::Left, pos(5, 4));
+        assert_eq!(click2.streak, 1);
+    }
+
+    #[test]
+    fn click_preserves_position_and_button() {
+        let click = LastMouseClick::new(MouseButton::Middle, pos(10, 20));
+        assert_eq!(click.position.column, 10);
+        assert_eq!(click.position.row, 20);
+        assert_eq!(click.button, MouseButton::Middle);
+    }
+}

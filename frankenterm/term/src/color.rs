@@ -191,3 +191,180 @@ impl ColorPalette {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Palette256 ──────────────────────────────────────────
+
+    #[test]
+    fn palette256_debug_is_suppressed() {
+        let palette = Palette256([SrgbaTuple::default(); 256]);
+        assert_eq!(format!("{palette:?}"), "[suppressed]");
+    }
+
+    #[test]
+    fn palette256_clone_eq() {
+        let a = Palette256([SrgbaTuple::default(); 256]);
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn palette256_from_iterator() {
+        let colors = (0..256).map(|i| {
+            let v = i as f32 / 255.0;
+            SrgbaTuple(v, v, v, 1.0)
+        });
+        let palette: Palette256 = colors.collect();
+        // First entry should be black
+        assert_eq!(palette.0[0], SrgbaTuple(0.0, 0.0, 0.0, 1.0));
+        // Last entry should be white
+        let last = palette.0[255];
+        assert!((last.0 - 1.0).abs() < 0.01);
+    }
+
+    // ── ColorPalette defaults ───────────────────────────────
+
+    #[test]
+    fn default_palette_has_256_colors() {
+        let palette = ColorPalette::default();
+        assert_eq!(palette.colors.0.len(), 256);
+    }
+
+    #[test]
+    fn default_palette_black_is_first_ansi() {
+        let palette = ColorPalette::default();
+        let black = palette.colors.0[AnsiColor::Black as usize];
+        // Black should have very low RGB values
+        assert!(black.0 < 0.01);
+        assert!(black.1 < 0.01);
+        assert!(black.2 < 0.01);
+    }
+
+    #[test]
+    fn default_palette_white_is_bright() {
+        let palette = ColorPalette::default();
+        let white = palette.colors.0[15]; // Bright white
+        assert!(white.0 > 0.9);
+        assert!(white.1 > 0.9);
+        assert!(white.2 > 0.9);
+    }
+
+    #[test]
+    fn default_palette_foreground_is_grey() {
+        let palette = ColorPalette::default();
+        // Foreground is set to colors[249] (a grey)
+        assert!(palette.foreground.0 > 0.5);
+    }
+
+    #[test]
+    fn default_palette_clone_eq() {
+        let a = ColorPalette::default();
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    // ── resolve_fg / resolve_bg ─────────────────────────────
+
+    #[test]
+    fn resolve_fg_default_returns_foreground() {
+        let palette = ColorPalette::default();
+        assert_eq!(
+            palette.resolve_fg(ColorAttribute::Default),
+            palette.foreground
+        );
+    }
+
+    #[test]
+    fn resolve_bg_default_returns_background() {
+        let palette = ColorPalette::default();
+        assert_eq!(
+            palette.resolve_bg(ColorAttribute::Default),
+            palette.background
+        );
+    }
+
+    #[test]
+    fn resolve_fg_palette_index() {
+        let palette = ColorPalette::default();
+        let color = palette.resolve_fg(ColorAttribute::PaletteIndex(1)); // Red/Maroon
+        assert_eq!(color, palette.colors.0[1]);
+    }
+
+    #[test]
+    fn resolve_bg_palette_index() {
+        let palette = ColorPalette::default();
+        let color = palette.resolve_bg(ColorAttribute::PaletteIndex(2)); // Green
+        assert_eq!(color, palette.colors.0[2]);
+    }
+
+    #[test]
+    fn resolve_fg_truecolor() {
+        let palette = ColorPalette::default();
+        let rgb = RgbColor::new_8bpc(0x12, 0x34, 0x56);
+        let color = palette.resolve_fg(ColorAttribute::TrueColorWithDefaultFallback(rgb.into()));
+        let expected: SrgbaTuple = rgb.into();
+        assert_eq!(color, expected);
+    }
+
+    #[test]
+    fn resolve_bg_truecolor_with_palette_fallback() {
+        let palette = ColorPalette::default();
+        let rgb = RgbColor::new_8bpc(0xab, 0xcd, 0xef);
+        let color = palette.resolve_bg(ColorAttribute::TrueColorWithPaletteFallback(
+            rgb.into(),
+            100,
+        ));
+        let expected: SrgbaTuple = rgb.into();
+        assert_eq!(color, expected);
+    }
+
+    // ── 216 color cube ──────────────────────────────────────
+
+    #[test]
+    fn color_cube_entry_16_is_black() {
+        let palette = ColorPalette::default();
+        let entry = palette.colors.0[16]; // First color cube entry (0,0,0)
+        assert!(entry.0 < 0.01);
+        assert!(entry.1 < 0.01);
+        assert!(entry.2 < 0.01);
+    }
+
+    #[test]
+    fn color_cube_entry_231_is_white() {
+        let palette = ColorPalette::default();
+        let entry = palette.colors.0[231]; // Last color cube entry (5,5,5) = (0xff, 0xff, 0xff)
+        assert!(entry.0 > 0.9);
+        assert!(entry.1 > 0.9);
+        assert!(entry.2 > 0.9);
+    }
+
+    // ── 24 grey ramp ────────────────────────────────────────
+
+    #[test]
+    fn grey_ramp_is_monotonically_increasing() {
+        let palette = ColorPalette::default();
+        for i in 232..255 {
+            let a = palette.colors.0[i];
+            let b = palette.colors.0[i + 1];
+            assert!(
+                b.0 >= a.0,
+                "Grey ramp not increasing at index {i}: {a:?} vs {b:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn grey_entries_are_grey() {
+        let palette = ColorPalette::default();
+        for i in 232..256 {
+            let c = palette.colors.0[i];
+            assert!(
+                (c.0 - c.1).abs() < 0.01 && (c.1 - c.2).abs() < 0.01,
+                "Entry {i} is not grey: {c:?}"
+            );
+        }
+    }
+}
