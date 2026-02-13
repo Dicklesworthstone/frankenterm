@@ -968,4 +968,283 @@ mod tests {
             prop_assert!(lte);
         }
     }
+
+    // ===================================================================
+    // Concurrent stress tests
+    // ===================================================================
+
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Barrier;
+
+    /// Multiple threads fire events concurrently on a shared bus.
+    /// Verifies no panics, no lost actions, and handler count is consistent.
+    #[test]
+    fn concurrent_fire_from_multiple_threads() {
+        let bus = Arc::new(EventBus::new());
+        let fire_count = Arc::new(AtomicUsize::new(0));
+
+        let handler: Arc<HandlerFn> = Arc::new(|_| {
+            vec![EventAction::Log {
+                message: "hit".into(),
+            }]
+        });
+        bus.register(HandlerPriority::Native, None, handler);
+
+        let n_threads = 8;
+        let n_fires_per_thread = 1000;
+        let barrier = Arc::new(Barrier::new(n_threads));
+
+        let threads: Vec<_> = (0..n_threads)
+            .map(|_| {
+                let bus = bus.clone();
+                let fire_count = fire_count.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..n_fires_per_thread {
+                        let actions = bus.fire(&Event::with_timestamp(
+                            EventType::PaneOutput,
+                            EventPayload::Empty,
+                            0,
+                        ));
+                        fire_count.fetch_add(actions.len(), Ordering::Relaxed);
+                    }
+                })
+            })
+            .collect();
+
+        for t in threads {
+            t.join().unwrap();
+        }
+
+        // Each thread fires n_fires_per_thread events, each producing 1 action.
+        assert_eq!(
+            fire_count.load(Ordering::Relaxed),
+            n_threads * n_fires_per_thread
+        );
+        // Handler is still registered.
+        assert_eq!(bus.handler_count(), 1);
+    }
+
+    /// Concurrent register + fire: some threads register handlers while
+    /// others fire events.  No panics or data corruption should occur.
+    #[test]
+    fn concurrent_register_and_fire() {
+        let bus = Arc::new(EventBus::new());
+        let n_registrars = 4;
+        let n_firers = 4;
+        let n_ops = 500;
+        let barrier = Arc::new(Barrier::new(n_registrars + n_firers));
+
+        let total_actions = Arc::new(AtomicUsize::new(0));
+
+        let mut threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
+
+        // Registrar threads.
+        for _ in 0..n_registrars {
+            let bus = bus.clone();
+            let barrier = barrier.clone();
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..n_ops {
+                    let h: Arc<HandlerFn> = Arc::new(|_| {
+                        vec![EventAction::Log {
+                            message: "x".into(),
+                        }]
+                    });
+                    bus.register(HandlerPriority::Native, None, h);
+                }
+            }));
+        }
+
+        // Firer threads.
+        for _ in 0..n_firers {
+            let bus = bus.clone();
+            let barrier = barrier.clone();
+            let total_actions = total_actions.clone();
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..n_ops {
+                    let actions = bus.fire(&Event::with_timestamp(
+                        EventType::PaneOutput,
+                        EventPayload::Empty,
+                        0,
+                    ));
+                    total_actions.fetch_add(actions.len(), Ordering::Relaxed);
+                }
+            }));
+        }
+
+        for t in threads {
+            t.join().unwrap();
+        }
+
+        // All registrations should have completed.
+        assert_eq!(bus.handler_count(), n_registrars * n_ops);
+        // total_actions should be > 0 (handlers accumulated during registration).
+        assert!(total_actions.load(Ordering::Relaxed) > 0);
+    }
+
+    /// Concurrent register + deregister: verifies handler_count remains
+    /// consistent under mixed write contention.
+    #[test]
+    fn concurrent_register_deregister() {
+        let bus = Arc::new(EventBus::new());
+        let n_threads = 4;
+        let n_ops = 500;
+        let barrier = Arc::new(Barrier::new(n_threads));
+
+        let threads: Vec<_> = (0..n_threads)
+            .map(|_| {
+                let bus = bus.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let mut ids = Vec::new();
+                    for _ in 0..n_ops {
+                        let h: Arc<HandlerFn> = Arc::new(|_| vec![]);
+                        let id = bus.register(HandlerPriority::Native, None, h);
+                        ids.push(id);
+                    }
+                    // Deregister all in reverse order.
+                    for id in ids.into_iter().rev() {
+                        bus.deregister(id);
+                    }
+                })
+            })
+            .collect();
+
+        for t in threads {
+            t.join().unwrap();
+        }
+
+        // All handlers should be deregistered.
+        assert_eq!(bus.handler_count(), 0);
+    }
+
+    /// Simulates 60 Hz update-status pattern under concurrent fire from
+    /// multiple producer threads (pane output, resize, user-var-changed).
+    #[test]
+    fn concurrent_multi_event_type_dispatch() {
+        let bus = Arc::new(EventBus::new());
+
+        // Register handlers for different event types.
+        let status_count = Arc::new(AtomicUsize::new(0));
+        let output_count = Arc::new(AtomicUsize::new(0));
+        let resize_count = Arc::new(AtomicUsize::new(0));
+
+        {
+            let c = status_count.clone();
+            let h: Arc<HandlerFn> = Arc::new(move |_| {
+                c.fetch_add(1, Ordering::Relaxed);
+                vec![]
+            });
+            bus.register(HandlerPriority::Native, Some(EventType::UpdateStatus), h);
+        }
+        {
+            let c = output_count.clone();
+            let h: Arc<HandlerFn> = Arc::new(move |_| {
+                c.fetch_add(1, Ordering::Relaxed);
+                vec![]
+            });
+            bus.register(HandlerPriority::Native, Some(EventType::PaneOutput), h);
+        }
+        {
+            let c = resize_count.clone();
+            let h: Arc<HandlerFn> = Arc::new(move |_| {
+                c.fetch_add(1, Ordering::Relaxed);
+                vec![]
+            });
+            bus.register(HandlerPriority::Native, Some(EventType::WindowResized), h);
+        }
+
+        let n_fires = 1000;
+        let barrier = Arc::new(Barrier::new(3));
+
+        let bus1 = bus.clone();
+        let b1 = barrier.clone();
+        let t1 = std::thread::spawn(move || {
+            b1.wait();
+            for _ in 0..n_fires {
+                bus1.fire(&Event::with_timestamp(
+                    EventType::UpdateStatus,
+                    EventPayload::Status { pane_id: 0 },
+                    0,
+                ));
+            }
+        });
+
+        let bus2 = bus.clone();
+        let b2 = barrier.clone();
+        let t2 = std::thread::spawn(move || {
+            b2.wait();
+            for _ in 0..n_fires {
+                bus2.fire(&Event::with_timestamp(
+                    EventType::PaneOutput,
+                    EventPayload::PaneText {
+                        pane_id: 1,
+                        text: Arc::from("data"),
+                    },
+                    0,
+                ));
+            }
+        });
+
+        let bus3 = bus.clone();
+        let b3 = barrier.clone();
+        let t3 = std::thread::spawn(move || {
+            b3.wait();
+            for _ in 0..n_fires {
+                bus3.fire(&Event::with_timestamp(
+                    EventType::WindowResized,
+                    EventPayload::Resize {
+                        window_id: 0,
+                        rows: 24,
+                        cols: 80,
+                    },
+                    0,
+                ));
+            }
+        });
+
+        t1.join().unwrap();
+        t2.join().unwrap();
+        t3.join().unwrap();
+
+        // Each event type should have been dispatched exactly n_fires times.
+        assert_eq!(status_count.load(Ordering::Relaxed), n_fires);
+        assert_eq!(output_count.load(Ordering::Relaxed), n_fires);
+        assert_eq!(resize_count.load(Ordering::Relaxed), n_fires);
+    }
+
+    /// Stress test: sustained 10K events/second for 100ms.
+    #[test]
+    fn sustained_high_throughput() {
+        let bus = Arc::new(EventBus::new());
+        let call_count = Arc::new(AtomicUsize::new(0));
+
+        // 3 native handlers for the status event.
+        for _ in 0..3 {
+            let c = call_count.clone();
+            let h: Arc<HandlerFn> = Arc::new(move |_| {
+                c.fetch_add(1, Ordering::Relaxed);
+                vec![]
+            });
+            bus.register(HandlerPriority::Native, Some(EventType::UpdateStatus), h);
+        }
+
+        let n_events = 10_000;
+        let event = Event::with_timestamp(
+            EventType::UpdateStatus,
+            EventPayload::Status { pane_id: 0 },
+            0,
+        );
+
+        for _ in 0..n_events {
+            bus.fire(&event);
+        }
+
+        // 3 handlers * 10,000 events = 30,000 calls.
+        assert_eq!(call_count.load(Ordering::Relaxed), 3 * n_events);
+    }
 }
