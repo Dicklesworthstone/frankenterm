@@ -263,7 +263,7 @@ dependencies = [
 [[package]]
 name = "asupersync"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/asupersync#f388be666a8b1aab04b9dfecec4ca962fa378d1d"
+source = "git+https://github.com/Dicklesworthstone/asupersync#dd619274c10c3d949c54dc5eefa2f983177fa0c6"
 dependencies = [
  "base64 0.22.1",
  "bincode",
@@ -859,9 +859,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.2.55"
+version = "1.2.56"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47b26a0954ae34af09b50f0de26458fa95369a0d478d8236d3f93082b219bd29"
+checksum = "aebf35691d1bfb0ac386a69bac2fde4dd276fb618cf8bf4f5318fe285e821bb2"
 dependencies = [
  "find-msvc-tools",
  "jobserver",
@@ -1110,6 +1110,7 @@ dependencies = [
  "serde_json",
  "shlex",
  "smol",
+ "tempfile",
  "termwiz 0.24.0",
  "toml",
  "umask",
@@ -2027,7 +2028,7 @@ dependencies = [
 [[package]]
 name = "fastapi-core"
 version = "0.1.0"
-source = "git+https://github.com/Dicklesworthstone/fastapi_rust#3006db73b8ad95eaccbf054e60e6208233513685"
+source = "git+https://github.com/Dicklesworthstone/fastapi_rust#faa421b6e5c43c616df5d71496aa555d1940bed2"
 dependencies = [
  "asupersync",
  "fastapi-openapi",
@@ -2042,7 +2043,7 @@ dependencies = [
 [[package]]
 name = "fastapi-http"
 version = "0.1.0"
-source = "git+https://github.com/Dicklesworthstone/fastapi_rust#3006db73b8ad95eaccbf054e60e6208233513685"
+source = "git+https://github.com/Dicklesworthstone/fastapi_rust#faa421b6e5c43c616df5d71496aa555d1940bed2"
 dependencies = [
  "asupersync",
  "fastapi-core",
@@ -2051,7 +2052,7 @@ dependencies = [
 [[package]]
 name = "fastapi-macros"
 version = "0.1.0"
-source = "git+https://github.com/Dicklesworthstone/fastapi_rust#3006db73b8ad95eaccbf054e60e6208233513685"
+source = "git+https://github.com/Dicklesworthstone/fastapi_rust#faa421b6e5c43c616df5d71496aa555d1940bed2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2063,7 +2064,7 @@ dependencies = [
 [[package]]
 name = "fastapi-openapi"
 version = "0.1.0"
-source = "git+https://github.com/Dicklesworthstone/fastapi_rust#3006db73b8ad95eaccbf054e60e6208233513685"
+source = "git+https://github.com/Dicklesworthstone/fastapi_rust#faa421b6e5c43c616df5d71496aa555d1940bed2"
 dependencies = [
  "fastapi-router",
  "fastapi-types",
@@ -2074,7 +2075,7 @@ dependencies = [
 [[package]]
 name = "fastapi-output"
 version = "0.1.0"
-source = "git+https://github.com/Dicklesworthstone/fastapi_rust#3006db73b8ad95eaccbf054e60e6208233513685"
+source = "git+https://github.com/Dicklesworthstone/fastapi_rust#faa421b6e5c43c616df5d71496aa555d1940bed2"
 dependencies = [
  "crossterm 0.28.1",
  "parking_lot",
@@ -2086,7 +2087,7 @@ dependencies = [
 [[package]]
 name = "fastapi-router"
 version = "0.1.0"
-source = "git+https://github.com/Dicklesworthstone/fastapi_rust#3006db73b8ad95eaccbf054e60e6208233513685"
+source = "git+https://github.com/Dicklesworthstone/fastapi_rust#faa421b6e5c43c616df5d71496aa555d1940bed2"
 dependencies = [
  "fastapi-types",
  "serde_json",
@@ -2095,7 +2096,7 @@ dependencies = [
 [[package]]
 name = "fastapi-rust"
 version = "0.1.2"
-source = "git+https://github.com/Dicklesworthstone/fastapi_rust#3006db73b8ad95eaccbf054e60e6208233513685"
+source = "git+https://github.com/Dicklesworthstone/fastapi_rust#faa421b6e5c43c616df5d71496aa555d1940bed2"
 dependencies = [
  "fastapi-core",
  "fastapi-http",
@@ -2110,7 +2111,7 @@ dependencies = [
 [[package]]
 name = "fastapi-types"
 version = "0.1.0"
-source = "git+https://github.com/Dicklesworthstone/fastapi_rust#3006db73b8ad95eaccbf054e60e6208233513685"
+source = "git+https://github.com/Dicklesworthstone/fastapi_rust#faa421b6e5c43c616df5d71496aa555d1940bed2"
 
 [[package]]
 name = "fastdivide"
@@ -2148,7 +2149,7 @@ dependencies = [
 [[package]]
 name = "fastmcp-client"
 version = "0.1.0"
-source = "git+https://github.com/Dicklesworthstone/fastmcp_rust#074ce51b0d138b39bb2efefca4dd5e519f19e14d"
+source = "git+https://github.com/Dicklesworthstone/fastmcp_rust#84eb0614db1c6e2c54c4697525e4917fc817d901"
 dependencies = [
  "asupersync",
  "dirs",
@@ -2164,7 +2165,7 @@ dependencies = [
 [[package]]
 name = "fastmcp-console"
 version = "0.1.0"
-source = "git+https://github.com/Dicklesworthstone/fastmcp_rust#074ce51b0d138b39bb2efefca4dd5e519f19e14d"
+source = "git+https://github.com/Dicklesworthstone/fastmcp_rust#84eb0614db1c6e2c54c4697525e4917fc817d901"
 dependencies = [
  "fastmcp-core",
  "fastmcp-protocol",
@@ -2182,7 +2183,7 @@ dependencies = [
 [[package]]
 name = "fastmcp-core"
 version = "0.1.0"
-source = "git+https://github.com/Dicklesworthstone/fastmcp_rust#074ce51b0d138b39bb2efefca4dd5e519f19e14d"
+source = "git+https://github.com/Dicklesworthstone/fastmcp_rust#84eb0614db1c6e2c54c4697525e4917fc817d901"
 dependencies = [
  "asupersync",
  "log",
@@ -2193,7 +2194,7 @@ dependencies = [
 [[package]]
 name = "fastmcp-derive"
 version = "0.1.0"
-source = "git+https://github.com/Dicklesworthstone/fastmcp_rust#074ce51b0d138b39bb2efefca4dd5e519f19e14d"
+source = "git+https://github.com/Dicklesworthstone/fastmcp_rust#84eb0614db1c6e2c54c4697525e4917fc817d901"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2203,7 +2204,7 @@ dependencies = [
 [[package]]
 name = "fastmcp-protocol"
 version = "0.1.0"
-source = "git+https://github.com/Dicklesworthstone/fastmcp_rust#074ce51b0d138b39bb2efefca4dd5e519f19e14d"
+source = "git+https://github.com/Dicklesworthstone/fastmcp_rust#84eb0614db1c6e2c54c4697525e4917fc817d901"
 dependencies = [
  "base64 0.22.1",
  "fastmcp-core",
@@ -2215,7 +2216,7 @@ dependencies = [
 [[package]]
 name = "fastmcp-rust"
 version = "0.1.0"
-source = "git+https://github.com/Dicklesworthstone/fastmcp_rust#074ce51b0d138b39bb2efefca4dd5e519f19e14d"
+source = "git+https://github.com/Dicklesworthstone/fastmcp_rust#84eb0614db1c6e2c54c4697525e4917fc817d901"
 dependencies = [
  "asupersync",
  "fastmcp-client",
@@ -2231,7 +2232,7 @@ dependencies = [
 [[package]]
 name = "fastmcp-server"
 version = "0.1.0"
-source = "git+https://github.com/Dicklesworthstone/fastmcp_rust#074ce51b0d138b39bb2efefca4dd5e519f19e14d"
+source = "git+https://github.com/Dicklesworthstone/fastmcp_rust#84eb0614db1c6e2c54c4697525e4917fc817d901"
 dependencies = [
  "asupersync",
  "base64 0.22.1",
@@ -2252,7 +2253,7 @@ dependencies = [
 [[package]]
 name = "fastmcp-transport"
 version = "0.1.0"
-source = "git+https://github.com/Dicklesworthstone/fastmcp_rust#074ce51b0d138b39bb2efefca4dd5e519f19e14d"
+source = "git+https://github.com/Dicklesworthstone/fastmcp_rust#84eb0614db1c6e2c54c4697525e4917fc817d901"
 dependencies = [
  "asupersync",
  "fastmcp-core",
@@ -2843,7 +2844,7 @@ dependencies = [
 [[package]]
 name = "ftui"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankentui#946e91bd12a80719d56c45605cb8b93625cd3f74"
+source = "git+https://github.com/Dicklesworthstone/frankentui#b9af1ed5ed1583a01b07e81702e00ca64b777ffd"
 dependencies = [
  "ftui-core",
  "ftui-layout",
@@ -2857,7 +2858,7 @@ dependencies = [
 [[package]]
 name = "ftui-backend"
 version = "0.1.0"
-source = "git+https://github.com/Dicklesworthstone/frankentui#946e91bd12a80719d56c45605cb8b93625cd3f74"
+source = "git+https://github.com/Dicklesworthstone/frankentui#b9af1ed5ed1583a01b07e81702e00ca64b777ffd"
 dependencies = [
  "ftui-core",
  "ftui-render",
@@ -2866,7 +2867,7 @@ dependencies = [
 [[package]]
 name = "ftui-core"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankentui#946e91bd12a80719d56c45605cb8b93625cd3f74"
+source = "git+https://github.com/Dicklesworthstone/frankentui#b9af1ed5ed1583a01b07e81702e00ca64b777ffd"
 dependencies = [
  "bitflags 2.10.0",
  "signal-hook 0.4.3",
@@ -2879,12 +2880,12 @@ dependencies = [
 [[package]]
 name = "ftui-i18n"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankentui#946e91bd12a80719d56c45605cb8b93625cd3f74"
+source = "git+https://github.com/Dicklesworthstone/frankentui#b9af1ed5ed1583a01b07e81702e00ca64b777ffd"
 
 [[package]]
 name = "ftui-layout"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankentui#946e91bd12a80719d56c45605cb8b93625cd3f74"
+source = "git+https://github.com/Dicklesworthstone/frankentui#b9af1ed5ed1583a01b07e81702e00ca64b777ffd"
 dependencies = [
  "ftui-core",
  "rustc-hash",
@@ -2894,7 +2895,7 @@ dependencies = [
 [[package]]
 name = "ftui-render"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankentui#946e91bd12a80719d56c45605cb8b93625cd3f74"
+source = "git+https://github.com/Dicklesworthstone/frankentui#b9af1ed5ed1583a01b07e81702e00ca64b777ffd"
 dependencies = [
  "bitflags 2.10.0",
  "ftui-core",
@@ -2907,7 +2908,7 @@ dependencies = [
 [[package]]
 name = "ftui-runtime"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankentui#946e91bd12a80719d56c45605cb8b93625cd3f74"
+source = "git+https://github.com/Dicklesworthstone/frankentui#b9af1ed5ed1583a01b07e81702e00ca64b777ffd"
 dependencies = [
  "ftui-backend",
  "ftui-core",
@@ -2925,7 +2926,7 @@ dependencies = [
 [[package]]
 name = "ftui-style"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankentui#946e91bd12a80719d56c45605cb8b93625cd3f74"
+source = "git+https://github.com/Dicklesworthstone/frankentui#b9af1ed5ed1583a01b07e81702e00ca64b777ffd"
 dependencies = [
  "ftui-render",
  "tracing",
@@ -2934,7 +2935,7 @@ dependencies = [
 [[package]]
 name = "ftui-text"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankentui#946e91bd12a80719d56c45605cb8b93625cd3f74"
+source = "git+https://github.com/Dicklesworthstone/frankentui#b9af1ed5ed1583a01b07e81702e00ca64b777ffd"
 dependencies = [
  "ftui-core",
  "ftui-layout",
@@ -2951,7 +2952,7 @@ dependencies = [
 [[package]]
 name = "ftui-widgets"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankentui#946e91bd12a80719d56c45605cb8b93625cd3f74"
+source = "git+https://github.com/Dicklesworthstone/frankentui#b9af1ed5ed1583a01b07e81702e00ca64b777ffd"
 dependencies = [
  "bitflags 2.10.0",
  "ftui-core",
@@ -4763,9 +4764,9 @@ checksum = "0c2cdeb66e45e9f36bfad5bbdb4d2384e70936afbee843c6f6543f0c551ebb25"
 
 [[package]]
 name = "libc"
-version = "0.2.181"
+version = "0.2.182"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "459427e2af2b9c839b132acb702a1c654d95e10f8c326bfc2ad11310e458b1c5"
+checksum = "6800badb6cb2082ffd7b6a67e6125bb39f18782f793520caee8cb8846be06112"
 
 [[package]]
 name = "libfuzzer-sys"
@@ -5270,6 +5271,7 @@ dependencies = [
  "bitflags 1.3.2",
  "chrono",
  "config",
+ "criterion 0.7.0",
  "crossbeam",
  "downcast-rs 1.2.1",
  "fancy-regex 0.14.0",
@@ -5294,6 +5296,7 @@ dependencies = [
  "portable-pty",
  "procinfo",
  "promise",
+ "proptest",
  "rangeset",
  "serde",
  "serde_json",
