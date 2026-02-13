@@ -115,3 +115,159 @@ impl core::fmt::Display for Hyperlink {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_creates_non_implicit_link() {
+        let link = Hyperlink::new("https://example.com");
+        assert_eq!(link.uri(), "https://example.com");
+        assert!(!link.is_implicit());
+        assert!(link.params().is_empty());
+    }
+
+    #[test]
+    fn new_implicit_creates_implicit_link() {
+        let link = Hyperlink::new_implicit("https://example.com");
+        assert_eq!(link.uri(), "https://example.com");
+        assert!(link.is_implicit());
+        assert!(link.params().is_empty());
+    }
+
+    #[test]
+    fn new_with_id() {
+        let link = Hyperlink::new_with_id("https://example.com", "link1");
+        assert_eq!(link.uri(), "https://example.com");
+        assert!(!link.is_implicit());
+        assert_eq!(link.params().get("id"), Some(&"link1".to_string()));
+    }
+
+    #[test]
+    fn new_with_params() {
+        let mut params = HashMap::new();
+        params.insert("id".to_string(), "myid".to_string());
+        params.insert("class".to_string(), "external".to_string());
+        let link = Hyperlink::new_with_params("https://example.com", params);
+        assert_eq!(link.uri(), "https://example.com");
+        assert_eq!(link.params().len(), 2);
+        assert_eq!(link.params().get("id"), Some(&"myid".to_string()));
+        assert_eq!(link.params().get("class"), Some(&"external".to_string()));
+    }
+
+    #[test]
+    fn equality() {
+        let a = Hyperlink::new("https://example.com");
+        let b = Hyperlink::new("https://example.com");
+        assert_eq!(a, b);
+
+        let c = Hyperlink::new("https://other.com");
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn implicit_vs_explicit_not_equal() {
+        let a = Hyperlink::new("https://example.com");
+        let b = Hyperlink::new_implicit("https://example.com");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn clone() {
+        let link = Hyperlink::new_with_id("https://example.com", "id1");
+        let cloned = link.clone();
+        assert_eq!(link, cloned);
+    }
+
+    #[test]
+    fn debug_format() {
+        let link = Hyperlink::new("https://example.com");
+        let dbg = format!("{:?}", link);
+        assert!(dbg.contains("Hyperlink"));
+        assert!(dbg.contains("https://example.com"));
+    }
+
+    #[test]
+    fn display_no_params() {
+        let link = Hyperlink::new("https://example.com");
+        let display = format!("{}", link);
+        assert!(display.starts_with("8;"));
+        assert!(display.ends_with(";https://example.com"));
+        // With no params: "8;;https://example.com"
+        assert_eq!(display, "8;;https://example.com");
+    }
+
+    #[test]
+    fn display_with_one_param() {
+        let link = Hyperlink::new_with_id("https://example.com", "link1");
+        let display = format!("{}", link);
+        assert!(display.starts_with("8;"));
+        assert!(display.contains("id=link1"));
+        assert!(display.ends_with(";https://example.com"));
+    }
+
+    #[test]
+    fn parse_clear_link() {
+        let osc: Vec<&[u8]> = vec![b"8", b"", b""];
+        let result = Hyperlink::parse(&osc).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn parse_simple_link() {
+        let osc: Vec<&[u8]> = vec![b"8", b"", b"https://example.com"];
+        let result = Hyperlink::parse(&osc).unwrap();
+        assert!(result.is_some());
+        let link = result.unwrap();
+        assert_eq!(link.uri(), "https://example.com");
+        assert!(link.params().is_empty());
+    }
+
+    #[test]
+    fn parse_link_with_id_param() {
+        let osc: Vec<&[u8]> = vec![b"8", b"id=mylink", b"https://example.com"];
+        let result = Hyperlink::parse(&osc).unwrap();
+        assert!(result.is_some());
+        let link = result.unwrap();
+        assert_eq!(link.uri(), "https://example.com");
+        assert_eq!(link.params().get("id"), Some(&"mylink".to_string()));
+    }
+
+    #[test]
+    fn parse_link_with_multiple_params() {
+        let osc: Vec<&[u8]> = vec![b"8", b"id=link1:class=external", b"https://example.com"];
+        let result = Hyperlink::parse(&osc).unwrap();
+        assert!(result.is_some());
+        let link = result.unwrap();
+        assert_eq!(link.params().len(), 2);
+        assert_eq!(link.params().get("id"), Some(&"link1".to_string()));
+        assert_eq!(link.params().get("class"), Some(&"external".to_string()));
+    }
+
+    #[test]
+    fn parse_wrong_param_count() {
+        let osc: Vec<&[u8]> = vec![b"8", b""];
+        let result = Hyperlink::parse(&osc);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn new_accepts_string_and_str() {
+        let a = Hyperlink::new("https://example.com");
+        let b = Hyperlink::new(String::from("https://example.com"));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn compute_shape_hash_same_for_equal_links() {
+        use std::collections::hash_map::DefaultHasher;
+        let a = Hyperlink::new("https://example.com");
+        let b = Hyperlink::new("https://example.com");
+        let mut h1 = DefaultHasher::new();
+        let mut h2 = DefaultHasher::new();
+        a.compute_shape_hash(&mut h1);
+        b.compute_shape_hash(&mut h2);
+        assert_eq!(h1.finish(), h2.finish());
+    }
+}
