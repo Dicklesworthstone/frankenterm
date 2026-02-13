@@ -15,7 +15,11 @@ pub mod manifest;
 pub mod sandbox;
 mod types;
 #[cfg(feature = "wasm")]
+mod wasm_cache;
+#[cfg(feature = "wasm")]
 mod wasm_engine;
+#[cfg(feature = "wasm")]
+mod wasm_host;
 
 pub use audit::{AuditOutcome, AuditTrail};
 pub use dispatcher::ScriptingDispatcher;
@@ -28,7 +32,11 @@ pub use types::{
     LogLevel,
 };
 #[cfg(feature = "wasm")]
+pub use wasm_cache::ModuleCache;
+#[cfg(feature = "wasm")]
 pub use wasm_engine::{WasmEngine, WasmEngineConfig};
+#[cfg(feature = "wasm")]
+pub use wasm_host::HostState;
 
 /// Unified interface for all scripting engines.
 ///
