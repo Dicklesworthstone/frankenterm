@@ -796,4 +796,395 @@ mod tests {
         assert!(rendered.contains("Indexed segments:"));
         assert!(rendered.contains("NO_INDEXED_DATA"));
     }
+
+    // ── Additional tests ──
+
+    #[test]
+    fn search_explain_reason_serde() {
+        let reason = SearchExplainReason {
+            code: "TEST_CODE",
+            summary: "Test summary".to_string(),
+            evidence: vec![SearchExplainEvidence {
+                key: "k".to_string(),
+                value: "v".to_string(),
+            }],
+            suggestions: vec!["Fix it".to_string()],
+            confidence: 0.75,
+        };
+        let json = serde_json::to_string(&reason).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["code"], "TEST_CODE");
+        assert_eq!(parsed["confidence"], 0.75);
+        assert!(parsed["evidence"].is_array());
+    }
+
+    #[test]
+    fn search_explain_evidence_serde() {
+        let ev = SearchExplainEvidence {
+            key: "gap_count".to_string(),
+            value: "5".to_string(),
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["key"], "gap_count");
+        assert_eq!(parsed["value"], "5");
+    }
+
+    #[test]
+    fn search_explain_result_serde() {
+        let result = SearchExplainResult {
+            query: "error".to_string(),
+            pane_filter: Some(42),
+            total_panes: 5,
+            observed_panes: 3,
+            ignored_panes: 2,
+            total_segments: 100,
+            reasons: vec![],
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["query"], "error");
+        assert_eq!(parsed["pane_filter"], 42);
+        assert_eq!(parsed["total_panes"], 5);
+    }
+
+    #[test]
+    fn render_plain_no_issues() {
+        let result = SearchExplainResult {
+            query: "hello".to_string(),
+            pane_filter: None,
+            total_panes: 2,
+            observed_panes: 2,
+            ignored_panes: 0,
+            total_segments: 500,
+            reasons: vec![],
+        };
+        let rendered = render_explain_plain(&result);
+        assert!(rendered.contains("No issues detected"));
+        assert!(rendered.contains("looks healthy"));
+    }
+
+    #[test]
+    fn render_plain_with_pane_filter() {
+        let result = SearchExplainResult {
+            query: "test".to_string(),
+            pane_filter: Some(42),
+            total_panes: 1,
+            observed_panes: 1,
+            ignored_panes: 0,
+            total_segments: 10,
+            reasons: vec![],
+        };
+        let rendered = render_explain_plain(&result);
+        assert!(rendered.contains("Pane filter: 42"));
+    }
+
+    #[test]
+    fn excluded_panes_without_filter_reports_panes_excluded() {
+        let now = now_ms();
+        let ctx = SearchExplainContext {
+            pane_filter: None,
+            panes: vec![
+                PaneExplainInfo {
+                    pane_id: 1,
+                    observed: true,
+                    ignore_reason: None,
+                    domain: "local".to_string(),
+                    last_seen_at: now,
+                },
+                PaneExplainInfo {
+                    pane_id: 2,
+                    observed: false,
+                    ignore_reason: Some("excluded".to_string()),
+                    domain: "local".to_string(),
+                    last_seen_at: now,
+                },
+                PaneExplainInfo {
+                    pane_id: 3,
+                    observed: false,
+                    ignore_reason: Some("excluded".to_string()),
+                    domain: "local".to_string(),
+                    last_seen_at: now,
+                },
+            ],
+            indexing_stats: vec![PaneIndexingInfo {
+                pane_id: 1,
+                segment_count: 100,
+                total_bytes: 5000,
+                last_segment_at: Some(now),
+                fts_row_count: 100,
+                fts_consistent: true,
+            }],
+            ..empty_context()
+        };
+        let result = explain_search(&ctx);
+        assert!(result.reasons.iter().any(|r| r.code == "PANES_EXCLUDED"));
+        assert_eq!(result.ignored_panes, 2);
+    }
+
+    #[test]
+    fn fts_consistent_pane_no_fts_reason() {
+        let now = now_ms();
+        let ctx = SearchExplainContext {
+            panes: vec![PaneExplainInfo {
+                pane_id: 1,
+                observed: true,
+                ignore_reason: None,
+                domain: "local".to_string(),
+                last_seen_at: now,
+            }],
+            indexing_stats: vec![PaneIndexingInfo {
+                pane_id: 1,
+                segment_count: 100,
+                total_bytes: 5000,
+                last_segment_at: Some(now),
+                fts_row_count: 100,
+                fts_consistent: true,
+            }],
+            earliest_segment_at: Some(now - 3_600_000),
+            latest_segment_at: Some(now),
+            now_ms: now,
+            ..empty_context()
+        };
+        let result = explain_search(&ctx);
+        assert!(
+            !result
+                .reasons
+                .iter()
+                .any(|r| r.code == "FTS_INDEX_INCONSISTENT")
+        );
+    }
+
+    #[test]
+    fn multiple_gaps_across_panes() {
+        let now = now_ms();
+        let ctx = SearchExplainContext {
+            panes: vec![
+                PaneExplainInfo {
+                    pane_id: 1,
+                    observed: true,
+                    ignore_reason: None,
+                    domain: "local".to_string(),
+                    last_seen_at: now,
+                },
+                PaneExplainInfo {
+                    pane_id: 2,
+                    observed: true,
+                    ignore_reason: None,
+                    domain: "local".to_string(),
+                    last_seen_at: now,
+                },
+            ],
+            indexing_stats: vec![
+                PaneIndexingInfo {
+                    pane_id: 1,
+                    segment_count: 50,
+                    total_bytes: 2500,
+                    last_segment_at: Some(now),
+                    fts_row_count: 50,
+                    fts_consistent: true,
+                },
+                PaneIndexingInfo {
+                    pane_id: 2,
+                    segment_count: 30,
+                    total_bytes: 1500,
+                    last_segment_at: Some(now),
+                    fts_row_count: 30,
+                    fts_consistent: true,
+                },
+            ],
+            gaps: vec![
+                GapInfo {
+                    pane_id: 1,
+                    seq_before: 10,
+                    seq_after: 20,
+                    reason: "restart".to_string(),
+                    detected_at: now,
+                },
+                GapInfo {
+                    pane_id: 2,
+                    seq_before: 5,
+                    seq_after: 15,
+                    reason: "timeout".to_string(),
+                    detected_at: now,
+                },
+            ],
+            earliest_segment_at: Some(now - 3_600_000),
+            latest_segment_at: Some(now),
+            now_ms: now,
+            ..empty_context()
+        };
+        let result = explain_search(&ctx);
+        let gap_reason = result
+            .reasons
+            .iter()
+            .find(|r| r.code == "CAPTURE_GAPS")
+            .unwrap();
+        assert!(gap_reason.summary.contains("2 capture gap(s)"));
+        assert!(gap_reason.summary.contains("2 pane(s)"));
+    }
+
+    #[test]
+    fn narrow_time_range_exactly_one_minute_no_report() {
+        let now = now_ms();
+        let ctx = SearchExplainContext {
+            earliest_segment_at: Some(now - 60_000),
+            latest_segment_at: Some(now),
+            panes: vec![PaneExplainInfo {
+                pane_id: 1,
+                observed: true,
+                ignore_reason: None,
+                domain: "local".to_string(),
+                last_seen_at: now,
+            }],
+            indexing_stats: vec![PaneIndexingInfo {
+                pane_id: 1,
+                segment_count: 10,
+                total_bytes: 500,
+                last_segment_at: Some(now),
+                fts_row_count: 10,
+                fts_consistent: true,
+            }],
+            now_ms: now,
+            ..empty_context()
+        };
+        let result = explain_search(&ctx);
+        assert!(
+            !result
+                .reasons
+                .iter()
+                .any(|r| r.code == "NARROW_TIME_RANGE")
+        );
+    }
+
+    #[test]
+    fn stale_unobserved_pane_not_reported() {
+        let now = now_ms();
+        let stale_time = now - (10 * 60 * 1000);
+        let ctx = SearchExplainContext {
+            panes: vec![PaneExplainInfo {
+                pane_id: 1,
+                observed: false, // not observed = not stale
+                ignore_reason: Some("excluded".to_string()),
+                domain: "local".to_string(),
+                last_seen_at: stale_time,
+            }],
+            indexing_stats: vec![],
+            now_ms: now,
+            ..empty_context()
+        };
+        let result = explain_search(&ctx);
+        assert!(!result.reasons.iter().any(|r| r.code == "STALE_PANES"));
+    }
+
+    #[test]
+    fn result_counts_panes_correctly() {
+        let now = now_ms();
+        let ctx = SearchExplainContext {
+            panes: vec![
+                PaneExplainInfo {
+                    pane_id: 1,
+                    observed: true,
+                    ignore_reason: None,
+                    domain: "local".to_string(),
+                    last_seen_at: now,
+                },
+                PaneExplainInfo {
+                    pane_id: 2,
+                    observed: true,
+                    ignore_reason: None,
+                    domain: "local".to_string(),
+                    last_seen_at: now,
+                },
+                PaneExplainInfo {
+                    pane_id: 3,
+                    observed: false,
+                    ignore_reason: Some("excluded".to_string()),
+                    domain: "local".to_string(),
+                    last_seen_at: now,
+                },
+            ],
+            indexing_stats: vec![
+                PaneIndexingInfo {
+                    pane_id: 1,
+                    segment_count: 50,
+                    total_bytes: 2500,
+                    last_segment_at: Some(now),
+                    fts_row_count: 50,
+                    fts_consistent: true,
+                },
+                PaneIndexingInfo {
+                    pane_id: 2,
+                    segment_count: 30,
+                    total_bytes: 1500,
+                    last_segment_at: Some(now),
+                    fts_row_count: 30,
+                    fts_consistent: true,
+                },
+            ],
+            earliest_segment_at: Some(now - 3_600_000),
+            latest_segment_at: Some(now),
+            now_ms: now,
+            ..empty_context()
+        };
+        let result = explain_search(&ctx);
+        assert_eq!(result.total_panes, 3);
+        assert_eq!(result.observed_panes, 2);
+        assert_eq!(result.ignored_panes, 1);
+        assert_eq!(result.total_segments, 80);
+    }
+
+    #[test]
+    fn reason_clone_and_debug() {
+        let reason = SearchExplainReason {
+            code: "TEST",
+            summary: "Test".to_string(),
+            evidence: vec![],
+            suggestions: vec![],
+            confidence: 0.5,
+        };
+        let cloned = reason.clone();
+        assert_eq!(cloned.code, "TEST");
+        let debug = format!("{:?}", reason);
+        assert!(debug.contains("TEST"));
+    }
+
+    #[test]
+    fn evidence_clone_and_debug() {
+        let ev = SearchExplainEvidence {
+            key: "k".to_string(),
+            value: "v".to_string(),
+        };
+        let cloned = ev.clone();
+        assert_eq!(cloned.key, "k");
+        let debug = format!("{:?}", ev);
+        assert!(debug.contains("k"));
+    }
+
+    #[test]
+    fn render_plain_with_evidence_and_suggestions() {
+        let result = SearchExplainResult {
+            query: "error".to_string(),
+            pane_filter: None,
+            total_panes: 1,
+            observed_panes: 1,
+            ignored_panes: 0,
+            total_segments: 0,
+            reasons: vec![SearchExplainReason {
+                code: "NO_INDEXED_DATA",
+                summary: "No data".to_string(),
+                evidence: vec![SearchExplainEvidence {
+                    key: "total_segments".to_string(),
+                    value: "0".to_string(),
+                }],
+                suggestions: vec!["Start the watcher".to_string()],
+                confidence: 1.0,
+            }],
+        };
+        let rendered = render_explain_plain(&result);
+        assert!(rendered.contains("[NO_INDEXED_DATA]"));
+        assert!(rendered.contains("total_segments: 0"));
+        assert!(rendered.contains("Start the watcher"));
+        assert!(rendered.contains("1 potential issue(s)"));
+    }
 }
