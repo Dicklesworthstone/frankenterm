@@ -26,7 +26,7 @@ pub use hybrid_search::{
     TwoTierMetrics,
 };
 pub use reranker::{RerankError, Reranker};
-pub use vector_index::{FtviIndex, FtviRecord, FtviWriter};
+pub use vector_index::{FtviIndex, FtviRecord, FtviWriter, write_ftvi_vec};
 
 #[cfg(feature = "semantic-search")]
 pub use fastembed_embedder::FastEmbedEmbedder;
