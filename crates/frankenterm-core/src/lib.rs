@@ -132,6 +132,7 @@ pub mod process_tree;
 pub mod process_triage;
 pub mod protocol_recovery;
 pub mod recorder_audit;
+pub mod recorder_export;
 pub mod recorder_invariants;
 pub mod recorder_query;
 pub mod recorder_replay;
