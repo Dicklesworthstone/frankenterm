@@ -65,3 +65,5 @@ winapi = { workspace=true, features = [
 
 [dev-dependencies]
 k9.workspace = true
+proptest = "1.8.0"
+serde_json.workspace = true
