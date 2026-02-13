@@ -36,6 +36,39 @@ fn setup_workspace() -> (TempDir, String) {
     (dir, ws)
 }
 
+/// Write a small deterministic simulation scenario used by CLI contract tests.
+fn write_contract_simulation_scenario(path: &std::path::Path) {
+    let yaml = r#"
+name: contract_resize_timeline
+description: "CLI contract scenario for resize timeline JSON"
+duration: "6s"
+metadata:
+  suite: resize_baseline
+  suite_version: "2026-02-13"
+  seed: "424242"
+panes:
+  - id: 0
+events:
+  - at: "1s"
+    pane: 0
+    action: resize
+    content: "120x40"
+  - at: "2s"
+    pane: 0
+    action: set_font_size
+    content: "1.10"
+  - at: "3s"
+    pane: 0
+    action: generate_scrollback
+    content: "4x32"
+expectations:
+  - contains:
+      pane: 0
+      text: "[FONT_SIZE:1.10]"
+"#;
+    std::fs::write(path, yaml).expect("write simulation scenario");
+}
+
 /// Create a workspace with populated fixture data (panes, events, accounts).
 fn setup_populated_workspace() -> (TempDir, String) {
     let (dir, ws) = setup_workspace();
@@ -225,6 +258,69 @@ fn contract_status_filter_by_pane() {
             "ft status --pane-id 1 should contain JSON data: {stdout}"
         );
     }
+}
+
+// =============================================================================
+// ft simulate contract tests
+// =============================================================================
+
+#[test]
+fn contract_simulate_resize_timeline_json_envelope() {
+    let (_dir, ws) = setup_workspace();
+    let scenario_path = std::path::Path::new(&ws).join("contract_resize_timeline.yaml");
+    write_contract_simulation_scenario(&scenario_path);
+
+    let scenario_arg = scenario_path.to_string_lossy().to_string();
+    let output = wa_cmd_for(&ws)
+        .args([
+            "simulate",
+            "run",
+            &scenario_arg,
+            "--json",
+            "--resize-timeline-json",
+        ])
+        .output()
+        .expect("ft simulate run --resize-timeline-json should execute");
+
+    assert!(
+        output.status.success(),
+        "simulate timeline mode should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("simulate timeline output should be JSON");
+
+    assert_eq!(parsed["mode"], "resize_timeline_json");
+    assert_eq!(parsed["expectations_failed"], 0);
+    assert!(parsed["scenario"]["reproducibility_key"].is_string());
+    assert!(parsed["timeline"]["events"].is_array());
+    assert!(parsed["stage_summary"].is_array());
+    assert!(parsed["flame_samples"].is_array());
+    assert_eq!(parsed["timeline"]["executed_resize_events"], 3);
+    assert_eq!(
+        parsed["stage_summary"]
+            .as_array()
+            .map(std::vec::Vec::len)
+            .unwrap_or_default(),
+        5
+    );
+}
+
+#[test]
+fn contract_simulate_resize_timeline_requires_json_flag() {
+    let (_dir, ws) = setup_workspace();
+    let scenario_path = std::path::Path::new(&ws).join("contract_resize_timeline.yaml");
+    write_contract_simulation_scenario(&scenario_path);
+    let scenario_arg = scenario_path.to_string_lossy().to_string();
+
+    wa_cmd_for(&ws)
+        .args(["simulate", "run", &scenario_arg, "--resize-timeline-json"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--resize-timeline-json requires --json",
+        ));
 }
 
 // =============================================================================

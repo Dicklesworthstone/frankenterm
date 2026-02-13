@@ -6,17 +6,89 @@
 //! Performance budgets:
 //! - Watcher loop overhead (idle): **< 100µs per pane check**
 
+use base64::Engine as _;
+use criterion::black_box;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use frankenterm_core::config::{PaneFilterConfig, PaneFilterRule};
 use frankenterm_core::ingest::PaneFingerprint;
 use frankenterm_core::wezterm::PaneInfo;
+use serde::Deserialize;
+use std::process::Command;
+use std::time::Duration;
 
 mod bench_common;
 
-const BUDGETS: &[bench_common::BenchBudget] = &[bench_common::BenchBudget {
-    name: "watcher_loop_idle",
-    budget: "< 100µs per pane check (idle, no new output)",
-}];
+const BUDGETS: &[bench_common::BenchBudget] = &[
+    bench_common::BenchBudget {
+        name: "watcher_loop_idle",
+        budget: "< 100µs per pane check (idle, no new output)",
+    },
+    bench_common::BenchBudget {
+        name: "watcher_native_event/native_decode_dispatch",
+        budget: "in-process native wire decode baseline (lower than Lua proxy simulation)",
+    },
+    bench_common::BenchBudget {
+        name: "watcher_native_event/lua_cli_proxy_sim",
+        budget: "legacy Lua->CLI proxy simulation includes per-event process spawn overhead",
+    },
+];
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum NativeWireBenchEvent {
+    PaneOutput {
+        pane_id: u64,
+        data_b64: String,
+        ts: u64,
+    },
+    #[serde(other)]
+    Other,
+}
+
+fn decode_native_pane_output(line: &str) -> Option<(u64, usize, u64)> {
+    let event: NativeWireBenchEvent = serde_json::from_str(line).ok()?;
+    match event {
+        NativeWireBenchEvent::PaneOutput {
+            pane_id,
+            data_b64,
+            ts,
+        } => {
+            let payload = base64::engine::general_purpose::STANDARD
+                .decode(data_b64.as_bytes())
+                .ok()?;
+            Some((pane_id, payload.len(), ts))
+        }
+        NativeWireBenchEvent::Other => None,
+    }
+}
+
+fn spawn_noop_process() -> bool {
+    #[cfg(windows)]
+    {
+        Command::new("cmd")
+            .args(["/C", "exit", "0"])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    #[cfg(not(windows))]
+    {
+        Command::new("sh")
+            .args(["-c", "true"])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+}
+
+fn simulate_lua_cli_proxy(pane_id: u64, pane_line: &str) -> bool {
+    let serialized_line = serde_json::to_string(pane_line).unwrap_or_else(|_| "\"\"".to_string());
+    let envelope =
+        format!("{{\"event\":\"status_update\",\"pane_id\":{pane_id},\"line\":{serialized_line}}}");
+    let envelope_len = envelope.len();
+    envelope_len > 0 && spawn_noop_process()
+}
 
 /// Create a realistic test pane.
 fn test_pane(pane_id: u64) -> PaneInfo {
@@ -197,6 +269,35 @@ fn bench_pane_check_combined(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_native_event_latency_comparison(c: &mut Criterion) {
+    let mut group = c.benchmark_group("watcher_native_event");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(3));
+
+    let wire_payload = format!(
+        r#"{{"type":"pane_output","pane_id":7,"data_b64":"{}","ts":12345}}"#,
+        base64::engine::general_purpose::STANDARD
+            .encode(b"usage reached: run /compact to continue")
+    );
+
+    group.bench_function("native_decode_dispatch", |b| {
+        b.iter(|| {
+            let decoded = decode_native_pane_output(black_box(&wire_payload)).expect("decode");
+            black_box(decoded);
+        });
+    });
+
+    let pane_line = "usage reached. compact requested";
+    group.bench_function("lua_cli_proxy_sim", |b| {
+        b.iter(|| {
+            let ok = simulate_lua_cli_proxy(black_box(7), black_box(pane_line));
+            black_box(ok);
+        });
+    });
+
+    group.finish();
+}
+
 fn bench_config() -> Criterion {
     bench_common::emit_bench_artifacts("watcher_loop", BUDGETS);
     Criterion::default().configure_from_args()
@@ -207,6 +308,7 @@ criterion_group!(
     config = bench_config();
     targets = bench_pane_filter,
         bench_pane_fingerprint,
-        bench_pane_check_combined
+        bench_pane_check_combined,
+        bench_native_event_latency_comparison
 );
 criterion_main!(benches);
