@@ -154,6 +154,7 @@ pub mod runtime;
 pub mod runtime_compat;
 pub mod screen_state;
 pub mod scrollback_eviction;
+pub mod search;
 pub mod search_explain;
 pub mod secrets;
 pub mod sequence_model;

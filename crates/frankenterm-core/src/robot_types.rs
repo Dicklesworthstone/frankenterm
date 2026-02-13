@@ -381,6 +381,12 @@ pub struct SearchData {
     pub pane_filter: Option<u64>,
     #[serde(default)]
     pub since_filter: Option<i64>,
+    /// Search mode used (fts5, lexical, semantic, hybrid, two-tier).
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// Tier-level metrics from the search pipeline.
+    #[serde(default)]
+    pub metrics: Option<serde_json::Value>,
 }
 
 /// Individual search result.
@@ -395,6 +401,12 @@ pub struct SearchHit {
     pub snippet: Option<String>,
     #[serde(default)]
     pub content: Option<String>,
+    /// Semantic similarity score (when using semantic/hybrid mode).
+    #[serde(default)]
+    pub semantic_score: Option<f64>,
+    /// Fused rank position from RRF (when using hybrid mode).
+    #[serde(default)]
+    pub fusion_rank: Option<usize>,
 }
 
 /// Response data for `ft robot events`.

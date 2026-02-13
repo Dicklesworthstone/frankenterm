@@ -88,6 +88,81 @@ pub struct Config {
 
     /// Session snapshot settings (periodic capture, retention)
     pub snapshots: SnapshotConfig,
+
+    /// Semantic search settings (embedding models, fusion, daemon)
+    pub search: SearchConfig,
+}
+
+// =============================================================================
+// Search Config
+// =============================================================================
+
+/// Configuration for 2-tier semantic search.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SearchConfig {
+    /// Enable semantic search features.
+    pub enabled: bool,
+    /// Search mode: "fts5", "lexical", "semantic", "hybrid", "two-tier".
+    pub mode: String,
+    /// Directory for downloaded model files.
+    pub models_dir: String,
+    /// Model name for the fast tier (Model2Vec).
+    pub fast_model: String,
+    /// Model name for the quality tier (MiniLM).
+    pub quality_model: String,
+    /// RRF fusion K parameter.
+    pub rrf_k: u32,
+    /// Two-tier blending weight for quality tier (0.0-1.0).
+    pub quality_weight: f64,
+    /// Enable cross-encoder reranking.
+    pub reranker_enabled: bool,
+    /// Background daemon configuration.
+    pub daemon: SearchDaemonConfig,
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: "fts5".into(),
+            models_dir: "~/.ft/models".into(),
+            fast_model: "potion-multilingual-128M".into(),
+            quality_model: "all-MiniLM-L6-v2".into(),
+            rrf_k: 60,
+            quality_weight: 0.7,
+            reranker_enabled: false,
+            daemon: SearchDaemonConfig::default(),
+        }
+    }
+}
+
+/// Configuration for the search daemon background service.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SearchDaemonConfig {
+    /// Enable the background daemon.
+    pub enabled: bool,
+    /// UDS socket path for daemon communication.
+    pub socket_path: String,
+    /// Auto-spawn daemon when client connects.
+    pub auto_spawn: bool,
+    /// Worker scan interval in seconds.
+    pub worker_scan_interval_secs: u64,
+    /// Batch size for worker embedding jobs.
+    pub worker_batch_size: usize,
+}
+
+impl Default for SearchDaemonConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            socket_path: ".ft/search-daemon.sock".into(),
+            auto_spawn: true,
+            worker_scan_interval_secs: 30,
+            worker_batch_size: 64,
+        }
+    }
 }
 
 // =============================================================================
