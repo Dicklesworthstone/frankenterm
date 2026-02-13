@@ -38,8 +38,15 @@ struct DistributedBridge {
 
 impl DistributedBridge {
     async fn new(db_path: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with_capacity(db_path, 32).await
+    }
+
+    async fn new_with_capacity(
+        db_path: &str,
+        max_agents: usize,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
-            aggregator: Aggregator::new(32),
+            aggregator: Aggregator::new(max_agents),
             storage: StorageHandle::new(db_path).await?,
             pane_seq_by_pane: HashMap::new(),
             diagnostics: BridgeDiagnostics::default(),
@@ -554,6 +561,52 @@ async fn distributed_streaming_e2e_rejects_malformed_wire_without_persisting() {
         events.is_empty(),
         "malformed payload should not persist events"
     );
+}
+
+#[tokio::test]
+async fn distributed_streaming_e2e_enforces_agent_capacity_without_cross_sender_persist() {
+    use frankenterm_core::wire_protocol::WireProtocolError;
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let db_path = temp_dir.path().join("distributed_streaming_capacity.db");
+    let mut bridge = DistributedBridge::new_with_capacity(db_path.to_str().expect("db path"), 1)
+        .await
+        .expect("bridge");
+
+    bridge
+        .ingest_envelope(WireEnvelope::new(
+            1,
+            "agent-cap-a",
+            WirePayload::PaneMeta(pane_meta(41)),
+        ))
+        .await
+        .expect("first sender should be accepted");
+
+    let err = bridge
+        .ingest_envelope(WireEnvelope::new(
+            1,
+            "agent-cap-b",
+            WirePayload::PaneMeta(pane_meta(42)),
+        ))
+        .await
+        .expect_err("second sender should be rejected at capacity");
+    let wire_err = err
+        .downcast_ref::<WireProtocolError>()
+        .expect("expected WireProtocolError");
+    assert!(matches!(
+        wire_err,
+        WireProtocolError::TooManyAgents { max: 1, sender: _ }
+    ));
+    assert_eq!(bridge.aggregator.total_rejected(), 1);
+    assert_eq!(bridge.aggregator.total_accepted(), 1);
+
+    let panes = bridge.storage.get_panes().await.expect("panes");
+    assert_eq!(
+        panes.len(),
+        1,
+        "rejected sender metadata must not persist to storage"
+    );
+    assert_eq!(panes[0].pane_id, 41);
 }
 
 #[test]

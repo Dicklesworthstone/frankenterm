@@ -1266,4 +1266,27 @@ mod tests {
         assert_eq!(agg.total_accepted(), 2);
         assert_eq!(agg.total_rejected(), 0);
     }
+
+    #[test]
+    fn aggregator_ingest_raw_rejects_new_sender_over_capacity() {
+        let mut agg = Aggregator::new(1);
+
+        let first = WireEnvelope::new(1, "agent-a", WirePayload::Gap(sample_gap()));
+        let first_bytes = first.to_json().expect("serialize");
+        assert!(matches!(
+            agg.ingest(&first_bytes).unwrap(),
+            IngestResult::Accepted(_)
+        ));
+
+        let second = WireEnvelope::new(1, "agent-b", WirePayload::Gap(sample_gap()));
+        let second_bytes = second.to_json().expect("serialize");
+        let err = agg
+            .ingest(&second_bytes)
+            .expect_err("second sender should be rejected at capacity");
+        assert!(matches!(
+            err,
+            WireProtocolError::TooManyAgents { max: 1, sender: _ }
+        ));
+        assert_eq!(agg.total_rejected(), 1);
+    }
 }
