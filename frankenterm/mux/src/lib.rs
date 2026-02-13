@@ -1466,3 +1466,178 @@ impl frankenterm_term::DownloadHandler for MuxDownloader {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_workspace_value() {
+        assert_eq!(DEFAULT_WORKSPACE, "default");
+    }
+
+    #[test]
+    fn mux_notification_pane_output_debug() {
+        let n = MuxNotification::PaneOutput(42);
+        let dbg = format!("{:?}", n);
+        assert!(dbg.contains("PaneOutput"));
+        assert!(dbg.contains("42"));
+    }
+
+    #[test]
+    fn mux_notification_pane_added_clone() {
+        let n = MuxNotification::PaneAdded(1);
+        let n2 = n.clone();
+        let dbg = format!("{:?}", n2);
+        assert!(dbg.contains("PaneAdded"));
+    }
+
+    #[test]
+    fn mux_notification_pane_removed() {
+        let n = MuxNotification::PaneRemoved(5);
+        let dbg = format!("{:?}", n);
+        assert!(dbg.contains("PaneRemoved"));
+    }
+
+    #[test]
+    fn mux_notification_window_created() {
+        let n = MuxNotification::WindowCreated(0);
+        let dbg = format!("{:?}", n);
+        assert!(dbg.contains("WindowCreated"));
+    }
+
+    #[test]
+    fn mux_notification_window_removed() {
+        let n = MuxNotification::WindowRemoved(1);
+        let dbg = format!("{:?}", n);
+        assert!(dbg.contains("WindowRemoved"));
+    }
+
+    #[test]
+    fn mux_notification_empty() {
+        let n = MuxNotification::Empty;
+        let dbg = format!("{:?}", n);
+        assert!(dbg.contains("Empty"));
+    }
+
+    #[test]
+    fn mux_notification_tab_title_changed() {
+        let n = MuxNotification::TabTitleChanged {
+            tab_id: 3,
+            title: "new title".to_string(),
+        };
+        let n2 = n.clone();
+        let dbg = format!("{:?}", n2);
+        assert!(dbg.contains("TabTitleChanged"));
+        assert!(dbg.contains("new title"));
+    }
+
+    #[test]
+    fn mux_notification_window_title_changed() {
+        let n = MuxNotification::WindowTitleChanged {
+            window_id: 1,
+            title: "window title".to_string(),
+        };
+        let dbg = format!("{:?}", n);
+        assert!(dbg.contains("WindowTitleChanged"));
+    }
+
+    #[test]
+    fn mux_notification_workspace_renamed() {
+        let n = MuxNotification::WorkspaceRenamed {
+            old_workspace: "old".to_string(),
+            new_workspace: "new".to_string(),
+        };
+        let dbg = format!("{:?}", n);
+        assert!(dbg.contains("WorkspaceRenamed"));
+        assert!(dbg.contains("old"));
+        assert!(dbg.contains("new"));
+    }
+
+    #[test]
+    fn mux_notification_pane_focused() {
+        let n = MuxNotification::PaneFocused(7);
+        let dbg = format!("{:?}", n);
+        assert!(dbg.contains("PaneFocused"));
+        assert!(dbg.contains("7"));
+    }
+
+    #[test]
+    fn mux_notification_tab_resized() {
+        let n = MuxNotification::TabResized(2);
+        let dbg = format!("{:?}", n);
+        assert!(dbg.contains("TabResized"));
+    }
+
+    #[test]
+    fn mux_notification_save_to_downloads() {
+        let n = MuxNotification::SaveToDownloads {
+            name: Some("file.txt".to_string()),
+            data: Arc::new(vec![1, 2, 3]),
+        };
+        let n2 = n.clone();
+        let dbg = format!("{:?}", n2);
+        assert!(dbg.contains("SaveToDownloads"));
+        assert!(dbg.contains("file.txt"));
+    }
+
+    #[test]
+    fn mux_notification_tab_added_to_window() {
+        let n = MuxNotification::TabAddedToWindow {
+            tab_id: 1,
+            window_id: 2,
+        };
+        let dbg = format!("{:?}", n);
+        assert!(dbg.contains("TabAddedToWindow"));
+    }
+
+    #[test]
+    fn session_terminated_window_closed_display() {
+        let err = SessionTerminated::WindowClosed;
+        assert_eq!(format!("{}", err), "Window Closed");
+    }
+
+    #[test]
+    fn session_terminated_window_closed_debug() {
+        let err = SessionTerminated::WindowClosed;
+        let dbg = format!("{:?}", err);
+        assert!(dbg.contains("WindowClosed"));
+    }
+
+    #[test]
+    fn session_terminated_is_error() {
+        let err = SessionTerminated::WindowClosed;
+        let error: &dyn std::error::Error = &err;
+        assert_eq!(error.to_string(), "Window Closed");
+    }
+
+    #[test]
+    fn terminal_size_to_pty_size_basic() {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        let pty_size = terminal_size_to_pty_size(size).unwrap();
+        assert_eq!(pty_size.rows, 24);
+        assert_eq!(pty_size.cols, 80);
+        assert_eq!(pty_size.pixel_width, 800);
+        assert_eq!(pty_size.pixel_height, 600);
+    }
+
+    #[test]
+    fn terminal_size_to_pty_size_zero() {
+        let size = TerminalSize {
+            rows: 0,
+            cols: 0,
+            pixel_width: 0,
+            pixel_height: 0,
+            dpi: 0,
+        };
+        let pty_size = terminal_size_to_pty_size(size).unwrap();
+        assert_eq!(pty_size.rows, 0);
+        assert_eq!(pty_size.cols, 0);
+    }
+}
