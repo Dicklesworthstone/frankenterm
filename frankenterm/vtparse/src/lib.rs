@@ -1162,4 +1162,466 @@ mod test {
             ]
         );
     }
+
+    // --- CsiParam tests ---
+
+    #[test]
+    fn csi_param_default_is_zero() {
+        assert_eq!(CsiParam::default(), CsiParam::Integer(0));
+    }
+
+    #[test]
+    fn csi_param_as_integer_some() {
+        assert_eq!(CsiParam::Integer(42).as_integer(), Some(42));
+        assert_eq!(CsiParam::Integer(0).as_integer(), Some(0));
+        assert_eq!(CsiParam::Integer(-1).as_integer(), Some(-1));
+    }
+
+    #[test]
+    fn csi_param_as_integer_none_for_p() {
+        assert_eq!(CsiParam::P(b';').as_integer(), None);
+        assert_eq!(CsiParam::P(b'?').as_integer(), None);
+    }
+
+    #[test]
+    fn csi_param_debug_integer() {
+        assert_eq!(format!("{:?}", CsiParam::Integer(42)), "Integer(42)");
+    }
+
+    #[test]
+    fn csi_param_debug_p() {
+        assert_eq!(format!("{:?}", CsiParam::P(b';')), "P(;)");
+        assert_eq!(format!("{:?}", CsiParam::P(b'?')), "P(?)");
+    }
+
+    #[test]
+    fn csi_param_display_integer() {
+        assert_eq!(format!("{}", CsiParam::Integer(99)), "99");
+        assert_eq!(format!("{}", CsiParam::Integer(0)), "0");
+    }
+
+    #[test]
+    fn csi_param_display_p() {
+        assert_eq!(format!("{}", CsiParam::P(b':')), ":");
+        assert_eq!(format!("{}", CsiParam::P(b';')), ";");
+    }
+
+    #[test]
+    fn csi_param_clone_eq() {
+        let a = CsiParam::Integer(7);
+        let b = a;
+        assert_eq!(a, b);
+
+        let c = CsiParam::P(b'?');
+        let d = c;
+        assert_eq!(c, d);
+        assert!(a != c);
+    }
+
+    #[test]
+    fn csi_param_hash_consistent() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        fn hash_of(p: &CsiParam) -> u64 {
+            let mut h = DefaultHasher::new();
+            p.hash(&mut h);
+            h.finish()
+        }
+
+        assert_eq!(
+            hash_of(&CsiParam::Integer(42)),
+            hash_of(&CsiParam::Integer(42))
+        );
+    }
+
+    // --- VTParser state tests ---
+
+    #[test]
+    fn parser_new_is_ground() {
+        let parser = VTParser::new();
+        assert!(parser.is_ground());
+    }
+
+    #[test]
+    fn parser_not_ground_during_escape() {
+        let mut parser = VTParser::new();
+        let mut actor = CollectingVTActor::default();
+        // ESC puts us into escape state
+        parser.parse_byte(0x1b, &mut actor);
+        assert!(!parser.is_ground());
+    }
+
+    #[test]
+    fn parser_returns_to_ground_after_sequence() {
+        let mut parser = VTParser::new();
+        let mut actor = CollectingVTActor::default();
+        // Complete CSI sequence: ESC [ 1 m
+        parser.parse(b"\x1b[1m", &mut actor);
+        assert!(parser.is_ground());
+    }
+
+    // --- parse_byte equivalence ---
+
+    #[test]
+    fn parse_byte_by_byte_matches_parse_all() {
+        let input = b"\x1b[32mhello\x1b[0m";
+        let all_at_once = parse_as_vec(input);
+
+        let mut parser = VTParser::new();
+        let mut actor = CollectingVTActor::default();
+        for &b in input {
+            parser.parse_byte(b, &mut actor);
+        }
+        let byte_by_byte = actor.into_vec();
+
+        assert_eq!(all_at_once, byte_by_byte);
+    }
+
+    // --- Additional CSI sequences ---
+
+    #[test]
+    fn csi_cursor_up() {
+        // CSI 5 A = cursor up 5
+        assert_eq!(
+            parse_as_vec(b"\x1b[5A"),
+            vec![VTAction::CsiDispatch {
+                params: vec![CsiParam::Integer(5)],
+                parameters_truncated: false,
+                byte: b'A',
+            }]
+        );
+    }
+
+    #[test]
+    fn csi_cursor_down() {
+        assert_eq!(
+            parse_as_vec(b"\x1b[3B"),
+            vec![VTAction::CsiDispatch {
+                params: vec![CsiParam::Integer(3)],
+                parameters_truncated: false,
+                byte: b'B',
+            }]
+        );
+    }
+
+    #[test]
+    fn csi_cursor_forward() {
+        assert_eq!(
+            parse_as_vec(b"\x1b[10C"),
+            vec![VTAction::CsiDispatch {
+                params: vec![CsiParam::Integer(10)],
+                parameters_truncated: false,
+                byte: b'C',
+            }]
+        );
+    }
+
+    #[test]
+    fn csi_cursor_position() {
+        // CSI 10;20 H = cursor to row 10, col 20
+        assert_eq!(
+            parse_as_vec(b"\x1b[10;20H"),
+            vec![VTAction::CsiDispatch {
+                params: vec![
+                    CsiParam::Integer(10),
+                    CsiParam::P(b';'),
+                    CsiParam::Integer(20)
+                ],
+                parameters_truncated: false,
+                byte: b'H',
+            }]
+        );
+    }
+
+    #[test]
+    fn csi_erase_display() {
+        // CSI 2 J = erase entire display
+        assert_eq!(
+            parse_as_vec(b"\x1b[2J"),
+            vec![VTAction::CsiDispatch {
+                params: vec![CsiParam::Integer(2)],
+                parameters_truncated: false,
+                byte: b'J',
+            }]
+        );
+    }
+
+    #[test]
+    fn csi_erase_line() {
+        // CSI 2 K = erase entire line
+        assert_eq!(
+            parse_as_vec(b"\x1b[2K"),
+            vec![VTAction::CsiDispatch {
+                params: vec![CsiParam::Integer(2)],
+                parameters_truncated: false,
+                byte: b'K',
+            }]
+        );
+    }
+
+    #[test]
+    fn csi_sgr_multiple_params() {
+        // CSI 1;31;42 m = bold + red fg + green bg
+        assert_eq!(
+            parse_as_vec(b"\x1b[1;31;42m"),
+            vec![VTAction::CsiDispatch {
+                params: vec![
+                    CsiParam::Integer(1),
+                    CsiParam::P(b';'),
+                    CsiParam::Integer(31),
+                    CsiParam::P(b';'),
+                    CsiParam::Integer(42),
+                ],
+                parameters_truncated: false,
+                byte: b'm',
+            }]
+        );
+    }
+
+    #[test]
+    fn csi_sgr_reset() {
+        // CSI 0 m = reset attributes
+        assert_eq!(
+            parse_as_vec(b"\x1b[0m"),
+            vec![VTAction::CsiDispatch {
+                params: vec![CsiParam::Integer(0)],
+                parameters_truncated: false,
+                byte: b'm',
+            }]
+        );
+    }
+
+    // --- C0 control characters ---
+
+    #[test]
+    fn c0_newline() {
+        assert_eq!(
+            parse_as_vec(b"\n"),
+            vec![VTAction::ExecuteC0orC1(0x0a)]
+        );
+    }
+
+    #[test]
+    fn c0_carriage_return() {
+        assert_eq!(
+            parse_as_vec(b"\r"),
+            vec![VTAction::ExecuteC0orC1(0x0d)]
+        );
+    }
+
+    #[test]
+    fn c0_tab() {
+        assert_eq!(
+            parse_as_vec(b"\t"),
+            vec![VTAction::ExecuteC0orC1(0x09)]
+        );
+    }
+
+    #[test]
+    fn c0_backspace() {
+        assert_eq!(
+            parse_as_vec(b"\x08"),
+            vec![VTAction::ExecuteC0orC1(0x08)]
+        );
+    }
+
+    #[test]
+    fn c0_bell() {
+        assert_eq!(
+            parse_as_vec(b"\x07"),
+            vec![VTAction::ExecuteC0orC1(0x07)]
+        );
+    }
+
+    #[test]
+    fn c0_escape_only() {
+        // ESC alone doesn't produce output until more bytes arrive
+        let actions = parse_as_vec(b"\x1b");
+        assert_eq!(actions, vec![]);
+    }
+
+    // --- Empty input ---
+
+    #[test]
+    fn empty_input() {
+        assert_eq!(parse_as_vec(b""), vec![]);
+    }
+
+    // --- ESC sequences ---
+
+    #[test]
+    fn esc_ri() {
+        // ESC M = reverse index
+        assert_eq!(
+            parse_as_vec(b"\x1bM"),
+            vec![VTAction::EscDispatch {
+                params: vec![],
+                intermediates: vec![],
+                ignored_excess_intermediates: false,
+                byte: b'M',
+            }]
+        );
+    }
+
+    #[test]
+    fn esc_decsc() {
+        // ESC 7 = save cursor
+        assert_eq!(
+            parse_as_vec(b"\x1b7"),
+            vec![VTAction::EscDispatch {
+                params: vec![],
+                intermediates: vec![],
+                ignored_excess_intermediates: false,
+                byte: b'7',
+            }]
+        );
+    }
+
+    #[test]
+    fn esc_decrc() {
+        // ESC 8 = restore cursor
+        assert_eq!(
+            parse_as_vec(b"\x1b8"),
+            vec![VTAction::EscDispatch {
+                params: vec![],
+                intermediates: vec![],
+                ignored_excess_intermediates: false,
+                byte: b'8',
+            }]
+        );
+    }
+
+    #[test]
+    fn esc_with_intermediate() {
+        // ESC ( B = designate G0 charset as ASCII
+        assert_eq!(
+            parse_as_vec(b"\x1b(B"),
+            vec![VTAction::EscDispatch {
+                params: vec![],
+                intermediates: vec![b'('],
+                ignored_excess_intermediates: false,
+                byte: b'B',
+            }]
+        );
+    }
+
+    // --- OSC with multiple parameters ---
+
+    #[test]
+    fn osc_three_params() {
+        assert_eq!(
+            parse_as_vec(b"\x1b]10;rgb:ff/00/ff\x07"),
+            vec![VTAction::OscDispatch(vec![
+                b"10".to_vec(),
+                b"rgb:ff/00/ff".to_vec(),
+            ])]
+        );
+    }
+
+    #[test]
+    fn osc_single_param() {
+        assert_eq!(
+            parse_as_vec(b"\x1b]hello\x07"),
+            vec![VTAction::OscDispatch(vec![b"hello".to_vec()])]
+        );
+    }
+
+    // --- CollectingVTActor ---
+
+    #[test]
+    fn collecting_actor_into_iter() {
+        let mut parser = VTParser::new();
+        let mut actor = CollectingVTActor::default();
+        parser.parse(b"ab", &mut actor);
+        let items: Vec<VTAction> = actor.into_iter().collect();
+        assert_eq!(items, vec![VTAction::Print('a'), VTAction::Print('b')]);
+    }
+
+    #[test]
+    fn collecting_actor_into_vec() {
+        let mut parser = VTParser::new();
+        let mut actor = CollectingVTActor::default();
+        parser.parse(b"x", &mut actor);
+        let v = actor.into_vec();
+        assert_eq!(v, vec![VTAction::Print('x')]);
+    }
+
+    // --- VTAction derive traits ---
+
+    #[test]
+    fn vt_action_clone() {
+        let a = VTAction::Print('z');
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn vt_action_debug() {
+        let a = VTAction::Print('a');
+        let dbg = format!("{:?}", a);
+        assert!(dbg.contains("Print"));
+    }
+
+    #[test]
+    fn vt_action_eq_different_variants() {
+        assert!(VTAction::Print('a') != VTAction::ExecuteC0orC1(b'a'));
+        assert!(VTAction::DcsUnhook != VTAction::Print('x'));
+    }
+
+    // --- Mixed content ---
+
+    #[test]
+    fn text_with_crlf() {
+        assert_eq!(
+            parse_as_vec(b"A\r\nB"),
+            vec![
+                VTAction::Print('A'),
+                VTAction::ExecuteC0orC1(0x0d),
+                VTAction::ExecuteC0orC1(0x0a),
+                VTAction::Print('B'),
+            ]
+        );
+    }
+
+    #[test]
+    fn multiple_csi_sequences() {
+        // Bold on, text, bold off
+        assert_eq!(
+            parse_as_vec(b"\x1b[1mhi\x1b[22m"),
+            vec![
+                VTAction::CsiDispatch {
+                    params: vec![CsiParam::Integer(1)],
+                    parameters_truncated: false,
+                    byte: b'm',
+                },
+                VTAction::Print('h'),
+                VTAction::Print('i'),
+                VTAction::CsiDispatch {
+                    params: vec![CsiParam::Integer(22)],
+                    parameters_truncated: false,
+                    byte: b'm',
+                },
+            ]
+        );
+    }
+
+    // --- Multi-byte UTF-8 ---
+
+    #[test]
+    fn utf8_emoji() {
+        // 😀 = U+1F600
+        assert_eq!(
+            parse_as_vec("😀".as_bytes()),
+            vec![VTAction::Print('😀')]
+        );
+    }
+
+    #[test]
+    fn utf8_cjk() {
+        assert_eq!(
+            parse_as_vec("中".as_bytes()),
+            vec![VTAction::Print('中')]
+        );
+    }
 }
