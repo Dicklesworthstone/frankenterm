@@ -45,6 +45,7 @@ mod keys;
 #[cfg(feature = "lua")]
 pub mod lua;
 pub mod meta;
+pub mod migrate;
 mod scheme_data;
 mod serial;
 mod ssh;
