@@ -12,6 +12,7 @@ mod dispatcher;
 pub mod events;
 pub mod extension;
 pub mod keybindings;
+pub mod lifecycle;
 #[cfg(feature = "lua")]
 mod lua_engine;
 pub mod manifest;
@@ -31,6 +32,7 @@ pub use dispatcher::ScriptingDispatcher;
 pub use events::{DispatchTier, EventBus, EventHookId};
 pub use extension::{ExtensionManager, InstalledExtension};
 pub use keybindings::{KeyCombo, KeybindingId, KeybindingRegistry, Modifiers};
+pub use lifecycle::{ExtensionLifecycle, ExtensionState, ManagedExtension};
 #[cfg(feature = "lua")]
 pub use lua_engine::LuaEngine;
 pub use manifest::{EngineConfig, EngineType, ExtensionPermissions, ParsedManifest};
