@@ -78,6 +78,7 @@ pub mod crash;
 pub mod cross_pane_correlation;
 #[cfg(feature = "asupersync-runtime")]
 pub mod cx;
+pub mod dataflow;
 pub mod degradation;
 pub mod desktop_notify;
 pub mod diagnostic;
@@ -168,6 +169,7 @@ pub mod session_retention;
 pub mod session_topology;
 pub mod setup;
 pub mod sharded_counter;
+pub mod sharding;
 pub mod simd_scan;
 pub mod snapshot_engine;
 pub mod spectral;
