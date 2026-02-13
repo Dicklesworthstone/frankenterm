@@ -4,6 +4,7 @@
 //! [`MockWezterm`](crate::wezterm::MockWezterm) for reproducible testing
 //! and interactive demonstrations.
 
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
@@ -36,6 +37,9 @@ pub struct Scenario {
     /// Expected outcomes to verify after execution.
     #[serde(default)]
     pub expectations: Vec<Expectation>,
+    /// Reproducibility metadata for deterministic baseline comparisons.
+    #[serde(default)]
+    pub metadata: BTreeMap<String, String>,
 }
 
 /// A pane to create at the start of the scenario.
@@ -52,6 +56,12 @@ pub struct ScenarioPane {
     /// Current working directory.
     #[serde(default = "default_cwd")]
     pub cwd: String,
+    /// Window ID for layout-scale scenarios.
+    #[serde(default = "default_window_id")]
+    pub window_id: u64,
+    /// Tab ID for layout-scale scenarios.
+    #[serde(default = "default_tab_id")]
+    pub tab_id: u64,
     /// Terminal columns.
     #[serde(default = "default_cols")]
     pub cols: u32,
@@ -77,6 +87,12 @@ fn default_cols() -> u32 {
 }
 fn default_rows() -> u32 {
     24
+}
+fn default_window_id() -> u64 {
+    0
+}
+fn default_tab_id() -> u64 {
+    0
 }
 
 /// A timed event to inject during scenario execution.
@@ -112,6 +128,10 @@ pub enum EventAction {
     SetTitle,
     /// Resize the pane. Uses `content` as "COLSxROWS".
     Resize,
+    /// Record a font-size transition marker. Uses `content` as the size token.
+    SetFontSize,
+    /// Deterministically synthesize scrollback text. Uses `content` as "LINES" or "LINESxWIDTH".
+    GenerateScrollback,
     /// Insert a named marker (for expectations).
     Marker,
 }
@@ -175,7 +195,7 @@ impl Scenario {
     /// Validate scenario consistency.
     pub fn validate(&self) -> Result<()> {
         // Check pane IDs are unique
-        let mut seen_ids = std::collections::HashSet::new();
+        let mut seen_ids = HashSet::new();
         for pane in &self.panes {
             if !seen_ids.insert(pane.id) {
                 return Err(crate::Error::Runtime(format!(
@@ -193,6 +213,27 @@ impl Scenario {
                     event.at, event.pane, self.name
                 )));
             }
+
+            match event.action {
+                EventAction::Resize => {
+                    let _ = parse_resize_spec(&event.content)?;
+                }
+                EventAction::SetFontSize => {
+                    if event.content.trim().is_empty() {
+                        return Err(crate::Error::Runtime(format!(
+                            "SetFontSize requires non-empty content in scenario '{}'",
+                            self.name
+                        )));
+                    }
+                }
+                EventAction::GenerateScrollback => {
+                    let _ = parse_scrollback_spec(&event.content)?;
+                }
+                EventAction::Append
+                | EventAction::Clear
+                | EventAction::SetTitle
+                | EventAction::Marker => {}
+            }
         }
 
         // Check events are in chronological order
@@ -205,7 +246,43 @@ impl Scenario {
             }
         }
 
+        for (key, value) in &self.metadata {
+            if key.trim().is_empty() {
+                return Err(crate::Error::Runtime(format!(
+                    "Scenario '{}' contains an empty metadata key",
+                    self.name
+                )));
+            }
+            if value.trim().is_empty() {
+                return Err(crate::Error::Runtime(format!(
+                    "Scenario '{}' metadata '{}' has an empty value",
+                    self.name, key
+                )));
+            }
+        }
+
         Ok(())
+    }
+
+    /// Stable reproducibility identifier for comparing baseline runs over time.
+    #[must_use]
+    pub fn reproducibility_key(&self) -> String {
+        let suite = self
+            .metadata
+            .get("suite")
+            .map(String::as_str)
+            .unwrap_or("ad_hoc");
+        let suite_version = self
+            .metadata
+            .get("suite_version")
+            .map(String::as_str)
+            .unwrap_or("v1");
+        let seed = self
+            .metadata
+            .get("seed")
+            .map(String::as_str)
+            .unwrap_or("0");
+        format!("{suite}:{suite_version}:{}:{seed}", self.name)
     }
 
     /// Apply scenario panes and initial content to a MockWezterm.
@@ -213,8 +290,8 @@ impl Scenario {
         for pane_def in &self.panes {
             let pane = MockPane {
                 pane_id: pane_def.id,
-                window_id: 0,
-                tab_id: 0,
+                window_id: pane_def.window_id,
+                tab_id: pane_def.tab_id,
                 title: pane_def.title.clone(),
                 domain: pane_def.domain.clone(),
                 cwd: pane_def.cwd.clone(),
@@ -236,20 +313,16 @@ impl Scenario {
             EventAction::Clear => Ok(MockEvent::ClearScreen),
             EventAction::SetTitle => Ok(MockEvent::SetTitle(event.content.clone())),
             EventAction::Resize => {
-                let parts: Vec<&str> = event.content.split('x').collect();
-                if parts.len() != 2 {
-                    return Err(crate::Error::Runtime(format!(
-                        "Resize content must be 'COLSxROWS', got '{}'",
-                        event.content
-                    )));
-                }
-                let cols: u32 = parts[0].trim().parse().map_err(|_| {
-                    crate::Error::Runtime(format!("Invalid cols in resize: '{}'", parts[0]))
-                })?;
-                let rows: u32 = parts[1].trim().parse().map_err(|_| {
-                    crate::Error::Runtime(format!("Invalid rows in resize: '{}'", parts[1]))
-                })?;
+                let (cols, rows) = parse_resize_spec(&event.content)?;
                 Ok(MockEvent::Resize(cols, rows))
+            }
+            EventAction::SetFontSize => Ok(MockEvent::AppendOutput(format!(
+                "[FONT_SIZE:{}]",
+                event.content.trim()
+            ))),
+            EventAction::GenerateScrollback => {
+                let (lines, width) = parse_scrollback_spec(&event.content)?;
+                Ok(MockEvent::AppendOutput(generate_scrollback(lines, width)))
             }
             EventAction::Marker => {
                 // Markers don't produce a MockEvent; they're used for expectations.
@@ -451,12 +524,15 @@ impl TutorialSandbox {
             name: "tutorial_sandbox".to_string(),
             description: "Pre-configured environment for wa learn exercises".to_string(),
             duration: Duration::from_secs(300),
+            metadata: BTreeMap::new(),
             panes: vec![
                 ScenarioPane {
                     id: 0,
                     title: "Local Shell".to_string(),
                     domain: "local".to_string(),
                     cwd: "/home/user/projects".to_string(),
+                    window_id: 0,
+                    tab_id: 0,
                     cols: 80,
                     rows: 24,
                     initial_content: "$ ".to_string(),
@@ -466,6 +542,8 @@ impl TutorialSandbox {
                     title: "Codex Agent".to_string(),
                     domain: "local".to_string(),
                     cwd: "/home/user/projects".to_string(),
+                    window_id: 0,
+                    tab_id: 0,
                     cols: 80,
                     rows: 24,
                     initial_content:
@@ -477,6 +555,8 @@ impl TutorialSandbox {
                     title: "Claude Code".to_string(),
                     domain: "local".to_string(),
                     cwd: "/home/user/projects".to_string(),
+                    window_id: 0,
+                    tab_id: 0,
                     cols: 80,
                     rows: 24,
                     initial_content: "claude> Analyzing your codebase...\n".to_string(),
@@ -563,6 +643,94 @@ fn parse_duration(s: &str) -> std::result::Result<Duration, String> {
     }
 
     Ok(Duration::from_millis(total_ms))
+}
+
+fn parse_resize_spec(spec: &str) -> Result<(u32, u32)> {
+    let (cols_raw, rows_raw) = spec
+        .split_once('x')
+        .or_else(|| spec.split_once('X'))
+        .ok_or_else(|| {
+            crate::Error::Runtime(format!("Resize content must be 'COLSxROWS', got '{spec}'"))
+        })?;
+
+    let cols: u32 = cols_raw
+        .trim()
+        .parse()
+        .map_err(|_| crate::Error::Runtime(format!("Invalid cols in resize: '{cols_raw}'")))?;
+    let rows: u32 = rows_raw
+        .trim()
+        .parse()
+        .map_err(|_| crate::Error::Runtime(format!("Invalid rows in resize: '{rows_raw}'")))?;
+
+    if cols == 0 || rows == 0 {
+        return Err(crate::Error::Runtime(format!(
+            "Resize dimensions must be > 0, got '{spec}'"
+        )));
+    }
+
+    Ok((cols, rows))
+}
+
+fn parse_scrollback_spec(spec: &str) -> Result<(usize, usize)> {
+    let trimmed = spec.trim();
+    if trimmed.is_empty() {
+        return Err(crate::Error::Runtime(
+            "GenerateScrollback requires non-empty content".to_string(),
+        ));
+    }
+
+    let (lines_raw, width_raw_opt) = if let Some((l, w)) =
+        trimmed.split_once('x').or_else(|| trimmed.split_once('X'))
+    {
+        (l.trim(), Some(w.trim()))
+    } else {
+        (trimmed, None)
+    };
+
+    let lines: usize = lines_raw.parse().map_err(|_| {
+        crate::Error::Runtime(format!(
+            "Invalid line count for GenerateScrollback: '{lines_raw}'"
+        ))
+    })?;
+    if lines == 0 {
+        return Err(crate::Error::Runtime(
+            "GenerateScrollback line count must be > 0".to_string(),
+        ));
+    }
+    if lines > 250_000 {
+        return Err(crate::Error::Runtime(format!(
+            "GenerateScrollback line count too large ({lines}); max 250000"
+        )));
+    }
+
+    let width: usize = match width_raw_opt {
+        Some(raw) => raw.parse().map_err(|_| {
+            crate::Error::Runtime(format!("Invalid width for GenerateScrollback: '{raw}'"))
+        })?,
+        None => 96,
+    };
+    if !(20..=4096).contains(&width) {
+        return Err(crate::Error::Runtime(format!(
+            "GenerateScrollback width out of range ({width}); expected 20..=4096"
+        )));
+    }
+
+    Ok((lines, width))
+}
+
+fn generate_scrollback(lines: usize, width: usize) -> String {
+    const FILLER: &str = "abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut out = String::with_capacity(lines.saturating_mul(width.saturating_add(1)));
+    for i in 0..lines {
+        let mut line = format!("[scrollback:{i:06}] ");
+        while line.len() < width {
+            line.push_str(FILLER);
+        }
+        line.truncate(width);
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
