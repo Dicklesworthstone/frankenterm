@@ -825,8 +825,14 @@ mod test {
 
     #[test]
     fn font_stretch_clamps_out_of_range() {
-        assert_eq!(FontStretch::from_opentype_stretch(0), FontStretch::UltraCondensed);
-        assert_eq!(FontStretch::from_opentype_stretch(100), FontStretch::UltraExpanded);
+        assert_eq!(
+            FontStretch::from_opentype_stretch(0),
+            FontStretch::UltraCondensed
+        );
+        assert_eq!(
+            FontStretch::from_opentype_stretch(100),
+            FontStretch::UltraExpanded
+        );
     }
 
     #[test]
@@ -931,7 +937,10 @@ mod test {
 
     #[test]
     fn freetype_load_flags_hidpi_default() {
-        assert_eq!(FreeTypeLoadFlags::default_hidpi(), FreeTypeLoadFlags::NO_HINTING);
+        assert_eq!(
+            FreeTypeLoadFlags::default_hidpi(),
+            FreeTypeLoadFlags::NO_HINTING
+        );
     }
 
     #[test]

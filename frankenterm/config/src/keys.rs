@@ -280,24 +280,21 @@ mod tests {
     #[test]
     fn mouse_event_alt_screen_from_dynamic_true() {
         let v = Value::Bool(true);
-        let result =
-            MouseEventAltScreen::from_dynamic(&v, FromDynamicOptions::default()).unwrap();
+        let result = MouseEventAltScreen::from_dynamic(&v, FromDynamicOptions::default()).unwrap();
         assert_eq!(result, MouseEventAltScreen::True);
     }
 
     #[test]
     fn mouse_event_alt_screen_from_dynamic_false() {
         let v = Value::Bool(false);
-        let result =
-            MouseEventAltScreen::from_dynamic(&v, FromDynamicOptions::default()).unwrap();
+        let result = MouseEventAltScreen::from_dynamic(&v, FromDynamicOptions::default()).unwrap();
         assert_eq!(result, MouseEventAltScreen::False);
     }
 
     #[test]
     fn mouse_event_alt_screen_from_dynamic_any_string() {
         let v = Value::String("Any".to_string());
-        let result =
-            MouseEventAltScreen::from_dynamic(&v, FromDynamicOptions::default()).unwrap();
+        let result = MouseEventAltScreen::from_dynamic(&v, FromDynamicOptions::default()).unwrap();
         assert_eq!(result, MouseEventAltScreen::Any);
     }
 
@@ -316,8 +313,7 @@ mod tests {
         ] {
             let dynamic = variant.to_dynamic();
             let back =
-                MouseEventAltScreen::from_dynamic(&dynamic, FromDynamicOptions::default())
-                    .unwrap();
+                MouseEventAltScreen::from_dynamic(&dynamic, FromDynamicOptions::default()).unwrap();
             assert_eq!(variant, back);
         }
     }

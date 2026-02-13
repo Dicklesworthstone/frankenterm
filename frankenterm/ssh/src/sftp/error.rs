@@ -152,3 +152,281 @@ impl TryFrom<ssh2::ErrorCode> for SftpError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::convert::TryFrom;
+
+    #[test]
+    fn try_from_zero_is_success() {
+        let result = SftpError::try_from(0);
+        assert_eq!(result, Err(Ok(())));
+    }
+
+    #[test]
+    fn try_from_eof() {
+        assert_eq!(SftpError::try_from(1), Ok(SftpError::Eof));
+    }
+
+    #[test]
+    fn try_from_no_such_file() {
+        assert_eq!(SftpError::try_from(2), Ok(SftpError::NoSuchFile));
+    }
+
+    #[test]
+    fn try_from_permission_denied() {
+        assert_eq!(SftpError::try_from(3), Ok(SftpError::PermissionDenied));
+    }
+
+    #[test]
+    fn try_from_failure() {
+        assert_eq!(SftpError::try_from(4), Ok(SftpError::Failure));
+    }
+
+    #[test]
+    fn try_from_bad_message() {
+        assert_eq!(SftpError::try_from(5), Ok(SftpError::BadMessage));
+    }
+
+    #[test]
+    fn try_from_no_connection() {
+        assert_eq!(SftpError::try_from(6), Ok(SftpError::NoConnection));
+    }
+
+    #[test]
+    fn try_from_connection_lost() {
+        assert_eq!(SftpError::try_from(7), Ok(SftpError::ConnectionLost));
+    }
+
+    #[test]
+    fn try_from_op_unsupported() {
+        assert_eq!(SftpError::try_from(8), Ok(SftpError::OpUnsupported));
+    }
+
+    #[test]
+    fn try_from_invalid_handle() {
+        assert_eq!(SftpError::try_from(9), Ok(SftpError::InvalidHandle));
+    }
+
+    #[test]
+    fn try_from_no_such_path() {
+        assert_eq!(SftpError::try_from(10), Ok(SftpError::NoSuchPath));
+    }
+
+    #[test]
+    fn try_from_file_already_exists() {
+        assert_eq!(SftpError::try_from(11), Ok(SftpError::FileAlreadyExists));
+    }
+
+    #[test]
+    fn try_from_write_protect() {
+        assert_eq!(SftpError::try_from(12), Ok(SftpError::WriteProtect));
+    }
+
+    #[test]
+    fn try_from_no_media() {
+        assert_eq!(SftpError::try_from(13), Ok(SftpError::NoMedia));
+    }
+
+    #[cfg(feature = "ssh2")]
+    #[test]
+    fn try_from_no_space_on_filesystem() {
+        assert_eq!(SftpError::try_from(14), Ok(SftpError::NoSpaceOnFilesystem));
+    }
+
+    #[cfg(feature = "ssh2")]
+    #[test]
+    fn try_from_quota_exceeded() {
+        assert_eq!(SftpError::try_from(15), Ok(SftpError::QuotaExceeded));
+    }
+
+    #[cfg(feature = "ssh2")]
+    #[test]
+    fn try_from_unknown_principal() {
+        assert_eq!(SftpError::try_from(16), Ok(SftpError::UnknownPrincipal));
+    }
+
+    #[cfg(feature = "ssh2")]
+    #[test]
+    fn try_from_lock_conflict() {
+        assert_eq!(SftpError::try_from(17), Ok(SftpError::LockConflict));
+    }
+
+    #[cfg(feature = "ssh2")]
+    #[test]
+    fn try_from_dir_not_empty() {
+        assert_eq!(SftpError::try_from(18), Ok(SftpError::DirNotEmpty));
+    }
+
+    #[cfg(feature = "ssh2")]
+    #[test]
+    fn try_from_not_a_directory() {
+        assert_eq!(SftpError::try_from(19), Ok(SftpError::NotADirectory));
+    }
+
+    #[cfg(feature = "ssh2")]
+    #[test]
+    fn try_from_invalid_filename() {
+        assert_eq!(SftpError::try_from(20), Ok(SftpError::InvalidFilename));
+    }
+
+    #[cfg(feature = "ssh2")]
+    #[test]
+    fn try_from_link_loop() {
+        assert_eq!(SftpError::try_from(21), Ok(SftpError::LinkLoop));
+    }
+
+    #[test]
+    fn try_from_unknown_code() {
+        assert_eq!(SftpError::try_from(999), Err(Err(999)));
+    }
+
+    #[test]
+    fn try_from_negative_code() {
+        assert_eq!(SftpError::try_from(-1), Err(Err(-1)));
+    }
+
+    #[test]
+    fn from_error_code_valid() {
+        assert_eq!(SftpError::from_error_code(1), Some(SftpError::Eof));
+        assert_eq!(
+            SftpError::from_error_code(3),
+            Some(SftpError::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn from_error_code_zero_is_none() {
+        assert_eq!(SftpError::from_error_code(0), None);
+    }
+
+    #[test]
+    fn from_error_code_unknown_is_none() {
+        assert_eq!(SftpError::from_error_code(999), None);
+    }
+
+    #[test]
+    fn to_error_code_roundtrip() {
+        let variants: Vec<(SftpError, i32)> = vec![
+            (SftpError::Eof, 1),
+            (SftpError::NoSuchFile, 2),
+            (SftpError::PermissionDenied, 3),
+            (SftpError::Failure, 4),
+            (SftpError::BadMessage, 5),
+            (SftpError::NoConnection, 6),
+            (SftpError::ConnectionLost, 7),
+            (SftpError::OpUnsupported, 8),
+            (SftpError::InvalidHandle, 9),
+            (SftpError::NoSuchPath, 10),
+            (SftpError::FileAlreadyExists, 11),
+            (SftpError::WriteProtect, 12),
+            (SftpError::NoMedia, 13),
+        ];
+        for (err, code) in variants {
+            assert_eq!(err.to_error_code(), code);
+            assert_eq!(SftpError::try_from(code), Ok(err));
+        }
+    }
+
+    #[cfg(feature = "ssh2")]
+    #[test]
+    fn to_error_code_roundtrip_ssh2_only() {
+        let variants: Vec<(SftpError, i32)> = vec![
+            (SftpError::NoSpaceOnFilesystem, 14),
+            (SftpError::QuotaExceeded, 15),
+            (SftpError::UnknownPrincipal, 16),
+            (SftpError::LockConflict, 17),
+            (SftpError::DirNotEmpty, 18),
+            (SftpError::NotADirectory, 19),
+            (SftpError::InvalidFilename, 20),
+            (SftpError::LinkLoop, 21),
+        ];
+        for (err, code) in variants {
+            assert_eq!(err.to_error_code(), code);
+            assert_eq!(SftpError::try_from(code), Ok(err));
+        }
+    }
+
+    #[test]
+    fn error_display_messages() {
+        assert_eq!(format!("{}", SftpError::Eof), "End-of-file encountered");
+        assert_eq!(format!("{}", SftpError::NoSuchFile), "File doesn't exist");
+        assert_eq!(
+            format!("{}", SftpError::PermissionDenied),
+            "Permission denied"
+        );
+        assert_eq!(format!("{}", SftpError::Failure), "Generic failure");
+        assert_eq!(
+            format!("{}", SftpError::BadMessage),
+            "Garbage received from server"
+        );
+        assert_eq!(
+            format!("{}", SftpError::NoConnection),
+            "No connection has been set up"
+        );
+        assert_eq!(
+            format!("{}", SftpError::ConnectionLost),
+            "There was a connection, but we lost it"
+        );
+        assert_eq!(
+            format!("{}", SftpError::OpUnsupported),
+            "Operation not supported by the server"
+        );
+        assert_eq!(
+            format!("{}", SftpError::InvalidHandle),
+            "Invalid file handle"
+        );
+        assert_eq!(
+            format!("{}", SftpError::NoSuchPath),
+            "No such file or directory path exists"
+        );
+        assert_eq!(
+            format!("{}", SftpError::FileAlreadyExists),
+            "An attempt to create an already existing file or directory has been made"
+        );
+        assert_eq!(
+            format!("{}", SftpError::WriteProtect),
+            "We are trying to write on a write-protected filesystem"
+        );
+        assert_eq!(
+            format!("{}", SftpError::NoMedia),
+            "No media in remote drive"
+        );
+    }
+
+    #[test]
+    fn error_clone_and_copy() {
+        let err = SftpError::PermissionDenied;
+        let cloned = err;
+        assert_eq!(err, cloned);
+    }
+
+    #[test]
+    fn error_hash() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(SftpError::Eof);
+        set.insert(SftpError::NoSuchFile);
+        set.insert(SftpError::Eof); // duplicate
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn error_debug() {
+        let dbg = format!("{:?}", SftpError::PermissionDenied);
+        assert!(dbg.contains("PermissionDenied"));
+    }
+
+    #[test]
+    fn sftp_result_ok() {
+        let result: SftpResult<i32> = Ok(42);
+        assert_eq!(result.unwrap(), 42);
+    }
+
+    #[test]
+    fn sftp_result_err() {
+        let result: SftpResult<i32> = Err(SftpError::Failure);
+        assert_eq!(result.unwrap_err(), SftpError::Failure);
+    }
+}

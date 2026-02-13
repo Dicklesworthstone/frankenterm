@@ -1633,4 +1633,178 @@ Config {
 "#
         );
     }
+
+    #[test]
+    fn wildcard_literal() {
+        let (pat, is_literal) = wildcard_to_pattern("foo");
+        assert!(is_literal);
+        assert_eq!(pat, "^foo$");
+    }
+
+    #[test]
+    fn wildcard_star() {
+        let (pat, is_literal) = wildcard_to_pattern("*.example.com");
+        assert!(!is_literal);
+        assert!(pat.contains(".*"));
+    }
+
+    #[test]
+    fn wildcard_question_mark() {
+        let (pat, is_literal) = wildcard_to_pattern("host?");
+        assert!(!is_literal);
+        assert!(pat.contains("."));
+    }
+
+    #[test]
+    fn wildcard_escapes_special_chars() {
+        let (pat, is_literal) = wildcard_to_pattern("192.168.1.1");
+        assert!(is_literal);
+        assert!(pat.contains(r"\."));
+    }
+
+    #[test]
+    fn pattern_match_literal() {
+        let pat = Pattern::new("myhost", false);
+        assert!(pat.match_text("myhost"));
+        assert!(!pat.match_text("otherhost"));
+    }
+
+    #[test]
+    fn pattern_match_wildcard() {
+        let pat = Pattern::new("*.example.com", false);
+        assert!(pat.match_text("foo.example.com"));
+        assert!(pat.match_text("bar.example.com"));
+        assert!(!pat.match_text("example.com"));
+    }
+
+    #[test]
+    fn pattern_match_question_mark() {
+        let pat = Pattern::new("host?", false);
+        assert!(pat.match_text("host1"));
+        assert!(pat.match_text("hostA"));
+        assert!(!pat.match_text("host12"));
+    }
+
+    #[test]
+    fn pattern_negated() {
+        let pat = Pattern::new("badhost", true);
+        assert!(pat.negated);
+        assert!(pat.match_text("badhost"));
+    }
+
+    #[test]
+    fn pattern_match_group_positive() {
+        let patterns = vec![Pattern::new("foo", false), Pattern::new("bar", false)];
+        assert!(Pattern::match_group("foo", &patterns));
+        assert!(Pattern::match_group("bar", &patterns));
+        assert!(!Pattern::match_group("baz", &patterns));
+    }
+
+    #[test]
+    fn pattern_match_group_negated() {
+        let patterns = vec![Pattern::new("excluded", true), Pattern::new("*", false)];
+        assert!(!Pattern::match_group("excluded", &patterns));
+        assert!(Pattern::match_group("anything_else", &patterns));
+    }
+
+    #[test]
+    fn pattern_match_group_empty() {
+        let patterns: Vec<Pattern> = vec![];
+        assert!(!Pattern::match_group("anything", &patterns));
+    }
+
+    #[test]
+    fn config_new_is_empty() {
+        let config = Config::new();
+        assert!(config.enumerate_hosts().is_empty());
+    }
+
+    #[test]
+    fn config_enumerate_hosts_excludes_patterns() {
+        let mut config = Config::new();
+        config.add_config_string(
+            r#"
+        Host literal_host
+            Port 22
+        Host *.wildcard.com
+            Port 22
+        "#,
+        );
+        let hosts = config.enumerate_hosts();
+        assert!(hosts.contains(&"literal_host".to_string()));
+        assert!(!hosts.iter().any(|h| h.contains("*")));
+    }
+
+    #[test]
+    fn config_for_host_defaults() {
+        let mut config = Config::new();
+        let mut fake_env = ConfigMap::new();
+        fake_env.insert("HOME".to_string(), "/home/test".to_string());
+        fake_env.insert("USER".to_string(), "test".to_string());
+        config.assign_environment(fake_env);
+
+        let opts = config.for_host("anyhost");
+        assert_eq!(opts.get("hostname").unwrap(), "anyhost");
+        assert_eq!(opts.get("port").unwrap(), "22");
+        assert_eq!(opts.get("user").unwrap(), "test");
+    }
+
+    #[test]
+    fn config_first_match_wins() {
+        let mut config = Config::new();
+        let mut fake_env = ConfigMap::new();
+        fake_env.insert("HOME".to_string(), "/home/me".to_string());
+        fake_env.insert("USER".to_string(), "me".to_string());
+        config.assign_environment(fake_env);
+
+        config.add_config_string(
+            r#"
+        Host myhost
+            Port 2222
+        Host myhost
+            Port 3333
+        "#,
+        );
+        let opts = config.for_host("myhost");
+        assert_eq!(opts.get("port").unwrap(), "2222");
+    }
+
+    #[test]
+    fn config_wildcard_host_applies() {
+        let mut config = Config::new();
+        let mut fake_env = ConfigMap::new();
+        fake_env.insert("HOME".to_string(), "/home/me".to_string());
+        fake_env.insert("USER".to_string(), "me".to_string());
+        config.assign_environment(fake_env);
+
+        config.add_config_string(
+            r#"
+        Host *
+            ServerAliveInterval 30
+        "#,
+        );
+        let opts = config.for_host("anyhost");
+        assert_eq!(opts.get("serveraliveinterval").unwrap(), "30");
+    }
+
+    #[test]
+    fn context_variants() {
+        assert_ne!(Context::FirstPass, Context::Canonical);
+        assert_ne!(Context::Canonical, Context::Final);
+        assert_ne!(Context::FirstPass, Context::Final);
+    }
+
+    #[test]
+    fn criteria_equality() {
+        let a = Criteria::All;
+        let b = Criteria::All;
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn config_loaded_files_empty_for_string_config() {
+        let mut config = Config::new();
+        config.add_config_string("Host foo\n    Port 22\n");
+        assert!(config.loaded_config_files().is_empty());
+    }
 }

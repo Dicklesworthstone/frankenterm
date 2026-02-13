@@ -413,10 +413,7 @@ mod test {
             DefaultUnit::Percent.to_dimension(50.0),
             Dimension::Percent(0.5)
         );
-        assert_eq!(
-            DefaultUnit::Cells.to_dimension(3.0),
-            Dimension::Cells(3.0)
-        );
+        assert_eq!(DefaultUnit::Cells.to_dimension(3.0), Dimension::Cells(3.0));
     }
 
     #[test]
@@ -477,8 +474,8 @@ mod test {
 
     #[test]
     fn from_dynamic_invalid_string() {
-        let result = DefaultUnit::Pixels
-            .from_dynamic_impl(&Value::String("not-a-number".to_string()));
+        let result =
+            DefaultUnit::Pixels.from_dynamic_impl(&Value::String("not-a-number".to_string()));
         assert!(result.is_err());
     }
 

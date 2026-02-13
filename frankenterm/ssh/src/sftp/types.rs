@@ -419,3 +419,282 @@ mod libssh_impl {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_type_is_dir() {
+        assert!(FileType::Dir.is_dir());
+        assert!(!FileType::Dir.is_file());
+        assert!(!FileType::Dir.is_symlink());
+    }
+
+    #[test]
+    fn file_type_is_file() {
+        assert!(!FileType::File.is_dir());
+        assert!(FileType::File.is_file());
+        assert!(!FileType::File.is_symlink());
+    }
+
+    #[test]
+    fn file_type_is_symlink() {
+        assert!(!FileType::Symlink.is_dir());
+        assert!(!FileType::Symlink.is_file());
+        assert!(FileType::Symlink.is_symlink());
+    }
+
+    #[test]
+    fn file_type_other() {
+        assert!(!FileType::Other.is_dir());
+        assert!(!FileType::Other.is_file());
+        assert!(!FileType::Other.is_symlink());
+    }
+
+    #[test]
+    fn file_type_from_unix_mode_dir() {
+        assert_eq!(FileType::from_unix_mode(0o040755), FileType::Dir);
+    }
+
+    #[test]
+    fn file_type_from_unix_mode_file() {
+        assert_eq!(FileType::from_unix_mode(0o100644), FileType::File);
+    }
+
+    #[test]
+    fn file_type_from_unix_mode_symlink() {
+        assert_eq!(FileType::from_unix_mode(0o120777), FileType::Symlink);
+    }
+
+    #[test]
+    fn file_type_from_unix_mode_other() {
+        assert_eq!(FileType::from_unix_mode(0o010644), FileType::Other);
+    }
+
+    #[test]
+    fn file_type_to_unix_mode_roundtrip() {
+        for ft in [FileType::Dir, FileType::File, FileType::Symlink] {
+            let mode = ft.to_unix_mode();
+            assert_eq!(FileType::from_unix_mode(mode), ft);
+        }
+    }
+
+    #[test]
+    fn file_type_other_to_unix_mode() {
+        assert_eq!(FileType::Other.to_unix_mode(), 0);
+    }
+
+    #[test]
+    fn file_permissions_from_unix_mode_755() {
+        let perms = FilePermissions::from_unix_mode(0o755);
+        assert!(perms.owner_read);
+        assert!(perms.owner_write);
+        assert!(perms.owner_exec);
+        assert!(perms.group_read);
+        assert!(!perms.group_write);
+        assert!(perms.group_exec);
+        assert!(perms.other_read);
+        assert!(!perms.other_write);
+        assert!(perms.other_exec);
+    }
+
+    #[test]
+    fn file_permissions_from_unix_mode_644() {
+        let perms = FilePermissions::from_unix_mode(0o644);
+        assert!(perms.owner_read);
+        assert!(perms.owner_write);
+        assert!(!perms.owner_exec);
+        assert!(perms.group_read);
+        assert!(!perms.group_write);
+        assert!(!perms.group_exec);
+        assert!(perms.other_read);
+        assert!(!perms.other_write);
+        assert!(!perms.other_exec);
+    }
+
+    #[test]
+    fn file_permissions_from_unix_mode_000() {
+        let perms = FilePermissions::from_unix_mode(0o000);
+        assert!(!perms.owner_read);
+        assert!(!perms.owner_write);
+        assert!(!perms.owner_exec);
+        assert!(!perms.group_read);
+        assert!(!perms.group_write);
+        assert!(!perms.group_exec);
+        assert!(!perms.other_read);
+        assert!(!perms.other_write);
+        assert!(!perms.other_exec);
+    }
+
+    #[test]
+    fn file_permissions_from_unix_mode_777() {
+        let perms = FilePermissions::from_unix_mode(0o777);
+        assert!(perms.owner_read);
+        assert!(perms.owner_write);
+        assert!(perms.owner_exec);
+        assert!(perms.group_read);
+        assert!(perms.group_write);
+        assert!(perms.group_exec);
+        assert!(perms.other_read);
+        assert!(perms.other_write);
+        assert!(perms.other_exec);
+    }
+
+    #[test]
+    fn file_permissions_to_unix_mode_roundtrip() {
+        for mode in [0o000, 0o400, 0o644, 0o755, 0o777] {
+            let perms = FilePermissions::from_unix_mode(mode);
+            assert_eq!(perms.to_unix_mode(), mode);
+        }
+    }
+
+    #[test]
+    fn file_permissions_is_readonly() {
+        let readonly = FilePermissions::from_unix_mode(0o444);
+        assert!(readonly.is_readonly());
+
+        let writable = FilePermissions::from_unix_mode(0o644);
+        assert!(!writable.is_readonly());
+    }
+
+    #[test]
+    fn file_permissions_is_readonly_group_write() {
+        let perms = FilePermissions::from_unix_mode(0o464);
+        assert!(!perms.is_readonly());
+    }
+
+    #[test]
+    fn file_permissions_is_readonly_other_write() {
+        let perms = FilePermissions::from_unix_mode(0o446);
+        assert!(!perms.is_readonly());
+    }
+
+    #[test]
+    fn metadata_is_dir() {
+        let meta = Metadata {
+            ty: FileType::Dir,
+            permissions: None,
+            size: None,
+            uid: None,
+            gid: None,
+            accessed: None,
+            modified: None,
+        };
+        assert!(meta.is_dir());
+        assert!(!meta.is_file());
+        assert!(!meta.is_symlink());
+    }
+
+    #[test]
+    fn metadata_is_file() {
+        let meta = Metadata {
+            ty: FileType::File,
+            permissions: Some(FilePermissions::from_unix_mode(0o644)),
+            size: Some(1024),
+            uid: Some(1000),
+            gid: Some(1000),
+            accessed: Some(1000000),
+            modified: Some(2000000),
+        };
+        assert!(!meta.is_dir());
+        assert!(meta.is_file());
+        assert!(!meta.is_symlink());
+        assert_eq!(meta.size, Some(1024));
+    }
+
+    #[test]
+    fn metadata_equality() {
+        let a = Metadata {
+            ty: FileType::File,
+            permissions: Some(FilePermissions::from_unix_mode(0o644)),
+            size: Some(100),
+            uid: None,
+            gid: None,
+            accessed: None,
+            modified: None,
+        };
+        let b = a;
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn open_options_equality() {
+        let a = OpenOptions {
+            read: true,
+            write: Some(WriteMode::Write),
+            mode: 0o644,
+            ty: OpenFileType::File,
+        };
+        let b = OpenOptions {
+            read: true,
+            write: Some(WriteMode::Write),
+            mode: 0o644,
+            ty: OpenFileType::File,
+        };
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn open_options_inequality() {
+        let a = OpenOptions {
+            read: true,
+            write: None,
+            mode: 0o644,
+            ty: OpenFileType::File,
+        };
+        let b = OpenOptions {
+            read: true,
+            write: Some(WriteMode::Append),
+            mode: 0o644,
+            ty: OpenFileType::File,
+        };
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn rename_options_default() {
+        let opts = RenameOptions::default();
+        assert!(opts.overwrite);
+        assert!(opts.atomic);
+        assert!(opts.native);
+    }
+
+    #[test]
+    fn write_mode_variants() {
+        assert_ne!(WriteMode::Append, WriteMode::Write);
+        assert_eq!(WriteMode::Append, WriteMode::Append);
+    }
+
+    #[test]
+    fn open_file_type_variants() {
+        assert_ne!(OpenFileType::Dir, OpenFileType::File);
+        assert_eq!(OpenFileType::Dir, OpenFileType::Dir);
+    }
+
+    #[test]
+    fn file_type_clone_and_hash() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(FileType::Dir);
+        set.insert(FileType::File);
+        set.insert(FileType::Symlink);
+        set.insert(FileType::Other);
+        assert_eq!(set.len(), 4);
+    }
+
+    #[test]
+    fn metadata_clone() {
+        let meta = Metadata {
+            ty: FileType::File,
+            permissions: Some(FilePermissions::from_unix_mode(0o755)),
+            size: Some(42),
+            uid: Some(0),
+            gid: Some(0),
+            accessed: Some(100),
+            modified: Some(200),
+        };
+        let cloned = meta;
+        assert_eq!(meta, cloned);
+    }
+}
