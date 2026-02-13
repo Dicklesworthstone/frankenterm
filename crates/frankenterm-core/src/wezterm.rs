@@ -2518,6 +2518,68 @@ pub fn build_unified_client(config: &crate::config::Config) -> UnifiedClient {
         "UnifiedClient backend selection"
     );
 
+    if config.vendored.sharding.enabled && config.vendored.sharding.socket_paths.len() >= 2 {
+        let mut shard_handles = Vec::with_capacity(config.vendored.sharding.socket_paths.len());
+        for socket_path in &config.vendored.sharding.socket_paths {
+            let client = WeztermClient::with_socket(socket_path.clone())
+                .with_timeout(config.cli.timeout_seconds);
+            #[cfg(all(feature = "vendored", unix))]
+            let client = if selection.kind == BackendKind::Vendored {
+                let mut mux = crate::vendored::DirectMuxClientConfig::from_wa_config(config);
+                mux.socket_path = Some(std::path::PathBuf::from(socket_path));
+                let pool = crate::pool::PoolConfig {
+                    max_size: config.vendored.mux_pool.max_connections.max(1),
+                    idle_timeout: std::time::Duration::from_secs(
+                        config.vendored.mux_pool.idle_timeout_seconds,
+                    ),
+                    acquire_timeout: std::time::Duration::from_secs(
+                        config.vendored.mux_pool.acquire_timeout_seconds.max(1),
+                    ),
+                };
+                let pool = crate::vendored::MuxPoolConfig {
+                    pool,
+                    mux,
+                    recovery: crate::vendored::MuxRecoveryConfig::default(),
+                    pipeline_depth: config.vendored.mux_pool.pipeline_depth.max(1),
+                    pipeline_timeout: std::time::Duration::from_millis(
+                        config.vendored.mux_pool.pipeline_timeout_ms.max(1),
+                    ),
+                };
+                let pool = Arc::new(crate::vendored::MuxPool::new(pool));
+                client.with_mux_pool(pool)
+            } else {
+                client
+            };
+
+            shard_handles.push(Arc::new(client) as WeztermHandle);
+        }
+
+        match crate::sharding::ShardedWeztermClient::from_handles(
+            config.vendored.sharding.assignment.clone(),
+            shard_handles,
+        ) {
+            Ok(sharded) => {
+                let mut shard_selection = selection.clone();
+                shard_selection.reason = format!(
+                    "{}; sharding enabled with {} sockets",
+                    shard_selection.reason,
+                    config.vendored.sharding.socket_paths.len()
+                );
+                let inner: WeztermHandle = Arc::new(sharded);
+                return UnifiedClient {
+                    inner,
+                    selection: shard_selection,
+                };
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "Failed to construct sharded WezTerm client; falling back to single backend"
+                );
+            }
+        }
+    }
+
     let client = match config.vendored.mux_socket_path.as_deref() {
         Some(path) if !path.trim().is_empty() => WeztermClient::with_socket(path.to_string()),
         _ => WeztermClient::new(),
@@ -3447,6 +3509,24 @@ mod unified_tests {
         if !cfg!(feature = "vendored") {
             assert_eq!(client.selection().kind, BackendKind::Cli);
         }
+    }
+
+    #[test]
+    fn build_unified_client_enables_sharding_when_configured() {
+        let mut config = crate::config::Config::default();
+        config.vendored.sharding.enabled = true;
+        config.vendored.sharding.socket_paths = vec![
+            "/tmp/ft-shard-0.sock".to_string(),
+            "/tmp/ft-shard-1.sock".to_string(),
+        ];
+
+        let client = build_unified_client(&config);
+        assert!(
+            client
+                .selection()
+                .reason
+                .contains("sharding enabled with 2 sockets")
+        );
     }
 
     #[test]

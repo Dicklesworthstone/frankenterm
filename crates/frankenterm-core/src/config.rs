@@ -2075,6 +2075,32 @@ impl Default for VendoredMuxPoolConfig {
     }
 }
 
+/// Vendored sharding configuration for multi-socket mux deployments.
+///
+/// When enabled with two or more `socket_paths`, the WezTerm client layer
+/// builds a sharded router that fans out pane discovery and routes pane-scoped
+/// operations to the owning socket backend.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VendoredShardingConfig {
+    /// Enable multi-socket sharding.
+    pub enabled: bool,
+    /// Socket paths for shard backends (WEZTERM_UNIX_SOCKET per shard).
+    pub socket_paths: Vec<String>,
+    /// Assignment strategy for shard routing.
+    pub assignment: crate::sharding::AssignmentStrategy,
+}
+
+impl Default for VendoredShardingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            socket_paths: Vec::new(),
+            assignment: crate::sharding::AssignmentStrategy::RoundRobin,
+        }
+    }
+}
+
 /// Vendored WezTerm configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -2083,6 +2109,8 @@ pub struct VendoredConfig {
     pub mux_socket_path: Option<String>,
     /// Vendored mux connection pool settings.
     pub mux_pool: VendoredMuxPoolConfig,
+    /// Optional sharding configuration for multi-socket routing.
+    pub sharding: VendoredShardingConfig,
 }
 
 impl Default for VendoredConfig {
@@ -2090,6 +2118,7 @@ impl Default for VendoredConfig {
         Self {
             mux_socket_path: None,
             mux_pool: VendoredMuxPoolConfig::default(),
+            sharding: VendoredShardingConfig::default(),
         }
     }
 }
@@ -3232,6 +3261,10 @@ impl Config {
             let mux_path = expand_tilde(&path);
             self.vendored.mux_socket_path = Some(path_to_string(&mux_path));
         }
+        for path in &mut self.vendored.sharding.socket_paths {
+            let expanded = expand_tilde(path);
+            *path = path_to_string(&expanded);
+        }
 
         let ipc_path = expand_tilde(&self.ipc.socket_path);
         self.ipc.socket_path = path_to_string(&ipc_path);
@@ -3361,6 +3394,28 @@ impl Config {
         self.distributed
             .validate()
             .map_err(crate::error::ConfigError::ValidationError)?;
+
+        if self.vendored.sharding.enabled {
+            if self.vendored.sharding.socket_paths.len() < 2 {
+                return Err(crate::error::ConfigError::ValidationError(
+                    "vendored.sharding.enabled=true requires at least 2 socket_paths".to_string(),
+                )
+                .into());
+            }
+
+            if self
+                .vendored
+                .sharding
+                .socket_paths
+                .iter()
+                .any(|path| path.trim().is_empty())
+            {
+                return Err(crate::error::ConfigError::ValidationError(
+                    "vendored.sharding.socket_paths entries must not be empty".to_string(),
+                )
+                .into());
+            }
+        }
 
         Ok(())
     }
@@ -3904,6 +3959,11 @@ disabled_rules = ["codex.usage_warning"]
         config.general.data_dir = "~/wa-data".to_string();
         config.storage.db_path = "~/ft.db".to_string();
         config.ipc.socket_path = "~/wa-ipc.sock".to_string();
+        config.vendored.mux_socket_path = Some("~/wa-mux.sock".to_string());
+        config.vendored.sharding.socket_paths = vec![
+            "~/wa-shard-0.sock".to_string(),
+            "~/wa-shard-1.sock".to_string(),
+        ];
         config.backup.scheduled.destination = Some("~/wa-backups".to_string());
         config.sync.allow_paths = vec!["~/wa-allow".to_string()];
         config.sync.deny_paths = vec!["~/wa-deny".to_string()];
@@ -3919,6 +3979,21 @@ disabled_rules = ["codex.usage_warning"]
         assert!(!config.general.data_dir.contains('~'));
         assert!(!config.storage.db_path.contains('~'));
         assert!(!config.ipc.socket_path.contains('~'));
+        assert!(
+            config
+                .vendored
+                .mux_socket_path
+                .as_ref()
+                .is_some_and(|path| !path.contains('~'))
+        );
+        assert!(
+            config
+                .vendored
+                .sharding
+                .socket_paths
+                .iter()
+                .all(|path| !path.contains('~'))
+        );
         assert!(
             config
                 .backup
@@ -3997,6 +4072,36 @@ disabled_rules = ["codex.usage_warning"]
         config.ingest.poll_interval_ms = 50;
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("poll_interval_ms"));
+    }
+
+    #[test]
+    fn validate_sharding_requires_at_least_two_socket_paths() {
+        let mut config = Config::default();
+        config.vendored.sharding.enabled = true;
+        config.vendored.sharding.socket_paths = vec!["/tmp/wa-shard-0.sock".to_string()];
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("requires at least 2 socket_paths"));
+    }
+
+    #[test]
+    fn validate_sharding_rejects_empty_socket_path_entries() {
+        let mut config = Config::default();
+        config.vendored.sharding.enabled = true;
+        config.vendored.sharding.socket_paths =
+            vec!["/tmp/wa-shard-0.sock".to_string(), "  ".to_string()];
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("socket_paths entries must not be empty"));
+    }
+
+    #[test]
+    fn validate_sharding_accepts_two_non_empty_socket_paths() {
+        let mut config = Config::default();
+        config.vendored.sharding.enabled = true;
+        config.vendored.sharding.socket_paths = vec![
+            "/tmp/wa-shard-0.sock".to_string(),
+            "/tmp/wa-shard-1.sock".to_string(),
+        ];
+        assert!(config.validate().is_ok());
     }
 
     #[test]
