@@ -134,6 +134,7 @@ pub mod protocol_recovery;
 pub mod recorder_audit;
 pub mod recorder_invariants;
 pub mod recorder_query;
+pub mod recorder_replay;
 pub mod recorder_retention;
 pub mod recorder_storage;
 pub mod recording;
