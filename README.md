@@ -1,7 +1,7 @@
 # ft — FrankenTerm
 
 <div align="center">
-  <img src="ft_illustration.webp" alt="ft - Terminal Hypervisor for AI Agent Swarms">
+  <img src="ft_illustration.webp" alt="ft - Swarm-Native Terminal Platform for AI Agent Fleets">
 </div>
 
 <div align="center">
@@ -12,7 +12,7 @@
 
 </div>
 
-**The central nervous system for coordinating fleets of AI coding agents across WezTerm terminal sessions.**
+**A swarm-native terminal platform designed to replace legacy terminal workflows for massive AI agent orchestration.**
 
 <div align="center">
 <h3>Quick Install</h3>
@@ -27,9 +27,17 @@ cargo install --git https://github.com/Dicklesworthstone/frankenterm.git ft
 
 ## TL;DR
 
-**The Problem**: Running multiple AI coding agents (Claude Code, Codex CLI, Gemini CLI) across terminal panes is chaos. You can't see what they're doing, can't detect when they hit rate limits or need input, and can't coordinate their work without manual babysitting and fragile timing heuristics.
+**The Problem**: Running large AI coding swarms across ad-hoc terminal panes is chaos. You can't reliably observe state, detect rate limits or auth failures, coordinate handoffs, or automate safe recovery without brittle glue code.
 
-**The Solution**: `ft` transforms WezTerm into a **terminal hypervisor** — capturing all pane output in real-time, detecting agent state transitions through pattern matching, automatically executing workflows in response, and exposing a machine-optimized Robot Mode API for AI-to-AI orchestration.
+**The Solution**: `ft` is a **full terminal platform for agent swarms** — with first-class observability, deterministic eventing, policy-gated automation, and machine-native control surfaces (Robot Mode + MCP). Existing WezTerm integration is a migration bridge, not the product boundary.
+
+### Platform Direction
+
+`ft` is developed as a replacement-class terminal runtime for multi-agent systems, not a thin wrapper around another terminal. The architecture is actively expanding with:
+
+- Concepts learned from Ghostty and Zellij (session model, ergonomics, and runtime resilience)
+- Ground-up `ft` subsystems purpose-built for agent swarms
+- Targeted integrations and code adaptation from `/dp/asupersync`, `/dp/frankensqlite`, and `/dp/frankentui`
 
 ### Why Use ft?
 
@@ -47,7 +55,7 @@ cargo install --git https://github.com/Dicklesworthstone/frankenterm.git ft
 ## Quick Example
 
 ```bash
-# Start the ft watcher (observes all WezTerm panes)
+# Start the ft watcher/runtime
 $ ft watch
 
 # See all active panes as JSON
@@ -134,14 +142,14 @@ Operator guidance:
 
 ## How ft Compares
 
-| Feature | ft | tmux scripting | Manual monitoring |
-|---------|-----|----------------|-------------------|
-| Multi-pane capture | Full scrollback + delta | Capture-pane (snapshot) | One pane at a time |
-| Pattern detection | <5ms, multi-agent | Manual grep | Human eyes |
-| Event-driven waits | Built-in | Polling loops | Not possible |
-| Full-text search | FTS5 with ranking | grep + manual | Not practical |
-| Policy/safety | Capability gates | None | Trust |
-| Robot Mode API | First-class JSON | Script parsing | N/A |
+| Feature | ft | WezTerm | Zellij | Ghostty |
+|---------|----|---------|--------|---------|
+| Swarm-native orchestration | First-class | External glue required | External glue required | External glue required |
+| Event-driven automation | Built-in workflows + policy gate | Not native | Not native | Not native |
+| Machine API for agents | Robot Mode + MCP | No equivalent | No equivalent | No equivalent |
+| Cross-session state + recovery | Built-in snapshots/sessions | Partial/manual | Session-centric, not swarm-centric | Minimal |
+| Agent-safe control plane | Capability/risk/approval/audit | Not native | Not native | Not native |
+| Backend extensibility | Explicit platform direction | Terminal app only | Terminal app only | Terminal app only |
 
 **When to use ft:**
 - Running 2+ AI coding agents that need coordination
@@ -149,8 +157,8 @@ Operator guidance:
 - Debugging multi-agent workflows with full observability
 
 **When ft might not be ideal:**
-- Single terminal, single agent (overkill)
-- Non-WezTerm terminal emulators (WezTerm-specific APIs)
+- Single shell/single-agent usage where orchestration is unnecessary
+- Environments that only need a lightweight interactive terminal and no swarm control plane
 
 ---
 
@@ -177,7 +185,7 @@ cargo install --git https://github.com/Dicklesworthstone/frankenterm.git ft
 ### Requirements
 
 - **Rust 1.85+** (nightly required for Rust 2024 edition)
-- **WezTerm** terminal emulator with CLI enabled
+- **Compatibility backend (current):** WezTerm CLI available for existing pane/session interop
 - **SQLite** (bundled via rusqlite)
 
 ---
@@ -191,10 +199,10 @@ cargo install --git https://github.com/Dicklesworthstone/frankenterm.git ft
 ft setup
 ```
 
-### 2. Verify WezTerm CLI
+### 2. Verify Terminal Backend Connectivity
 
 ```bash
-# Should list your current panes
+# Compatibility backend check (current migration path)
 wezterm cli list
 ```
 
@@ -477,14 +485,14 @@ send_text = { max_per_second = 2 }
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                           WezTerm Multiplexer                           │
-│   Pane 0 (Claude)    Pane 1 (Codex)    Pane 2 (Gemini)    Pane N...   │
+│                         ft Swarm Runtime Core                           │
+│   Session Graph │ Pane Registry │ State Store │ Control Plane          │
 └─────────────────────────────────────────────────────────────────────────┘
                                    │
-                    wezterm cli list / get-text
+                    Backend Adapters + Runtime Integrations
                                    ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                         Ingest Pipeline                                  │
+│                      Ingest + Normalization Pipeline                     │
 │   Discovery → Delta Extraction → Fingerprinting → Observation Filter    │
 └─────────────────────────────────────────────────────────────────────────┘
                                    │
@@ -511,8 +519,8 @@ send_text = { max_per_second = 2 }
                                    │
                                    ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                 Robot Mode API + MCP (stdio)                             │
-│   ft robot state │ get-text │ send │ wait-for │ search │ events        │
+│                 Robot Mode API + MCP + Platform Interfaces               │
+│   ft robot state │ get-text │ send │ wait-for │ search │ events         │
 │   ft mcp serve (feature-gated, stdio transport)                          │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
@@ -521,8 +529,8 @@ For a deeper architecture writeup (OSC 133 prompt markers, gap semantics, librar
 
 ### Data Flow
 
-1. **Discovery**: Enumerate panes via `wezterm cli list`
-2. **Capture**: Get output via `wezterm cli get-text`
+1. **Discovery**: Enumerate pane/session resources via active backend adapters
+2. **Capture**: Stream output and state deltas from adapters/runtime hooks
 3. **Delta**: Compare with previous capture using 4KB overlap matching
 4. **Store**: Append new segments to SQLite with FTS5 indexing
 5. **Detect**: Run pattern engine against new content
@@ -542,7 +550,7 @@ For a deeper architecture writeup (OSC 133 prompt markers, gap semantics, librar
 | **Codex** | `core.codex:usage_reached`, `core.codex:compaction_complete` |
 | **Claude Code** | `core.claude:rate_limited`, `core.claude:approval_needed` |
 | **Gemini** | `core.gemini:quota_exceeded`, `core.gemini:error` |
-| **WezTerm** | `core.wezterm:pane_closed`, `core.wezterm:title_changed` |
+| **Terminal Runtime** | `core.wezterm:pane_closed`, `core.wezterm:title_changed` |
 
 ### Pattern IDs
 
@@ -577,10 +585,10 @@ When a bench runs, it prints a `[BENCH] {...}` metadata line and writes:
 
 For a step-by-step operator guide (triage → why → reproduce), see `docs/operator-playbook.md`.
 
-### "wezterm cli list" returns empty
+### Compatibility backend returns empty pane list
 
 ```bash
-# Ensure WezTerm is running with multiplexer enabled
+# Ensure compatibility backend is up
 wezterm start --always-new-process
 ```
 
@@ -630,6 +638,9 @@ ft rules test "Usage limit reached. Try again later."
 ft status
 
 # Verify pane exists
+ft robot state
+
+# Compatibility backend sanity check
 wezterm cli list
 
 # Check policy blocks
@@ -642,19 +653,20 @@ ft robot send 0 "test" --dry-run
 
 ### What ft Doesn't Do (Yet)
 
-- **Non-WezTerm terminals**: Relies on WezTerm's CLI protocol. tmux/iTerm2 not supported.
-- **Remote panes without SSH**: WezTerm SSH domains work; raw remote terminals don't.
-- **GUI interaction**: Detects terminal output only, not graphical elements.
-- **Multi-host federation**: Full fleet/federation orchestration is not implemented yet.
+- **Complete backend independence**: Compatibility bridge still leans on WezTerm in current builds.
+- **Unified UX parity across all target backends**: Active migration area.
+- **GUI interaction**: Core focus is terminal/state orchestration, not arbitrary GUI automation.
+- **Production-grade multi-host federation**: Distributed mode exists, but hardening is still ongoing.
 
 ### Known Limitations
 
 | Capability | Current State | Planned |
 |------------|---------------|---------|
-| Browser automation (OAuth) | Feature-gated, partial | v0.2 |
-| MCP server integration | Feature-gated (stdio) | v0.2 |
-| Web dashboard | Feature-gated (health-only) | v0.3 |
-| Multi-host federation | Not started | v2.0 |
+| Backend decoupling from compatibility bridge | In progress | Ongoing |
+| Browser automation (OAuth) | Feature-gated, partial | v0.2+ |
+| MCP server integration | Feature-gated (stdio) | v0.2+ |
+| Web dashboard | Feature-gated (health-only) | v0.3+ |
+| Multi-host federation | Early distributed mode | v2.0+ |
 
 ---
 
@@ -670,7 +682,7 @@ By default, output is retained for 30 days (configurable via `storage.retention_
 
 ### Does ft send data anywhere?
 
-No. Everything stays local. No telemetry, no cloud, no network calls except to WezTerm's local CLI.
+Default mode is local-first: no telemetry and no cloud dependency. Network activity only occurs when you explicitly enable integrations like webhooks, SMTP email alerts, or distributed mode.
 
 ### Can I use ft without running AI agents?
 
@@ -710,6 +722,6 @@ MIT License. See [LICENSE](LICENSE) for details.
 
 <div align="center">
 
-**Built for the AI agent age. Observability without compromise.**
+**Built to be the terminal runtime for the AI agent age.**
 
 </div>
