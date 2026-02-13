@@ -22,3 +22,54 @@ pub enum Error {
     #[error("Storage location {0} may be corrupt: {1}")]
     StorageDirIoError(PathBuf, std::io::Error),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lease_expired_display() {
+        let err = Error::LeaseExpired;
+        assert_eq!(
+            err.to_string(),
+            "Lease Expired, data is no longer accessible"
+        );
+    }
+
+    #[test]
+    fn content_not_found_includes_id() {
+        let id = ContentId::for_bytes(b"missing");
+        let err = Error::ContentNotFound(id);
+        let msg = err.to_string();
+        assert!(msg.contains("not found"), "got: {msg}");
+        assert!(msg.contains("sha256-"), "got: {msg}");
+    }
+
+    #[test]
+    fn io_error_from_conversion() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file gone");
+        let err: Error = io_err.into();
+        assert!(err.to_string().contains("file gone"));
+    }
+
+    #[test]
+    fn storage_not_init_display() {
+        let err = Error::StorageNotInit;
+        assert_eq!(err.to_string(), "Storage has not been initialized");
+    }
+
+    #[test]
+    fn already_initialized_display() {
+        let err = Error::AlreadyInitializedStorage;
+        assert!(err.to_string().contains("already been initialized"));
+    }
+
+    #[test]
+    fn storage_dir_io_error_includes_path() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        let err = Error::StorageDirIoError(PathBuf::from("/tmp/blobs"), io_err);
+        let msg = err.to_string();
+        assert!(msg.contains("/tmp/blobs"), "got: {msg}");
+        assert!(msg.contains("denied"), "got: {msg}");
+    }
+}

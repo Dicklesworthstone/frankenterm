@@ -90,8 +90,6 @@ impl BlobStorage for SimpleTempDir {
     }
 
     fn lease_by_content(&self, content_id: ContentId, _lease_id: LeaseId) -> Result<(), Error> {
-        let _refs = self.refs.lock().unwrap();
-
         let path = self.path_for_content(content_id)?;
         if path.exists() {
             self.add_ref(content_id);
@@ -168,5 +166,179 @@ impl BlobStorage for SimpleTempDir {
 
     fn advise_pid_terminated(&self, _pid: u32) -> Result<(), Error> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_creates_temp_directory() {
+        let store = SimpleTempDir::new().unwrap();
+        assert!(store.root.path().exists());
+    }
+
+    #[test]
+    fn new_in_creates_under_specified_path() {
+        let parent = tempfile::tempdir().unwrap();
+        let store = SimpleTempDir::new_in(parent.path()).unwrap();
+        assert!(store.root.path().starts_with(parent.path()));
+    }
+
+    #[test]
+    fn store_and_get_roundtrip() {
+        let store = SimpleTempDir::new().unwrap();
+        let content_id = ContentId::for_bytes(b"hello");
+        let lease_id = LeaseId::new();
+        store.store(content_id, b"hello", lease_id).unwrap();
+
+        let data = store.get_data(content_id, lease_id).unwrap();
+        assert_eq!(data, b"hello");
+    }
+
+    #[test]
+    fn store_empty_data() {
+        let store = SimpleTempDir::new().unwrap();
+        let content_id = ContentId::for_bytes(b"");
+        let lease_id = LeaseId::new();
+        store.store(content_id, b"", lease_id).unwrap();
+
+        let data = store.get_data(content_id, lease_id).unwrap();
+        assert!(data.is_empty());
+    }
+
+    #[test]
+    fn store_large_data() {
+        let store = SimpleTempDir::new().unwrap();
+        let big = vec![0xABu8; 1_000_000];
+        let content_id = ContentId::for_bytes(&big);
+        let lease_id = LeaseId::new();
+        store.store(content_id, &big, lease_id).unwrap();
+
+        let data = store.get_data(content_id, lease_id).unwrap();
+        assert_eq!(data.len(), 1_000_000);
+        assert_eq!(data, big);
+    }
+
+    #[test]
+    fn dedup_same_content_id() {
+        let store = SimpleTempDir::new().unwrap();
+        let content_id = ContentId::for_bytes(b"dedup");
+        let lease1 = LeaseId::new();
+        let lease2 = LeaseId::new();
+
+        store.store(content_id, b"dedup", lease1).unwrap();
+        store.store(content_id, b"dedup", lease2).unwrap();
+
+        let data = store.get_data(content_id, lease1).unwrap();
+        assert_eq!(data, b"dedup");
+    }
+
+    #[test]
+    fn get_nonexistent_content_fails() {
+        let store = SimpleTempDir::new().unwrap();
+        let content_id = ContentId::for_bytes(b"missing");
+        let lease_id = LeaseId::new();
+
+        let result = store.get_data(content_id, lease_id);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn lease_by_content_succeeds_for_stored_data() {
+        let store = SimpleTempDir::new().unwrap();
+        let content_id = ContentId::for_bytes(b"leaseable");
+        let lease_id = LeaseId::new();
+        store.store(content_id, b"leaseable", lease_id).unwrap();
+
+        let new_lease = LeaseId::new();
+        store.lease_by_content(content_id, new_lease).unwrap();
+    }
+
+    #[test]
+    fn lease_by_content_fails_for_missing_data() {
+        let store = SimpleTempDir::new().unwrap();
+        let content_id = ContentId::for_bytes(b"not stored");
+        let lease_id = LeaseId::new();
+
+        let result = store.lease_by_content(content_id, lease_id);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn get_reader_returns_correct_data() {
+        let store = SimpleTempDir::new().unwrap();
+        let content_id = ContentId::for_bytes(b"reader data");
+        let lease_id = LeaseId::new();
+        store.store(content_id, b"reader data", lease_id).unwrap();
+
+        let mut reader = store.get_reader(content_id, lease_id).unwrap();
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut buf).unwrap();
+        assert_eq!(buf, b"reader data");
+    }
+
+    #[test]
+    fn get_reader_supports_seek() {
+        let store = SimpleTempDir::new().unwrap();
+        let content_id = ContentId::for_bytes(b"seekable");
+        let lease_id = LeaseId::new();
+        store.store(content_id, b"seekable", lease_id).unwrap();
+
+        let mut reader = store.get_reader(content_id, lease_id).unwrap();
+        // Seek to position 4
+        use std::io::{Read, Seek, SeekFrom};
+        reader.seek(SeekFrom::Start(4)).unwrap();
+        let mut buf = [0u8; 4];
+        reader.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"able");
+    }
+
+    #[test]
+    fn advise_of_pid_is_noop() {
+        let store = SimpleTempDir::new().unwrap();
+        store.advise_of_pid(12345).unwrap();
+    }
+
+    #[test]
+    fn advise_pid_terminated_is_noop() {
+        let store = SimpleTempDir::new().unwrap();
+        store.advise_pid_terminated(12345).unwrap();
+    }
+
+    #[test]
+    fn multiple_content_ids_coexist() {
+        let store = SimpleTempDir::new().unwrap();
+        let id1 = ContentId::for_bytes(b"one");
+        let id2 = ContentId::for_bytes(b"two");
+        let id3 = ContentId::for_bytes(b"three");
+        let lease = LeaseId::new();
+
+        store.store(id1, b"one", lease).unwrap();
+        store.store(id2, b"two", lease).unwrap();
+        store.store(id3, b"three", lease).unwrap();
+
+        assert_eq!(store.get_data(id1, lease).unwrap(), b"one");
+        assert_eq!(store.get_data(id2, lease).unwrap(), b"two");
+        assert_eq!(store.get_data(id3, lease).unwrap(), b"three");
+    }
+
+    #[test]
+    fn advise_lease_dropped_decrements_refcount() {
+        let store = SimpleTempDir::new().unwrap();
+        let content_id = ContentId::for_bytes(b"ref test");
+        let lease1 = LeaseId::new();
+        let lease2 = LeaseId::new();
+
+        store.store(content_id, b"ref test", lease1).unwrap();
+        // Add another ref via store
+        store.store(content_id, b"ref test", lease2).unwrap();
+
+        // Drop one lease — file should still exist (ref count > 0)
+        store.advise_lease_dropped(lease1, content_id).unwrap();
+
+        // Data should still be accessible
+        assert_eq!(store.get_data(content_id, lease2).unwrap(), b"ref test");
     }
 }
