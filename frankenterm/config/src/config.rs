@@ -1011,7 +1011,11 @@ impl Config {
     }
 
     #[cfg(not(feature = "lua"))]
-    pub fn load_with_overrides(_overrides: &frankenterm_dynamic::Value) -> LoadedConfig {
+    pub fn load_with_overrides(overrides: &frankenterm_dynamic::Value) -> LoadedConfig {
+        // Without Lua, try TOML config first, then fall back to defaults
+        if let Some(loaded) = crate::toml_config::try_load_toml_config(overrides) {
+            return loaded;
+        }
         LoadedConfig {
             config: Ok(Self::default_config()),
             file_name: None,
@@ -1022,6 +1026,13 @@ impl Config {
 
     #[cfg(feature = "lua")]
     pub fn load_with_overrides(overrides: &frankenterm_dynamic::Value) -> LoadedConfig {
+        // Try TOML config first — frankenterm.toml doesn't require Lua and
+        // takes precedence when present. If no TOML config is found, fall
+        // through to the Lua config search.
+        if let Some(loaded) = crate::toml_config::try_load_toml_config(overrides) {
+            return loaded;
+        }
+
         // Note that the directories crate has methods for locating project
         // specific config directories, but only returns one of them, not
         // multiple.  In addition, it spawns a lot of subprocesses,

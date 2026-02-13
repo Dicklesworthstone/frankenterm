@@ -1,16 +1,20 @@
+#[cfg(feature = "lua")]
 use config::lua::get_or_create_module;
+#[cfg(feature = "lua")]
 use config::lua::mlua::{self, IntoLua, Lua};
 use finl_unicode::grapheme_clusters::Graphemes;
 use frankenterm_dynamic::{FromDynamic, ToDynamic};
+#[cfg(feature = "lua")]
 use luahelper::impl_lua_conversion_dynamic;
 use std::str::FromStr;
 use termwiz::caps::{Capabilities, ColorLevel, ProbeHints};
-use termwiz::cell::{grapheme_column_width, unicode_column_width, AttributeChange, CellAttributes};
+use termwiz::cell::{AttributeChange, CellAttributes, grapheme_column_width, unicode_column_width};
 use termwiz::color::{AnsiColor, ColorAttribute, ColorSpec, SrgbaTuple};
 use termwiz::render::terminfo::TerminfoRenderer;
-use termwiz::surface::change::Change;
 use termwiz::surface::Line;
+use termwiz::surface::change::Change;
 
+#[cfg(feature = "lua")]
 pub fn register(lua: &Lua) -> anyhow::Result<()> {
     let wezterm_mod = get_or_create_module(lua, "wezterm")?;
     wezterm_mod.set("nerdfonts", NerdFonts {})?;
@@ -50,8 +54,10 @@ pub fn register(lua: &Lua) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "lua")]
 struct NerdFonts {}
 
+#[cfg(feature = "lua")]
 impl mlua::UserData for NerdFonts {
     fn add_methods<'lua, M: mlua::UserDataMethods<'lua, Self>>(methods: &mut M) {
         methods.add_meta_method(
@@ -101,6 +107,7 @@ pub enum FormatItem {
     ResetAttributes,
     Text(String),
 }
+#[cfg(feature = "lua")]
 impl_lua_conversion_dynamic!(FormatItem);
 
 impl From<FormatItem> for Change {
@@ -143,6 +150,7 @@ pub fn format_as_escapes(items: Vec<FormatItem>) -> anyhow::Result<String> {
     Ok(String::from_utf8(target.target)?)
 }
 
+#[cfg(feature = "lua")]
 fn format<'lua>(_: &'lua Lua, items: Vec<FormatItem>) -> mlua::Result<String> {
     format_as_escapes(items).map_err(mlua::Error::external)
 }
@@ -198,6 +206,7 @@ pub fn truncate_right(s: &str, max_width: usize) -> String {
     result
 }
 
+#[cfg(feature = "lua")]
 fn permute_mods<'lua>(
     lua: &'lua Lua,
     item: mlua::Table,
@@ -229,6 +238,7 @@ fn permute_mods<'lua>(
     Ok(result)
 }
 
+#[cfg(feature = "lua")]
 fn permute_any_mods<'lua>(
     lua: &'lua Lua,
     item: mlua::Table,
@@ -236,6 +246,7 @@ fn permute_any_mods<'lua>(
     permute_mods(lua, item, false)
 }
 
+#[cfg(feature = "lua")]
 fn permute_any_or_no_mods<'lua>(
     lua: &'lua Lua,
     item: mlua::Table,

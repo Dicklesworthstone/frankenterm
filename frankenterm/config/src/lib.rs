@@ -49,6 +49,7 @@ mod serial;
 mod ssh;
 mod terminal;
 mod tls;
+pub(crate) mod toml_config;
 mod units;
 mod unix;
 mod version;
