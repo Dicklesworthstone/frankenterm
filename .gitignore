@@ -89,5 +89,9 @@ triage.json
 # Proptest regression files (auto-generated, machine-specific)
 **/proptest-regressions/
 
+# TLA+ model checker generated state files (multi-GB, regeneratable)
+docs/formal/states/
+docs/formal/*.tlc.log
+
 # WezTerm Automata runtime state (backups, locks)
 .wa/
