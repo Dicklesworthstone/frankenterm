@@ -9,9 +9,11 @@ use std::path::Path;
 
 pub mod audit;
 mod dispatcher;
+pub mod extension;
 #[cfg(feature = "lua")]
 mod lua_engine;
 pub mod manifest;
+pub mod package;
 pub mod sandbox;
 mod types;
 #[cfg(feature = "wasm")]
@@ -23,9 +25,11 @@ mod wasm_host;
 
 pub use audit::{AuditOutcome, AuditTrail};
 pub use dispatcher::ScriptingDispatcher;
+pub use extension::{ExtensionManager, InstalledExtension};
 #[cfg(feature = "lua")]
 pub use lua_engine::LuaEngine;
-pub use manifest::{ExtensionPermissions, ParsedManifest};
+pub use manifest::{EngineConfig, EngineType, ExtensionPermissions, ParsedManifest};
+pub use package::{FtxBuilder, FtxPackage};
 pub use sandbox::{ResourceLimits, SandboxConfig, SandboxEnforcer};
 pub use types::{
     Action, ConfigValue, EngineCapabilities, ExtensionId, ExtensionManifest, HookHandler, HookId,

@@ -49,6 +49,51 @@ impl ExtensionPermissions {
     }
 }
 
+/// Engine type for an extension.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EngineType {
+    Wasm,
+    Lua,
+    Both,
+}
+
+impl EngineType {
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "wasm" => Some(Self::Wasm),
+            "lua" => Some(Self::Lua),
+            "both" => Some(Self::Both),
+            _ => None,
+        }
+    }
+
+    /// Whether this engine type requires a WASM module.
+    pub fn needs_wasm(self) -> bool {
+        matches!(self, Self::Wasm | Self::Both)
+    }
+
+    /// Whether this engine type requires a Lua script.
+    pub fn needs_lua(self) -> bool {
+        matches!(self, Self::Lua | Self::Both)
+    }
+}
+
+/// Engine configuration from the `[engine]` section.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EngineConfig {
+    pub engine_type: EngineType,
+    pub entry: String,
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            engine_type: EngineType::Wasm,
+            entry: "main.wasm".to_string(),
+        }
+    }
+}
+
 /// Parsed extension manifest.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParsedManifest {
@@ -57,9 +102,12 @@ pub struct ParsedManifest {
     pub description: String,
     pub authors: Vec<String>,
     pub license: Option<String>,
+    pub homepage: Option<String>,
     pub min_frankenterm_version: Option<String>,
+    pub engine: EngineConfig,
     pub permissions: ExtensionPermissions,
     pub hooks: Vec<(String, String)>,
+    pub asset_themes: Vec<String>,
 }
 
 impl ParsedManifest {
@@ -102,10 +150,18 @@ impl ParsedManifest {
             .and_then(|v| v.as_str())
             .map(String::from);
 
+        let homepage = ext
+            .get("homepage")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
         let min_frankenterm_version = ext
             .get("min_frankenterm_version")
             .and_then(|v| v.as_str())
             .map(String::from);
+
+        // Parse engine configuration
+        let engine = parse_engine_config(doc.get("engine"));
 
         // Parse permissions
         let perms = doc.get("permissions");
@@ -125,15 +181,30 @@ impl ParsedManifest {
             })
             .unwrap_or_default();
 
+        // Parse assets
+        let asset_themes = doc
+            .get("assets")
+            .and_then(|v| v.get("themes"))
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         Ok(Self {
             name,
             version,
             description,
             authors,
             license,
+            homepage,
             min_frankenterm_version,
+            engine,
             permissions,
             hooks,
+            asset_themes,
         })
     }
 
@@ -143,6 +214,31 @@ impl ParsedManifest {
             .with_context(|| format!("failed to read {}", path.display()))?;
         Self::from_toml_str(&content)
     }
+}
+
+fn parse_engine_config(engine: Option<&toml::Value>) -> EngineConfig {
+    let Some(engine) = engine else {
+        return EngineConfig::default();
+    };
+
+    let engine_type = engine
+        .get("type")
+        .and_then(|v| v.as_str())
+        .and_then(EngineType::from_str)
+        .unwrap_or(EngineType::Wasm);
+
+    let default_entry = match engine_type {
+        EngineType::Wasm | EngineType::Both => "main.wasm",
+        EngineType::Lua => "main.lua",
+    };
+
+    let entry = engine
+        .get("entry")
+        .and_then(|v| v.as_str())
+        .unwrap_or(default_entry)
+        .to_string();
+
+    EngineConfig { engine_type, entry }
 }
 
 fn parse_permissions(perms: Option<&toml::Value>) -> ExtensionPermissions {
@@ -201,7 +297,12 @@ version = "1.0.0"
 description = "A beautiful theme"
 authors = ["Author <author@example.com>"]
 license = "MIT"
+homepage = "https://github.com/author/my-theme"
 min_frankenterm_version = "0.2.0"
+
+[engine]
+type = "wasm"
+entry = "main.wasm"
 
 [permissions]
 filesystem = ["read:~/.config/frankenterm/", "write:~/.local/share/frankenterm/"]
@@ -212,6 +313,9 @@ pane_access = false
 [hooks]
 on_config_reload = "handle_config_reload"
 on_pane_focus = "handle_pane_focus"
+
+[assets]
+themes = ["assets/theme.toml"]
 "#;
 
     #[test]
@@ -222,12 +326,19 @@ on_pane_focus = "handle_pane_focus"
         assert_eq!(manifest.description, "A beautiful theme");
         assert_eq!(manifest.authors.len(), 1);
         assert_eq!(manifest.license.as_deref(), Some("MIT"));
+        assert_eq!(
+            manifest.homepage.as_deref(),
+            Some("https://github.com/author/my-theme")
+        );
         assert_eq!(manifest.min_frankenterm_version.as_deref(), Some("0.2.0"));
+        assert_eq!(manifest.engine.engine_type, EngineType::Wasm);
+        assert_eq!(manifest.engine.entry, "main.wasm");
         assert!(!manifest.permissions.network);
         assert!(!manifest.permissions.pane_access);
         assert_eq!(manifest.permissions.filesystem_read.len(), 1);
         assert_eq!(manifest.permissions.filesystem_write.len(), 1);
         assert_eq!(manifest.hooks.len(), 2);
+        assert_eq!(manifest.asset_themes, vec!["assets/theme.toml"]);
     }
 
     #[test]
@@ -239,8 +350,42 @@ name = "minimal"
         let manifest = ParsedManifest::from_toml_str(toml).unwrap();
         assert_eq!(manifest.name, "minimal");
         assert_eq!(manifest.version, "0.0.0");
+        assert_eq!(manifest.engine.engine_type, EngineType::Wasm);
+        assert_eq!(manifest.engine.entry, "main.wasm");
         assert!(manifest.permissions.filesystem_read.is_empty());
         assert!(!manifest.permissions.network);
+    }
+
+    #[test]
+    fn lua_engine_type() {
+        let toml = r#"
+[extension]
+name = "lua-ext"
+
+[engine]
+type = "lua"
+"#;
+        let manifest = ParsedManifest::from_toml_str(toml).unwrap();
+        assert_eq!(manifest.engine.engine_type, EngineType::Lua);
+        assert_eq!(manifest.engine.entry, "main.lua");
+        assert!(manifest.engine.engine_type.needs_lua());
+        assert!(!manifest.engine.engine_type.needs_wasm());
+    }
+
+    #[test]
+    fn both_engine_type() {
+        let toml = r#"
+[extension]
+name = "dual-ext"
+
+[engine]
+type = "both"
+entry = "main.wasm"
+"#;
+        let manifest = ParsedManifest::from_toml_str(toml).unwrap();
+        assert_eq!(manifest.engine.engine_type, EngineType::Both);
+        assert!(manifest.engine.engine_type.needs_wasm());
+        assert!(manifest.engine.engine_type.needs_lua());
     }
 
     #[test]

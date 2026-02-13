@@ -15,7 +15,9 @@ config = { workspace = true, optional = true }
 frankenterm-dynamic.workspace = true
 log = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
+sha2 = { workspace = true }
 toml.workspace = true
+zip.workspace = true
 luahelper = { workspace = true, optional = true }
 mlua = { workspace = true, optional = true, features = ["vendored", "lua54", "async", "send", "serialize"] }
 smol = { workspace = true, optional = true }
@@ -25,6 +27,7 @@ wasmtime-wasi = { workspace = true, optional = true }
 [dev-dependencies]
 criterion.workspace = true
 proptest = "1.8.0"
+tempfile.workspace = true
 
 [[bench]]
 name = "dispatch_overhead"
