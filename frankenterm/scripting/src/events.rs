@@ -430,4 +430,172 @@ mod tests {
         assert!(!matches_event("pane.*", "tab.created"));
         assert!(!matches_event("pane.*", "pane"));
     }
+
+    // ===================================================================
+    // Property-based tests
+    // ===================================================================
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(50))]
+
+        /// Wildcard "*" matches any event.
+        #[test]
+        fn prop_wildcard_matches_all(event in "[a-z]{2,8}(\\.[a-z]{2,8}){0,3}") {
+            prop_assert!(matches_event("*", &event));
+        }
+
+        /// Exact patterns match themselves and nothing else.
+        #[test]
+        fn prop_exact_match_reflexive(event in "[a-z]{2,8}\\.[a-z]{2,8}") {
+            prop_assert!(matches_event(&event, &event));
+        }
+
+        /// Exact patterns don't match different events.
+        #[test]
+        fn prop_exact_no_cross_match(
+            a in "[a-z]{2,6}\\.[a-z]{2,6}",
+            b in "[A-Z]{2,6}\\.[A-Z]{2,6}",
+        ) {
+            // a is lowercase, b is uppercase — guaranteed different
+            prop_assert!(!matches_event(&a, &b));
+        }
+
+        /// Prefix wildcard "foo.*" matches "foo.bar" but not "foo".
+        #[test]
+        fn prop_prefix_wildcard_requires_dot(
+            prefix in "[a-z]{2,8}",
+            suffix in "[a-z]{2,8}",
+        ) {
+            let pattern = format!("{prefix}.*");
+            let matching = format!("{prefix}.{suffix}");
+            prop_assert!(matches_event(&pattern, &matching));
+            // Bare prefix without dot should NOT match
+            prop_assert!(!matches_event(&pattern, &prefix));
+        }
+
+        /// Prefix wildcard doesn't match events with different prefix.
+        #[test]
+        fn prop_prefix_wildcard_rejects_different(
+            prefix_a in "[a-z]{2,6}",
+            prefix_b in "[A-Z]{2,6}",
+            suffix in "[a-z]{2,8}",
+        ) {
+            let pattern = format!("{prefix_a}.*");
+            let event = format!("{prefix_b}.{suffix}");
+            prop_assert!(!matches_event(&pattern, &event));
+        }
+
+        /// hook_count reflects register and unregister operations.
+        #[test]
+        fn prop_hook_count_consistent(
+            n_register in 1_usize..20,
+            n_unregister in 0_usize..10,
+        ) {
+            let bus = EventBus::new();
+            let mut ids = Vec::new();
+            for i in 0..n_register {
+                let id = bus.register(
+                    &format!("evt.{i}"),
+                    DispatchTier::Native,
+                    0,
+                    None,
+                    |_, _| Ok(vec![]),
+                );
+                ids.push(id);
+            }
+            prop_assert_eq!(bus.hook_count(), n_register);
+
+            let to_remove = n_unregister.min(n_register);
+            for id in ids.iter().take(to_remove) {
+                bus.unregister(*id);
+            }
+            prop_assert_eq!(bus.hook_count(), n_register - to_remove);
+        }
+
+        /// fire_counts accurately track number of fires per event.
+        #[test]
+        fn prop_fire_counts_accurate(
+            n_a in 0_usize..15,
+            n_b in 0_usize..15,
+        ) {
+            let bus = EventBus::new();
+            for _ in 0..n_a {
+                let _ = bus.fire("event.a", &Value::Null);
+            }
+            for _ in 0..n_b {
+                let _ = bus.fire("event.b", &Value::Null);
+            }
+
+            let counts = bus.fire_counts();
+            if n_a > 0 {
+                prop_assert_eq!(counts.get("event.a").copied().unwrap_or(0), n_a as u64);
+            }
+            if n_b > 0 {
+                prop_assert_eq!(counts.get("event.b").copied().unwrap_or(0), n_b as u64);
+            }
+        }
+
+        /// unregister_extension removes exactly the hooks for that extension.
+        #[test]
+        fn prop_unregister_extension_exact(
+            n_target in 1_usize..10,
+            n_other in 0_usize..10,
+        ) {
+            let bus = EventBus::new();
+            for i in 0..n_target {
+                bus.register(&format!("e.{i}"), DispatchTier::Wasm, 0, Some("target"), |_, _| Ok(vec![]));
+            }
+            for i in 0..n_other {
+                bus.register(&format!("e.{i}"), DispatchTier::Wasm, 0, Some("other"), |_, _| Ok(vec![]));
+            }
+
+            let removed = bus.unregister_extension("target");
+            prop_assert_eq!(removed, n_target);
+            prop_assert_eq!(bus.hook_count(), n_other);
+        }
+
+        /// hooks_for_extension returns correct count.
+        #[test]
+        fn prop_hooks_for_extension_count(
+            n_ext in 0_usize..10,
+            n_other in 0_usize..10,
+        ) {
+            let bus = EventBus::new();
+            for i in 0..n_ext {
+                bus.register(&format!("e.{i}"), DispatchTier::Wasm, 0, Some("my-ext"), |_, _| Ok(vec![]));
+            }
+            for i in 0..n_other {
+                bus.register(&format!("e.{i}"), DispatchTier::Native, 0, Some("other"), |_, _| Ok(vec![]));
+            }
+
+            prop_assert_eq!(bus.hooks_for_extension("my-ext").len(), n_ext);
+            prop_assert_eq!(bus.hooks_for_extension("other").len(), n_other);
+        }
+
+        /// hooks_for_event counts only matching hooks.
+        #[test]
+        fn prop_hooks_for_event_count(
+            n_matching in 0_usize..10,
+            n_other in 0_usize..10,
+        ) {
+            let bus = EventBus::new();
+            for _ in 0..n_matching {
+                bus.register("target.event", DispatchTier::Native, 0, None, |_, _| Ok(vec![]));
+            }
+            for _ in 0..n_other {
+                bus.register("other.event", DispatchTier::Native, 0, None, |_, _| Ok(vec![]));
+            }
+
+            prop_assert_eq!(bus.hooks_for_event("target.event"), n_matching);
+        }
+
+        /// DispatchTier ordering: Native < Wasm < Lua.
+        #[test]
+        fn prop_dispatch_tier_ordering(_dummy in 0..1_u8) {
+            prop_assert!(DispatchTier::Native < DispatchTier::Wasm);
+            prop_assert!(DispatchTier::Wasm < DispatchTier::Lua);
+        }
+    }
 }

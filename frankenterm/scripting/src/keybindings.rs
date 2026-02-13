@@ -378,4 +378,166 @@ mod tests {
         let actions = registry.dispatch(&combo, &Value::Null).unwrap();
         assert_eq!(actions.len(), 2);
     }
+
+    // ===================================================================
+    // Property-based tests
+    // ===================================================================
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(50))]
+
+        /// Modifiers parse → to_string_repr is idempotent (canonical form).
+        #[test]
+        fn prop_modifiers_roundtrip(
+            ctrl in any::<bool>(),
+            shift in any::<bool>(),
+            alt in any::<bool>(),
+            super_key in any::<bool>(),
+        ) {
+            let mods = Modifiers { ctrl, shift, alt, super_key };
+            let repr = mods.to_string_repr();
+            let reparsed = Modifiers::parse(&repr);
+            prop_assert_eq!(reparsed.ctrl, mods.ctrl);
+            prop_assert_eq!(reparsed.shift, mods.shift);
+            prop_assert_eq!(reparsed.alt, mods.alt);
+            prop_assert_eq!(reparsed.super_key, mods.super_key);
+        }
+
+        /// KeyCombo parse → to_string_repr → parse roundtrip.
+        #[test]
+        fn prop_key_combo_roundtrip(key in "[a-z][a-z0-9]{0,5}") {
+            let combos = [
+                format!("ctrl+{key}"),
+                format!("shift+{key}"),
+                format!("alt+{key}"),
+                format!("ctrl+shift+{key}"),
+                key.clone(),
+            ];
+            for input in &combos {
+                let combo = KeyCombo::parse(input).unwrap();
+                let repr = combo.to_string_repr();
+                let reparsed = KeyCombo::parse(&repr).unwrap();
+                prop_assert_eq!(&reparsed.key, &combo.key);
+                prop_assert_eq!(reparsed.modifiers, combo.modifiers);
+            }
+        }
+
+        /// Modifier aliases all parse to the same canonical form.
+        #[test]
+        fn prop_modifier_aliases_equivalent(_dummy in 0..1_u8) {
+            // cmd, command, meta all map to super_key
+            let aliases = ["cmd", "command", "meta", "super"];
+            for alias in &aliases {
+                let mods = Modifiers::parse(alias);
+                prop_assert!(mods.super_key, "alias '{alias}' should set super_key");
+                prop_assert!(!mods.ctrl);
+                prop_assert!(!mods.shift);
+                prop_assert!(!mods.alt);
+            }
+            // opt, option map to alt
+            let alt_aliases = ["alt", "opt", "option"];
+            for alias in &alt_aliases {
+                let mods = Modifiers::parse(alias);
+                prop_assert!(mods.alt, "alias '{alias}' should set alt");
+            }
+            // ctrl, control
+            let ctrl_aliases = ["ctrl", "control"];
+            for alias in &ctrl_aliases {
+                let mods = Modifiers::parse(alias);
+                prop_assert!(mods.ctrl, "alias '{alias}' should set ctrl");
+            }
+        }
+
+        /// Register/unregister maintains correct count.
+        #[test]
+        fn prop_register_unregister_count(
+            n_register in 1_usize..15,
+            n_unregister in 0_usize..8,
+        ) {
+            let registry = KeybindingRegistry::new();
+            let mut ids = Vec::new();
+            for i in 0..n_register {
+                let combo = KeyCombo {
+                    key: format!("k{i}"),
+                    modifiers: Modifiers::NONE,
+                };
+                let id = registry.register(combo, "ext", |_| Ok(vec![]));
+                ids.push(id);
+            }
+            prop_assert_eq!(registry.count(), n_register);
+
+            let to_remove = n_unregister.min(n_register);
+            for id in ids.iter().take(to_remove) {
+                registry.unregister(*id);
+            }
+            prop_assert_eq!(registry.count(), n_register - to_remove);
+        }
+
+        /// unregister_extension removes exactly the right count.
+        #[test]
+        fn prop_unregister_extension_count(
+            n_target in 1_usize..10,
+            n_other in 0_usize..10,
+        ) {
+            let registry = KeybindingRegistry::new();
+            for i in 0..n_target {
+                let combo = KeyCombo {
+                    key: format!("a{i}"),
+                    modifiers: Modifiers::NONE,
+                };
+                registry.register(combo, "target-ext", |_| Ok(vec![]));
+            }
+            for i in 0..n_other {
+                let combo = KeyCombo {
+                    key: format!("b{i}"),
+                    modifiers: Modifiers::NONE,
+                };
+                registry.register(combo, "other-ext", |_| Ok(vec![]));
+            }
+
+            let removed = registry.unregister_extension("target-ext");
+            prop_assert_eq!(removed, n_target);
+            prop_assert_eq!(registry.count(), n_other);
+        }
+
+        /// Dispatch returns empty actions for unregistered combos.
+        #[test]
+        fn prop_dispatch_unregistered_empty(key in "[a-z]{2,6}") {
+            let registry = KeybindingRegistry::new();
+            let combo = KeyCombo {
+                key,
+                modifiers: Modifiers::NONE,
+            };
+            let actions = registry.dispatch(&combo, &Value::Null).unwrap();
+            prop_assert!(actions.is_empty());
+        }
+
+        /// Modifiers::NONE has all fields false.
+        #[test]
+        fn prop_modifiers_none_all_false(_dummy in 0..1_u8) {
+            let none = Modifiers::NONE;
+            prop_assert!(!none.ctrl);
+            prop_assert!(!none.shift);
+            prop_assert!(!none.alt);
+            prop_assert!(!none.super_key);
+            prop_assert!(none.to_string_repr().is_empty());
+        }
+
+        /// bound_combos reflects registered keys.
+        #[test]
+        fn prop_bound_combos_tracks_registrations(n in 1_usize..10) {
+            let registry = KeybindingRegistry::new();
+            for i in 0..n {
+                let combo = KeyCombo {
+                    key: format!("unique{i}"),
+                    modifiers: Modifiers::NONE,
+                };
+                registry.register(combo, "ext", |_| Ok(vec![]));
+            }
+            let combos = registry.bound_combos();
+            prop_assert_eq!(combos.len(), n);
+        }
+    }
 }
