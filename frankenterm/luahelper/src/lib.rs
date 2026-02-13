@@ -1,5 +1,8 @@
 #![macro_use]
 
+#[cfg(test)]
+mod tests;
+
 use frankenterm_dynamic::{FromDynamic, ToDynamic, Value as DynValue};
 pub use mlua;
 use mlua::{IntoLua, Value as LuaValue};
@@ -193,7 +196,7 @@ fn lua_value_to_dynamic_impl(
                 let mut array = vec![];
                 let pairs = table.clone();
                 for value in table.sequence_values() {
-                    array.push(lua_value_to_dynamic(value?)?);
+                    array.push(lua_value_to_dynamic_impl(value?, visited)?);
                 }
 
                 for pair in pairs.pairs::<LuaValue, LuaValue>() {
@@ -221,9 +224,9 @@ fn lua_value_to_dynamic_impl(
                 let mut obj = BTreeMap::default();
                 for pair in table.pairs::<LuaValue, LuaValue>() {
                     let (key, value) = pair?;
-                    let key = lua_value_to_dynamic(key)?;
+                    let key = lua_value_to_dynamic_impl(key, visited)?;
                     let lua_type = value.type_name();
-                    let value = lua_value_to_dynamic(value).map_err(|e| {
+                    let value = lua_value_to_dynamic_impl(value, visited).map_err(|e| {
                         mlua::Error::FromLuaConversionError {
                             from: lua_type,
                             to: "value",
