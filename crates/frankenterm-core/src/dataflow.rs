@@ -806,10 +806,15 @@ impl DataflowGraph {
     // Graph composition
     // =========================================================================
 
-    /// Merge another graph into this one.
+    /// Merge another graph's topology and values into this one.
     ///
     /// All node IDs in `other` are remapped to avoid conflicts. Returns a
     /// mapping from old IDs (in `other`) to new IDs (in `self`).
+    ///
+    /// **Limitation**: Compute functions (`ComputeFn`) are not clonable, so
+    /// merged compute/debounce nodes become inert sources retaining their
+    /// last-computed value. Callers must re-register compute functions on
+    /// the remapped IDs if dynamic behavior is needed.
     pub fn merge(&mut self, other: &DataflowGraph) -> HashMap<NodeId, NodeId> {
         let mut id_map: HashMap<NodeId, NodeId> = HashMap::new();
 

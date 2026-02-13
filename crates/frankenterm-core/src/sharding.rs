@@ -466,6 +466,31 @@ impl ShardedWeztermClient {
         self.next_round_robin_shard()
     }
 
+    /// Spawn a new pane while honoring shard-assignment hints.
+    pub async fn spawn_with_hints(
+        &self,
+        cwd: Option<&str>,
+        domain_name: Option<&str>,
+        agent_hint: Option<AgentType>,
+    ) -> Result<u64> {
+        let shard = self.choose_spawn_shard(domain_name, agent_hint);
+        let backend = self.backend_for_id(shard)?;
+        let local_id = backend
+            .handle
+            .spawn(cwd, domain_name)
+            .await
+            .map_err(|err| self.backend_error(shard, "spawn", None, err))?;
+        let global_id = encode_sharded_pane_id(shard, local_id);
+        self.pane_routes.write().await.insert(
+            global_id,
+            PaneRoute {
+                shard_id: shard,
+                local_pane_id: local_id,
+            },
+        );
+        Ok(global_id)
+    }
+
     async fn collect_panes(&self) -> Result<(Vec<PaneInfo>, HashMap<u64, PaneRoute>)> {
         let mut all = Vec::new();
         let mut routes = HashMap::new();
@@ -700,22 +725,8 @@ impl WeztermInterface for ShardedWeztermClient {
         let cwd = cwd.map(ToString::to_string);
         let domain_name = domain_name.map(ToString::to_string);
         Box::pin(async move {
-            let shard = self.choose_spawn_shard(domain_name.as_deref(), None);
-            let backend = self.backend_for_id(shard)?;
-            let local_id = backend
-                .handle
-                .spawn(cwd.as_deref(), domain_name.as_deref())
+            self.spawn_with_hints(cwd.as_deref(), domain_name.as_deref(), None)
                 .await
-                .map_err(|err| self.backend_error(shard, "spawn", None, err))?;
-            let global_id = encode_sharded_pane_id(shard, local_id);
-            self.pane_routes.write().await.insert(
-                global_id,
-                PaneRoute {
-                    shard_id: shard,
-                    local_pane_id: local_id,
-                },
-            );
-            Ok(global_id)
         })
     }
 
@@ -1004,6 +1015,37 @@ mod tests {
         assert_eq!(decode_sharded_pane_id(pane_a), (ShardId(0), 0));
         assert_eq!(decode_sharded_pane_id(pane_b), (ShardId(1), 0));
         assert_eq!(shard0.pane_count().await, 1);
+        assert_eq!(shard1.pane_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn spawn_with_agent_hint_uses_agent_assignment() {
+        let shard0 = Arc::new(MockWezterm::new());
+        let shard1 = Arc::new(MockWezterm::new());
+        let handle0: WeztermHandle = shard0.clone();
+        let handle1: WeztermHandle = shard1.clone();
+
+        let client = ShardedWeztermClient::new(
+            vec![
+                ShardBackend::new(ShardId(0), "zero", handle0),
+                ShardBackend::new(ShardId(1), "one", handle1),
+            ],
+            AssignmentStrategy::ByAgentType {
+                agent_to_shard: HashMap::from([
+                    (AgentType::Codex, ShardId(1)),
+                    (AgentType::ClaudeCode, ShardId(0)),
+                ]),
+                default_shard: Some(ShardId(0)),
+            },
+        )
+        .unwrap();
+
+        let pane = client
+            .spawn_with_hints(None, None, Some(AgentType::Codex))
+            .await
+            .unwrap();
+        assert_eq!(decode_sharded_pane_id(pane), (ShardId(1), 0));
+        assert_eq!(shard0.pane_count().await, 0);
         assert_eq!(shard1.pane_count().await, 1);
     }
 
