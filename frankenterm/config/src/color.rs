@@ -1012,11 +1012,11 @@ brights = [ "#8ca6a6" ,"#e5164a" ,"#00b368" ,"#b3694d" ,"#0094f0" ,"#ff5792" ,"#
 
     #[test]
     fn color_scheme_file_from_toml_requires_ansi() {
-        let scheme = r#"
+        let scheme = r##"
 [colors]
 foreground = "#ffffff"
 background = "#000000"
-"#;
+"##;
         let result = ColorSchemeFile::from_toml_str(scheme);
         assert!(result.is_err());
     }
