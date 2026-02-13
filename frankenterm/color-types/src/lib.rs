@@ -1203,4 +1203,441 @@ mod tests {
             contrast_ratio
         );
     }
+
+    // ── SrgbaPixel ────────────────────────────────────────────
+
+    #[test]
+    fn srgba_pixel_rgba_roundtrip() {
+        let p = SrgbaPixel::rgba(255, 128, 0, 200);
+        let (r, g, b, a) = p.as_rgba();
+        assert_eq!((r, g, b, a), (255, 128, 0, 200));
+    }
+
+    #[test]
+    fn srgba_pixel_black() {
+        let p = SrgbaPixel::rgba(0, 0, 0, 255);
+        let (r, g, b, a) = p.as_rgba();
+        assert_eq!((r, g, b, a), (0, 0, 0, 255));
+    }
+
+    #[test]
+    fn srgba_pixel_white() {
+        let p = SrgbaPixel::rgba(255, 255, 255, 255);
+        let (r, g, b, a) = p.as_rgba();
+        assert_eq!((r, g, b, a), (255, 255, 255, 255));
+    }
+
+    #[test]
+    fn srgba_pixel_with_srgba_u32_and_as_srgba32() {
+        let p = SrgbaPixel::rgba(100, 150, 200, 255);
+        let raw = p.as_srgba32();
+        let p2 = SrgbaPixel::with_srgba_u32(raw);
+        assert_eq!(p, p2);
+    }
+
+    #[test]
+    fn srgba_pixel_to_linear() {
+        let p = SrgbaPixel::rgba(255, 0, 0, 255);
+        let lin = p.to_linear();
+        assert!(lin.0 > 0.9); // red channel should be high
+        assert!(lin.1 < 0.01); // green near zero
+        assert!(lin.2 < 0.01); // blue near zero
+    }
+
+    #[test]
+    fn srgba_pixel_as_srgba_tuple() {
+        let p = SrgbaPixel::rgba(255, 0, 0, 255);
+        let (r, g, b, a) = p.as_srgba_tuple();
+        assert!((r - 1.0).abs() < 0.01);
+        assert!(g < 0.01);
+        assert!(b < 0.01);
+        assert!((a - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn srgba_pixel_debug_eq() {
+        let a = SrgbaPixel::rgba(1, 2, 3, 4);
+        let b = SrgbaPixel::rgba(1, 2, 3, 4);
+        assert_eq!(a, b);
+        let debug = format!("{a:?}");
+        assert!(debug.contains("SrgbaPixel"));
+    }
+
+    // ── SrgbaTuple construction ───────────────────────────────
+
+    #[test]
+    fn srgba_tuple_from_u8_tuple() {
+        let t: SrgbaTuple = (255u8, 0u8, 0u8, 255u8).into();
+        assert!((t.0 - 1.0).abs() < 0.01);
+        assert!(t.1 < 0.01);
+    }
+
+    #[test]
+    fn srgba_tuple_from_u8_triple() {
+        let t: SrgbaTuple = (128u8, 128u8, 128u8).into();
+        assert!((t.0 - 0.502).abs() < 0.01);
+        assert!((t.3 - 1.0).abs() < 0.001); // alpha defaults to 1.0
+    }
+
+    #[test]
+    fn srgba_tuple_from_f32_tuple() {
+        let t: SrgbaTuple = (0.5f32, 0.25f32, 0.75f32, 1.0f32).into();
+        assert_eq!(t.0, 0.5);
+        assert_eq!(t.1, 0.25);
+    }
+
+    #[test]
+    fn srgba_tuple_default() {
+        let t = SrgbaTuple::default();
+        assert_eq!(t, SrgbaTuple(0.0, 0.0, 0.0, 0.0));
+    }
+
+    // ── SrgbaTuple operations ─────────────────────────────────
+
+    #[test]
+    fn srgba_tuple_premultiply() {
+        let t = SrgbaTuple(1.0, 0.5, 0.25, 0.5);
+        let pm = t.premultiply();
+        assert!((pm.0 - 0.5).abs() < 0.001);
+        assert!((pm.1 - 0.25).abs() < 0.001);
+        assert!((pm.2 - 0.125).abs() < 0.001);
+        assert!((pm.3 - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn srgba_tuple_demultiply() {
+        let pm = SrgbaTuple(0.5, 0.25, 0.125, 0.5);
+        let dm = pm.demultiply();
+        assert!((dm.0 - 1.0).abs() < 0.001);
+        assert!((dm.1 - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn srgba_tuple_demultiply_zero_alpha() {
+        let t = SrgbaTuple(0.5, 0.5, 0.5, 0.0);
+        let dm = t.demultiply();
+        assert_eq!(dm, t); // unchanged when alpha is 0
+    }
+
+    #[test]
+    fn srgba_tuple_mul_alpha() {
+        let t = SrgbaTuple(1.0, 1.0, 1.0, 1.0);
+        let t2 = t.mul_alpha(0.5);
+        assert!((t2.3 - 0.5).abs() < 0.001);
+        assert_eq!(t2.0, 1.0); // RGB unchanged
+    }
+
+    #[test]
+    fn srgba_tuple_interpolate_midpoint() {
+        let a = SrgbaTuple(0.0, 0.0, 0.0, 1.0);
+        let b = SrgbaTuple(1.0, 1.0, 1.0, 1.0);
+        let mid = a.interpolate(b, 0.5);
+        assert!((mid.0 - 0.5).abs() < 0.01);
+        assert!((mid.1 - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn srgba_tuple_interpolate_endpoints() {
+        let a = SrgbaTuple(0.0, 0.0, 0.0, 1.0);
+        let b = SrgbaTuple(1.0, 1.0, 1.0, 1.0);
+        let start = a.interpolate(b, 0.0);
+        let end = a.interpolate(b, 1.0);
+        assert!((start.0 - 0.0).abs() < 0.01);
+        assert!((end.0 - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn srgba_tuple_to_tuple_rgba() {
+        let t = SrgbaTuple(0.1, 0.2, 0.3, 0.4);
+        let (r, g, b, a) = t.to_tuple_rgba();
+        assert_eq!((r, g, b, a), (0.1, 0.2, 0.3, 0.4));
+    }
+
+    #[test]
+    fn srgba_tuple_as_rgba_u8() {
+        let t = SrgbaTuple(1.0, 0.5, 0.0, 1.0);
+        let (r, g, b, a) = t.as_rgba_u8();
+        assert_eq!(r, 255);
+        assert_eq!(g, 127);
+        assert_eq!(b, 0);
+        assert_eq!(a, 255);
+    }
+
+    // ── SrgbaTuple string conversions ─────────────────────────
+
+    #[test]
+    fn to_rgb_string_red() {
+        let t = SrgbaTuple(1.0, 0.0, 0.0, 1.0);
+        assert_eq!(t.to_rgb_string(), "#ff0000");
+    }
+
+    #[test]
+    fn to_string_opaque() {
+        let t = SrgbaTuple(0.0, 1.0, 0.0, 1.0);
+        assert_eq!(t.to_string(), "#00ff00");
+    }
+
+    #[test]
+    fn to_string_transparent_uses_rgba() {
+        let t = SrgbaTuple(1.0, 0.0, 0.0, 0.5);
+        let s = t.to_string();
+        assert!(s.starts_with("rgba("));
+    }
+
+    #[test]
+    fn to_x11_16bit_rgb_string() {
+        let t = SrgbaTuple(1.0, 1.0, 1.0, 1.0);
+        assert_eq!(t.to_x11_16bit_rgb_string(), "rgb:ffff/ffff/ffff");
+    }
+
+    #[test]
+    fn to_x11_16bit_rgb_string_black() {
+        let t = SrgbaTuple(0.0, 0.0, 0.0, 1.0);
+        assert_eq!(t.to_x11_16bit_rgb_string(), "rgb:0000/0000/0000");
+    }
+
+    // ── SrgbaTuple named colors ───────────────────────────────
+
+    #[test]
+    fn named_transparent() {
+        let t = SrgbaTuple::from_named("transparent").unwrap();
+        assert_eq!(t, SrgbaTuple(0.0, 0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn named_none() {
+        let t = SrgbaTuple::from_named("none").unwrap();
+        assert_eq!(t, SrgbaTuple(0.0, 0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn named_clear() {
+        let t = SrgbaTuple::from_named("clear").unwrap();
+        assert_eq!(t, SrgbaTuple(0.0, 0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn named_case_insensitive() {
+        let a = SrgbaTuple::from_named("Red").unwrap();
+        let b = SrgbaTuple::from_named("red").unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn named_unknown_returns_none() {
+        assert!(SrgbaTuple::from_named("notacolor").is_none());
+    }
+
+    // ── SrgbaTuple to/from linear ─────────────────────────────
+
+    #[test]
+    fn srgba_to_linear_roundtrip() {
+        let srgb = SrgbaTuple(0.5, 0.5, 0.5, 1.0);
+        let linear = srgb.to_linear();
+        let back = linear.to_srgb();
+        assert!((back.0 - srgb.0).abs() < 0.02);
+        assert!((back.1 - srgb.1).abs() < 0.02);
+    }
+
+    #[test]
+    fn srgba_to_linear_black() {
+        let linear = SrgbaTuple(0.0, 0.0, 0.0, 1.0).to_linear();
+        assert_eq!(linear.0, 0.0);
+        assert_eq!(linear.1, 0.0);
+        assert_eq!(linear.2, 0.0);
+    }
+
+    #[test]
+    fn srgba_to_linear_white() {
+        let linear = SrgbaTuple(1.0, 1.0, 1.0, 1.0).to_linear();
+        assert!((linear.0 - 1.0).abs() < 0.01);
+    }
+
+    // ── SrgbaTuple HSL operations ─────────────────────────────
+
+    #[test]
+    fn lighten_increases_lightness() {
+        let dark = SrgbaTuple::from_str("hsl:0 100 25").unwrap();
+        let lighter = dark.lighten(0.5);
+        let (_, _, l_dark, _) = dark.to_hsla();
+        let (_, _, l_light, _) = lighter.to_hsla();
+        assert!(l_light > l_dark);
+    }
+
+    #[test]
+    fn complement_shifts_hue_180() {
+        let red = SrgbaTuple::from_str("hsl:0 100 50").unwrap();
+        let comp = red.complement();
+        let (h, _, _, _) = comp.to_hsla();
+        assert!((h - 180.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn triad_returns_two_colors() {
+        let c = SrgbaTuple::from_str("hsl:0 100 50").unwrap();
+        let (t1, t2) = c.triad();
+        let (h1, _, _, _) = t1.to_hsla();
+        let (h2, _, _, _) = t2.to_hsla();
+        assert!((h1 - 120.0).abs() < 1.0);
+        assert!((h2 - 240.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn square_returns_three_colors() {
+        let c = SrgbaTuple::from_str("hsl:0 100 50").unwrap();
+        let (s1, s2, s3) = c.square();
+        let _ = (s1, s2, s3); // just verify it doesn't panic
+    }
+
+    // ── LinearRgba ────────────────────────────────────────────
+
+    #[test]
+    fn linear_rgba_transparent() {
+        assert!(LinearRgba::TRANSPARENT.is_fully_transparent());
+    }
+
+    #[test]
+    fn linear_rgba_when_fully_transparent_returns_other() {
+        let other = LinearRgba(1.0, 0.0, 0.0, 1.0);
+        let result = LinearRgba::TRANSPARENT.when_fully_transparent(other);
+        assert_eq!(result, other);
+    }
+
+    #[test]
+    fn linear_rgba_when_not_transparent_returns_self() {
+        let self_ = LinearRgba(0.0, 1.0, 0.0, 1.0);
+        let other = LinearRgba(1.0, 0.0, 0.0, 1.0);
+        let result = self_.when_fully_transparent(other);
+        assert_eq!(result, self_);
+    }
+
+    #[test]
+    fn linear_rgba_with_components() {
+        let c = LinearRgba::with_components(0.1, 0.2, 0.3, 0.4);
+        assert_eq!(c.tuple(), (0.1, 0.2, 0.3, 0.4));
+    }
+
+    #[test]
+    fn linear_rgba_mul_alpha() {
+        let c = LinearRgba(1.0, 1.0, 1.0, 1.0);
+        let c2 = c.mul_alpha(0.5);
+        assert!((c2.3 - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn linear_rgba_from_tuple() {
+        let c: LinearRgba = (0.5f32, 0.6f32, 0.7f32, 0.8f32).into();
+        assert_eq!(c.0, 0.5);
+    }
+
+    #[test]
+    fn linear_rgba_from_array() {
+        let c: LinearRgba = [0.1f32, 0.2, 0.3, 0.4].into();
+        assert_eq!(c.0, 0.1);
+    }
+
+    #[test]
+    fn linear_rgba_to_array() {
+        let c = LinearRgba(0.1, 0.2, 0.3, 0.4);
+        let arr: [f32; 4] = c.into();
+        assert_eq!(arr, [0.1, 0.2, 0.3, 0.4]);
+    }
+
+    #[test]
+    fn linear_rgba_srgba_pixel_roundtrip() {
+        let orig = LinearRgba::with_srgba(200, 100, 50, 255);
+        let pixel = orig.srgba_pixel();
+        let (r, g, b, _a) = pixel.as_rgba();
+        assert!((r as i32 - 200).abs() <= 1);
+        assert!((g as i32 - 100).abs() <= 1);
+        assert!((b as i32 - 50).abs() <= 1);
+    }
+
+    #[test]
+    fn linear_rgba_relative_luminance_white() {
+        let white = LinearRgba(1.0, 1.0, 1.0, 1.0);
+        let lum = white.relative_luminance();
+        assert!((lum - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn linear_rgba_relative_luminance_black() {
+        let black = LinearRgba(0.0, 0.0, 0.0, 1.0);
+        let lum = black.relative_luminance();
+        assert!(lum < 0.01);
+    }
+
+    #[test]
+    fn linear_rgba_contrast_ratio_black_white() {
+        let black = LinearRgba(0.0, 0.0, 0.0, 1.0);
+        let white = LinearRgba(1.0, 1.0, 1.0, 1.0);
+        let ratio = black.contrast_ratio(&white);
+        assert!((ratio - 21.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn linear_rgba_default() {
+        let d = LinearRgba::default();
+        assert_eq!(d, LinearRgba(0.0, 0.0, 0.0, 0.0));
+    }
+
+    // ── SrgbaTuple Hash/Eq ────────────────────────────────────
+
+    #[test]
+    fn srgba_tuple_hash_consistent() {
+        use std::collections::hash_map::DefaultHasher;
+        let a = SrgbaTuple(0.5, 0.5, 0.5, 1.0);
+        let b = SrgbaTuple(0.5, 0.5, 0.5, 1.0);
+        let mut ha = DefaultHasher::new();
+        let mut hb = DefaultHasher::new();
+        a.hash(&mut ha);
+        b.hash(&mut hb);
+        assert_eq!(ha.finish(), hb.finish());
+    }
+
+    // ── FromStr edge cases ────────────────────────────────────
+
+    #[test]
+    fn from_str_non_ascii_rejected() {
+        assert!(SrgbaTuple::from_str("café").is_err());
+    }
+
+    #[test]
+    fn from_str_hash_single_digit() {
+        let t = SrgbaTuple::from_str("#F00").unwrap();
+        // #F00 means R=F0, G=00, B=00 (scaled from 1-digit)
+        assert!((t.0 - (0xF0 as f32 / 255.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn from_str_rgba_colon_four_fields() {
+        let t = SrgbaTuple::from_str("rgba:ff/00/ff/80").unwrap();
+        assert!((t.0 - 1.0).abs() < 0.01); // red
+        assert!(t.1 < 0.01); // green
+        assert!((t.2 - 1.0).abs() < 0.01); // blue
+        assert!((t.3 - 0.502).abs() < 0.01); // alpha ~0.5
+    }
+
+    #[test]
+    fn from_str_invalid_hash_length() {
+        assert!(SrgbaTuple::from_str("#12").is_err());
+        assert!(SrgbaTuple::from_str("#12345").is_err());
+    }
+
+    // ── delta_e ───────────────────────────────────────────────
+
+    #[test]
+    fn delta_e_identical_colors_is_zero() {
+        let c = SrgbaTuple(0.5, 0.5, 0.5, 1.0);
+        let de = c.delta_e(&c);
+        assert!(de < 0.01);
+    }
+
+    #[test]
+    fn delta_e_different_colors_positive() {
+        let a = SrgbaTuple(1.0, 0.0, 0.0, 1.0);
+        let b = SrgbaTuple(0.0, 0.0, 1.0, 1.0);
+        let de = a.delta_e(&b);
+        assert!(de > 1.0);
+    }
 }
