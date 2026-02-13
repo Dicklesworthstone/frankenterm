@@ -2,10 +2,8 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
-
 use crate::config as wa_config;
+use crate::runtime_compat::unix::{self as compat_unix, AsyncReadExt, AsyncWriteExt, UnixStream};
 use crate::runtime_compat::{sleep, timeout};
 use codec::{
     CODEC_VERSION, CompressionMode, DecodedPdu, GetCodecVersion, GetCodecVersionResponse, GetLines,
@@ -168,7 +166,7 @@ impl DirectMuxClient {
             return Err(DirectMuxError::SocketNotFound(socket_path));
         }
 
-        let stream = timeout(config.connect_timeout, UnixStream::connect(&socket_path))
+        let stream = timeout(config.connect_timeout, compat_unix::connect(&socket_path))
             .await
             .map_err(|_| DirectMuxError::ConnectTimeout(socket_path.clone()))??;
 

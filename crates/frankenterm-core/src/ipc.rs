@@ -11,16 +11,14 @@
 //! - Server responds: `{"ok":true}\n` or `{"ok":false,"error":"..."}\n`
 
 use crate::runtime_compat::RwLock;
+#[cfg(unix)]
+use crate::runtime_compat::unix::{self as compat_unix, AsyncWriteExt, UnixListener, UnixStream};
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-#[cfg(unix)]
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-#[cfg(unix)]
-use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 
 use crate::config::{IpcAuthToken, IpcScope};
@@ -435,7 +433,7 @@ impl IpcServer {
             std::fs::create_dir_all(parent)?;
         }
 
-        let listener = UnixListener::bind(&socket_path)?;
+        let listener = compat_unix::bind(&socket_path).await?;
         if let Some(mode) = permissions {
             let perms = std::fs::Permissions::from_mode(mode);
             std::fs::set_permissions(&socket_path, perms)?;
@@ -654,14 +652,12 @@ async fn handle_client_with_context(
 ) -> std::io::Result<()> {
     let start = Instant::now();
     let (reader, mut writer) = stream.into_split();
-    let mut reader = BufReader::new(reader);
-    let mut line = String::new();
 
     // Read one request per connection (simple request-response)
-    let bytes_read = reader.read_line(&mut line).await?;
-    if bytes_read == 0 {
+    let mut lines = compat_unix::lines(compat_unix::buffered(reader));
+    let Some(line) = compat_unix::next_line(&mut lines).await? else {
         return Ok(()); // Client disconnected
-    }
+    };
 
     // Check message size
     if line.len() > MAX_MESSAGE_SIZE {
@@ -1019,7 +1015,7 @@ impl IpcClient {
         }
 
         // Connect to socket
-        let stream = UnixStream::connect(&self.socket_path).await.map_err(|e| {
+        let stream = compat_unix::connect(&self.socket_path).await.map_err(|e| {
             UserVarError::IpcSendFailed {
                 message: format!("failed to connect: {e}"),
             }
@@ -1058,13 +1054,14 @@ impl IpcClient {
             })?;
 
         // Read response
-        let mut reader = BufReader::new(reader);
-        let mut line = String::new();
-        reader
-            .read_line(&mut line)
+        let mut lines = compat_unix::lines(compat_unix::buffered(reader));
+        let line = compat_unix::next_line(&mut lines)
             .await
             .map_err(|e| UserVarError::IpcSendFailed {
                 message: format!("failed to read response: {e}"),
+            })?
+            .ok_or_else(|| UserVarError::IpcSendFailed {
+                message: "failed to read response: server closed connection".to_string(),
             })?;
 
         // Parse response
@@ -1590,7 +1587,7 @@ mod tests {
 
     #[tokio::test]
     async fn ipc_handles_invalid_json_request() {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        use crate::runtime_compat::unix::{self as compat_unix, AsyncWriteExt};
 
         let temp_dir = TempDir::new().unwrap();
         let socket_path = temp_dir.path().join("test.sock");
@@ -1607,15 +1604,17 @@ mod tests {
         crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
 
         // Send invalid JSON directly via raw socket
-        let mut stream = UnixStream::connect(&socket_path).await.unwrap();
+        let mut stream = compat_unix::connect(&socket_path).await.unwrap();
         stream.write_all(b"not valid json\n").await.unwrap();
         stream.flush().await.unwrap();
 
         // Read response
         let (reader, _) = stream.into_split();
-        let mut reader = tokio::io::BufReader::new(reader);
-        let mut line = String::new();
-        reader.read_line(&mut line).await.unwrap();
+        let mut lines = compat_unix::lines(compat_unix::buffered(reader));
+        let line = compat_unix::next_line(&mut lines)
+            .await
+            .unwrap()
+            .expect("expected response line");
 
         let response: IpcResponse = serde_json::from_str(&line).unwrap();
         assert!(!response.ok);
@@ -1628,7 +1627,7 @@ mod tests {
 
     #[tokio::test]
     async fn ipc_rejects_oversized_messages() {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        use crate::runtime_compat::unix::{self as compat_unix, AsyncWriteExt};
 
         let temp_dir = TempDir::new().unwrap();
         let socket_path = temp_dir.path().join("test.sock");
@@ -1654,15 +1653,17 @@ mod tests {
         let request_json = serde_json::to_string(&request).unwrap();
 
         // Send directly
-        let mut stream = UnixStream::connect(&socket_path).await.unwrap();
+        let mut stream = compat_unix::connect(&socket_path).await.unwrap();
         stream.write_all(request_json.as_bytes()).await.unwrap();
         stream.write_all(b"\n").await.unwrap();
         stream.flush().await.unwrap();
 
         let (reader, _) = stream.into_split();
-        let mut reader = tokio::io::BufReader::new(reader);
-        let mut line = String::new();
-        reader.read_line(&mut line).await.unwrap();
+        let mut lines = compat_unix::lines(compat_unix::buffered(reader));
+        let line = compat_unix::next_line(&mut lines)
+            .await
+            .unwrap()
+            .expect("expected response line");
 
         let response: IpcResponse = serde_json::from_str(&line).unwrap();
         assert!(!response.ok);
