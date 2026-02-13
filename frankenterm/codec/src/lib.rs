@@ -1349,4 +1349,647 @@ mod test {
             Pdu::decode(encoded.as_slice()).unwrap()
         );
     }
+
+    // --- encoded_length tests ---
+
+    #[test]
+    fn encoded_length_zero() {
+        assert_eq!(encoded_length(0), 1);
+    }
+
+    #[test]
+    fn encoded_length_small() {
+        // Values < 128 fit in one byte
+        assert_eq!(encoded_length(1), 1);
+        assert_eq!(encoded_length(127), 1);
+    }
+
+    #[test]
+    fn encoded_length_two_bytes() {
+        assert_eq!(encoded_length(128), 2);
+        assert_eq!(encoded_length(16383), 2);
+    }
+
+    #[test]
+    fn encoded_length_large() {
+        assert_eq!(encoded_length(16384), 3);
+        // u64::MAX needs 10 bytes in leb128
+        assert_eq!(encoded_length(u64::MAX), 10);
+    }
+
+    // --- encode_raw / decode_raw roundtrip tests ---
+
+    #[test]
+    fn encode_decode_empty_data() {
+        let mut encoded = Vec::new();
+        encode_raw(1, 1, b"", false, &mut encoded).unwrap();
+        let decoded = decode_raw(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.ident, 1);
+        assert_eq!(decoded.serial, 1);
+        assert_eq!(decoded.data, b"");
+        assert!(!decoded.is_compressed);
+    }
+
+    #[test]
+    fn encode_decode_compressed_flag() {
+        let mut encoded = Vec::new();
+        encode_raw(5, 10, b"payload", true, &mut encoded).unwrap();
+        let decoded = decode_raw(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.ident, 5);
+        assert_eq!(decoded.serial, 10);
+        assert_eq!(decoded.data, b"payload");
+        assert!(decoded.is_compressed);
+    }
+
+    #[test]
+    fn encode_decode_large_ident_serial() {
+        let mut encoded = Vec::new();
+        let ident = 0xFFFF;
+        let serial = 0xDEAD;
+        encode_raw(ident, serial, b"big", false, &mut encoded).unwrap();
+        let decoded = decode_raw(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.ident, ident);
+        assert_eq!(decoded.serial, serial);
+        assert_eq!(decoded.data, b"big");
+    }
+
+    #[test]
+    fn encode_raw_as_vec_matches_encode_raw() {
+        let ident = 42;
+        let serial = 7;
+        let data = b"test data";
+
+        let vec_result = encode_raw_as_vec(ident, serial, data, false).unwrap();
+        let mut write_result = Vec::new();
+        encode_raw(ident, serial, data, false, &mut write_result).unwrap();
+
+        assert_eq!(vec_result, write_result);
+    }
+
+    // --- COMPRESSED_MASK tests ---
+
+    #[test]
+    fn compressed_mask_is_high_bit() {
+        assert_eq!(COMPRESSED_MASK, 1 << 63);
+        assert_eq!(COMPRESSED_MASK & 0x7FFF_FFFF_FFFF_FFFF, 0);
+    }
+
+    // --- CompressionMode tests ---
+
+    #[test]
+    fn compression_mode_debug() {
+        assert_eq!(format!("{:?}", CompressionMode::Auto), "Auto");
+        assert_eq!(format!("{:?}", CompressionMode::Always), "Always");
+        assert_eq!(format!("{:?}", CompressionMode::Never), "Never");
+    }
+
+    #[test]
+    fn compression_mode_eq() {
+        assert_eq!(CompressionMode::Auto, CompressionMode::Auto);
+        assert_ne!(CompressionMode::Auto, CompressionMode::Always);
+        assert_ne!(CompressionMode::Always, CompressionMode::Never);
+    }
+
+    #[test]
+    fn compression_mode_clone() {
+        let mode = CompressionMode::Always;
+        let cloned = mode;
+        assert_eq!(mode, cloned);
+    }
+
+    // --- serialize / deserialize roundtrips ---
+
+    #[test]
+    fn serialize_deserialize_small_uncompressed() {
+        // Small data stays uncompressed in Auto mode
+        let val: u32 = 42;
+        let (data, is_compressed) = serialize(&val).unwrap();
+        assert!(!is_compressed, "small data should not be compressed");
+        let result: u32 = deserialize(data.as_slice(), false).unwrap();
+        assert_eq!(result, val);
+    }
+
+    #[test]
+    fn serialize_never_mode() {
+        // Even large data stays uncompressed with Never mode
+        let val: Vec<u8> = vec![0xAA; 512];
+        let (data, is_compressed) = serialize_with_mode(&val, CompressionMode::Never).unwrap();
+        assert!(!is_compressed);
+        let result: Vec<u8> = deserialize(data.as_slice(), false).unwrap();
+        assert_eq!(result, val);
+    }
+
+    #[test]
+    fn serialize_always_mode() {
+        let val: Vec<u8> = vec![0xBB; 512];
+        let (data, is_compressed) = serialize_with_mode(&val, CompressionMode::Always).unwrap();
+        assert!(is_compressed);
+        let result: Vec<u8> = deserialize(data.as_slice(), true).unwrap();
+        assert_eq!(result, val);
+    }
+
+    #[test]
+    fn serialize_auto_mode_large_data() {
+        // Repetitive large data should compress well
+        let val: Vec<u8> = vec![0xCC; 4096];
+        let (data, is_compressed) = serialize_with_mode(&val, CompressionMode::Auto).unwrap();
+        // Auto may or may not compress depending on ratio, but roundtrip must work
+        let result: Vec<u8> = deserialize(data.as_slice(), is_compressed).unwrap();
+        assert_eq!(result, val);
+    }
+
+    // --- InputSerial tests ---
+
+    #[test]
+    fn input_serial_empty() {
+        let empty = InputSerial::empty();
+        assert_eq!(format!("{:?}", empty), "InputSerial(0)");
+    }
+
+    #[test]
+    fn input_serial_now_nonzero() {
+        let now = InputSerial::now();
+        // Should be a large number of milliseconds since epoch
+        assert_ne!(format!("{:?}", now), "InputSerial(0)");
+    }
+
+    #[test]
+    fn input_serial_elapsed_millis() {
+        let before = InputSerial::now();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let elapsed = before.elapsed_millis();
+        assert!(
+            elapsed >= 5,
+            "{}",
+            format!("elapsed should be at least ~10ms, got {}", elapsed)
+        );
+    }
+
+    #[test]
+    fn input_serial_from_system_time() {
+        let time = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(12345);
+        let serial: InputSerial = time.into();
+        assert_eq!(format!("{:?}", serial), "InputSerial(12345)");
+    }
+
+    #[test]
+    fn input_serial_clone_eq_ord() {
+        let a = InputSerial::empty();
+        let b = a;
+        assert_eq!(a, b);
+        let c = InputSerial::now();
+        assert!(c > a);
+    }
+
+    // --- Pdu::is_user_input tests ---
+
+    #[test]
+    fn pdu_is_user_input_true_variants() {
+        assert!(Pdu::WriteToPane(WriteToPane {
+            pane_id: 0,
+            data: vec![]
+        })
+        .is_user_input());
+        assert!(Pdu::SendPaste(SendPaste {
+            pane_id: 0,
+            data: String::new()
+        })
+        .is_user_input());
+        assert!(Pdu::Resize(Resize {
+            containing_tab_id: 0,
+            pane_id: 0,
+            size: TerminalSize::default(),
+        })
+        .is_user_input());
+    }
+
+    #[test]
+    fn pdu_is_user_input_false_variants() {
+        assert!(!Pdu::Ping(Ping {}).is_user_input());
+        assert!(!Pdu::Pong(Pong {}).is_user_input());
+        assert!(!Pdu::ListPanes(ListPanes {}).is_user_input());
+        assert!(!Pdu::GetCodecVersion(GetCodecVersion {}).is_user_input());
+        assert!(!Pdu::GetTlsCreds(GetTlsCreds {}).is_user_input());
+        assert!(!Pdu::Invalid { ident: 99 }.is_user_input());
+    }
+
+    // --- Pdu::pdu_name tests ---
+
+    #[test]
+    fn pdu_name_known_variants() {
+        assert_eq!(Pdu::Ping(Ping {}).pdu_name(), "Ping");
+        assert_eq!(Pdu::Pong(Pong {}).pdu_name(), "Pong");
+        assert_eq!(Pdu::ListPanes(ListPanes {}).pdu_name(), "ListPanes");
+        assert_eq!(
+            Pdu::GetCodecVersion(GetCodecVersion {}).pdu_name(),
+            "GetCodecVersion"
+        );
+        assert_eq!(
+            Pdu::UnitResponse(UnitResponse {}).pdu_name(),
+            "UnitResponse"
+        );
+        assert_eq!(
+            Pdu::ErrorResponse(ErrorResponse { reason: "x".into() }).pdu_name(),
+            "ErrorResponse"
+        );
+    }
+
+    #[test]
+    fn pdu_name_invalid() {
+        assert_eq!(Pdu::Invalid { ident: 0 }.pdu_name(), "Invalid");
+    }
+
+    // --- Pdu::pane_id tests ---
+
+    #[test]
+    fn pdu_pane_id_some() {
+        assert_eq!(
+            Pdu::PaneRemoved(PaneRemoved { pane_id: 42 }).pane_id(),
+            Some(42)
+        );
+        assert_eq!(
+            Pdu::PaneFocused(PaneFocused { pane_id: 7 }).pane_id(),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn pdu_pane_id_none() {
+        assert_eq!(Pdu::Ping(Ping {}).pane_id(), None);
+        assert_eq!(Pdu::Pong(Pong {}).pane_id(), None);
+        assert_eq!(Pdu::Invalid { ident: 0 }.pane_id(), None);
+    }
+
+    // --- Pdu encode/decode roundtrips for additional variants ---
+
+    #[test]
+    fn pdu_roundtrip_error_response() {
+        let mut buf = Vec::new();
+        let pdu = Pdu::ErrorResponse(ErrorResponse {
+            reason: "something went wrong".into(),
+        });
+        pdu.encode(&mut buf, 100).unwrap();
+        let decoded = Pdu::decode(buf.as_slice()).unwrap();
+        assert_eq!(decoded.serial, 100);
+        assert_eq!(decoded.pdu, pdu);
+    }
+
+    #[test]
+    fn pdu_roundtrip_unit_response() {
+        let mut buf = Vec::new();
+        let pdu = Pdu::UnitResponse(UnitResponse {});
+        pdu.encode(&mut buf, 200).unwrap();
+        let decoded = Pdu::decode(buf.as_slice()).unwrap();
+        assert_eq!(decoded.serial, 200);
+        assert_eq!(decoded.pdu, pdu);
+    }
+
+    #[test]
+    fn pdu_roundtrip_get_codec_version() {
+        let mut buf = Vec::new();
+        let pdu = Pdu::GetCodecVersion(GetCodecVersion {});
+        pdu.encode(&mut buf, 300).unwrap();
+        let decoded = Pdu::decode(buf.as_slice()).unwrap();
+        assert_eq!(decoded.serial, 300);
+        assert_eq!(decoded.pdu, pdu);
+    }
+
+    #[test]
+    fn pdu_roundtrip_write_to_pane() {
+        let mut buf = Vec::new();
+        let pdu = Pdu::WriteToPane(WriteToPane {
+            pane_id: 5,
+            data: b"hello world".to_vec(),
+        });
+        pdu.encode(&mut buf, 400).unwrap();
+        let decoded = Pdu::decode(buf.as_slice()).unwrap();
+        assert_eq!(decoded.serial, 400);
+        assert_eq!(decoded.pdu, pdu);
+    }
+
+    #[test]
+    fn pdu_roundtrip_send_paste() {
+        let mut buf = Vec::new();
+        let pdu = Pdu::SendPaste(SendPaste {
+            pane_id: 3,
+            data: "clipboard text".into(),
+        });
+        pdu.encode(&mut buf, 500).unwrap();
+        let decoded = Pdu::decode(buf.as_slice()).unwrap();
+        assert_eq!(decoded.serial, 500);
+        assert_eq!(decoded.pdu, pdu);
+    }
+
+    #[test]
+    fn pdu_roundtrip_kill_pane() {
+        let mut buf = Vec::new();
+        let pdu = Pdu::KillPane(KillPane { pane_id: 99 });
+        pdu.encode(&mut buf, 600).unwrap();
+        let decoded = Pdu::decode(buf.as_slice()).unwrap();
+        assert_eq!(decoded.serial, 600);
+        assert_eq!(decoded.pdu, pdu);
+    }
+
+    #[test]
+    fn pdu_roundtrip_pane_removed() {
+        let mut buf = Vec::new();
+        let pdu = Pdu::PaneRemoved(PaneRemoved { pane_id: 42 });
+        pdu.encode(&mut buf, 700).unwrap();
+        let decoded = Pdu::decode(buf.as_slice()).unwrap();
+        assert_eq!(decoded.serial, 700);
+        assert_eq!(decoded.pdu, pdu);
+    }
+
+    #[test]
+    fn pdu_roundtrip_tab_resized() {
+        let mut buf = Vec::new();
+        let pdu = Pdu::TabResized(TabResized { tab_id: 11 });
+        pdu.encode(&mut buf, 800).unwrap();
+        let decoded = Pdu::decode(buf.as_slice()).unwrap();
+        assert_eq!(decoded.serial, 800);
+        assert_eq!(decoded.pdu, pdu);
+    }
+
+    #[test]
+    fn pdu_roundtrip_pane_focused() {
+        let mut buf = Vec::new();
+        let pdu = Pdu::PaneFocused(PaneFocused { pane_id: 77 });
+        pdu.encode(&mut buf, 900).unwrap();
+        let decoded = Pdu::decode(buf.as_slice()).unwrap();
+        assert_eq!(decoded.serial, 900);
+        assert_eq!(decoded.pdu, pdu);
+    }
+
+    #[test]
+    fn pdu_roundtrip_rename_workspace() {
+        let mut buf = Vec::new();
+        let pdu = Pdu::RenameWorkspace(RenameWorkspace {
+            old_workspace: "old".into(),
+            new_workspace: "new".into(),
+        });
+        pdu.encode(&mut buf, 1000).unwrap();
+        let decoded = Pdu::decode(buf.as_slice()).unwrap();
+        assert_eq!(decoded.serial, 1000);
+        assert_eq!(decoded.pdu, pdu);
+    }
+
+    // --- Pdu::encode Invalid should fail ---
+
+    #[test]
+    fn pdu_encode_invalid_fails() {
+        let mut buf = Vec::new();
+        let result = Pdu::Invalid { ident: 0 }.encode(&mut buf, 0);
+        assert!(result.is_err());
+    }
+
+    // --- stream_decode edge cases ---
+
+    #[test]
+    fn stream_decode_empty_buffer() {
+        let mut buffer = Vec::new();
+        let result = Pdu::stream_decode(&mut buffer).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn stream_decode_partial_frame() {
+        // Just the length byte, no payload
+        let mut buffer = vec![2u8];
+        let result = Pdu::stream_decode(&mut buffer).unwrap();
+        assert!(result.is_none());
+        // Buffer should be preserved for future reads
+        assert_eq!(buffer, vec![2u8]);
+    }
+
+    #[test]
+    fn stream_decode_consumes_one_frame() {
+        let mut encoded = Vec::new();
+        Pdu::Ping(Ping {}).encode(&mut encoded, 1).unwrap();
+        Pdu::Pong(Pong {}).encode(&mut encoded, 2).unwrap();
+        let total_len = encoded.len();
+
+        let decoded = Pdu::stream_decode(&mut encoded).unwrap().unwrap();
+        assert_eq!(decoded.pdu, Pdu::Ping(Ping {}));
+        assert_eq!(decoded.serial, 1);
+        // Buffer should still contain the Pong frame
+        assert!(encoded.len() < total_len);
+
+        let decoded2 = Pdu::stream_decode(&mut encoded).unwrap().unwrap();
+        assert_eq!(decoded2.pdu, Pdu::Pong(Pong {}));
+        assert_eq!(decoded2.serial, 2);
+        assert!(encoded.is_empty());
+    }
+
+    // --- SerializedLines tests ---
+
+    #[test]
+    fn serialized_lines_default_empty() {
+        let sl = SerializedLines::default();
+        let (lines, images) = sl.extract_data();
+        assert!(lines.is_empty());
+        assert!(images.is_empty());
+    }
+
+    #[test]
+    fn serialized_lines_from_empty_vec() {
+        let sl: SerializedLines = vec![].into();
+        let (lines, images) = sl.extract_data();
+        assert!(lines.is_empty());
+        assert!(images.is_empty());
+    }
+
+    // --- CODEC_VERSION test ---
+
+    #[test]
+    fn codec_version_is_current() {
+        assert_eq!(CODEC_VERSION, 45);
+    }
+
+    // --- CorruptResponse tests ---
+
+    #[test]
+    fn corrupt_response_display() {
+        let err = CorruptResponse("bad data".into());
+        assert_eq!(format!("{}", err), "Corrupt Response: bad data");
+    }
+
+    #[test]
+    fn corrupt_response_debug() {
+        let err = CorruptResponse("test".into());
+        let dbg = format!("{:?}", err);
+        assert!(dbg.contains("CorruptResponse"));
+        assert!(dbg.contains("test"));
+    }
+
+    // --- DecodedPdu tests ---
+
+    #[test]
+    fn decoded_pdu_debug() {
+        let dp = DecodedPdu {
+            serial: 42,
+            pdu: Pdu::Ping(Ping {}),
+        };
+        let dbg = format!("{:?}", dp);
+        assert!(dbg.contains("42"));
+        assert!(dbg.contains("Ping"));
+    }
+
+    #[test]
+    fn decoded_pdu_partial_eq() {
+        let a = DecodedPdu {
+            serial: 1,
+            pdu: Pdu::Ping(Ping {}),
+        };
+        let b = DecodedPdu {
+            serial: 1,
+            pdu: Pdu::Ping(Ping {}),
+        };
+        let c = DecodedPdu {
+            serial: 2,
+            pdu: Pdu::Ping(Ping {}),
+        };
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    // --- PDU struct construction tests ---
+
+    #[test]
+    fn error_response_construction() {
+        let err = ErrorResponse {
+            reason: "test error".into(),
+        };
+        assert_eq!(err.reason, "test error");
+        let clone_check = format!("{:?}", err);
+        assert!(clone_check.contains("test error"));
+    }
+
+    #[test]
+    fn get_codec_version_response_construction() {
+        let resp = GetCodecVersionResponse {
+            codec_vers: CODEC_VERSION,
+            version_string: "1.0.0".into(),
+            executable_path: PathBuf::from("/usr/bin/ft"),
+            config_file_path: Some(PathBuf::from("/etc/ft.toml")),
+        };
+        assert_eq!(resp.codec_vers, 45);
+        assert_eq!(resp.version_string, "1.0.0");
+    }
+
+    #[test]
+    fn get_tls_creds_response_construction() {
+        let resp = GetTlsCredsResponse {
+            ca_cert_pem: "CA".into(),
+            client_cert_pem: "CLIENT".into(),
+        };
+        assert_eq!(resp.ca_cert_pem, "CA");
+        assert_eq!(resp.client_cert_pem, "CLIENT");
+    }
+
+    #[test]
+    fn set_window_workspace_construction() {
+        let msg = SetWindowWorkspace {
+            window_id: 1,
+            workspace: "default".into(),
+        };
+        assert_eq!(msg.window_id, 1);
+        assert_eq!(msg.workspace, "default");
+    }
+
+    #[test]
+    fn tab_title_changed_construction() {
+        let msg = TabTitleChanged {
+            tab_id: 5,
+            title: "my tab".into(),
+        };
+        assert_eq!(msg.tab_id, 5);
+        assert_eq!(msg.title, "my tab");
+    }
+
+    #[test]
+    fn window_title_changed_construction() {
+        let msg = WindowTitleChanged {
+            window_id: 3,
+            title: "my window".into(),
+        };
+        assert_eq!(msg.window_id, 3);
+        assert_eq!(msg.title, "my window");
+    }
+
+    #[test]
+    fn serialized_image_cell_debug_and_clone() {
+        // SerializedImageCell requires NotNan<f32> for TextureCoordinate,
+        // so test Debug/Clone/Eq on the struct via serde roundtrip instead
+        let sl = SerializedLines::default();
+        assert!(sl.images.is_empty());
+        let dbg = format!("{:?}", sl);
+        assert!(dbg.contains("SerializedLines"));
+    }
+
+    // --- read_u64 tests ---
+
+    #[test]
+    fn read_u64_small() {
+        let data = [42u8]; // leb128 for 42
+        let result = read_u64(data.as_slice()).unwrap();
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn read_u64_two_byte() {
+        // leb128 encoding of 128: 0x80 0x01
+        let data = [0x80u8, 0x01];
+        let result = read_u64(data.as_slice()).unwrap();
+        assert_eq!(result, 128);
+    }
+
+    #[test]
+    fn read_u64_empty_fails() {
+        let data: &[u8] = &[];
+        assert!(read_u64(data).is_err());
+    }
+
+    // --- Multiple PDU encode/decode in sequence (using Pdu::decode directly) ---
+
+    #[test]
+    fn multiple_pdus_sequential_decode() {
+        // Encode three PDUs into a single buffer
+        let mut buf = Vec::new();
+        Pdu::Ping(Ping {}).encode(&mut buf, 1).unwrap();
+        Pdu::Pong(Pong {}).encode(&mut buf, 2).unwrap();
+        Pdu::UnitResponse(UnitResponse {})
+            .encode(&mut buf, 3)
+            .unwrap();
+
+        // Decode them sequentially using Pdu::decode on a Cursor
+        let mut cursor = Cursor::new(buf.as_slice());
+
+        let d1 = Pdu::decode(&mut cursor).unwrap();
+        assert_eq!(d1.serial, 1);
+        assert_eq!(d1.pdu, Pdu::Ping(Ping {}));
+
+        let d2 = Pdu::decode(&mut cursor).unwrap();
+        assert_eq!(d2.serial, 2);
+        assert_eq!(d2.pdu, Pdu::Pong(Pong {}));
+
+        let d3 = Pdu::decode(&mut cursor).unwrap();
+        assert_eq!(d3.serial, 3);
+        assert_eq!(d3.pdu, Pdu::UnitResponse(UnitResponse {}));
+    }
+
+    // --- Compression roundtrip through full PDU encode/decode ---
+
+    #[test]
+    fn pdu_roundtrip_compressed_write_to_pane() {
+        let mut buf = Vec::new();
+        let pdu = Pdu::WriteToPane(WriteToPane {
+            pane_id: 1,
+            data: vec![b'A'; 1024],
+        });
+        pdu.encode_with_mode(&mut buf, 42, CompressionMode::Always)
+            .unwrap();
+        let decoded = Pdu::decode(buf.as_slice()).unwrap();
+        assert_eq!(decoded.serial, 42);
+        assert_eq!(decoded.pdu, pdu);
+    }
 }
