@@ -231,6 +231,10 @@ harness = false
 name = "semantic_compression"
 harness = false
 
+[[bench]]
+name = "irl_bench"
+harness = false
+
 [features]
 default = []
 # Public feature flags (stable surface)
