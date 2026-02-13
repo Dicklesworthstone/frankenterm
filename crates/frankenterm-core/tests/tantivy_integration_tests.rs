@@ -17,28 +17,27 @@ use std::path::Path;
 use tempfile::tempdir;
 
 use frankenterm_core::recorder_storage::{
-    AppendLogRecorderStorage, AppendLogStorageConfig, AppendRequest,
-    DurabilityLevel, RecorderStorage,
+    AppendLogRecorderStorage, AppendLogStorageConfig, AppendRequest, DurabilityLevel,
+    RecorderStorage,
 };
 use frankenterm_core::recording::{
-    RecorderEvent, RecorderEventCausality, RecorderEventPayload, RecorderEventSource,
-    RecorderIngressKind, RecorderRedactionLevel, RecorderSegmentKind, RecorderTextEncoding,
-    RECORDER_EVENT_SCHEMA_VERSION_V1,
+    RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderEvent, RecorderEventCausality, RecorderEventPayload,
+    RecorderEventSource, RecorderIngressKind, RecorderRedactionLevel, RecorderSegmentKind,
+    RecorderTextEncoding,
 };
 use frankenterm_core::tantivy_ingest::{
-    compute_indexer_lag, IndexCommitStats, IndexDocumentFields,
-    IndexWriteError, IndexWriter, IndexerConfig, IncrementalIndexer,
-    LEXICAL_SCHEMA_VERSION,
+    IncrementalIndexer, IndexCommitStats, IndexDocumentFields, IndexWriteError, IndexWriter,
+    IndexerConfig, LEXICAL_SCHEMA_VERSION, compute_indexer_lag,
 };
 use frankenterm_core::tantivy_quality::{
-    build_forensic_corpus, forensic_golden_queries, agent_workflow_golden_queries,
-    GoldenQuery, QualityHarness, QueryClass, RelevanceAssertion,
+    GoldenQuery, QualityHarness, QueryClass, RelevanceAssertion, agent_workflow_golden_queries,
+    build_forensic_corpus, forensic_golden_queries,
 };
 use frankenterm_core::tantivy_query::{
     EventDirection, InMemorySearchService, LexicalSearchService, SearchFilter, SearchQuery,
 };
 use frankenterm_core::tantivy_reindex::{
-    BackfillConfig, BackfillRange, IntegrityCheckConfig, IntegrityChecker, IndexLookup,
+    BackfillConfig, BackfillRange, IndexLookup, IntegrityCheckConfig, IntegrityChecker,
     ReindexConfig, ReindexPipeline, ReindexableWriter,
 };
 
@@ -269,16 +268,17 @@ async fn ingest_then_query_end_to_end() {
     // Query: direction filter (ingress only)
     let ingress_results = svc
         .search(
-            &SearchQuery::simple("cargo git")
-                .with_filter(SearchFilter::Direction {
-                    direction: EventDirection::Ingress,
-                }),
+            &SearchQuery::simple("cargo git").with_filter(SearchFilter::Direction {
+                direction: EventDirection::Ingress,
+            }),
         )
         .unwrap();
-    assert!(ingress_results
-        .hits
-        .iter()
-        .all(|h| h.doc.event_type == "ingress_text"));
+    assert!(
+        ingress_results
+            .hits
+            .iter()
+            .all(|h| h.doc.event_type == "ingress_text")
+    );
 
     // Verify get_by_event_id matches indexed doc
     let doc = svc.get_by_event_id("cmd-1").unwrap().unwrap();
@@ -619,11 +619,21 @@ async fn custom_golden_queries_on_ingested_data() {
     // Write a specific scenario: agent runs tests, gets errors, fixes them
     let events = vec![
         ingress_event("q-cmd1", 5, 0, "cargo test"),
-        egress_event("q-out1", 5, 1, "running 10 tests\ntest result: FAILED. 2 failed"),
+        egress_event(
+            "q-out1",
+            5,
+            1,
+            "running 10 tests\ntest result: FAILED. 2 failed",
+        ),
         ingress_event("q-cmd2", 5, 2, "cargo clippy -- -D warnings"),
         egress_event("q-out2", 5, 3, "warning: unused import `std::io`"),
         ingress_event("q-cmd3", 5, 4, "cargo test"),
-        egress_event("q-out3", 5, 5, "running 10 tests\ntest result: ok. 10 passed; 0 failed"),
+        egress_event(
+            "q-out3",
+            5,
+            5,
+            "running 10 tests\ntest result: ok. 10 passed; 0 failed",
+        ),
     ];
     append_events(&storage, events).await;
 
@@ -668,10 +678,9 @@ async fn custom_golden_queries_on_ingested_data() {
         GoldenQuery {
             name: "cargo_commands_ingress_only".to_string(),
             class: QueryClass::Filtered,
-            query: SearchQuery::simple("cargo")
-                .with_filter(SearchFilter::Direction {
-                    direction: EventDirection::Ingress,
-                }),
+            query: SearchQuery::simple("cargo").with_filter(SearchFilter::Direction {
+                direction: EventDirection::Ingress,
+            }),
             assertions: vec![
                 RelevanceAssertion::ExactTotalHits(3), // cmd1, cmd2, cmd3
                 RelevanceAssertion::AllMatchFilter(SearchFilter::EventType {
@@ -843,7 +852,11 @@ async fn snippets_extracted_from_indexed_data() {
     // Search for "error" and check snippets
     let results = svc.search(&SearchQuery::simple("error")).unwrap();
     assert!(results.total_hits >= 1);
-    let hit = results.hits.iter().find(|h| h.doc.event_id == "snip-1").unwrap();
+    let hit = results
+        .hits
+        .iter()
+        .find(|h| h.doc.event_id == "snip-1")
+        .unwrap();
     assert!(!hit.snippets.is_empty());
     // Default snippet markers are « and »
     assert!(hit.snippets[0].fragment.contains("«"));
@@ -880,12 +893,10 @@ async fn count_matches_search_total_hits() {
         SearchQuery::simple("alpha"),
         SearchQuery::simple("beta"),
         SearchQuery::simple("gamma"),
-        SearchQuery::simple("alpha")
-            .with_filter(SearchFilter::PaneId { values: vec![1] }),
-        SearchQuery::simple("alpha")
-            .with_filter(SearchFilter::Direction {
-                direction: EventDirection::Ingress,
-            }),
+        SearchQuery::simple("alpha").with_filter(SearchFilter::PaneId { values: vec![1] }),
+        SearchQuery::simple("alpha").with_filter(SearchFilter::Direction {
+            direction: EventDirection::Ingress,
+        }),
     ];
 
     for q in queries {
@@ -910,9 +921,9 @@ async fn time_range_filter_on_indexed_data() {
     let storage = AppendLogRecorderStorage::open(scfg).unwrap();
 
     let events = vec![
-        ingress_event("tr-1", 1, 0, "early event"),  // occurred_at_ms = 1_700_000_000_000
-        ingress_event("tr-2", 1, 5, "mid event"),     // occurred_at_ms = 1_700_000_000_500
-        ingress_event("tr-3", 1, 10, "late event"),   // occurred_at_ms = 1_700_000_001_000
+        ingress_event("tr-1", 1, 0, "early event"), // occurred_at_ms = 1_700_000_000_000
+        ingress_event("tr-2", 1, 5, "mid event"),   // occurred_at_ms = 1_700_000_000_500
+        ingress_event("tr-3", 1, 10, "late event"), // occurred_at_ms = 1_700_000_001_000
     ];
     append_events(&storage, events).await;
 
@@ -923,11 +934,10 @@ async fn time_range_filter_on_indexed_data() {
     let svc = indexer.into_writer().into_search_service();
 
     // Query with time range filter
-    let q = SearchQuery::simple("event")
-        .with_filter(SearchFilter::TimeRange {
-            min_ms: Some(1_700_000_000_100),
-            max_ms: Some(1_700_000_000_900),
-        });
+    let q = SearchQuery::simple("event").with_filter(SearchFilter::TimeRange {
+        min_ms: Some(1_700_000_000_100),
+        max_ms: Some(1_700_000_000_900),
+    });
 
     let results = svc.search(&q).unwrap();
     assert_eq!(results.total_hits, 1);
@@ -1014,13 +1024,28 @@ async fn full_pipeline_reindex_query_quality() {
         // Agent 1 building
         ingress_event("fp-build-cmd", 10, 0, "cargo build --release"),
         egress_event("fp-build-out", 10, 1, "   Compiling frankenterm v0.1.0"),
-        egress_event("fp-build-err", 10, 2, "error[E0308]: mismatched types\n  --> src/lib.rs:42:5"),
+        egress_event(
+            "fp-build-err",
+            10,
+            2,
+            "error[E0308]: mismatched types\n  --> src/lib.rs:42:5",
+        ),
         // Agent 2 testing
         ingress_event("fp-test-cmd", 20, 3, "cargo test"),
-        egress_event("fp-test-out", 20, 4, "running 50 tests\ntest result: ok. 50 passed; 0 failed"),
+        egress_event(
+            "fp-test-out",
+            20,
+            4,
+            "running 50 tests\ntest result: ok. 50 passed; 0 failed",
+        ),
         // Agent 1 retrying after fix
         ingress_event("fp-fix-cmd", 10, 5, "cargo build --release"),
-        egress_event("fp-fix-out", 10, 6, "   Compiling frankenterm v0.1.0\n    Finished release"),
+        egress_event(
+            "fp-fix-out",
+            10,
+            6,
+            "   Compiling frankenterm v0.1.0\n    Finished release",
+        ),
     ];
     append_events(&storage, events).await;
 
@@ -1192,12 +1217,18 @@ async fn redacted_events_through_pipeline() {
     let storage = AppendLogRecorderStorage::open(scfg).unwrap();
 
     let mut partial_event = ingress_event("red-partial", 1, 0, "secret password");
-    if let RecorderEventPayload::IngressText { ref mut redaction, .. } = partial_event.payload {
+    if let RecorderEventPayload::IngressText {
+        ref mut redaction, ..
+    } = partial_event.payload
+    {
         *redaction = RecorderRedactionLevel::Partial;
     }
 
     let mut full_event = ingress_event("red-full", 1, 1, "top secret data");
-    if let RecorderEventPayload::IngressText { ref mut redaction, .. } = full_event.payload {
+    if let RecorderEventPayload::IngressText {
+        ref mut redaction, ..
+    } = full_event.payload
+    {
         *redaction = RecorderRedactionLevel::Full;
     }
 
@@ -1229,10 +1260,12 @@ async fn redacted_events_through_pipeline() {
     // Redacted text is not searchable by original content
     let secret_results = svc.search(&SearchQuery::simple("secret password")).unwrap();
     // Should NOT find the redacted events by their original text
-    assert!(secret_results
-        .hits
-        .iter()
-        .all(|h| h.doc.event_id != "red-partial"));
+    assert!(
+        secret_results
+            .hits
+            .iter()
+            .all(|h| h.doc.event_id != "red-partial")
+    );
 }
 
 // ===========================================================================
@@ -1266,10 +1299,11 @@ async fn source_filter_across_pipeline() {
     // Filter by robot_mode source
     let robot_results = svc
         .search(
-            &SearchQuery::simple("command output automated manual terminal")
-                .with_filter(SearchFilter::Source {
+            &SearchQuery::simple("command output automated manual terminal").with_filter(
+                SearchFilter::Source {
                     values: vec!["robot_mode".to_string()],
-                }),
+                },
+            ),
         )
         .unwrap();
     assert_eq!(robot_results.total_hits, 1);
@@ -1278,10 +1312,11 @@ async fn source_filter_across_pipeline() {
     // Filter by operator_action source
     let operator_results = svc
         .search(
-            &SearchQuery::simple("command output automated manual terminal")
-                .with_filter(SearchFilter::Source {
+            &SearchQuery::simple("command output automated manual terminal").with_filter(
+                SearchFilter::Source {
                     values: vec!["operator_action".to_string()],
-                }),
+                },
+            ),
         )
         .unwrap();
     assert_eq!(operator_results.total_hits, 1);

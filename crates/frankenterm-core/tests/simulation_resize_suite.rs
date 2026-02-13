@@ -1,4 +1,4 @@
-use frankenterm_core::simulation::{ExpectationKind, Scenario};
+use frankenterm_core::simulation::{ExpectationKind, ResizeTimelineStage, Scenario};
 use frankenterm_core::wezterm::{MockWezterm, WeztermInterface};
 
 struct SuiteFixture {
@@ -118,4 +118,60 @@ async fn resize_suite_preserves_window_and_tab_assignments() {
     let pane_7 = mock.pane_state(7).await.unwrap();
     assert_eq!(pane_7.window_id, 0);
     assert_eq!(pane_7.tab_id, 3);
+}
+
+#[tokio::test]
+async fn resize_suite_timeline_probes_cover_required_stages() {
+    for fixture in FIXTURES {
+        let scenario = Scenario::from_yaml(fixture.yaml)
+            .unwrap_or_else(|err| panic!("failed to parse {}: {err}", fixture.name));
+        let mock = MockWezterm::new();
+        scenario.setup(&mock).await.unwrap();
+
+        let (executed, timeline) = scenario
+            .execute_all_with_resize_timeline(&mock)
+            .await
+            .unwrap_or_else(|err| panic!("timeline execution failed for {}: {err}", fixture.name));
+        assert_eq!(executed, scenario.events.len());
+        assert!(
+            !timeline.events.is_empty(),
+            "{} should contain resize timeline events",
+            fixture.name
+        );
+
+        for event in &timeline.events {
+            assert_eq!(
+                event.stages.len(),
+                ResizeTimelineStage::ALL.len(),
+                "{} stage count mismatch for event {}",
+                fixture.name,
+                event.event_index
+            );
+            for (sample, expected) in event.stages.iter().zip(ResizeTimelineStage::ALL.iter()) {
+                assert_eq!(
+                    sample.stage, *expected,
+                    "{} stage order mismatch for event {}",
+                    fixture.name, event.event_index
+                );
+            }
+            let queue = event.stages[1]
+                .queue_metrics
+                .as_ref()
+                .expect("scheduler stage should emit queue metrics");
+            assert!(
+                queue.depth_before >= queue.depth_after,
+                "{} queue depth must be non-increasing for event {}",
+                fixture.name,
+                event.event_index
+            );
+        }
+
+        let summary = timeline.stage_summary();
+        assert_eq!(summary.len(), ResizeTimelineStage::ALL.len());
+        assert!(
+            summary.iter().all(|stage| stage.samples > 0),
+            "{} summary should include samples for each stage",
+            fixture.name
+        );
+    }
 }

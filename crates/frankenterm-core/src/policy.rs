@@ -3427,8 +3427,7 @@ where
         // Notify ingress tap (ft-oegrb.2.2)
         if let Some(ref tap) = self.ingress_tap {
             use crate::recording::{
-                IngressEvent, IngressOutcome, action_to_ingress_kind, actor_to_source,
-                epoch_ms_now,
+                IngressEvent, IngressOutcome, action_to_ingress_kind, actor_to_source, epoch_ms_now,
             };
             let outcome = match &result {
                 InjectionResult::Allowed { .. } => IngressOutcome::Allowed,

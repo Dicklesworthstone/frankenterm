@@ -24,8 +24,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::mpsc;
 use tokio::sync::Mutex;
+use tokio::sync::mpsc;
 
 use crate::agent_correlator::AgentCorrelator;
 use crate::config::{SnapshotConfig, SnapshotSchedulingMode};
@@ -1278,9 +1278,7 @@ mod tests {
             (engine.trigger_value(SnapshotTrigger::StateTransition) - 1.0).abs() < f64::EPSILON
         );
         assert!((engine.trigger_value(SnapshotTrigger::IdleWindow) - 3.0).abs() < f64::EPSILON);
-        assert!(
-            (engine.trigger_value(SnapshotTrigger::MemoryPressure) - 4.0).abs() < f64::EPSILON
-        );
+        assert!((engine.trigger_value(SnapshotTrigger::MemoryPressure) - 4.0).abs() < f64::EPSILON);
         assert!(
             (engine.trigger_value(SnapshotTrigger::HazardThreshold) - 10.0).abs() < f64::EPSILON
         );
@@ -1324,20 +1322,18 @@ mod tests {
 
     fn checkpoint_count(db_path: &str) -> i64 {
         let conn = Connection::open(db_path).unwrap();
-        conn.query_row(
-            "SELECT COUNT(*) FROM session_checkpoints",
-            [],
-            |row| row.get(0),
-        )
+        conn.query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| {
+            row.get(0)
+        })
         .unwrap()
     }
 
-    fn counting_pane_provider(
-    ) -> impl Fn() -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Option<Vec<PaneInfo>>> + Send>,
-    > + Send
-           + Sync
-           + 'static {
+    fn counting_pane_provider()
+    -> impl Fn()
+        -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<PaneInfo>>> + Send>>
+    + Send
+    + Sync
+    + 'static {
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         move || {
             let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1348,7 +1344,10 @@ mod tests {
     #[tokio::test]
     async fn intelligent_accumulates_below_threshold() {
         let (_tmp, db_path) = setup_test_db();
-        let engine = Arc::new(SnapshotEngine::new(db_path.clone(), intelligent_config(5.0)));
+        let engine = Arc::new(SnapshotEngine::new(
+            db_path.clone(),
+            intelligent_config(5.0),
+        ));
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
         let e2 = engine.clone();
@@ -1378,7 +1377,10 @@ mod tests {
     #[tokio::test]
     async fn intelligent_captures_at_threshold() {
         let (_tmp, db_path) = setup_test_db();
-        let engine = Arc::new(SnapshotEngine::new(db_path.clone(), intelligent_config(5.0)));
+        let engine = Arc::new(SnapshotEngine::new(
+            db_path.clone(),
+            intelligent_config(5.0),
+        ));
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
         let e2 = engine.clone();
@@ -1458,7 +1460,10 @@ mod tests {
     #[tokio::test]
     async fn intelligent_value_resets_after_capture() {
         let (_tmp, db_path) = setup_test_db();
-        let engine = Arc::new(SnapshotEngine::new(db_path.clone(), intelligent_config(5.0)));
+        let engine = Arc::new(SnapshotEngine::new(
+            db_path.clone(),
+            intelligent_config(5.0),
+        ));
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
         let e2 = engine.clone();
@@ -1507,7 +1512,10 @@ mod tests {
     #[tokio::test]
     async fn intelligent_shutdown_stops_loop() {
         let (_tmp, db_path) = setup_test_db();
-        let engine = Arc::new(SnapshotEngine::new(db_path.clone(), intelligent_config(5.0)));
+        let engine = Arc::new(SnapshotEngine::new(
+            db_path.clone(),
+            intelligent_config(5.0),
+        ));
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
         let e2 = engine.clone();
@@ -1525,7 +1533,10 @@ mod tests {
     #[tokio::test]
     async fn intelligent_zero_threshold_captures_every_trigger() {
         let (_tmp, db_path) = setup_test_db();
-        let engine = Arc::new(SnapshotEngine::new(db_path.clone(), intelligent_config(0.0)));
+        let engine = Arc::new(SnapshotEngine::new(
+            db_path.clone(),
+            intelligent_config(0.0),
+        ));
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
         let e2 = engine.clone();
@@ -1611,7 +1622,10 @@ mod tests {
         // capture AND reset the accumulator, so subsequent triggers
         // need to re-accumulate from zero.
         let (_tmp, db_path) = setup_test_db();
-        let engine = Arc::new(SnapshotEngine::new(db_path.clone(), intelligent_config(5.0)));
+        let engine = Arc::new(SnapshotEngine::new(
+            db_path.clone(),
+            intelligent_config(5.0),
+        ));
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
         let e2 = engine.clone();
@@ -1704,7 +1718,10 @@ mod tests {
     async fn intelligent_exact_threshold_boundary() {
         // threshold = 5.0, send WorkCompleted(2.0) + IdleWindow(3.0) = exactly 5.0
         let (_tmp, db_path) = setup_test_db();
-        let engine = Arc::new(SnapshotEngine::new(db_path.clone(), intelligent_config(5.0)));
+        let engine = Arc::new(SnapshotEngine::new(
+            db_path.clone(),
+            intelligent_config(5.0),
+        ));
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
         let e2 = engine.clone();
@@ -1734,7 +1751,10 @@ mod tests {
     async fn intelligent_idle_window_accumulation() {
         // IdleWindow has value 3.0; two IdleWindows = 6.0 >= threshold(5.0)
         let (_tmp, db_path) = setup_test_db();
-        let engine = Arc::new(SnapshotEngine::new(db_path.clone(), intelligent_config(5.0)));
+        let engine = Arc::new(SnapshotEngine::new(
+            db_path.clone(),
+            intelligent_config(5.0),
+        ));
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
         let e2 = engine.clone();
@@ -1798,7 +1818,10 @@ mod tests {
         // If run_periodic is called twice, the second call should return
         // immediately because the receiver was already taken.
         let (_tmp, db_path) = setup_test_db();
-        let engine = Arc::new(SnapshotEngine::new(db_path.clone(), intelligent_config(5.0)));
+        let engine = Arc::new(SnapshotEngine::new(
+            db_path.clone(),
+            intelligent_config(5.0),
+        ));
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
         // First call takes the receiver
@@ -1811,11 +1834,11 @@ mod tests {
         // Second call should return immediately (receiver already taken)
         let (_shutdown_tx2, shutdown_rx2) = tokio::sync::watch::channel(false);
         let e3 = engine.clone();
-        let result =
-            tokio::time::timeout(Duration::from_secs(2), async move {
-                e3.run_periodic(shutdown_rx2, counting_pane_provider()).await;
-            })
-            .await;
+        let result = tokio::time::timeout(Duration::from_secs(2), async move {
+            e3.run_periodic(shutdown_rx2, counting_pane_provider())
+                .await;
+        })
+        .await;
         assert!(result.is_ok(), "second run_periodic returns immediately");
 
         shutdown_tx.send(true).unwrap();
@@ -1876,7 +1899,10 @@ mod tests {
     async fn intelligent_rapid_burst_all_processed() {
         // Send a burst of triggers rapidly — all should be processed.
         let (_tmp, db_path) = setup_test_db();
-        let engine = Arc::new(SnapshotEngine::new(db_path.clone(), intelligent_config(5.0)));
+        let engine = Arc::new(SnapshotEngine::new(
+            db_path.clone(),
+            intelligent_config(5.0),
+        ));
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
         let e2 = engine.clone();

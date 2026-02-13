@@ -16,12 +16,12 @@
 //! - Multi-pane search isolation
 
 use frankenterm_core::recording::{
-    RecorderControlMarkerType, RecorderEvent, RecorderEventCausality, RecorderEventPayload,
-    RecorderEventSource, RecorderIngressKind, RecorderRedactionLevel, RecorderSegmentKind,
-    RecorderTextEncoding, RECORDER_EVENT_SCHEMA_VERSION_V1,
+    RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderControlMarkerType, RecorderEvent,
+    RecorderEventCausality, RecorderEventPayload, RecorderEventSource, RecorderIngressKind,
+    RecorderRedactionLevel, RecorderSegmentKind, RecorderTextEncoding,
 };
 use frankenterm_core::tantivy_ingest::{
-    map_event_to_document, IndexDocumentFields, LEXICAL_SCHEMA_VERSION,
+    IndexDocumentFields, LEXICAL_SCHEMA_VERSION, map_event_to_document,
 };
 use frankenterm_core::tantivy_query::{
     EventDirection, InMemorySearchService, LexicalSearchService, SearchFilter, SearchQuery,
@@ -231,8 +231,8 @@ fn pane_id_filter_isolates_pane() {
     ];
     let svc = build_search_service(&events);
 
-    let query = SearchQuery::simple("command")
-        .with_filter(SearchFilter::PaneId { values: vec![10] });
+    let query =
+        SearchQuery::simple("command").with_filter(SearchFilter::PaneId { values: vec![10] });
     let results = svc.search(&query).unwrap();
     assert_eq!(results.total_hits, 1);
     assert_eq!(results.hits[0].doc.pane_id, 10);
@@ -470,14 +470,18 @@ fn cursor_pagination_traverses_all_results() {
     let cursor1 = page1.next_cursor.clone().unwrap();
 
     // Page 2
-    let query = SearchQuery::simple("page").with_limit(3).with_cursor(cursor1);
+    let query = SearchQuery::simple("page")
+        .with_limit(3)
+        .with_cursor(cursor1);
     let page2 = svc.search(&query).unwrap();
     assert_eq!(page2.hits.len(), 3);
 
     let cursor2 = page2.next_cursor.clone().unwrap();
 
     // Page 3 (last item)
-    let query = SearchQuery::simple("page").with_limit(3).with_cursor(cursor2);
+    let query = SearchQuery::simple("page")
+        .with_limit(3)
+        .with_cursor(cursor2);
     let page3 = svc.search(&query).unwrap();
     assert_eq!(page3.hits.len(), 1);
     assert!(!page3.has_more);
@@ -598,9 +602,7 @@ fn empty_query_with_filter_returns_all_matching() {
     // Empty text + pane filter → should return matching docs with score 0
     let mut query = SearchQuery::simple("");
     query.text = String::new();
-    query
-        .filters
-        .push(SearchFilter::PaneId { values: vec![1] });
+    query.filters.push(SearchFilter::PaneId { values: vec![1] });
     let results = svc.search(&query).unwrap();
     assert_eq!(results.total_hits, 1);
     assert_eq!(results.hits[0].doc.pane_id, 1);
@@ -621,9 +623,7 @@ fn search_no_matches_returns_empty() {
     let events = vec![make_ingress(1, 0, "hello world", 1000)];
     let svc = build_search_service(&events);
 
-    let results = svc
-        .search(&SearchQuery::simple("xyznonexistent"))
-        .unwrap();
+    let results = svc.search(&SearchQuery::simple("xyznonexistent")).unwrap();
     assert_eq!(results.total_hits, 0);
     assert!(results.hits.is_empty());
     assert!(!results.has_more);
@@ -704,10 +704,7 @@ fn mapped_ingress_has_correct_fields() {
     assert_eq!(doc.source, "wezterm_mux");
     assert!(doc.text.contains("cargo test"));
     assert_eq!(doc.session_id.as_deref(), Some("session-42"));
-    assert_eq!(
-        doc.schema_version,
-        RECORDER_EVENT_SCHEMA_VERSION_V1
-    );
+    assert_eq!(doc.schema_version, RECORDER_EVENT_SCHEMA_VERSION_V1);
     assert_eq!(doc.lexical_schema_version, LEXICAL_SCHEMA_VERSION);
 }
 
@@ -781,10 +778,7 @@ fn combined_event_type_and_session_filter() {
     let results = svc.search(&query).unwrap();
     assert_eq!(results.total_hits, 1);
     assert_eq!(results.hits[0].doc.event_type, "egress_output");
-    assert_eq!(
-        results.hits[0].doc.session_id.as_deref(),
-        Some("session-1")
-    );
+    assert_eq!(results.hits[0].doc.session_id.as_deref(), Some("session-1"));
 }
 
 // ---------------------------------------------------------------------------
@@ -849,8 +843,7 @@ fn realistic_agent_workflow_search() {
     assert!(results.hits[0].doc.text.contains("git commit"));
 
     // Find CUDA errors in pane 2
-    let query =
-        SearchQuery::simple("error").with_filter(SearchFilter::PaneId { values: vec![2] });
+    let query = SearchQuery::simple("error").with_filter(SearchFilter::PaneId { values: vec![2] });
     let results = svc.search(&query).unwrap();
     assert_eq!(results.total_hits, 1);
     assert!(results.hits[0].doc.text.contains("CUDA"));
@@ -896,8 +889,7 @@ fn large_scale_multi_pane_search() {
     assert_eq!(results.total_hits, 100); // 20 panes × 5 ingress each
 
     // Single pane
-    let query =
-        SearchQuery::simple("cargo").with_filter(SearchFilter::PaneId { values: vec![7] });
+    let query = SearchQuery::simple("cargo").with_filter(SearchFilter::PaneId { values: vec![7] });
     let results = svc.search(&query).unwrap();
     assert_eq!(results.total_hits, 5);
 

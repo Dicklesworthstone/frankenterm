@@ -62,8 +62,8 @@ fn arb_ops(max: usize) -> impl Strategy<Value = Vec<Op>> {
 /// A reference model tracking recency order as a VecDeque (front=MRU, back=LRU).
 struct RefModel {
     capacity: usize,
-    order: VecDeque<u16>,        // front=MRU, back=LRU
-    map: HashMap<u16, i32>,      // key → value
+    order: VecDeque<u16>,   // front=MRU, back=LRU
+    map: HashMap<u16, i32>, // key → value
 }
 
 impl RefModel {

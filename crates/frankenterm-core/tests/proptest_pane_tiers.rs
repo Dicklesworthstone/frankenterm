@@ -29,7 +29,9 @@ fn arb_pane_id() -> impl Strategy<Value = u64> {
     1_u64..10_000
 }
 
-fn arb_pane_ids(count: impl Into<proptest::collection::SizeRange>) -> impl Strategy<Value = Vec<u64>> {
+fn arb_pane_ids(
+    count: impl Into<proptest::collection::SizeRange>,
+) -> impl Strategy<Value = Vec<u64>> {
     proptest::collection::hash_set(arb_pane_id(), count).prop_map(|s| s.into_iter().collect())
 }
 
@@ -54,13 +56,13 @@ fn arb_bp_tier() -> impl Strategy<Value = BackpressureTier> {
 
 fn arb_config() -> impl Strategy<Value = TierConfig> {
     (
-        50_u64..500,     // active_ms
-        500_u64..5000,   // thinking_ms
-        2000_u64..10000, // idle_ms
-        5000_u64..30000, // background_ms
+        50_u64..500,      // active_ms
+        500_u64..5000,    // thinking_ms
+        2000_u64..10000,  // idle_ms
+        5000_u64..30000,  // background_ms
         10000_u64..60000, // dormant_ms
-        10_u64..120,     // idle_threshold_secs
-        120_u64..600,    // dormant_threshold_secs
+        10_u64..120,      // idle_threshold_secs
+        120_u64..600,     // dormant_threshold_secs
     )
         .prop_map(|(a, t, i, b, d, it, dt)| TierConfig {
             active_ms: a,

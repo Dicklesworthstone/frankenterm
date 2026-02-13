@@ -34,8 +34,7 @@ fn arb_pane_ids(max_count: usize) -> impl Strategy<Value = Vec<u64>> {
 }
 
 fn arb_replay_order() -> impl Strategy<Value = ReplayOrder> {
-    (any::<u64>(), any::<u64>(), any::<u64>())
-        .prop_map(|(g, p, s)| ReplayOrder::new(g, p, s))
+    (any::<u64>(), any::<u64>(), any::<u64>()).prop_map(|(g, p, s)| ReplayOrder::new(g, p, s))
 }
 
 // ────────────────────────────────────────────────────────────────────

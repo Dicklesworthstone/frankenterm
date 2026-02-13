@@ -55,8 +55,8 @@ fn arb_detection() -> impl Strategy<Value = Detection> {
         "[a-zA-Z0-9 ]{0,50}",
         (0usize..1000, 0usize..1000),
     )
-        .prop_map(|(rule_id, agent_type, event_type, severity, confidence, extracted, matched_text, span)| {
-            Detection {
+        .prop_map(
+            |(
                 rule_id,
                 agent_type,
                 event_type,
@@ -65,8 +65,19 @@ fn arb_detection() -> impl Strategy<Value = Detection> {
                 extracted,
                 matched_text,
                 span,
-            }
-        })
+            )| {
+                Detection {
+                    rule_id,
+                    agent_type,
+                    event_type,
+                    severity,
+                    confidence,
+                    extracted,
+                    matched_text,
+                    span,
+                }
+            },
+        )
 }
 
 fn arb_trace_span() -> impl Strategy<Value = TraceSpan> {
@@ -114,16 +125,25 @@ fn arb_trace_bounds() -> impl Strategy<Value = TraceBounds> {
         // skip_serializing_if="Vec::is_empty" without serde(default)
         prop::collection::vec("[a-z_]{3,15}", 1..5),
     )
-        .prop_map(|(max_evidence_items, max_excerpt_bytes, max_capture_bytes, evidence_total, evidence_truncated, truncated_fields)| {
-            TraceBounds {
+        .prop_map(
+            |(
                 max_evidence_items,
                 max_excerpt_bytes,
                 max_capture_bytes,
                 evidence_total,
                 evidence_truncated,
                 truncated_fields,
-            }
-        })
+            )| {
+                TraceBounds {
+                    max_evidence_items,
+                    max_excerpt_bytes,
+                    max_capture_bytes,
+                    evidence_total,
+                    evidence_truncated,
+                    truncated_fields,
+                }
+            },
+        )
 }
 
 fn arb_rule_def() -> impl Strategy<Value = RuleDef> {

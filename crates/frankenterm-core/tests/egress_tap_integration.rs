@@ -26,9 +26,15 @@ struct TestEgressTap {
 }
 
 impl TestEgressTap {
-    fn new() -> Self { Self::default() }
-    fn events(&self) -> Vec<EgressEvent> { self.events.lock().unwrap().clone() }
-    fn len(&self) -> usize { self.events.lock().unwrap().len() }
+    fn new() -> Self {
+        Self::default()
+    }
+    fn events(&self) -> Vec<EgressEvent> {
+        self.events.lock().unwrap().clone()
+    }
+    fn len(&self) -> usize {
+        self.events.lock().unwrap().len()
+    }
 }
 
 impl EgressTap for TestEgressTap {
@@ -44,7 +50,9 @@ struct FakePaneSource {
 
 impl FakePaneSource {
     fn new() -> Self {
-        Self { texts: Arc::new(RwLock::new(HashMap::new())) }
+        Self {
+            texts: Arc::new(RwLock::new(HashMap::new())),
+        }
     }
     async fn set_text(&self, pane_id: u64, text: &str) {
         self.texts.write().await.insert(pane_id, text.to_string());
@@ -60,7 +68,9 @@ impl PaneTextSource for FakePaneSource {
             let map = texts.read().await;
             match map.get(&pane_id) {
                 Some(text) => Ok(text.clone()),
-                None => Err(frankenterm_core::Error::Runtime(format!("pane {pane_id} not found"))),
+                None => Err(frankenterm_core::Error::Runtime(format!(
+                    "pane {pane_id} not found"
+                ))),
             }
         })
     }
@@ -115,12 +125,18 @@ async fn egress_tap_fires_on_delta_capture() {
     let source = Arc::new(FakePaneSource::new());
 
     source.set_text(1, "$ prompt\nline1\nline2\n").await;
-    { cursors.write().await.insert(1, PaneCursor::new(1)); }
+    {
+        cursors.write().await.insert(1, PaneCursor::new(1));
+    }
 
     let tap = Arc::new(TestEgressTap::new());
     let mut tailer = TailerSupervisor::new(
-        fast_config(), tx, Arc::clone(&cursors), Arc::clone(&registry),
-        shutdown.clone(), Arc::clone(&source),
+        fast_config(),
+        tx,
+        Arc::clone(&cursors),
+        Arc::clone(&registry),
+        shutdown.clone(),
+        Arc::clone(&source),
     );
     tailer.set_egress_tap(tap.clone());
     tailer.sync_tailers(&pane_map(&[1]));
@@ -140,7 +156,9 @@ async fn egress_tap_fires_on_delta_capture() {
         assert!(e.occurred_at_ms > 0);
     }
 
-    source.set_text(1, "$ prompt\nline1\nline2\nnew output\n").await;
+    source
+        .set_text(1, "$ prompt\nline1\nline2\nnew output\n")
+        .await;
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     let mut js = tokio::task::JoinSet::new();
@@ -155,8 +173,10 @@ async fn egress_tap_fires_on_delta_capture() {
     if all.len() >= 2 {
         let last = &all[all.len() - 1];
         assert_eq!(last.pane_id, 1);
-        assert!(last.segment_kind == RecorderSegmentKind::Delta
-            || last.segment_kind == RecorderSegmentKind::Gap);
+        assert!(
+            last.segment_kind == RecorderSegmentKind::Delta
+                || last.segment_kind == RecorderSegmentKind::Gap
+        );
     }
 }
 
@@ -169,12 +189,18 @@ async fn egress_tap_captures_gap_segments() {
     let source = Arc::new(FakePaneSource::new());
 
     source.set_text(1, "initial content").await;
-    { cursors.write().await.insert(1, PaneCursor::new(1)); }
+    {
+        cursors.write().await.insert(1, PaneCursor::new(1));
+    }
 
     let tap = Arc::new(TestEgressTap::new());
     let mut tailer = TailerSupervisor::new(
-        fast_config(), tx, Arc::clone(&cursors), Arc::clone(&registry),
-        shutdown.clone(), Arc::clone(&source),
+        fast_config(),
+        tx,
+        Arc::clone(&cursors),
+        Arc::clone(&registry),
+        shutdown.clone(),
+        Arc::clone(&source),
     );
     tailer.set_egress_tap(tap.clone());
     tailer.sync_tailers(&pane_map(&[1]));
@@ -187,7 +213,9 @@ async fn egress_tap_captures_gap_segments() {
     }
     while let Ok(_) = rx.try_recv() {}
 
-    source.set_text(1, "completely different text that shares no overlap").await;
+    source
+        .set_text(1, "completely different text that shares no overlap")
+        .await;
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     let mut js = tokio::task::JoinSet::new();
@@ -228,8 +256,12 @@ async fn egress_tap_multi_pane() {
 
     let tap = Arc::new(TestEgressTap::new());
     let mut tailer = TailerSupervisor::new(
-        fast_config(), tx, Arc::clone(&cursors), Arc::clone(&registry),
-        shutdown.clone(), Arc::clone(&source),
+        fast_config(),
+        tx,
+        Arc::clone(&cursors),
+        Arc::clone(&registry),
+        shutdown.clone(),
+        Arc::clone(&source),
     );
     tailer.set_egress_tap(tap.clone());
     tailer.sync_tailers(&pane_map(&[10, 20]));
@@ -256,11 +288,17 @@ async fn egress_tap_not_set_still_works() {
     let source = Arc::new(FakePaneSource::new());
 
     source.set_text(1, "some text").await;
-    { cursors.write().await.insert(1, PaneCursor::new(1)); }
+    {
+        cursors.write().await.insert(1, PaneCursor::new(1));
+    }
 
     let mut tailer = TailerSupervisor::new(
-        fast_config(), tx, Arc::clone(&cursors), Arc::clone(&registry),
-        shutdown.clone(), Arc::clone(&source),
+        fast_config(),
+        tx,
+        Arc::clone(&cursors),
+        Arc::clone(&registry),
+        shutdown.clone(),
+        Arc::clone(&source),
     );
     tailer.sync_tailers(&pane_map(&[1]));
 
@@ -272,7 +310,9 @@ async fn egress_tap_not_set_still_works() {
     }
 
     let mut count = 0;
-    while let Ok(_) = rx.try_recv() { count += 1; }
+    while let Ok(_) = rx.try_recv() {
+        count += 1;
+    }
     // Primary assertion: no panic without a tap set.
     // Capture may or may not produce events depending on scheduler state.
     let _ = count;
@@ -287,18 +327,26 @@ async fn egress_monotonic_sequence() {
     let source = Arc::new(FakePaneSource::new());
 
     source.set_text(1, "aaaa\nbbbb\ncccc\ndddd\neeee\n").await;
-    { cursors.write().await.insert(1, PaneCursor::new(1)); }
+    {
+        cursors.write().await.insert(1, PaneCursor::new(1));
+    }
 
     let tap = Arc::new(TestEgressTap::new());
     let mut tailer = TailerSupervisor::new(
-        fast_config(), tx, Arc::clone(&cursors), Arc::clone(&registry),
-        shutdown.clone(), Arc::clone(&source),
+        fast_config(),
+        tx,
+        Arc::clone(&cursors),
+        Arc::clone(&registry),
+        shutdown.clone(),
+        Arc::clone(&source),
     );
     tailer.set_egress_tap(tap.clone());
     tailer.sync_tailers(&pane_map(&[1]));
 
     for i in 0..3 {
-        source.set_text(1, &format!("aaaa\nbbbb\ncccc\ndddd\neeee\nout-{i}\n")).await;
+        source
+            .set_text(1, &format!("aaaa\nbbbb\ncccc\ndddd\neeee\nout-{i}\n"))
+            .await;
         tokio::time::sleep(Duration::from_millis(20)).await;
         let mut js = tokio::task::JoinSet::new();
         tailer.spawn_ready(&mut js);
@@ -312,8 +360,12 @@ async fn egress_monotonic_sequence() {
     let all = tap.events();
     if all.len() >= 2 {
         for w in all.windows(2) {
-            assert!(w[1].sequence >= w[0].sequence,
-                "monotonic: {} >= {}", w[1].sequence, w[0].sequence);
+            assert!(
+                w[1].sequence >= w[0].sequence,
+                "monotonic: {} >= {}",
+                w[1].sequence,
+                w[0].sequence
+            );
         }
     }
 }

@@ -847,10 +847,7 @@ mod tests {
         cache.put("hello".to_string(), "world".to_string());
         cache.put("foo".to_string(), "bar".to_string());
 
-        assert_eq!(
-            cache.get(&"hello".to_string()),
-            Some(&"world".to_string())
-        );
+        assert_eq!(cache.get(&"hello".to_string()), Some(&"world".to_string()));
     }
 
     #[test]

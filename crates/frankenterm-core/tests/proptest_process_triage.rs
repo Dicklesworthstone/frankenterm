@@ -35,8 +35,8 @@ use proptest::prelude::*;
 
 use frankenterm_core::process_tree::{ProcessNode, ProcessState, ProcessTree};
 use frankenterm_core::process_triage::{
-    classify, build_plan, ClassifiedProcess, TriageAction, TriageCategory, TriageConfig,
-    ProcessContext,
+    ClassifiedProcess, ProcessContext, TriageAction, TriageCategory, TriageConfig, build_plan,
+    classify,
 };
 
 // =============================================================================
@@ -92,24 +92,49 @@ fn make_context(age_hours: f64, cpu: f64, is_test: bool) -> ProcessContext {
 
 // System process names (from the source)
 const SYSTEM_NAMES: &[&str] = &[
-    "init", "systemd", "launchd", "kernel_task", "WindowServer",
-    "sshd", "postgres", "mysqld", "dockerd", "containerd",
-    "kubelet", "cron", "rsyslogd", "loginwindow",
-    "CoreServicesUIAgent", "mds", "mds_stores", "mdworker",
+    "init",
+    "systemd",
+    "launchd",
+    "kernel_task",
+    "WindowServer",
+    "sshd",
+    "postgres",
+    "mysqld",
+    "dockerd",
+    "containerd",
+    "kubelet",
+    "cron",
+    "rsyslogd",
+    "loginwindow",
+    "CoreServicesUIAgent",
+    "mds",
+    "mds_stores",
+    "mdworker",
     "wezterm-mux-server",
 ];
 
 const TEST_RUNNER_NAMES: &[&str] = &["cargo-nextest", "pytest", "jest", "mocha", "vitest"];
 
-const CLI_TOOL_NAMES: &[&str] = &["git", "gh", "npm", "npx", "yarn", "pnpm", "bun", "vercel", "pip", "pip3"];
+const CLI_TOOL_NAMES: &[&str] = &[
+    "git", "gh", "npm", "npx", "yarn", "pnpm", "bun", "vercel", "pip", "pip3",
+];
 
-const BUILD_TOOL_NAMES: &[&str] = &["cargo", "rustc", "cc1", "gcc", "g++", "clang", "make", "cmake", "ninja"];
+const BUILD_TOOL_NAMES: &[&str] = &[
+    "cargo", "rustc", "cc1", "gcc", "g++", "clang", "make", "cmake", "ninja",
+];
 
 // "django" excluded: contains "go" substring → matches test runner check first.
 // "bun" excluded: also appears in CLI_TOOLS, gets classified as StuckCli if old enough.
 const DEV_SERVER_NAMES: &[&str] = &["next", "vite", "uvicorn", "gunicorn", "flask"];
 
-const AGENT_NAMES: &[&str] = &["claude", "claude-code", "codex", "gemini", "aider", "copilot"];
+const AGENT_NAMES: &[&str] = &[
+    "claude",
+    "claude-code",
+    "codex",
+    "gemini",
+    "aider",
+    "copilot",
+];
 
 // =============================================================================
 // Property 1: TriageCategory ordering matches priority values

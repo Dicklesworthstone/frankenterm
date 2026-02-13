@@ -166,11 +166,13 @@ impl EntropyScheduler {
     ///
     /// Idempotent — re-registering a pane that already exists is a no-op.
     pub fn register_pane(&mut self, pane_id: u64) {
-        self.panes.entry(pane_id).or_insert_with(|| PaneEntropyState {
-            estimator: EntropyEstimator::new(self.config.window_size),
-            last_interval_ms: self.config.warmup_interval_ms,
-            last_density: 0.0,
-        });
+        self.panes
+            .entry(pane_id)
+            .or_insert_with(|| PaneEntropyState {
+                estimator: EntropyEstimator::new(self.config.window_size),
+                last_interval_ms: self.config.warmup_interval_ms,
+                last_density: 0.0,
+            });
     }
 
     /// Remove a pane from tracking.
@@ -209,12 +211,10 @@ impl EntropyScheduler {
 
     /// Get the raw Shannon entropy for a pane (bits/byte, 0.0..=8.0).
     pub fn entropy(&self, pane_id: u64) -> Option<f64> {
-        self.panes
-            .get(&pane_id)
-            .map(|s| {
-                // Reconstruct from density; avoids needing &mut for cached entropy
-                s.last_density * H_MAX
-            })
+        self.panes.get(&pane_id).map(|s| {
+            // Reconstruct from density; avoids needing &mut for cached entropy
+            s.last_density * H_MAX
+        })
     }
 
     /// Get the recommended capture interval for a pane (milliseconds).

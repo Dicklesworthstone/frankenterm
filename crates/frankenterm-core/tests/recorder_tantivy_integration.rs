@@ -16,15 +16,14 @@ use frankenterm_core::recorder_storage::{
     DurabilityLevel, FlushMode, RecorderStorage,
 };
 use frankenterm_core::recording::{
-    RecorderControlMarkerType, RecorderEvent, RecorderEventCausality, RecorderEventPayload,
-    RecorderEventSource, RecorderIngressKind, RecorderLifecyclePhase, RecorderRedactionLevel,
-    RecorderSegmentKind, RecorderTextEncoding, RECORDER_EVENT_SCHEMA_VERSION_V1,
+    RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderControlMarkerType, RecorderEvent,
+    RecorderEventCausality, RecorderEventPayload, RecorderEventSource, RecorderIngressKind,
+    RecorderLifecyclePhase, RecorderRedactionLevel, RecorderSegmentKind, RecorderTextEncoding,
 };
 use frankenterm_core::sequence_model::SequenceAssigner;
 use frankenterm_core::tantivy_ingest::{
-    compute_indexer_lag, map_event_to_document, AppendLogReader, IndexCommitStats,
-    IndexDocumentFields, IndexWriteError, IndexWriter, IndexerConfig, IncrementalIndexer,
-    LEXICAL_SCHEMA_VERSION,
+    AppendLogReader, IncrementalIndexer, IndexCommitStats, IndexDocumentFields, IndexWriteError,
+    IndexWriter, IndexerConfig, LEXICAL_SCHEMA_VERSION, compute_indexer_lag, map_event_to_document,
 };
 
 // ===========================================================================
@@ -249,8 +248,7 @@ impl IndexWriter for TrackingWriter {
     }
 
     fn delete_by_event_id(&mut self, event_id: &str) -> Result<(), IndexWriteError> {
-        self.operations
-            .push(WriteOp::Delete(event_id.to_string()));
+        self.operations.push(WriteOp::Delete(event_id.to_string()));
         self.deleted_ids.push(event_id.to_string());
         Ok(())
     }
@@ -293,9 +291,8 @@ async fn full_pipeline_cold_start_with_invariant_check() {
 
     // Run original events through InvariantChecker — should pass
     let mut sorted_events = events.clone();
-    sorted_events.sort_by(|a, b| {
-        RecorderMergeKey::from_event(a).cmp(&RecorderMergeKey::from_event(b))
-    });
+    sorted_events
+        .sort_by(|a, b| RecorderMergeKey::from_event(a).cmp(&RecorderMergeKey::from_event(b)));
     let config = InvariantCheckerConfig {
         check_merge_order: true,
         check_causality: false,
@@ -304,7 +301,11 @@ async fn full_pipeline_cold_start_with_invariant_check() {
     };
     let checker = InvariantChecker::with_config(config);
     let report = checker.check(&sorted_events);
-    assert!(report.passed, "invariant violations: {:?}", report.violations);
+    assert!(
+        report.passed,
+        "invariant violations: {:?}",
+        report.violations
+    );
 }
 
 // ===========================================================================
@@ -337,7 +338,12 @@ async fn multi_run_checkpoint_resume_no_reprocessing() {
     assert_eq!(r1.final_ordinal, Some(4));
     assert!(!r1.caught_up);
 
-    let indexed_ids_run1: Vec<String> = ix1.writer().docs.iter().map(|d| d.event_id.clone()).collect();
+    let indexed_ids_run1: Vec<String> = ix1
+        .writer()
+        .docs
+        .iter()
+        .map(|d| d.event_id.clone())
+        .collect();
 
     // Run 2: index next 5
     let icfg2 = IndexerConfig {
@@ -350,7 +356,12 @@ async fn multi_run_checkpoint_resume_no_reprocessing() {
     assert_eq!(r2.events_indexed, 5);
     assert_eq!(r2.final_ordinal, Some(9));
 
-    let indexed_ids_run2: Vec<String> = ix2.writer().docs.iter().map(|d| d.event_id.clone()).collect();
+    let indexed_ids_run2: Vec<String> = ix2
+        .writer()
+        .docs
+        .iter()
+        .map(|d| d.event_id.clone())
+        .collect();
 
     // Run 3: index remaining 2
     let icfg3 = indexer_config(dir.path(), consumer);
@@ -360,7 +371,12 @@ async fn multi_run_checkpoint_resume_no_reprocessing() {
     assert_eq!(r3.final_ordinal, Some(11));
     assert!(r3.caught_up);
 
-    let indexed_ids_run3: Vec<String> = ix3.writer().docs.iter().map(|d| d.event_id.clone()).collect();
+    let indexed_ids_run3: Vec<String> = ix3
+        .writer()
+        .docs
+        .iter()
+        .map(|d| d.event_id.clone())
+        .collect();
 
     // Verify no overlap between runs
     for id in &indexed_ids_run1 {
@@ -499,12 +515,7 @@ async fn dedup_disabled_no_deletes() {
     let scfg = storage_config(dir.path());
     let storage = AppendLogRecorderStorage::open(scfg).unwrap();
 
-    append_events(
-        &storage,
-        "b1",
-        vec![make_ingress("ev-1", 1, 0, "text")],
-    )
-    .await;
+    append_events(&storage, "b1", vec![make_ingress("ev-1", 1, 0, "text")]).await;
 
     let icfg = IndexerConfig {
         dedup_on_replay: false,
@@ -583,7 +594,12 @@ async fn schema_version_filtering_skips_unknown() {
     v2_event.schema_version = "ft.recorder.event.v2-beta".to_string();
     let v1_event_2 = make_ingress("v1-evt-2", 1, 2, "also valid");
 
-    append_events(&storage, "mixed-schema", vec![v1_event, v2_event, v1_event_2]).await;
+    append_events(
+        &storage,
+        "mixed-schema",
+        vec![v1_event, v2_event, v1_event_2],
+    )
+    .await;
 
     let icfg = indexer_config(dir.path(), "schema-filter");
     let mut indexer = IncrementalIndexer::new(icfg, TrackingWriter::new());
@@ -793,12 +809,7 @@ async fn commit_failure_prevents_checkpoint_advance() {
     let scfg = storage_config(dir.path());
     let storage = AppendLogRecorderStorage::open(scfg).unwrap();
 
-    append_events(
-        &storage,
-        "b1",
-        vec![make_ingress("e0", 1, 0, "text")],
-    )
-    .await;
+    append_events(&storage, "b1", vec![make_ingress("e0", 1, 0, "text")]).await;
 
     // First run with fail_commit → should error
     let icfg = indexer_config(dir.path(), "fail-commit");
@@ -811,7 +822,10 @@ async fn commit_failure_prevents_checkpoint_advance() {
         .read_checkpoint(&CheckpointConsumerId("fail-commit".to_string()))
         .await
         .unwrap();
-    assert!(cp.is_none(), "checkpoint should not exist after commit failure");
+    assert!(
+        cp.is_none(),
+        "checkpoint should not exist after commit failure"
+    );
 
     // Retry with working writer should process the same event
     let mut ix2 = IncrementalIndexer::new(icfg, TrackingWriter::new());
@@ -1058,7 +1072,11 @@ async fn large_scale_multi_pane_end_to_end() {
     };
     let checker = InvariantChecker::with_config(config);
     let report = checker.check(&sorted);
-    assert!(report.passed, "invariant violations: {:?}", report.violations);
+    assert!(
+        report.passed,
+        "invariant violations: {:?}",
+        report.violations
+    );
 
     // Verify event IDs in indexed docs are unique
     let mut seen_ids = std::collections::HashSet::new();
@@ -1081,12 +1099,7 @@ async fn storage_flush_modes_with_indexer() {
     let scfg = storage_config(dir.path());
     let storage = AppendLogRecorderStorage::open(scfg).unwrap();
 
-    append_events(
-        &storage,
-        "b1",
-        vec![make_ingress("e0", 1, 0, "hello")],
-    )
-    .await;
+    append_events(&storage, "b1", vec![make_ingress("e0", 1, 0, "hello")]).await;
 
     // Flush in buffered mode
     let stats = storage.flush(FlushMode::Buffered).await.unwrap();
@@ -1200,7 +1213,11 @@ async fn deterministic_ids_unique_after_roundtrip() {
     for pane_id in 0..3u64 {
         for _ in 0..10 {
             let (seq, _) = assigner.assign(pane_id);
-            events.push(make_event_with_det_id(pane_id, seq, &format!("p{pane_id}-s{seq}")));
+            events.push(make_event_with_det_id(
+                pane_id,
+                seq,
+                &format!("p{pane_id}-s{seq}"),
+            ));
         }
     }
 
@@ -1304,12 +1321,7 @@ async fn empty_run_between_populated_runs() {
     let consumer = "empty-between";
 
     // Phase 1: append and index
-    append_events(
-        &storage,
-        "b1",
-        vec![make_ingress("e0", 1, 0, "first")],
-    )
-    .await;
+    append_events(&storage, "b1", vec![make_ingress("e0", 1, 0, "first")]).await;
 
     let icfg = indexer_config(dir.path(), consumer);
     let mut ix1 = IncrementalIndexer::new(icfg.clone(), TrackingWriter::new());
@@ -1324,12 +1336,7 @@ async fn empty_run_between_populated_runs() {
     assert!(r2.caught_up);
 
     // Phase 3: append more and index
-    append_events(
-        &storage,
-        "b2",
-        vec![make_ingress("e1", 1, 1, "third")],
-    )
-    .await;
+    append_events(&storage, "b2", vec![make_ingress("e1", 1, 1, "third")]).await;
 
     let mut ix3 = IncrementalIndexer::new(icfg, TrackingWriter::new());
     let r3 = ix3.run(&storage).await.unwrap();
@@ -1366,8 +1373,7 @@ async fn indexed_document_serde_roundtrip() {
     // Serialize and deserialize each indexed document
     for doc in &indexer.writer().docs {
         let json = serde_json::to_string(doc).expect("serialize");
-        let roundtripped: IndexDocumentFields =
-            serde_json::from_str(&json).expect("deserialize");
+        let roundtripped: IndexDocumentFields = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(doc, &roundtripped);
     }
 }

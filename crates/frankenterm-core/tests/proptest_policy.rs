@@ -62,7 +62,14 @@ fn arb_pane_capabilities() -> impl Strategy<Value = PaneCapabilities> {
         proptest::option::of("[a-z-]{3,20}"),
     )
         .prop_map(
-            |(prompt_active, command_running, alt_screen, has_recent_gap, is_reserved, reserved_by)| {
+            |(
+                prompt_active,
+                command_running,
+                alt_screen,
+                has_recent_gap,
+                is_reserved,
+                reserved_by,
+            )| {
                 PaneCapabilities {
                     prompt_active,
                     command_running,
@@ -115,10 +122,7 @@ fn arb_rule_evaluation() -> impl Strategy<Value = RuleEvaluation> {
 }
 
 fn arb_decision_evidence() -> impl Strategy<Value = DecisionEvidence> {
-    ("[a-z_]{3,20}", "[a-zA-Z0-9 ]{1,30}").prop_map(|(key, value)| DecisionEvidence {
-        key,
-        value,
-    })
+    ("[a-z_]{3,20}", "[a-zA-Z0-9 ]{1,30}").prop_map(|(key, value)| DecisionEvidence { key, value })
 }
 
 fn arb_rate_limit_snapshot() -> impl Strategy<Value = RateLimitSnapshot> {
@@ -132,13 +136,15 @@ fn arb_rate_limit_snapshot() -> impl Strategy<Value = RateLimitSnapshot> {
         0..100usize,
         0..120u64,
     )
-        .prop_map(|(scope, action, limit, current, retry_after_secs)| RateLimitSnapshot {
-            scope,
-            action,
-            limit,
-            current,
-            retry_after_secs,
-        })
+        .prop_map(
+            |(scope, action, limit, current, retry_after_secs)| RateLimitSnapshot {
+                scope,
+                action,
+                limit,
+                current,
+                retry_after_secs,
+            },
+        )
 }
 
 fn arb_decision_context() -> impl Strategy<Value = DecisionContext> {

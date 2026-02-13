@@ -508,7 +508,9 @@ fn error_code_description(code: &str) -> &'static str {
         "robot.unknown_subcommand" => "Unrecognized robot subcommand",
         "robot.not_implemented" => "Command is not yet implemented",
         "robot.config_error" => "Configuration error (missing or invalid config)",
-        "robot.wezterm_error" => "Error communicating with WezTerm",
+        "robot.wezterm_error" => {
+            "Error communicating with terminal backend bridge (current: WezTerm)"
+        }
         "robot.storage_error" => "Database or storage layer error",
         "robot.policy_denied" => "Action denied by safety policy",
         "robot.pane_not_found" => "Specified pane does not exist",

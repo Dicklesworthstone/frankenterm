@@ -21,14 +21,14 @@ use std::collections::{HashMap, HashSet};
 use proptest::prelude::*;
 
 use frankenterm_core::recording::{
-    RecorderControlMarkerType, RecorderEvent, RecorderEventCausality, RecorderEventPayload,
-    RecorderEventSource, RecorderIngressKind, RecorderLifecyclePhase, RecorderRedactionLevel,
-    RecorderSegmentKind, RecorderTextEncoding, RECORDER_EVENT_SCHEMA_VERSION_V1,
+    RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderControlMarkerType, RecorderEvent,
+    RecorderEventCausality, RecorderEventPayload, RecorderEventSource, RecorderIngressKind,
+    RecorderLifecyclePhase, RecorderRedactionLevel, RecorderSegmentKind, RecorderTextEncoding,
 };
-use frankenterm_core::tantivy_ingest::{map_event_to_document, IndexDocumentFields};
+use frankenterm_core::tantivy_ingest::{IndexDocumentFields, map_event_to_document};
 use frankenterm_core::tantivy_query::{
     EventDirection, InMemorySearchService, LexicalSearchService, Pagination, PaginationCursor,
-    SearchFilter, SearchQuery, SearchSortOrder, SortField, SnippetConfig,
+    SearchFilter, SearchQuery, SearchSortOrder, SnippetConfig, SortField,
 };
 
 // ---------------------------------------------------------------------------
@@ -128,15 +128,21 @@ fn arb_payload() -> impl Strategy<Value = RecorderEventPayload> {
             }
         ),
         // EgressOutput
-        (arb_terminal_text(), arb_redaction(), arb_segment_kind(), any::<bool>()).prop_map(
-            |(text, redaction, segment_kind, is_gap)| RecorderEventPayload::EgressOutput {
-                text,
-                encoding: RecorderTextEncoding::Utf8,
-                redaction,
-                segment_kind,
-                is_gap,
-            }
-        ),
+        (
+            arb_terminal_text(),
+            arb_redaction(),
+            arb_segment_kind(),
+            any::<bool>()
+        )
+            .prop_map(|(text, redaction, segment_kind, is_gap)| {
+                RecorderEventPayload::EgressOutput {
+                    text,
+                    encoding: RecorderTextEncoding::Utf8,
+                    redaction,
+                    segment_kind,
+                    is_gap,
+                }
+            }),
         // ControlMarker
         arb_control_marker_type().prop_map(|control_marker_type| {
             RecorderEventPayload::ControlMarker {
@@ -157,7 +163,7 @@ fn arb_payload() -> impl Strategy<Value = RecorderEventPayload> {
 
 fn arb_event(seq: u64) -> impl Strategy<Value = RecorderEvent> {
     (
-        1u64..=20,  // pane_id
+        1u64..=20, // pane_id
         arb_source(),
         arb_payload(),
         arb_causality(),
@@ -166,7 +172,15 @@ fn arb_event(seq: u64) -> impl Strategy<Value = RecorderEvent> {
         proptest::option::of("corr-[0-9]{1,3}".prop_map(|s| s)),
     )
         .prop_map(
-            move |(pane_id, source, payload, causality, session_id, workflow_id, correlation_id)| {
+            move |(
+                pane_id,
+                source,
+                payload,
+                causality,
+                session_id,
+                workflow_id,
+                correlation_id,
+            )| {
                 RecorderEvent {
                     schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
                     event_id: format!("evt-{}-{}", pane_id, seq),

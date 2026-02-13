@@ -18,11 +18,11 @@
 
 use proptest::prelude::*;
 
+use frankenterm_core::Error as CoreError;
 use frankenterm_core::error::{
     ConfigError, PatternError, Remediation, RemediationCommand, StorageError, WeztermError,
     WorkflowError, format_error_with_remediation,
 };
-use frankenterm_core::Error as CoreError;
 
 // =============================================================================
 // Strategies
@@ -30,16 +30,14 @@ use frankenterm_core::Error as CoreError;
 
 /// Arbitrary non-empty string for error messages, labels, etc.
 fn arb_nonempty_string() -> impl Strategy<Value = String> {
-    "[a-zA-Z0-9 _/.-]{1,80}".prop_map(|s| s.trim().to_string())
+    "[a-zA-Z0-9 _/.-]{1,80}"
+        .prop_map(|s| s.trim().to_string())
         .prop_filter("must be non-empty", |s| !s.is_empty())
 }
 
 /// Arbitrary optional string for platform hints, learn_more links.
 fn arb_opt_string() -> impl Strategy<Value = Option<String>> {
-    prop_oneof![
-        Just(None),
-        arb_nonempty_string().prop_map(Some),
-    ]
+    prop_oneof![Just(None), arb_nonempty_string().prop_map(Some),]
 }
 
 /// Arbitrary u64 for pane IDs, timeouts, retry_after_ms, sequence numbers.
@@ -54,13 +52,16 @@ fn arb_i32() -> impl Strategy<Value = i32> {
 
 /// Arbitrary RemediationCommand.
 fn arb_remediation_command() -> impl Strategy<Value = RemediationCommand> {
-    (arb_nonempty_string(), arb_nonempty_string(), arb_opt_string()).prop_map(
-        |(label, command, platform)| RemediationCommand {
+    (
+        arb_nonempty_string(),
+        arb_nonempty_string(),
+        arb_opt_string(),
+    )
+        .prop_map(|(label, command, platform)| RemediationCommand {
             label,
             command,
             platform,
-        },
-    )
+        })
 }
 
 /// Arbitrary Remediation with varying field population.
@@ -71,12 +72,14 @@ fn arb_remediation() -> impl Strategy<Value = Remediation> {
         proptest::collection::vec(arb_nonempty_string(), 0..4),
         arb_opt_string(),
     )
-        .prop_map(|(summary, commands, alternatives, learn_more)| Remediation {
-            summary,
-            commands,
-            alternatives,
-            learn_more,
-        })
+        .prop_map(
+            |(summary, commands, alternatives, learn_more)| Remediation {
+                summary,
+                commands,
+                alternatives,
+                learn_more,
+            },
+        )
 }
 
 /// Arbitrary WeztermError variant.
@@ -102,10 +105,8 @@ fn arb_storage_error() -> impl Strategy<Value = StorageError> {
             actual,
         }),
         arb_nonempty_string().prop_map(StorageError::MigrationFailed),
-        (arb_i32(), arb_i32()).prop_map(|(current, supported)| StorageError::SchemaTooNew {
-            current,
-            supported,
-        }),
+        (arb_i32(), arb_i32())
+            .prop_map(|(current, supported)| StorageError::SchemaTooNew { current, supported }),
         (arb_nonempty_string(), arb_nonempty_string()).prop_map(|(current, min_compatible)| {
             StorageError::WaTooOld {
                 current,

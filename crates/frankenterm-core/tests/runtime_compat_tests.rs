@@ -8,8 +8,8 @@
 //! - CompatRuntime trait methods (block_on, spawn_detached) execute properly
 //! - sleep() and timeout() wrappers behave as expected
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use frankenterm_core::runtime_compat::{
@@ -438,7 +438,10 @@ async fn try_acquire_error_display_no_permits() {
     let sem = Semaphore::new(0);
     let err = sem.try_acquire().unwrap_err();
     let msg = format!("{}", err);
-    assert!(!msg.is_empty(), "TryAcquireError should have a display message");
+    assert!(
+        !msg.is_empty(),
+        "TryAcquireError should have a display message"
+    );
 }
 
 #[tokio::test]
@@ -447,7 +450,10 @@ async fn try_acquire_error_display_closed() {
     sem.close();
     let err = sem.try_acquire().unwrap_err();
     let msg = format!("{}", err);
-    assert!(!msg.is_empty(), "TryAcquireError::Closed should have a display message");
+    assert!(
+        !msg.is_empty(),
+        "TryAcquireError::Closed should have a display message"
+    );
 }
 
 #[tokio::test]

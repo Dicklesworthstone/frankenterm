@@ -36,46 +36,48 @@ fn arb_cpu() -> impl Strategy<Value = f64> {
 /// Generate a LifecycleConfig with reasonable values.
 fn arb_lifecycle_config() -> impl Strategy<Value = LifecycleConfig> {
     (
-        any::<bool>(),             // enabled
-        1usize..200,               // trend_window
-        8.0f64..32.0,              // warn_age_hours
-        16.0f64..48.0,             // kill_age_hours
-        1.0f64..50.0,              // active_cpu_threshold
-        0.1f64..10.0,              // stuck_cpu_threshold
-        0.5f64..1.0,               // pressure_renice_threshold
+        any::<bool>(),                              // enabled
+        1usize..200,                                // trend_window
+        8.0f64..32.0,                               // warn_age_hours
+        16.0f64..48.0,                              // kill_age_hours
+        1.0f64..50.0,                               // active_cpu_threshold
+        0.1f64..10.0,                               // stuck_cpu_threshold
+        0.5f64..1.0,                                // pressure_renice_threshold
         proptest::collection::vec(1u64..100, 0..5), // protected_panes
     )
-        .prop_map(|(enabled, tw, warn, kill, active_cpu, stuck_cpu, prt, protected)| {
-            // Ensure kill > warn
-            let (warn_h, kill_h) = if warn < kill { (warn, kill) } else { (kill, warn + 1.0) };
-            LifecycleConfig {
-                enabled,
-                sample_interval: Duration::from_secs(30),
-                trend_window: tw,
-                warn_age_hours: warn_h,
-                kill_age_hours: kill_h,
-                grace_period: Duration::from_secs(30),
-                active_cpu_threshold: active_cpu,
-                stuck_cpu_threshold: stuck_cpu,
-                pressure_renice_threshold: prt,
-                renice_value: 19,
-                protected_panes: protected,
-            }
-        })
+        .prop_map(
+            |(enabled, tw, warn, kill, active_cpu, stuck_cpu, prt, protected)| {
+                // Ensure kill > warn
+                let (warn_h, kill_h) = if warn < kill {
+                    (warn, kill)
+                } else {
+                    (kill, warn + 1.0)
+                };
+                LifecycleConfig {
+                    enabled,
+                    sample_interval: Duration::from_secs(30),
+                    trend_window: tw,
+                    warn_age_hours: warn_h,
+                    kill_age_hours: kill_h,
+                    grace_period: Duration::from_secs(30),
+                    active_cpu_threshold: active_cpu,
+                    stuck_cpu_threshold: stuck_cpu,
+                    pressure_renice_threshold: prt,
+                    renice_value: 19,
+                    protected_panes: protected,
+                }
+            },
+        )
 }
 
 /// Generate a vec of (pane_id, PaneHealth, Duration) for pressure testing.
 fn arb_pane_healths() -> impl Strategy<Value = Vec<(u64, PaneHealth, Duration)>> {
-    proptest::collection::vec(
-        (1u64..100, arb_pane_health(), arb_age_secs()),
-        0..10,
-    )
-        .prop_map(|v| {
-            v.into_iter()
-                .enumerate()
-                .map(|(i, (_, health, secs))| ((i as u64) + 1, health, Duration::from_secs(secs)))
-                .collect()
-        })
+    proptest::collection::vec((1u64..100, arb_pane_health(), arb_age_secs()), 0..10).prop_map(|v| {
+        v.into_iter()
+            .enumerate()
+            .map(|(i, (_, health, secs))| ((i as u64) + 1, health, Duration::from_secs(secs)))
+            .collect()
+    })
 }
 
 // ============================================================================

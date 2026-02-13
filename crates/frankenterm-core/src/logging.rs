@@ -630,7 +630,10 @@ mod tests {
         let cloned = config.clone();
         assert_eq!(cloned.level, "error");
         assert_eq!(cloned.format, LogFormat::Json);
-        assert_eq!(cloned.file.as_deref(), Some(std::path::Path::new("/var/log/wa.log")));
+        assert_eq!(
+            cloned.file.as_deref(),
+            Some(std::path::Path::new("/var/log/wa.log"))
+        );
     }
 
     #[test]

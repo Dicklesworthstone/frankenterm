@@ -631,14 +631,27 @@ mod tests {
 
     #[test]
     fn correlation_status_serde_uses_snake_case() {
-        assert_eq!(serde_json::to_string(&CorrelationStatus::Linked).unwrap(), "\"linked\"");
-        assert_eq!(serde_json::to_string(&CorrelationStatus::Unlinked).unwrap(), "\"unlinked\"");
-        assert_eq!(serde_json::to_string(&CorrelationStatus::Error).unwrap(), "\"error\"");
+        assert_eq!(
+            serde_json::to_string(&CorrelationStatus::Linked).unwrap(),
+            "\"linked\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CorrelationStatus::Unlinked).unwrap(),
+            "\"unlinked\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CorrelationStatus::Error).unwrap(),
+            "\"error\""
+        );
     }
 
     #[test]
     fn correlation_status_serde_roundtrip() {
-        for s in [CorrelationStatus::Linked, CorrelationStatus::Unlinked, CorrelationStatus::Error] {
+        for s in [
+            CorrelationStatus::Linked,
+            CorrelationStatus::Unlinked,
+            CorrelationStatus::Error,
+        ] {
             let json = serde_json::to_string(&s).unwrap();
             let back: CorrelationStatus = serde_json::from_str(&json).unwrap();
             assert_eq!(s, back);
@@ -648,8 +661,13 @@ mod tests {
     #[test]
     fn session_correlation_linked_constructor() {
         let c = SessionCorrelation::linked(
-            "ext-1".to_string(), 0.9, vec!["reason1".to_string()], 3,
-            1000, 2000, Some(1500),
+            "ext-1".to_string(),
+            0.9,
+            vec!["reason1".to_string()],
+            3,
+            1000,
+            2000,
+            Some(1500),
         );
         assert_eq!(c.status, CorrelationStatus::Linked);
         assert_eq!(c.external_id.as_deref(), Some("ext-1"));
@@ -664,9 +682,7 @@ mod tests {
 
     #[test]
     fn session_correlation_unlinked_constructor() {
-        let c = SessionCorrelation::unlinked(
-            vec!["no_match".to_string()], 0, 100, 200,
-        );
+        let c = SessionCorrelation::unlinked(vec!["no_match".to_string()], 0, 100, 200);
         assert_eq!(c.status, CorrelationStatus::Unlinked);
         assert!(c.external_id.is_none());
         assert_eq!(c.confidence, 0.0);
@@ -677,7 +693,10 @@ mod tests {
     #[test]
     fn session_correlation_error_constructor() {
         let c = SessionCorrelation::error(
-            "timeout".to_string(), vec!["cass_fail".to_string()], 100, 200,
+            "timeout".to_string(),
+            vec!["cass_fail".to_string()],
+            100,
+            200,
         );
         assert_eq!(c.status, CorrelationStatus::Error);
         assert!(c.external_id.is_none());
@@ -687,8 +706,13 @@ mod tests {
     #[test]
     fn session_correlation_serde_roundtrip() {
         let c = SessionCorrelation::linked(
-            "ext-1".to_string(), 0.85, vec!["ok".to_string()], 2,
-            1000, 2000, Some(1500),
+            "ext-1".to_string(),
+            0.85,
+            vec!["ok".to_string()],
+            2,
+            1000,
+            2000,
+            Some(1500),
         );
         let json = serde_json::to_string(&c).unwrap();
         let back: SessionCorrelation = serde_json::from_str(&json).unwrap();
@@ -699,9 +723,7 @@ mod tests {
 
     #[test]
     fn to_external_meta_is_valid_json() {
-        let c = SessionCorrelation::linked(
-            "ext-1".to_string(), 0.9, vec![], 1, 0, 0, None,
-        );
+        let c = SessionCorrelation::linked("ext-1".to_string(), 0.9, vec![], 1, 0, 0, None);
         let meta = c.to_external_meta();
         assert!(meta.is_object());
         assert_eq!(meta["status"], "linked");
@@ -753,9 +775,7 @@ mod tests {
 
     #[test]
     fn correlate_empty_sessions() {
-        let result = correlate_from_sessions(
-            &[], 1_000_000, &CassCorrelationOptions::default(),
-        );
+        let result = correlate_from_sessions(&[], 1_000_000, &CassCorrelationOptions::default());
         assert_eq!(result.status, CorrelationStatus::Unlinked);
         assert_eq!(result.candidates_considered, 0);
     }
@@ -768,7 +788,8 @@ mod tests {
             ..CassSession::default()
         }];
         let start_ms = parse_cass_timestamp_ms("2026-01-29T17:00:00Z").unwrap();
-        let result = correlate_from_sessions(&sessions, start_ms, &CassCorrelationOptions::default());
+        let result =
+            correlate_from_sessions(&sessions, start_ms, &CassCorrelationOptions::default());
         assert_eq!(result.status, CorrelationStatus::Unlinked);
         assert!(result.reasons[0].contains("skipped_missing_id=1"));
     }
@@ -781,7 +802,8 @@ mod tests {
             ..CassSession::default()
         }];
         let start_ms = parse_cass_timestamp_ms("2026-01-29T17:00:00Z").unwrap();
-        let result = correlate_from_sessions(&sessions, start_ms, &CassCorrelationOptions::default());
+        let result =
+            correlate_from_sessions(&sessions, start_ms, &CassCorrelationOptions::default());
         assert_eq!(result.status, CorrelationStatus::Unlinked);
         assert!(result.reasons[0].contains("skipped_missing_time=1"));
     }
@@ -790,10 +812,11 @@ mod tests {
     fn correlate_closest_start_time_wins() {
         let start_ms = parse_cass_timestamp_ms("2026-01-29T17:00:00Z").unwrap();
         let sessions = vec![
-            make_session("far", "2026-01-29T16:55:00Z"),   // 5 min before
+            make_session("far", "2026-01-29T16:55:00Z"), // 5 min before
             make_session("close", "2026-01-29T17:00:30Z"), // 30 sec after
         ];
-        let result = correlate_from_sessions(&sessions, start_ms, &CassCorrelationOptions::default());
+        let result =
+            correlate_from_sessions(&sessions, start_ms, &CassCorrelationOptions::default());
         assert_eq!(result.external_id.as_deref(), Some("close"));
     }
 
@@ -804,9 +827,15 @@ mod tests {
             make_session("a", "2026-01-29T17:01:00Z"),
             make_session("b", "2026-01-29T17:02:00Z"),
         ];
-        let result = correlate_from_sessions(&sessions, start_ms, &CassCorrelationOptions::default());
+        let result =
+            correlate_from_sessions(&sessions, start_ms, &CassCorrelationOptions::default());
         assert_eq!(result.status, CorrelationStatus::Linked);
-        assert!(result.reasons.iter().any(|r| r.contains("ambiguous_candidates")));
+        assert!(
+            result
+                .reasons
+                .iter()
+                .any(|r| r.contains("ambiguous_candidates"))
+        );
     }
 
     #[test]

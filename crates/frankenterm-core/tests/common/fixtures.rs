@@ -8,8 +8,8 @@ use asupersync::sync::Mutex;
 use asupersync::{Budget, CancelKind, Cx};
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
 // MockPool — simulates a connection pool using Semaphore + Mutex
@@ -259,7 +259,7 @@ pub fn mock_unix_stream_pair() -> (Arc<MockUnixStream>, Arc<MockUnixStream>) {
     let buf_b_to_a = Arc::new(Mutex::new(std::collections::VecDeque::<u8>::new()));
 
     let stream_a = Arc::new(MockUnixStream {
-        read_buf: buf_b_to_a.clone(), // A reads what B writes
+        read_buf: buf_b_to_a.clone(),  // A reads what B writes
         write_buf: buf_a_to_b.clone(), // A writes to B's read buffer
         bytes_written: AtomicU64::new(0),
         bytes_read: AtomicU64::new(0),
@@ -267,7 +267,7 @@ pub fn mock_unix_stream_pair() -> (Arc<MockUnixStream>, Arc<MockUnixStream>) {
     });
 
     let stream_b = Arc::new(MockUnixStream {
-        read_buf: buf_a_to_b, // B reads what A writes
+        read_buf: buf_a_to_b,  // B reads what A writes
         write_buf: buf_b_to_a, // B writes to A's read buffer
         bytes_written: AtomicU64::new(0),
         bytes_read: AtomicU64::new(0),

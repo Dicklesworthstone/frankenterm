@@ -13,7 +13,6 @@
 //! Bead: wa-oegrb.4.3
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};

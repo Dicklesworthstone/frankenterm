@@ -6,11 +6,11 @@
 use proptest::prelude::*;
 use std::collections::HashSet;
 
+use frankenterm_core::VERSION;
 use frankenterm_core::api_schema::{
     ApiVersion, ChangeKind, EndpointMeta, SchemaChange, SchemaDiffResult, SchemaRegistry,
     VersionCompatibility,
 };
-use frankenterm_core::VERSION;
 
 // =============================================================================
 // Strategies
@@ -413,10 +413,16 @@ fn canonical_registry_invariants() {
     let reg = SchemaRegistry::canonical();
 
     // Non-empty
-    assert!(!reg.endpoints.is_empty(), "canonical registry should have endpoints");
+    assert!(
+        !reg.endpoints.is_empty(),
+        "canonical registry should have endpoints"
+    );
 
     // Version matches crate VERSION
-    assert_eq!(reg.version, VERSION, "canonical registry version must match VERSION");
+    assert_eq!(
+        reg.version, VERSION,
+        "canonical registry version must match VERSION"
+    );
 
     // Unique ids
     let ids: Vec<&str> = reg.ids().collect();
@@ -430,7 +436,10 @@ fn canonical_registry_invariants() {
     // Every endpoint has a non-empty id and schema_file
     for ep in &reg.endpoints {
         assert!(!ep.id.is_empty(), "endpoint id must not be empty");
-        assert!(!ep.schema_file.is_empty(), "endpoint schema_file must not be empty");
+        assert!(
+            !ep.schema_file.is_empty(),
+            "endpoint schema_file must not be empty"
+        );
         assert!(
             ep.schema_file.ends_with(".json"),
             "schema_file must end with .json, got: {}",
@@ -592,7 +601,11 @@ fn canonical_schema_files_sorted_and_deduped() {
 
     // No duplicates
     let unique: HashSet<&str> = files.iter().copied().collect();
-    assert_eq!(files.len(), unique.len(), "schema_files should have no duplicates");
+    assert_eq!(
+        files.len(),
+        unique.len(),
+        "schema_files should have no duplicates"
+    );
 }
 
 proptest! {
@@ -638,7 +651,10 @@ fn uncovered_schemas_empty_when_all_covered() {
     let reg = SchemaRegistry::canonical();
     let on_disk: Vec<String> = reg.schema_files().iter().map(|s| s.to_string()).collect();
     let uncovered = reg.uncovered_schemas(&on_disk);
-    assert!(uncovered.is_empty(), "should be empty when all files are in registry");
+    assert!(
+        uncovered.is_empty(),
+        "should be empty when all files are in registry"
+    );
 }
 
 proptest! {

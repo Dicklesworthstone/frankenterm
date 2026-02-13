@@ -90,6 +90,10 @@ pub struct MuxPoolConfig {
     pub mux: DirectMuxClientConfig,
     /// Auto-recovery configuration for protocol errors.
     pub recovery: MuxRecoveryConfig,
+    /// Max concurrent in-flight requests per pipelined batch.
+    pub pipeline_depth: usize,
+    /// Timeout for the full pipelined batch operation.
+    pub pipeline_timeout: Duration,
 }
 
 impl Default for MuxPoolConfig {
@@ -102,6 +106,8 @@ impl Default for MuxPoolConfig {
             },
             mux: DirectMuxClientConfig::default(),
             recovery: MuxRecoveryConfig::default(),
+            pipeline_depth: 32,
+            pipeline_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -142,6 +148,8 @@ pub struct MuxPool {
     recovery_attempts: AtomicU64,
     recovery_successes: AtomicU64,
     permanent_failures: AtomicU64,
+    pipeline_depth: usize,
+    pipeline_timeout: Duration,
 }
 
 type MuxOpFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, DirectMuxError>> + Send + 'a>>;
@@ -150,6 +158,12 @@ impl MuxPool {
     /// Create a new mux connection pool.
     #[must_use]
     pub fn new(config: MuxPoolConfig) -> Self {
+        let pipeline_depth = config.pipeline_depth.max(1);
+        let pipeline_timeout = if config.pipeline_timeout.is_zero() {
+            Duration::from_millis(1)
+        } else {
+            config.pipeline_timeout
+        };
         Self {
             pool: Pool::new(config.pool),
             mux_config: config.mux,
@@ -161,6 +175,8 @@ impl MuxPool {
             recovery_attempts: AtomicU64::new(0),
             recovery_successes: AtomicU64::new(0),
             permanent_failures: AtomicU64::new(0),
+            pipeline_depth,
+            pipeline_timeout,
         }
     }
 
@@ -297,6 +313,60 @@ impl MuxPool {
         .await
     }
 
+    /// Poll render changes for many panes using depth-limited pipelining.
+    ///
+    /// If pipelining fails, falls back to sequential requests on a fresh
+    /// connection so callers still receive results.
+    pub async fn get_pane_render_changes_batch(
+        &self,
+        pane_ids: Vec<u64>,
+    ) -> Result<Vec<GetPaneRenderChangesResponse>, MuxPoolError> {
+        if pane_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let depth = self.pipeline_depth;
+        let timeout = self.pipeline_timeout;
+        let pane_ids_for_pipeline = pane_ids.clone();
+        let pipeline_result = self
+            .execute_with_recovery("get_pane_render_changes_batch", move |client| {
+                let pane_ids = pane_ids_for_pipeline.clone();
+                Box::pin(async move {
+                    client
+                        .get_pane_render_changes_batch(&pane_ids, depth, timeout)
+                        .await
+                })
+            })
+            .await;
+
+        if depth <= 1 {
+            return pipeline_result;
+        }
+
+        match pipeline_result {
+            Ok(result) => Ok(result),
+            Err(err) => {
+                tracing::debug!(
+                    error = %err,
+                    depth,
+                    "pipelined render batch failed; falling back to sequential"
+                );
+                self.execute_with_recovery(
+                    "get_pane_render_changes_batch_fallback",
+                    move |client| {
+                        let pane_ids = pane_ids.clone();
+                        Box::pin(async move {
+                            client
+                                .get_pane_render_changes_batch(&pane_ids, 1, timeout)
+                                .await
+                        })
+                    },
+                )
+                .await
+            }
+        }
+    }
+
     /// Write raw bytes to a pane via a pooled connection (no-paste mode).
     pub async fn write_to_pane(
         &self,
@@ -369,7 +439,10 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
     use std::time::Duration;
 
-    use codec::{CODEC_VERSION, GetCodecVersionResponse, ListPanesResponse, Pdu, UnitResponse};
+    use codec::{
+        CODEC_VERSION, GetCodecVersionResponse, GetPaneRenderChangesResponse, ListPanesResponse,
+        Pdu, UnitResponse,
+    };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// Spawn a mock mux server that handles handshake + ListPanes.
@@ -413,6 +486,33 @@ mod tests {
                                     tab_titles: Vec::new(),
                                     window_titles: HashMap::new(),
                                 }),
+                                Pdu::GetPaneRenderChanges(req) => {
+                                    Pdu::GetPaneRenderChangesResponse(
+                                        GetPaneRenderChangesResponse {
+                                            pane_id: req.pane_id,
+                                            mouse_grabbed: false,
+                                            cursor_position:
+                                                mux::renderable::StableCursorPosition::default(),
+                                            dimensions: mux::renderable::RenderableDimensions {
+                                                cols: 80,
+                                                viewport_rows: 24,
+                                                scrollback_rows: 0,
+                                                physical_top: 0,
+                                                scrollback_top: 0,
+                                                dpi: 96,
+                                                pixel_width: 0,
+                                                pixel_height: 0,
+                                                reverse_video: false,
+                                            },
+                                            dirty_lines: Vec::new(),
+                                            title: format!("pane-{}", req.pane_id),
+                                            working_dir: None,
+                                            bonus_lines: Vec::new().into(),
+                                            input_serial: None,
+                                            seqno: req.pane_id,
+                                        },
+                                    )
+                                }
                                 _ => continue,
                             };
                             responses.push((decoded.serial, response));
@@ -512,6 +612,8 @@ mod tests {
             },
             mux: DirectMuxClientConfig::default().with_socket_path(socket_path),
             recovery: MuxRecoveryConfig::default(),
+            pipeline_depth: 32,
+            pipeline_timeout: Duration::from_secs(5),
         }
     }
 
@@ -584,6 +686,8 @@ mod tests {
             mux: DirectMuxClientConfig::default()
                 .with_socket_path("/tmp/wa-mux-pool-test-nonexistent.sock"),
             recovery: MuxRecoveryConfig::default(),
+            pipeline_depth: 32,
+            pipeline_timeout: Duration::from_secs(5),
         };
         let pool = MuxPool::new(config);
 
@@ -620,6 +724,8 @@ mod tests {
                     Some(2),
                 ),
             },
+            pipeline_depth: 32,
+            pipeline_timeout: Duration::from_secs(5),
         };
 
         let pool = MuxPool::new(config);
@@ -659,6 +765,8 @@ mod tests {
             mux: DirectMuxClientConfig::default()
                 .with_socket_path("/tmp/wa-mux-pool-test-nonexistent.sock"),
             recovery: MuxRecoveryConfig::default(),
+            pipeline_depth: 32,
+            pipeline_timeout: Duration::from_secs(5),
         };
         let pool = MuxPool::new(config);
 
@@ -703,6 +811,8 @@ mod tests {
             },
             mux: DirectMuxClientConfig::default().with_socket_path(socket_path),
             recovery: MuxRecoveryConfig::default(),
+            pipeline_depth: 32,
+            pipeline_timeout: Duration::from_secs(5),
         };
         let pool = MuxPool::new(config);
 
@@ -757,6 +867,8 @@ mod tests {
             },
             mux: DirectMuxClientConfig::default().with_socket_path(socket_path),
             recovery: MuxRecoveryConfig::default(),
+            pipeline_depth: 32,
+            pipeline_timeout: Duration::from_secs(5),
         };
         let pool = Arc::new(MuxPool::new(config));
 
@@ -785,6 +897,8 @@ mod tests {
         assert_eq!(config.pool.max_size, 8);
         assert_eq!(config.pool.idle_timeout, Duration::from_secs(300));
         assert_eq!(config.pool.acquire_timeout, Duration::from_secs(10));
+        assert_eq!(config.pipeline_depth, 32);
+        assert_eq!(config.pipeline_timeout, Duration::from_secs(5));
     }
 
     #[test]

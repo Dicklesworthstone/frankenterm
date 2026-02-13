@@ -94,10 +94,7 @@ impl BloomFilter {
     #[must_use]
     pub fn with_capacity(capacity: usize, fp_rate: f64) -> Self {
         assert!(capacity > 0, "capacity must be > 0");
-        assert!(
-            fp_rate > 0.0 && fp_rate < 1.0,
-            "fp_rate must be in (0, 1)"
-        );
+        assert!(fp_rate > 0.0 && fp_rate < 1.0, "fp_rate must be in (0, 1)");
 
         let num_bits = optimal_num_bits(capacity, fp_rate);
         let num_hashes = optimal_num_hashes(num_bits, capacity);
@@ -172,7 +169,11 @@ impl BloomFilter {
     /// Estimated current false-positive rate based on the number of set bits.
     #[must_use]
     pub fn estimated_fp_rate(&self) -> f64 {
-        let set_bits = self.bits.iter().map(|w| w.count_ones() as usize).sum::<usize>();
+        let set_bits = self
+            .bits
+            .iter()
+            .map(|w| w.count_ones() as usize)
+            .sum::<usize>();
         let fraction = set_bits as f64 / self.num_bits as f64;
         fraction.powi(self.num_hashes as i32)
     }
@@ -251,10 +252,7 @@ impl CountingBloomFilter {
     #[must_use]
     pub fn with_capacity(capacity: usize, fp_rate: f64) -> Self {
         assert!(capacity > 0, "capacity must be > 0");
-        assert!(
-            fp_rate > 0.0 && fp_rate < 1.0,
-            "fp_rate must be in (0, 1)"
-        );
+        assert!(fp_rate > 0.0 && fp_rate < 1.0, "fp_rate must be in (0, 1)");
 
         let num_buckets = optimal_num_bits(capacity, fp_rate);
         let num_hashes = optimal_num_hashes(num_buckets, capacity);
@@ -394,7 +392,11 @@ impl BloomFilter {
     /// Get statistics about the current state of the filter.
     #[must_use]
     pub fn stats(&self) -> BloomStats {
-        let set_bits = self.bits.iter().map(|w| w.count_ones() as usize).sum::<usize>();
+        let set_bits = self
+            .bits
+            .iter()
+            .map(|w| w.count_ones() as usize)
+            .sum::<usize>();
         BloomStats {
             count: self.count,
             num_bits: self.num_bits,

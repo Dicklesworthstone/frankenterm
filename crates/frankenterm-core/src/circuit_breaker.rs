@@ -887,10 +887,7 @@ mod tests {
             subsystem_for_circuit("capture_pipeline"),
             Some(Subsystem::Capture)
         );
-        assert_eq!(
-            subsystem_for_circuit("db_write"),
-            Some(Subsystem::DbWrite)
-        );
+        assert_eq!(subsystem_for_circuit("db_write"), Some(Subsystem::DbWrite));
         assert_eq!(
             subsystem_for_circuit("pattern_engine"),
             Some(Subsystem::PatternEngine)
@@ -969,10 +966,7 @@ mod tests {
 
     #[test]
     fn with_name_sets_name() {
-        let breaker = CircuitBreaker::with_name(
-            "my_circuit",
-            CircuitBreakerConfig::default(),
-        );
+        let breaker = CircuitBreaker::with_name("my_circuit", CircuitBreakerConfig::default());
         assert_eq!(breaker.name, "my_circuit");
     }
 

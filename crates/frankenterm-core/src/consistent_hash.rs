@@ -222,8 +222,7 @@ impl<N: Clone + Eq + Hash + std::fmt::Debug> HashRing<N> {
         let repr = format!("{:?}", node);
         let node_hash = fnv1a_hash(repr.as_bytes());
         // Golden-ratio mixing produces well-spread vnode positions
-        let mixed = node_hash
-            .wrapping_add((vnode_idx as u64).wrapping_mul(0x9e3779b97f4a7c15));
+        let mixed = node_hash.wrapping_add((vnode_idx as u64).wrapping_mul(0x9e3779b97f4a7c15));
         fnv1a_hash(&mixed.to_le_bytes())
     }
 
@@ -384,17 +383,11 @@ mod tests {
 
         // Record key→node mappings
         let keys: Vec<String> = (0..1000).map(|i| format!("key-{}", i)).collect();
-        let before: Vec<&str> = keys
-            .iter()
-            .map(|k| *ring.get_node(k).unwrap())
-            .collect();
+        let before: Vec<&str> = keys.iter().map(|k| *ring.get_node(k).unwrap()).collect();
 
         // Add a third node
         ring.add_node("C");
-        let after: Vec<&str> = keys
-            .iter()
-            .map(|k| *ring.get_node(k).unwrap())
-            .collect();
+        let after: Vec<&str> = keys.iter().map(|k| *ring.get_node(k).unwrap()).collect();
 
         // Count how many keys changed assignment
         let changed: usize = before
@@ -422,16 +415,10 @@ mod tests {
         ring.add_node("C");
 
         let keys: Vec<String> = (0..1000).map(|i| format!("key-{}", i)).collect();
-        let before: Vec<&str> = keys
-            .iter()
-            .map(|k| *ring.get_node(k).unwrap())
-            .collect();
+        let before: Vec<&str> = keys.iter().map(|k| *ring.get_node(k).unwrap()).collect();
 
         ring.remove_node(&"B");
-        let after: Vec<&str> = keys
-            .iter()
-            .map(|k| *ring.get_node(k).unwrap())
-            .collect();
+        let after: Vec<&str> = keys.iter().map(|k| *ring.get_node(k).unwrap()).collect();
 
         // Keys that were on B must move; keys on A/C should stay
         let changed: usize = before
@@ -662,12 +649,7 @@ mod tests {
             assert_eq!(replicas.len(), 3);
 
             let unique: std::collections::HashSet<_> = replicas.iter().collect();
-            assert_eq!(
-                unique.len(),
-                3,
-                "Replicas should be distinct for key-{}",
-                i
-            );
+            assert_eq!(unique.len(), 3, "Replicas should be distinct for key-{}", i);
         }
     }
 }

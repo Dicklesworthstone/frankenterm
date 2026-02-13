@@ -2041,6 +2041,10 @@ pub struct VendoredMuxPoolConfig {
     pub idle_timeout_seconds: u64,
     /// How long to wait to acquire a pooled connection.
     pub acquire_timeout_seconds: u64,
+    /// Maximum in-flight requests per pipelined mux batch.
+    pub pipeline_depth: usize,
+    /// Timeout for a full pipelined mux batch operation.
+    pub pipeline_timeout_ms: u64,
 }
 
 impl Default for VendoredMuxPoolConfig {
@@ -2049,6 +2053,8 @@ impl Default for VendoredMuxPoolConfig {
             max_connections: 8,
             idle_timeout_seconds: 300,
             acquire_timeout_seconds: 10,
+            pipeline_depth: 32,
+            pipeline_timeout_ms: 5_000,
         }
     }
 }

@@ -48,17 +48,17 @@ fn arb_metric() -> impl Strategy<Value = AlertMetric> {
 
 fn arb_rule() -> impl Strategy<Value = AlertRule> {
     (
-        "[a-z]{3,10}",              // id
-        arb_metric(),               // metric
-        0.01f64..=100_000.0,        // threshold
-        arb_period(),               // period
+        "[a-z]{3,10}",                  // id
+        arb_metric(),                   // metric
+        0.01f64..=100_000.0,            // threshold
+        arb_period(),                   // period
         prop::option::of("[a-z]{3,8}"), // agent_type
         prop::option::of("[a-z]{3,8}"), // account_id
         prop::option::of("[a-z]{3,8}"), // service
-        prop::bool::ANY,            // enabled
+        prop::bool::ANY,                // enabled
     )
-        .prop_map(|(id, metric, threshold, period, agent, account, service, enabled)| {
-            AlertRule {
+        .prop_map(
+            |(id, metric, threshold, period, agent, account, service, enabled)| AlertRule {
                 id,
                 metric,
                 threshold,
@@ -67,23 +67,23 @@ fn arb_rule() -> impl Strategy<Value = AlertRule> {
                 account_id: account,
                 service,
                 enabled,
-            }
-        })
+            },
+        )
 }
 
 fn arb_triggered_alert() -> impl Strategy<Value = TriggeredAlert> {
     (
-        "[a-z]{3,10}",     // rule_id
-        arb_metric(),      // metric
-        arb_level(),       // level
-        0.0f64..=100_000.0, // current_value
+        "[a-z]{3,10}",       // rule_id
+        arb_metric(),        // metric
+        arb_level(),         // level
+        0.0f64..=100_000.0,  // current_value
         0.01f64..=100_000.0, // threshold
-        0.0f64..=2.0,      // percent_of_threshold
-        arb_period(),      // period
+        0.0f64..=2.0,        // percent_of_threshold
+        arb_period(),        // period
         0i64..=i64::MAX / 2, // evaluated_at
     )
-        .prop_map(|(rule_id, metric, level, current, threshold, pct, period, ts)| {
-            TriggeredAlert {
+        .prop_map(
+            |(rule_id, metric, level, current, threshold, pct, period, ts)| TriggeredAlert {
                 rule_id,
                 metric,
                 level,
@@ -92,8 +92,8 @@ fn arb_triggered_alert() -> impl Strategy<Value = TriggeredAlert> {
                 percent_of_threshold: pct,
                 period,
                 evaluated_at: ts,
-            }
-        })
+            },
+        )
 }
 
 // ────────────────────────────────────────────────────────────────────

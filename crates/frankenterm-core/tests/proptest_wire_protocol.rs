@@ -6,8 +6,8 @@
 //! Aggregator dedup/ordering/multi-agent, AgentStreamer seq monotonicity.
 
 use frankenterm_core::wire_protocol::{
-    Aggregator, AgentStreamer, BackoffConfig, ConnectionState, GapNotice, IngestResult,
-    PaneDelta, PaneMeta, PanesMeta, WireEnvelope, WirePayload, MAX_MESSAGE_SIZE, PROTOCOL_VERSION,
+    AgentStreamer, Aggregator, BackoffConfig, ConnectionState, GapNotice, IngestResult,
+    MAX_MESSAGE_SIZE, PROTOCOL_VERSION, PaneDelta, PaneMeta, PanesMeta, WireEnvelope, WirePayload,
 };
 use proptest::prelude::*;
 
@@ -52,13 +52,15 @@ fn arb_pane_delta() -> impl Strategy<Value = PaneDelta> {
         0..10000usize,
         1_000_000_000_000i64..2_000_000_000_000i64,
     )
-        .prop_map(|(pane_id, seq, content, content_len, captured_at_ms)| PaneDelta {
-            pane_id,
-            seq,
-            content,
-            content_len,
-            captured_at_ms,
-        })
+        .prop_map(
+            |(pane_id, seq, content, content_len, captured_at_ms)| PaneDelta {
+                pane_id,
+                seq,
+                content,
+                content_len,
+                captured_at_ms,
+            },
+        )
 }
 
 fn arb_gap_notice() -> impl Strategy<Value = GapNotice> {
@@ -85,11 +87,10 @@ fn arb_wire_payload() -> impl Strategy<Value = WirePayload> {
         arb_pane_meta().prop_map(WirePayload::PaneMeta),
         arb_pane_delta().prop_map(WirePayload::PaneDelta),
         arb_gap_notice().prop_map(WirePayload::Gap),
-        arb_pane_meta()
-            .prop_map(|pm| WirePayload::PanesMeta(PanesMeta {
-                panes: vec![pm],
-                timestamp_ms: 1_700_000_000_000,
-            })),
+        arb_pane_meta().prop_map(|pm| WirePayload::PanesMeta(PanesMeta {
+            panes: vec![pm],
+            timestamp_ms: 1_700_000_000_000,
+        })),
     ]
 }
 

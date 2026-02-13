@@ -643,10 +643,7 @@ mod tests {
     #[test]
     fn snapshot_serde_roundtrip() {
         let snap = ShardedSnapshot {
-            counters: vec![
-                ("events".to_string(), 42),
-                ("segments".to_string(), 7),
-            ],
+            counters: vec![("events".to_string(), 42), ("segments".to_string(), 7)],
             maxes: vec![("lag_ms".to_string(), 150)],
             gauges: vec![("last_write".to_string(), 1707753600000)],
         };

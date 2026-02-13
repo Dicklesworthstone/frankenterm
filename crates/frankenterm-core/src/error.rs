@@ -200,7 +200,9 @@ impl Error {
                     .alternative("If the issue persists, restart ft watch."),
             ),
             Self::SetupError(_) => Some(
-                Remediation::new("Check WezTerm configuration and filesystem permissions.")
+                Remediation::new(
+                    "Check terminal-backend bridge configuration (current: WezTerm) and filesystem permissions.",
+                )
                     .command("Locate config", "ls -la ~/.config/wezterm/ ~/.wezterm.lua 2>/dev/null || echo 'No config found'")
                     .command("Diagnostics", "ft doctor")
                     .alternative("Create a wezterm.lua config file if it doesn't exist."),
@@ -223,11 +225,11 @@ impl Error {
 #[derive(Error, Debug)]
 pub enum WeztermError {
     /// WezTerm CLI binary not found in PATH
-    #[error("WezTerm CLI not found in PATH. Install WezTerm or add it to PATH.")]
+    #[error("WezTerm bridge CLI not found in PATH. Install/configure WezTerm or add it to PATH.")]
     CliNotFound,
 
-    /// WezTerm is not running (no GUI or socket available)
-    #[error("WezTerm is not running. Start WezTerm first.")]
+    /// WezTerm bridge is not running (no GUI or socket available)
+    #[error("WezTerm bridge is not running. Start the active backend first.")]
     NotRunning,
 
     /// Specified pane does not exist
@@ -260,7 +262,9 @@ impl WeztermError {
     pub fn remediation(&self) -> Remediation {
         match self {
             Self::CliNotFound => {
-                Remediation::new("Install WezTerm and ensure the `wezterm` binary is on PATH.")
+                Remediation::new(
+                    "Install/configure the active backend bridge (current: WezTerm) and ensure `wezterm` is on PATH.",
+                )
                     .platform_command("Install", "brew install wezterm", "macOS")
                     .platform_command(
                         "Install",
@@ -272,8 +276,10 @@ impl WeztermError {
                     .alternative("If WezTerm is installed elsewhere, add it to PATH.")
                     .learn_more("https://wezfurlong.org/wezterm/install.html")
             }
-            Self::NotRunning => Remediation::new("Start WezTerm and retry the command.")
-                .command("Start WezTerm", "wezterm start")
+            Self::NotRunning => Remediation::new(
+                "Start the active backend bridge (current: WezTerm) and retry the command.",
+            )
+            .command("Start backend bridge (WezTerm)", "wezterm start")
                 .command("Check panes", "wezterm cli list --format json")
                 .alternative("If using a remote socket, set WEZTERM_UNIX_SOCKET."),
             Self::PaneNotFound(_) => Remediation::new("List panes and use a valid pane id.")
@@ -286,10 +292,14 @@ impl WeztermError {
                     .alternative("Unset WEZTERM_UNIX_SOCKET to use the default socket.")
             }
             Self::CommandFailed(_) => {
-                Remediation::new("WezTerm CLI command failed. Check WezTerm logs and retry.")
+                Remediation::new(
+                    "Backend bridge CLI command failed. Check WezTerm/backend logs and retry.",
+                )
                     .command("Check panes", "wezterm cli list --format json")
                     .command("Diagnostics", "ft doctor")
-                    .alternative("Ensure WezTerm is running and responsive.")
+                    .alternative(
+                        "Ensure the active backend bridge (current: WezTerm) is running and responsive.",
+                    )
             }
             Self::ParseError(_) => {
                 Remediation::new("WezTerm returned unexpected output; verify the version.")
@@ -297,16 +307,18 @@ impl WeztermError {
                     .alternative("Upgrade WezTerm if the output format changed.")
             }
             Self::Timeout(timeout) => Remediation::new(format!(
-                "WezTerm CLI timed out after {timeout} seconds. Try again when the system is idle."
+                "Backend bridge CLI timed out after {timeout} seconds. Try again when the system is idle."
             ))
             .command("Diagnostics", "ft doctor")
             .alternative("Reduce load or retry with a longer timeout."),
             Self::CircuitOpen { retry_after_ms } => Remediation::new(format!(
-                "WezTerm circuit breaker is open. Retry after {retry_after_ms} ms."
+                "Backend bridge circuit breaker is open. Retry after {retry_after_ms} ms."
             ))
             .command("Check status", "ft status")
             .command("Diagnostics", "ft doctor")
-            .alternative("Ensure WezTerm is running and responsive."),
+            .alternative(
+                "Ensure the active backend bridge (current: WezTerm) is running and responsive.",
+            ),
         }
     }
 
@@ -672,8 +684,7 @@ mod tests {
 
     #[test]
     fn render_plain_includes_commands() {
-        let r = Remediation::new("Fix it")
-            .command("Diagnose", "ft doctor");
+        let r = Remediation::new("Fix it").command("Diagnose", "ft doctor");
         let output = r.render_plain();
         assert!(output.contains("Commands:"));
         assert!(output.contains("Diagnose: ft doctor"));
@@ -681,16 +692,15 @@ mod tests {
 
     #[test]
     fn render_plain_includes_platform_hint() {
-        let r = Remediation::new("Fix it")
-            .platform_command("Install", "brew install wezterm", "macOS");
+        let r =
+            Remediation::new("Fix it").platform_command("Install", "brew install wezterm", "macOS");
         let output = r.render_plain();
         assert!(output.contains("Install (macOS): brew install wezterm"));
     }
 
     #[test]
     fn render_plain_includes_alternatives() {
-        let r = Remediation::new("Fix it")
-            .alternative("Try plan B");
+        let r = Remediation::new("Fix it").alternative("Try plan B");
         let output = r.render_plain();
         assert!(output.contains("Alternatives:"));
         assert!(output.contains("Try plan B"));
@@ -698,8 +708,7 @@ mod tests {
 
     #[test]
     fn render_plain_includes_learn_more() {
-        let r = Remediation::new("Fix it")
-            .learn_more("https://docs.example.com");
+        let r = Remediation::new("Fix it").learn_more("https://docs.example.com");
         let output = r.render_plain();
         assert!(output.contains("Learn more: https://docs.example.com"));
     }
@@ -763,17 +772,21 @@ mod tests {
         assert!(WeztermError::NotRunning.to_string().contains("not running"));
         assert!(WeztermError::Timeout(10).to_string().contains("10"));
         assert!(
-            WeztermError::CircuitOpen { retry_after_ms: 500 }
-                .to_string()
-                .contains("500")
+            WeztermError::CircuitOpen {
+                retry_after_ms: 500
+            }
+            .to_string()
+            .contains("500")
         );
     }
 
     #[test]
     fn storage_error_display() {
-        assert!(StorageError::Database("corruption".to_string())
-            .to_string()
-            .contains("corruption"));
+        assert!(
+            StorageError::Database("corruption".to_string())
+                .to_string()
+                .contains("corruption")
+        );
         let seq = StorageError::SequenceDiscontinuity {
             expected: 5,
             actual: 8,

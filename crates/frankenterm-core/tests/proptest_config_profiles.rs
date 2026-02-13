@@ -10,8 +10,8 @@
 use proptest::prelude::*;
 
 use frankenterm_core::config_profiles::{
-    canonicalize_profile_name, touch_last_applied, ConfigProfileManifest,
-    ConfigProfileManifestEntry,
+    ConfigProfileManifest, ConfigProfileManifestEntry, canonicalize_profile_name,
+    touch_last_applied,
 };
 
 // ────────────────────────────────────────────────────────────────────
@@ -71,14 +71,14 @@ fn arb_manifest() -> impl Strategy<Value = ConfigProfileManifest> {
         prop::option::of(arb_valid_name()),
         prop::option::of(0u64..=10_000_000_000),
     )
-        .prop_map(|(profiles, last_applied_profile, last_applied_at)| {
-            ConfigProfileManifest {
+        .prop_map(
+            |(profiles, last_applied_profile, last_applied_at)| ConfigProfileManifest {
                 version: 1,
                 profiles,
                 last_applied_profile,
                 last_applied_at,
-            }
-        })
+            },
+        )
 }
 
 // ────────────────────────────────────────────────────────────────────

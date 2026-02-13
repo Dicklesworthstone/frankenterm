@@ -131,11 +131,7 @@ impl EntropyEstimator {
     #[must_use]
     pub fn compression_ratio_bound(&mut self) -> f64 {
         let h = self.entropy();
-        if h < 1e-10 {
-            f64::INFINITY
-        } else {
-            8.0 / h
-        }
+        if h < 1e-10 { f64::INFINITY } else { 8.0 / h }
     }
 
     /// Reset the estimator to empty state.
@@ -254,11 +250,7 @@ pub struct PaneEntropySummary {
 ///
 /// Low score → good eviction candidate (low information or stale).
 #[must_use]
-pub fn eviction_score(
-    info_cost: f64,
-    age_ms: u64,
-    config: &EvictionConfig,
-) -> f64 {
+pub fn eviction_score(info_cost: f64, age_ms: u64, config: &EvictionConfig) -> f64 {
     if config.recency_half_life_ms == 0 {
         return info_cost;
     }
@@ -413,7 +405,10 @@ mod tests {
         let data = vec![0u8; 100_000];
         let h = compute_entropy(&data);
         let cost = information_cost(data.len(), h);
-        assert!(cost < 100.0, "constant data cost should be near 0, got {cost}");
+        assert!(
+            cost < 100.0,
+            "constant data cost should be near 0, got {cost}"
+        );
     }
 
     #[test]
@@ -508,7 +503,10 @@ mod tests {
         }
         // Entropy should now be high (not stuck at 0).
         let h = est.entropy();
-        assert!(h > 5.0, "after feeding uniform data, H should be high, got {h}");
+        assert!(
+            h > 5.0,
+            "after feeding uniform data, H should be high, got {h}"
+        );
     }
 
     #[test]
@@ -548,7 +546,10 @@ mod tests {
             est2.update_block(text);
         }
         let cr = est2.compression_ratio_bound();
-        assert!(cr > 1.0 && cr < 4.0, "English text CR should be 1-4, got {cr}");
+        assert!(
+            cr > 1.0 && cr < 4.0,
+            "English text CR should be 1-4, got {cr}"
+        );
     }
 
     // -- eviction_score -------------------------------------------------------
@@ -557,7 +558,10 @@ mod tests {
     fn eviction_score_fresh_data() {
         let config = EvictionConfig::default();
         let score = eviction_score(1000.0, 0, &config);
-        assert!((score - 1000.0).abs() < 0.01, "fresh data score should equal info cost");
+        assert!(
+            (score - 1000.0).abs() < 0.01,
+            "fresh data score should equal info cost"
+        );
     }
 
     #[test]
@@ -570,8 +574,14 @@ mod tests {
         let one_halflife = eviction_score(1000.0, 60_000, &config);
         let two_halflives = eviction_score(1000.0, 120_000, &config);
 
-        assert!((one_halflife - 500.0).abs() < 1.0, "score at 1 half-life should be ~500, got {one_halflife}");
-        assert!((two_halflives - 250.0).abs() < 1.0, "score at 2 half-lives should be ~250, got {two_halflives}");
+        assert!(
+            (one_halflife - 500.0).abs() < 1.0,
+            "score at 1 half-life should be ~500, got {one_halflife}"
+        );
+        assert!(
+            (two_halflives - 250.0).abs() < 1.0,
+            "score at 2 half-lives should be ~250, got {two_halflives}"
+        );
         assert!(fresh > one_halflife);
         assert!(one_halflife > two_halflives);
     }

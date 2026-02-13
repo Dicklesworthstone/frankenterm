@@ -18,8 +18,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use serde::{Deserialize, Serialize};
 use crate::runtime_compat::{Mutex, Semaphore, TryAcquireError};
+use serde::{Deserialize, Serialize};
 
 /// Configuration for the connection pool.
 #[derive(Debug, Clone, Serialize, Deserialize)]

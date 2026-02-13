@@ -21,13 +21,18 @@ fn arb_replay_mode() -> impl Strategy<Value = ReplayMode> {
 }
 
 fn arb_pane_priority_override() -> impl Strategy<Value = PanePriorityOverrideSnapshot> {
-    (0..10000u64, 0..100u32, proptest::option::of(1_000_000u64..2_000_000_000u64)).prop_map(
-        |(pane_id, priority, expires_at)| PanePriorityOverrideSnapshot {
-            pane_id,
-            priority,
-            expires_at,
-        },
+    (
+        0..10000u64,
+        0..100u32,
+        proptest::option::of(1_000_000u64..2_000_000_000u64),
     )
+        .prop_map(
+            |(pane_id, priority, expires_at)| PanePriorityOverrideSnapshot {
+                pane_id,
+                priority,
+                expires_at,
+            },
+        )
 }
 
 fn arb_health_snapshot() -> impl Strategy<Value = HealthSnapshot> {
@@ -194,14 +199,20 @@ fn arb_crash_loop_config() -> impl Strategy<Value = CrashLoopConfig> {
 }
 
 fn arb_pane_capture_state() -> impl Strategy<Value = PaneCaptureState> {
-    (0..10000u64, 0..100000i64, 0..1000000u64, 1_000_000u64..2_000_000_000u64).prop_map(
-        |(pane_id, last_seq, cursor_offset, last_capture_at)| PaneCaptureState {
-            pane_id,
-            last_seq,
-            cursor_offset,
-            last_capture_at,
-        },
+    (
+        0..10000u64,
+        0..100000i64,
+        0..1000000u64,
+        1_000_000u64..2_000_000_000u64,
     )
+        .prop_map(
+            |(pane_id, last_seq, cursor_offset, last_capture_at)| PaneCaptureState {
+                pane_id,
+                last_seq,
+                cursor_offset,
+                last_capture_at,
+            },
+        )
 }
 
 fn arb_crash_loop_diagnostics() -> impl Strategy<Value = CrashLoopDiagnostics> {
@@ -213,7 +224,13 @@ fn arb_crash_loop_diagnostics() -> impl Strategy<Value = CrashLoopDiagnostics> {
         proptest::bool::ANY,
     )
         .prop_map(
-            |(restart_count, last_crash_at, consecutive_crashes, current_backoff_ms, in_crash_loop)| {
+            |(
+                restart_count,
+                last_crash_at,
+                consecutive_crashes,
+                current_backoff_ms,
+                in_crash_loop,
+            )| {
                 CrashLoopDiagnostics {
                     restart_count,
                     last_crash_at,
@@ -227,10 +244,8 @@ fn arb_crash_loop_diagnostics() -> impl Strategy<Value = CrashLoopDiagnostics> {
 
 fn arb_redaction_report() -> impl Strategy<Value = RedactionReport> {
     prop::collection::vec(
-        ("[a-z_]{3,20}\\.json", 0..100usize).prop_map(|(file, count)| FileRedactionEntry {
-            file,
-            count,
-        }),
+        ("[a-z_]{3,20}\\.json", 0..100usize)
+            .prop_map(|(file, count)| FileRedactionEntry { file, count }),
         0..5,
     )
     .prop_map(|per_file| {

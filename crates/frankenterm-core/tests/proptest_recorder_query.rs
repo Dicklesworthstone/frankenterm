@@ -14,16 +14,15 @@ use proptest::prelude::*;
 
 use frankenterm_core::policy::ActorKind;
 use frankenterm_core::recorder_audit::{
-    AccessTier, ActorIdentity, AuditLogConfig, AuditLog, AuthzDecision,
+    AccessTier, ActorIdentity, AuditLog, AuditLogConfig, AuthzDecision,
 };
 use frankenterm_core::recorder_query::{
     InMemoryEventStore, QueryError, RecorderQueryExecutor, RecorderQueryRequest,
 };
 use frankenterm_core::recorder_retention::SensitivityTier;
 use frankenterm_core::recording::{
-    RecorderEvent, RecorderEventCausality, RecorderEventPayload, RecorderEventSource,
-    RecorderIngressKind, RecorderRedactionLevel, RecorderTextEncoding,
-    RECORDER_EVENT_SCHEMA_VERSION_V1,
+    RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderEvent, RecorderEventCausality, RecorderEventPayload,
+    RecorderEventSource, RecorderIngressKind, RecorderRedactionLevel, RecorderTextEncoding,
 };
 
 // =============================================================================
@@ -68,15 +67,10 @@ fn arb_access_tier() -> impl Strategy<Value = AccessTier> {
 }
 
 fn arb_text(max_len: usize) -> impl Strategy<Value = String> {
-    proptest::string::string_regex(&format!("[a-zA-Z0-9 _=-]{{1,{}}}", max_len))
-        .unwrap()
+    proptest::string::string_regex(&format!("[a-zA-Z0-9 _=-]{{1,{}}}", max_len)).unwrap()
 }
 
-fn arb_event(
-    pane_id: u64,
-    seq: u64,
-    ts_ms: u64,
-) -> impl Strategy<Value = RecorderEvent> {
+fn arb_event(pane_id: u64, seq: u64, ts_ms: u64) -> impl Strategy<Value = RecorderEvent> {
     (arb_text(80), arb_redaction_level(), arb_event_source()).prop_map(
         move |(text, redaction, source)| RecorderEvent {
             schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
@@ -116,9 +110,7 @@ fn arb_event_set(count: usize) -> impl Strategy<Value = Vec<RecorderEvent>> {
     strategies
 }
 
-fn make_executor(
-    events: Vec<RecorderEvent>,
-) -> RecorderQueryExecutor<InMemoryEventStore> {
+fn make_executor(events: Vec<RecorderEvent>) -> RecorderQueryExecutor<InMemoryEventStore> {
     let store = InMemoryEventStore::new();
     store.insert(events);
     RecorderQueryExecutor::new(store, AuditLog::new(AuditLogConfig::default()))

@@ -35,9 +35,9 @@ use serde::{Deserialize, Serialize};
 pub struct RingBuffer<T> {
     buf: Vec<Option<T>>,
     capacity: usize,
-    head: usize,   // next write position
-    len: usize,    // current number of items
-    total: u64,    // total items ever pushed
+    head: usize, // next write position
+    len: usize,  // current number of items
+    total: u64,  // total items ever pushed
 }
 
 impl<T> RingBuffer<T> {
@@ -375,7 +375,7 @@ mod tests {
         assert_eq!(rb.get(0), Some(&10)); // oldest
         assert_eq!(rb.get(1), Some(&20));
         assert_eq!(rb.get(2), Some(&30)); // newest
-        assert_eq!(rb.get(3), None);      // out of bounds
+        assert_eq!(rb.get(3), None); // out of bounds
     }
 
     #[test]

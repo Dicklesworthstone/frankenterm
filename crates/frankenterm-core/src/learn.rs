@@ -400,19 +400,22 @@ impl TutorialEngine {
             Track {
                 id: "basics".into(),
                 name: "Basics".into(),
-                description: "What is wa? Check WezTerm. Start watching. View status. See events."
+                description:
+                    "What is ft? Check backend compatibility. Start watching. View status. See events."
                     .into(),
                 estimated_minutes: 5,
                 exercises: vec![
                     Exercise {
                         id: "basics.1".into(),
-                        title: "What is wa?".into(),
+                        title: "What is ft?".into(),
                         description:
-                            "Get the 30-second mental model: wa is a terminal hypervisor for AI agent swarms."
+                            "Get the 30-second mental model: ft is a swarm-native terminal platform for AI agent fleets."
                                 .into(),
                         instructions: vec![
-                            "Read this flow: WezTerm panes -> ingest -> storage/events -> workflows + robot/MCP.".into(),
-                            "Goal: understand wa observes output, detects state transitions, then safely automates responses.".into(),
+                            "Read this flow: backend adapters -> ingest -> storage/events -> workflows + robot/MCP."
+                                .into(),
+                            "Goal: understand ft observes output, detects state transitions, then safely automates responses."
+                                .into(),
                         ],
                         verification_command: None,
                         verification_pattern: None,
@@ -421,11 +424,11 @@ impl TutorialEngine {
                     },
                     Exercise {
                         id: "basics.2".into(),
-                        title: "Check WezTerm".into(),
-                        description: "Verify wa can see your WezTerm environment".into(),
+                        title: "Check Backend".into(),
+                        description: "Verify ft can see your current backend environment".into(),
                         instructions: vec![
                             "Run: ft doctor".into(),
-                            "Confirm WezTerm is detected (or use sandbox mode if unavailable).".into(),
+                            "Confirm backend compatibility is healthy (or use sandbox mode if unavailable).".into(),
                         ],
                         verification_command: Some("ft doctor --json".into()),
                         verification_pattern: Some("wezterm".into()),
@@ -1505,7 +1508,9 @@ impl TutorialEnvironment {
 
             if !met {
                 let reason = match req {
-                    Requirement::WeztermRunning => "Start WezTerm first",
+                    Requirement::WeztermRunning => {
+                        "Start a compatible terminal backend first (current: WezTerm bridge)"
+                    }
                     Requirement::AgentPresent => "No agents detected",
                     Requirement::WatcherRunning => "Start the watcher first (ft watch)",
                     Requirement::DbHasData => "No captured data yet",
@@ -2712,7 +2717,7 @@ mod tests {
 
         assert_eq!(
             tenv.can_run_exercise(&exercise),
-            CanRun::No("Start WezTerm first")
+            CanRun::No("Start a compatible terminal backend first (current: WezTerm bridge)")
         );
     }
 
@@ -2734,7 +2739,9 @@ mod tests {
 
         assert_eq!(
             tenv.can_run_exercise(&exercise),
-            CanRun::Simulation("Start WezTerm first")
+            CanRun::Simulation(
+                "Start a compatible terminal backend first (current: WezTerm bridge)",
+            )
         );
     }
 
@@ -2817,7 +2824,7 @@ mod tests {
         // First unsatisfied requirement should be reported
         assert_eq!(
             tenv.can_run_exercise(&exercise),
-            CanRun::No("Start WezTerm first")
+            CanRun::No("Start a compatible terminal backend first (current: WezTerm bridge)")
         );
     }
 
@@ -2872,7 +2879,7 @@ mod tests {
         assert!(basics.exercises[0].requirements.is_empty());
         assert!(basics.exercises[0].can_simulate);
 
-        // basics.3 requires WezTerm
+        // basics.3 requires an active terminal backend bridge (current: WezTerm)
         assert!(
             basics.exercises[2]
                 .requirements

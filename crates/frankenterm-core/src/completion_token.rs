@@ -339,9 +339,7 @@ impl CompletionToken {
     /// Check if the deadline has passed (if set).
     #[must_use]
     pub fn is_expired(&self) -> bool {
-        self.deadline_ms
-            .map(|dl| now_ms() >= dl)
-            .unwrap_or(false)
+        self.deadline_ms.map(|dl| now_ms() >= dl).unwrap_or(false)
     }
 }
 
@@ -400,11 +398,7 @@ impl CompletionTracker {
     ///
     /// Returns the token ID for correlation. Returns `None` if the tracker
     /// is at capacity.
-    pub fn begin(
-        &mut self,
-        operation: &str,
-        boundary: CompletionBoundary,
-    ) -> Option<TokenId> {
+    pub fn begin(&mut self, operation: &str, boundary: CompletionBoundary) -> Option<TokenId> {
         self.begin_with_options(operation, boundary, None, None)
     }
 
@@ -423,12 +417,11 @@ impl CompletionTracker {
         self.counter += 1;
         let id = TokenId::generate(self.counter);
         let now = now_ms();
-        let effective_timeout = timeout_ms
-            .or(if self.config.default_timeout_ms > 0 {
-                Some(self.config.default_timeout_ms)
-            } else {
-                None
-            });
+        let effective_timeout = timeout_ms.or(if self.config.default_timeout_ms > 0 {
+            Some(self.config.default_timeout_ms)
+        } else {
+            None
+        });
         let deadline = effective_timeout.map(|t| now + t as i64);
 
         let token = CompletionToken {
@@ -537,11 +530,9 @@ impl CompletionTracker {
     pub fn timeout(&mut self, token_id: &TokenId) -> Option<CompletionState> {
         let token = self.tokens.get_mut(token_id)?;
         if !token.state().is_terminal() {
-            token.cause_chain.record(
-                "_system",
-                StepOutcome::Error,
-                "operation timed out",
-            );
+            token
+                .cause_chain
+                .record("_system", StepOutcome::Error, "operation timed out");
             token.set_state(CompletionState::TimedOut);
         }
         Some(token.state())
@@ -556,8 +547,7 @@ impl CompletionTracker {
             .tokens
             .iter()
             .filter(|(_, t)| {
-                !t.state().is_terminal()
-                    && t.deadline_ms.map(|dl| now >= dl).unwrap_or(false)
+                !t.state().is_terminal() && t.deadline_ms.map(|dl| now >= dl).unwrap_or(false)
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -574,9 +564,8 @@ impl CompletionTracker {
     pub fn evict_completed(&mut self) -> usize {
         let cutoff = now_ms() - self.config.retention_ms as i64;
         let before = self.tokens.len();
-        self.tokens.retain(|_, t| {
-            !t.state().is_terminal() || t.created_at_ms > cutoff
-        });
+        self.tokens
+            .retain(|_, t| !t.state().is_terminal() || t.created_at_ms > cutoff);
         before - self.tokens.len()
     }
 
@@ -632,7 +621,9 @@ impl CompletionTracker {
                 operation: t.operation.clone(),
                 state: t.state(),
                 steps_completed: t.cause_chain.len(),
-                pending: t.boundary.pending_subsystems(&t.cause_chain)
+                pending: t
+                    .boundary
+                    .pending_subsystems(&t.cause_chain)
                     .iter()
                     .map(|s| (*s).to_string())
                     .collect(),
@@ -1057,7 +1048,9 @@ mod tests {
     fn tracker_active_summary() {
         let mut tracker = CompletionTracker::new(test_config());
         let boundary = CompletionBoundary::new(&["a", "b"]);
-        let id = tracker.begin_with_options("test_op", boundary, None, Some(42)).unwrap();
+        let id = tracker
+            .begin_with_options("test_op", boundary, None, Some(42))
+            .unwrap();
         tracker.advance(&id, "a", StepOutcome::Ok, "ok");
 
         let summaries = tracker.active_summary();
@@ -1142,13 +1135,7 @@ mod tests {
         let mut meta = HashMap::new();
         meta.insert("bytes_sent".to_string(), "42".to_string());
         meta.insert("pane_id".to_string(), "7".to_string());
-        tracker.advance_with_metadata(
-            &id,
-            "a",
-            StepOutcome::Ok,
-            "sent",
-            meta,
-        );
+        tracker.advance_with_metadata(&id, "a", StepOutcome::Ok, "sent", meta);
 
         let chain = tracker.cause_chain(&id).unwrap();
         assert_eq!(

@@ -235,9 +235,7 @@ impl ClientPolicyDecision {
             Self::DeniedWatcher { action, client_id } => Some(format!(
                 "watcher client {client_id} cannot perform mutating action {action:?}"
             )),
-            Self::DeniedUnknown { client_id } => {
-                Some(format!("unknown client {client_id}"))
-            }
+            Self::DeniedUnknown { client_id } => Some(format!("unknown client {client_id}")),
         }
     }
 }
@@ -464,18 +462,19 @@ impl ClientRegistry {
     pub fn effective_focus(&self, client_id: &ClientId) -> Option<(u64, u64)> {
         let session = self.clients.get(client_id)?;
         match session.view_state.view_mode {
-            ViewMode::Independent => {
-                Some((session.view_state.active_tab, session.view_state.active_pane))
-            }
+            ViewMode::Independent => Some((
+                session.view_state.active_tab,
+                session.view_state.active_pane,
+            )),
             ViewMode::Mirrored => {
                 if let Some(leader) = self.leader.as_ref().and_then(|l| self.clients.get(l)) {
-                    Some((
-                        leader.view_state.active_tab,
-                        leader.view_state.active_pane,
-                    ))
+                    Some((leader.view_state.active_tab, leader.view_state.active_pane))
                 } else {
                     // No leader — fall back to own focus.
-                    Some((session.view_state.active_tab, session.view_state.active_pane))
+                    Some((
+                        session.view_state.active_tab,
+                        session.view_state.active_pane,
+                    ))
                 }
             }
         }

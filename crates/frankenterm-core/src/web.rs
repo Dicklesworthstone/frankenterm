@@ -2,22 +2,31 @@
 //!
 //! Provides a minimal `ft web` HTTP server with /health and read-only
 //! data endpoints (/panes, /events, /search, /bookmarks, /ruleset-profile, /saved-searches)
-//! backed by shared query helpers.
+//! backed by shared query helpers, plus SSE subscriptions for live event/delta streams.
 
+use crate::events::{Event, EventBus, RecvError};
 use crate::policy::Redactor;
-use crate::storage::{EventQuery, PaneRecord, SearchOptions, SearchResult, StorageHandle};
+use crate::storage::{
+    EventQuery, PaneRecord, SearchOptions, SearchResult, SegmentScanQuery, StorageHandle,
+};
 use crate::ui_query;
 use crate::{Error, Result, VERSION};
 use asupersync::net::TcpListener;
+use asupersync::stream::Stream;
 use fastapi::ResponseBody;
-use fastapi::core::{ControlFlow, Cx, Handler, Middleware, StartupOutcome};
+use fastapi::core::{ControlFlow, Cx, Handler, Middleware, SseEvent, SseResponse, StartupOutcome};
 use fastapi::http::QueryString;
 use fastapi::prelude::{App, Method, Request, RequestContext, Response, StatusCode};
 use fastapi::{ServerConfig, ServerError, TcpServer};
 use serde::Serialize;
+use serde_json::json;
 use std::net::{SocketAddr, TcpStream};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 const DEFAULT_HOST: &str = "127.0.0.1";
@@ -30,6 +39,14 @@ const DEFAULT_LIMIT: usize = 50;
 
 /// Maximum request body size (64 KB). Rejects oversized requests early.
 const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
+const STREAM_SCHEMA_VERSION: &str = "ft.stream.v1";
+const STREAM_DEFAULT_MAX_HZ: u64 = 50;
+const STREAM_MAX_MAX_HZ: u64 = 500;
+const STREAM_CHANNEL_BUFFER: usize = 256;
+const STREAM_KEEPALIVE_SECS: u64 = 15;
+const STREAM_SCAN_LIMIT: usize = 256;
+const STREAM_SCAN_MAX_PAGES: usize = 8;
+const STREAM_MAX_CONSECUTIVE_DROPS: u64 = 64;
 
 /// Configuration for the web server.
 #[derive(Clone)]
@@ -37,6 +54,7 @@ pub struct WebServerConfig {
     host: String,
     port: u16,
     storage: Option<StorageHandle>,
+    event_bus: Option<Arc<EventBus>>,
     /// Must be set to `true` to bind on a non-localhost address.
     allow_public_bind: bool,
 }
@@ -47,6 +65,7 @@ impl std::fmt::Debug for WebServerConfig {
             .field("host", &self.host)
             .field("port", &self.port)
             .field("storage", &self.storage.is_some())
+            .field("event_bus", &self.event_bus.is_some())
             .field("allow_public_bind", &self.allow_public_bind)
             .finish()
     }
@@ -60,6 +79,7 @@ impl WebServerConfig {
             host: DEFAULT_HOST.to_string(),
             port,
             storage: None,
+            event_bus: None,
             allow_public_bind: false,
         }
     }
@@ -84,6 +104,13 @@ impl WebServerConfig {
     #[must_use]
     pub fn with_storage(mut self, storage: StorageHandle) -> Self {
         self.storage = Some(storage);
+        self
+    }
+
+    /// Attach an event bus for live stream endpoints.
+    #[must_use]
+    pub fn with_event_bus(mut self, event_bus: Arc<EventBus>) -> Self {
+        self.event_bus = Some(event_bus);
         self
     }
 
@@ -195,6 +222,7 @@ impl Middleware for RequestSpanLogger {
 #[derive(Clone)]
 struct AppState {
     storage: Option<StorageHandle>,
+    event_bus: Option<Arc<EventBus>>,
     redactor: Arc<Redactor>,
 }
 
@@ -323,6 +351,53 @@ fn require_storage(req: &Request) -> std::result::Result<(StorageHandle, Arc<Red
     Ok((storage, Arc::clone(&state.redactor)))
 }
 
+fn require_event_bus(
+    req: &Request,
+) -> std::result::Result<(Arc<EventBus>, Arc<Redactor>), Response> {
+    let state = req.get_extension::<AppState>().ok_or_else(|| {
+        json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "App state not configured",
+        )
+    })?;
+    let event_bus = state.event_bus.clone().ok_or_else(|| {
+        json_err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no_event_bus",
+            "No event bus configured",
+        )
+    })?;
+    Ok((event_bus, Arc::clone(&state.redactor)))
+}
+
+fn require_storage_and_event_bus(
+    req: &Request,
+) -> std::result::Result<(StorageHandle, Arc<EventBus>, Arc<Redactor>), Response> {
+    let state = req.get_extension::<AppState>().ok_or_else(|| {
+        json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "App state not configured",
+        )
+    })?;
+    let storage = state.storage.clone().ok_or_else(|| {
+        json_err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no_storage",
+            "No database connected",
+        )
+    })?;
+    let event_bus = state.event_bus.clone().ok_or_else(|| {
+        json_err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no_event_bus",
+            "No event bus configured",
+        )
+    })?;
+    Ok((storage, event_bus, Arc::clone(&state.redactor)))
+}
+
 // =============================================================================
 // Query parameter helpers
 // =============================================================================
@@ -344,6 +419,524 @@ fn parse_i64(qs: &QueryString<'_>, key: &str) -> Option<i64> {
 
 fn parse_bool(qs: &QueryString<'_>, key: &str) -> bool {
     matches!(qs.get(key), Some("1" | "true" | "yes"))
+}
+
+fn parse_stream_max_hz(qs: &QueryString<'_>) -> u64 {
+    qs.get("max_hz")
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|hz| *hz > 0)
+        .unwrap_or(STREAM_DEFAULT_MAX_HZ)
+        .min(STREAM_MAX_MAX_HZ)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum EventStreamChannel {
+    All,
+    Deltas,
+    Detections,
+    Signals,
+}
+
+fn parse_event_stream_channel(
+    qs: &QueryString<'_>,
+) -> std::result::Result<EventStreamChannel, Response> {
+    match qs.get("channel") {
+        None | Some("all") => Ok(EventStreamChannel::All),
+        Some("deltas" | "delta") => Ok(EventStreamChannel::Deltas),
+        Some("detections" | "detection") => Ok(EventStreamChannel::Detections),
+        Some("signals" | "signal") => Ok(EventStreamChannel::Signals),
+        Some(other) => Err(json_err(
+            StatusCode::BAD_REQUEST,
+            "invalid_channel",
+            format!(
+                "Invalid stream channel '{other}'. Expected one of: all, deltas, detections, signals"
+            ),
+        )),
+    }
+}
+
+fn epoch_ms_now() -> i64 {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    i64::try_from(ts.as_millis()).unwrap_or(0)
+}
+
+fn redact_json_value(value: &mut serde_json::Value, redactor: &Redactor) {
+    match value {
+        serde_json::Value::String(s) => {
+            *s = redactor.redact(s);
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact_json_value(item, redactor);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for v in map.values_mut() {
+                redact_json_value(v, redactor);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
+struct TokioSseStream {
+    rx: mpsc::Receiver<SseEvent>,
+}
+
+impl TokioSseStream {
+    fn new(rx: mpsc::Receiver<SseEvent>) -> Self {
+        Self { rx }
+    }
+}
+
+impl Stream for TokioSseStream {
+    type Item = SseEvent;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.rx.poll_recv(cx)
+    }
+}
+
+fn make_stream_frame(
+    stream: &'static str,
+    kind: &'static str,
+    seq: u64,
+    data: serde_json::Value,
+) -> serde_json::Value {
+    json!({
+        "schema": STREAM_SCHEMA_VERSION,
+        "stream": stream,
+        "kind": kind,
+        "seq": seq,
+        "ts_ms": epoch_ms_now(),
+        "data": data
+    })
+}
+
+fn frame_to_sse(event_type: &'static str, seq: u64, frame: serde_json::Value) -> Option<SseEvent> {
+    serde_json::to_string(&frame).ok().map(|body| {
+        SseEvent::new(body)
+            .event_type(event_type)
+            .id(seq.to_string())
+    })
+}
+
+async fn send_rate_limited_sse(
+    tx: &mpsc::Sender<SseEvent>,
+    event: SseEvent,
+    next_emit_at: &mut Instant,
+    min_interval: Duration,
+    consecutive_drops: &mut u64,
+) -> bool {
+    let now = Instant::now();
+    if *next_emit_at > now {
+        tokio::time::sleep(*next_emit_at - now).await;
+    }
+    *next_emit_at = Instant::now() + min_interval;
+
+    match tx.try_send(event) {
+        Ok(()) => {
+            *consecutive_drops = 0;
+            true
+        }
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            *consecutive_drops += 1;
+            *consecutive_drops < STREAM_MAX_CONSECUTIVE_DROPS
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => false,
+    }
+}
+
+fn event_matches_pane(event: &Event, pane_filter: Option<u64>) -> bool {
+    pane_filter.is_none_or(|pane_id| event.pane_id() == Some(pane_id))
+}
+
+async fn emit_new_segment_frames(
+    storage: &StorageHandle,
+    pane_filter: Option<u64>,
+    started_at_ms: i64,
+    after_id: &mut Option<i64>,
+    redactor: &Redactor,
+    tx: &mpsc::Sender<SseEvent>,
+    seq: &mut u64,
+    next_emit_at: &mut Instant,
+    min_interval: Duration,
+    consecutive_drops: &mut u64,
+) -> bool {
+    for _ in 0..STREAM_SCAN_MAX_PAGES {
+        let query = SegmentScanQuery {
+            after_id: *after_id,
+            pane_id: pane_filter,
+            since: Some(started_at_ms),
+            until: None,
+            limit: STREAM_SCAN_LIMIT,
+        };
+
+        let segments = match storage.scan_segments(query).await {
+            Ok(segments) => segments,
+            Err(err) => {
+                *seq += 1;
+                let frame = make_stream_frame(
+                    "deltas",
+                    "error",
+                    *seq,
+                    json!({
+                        "code": "storage_error",
+                        "message": redactor.redact(&err.to_string())
+                    }),
+                );
+                if let Some(event) = frame_to_sse("error", *seq, frame) {
+                    let _ = send_rate_limited_sse(
+                        tx,
+                        event,
+                        next_emit_at,
+                        min_interval,
+                        consecutive_drops,
+                    )
+                    .await;
+                }
+                return false;
+            }
+        };
+
+        if segments.is_empty() {
+            break;
+        }
+
+        let page_len = segments.len();
+        for segment in segments {
+            *after_id = Some(segment.id);
+
+            *seq += 1;
+            let frame = make_stream_frame(
+                "deltas",
+                "delta",
+                *seq,
+                json!({
+                    "segment_id": segment.id,
+                    "pane_id": segment.pane_id,
+                    "seq": segment.seq,
+                    "captured_at": segment.captured_at,
+                    "content_len": segment.content_len,
+                    "content": redactor.redact(&segment.content),
+                }),
+            );
+
+            if let Some(event) = frame_to_sse("delta", *seq, frame) {
+                if !send_rate_limited_sse(tx, event, next_emit_at, min_interval, consecutive_drops)
+                    .await
+                {
+                    return false;
+                }
+            }
+        }
+
+        if page_len < STREAM_SCAN_LIMIT {
+            break;
+        }
+    }
+
+    true
+}
+
+fn handle_stream_events(
+    req: &Request,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>> {
+    let qs_raw = req.query().unwrap_or("").to_string();
+    let qs = QueryString::parse(&qs_raw);
+    let pane_filter = parse_u64(&qs, "pane_id");
+    let max_hz = parse_stream_max_hz(&qs);
+    let channel = match parse_event_stream_channel(&qs) {
+        Ok(channel) => channel,
+        Err(resp) => return Box::pin(async move { resp }),
+    };
+    let result = require_event_bus(req);
+
+    Box::pin(async move {
+        let (event_bus, redactor) = match result {
+            Ok(r) => r,
+            Err(resp) => return resp,
+        };
+
+        let mut subscriber = match channel {
+            EventStreamChannel::All => event_bus.subscribe(),
+            EventStreamChannel::Deltas => event_bus.subscribe_deltas(),
+            EventStreamChannel::Detections => event_bus.subscribe_detections(),
+            EventStreamChannel::Signals => event_bus.subscribe_signals(),
+        };
+
+        let (tx, rx) = mpsc::channel(STREAM_CHANNEL_BUFFER);
+        tokio::spawn(async move {
+            let min_interval = Duration::from_millis((1000 / max_hz.max(1)).max(1));
+            let mut next_emit_at = Instant::now();
+            let mut seq = 0_u64;
+            let mut consecutive_drops = 0_u64;
+
+            seq += 1;
+            let ready = make_stream_frame(
+                "events",
+                "ready",
+                seq,
+                json!({
+                    "channel": format!("{channel:?}").to_lowercase(),
+                    "max_hz": max_hz,
+                    "pane_id": pane_filter
+                }),
+            );
+            if let Some(event) = frame_to_sse("ready", seq, ready) {
+                if !send_rate_limited_sse(
+                    &tx,
+                    event,
+                    &mut next_emit_at,
+                    min_interval,
+                    &mut consecutive_drops,
+                )
+                .await
+                {
+                    return;
+                }
+            }
+
+            loop {
+                let recv_result = tokio::select! {
+                    () = tx.closed() => break,
+                    recv = tokio::time::timeout(
+                        Duration::from_secs(STREAM_KEEPALIVE_SECS),
+                        subscriber.recv(),
+                    ) => recv,
+                };
+
+                match recv_result {
+                    Ok(Ok(event)) => {
+                        if !event_matches_pane(&event, pane_filter) {
+                            continue;
+                        }
+
+                        let mut event_json = serde_json::to_value(&event).unwrap_or_else(|_| {
+                            json!({
+                                "error": "event_serialization_failed"
+                            })
+                        });
+                        redact_json_value(&mut event_json, &redactor);
+
+                        seq += 1;
+                        let frame = make_stream_frame(
+                            "events",
+                            "event",
+                            seq,
+                            json!({ "event": event_json }),
+                        );
+                        if let Some(event) = frame_to_sse("event", seq, frame) {
+                            if !send_rate_limited_sse(
+                                &tx,
+                                event,
+                                &mut next_emit_at,
+                                min_interval,
+                                &mut consecutive_drops,
+                            )
+                            .await
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    Ok(Err(RecvError::Lagged { missed_count })) => {
+                        seq += 1;
+                        let frame = make_stream_frame(
+                            "events",
+                            "lag",
+                            seq,
+                            json!({ "missed_count": missed_count }),
+                        );
+                        if let Some(event) = frame_to_sse("lag", seq, frame) {
+                            if !send_rate_limited_sse(
+                                &tx,
+                                event,
+                                &mut next_emit_at,
+                                min_interval,
+                                &mut consecutive_drops,
+                            )
+                            .await
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    Ok(Err(RecvError::Closed)) => break,
+                    Err(_) => {
+                        if tx.try_send(SseEvent::comment("keepalive")).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        SseResponse::new(TokioSseStream::new(rx)).into_response()
+    })
+}
+
+fn handle_stream_deltas(
+    req: &Request,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>> {
+    let qs_raw = req.query().unwrap_or("").to_string();
+    let qs = QueryString::parse(&qs_raw);
+    let pane_filter = parse_u64(&qs, "pane_id");
+    let max_hz = parse_stream_max_hz(&qs);
+    let result = require_storage_and_event_bus(req);
+
+    Box::pin(async move {
+        let (storage, event_bus, redactor) = match result {
+            Ok(r) => r,
+            Err(resp) => return resp,
+        };
+
+        let mut subscriber = event_bus.subscribe_deltas();
+        let (tx, rx) = mpsc::channel(STREAM_CHANNEL_BUFFER);
+        let started_at_ms = epoch_ms_now();
+        tokio::spawn(async move {
+            let min_interval = Duration::from_millis((1000 / max_hz.max(1)).max(1));
+            let mut next_emit_at = Instant::now();
+            let mut seq = 0_u64;
+            let mut consecutive_drops = 0_u64;
+            let mut after_id: Option<i64> = None;
+
+            seq += 1;
+            let ready = make_stream_frame(
+                "deltas",
+                "ready",
+                seq,
+                json!({
+                    "max_hz": max_hz,
+                    "pane_id": pane_filter
+                }),
+            );
+            if let Some(event) = frame_to_sse("ready", seq, ready) {
+                if !send_rate_limited_sse(
+                    &tx,
+                    event,
+                    &mut next_emit_at,
+                    min_interval,
+                    &mut consecutive_drops,
+                )
+                .await
+                {
+                    return;
+                }
+            }
+
+            loop {
+                let recv_result = tokio::select! {
+                    () = tx.closed() => break,
+                    recv = tokio::time::timeout(
+                        Duration::from_secs(STREAM_KEEPALIVE_SECS),
+                        subscriber.recv(),
+                    ) => recv,
+                };
+
+                match recv_result {
+                    Ok(Ok(Event::SegmentCaptured { pane_id, .. })) => {
+                        if pane_filter.is_some_and(|pid| pid != pane_id) {
+                            continue;
+                        }
+                        if !emit_new_segment_frames(
+                            &storage,
+                            pane_filter,
+                            started_at_ms,
+                            &mut after_id,
+                            &redactor,
+                            &tx,
+                            &mut seq,
+                            &mut next_emit_at,
+                            min_interval,
+                            &mut consecutive_drops,
+                        )
+                        .await
+                        {
+                            break;
+                        }
+                    }
+                    Ok(Ok(Event::GapDetected { pane_id, reason })) => {
+                        if pane_filter.is_some_and(|pid| pid != pane_id) {
+                            continue;
+                        }
+
+                        seq += 1;
+                        let frame = make_stream_frame(
+                            "deltas",
+                            "gap",
+                            seq,
+                            json!({
+                                "pane_id": pane_id,
+                                "reason": redactor.redact(&reason),
+                            }),
+                        );
+                        if let Some(event) = frame_to_sse("gap", seq, frame) {
+                            if !send_rate_limited_sse(
+                                &tx,
+                                event,
+                                &mut next_emit_at,
+                                min_interval,
+                                &mut consecutive_drops,
+                            )
+                            .await
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(RecvError::Lagged { missed_count })) => {
+                        seq += 1;
+                        let frame = make_stream_frame(
+                            "deltas",
+                            "lag",
+                            seq,
+                            json!({ "missed_count": missed_count }),
+                        );
+                        if let Some(event) = frame_to_sse("lag", seq, frame) {
+                            if !send_rate_limited_sse(
+                                &tx,
+                                event,
+                                &mut next_emit_at,
+                                min_interval,
+                                &mut consecutive_drops,
+                            )
+                            .await
+                            {
+                                break;
+                            }
+                        }
+
+                        if !emit_new_segment_frames(
+                            &storage,
+                            pane_filter,
+                            started_at_ms,
+                            &mut after_id,
+                            &redactor,
+                            &tx,
+                            &mut seq,
+                            &mut next_emit_at,
+                            min_interval,
+                            &mut consecutive_drops,
+                        )
+                        .await
+                        {
+                            break;
+                        }
+                    }
+                    Ok(Err(RecvError::Closed)) => break,
+                    Err(_) => {
+                        let _ = tx.try_send(SseEvent::comment("keepalive"));
+                    }
+                }
+            }
+        });
+
+        SseResponse::new(TokioSseStream::new(rx)).into_response()
+    })
 }
 
 // =============================================================================
@@ -880,9 +1473,10 @@ fn handle_saved_searches(
 // App builder
 // =============================================================================
 
-fn build_app(storage: Option<StorageHandle>) -> App {
+fn build_app(storage: Option<StorageHandle>, event_bus: Option<Arc<EventBus>>) -> App {
     let state = AppState {
         storage,
+        event_bus,
         redactor: Arc::new(Redactor::new()),
     };
 
@@ -925,6 +1519,16 @@ fn build_app(storage: Option<StorageHandle>) -> App {
             Method::Get,
             |_ctx: &RequestContext, req: &mut Request| handle_saved_searches(req),
         )
+        .route(
+            "/stream/events",
+            Method::Get,
+            |_ctx: &RequestContext, req: &mut Request| handle_stream_events(req),
+        )
+        .route(
+            "/stream/deltas",
+            Method::Get,
+            |_ctx: &RequestContext, req: &mut Request| handle_stream_deltas(req),
+        )
         .build()
 }
 
@@ -948,7 +1552,7 @@ pub async fn start_web_server(config: WebServerConfig) -> Result<WebServerHandle
         );
     }
     let bind_addr = config.bind_addr();
-    let app = build_app(config.storage);
+    let app = build_app(config.storage, config.event_bus);
 
     match app.run_startup_hooks().await {
         StartupOutcome::Success => {}

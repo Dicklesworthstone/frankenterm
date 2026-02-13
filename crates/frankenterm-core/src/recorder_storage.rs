@@ -168,7 +168,9 @@ pub enum RecorderStorageError {
     #[error("invalid append request: {message}")]
     InvalidRequest { message: String },
 
-    #[error("checkpoint regression for consumer {consumer}: current={current_ordinal}, attempted={attempted_ordinal}")]
+    #[error(
+        "checkpoint regression for consumer {consumer}: current={current_ordinal}, attempted={attempted_ordinal}"
+    )]
     CheckpointRegression {
         consumer: String,
         current_ordinal: u64,
@@ -211,10 +213,8 @@ pub trait RecorderStorage: Send + Sync {
         req: AppendRequest,
     ) -> std::result::Result<AppendResponse, RecorderStorageError>;
 
-    async fn flush(
-        &self,
-        mode: FlushMode,
-    ) -> std::result::Result<FlushStats, RecorderStorageError>;
+    async fn flush(&self, mode: FlushMode)
+    -> std::result::Result<FlushStats, RecorderStorageError>;
 
     async fn read_checkpoint(
         &self,
@@ -891,7 +891,8 @@ mod tests {
                 .truncate(true)
                 .open(&cfg.data_path)
                 .unwrap();
-            file.write_all(&(payload.len() as u32).to_le_bytes()).unwrap();
+            file.write_all(&(payload.len() as u32).to_le_bytes())
+                .unwrap();
             file.write_all(&payload).unwrap();
             file.write_all(&(100u32).to_le_bytes()).unwrap();
             file.write_all(b"abc").unwrap();

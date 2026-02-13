@@ -723,13 +723,13 @@ impl Default for GlobalSequence {
 /// A collecting tap that stores all received events for testing.
 ///
 /// Uses `std::sync::Mutex` (not async) because these methods are synchronous.
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(test)]
 #[derive(Debug, Default)]
 pub struct CollectingTap {
     events: std::sync::Mutex<Vec<IngressEvent>>,
 }
 
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(test)]
 impl CollectingTap {
     /// Create a new empty collecting tap.
     #[must_use]
@@ -753,7 +753,7 @@ impl CollectingTap {
     }
 }
 
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(test)]
 impl IngressTap for CollectingTap {
     fn on_ingress(&self, event: IngressEvent) {
         self.events.lock().unwrap().push(event);
@@ -841,13 +841,13 @@ pub fn captured_kind_to_segment(
 }
 
 /// A collecting egress tap that stores all received events for testing.
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(test)]
 #[derive(Debug, Default)]
 pub struct CollectingEgressTap {
     events: std::sync::Mutex<Vec<EgressEvent>>,
 }
 
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(test)]
 impl CollectingEgressTap {
     /// Create a new empty collecting egress tap.
     #[must_use]
@@ -871,7 +871,7 @@ impl CollectingEgressTap {
     }
 }
 
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(test)]
 impl EgressTap for CollectingEgressTap {
     fn on_egress(&self, event: EgressEvent) {
         self.events.lock().unwrap().push(event);

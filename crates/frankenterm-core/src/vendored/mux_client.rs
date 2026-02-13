@@ -1,3 +1,4 @@
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -75,10 +76,14 @@ pub enum DirectMuxError {
     Disconnected,
     #[error("frame exceeded max size ({max_bytes} bytes)")]
     FrameTooLarge { max_bytes: usize },
+    #[error("request serial space exhausted for this connection")]
+    SerialExhausted,
     #[error("codec error: {0}")]
     Codec(String),
     #[error("remote error: {0}")]
     RemoteError(String),
+    #[error("pipeline batch timed out after {timeout_ms}ms")]
+    BatchTimeout { timeout_ms: u64 },
     #[error("unexpected response: expected {expected}, got {got}")]
     UnexpectedResponse { expected: String, got: String },
     #[error("codec version mismatch: local {local} != remote {remote} (version {remote_version})")]
@@ -113,7 +118,9 @@ impl DirectMuxError {
             | Self::WriteTimeout
             | Self::ConnectTimeout(_)
             | Self::FrameTooLarge { .. }
-            | Self::Codec(_) => ProtocolErrorKind::Recoverable,
+            | Self::Codec(_)
+            | Self::BatchTimeout { .. }
+            | Self::SerialExhausted => ProtocolErrorKind::Recoverable,
             Self::IncompatibleCodec { .. }
             | Self::SocketPathMissing
             | Self::SocketNotFound(_)
@@ -134,6 +141,7 @@ pub struct DirectMuxClient {
     socket_path: PathBuf,
     read_buf: Vec<u8>,
     serial: u64,
+    pending_responses: HashMap<u64, Pdu>,
     config: DirectMuxClientConfig,
 }
 
@@ -142,6 +150,7 @@ impl std::fmt::Debug for DirectMuxClient {
         f.debug_struct("DirectMuxClient")
             .field("socket_path", &self.socket_path)
             .field("serial", &self.serial)
+            .field("pending_responses", &self.pending_responses.len())
             .finish_non_exhaustive()
     }
 }
@@ -163,6 +172,7 @@ impl DirectMuxClient {
             socket_path,
             read_buf: Vec::new(),
             serial: 0,
+            pending_responses: HashMap::new(),
             config,
         };
 
@@ -308,32 +318,163 @@ impl DirectMuxClient {
         }
     }
 
+    /// Batch `GetPaneRenderChanges` requests with depth-limited pipelining.
+    ///
+    /// Responses are returned in the same order as `pane_ids`, regardless of
+    /// on-wire response ordering.
+    pub async fn get_pane_render_changes_batch(
+        &mut self,
+        pane_ids: &[u64],
+        max_pipeline_depth: usize,
+        pipeline_timeout: Duration,
+    ) -> Result<Vec<GetPaneRenderChangesResponse>, DirectMuxError> {
+        if pane_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let requests = pane_ids
+            .iter()
+            .map(|pane_id| {
+                Pdu::GetPaneRenderChanges(GetPaneRenderChanges {
+                    pane_id: *pane_id as usize,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let responses = self
+            .batch(requests, max_pipeline_depth, pipeline_timeout)
+            .await?;
+        let mut out = Vec::with_capacity(responses.len());
+        for response in responses {
+            match response {
+                Pdu::GetPaneRenderChangesResponse(payload) => out.push(payload),
+                other => {
+                    return Err(DirectMuxError::UnexpectedResponse {
+                        expected: "GetPaneRenderChangesResponse".to_string(),
+                        got: other.pdu_name().to_string(),
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Send a batch of requests using depth-limited pipelining.
+    ///
+    /// The method issues up to `max_pipeline_depth` requests before waiting
+    /// for a response, then keeps the pipeline full until all requests are
+    /// completed. Responses are returned in request order.
+    pub async fn batch(
+        &mut self,
+        requests: Vec<Pdu>,
+        max_pipeline_depth: usize,
+        pipeline_timeout: Duration,
+    ) -> Result<Vec<Pdu>, DirectMuxError> {
+        let timeout_ms = duration_to_ms_u64(pipeline_timeout);
+        tokio::time::timeout(
+            pipeline_timeout,
+            self.batch_inner(requests, max_pipeline_depth.max(1)),
+        )
+        .await
+        .map_err(|_| DirectMuxError::BatchTimeout { timeout_ms })?
+    }
+
+    async fn batch_inner(
+        &mut self,
+        requests: Vec<Pdu>,
+        max_pipeline_depth: usize,
+    ) -> Result<Vec<Pdu>, DirectMuxError> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        if max_pipeline_depth <= 1 {
+            let mut responses = Vec::with_capacity(requests.len());
+            for request in requests {
+                responses.push(self.send_request(request).await?);
+            }
+            return Ok(responses);
+        }
+
+        let total = requests.len();
+        let mut requests = requests.into_iter().enumerate();
+        let mut in_flight: VecDeque<(usize, u64)> = VecDeque::with_capacity(max_pipeline_depth);
+        let mut responses: Vec<Option<Pdu>> = std::iter::repeat_with(|| None).take(total).collect();
+
+        while in_flight.len() < max_pipeline_depth {
+            let Some((request_idx, request)) = requests.next() else {
+                break;
+            };
+            let serial = self.send_request_only(request).await?;
+            in_flight.push_back((request_idx, serial));
+        }
+
+        while !in_flight.is_empty() {
+            let decoded = self.read_next_pdu().await?;
+            if let Some(response_idx) = take_in_flight_slot(&mut in_flight, decoded.serial) {
+                responses[response_idx] = Some(Self::response_from_pdu(decoded.pdu)?);
+                if let Some((request_idx, request)) = requests.next() {
+                    let serial = self.send_request_only(request).await?;
+                    in_flight.push_back((request_idx, serial));
+                }
+            } else {
+                self.stash_pending_response(decoded.serial, decoded.pdu)?;
+            }
+        }
+
+        let mut ordered = Vec::with_capacity(total);
+        for response in responses {
+            ordered.push(response.ok_or_else(|| {
+                DirectMuxError::Codec("pipeline batch completed with missing response".to_string())
+            })?);
+        }
+        Ok(ordered)
+    }
+
     async fn send_request(&mut self, pdu: Pdu) -> Result<Pdu, DirectMuxError> {
-        self.serial = self.serial.wrapping_add(1).max(1);
-        let serial = self.serial;
-
-        let mut buf = Vec::new();
-        pdu.encode(&mut buf, serial)
-            .map_err(|err| DirectMuxError::Codec(err.to_string()))?;
-
-        tokio::time::timeout(self.config.write_timeout, self.stream.write_all(&buf))
-            .await
-            .map_err(|_| DirectMuxError::WriteTimeout)??;
-
+        let serial = self.send_request_only(pdu).await?;
         self.await_response(serial).await
     }
 
+    async fn send_request_only(&mut self, pdu: Pdu) -> Result<u64, DirectMuxError> {
+        let serial = next_request_serial(&mut self.serial)?;
+        let mut buf = Vec::new();
+        pdu.encode(&mut buf, serial)
+            .map_err(|err| DirectMuxError::Codec(err.to_string()))?;
+        tokio::time::timeout(self.config.write_timeout, self.stream.write_all(&buf))
+            .await
+            .map_err(|_| DirectMuxError::WriteTimeout)??;
+        Ok(serial)
+    }
+
     async fn await_response(&mut self, serial: u64) -> Result<Pdu, DirectMuxError> {
+        if let Some(pending) = self.pending_responses.remove(&serial) {
+            return Self::response_from_pdu(pending);
+        }
         loop {
             let decoded = self.read_next_pdu().await?;
-            if decoded.serial != serial {
-                continue;
+            if decoded.serial == serial {
+                return Self::response_from_pdu(decoded.pdu);
             }
-            return match decoded.pdu {
-                Pdu::ErrorResponse(err) => Err(DirectMuxError::RemoteError(err.reason)),
-                other => Ok(other),
-            };
+            self.stash_pending_response(decoded.serial, decoded.pdu)?;
         }
+    }
+
+    fn response_from_pdu(pdu: Pdu) -> Result<Pdu, DirectMuxError> {
+        match pdu {
+            Pdu::ErrorResponse(err) => Err(DirectMuxError::RemoteError(err.reason)),
+            other => Ok(other),
+        }
+    }
+
+    fn stash_pending_response(&mut self, serial: u64, pdu: Pdu) -> Result<(), DirectMuxError> {
+        if self.pending_responses.insert(serial, pdu).is_some() {
+            return Err(DirectMuxError::UnexpectedResponse {
+                expected: "unique serial".to_string(),
+                got: format!("duplicate response serial {serial}"),
+            });
+        }
+        Ok(())
     }
 
     async fn read_next_pdu(&mut self) -> Result<DecodedPdu, DirectMuxError> {
@@ -359,6 +500,24 @@ impl DirectMuxClient {
             }
         }
     }
+}
+
+fn next_request_serial(serial: &mut u64) -> Result<u64, DirectMuxError> {
+    *serial = serial
+        .checked_add(1)
+        .ok_or(DirectMuxError::SerialExhausted)?;
+    Ok(*serial)
+}
+
+fn duration_to_ms_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn take_in_flight_slot(in_flight: &mut VecDeque<(usize, u64)>, serial: u64) -> Option<usize> {
+    let pos = in_flight
+        .iter()
+        .position(|(_, expected)| *expected == serial)?;
+    in_flight.remove(pos).map(|(idx, _)| idx)
 }
 
 fn decode_from_buffer(
@@ -597,7 +756,8 @@ pub fn subscribe_pane_output(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use proptest::prelude::*;
+    use std::collections::{HashMap, HashSet};
 
     #[test]
     fn decode_from_buffer_roundtrip() {
@@ -684,6 +844,166 @@ mod tests {
     }
 
     #[test]
+    fn next_request_serial_rejects_overflow() {
+        let mut serial = u64::MAX;
+        let err = next_request_serial(&mut serial).expect_err("overflow should be rejected");
+        assert!(matches!(err, DirectMuxError::SerialExhausted));
+    }
+
+    fn permutation_from_keys(keys: &[u32]) -> Vec<usize> {
+        let mut with_index = keys
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(idx, key)| (key, idx))
+            .collect::<Vec<_>>();
+        with_index.sort_unstable();
+        with_index.into_iter().map(|(_, idx)| idx).collect()
+    }
+
+    fn causal_response_order(
+        total_requests: usize,
+        max_pipeline_depth: usize,
+        keys: &[u32],
+    ) -> Vec<usize> {
+        let mut in_flight: VecDeque<usize> = VecDeque::new();
+        let mut order = Vec::with_capacity(total_requests);
+        let depth = max_pipeline_depth.max(1);
+        let mut next_request = 0usize;
+        let mut key_cursor = 0usize;
+
+        while next_request < total_requests && in_flight.len() < depth {
+            in_flight.push_back(next_request);
+            next_request += 1;
+        }
+
+        while !in_flight.is_empty() {
+            let key = keys[key_cursor % keys.len()];
+            let pick = (key as usize) % in_flight.len();
+            let response_idx = in_flight
+                .remove(pick)
+                .expect("picked index must refer to in-flight request");
+            order.push(response_idx);
+
+            if next_request < total_requests {
+                in_flight.push_back(next_request);
+                next_request += 1;
+            }
+            key_cursor += 1;
+        }
+
+        order
+    }
+
+    fn simulate_pipeline_dispatch(
+        total_requests: usize,
+        max_pipeline_depth: usize,
+        response_order: &[usize],
+    ) -> (Vec<Option<u64>>, usize) {
+        let depth = max_pipeline_depth.max(1);
+        let mut in_flight: VecDeque<(usize, u64)> = VecDeque::new();
+        let mut delivered: Vec<Option<u64>> = vec![None; total_requests];
+        let mut next_request = 0usize;
+        let mut peak = 0usize;
+
+        while next_request < total_requests && in_flight.len() < depth {
+            let serial = (next_request + 1) as u64;
+            in_flight.push_back((next_request, serial));
+            next_request += 1;
+            peak = peak.max(in_flight.len());
+        }
+
+        for &response_idx in response_order {
+            let serial = (response_idx + 1) as u64;
+            let slot = take_in_flight_slot(&mut in_flight, serial)
+                .expect("response serial must correspond to an in-flight request");
+            delivered[slot] = Some(serial);
+            if next_request < total_requests {
+                let serial = (next_request + 1) as u64;
+                in_flight.push_back((next_request, serial));
+                next_request += 1;
+                peak = peak.max(in_flight.len());
+            }
+        }
+
+        (delivered, peak)
+    }
+
+    proptest! {
+        #[test]
+        fn prop_message_ordering_invariant(keys in prop::collection::vec(any::<u32>(), 1..64)) {
+            let total = keys.len();
+            let order = permutation_from_keys(&keys);
+            let (delivered, _) = simulate_pipeline_dispatch(total, total, &order);
+
+            for (idx, serial) in delivered.into_iter().enumerate() {
+                prop_assert_eq!(serial, Some((idx + 1) as u64));
+            }
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn prop_pipeline_completeness(
+            (total, depth, keys) in (1usize..96, 1usize..32).prop_flat_map(|(total, depth)| {
+                (
+                    Just(total),
+                    Just(depth),
+                    prop::collection::vec(any::<u32>(), total),
+                )
+            })
+        ) {
+            let order = causal_response_order(total, depth, &keys);
+            let (delivered, _) = simulate_pipeline_dispatch(total, depth, &order);
+
+            prop_assert_eq!(delivered.iter().filter(|v| v.is_some()).count(), total);
+            let unique = delivered
+                .into_iter()
+                .flatten()
+                .collect::<HashSet<_>>();
+            prop_assert_eq!(unique.len(), total);
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn prop_sequence_numbers_monotonic_and_unique(
+            start in 0u64..1_000_000,
+            count in 1usize..10_000
+        ) {
+            let mut serial = start;
+            let mut previous = serial;
+            let mut seen = HashSet::new();
+
+            for _ in 0..count {
+                let next = next_request_serial(&mut serial).expect("serial should advance");
+                prop_assert!(next > previous);
+                prop_assert!(seen.insert(next));
+                previous = next;
+            }
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn prop_depth_limiting_enforced(
+            (total, depth, keys) in (1usize..96, 1usize..64).prop_flat_map(|(total, depth)| {
+                (
+                    Just(total),
+                    Just(depth),
+                    prop::collection::vec(any::<u32>(), total),
+                )
+            })
+        ) {
+            let order = causal_response_order(total, depth, &keys);
+            let (_delivered, peak) = simulate_pipeline_dispatch(total, depth, &order);
+
+            prop_assert!(peak <= depth.max(1));
+            prop_assert_eq!(peak, total.min(depth.max(1)));
+        }
+    }
+
+    #[test]
     fn default_config_has_sane_timeouts() {
         let config = DirectMuxClientConfig::default();
         assert!(config.connect_timeout.as_secs() > 0);
@@ -746,8 +1066,10 @@ mod tests {
             DirectMuxError::WriteTimeout,
             DirectMuxError::Disconnected,
             DirectMuxError::FrameTooLarge { max_bytes: 1024 },
+            DirectMuxError::SerialExhausted,
             DirectMuxError::Codec("bad frame".to_string()),
             DirectMuxError::RemoteError("denied".to_string()),
+            DirectMuxError::BatchTimeout { timeout_ms: 5000 },
             DirectMuxError::UnexpectedResponse {
                 expected: "Pong".to_string(),
                 got: "Error".to_string(),

@@ -80,8 +80,7 @@ fn arb_timestamp() -> impl Strategy<Value = i64> {
 
 /// Arbitrary content string (for fingerprinting).
 fn arb_content() -> impl Strategy<Value = String> {
-    proptest::collection::vec("[ -~]{0,80}\n", 0..100)
-        .prop_map(|lines| lines.join(""))
+    proptest::collection::vec("[ -~]{0,80}\n", 0..100).prop_map(|lines| lines.join(""))
 }
 
 /// Arbitrary reason string for Ignored / Gap.

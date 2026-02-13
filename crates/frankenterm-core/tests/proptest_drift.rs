@@ -43,27 +43,29 @@ fn arb_observations(max_len: usize) -> impl Strategy<Value = Vec<f64>> {
 
 fn arb_config() -> impl Strategy<Value = DriftConfig> {
     (
-        any::<bool>(),          // enabled
-        0.001..=0.5_f64,        // confidence
-        4usize..=50,            // min_window_size
-        100usize..=500,         // max_window_size
-        0.0..=5.0_f64,          // min_mean_diff
+        any::<bool>(),   // enabled
+        0.001..=0.5_f64, // confidence
+        4usize..=50,     // min_window_size
+        100usize..=500,  // max_window_size
+        0.0..=5.0_f64,   // min_mean_diff
     )
-        .prop_map(|(enabled, confidence, min_ws, max_ws, min_diff)| DriftConfig {
-            enabled,
-            confidence,
-            min_window_size: min_ws,
-            max_window_size: max_ws.max(min_ws + 10),
-            min_mean_diff: min_diff,
-        })
+        .prop_map(
+            |(enabled, confidence, min_ws, max_ws, min_diff)| DriftConfig {
+                enabled,
+                confidence,
+                min_window_size: min_ws,
+                max_window_size: max_ws.max(min_ws + 10),
+                min_mean_diff: min_diff,
+            },
+        )
 }
 
 fn arb_drift_info() -> impl Strategy<Value = DriftInfo> {
     (
-        -100.0..=100.0_f64,     // old_mean
-        -100.0..=100.0_f64,     // new_mean
-        1usize..=1000,          // dropped_count
-        1usize..=1000,          // remaining_count
+        -100.0..=100.0_f64, // old_mean
+        -100.0..=100.0_f64, // new_mean
+        1usize..=1000,      // dropped_count
+        1usize..=1000,      // remaining_count
     )
         .prop_map(|(old_mean, new_mean, dropped, remaining)| {
             let mean_diff = (old_mean - new_mean).abs();

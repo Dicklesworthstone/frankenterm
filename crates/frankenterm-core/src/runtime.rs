@@ -45,6 +45,7 @@ use crate::native_events::{NativeEvent, NativeEventListener};
 use crate::patterns::{Detection, DetectionContext, PatternEngine};
 use crate::recording::RecordingManager;
 use crate::runtime_compat::{mpsc, watch};
+use crate::spsc_ring_buffer::{SpscConsumer, SpscProducer, channel as spsc_channel};
 #[cfg(feature = "native-wezterm")]
 use crate::storage::PaneRecord;
 use crate::storage::{StorageHandle, StoredEvent};
@@ -292,6 +293,28 @@ pub struct RuntimeMetrics {
     ingest_lag_count: ShardedCounter,
     /// Maximum ingest lag observed
     ingest_lag_max_ms: ShardedMax,
+    /// Sum of storage mutex wait time samples (microseconds).
+    storage_lock_wait_us_sum: ShardedCounter,
+    /// Count of storage mutex wait time samples.
+    storage_lock_wait_samples: ShardedCounter,
+    /// Maximum storage mutex wait time observed (microseconds).
+    storage_lock_wait_us_max: ShardedMax,
+    /// Number of storage lock acquisitions with meaningful wait (contention).
+    storage_lock_contention_events: ShardedCounter,
+    /// Sum of storage mutex hold time samples (microseconds).
+    storage_lock_hold_us_sum: ShardedCounter,
+    /// Count of storage mutex hold time samples.
+    storage_lock_hold_samples: ShardedCounter,
+    /// Maximum storage mutex hold time observed (microseconds).
+    storage_lock_hold_us_max: ShardedMax,
+    /// Number of cursor snapshot memory samples.
+    cursor_snapshot_samples: ShardedCounter,
+    /// Sum of cursor snapshot bytes across samples.
+    cursor_snapshot_bytes_sum: ShardedCounter,
+    /// Peak cursor snapshot bytes observed.
+    cursor_snapshot_bytes_max: ShardedMax,
+    /// Last cursor snapshot bytes sample.
+    cursor_snapshot_bytes_last: ShardedGauge,
     /// Total native pane output events received (pre-coalesce).
     native_output_input_events: ShardedCounter,
     /// Total native pane output batches emitted (post-coalesce).
@@ -316,6 +339,17 @@ impl Default for RuntimeMetrics {
             ingest_lag_sum_ms: ShardedCounter::new(),
             ingest_lag_count: ShardedCounter::new(),
             ingest_lag_max_ms: ShardedMax::new(),
+            storage_lock_wait_us_sum: ShardedCounter::new(),
+            storage_lock_wait_samples: ShardedCounter::new(),
+            storage_lock_wait_us_max: ShardedMax::new(),
+            storage_lock_contention_events: ShardedCounter::new(),
+            storage_lock_hold_us_sum: ShardedCounter::new(),
+            storage_lock_hold_samples: ShardedCounter::new(),
+            storage_lock_hold_us_max: ShardedMax::new(),
+            cursor_snapshot_samples: ShardedCounter::new(),
+            cursor_snapshot_bytes_sum: ShardedCounter::new(),
+            cursor_snapshot_bytes_max: ShardedMax::new(),
+            cursor_snapshot_bytes_last: ShardedGauge::new(),
             native_output_input_events: ShardedCounter::new(),
             native_output_batches_emitted: ShardedCounter::new(),
             native_output_input_bytes: ShardedCounter::new(),
@@ -339,6 +373,33 @@ impl RuntimeMetrics {
         self.last_db_write_at.set(epoch_ms_u64());
     }
 
+    /// Record storage mutex lock wait duration.
+    pub fn record_storage_lock_wait(&self, waited: Duration) {
+        let waited_us = u64::try_from(waited.as_micros()).unwrap_or(u64::MAX);
+        self.storage_lock_wait_us_sum.add(waited_us);
+        self.storage_lock_wait_samples.increment();
+        self.storage_lock_wait_us_max.observe(waited_us);
+        if waited_us >= STORAGE_LOCK_CONTENTION_MIN_US {
+            self.storage_lock_contention_events.increment();
+        }
+    }
+
+    /// Record storage mutex lock hold duration.
+    pub fn record_storage_lock_hold(&self, held: Duration) {
+        let held_us = u64::try_from(held.as_micros()).unwrap_or(u64::MAX);
+        self.storage_lock_hold_us_sum.add(held_us);
+        self.storage_lock_hold_samples.increment();
+        self.storage_lock_hold_us_max.observe(held_us);
+    }
+
+    /// Record a cursor snapshot memory sample.
+    pub fn record_cursor_snapshot_memory(&self, total_bytes: u64) {
+        self.cursor_snapshot_samples.increment();
+        self.cursor_snapshot_bytes_sum.add(total_bytes);
+        self.cursor_snapshot_bytes_max.observe(total_bytes);
+        self.cursor_snapshot_bytes_last.set(total_bytes);
+    }
+
     pub fn record_native_output_input(&self, bytes: usize) {
         self.native_output_input_events.increment();
         self.native_output_input_bytes.add(bytes as u64);
@@ -349,8 +410,7 @@ impl RuntimeMetrics {
         self.native_output_emitted_bytes.add(bytes as u64);
         self.native_output_max_batch_events
             .observe(u64::from(input_events));
-        self.native_output_max_batch_bytes
-            .observe(bytes as u64);
+        self.native_output_max_batch_bytes.observe(bytes as u64);
     }
 
     /// Get average ingest lag in milliseconds.
@@ -378,6 +438,69 @@ impl RuntimeMetrics {
     /// Get maximum ingest lag in milliseconds.
     pub fn max_ingest_lag_ms(&self) -> u64 {
         self.ingest_lag_max_ms.get()
+    }
+
+    /// Average storage mutex wait time in milliseconds.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn avg_storage_lock_wait_ms(&self) -> f64 {
+        let sum = self.storage_lock_wait_us_sum.get();
+        let count = self.storage_lock_wait_samples.get();
+        if count == 0 {
+            0.0
+        } else {
+            (sum as f64 / count as f64) / 1000.0
+        }
+    }
+
+    /// Maximum storage mutex wait time in milliseconds.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn max_storage_lock_wait_ms(&self) -> f64 {
+        self.storage_lock_wait_us_max.get() as f64 / 1000.0
+    }
+
+    /// Total number of storage lock contention events (wait >= threshold).
+    pub fn storage_lock_contention_events(&self) -> u64 {
+        self.storage_lock_contention_events.get()
+    }
+
+    /// Average storage mutex hold time in milliseconds.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn avg_storage_lock_hold_ms(&self) -> f64 {
+        let sum = self.storage_lock_hold_us_sum.get();
+        let count = self.storage_lock_hold_samples.get();
+        if count == 0 {
+            0.0
+        } else {
+            (sum as f64 / count as f64) / 1000.0
+        }
+    }
+
+    /// Maximum storage mutex hold time in milliseconds.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn max_storage_lock_hold_ms(&self) -> f64 {
+        self.storage_lock_hold_us_max.get() as f64 / 1000.0
+    }
+
+    /// Last sampled cursor snapshot bytes.
+    pub fn cursor_snapshot_bytes_last(&self) -> u64 {
+        self.cursor_snapshot_bytes_last.get_max()
+    }
+
+    /// Maximum sampled cursor snapshot bytes.
+    pub fn cursor_snapshot_bytes_max(&self) -> u64 {
+        self.cursor_snapshot_bytes_max.get()
+    }
+
+    /// Average sampled cursor snapshot bytes.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn avg_cursor_snapshot_bytes(&self) -> f64 {
+        let sum = self.cursor_snapshot_bytes_sum.get();
+        let count = self.cursor_snapshot_samples.get();
+        if count == 0 {
+            0.0
+        } else {
+            sum as f64 / count as f64
+        }
     }
 
     /// Get last DB write timestamp (epoch ms), or None if never written.
@@ -559,10 +682,16 @@ impl ObservationRuntime {
     pub async fn start(&mut self) -> Result<RuntimeHandle> {
         info!("Starting observation runtime");
 
-        let (capture_tx, capture_rx) = mpsc::channel::<CaptureEvent>(self.config.channel_buffer);
+        // Stage 1 ingress: multi-producer capture tasks write into bounded MPSC.
+        let (capture_ingress_tx, capture_ingress_rx) =
+            mpsc::channel::<CaptureEvent>(self.config.channel_buffer);
+        // Stage 2 handoff: single relay task forwards ingress into lock-free SPSC
+        // consumed by the persistence task.
+        let (capture_ring_tx, capture_ring_rx) =
+            spsc_channel::<CaptureEvent>(self.config.channel_buffer);
 
-        // Clone capture_tx for queue depth instrumentation before moving it
-        let capture_tx_probe = capture_tx.clone();
+        // Clone ingress sender for queue depth instrumentation before moving it.
+        let capture_tx_probe = capture_ingress_tx.clone();
 
         // Spawn discovery task
         let discovery_handle = self.spawn_discovery_task();
@@ -578,13 +707,13 @@ impl ObservationRuntime {
         let capture_handle = if native_enabled {
             self.spawn_idle_capture_task()
         } else {
-            self.spawn_capture_task(capture_tx.clone())
+            self.spawn_capture_task(capture_ingress_tx.clone())
         };
 
         // Spawn native event listener if configured and supported.
         #[cfg(feature = "native-wezterm")]
-        let native_handle =
-            native_socket.map(|socket| self.spawn_native_event_task(socket, capture_tx.clone()));
+        let native_handle = native_socket
+            .map(|socket| self.spawn_native_event_task(socket, capture_ingress_tx.clone()));
         #[cfg(not(feature = "native-wezterm"))]
         let native_handle = {
             if native_socket.is_some() {
@@ -595,9 +724,12 @@ impl ObservationRuntime {
             None
         };
 
+        // Spawn relay task from multi-producer ingress into SPSC persistence queue.
+        let relay_handle = self.spawn_capture_relay_task(capture_ingress_rx, capture_ring_tx);
+
         // Spawn persistence and detection task
         let persistence_handle = self.spawn_persistence_task(
-            capture_rx,
+            capture_ring_rx,
             Arc::clone(&self.cursors),
             Arc::clone(&self.registry),
         );
@@ -610,8 +742,13 @@ impl ObservationRuntime {
             if let Some(ref snap_config) = self.snapshot_config {
                 if snap_config.enabled {
                     let db_path = {
-                        let storage_guard = self.storage.lock().await;
-                        Arc::new(storage_guard.db_path().to_string())
+                        let (storage_guard, lock_held_since) =
+                            lock_storage_with_profile(&self.storage, &self.metrics).await;
+                        let db_path = Arc::new(storage_guard.db_path().to_string());
+                        drop(storage_guard);
+                        self.metrics
+                            .record_storage_lock_hold(lock_held_since.elapsed());
+                        db_path
                     };
                     let engine = Arc::new(crate::snapshot_engine::SnapshotEngine::new(
                         db_path,
@@ -653,6 +790,7 @@ impl ObservationRuntime {
         Ok(RuntimeHandle {
             discovery: discovery_handle,
             capture: capture_handle,
+            relay: relay_handle,
             persistence: persistence_handle,
             maintenance: Some(maintenance_handle),
             snapshot: snapshot_handle,
@@ -731,7 +869,8 @@ impl ObservationRuntime {
                                 let cutoff_ms = epoch_ms().saturating_sub(
                                     i64::try_from(cutoff_window_ms).unwrap_or(i64::MAX),
                                 );
-                                let storage_guard = storage.lock().await;
+                                let (storage_guard, lock_held_since) =
+                                    lock_storage_with_profile(&storage, &metrics).await;
                                 if let Err(e) = storage_guard.retention_cleanup(cutoff_ms).await {
                                     error!(error = %e, "Retention cleanup failed");
                                 } else {
@@ -741,6 +880,8 @@ impl ObservationRuntime {
                                 if let Err(e) = storage_guard.purge_audit_actions_before(cutoff_ms).await {
                                     error!(error = %e, "Audit purge failed");
                                 }
+                                drop(storage_guard);
+                                metrics.record_storage_lock_hold(lock_held_since.elapsed());
                             }
                             last_retention_check = now;
                         }
@@ -750,7 +891,8 @@ impl ObservationRuntime {
                             && now.duration_since(last_checkpoint)
                                 >= Duration::from_secs(u64::from(checkpoint_secs))
                         {
-                            let storage_guard = storage.lock().await;
+                            let (storage_guard, lock_held_since) =
+                                lock_storage_with_profile(&storage, &metrics).await;
                             match storage_guard.checkpoint().await {
                                 Ok(result) => {
                                     debug!(
@@ -764,6 +906,7 @@ impl ObservationRuntime {
                                 }
                             }
                             drop(storage_guard);
+                            metrics.record_storage_lock_hold(lock_held_since.elapsed());
                             last_checkpoint = now;
                         }
 
@@ -782,23 +925,35 @@ impl ObservationRuntime {
                                 (ids.len(), activity)
                             };
 
-                            let last_seq_by_pane: Vec<(u64, i64)> = {
+                            let (last_seq_by_pane, cursor_snapshot_bytes): (Vec<(u64, i64)>, u64) = {
                                 let cursors = cursors.read().await;
-                                cursors
+                                let mut total_bytes = 0u64;
+                                let seqs = cursors
                                     .iter()
-                                    .map(|(pane_id, cursor)| (*pane_id, cursor.last_seq()))
-                                    .collect()
+                                    .map(|(pane_id, cursor)| {
+                                        total_bytes = total_bytes
+                                            .saturating_add(
+                                                u64::try_from(cursor.last_snapshot.len())
+                                                    .unwrap_or(u64::MAX),
+                                            );
+                                        (*pane_id, cursor.last_seq())
+                                    })
+                                    .collect();
+                                (seqs, total_bytes)
                             };
+                            metrics.record_cursor_snapshot_memory(cursor_snapshot_bytes);
 
                             let capture_cap = capture_tx.max_capacity();
                             let capture_depth = capture_cap.saturating_sub(capture_tx.capacity());
 
                             let (write_depth, write_cap, db_writable) = {
-                                let storage_guard = storage.lock().await;
+                                let (storage_guard, lock_held_since) =
+                                    lock_storage_with_profile(&storage, &metrics).await;
                                 let wd = storage_guard.write_queue_depth();
                                 let wc = storage_guard.write_queue_capacity();
                                 let writable = storage_guard.is_writable().await;
                                 drop(storage_guard);
+                                metrics.record_storage_lock_hold(lock_held_since.elapsed());
                                 (wd, wc, writable)
                             };
 
@@ -828,6 +983,28 @@ impl ObservationRuntime {
 
                             if !db_writable {
                                 warnings.push("Database is not writable".to_string());
+                            }
+                            if metrics.max_storage_lock_wait_ms() >= STORAGE_LOCK_WAIT_WARN_MS {
+                                warnings.push(format!(
+                                    "Storage lock contention: wait max {:.2} ms, avg {:.2} ms, events {}",
+                                    metrics.max_storage_lock_wait_ms(),
+                                    metrics.avg_storage_lock_wait_ms(),
+                                    metrics.storage_lock_contention_events()
+                                ));
+                            }
+                            if metrics.max_storage_lock_hold_ms() >= STORAGE_LOCK_HOLD_WARN_MS {
+                                warnings.push(format!(
+                                    "Storage lock hold high: max {:.2} ms, avg {:.2} ms",
+                                    metrics.max_storage_lock_hold_ms(),
+                                    metrics.avg_storage_lock_hold_ms(),
+                                ));
+                            }
+                            if cursor_snapshot_bytes >= CURSOR_SNAPSHOT_MEMORY_WARN_BYTES {
+                                warnings.push(format!(
+                                    "Cursor snapshot memory high: {:.1} MiB (peak {:.1} MiB)",
+                                    bytes_to_mib(cursor_snapshot_bytes),
+                                    bytes_to_mib(metrics.cursor_snapshot_bytes_max()),
+                                ));
                             }
 
                             let snapshot = HealthSnapshot {
@@ -883,6 +1060,7 @@ impl ObservationRuntime {
         let cursors = Arc::clone(&self.cursors);
         let detection_contexts = Arc::clone(&self.detection_contexts);
         let storage = Arc::clone(&self.storage);
+        let metrics = Arc::clone(&self.metrics);
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
         let initial_interval = self.config.discovery_interval;
         let mut config_rx = self.config_rx.clone();
@@ -937,19 +1115,23 @@ impl ObservationRuntime {
                             if let Some(entry) = reg.get_entry(*pane_id) {
                                 // Upsert pane in storage
                                 let record = entry.to_pane_record();
-                                let storage_guard = storage.lock().await;
+                                let (storage_guard, lock_held_since) =
+                                    lock_storage_with_profile(&storage, &metrics).await;
                                 if let Err(e) = storage_guard.upsert_pane(record).await {
                                     error!(pane_id = pane_id, error = %e, "Failed to upsert pane");
                                 }
                                 drop(storage_guard);
+                                metrics.record_storage_lock_hold(lock_held_since.elapsed());
 
                                 // Create cursor if observed
                                 if entry.should_observe() {
                                     // Initialize cursor from storage to resume capture
-                                    let storage_guard = storage.lock().await;
+                                    let (storage_guard, lock_held_since) =
+                                        lock_storage_with_profile(&storage, &metrics).await;
                                     let max_seq =
                                         storage_guard.get_max_seq(*pane_id).await.unwrap_or(None);
                                     drop(storage_guard);
+                                    metrics.record_storage_lock_hold(lock_held_since.elapsed());
 
                                     let next_seq = max_seq.map_or(0, |s| s + 1);
 
@@ -1344,10 +1526,52 @@ impl ObservationRuntime {
         })
     }
 
+    /// Spawn relay task from capture ingress to lock-free SPSC persistence queue.
+    ///
+    /// Capture producers (tailers/native handlers) write into a bounded MPSC.
+    /// This task is the sole producer for the SPSC ring consumed by persistence.
+    fn spawn_capture_relay_task(
+        &self,
+        mut capture_ingress_rx: mpsc::Receiver<CaptureEvent>,
+        capture_ring_tx: SpscProducer<CaptureEvent>,
+    ) -> JoinHandle<()> {
+        let shutdown_flag = Arc::clone(&self.shutdown_flag);
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    maybe_event = capture_ingress_rx.recv() => {
+                        match maybe_event {
+                            Some(event) => {
+                                if shutdown_flag.load(Ordering::SeqCst) {
+                                    debug!("Capture relay: shutdown signal received, draining remaining events");
+                                }
+
+                                if capture_ring_tx.send(event).await.is_err() {
+                                    debug!("Capture relay: persistence ring closed");
+                                    return;
+                                }
+                            }
+                            None => break,
+                        }
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(25)) => {
+                        if shutdown_flag.load(Ordering::SeqCst) && capture_ingress_rx.is_empty() {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            capture_ring_tx.close();
+            debug!("Capture relay exited");
+        })
+    }
+
     /// Spawn the persistence and detection task.
     fn spawn_persistence_task(
         &self,
-        mut capture_rx: mpsc::Receiver<CaptureEvent>,
+        capture_rx: SpscConsumer<CaptureEvent>,
         cursors: Arc<RwLock<HashMap<u64, PaneCursor>>>,
         registry: Arc<RwLock<PaneRegistry>>,
     ) -> JoinHandle<()> {
@@ -1365,7 +1589,7 @@ impl ObservationRuntime {
         let registry = Arc::clone(&registry);
 
         tokio::spawn(async move {
-            // Process events until channel closes or shutdown
+            // Process events until producer is closed and the ring is drained.
             while let Some(event) = capture_rx.recv().await {
                 heartbeats.record_persistence();
                 // Check shutdown flag - if set, drain remaining events quickly
@@ -1402,7 +1626,8 @@ impl ObservationRuntime {
                 let captured_seq = event.segment.seq;
 
                 // Persist the segment
-                let storage_guard = storage.lock().await;
+                let (storage_guard, lock_held_since) =
+                    lock_storage_with_profile(&storage, &metrics).await;
                 match persist_captured_segment(&storage_guard, &event.segment).await {
                     Ok(persisted) => {
                         // Check for sequence discontinuity and resync cursor if needed
@@ -1442,6 +1667,29 @@ impl ObservationRuntime {
                                     error = %err,
                                     "Failed to record segment"
                                 );
+                            }
+                        }
+
+                        // Publish delta/gap events for live stream subscribers.
+                        if let Some(ref bus) = event_bus {
+                            let delivered = bus.publish(crate::events::Event::SegmentCaptured {
+                                pane_id,
+                                seq: persisted.segment.seq,
+                                content_len: persisted.segment.content_len,
+                            });
+                            if delivered == 0 {
+                                debug!(pane_id, "No subscribers for segment event bus");
+                            }
+
+                            if let Some(gap) = &persisted.gap {
+                                let delivered_gap =
+                                    bus.publish(crate::events::Event::GapDetected {
+                                        pane_id: gap.pane_id,
+                                        reason: gap.reason.clone(),
+                                    });
+                                if delivered_gap == 0 {
+                                    debug!(pane_id, "No subscribers for gap event bus");
+                                }
                             }
                         }
 
@@ -1542,6 +1790,7 @@ impl ObservationRuntime {
                     }
                 }
                 drop(storage_guard);
+                metrics.record_storage_lock_hold(lock_held_since.elapsed());
             }
         })
     }
@@ -1727,6 +1976,8 @@ pub struct RuntimeHandle {
     pub discovery: JoinHandle<()>,
     /// Capture task handle
     pub capture: JoinHandle<()>,
+    /// Relay task handle (capture ingress -> SPSC persistence queue)
+    pub relay: JoinHandle<()>,
     /// Native events listener task handle (optional)
     pub native_events: Option<JoinHandle<()>>,
     /// Persistence task handle
@@ -1766,6 +2017,14 @@ pub struct RuntimeHandle {
 /// When queue depth exceeds this fraction of max capacity, a warning is
 /// included in the health snapshot.  0.75 = warn at 75% full.
 const BACKPRESSURE_WARN_RATIO: f64 = 0.75;
+/// Storage lock contention threshold (microseconds) used for contention counts.
+const STORAGE_LOCK_CONTENTION_MIN_US: u64 = 1_000;
+/// Maximum acceptable storage lock wait for healthy operation.
+const STORAGE_LOCK_WAIT_WARN_MS: f64 = 15.0;
+/// Maximum acceptable storage lock hold for healthy operation.
+const STORAGE_LOCK_HOLD_WARN_MS: f64 = 75.0;
+/// Memory warning threshold for retained pane snapshots.
+const CURSOR_SNAPSHOT_MEMORY_WARN_BYTES: u64 = 64 * 1024 * 1024;
 
 impl RuntimeHandle {
     /// Current capture channel queue depth (pending items waiting for persistence).
@@ -1782,14 +2041,20 @@ impl RuntimeHandle {
 
     /// Current write queue depth (pending commands for the storage writer thread).
     pub async fn write_queue_depth(&self) -> usize {
-        let storage_guard = self.storage.lock().await;
-        storage_guard.write_queue_depth()
+        let (storage_guard, lock_held_since) =
+            lock_storage_with_profile(&self.storage, &self.metrics).await;
+        let depth = storage_guard.write_queue_depth();
+        drop(storage_guard);
+        self.metrics
+            .record_storage_lock_hold(lock_held_since.elapsed());
+        depth
     }
 
     /// Wait for all tasks to complete.
     pub async fn join(self) {
         let _ = self.discovery.await;
         let _ = self.capture.await;
+        let _ = self.relay.await;
         if let Some(native) = self.native_events {
             let _ = native.await;
         }
@@ -1825,6 +2090,7 @@ impl RuntimeHandle {
         let join_result = tokio::time::timeout(timeout, async {
             let _ = self.discovery.await;
             let _ = self.capture.await;
+            let _ = self.relay.await;
             if let Some(native) = self.native_events {
                 let _ = native.await;
             }
@@ -1857,10 +2123,14 @@ impl RuntimeHandle {
 
         // Flush storage
         {
-            let storage_guard = self.storage.lock().await;
+            let (storage_guard, lock_held_since) =
+                lock_storage_with_profile(&self.storage, &self.metrics).await;
             if let Err(e) = storage_guard.shutdown().await {
                 warnings.push(format!("Storage shutdown error: {e}"));
             }
+            drop(storage_guard);
+            self.metrics
+                .record_storage_lock_hold(lock_held_since.elapsed());
         }
 
         ShutdownSummary {
@@ -1912,24 +2182,36 @@ impl RuntimeHandle {
             (ids.len(), activity)
         };
 
-        let last_seq_by_pane: Vec<(u64, i64)> = {
+        let (last_seq_by_pane, cursor_snapshot_bytes): (Vec<(u64, i64)>, u64) = {
             let cursors = self.cursors.read().await;
-            cursors
+            let mut total_bytes = 0u64;
+            let seqs = cursors
                 .iter()
-                .map(|(pane_id, cursor)| (*pane_id, cursor.last_seq()))
-                .collect()
+                .map(|(pane_id, cursor)| {
+                    total_bytes = total_bytes.saturating_add(
+                        u64::try_from(cursor.last_snapshot.len()).unwrap_or(u64::MAX),
+                    );
+                    (*pane_id, cursor.last_seq())
+                })
+                .collect();
+            (seqs, total_bytes)
         };
+        self.metrics
+            .record_cursor_snapshot_memory(cursor_snapshot_bytes);
 
         // Measure queue depths for backpressure visibility
         let capture_depth = self.capture_queue_depth();
         let capture_cap = self.capture_queue_capacity();
 
         let (write_depth, write_cap, db_writable) = {
-            let storage_guard = self.storage.lock().await;
+            let (storage_guard, lock_held_since) =
+                lock_storage_with_profile(&self.storage, &self.metrics).await;
             let wd = storage_guard.write_queue_depth();
             let wc = storage_guard.write_queue_capacity();
             let writable = storage_guard.is_writable().await;
             drop(storage_guard);
+            self.metrics
+                .record_storage_lock_hold(lock_held_since.elapsed());
             (wd, wc, writable)
         };
 
@@ -1960,6 +2242,28 @@ impl RuntimeHandle {
 
         if !db_writable {
             warnings.push("Database is not writable".to_string());
+        }
+        if self.metrics.max_storage_lock_wait_ms() >= STORAGE_LOCK_WAIT_WARN_MS {
+            warnings.push(format!(
+                "Storage lock contention: wait max {:.2} ms, avg {:.2} ms, events {}",
+                self.metrics.max_storage_lock_wait_ms(),
+                self.metrics.avg_storage_lock_wait_ms(),
+                self.metrics.storage_lock_contention_events()
+            ));
+        }
+        if self.metrics.max_storage_lock_hold_ms() >= STORAGE_LOCK_HOLD_WARN_MS {
+            warnings.push(format!(
+                "Storage lock hold high: max {:.2} ms, avg {:.2} ms",
+                self.metrics.max_storage_lock_hold_ms(),
+                self.metrics.avg_storage_lock_hold_ms(),
+            ));
+        }
+        if cursor_snapshot_bytes >= CURSOR_SNAPSHOT_MEMORY_WARN_BYTES {
+            warnings.push(format!(
+                "Cursor snapshot memory high: {:.1} MiB (peak {:.1} MiB)",
+                bytes_to_mib(cursor_snapshot_bytes),
+                bytes_to_mib(self.metrics.cursor_snapshot_bytes_max()),
+            ));
         }
 
         let snapshot = HealthSnapshot {
@@ -2034,6 +2338,21 @@ impl RuntimeHandle {
     pub fn current_config(&self) -> HotReloadableConfig {
         self.config_tx.borrow().clone()
     }
+}
+
+async fn lock_storage_with_profile<'a>(
+    storage: &'a Arc<tokio::sync::Mutex<StorageHandle>>,
+    metrics: &RuntimeMetrics,
+) -> (tokio::sync::MutexGuard<'a, StorageHandle>, Instant) {
+    let wait_started = Instant::now();
+    let guard = storage.lock().await;
+    metrics.record_storage_lock_wait(wait_started.elapsed());
+    (guard, Instant::now())
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn bytes_to_mib(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0)
 }
 
 /// Get current time as epoch milliseconds.
@@ -2223,6 +2542,44 @@ mod tests {
     }
 
     #[test]
+    fn runtime_metrics_record_storage_lock_profiles() {
+        let metrics = RuntimeMetrics::default();
+
+        assert!((metrics.avg_storage_lock_wait_ms() - 0.0).abs() < f64::EPSILON);
+        assert!((metrics.max_storage_lock_wait_ms() - 0.0).abs() < f64::EPSILON);
+        assert_eq!(metrics.storage_lock_contention_events(), 0);
+        assert!((metrics.avg_storage_lock_hold_ms() - 0.0).abs() < f64::EPSILON);
+        assert!((metrics.max_storage_lock_hold_ms() - 0.0).abs() < f64::EPSILON);
+
+        metrics.record_storage_lock_wait(Duration::from_micros(500));
+        metrics.record_storage_lock_wait(Duration::from_micros(2_000));
+        metrics.record_storage_lock_hold(Duration::from_millis(2));
+        metrics.record_storage_lock_hold(Duration::from_millis(10));
+
+        assert!(metrics.avg_storage_lock_wait_ms() > 0.0);
+        assert!(metrics.max_storage_lock_wait_ms() >= 2.0);
+        assert_eq!(metrics.storage_lock_contention_events(), 1);
+        assert!(metrics.avg_storage_lock_hold_ms() >= 2.0);
+        assert!(metrics.max_storage_lock_hold_ms() >= 10.0);
+    }
+
+    #[test]
+    fn runtime_metrics_record_cursor_snapshot_memory() {
+        let metrics = RuntimeMetrics::default();
+
+        assert_eq!(metrics.cursor_snapshot_bytes_last(), 0);
+        assert_eq!(metrics.cursor_snapshot_bytes_max(), 0);
+        assert!((metrics.avg_cursor_snapshot_bytes() - 0.0).abs() < f64::EPSILON);
+
+        metrics.record_cursor_snapshot_memory(1024);
+        metrics.record_cursor_snapshot_memory(4096);
+
+        assert_eq!(metrics.cursor_snapshot_bytes_last(), 4096);
+        assert_eq!(metrics.cursor_snapshot_bytes_max(), 4096);
+        assert!((metrics.avg_cursor_snapshot_bytes() - 2560.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn health_snapshot_reflects_runtime_metrics() {
         use crate::crash::HealthSnapshot;
 
@@ -2378,6 +2735,53 @@ mod tests {
         assert!(warning.contains("Capture queue backpressure"));
         assert!(warning.contains("80/100"));
         assert!(warning.contains("80%"));
+    }
+
+    #[test]
+    fn storage_lock_contention_warning_threshold_fires() {
+        let metrics = RuntimeMetrics::default();
+        metrics.record_storage_lock_wait(Duration::from_millis(20));
+
+        assert!(metrics.max_storage_lock_wait_ms() >= STORAGE_LOCK_WAIT_WARN_MS);
+
+        let warning = format!(
+            "Storage lock contention: wait max {:.2} ms, avg {:.2} ms, events {}",
+            metrics.max_storage_lock_wait_ms(),
+            metrics.avg_storage_lock_wait_ms(),
+            metrics.storage_lock_contention_events()
+        );
+        assert!(warning.contains("Storage lock contention"));
+        assert!(warning.contains("events"));
+    }
+
+    #[test]
+    fn storage_lock_hold_warning_threshold_fires() {
+        let metrics = RuntimeMetrics::default();
+        metrics.record_storage_lock_hold(Duration::from_millis(60));
+
+        assert!(metrics.max_storage_lock_hold_ms() >= STORAGE_LOCK_HOLD_WARN_MS);
+
+        let warning = format!(
+            "Storage lock hold high: max {:.2} ms, avg {:.2} ms",
+            metrics.max_storage_lock_hold_ms(),
+            metrics.avg_storage_lock_hold_ms(),
+        );
+        assert!(warning.contains("Storage lock hold high"));
+    }
+
+    #[test]
+    fn cursor_snapshot_memory_warning_threshold_fires() {
+        let metrics = RuntimeMetrics::default();
+        let sample = CURSOR_SNAPSHOT_MEMORY_WARN_BYTES.saturating_add(1024);
+        metrics.record_cursor_snapshot_memory(sample);
+
+        let warning = format!(
+            "Cursor snapshot memory high: {:.1} MiB (peak {:.1} MiB)",
+            bytes_to_mib(sample),
+            bytes_to_mib(metrics.cursor_snapshot_bytes_max()),
+        );
+        assert!(warning.contains("Cursor snapshot memory high"));
+        assert!(warning.contains("MiB"));
     }
 
     #[test]

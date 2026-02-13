@@ -20,7 +20,7 @@ use frankenterm_core::differential_snapshot::{
 };
 use frankenterm_core::session_pane_state::{PaneStateSnapshot, ScrollbackRef, TerminalState};
 use frankenterm_core::session_topology::{
-    PaneNode, TabSnapshot, TopologySnapshot, WindowSnapshot, TOPOLOGY_SCHEMA_VERSION,
+    PaneNode, TOPOLOGY_SCHEMA_VERSION, TabSnapshot, TopologySnapshot, WindowSnapshot,
 };
 
 // ────────────────────────────────────────────────────────────────────

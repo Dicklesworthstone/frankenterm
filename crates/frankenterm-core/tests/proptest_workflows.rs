@@ -16,13 +16,13 @@ use proptest::prelude::*;
 
 use frankenterm_core::policy::PaneCapabilities;
 use frankenterm_core::workflows::{
-    BroadcastPrecondition, BroadcastResult, DescriptorFailureHandler,
-    FallbackNextStepPlan, FallbackReason, LockAcquisitionResult, PaneBroadcastOutcome,
-    PaneGroupStrategy, PaneWorkflowLockManager, ResumeSessionConfig, StepResult, TextMatch,
-    WaitCondition, WorkflowDescriptor,
-    build_all_accounts_exhausted_plan, build_failover_disabled_plan, build_needs_human_auth_plan,
-    build_tool_missing_plan, check_preconditions, default_broadcast_preconditions,
-    fallback_plan_to_step_result, format_resume_command, is_fallback_result, validate_session_id,
+    BroadcastPrecondition, BroadcastResult, DescriptorFailureHandler, FallbackNextStepPlan,
+    FallbackReason, LockAcquisitionResult, PaneBroadcastOutcome, PaneGroupStrategy,
+    PaneWorkflowLockManager, ResumeSessionConfig, StepResult, TextMatch, WaitCondition,
+    WorkflowDescriptor, build_all_accounts_exhausted_plan, build_failover_disabled_plan,
+    build_needs_human_auth_plan, build_tool_missing_plan, check_preconditions,
+    default_broadcast_preconditions, fallback_plan_to_step_result, format_resume_command,
+    is_fallback_result, validate_session_id,
 };
 
 // ────────────────────────────────────────────────────────────────────
@@ -59,16 +59,21 @@ fn arb_step_result() -> impl Strategy<Value = StepResult> {
 }
 
 fn arb_pane_capabilities() -> impl Strategy<Value = PaneCapabilities> {
-    (any::<bool>(), any::<bool>(), any::<Option<bool>>(), any::<bool>(), any::<bool>()).prop_map(
-        |(prompt, cmd, alt, gap, reserved)| PaneCapabilities {
+    (
+        any::<bool>(),
+        any::<bool>(),
+        any::<Option<bool>>(),
+        any::<bool>(),
+        any::<bool>(),
+    )
+        .prop_map(|(prompt, cmd, alt, gap, reserved)| PaneCapabilities {
             prompt_active: prompt,
             command_running: cmd,
             alt_screen: alt,
             has_recent_gap: gap,
             is_reserved: reserved,
             reserved_by: None,
-        },
-    )
+        })
 }
 
 fn arb_fallback_reason() -> impl Strategy<Value = FallbackReason> {

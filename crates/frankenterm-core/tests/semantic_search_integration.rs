@@ -4,13 +4,15 @@
 //! Uses the HashEmbedder (always available, no ML deps required).
 
 use frankenterm_core::search::{
-    Embedder, EmbedderTier, FtviIndex, FusedResult,
-    HashEmbedder, HybridSearchService, blend_two_tier,
-    write_ftvi_vec,
+    Embedder, EmbedderTier, FtviIndex, FusedResult, HashEmbedder, HybridSearchService,
+    blend_two_tier, write_ftvi_vec,
 };
 
 /// Helper: embed texts and build an FTVI index.
-fn embed_and_index(embedder: &HashEmbedder, segments: &[(u64, &str)]) -> (Vec<(u64, Vec<f32>)>, FtviIndex) {
+fn embed_and_index(
+    embedder: &HashEmbedder,
+    segments: &[(u64, &str)],
+) -> (Vec<(u64, Vec<f32>)>, FtviIndex) {
     let dim = embedder.dimension() as u16;
     let embeddings: Vec<(u64, Vec<f32>)> = segments
         .iter()
@@ -75,7 +77,10 @@ fn hash_embedder_different_inputs_differ() {
     let v1 = embedder.embed("error compilation").unwrap();
     let v2 = embedder.embed("test passed successfully").unwrap();
 
-    assert_ne!(v1, v2, "different inputs should produce different embeddings");
+    assert_ne!(
+        v1, v2,
+        "different inputs should produce different embeddings"
+    );
 }
 
 #[test]
@@ -144,11 +149,7 @@ fn full_pipeline_with_hybrid_search() {
     let embedder = HashEmbedder::new(32);
 
     // Simulate BM25 results (lexical)
-    let bm25_results = vec![
-        (1u64, 10.5f32),
-        (2, 8.2),
-        (3, 5.0),
-    ];
+    let bm25_results = vec![(1u64, 10.5f32), (2, 8.2), (3, 5.0)];
 
     let segments = vec![
         (1u64, "npm install failed with ENOENT"),
@@ -271,11 +272,19 @@ fn similar_content_scores_higher_than_dissimilar() {
     let embedder = HashEmbedder::new(64);
 
     let query = embedder.embed("compilation error in main.rs").unwrap();
-    let similar = embedder.embed("compilation failed in main.rs line 42").unwrap();
-    let dissimilar = embedder.embed("network timeout connecting to database").unwrap();
+    let similar = embedder
+        .embed("compilation failed in main.rs line 42")
+        .unwrap();
+    let dissimilar = embedder
+        .embed("network timeout connecting to database")
+        .unwrap();
 
     let sim_score: f32 = query.iter().zip(similar.iter()).map(|(a, b)| a * b).sum();
-    let dis_score: f32 = query.iter().zip(dissimilar.iter()).map(|(a, b)| a * b).sum();
+    let dis_score: f32 = query
+        .iter()
+        .zip(dissimilar.iter())
+        .map(|(a, b)| a * b)
+        .sum();
 
     assert!(
         sim_score > dis_score,

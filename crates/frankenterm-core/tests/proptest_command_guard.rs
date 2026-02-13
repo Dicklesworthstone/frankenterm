@@ -29,8 +29,8 @@
 use proptest::prelude::*;
 
 use frankenterm_core::command_guard::{
-    evaluate_stateless, AuditEntry, CommandGuard, GuardDecision, GuardPolicy, PaneGuardConfig,
-    TrustLevel,
+    AuditEntry, CommandGuard, GuardDecision, GuardPolicy, PaneGuardConfig, TrustLevel,
+    evaluate_stateless,
 };
 
 // =============================================================================

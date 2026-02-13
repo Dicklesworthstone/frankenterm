@@ -24,14 +24,11 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-use crate::policy::ActorKind;
 use crate::recorder_audit::{
     AccessTier, ActorIdentity, AuditEventBuilder, AuditEventType, AuditLog, AuditScope,
     AuthzDecision,
 };
 use crate::recorder_query::{QueryEventKind, QueryResultEvent};
-use crate::recorder_retention::SensitivityTier;
-use crate::recording::RecorderEventSource;
 
 // =============================================================================
 // Replay configuration
@@ -188,7 +185,11 @@ pub enum ReplayError {
     /// No events to replay.
     EmptySession,
     /// Seek target is out of range.
-    SeekOutOfRange { target_ms: u64, min_ms: u64, max_ms: u64 },
+    SeekOutOfRange {
+        target_ms: u64,
+        min_ms: u64,
+        max_ms: u64,
+    },
     /// Session already completed.
     SessionCompleted,
 }
@@ -533,42 +534,34 @@ impl ReplaySession {
         };
 
         audit_log.append(
-            AuditEventBuilder::new(
-                AuditEventType::RecorderReplay,
-                self.actor.clone(),
-                now_ms,
-            )
-            .with_decision(AuthzDecision::Allow)
-            .with_scope(AuditScope {
-                pane_ids,
-                time_range: Some((start_ts, end_ts)),
-                query: None,
-                segment_ids: Vec::new(),
-                result_count: Some(self.events.len() as u64),
-            })
-            .with_details(serde_json::json!({
-                "session_id": self.session_id,
-                "speed": self.config.speed,
-                "total_events": self.events.len(),
-            })),
+            AuditEventBuilder::new(AuditEventType::RecorderReplay, self.actor.clone(), now_ms)
+                .with_decision(AuthzDecision::Allow)
+                .with_scope(AuditScope {
+                    pane_ids,
+                    time_range: Some((start_ts, end_ts)),
+                    query: None,
+                    segment_ids: Vec::new(),
+                    result_count: Some(self.events.len() as u64),
+                })
+                .with_details(serde_json::json!({
+                    "session_id": self.session_id,
+                    "speed": self.config.speed,
+                    "total_events": self.events.len(),
+                })),
         );
     }
 
     /// Audit the completion of a replay session.
     pub fn audit_complete(&self, audit_log: &AuditLog, now_ms: u64) {
         audit_log.append(
-            AuditEventBuilder::new(
-                AuditEventType::RecorderReplay,
-                self.actor.clone(),
-                now_ms,
-            )
-            .with_decision(AuthzDecision::Allow)
-            .with_details(serde_json::json!({
-                "session_id": self.session_id,
-                "frames_emitted": self.stats.frames_emitted,
-                "frames_skipped": self.stats.frames_skipped,
-                "completed": self.stats.completed,
-            })),
+            AuditEventBuilder::new(AuditEventType::RecorderReplay, self.actor.clone(), now_ms)
+                .with_decision(AuthzDecision::Allow)
+                .with_details(serde_json::json!({
+                    "session_id": self.session_id,
+                    "frames_emitted": self.stats.frames_emitted,
+                    "frames_skipped": self.stats.frames_skipped,
+                    "completed": self.stats.completed,
+                })),
         );
     }
 }
@@ -652,7 +645,13 @@ impl ReplayBuilder {
             .session_id
             .unwrap_or_else(|| format!("replay-{}", self.actor.identity));
 
-        ReplaySession::new(events, self.config, self.actor, self.effective_tier, session_id)
+        ReplaySession::new(
+            events,
+            self.config,
+            self.actor,
+            self.effective_tier,
+            session_id,
+        )
     }
 }
 
@@ -663,6 +662,9 @@ impl ReplayBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::ActorKind;
+    use crate::recorder_retention::SensitivityTier;
+    use crate::recording::RecorderEventSource;
 
     // -----------------------------------------------------------------------
     // Helpers
@@ -951,9 +953,11 @@ mod tests {
 
         let frames = session.collect_remaining();
         assert_eq!(frames.len(), 4); // 4 IngressText, 1 LifecycleMarker skipped.
-        assert!(frames
-            .iter()
-            .all(|f| f.event.event_kind == QueryEventKind::IngressText));
+        assert!(
+            frames
+                .iter()
+                .all(|f| f.event.event_kind == QueryEventKind::IngressText)
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1222,20 +1226,21 @@ mod tests {
 
     #[test]
     fn replay_error_display() {
-        assert_eq!(
-            ReplayError::EmptySession.to_string(),
-            "no events to replay"
+        assert_eq!(ReplayError::EmptySession.to_string(), "no events to replay");
+        assert!(
+            ReplayError::InvalidConfig("bad".into())
+                .to_string()
+                .contains("bad")
         );
-        assert!(ReplayError::InvalidConfig("bad".into())
+        assert!(
+            ReplayError::SeekOutOfRange {
+                target_ms: 50,
+                min_ms: 100,
+                max_ms: 200
+            }
             .to_string()
-            .contains("bad"));
-        assert!(ReplayError::SeekOutOfRange {
-            target_ms: 50,
-            min_ms: 100,
-            max_ms: 200
-        }
-        .to_string()
-        .contains("50"));
+            .contains("50")
+        );
     }
 
     #[test]

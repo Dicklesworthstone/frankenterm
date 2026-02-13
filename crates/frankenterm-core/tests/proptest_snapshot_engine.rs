@@ -80,25 +80,16 @@ fn arb_scheduling_mode() -> impl Strategy<Value = SnapshotSchedulingMode> {
 fn arb_scheduling_config() -> impl Strategy<Value = SnapshotSchedulingConfig> {
     (
         arb_scheduling_mode(),
-        0.1_f64..100.0,   // snapshot_threshold
-        0.1_f64..50.0,    // work_completed_value
-        0.1_f64..50.0,    // state_transition_value
-        0.1_f64..50.0,    // idle_window_value
-        0.1_f64..50.0,    // memory_pressure_value
-        0.1_f64..50.0,    // hazard_trigger_value
-        1_u64..120,       // periodic_fallback_minutes
+        0.1_f64..100.0, // snapshot_threshold
+        0.1_f64..50.0,  // work_completed_value
+        0.1_f64..50.0,  // state_transition_value
+        0.1_f64..50.0,  // idle_window_value
+        0.1_f64..50.0,  // memory_pressure_value
+        0.1_f64..50.0,  // hazard_trigger_value
+        1_u64..120,     // periodic_fallback_minutes
     )
         .prop_map(
-            |(
-                mode,
-                threshold,
-                work,
-                state,
-                idle,
-                memory,
-                hazard,
-                fallback,
-            )| {
+            |(mode, threshold, work, state, idle, memory, hazard, fallback)| {
                 SnapshotSchedulingConfig {
                     mode,
                     snapshot_threshold: threshold,
@@ -116,24 +107,22 @@ fn arb_scheduling_config() -> impl Strategy<Value = SnapshotSchedulingConfig> {
 /// Strategy for arbitrary SnapshotConfig with sensible ranges.
 fn arb_snapshot_config() -> impl Strategy<Value = SnapshotConfig> {
     (
-        any::<bool>(),     // enabled
-        30_u64..3600,      // interval_seconds
-        1_usize..50,       // max_concurrent_captures
-        1_usize..100,      // retention_count
-        1_u64..365,        // retention_days
+        any::<bool>(), // enabled
+        30_u64..3600,  // interval_seconds
+        1_usize..50,   // max_concurrent_captures
+        1_usize..100,  // retention_count
+        1_u64..365,    // retention_days
         arb_scheduling_config(),
     )
         .prop_map(
-            |(enabled, interval, max_captures, ret_count, ret_days, scheduling)| {
-                SnapshotConfig {
-                    enabled,
-                    interval_seconds: interval,
-                    max_concurrent_captures: max_captures,
-                    retention_count: ret_count,
-                    retention_days: ret_days,
-                    scheduling,
-                    ..SnapshotConfig::default()
-                }
+            |(enabled, interval, max_captures, ret_count, ret_days, scheduling)| SnapshotConfig {
+                enabled,
+                interval_seconds: interval,
+                max_concurrent_captures: max_captures,
+                retention_count: ret_count,
+                retention_days: ret_days,
+                scheduling,
+                ..SnapshotConfig::default()
             },
         )
 }

@@ -409,9 +409,12 @@ impl InvariantChecker {
             }
         }
 
-        let passed = !violations
-            .iter()
-            .any(|v| matches!(v.severity, ViolationSeverity::Error | ViolationSeverity::Critical));
+        let passed = !violations.iter().any(|v| {
+            matches!(
+                v.severity,
+                ViolationSeverity::Error | ViolationSeverity::Critical
+            )
+        });
 
         InvariantReport {
             violations,
@@ -497,18 +500,12 @@ pub struct ReplayDeterminismResult {
 mod tests {
     use super::*;
     use crate::recording::{
-        RecorderControlMarkerType, RecorderEventCausality, RecorderEventSource,
-        RecorderIngressKind, RecorderLifecyclePhase, RecorderRedactionLevel,
-        RecorderSegmentKind, RecorderTextEncoding, RECORDER_EVENT_SCHEMA_VERSION_V1,
+        RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderControlMarkerType, RecorderEventCausality,
+        RecorderEventSource, RecorderIngressKind, RecorderLifecyclePhase, RecorderRedactionLevel,
+        RecorderSegmentKind, RecorderTextEncoding,
     };
 
-    fn make_event(
-        id: &str,
-        pane_id: u64,
-        seq: u64,
-        ts: u64,
-        text: &str,
-    ) -> RecorderEvent {
+    fn make_event(id: &str, pane_id: u64, seq: u64, ts: u64, text: &str) -> RecorderEvent {
         RecorderEvent {
             schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
             event_id: id.to_string(),
@@ -534,12 +531,7 @@ mod tests {
         }
     }
 
-    fn make_egress_gap(
-        id: &str,
-        pane_id: u64,
-        seq: u64,
-        ts: u64,
-    ) -> RecorderEvent {
+    fn make_egress_gap(id: &str, pane_id: u64, seq: u64, ts: u64) -> RecorderEvent {
         RecorderEvent {
             schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
             event_id: id.to_string(),
@@ -649,10 +641,7 @@ mod tests {
         let report = checker.check(&events);
         assert!(report.passed); // warnings don't fail
         assert_eq!(report.count_by_kind(ViolationKind::SequenceGap), 1);
-        assert_eq!(
-            report.count_by_severity(ViolationSeverity::Warning),
-            1
-        );
+        assert_eq!(report.count_by_severity(ViolationSeverity::Warning), 1);
     }
 
     #[test]
@@ -894,10 +883,7 @@ mod tests {
             make_event("c", 2, 0, 1002, "third"),
         ];
         let report = checker.check(&events);
-        assert_eq!(
-            report.count_by_kind(ViolationKind::MergeOrderViolation),
-            0
-        );
+        assert_eq!(report.count_by_kind(ViolationKind::MergeOrderViolation), 0);
     }
 
     #[test]
@@ -908,10 +894,7 @@ mod tests {
             make_event("a", 1, 1, 1000, "first"),  // recorded_at=1001 < 2001
         ];
         let report = checker.check(&events);
-        assert_eq!(
-            report.count_by_kind(ViolationKind::MergeOrderViolation),
-            1
-        );
+        assert_eq!(report.count_by_kind(ViolationKind::MergeOrderViolation), 1);
     }
 
     #[test]
@@ -926,10 +909,7 @@ mod tests {
             make_event("a", 1, 1, 1000, "first"),
         ];
         let report = checker.check(&events);
-        assert_eq!(
-            report.count_by_kind(ViolationKind::MergeOrderViolation),
-            0
-        );
+        assert_eq!(report.count_by_kind(ViolationKind::MergeOrderViolation), 0);
     }
 
     // -- Report helpers --
@@ -942,8 +922,8 @@ mod tests {
         };
         let checker = InvariantChecker::with_config(config);
         let events = vec![
-            make_event("", 1, 0, 1000, "a"),  // empty id
-            make_event("", 2, 0, 1001, "b"),  // empty id
+            make_event("", 1, 0, 1000, "a"),   // empty id
+            make_event("", 2, 0, 1001, "b"),   // empty id
             make_event("e3", 1, 0, 1002, "c"), // dup seq
         ];
         let report = checker.check(&events);
@@ -982,7 +962,7 @@ mod tests {
         };
         let events = vec![
             make_event("e1", 1, 0, 1000, "a"), // pane 1, ingress
-            e_egress,                           // pane 1, egress
+            e_egress,                          // pane 1, egress
         ];
         let report = checker.check(&events);
         assert_eq!(report.panes_observed, 1);
@@ -1178,13 +1158,7 @@ mod tests {
 
     // -- Gap marker in correct stream domain --
 
-    fn make_egress_delta(
-        id: &str,
-        pane_id: u64,
-        seq: u64,
-        ts: u64,
-        text: &str,
-    ) -> RecorderEvent {
+    fn make_egress_delta(id: &str, pane_id: u64, seq: u64, ts: u64, text: &str) -> RecorderEvent {
         RecorderEvent {
             schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
             event_id: id.to_string(),

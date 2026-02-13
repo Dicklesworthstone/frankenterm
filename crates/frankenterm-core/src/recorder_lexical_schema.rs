@@ -9,10 +9,11 @@
 
 use sha2::{Digest, Sha256};
 use tantivy::schema::{
-    Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, FAST, INDEXED, STORED,
-    STRING,
+    FAST, Field, INDEXED, IndexRecordOption, STORED, STRING, Schema, TextFieldIndexing, TextOptions,
 };
-use tantivy::tokenizer::{AsciiFoldingFilter, LowerCaser, RegexTokenizer, RemoveLongFilter, TextAnalyzer};
+use tantivy::tokenizer::{
+    AsciiFoldingFilter, LowerCaser, RegexTokenizer, RemoveLongFilter, TextAnalyzer,
+};
 use tantivy::{Index, TantivyDocument};
 
 use crate::tantivy_ingest::{IndexDocumentFields, LEXICAL_SCHEMA_VERSION};
@@ -335,13 +336,13 @@ pub fn schema_fingerprint(schema: &Schema) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tantivy::Document;
     use crate::recording::{
-        RecorderControlMarkerType, RecorderEvent, RecorderEventCausality, RecorderEventPayload,
-        RecorderEventSource, RecorderIngressKind, RecorderLifecyclePhase, RecorderRedactionLevel,
-        RecorderSegmentKind, RecorderTextEncoding, RECORDER_EVENT_SCHEMA_VERSION_V1,
+        RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderControlMarkerType, RecorderEvent,
+        RecorderEventCausality, RecorderEventPayload, RecorderEventSource, RecorderIngressKind,
+        RecorderLifecyclePhase, RecorderRedactionLevel, RecorderSegmentKind, RecorderTextEncoding,
     };
     use crate::tantivy_ingest::map_event_to_document;
+    use tantivy::Document;
 
     fn sample_ingress_event() -> RecorderEvent {
         RecorderEvent {

@@ -166,9 +166,7 @@ impl SearchFilter {
             Self::PaneId { values } => values.contains(&doc.pane_id),
             Self::SessionId { value } => doc.session_id.as_deref() == Some(value.as_str()),
             Self::WorkflowId { value } => doc.workflow_id.as_deref() == Some(value.as_str()),
-            Self::CorrelationId { value } => {
-                doc.correlation_id.as_deref() == Some(value.as_str())
-            }
+            Self::CorrelationId { value } => doc.correlation_id.as_deref() == Some(value.as_str()),
             Self::Source { values } => values.iter().any(|v| v == &doc.source),
             Self::EventType { values } => values.iter().any(|v| v == &doc.event_type),
             Self::IngressKind { value } => doc.ingress_kind.as_deref() == Some(value.as_str()),
@@ -428,7 +426,12 @@ pub fn extract_snippets(
             // Insert highlight markers
             let highlighted = raw_fragment.replacen(
                 &text[pos..pos + term.len()],
-                &format!("{}{}{}", config.highlight_pre, &text[pos..pos + term.len()], config.highlight_post),
+                &format!(
+                    "{}{}{}",
+                    config.highlight_pre,
+                    &text[pos..pos + term.len()],
+                    config.highlight_post
+                ),
                 1,
             );
 
@@ -604,7 +607,12 @@ impl InMemorySearchService {
     }
 
     /// Score a document against query terms using basic TF matching.
-    fn score_doc(doc: &IndexDocumentFields, terms: &[String], text_boost: f32, symbols_boost: f32) -> f32 {
+    fn score_doc(
+        doc: &IndexDocumentFields,
+        terms: &[String],
+        text_boost: f32,
+        symbols_boost: f32,
+    ) -> f32 {
         let mut score = 0.0f32;
         let text_lower = doc.text.to_lowercase();
         let symbols_lower = doc.text_symbols.to_lowercase();
@@ -776,9 +784,7 @@ impl LexicalSearchService for InMemorySearchService {
                     true
                 } else {
                     let text_lower = doc.text.to_lowercase();
-                    terms
-                        .iter()
-                        .any(|t| text_lower.contains(&t.to_lowercase()))
+                    terms.iter().any(|t| text_lower.contains(&t.to_lowercase()))
                 }
             })
             .count();
@@ -813,12 +819,12 @@ impl LexicalSearchService for InMemorySearchService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tantivy_ingest::{map_event_to_document, LEXICAL_SCHEMA_VERSION};
     use crate::recording::{
-        RecorderEvent, RecorderEventCausality, RecorderEventPayload, RecorderEventSource,
-        RecorderIngressKind, RecorderRedactionLevel, RecorderSegmentKind, RecorderTextEncoding,
-        RecorderControlMarkerType, RecorderLifecyclePhase, RECORDER_EVENT_SCHEMA_VERSION_V1,
+        RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderControlMarkerType, RecorderEvent,
+        RecorderEventCausality, RecorderEventPayload, RecorderEventSource, RecorderIngressKind,
+        RecorderLifecyclePhase, RecorderRedactionLevel, RecorderSegmentKind, RecorderTextEncoding,
     };
+    use crate::tantivy_ingest::{LEXICAL_SCHEMA_VERSION, map_event_to_document};
 
     fn make_ingress(id: &str, pane: u64, seq: u64, text: &str) -> IndexDocumentFields {
         let event = RecorderEvent {
@@ -984,52 +990,60 @@ mod tests {
     #[test]
     fn filter_by_event_type() {
         let svc = test_service();
-        let q = SearchQuery::simple("hello world echo Compiling error cargo git")
-            .with_filter(SearchFilter::EventType {
+        let q = SearchQuery::simple("hello world echo Compiling error cargo git").with_filter(
+            SearchFilter::EventType {
                 values: vec!["ingress_text".to_string()],
-            });
+            },
+        );
         let results = svc.search(&q).unwrap();
-        assert!(results
-            .hits
-            .iter()
-            .all(|h| h.doc.event_type == "ingress_text"));
+        assert!(
+            results
+                .hits
+                .iter()
+                .all(|h| h.doc.event_type == "ingress_text")
+        );
     }
 
     #[test]
     fn filter_by_direction_ingress() {
         let svc = test_service();
-        let q = SearchQuery::simple("hello cargo git push echo Compiling error")
-            .with_filter(SearchFilter::Direction {
+        let q = SearchQuery::simple("hello cargo git push echo Compiling error").with_filter(
+            SearchFilter::Direction {
                 direction: EventDirection::Ingress,
-            });
+            },
+        );
         let results = svc.search(&q).unwrap();
-        assert!(results
-            .hits
-            .iter()
-            .all(|h| h.doc.event_type == "ingress_text"));
+        assert!(
+            results
+                .hits
+                .iter()
+                .all(|h| h.doc.event_type == "ingress_text")
+        );
     }
 
     #[test]
     fn filter_by_direction_egress() {
         let svc = test_service();
-        let q = SearchQuery::simple("hello world Compiling error")
-            .with_filter(SearchFilter::Direction {
+        let q = SearchQuery::simple("hello world Compiling error").with_filter(
+            SearchFilter::Direction {
                 direction: EventDirection::Egress,
-            });
+            },
+        );
         let results = svc.search(&q).unwrap();
-        assert!(results
-            .hits
-            .iter()
-            .all(|h| h.doc.event_type == "egress_output"));
+        assert!(
+            results
+                .hits
+                .iter()
+                .all(|h| h.doc.event_type == "egress_output")
+        );
     }
 
     #[test]
     fn filter_by_source() {
         let svc = test_service();
-        let q = SearchQuery::simple("hello cargo echo git")
-            .with_filter(SearchFilter::Source {
-                values: vec!["robot_mode".to_string()],
-            });
+        let q = SearchQuery::simple("hello cargo echo git").with_filter(SearchFilter::Source {
+            values: vec!["robot_mode".to_string()],
+        });
         let results = svc.search(&q).unwrap();
         assert!(results.hits.iter().all(|h| h.doc.source == "robot_mode"));
     }
@@ -1038,46 +1052,52 @@ mod tests {
     fn filter_by_time_range() {
         let svc = test_service();
         // Events at seq 0 and 1 have occurred_at_ms 1_700_000_000_000 and 1_700_000_000_100
-        let q = SearchQuery::simple("echo cargo")
-            .with_filter(SearchFilter::TimeRange {
-                min_ms: Some(1_700_000_000_000),
-                max_ms: Some(1_700_000_000_100),
-            });
+        let q = SearchQuery::simple("echo cargo").with_filter(SearchFilter::TimeRange {
+            min_ms: Some(1_700_000_000_000),
+            max_ms: Some(1_700_000_000_100),
+        });
         let results = svc.search(&q).unwrap();
         assert!(results.total_hits >= 1);
-        assert!(results
-            .hits
-            .iter()
-            .all(|h| h.doc.occurred_at_ms >= 1_700_000_000_000
-                && h.doc.occurred_at_ms <= 1_700_000_000_100));
+        assert!(
+            results
+                .hits
+                .iter()
+                .all(|h| h.doc.occurred_at_ms >= 1_700_000_000_000
+                    && h.doc.occurred_at_ms <= 1_700_000_000_100)
+        );
     }
 
     #[test]
     fn filter_by_session_id() {
         let svc = test_service();
-        let q = SearchQuery::simple("hello cargo git Compiling error echo")
-            .with_filter(SearchFilter::SessionId {
+        let q = SearchQuery::simple("hello cargo git Compiling error echo").with_filter(
+            SearchFilter::SessionId {
                 value: "sess-1".to_string(),
-            });
+            },
+        );
         let results = svc.search(&q).unwrap();
-        assert!(results
-            .hits
-            .iter()
-            .all(|h| h.doc.session_id == Some("sess-1".to_string())));
+        assert!(
+            results
+                .hits
+                .iter()
+                .all(|h| h.doc.session_id == Some("sess-1".to_string()))
+        );
     }
 
     #[test]
     fn filter_by_correlation_id() {
         let svc = test_service();
-        let q = SearchQuery::simple("echo cargo git hello")
-            .with_filter(SearchFilter::CorrelationId {
+        let q =
+            SearchQuery::simple("echo cargo git hello").with_filter(SearchFilter::CorrelationId {
                 value: "corr-1".to_string(),
             });
         let results = svc.search(&q).unwrap();
-        assert!(results
-            .hits
-            .iter()
-            .all(|h| h.doc.correlation_id == Some("corr-1".to_string())));
+        assert!(
+            results
+                .hits
+                .iter()
+                .all(|h| h.doc.correlation_id == Some("corr-1".to_string()))
+        );
     }
 
     #[test]
@@ -1089,25 +1109,30 @@ mod tests {
                 direction: EventDirection::Ingress,
             });
         let results = svc.search(&q).unwrap();
-        assert!(results
-            .hits
-            .iter()
-            .all(|h| h.doc.pane_id == 1 && h.doc.event_type == "ingress_text"));
+        assert!(
+            results
+                .hits
+                .iter()
+                .all(|h| h.doc.pane_id == 1 && h.doc.event_type == "ingress_text")
+        );
     }
 
     #[test]
     fn filter_sequence_range() {
         let svc = test_service();
-        let q = SearchQuery::simple("hello cargo echo Compiling error git")
-            .with_filter(SearchFilter::SequenceRange {
+        let q = SearchQuery::simple("hello cargo echo Compiling error git").with_filter(
+            SearchFilter::SequenceRange {
                 min_seq: Some(2),
                 max_seq: Some(4),
-            });
+            },
+        );
         let results = svc.search(&q).unwrap();
-        assert!(results
-            .hits
-            .iter()
-            .all(|h| h.doc.sequence >= 2 && h.doc.sequence <= 4));
+        assert!(
+            results
+                .hits
+                .iter()
+                .all(|h| h.doc.sequence >= 2 && h.doc.sequence <= 4)
+        );
     }
 
     // =========================================================================
@@ -1481,16 +1506,20 @@ mod tests {
     #[test]
     fn filter_log_offset_range() {
         let doc = make_ingress("i1", 1, 5, "text"); // log_offset = 5
-        assert!(SearchFilter::LogOffsetRange {
-            min_offset: Some(3),
-            max_offset: Some(7),
-        }
-        .matches(&doc));
-        assert!(!SearchFilter::LogOffsetRange {
-            min_offset: Some(6),
-            max_offset: None,
-        }
-        .matches(&doc));
+        assert!(
+            SearchFilter::LogOffsetRange {
+                min_offset: Some(3),
+                max_offset: Some(7),
+            }
+            .matches(&doc)
+        );
+        assert!(
+            !SearchFilter::LogOffsetRange {
+                min_offset: Some(6),
+                max_offset: None,
+            }
+            .matches(&doc)
+        );
     }
 
     #[test]

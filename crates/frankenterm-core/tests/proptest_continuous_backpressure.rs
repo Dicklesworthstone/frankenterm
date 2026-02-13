@@ -30,7 +30,7 @@ use proptest::prelude::*;
 
 use frankenterm_core::backpressure::BackpressureTier;
 use frankenterm_core::continuous_backpressure::{
-    severity, severity_to_tier, ContinuousBackpressure, ContinuousBackpressureConfig, EmaSmoother,
+    ContinuousBackpressure, ContinuousBackpressureConfig, EmaSmoother, severity, severity_to_tier,
 };
 
 // =============================================================================
@@ -61,11 +61,11 @@ fn arb_config() -> impl Strategy<Value = ContinuousBackpressureConfig> {
     (
         arb_center(),
         arb_steepness(),
-        1_usize..50,          // smoothing_window
-        1.0_f64..10.0,        // max_backoff_multiplier
-        0.1_f64..0.9,         // max_pane_skip
-        0.05_f64..0.5,        // max_detection_skip
-        0.05_f64..0.5,        // min_buffer_fraction
+        1_usize..50,   // smoothing_window
+        1.0_f64..10.0, // max_backoff_multiplier
+        0.1_f64..0.9,  // max_pane_skip
+        0.05_f64..0.5, // max_detection_skip
+        0.05_f64..0.5, // min_buffer_fraction
     )
         .prop_map(|(center, steep, window, backoff, pane, detect, buf)| {
             ContinuousBackpressureConfig {

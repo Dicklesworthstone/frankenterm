@@ -1049,12 +1049,7 @@ mod tests {
             ..empty_context()
         };
         let result = explain_search(&ctx);
-        assert!(
-            !result
-                .reasons
-                .iter()
-                .any(|r| r.code == "NARROW_TIME_RANGE")
-        );
+        assert!(!result.reasons.iter().any(|r| r.code == "NARROW_TIME_RANGE"));
     }
 
     #[test]

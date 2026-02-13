@@ -32,7 +32,9 @@ fn arb_value() -> impl Strategy<Value = f64> {
     -10_000.0_f64..10_000.0
 }
 
-fn arb_positive_values(count: impl Into<proptest::collection::SizeRange>) -> impl Strategy<Value = Vec<f64>> {
+fn arb_positive_values(
+    count: impl Into<proptest::collection::SizeRange>,
+) -> impl Strategy<Value = Vec<f64>> {
     proptest::collection::vec(0.0_f64..10_000.0, count)
 }
 
@@ -53,11 +55,7 @@ fn arb_snapshot(pid: u32, ts: u64) -> ResourceSnapshot {
     }
 }
 
-fn arb_snapshot_with_resources(
-    rss: u64,
-    fd: u64,
-    cpu: Option<f64>,
-) -> ResourceSnapshot {
+fn arb_snapshot_with_resources(rss: u64, fd: u64, cpu: Option<f64>) -> ResourceSnapshot {
     ResourceSnapshot {
         pid: 1,
         rss_bytes: rss,

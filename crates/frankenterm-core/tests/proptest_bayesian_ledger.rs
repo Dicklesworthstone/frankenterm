@@ -16,9 +16,7 @@
 
 use proptest::prelude::*;
 
-use frankenterm_core::bayesian_ledger::{
-    BayesianClassifier, Evidence, LedgerConfig, PaneState,
-};
+use frankenterm_core::bayesian_ledger::{BayesianClassifier, Evidence, LedgerConfig, PaneState};
 
 // =============================================================================
 // Strategies
@@ -63,10 +61,10 @@ fn arb_state() -> impl Strategy<Value = PaneState> {
 
 fn arb_config() -> impl Strategy<Value = LedgerConfig> {
     (
-        1_usize..20,       // min_observations
-        1.0_f64..100.0,    // bayes_factor_threshold
-        0.1_f64..10.0,     // dirichlet_alpha
-        5_usize..200,      // max_ledger_entries
+        1_usize..20,    // min_observations
+        1.0_f64..100.0, // bayes_factor_threshold
+        0.1_f64..10.0,  // dirichlet_alpha
+        5_usize..200,   // max_ledger_entries
     )
         .prop_map(|(min_obs, bf_thresh, alpha, max_entries)| LedgerConfig {
             min_observations: min_obs,

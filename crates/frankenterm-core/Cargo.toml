@@ -49,6 +49,7 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 fs2.workspace = true
 
 base64 = "0.22.1"
+crossbeam.workspace = true
 
 # FrankenTerm crates (optional, in-tree ex-WezTerm)
 codec = { workspace = true, optional = true }
@@ -149,6 +150,11 @@ name = "pool_benchmark"
 harness = false
 
 [[bench]]
+name = "pdu_pipelining"
+harness = false
+required-features = ["vendored"]
+
+[[bench]]
 name = "bocpd"
 harness = false
 
@@ -201,6 +207,15 @@ name = "lockfree_contention"
 harness = false
 
 [[bench]]
+name = "spsc_ring_buffer"
+harness = false
+
+[[bench]]
+name = "subscription_streaming"
+harness = false
+required-features = ["streaming"]
+
+[[bench]]
 name = "tantivy_search"
 harness = false
 
@@ -212,6 +227,7 @@ vendored = ["frankenterm"]  # backward compat alias
 browser = ["browser-automation"]
 mcp = ["mcp-server"]
 web = ["dep:fastapi", "dep:fastapi-core", "dep:asupersync"]
+streaming = ["web"]
 tui = ["dep:ratatui", "dep:crossterm"]
 ftui = ["dep:ftui"]
 rollout = ["tui", "ftui"]

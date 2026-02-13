@@ -27,19 +27,21 @@ fn arb_tier() -> impl Strategy<Value = CpuPressureTier> {
 
 fn arb_config() -> impl Strategy<Value = CpuPressureConfig> {
     (
-        prop::bool::ANY,          // enabled
-        1000u64..=30_000,         // sample_interval_ms
-        1.0f64..=30.0,            // yellow_threshold
-        31.0f64..=60.0,           // orange_threshold
-        61.0f64..=100.0,          // red_threshold
+        prop::bool::ANY,  // enabled
+        1000u64..=30_000, // sample_interval_ms
+        1.0f64..=30.0,    // yellow_threshold
+        31.0f64..=60.0,   // orange_threshold
+        61.0f64..=100.0,  // red_threshold
     )
-        .prop_map(|(enabled, interval, yellow, orange, red)| CpuPressureConfig {
-            enabled,
-            sample_interval_ms: interval,
-            yellow_threshold: yellow,
-            orange_threshold: orange,
-            red_threshold: red,
-        })
+        .prop_map(
+            |(enabled, interval, yellow, orange, red)| CpuPressureConfig {
+                enabled,
+                sample_interval_ms: interval,
+                yellow_threshold: yellow,
+                orange_threshold: orange,
+                red_threshold: red,
+            },
+        )
 }
 
 // ────────────────────────────────────────────────────────────────────

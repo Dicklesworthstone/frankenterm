@@ -15,6 +15,7 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::error_codes::ErrorCategory;
 
@@ -332,6 +333,62 @@ pub struct GetTextData {
     pub truncated: bool,
     #[serde(default)]
     pub truncation_info: Option<TruncationInfo>,
+}
+
+/// Response data for batched `ft robot get-text --panes ...` and `--all`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchGetTextData {
+    pub pane_ids: Vec<u64>,
+    pub tail_lines: usize,
+    pub escapes_included: bool,
+    pub results: BTreeMap<u64, PaneTextResult>,
+}
+
+/// Response data for `ft robot state --include-text`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StateWithTextData {
+    pub panes: Vec<PaneStateData>,
+    pub tail_lines: usize,
+    pub escapes_included: bool,
+    pub pane_text: BTreeMap<u64, PaneTextResult>,
+}
+
+/// Pane metadata entry returned by `ft robot state`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaneStateData {
+    pub pane_id: u64,
+    #[serde(default)]
+    pub pane_uuid: Option<String>,
+    pub tab_id: u64,
+    pub window_id: u64,
+    pub domain: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub observed: bool,
+    #[serde(default)]
+    pub ignore_reason: Option<String>,
+}
+
+/// Per-pane result entry for batch pane text reads.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum PaneTextResult {
+    Ok {
+        text: String,
+        #[serde(default)]
+        truncated: bool,
+        #[serde(default)]
+        truncation_info: Option<TruncationInfo>,
+    },
+    Error {
+        code: String,
+        message: String,
+        #[serde(default)]
+        hint: Option<String>,
+    },
 }
 
 /// Truncation details when pane output exceeds limits.
@@ -725,6 +782,20 @@ pub struct AccountPickPreview {
     pub threshold_percent: f64,
     pub candidates_count: usize,
     pub filtered_count: usize,
+    #[serde(default)]
+    pub quota_advisory: Option<AccountQuotaAdvisoryInfo>,
+}
+
+/// Quota advisory details returned with account pick previews.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountQuotaAdvisoryInfo {
+    pub availability: String,
+    pub low_quota_threshold_percent: f64,
+    #[serde(default)]
+    pub selected_percent_remaining: Option<f64>,
+    #[serde(default)]
+    pub warning: Option<String>,
+    pub blocking: bool,
 }
 
 /// Response data for `ft robot accounts refresh`.
@@ -1077,6 +1148,91 @@ mod tests {
     }
 
     #[test]
+    fn parse_batch_get_text_data() {
+        let json = json!({
+            "ok": true,
+            "data": {
+                "pane_ids": [0, 1],
+                "tail_lines": 20,
+                "escapes_included": false,
+                "results": {
+                    "0": {
+                        "status": "ok",
+                        "text": "ready",
+                        "truncated": false
+                    },
+                    "1": {
+                        "status": "error",
+                        "code": "robot.pane_not_found",
+                        "message": "Pane not found: 1",
+                        "hint": "Use 'ft robot state' to list panes."
+                    }
+                }
+            },
+            "elapsed_ms": 4,
+            "version": "0.1.0",
+            "now": 0
+        });
+        let resp: RobotResponse<BatchGetTextData> = serde_json::from_value(json).unwrap();
+        let data = resp.into_result().unwrap();
+        assert_eq!(data.pane_ids, vec![0, 1]);
+        match data.results.get(&0).unwrap() {
+            PaneTextResult::Ok { text, .. } => assert_eq!(text, "ready"),
+            other => panic!("expected ok variant, got {other:?}"),
+        }
+        match data.results.get(&1).unwrap() {
+            PaneTextResult::Error { code, .. } => assert_eq!(code, "robot.pane_not_found"),
+            other => panic!("expected error variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_state_with_text_data() {
+        let json = json!({
+            "ok": true,
+            "data": {
+                "panes": [{
+                    "pane_id": 2,
+                    "pane_uuid": "abc-123",
+                    "tab_id": 10,
+                    "window_id": 11,
+                    "domain": "local",
+                    "title": "shell",
+                    "cwd": "/tmp",
+                    "observed": true
+                }],
+                "tail_lines": 10,
+                "escapes_included": true,
+                "pane_text": {
+                    "2": {
+                        "status": "ok",
+                        "text": "line1\\nline2",
+                        "truncated": true,
+                        "truncation_info": {
+                            "original_bytes": 1000,
+                            "returned_bytes": 200,
+                            "original_lines": 100,
+                            "returned_lines": 10
+                        }
+                    }
+                }
+            },
+            "elapsed_ms": 9,
+            "version": "0.1.0",
+            "now": 0
+        });
+        let resp: RobotResponse<StateWithTextData> = serde_json::from_value(json).unwrap();
+        let data = resp.into_result().unwrap();
+        assert_eq!(data.panes.len(), 1);
+        assert_eq!(data.panes[0].pane_id, 2);
+        assert_eq!(data.tail_lines, 10);
+        match data.pane_text.get(&2).unwrap() {
+            PaneTextResult::Ok { truncated, .. } => assert!(*truncated),
+            other => panic!("expected ok variant, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_wait_for_data() {
         let json = json!({
             "ok": true,
@@ -1311,7 +1467,21 @@ mod tests {
                     "last_refreshed_at": 1700000000000i64
                 }],
                 "total": 1,
-                "service": "anthropic"
+                "service": "anthropic",
+                "pick_preview": {
+                    "selected_account_id": "acc-1",
+                    "selected_name": "Primary",
+                    "selection_reason": "Highest percent_remaining (85.5%)",
+                    "threshold_percent": 5.0,
+                    "candidates_count": 1,
+                    "filtered_count": 0,
+                    "quota_advisory": {
+                        "availability": "available",
+                        "low_quota_threshold_percent": 10.0,
+                        "selected_percent_remaining": 85.5,
+                        "blocking": false
+                    }
+                }
             },
             "elapsed_ms": 3,
             "version": "0.1.0",
@@ -1320,6 +1490,10 @@ mod tests {
         let resp: RobotResponse<AccountsListData> = serde_json::from_value(json).unwrap();
         let data = resp.into_result().unwrap();
         assert!((data.accounts[0].percent_remaining - 85.5).abs() < f64::EPSILON);
+        let pick = data.pick_preview.expect("pick preview should parse");
+        let advisory = pick.quota_advisory.expect("quota advisory should parse");
+        assert_eq!(advisory.availability, "available");
+        assert!(!advisory.blocking);
     }
 
     #[test]

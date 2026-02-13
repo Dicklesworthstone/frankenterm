@@ -142,9 +142,7 @@ async fn tap_fires_for_ctrl_c_requires_approval() {
 
     let caps = safe_caps();
     // Ctrl-C is considered destructive → requires approval
-    let result = injector
-        .send_ctrl_c(1, ActorKind::Robot, &caps, None)
-        .await;
+    let result = injector.send_ctrl_c(1, ActorKind::Robot, &caps, None).await;
     assert!(
         matches!(result, InjectionResult::RequiresApproval { .. }),
         "expected RequiresApproval, got: {result:?}"

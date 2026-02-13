@@ -7,7 +7,7 @@
 //!
 //! | Range      | Category     | Description                          |
 //! |------------|--------------|--------------------------------------|
-//! | WA-1xxx    | WezTerm      | WezTerm CLI and pane errors          |
+//! | WA-1xxx    | WezTerm      | Terminal backend bridge CLI/pane errors (current: WezTerm) |
 //! | WA-2xxx    | Storage      | Database and FTS errors              |
 //! | WA-3xxx    | Pattern      | Pattern matching and pack errors     |
 //! | WA-4xxx    | Policy       | Safety policy and send blocks        |
@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCategory {
-    /// WA-1xxx: WezTerm CLI and pane errors
+    /// WA-1xxx: Terminal backend bridge CLI and pane errors (current bridge: WezTerm)
     Wezterm,
     /// WA-2xxx: Database and FTS errors
     Storage,
@@ -172,7 +172,7 @@ pub static FT_1001: ErrorCodeDef = ErrorCodeDef {
     category: ErrorCategory::Wezterm,
     title: "WezTerm CLI not found",
     description: "The `wezterm` command-line tool could not be found in your PATH. \
-                  ft requires WezTerm to be installed and accessible.",
+                  ft currently uses a WezTerm compatibility bridge for pane/session interop.",
     causes: &[
         "WezTerm is not installed",
         "WezTerm is installed but not in PATH",
@@ -186,20 +186,20 @@ pub static FT_1001: ErrorCodeDef = ErrorCodeDef {
     doc_link: Some("https://wezfurlong.org/wezterm/install.html"),
 };
 
-/// WA-1002: WezTerm not running
+/// WA-1002: Backend bridge not running (current: WezTerm)
 pub static FT_1002: ErrorCodeDef = ErrorCodeDef {
     code: "FT-1002",
     category: ErrorCategory::Wezterm,
-    title: "WezTerm not running",
-    description: "WezTerm is not currently running. ft requires an active WezTerm instance \
-                  to observe and control terminal panes.",
+    title: "Backend bridge not running (current: WezTerm)",
+    description: "WezTerm is not currently running. ft currently relies on an active \
+                  WezTerm compatibility bridge for backend pane/session interop.",
     causes: &[
         "WezTerm application is not started",
         "WezTerm was recently closed",
         "Wrong socket path configured",
     ],
     recovery_steps: &[
-        RecoveryStep::with_command("Start WezTerm", "wezterm start"),
+        RecoveryStep::with_command("Start backend bridge (WezTerm)", "wezterm start"),
         RecoveryStep::with_command("Check panes", "wezterm cli list --format json"),
     ],
     doc_link: None,
@@ -213,13 +213,13 @@ pub static FT_1003: ErrorCodeDef = ErrorCodeDef {
     description: "The WezTerm IPC socket could not be found or accessed. \
                   This is used for communication between ft and WezTerm.",
     causes: &[
-        "WezTerm is not running",
+        "Current compatibility backend bridge (WezTerm) is not running",
         "WEZTERM_UNIX_SOCKET environment variable points to wrong path",
         "Socket permissions prevent access",
     ],
     recovery_steps: &[
         RecoveryStep::with_command("Check socket env", "echo $WEZTERM_UNIX_SOCKET"),
-        RecoveryStep::with_command("Start WezTerm fresh", "wezterm start"),
+        RecoveryStep::with_command("Start backend bridge fresh (WezTerm)", "wezterm start"),
         RecoveryStep::text("Unset WEZTERM_UNIX_SOCKET to use the default"),
     ],
     doc_link: None,
@@ -250,17 +250,17 @@ pub static FT_1020: ErrorCodeDef = ErrorCodeDef {
     code: "FT-1020",
     category: ErrorCategory::Wezterm,
     title: "WezTerm command failed",
-    description: "A WezTerm CLI command failed to execute. This could indicate \
-                  a transient issue or a problem with WezTerm itself.",
+    description: "A WezTerm-bridge CLI command failed to execute. This could indicate \
+                  a transient issue or a problem with the compatibility backend.",
     causes: &[
         "WezTerm is unresponsive",
         "System resource constraints",
         "WezTerm internal error",
     ],
     recovery_steps: &[
-        RecoveryStep::with_command("Check WezTerm status", "wezterm cli list"),
+        RecoveryStep::with_command("Check backend bridge status", "wezterm cli list"),
         RecoveryStep::with_command("Run diagnostics", "ft doctor"),
-        RecoveryStep::text("Restart WezTerm if issues persist"),
+        RecoveryStep::text("Restart the WezTerm bridge if issues persist"),
     ],
     doc_link: None,
 };
@@ -270,7 +270,7 @@ pub static FT_1021: ErrorCodeDef = ErrorCodeDef {
     code: "FT-1021",
     category: ErrorCategory::Wezterm,
     title: "WezTerm parse error",
-    description: "Failed to parse output or response from WezTerm CLI. The data \
+    description: "Failed to parse output or response from the WezTerm bridge CLI. The data \
                   received was not in the expected format.",
     causes: &[
         "WezTerm returned unexpected output format",
@@ -278,7 +278,7 @@ pub static FT_1021: ErrorCodeDef = ErrorCodeDef {
         "Version mismatch between ft and WezTerm",
     ],
     recovery_steps: &[
-        RecoveryStep::with_command("Check WezTerm version", "wezterm --version"),
+        RecoveryStep::with_command("Check backend bridge version", "wezterm --version"),
         RecoveryStep::with_command("Run diagnostics", "ft doctor"),
         RecoveryStep::text("Update WezTerm to the latest stable version"),
     ],
@@ -290,7 +290,7 @@ pub static FT_1022: ErrorCodeDef = ErrorCodeDef {
     code: "FT-1022",
     category: ErrorCategory::Wezterm,
     title: "WezTerm command timeout",
-    description: "A WezTerm CLI command timed out before completing. The operation \
+    description: "A WezTerm bridge CLI command timed out before completing. The operation \
                   may still be running in the background.",
     causes: &[
         "WezTerm is under heavy load",
@@ -298,9 +298,9 @@ pub static FT_1022: ErrorCodeDef = ErrorCodeDef {
         "Large amount of terminal output being processed",
     ],
     recovery_steps: &[
-        RecoveryStep::with_command("Check WezTerm responsiveness", "wezterm cli list"),
+        RecoveryStep::with_command("Check backend bridge responsiveness", "wezterm cli list"),
         RecoveryStep::text("Retry after a brief wait"),
-        RecoveryStep::text("Restart WezTerm if timeouts persist"),
+        RecoveryStep::text("Restart the WezTerm bridge if timeouts persist"),
     ],
     doc_link: None,
 };
@@ -310,7 +310,7 @@ pub static FT_1030: ErrorCodeDef = ErrorCodeDef {
     code: "FT-1030",
     category: ErrorCategory::Wezterm,
     title: "WezTerm output parse error",
-    description: "Failed to parse JSON output from WezTerm CLI. This may indicate \
+    description: "Failed to parse JSON output from the WezTerm bridge CLI. This may indicate \
                   a version mismatch or unexpected output format.",
     causes: &[
         "WezTerm version is too old or too new",
@@ -318,8 +318,8 @@ pub static FT_1030: ErrorCodeDef = ErrorCodeDef {
         "Corrupted or incomplete output",
     ],
     recovery_steps: &[
-        RecoveryStep::with_command("Check WezTerm version", "wezterm --version"),
-        RecoveryStep::text("Update WezTerm to the latest stable version"),
+        RecoveryStep::with_command("Check backend bridge version", "wezterm --version"),
+        RecoveryStep::text("Update WezTerm bridge to a compatible version"),
         RecoveryStep::text("Report issue if the problem persists"),
     ],
     doc_link: None,

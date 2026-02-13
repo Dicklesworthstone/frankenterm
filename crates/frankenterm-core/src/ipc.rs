@@ -10,6 +10,7 @@
 //! - Client sends: `{"type":"user_var","pane_id":1,"name":"FT_EVENT","value":"base64..."}\n`
 //! - Server responds: `{"ok":true}\n` or `{"ok":false,"error":"..."}\n`
 
+use crate::runtime_compat::RwLock;
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -20,7 +21,6 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
-use crate::runtime_compat::RwLock;
 use tokio::sync::mpsc;
 
 use crate::config::{IpcAuthToken, IpcScope};
@@ -1120,10 +1120,10 @@ impl IpcClient {
 #[allow(clippy::items_after_statements, clippy::significant_drop_tightening)]
 mod tests {
     use super::*;
+    use crate::runtime_compat::RwLock;
     use std::collections::HashMap;
     use std::sync::Arc;
     use tempfile::TempDir;
-    use crate::runtime_compat::RwLock;
 
     #[test]
     fn ipc_response_ok_serializes() {

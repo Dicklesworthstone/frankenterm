@@ -43,7 +43,16 @@ fn arb_exercise() -> impl Strategy<Value = Exercise> {
         proptest::bool::ANY,
     )
         .prop_map(
-            |(id, title, description, instructions, verification_command, verification_pattern, requirements, can_simulate)| {
+            |(
+                id,
+                title,
+                description,
+                instructions,
+                verification_command,
+                verification_pattern,
+                requirements,
+                can_simulate,
+            )| {
                 Exercise {
                     id,
                     title,
@@ -66,13 +75,15 @@ fn arb_track() -> impl Strategy<Value = Track> {
         1..60u32,
         prop::collection::vec(arb_exercise(), 1..5),
     )
-        .prop_map(|(id, name, description, estimated_minutes, exercises)| Track {
-            id,
-            name,
-            description,
-            estimated_minutes,
-            exercises,
-        })
+        .prop_map(
+            |(id, name, description, estimated_minutes, exercises)| Track {
+                id,
+                name,
+                description,
+                estimated_minutes,
+                exercises,
+            },
+        )
 }
 
 // ============================================================================

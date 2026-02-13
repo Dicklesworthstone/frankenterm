@@ -627,7 +627,10 @@ mod tests {
 
     #[test]
     fn event_template_with_suggestions() {
-        let suggs = vec![Suggestion::text("fix it"), Suggestion::with_command("run", "cmd")];
+        let suggs = vec![
+            Suggestion::text("fix it"),
+            Suggestion::with_command("run", "cmd"),
+        ];
         let t = EventTemplate::new("e", "s", "d", Severity::Warning).with_suggestions(suggs);
         assert_eq!(t.suggestions.len(), 2);
         assert!(t.suggestions[0].command.is_none());

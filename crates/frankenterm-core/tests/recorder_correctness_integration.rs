@@ -17,13 +17,12 @@ use frankenterm_core::recorder_invariants::{
     verify_replay_determinism,
 };
 use frankenterm_core::recording::{
-    RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderEvent, RecorderEventCausality,
-    RecorderEventPayload, RecorderEventSource, RecorderIngressKind, RecorderLifecyclePhase,
-    RecorderRedactionLevel, RecorderSegmentKind, RecorderTextEncoding,
+    RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderEvent, RecorderEventCausality, RecorderEventPayload,
+    RecorderEventSource, RecorderIngressKind, RecorderLifecyclePhase, RecorderRedactionLevel,
+    RecorderSegmentKind, RecorderTextEncoding,
 };
 use frankenterm_core::sequence_model::{
-    CorrelationContext, CorrelationTracker, ReplayOrder, SequenceAssigner,
-    validate_replay_order,
+    CorrelationContext, CorrelationTracker, ReplayOrder, SequenceAssigner, validate_replay_order,
 };
 
 // ---------------------------------------------------------------------------
@@ -243,7 +242,13 @@ fn correlation_tracker_builds_valid_causal_chains() {
 
     // First event: no parent
     let (seq0, _) = assigner.assign(pane_id);
-    let e0 = build_event(pane_id, seq0, 1000, ingress_payload("first"), empty_causality());
+    let e0 = build_event(
+        pane_id,
+        seq0,
+        1000,
+        ingress_payload("first"),
+        empty_causality(),
+    );
     let ctx0 = tracker.build_context(pane_id, &e0.event_id, None, None);
     assert!(ctx0.parent_event_id.is_none());
     let mut e0_final = e0.clone();
@@ -252,7 +257,13 @@ fn correlation_tracker_builds_valid_causal_chains() {
 
     // Second event: parent = first
     let (seq1, _) = assigner.assign(pane_id);
-    let e1 = build_event(pane_id, seq1, 1010, ingress_payload("second"), empty_causality());
+    let e1 = build_event(
+        pane_id,
+        seq1,
+        1010,
+        ingress_payload("second"),
+        empty_causality(),
+    );
     let ctx1 = tracker.build_context(pane_id, &e1.event_id, None, None);
     assert_eq!(ctx1.parent_event_id.as_deref(), Some(e0.event_id.as_str()));
     let mut e1_final = e1.clone();
@@ -261,7 +272,13 @@ fn correlation_tracker_builds_valid_causal_chains() {
 
     // Third event: parent = second, trigger = first (response)
     let (seq2, _) = assigner.assign(pane_id);
-    let e2 = build_event(pane_id, seq2, 1020, ingress_payload("third"), empty_causality());
+    let e2 = build_event(
+        pane_id,
+        seq2,
+        1020,
+        ingress_payload("third"),
+        empty_causality(),
+    );
     let ctx2 = tracker.build_context(
         pane_id,
         &e2.event_id,
@@ -427,7 +444,8 @@ fn mixed_event_types_across_streams_pass_invariants() {
         seq,
         1030,
         RecorderEventPayload::ControlMarker {
-            control_marker_type: frankenterm_core::recording::RecorderControlMarkerType::PromptBoundary,
+            control_marker_type:
+                frankenterm_core::recording::RecorderControlMarkerType::PromptBoundary,
             details: serde_json::json!({"osc": "133"}),
         },
         empty_causality(),
@@ -516,14 +534,8 @@ fn batch_correlation_chain_passes_invariants() {
 #[test]
 fn stream_kind_from_payload_matches_event_type() {
     let payloads = vec![
-        (
-            ingress_payload("test"),
-            StreamKind::Ingress,
-        ),
-        (
-            egress_payload("output"),
-            StreamKind::Egress,
-        ),
+        (ingress_payload("test"), StreamKind::Ingress),
+        (egress_payload("output"), StreamKind::Egress),
         (
             lifecycle_payload(RecorderLifecyclePhase::PaneOpened),
             StreamKind::Lifecycle,
@@ -548,8 +560,20 @@ fn merge_keys_sort_by_recorded_at_then_pane_then_stream_then_sequence() {
     let mut events = Vec::new();
 
     // Two events at same recorded_at_ms, different panes
-    events.push(build_event(1, 0, 1000, ingress_payload("p1"), empty_causality()));
-    events.push(build_event(0, 0, 1000, ingress_payload("p0"), empty_causality()));
+    events.push(build_event(
+        1,
+        0,
+        1000,
+        ingress_payload("p1"),
+        empty_causality(),
+    ));
+    events.push(build_event(
+        0,
+        0,
+        1000,
+        ingress_payload("p0"),
+        empty_causality(),
+    ));
 
     let mut keys: Vec<RecorderMergeKey> = events.iter().map(RecorderMergeKey::from_event).collect();
     keys.sort();
@@ -599,15 +623,18 @@ fn large_scale_correctness_500_events_10_panes() {
     assert!(!report.has_errors());
 
     // Verify all event IDs are unique
-    let ids: std::collections::HashSet<&str> =
-        events.iter().map(|e| e.event_id.as_str()).collect();
+    let ids: std::collections::HashSet<&str> = events.iter().map(|e| e.event_id.as_str()).collect();
     assert_eq!(ids.len(), 500);
 
     // Verify replay determinism with reversed order
     let mut reversed = events.clone();
     reversed.reverse();
     let result = verify_replay_determinism(&events, &reversed);
-    assert!(result.deterministic, "replay divergence: {}", result.message);
+    assert!(
+        result.deterministic,
+        "replay divergence: {}",
+        result.message
+    );
 }
 
 #[test]
@@ -619,7 +646,13 @@ fn cross_pane_trigger_response_chain_passes() {
 
     // Pane 0: root event
     let (seq0, _) = assigner.assign(0);
-    let root = build_event(0, seq0, 1000, ingress_payload("root-cmd"), empty_causality());
+    let root = build_event(
+        0,
+        seq0,
+        1000,
+        ingress_payload("root-cmd"),
+        empty_causality(),
+    );
     let ctx0 = tracker.build_context(0, &root.event_id, None, None);
     let mut root_final = root.clone();
     root_final.causality = causality_from_context(&ctx0);
@@ -641,12 +674,7 @@ fn cross_pane_trigger_response_chain_passes() {
     // Pane 2: triggered by pane 1, root = pane 0
     let (seq2, _) = assigner.assign(2);
     let e2 = build_event(2, seq2, 1020, ingress_payload("cascade"), empty_causality());
-    let ctx2 = tracker.build_context(
-        2,
-        &e2.event_id,
-        Some(&resp.event_id),
-        Some(&root.event_id),
-    );
+    let ctx2 = tracker.build_context(2, &e2.event_id, Some(&resp.event_id), Some(&root.event_id));
     let mut e2_final = e2.clone();
     e2_final.causality = causality_from_context(&ctx2);
     events.push(e2_final);
@@ -672,10 +700,22 @@ fn intentionally_corrupted_pipeline_detected() {
 
     // Valid first event
     let (seq0, _) = assigner.assign(0);
-    events.push(build_event(0, seq0, 1000, ingress_payload("ok"), empty_causality()));
+    events.push(build_event(
+        0,
+        seq0,
+        1000,
+        ingress_payload("ok"),
+        empty_causality(),
+    ));
 
     // Inject corrupted event: sequence regression
-    events.push(build_event(0, 0, 1010, ingress_payload("dup-seq"), empty_causality()));
+    events.push(build_event(
+        0,
+        0,
+        1010,
+        ingress_payload("dup-seq"),
+        empty_causality(),
+    ));
 
     // Inject corrupted event: duplicate event_id (same content)
     let dup = events[0].clone();
@@ -725,11 +765,23 @@ fn clock_regression_flagged_as_warning_not_failure() {
 
     // Normal timestamp
     let (seq0, _) = assigner.assign(0);
-    events.push(build_event(0, seq0, 2000, ingress_payload("a"), empty_causality()));
+    events.push(build_event(
+        0,
+        seq0,
+        2000,
+        ingress_payload("a"),
+        empty_causality(),
+    ));
 
     // Clock regression: timestamp goes backwards
     let (seq1, _) = assigner.assign(0);
-    events.push(build_event(0, seq1, 1000, ingress_payload("b"), empty_causality()));
+    events.push(build_event(
+        0,
+        seq1,
+        1000,
+        ingress_payload("b"),
+        empty_causality(),
+    ));
 
     let config = InvariantCheckerConfig {
         check_merge_order: false,
@@ -740,10 +792,7 @@ fn clock_regression_flagged_as_warning_not_failure() {
 
     // Clock regressions are warnings — the report should still pass
     assert!(report.passed);
-    assert_eq!(
-        report.count_by_severity(ViolationSeverity::Warning),
-        1
-    );
+    assert_eq!(report.count_by_severity(ViolationSeverity::Warning), 1);
     assert_eq!(report.count_by_kind(ViolationKind::ClockRegression), 1);
 }
 
@@ -798,7 +847,11 @@ fn serde_roundtrip_preserves_invariant_compliance() {
     };
     let checker = InvariantChecker::with_config(config);
     let report = checker.check(&deserialized);
-    assert!(report.passed, "serde roundtrip broke invariants: {:?}", report.violations);
+    assert!(
+        report.passed,
+        "serde roundtrip broke invariants: {:?}",
+        report.violations
+    );
 
     // Replay determinism should hold
     let result = verify_replay_determinism(&events, &deserialized);

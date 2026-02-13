@@ -67,9 +67,9 @@ fn arb_cause_step() -> impl Strategy<Value = CauseStep> {
 
 fn arb_config() -> impl Strategy<Value = CompletionTrackerConfig> {
     (
-        0u64..=120_000,       // default_timeout_ms
-        1usize..=50_000,      // max_active_tokens
-        0u64..=600_000,       // retention_ms
+        0u64..=120_000,  // default_timeout_ms
+        1usize..=50_000, // max_active_tokens
+        0u64..=600_000,  // retention_ms
     )
         .prop_map(|(timeout, max_tokens, retention)| CompletionTrackerConfig {
             default_timeout_ms: timeout,

@@ -14,8 +14,8 @@
 use proptest::prelude::*;
 
 use frankenterm_core::session_dna::{
-    cosine_similarity, l2_distance, DetectionType, FeatureNormalizer, KnnPrediction, PcaModel,
-    SessionDna, SessionDnaBuilder, SessionDnaConfig, RAW_FEATURE_DIM,
+    DetectionType, FeatureNormalizer, KnnPrediction, PcaModel, RAW_FEATURE_DIM, SessionDna,
+    SessionDnaBuilder, SessionDnaConfig, cosine_similarity, l2_distance,
 };
 
 // ────────────────────────────────────────────────────────────────────
@@ -34,25 +34,25 @@ fn arb_detection_type() -> impl Strategy<Value = DetectionType> {
 fn arb_session_dna() -> impl Strategy<Value = SessionDna> {
     // Split into two tuples (max 12 elements each) to satisfy proptest bounds.
     let activity = (
-        0.0f32..=1.0,           // active_fraction
-        0.0f32..=1.0,           // idle_fraction
-        0u32..=1000,            // burst_count
-        0.0f32..=3600.0,        // mean_burst_duration_s
-        0.0f32..=3600.0,        // mean_idle_duration_s
-        0u64..=1_000_000,       // total_lines
-        0.0f32..=8.0,           // output_entropy
-        0.0f32..=1.0,           // unique_line_ratio
-        0.0f32..=1.0,           // ansi_density
-        0.0f32..=500.0,         // mean_line_length
+        0.0f32..=1.0,     // active_fraction
+        0.0f32..=1.0,     // idle_fraction
+        0u32..=1000,      // burst_count
+        0.0f32..=3600.0,  // mean_burst_duration_s
+        0.0f32..=3600.0,  // mean_idle_duration_s
+        0u64..=1_000_000, // total_lines
+        0.0f32..=8.0,     // output_entropy
+        0.0f32..=1.0,     // unique_line_ratio
+        0.0f32..=1.0,     // ansi_density
+        0.0f32..=500.0,   // mean_line_length
     );
     let events = (
-        0u32..=10000,           // tool_call_count
-        0u32..=1000,            // error_count
-        0u32..=1000,            // rate_limit_count
-        0u32..=100,             // compaction_count
-        0.0f32..=100.0,         // duration_hours
+        0u32..=10000,                     // tool_call_count
+        0u32..=1000,                      // error_count
+        0u32..=1000,                      // rate_limit_count
+        0u32..=100,                       // compaction_count
+        0.0f32..=100.0,                   // duration_hours
         prop::option::of(0.0f32..=100.0), // time_to_first_error
-        0.0f32..=100000.0,      // tokens_per_hour
+        0.0f32..=100000.0,                // tokens_per_hour
     );
     (activity, events).prop_map(
         |((af, idf, bc, mbd, mid, tl, oe, ulr, ad, mll), (tc, ec, rl, cc, dh, ttfe, tph))| {
@@ -81,10 +81,10 @@ fn arb_session_dna() -> impl Strategy<Value = SessionDna> {
 
 fn arb_config() -> impl Strategy<Value = SessionDnaConfig> {
     (
-        1usize..=32,            // embedding_dim
-        0.0f64..=1.0,           // similarity_threshold
-        1usize..=100,           // k_neighbors
-        1usize..=500,           // min_sessions_for_pca
+        1usize..=32,  // embedding_dim
+        0.0f64..=1.0, // similarity_threshold
+        1usize..=100, // k_neighbors
+        1usize..=500, // min_sessions_for_pca
     )
         .prop_map(|(dim, thresh, k, min_pca)| SessionDnaConfig {
             embedding_dim: dim,

@@ -14,18 +14,16 @@
 //! All operations use resumable checkpoints with a separate consumer ID
 //! so they don't interfere with the live incremental indexer.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
 use crate::recorder_storage::{
-    CheckpointCommitOutcome, CheckpointConsumerId, RecorderCheckpoint, RecorderOffset,
-    RecorderStorage, RecorderStorageError,
+    CheckpointConsumerId, RecorderCheckpoint, RecorderOffset, RecorderStorage,
 };
 use crate::recording::RECORDER_EVENT_SCHEMA_VERSION_V1;
 use crate::tantivy_ingest::{
-    map_event_to_document, AppendLogReader, IndexDocumentFields, IndexWriteError, IndexWriter,
-    IndexerError, LogReadError, LEXICAL_SCHEMA_VERSION,
+    AppendLogReader, IndexWriteError, IndexWriter, IndexerError, map_event_to_document,
 };
 
 // ---------------------------------------------------------------------------
@@ -254,10 +252,7 @@ impl<W: ReindexableWriter> ReindexPipeline<W> {
             let existing_checkpoint = storage.read_checkpoint(&consumer_id).await?;
             // Only clear if we're starting fresh (no existing checkpoint)
             if existing_checkpoint.is_none() {
-                let cleared = self
-                    .writer
-                    .clear_all()
-                    .map_err(IndexerError::IndexWrite)?;
+                let cleared = self.writer.clear_all().map_err(IndexerError::IndexWrite)?;
                 progress.docs_cleared = cleared;
             }
         }
@@ -679,8 +674,9 @@ mod tests {
         RecorderEvent, RecorderEventCausality, RecorderEventPayload, RecorderEventSource,
         RecorderIngressKind, RecorderRedactionLevel, RecorderTextEncoding,
     };
-    use crate::tantivy_ingest::IndexCommitStats;
+    use crate::tantivy_ingest::{IndexCommitStats, IndexDocumentFields};
     use std::collections::HashMap;
+    use std::path::Path;
     use tempfile::tempdir;
 
     // -- test helpers --
@@ -1026,11 +1022,7 @@ mod tests {
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
 
-        populate_log(
-            &storage,
-            vec![sample_event("e1", 1, 0, "text")],
-        )
-        .await;
+        populate_log(&storage, vec![sample_event("e1", 1, 0, "text")]).await;
 
         let config = ReindexConfig {
             data_path: dir.path().join("events.log"),
@@ -1429,9 +1421,7 @@ mod tests {
         // Only index ordinals 3-6
         let mut lookup = MockIndexLookup::new();
         for i in 3..=6 {
-            lookup
-                .docs
-                .insert(format!("e{i}"), i);
+            lookup.docs.insert(format!("e{i}"), i);
         }
         lookup.total = 4;
 

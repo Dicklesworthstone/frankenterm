@@ -61,6 +61,7 @@ pub fn classify_error_message(msg: &str) -> ProtocolErrorKind {
         || lower.contains("codec error")
         || lower.contains("frame exceeded max size")
         || lower.contains("remote error")
+        || lower.contains("request serial space exhausted")
     {
         return ProtocolErrorKind::Recoverable;
     }
@@ -114,7 +115,10 @@ pub fn classify_mux_error(err: &crate::vendored::DirectMuxError) -> ProtocolErro
 
         DirectMuxError::ConnectTimeout(_)
         | DirectMuxError::ReadTimeout
-        | DirectMuxError::WriteTimeout => ProtocolErrorKind::Transient,
+        | DirectMuxError::WriteTimeout
+        | DirectMuxError::BatchTimeout { .. } => ProtocolErrorKind::Transient,
+
+        DirectMuxError::SerialExhausted => ProtocolErrorKind::Recoverable,
 
         DirectMuxError::SocketNotFound(_) => ProtocolErrorKind::Transient,
 

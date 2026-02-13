@@ -22,9 +22,9 @@ use frankenterm_core::pool::{Pool, PoolConfig, PoolError, PoolStats};
 
 fn arb_pool_config() -> impl Strategy<Value = PoolConfig> {
     (
-        1usize..=20,           // max_size
-        1u64..=600,            // idle_timeout_secs
-        1u64..=30,             // acquire_timeout_secs
+        1usize..=20, // max_size
+        1u64..=600,  // idle_timeout_secs
+        1u64..=30,   // acquire_timeout_secs
     )
         .prop_map(|(max_size, idle_secs, acq_secs)| PoolConfig {
             max_size,
@@ -35,16 +35,24 @@ fn arb_pool_config() -> impl Strategy<Value = PoolConfig> {
 
 fn arb_pool_stats() -> impl Strategy<Value = PoolStats> {
     (
-        1usize..=100,          // max_size
-        0usize..=100,          // idle_count
-        0usize..=100,          // active_count
-        0u64..=10_000,         // total_acquired
-        0u64..=10_000,         // total_returned
-        0u64..=10_000,         // total_evicted
-        0u64..=10_000,         // total_timeouts
+        1usize..=100,  // max_size
+        0usize..=100,  // idle_count
+        0usize..=100,  // active_count
+        0u64..=10_000, // total_acquired
+        0u64..=10_000, // total_returned
+        0u64..=10_000, // total_evicted
+        0u64..=10_000, // total_timeouts
     )
         .prop_map(
-            |(max_size, idle_count, active_count, total_acquired, total_returned, total_evicted, total_timeouts)| {
+            |(
+                max_size,
+                idle_count,
+                active_count,
+                total_acquired,
+                total_returned,
+                total_evicted,
+                total_timeouts,
+            )| {
                 PoolStats {
                     max_size,
                     idle_count,
@@ -59,10 +67,7 @@ fn arb_pool_stats() -> impl Strategy<Value = PoolStats> {
 }
 
 fn arb_pool_error() -> impl Strategy<Value = PoolError> {
-    prop_oneof![
-        Just(PoolError::AcquireTimeout),
-        Just(PoolError::Closed),
-    ]
+    prop_oneof![Just(PoolError::AcquireTimeout), Just(PoolError::Closed),]
 }
 
 // ────────────────────────────────────────────────────────────────────

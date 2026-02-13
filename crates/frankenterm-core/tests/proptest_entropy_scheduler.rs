@@ -25,10 +25,10 @@ use frankenterm_core::entropy_scheduler::{
 
 fn arb_config() -> impl Strategy<Value = EntropySchedulerConfig> {
     (
-        100u64..=5000,      // base_interval_ms
-        10u64..=100,        // min_interval_ms
-        5000u64..=60_000,   // max_interval_ms
-        1u64..=200,         // min_samples
+        100u64..=5000,    // base_interval_ms
+        10u64..=100,      // min_interval_ms
+        5000u64..=60_000, // max_interval_ms
+        1u64..=200,       // min_samples
     )
         .prop_map(|(base, min_i, max_i, min_s)| EntropySchedulerConfig {
             base_interval_ms: base,
@@ -46,8 +46,11 @@ fn arb_data(max_len: usize) -> impl Strategy<Value = Vec<u8>> {
 }
 
 fn arb_pane_ids(max_count: usize) -> impl Strategy<Value = Vec<u64>> {
-    prop::collection::vec(1u64..=100, 1..max_count)
-        .prop_map(|mut ids| { ids.sort(); ids.dedup(); ids })
+    prop::collection::vec(1u64..=100, 1..max_count).prop_map(|mut ids| {
+        ids.sort();
+        ids.dedup();
+        ids
+    })
 }
 
 // ────────────────────────────────────────────────────────────────────

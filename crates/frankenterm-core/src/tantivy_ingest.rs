@@ -21,11 +21,10 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::recorder_storage::{
-    AppendLogStorageConfig, CheckpointConsumerId, CheckpointCommitOutcome, RecorderCheckpoint,
-    RecorderOffset, RecorderStorage, RecorderStorageError,
+    CheckpointConsumerId, RecorderCheckpoint, RecorderOffset, RecorderStorage, RecorderStorageError,
 };
 use crate::recording::{
-    RecorderEvent, RecorderEventPayload, RecorderRedactionLevel, RECORDER_EVENT_SCHEMA_VERSION_V1,
+    RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderEvent, RecorderEventPayload, RecorderRedactionLevel,
 };
 
 // ---------------------------------------------------------------------------
@@ -96,74 +95,83 @@ pub struct IndexDocumentFields {
 
 /// Maps a [`RecorderEvent`] at a given log offset to [`IndexDocumentFields`].
 pub fn map_event_to_document(event: &RecorderEvent, log_offset: u64) -> IndexDocumentFields {
-    let (event_type, text, ingress_kind, segment_kind, control_marker_type, lifecycle_phase, is_gap, redaction, details_json) =
-        match &event.payload {
-            RecorderEventPayload::IngressText {
-                text,
-                redaction,
-                ingress_kind,
-                ..
-            } => (
-                "ingress_text".to_string(),
-                redacted_text(text, *redaction),
-                Some(format_ingress_kind(*ingress_kind)),
+    let (
+        event_type,
+        text,
+        ingress_kind,
+        segment_kind,
+        control_marker_type,
+        lifecycle_phase,
+        is_gap,
+        redaction,
+        details_json,
+    ) = match &event.payload {
+        RecorderEventPayload::IngressText {
+            text,
+            redaction,
+            ingress_kind,
+            ..
+        } => (
+            "ingress_text".to_string(),
+            redacted_text(text, *redaction),
+            Some(format_ingress_kind(*ingress_kind)),
+            None,
+            None,
+            None,
+            false,
+            Some(format_redaction(*redaction)),
+            "{}".to_string(),
+        ),
+        RecorderEventPayload::EgressOutput {
+            text,
+            redaction,
+            segment_kind,
+            is_gap,
+            ..
+        } => (
+            "egress_output".to_string(),
+            redacted_text(text, *redaction),
+            None,
+            Some(format_segment_kind(*segment_kind)),
+            None,
+            None,
+            *is_gap,
+            Some(format_redaction(*redaction)),
+            "{}".to_string(),
+        ),
+        RecorderEventPayload::ControlMarker {
+            control_marker_type,
+            details,
+        } => (
+            "control_marker".to_string(),
+            String::new(),
+            None,
+            None,
+            Some(format_control_marker(*control_marker_type)),
+            None,
+            false,
+            None,
+            serde_json::to_string(details).unwrap_or_else(|_| "{}".to_string()),
+        ),
+        RecorderEventPayload::LifecycleMarker {
+            lifecycle_phase,
+            reason,
+            details,
+        } => {
+            let reason_text = reason.as_deref().unwrap_or("");
+            (
+                "lifecycle_marker".to_string(),
+                reason_text.to_string(),
                 None,
                 None,
                 None,
-                false,
-                Some(format_redaction(*redaction)),
-                "{}".to_string(),
-            ),
-            RecorderEventPayload::EgressOutput {
-                text,
-                redaction,
-                segment_kind,
-                is_gap,
-                ..
-            } => (
-                "egress_output".to_string(),
-                redacted_text(text, *redaction),
-                None,
-                Some(format_segment_kind(*segment_kind)),
-                None,
-                None,
-                *is_gap,
-                Some(format_redaction(*redaction)),
-                "{}".to_string(),
-            ),
-            RecorderEventPayload::ControlMarker {
-                control_marker_type,
-                details,
-            } => (
-                "control_marker".to_string(),
-                String::new(),
-                None,
-                None,
-                Some(format_control_marker(*control_marker_type)),
-                None,
+                Some(format_lifecycle_phase(*lifecycle_phase)),
                 false,
                 None,
                 serde_json::to_string(details).unwrap_or_else(|_| "{}".to_string()),
-            ),
-            RecorderEventPayload::LifecycleMarker {
-                lifecycle_phase,
-                reason,
-                details,
-            } => {
-                let reason_text = reason.as_deref().unwrap_or("");
-                (
-                    "lifecycle_marker".to_string(),
-                    reason_text.to_string(),
-                    None,
-                    None,
-                    None,
-                    Some(format_lifecycle_phase(*lifecycle_phase)),
-                    false,
-                    None,
-                    serde_json::to_string(details).unwrap_or_else(|_| "{}".to_string()),
-                )
-            }
-        };
+            )
+        }
+    };
 
     // text_symbols gets the same text content — the schema uses a different tokenizer
     // at index time (ft_terminal_symbols_v1 vs ft_terminal_text_v1).
@@ -302,17 +310,26 @@ pub enum LogReadError {
     /// Corrupt or truncated record at the given byte offset.
     Corrupt { byte_offset: u64, reason: String },
     /// JSON deserialization failure.
-    Deserialize { byte_offset: u64, source: serde_json::Error },
+    Deserialize {
+        byte_offset: u64,
+        source: serde_json::Error,
+    },
 }
 
 impl std::fmt::Display for LogReadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(e) => write!(f, "log read I/O error: {e}"),
-            Self::Corrupt { byte_offset, reason } => {
+            Self::Corrupt {
+                byte_offset,
+                reason,
+            } => {
                 write!(f, "corrupt record at byte {byte_offset}: {reason}")
             }
-            Self::Deserialize { byte_offset, source } => {
+            Self::Deserialize {
+                byte_offset,
+                source,
+            } => {
                 write!(f, "JSON error at byte {byte_offset}: {source}")
             }
         }
@@ -426,12 +443,11 @@ impl AppendLogReader {
         let mut payload_buf = vec![0u8; payload_len as usize];
         self.file.read_exact(&mut payload_buf)?;
 
-        let event: RecorderEvent = serde_json::from_slice(&payload_buf).map_err(|e| {
-            LogReadError::Deserialize {
+        let event: RecorderEvent =
+            serde_json::from_slice(&payload_buf).map_err(|e| LogReadError::Deserialize {
                 byte_offset: record_start,
                 source: e,
-            }
-        })?;
+            })?;
 
         let offset = RecorderOffset {
             segment_id: 0,
@@ -841,9 +857,9 @@ mod tests {
         AppendLogRecorderStorage, AppendLogStorageConfig, AppendRequest, DurabilityLevel,
     };
     use crate::recording::{
-        RecorderEventCausality, RecorderEventPayload, RecorderEventSource, RecorderIngressKind,
-        RecorderRedactionLevel, RecorderSegmentKind, RecorderTextEncoding,
-        RecorderControlMarkerType, RecorderLifecyclePhase,
+        RecorderControlMarkerType, RecorderEventCausality, RecorderEventPayload,
+        RecorderEventSource, RecorderIngressKind, RecorderLifecyclePhase, RecorderRedactionLevel,
+        RecorderSegmentKind, RecorderTextEncoding,
     };
     use tempfile::tempdir;
 
@@ -1025,10 +1041,7 @@ mod tests {
         }
     }
 
-    async fn populate_log(
-        storage: &AppendLogRecorderStorage,
-        events: Vec<RecorderEvent>,
-    ) {
+    async fn populate_log(storage: &AppendLogRecorderStorage, events: Vec<RecorderEvent>) {
         for (i, chunk) in events.chunks(4).enumerate() {
             storage
                 .append_batch(AppendRequest {
@@ -1082,7 +1095,12 @@ mod tests {
     #[test]
     fn map_egress_gap_event() {
         let mut event = egress_event("ev-gap", 10, 4, "");
-        if let RecorderEventPayload::EgressOutput { ref mut is_gap, ref mut segment_kind, .. } = event.payload {
+        if let RecorderEventPayload::EgressOutput {
+            ref mut is_gap,
+            ref mut segment_kind,
+            ..
+        } = event.payload
+        {
             *is_gap = true;
             *segment_kind = RecorderSegmentKind::Gap;
         }
@@ -1118,7 +1136,10 @@ mod tests {
     #[test]
     fn map_redacted_partial() {
         let mut event = sample_event("ev-r", 1, 0, "secret stuff");
-        if let RecorderEventPayload::IngressText { ref mut redaction, .. } = event.payload {
+        if let RecorderEventPayload::IngressText {
+            ref mut redaction, ..
+        } = event.payload
+        {
             *redaction = RecorderRedactionLevel::Partial;
         }
         let doc = map_event_to_document(&event, 0);
@@ -1129,7 +1150,10 @@ mod tests {
     #[test]
     fn map_redacted_full() {
         let mut event = sample_event("ev-rf", 1, 0, "top secret");
-        if let RecorderEventPayload::IngressText { ref mut redaction, .. } = event.payload {
+        if let RecorderEventPayload::IngressText {
+            ref mut redaction, ..
+        } = event.payload
+        {
             *redaction = RecorderRedactionLevel::Full;
         }
         let doc = map_event_to_document(&event, 0);
@@ -1227,12 +1251,9 @@ mod tests {
         let offset_2 = &all[2].offset;
 
         // Open at the byte offset of record 2
-        let mut reader2 = AppendLogReader::open_at_offset(
-            &cfg.data_path,
-            offset_2.byte_offset,
-            offset_2.ordinal,
-        )
-        .unwrap();
+        let mut reader2 =
+            AppendLogReader::open_at_offset(&cfg.data_path, offset_2.byte_offset, offset_2.ordinal)
+                .unwrap();
         let rec = reader2.next_record().unwrap().unwrap();
         assert_eq!(rec.event.event_id, "e2");
     }
@@ -1442,10 +1463,14 @@ mod tests {
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
 
-        populate_log(&storage, vec![
-            sample_event("dup-1", 1, 0, "text"),
-            sample_event("dup-2", 1, 1, "text2"),
-        ]).await;
+        populate_log(
+            &storage,
+            vec![
+                sample_event("dup-1", 1, 0, "text"),
+                sample_event("dup-2", 1, 1, "text2"),
+            ],
+        )
+        .await;
 
         let icfg = IndexerConfig {
             dedup_on_replay: true,
@@ -1484,11 +1509,15 @@ mod tests {
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
 
-        populate_log(&storage, vec![
-            sample_event("ok-1", 1, 0, "good"),
-            sample_event("reject-me", 1, 1, "bad"),
-            sample_event("ok-2", 1, 2, "good"),
-        ]).await;
+        populate_log(
+            &storage,
+            vec![
+                sample_event("ok-1", 1, 0, "good"),
+                sample_event("reject-me", 1, 1, "bad"),
+                sample_event("ok-2", 1, 2, "good"),
+            ],
+        )
+        .await;
 
         let icfg = test_indexer_config(dir.path());
         let mut writer = MockIndexWriter::new();
@@ -1549,10 +1578,11 @@ mod tests {
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
 
-        populate_log(&storage, vec![
-            sample_event("e1", 1, 0, "a"),
-            sample_event("e2", 1, 1, "b"),
-        ]).await;
+        populate_log(
+            &storage,
+            vec![sample_event("e1", 1, 0, "a"), sample_event("e2", 1, 1, "b")],
+        )
+        .await;
 
         let icfg = IndexerConfig {
             batch_size: 1,
@@ -1591,12 +1621,16 @@ mod tests {
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
 
-        populate_log(&storage, vec![
-            sample_event("ingress-1", 1, 0, "echo hello"),
-            egress_event("egress-1", 1, 1, "hello\n"),
-            control_event("ctrl-1", 1, 2),
-            lifecycle_event("lc-1", 2, 3),
-        ]).await;
+        populate_log(
+            &storage,
+            vec![
+                sample_event("ingress-1", 1, 0, "echo hello"),
+                egress_event("egress-1", 1, 1, "hello\n"),
+                control_event("ctrl-1", 1, 2),
+                lifecycle_event("lc-1", 2, 3),
+            ],
+        )
+        .await;
 
         let icfg = test_indexer_config(dir.path());
         let mut indexer = IncrementalIndexer::new(icfg, MockIndexWriter::new());
@@ -1620,7 +1654,9 @@ mod tests {
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
 
-        let lag = compute_indexer_lag(&storage, "test-consumer").await.unwrap();
+        let lag = compute_indexer_lag(&storage, "test-consumer")
+            .await
+            .unwrap();
         assert_eq!(lag.log_head_ordinal, None);
         assert_eq!(lag.indexer_ordinal, None);
         assert_eq!(lag.records_behind, 0);
@@ -1633,13 +1669,19 @@ mod tests {
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
 
-        populate_log(&storage, vec![
-            sample_event("e1", 1, 0, "a"),
-            sample_event("e2", 1, 1, "b"),
-            sample_event("e3", 1, 2, "c"),
-        ]).await;
+        populate_log(
+            &storage,
+            vec![
+                sample_event("e1", 1, 0, "a"),
+                sample_event("e2", 1, 1, "b"),
+                sample_event("e3", 1, 2, "c"),
+            ],
+        )
+        .await;
 
-        let lag = compute_indexer_lag(&storage, "test-consumer").await.unwrap();
+        let lag = compute_indexer_lag(&storage, "test-consumer")
+            .await
+            .unwrap();
         assert_eq!(lag.log_head_ordinal, Some(2));
         assert_eq!(lag.indexer_ordinal, None);
         assert_eq!(lag.records_behind, 3);
@@ -1705,10 +1747,14 @@ mod tests {
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
 
         // Initial events
-        populate_log(&storage, vec![
-            sample_event("e1", 1, 0, "first"),
-            sample_event("e2", 1, 1, "second"),
-        ]).await;
+        populate_log(
+            &storage,
+            vec![
+                sample_event("e1", 1, 0, "first"),
+                sample_event("e2", 1, 1, "second"),
+            ],
+        )
+        .await;
 
         // First index run
         let icfg = IndexerConfig {
@@ -1775,7 +1821,10 @@ mod tests {
 
             let current = result.final_ordinal.unwrap();
             if let Some(prev) = prev_ordinal {
-                assert!(current > prev, "checkpoint must advance: {current} > {prev}");
+                assert!(
+                    current > prev,
+                    "checkpoint must advance: {current} > {prev}"
+                );
             }
             prev_ordinal = Some(current);
         }
@@ -1792,12 +1841,16 @@ mod tests {
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
 
-        populate_log(&storage, vec![
-            sample_event("p1-e1", 1, 0, "pane 1 first"),
-            sample_event("p2-e1", 2, 0, "pane 2 first"),
-            sample_event("p3-e1", 3, 0, "pane 3 first"),
-            sample_event("p1-e2", 1, 1, "pane 1 second"),
-        ]).await;
+        populate_log(
+            &storage,
+            vec![
+                sample_event("p1-e1", 1, 0, "pane 1 first"),
+                sample_event("p2-e1", 2, 0, "pane 2 first"),
+                sample_event("p3-e1", 3, 0, "pane 3 first"),
+                sample_event("p1-e2", 1, 1, "pane 1 second"),
+            ],
+        )
+        .await;
 
         let icfg = test_indexer_config(dir.path());
         let mut indexer = IncrementalIndexer::new(icfg, MockIndexWriter::new());
@@ -1854,13 +1907,19 @@ mod tests {
 
     #[test]
     fn index_write_error_display() {
-        let e1 = IndexWriteError::Rejected { reason: "bad".to_string() };
+        let e1 = IndexWriteError::Rejected {
+            reason: "bad".to_string(),
+        };
         assert!(e1.to_string().contains("rejected"));
 
-        let e2 = IndexWriteError::Transient { reason: "busy".to_string() };
+        let e2 = IndexWriteError::Transient {
+            reason: "busy".to_string(),
+        };
         assert!(e2.to_string().contains("transient"));
 
-        let e3 = IndexWriteError::CommitFailed { reason: "disk".to_string() };
+        let e3 = IndexWriteError::CommitFailed {
+            reason: "disk".to_string(),
+        };
         assert!(e3.to_string().contains("commit"));
     }
 

@@ -383,11 +383,13 @@ impl UndoExecutor {
         let engine = WorkflowEngine::new(10);
         let lock_manager = Arc::new(PaneWorkflowLockManager::new());
         let policy = PolicyEngine::permissive();
-        let injector = Arc::new(crate::runtime_compat::Mutex::new(PolicyGatedInjector::with_storage(
-            policy,
-            Arc::clone(&self.wezterm),
-            self.storage.as_ref().clone(),
-        )));
+        let injector = Arc::new(crate::runtime_compat::Mutex::new(
+            PolicyGatedInjector::with_storage(
+                policy,
+                Arc::clone(&self.wezterm),
+                self.storage.as_ref().clone(),
+            ),
+        ));
         WorkflowRunner::new(
             engine,
             lock_manager,
@@ -740,7 +742,11 @@ mod tests {
 
     #[test]
     fn undo_outcome_serde_roundtrip() {
-        for variant in [UndoOutcome::Success, UndoOutcome::NotApplicable, UndoOutcome::Failed] {
+        for variant in [
+            UndoOutcome::Success,
+            UndoOutcome::NotApplicable,
+            UndoOutcome::Failed,
+        ] {
             let json = serde_json::to_string(&variant).unwrap();
             let back: UndoOutcome = serde_json::from_str(&json).unwrap();
             assert_eq!(variant, back);
@@ -749,9 +755,18 @@ mod tests {
 
     #[test]
     fn undo_outcome_serde_uses_snake_case() {
-        assert_eq!(serde_json::to_string(&UndoOutcome::Success).unwrap(), "\"success\"");
-        assert_eq!(serde_json::to_string(&UndoOutcome::NotApplicable).unwrap(), "\"not_applicable\"");
-        assert_eq!(serde_json::to_string(&UndoOutcome::Failed).unwrap(), "\"failed\"");
+        assert_eq!(
+            serde_json::to_string(&UndoOutcome::Success).unwrap(),
+            "\"success\""
+        );
+        assert_eq!(
+            serde_json::to_string(&UndoOutcome::NotApplicable).unwrap(),
+            "\"not_applicable\""
+        );
+        assert_eq!(
+            serde_json::to_string(&UndoOutcome::Failed).unwrap(),
+            "\"failed\""
+        );
     }
 
     #[test]
@@ -930,9 +945,13 @@ mod tests {
             undone_at: None,
             undone_by: None,
         };
-        let action = make_action_history(1, "workflow", Some("wf-actor"), Some("wf-workflow"), None);
+        let action =
+            make_action_history(1, "workflow", Some("wf-actor"), Some("wf-workflow"), None);
         // Payload takes priority
-        assert_eq!(execution_id_from_undo(&undo, &action).as_deref(), Some("wf-payload"));
+        assert_eq!(
+            execution_id_from_undo(&undo, &action).as_deref(),
+            Some("wf-payload")
+        );
     }
 
     #[test]
@@ -948,7 +967,10 @@ mod tests {
         };
         let action = make_action_history(1, "workflow", Some("wf-from-actor"), Some("wf-id"), None);
         // Falls back to actor_id when actor_kind is "workflow"
-        assert_eq!(execution_id_from_undo(&undo, &action).as_deref(), Some("wf-from-actor"));
+        assert_eq!(
+            execution_id_from_undo(&undo, &action).as_deref(),
+            Some("wf-from-actor")
+        );
     }
 
     #[test]
@@ -963,7 +985,10 @@ mod tests {
             undone_by: None,
         };
         let action = make_action_history(1, "human", None, Some("wf-fallback"), None);
-        assert_eq!(execution_id_from_undo(&undo, &action).as_deref(), Some("wf-fallback"));
+        assert_eq!(
+            execution_id_from_undo(&undo, &action).as_deref(),
+            Some("wf-fallback")
+        );
     }
 
     #[test]
@@ -1043,11 +1068,18 @@ mod tests {
     async fn action_not_found_returns_not_applicable() {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let db_path = temp.path().join("undo-not-found.db");
-        let storage = Arc::new(StorageHandle::new(&db_path.to_string_lossy()).await.expect("storage"));
+        let storage = Arc::new(
+            StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
 
         let mock = Arc::new(MockWezterm::new());
         let executor = UndoExecutor::new(Arc::clone(&storage), mock);
-        let result = executor.execute(UndoRequest::new(99999)).await.expect("result");
+        let result = executor
+            .execute(UndoRequest::new(99999))
+            .await
+            .expect("result");
 
         assert_eq!(result.outcome, UndoOutcome::NotApplicable);
         assert!(result.message.contains("not found"));
@@ -1060,14 +1092,21 @@ mod tests {
     async fn no_undo_metadata_returns_not_applicable() {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let db_path = temp.path().join("undo-no-metadata.db");
-        let storage = Arc::new(StorageHandle::new(&db_path.to_string_lossy()).await.expect("storage"));
+        let storage = Arc::new(
+            StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
 
         seed_pane(storage.as_ref(), 1).await;
         let action_id = seed_action(storage.as_ref(), 1, "human", Some("cli"), "send_text").await;
 
         let mock = Arc::new(MockWezterm::new());
         let executor = UndoExecutor::new(Arc::clone(&storage), mock);
-        let result = executor.execute(UndoRequest::new(action_id)).await.expect("result");
+        let result = executor
+            .execute(UndoRequest::new(action_id))
+            .await
+            .expect("result");
 
         assert_eq!(result.outcome, UndoOutcome::NotApplicable);
         assert!(result.message.contains("No undo metadata"));
@@ -1079,7 +1118,11 @@ mod tests {
     async fn not_undoable_returns_not_applicable() {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let db_path = temp.path().join("undo-not-undoable.db");
-        let storage = Arc::new(StorageHandle::new(&db_path.to_string_lossy()).await.expect("storage"));
+        let storage = Arc::new(
+            StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
 
         seed_pane(storage.as_ref(), 1).await;
         let action_id = seed_action(storage.as_ref(), 1, "human", None, "send_text").await;
@@ -1099,7 +1142,10 @@ mod tests {
 
         let mock = Arc::new(MockWezterm::new());
         let executor = UndoExecutor::new(Arc::clone(&storage), mock);
-        let result = executor.execute(UndoRequest::new(action_id)).await.expect("result");
+        let result = executor
+            .execute(UndoRequest::new(action_id))
+            .await
+            .expect("result");
 
         assert_eq!(result.outcome, UndoOutcome::NotApplicable);
         assert!(result.message.contains("not currently undoable"));
@@ -1111,7 +1157,11 @@ mod tests {
     async fn unknown_strategy_returns_failed() {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let db_path = temp.path().join("undo-unknown-strategy.db");
-        let storage = Arc::new(StorageHandle::new(&db_path.to_string_lossy()).await.expect("storage"));
+        let storage = Arc::new(
+            StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
 
         seed_pane(storage.as_ref(), 1).await;
         let action_id = seed_action(storage.as_ref(), 1, "human", None, "send_text").await;
@@ -1131,7 +1181,10 @@ mod tests {
 
         let mock = Arc::new(MockWezterm::new());
         let executor = UndoExecutor::new(Arc::clone(&storage), mock);
-        let result = executor.execute(UndoRequest::new(action_id)).await.expect("result");
+        let result = executor
+            .execute(UndoRequest::new(action_id))
+            .await
+            .expect("result");
 
         assert_eq!(result.outcome, UndoOutcome::Failed);
         assert!(result.message.contains("Unknown undo strategy"));
@@ -1144,7 +1197,11 @@ mod tests {
     async fn custom_strategy_returns_not_applicable() {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let db_path = temp.path().join("undo-custom-strategy.db");
-        let storage = Arc::new(StorageHandle::new(&db_path.to_string_lossy()).await.expect("storage"));
+        let storage = Arc::new(
+            StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
 
         seed_pane(storage.as_ref(), 1).await;
         let action_id = seed_action(storage.as_ref(), 1, "human", None, "send_text").await;
@@ -1164,7 +1221,10 @@ mod tests {
 
         let mock = Arc::new(MockWezterm::new());
         let executor = UndoExecutor::new(Arc::clone(&storage), mock);
-        let result = executor.execute(UndoRequest::new(action_id)).await.expect("result");
+        let result = executor
+            .execute(UndoRequest::new(action_id))
+            .await
+            .expect("result");
 
         assert_eq!(result.outcome, UndoOutcome::NotApplicable);
         assert!(result.message.contains("not supported"));
@@ -1177,7 +1237,11 @@ mod tests {
     async fn pane_close_nonexistent_pane_returns_not_applicable() {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let db_path = temp.path().join("undo-pane-gone.db");
-        let storage = Arc::new(StorageHandle::new(&db_path.to_string_lossy()).await.expect("storage"));
+        let storage = Arc::new(
+            StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
 
         seed_pane(storage.as_ref(), 1).await;
         let action_id = seed_action(storage.as_ref(), 1, "human", None, "spawn").await;
@@ -1198,7 +1262,10 @@ mod tests {
         let mock = Arc::new(MockWezterm::new());
         // Don't add pane 999, so get_pane will return PaneNotFound
         let executor = UndoExecutor::new(Arc::clone(&storage), mock);
-        let result = executor.execute(UndoRequest::new(action_id)).await.expect("result");
+        let result = executor
+            .execute(UndoRequest::new(action_id))
+            .await
+            .expect("result");
 
         assert_eq!(result.outcome, UndoOutcome::NotApplicable);
         assert!(result.message.contains("no longer exists"));
@@ -1211,7 +1278,11 @@ mod tests {
     async fn pane_close_no_pane_id_in_payload_returns_not_applicable() {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let db_path = temp.path().join("undo-pane-no-id.db");
-        let storage = Arc::new(StorageHandle::new(&db_path.to_string_lossy()).await.expect("storage"));
+        let storage = Arc::new(
+            StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
 
         // Seed pane but action has no pane_id
         seed_pane(storage.as_ref(), 1).await;
@@ -1252,7 +1323,10 @@ mod tests {
 
         let mock = Arc::new(MockWezterm::new());
         let executor = UndoExecutor::new(Arc::clone(&storage), mock);
-        let result = executor.execute(UndoRequest::new(action_id)).await.expect("result");
+        let result = executor
+            .execute(UndoRequest::new(action_id))
+            .await
+            .expect("result");
 
         assert_eq!(result.outcome, UndoOutcome::NotApplicable);
         assert!(result.message.contains("pane ID"));
@@ -1264,7 +1338,11 @@ mod tests {
     async fn workflow_abort_no_execution_id_returns_not_applicable() {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let db_path = temp.path().join("undo-wf-no-exec.db");
-        let storage = Arc::new(StorageHandle::new(&db_path.to_string_lossy()).await.expect("storage"));
+        let storage = Arc::new(
+            StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
 
         seed_pane(storage.as_ref(), 1).await;
         // Non-workflow actor, no workflow_id, no payload execution_id
@@ -1305,7 +1383,10 @@ mod tests {
 
         let mock = Arc::new(MockWezterm::new());
         let executor = UndoExecutor::new(Arc::clone(&storage), mock);
-        let result = executor.execute(UndoRequest::new(action_id)).await.expect("result");
+        let result = executor
+            .execute(UndoRequest::new(action_id))
+            .await
+            .expect("result");
 
         assert_eq!(result.outcome, UndoOutcome::NotApplicable);
         assert!(result.message.contains("execution ID"));

@@ -78,16 +78,22 @@ fn bench_setup_teardown(c: &mut Criterion) {
 
     group.bench_function("empty", |b| {
         b.iter(|| {
-            let mut runtime =
-                LabRuntime::new(LabConfig::new(black_box(42)).worker_count(1).max_steps(1_000));
+            let mut runtime = LabRuntime::new(
+                LabConfig::new(black_box(42))
+                    .worker_count(1)
+                    .max_steps(1_000),
+            );
             black_box(runtime.run_until_quiescent());
         });
     });
 
     group.bench_function("with_report", |b| {
         b.iter(|| {
-            let mut runtime =
-                LabRuntime::new(LabConfig::new(black_box(42)).worker_count(1).max_steps(1_000));
+            let mut runtime = LabRuntime::new(
+                LabConfig::new(black_box(42))
+                    .worker_count(1)
+                    .max_steps(1_000),
+            );
             let report = runtime.run_until_quiescent_with_report();
             black_box(report.oracle_report.all_passed());
         });
@@ -105,8 +111,11 @@ fn bench_oracle_check(c: &mut Criterion) {
 
     group.bench_function("no_tasks", |b| {
         b.iter(|| {
-            let mut runtime =
-                LabRuntime::new(LabConfig::new(black_box(7)).worker_count(1).max_steps(1_000));
+            let mut runtime = LabRuntime::new(
+                LabConfig::new(black_box(7))
+                    .worker_count(1)
+                    .max_steps(1_000),
+            );
             runtime.run_until_quiescent();
             let report = runtime.report();
             black_box(report.oracle_report.all_passed());
@@ -115,8 +124,11 @@ fn bench_oracle_check(c: &mut Criterion) {
 
     group.bench_function("after_tasks", |b| {
         b.iter(|| {
-            let mut runtime =
-                LabRuntime::new(LabConfig::new(black_box(7)).worker_count(2).max_steps(10_000));
+            let mut runtime = LabRuntime::new(
+                LabConfig::new(black_box(7))
+                    .worker_count(2)
+                    .max_steps(10_000),
+            );
             let region = runtime.state.create_root_region(Budget::INFINITE);
             for i in 0..5_u32 {
                 let (task_id, _handle) = runtime
@@ -149,8 +161,11 @@ fn bench_virtual_time(c: &mut Criterion) {
 
     group.bench_function("advance_1ms", |b| {
         b.iter(|| {
-            let mut runtime =
-                LabRuntime::new(LabConfig::new(black_box(42)).worker_count(1).max_steps(10_000));
+            let mut runtime = LabRuntime::new(
+                LabConfig::new(black_box(42))
+                    .worker_count(1)
+                    .max_steps(10_000),
+            );
             runtime.advance_time(black_box(1_000_000)); // 1ms in nanos
             black_box(runtime.now());
         });
@@ -158,8 +173,11 @@ fn bench_virtual_time(c: &mut Criterion) {
 
     group.bench_function("advance_100ms", |b| {
         b.iter(|| {
-            let mut runtime =
-                LabRuntime::new(LabConfig::new(black_box(42)).worker_count(1).max_steps(10_000));
+            let mut runtime = LabRuntime::new(
+                LabConfig::new(black_box(42))
+                    .worker_count(1)
+                    .max_steps(10_000),
+            );
             runtime.advance_time(black_box(100_000_000)); // 100ms in nanos
             black_box(runtime.now());
         });
@@ -177,8 +195,11 @@ fn bench_task_spawn(c: &mut Criterion) {
 
     group.bench_function("single", |b| {
         b.iter(|| {
-            let mut runtime =
-                LabRuntime::new(LabConfig::new(black_box(42)).worker_count(1).max_steps(10_000));
+            let mut runtime = LabRuntime::new(
+                LabConfig::new(black_box(42))
+                    .worker_count(1)
+                    .max_steps(10_000),
+            );
             let region = runtime.state.create_root_region(Budget::INFINITE);
             let (task_id, _handle) = runtime
                 .state
@@ -195,8 +216,11 @@ fn bench_task_spawn(c: &mut Criterion) {
 
     group.bench_function("ten", |b| {
         b.iter(|| {
-            let mut runtime =
-                LabRuntime::new(LabConfig::new(black_box(42)).worker_count(2).max_steps(10_000));
+            let mut runtime = LabRuntime::new(
+                LabConfig::new(black_box(42))
+                    .worker_count(2)
+                    .max_steps(10_000),
+            );
             let region = runtime.state.create_root_region(Budget::INFINITE);
             for i in 0..10_u32 {
                 let (task_id, _handle) = runtime
@@ -282,8 +306,11 @@ fn bench_comparison(c: &mut Criterion) {
 
     group.bench_function("lab_block_on", |b| {
         b.iter(|| {
-            let mut runtime =
-                LabRuntime::new(LabConfig::new(black_box(42)).worker_count(1).max_steps(1_000));
+            let mut runtime = LabRuntime::new(
+                LabConfig::new(black_box(42))
+                    .worker_count(1)
+                    .max_steps(1_000),
+            );
             let region = runtime.state.create_root_region(Budget::INFINITE);
             let (task_id, _handle) = runtime
                 .state

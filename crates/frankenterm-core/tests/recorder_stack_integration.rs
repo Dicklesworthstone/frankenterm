@@ -15,25 +15,22 @@ use std::time::Instant;
 
 use frankenterm_core::policy::ActorKind;
 use frankenterm_core::recorder_audit::{
-    AccessTier, AuditEventBuilder, AuditEventType, AuditLog, AuditLogConfig, ActorIdentity,
-    AuthzDecision, AUDIT_SCHEMA_VERSION, GENESIS_HASH,
-    check_authorization, required_tier_for_event,
+    AUDIT_SCHEMA_VERSION, AccessTier, ActorIdentity, AuditEventBuilder, AuditEventType, AuditLog,
+    AuditLogConfig, AuthzDecision, GENESIS_HASH, check_authorization, required_tier_for_event,
 };
 use frankenterm_core::recorder_retention::{
     RetentionConfig, RetentionManager, SegmentMeta, SegmentPhase, SensitivityTier,
 };
 use frankenterm_core::recorder_storage::{
-    AppendLogRecorderStorage, AppendLogStorageConfig, AppendRequest,
-    DurabilityLevel, FlushMode, RecorderStorage, RecorderStorageErrorClass,
+    AppendLogRecorderStorage, AppendLogStorageConfig, AppendRequest, DurabilityLevel, FlushMode,
+    RecorderStorage, RecorderStorageErrorClass,
 };
 use frankenterm_core::recording::{
-    RecorderEvent, RecorderEventCausality, RecorderEventPayload, RecorderEventSource,
-    RecorderIngressKind, RecorderRedactionLevel, RecorderTextEncoding,
-    RECORDER_EVENT_SCHEMA_VERSION_V1,
+    RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderEvent, RecorderEventCausality, RecorderEventPayload,
+    RecorderEventSource, RecorderIngressKind, RecorderRedactionLevel, RecorderTextEncoding,
 };
 use frankenterm_core::storage_telemetry::{
-    StorageHealthTier, StorageTelemetry, StorageTelemetryConfig,
-    diagnose, remediation_for_error,
+    StorageHealthTier, StorageTelemetry, StorageTelemetryConfig, diagnose, remediation_for_error,
 };
 
 // =============================================================================
@@ -202,7 +199,12 @@ async fn storage_flush_updates_telemetry() {
     };
     let start = Instant::now();
     let resp = storage.append_batch(req).await.unwrap();
-    telemetry.record_append(start.elapsed().as_micros() as f64, resp.accepted_count, 100, false);
+    telemetry.record_append(
+        start.elapsed().as_micros() as f64,
+        resp.accepted_count,
+        100,
+        false,
+    );
 
     // Flush.
     let flush_start = Instant::now();
@@ -389,9 +391,33 @@ fn sensitivity_classification_flows_through_retention_and_audit() {
     let mut mgr = RetentionManager::with_defaults();
     let base_ms = 1_700_000_000_000u64;
 
-    mgr.add_segment(make_segment("seg_t1", t1, SegmentPhase::Active, base_ms, 1000, 10, 0));
-    mgr.add_segment(make_segment("seg_t2", t2, SegmentPhase::Active, base_ms, 2000, 20, 10));
-    mgr.add_segment(make_segment("seg_t3", t3, SegmentPhase::Active, base_ms, 3000, 30, 30));
+    mgr.add_segment(make_segment(
+        "seg_t1",
+        t1,
+        SegmentPhase::Active,
+        base_ms,
+        1000,
+        10,
+        0,
+    ));
+    mgr.add_segment(make_segment(
+        "seg_t2",
+        t2,
+        SegmentPhase::Active,
+        base_ms,
+        2000,
+        20,
+        10,
+    ));
+    mgr.add_segment(make_segment(
+        "seg_t3",
+        t3,
+        SegmentPhase::Active,
+        base_ms,
+        3000,
+        30,
+        30,
+    ));
 
     assert_eq!(mgr.segment_count(), 3);
     assert_eq!(mgr.segments_by_tier(SensitivityTier::T1Standard).len(), 1);
@@ -774,8 +800,18 @@ fn retention_windows_differ_by_tier() {
     let t3_hours = config.retention_hours(SensitivityTier::T3Restricted);
 
     // T3 has accelerated purge (shortest retention).
-    assert!(t3_hours <= t1_hours, "T3 ({}) should be <= T1 ({})", t3_hours, t1_hours);
-    assert!(t3_hours <= t2_hours, "T3 ({}) should be <= T2 ({})", t3_hours, t2_hours);
+    assert!(
+        t3_hours <= t1_hours,
+        "T3 ({}) should be <= T1 ({})",
+        t3_hours,
+        t1_hours
+    );
+    assert!(
+        t3_hours <= t2_hours,
+        "T3 ({}) should be <= T2 ({})",
+        t3_hours,
+        t2_hours
+    );
 
     // All tiers have positive retention.
     assert!(t1_hours > 0);
@@ -827,17 +863,25 @@ fn multi_actor_concurrent_operations_audited() {
             AuthzDecision::Deny
         };
         audit_log.append(
-            AuditEventBuilder::new(AuditEventType::RecorderQuery, robot_actor(), now + 1000 + i * 100)
-                .with_decision(decision),
+            AuditEventBuilder::new(
+                AuditEventType::RecorderQuery,
+                robot_actor(),
+                now + 1000 + i * 100,
+            )
+            .with_decision(decision),
         );
     }
 
     // Workflow: replay with elevation.
     for i in 0..3 {
         audit_log.append(
-            AuditEventBuilder::new(AuditEventType::RecorderReplay, workflow_actor(), now + 2000 + i * 100)
-                .with_decision(AuthzDecision::Elevate)
-                .with_justification("Automated incident analysis"),
+            AuditEventBuilder::new(
+                AuditEventType::RecorderReplay,
+                workflow_actor(),
+                now + 2000 + i * 100,
+            )
+            .with_decision(AuthzDecision::Elevate)
+            .with_justification("Automated incident analysis"),
         );
     }
 
@@ -873,9 +917,11 @@ fn multi_actor_concurrent_operations_audited() {
 fn tamper_detection_modified_field() {
     let log = AuditLog::new(AuditLogConfig::default());
     for i in 0..5 {
-        log.append(
-            AuditEventBuilder::new(AuditEventType::RecorderQuery, human_actor(), i * 1000),
-        );
+        log.append(AuditEventBuilder::new(
+            AuditEventType::RecorderQuery,
+            human_actor(),
+            i * 1000,
+        ));
     }
 
     let mut entries = log.entries();
@@ -892,9 +938,11 @@ fn tamper_detection_modified_field() {
 fn tamper_detection_deleted_entry() {
     let log = AuditLog::new(AuditLogConfig::default());
     for i in 0..5 {
-        log.append(
-            AuditEventBuilder::new(AuditEventType::RecorderQuery, human_actor(), i * 1000),
-        );
+        log.append(AuditEventBuilder::new(
+            AuditEventType::RecorderQuery,
+            human_actor(),
+            i * 1000,
+        ));
     }
 
     let mut entries = log.entries();
@@ -910,9 +958,11 @@ fn tamper_detection_deleted_entry() {
 fn tamper_detection_inserted_entry() {
     let log = AuditLog::new(AuditLogConfig::default());
     for i in 0..3 {
-        log.append(
-            AuditEventBuilder::new(AuditEventType::RecorderQuery, human_actor(), i * 1000),
-        );
+        log.append(AuditEventBuilder::new(
+            AuditEventType::RecorderQuery,
+            human_actor(),
+            i * 1000,
+        ));
     }
 
     let mut entries = log.entries();
@@ -966,17 +1016,17 @@ fn checkpoint_holds_prevent_purge() {
 
     // A consumer holds a checkpoint referencing this segment.
     let mut holders: HashMap<String, Vec<String>> = HashMap::new();
-    holders.insert(
-        "seg_held".to_string(),
-        vec!["tantivy-indexer".to_string()],
-    );
+    holders.insert("seg_held".to_string(), vec!["tantivy-indexer".to_string()]);
 
     // Sweep well past cold window.
     let sweep_time = base_ms + 90 * 86_400_000;
     let result = mgr.sweep(sweep_time, &holders);
 
     // Segment should be held, not purged.
-    assert!(!result.held.is_empty(), "Segment should be held by checkpoint");
+    assert!(
+        !result.held.is_empty(),
+        "Segment should be held by checkpoint"
+    );
 
     // Audit the hold.
     for (seg_id, consumer) in &result.held {
@@ -1058,16 +1108,31 @@ fn retention_tracks_aggregate_data() {
     let base_ms = 1_700_000_000_000u64;
 
     mgr.add_segment(make_segment(
-        "seg_a", SensitivityTier::T1Standard, SegmentPhase::Active,
-        base_ms, 10_000, 100, 0,
+        "seg_a",
+        SensitivityTier::T1Standard,
+        SegmentPhase::Active,
+        base_ms,
+        10_000,
+        100,
+        0,
     ));
     mgr.add_segment(make_segment(
-        "seg_b", SensitivityTier::T2Sensitive, SegmentPhase::Sealed,
-        base_ms, 20_000, 200, 100,
+        "seg_b",
+        SensitivityTier::T2Sensitive,
+        SegmentPhase::Sealed,
+        base_ms,
+        20_000,
+        200,
+        100,
     ));
     mgr.add_segment(make_segment(
-        "seg_c", SensitivityTier::T3Restricted, SegmentPhase::Archived,
-        base_ms, 5_000, 50, 300,
+        "seg_c",
+        SensitivityTier::T3Restricted,
+        SegmentPhase::Archived,
+        base_ms,
+        5_000,
+        50,
+        300,
     ));
 
     assert_eq!(mgr.total_data_bytes(), 35_000);

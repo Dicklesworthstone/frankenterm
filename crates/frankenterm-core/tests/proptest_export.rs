@@ -63,7 +63,17 @@ fn arb_export_header() -> impl Strategy<Value = ExportHeader> {
         0..10000usize,
     )
         .prop_map(
-            |(version, kind, redacted, exported_at_ms, pane_id, since, until, limit, record_count)| {
+            |(
+                version,
+                kind,
+                redacted,
+                exported_at_ms,
+                pane_id,
+                since,
+                until,
+                limit,
+                record_count,
+            )| {
                 ExportHeader {
                     export: true,
                     version,
@@ -115,7 +125,8 @@ proptest! {
     fn prop_export_kind_as_str_nonempty_lowercase(kind in arb_export_kind()) {
         let s = kind.as_str();
         prop_assert!(!s.is_empty(), "as_str should return non-empty string");
-        prop_assert_eq!(s, s.to_lowercase().as_str(),
+        let lower = s.to_lowercase();
+        prop_assert_eq!(s, lower.as_str(),
             "as_str should return lowercase: got {}", s);
     }
 

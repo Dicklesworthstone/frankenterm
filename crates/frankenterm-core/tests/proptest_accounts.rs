@@ -10,9 +10,10 @@ use std::collections::HashMap;
 use proptest::prelude::*;
 
 use frankenterm_core::accounts::{
-    build_exhaustion_info, find_earliest_reset, parse_reset_at_ms, select_account,
     AccountExhaustionInfo, AccountRecord, AccountSelectionConfig, AccountSelectionResult,
-    CandidateAccount, FilteredAccount, SelectionExplanation,
+    CandidateAccount, DEFAULT_LOW_QUOTA_THRESHOLD_PERCENT, FilteredAccount, QuotaAvailability,
+    SelectionExplanation, build_exhaustion_info, build_quota_advisory, find_earliest_reset,
+    parse_reset_at_ms, select_account,
 };
 use frankenterm_core::caut::{CautAccountUsage, CautService};
 
@@ -62,18 +63,18 @@ fn arb_opt_tokens() -> impl Strategy<Value = Option<i64>> {
 /// Generate a complete AccountRecord with controlled randomness.
 fn arb_account_record() -> impl Strategy<Value = AccountRecord> {
     (
-        arb_safe_string(),    // account_id
-        arb_safe_string(),    // service
-        arb_opt_string(),     // name
-        arb_percent(),        // percent_remaining
-        arb_opt_string(),     // reset_at
-        arb_opt_tokens(),     // tokens_used
-        arb_opt_tokens(),     // tokens_remaining
-        arb_opt_tokens(),     // tokens_limit
-        arb_timestamp(),      // last_refreshed_at
-        arb_opt_timestamp(),  // last_used_at
-        arb_timestamp(),      // created_at
-        arb_timestamp(),      // updated_at
+        arb_safe_string(),   // account_id
+        arb_safe_string(),   // service
+        arb_opt_string(),    // name
+        arb_percent(),       // percent_remaining
+        arb_opt_string(),    // reset_at
+        arb_opt_tokens(),    // tokens_used
+        arb_opt_tokens(),    // tokens_remaining
+        arb_opt_tokens(),    // tokens_limit
+        arb_timestamp(),     // last_refreshed_at
+        arb_opt_timestamp(), // last_used_at
+        arb_timestamp(),     // created_at
+        arb_timestamp(),     // updated_at
     )
         .prop_map(
             |(
@@ -121,26 +122,38 @@ fn arb_selection_config() -> impl Strategy<Value = AccountSelectionConfig> {
 
 /// Generate a FilteredAccount.
 fn arb_filtered_account() -> impl Strategy<Value = FilteredAccount> {
-    (arb_safe_string(), arb_opt_string(), arb_percent(), arb_safe_string()).prop_map(
-        |(account_id, name, percent_remaining, reason)| FilteredAccount {
-            account_id,
-            name,
-            percent_remaining,
-            reason,
-        },
+    (
+        arb_safe_string(),
+        arb_opt_string(),
+        arb_percent(),
+        arb_safe_string(),
     )
+        .prop_map(
+            |(account_id, name, percent_remaining, reason)| FilteredAccount {
+                account_id,
+                name,
+                percent_remaining,
+                reason,
+            },
+        )
 }
 
 /// Generate a CandidateAccount.
 fn arb_candidate_account() -> impl Strategy<Value = CandidateAccount> {
-    (arb_safe_string(), arb_opt_string(), arb_percent(), arb_opt_timestamp()).prop_map(
-        |(account_id, name, percent_remaining, last_used_at)| CandidateAccount {
-            account_id,
-            name,
-            percent_remaining,
-            last_used_at,
-        },
+    (
+        arb_safe_string(),
+        arb_opt_string(),
+        arb_percent(),
+        arb_opt_timestamp(),
     )
+        .prop_map(
+            |(account_id, name, percent_remaining, last_used_at)| CandidateAccount {
+                account_id,
+                name,
+                percent_remaining,
+                last_used_at,
+            },
+        )
 }
 
 /// Generate a SelectionExplanation.
@@ -152,13 +165,11 @@ fn arb_selection_explanation() -> impl Strategy<Value = SelectionExplanation> {
         arb_safe_string(),
     )
         .prop_map(
-            |(total_considered, filtered_out, candidates, selection_reason)| {
-                SelectionExplanation {
-                    total_considered,
-                    filtered_out,
-                    candidates,
-                    selection_reason,
-                }
+            |(total_considered, filtered_out, candidates, selection_reason)| SelectionExplanation {
+                total_considered,
+                filtered_out,
+                candidates,
+                selection_reason,
             },
         )
 }
@@ -166,17 +177,26 @@ fn arb_selection_explanation() -> impl Strategy<Value = SelectionExplanation> {
 /// Generate a CautAccountUsage with controlled fields.
 fn arb_caut_account_usage() -> impl Strategy<Value = CautAccountUsage> {
     (
-        arb_opt_string(),                                           // id
-        arb_opt_string(),                                           // name
-        prop_oneof![3 => Just(None), 7 => arb_percent().prop_map(Some)], // percent_remaining
-        prop_oneof![3 => Just(None), 7 => (1u64..1000u64).prop_map(Some)], // limit_hours
-        arb_opt_string(),                                           // reset_at
+        arb_opt_string(),                                                       // id
+        arb_opt_string(),                                                       // name
+        prop_oneof![3 => Just(None), 7 => arb_percent().prop_map(Some)],        // percent_remaining
+        prop_oneof![3 => Just(None), 7 => (1u64..1000u64).prop_map(Some)],      // limit_hours
+        arb_opt_string(),                                                       // reset_at
         prop_oneof![3 => Just(None), 7 => (0u64..1_000_000u64).prop_map(Some)], // tokens_used
         prop_oneof![3 => Just(None), 7 => (0u64..1_000_000u64).prop_map(Some)], // tokens_remaining
         prop_oneof![3 => Just(None), 7 => (0u64..1_000_000u64).prop_map(Some)], // tokens_limit
     )
         .prop_map(
-            |(id, name, percent_remaining, limit_hours, reset_at, tokens_used, tokens_remaining, tokens_limit)| {
+            |(
+                id,
+                name,
+                percent_remaining,
+                limit_hours,
+                reset_at,
+                tokens_used,
+                tokens_remaining,
+                tokens_limit,
+            )| {
                 CautAccountUsage {
                     id,
                     name,
@@ -199,9 +219,17 @@ fn arb_epoch_ms_string() -> impl Strategy<Value = String> {
 
 /// Generate an ISO 8601 UTC datetime string.
 fn arb_iso8601_string() -> impl Strategy<Value = String> {
-    (2000i32..2050, 1u32..=12, 1u32..=28, 0u32..24, 0u32..60, 0u32..60).prop_map(
-        |(y, m, d, h, min, s)| format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m, d, h, min, s),
+    (
+        2000i32..2050,
+        1u32..=12,
+        1u32..=28,
+        0u32..24,
+        0u32..60,
+        0u32..60,
     )
+        .prop_map(|(y, m, d, h, min, s)| {
+            format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m, d, h, min, s)
+        })
 }
 
 /// Generate an ISO 8601 date-only string.
@@ -1125,5 +1153,73 @@ proptest! {
                 selected.account_id
             );
         }
+    }
+}
+
+// =============================================================================
+// 14. Quota advisory invariants
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(40))]
+
+    /// Quota advisory classification matches selection + threshold semantics.
+    #[test]
+    fn quota_advisory_matches_selection_semantics(
+        accounts in arb_account_vec(12),
+        config in arb_selection_config(),
+        low_quota_threshold_percent in arb_percent(),
+    ) {
+        let selection = select_account(&accounts, &config);
+        let advisory = build_quota_advisory(&selection, low_quota_threshold_percent);
+
+        match selection.selected.as_ref() {
+            None => {
+                prop_assert_eq!(advisory.availability, QuotaAvailability::Exhausted);
+                prop_assert!(advisory.selected_percent_remaining.is_none());
+                prop_assert!(advisory.warning.is_some());
+                prop_assert!(advisory.is_blocking());
+            }
+            Some(selected) if selected.percent_remaining < low_quota_threshold_percent => {
+                prop_assert_eq!(advisory.availability, QuotaAvailability::Low);
+                prop_assert_eq!(advisory.selected_percent_remaining, Some(selected.percent_remaining));
+                prop_assert!(advisory.warning.is_some());
+                prop_assert!(!advisory.is_blocking());
+            }
+            Some(selected) => {
+                prop_assert_eq!(advisory.availability, QuotaAvailability::Available);
+                prop_assert_eq!(advisory.selected_percent_remaining, Some(selected.percent_remaining));
+                prop_assert!(advisory.warning.is_none());
+                prop_assert!(!advisory.is_blocking());
+            }
+        }
+    }
+
+    /// Default low-quota threshold emits low advisory for selected accounts below 10%.
+    #[test]
+    fn quota_advisory_low_below_default_threshold(pct_cents in 0u64..1000u64) {
+        let pct = pct_cents as f64 / 100.0; // [0.00, 9.99]
+        let accounts = vec![make_record("acc-low", pct, None)];
+        let config = AccountSelectionConfig { threshold_percent: 0.0 };
+        let selection = select_account(&accounts, &config);
+        let advisory = build_quota_advisory(&selection, DEFAULT_LOW_QUOTA_THRESHOLD_PERCENT);
+
+        prop_assert_eq!(advisory.availability, QuotaAvailability::Low);
+        prop_assert_eq!(advisory.selected_percent_remaining, Some(pct));
+        prop_assert!(advisory.warning.is_some());
+    }
+
+    /// Default low-quota threshold emits available advisory for selected accounts at/above 10%.
+    #[test]
+    fn quota_advisory_available_at_or_above_default_threshold(pct_cents in 1000u64..=10000u64) {
+        let pct = pct_cents as f64 / 100.0; // [10.00, 100.00]
+        let accounts = vec![make_record("acc-ok", pct, None)];
+        let config = AccountSelectionConfig { threshold_percent: 0.0 };
+        let selection = select_account(&accounts, &config);
+        let advisory = build_quota_advisory(&selection, DEFAULT_LOW_QUOTA_THRESHOLD_PERCENT);
+
+        prop_assert_eq!(advisory.availability, QuotaAvailability::Available);
+        prop_assert_eq!(advisory.selected_percent_remaining, Some(pct));
+        prop_assert!(advisory.warning.is_none());
     }
 }

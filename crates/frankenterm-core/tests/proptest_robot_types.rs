@@ -65,25 +65,33 @@ fn arb_get_text_data() -> impl Strategy<Value = GetTextData> {
         proptest::bool::ANY,
         proptest::bool::ANY,
     )
-        .prop_map(|(pane_id, text, tail_lines, escapes_included, truncated)| GetTextData {
-            pane_id,
-            text,
-            tail_lines,
-            escapes_included,
-            truncated,
-            truncation_info: None,
-        })
+        .prop_map(
+            |(pane_id, text, tail_lines, escapes_included, truncated)| GetTextData {
+                pane_id,
+                text,
+                tail_lines,
+                escapes_included,
+                truncated,
+                truncation_info: None,
+            },
+        )
 }
 
 fn arb_truncation_info() -> impl Strategy<Value = TruncationInfo> {
-    (0usize..100_000, 0usize..100_000, 0usize..10_000, 0usize..10_000).prop_map(
-        |(original_bytes, returned_bytes, original_lines, returned_lines)| TruncationInfo {
-            original_bytes,
-            returned_bytes,
-            original_lines,
-            returned_lines,
-        },
+    (
+        0usize..100_000,
+        0usize..100_000,
+        0usize..10_000,
+        0usize..10_000,
     )
+        .prop_map(
+            |(original_bytes, returned_bytes, original_lines, returned_lines)| TruncationInfo {
+                original_bytes,
+                returned_bytes,
+                original_lines,
+                returned_lines,
+            },
+        )
 }
 
 fn arb_wait_for_data() -> impl Strategy<Value = WaitForData> {
@@ -95,14 +103,16 @@ fn arb_wait_for_data() -> impl Strategy<Value = WaitForData> {
         0usize..100,
         proptest::bool::ANY,
     )
-        .prop_map(|(pane_id, pattern, matched, elapsed_ms, polls, is_regex)| WaitForData {
-            pane_id,
-            pattern,
-            matched,
-            elapsed_ms,
-            polls,
-            is_regex,
-        })
+        .prop_map(
+            |(pane_id, pattern, matched, elapsed_ms, polls, is_regex)| WaitForData {
+                pane_id,
+                pattern,
+                matched,
+                elapsed_ms,
+                polls,
+                is_regex,
+            },
+        )
 }
 
 fn arb_search_hit() -> impl Strategy<Value = SearchHit> {
@@ -143,10 +153,14 @@ fn arb_reservation_info() -> impl Strategy<Value = ReservationInfo> {
         "[a-z0-9-]{5,20}",
         0i64..2_000_000_000_000,
         0i64..2_000_000_000_000,
-        prop_oneof![Just("active".to_string()), Just("released".to_string()), Just("expired".to_string())],
+        prop_oneof![
+            Just("active".to_string()),
+            Just("released".to_string()),
+            Just("expired".to_string())
+        ],
     )
-        .prop_map(|(id, pane_id, owner_kind, owner_id, created_at, expires_at, status)| {
-            ReservationInfo {
+        .prop_map(
+            |(id, pane_id, owner_kind, owner_id, created_at, expires_at, status)| ReservationInfo {
                 id,
                 pane_id,
                 owner_kind,
@@ -156,8 +170,8 @@ fn arb_reservation_info() -> impl Strategy<Value = ReservationInfo> {
                 expires_at,
                 released_at: None,
                 status,
-            }
-        })
+            },
+        )
 }
 
 fn arb_lint_issue() -> impl Strategy<Value = LintIssue> {

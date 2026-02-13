@@ -1612,12 +1612,12 @@ impl SuggestionRule for NoPanesAvailableRule {
             Suggestion::new(
                 "no_panes",
                 SuggestionType::Tip,
-                "No WezTerm panes detected. Is WezTerm running?",
+                "No backend panes detected. Is the active compatibility bridge (current: WezTerm) running?",
                 self.id(),
             )
             .with_priority(Priority::Medium)
             .with_action(SuggestedAction::new(
-                "Check WezTerm status",
+                "Check backend bridge status",
                 "wezterm cli list",
             ))
             .with_learn_more("https://wezfurlong.org/wezterm/"),

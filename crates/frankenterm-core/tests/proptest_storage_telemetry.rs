@@ -20,8 +20,8 @@ use frankenterm_core::recorder_storage::{
     CheckpointCommitOutcome, RecorderBackendKind, RecorderStorageErrorClass, RecorderStorageHealth,
 };
 use frankenterm_core::storage_telemetry::{
-    ErrorCounts, SloStatus, StorageHealthTier,
-    StorageTelemetry, StorageTelemetryConfig, diagnose, remediation_for_error,
+    ErrorCounts, SloStatus, StorageHealthTier, StorageTelemetry, StorageTelemetryConfig, diagnose,
+    remediation_for_error,
 };
 
 // ────────────────────────────────────────────────────────────────────

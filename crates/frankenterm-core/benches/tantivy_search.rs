@@ -12,15 +12,14 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
 use frankenterm_core::recording::{
-    RecorderControlMarkerType, RecorderEvent, RecorderEventCausality, RecorderEventPayload,
-    RecorderEventSource, RecorderIngressKind, RecorderRedactionLevel, RecorderSegmentKind,
-    RecorderTextEncoding, RECORDER_EVENT_SCHEMA_VERSION_V1,
+    RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderControlMarkerType, RecorderEvent,
+    RecorderEventCausality, RecorderEventPayload, RecorderEventSource, RecorderIngressKind,
+    RecorderRedactionLevel, RecorderSegmentKind, RecorderTextEncoding,
 };
-use frankenterm_core::tantivy_ingest::{map_event_to_document, IndexDocumentFields};
+use frankenterm_core::tantivy_ingest::{IndexDocumentFields, map_event_to_document};
 use frankenterm_core::tantivy_query::{
     EventDirection, InMemorySearchService, LexicalSearchService, Pagination, PaginationCursor,
-    SearchFilter, SearchQuery, SearchSortOrder, SnippetConfig, SortField,
-    extract_snippets,
+    SearchFilter, SearchQuery, SearchSortOrder, SnippetConfig, SortField, extract_snippets,
 };
 
 // ---------------------------------------------------------------------------
@@ -197,10 +196,18 @@ fn bench_search_scaling(c: &mut Criterion) {
             |b, _| {
                 let q = SearchQuery {
                     text: String::new(),
-                    filters: vec![SearchFilter::PaneId { values: vec![1, 2, 3] }],
+                    filters: vec![SearchFilter::PaneId {
+                        values: vec![1, 2, 3],
+                    }],
                     sort: SearchSortOrder::default(),
-                    pagination: Pagination { limit: 20, after: None },
-                    snippet_config: SnippetConfig { enabled: false, ..Default::default() },
+                    pagination: Pagination {
+                        limit: 20,
+                        after: None,
+                    },
+                    snippet_config: SnippetConfig {
+                        enabled: false,
+                        ..Default::default()
+                    },
                     field_boosts: std::collections::HashMap::new(),
                 };
                 b.iter(|| svc.search(&q).unwrap());
@@ -231,7 +238,9 @@ fn bench_filter_overhead(c: &mut Criterion) {
     // Single filter: PaneId
     group.bench_function("pane_id_filter", |b| {
         let q = SearchQuery::simple("cargo test")
-            .with_filter(SearchFilter::PaneId { values: vec![1, 2, 3] })
+            .with_filter(SearchFilter::PaneId {
+                values: vec![1, 2, 3],
+            })
             .with_limit(20);
         b.iter(|| svc.search(&q).unwrap());
     });
@@ -250,8 +259,12 @@ fn bench_filter_overhead(c: &mut Criterion) {
     // Combined filters: PaneId + Direction + TimeRange
     group.bench_function("combined_3_filters", |b| {
         let q = SearchQuery::simple("cargo test")
-            .with_filter(SearchFilter::PaneId { values: vec![1, 2, 3] })
-            .with_filter(SearchFilter::Direction { direction: EventDirection::Ingress })
+            .with_filter(SearchFilter::PaneId {
+                values: vec![1, 2, 3],
+            })
+            .with_filter(SearchFilter::Direction {
+                direction: EventDirection::Ingress,
+            })
             .with_filter(SearchFilter::TimeRange {
                 min_ms: Some(1_700_000_000_000),
                 max_ms: Some(1_700_000_050_000),
@@ -291,8 +304,14 @@ fn bench_sort_orders(c: &mut Criterion) {
                     primary: *field,
                     descending: *descending,
                 },
-                pagination: Pagination { limit: 50, after: None },
-                snippet_config: SnippetConfig { enabled: false, ..Default::default() },
+                pagination: Pagination {
+                    limit: 50,
+                    after: None,
+                },
+                snippet_config: SnippetConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
                 field_boosts: std::collections::HashMap::new(),
             };
             b.iter(|| svc.search(&q).unwrap());
@@ -321,7 +340,9 @@ fn bench_pagination(c: &mut Criterion) {
             loop {
                 let q = SearchQuery {
                     text: String::new(),
-                    filters: vec![SearchFilter::Direction { direction: EventDirection::Both }],
+                    filters: vec![SearchFilter::Direction {
+                        direction: EventDirection::Both,
+                    }],
                     sort: SearchSortOrder {
                         primary: SortField::OccurredAt,
                         descending: true,
@@ -330,7 +351,10 @@ fn bench_pagination(c: &mut Criterion) {
                         limit: 20,
                         after: cursor.clone(),
                     },
-                    snippet_config: SnippetConfig { enabled: false, ..Default::default() },
+                    snippet_config: SnippetConfig {
+                        enabled: false,
+                        ..Default::default()
+                    },
                     field_boosts: std::collections::HashMap::new(),
                 };
                 match svc.search(&q) {
@@ -352,13 +376,21 @@ fn bench_pagination(c: &mut Criterion) {
     group.bench_function("first_page_only", |b| {
         let q = SearchQuery {
             text: String::new(),
-            filters: vec![SearchFilter::Direction { direction: EventDirection::Both }],
+            filters: vec![SearchFilter::Direction {
+                direction: EventDirection::Both,
+            }],
             sort: SearchSortOrder {
                 primary: SortField::OccurredAt,
                 descending: true,
             },
-            pagination: Pagination { limit: 20, after: None },
-            snippet_config: SnippetConfig { enabled: false, ..Default::default() },
+            pagination: Pagination {
+                limit: 20,
+                after: None,
+            },
+            snippet_config: SnippetConfig {
+                enabled: false,
+                ..Default::default()
+            },
             field_boosts: std::collections::HashMap::new(),
         };
         b.iter(|| svc.search(&q).unwrap());

@@ -35,11 +35,7 @@ pub struct TwoTierMetrics {
 ///
 /// Given multiple ranked lists of (id, score), produce a single fused ranking.
 /// RRF score = sum(1 / (k + rank_i)) for each list where the item appears.
-pub fn rrf_fuse(
-    lexical: &[(u64, f32)],
-    semantic: &[(u64, f32)],
-    k: u32,
-) -> Vec<FusedResult> {
+pub fn rrf_fuse(lexical: &[(u64, f32)], semantic: &[(u64, f32)], k: u32) -> Vec<FusedResult> {
     let mut scores: HashMap<u64, (f32, Option<usize>, Option<usize>)> = HashMap::new();
 
     for (rank, &(id, _score)) in lexical.iter().enumerate() {
@@ -64,7 +60,11 @@ pub fn rrf_fuse(
         })
         .collect();
 
-    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     results
 }
 
@@ -137,8 +137,16 @@ pub fn kendall_tau(ranking_a: &[u64], ranking_b: &[u64]) -> f32 {
     }
 
     // Build rank maps
-    let rank_a: HashMap<u64, usize> = ranking_a.iter().enumerate().map(|(i, &id)| (id, i)).collect();
-    let rank_b: HashMap<u64, usize> = ranking_b.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+    let rank_a: HashMap<u64, usize> = ranking_a
+        .iter()
+        .enumerate()
+        .map(|(i, &id)| (id, i))
+        .collect();
+    let rank_b: HashMap<u64, usize> = ranking_b
+        .iter()
+        .enumerate()
+        .map(|(i, &id)| (id, i))
+        .collect();
 
     // Only consider items present in both
     let common: Vec<u64> = ranking_a
@@ -309,12 +317,32 @@ mod tests {
     #[test]
     fn blend_two_tier_basic() {
         let tier1 = vec![
-            FusedResult { id: 1, score: 1.0, lexical_rank: Some(0), semantic_rank: Some(0) },
-            FusedResult { id: 2, score: 0.8, lexical_rank: Some(1), semantic_rank: None },
+            FusedResult {
+                id: 1,
+                score: 1.0,
+                lexical_rank: Some(0),
+                semantic_rank: Some(0),
+            },
+            FusedResult {
+                id: 2,
+                score: 0.8,
+                lexical_rank: Some(1),
+                semantic_rank: None,
+            },
         ];
         let tier2 = vec![
-            FusedResult { id: 3, score: 0.9, lexical_rank: None, semantic_rank: Some(0) },
-            FusedResult { id: 4, score: 0.7, lexical_rank: None, semantic_rank: Some(1) },
+            FusedResult {
+                id: 3,
+                score: 0.9,
+                lexical_rank: None,
+                semantic_rank: Some(0),
+            },
+            FusedResult {
+                id: 4,
+                score: 0.7,
+                lexical_rank: None,
+                semantic_rank: Some(1),
+            },
         ];
         let (results, metrics) = blend_two_tier(&tier1, &tier2, 3, 0.7);
         assert_eq!(results.len(), 3);
@@ -324,12 +352,25 @@ mod tests {
 
     #[test]
     fn blend_deduplicates() {
-        let tier1 = vec![
-            FusedResult { id: 1, score: 1.0, lexical_rank: None, semantic_rank: None },
-        ];
+        let tier1 = vec![FusedResult {
+            id: 1,
+            score: 1.0,
+            lexical_rank: None,
+            semantic_rank: None,
+        }];
         let tier2 = vec![
-            FusedResult { id: 1, score: 0.5, lexical_rank: None, semantic_rank: None },
-            FusedResult { id: 2, score: 0.4, lexical_rank: None, semantic_rank: None },
+            FusedResult {
+                id: 1,
+                score: 0.5,
+                lexical_rank: None,
+                semantic_rank: None,
+            },
+            FusedResult {
+                id: 2,
+                score: 0.4,
+                lexical_rank: None,
+                semantic_rank: None,
+            },
         ];
         let (results, metrics) = blend_two_tier(&tier1, &tier2, 5, 0.5);
         // id=1 appears only once
@@ -339,12 +380,18 @@ mod tests {
 
     #[test]
     fn blend_alpha_zero() {
-        let tier1 = vec![
-            FusedResult { id: 1, score: 1.0, lexical_rank: None, semantic_rank: None },
-        ];
-        let tier2 = vec![
-            FusedResult { id: 2, score: 0.5, lexical_rank: None, semantic_rank: None },
-        ];
+        let tier1 = vec![FusedResult {
+            id: 1,
+            score: 1.0,
+            lexical_rank: None,
+            semantic_rank: None,
+        }];
+        let tier2 = vec![FusedResult {
+            id: 2,
+            score: 0.5,
+            lexical_rank: None,
+            semantic_rank: None,
+        }];
         let (results, _) = blend_two_tier(&tier1, &tier2, 10, 0.0);
         // alpha=0 means tier1 scores are zeroed, tier2 scores are full
         assert_eq!(results[0].score, 0.0); // 1.0 * 0.0

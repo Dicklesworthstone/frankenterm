@@ -39,16 +39,16 @@ fn arb_action() -> impl Strategy<Value = MemoryAction> {
 
 fn arb_config() -> impl Strategy<Value = MemoryPressureConfig> {
     (
-        prop::bool::ANY,         // enabled
-        1000u64..=60_000,        // sample_interval_ms
-        1.0f64..=40.0,           // yellow_threshold
-        41.0f64..=70.0,          // orange_threshold
-        71.0f64..=100.0,         // red_threshold
-        60u64..=600,             // compress_idle_secs
-        600u64..=7200,           // evict_idle_secs
+        prop::bool::ANY,  // enabled
+        1000u64..=60_000, // sample_interval_ms
+        1.0f64..=40.0,    // yellow_threshold
+        41.0f64..=70.0,   // orange_threshold
+        71.0f64..=100.0,  // red_threshold
+        60u64..=600,      // compress_idle_secs
+        600u64..=7200,    // evict_idle_secs
     )
-        .prop_map(|(enabled, interval, yellow, orange, red, compress, evict)| {
-            MemoryPressureConfig {
+        .prop_map(
+            |(enabled, interval, yellow, orange, red, compress, evict)| MemoryPressureConfig {
                 enabled,
                 sample_interval_ms: interval,
                 yellow_threshold: yellow,
@@ -56,25 +56,27 @@ fn arb_config() -> impl Strategy<Value = MemoryPressureConfig> {
                 red_threshold: red,
                 compress_idle_secs: compress,
                 evict_idle_secs: evict,
-            }
-        })
+            },
+        )
 }
 
 fn arb_pane_memory_info() -> impl Strategy<Value = PaneMemoryInfo> {
     (
-        0u64..=1_000_000,      // pane_id
-        0u64..=100_000_000,    // rss_kb
-        prop::bool::ANY,       // scrollback_compressed
-        prop::bool::ANY,       // scrollback_evicted
-        0u64..=86_400,         // idle_secs
+        0u64..=1_000_000,   // pane_id
+        0u64..=100_000_000, // rss_kb
+        prop::bool::ANY,    // scrollback_compressed
+        prop::bool::ANY,    // scrollback_evicted
+        0u64..=86_400,      // idle_secs
     )
-        .prop_map(|(pane_id, rss_kb, compressed, evicted, idle)| PaneMemoryInfo {
-            pane_id,
-            rss_kb,
-            scrollback_compressed: compressed,
-            scrollback_evicted: evicted,
-            idle_secs: idle,
-        })
+        .prop_map(
+            |(pane_id, rss_kb, compressed, evicted, idle)| PaneMemoryInfo {
+                pane_id,
+                rss_kb,
+                scrollback_compressed: compressed,
+                scrollback_evicted: evicted,
+                idle_secs: idle,
+            },
+        )
 }
 
 // ────────────────────────────────────────────────────────────────────

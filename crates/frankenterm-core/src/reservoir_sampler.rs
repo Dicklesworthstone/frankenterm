@@ -228,11 +228,13 @@ impl<T> WeightedReservoir<T> {
         if self.items.len() < self.capacity {
             self.items.push((key, item));
             // Keep sorted by key (ascending) so index 0 is the minimum.
-            self.items.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            self.items
+                .sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         } else if key > self.items[0].0 {
             // Replace the minimum-key item.
             self.items[0] = (key, item);
-            self.items.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            self.items
+                .sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         }
     }
 

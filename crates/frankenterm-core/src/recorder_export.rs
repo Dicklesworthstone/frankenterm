@@ -21,14 +21,12 @@
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as FmtWrite;
 
-use crate::policy::ActorKind;
 use crate::recorder_audit::{
     AccessTier, ActorIdentity, AuditEventBuilder, AuditEventType, AuditLog, AuditScope,
     AuthzDecision,
 };
 use crate::recorder_query::{
-    EventFilter, InMemoryEventStore, QueryEventKind, RecorderEventReader, RecorderQueryExecutor,
-    RecorderQueryRequest, TimeRange,
+    QueryEventKind, RecorderEventReader, RecorderQueryExecutor, RecorderQueryRequest, TimeRange,
 };
 use crate::recorder_retention::SensitivityTier;
 
@@ -210,7 +208,10 @@ pub enum ExportError {
     /// No events match the export criteria.
     NoMatchingEvents,
     /// Export too large.
-    TooLarge { event_count: usize, max_events: usize },
+    TooLarge {
+        event_count: usize,
+        max_events: usize,
+    },
     /// Format error during serialization.
     FormatError(String),
 }
@@ -322,9 +323,7 @@ impl<R: RecorderEventReader> RecorderExporter<R> {
                 crate::recorder_query::QueryError::InvalidRequest(msg) => {
                     ExportError::FormatError(msg)
                 }
-                crate::recorder_query::QueryError::Internal(msg) => {
-                    ExportError::FormatError(msg)
-                }
+                crate::recorder_query::QueryError::Internal(msg) => ExportError::FormatError(msg),
             })?;
 
         // 3. Apply kind filter (query executor doesn't have this).
@@ -426,9 +425,7 @@ struct ExportRow {
     text: Option<String>,
 }
 
-fn to_export_row(
-    event: &crate::recorder_query::QueryResultEvent,
-) -> ExportRow {
+fn to_export_row(event: &crate::recorder_query::QueryResultEvent) -> ExportRow {
     ExportRow {
         event_id: event.event_id.clone(),
         pane_id: event.pane_id,
@@ -443,34 +440,26 @@ fn to_export_row(
     }
 }
 
-fn format_jsonl(
-    events: &[crate::recorder_query::QueryResultEvent],
-) -> Result<String, ExportError> {
+fn format_jsonl(events: &[crate::recorder_query::QueryResultEvent]) -> Result<String, ExportError> {
     let mut output = String::new();
     for event in events {
         let row = to_export_row(event);
-        let json = serde_json::to_string(&row)
-            .map_err(|e| ExportError::FormatError(e.to_string()))?;
+        let json =
+            serde_json::to_string(&row).map_err(|e| ExportError::FormatError(e.to_string()))?;
         output.push_str(&json);
         output.push('\n');
     }
     Ok(output)
 }
 
-fn format_csv(
-    events: &[crate::recorder_query::QueryResultEvent],
-) -> Result<String, ExportError> {
+fn format_csv(events: &[crate::recorder_query::QueryResultEvent]) -> Result<String, ExportError> {
     let mut output = String::new();
     // Header.
     output.push_str("event_id,pane_id,source,occurred_at_ms,sequence,event_kind,sensitivity,redacted,session_id,text\n");
 
     for event in events {
         let row = to_export_row(event);
-        let text_escaped = row
-            .text
-            .as_deref()
-            .unwrap_or("")
-            .replace('"', "\"\"");
+        let text_escaped = row.text.as_deref().unwrap_or("").replace('"', "\"\"");
         let session = row.session_id.as_deref().unwrap_or("");
 
         write!(
@@ -558,8 +547,9 @@ fn format_transcript(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::ActorKind;
     use crate::recorder_audit::AuditLogConfig;
-    use crate::recorder_query::QueryResultEvent;
+    use crate::recorder_query::{InMemoryEventStore, QueryResultEvent};
     use crate::recording::RecorderEventSource;
 
     // -----------------------------------------------------------------------
@@ -611,8 +601,7 @@ mod tests {
     ) -> RecorderExporter<InMemoryEventStore> {
         let store = InMemoryEventStore::new();
         store.insert(events);
-        let executor =
-            RecorderQueryExecutor::new(store, AuditLog::new(AuditLogConfig::default()));
+        let executor = RecorderQueryExecutor::new(store, AuditLog::new(AuditLogConfig::default()));
         RecorderExporter::new(executor)
     }
 

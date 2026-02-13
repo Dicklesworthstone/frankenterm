@@ -111,6 +111,42 @@ pub struct AccountSelectionResult {
     pub explanation: SelectionExplanation,
 }
 
+/// Default low-quota warning threshold for account launch decisions.
+pub const DEFAULT_LOW_QUOTA_THRESHOLD_PERCENT: f64 = 10.0;
+
+/// Quota availability classification for launch/scheduling decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaAvailability {
+    /// At least one eligible account exists and selected account has healthy quota.
+    Available,
+    /// At least one eligible account exists, but selected account is below low-quota threshold.
+    Low,
+    /// No eligible account is available.
+    Exhausted,
+}
+
+/// Quota advisory derived from an account selection result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountQuotaAdvisory {
+    /// Availability state for downstream schedulers/workflows.
+    pub availability: QuotaAvailability,
+    /// Threshold used to classify low quota.
+    pub low_quota_threshold_percent: f64,
+    /// Selected account quota percentage (if any account was selected).
+    pub selected_percent_remaining: Option<f64>,
+    /// Optional human-readable warning message.
+    pub warning: Option<String>,
+}
+
+impl AccountQuotaAdvisory {
+    /// Returns true when no account is available and execution should be blocked.
+    #[must_use]
+    pub const fn is_blocking(&self) -> bool {
+        matches!(self.availability, QuotaAvailability::Exhausted)
+    }
+}
+
 /// Detailed explanation of the selection decision.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SelectionExplanation {
@@ -284,6 +320,43 @@ pub fn select_account(
             filtered_out,
             candidates: candidate_explanations,
             selection_reason,
+        },
+    }
+}
+
+/// Build a quota advisory for launch/scheduling from selection output.
+///
+/// Semantics:
+/// - `Exhausted`: no account selected
+/// - `Low`: selected account exists but is below `low_quota_threshold_percent`
+/// - `Available`: selected account exists and is at/above threshold
+#[must_use]
+pub fn build_quota_advisory(
+    selection: &AccountSelectionResult,
+    low_quota_threshold_percent: f64,
+) -> AccountQuotaAdvisory {
+    let selected_percent_remaining = selection.selected.as_ref().map(|a| a.percent_remaining);
+
+    match selected_percent_remaining {
+        None => AccountQuotaAdvisory {
+            availability: QuotaAvailability::Exhausted,
+            low_quota_threshold_percent,
+            selected_percent_remaining: None,
+            warning: Some(selection.explanation.selection_reason.clone()),
+        },
+        Some(pct) if pct < low_quota_threshold_percent => AccountQuotaAdvisory {
+            availability: QuotaAvailability::Low,
+            low_quota_threshold_percent,
+            selected_percent_remaining: Some(pct),
+            warning: Some(format!(
+                "Selected account is low on quota ({pct:.1}% < {low_quota_threshold_percent:.1}%)"
+            )),
+        },
+        Some(pct) => AccountQuotaAdvisory {
+            availability: QuotaAvailability::Available,
+            low_quota_threshold_percent,
+            selected_percent_remaining: Some(pct),
+            warning: None,
         },
     }
 }
@@ -608,6 +681,57 @@ mod tests {
             result1.selected.as_ref().map(|a| &a.account_id),
             result2.selected.as_ref().map(|a| &a.account_id)
         );
+    }
+
+    #[test]
+    fn quota_advisory_exhausted_when_no_selection() {
+        let selection = AccountSelectionResult {
+            selected: None,
+            explanation: SelectionExplanation {
+                total_considered: 2,
+                filtered_out: vec![],
+                candidates: vec![],
+                selection_reason: "All accounts below threshold".to_string(),
+            },
+        };
+        let advisory = build_quota_advisory(&selection, DEFAULT_LOW_QUOTA_THRESHOLD_PERCENT);
+        assert_eq!(advisory.availability, QuotaAvailability::Exhausted);
+        assert!(advisory.is_blocking());
+        assert!(advisory.warning.is_some());
+    }
+
+    #[test]
+    fn quota_advisory_low_when_selected_below_threshold() {
+        let selection = AccountSelectionResult {
+            selected: Some(make_account("alpha", 7.5, None)),
+            explanation: SelectionExplanation {
+                total_considered: 1,
+                filtered_out: vec![],
+                candidates: vec![],
+                selection_reason: "Only eligible account".to_string(),
+            },
+        };
+        let advisory = build_quota_advisory(&selection, DEFAULT_LOW_QUOTA_THRESHOLD_PERCENT);
+        assert_eq!(advisory.availability, QuotaAvailability::Low);
+        assert!(!advisory.is_blocking());
+        assert!(advisory.warning.is_some());
+    }
+
+    #[test]
+    fn quota_advisory_available_when_selected_above_threshold() {
+        let selection = AccountSelectionResult {
+            selected: Some(make_account("alpha", 42.0, None)),
+            explanation: SelectionExplanation {
+                total_considered: 1,
+                filtered_out: vec![],
+                candidates: vec![],
+                selection_reason: "Only eligible account".to_string(),
+            },
+        };
+        let advisory = build_quota_advisory(&selection, DEFAULT_LOW_QUOTA_THRESHOLD_PERCENT);
+        assert_eq!(advisory.availability, QuotaAvailability::Available);
+        assert!(!advisory.is_blocking());
+        assert!(advisory.warning.is_none());
     }
 
     #[test]

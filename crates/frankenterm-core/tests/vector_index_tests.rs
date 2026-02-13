@@ -7,8 +7,7 @@ use frankenterm_core::search::{FtviIndex, FtviRecord, FtviWriter};
 
 /// Helper: build an FTVI index from (id, vector) pairs using write_ftvi_vec.
 fn build_index(dimension: u16, records: &[(u64, &[f32])]) -> FtviIndex {
-    let buf =
-        frankenterm_core::search::write_ftvi_vec(dimension, records).expect("write_ftvi_vec");
+    let buf = frankenterm_core::search::write_ftvi_vec(dimension, records).expect("write_ftvi_vec");
     FtviIndex::from_bytes(&buf).expect("from_bytes")
 }
 
@@ -126,10 +125,7 @@ fn ftvi_f16_preserves_reasonable_precision() {
 
 #[test]
 fn ftvi_f16_handles_zero_vectors() {
-    let records: Vec<(u64, &[f32])> = vec![
-        (1, &[0.0, 0.0, 0.0]),
-        (2, &[1.0, 0.0, 0.0]),
-    ];
+    let records: Vec<(u64, &[f32])> = vec![(1, &[0.0, 0.0, 0.0]), (2, &[1.0, 0.0, 0.0])];
 
     let index = build_index(3, &records);
     let results = index.search(&[1.0, 0.0, 0.0], 2);
@@ -138,10 +134,7 @@ fn ftvi_f16_handles_zero_vectors() {
 
 #[test]
 fn ftvi_f16_handles_large_values() {
-    let records: Vec<(u64, &[f32])> = vec![
-        (1, &[100.0, 200.0]),
-        (2, &[0.001, 0.002]),
-    ];
+    let records: Vec<(u64, &[f32])> = vec![(1, &[100.0, 200.0]), (2, &[0.001, 0.002])];
 
     let index = build_index(2, &records);
     let results = index.search(&[100.0, 200.0], 2);
@@ -242,15 +235,10 @@ fn ftvi_large_index_search() {
 
 #[test]
 fn ftvi_reproducible_output() {
-    let records: Vec<(u64, &[f32])> = vec![
-        (1, &[0.5f32, 0.5]),
-        (2, &[0.1, 0.9]),
-    ];
+    let records: Vec<(u64, &[f32])> = vec![(1, &[0.5f32, 0.5]), (2, &[0.1, 0.9])];
 
-    let buf1 =
-        frankenterm_core::search::write_ftvi_vec(2, &records).unwrap();
-    let buf2 =
-        frankenterm_core::search::write_ftvi_vec(2, &records).unwrap();
+    let buf1 = frankenterm_core::search::write_ftvi_vec(2, &records).unwrap();
+    let buf2 = frankenterm_core::search::write_ftvi_vec(2, &records).unwrap();
 
     assert_eq!(buf1, buf2, "same input should produce identical output");
 }

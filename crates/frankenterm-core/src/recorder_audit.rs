@@ -596,11 +596,7 @@ pub struct AuditEventBuilder {
 impl AuditEventBuilder {
     /// Create a new builder with required fields.
     #[must_use]
-    pub fn new(
-        event_type: AuditEventType,
-        actor: ActorIdentity,
-        timestamp_ms: u64,
-    ) -> Self {
+    pub fn new(event_type: AuditEventType, actor: ActorIdentity, timestamp_ms: u64) -> Self {
         Self {
             event_type,
             actor,
@@ -876,7 +872,10 @@ mod tests {
 
     #[test]
     fn access_tier_display() {
-        assert_eq!(format!("{}", AccessTier::A0PublicMetadata), "A0 (public metadata)");
+        assert_eq!(
+            format!("{}", AccessTier::A0PublicMetadata),
+            "A0 (public metadata)"
+        );
         assert_eq!(format!("{}", AccessTier::A4Admin), "A4 (admin)");
     }
 
@@ -1442,13 +1441,9 @@ mod tests {
     fn builder_with_justification() {
         let log = AuditLog::new(test_config());
         let entry = log.append(
-            AuditEventBuilder::new(
-                AuditEventType::RecorderQueryPrivileged,
-                test_actor(),
-                1000,
-            )
-            .with_decision(AuthzDecision::Elevate)
-            .with_justification("Investigating production incident INC-123"),
+            AuditEventBuilder::new(AuditEventType::RecorderQueryPrivileged, test_actor(), 1000)
+                .with_decision(AuthzDecision::Elevate)
+                .with_justification("Investigating production incident INC-123"),
         );
 
         assert_eq!(entry.decision, AuthzDecision::Elevate);
@@ -1502,12 +1497,8 @@ mod tests {
                 .with_decision(AuthzDecision::Deny),
         );
         log.append(
-            AuditEventBuilder::new(
-                AuditEventType::RecorderQueryPrivileged,
-                test_actor(),
-                3000,
-            )
-            .with_decision(AuthzDecision::Elevate),
+            AuditEventBuilder::new(AuditEventType::RecorderQueryPrivileged, test_actor(), 3000)
+                .with_decision(AuthzDecision::Elevate),
         );
 
         let stats = log.stats();
@@ -1601,12 +1592,8 @@ mod tests {
 
         // Robot denied A3.
         log.append(
-            AuditEventBuilder::new(
-                AuditEventType::RecorderQueryPrivileged,
-                robot_actor(),
-                2000,
-            )
-            .with_decision(AuthzDecision::Deny),
+            AuditEventBuilder::new(AuditEventType::RecorderQueryPrivileged, robot_actor(), 2000)
+                .with_decision(AuthzDecision::Deny),
         );
 
         // MCP query.

@@ -13,15 +13,22 @@ use proptest::prelude::*;
 
 fn arb_config() -> impl Strategy<Value = ClusteringConfig> {
     // num_bands must divide num_hashes; pick bands first then multiply
-    (2usize..=8, 2usize..=8, 3usize..=7, 10usize..=200, 1usize..=10).prop_map(
-        |(bands, rows_per_band, shingle_size, max_clusters, max_samples)| ClusteringConfig {
-            num_hashes: bands * rows_per_band,
-            num_bands: bands,
-            shingle_size,
-            max_clusters,
-            max_samples_per_cluster: max_samples,
-        },
+    (
+        2usize..=8,
+        2usize..=8,
+        3usize..=7,
+        10usize..=200,
+        1usize..=10,
     )
+        .prop_map(
+            |(bands, rows_per_band, shingle_size, max_clusters, max_samples)| ClusteringConfig {
+                num_hashes: bands * rows_per_band,
+                num_bands: bands,
+                shingle_size,
+                max_clusters,
+                max_samples_per_cluster: max_samples,
+            },
+        )
 }
 
 fn arb_error_text() -> impl Strategy<Value = String> {

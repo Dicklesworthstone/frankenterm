@@ -30,8 +30,8 @@
 use proptest::prelude::*;
 
 use frankenterm_core::cross_pane_correlation::{
-    chi_squared_test, ChiSquaredResult, CoOccurrenceMatrix, Correlation, CorrelationConfig,
-    CorrelationEngine, EventRecord,
+    ChiSquaredResult, CoOccurrenceMatrix, Correlation, CorrelationConfig, CorrelationEngine,
+    EventRecord, chi_squared_test,
 };
 
 // =============================================================================
@@ -60,12 +60,12 @@ fn arb_window_events() -> impl Strategy<Value = Vec<String>> {
 /// Arbitrary CorrelationConfig with reasonable bounds.
 fn arb_config() -> impl Strategy<Value = CorrelationConfig> {
     (
-        1000u64..60_000,      // window_ms
-        1usize..20,           // min_observations
-        0.001f64..0.1,        // p_value_threshold
-        10usize..100,         // max_event_types
-        10_000u64..600_000,   // retention_ms
-        10usize..500,         // max_panes
+        1000u64..60_000,    // window_ms
+        1usize..20,         // min_observations
+        0.001f64..0.1,      // p_value_threshold
+        10usize..100,       // max_event_types
+        10_000u64..600_000, // retention_ms
+        10usize..500,       // max_panes
     )
         .prop_map(|(w, mo, p, me, r, mp)| CorrelationConfig {
             window_ms: w,
@@ -79,12 +79,13 @@ fn arb_config() -> impl Strategy<Value = CorrelationConfig> {
 
 /// Arbitrary EventRecord.
 fn arb_event_record() -> impl Strategy<Value = EventRecord> {
-    (0u64..100, arb_event_type(), 0u64..1_000_000)
-        .prop_map(|(pane_id, event_type, timestamp_ms)| EventRecord {
+    (0u64..100, arb_event_type(), 0u64..1_000_000).prop_map(
+        |(pane_id, event_type, timestamp_ms)| EventRecord {
             pane_id,
             event_type,
             timestamp_ms,
-        })
+        },
+    )
 }
 
 // =============================================================================

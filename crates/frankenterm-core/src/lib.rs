@@ -168,6 +168,7 @@ pub mod setup;
 pub mod sharded_counter;
 pub mod snapshot_engine;
 pub mod spectral;
+pub mod spsc_ring_buffer;
 pub mod storage;
 pub mod storage_targets;
 pub mod storage_telemetry;
@@ -186,8 +187,8 @@ pub mod undo;
 pub mod user_preferences;
 pub mod voi;
 pub mod wait;
-pub mod watcher_client;
 pub mod watchdog;
+pub mod watcher_client;
 pub mod webhook;
 pub mod wezterm;
 pub mod workflows;
@@ -205,9 +206,9 @@ pub mod native_events;
 pub mod browser;
 
 #[cfg(feature = "recorder-lexical")]
-pub mod recorder_lexical_schema;
-#[cfg(feature = "recorder-lexical")]
 pub mod recorder_lexical_ingest;
+#[cfg(feature = "recorder-lexical")]
+pub mod recorder_lexical_schema;
 
 // tui and ftui are mutually exclusive feature flags (unless `rollout` is active).
 // The legacy `tui` feature uses ratatui/crossterm; the new `ftui` feature uses FrankenTUI.

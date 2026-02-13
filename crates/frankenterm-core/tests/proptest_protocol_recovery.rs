@@ -37,8 +37,8 @@
 use proptest::prelude::*;
 
 use frankenterm_core::protocol_recovery::{
-    classify_error_message, ConnectionHealth, ConnectionHealthTracker, FrameCorruptionDetector,
-    ProtocolErrorKind, RecoveryConfig, RecoveryStats,
+    ConnectionHealth, ConnectionHealthTracker, FrameCorruptionDetector, ProtocolErrorKind,
+    RecoveryConfig, RecoveryStats, classify_error_message,
 };
 
 // =============================================================================

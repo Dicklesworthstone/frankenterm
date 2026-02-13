@@ -897,12 +897,18 @@ fn entropy_scheduler_composes_with_voi_scheduler() {
     // Verify entropy densities
     let d1 = entropy_sched.entropy_density(1).unwrap();
     let d2 = entropy_sched.entropy_density(2).unwrap();
-    assert!(d2 > d1, "high-entropy pane should have higher density: d1={d1}, d2={d2}");
+    assert!(
+        d2 > d1,
+        "high-entropy pane should have higher density: d1={d1}, d2={d2}"
+    );
 
     // Verify entropy-based intervals
     let i1 = entropy_sched.interval_ms(1).unwrap();
     let i2 = entropy_sched.interval_ms(2).unwrap();
-    assert!(i2 < i1, "high-entropy pane should have shorter interval: i1={i1}, i2={i2}");
+    assert!(
+        i2 < i1,
+        "high-entropy pane should have shorter interval: i1={i1}, i2={i2}"
+    );
 
     // Compose with VOI: use entropy density as importance weight
     let now_ms = 10_000;
@@ -986,11 +992,16 @@ fn entropy_voi_pipeline_allocates_capture_budget() {
 
     // Simulate a realistic swarm: 5 panes with different activity patterns
     let pane_data: Vec<(u64, Vec<u8>)> = vec![
-        (1, vec![0u8; 2000]),                                            // idle (constant)
-        (2, b"ERROR: connection refused\n".repeat(100).to_vec()),        // error loop (low entropy)
-        (3, (0..2000).map(|i| (i % 256) as u8).collect()),              // binary data (high entropy)
-        (4, b"Processing item 12345... done.\n".repeat(80).to_vec()),    // active work (medium)
-        (5, b"$ ls\nfile1.txt\nfile2.rs\n$ cargo test\n".repeat(60).to_vec()), // shell (medium-high)
+        (1, vec![0u8; 2000]),                                         // idle (constant)
+        (2, b"ERROR: connection refused\n".repeat(100).to_vec()),     // error loop (low entropy)
+        (3, (0..2000).map(|i| (i % 256) as u8).collect()),            // binary data (high entropy)
+        (4, b"Processing item 12345... done.\n".repeat(80).to_vec()), // active work (medium)
+        (
+            5,
+            b"$ ls\nfile1.txt\nfile2.rs\n$ cargo test\n"
+                .repeat(60)
+                .to_vec(),
+        ), // shell (medium-high)
     ];
 
     for (pane_id, data) in &pane_data {
@@ -1013,22 +1024,14 @@ fn entropy_voi_pipeline_allocates_capture_budget() {
     assert_eq!(result.schedule.len(), 5);
 
     // The binary-data pane (id=3, highest entropy) should be first or near first
-    let binary_pane_rank = result
-        .schedule
-        .iter()
-        .position(|d| d.pane_id == 3)
-        .unwrap();
+    let binary_pane_rank = result.schedule.iter().position(|d| d.pane_id == 3).unwrap();
     assert!(
         binary_pane_rank <= 1,
         "binary pane should be top-2 priority, got rank {binary_pane_rank}"
     );
 
     // The idle pane (id=1, lowest entropy) should be last or near last
-    let idle_pane_rank = result
-        .schedule
-        .iter()
-        .position(|d| d.pane_id == 1)
-        .unwrap();
+    let idle_pane_rank = result.schedule.iter().position(|d| d.pane_id == 1).unwrap();
     assert!(
         idle_pane_rank >= 3,
         "idle pane should be bottom-2 priority, got rank {idle_pane_rank}"

@@ -64,15 +64,13 @@ fn arb_detection() -> impl Strategy<Value = Detection> {
 
 /// Generate arbitrary UserVarPayload
 fn arb_user_var_payload() -> impl Strategy<Value = UserVarPayload> {
-    (
-        "[a-zA-Z0-9_=-]{0,50}",
-        proptest::option::of("[a-z_]{1,20}"),
-    )
-        .prop_map(|(value, event_type)| UserVarPayload {
+    ("[a-zA-Z0-9_=-]{0,50}", proptest::option::of("[a-z_]{1,20}")).prop_map(
+        |(value, event_type)| UserVarPayload {
             value,
             event_type,
             event_data: None,
-        })
+        },
+    )
 }
 
 /// Generate arbitrary Event
@@ -87,10 +85,8 @@ fn arb_event() -> impl Strategy<Value = Event> {
             }
         }),
         // GapDetected
-        (0..1000u64, "[a-z_ ]{1,30}").prop_map(|(pane_id, reason)| Event::GapDetected {
-            pane_id,
-            reason,
-        }),
+        (0..1000u64, "[a-z_ ]{1,30}")
+            .prop_map(|(pane_id, reason)| Event::GapDetected { pane_id, reason }),
         // PatternDetected
         (0..1000u64, arb_detection()).prop_map(|(pane_id, detection)| Event::PatternDetected {
             pane_id,
@@ -109,16 +105,13 @@ fn arb_event() -> impl Strategy<Value = Event> {
         // PaneDisappeared
         (0..1000u64).prop_map(|pane_id| Event::PaneDisappeared { pane_id }),
         // WorkflowStarted
-        (
-            "[a-z0-9-]{1,15}",
-            "[a-zA-Z ]{1,20}",
-            0..1000u64,
-        )
-            .prop_map(|(workflow_id, workflow_name, pane_id)| Event::WorkflowStarted {
+        ("[a-z0-9-]{1,15}", "[a-zA-Z ]{1,20}", 0..1000u64,).prop_map(
+            |(workflow_id, workflow_name, pane_id)| Event::WorkflowStarted {
                 workflow_id,
                 workflow_name,
                 pane_id,
-            }),
+            }
+        ),
         // WorkflowStep
         ("[a-z0-9-]{1,15}", "[a-z_]{1,15}", "[a-z]{1,10}").prop_map(
             |(workflow_id, step_name, result)| Event::WorkflowStep {
@@ -152,7 +145,12 @@ fn arb_event() -> impl Strategy<Value = Event> {
 /// Generate arbitrary MetricsSnapshot
 fn arb_metrics_snapshot() -> impl Strategy<Value = MetricsSnapshot> {
     (0..100000u64, 0..10000u64, 0..100u64, 0..50000u64).prop_map(
-        |(events_published, events_dropped_no_subscribers, active_subscribers, subscriber_lag_events)| {
+        |(
+            events_published,
+            events_dropped_no_subscribers,
+            active_subscribers,
+            subscriber_lag_events,
+        )| {
             MetricsSnapshot {
                 events_published,
                 events_dropped_no_subscribers,
@@ -214,10 +212,10 @@ fn arb_dedup_key() -> impl Strategy<Value = String> {
 /// Generate a simple glob pattern
 fn arb_glob_pattern() -> impl Strategy<Value = String> {
     prop_oneof![
-        "[a-z.]{1,15}",                        // exact
-        "[a-z.]{1,10}\\*".prop_map(|s| s),     // suffix wildcard
-        "\\*[a-z.]{1,10}".prop_map(|s| s),     // prefix wildcard
-        "[a-z]{1,5}\\.[a-z]{1,5}",             // dotted exact
+        "[a-z.]{1,15}",                    // exact
+        "[a-z.]{1,10}\\*".prop_map(|s| s), // suffix wildcard
+        "\\*[a-z.]{1,10}".prop_map(|s| s), // prefix wildcard
+        "[a-z]{1,5}\\.[a-z]{1,5}",         // dotted exact
     ]
 }
 

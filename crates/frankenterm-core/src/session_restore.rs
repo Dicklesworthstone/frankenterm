@@ -201,16 +201,38 @@ pub fn load_latest_checkpoint(
     let conn = open_conn(db_path)?;
 
     // Get latest checkpoint
-    let checkpoint = conn.query_row(
-        "SELECT id, checkpoint_at, checkpoint_type, pane_count
+    let checkpoint_id = conn.query_row(
+        "SELECT id
          FROM session_checkpoints
          WHERE session_id = ?1
          ORDER BY checkpoint_at DESC
          LIMIT 1",
         [session_id],
+        |row| row.get::<_, i64>(0),
+    );
+
+    match checkpoint_id {
+        Ok(id) => load_checkpoint_by_id(db_path, id),
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+        Err(e) => return Err(RestoreError::Database(e.to_string())),
+    }
+}
+
+/// Load a specific checkpoint by row ID, including pane states.
+pub fn load_checkpoint_by_id(
+    db_path: &str,
+    checkpoint_id: i64,
+) -> Result<Option<CheckpointData>, RestoreError> {
+    let conn = open_conn(db_path)?;
+
+    let checkpoint = conn.query_row(
+        "SELECT session_id, checkpoint_at, checkpoint_type, pane_count
+         FROM session_checkpoints
+         WHERE id = ?1",
+        [checkpoint_id],
         |row| {
             Ok((
-                row.get::<_, i64>(0)?,
+                row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)? as u64,
                 row.get::<_, Option<String>>(2)?,
                 row.get::<_, i64>(3)? as usize,
@@ -218,13 +240,13 @@ pub fn load_latest_checkpoint(
         },
     );
 
-    let (checkpoint_id, checkpoint_at, checkpoint_type, pane_count) = match checkpoint {
+    let (session_id, checkpoint_at, checkpoint_type, pane_count) = match checkpoint {
         Ok(c) => c,
         Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
         Err(e) => return Err(RestoreError::Database(e.to_string())),
     };
 
-    // Load pane states
+    // Load pane states for this checkpoint ID.
     let mut stmt = conn.prepare(
         "SELECT pane_id, cwd, command, terminal_state_json, agent_metadata_json
          FROM mux_pane_state
@@ -250,7 +272,7 @@ pub fn load_latest_checkpoint(
 
     Ok(Some(CheckpointData {
         checkpoint_id,
-        session_id: session_id.to_string(),
+        session_id,
         checkpoint_at,
         checkpoint_type,
         pane_count,
@@ -985,8 +1007,9 @@ mod tests {
     fn load_latest_checkpoint_picks_newest() {
         let (db_path, conn) = setup_test_db();
         insert_session(&conn, "sess-multi", false);
-        let _old_cp = insert_checkpoint(&conn, "sess-multi", 1000, 1);
+        let old_cp = insert_checkpoint(&conn, "sess-multi", 1000, 1);
         let new_cp = insert_checkpoint(&conn, "sess-multi", 2000, 3);
+        insert_pane_state(&conn, old_cp, 9, Some("/old"), Some("bash"));
         insert_pane_state(&conn, new_cp, 10, Some("/new"), None);
 
         let data = load_latest_checkpoint(&db_path, "sess-multi")
@@ -994,6 +1017,30 @@ mod tests {
             .unwrap();
         assert_eq!(data.checkpoint_id, new_cp);
         assert_eq!(data.checkpoint_at, 2000);
+    }
+
+    #[test]
+    fn load_checkpoint_by_id_returns_none_for_missing_checkpoint() {
+        let (db_path, _conn) = setup_test_db();
+        let result = load_checkpoint_by_id(&db_path, 999).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn load_checkpoint_by_id_can_load_non_latest_checkpoint() {
+        let (db_path, conn) = setup_test_db();
+        insert_session(&conn, "sess-multi-id", false);
+        let old_cp = insert_checkpoint(&conn, "sess-multi-id", 1000, 1);
+        let _new_cp = insert_checkpoint(&conn, "sess-multi-id", 2000, 2);
+        insert_pane_state(&conn, old_cp, 42, Some("/old"), Some("bash"));
+
+        let data = load_checkpoint_by_id(&db_path, old_cp).unwrap().unwrap();
+        assert_eq!(data.checkpoint_id, old_cp);
+        assert_eq!(data.session_id, "sess-multi-id");
+        assert_eq!(data.checkpoint_at, 1000);
+        assert_eq!(data.pane_states.len(), 1);
+        assert_eq!(data.pane_states[0].pane_id, 42);
+        assert_eq!(data.pane_states[0].cwd.as_deref(), Some("/old"));
     }
 
     #[test]

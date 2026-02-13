@@ -6172,9 +6172,8 @@ impl StorageHandle {
         let embedder_id = embedder_id.to_string();
 
         tokio::task::spawn_blocking(move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open connection: {e}"))
-            })?;
+            let conn = Connection::open(db_path.as_str())
+                .map_err(|e| StorageError::Database(format!("Failed to open connection: {e}")))?;
 
             let mut stmt = conn
                 .prepare(
@@ -6187,7 +6186,9 @@ impl StorageHandle {
                 .map_err(|e| StorageError::Database(format!("get_unembedded_segments: {e}")))?;
 
             let ids: Vec<i64> = stmt
-                .query_map(rusqlite::params![embedder_id, limit as i64], |row| row.get(0))
+                .query_map(rusqlite::params![embedder_id, limit as i64], |row| {
+                    row.get(0)
+                })
                 .map_err(|e| StorageError::Database(format!("get_unembedded_segments: {e}")))?
                 .filter_map(|r| r.ok())
                 .collect();
@@ -6232,9 +6233,8 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
 
         tokio::task::spawn_blocking(move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open connection: {e}"))
-            })?;
+            let conn = Connection::open(db_path.as_str())
+                .map_err(|e| StorageError::Database(format!("Failed to open connection: {e}")))?;
 
             let mut stmt = conn
                 .prepare(

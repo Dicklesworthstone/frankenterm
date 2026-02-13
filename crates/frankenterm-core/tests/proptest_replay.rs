@@ -42,9 +42,7 @@ fn arb_frame_type() -> impl Strategy<Value = FrameType> {
 /// Generate a valid payload for the given frame type.
 fn arb_payload_for(ft: FrameType) -> BoxedStrategy<Vec<u8>> {
     match ft {
-        FrameType::Output | FrameType::Input => {
-            prop::collection::vec(any::<u8>(), 0..100).boxed()
-        }
+        FrameType::Output | FrameType::Input => prop::collection::vec(any::<u8>(), 0..100).boxed(),
         FrameType::Resize => {
             // Resize needs exactly 4 bytes: cols(u16 LE) + rows(u16 LE)
             (1u16..500, 1u16..200)
@@ -66,9 +64,7 @@ fn arb_payload_for(ft: FrameType) -> BoxedStrategy<Vec<u8>> {
             ]
             .boxed()
         }
-        FrameType::Marker => {
-            "[a-z ]{1,50}".prop_map(|s| s.into_bytes()).boxed()
-        }
+        FrameType::Marker => "[a-z ]{1,50}".prop_map(|s| s.into_bytes()).boxed(),
     }
 }
 

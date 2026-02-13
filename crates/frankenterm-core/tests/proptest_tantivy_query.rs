@@ -68,9 +68,8 @@ fn arb_pagination_cursor() -> impl Strategy<Value = PaginationCursor> {
 }
 
 fn arb_pagination() -> impl Strategy<Value = Pagination> {
-    (1usize..1000, proptest::option::of(arb_pagination_cursor())).prop_map(|(limit, after)| {
-        Pagination { limit, after }
-    })
+    (1usize..1000, proptest::option::of(arb_pagination_cursor()))
+        .prop_map(|(limit, after)| Pagination { limit, after })
 }
 
 fn arb_snippet_config() -> impl Strategy<Value = SnippetConfig> {
@@ -95,16 +94,13 @@ fn arb_snippet_config() -> impl Strategy<Value = SnippetConfig> {
 }
 
 fn arb_snippet() -> impl Strategy<Value = Snippet> {
-    ("[a-zA-Z0-9 ]{1,100}", "[a-z_]{3,20}").prop_map(|(fragment, field)| Snippet {
-        fragment,
-        field,
-    })
+    ("[a-zA-Z0-9 ]{1,100}", "[a-z_]{3,20}")
+        .prop_map(|(fragment, field)| Snippet { fragment, field })
 }
 
 fn arb_search_filter() -> impl Strategy<Value = SearchFilter> {
     prop_oneof![
-        prop::collection::vec(0u64..1000, 1..5)
-            .prop_map(|values| SearchFilter::PaneId { values }),
+        prop::collection::vec(0u64..1000, 1..5).prop_map(|values| SearchFilter::PaneId { values }),
         "[a-z0-9-]{5,20}".prop_map(|value| SearchFilter::SessionId { value }),
         "[a-z0-9-]{5,20}".prop_map(|value| SearchFilter::WorkflowId { value }),
         "[a-z0-9-]{5,20}".prop_map(|value| SearchFilter::CorrelationId { value }),
@@ -118,16 +114,30 @@ fn arb_search_filter() -> impl Strategy<Value = SearchFilter> {
         "[a-z_]{3,15}".prop_map(|value| SearchFilter::LifecyclePhase { value }),
         proptest::bool::ANY.prop_map(|value| SearchFilter::IsGap { value }),
         "[a-z_]{3,10}".prop_map(|value| SearchFilter::Redaction { value }),
-        (proptest::option::of(0i64..2_000_000_000_000), proptest::option::of(0i64..2_000_000_000_000))
+        (
+            proptest::option::of(0i64..2_000_000_000_000),
+            proptest::option::of(0i64..2_000_000_000_000)
+        )
             .prop_map(|(min_ms, max_ms)| SearchFilter::TimeRange { min_ms, max_ms }),
-        (proptest::option::of(0i64..2_000_000_000_000), proptest::option::of(0i64..2_000_000_000_000))
+        (
+            proptest::option::of(0i64..2_000_000_000_000),
+            proptest::option::of(0i64..2_000_000_000_000)
+        )
             .prop_map(|(min_ms, max_ms)| SearchFilter::RecordedTimeRange { min_ms, max_ms }),
-        (proptest::option::of(0u64..100_000), proptest::option::of(0u64..100_000))
+        (
+            proptest::option::of(0u64..100_000),
+            proptest::option::of(0u64..100_000)
+        )
             .prop_map(|(min_seq, max_seq)| SearchFilter::SequenceRange { min_seq, max_seq }),
-        (proptest::option::of(0u64..100_000), proptest::option::of(0u64..100_000))
-            .prop_map(|(min_offset, max_offset)| SearchFilter::LogOffsetRange { min_offset, max_offset }),
-        arb_event_direction()
-            .prop_map(|direction| SearchFilter::Direction { direction }),
+        (
+            proptest::option::of(0u64..100_000),
+            proptest::option::of(0u64..100_000)
+        )
+            .prop_map(|(min_offset, max_offset)| SearchFilter::LogOffsetRange {
+                min_offset,
+                max_offset
+            }),
+        arb_event_direction().prop_map(|direction| SearchFilter::Direction { direction }),
     ]
 }
 
@@ -139,14 +149,16 @@ fn arb_search_query() -> impl Strategy<Value = SearchQuery> {
         arb_pagination(),
         arb_snippet_config(),
     )
-        .prop_map(|(text, filters, sort, pagination, snippet_config)| SearchQuery {
-            text,
-            filters,
-            sort,
-            pagination,
-            snippet_config,
-            field_boosts: HashMap::new(),
-        })
+        .prop_map(
+            |(text, filters, sort, pagination, snippet_config)| SearchQuery {
+                text,
+                filters,
+                sort,
+                pagination,
+                snippet_config,
+                field_boosts: HashMap::new(),
+            },
+        )
 }
 
 // ============================================================================

@@ -21,8 +21,8 @@ use tantivy::schema::Term;
 use tantivy::{Index, IndexWriter as TantivyWriter};
 
 use crate::recorder_lexical_schema::{
-    build_lexical_schema_v1, fields_to_document, register_tokenizers, schema_fingerprint,
-    LexicalFieldHandles,
+    LexicalFieldHandles, build_lexical_schema_v1, fields_to_document, register_tokenizers,
+    schema_fingerprint,
 };
 use crate::tantivy_ingest::{IndexCommitStats, IndexDocumentFields, IndexWriteError, IndexWriter};
 
@@ -132,21 +132,21 @@ impl TantivyIndexWriterAdapter {
 impl IndexWriter for TantivyIndexWriterAdapter {
     fn add_document(&mut self, doc: &IndexDocumentFields) -> Result<(), IndexWriteError> {
         let tantivy_doc = fields_to_document(doc, &self.handles);
-        self.writer.add_document(tantivy_doc).map_err(|e| {
-            IndexWriteError::Rejected {
+        self.writer
+            .add_document(tantivy_doc)
+            .map_err(|e| IndexWriteError::Rejected {
                 reason: e.to_string(),
-            }
-        })?;
+            })?;
         self.docs_added += 1;
         Ok(())
     }
 
     fn commit(&mut self) -> Result<IndexCommitStats, IndexWriteError> {
-        self.writer.commit().map_err(|e| {
-            IndexWriteError::CommitFailed {
+        self.writer
+            .commit()
+            .map_err(|e| IndexWriteError::CommitFailed {
                 reason: e.to_string(),
-            }
-        })?;
+            })?;
 
         let stats = IndexCommitStats {
             docs_added: self.docs_added,
@@ -246,9 +246,7 @@ impl LexicalIndexer {
         &self,
         memory_bytes: usize,
     ) -> Result<TantivyIndexWriterAdapter, LexicalIngestError> {
-        let writer = self
-            .index
-            .writer_with_num_threads(1, memory_bytes)?;
+        let writer = self.index.writer_with_num_threads(1, memory_bytes)?;
         Ok(TantivyIndexWriterAdapter::new(writer, self.handles))
     }
 
@@ -294,9 +292,9 @@ pub fn read_stored_fingerprint(index_dir: &Path) -> Option<String> {
 mod tests {
     use super::*;
     use crate::recording::{
-        RecorderEvent, RecorderEventCausality, RecorderEventPayload, RecorderEventSource,
-        RecorderIngressKind, RecorderRedactionLevel, RecorderSegmentKind, RecorderTextEncoding,
-        RECORDER_EVENT_SCHEMA_VERSION_V1,
+        RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderEvent, RecorderEventCausality,
+        RecorderEventPayload, RecorderEventSource, RecorderIngressKind, RecorderRedactionLevel,
+        RecorderSegmentKind, RecorderTextEncoding,
     };
     use crate::tantivy_ingest::map_event_to_document;
     use tempfile::tempdir;
@@ -410,9 +408,7 @@ mod tests {
         // Reopen should fail
         let result = LexicalIndexer::open(config);
         assert!(result.is_err());
-        if let Err(LexicalIngestError::SchemaFingerprintMismatch { expected, found }) =
-            result
-        {
+        if let Err(LexicalIngestError::SchemaFingerprintMismatch { expected, found }) = result {
             assert_ne!(expected, found);
             assert_eq!(found, "tampered_fingerprint_value");
         } else {
@@ -551,7 +547,7 @@ mod tests {
             AppendLogRecorderStorage, AppendLogStorageConfig, AppendRequest, DurabilityLevel,
             RecorderStorage,
         };
-        use crate::tantivy_ingest::{IndexerConfig, IncrementalIndexer, LEXICAL_INDEXER_CONSUMER};
+        use crate::tantivy_ingest::{IncrementalIndexer, IndexerConfig, LEXICAL_INDEXER_CONSUMER};
 
         let dir = tempdir().unwrap();
 
@@ -588,7 +584,9 @@ mod tests {
             writer_memory_bytes: 15_000_000,
         };
         let lexical_indexer = LexicalIndexer::open(indexer_config).unwrap();
-        let writer = lexical_indexer.create_writer_with_memory(15_000_000).unwrap();
+        let writer = lexical_indexer
+            .create_writer_with_memory(15_000_000)
+            .unwrap();
 
         // Run incremental indexer
         let pipeline_config = IndexerConfig {
@@ -617,7 +615,7 @@ mod tests {
             AppendLogRecorderStorage, AppendLogStorageConfig, AppendRequest, DurabilityLevel,
             RecorderStorage,
         };
-        use crate::tantivy_ingest::{IndexerConfig, IncrementalIndexer};
+        use crate::tantivy_ingest::{IncrementalIndexer, IndexerConfig};
 
         let dir = tempdir().unwrap();
 
@@ -661,7 +659,9 @@ mod tests {
             expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
         };
 
-        let writer1 = lexical_indexer.create_writer_with_memory(15_000_000).unwrap();
+        let writer1 = lexical_indexer
+            .create_writer_with_memory(15_000_000)
+            .unwrap();
         let mut pipeline1 = IncrementalIndexer::new(pipeline_config.clone(), writer1);
         let r1 = pipeline1.run(&storage).await.unwrap();
         assert_eq!(r1.events_indexed, 2);
@@ -675,7 +675,9 @@ mod tests {
             max_batches: 0,
             ..pipeline_config
         };
-        let writer2 = lexical_indexer.create_writer_with_memory(15_000_000).unwrap();
+        let writer2 = lexical_indexer
+            .create_writer_with_memory(15_000_000)
+            .unwrap();
         let mut pipeline2 = IncrementalIndexer::new(pipeline_config2, writer2);
         let r2 = pipeline2.run(&storage).await.unwrap();
         assert_eq!(r2.events_indexed, 2);

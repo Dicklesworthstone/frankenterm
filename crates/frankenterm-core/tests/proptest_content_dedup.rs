@@ -21,8 +21,8 @@ use proptest::prelude::*;
 use std::collections::HashMap;
 
 use frankenterm_core::content_dedup::{
-    content_hash, ContentBlock, ContentStore, DedupConfig, DedupEngine, DedupStats,
-    EngineCounters, StoreResult,
+    ContentBlock, ContentStore, DedupConfig, DedupEngine, DedupStats, EngineCounters, StoreResult,
+    content_hash,
 };
 
 // ────────────────────────────────────────────────────────────────────
@@ -137,9 +137,9 @@ fn arb_config() -> impl Strategy<Value = DedupConfig> {
 
 fn arb_dedup_stats() -> impl Strategy<Value = DedupStats> {
     (
-        1u64..=1000,     // unique_blocks
-        1u64..=100_000,  // unique_bytes
-        1u64..=10,       // multiplier for logical_bytes
+        1u64..=1000,    // unique_blocks
+        1u64..=100_000, // unique_bytes
+        1u64..=10,      // multiplier for logical_bytes
     )
         .prop_map(|(unique_blocks, unique_bytes, mult)| {
             let logical_bytes = unique_bytes * mult;

@@ -844,17 +844,17 @@ mod tests {
     #[test]
     fn is_retryable_wezterm_command_failed() {
         use crate::error::WeztermError;
-        assert!(is_retryable(&Error::Wezterm(
-            WeztermError::CommandFailed("stderr".into())
-        )));
+        assert!(is_retryable(&Error::Wezterm(WeztermError::CommandFailed(
+            "stderr".into()
+        ))));
     }
 
     #[test]
     fn is_retryable_wezterm_socket_not_found() {
         use crate::error::WeztermError;
-        assert!(is_retryable(&Error::Wezterm(
-            WeztermError::SocketNotFound("/tmp/wez.sock".into())
-        )));
+        assert!(is_retryable(&Error::Wezterm(WeztermError::SocketNotFound(
+            "/tmp/wez.sock".into()
+        ))));
     }
 
     #[test]
@@ -874,9 +874,9 @@ mod tests {
     #[test]
     fn not_retryable_wezterm_pane_not_found() {
         use crate::error::WeztermError;
-        assert!(!is_retryable(&Error::Wezterm(
-            WeztermError::PaneNotFound(42)
-        )));
+        assert!(!is_retryable(&Error::Wezterm(WeztermError::PaneNotFound(
+            42
+        ))));
     }
 
     #[test]
@@ -935,9 +935,9 @@ mod tests {
     #[test]
     fn not_retryable_storage_fts_query_error() {
         use crate::error::StorageError;
-        assert!(!is_retryable(&Error::Storage(
-            StorageError::FtsQueryError("bad syntax".into())
-        )));
+        assert!(!is_retryable(&Error::Storage(StorageError::FtsQueryError(
+            "bad syntax".into()
+        ))));
     }
 
     #[test]
@@ -959,9 +959,9 @@ mod tests {
     #[test]
     fn not_retryable_pattern_error() {
         use crate::error::PatternError;
-        assert!(!is_retryable(&Error::Pattern(
-            PatternError::InvalidRule("bad rule".into())
-        )));
+        assert!(!is_retryable(&Error::Pattern(PatternError::InvalidRule(
+            "bad rule".into()
+        ))));
     }
 
     #[test]
@@ -982,9 +982,7 @@ mod tests {
 
     #[test]
     fn not_retryable_policy_error() {
-        assert!(!is_retryable(&Error::Policy(
-            "rate limit exceeded".into()
-        )));
+        assert!(!is_retryable(&Error::Policy("rate limit exceeded".into())));
     }
 
     #[test]
@@ -1000,9 +998,7 @@ mod tests {
 
     #[test]
     fn not_retryable_setup_error() {
-        assert!(!is_retryable(&Error::SetupError(
-            "missing config".into()
-        )));
+        assert!(!is_retryable(&Error::SetupError("missing config".into())));
     }
 
     #[test]
@@ -1150,11 +1146,8 @@ mod tests {
             max_attempts: Some(3),
         };
 
-        let mut circuit = CircuitBreaker::new(CircuitBreakerConfig::new(
-            3,
-            1,
-            Duration::from_secs(60),
-        ));
+        let mut circuit =
+            CircuitBreaker::new(CircuitBreakerConfig::new(3, 1, Duration::from_secs(60)));
 
         let result =
             with_retry_and_circuit(&policy, &mut circuit, || async { Ok::<_, Error>(42) }).await;

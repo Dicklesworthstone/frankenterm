@@ -25,8 +25,8 @@
 use proptest::prelude::*;
 
 use frankenterm_core::session_topology::{
-    InferenceQuality, PaneNode, TabSnapshot, TopologySnapshot, WindowSnapshot,
-    TOPOLOGY_SCHEMA_VERSION,
+    InferenceQuality, PaneNode, TOPOLOGY_SCHEMA_VERSION, TabSnapshot, TopologySnapshot,
+    WindowSnapshot,
 };
 
 // =============================================================================
@@ -46,46 +46,66 @@ fn arb_cols() -> impl Strategy<Value = u16> {
 }
 
 fn arb_leaf() -> impl Strategy<Value = PaneNode> {
-    (arb_pane_id(), arb_rows(), arb_cols(), proptest::option::of("[a-z/]{1,20}"), proptest::option::of("[a-zA-Z0-9 ]{1,20}"), proptest::bool::ANY)
-        .prop_map(|(pane_id, rows, cols, cwd, title, is_active)| {
-            PaneNode::Leaf { pane_id, rows, cols, cwd, title, is_active }
-        })
+    (
+        arb_pane_id(),
+        arb_rows(),
+        arb_cols(),
+        proptest::option::of("[a-z/]{1,20}"),
+        proptest::option::of("[a-zA-Z0-9 ]{1,20}"),
+        proptest::bool::ANY,
+    )
+        .prop_map(
+            |(pane_id, rows, cols, cwd, title, is_active)| PaneNode::Leaf {
+                pane_id,
+                rows,
+                cols,
+                cwd,
+                title,
+                is_active,
+            },
+        )
 }
 
 fn arb_pane_node() -> impl Strategy<Value = PaneNode> {
     arb_leaf().prop_recursive(
-        3,   // depth
-        32,  // max nodes
-        4,   // items per collection
+        3,  // depth
+        32, // max nodes
+        4,  // items per collection
         |inner| {
             prop_oneof![
                 // HSplit with 2-4 children, equal ratios
-                proptest::collection::vec(inner.clone(), 2..=4)
-                    .prop_map(|children| {
-                        let n = children.len() as f64;
-                        let ratio = 1.0 / n;
-                        PaneNode::HSplit {
-                            children: children.into_iter().map(|c| (ratio, c)).collect(),
-                        }
-                    }),
+                proptest::collection::vec(inner.clone(), 2..=4).prop_map(|children| {
+                    let n = children.len() as f64;
+                    let ratio = 1.0 / n;
+                    PaneNode::HSplit {
+                        children: children.into_iter().map(|c| (ratio, c)).collect(),
+                    }
+                }),
                 // VSplit with 2-4 children, equal ratios
-                proptest::collection::vec(inner, 2..=4)
-                    .prop_map(|children| {
-                        let n = children.len() as f64;
-                        let ratio = 1.0 / n;
-                        PaneNode::VSplit {
-                            children: children.into_iter().map(|c| (ratio, c)).collect(),
-                        }
-                    }),
+                proptest::collection::vec(inner, 2..=4).prop_map(|children| {
+                    let n = children.len() as f64;
+                    let ratio = 1.0 / n;
+                    PaneNode::VSplit {
+                        children: children.into_iter().map(|c| (ratio, c)).collect(),
+                    }
+                }),
             ]
         },
     )
 }
 
 fn arb_tab_snapshot() -> impl Strategy<Value = TabSnapshot> {
-    (arb_pane_id(), proptest::option::of("[a-zA-Z0-9 ]{1,20}"), arb_pane_node(), proptest::option::of(arb_pane_id()))
-        .prop_map(|(tab_id, title, pane_tree, active_pane_id)| {
-            TabSnapshot { tab_id, title, pane_tree, active_pane_id }
+    (
+        arb_pane_id(),
+        proptest::option::of("[a-zA-Z0-9 ]{1,20}"),
+        arb_pane_node(),
+        proptest::option::of(arb_pane_id()),
+    )
+        .prop_map(|(tab_id, title, pane_tree, active_pane_id)| TabSnapshot {
+            tab_id,
+            title,
+            pane_tree,
+            active_pane_id,
         })
 }
 
@@ -98,9 +118,16 @@ fn arb_window_snapshot() -> impl Strategy<Value = WindowSnapshot> {
         proptest::collection::vec(arb_tab_snapshot(), 1..=3),
         proptest::option::of(0_usize..3),
     )
-        .prop_map(|(window_id, title, position, size, tabs, active_tab_index)| {
-            WindowSnapshot { window_id, title, position, size, tabs, active_tab_index }
-        })
+        .prop_map(
+            |(window_id, title, position, size, tabs, active_tab_index)| WindowSnapshot {
+                window_id,
+                title,
+                position,
+                size,
+                tabs,
+                active_tab_index,
+            },
+        )
 }
 
 fn arb_topology_snapshot() -> impl Strategy<Value = TopologySnapshot> {
@@ -109,13 +136,11 @@ fn arb_topology_snapshot() -> impl Strategy<Value = TopologySnapshot> {
         proptest::option::of("[a-z_]{3,15}"),
         proptest::collection::vec(arb_window_snapshot(), 0..=3),
     )
-        .prop_map(|(captured_at, workspace_id, windows)| {
-            TopologySnapshot {
-                schema_version: TOPOLOGY_SCHEMA_VERSION,
-                captured_at,
-                workspace_id,
-                windows,
-            }
+        .prop_map(|(captured_at, workspace_id, windows)| TopologySnapshot {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            captured_at,
+            workspace_id,
+            windows,
         })
 }
 

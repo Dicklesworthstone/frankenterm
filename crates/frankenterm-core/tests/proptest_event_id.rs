@@ -18,13 +18,12 @@ use proptest::prelude::*;
 use std::collections::HashSet;
 
 use frankenterm_core::event_id::{
-    ClockAnomalyTracker, RecorderMergeKey, StreamKind, detect_clock_anomaly,
-    generate_event_id_v1,
+    ClockAnomalyTracker, RecorderMergeKey, StreamKind, detect_clock_anomaly, generate_event_id_v1,
 };
 use frankenterm_core::recording::{
-    RecorderControlMarkerType, RecorderEvent, RecorderEventCausality, RecorderEventPayload,
-    RecorderEventSource, RecorderIngressKind, RecorderLifecyclePhase, RecorderRedactionLevel,
-    RecorderSegmentKind, RecorderTextEncoding, RECORDER_EVENT_SCHEMA_VERSION_V1,
+    RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderControlMarkerType, RecorderEvent,
+    RecorderEventCausality, RecorderEventPayload, RecorderEventSource, RecorderIngressKind,
+    RecorderLifecyclePhase, RecorderRedactionLevel, RecorderSegmentKind, RecorderTextEncoding,
 };
 
 // ────────────────────────────────────────────────────────────────────
@@ -123,17 +122,15 @@ fn arb_payload() -> impl Strategy<Value = RecorderEventPayload> {
             arb_segment_kind(),
             any::<bool>(),
         )
-            .prop_map(
-                |(text, encoding, redaction, segment_kind, is_gap)| {
-                    RecorderEventPayload::EgressOutput {
-                        text,
-                        encoding,
-                        redaction,
-                        segment_kind,
-                        is_gap,
-                    }
+            .prop_map(|(text, encoding, redaction, segment_kind, is_gap)| {
+                RecorderEventPayload::EgressOutput {
+                    text,
+                    encoding,
+                    redaction,
+                    segment_kind,
+                    is_gap,
                 }
-            ),
+            }),
         // ControlMarker
         arb_control_marker_type().prop_map(|control_marker_type| {
             RecorderEventPayload::ControlMarker {
@@ -160,21 +157,21 @@ fn arb_causality() -> impl Strategy<Value = RecorderEventCausality> {
         proptest::option::of("[a-f0-9]{16}"),
         proptest::option::of("[a-f0-9]{16}"),
     )
-        .prop_map(
-            |(parent_event_id, trigger_event_id, root_event_id)| RecorderEventCausality {
+        .prop_map(|(parent_event_id, trigger_event_id, root_event_id)| {
+            RecorderEventCausality {
                 parent_event_id,
                 trigger_event_id,
                 root_event_id,
-            },
-        )
+            }
+        })
 }
 
 fn arb_recorder_event() -> impl Strategy<Value = RecorderEvent> {
     (
-        0u64..=100,          // pane_id
-        0u64..=1000,         // sequence
-        1u64..=1_000_000,    // occurred_at_ms
-        1u64..=1_000_000,    // recorded_at_ms
+        0u64..=100,       // pane_id
+        0u64..=1000,      // sequence
+        1u64..=1_000_000, // occurred_at_ms
+        1u64..=1_000_000, // recorded_at_ms
         arb_event_source(),
         arb_payload(),
         arb_causality(),
@@ -215,11 +212,11 @@ fn arb_recorder_event() -> impl Strategy<Value = RecorderEvent> {
 
 fn arb_merge_key() -> impl Strategy<Value = RecorderMergeKey> {
     (
-        0u64..=1_000_000,    // recorded_at_ms
-        0u64..=100,          // pane_id
+        0u64..=1_000_000, // recorded_at_ms
+        0u64..=100,       // pane_id
         arb_stream_kind(),
-        0u64..=1000,         // sequence
-        "[a-f0-9]{8}",       // event_id
+        0u64..=1000,   // sequence
+        "[a-f0-9]{8}", // event_id
     )
         .prop_map(
             |(recorded_at_ms, pane_id, stream_kind, sequence, event_id)| RecorderMergeKey {

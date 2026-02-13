@@ -295,14 +295,17 @@ impl PriorityClassifier {
     /// Register a pane for priority tracking.
     pub fn register_pane(&self, pane_id: u64) {
         let half_life = Duration::from_secs_f64(self.config.rate_half_life_secs);
-        self.panes.insert_if_absent(pane_id, PaneClassification {
-            priority: PanePriority::Medium,
-            tier: PaneTier::Active,
-            rate: OutputRateTracker::new(half_life),
-            last_critical_signal: None,
-            last_rate_limited_signal: None,
-            manual_override: None,
-        });
+        self.panes.insert_if_absent(
+            pane_id,
+            PaneClassification {
+                priority: PanePriority::Medium,
+                tier: PaneTier::Active,
+                rate: OutputRateTracker::new(half_life),
+                last_critical_signal: None,
+                last_rate_limited_signal: None,
+                manual_override: None,
+            },
+        );
     }
 
     /// Unregister a pane.
@@ -384,8 +387,7 @@ impl PriorityClassifier {
     pub fn classify_all_at(&self, now: Instant) -> HashMap<u64, PanePriority> {
         self.panes
             .map_all_mut(|_pane_id, state| {
-                self.total_classifications
-                    .fetch_add(1, Ordering::Relaxed);
+                self.total_classifications.fetch_add(1, Ordering::Relaxed);
                 let priority = self.compute_priority(state, now);
                 state.priority = priority;
                 priority

@@ -11,7 +11,6 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::recorder_storage::RecorderOffset;
 use crate::recording::RecorderRedactionLevel;
 
 // =============================================================================
@@ -47,7 +46,7 @@ impl Default for RetentionConfig {
             t3_max_hours: 24,
             t1_extended_days: 30,
             max_segment_bytes: 256 * 1024 * 1024, // 256 MB
-            max_segment_duration_secs: 3600,       // 1 hour
+            max_segment_duration_secs: 3600,      // 1 hour
         }
     }
 }
@@ -56,13 +55,19 @@ impl RetentionConfig {
     /// Validate configuration constraints.
     pub fn validate(&self) -> Result<(), RetentionError> {
         if self.hot_hours == 0 {
-            return Err(RetentionError::InvalidConfig("hot_hours must be > 0".into()));
+            return Err(RetentionError::InvalidConfig(
+                "hot_hours must be > 0".into(),
+            ));
         }
         if self.warm_days == 0 {
-            return Err(RetentionError::InvalidConfig("warm_days must be > 0".into()));
+            return Err(RetentionError::InvalidConfig(
+                "warm_days must be > 0".into(),
+            ));
         }
         if self.cold_days == 0 {
-            return Err(RetentionError::InvalidConfig("cold_days must be > 0".into()));
+            return Err(RetentionError::InvalidConfig(
+                "cold_days must be > 0".into(),
+            ));
         }
         if self.t1_extended_days > 90 {
             return Err(RetentionError::InvalidConfig(
@@ -86,15 +91,13 @@ impl RetentionConfig {
     #[must_use]
     pub fn retention_hours(&self, tier: SensitivityTier) -> u64 {
         match tier {
-            SensitivityTier::T1Standard => {
-                (self.t1_extended_days as u64) * 24
-            }
+            SensitivityTier::T1Standard => (self.t1_extended_days as u64) * 24,
             SensitivityTier::T2Sensitive => {
-                (self.hot_hours as u64) + (self.warm_days as u64) * 24 + (self.cold_days as u64) * 24
+                (self.hot_hours as u64)
+                    + (self.warm_days as u64) * 24
+                    + (self.cold_days as u64) * 24
             }
-            SensitivityTier::T3Restricted => {
-                self.t3_max_hours as u64
-            }
+            SensitivityTier::T3Restricted => self.t3_max_hours as u64,
         }
     }
 }
@@ -127,11 +130,26 @@ impl std::fmt::Display for RetentionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidConfig(msg) => write!(f, "invalid retention config: {}", msg),
-            Self::InvalidTransition { segment_id, from, to } => {
-                write!(f, "invalid transition for {}: {:?} -> {:?}", segment_id, from, to)
+            Self::InvalidTransition {
+                segment_id,
+                from,
+                to,
+            } => {
+                write!(
+                    f,
+                    "invalid transition for {}: {:?} -> {:?}",
+                    segment_id, from, to
+                )
             }
-            Self::CheckpointHold { segment_id, consumer } => {
-                write!(f, "segment {} held by consumer checkpoint: {}", segment_id, consumer)
+            Self::CheckpointHold {
+                segment_id,
+                consumer,
+            } => {
+                write!(
+                    f,
+                    "segment {} held by consumer checkpoint: {}",
+                    segment_id, consumer
+                )
             }
             Self::NotFound(id) => write!(f, "segment not found: {}", id),
         }
@@ -207,7 +225,10 @@ impl SegmentPhase {
     /// Whether data in this phase is queryable.
     #[must_use]
     pub fn is_queryable(&self) -> bool {
-        matches!(self, SegmentPhase::Active | SegmentPhase::Sealed | SegmentPhase::Archived)
+        matches!(
+            self,
+            SegmentPhase::Active | SegmentPhase::Sealed | SegmentPhase::Archived
+        )
     }
 
     /// Valid next phase.
@@ -268,7 +289,7 @@ impl SegmentMeta {
             SensitivityTier::T2Sensitive => "t2",
             SensitivityTier::T3Restricted => "t3",
         };
-        format!("{}_{}_{}",start_ordinal, tier_label, created_at_ms)
+        format!("{}_{}_{}", start_ordinal, tier_label, created_at_ms)
     }
 
     /// Whether this segment needs to roll (create a new segment).
@@ -291,7 +312,11 @@ impl SegmentMeta {
 
     /// Determine if this segment is eligible for the next lifecycle transition.
     #[must_use]
-    pub fn eligible_transition(&self, config: &RetentionConfig, now_ms: u64) -> Option<SegmentPhase> {
+    pub fn eligible_transition(
+        &self,
+        config: &RetentionConfig,
+        now_ms: u64,
+    ) -> Option<SegmentPhase> {
         let age_hours = now_ms.saturating_sub(self.created_at_ms) / (1000 * 3600);
 
         // T3 accelerated purge: skip directly to Purged if past max hours
@@ -317,7 +342,8 @@ impl SegmentMeta {
                 }
             }
             SegmentPhase::Sealed => {
-                let sealed_age_days = self.sealed_at_ms
+                let sealed_age_days = self
+                    .sealed_at_ms
                     .map(|ts| now_ms.saturating_sub(ts) / (1000 * 3600 * 24))
                     .unwrap_or(0);
                 if sealed_age_days >= config.warm_days as u64 {
@@ -327,7 +353,8 @@ impl SegmentMeta {
                 }
             }
             SegmentPhase::Archived => {
-                let archived_age_days = self.archived_at_ms
+                let archived_age_days = self
+                    .archived_at_ms
                     .map(|ts| now_ms.saturating_sub(ts) / (1000 * 3600 * 24))
                     .unwrap_or(0);
                 let cold_limit = if self.sensitivity == SensitivityTier::T1Standard {
@@ -428,7 +455,9 @@ impl RetentionManager {
 
     /// Get a mutable reference to a segment by ID.
     pub fn get_segment_mut(&mut self, segment_id: &str) -> Option<&mut SegmentMeta> {
-        self.segments.iter_mut().find(|s| s.segment_id == segment_id)
+        self.segments
+            .iter_mut()
+            .find(|s| s.segment_id == segment_id)
     }
 
     /// List segments in a given phase.
@@ -440,7 +469,10 @@ impl RetentionManager {
     /// List segments by sensitivity tier.
     #[must_use]
     pub fn segments_by_tier(&self, tier: SensitivityTier) -> Vec<&SegmentMeta> {
-        self.segments.iter().filter(|s| s.sensitivity == tier).collect()
+        self.segments
+            .iter()
+            .filter(|s| s.sensitivity == tier)
+            .collect()
     }
 
     /// Determine which segments need to roll (active segment exceeded size/time).
@@ -465,7 +497,8 @@ impl RetentionManager {
         let mut result = RetentionSweepResult::default();
 
         // Collect transitions first to avoid borrow issues
-        let transitions: Vec<(usize, SegmentPhase)> = self.segments
+        let transitions: Vec<(usize, SegmentPhase)> = self
+            .segments
             .iter()
             .enumerate()
             .filter_map(|(i, seg)| {
@@ -663,8 +696,16 @@ mod tests {
             size_bytes: 1024,
             event_count: 100,
             created_at_ms,
-            sealed_at_ms: if phase >= SegmentPhase::Sealed { Some(created_at_ms + ms(24)) } else { None },
-            archived_at_ms: if phase >= SegmentPhase::Archived { Some(created_at_ms + ms(24) + ms_days(7)) } else { None },
+            sealed_at_ms: if phase >= SegmentPhase::Sealed {
+                Some(created_at_ms + ms(24))
+            } else {
+                None
+            },
+            archived_at_ms: if phase >= SegmentPhase::Archived {
+                Some(created_at_ms + ms(24) + ms_days(7))
+            } else {
+                None
+            },
             purged_at_ms: None,
         }
     }
@@ -894,15 +935,24 @@ mod tests {
 
     #[test]
     fn segment_eligible_hot_to_sealed() {
-        let cfg = RetentionConfig { hot_hours: 24, ..Default::default() };
+        let cfg = RetentionConfig {
+            hot_hours: 24,
+            ..Default::default()
+        };
         let seg = make_segment("s1", SensitivityTier::T2Sensitive, SegmentPhase::Active, 0);
         assert_eq!(seg.eligible_transition(&cfg, ms(23)), None);
-        assert_eq!(seg.eligible_transition(&cfg, ms(24)), Some(SegmentPhase::Sealed));
+        assert_eq!(
+            seg.eligible_transition(&cfg, ms(24)),
+            Some(SegmentPhase::Sealed)
+        );
     }
 
     #[test]
     fn segment_eligible_sealed_to_archived() {
-        let cfg = RetentionConfig { warm_days: 7, ..Default::default() };
+        let cfg = RetentionConfig {
+            warm_days: 7,
+            ..Default::default()
+        };
         let mut seg = make_segment("s1", SensitivityTier::T2Sensitive, SegmentPhase::Active, 0);
         seg.transition(SegmentPhase::Sealed, ms(24)).unwrap();
 
@@ -917,13 +967,20 @@ mod tests {
 
     #[test]
     fn segment_eligible_archived_to_purged() {
-        let cfg = RetentionConfig { cold_days: 30, ..Default::default() };
+        let cfg = RetentionConfig {
+            cold_days: 30,
+            ..Default::default()
+        };
         let mut seg = make_segment("s1", SensitivityTier::T2Sensitive, SegmentPhase::Active, 0);
         seg.transition(SegmentPhase::Sealed, ms(24)).unwrap();
-        seg.transition(SegmentPhase::Archived, ms(24) + ms_days(7)).unwrap();
+        seg.transition(SegmentPhase::Archived, ms(24) + ms_days(7))
+            .unwrap();
 
         let archive_time = ms(24) + ms_days(7);
-        assert_eq!(seg.eligible_transition(&cfg, archive_time + ms_days(29)), None);
+        assert_eq!(
+            seg.eligible_transition(&cfg, archive_time + ms_days(29)),
+            None
+        );
         assert_eq!(
             seg.eligible_transition(&cfg, archive_time + ms_days(30)),
             Some(SegmentPhase::Purged)
@@ -932,10 +989,16 @@ mod tests {
 
     #[test]
     fn segment_t3_accelerated_purge() {
-        let cfg = RetentionConfig { t3_max_hours: 24, ..Default::default() };
+        let cfg = RetentionConfig {
+            t3_max_hours: 24,
+            ..Default::default()
+        };
         let seg = make_segment("s1", SensitivityTier::T3Restricted, SegmentPhase::Active, 0);
         // At 24 hours, T3 should be eligible for transition
-        assert_eq!(seg.eligible_transition(&cfg, ms(24)), Some(SegmentPhase::Sealed));
+        assert_eq!(
+            seg.eligible_transition(&cfg, ms(24)),
+            Some(SegmentPhase::Sealed)
+        );
     }
 
     #[test]
@@ -947,12 +1010,19 @@ mod tests {
         };
         let mut seg = make_segment("s1", SensitivityTier::T1Standard, SegmentPhase::Active, 0);
         seg.transition(SegmentPhase::Sealed, ms(24)).unwrap();
-        seg.transition(SegmentPhase::Archived, ms(24) + ms_days(7)).unwrap();
+        seg.transition(SegmentPhase::Archived, ms(24) + ms_days(7))
+            .unwrap();
 
         let archive_time = ms(24) + ms_days(7);
         // T1 should use extended retention (60 days)
-        assert_eq!(seg.eligible_transition(&cfg, archive_time + ms_days(30)), None);
-        assert_eq!(seg.eligible_transition(&cfg, archive_time + ms_days(59)), None);
+        assert_eq!(
+            seg.eligible_transition(&cfg, archive_time + ms_days(30)),
+            None
+        );
+        assert_eq!(
+            seg.eligible_transition(&cfg, archive_time + ms_days(59)),
+            None
+        );
         assert_eq!(
             seg.eligible_transition(&cfg, archive_time + ms_days(60)),
             Some(SegmentPhase::Purged)
@@ -966,15 +1036,30 @@ mod tests {
     #[test]
     fn manager_add_and_count_segments() {
         let mut mgr = RetentionManager::with_defaults();
-        mgr.add_segment(make_segment("s1", SensitivityTier::T1Standard, SegmentPhase::Active, 0));
-        mgr.add_segment(make_segment("s2", SensitivityTier::T2Sensitive, SegmentPhase::Sealed, 0));
+        mgr.add_segment(make_segment(
+            "s1",
+            SensitivityTier::T1Standard,
+            SegmentPhase::Active,
+            0,
+        ));
+        mgr.add_segment(make_segment(
+            "s2",
+            SensitivityTier::T2Sensitive,
+            SegmentPhase::Sealed,
+            0,
+        ));
         assert_eq!(mgr.segment_count(), 2);
     }
 
     #[test]
     fn manager_get_segment() {
         let mut mgr = RetentionManager::with_defaults();
-        mgr.add_segment(make_segment("s1", SensitivityTier::T1Standard, SegmentPhase::Active, 0));
+        mgr.add_segment(make_segment(
+            "s1",
+            SensitivityTier::T1Standard,
+            SegmentPhase::Active,
+            0,
+        ));
         assert!(mgr.get_segment("s1").is_some());
         assert!(mgr.get_segment("s99").is_none());
     }
@@ -982,9 +1067,24 @@ mod tests {
     #[test]
     fn manager_segments_in_phase() {
         let mut mgr = RetentionManager::with_defaults();
-        mgr.add_segment(make_segment("s1", SensitivityTier::T1Standard, SegmentPhase::Active, 0));
-        mgr.add_segment(make_segment("s2", SensitivityTier::T1Standard, SegmentPhase::Sealed, 0));
-        mgr.add_segment(make_segment("s3", SensitivityTier::T2Sensitive, SegmentPhase::Sealed, 0));
+        mgr.add_segment(make_segment(
+            "s1",
+            SensitivityTier::T1Standard,
+            SegmentPhase::Active,
+            0,
+        ));
+        mgr.add_segment(make_segment(
+            "s2",
+            SensitivityTier::T1Standard,
+            SegmentPhase::Sealed,
+            0,
+        ));
+        mgr.add_segment(make_segment(
+            "s3",
+            SensitivityTier::T2Sensitive,
+            SegmentPhase::Sealed,
+            0,
+        ));
 
         assert_eq!(mgr.segments_in_phase(SegmentPhase::Active).len(), 1);
         assert_eq!(mgr.segments_in_phase(SegmentPhase::Sealed).len(), 2);
@@ -994,9 +1094,24 @@ mod tests {
     #[test]
     fn manager_segments_by_tier() {
         let mut mgr = RetentionManager::with_defaults();
-        mgr.add_segment(make_segment("s1", SensitivityTier::T1Standard, SegmentPhase::Active, 0));
-        mgr.add_segment(make_segment("s2", SensitivityTier::T2Sensitive, SegmentPhase::Active, 0));
-        mgr.add_segment(make_segment("s3", SensitivityTier::T3Restricted, SegmentPhase::Active, 0));
+        mgr.add_segment(make_segment(
+            "s1",
+            SensitivityTier::T1Standard,
+            SegmentPhase::Active,
+            0,
+        ));
+        mgr.add_segment(make_segment(
+            "s2",
+            SensitivityTier::T2Sensitive,
+            SegmentPhase::Active,
+            0,
+        ));
+        mgr.add_segment(make_segment(
+            "s3",
+            SensitivityTier::T3Restricted,
+            SegmentPhase::Active,
+            0,
+        ));
 
         assert_eq!(mgr.segments_by_tier(SensitivityTier::T1Standard).len(), 1);
         assert_eq!(mgr.segments_by_tier(SensitivityTier::T3Restricted).len(), 1);
@@ -1007,9 +1122,15 @@ mod tests {
         let mut mgr = RetentionManager::new(RetentionConfig {
             hot_hours: 24,
             ..Default::default()
-        }).unwrap();
+        })
+        .unwrap();
 
-        mgr.add_segment(make_segment("s1", SensitivityTier::T2Sensitive, SegmentPhase::Active, 0));
+        mgr.add_segment(make_segment(
+            "s1",
+            SensitivityTier::T2Sensitive,
+            SegmentPhase::Active,
+            0,
+        ));
         let result = mgr.sweep(ms(25), &HashMap::new());
         assert_eq!(result.sealed, vec!["s1".to_string()]);
         assert_eq!(mgr.get_segment("s1").unwrap().phase, SegmentPhase::Sealed);
@@ -1021,7 +1142,8 @@ mod tests {
             hot_hours: 24,
             warm_days: 7,
             ..Default::default()
-        }).unwrap();
+        })
+        .unwrap();
 
         let mut seg = make_segment("s1", SensitivityTier::T2Sensitive, SegmentPhase::Active, 0);
         seg.transition(SegmentPhase::Sealed, ms(24)).unwrap();
@@ -1037,11 +1159,13 @@ mod tests {
         let mut mgr = RetentionManager::new(RetentionConfig {
             cold_days: 30,
             ..Default::default()
-        }).unwrap();
+        })
+        .unwrap();
 
         let mut seg = make_segment("s1", SensitivityTier::T2Sensitive, SegmentPhase::Active, 0);
         seg.transition(SegmentPhase::Sealed, ms(24)).unwrap();
-        seg.transition(SegmentPhase::Archived, ms(24) + ms_days(7)).unwrap();
+        seg.transition(SegmentPhase::Archived, ms(24) + ms_days(7))
+            .unwrap();
         mgr.add_segment(seg);
 
         let now = ms(24) + ms_days(7) + ms_days(31);
@@ -1054,11 +1178,13 @@ mod tests {
         let mut mgr = RetentionManager::new(RetentionConfig {
             cold_days: 1,
             ..Default::default()
-        }).unwrap();
+        })
+        .unwrap();
 
         let mut seg = make_segment("s1", SensitivityTier::T2Sensitive, SegmentPhase::Active, 0);
         seg.transition(SegmentPhase::Sealed, ms(24)).unwrap();
-        seg.transition(SegmentPhase::Archived, ms(24) + ms_days(1)).unwrap();
+        seg.transition(SegmentPhase::Archived, ms(24) + ms_days(1))
+            .unwrap();
         mgr.add_segment(seg);
 
         let mut holders = HashMap::new();

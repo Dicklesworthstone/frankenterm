@@ -29,15 +29,12 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use crate::policy::ActorKind;
 use crate::recorder_audit::{
     AccessTier, ActorIdentity, AuditEventBuilder, AuditEventType, AuditLog, AuditScope,
     AuthzDecision,
 };
 use crate::recorder_retention::SensitivityTier;
-use crate::recording::{
-    RecorderEvent, RecorderEventPayload, RecorderEventSource, RecorderRedactionLevel,
-};
+use crate::recording::{RecorderEvent, RecorderEventPayload, RecorderEventSource};
 
 // =============================================================================
 // Query request
@@ -744,13 +741,9 @@ impl<R: RecorderEventReader> RecorderQueryExecutor<R> {
     ) {
         // Audit the elevation grant.
         self.audit_log.append(
-            AuditEventBuilder::new(
-                AuditEventType::AccessApprovalGranted,
-                actor.clone(),
-                now_ms,
-            )
-            .with_decision(AuthzDecision::Allow)
-            .with_justification(justification.clone()),
+            AuditEventBuilder::new(AuditEventType::AccessApprovalGranted, actor.clone(), now_ms)
+                .with_decision(AuthzDecision::Allow)
+                .with_justification(justification.clone()),
         );
 
         let mut grants = self.elevation_grants.lock().unwrap();
@@ -825,7 +818,10 @@ impl<R: RecorderEventReader> RecorderQueryExecutor<R> {
         let base = AccessTier::default_for_actor(actor.kind);
 
         let grants = self.elevation_grants.lock().unwrap();
-        if let Some(grant) = grants.iter().find(|g| g.actor == *actor && g.is_valid_at(now_ms)) {
+        if let Some(grant) = grants
+            .iter()
+            .find(|g| g.actor == *actor && g.is_valid_at(now_ms))
+        {
             if grant.tier > base {
                 return grant.tier;
             }
@@ -884,9 +880,8 @@ fn extract_text(payload: &RecorderEventPayload) -> Option<&str> {
     match payload {
         RecorderEventPayload::IngressText { text, .. } => Some(text.as_str()),
         RecorderEventPayload::EgressOutput { text, .. } => Some(text.as_str()),
-        RecorderEventPayload::ControlMarker { .. } | RecorderEventPayload::LifecycleMarker { .. } => {
-            None
-        }
+        RecorderEventPayload::ControlMarker { .. }
+        | RecorderEventPayload::LifecycleMarker { .. } => None,
     }
 }
 
@@ -974,7 +969,7 @@ fn mask_text(text: &str) -> String {
         // Show first 2 and last 2 characters, mask the rest.
         let first = &text[..2];
         let last = &text[text.len() - 2..];
-        format!("{}{}{}",first, "*".repeat(len - 4), last)
+        format!("{}{}{}", first, "*".repeat(len - 4), last)
     }
 }
 
@@ -1033,11 +1028,12 @@ impl QueryStatsAggregator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::ActorKind;
     use crate::recorder_audit::AuditLogConfig;
     use crate::recording::{
-        RecorderEventCausality, RecorderEventPayload, RecorderEventSource, RecorderIngressKind,
-        RecorderRedactionLevel, RecorderSegmentKind, RecorderTextEncoding,
-        RECORDER_EVENT_SCHEMA_VERSION_V1,
+        RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderEventCausality, RecorderEventPayload,
+        RecorderEventSource, RecorderIngressKind, RecorderRedactionLevel, RecorderSegmentKind,
+        RecorderTextEncoding,
     };
 
     // -----------------------------------------------------------------------
@@ -1153,10 +1149,7 @@ mod tests {
     }
 
     fn test_executor(events: Vec<RecorderEvent>) -> RecorderQueryExecutor<InMemoryEventStore> {
-        RecorderQueryExecutor::new(
-            test_store(events),
-            AuditLog::new(AuditLogConfig::default()),
-        )
+        RecorderQueryExecutor::new(test_store(events), AuditLog::new(AuditLogConfig::default()))
     }
 
     fn now() -> u64 {
@@ -1286,7 +1279,13 @@ mod tests {
     #[test]
     fn store_filters_by_text_pattern() {
         let store = test_store(vec![
-            make_event(1, 0, 100, "error: file not found", RecorderRedactionLevel::None),
+            make_event(
+                1,
+                0,
+                100,
+                "error: file not found",
+                RecorderRedactionLevel::None,
+            ),
             make_event(1, 1, 200, "success: done", RecorderRedactionLevel::None),
             make_event(1, 2, 300, "error: timeout", RecorderRedactionLevel::None),
         ]);
@@ -1396,9 +1395,21 @@ mod tests {
     #[test]
     fn execute_text_search() {
         let exec = test_executor(vec![
-            make_event(1, 0, 100, "compile error: missing semi", RecorderRedactionLevel::None),
+            make_event(
+                1,
+                0,
+                100,
+                "compile error: missing semi",
+                RecorderRedactionLevel::None,
+            ),
             make_event(1, 1, 200, "all tests pass", RecorderRedactionLevel::None),
-            make_event(1, 2, 300, "error: timeout expired", RecorderRedactionLevel::None),
+            make_event(
+                1,
+                2,
+                300,
+                "error: timeout expired",
+                RecorderRedactionLevel::None,
+            ),
         ]);
 
         let req = RecorderQueryRequest::text_search("error");
@@ -1430,9 +1441,13 @@ mod tests {
 
     #[test]
     fn robot_allowed_metadata_only() {
-        let exec = test_executor(vec![
-            make_event(1, 0, 100, "hello", RecorderRedactionLevel::None),
-        ]);
+        let exec = test_executor(vec![make_event(
+            1,
+            0,
+            100,
+            "hello",
+            RecorderRedactionLevel::None,
+        )]);
 
         // A0 metadata query — robot should be allowed.
         let req = RecorderQueryRequest::default().with_text(false);
@@ -1444,9 +1459,13 @@ mod tests {
 
     #[test]
     fn robot_single_pane_allowed() {
-        let exec = test_executor(vec![
-            make_event(1, 0, 100, "hello world", RecorderRedactionLevel::None),
-        ]);
+        let exec = test_executor(vec![make_event(
+            1,
+            0,
+            100,
+            "hello world",
+            RecorderRedactionLevel::None,
+        )]);
 
         let req = RecorderQueryRequest::for_panes(vec![1]);
         let resp = exec.execute(&robot_actor(), &req, now()).unwrap();
@@ -1456,9 +1475,13 @@ mod tests {
 
     #[test]
     fn denied_query_generates_audit_entry() {
-        let exec = test_executor(vec![
-            make_event(1, 0, 100, "a", RecorderRedactionLevel::None),
-        ]);
+        let exec = test_executor(vec![make_event(
+            1,
+            0,
+            100,
+            "a",
+            RecorderRedactionLevel::None,
+        )]);
 
         let req = RecorderQueryRequest::for_panes(vec![1, 2]);
         let _ = exec.execute(&robot_actor(), &req, now());
@@ -1470,9 +1493,13 @@ mod tests {
 
     #[test]
     fn successful_query_generates_audit_entry() {
-        let exec = test_executor(vec![
-            make_event(1, 0, 100, "hello", RecorderRedactionLevel::None),
-        ]);
+        let exec = test_executor(vec![make_event(
+            1,
+            0,
+            100,
+            "hello",
+            RecorderRedactionLevel::None,
+        )]);
 
         let req = RecorderQueryRequest::for_panes(vec![1]);
         let _ = exec.execute(&human_actor(), &req, now());
@@ -1491,7 +1518,13 @@ mod tests {
     fn robot_sees_t1_text_but_t2_masked() {
         let exec = test_executor(vec![
             make_event(1, 0, 100, "normal output", RecorderRedactionLevel::None),
-            make_event(1, 1, 200, "secret: API_KEY=abc123def", RecorderRedactionLevel::Partial),
+            make_event(
+                1,
+                1,
+                200,
+                "secret: API_KEY=abc123def",
+                RecorderRedactionLevel::Partial,
+            ),
         ]);
 
         let req = RecorderQueryRequest::for_panes(vec![1]);
@@ -1502,7 +1535,10 @@ mod tests {
         assert!(!resp.events[0].redacted);
 
         // T2 (Partial redaction): masked for A1.
-        assert_ne!(resp.events[1].text.as_deref(), Some("secret: API_KEY=abc123def"));
+        assert_ne!(
+            resp.events[1].text.as_deref(),
+            Some("secret: API_KEY=abc123def")
+        );
         assert!(resp.events[1].redacted);
     }
 
@@ -1526,9 +1562,13 @@ mod tests {
 
     #[test]
     fn metadata_only_strips_text() {
-        let exec = test_executor(vec![
-            make_event(1, 0, 100, "hello", RecorderRedactionLevel::None),
-        ]);
+        let exec = test_executor(vec![make_event(
+            1,
+            0,
+            100,
+            "hello",
+            RecorderRedactionLevel::None,
+        )]);
 
         let req = RecorderQueryRequest::default().with_text(false);
         let resp = exec.execute(&human_actor(), &req, now()).unwrap();
@@ -1650,9 +1690,13 @@ mod tests {
 
     #[test]
     fn explain_human_simple_query() {
-        let exec = test_executor(vec![
-            make_event(1, 0, 100, "a", RecorderRedactionLevel::None),
-        ]);
+        let exec = test_executor(vec![make_event(
+            1,
+            0,
+            100,
+            "a",
+            RecorderRedactionLevel::None,
+        )]);
 
         let req = RecorderQueryRequest::for_panes(vec![1]);
         let plan = exec.explain(&human_actor(), &req, now());
@@ -1665,9 +1709,13 @@ mod tests {
 
     #[test]
     fn explain_robot_denied() {
-        let exec = test_executor(vec![
-            make_event(1, 0, 100, "a", RecorderRedactionLevel::None),
-        ]);
+        let exec = test_executor(vec![make_event(
+            1,
+            0,
+            100,
+            "a",
+            RecorderRedactionLevel::None,
+        )]);
 
         let req = RecorderQueryRequest::text_search("a"); // needs A2
         let plan = exec.explain(&robot_actor(), &req, now());
@@ -1683,8 +1731,8 @@ mod tests {
     #[test]
     fn filter_by_max_sensitivity() {
         let exec = test_executor(vec![
-            make_event(1, 0, 100, "public", RecorderRedactionLevel::None),       // T1
-            make_event(1, 1, 200, "redacted", RecorderRedactionLevel::Partial),   // T2
+            make_event(1, 0, 100, "public", RecorderRedactionLevel::None), // T1
+            make_event(1, 1, 200, "redacted", RecorderRedactionLevel::Partial), // T2
         ]);
 
         let mut req = RecorderQueryRequest::for_panes(vec![1]);
@@ -1698,8 +1746,8 @@ mod tests {
     #[test]
     fn filter_by_min_sensitivity() {
         let exec = test_executor(vec![
-            make_event(1, 0, 100, "public", RecorderRedactionLevel::None),       // T1
-            make_event(1, 1, 200, "redacted", RecorderRedactionLevel::Partial),   // T2
+            make_event(1, 0, 100, "public", RecorderRedactionLevel::None), // T1
+            make_event(1, 1, 200, "redacted", RecorderRedactionLevel::Partial), // T2
         ]);
 
         let mut req = RecorderQueryRequest::for_panes(vec![1]);
@@ -1808,9 +1856,13 @@ mod tests {
 
     #[test]
     fn stats_aggregator_tracks_queries() {
-        let exec = test_executor(vec![
-            make_event(1, 0, 100, "hello", RecorderRedactionLevel::None),
-        ]);
+        let exec = test_executor(vec![make_event(
+            1,
+            0,
+            100,
+            "hello",
+            RecorderRedactionLevel::None,
+        )]);
 
         let mut agg = QueryStatsAggregator::new();
         let actor = human_actor();
@@ -1840,9 +1892,13 @@ mod tests {
 
     #[test]
     fn privileged_query_type_in_audit() {
-        let exec = test_executor(vec![
-            make_event(1, 0, 100, "secret stuff", RecorderRedactionLevel::None),
-        ]);
+        let exec = test_executor(vec![make_event(
+            1,
+            0,
+            100,
+            "secret stuff",
+            RecorderRedactionLevel::None,
+        )]);
 
         let actor = human_actor();
         exec.grant_elevation(
@@ -1871,9 +1927,13 @@ mod tests {
 
     #[test]
     fn query_response_serializable() {
-        let exec = test_executor(vec![
-            make_event(1, 0, 100, "hello", RecorderRedactionLevel::None),
-        ]);
+        let exec = test_executor(vec![make_event(
+            1,
+            0,
+            100,
+            "hello",
+            RecorderRedactionLevel::None,
+        )]);
 
         let req = RecorderQueryRequest::for_panes(vec![1]);
         let resp = exec.execute(&human_actor(), &req, now()).unwrap();
@@ -1966,12 +2026,15 @@ mod tests {
 
     #[test]
     fn audit_scope_records_query_context() {
-        let exec = test_executor(vec![
-            make_event(1, 0, 100, "data", RecorderRedactionLevel::None),
-        ]);
+        let exec = test_executor(vec![make_event(
+            1,
+            0,
+            100,
+            "data",
+            RecorderRedactionLevel::None,
+        )]);
 
-        let req = RecorderQueryRequest::for_panes(vec![1, 2])
-            .with_time_range(100, 200);
+        let req = RecorderQueryRequest::for_panes(vec![1, 2]).with_time_range(100, 200);
         let _ = exec.execute(&human_actor(), &req, now());
 
         let entries = exec.audit_log().entries();
@@ -2033,7 +2096,13 @@ mod tests {
     fn multiple_actors_see_different_views() {
         let exec = test_executor(vec![
             make_event(1, 0, 100, "normal output", RecorderRedactionLevel::None),
-            make_event(1, 1, 200, "sensitive: password=hunter2", RecorderRedactionLevel::Partial),
+            make_event(
+                1,
+                1,
+                200,
+                "sensitive: password=hunter2",
+                RecorderRedactionLevel::Partial,
+            ),
         ]);
 
         let req = RecorderQueryRequest::for_panes(vec![1]);

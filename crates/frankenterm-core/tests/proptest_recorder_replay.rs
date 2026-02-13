@@ -39,27 +39,25 @@ fn arb_result_event(
     seq: u64,
     ts_ms: u64,
 ) -> impl Strategy<Value = frankenterm_core::recorder_query::QueryResultEvent> {
-    (
-        proptest::option::of("[a-z0-9 ]{1,40}"),
-        arb_event_kind(),
-    )
-        .prop_map(move |(text, kind)| {
-            frankenterm_core::recorder_query::QueryResultEvent {
-                event_id: format!("evt-{}-{}", pane_id, seq),
-                pane_id,
-                source: RecorderEventSource::WeztermMux,
-                occurred_at_ms: ts_ms,
-                sequence: seq,
-                session_id: None,
-                text,
-                redacted: false,
-                sensitivity: SensitivityTier::T1Standard,
-                event_kind: kind,
-            }
-        })
+    (proptest::option::of("[a-z0-9 ]{1,40}"), arb_event_kind()).prop_map(move |(text, kind)| {
+        frankenterm_core::recorder_query::QueryResultEvent {
+            event_id: format!("evt-{}-{}", pane_id, seq),
+            pane_id,
+            source: RecorderEventSource::WeztermMux,
+            occurred_at_ms: ts_ms,
+            sequence: seq,
+            session_id: None,
+            text,
+            redacted: false,
+            sensitivity: SensitivityTier::T1Standard,
+            event_kind: kind,
+        }
+    })
 }
 
-fn arb_events(count: usize) -> impl Strategy<Value = Vec<frankenterm_core::recorder_query::QueryResultEvent>> {
+fn arb_events(
+    count: usize,
+) -> impl Strategy<Value = Vec<frankenterm_core::recorder_query::QueryResultEvent>> {
     let strategies: Vec<_> = (0..count)
         .map(|i| {
             let pane_id = (i % 4) as u64 + 1;
@@ -79,7 +77,13 @@ fn make_session(
     events: Vec<frankenterm_core::recorder_query::QueryResultEvent>,
     config: ReplayConfig,
 ) -> Result<ReplaySession, frankenterm_core::recorder_replay::ReplayError> {
-    ReplaySession::new(events, config, human(), AccessTier::A2FullQuery, "prop-test")
+    ReplaySession::new(
+        events,
+        config,
+        human(),
+        AccessTier::A2FullQuery,
+        "prop-test",
+    )
 }
 
 // =============================================================================

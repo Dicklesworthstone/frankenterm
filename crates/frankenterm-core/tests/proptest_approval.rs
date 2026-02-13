@@ -30,7 +30,7 @@
 use proptest::prelude::*;
 
 use frankenterm_core::approval::{
-    fingerprint_for_input, hash_allow_once_code, ApprovalAuditContext, ApprovalScope,
+    ApprovalAuditContext, ApprovalScope, fingerprint_for_input, hash_allow_once_code,
 };
 use frankenterm_core::config::ApprovalConfig;
 use frankenterm_core::policy::{ActionKind, ActorKind, PolicyInput};
@@ -85,7 +85,18 @@ fn arb_policy_input() -> impl Strategy<Value = PolicyInput> {
         proptest::option::of("[a-zA-Z0-9/]{1,30}"),
     )
         .prop_map(
-            |(action, actor, pane_id, domain, text_summary, command_text, workflow_id, agent_type, pane_title, pane_cwd)| {
+            |(
+                action,
+                actor,
+                pane_id,
+                domain,
+                text_summary,
+                command_text,
+                workflow_id,
+                agent_type,
+                pane_title,
+                pane_cwd,
+            )| {
                 let mut input = PolicyInput::new(action, actor);
                 if let Some(pid) = pane_id {
                     input = input.with_pane(pid);

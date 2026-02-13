@@ -13,9 +13,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::recording::{
-    RecorderEvent, RecorderEventPayload, RecorderLifecyclePhase, RecorderSegmentKind,
-};
+use crate::recording::{RecorderEvent, RecorderEventPayload};
 
 /// Sequence stream domain for per-pane ordering.
 ///
@@ -276,9 +274,9 @@ impl ClockAnomalyTracker {
 mod tests {
     use super::*;
     use crate::recording::{
-        RecorderControlMarkerType, RecorderEventCausality, RecorderEventSource,
-        RecorderIngressKind, RecorderRedactionLevel, RecorderTextEncoding,
-        RECORDER_EVENT_SCHEMA_VERSION_V1,
+        RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderControlMarkerType, RecorderEventCausality,
+        RecorderEventSource, RecorderIngressKind, RecorderLifecyclePhase, RecorderRedactionLevel,
+        RecorderSegmentKind, RecorderTextEncoding,
     };
     use serde_json::json;
 

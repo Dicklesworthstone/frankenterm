@@ -9,6 +9,7 @@
 
 use crate::error::Remediation;
 use crate::policy::Redactor;
+use crate::runtime_compat::timeout;
 use crate::suggestions::Platform;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -17,7 +18,6 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 use tokio::process::Command;
-use crate::runtime_compat::timeout;
 
 /// Supported cass agents for filtering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -17,9 +17,9 @@ use frankenterm_core::recorder_invariants::{
     InvariantChecker, InvariantCheckerConfig, ViolationKind, verify_replay_determinism,
 };
 use frankenterm_core::recording::{
-    RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderEvent, RecorderEventCausality,
-    RecorderEventPayload, RecorderEventSource, RecorderIngressKind,
-    RecorderRedactionLevel, RecorderSegmentKind, RecorderTextEncoding,
+    RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderEvent, RecorderEventCausality, RecorderEventPayload,
+    RecorderEventSource, RecorderIngressKind, RecorderRedactionLevel, RecorderSegmentKind,
+    RecorderTextEncoding,
 };
 use frankenterm_core::sequence_model::{ReplayOrder, SequenceAssigner, validate_replay_order};
 

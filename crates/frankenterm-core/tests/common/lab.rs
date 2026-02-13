@@ -9,7 +9,7 @@
 //! outcome information for debugging.
 
 use asupersync::lab::chaos::ChaosConfig;
-use asupersync::lab::explorer::{ExplorerConfig, ExplorationReport, ScheduleExplorer};
+use asupersync::lab::explorer::{ExplorationReport, ExplorerConfig, ScheduleExplorer};
 use asupersync::{LabConfig, LabRuntime, Time};
 
 // ---------------------------------------------------------------------------
@@ -481,10 +481,7 @@ impl ExplorationTestReport {
 ///     },
 /// );
 /// ```
-pub fn run_exploration_test<F>(
-    config: ExplorationTestConfig,
-    test_fn: F,
-) -> ExplorationTestReport
+pub fn run_exploration_test<F>(config: ExplorationTestConfig, test_fn: F) -> ExplorationTestReport
 where
     F: Fn(&mut LabRuntime),
 {
@@ -538,11 +535,7 @@ where
 /// Run the same test across multiple seeds, asserting all pass.
 ///
 /// Useful for catching seed-dependent bugs without full DPOR exploration.
-pub fn run_multi_seed_test<F>(
-    test_name: &str,
-    seeds: &[u64],
-    test_fn: F,
-) -> Vec<LabTestReport>
+pub fn run_multi_seed_test<F>(test_name: &str, seeds: &[u64], test_fn: F) -> Vec<LabTestReport>
 where
     F: Fn(&mut LabRuntime),
 {

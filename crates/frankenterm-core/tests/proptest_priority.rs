@@ -19,8 +19,8 @@ use proptest::prelude::*;
 
 use frankenterm_core::pane_tiers::PaneTier;
 use frankenterm_core::priority::{
-    shedding_order, OutputRateTracker, PanePriority, PriorityClassifier, PriorityConfig,
-    PriorityMetrics,
+    OutputRateTracker, PanePriority, PriorityClassifier, PriorityConfig, PriorityMetrics,
+    shedding_order,
 };
 
 // ────────────────────────────────────────────────────────────────────

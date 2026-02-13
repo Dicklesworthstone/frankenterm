@@ -40,7 +40,10 @@ fn arb_overall_status() -> impl Strategy<Value = OverallStatus> {
 fn arb_snapshot() -> impl Strategy<Value = DegradationSnapshot> {
     (
         arb_subsystem(),
-        prop_oneof![Just("degraded".to_string()), Just("unavailable".to_string())],
+        prop_oneof![
+            Just("degraded".to_string()),
+            Just("unavailable".to_string())
+        ],
         prop::option::of("[a-z ]{1,30}"),
         prop::option::of(0u64..=10_000_000_000),
         prop::option::of(0u64..=1_000_000),
@@ -70,15 +73,15 @@ fn arb_report() -> impl Strategy<Value = DegradationReport> {
         0usize..=50,
         0usize..=50,
     )
-        .prop_map(
-            |(overall, active_degradations, queued, disabled, paused)| DegradationReport {
+        .prop_map(|(overall, active_degradations, queued, disabled, paused)| {
+            DegradationReport {
                 overall,
                 active_degradations,
                 queued_write_count: queued,
                 disabled_pattern_count: disabled,
                 paused_workflow_count: paused,
-            },
-        )
+            }
+        })
 }
 
 // ────────────────────────────────────────────────────────────────────

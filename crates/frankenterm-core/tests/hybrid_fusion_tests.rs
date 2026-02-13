@@ -4,8 +4,8 @@
 //! verifies that the fusion pipeline produces correct rankings.
 
 use frankenterm_core::search::{
-    blend_two_tier, kendall_tau, rrf_fuse, FusedResult, HybridSearchService, SearchMode,
-    TwoTierMetrics,
+    FusedResult, HybridSearchService, SearchMode, TwoTierMetrics, blend_two_tier, kendall_tau,
+    rrf_fuse,
 };
 
 // =============================================================================
@@ -71,8 +71,9 @@ fn rrf_empty_inputs() {
 #[test]
 fn rrf_score_monotonically_decreases() {
     let lexical: Vec<(u64, f32)> = (0..20).map(|i| (i as u64, 1.0 - i as f32 * 0.05)).collect();
-    let semantic: Vec<(u64, f32)> =
-        (10..30).map(|i| (i as u64, 1.0 - (i - 10) as f32 * 0.05)).collect();
+    let semantic: Vec<(u64, f32)> = (10..30)
+        .map(|i| (i as u64, 1.0 - (i - 10) as f32 * 0.05))
+        .collect();
 
     let fused = rrf_fuse(&lexical, &semantic, 60);
 
@@ -294,7 +295,11 @@ fn fused_result_scores_are_positive() {
     let fused = rrf_fuse(&lexical, &semantic, 60);
 
     for r in &fused {
-        assert!(r.score > 0.0, "RRF scores should be positive, got {}", r.score);
+        assert!(
+            r.score > 0.0,
+            "RRF scores should be positive, got {}",
+            r.score
+        );
     }
 }
 
@@ -304,19 +309,9 @@ fn fused_result_scores_are_positive() {
 
 #[test]
 fn full_hybrid_pipeline() {
-    let bm25_results = vec![
-        (100u64, 12.5f32),
-        (200, 8.3),
-        (300, 5.1),
-        (400, 3.2),
-    ];
+    let bm25_results = vec![(100u64, 12.5f32), (200, 8.3), (300, 5.1), (400, 3.2)];
 
-    let semantic_results = vec![
-        (200u64, 0.92f32),
-        (500, 0.88),
-        (100, 0.85),
-        (600, 0.72),
-    ];
+    let semantic_results = vec![(200u64, 0.92f32), (500, 0.88), (100, 0.85), (600, 0.72)];
 
     let service = HybridSearchService::new().with_rrf_k(60);
     let results = service.fuse(&bm25_results, &semantic_results, 10);

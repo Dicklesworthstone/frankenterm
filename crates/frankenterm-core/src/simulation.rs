@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -134,6 +134,225 @@ pub enum EventAction {
     GenerateScrollback,
     /// Insert a named marker (for expectations).
     Marker,
+}
+
+impl EventAction {
+    /// Canonical snake-case action string for metrics/events.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Append => "append",
+            Self::Clear => "clear",
+            Self::SetTitle => "set_title",
+            Self::Resize => "resize",
+            Self::SetFontSize => "set_font_size",
+            Self::GenerateScrollback => "generate_scrollback",
+            Self::Marker => "marker",
+        }
+    }
+
+    /// Whether this action participates in resize/reflow baseline attribution.
+    #[must_use]
+    pub const fn is_resize_timeline_action(&self) -> bool {
+        matches!(
+            self,
+            Self::Resize | Self::SetFontSize | Self::GenerateScrollback
+        )
+    }
+}
+
+/// Ordered execution stages for resize/reflow timeline attribution.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ResizeTimelineStage {
+    /// Event intent was received/selected.
+    InputIntent,
+    /// Event spent time queued before processing.
+    SchedulerQueueing,
+    /// Logical reflow and semantic action parsing.
+    LogicalReflow,
+    /// Render-preparation work before presentation.
+    RenderPrep,
+    /// Final presentation/injection stage.
+    Presentation,
+}
+
+impl ResizeTimelineStage {
+    /// Canonical stage order for per-event probes and summaries.
+    pub const ALL: [Self; 5] = [
+        Self::InputIntent,
+        Self::SchedulerQueueing,
+        Self::LogicalReflow,
+        Self::RenderPrep,
+        Self::Presentation,
+    ];
+
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::InputIntent => "input_intent",
+            Self::SchedulerQueueing => "scheduler_queueing",
+            Self::LogicalReflow => "logical_reflow",
+            Self::RenderPrep => "render_prep",
+            Self::Presentation => "presentation",
+        }
+    }
+}
+
+/// Queue depth metrics captured for queueing stages.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResizeQueueMetrics {
+    /// Pending resize-class events before current event is dequeued.
+    pub depth_before: u64,
+    /// Pending resize-class events after current event is dequeued.
+    pub depth_after: u64,
+}
+
+/// One stage timing sample for a single resize timeline event.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResizeTimelineStageSample {
+    /// Pipeline stage identifier.
+    pub stage: ResizeTimelineStage,
+    /// Stage start offset from event dispatch (nanoseconds).
+    pub start_offset_ns: u64,
+    /// Stage duration (nanoseconds).
+    pub duration_ns: u64,
+    /// Queue depth attribution (present for scheduler stage).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_metrics: Option<ResizeQueueMetrics>,
+}
+
+/// Per-event timeline attribution for resize-class actions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResizeTimelineEvent {
+    /// 0-based event index in scenario event list.
+    pub event_index: usize,
+    /// Target pane ID.
+    pub pane_id: u64,
+    /// Action executed.
+    pub action: EventAction,
+    /// Scheduled scenario timestamp offset (nanoseconds).
+    pub scheduled_at_ns: u64,
+    /// Actual dispatch offset relative to scenario execution start (nanoseconds).
+    pub dispatch_offset_ns: u64,
+    /// Total wall duration for this event probe (nanoseconds).
+    pub total_duration_ns: u64,
+    /// Ordered stage probes.
+    pub stages: Vec<ResizeTimelineStageSample>,
+}
+
+/// Flamegraph-friendly sample row.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResizeTimelineFlameSample {
+    /// Collapsed stack label (`scenario;action;stage`).
+    pub stack: String,
+    /// Sample value in nanoseconds.
+    pub duration_ns: u64,
+    /// Source event index.
+    pub event_index: usize,
+    /// Source pane ID.
+    pub pane_id: u64,
+}
+
+/// Aggregate stats per resize timeline stage.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ResizeTimelineStageSummary {
+    /// Stage identifier.
+    pub stage: ResizeTimelineStage,
+    /// Number of samples contributing to this stage.
+    pub samples: usize,
+    /// Sum of all sample durations (nanoseconds).
+    pub total_duration_ns: u64,
+    /// Arithmetic mean duration (nanoseconds).
+    pub avg_duration_ns: f64,
+    /// p95 duration (nanoseconds).
+    pub p95_duration_ns: u64,
+    /// Maximum observed duration (nanoseconds).
+    pub max_duration_ns: u64,
+}
+
+/// Resize timeline artifact for one scenario execution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ResizeTimeline {
+    /// Scenario name.
+    pub scenario: String,
+    /// Reproducibility key from scenario metadata.
+    pub reproducibility_key: String,
+    /// Capture timestamp in epoch ms.
+    pub captured_at_ms: u64,
+    /// Resize-class events executed and probed.
+    pub executed_resize_events: usize,
+    /// Per-event stage probes.
+    pub events: Vec<ResizeTimelineEvent>,
+}
+
+impl ResizeTimeline {
+    /// Build flamegraph-ready rows from stage samples.
+    #[must_use]
+    pub fn flame_samples(&self) -> Vec<ResizeTimelineFlameSample> {
+        let mut rows = Vec::new();
+        for event in &self.events {
+            for stage in &event.stages {
+                rows.push(ResizeTimelineFlameSample {
+                    stack: format!(
+                        "{};{};{}",
+                        self.scenario,
+                        event.action.as_str(),
+                        stage.stage.as_str()
+                    ),
+                    duration_ns: stage.duration_ns,
+                    event_index: event.event_index,
+                    pane_id: event.pane_id,
+                });
+            }
+        }
+        rows
+    }
+
+    /// Per-stage summary for attribution and regression triage.
+    #[must_use]
+    pub fn stage_summary(&self) -> Vec<ResizeTimelineStageSummary> {
+        let mut per_stage: BTreeMap<ResizeTimelineStage, Vec<u64>> = BTreeMap::new();
+        for event in &self.events {
+            for stage in &event.stages {
+                per_stage
+                    .entry(stage.stage)
+                    .or_default()
+                    .push(stage.duration_ns);
+            }
+        }
+
+        ResizeTimelineStage::ALL
+            .iter()
+            .copied()
+            .map(|stage| {
+                let mut samples = per_stage.remove(&stage).unwrap_or_default();
+                samples.sort_unstable();
+                let count = samples.len();
+                let total = samples.iter().fold(0u64, |acc, v| acc.saturating_add(*v));
+                let avg = if count == 0 {
+                    0.0
+                } else {
+                    total as f64 / count as f64
+                };
+                let max = samples.last().copied().unwrap_or(0);
+                let p95 = if count == 0 {
+                    0
+                } else {
+                    let idx = ((count - 1) * 95) / 100;
+                    samples[idx]
+                };
+                ResizeTimelineStageSummary {
+                    stage,
+                    samples: count,
+                    total_duration_ns: total,
+                    avg_duration_ns: avg,
+                    p95_duration_ns: p95,
+                    max_duration_ns: max,
+                }
+            })
+            .collect()
+    }
 }
 
 /// An expected outcome to verify after scenario execution.
@@ -347,6 +566,150 @@ impl Scenario {
     /// Execute all events in the scenario.
     pub async fn execute_all(&self, mock: &MockWezterm) -> Result<usize> {
         self.execute_until(mock, self.duration).await
+    }
+
+    /// Execute events up to `elapsed` and capture stage-level resize timeline probes.
+    ///
+    /// This emits structured per-event stage timings for resize-class actions
+    /// (`resize`, `set_font_size`, `generate_scrollback`) with queue depth
+    /// attribution suitable for flamegraph/post-hoc analysis.
+    pub async fn execute_until_with_resize_timeline(
+        &self,
+        mock: &MockWezterm,
+        elapsed: Duration,
+    ) -> Result<(usize, ResizeTimeline)> {
+        let mut count = 0usize;
+        let run_started = Instant::now();
+        let events_in_window = self.events.iter().take_while(|e| e.at <= elapsed);
+        let resize_total = events_in_window
+            .clone()
+            .filter(|e| e.action.is_resize_timeline_action())
+            .count();
+        let mut resize_seen = 0usize;
+        let mut timeline_events = Vec::new();
+
+        for (index, event) in self.events.iter().enumerate() {
+            if event.at > elapsed {
+                break;
+            }
+
+            if !event.action.is_resize_timeline_action() {
+                let mock_event = Self::to_mock_event(event)?;
+                mock.inject(event.pane, mock_event).await?;
+                count += 1;
+                continue;
+            }
+
+            let event_started = Instant::now();
+            let dispatch_offset_ns = duration_ns_u64(run_started.elapsed());
+            let scheduled_at_ns = duration_ns_u64(event.at);
+            let mut stages = Vec::with_capacity(ResizeTimelineStage::ALL.len());
+            let mut offset_ns = 0u64;
+
+            // Stage 1: input intent
+            let stage_started = Instant::now();
+            let _ = scheduled_at_ns;
+            let duration_ns = duration_ns_u64(stage_started.elapsed());
+            stages.push(ResizeTimelineStageSample {
+                stage: ResizeTimelineStage::InputIntent,
+                start_offset_ns: offset_ns,
+                duration_ns,
+                queue_metrics: None,
+            });
+            offset_ns = offset_ns.saturating_add(duration_ns);
+
+            // Stage 2: scheduler queueing
+            let depth_before =
+                u64::try_from(resize_total.saturating_sub(resize_seen)).unwrap_or(u64::MAX);
+            let depth_after = depth_before.saturating_sub(1);
+            let stage_started = Instant::now();
+            let queue_delay_ns = dispatch_offset_ns.saturating_sub(scheduled_at_ns);
+            let duration_ns =
+                duration_ns_u64(stage_started.elapsed()).saturating_add(queue_delay_ns);
+            stages.push(ResizeTimelineStageSample {
+                stage: ResizeTimelineStage::SchedulerQueueing,
+                start_offset_ns: offset_ns,
+                duration_ns,
+                queue_metrics: Some(ResizeQueueMetrics {
+                    depth_before,
+                    depth_after,
+                }),
+            });
+            offset_ns = offset_ns.saturating_add(duration_ns);
+
+            // Stage 3: logical reflow
+            let stage_started = Instant::now();
+            let mock_event = Self::to_mock_event(event)?;
+            let duration_ns = duration_ns_u64(stage_started.elapsed());
+            stages.push(ResizeTimelineStageSample {
+                stage: ResizeTimelineStage::LogicalReflow,
+                start_offset_ns: offset_ns,
+                duration_ns,
+                queue_metrics: None,
+            });
+            offset_ns = offset_ns.saturating_add(duration_ns);
+
+            // Stage 4: render prep
+            let stage_started = Instant::now();
+            let _render_hint = match &mock_event {
+                MockEvent::AppendOutput(text) => text.len(),
+                MockEvent::SetTitle(text) => text.len(),
+                MockEvent::Resize(cols, rows) => (*cols as usize) + (*rows as usize),
+                MockEvent::ClearScreen => 0,
+            };
+            let duration_ns = duration_ns_u64(stage_started.elapsed());
+            stages.push(ResizeTimelineStageSample {
+                stage: ResizeTimelineStage::RenderPrep,
+                start_offset_ns: offset_ns,
+                duration_ns,
+                queue_metrics: None,
+            });
+            offset_ns = offset_ns.saturating_add(duration_ns);
+
+            // Stage 5: presentation
+            let stage_started = Instant::now();
+            mock.inject(event.pane, mock_event).await?;
+            let duration_ns = duration_ns_u64(stage_started.elapsed());
+            stages.push(ResizeTimelineStageSample {
+                stage: ResizeTimelineStage::Presentation,
+                start_offset_ns: offset_ns,
+                duration_ns,
+                queue_metrics: None,
+            });
+
+            let total_duration_ns = duration_ns_u64(event_started.elapsed());
+            timeline_events.push(ResizeTimelineEvent {
+                event_index: index,
+                pane_id: event.pane,
+                action: event.action.clone(),
+                scheduled_at_ns,
+                dispatch_offset_ns,
+                total_duration_ns,
+                stages,
+            });
+            resize_seen += 1;
+            count += 1;
+        }
+
+        Ok((
+            count,
+            ResizeTimeline {
+                scenario: self.name.clone(),
+                reproducibility_key: self.reproducibility_key(),
+                captured_at_ms: epoch_ms_u64(),
+                executed_resize_events: timeline_events.len(),
+                events: timeline_events,
+            },
+        ))
+    }
+
+    /// Execute all events and capture stage-level resize timeline probes.
+    pub async fn execute_all_with_resize_timeline(
+        &self,
+        mock: &MockWezterm,
+    ) -> Result<(usize, ResizeTimeline)> {
+        self.execute_until_with_resize_timeline(mock, self.duration)
+            .await
     }
 }
 
@@ -728,6 +1091,18 @@ fn generate_scrollback(lines: usize, width: usize) -> String {
     out
 }
 
+fn duration_ns_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+fn epoch_ms_u64() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
+        .unwrap_or(0)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -736,6 +1111,7 @@ fn generate_scrollback(lines: usize, width: usize) -> String {
 mod tests {
     use super::*;
     use crate::wezterm::WeztermInterface;
+    use std::collections::BTreeSet;
 
     const BASIC_SCENARIO: &str = r#"
 name: basic_test
@@ -910,6 +1286,20 @@ events:
     }
 
     #[test]
+    fn event_action_resize_timeline_helpers() {
+        assert_eq!(EventAction::Resize.as_str(), "resize");
+        assert_eq!(EventAction::SetFontSize.as_str(), "set_font_size");
+        assert_eq!(
+            EventAction::GenerateScrollback.as_str(),
+            "generate_scrollback"
+        );
+        assert!(!EventAction::Append.is_resize_timeline_action());
+        assert!(EventAction::Resize.is_resize_timeline_action());
+        assert!(EventAction::SetFontSize.is_resize_timeline_action());
+        assert!(EventAction::GenerateScrollback.is_resize_timeline_action());
+    }
+
+    #[test]
     fn to_mock_event_append() {
         let event = ScenarioEvent {
             at: Duration::from_secs(1),
@@ -1010,6 +1400,104 @@ events:
         let text = mock.get_text(0, false).await.unwrap();
         assert!(text.contains("hello world"));
         assert!(text.contains("done"));
+    }
+
+    #[tokio::test]
+    async fn execute_all_with_resize_timeline_records_stage_probes() {
+        let yaml = r#"
+name: resize_probe_case
+duration: "10s"
+panes:
+  - id: 0
+events:
+  - at: "1s"
+    pane: 0
+    action: append
+    content: "bootstrap\n"
+  - at: "2s"
+    pane: 0
+    action: resize
+    content: "120x40"
+  - at: "3s"
+    pane: 0
+    action: set_font_size
+    content: "1.15"
+  - at: "4s"
+    pane: 0
+    action: generate_scrollback
+    content: "4x48"
+"#;
+        let scenario = Scenario::from_yaml(yaml).unwrap();
+        let mock = MockWezterm::new();
+        scenario.setup(&mock).await.unwrap();
+
+        let (executed, timeline) = scenario
+            .execute_all_with_resize_timeline(&mock)
+            .await
+            .unwrap();
+        assert_eq!(executed, scenario.events.len());
+        assert_eq!(timeline.executed_resize_events, 3);
+        assert_eq!(timeline.events.len(), 3);
+
+        for event in &timeline.events {
+            assert_eq!(event.stages.len(), ResizeTimelineStage::ALL.len());
+            for (sample, expected) in event.stages.iter().zip(ResizeTimelineStage::ALL.iter()) {
+                assert_eq!(sample.stage, *expected);
+            }
+            let queue = event.stages[1].queue_metrics.as_ref().unwrap();
+            assert!(
+                queue.depth_before >= queue.depth_after,
+                "queue depth should be non-increasing for dequeued event"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resize_timeline_summary_and_flame_samples_cover_all_stages() {
+        let yaml = r#"
+name: resize_probe_summary
+duration: "6s"
+panes:
+  - id: 0
+events:
+  - at: "1s"
+    pane: 0
+    action: resize
+    content: "100x30"
+  - at: "2s"
+    pane: 0
+    action: set_font_size
+    content: "1.20"
+  - at: "3s"
+    pane: 0
+    action: generate_scrollback
+    content: "5x60"
+"#;
+        let scenario = Scenario::from_yaml(yaml).unwrap();
+        let mock = MockWezterm::new();
+        scenario.setup(&mock).await.unwrap();
+
+        let (_executed, timeline) = scenario
+            .execute_all_with_resize_timeline(&mock)
+            .await
+            .unwrap();
+        let summary = timeline.stage_summary();
+        assert_eq!(summary.len(), ResizeTimelineStage::ALL.len());
+        assert!(summary.iter().all(|entry| entry.samples == 3));
+
+        let flame = timeline.flame_samples();
+        assert_eq!(
+            flame.len(),
+            timeline.events.len() * ResizeTimelineStage::ALL.len()
+        );
+        let mut stage_suffixes = BTreeSet::new();
+        for row in &flame {
+            let suffix = row.stack.rsplit(';').next().unwrap_or_default().to_string();
+            stage_suffixes.insert(suffix);
+        }
+        for stage in ResizeTimelineStage::ALL {
+            assert!(stage_suffixes.contains(stage.as_str()));
+        }
     }
 
     #[tokio::test]

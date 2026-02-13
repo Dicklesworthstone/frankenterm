@@ -165,7 +165,10 @@ fn smoke_exploration_test_with_tasks() {
         runtime.run_until_quiescent();
     });
     assert!(report.passed());
-    assert!(report.total_runs >= 5, "should have explored multiple seeds");
+    assert!(
+        report.total_runs >= 5,
+        "should have explored multiple seeds"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -304,10 +307,7 @@ fn smoke_mock_unix_stream_pair_write_read() {
         let (stream_a, stream_b) = mock_unix_stream_pair();
 
         // A writes, B reads
-        let written = stream_a
-            .write(&cx, b"hello from A")
-            .await
-            .expect("write A");
+        let written = stream_a.write(&cx, b"hello from A").await.expect("write A");
         assert_eq!(written, 12);
         assert_eq!(stream_a.bytes_written(), 12);
 
@@ -316,10 +316,7 @@ fn smoke_mock_unix_stream_pair_write_read() {
         assert_eq!(stream_b.bytes_read(), 12);
 
         // B writes, A reads
-        stream_b
-            .write(&cx, b"reply from B")
-            .await
-            .expect("write B");
+        stream_b.write(&cx, b"reply from B").await.expect("write B");
         let reply = stream_a.read(&cx, 1024).await.expect("read A");
         assert_eq!(reply, b"reply from B");
     });

@@ -8,6 +8,7 @@
 
 use crate::error::Remediation;
 use crate::policy::Redactor;
+use crate::runtime_compat::timeout;
 use crate::suggestions::Platform;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -15,7 +16,6 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::process::Command;
-use crate::runtime_compat::timeout;
 
 /// Supported caut services.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,7 +88,7 @@ pub struct CautAccountUsage {
 }
 
 /// Errors produced by the caut wrapper.
-#[derive(thiserror::Error, Debug)]
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CautError {
     #[error("caut is not installed or not found on PATH")]
     NotInstalled,
@@ -283,7 +283,15 @@ fn redact_and_truncate(input: &str, max_len: usize) -> String {
     if redacted.len() <= max_len {
         return redacted;
     }
-    let mut truncated = redacted.chars().take(max_len).collect::<String>();
+
+    // `max_len` is byte-oriented (CLI/output budgets). Truncate on a UTF-8
+    // boundary so we never exceed that byte budget while keeping valid UTF-8.
+    let mut end = max_len.min(redacted.len());
+    while end > 0 && !redacted.is_char_boundary(end) {
+        end -= 1;
+    }
+
+    let mut truncated = redacted[..end].to_string();
     truncated.push_str("...");
     truncated
 }
@@ -291,6 +299,7 @@ fn redact_and_truncate(input: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use serde_json::json;
 
     #[test]
@@ -359,6 +368,58 @@ mod tests {
         let redacted = redact_and_truncate(&text, 200);
         assert!(!redacted.contains("sk-"));
         assert!(redacted.contains("[REDACTED]"));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(40))]
+
+        #[test]
+        fn redact_and_truncate_never_exceeds_limit_plus_ellipsis(
+            input in "\\PC*",
+            max_len in 0usize..256usize,
+        ) {
+            let redacted = redact_and_truncate(&input, max_len);
+            prop_assert!(
+                redacted.len() <= max_len + 3,
+                "redacted length {} should be <= limit+ellipsis {}",
+                redacted.len(),
+                max_len + 3
+            );
+        }
+
+        #[test]
+        fn redact_and_truncate_masks_sk_prefix(
+            suffix in "[A-Za-z0-9]{24,64}",
+            max_len in 16usize..256usize,
+        ) {
+            let input = format!("prefix sk-{suffix} suffix");
+            let redacted = redact_and_truncate(&input, max_len);
+            prop_assert!(
+                !redacted.contains("sk-"),
+                "redacted output should not expose OpenAI-style key prefixes: {redacted}"
+            );
+        }
+
+        #[test]
+        fn parse_json_invalid_preview_respects_bound(
+            input in "\\PC{1,200}",
+            max_preview in 0usize..96usize,
+        ) {
+            prop_assume!(serde_json::from_str::<serde_json::Value>(&input).is_err());
+
+            let err = parse_json::<CautUsage>(&input, max_preview).expect_err("invalid json expected");
+            match err {
+                CautError::InvalidJson { preview, .. } => {
+                    prop_assert!(
+                        preview.len() <= max_preview + 3,
+                        "preview length {} should be <= {}",
+                        preview.len(),
+                        max_preview + 3
+                    );
+                }
+                other => prop_assert!(false, "expected InvalidJson, got {other:?}"),
+            }
+        }
     }
 
     // =========================================================================

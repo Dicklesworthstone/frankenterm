@@ -2731,12 +2731,13 @@ impl ToolHandler for WaWorkflowRunTool {
                 let lock_manager = Arc::new(PaneWorkflowLockManager::new());
                 let injector_engine =
                     build_policy_engine(&config, config.safety.require_prompt_active);
-                let injector =
-                    Arc::new(crate::runtime_compat::Mutex::new(PolicyGatedInjector::with_storage(
+                let injector = Arc::new(crate::runtime_compat::Mutex::new(
+                    PolicyGatedInjector::with_storage(
                         injector_engine,
                         Arc::clone(&wezterm),
                         storage.as_ref().clone(),
-                    )));
+                    ),
+                ));
                 let runner = WorkflowRunner::new(
                     engine,
                     lock_manager,
@@ -4368,14 +4369,25 @@ fn map_mcp_error(error: &Error) -> (&'static str, Option<String>) {
         ),
         Error::Wezterm(WeztermError::Timeout(_)) => (
             MCP_ERR_TIMEOUT,
-            Some("Increase timeout or ensure WezTerm is responsive.".to_string()),
+            Some(
+                "Increase timeout or ensure the active backend bridge (current: WezTerm) is responsive."
+                    .to_string(),
+            ),
         ),
         Error::Wezterm(WeztermError::NotRunning) => {
-            (MCP_ERR_WEZTERM, Some("Is WezTerm running?".to_string()))
+            (
+                MCP_ERR_WEZTERM,
+                Some(
+                    "Is the active backend bridge (current: WezTerm) running?".to_string(),
+                ),
+            )
         }
         Error::Wezterm(WeztermError::CliNotFound) => (
             MCP_ERR_WEZTERM,
-            Some("Install WezTerm and ensure it is in PATH.".to_string()),
+            Some(
+                "Install/configure the active backend bridge (current: WezTerm) and ensure it is in PATH."
+                    .to_string(),
+            ),
         ),
         Error::Wezterm(_) => (MCP_ERR_WEZTERM, None),
         Error::Config(_) => (MCP_ERR_CONFIG, None),

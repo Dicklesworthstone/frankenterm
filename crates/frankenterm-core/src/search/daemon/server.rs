@@ -1,8 +1,8 @@
 //! Embedding daemon server.
 
 use super::protocol::{DaemonRequest, DaemonResponse};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Embedding server that processes embedding requests.
 pub struct EmbedServer {
@@ -37,9 +37,7 @@ impl EmbedServer {
                 self.running.store(false, Ordering::Relaxed);
                 DaemonResponse::Pong
             }
-            DaemonRequest::Embed(_req) => {
-                DaemonResponse::Error("not yet implemented".into())
-            }
+            DaemonRequest::Embed(_req) => DaemonResponse::Error("not yet implemented".into()),
         }
     }
 }

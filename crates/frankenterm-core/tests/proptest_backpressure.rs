@@ -45,32 +45,32 @@ fn arb_depth(capacity: usize) -> impl Strategy<Value = usize> {
 
 fn arb_queue_depths() -> impl Strategy<Value = QueueDepths> {
     (arb_capacity(), arb_capacity()).prop_flat_map(|(cc, wc)| {
-        (arb_depth(cc), Just(cc), arb_depth(wc), Just(wc)).prop_map(
-            |(cd, cc, wd, wc)| QueueDepths {
+        (arb_depth(cc), Just(cc), arb_depth(wc), Just(wc)).prop_map(|(cd, cc, wd, wc)| {
+            QueueDepths {
                 capture_depth: cd,
                 capture_capacity: cc,
                 write_depth: wd,
                 write_capacity: wc,
-            },
-        )
+            }
+        })
     })
 }
 
 /// Config with valid thresholds (yellow < red for both capture and write).
 fn arb_config() -> impl Strategy<Value = BackpressureConfig> {
     (
-        prop::bool::ANY,                  // enabled
-        100u64..=10_000,                  // check_interval_ms
-        0.1f64..=0.4,                     // yellow_capture
-        0.5f64..=0.9,                     // red_capture
-        0.1f64..=0.4,                     // yellow_write
-        0.5f64..=0.9,                     // red_write
-        100u64..=60_000,                  // hysteresis_ms
-        1.0f64..=5.0,                     // idle_poll_backoff_factor
-        0.0f64..=1.0,                     // skip_detection_ratio
-        0.0f64..=1.0,                     // pause_ratio
-        1usize..=1000,                    // max_buffered_segments
-        100u64..=10_000,                  // recovery_resume_interval_ms
+        prop::bool::ANY, // enabled
+        100u64..=10_000, // check_interval_ms
+        0.1f64..=0.4,    // yellow_capture
+        0.5f64..=0.9,    // red_capture
+        0.1f64..=0.4,    // yellow_write
+        0.5f64..=0.9,    // red_write
+        100u64..=60_000, // hysteresis_ms
+        1.0f64..=5.0,    // idle_poll_backoff_factor
+        0.0f64..=1.0,    // skip_detection_ratio
+        0.0f64..=1.0,    // pause_ratio
+        1usize..=1000,   // max_buffered_segments
+        100u64..=10_000, // recovery_resume_interval_ms
     )
         .prop_map(
             |(

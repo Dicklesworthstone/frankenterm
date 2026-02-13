@@ -58,8 +58,8 @@
 //! ```
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -189,10 +189,7 @@ impl ReplayOrder {
 ///
 /// Each input stream must be sorted by pane-local sequence. The output is sorted
 /// by [`ReplayOrder`] — lexicographic `(global_sequence, pane_id, sequence)`.
-pub fn merge_replay_streams<T, F>(
-    streams: Vec<Vec<T>>,
-    order_key: F,
-) -> Vec<T>
+pub fn merge_replay_streams<T, F>(streams: Vec<Vec<T>>, order_key: F) -> Vec<T>
 where
     F: Fn(&T) -> ReplayOrder,
 {
@@ -500,9 +497,7 @@ pub fn validate_replay_order(orders: &[ReplayOrder]) -> Vec<ReplayOrderViolation
             && curr.pane_id == prev.pane_id
             && curr.sequence == prev.sequence
         {
-            violations.push(ReplayOrderViolation::DuplicateOrder {
-                order: *curr,
-            });
+            violations.push(ReplayOrderViolation::DuplicateOrder { order: *curr });
         }
     }
 
@@ -525,9 +520,7 @@ pub enum ReplayOrderViolation {
         curr: ReplayOrder,
     },
     /// Exact duplicate ordering key.
-    DuplicateOrder {
-        order: ReplayOrder,
-    },
+    DuplicateOrder { order: ReplayOrder },
 }
 
 // ---------------------------------------------------------------------------
@@ -637,7 +630,11 @@ mod tests {
         all_globals.sort();
         let len_before = all_globals.len();
         all_globals.dedup();
-        assert_eq!(all_globals.len(), len_before, "global sequences must be unique");
+        assert_eq!(
+            all_globals.len(),
+            len_before,
+            "global sequences must be unique"
+        );
         assert_eq!(all_globals.len(), 400);
     }
 
@@ -982,7 +979,10 @@ mod tests {
         ];
         let violations = validate_replay_order(&orders);
         assert_eq!(violations.len(), 1);
-        matches!(&violations[0], ReplayOrderViolation::GlobalSequenceRegression { .. });
+        matches!(
+            &violations[0],
+            ReplayOrderViolation::GlobalSequenceRegression { .. }
+        );
     }
 
     #[test]
@@ -992,9 +992,11 @@ mod tests {
             ReplayOrder::new(1, 0, 3), // same pane, sequence went down
         ];
         let violations = validate_replay_order(&orders);
-        assert!(violations
-            .iter()
-            .any(|v| matches!(v, ReplayOrderViolation::PaneSequenceRegression { .. })));
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, ReplayOrderViolation::PaneSequenceRegression { .. }))
+        );
     }
 
     #[test]
@@ -1004,9 +1006,11 @@ mod tests {
             ReplayOrder::new(0, 0, 0), // exact duplicate
         ];
         let violations = validate_replay_order(&orders);
-        assert!(violations
-            .iter()
-            .any(|v| matches!(v, ReplayOrderViolation::DuplicateOrder { .. })));
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, ReplayOrderViolation::DuplicateOrder { .. }))
+        );
     }
 
     #[test]
@@ -1100,6 +1104,9 @@ mod tests {
         }
 
         let merged2 = merge_replay_streams(vec![s1, s0], |o| *o);
-        assert_eq!(merged, merged2, "merge must be deterministic regardless of input order");
+        assert_eq!(
+            merged, merged2,
+            "merge must be deterministic regardless of input order"
+        );
     }
 }

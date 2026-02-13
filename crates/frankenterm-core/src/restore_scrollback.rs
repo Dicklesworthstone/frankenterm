@@ -23,8 +23,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
 use crate::runtime_compat::Semaphore;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::wezterm::WeztermHandle;

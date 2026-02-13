@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use proptest::prelude::*;
 
-use frankenterm_core::retry::{is_retryable, RetryPolicy};
+use frankenterm_core::retry::{RetryPolicy, is_retryable};
 
 // =============================================================================
 // Strategies
@@ -47,7 +47,11 @@ fn arb_attempt() -> impl Strategy<Value = u32> {
 
 /// Generate a policy with zero jitter for deterministic delay tests.
 fn arb_no_jitter_policy() -> impl Strategy<Value = RetryPolicy> {
-    (arb_initial_delay_ms(), arb_max_delay_ms(), arb_backoff_factor())
+    (
+        arb_initial_delay_ms(),
+        arb_max_delay_ms(),
+        arb_backoff_factor(),
+    )
         .prop_filter("max >= initial", |(init, max, _)| max >= init)
         .prop_map(|(init, max, factor)| RetryPolicy {
             initial_delay: Duration::from_millis(init),

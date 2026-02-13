@@ -861,7 +861,7 @@ pub fn export_html<W: std::io::Write>(
 <h1>{title}</h1>
 <div class="info">{cols}x{rows} &middot; {event_count} events</div>
 <div id="player-container"></div>
-<div class="footer">Exported by wa (WezTerm Automata)</div>
+<div class="footer">Exported by ft (FrankenTerm)</div>
 
 <script id="cast-data" type="application/x-asciicast">{cast_data}</script>
 

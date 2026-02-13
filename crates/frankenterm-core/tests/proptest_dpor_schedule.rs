@@ -9,11 +9,11 @@
 
 mod common;
 
-use asupersync::{Budget, LabConfig, LabRuntime};
 use asupersync::lab::explorer::{ExplorerConfig, ScheduleExplorer};
+use asupersync::{Budget, LabConfig, LabRuntime};
 use proptest::prelude::*;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
 // Task graph generation strategies

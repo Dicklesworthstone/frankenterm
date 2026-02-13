@@ -161,8 +161,7 @@ impl NativeEventListener {
                 break;
             }
 
-            match crate::runtime_compat::timeout(ACCEPT_POLL_INTERVAL, self.listener.accept())
-                .await
+            match crate::runtime_compat::timeout(ACCEPT_POLL_INTERVAL, self.listener.accept()).await
             {
                 Ok(Ok((stream, _addr))) => {
                     let tx = event_tx.clone();
@@ -364,7 +363,8 @@ mod tests {
 
     #[test]
     fn decode_pane_created_event() {
-        let payload = r#"{"type":"pane_created","pane_id":10,"domain":"local","cwd":"/home/user","ts":555}"#;
+        let payload =
+            r#"{"type":"pane_created","pane_id":10,"domain":"local","cwd":"/home/user","ts":555}"#;
         let event = decode_wire_event(payload).unwrap().unwrap();
         match event {
             NativeEvent::PaneCreated {
@@ -429,7 +429,10 @@ mod tests {
         let result = decode_wire_event(payload);
         assert!(result.is_err());
         let err_msg = result.unwrap_err();
-        assert!(err_msg.contains("base64"), "expected base64 error, got: {err_msg}");
+        assert!(
+            err_msg.contains("base64"),
+            "expected base64 error, got: {err_msg}"
+        );
     }
 
     #[test]
@@ -738,8 +741,7 @@ mod tests {
         shutdown.store(true, Ordering::SeqCst);
 
         // Listener should exit within a few poll intervals
-        let result =
-            crate::runtime_compat::timeout(Duration::from_secs(2), handle).await;
+        let result = crate::runtime_compat::timeout(Duration::from_secs(2), handle).await;
         assert!(result.is_ok(), "listener did not shut down in time");
     }
 }

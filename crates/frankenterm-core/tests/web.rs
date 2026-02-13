@@ -1,10 +1,15 @@
 #[cfg(feature = "web")]
 mod web_tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
     use std::time::Duration;
 
+    use frankenterm_core::events::{Event, EventBus};
+    use frankenterm_core::patterns::{AgentType, Detection, Severity};
+    use frankenterm_core::storage::{PaneRecord, StorageHandle};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
+    use tokio::time::Instant;
 
     use frankenterm_core::web::{WebServerConfig, start_web_server};
 
@@ -64,6 +69,82 @@ mod web_tests {
         Err(last_err.unwrap_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::TimedOut, "server not ready")
         }))
+    }
+
+    async fn fetch_stream_prefix(
+        addr: SocketAddr,
+        raw_request: &[u8],
+        timeout: Duration,
+        min_bytes: usize,
+    ) -> std::io::Result<String> {
+        let mut last_err = None;
+        for _ in 0..50 {
+            match TcpStream::connect(addr).await {
+                Ok(mut stream) => {
+                    stream.write_all(raw_request).await?;
+                    let deadline = Instant::now() + timeout;
+                    let mut buf = Vec::new();
+                    while buf.len() < min_bytes {
+                        let now = Instant::now();
+                        if now >= deadline {
+                            break;
+                        }
+                        let mut chunk = [0_u8; 2048];
+                        match tokio::time::timeout(deadline - now, stream.read(&mut chunk)).await {
+                            Ok(Ok(0)) => break,
+                            Ok(Ok(n)) => {
+                                buf.extend_from_slice(&chunk[..n]);
+                            }
+                            Ok(Err(err)) => return Err(err),
+                            Err(_) => break,
+                        }
+                    }
+                    return Ok(String::from_utf8_lossy(&buf).to_string());
+                }
+                Err(err) => {
+                    last_err = Some(err);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "server not ready")
+        }))
+    }
+
+    fn epoch_ms_now() -> i64 {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        i64::try_from(ts.as_millis()).unwrap_or(0)
+    }
+
+    async fn create_test_storage_with_pane(
+        pane_id: u64,
+    ) -> Result<(StorageHandle, tempfile::TempDir), Box<dyn std::error::Error>> {
+        let tempdir = tempfile::tempdir()?;
+        let db_path = tempdir.path().join("web_stream_test.db");
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let storage = StorageHandle::new(&db_path_str).await?;
+        storage
+            .upsert_pane(PaneRecord {
+                pane_id,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: Some("test-pane".to_string()),
+                cwd: Some("/tmp".to_string()),
+                tty_name: None,
+                first_seen_at: epoch_ms_now(),
+                last_seen_at: epoch_ms_now(),
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: Some(epoch_ms_now()),
+            })
+            .await?;
+        Ok((storage, tempdir))
     }
 
     #[tokio::test]
@@ -273,6 +354,130 @@ mod web_tests {
         assert!(
             status == 404 || status == 405,
             "POST should be rejected (404 or 405), got {status}: {response}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_deltas_emits_schema_and_redacts_content()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (storage, _tmp) = create_test_storage_with_pane(7).await?;
+        let event_bus = Arc::new(EventBus::new(64));
+        let server = start_web_server(
+            WebServerConfig::default()
+                .with_port(0)
+                .with_storage(storage.clone())
+                .with_event_bus(Arc::clone(&event_bus)),
+        )
+        .await?;
+        let addr = server.bound_addr();
+
+        let req = b"GET /stream/deltas?pane_id=7&max_hz=200 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        let fetch_task = tokio::spawn(async move {
+            fetch_stream_prefix(addr, req, Duration::from_secs(3), 512).await
+        });
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let secret = "auth token sk-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let seg = storage.append_segment(7, secret, None).await?;
+        let _ = event_bus.publish(Event::SegmentCaptured {
+            pane_id: 7,
+            seq: seg.seq,
+            content_len: seg.content_len,
+        });
+
+        let response = fetch_task.await??;
+        server.shutdown().await?;
+
+        assert!(
+            response.contains("text/event-stream"),
+            "SSE content-type header expected: {response}"
+        );
+
+        let delta_data = response
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .find(|line| line.contains("\"kind\":\"delta\""))
+            .ok_or("missing delta frame in SSE response")?;
+        let frame: serde_json::Value = serde_json::from_str(delta_data)?;
+
+        assert_eq!(frame["schema"], "ft.stream.v1");
+        assert_eq!(frame["stream"], "deltas");
+        assert_eq!(frame["kind"], "delta");
+        assert_eq!(frame["data"]["pane_id"], 7);
+
+        let redacted = frame["data"]["content"]
+            .as_str()
+            .ok_or("delta content should be a string")?;
+        assert!(redacted.contains("[REDACTED]"), "content must be redacted");
+        assert!(
+            !redacted.contains("sk-aaaaaaaa"),
+            "raw secret should not appear"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_events_reports_lag_and_releases_subscriber()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let event_bus = Arc::new(EventBus::new(2));
+        let server = start_web_server(
+            WebServerConfig::default()
+                .with_port(0)
+                .with_event_bus(Arc::clone(&event_bus)),
+        )
+        .await?;
+        let addr = server.bound_addr();
+
+        let req = b"GET /stream/events?channel=detections&max_hz=1 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        let fetch_task = tokio::spawn(async move {
+            fetch_stream_prefix(addr, req, Duration::from_secs(4), 640).await
+        });
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        for i in 0..64_u64 {
+            let detection = Detection {
+                rule_id: format!("core.test:{i}"),
+                agent_type: AgentType::Codex,
+                event_type: "usage_reached".to_string(),
+                severity: Severity::Warning,
+                confidence: 1.0,
+                extracted: serde_json::json!({
+                    "token": "sk-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "index": i
+                }),
+                matched_text: format!(
+                    "usage reached with secret sk-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb #{i}"
+                ),
+                span: (0, 0),
+            };
+            let _ = event_bus.publish(Event::PatternDetected {
+                pane_id: 11,
+                pane_uuid: None,
+                detection,
+                event_id: None,
+            });
+        }
+
+        let response = fetch_task.await??;
+        server.shutdown().await?;
+
+        assert!(
+            response.contains("event: lag") || response.contains("\"kind\":\"lag\""),
+            "expected lag event in stream output: {response}"
+        );
+
+        for _ in 0..20 {
+            if event_bus.subscriber_count() == 0 {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        assert_eq!(
+            event_bus.subscriber_count(),
+            0,
+            "subscriber should be released after disconnect"
         );
         Ok(())
     }

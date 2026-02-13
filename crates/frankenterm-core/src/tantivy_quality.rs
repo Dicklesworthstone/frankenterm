@@ -23,9 +23,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::tantivy_ingest::IndexDocumentFields;
-use crate::tantivy_query::{
-    LexicalSearchService, SearchError, SearchFilter, SearchQuery, SearchResults,
-};
+use crate::tantivy_query::{LexicalSearchService, SearchFilter, SearchQuery, SearchResults};
 
 // ---------------------------------------------------------------------------
 // Golden query definition
@@ -78,10 +76,7 @@ pub enum RelevanceAssertion {
     /// A specific event_id must appear within the top N results.
     InTopN { event_id: String, n: usize },
     /// Event A must rank higher (earlier index) than event B in results.
-    RankedBefore {
-        higher: String,
-        lower: String,
-    },
+    RankedBefore { higher: String, lower: String },
     /// The first result must have this event_id.
     FirstResult { event_id: String },
     /// All results must pass the given filter.
@@ -313,7 +308,9 @@ fn evaluate_assertion(assertion: &RelevanceAssertion, results: &SearchResults) -
                 message: if !found {
                     None
                 } else {
-                    Some(format!("event_id '{event_id}' unexpectedly found in results"))
+                    Some(format!(
+                        "event_id '{event_id}' unexpectedly found in results"
+                    ))
                 },
             }
         }
@@ -385,14 +382,8 @@ fn evaluate_assertion(assertion: &RelevanceAssertion, results: &SearchResults) -
             }
         }
         RelevanceAssertion::RankedBefore { higher, lower } => {
-            let pos_h = results
-                .hits
-                .iter()
-                .position(|h| h.doc.event_id == *higher);
-            let pos_l = results
-                .hits
-                .iter()
-                .position(|h| h.doc.event_id == *lower);
+            let pos_h = results.hits.iter().position(|h| h.doc.event_id == *higher);
+            let pos_l = results.hits.iter().position(|h| h.doc.event_id == *lower);
 
             match (pos_h, pos_l) {
                 (Some(h), Some(l)) => {
@@ -515,8 +506,9 @@ pub fn forensic_golden_queries() -> Vec<GoldenQuery> {
         GoldenQuery {
             name: "egress_event_type_filter".to_string(),
             class: QueryClass::Filtered,
-            query: SearchQuery::simple("Compiling")
-                .with_filter(SearchFilter::EventType { values: vec!["egress_output".to_string()] }),
+            query: SearchQuery::simple("Compiling").with_filter(SearchFilter::EventType {
+                values: vec!["egress_output".to_string()],
+            }),
             assertions: vec![
                 RelevanceAssertion::MinTotalHits(1),
                 RelevanceAssertion::AllMatchFilter(SearchFilter::EventType {
@@ -546,8 +538,9 @@ pub fn agent_workflow_golden_queries() -> Vec<GoldenQuery> {
         GoldenQuery {
             name: "git_commit_ingress".to_string(),
             class: QueryClass::Filtered,
-            query: SearchQuery::simple("git commit")
-                .with_filter(SearchFilter::EventType { values: vec!["ingress_text".to_string()] }),
+            query: SearchQuery::simple("git commit").with_filter(SearchFilter::EventType {
+                values: vec!["ingress_text".to_string()],
+            }),
             assertions: vec![
                 RelevanceAssertion::MinTotalHits(1),
                 RelevanceAssertion::MustHit {
@@ -896,9 +889,7 @@ mod tests {
         let first_id = results.hits[0].doc.event_id.clone();
 
         let r = evaluate_assertion(
-            &RelevanceAssertion::FirstResult {
-                event_id: first_id,
-            },
+            &RelevanceAssertion::FirstResult { event_id: first_id },
             &results,
         );
         assert!(r.passed);

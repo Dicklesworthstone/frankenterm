@@ -377,6 +377,8 @@ pub struct AccountSelectionStepResult {
     pub selected: Option<crate::accounts::AccountRecord>,
     /// Full explanation of the selection decision
     pub explanation: crate::accounts::SelectionExplanation,
+    /// Quota availability advisory for downstream scheduling/launch logic
+    pub quota_advisory: crate::accounts::AccountQuotaAdvisory,
     /// Number of accounts refreshed from caut
     pub accounts_refreshed: usize,
 }
@@ -447,10 +449,15 @@ pub(crate) async fn refresh_and_select_account(
         .select_account("openai", config)
         .await
         .map_err(|e| AccountSelectionStepError::Storage(e.to_string()))?;
+    let quota_advisory = crate::accounts::build_quota_advisory(
+        &selection,
+        crate::accounts::DEFAULT_LOW_QUOTA_THRESHOLD_PERCENT,
+    );
 
     Ok(AccountSelectionStepResult {
         selected: selection.selected,
         explanation: selection.explanation,
+        quota_advisory,
         accounts_refreshed,
     })
 }
@@ -6266,24 +6273,19 @@ impl WorkflowRunner {
                                     WaitCondition::PaneIdle {
                                         idle_threshold_ms, ..
                                     } => {
-                                        sleep(Duration::from_millis(
-                                            *idle_threshold_ms,
-                                        ))
-                                        .await;
+                                        sleep(Duration::from_millis(*idle_threshold_ms)).await;
                                     }
                                     WaitCondition::Pattern { .. } => {
                                         sleep(timeout).await;
                                     }
                                     WaitCondition::StableTail { stable_for_ms, .. } => {
-                                        sleep(Duration::from_millis(*stable_for_ms))
-                                            .await;
+                                        sleep(Duration::from_millis(*stable_for_ms)).await;
                                     }
                                     WaitCondition::TextMatch { .. } => {
                                         sleep(timeout).await;
                                     }
                                     WaitCondition::Sleep { duration_ms } => {
-                                        sleep(Duration::from_millis(*duration_ms))
-                                            .await;
+                                        sleep(Duration::from_millis(*duration_ms)).await;
                                     }
                                     WaitCondition::External { .. } => {
                                         sleep(timeout).await;
@@ -7900,6 +7902,18 @@ impl Workflow for HandleUsageLimits {
                     match result {
                         Ok(selection) => {
                             if selection.selected.is_some() {
+                                if matches!(
+                                    selection.quota_advisory.availability,
+                                    crate::accounts::QuotaAvailability::Low
+                                ) {
+                                    tracing::warn!(
+                                        pane_id,
+                                        selected_percent = ?selection.quota_advisory.selected_percent_remaining,
+                                        threshold_percent = selection.quota_advisory.low_quota_threshold_percent,
+                                        warning = ?selection.quota_advisory.warning,
+                                        "handle_usage_limits: selected account has low remaining quota"
+                                    );
+                                }
                                 // Account available — proceed with failover
                                 let json = serde_json::to_value(&selection).unwrap_or_default();
                                 StepResult::done(json)
@@ -16305,6 +16319,12 @@ Try again at 3:00 PM UTC.
         let result = AccountSelectionStepResult {
             selected: None,
             explanation,
+            quota_advisory: crate::accounts::AccountQuotaAdvisory {
+                availability: crate::accounts::QuotaAvailability::Exhausted,
+                low_quota_threshold_percent: crate::accounts::DEFAULT_LOW_QUOTA_THRESHOLD_PERCENT,
+                selected_percent_remaining: None,
+                warning: Some("Test reason".to_string()),
+            },
             accounts_refreshed: 2,
         };
 
@@ -16343,6 +16363,12 @@ Try again at 3:00 PM UTC.
         let result = AccountSelectionStepResult {
             selected: Some(account),
             explanation,
+            quota_advisory: crate::accounts::AccountQuotaAdvisory {
+                availability: crate::accounts::QuotaAvailability::Available,
+                low_quota_threshold_percent: crate::accounts::DEFAULT_LOW_QUOTA_THRESHOLD_PERCENT,
+                selected_percent_remaining: Some(75.0),
+                warning: None,
+            },
             accounts_refreshed: 1,
         };
 

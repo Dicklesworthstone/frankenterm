@@ -7,8 +7,8 @@
 //! These tests use loom's own atomic types (which loom can intercept
 //! and permute) rather than the production std::sync::atomic types.
 
-use loom::sync::atomic::{AtomicU64, Ordering};
 use loom::sync::Arc;
+use loom::sync::atomic::{AtomicU64, Ordering};
 use loom::thread;
 
 // ===========================================================================
@@ -34,10 +34,7 @@ impl LoomShardedCounter {
     }
 
     fn get(&self) -> u64 {
-        self.shards
-            .iter()
-            .map(|s| s.load(Ordering::Relaxed))
-            .sum()
+        self.shards.iter().map(|s| s.load(Ordering::Relaxed)).sum()
     }
 }
 
@@ -56,12 +53,7 @@ impl LoomShardedMax {
         let s = &self.shards[shard];
         let mut current = s.load(Ordering::Relaxed);
         while value > current {
-            match s.compare_exchange_weak(
-                current,
-                value,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
+            match s.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
                 Ok(_) => break,
                 Err(v) => current = v,
             }

@@ -83,8 +83,16 @@ mod tests {
     fn passthrough_returns_unchanged() {
         let reranker = PassthroughReranker;
         let docs = vec![
-            ScoredDoc { id: 1, text: "hello".into(), score: 0.9 },
-            ScoredDoc { id: 2, text: "world".into(), score: 0.8 },
+            ScoredDoc {
+                id: 1,
+                text: "hello".into(),
+                score: 0.9,
+            },
+            ScoredDoc {
+                id: 2,
+                text: "world".into(),
+                score: 0.8,
+            },
         ];
         let result = reranker.rerank("query", docs).unwrap();
         assert_eq!(result.len(), 2);
@@ -108,7 +116,11 @@ mod tests {
 
     #[test]
     fn scored_doc_clone() {
-        let doc = ScoredDoc { id: 42, text: "test".into(), score: 0.5 };
+        let doc = ScoredDoc {
+            id: 42,
+            text: "test".into(),
+            score: 0.5,
+        };
         let doc2 = doc.clone();
         assert_eq!(doc2.id, 42);
         assert_eq!(doc2.text, "test");
@@ -118,8 +130,16 @@ mod tests {
     fn passthrough_preserves_scores() {
         let reranker = PassthroughReranker;
         let docs = vec![
-            ScoredDoc { id: 1, text: "a".into(), score: 0.1 },
-            ScoredDoc { id: 2, text: "b".into(), score: 0.9 },
+            ScoredDoc {
+                id: 1,
+                text: "a".into(),
+                score: 0.1,
+            },
+            ScoredDoc {
+                id: 2,
+                text: "b".into(),
+                score: 0.9,
+            },
         ];
         let result = reranker.rerank("q", docs).unwrap();
         assert!((result[0].score - 0.1).abs() < f32::EPSILON);
