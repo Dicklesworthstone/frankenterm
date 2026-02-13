@@ -1997,4 +1997,708 @@ mod test {
             )))
         );
     }
+
+    // ── ColorOrQuery ──────────────────────────────────────
+
+    #[test]
+    fn color_or_query_display_query() {
+        assert_eq!(format!("{}", ColorOrQuery::Query), "?");
+    }
+
+    #[test]
+    fn color_or_query_clone_eq() {
+        let a = ColorOrQuery::Query;
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn color_or_query_ne() {
+        let q = ColorOrQuery::Query;
+        let c = ColorOrQuery::Color(SrgbaTuple(1.0, 0.0, 0.0, 1.0));
+        assert_ne!(q, c);
+    }
+
+    #[test]
+    fn color_or_query_debug() {
+        let debug = format!("{:?}", ColorOrQuery::Query);
+        assert!(debug.contains("Query"));
+    }
+
+    // ── DynamicColorNumber ────────────────────────────────
+
+    #[test]
+    fn dynamic_color_number_values() {
+        assert_eq!(DynamicColorNumber::TextForegroundColor as u8, 10);
+        assert_eq!(DynamicColorNumber::TextBackgroundColor as u8, 11);
+        assert_eq!(DynamicColorNumber::TextCursorColor as u8, 12);
+        assert_eq!(DynamicColorNumber::MouseForegroundColor as u8, 13);
+        assert_eq!(DynamicColorNumber::MouseBackgroundColor as u8, 14);
+        assert_eq!(DynamicColorNumber::HighlightBackgroundColor as u8, 17);
+        assert_eq!(DynamicColorNumber::HighlightForegroundColor as u8, 19);
+    }
+
+    #[test]
+    fn dynamic_color_number_from_primitive() {
+        use num_traits::FromPrimitive;
+        assert_eq!(
+            DynamicColorNumber::from_u8(10),
+            Some(DynamicColorNumber::TextForegroundColor)
+        );
+        assert_eq!(
+            DynamicColorNumber::from_u8(11),
+            Some(DynamicColorNumber::TextBackgroundColor)
+        );
+        assert_eq!(DynamicColorNumber::from_u8(0), None);
+        assert_eq!(DynamicColorNumber::from_u8(20), None);
+    }
+
+    #[test]
+    fn dynamic_color_number_clone_copy() {
+        let a = DynamicColorNumber::TextCursorColor;
+        let b = a;
+        assert_eq!(a, b);
+    }
+
+    // ── Selection ─────────────────────────────────────────
+
+    #[test]
+    fn selection_bitflags_empty() {
+        assert_eq!(Selection::NONE.bits(), 0);
+    }
+
+    #[test]
+    fn selection_bitflags_combine() {
+        let s = Selection::CLIPBOARD | Selection::PRIMARY;
+        assert!(s.contains(Selection::CLIPBOARD));
+        assert!(s.contains(Selection::PRIMARY));
+        assert!(!s.contains(Selection::SELECT));
+    }
+
+    #[test]
+    fn selection_display_clipboard() {
+        let s = Selection::CLIPBOARD;
+        assert_eq!(format!("{}", s), "c");
+    }
+
+    #[test]
+    fn selection_display_primary() {
+        let s = Selection::PRIMARY;
+        assert_eq!(format!("{}", s), "p");
+    }
+
+    #[test]
+    fn selection_display_multiple() {
+        let s = Selection::CLIPBOARD | Selection::PRIMARY | Selection::SELECT;
+        let display = format!("{}", s);
+        assert!(display.contains('c'));
+        assert!(display.contains('p'));
+        assert!(display.contains('s'));
+    }
+
+    #[test]
+    fn selection_display_cut_buffers() {
+        assert_eq!(format!("{}", Selection::CUT0), "0");
+        assert_eq!(format!("{}", Selection::CUT1), "1");
+        assert_eq!(format!("{}", Selection::CUT9), "9");
+    }
+
+    #[test]
+    fn selection_clone_copy_eq() {
+        let a = Selection::CLIPBOARD;
+        let b = a;
+        assert_eq!(a, b);
+    }
+
+    // ── ChangeColorPair ───────────────────────────────────
+
+    #[test]
+    fn change_color_pair_clone_eq() {
+        let a = ChangeColorPair {
+            palette_index: 5,
+            color: ColorOrQuery::Query,
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn change_color_pair_debug() {
+        let pair = ChangeColorPair {
+            palette_index: 0,
+            color: ColorOrQuery::Query,
+        };
+        let debug = format!("{:?}", pair);
+        assert!(debug.contains("palette_index"));
+    }
+
+    // ── FinalTermClick ────────────────────────────────────
+
+    #[test]
+    fn finalterm_click_try_from() {
+        use core::convert::TryFrom;
+        assert_eq!(
+            FinalTermClick::try_from("line").unwrap(),
+            FinalTermClick::Line
+        );
+        assert_eq!(
+            FinalTermClick::try_from("m").unwrap(),
+            FinalTermClick::MultipleLine
+        );
+        assert_eq!(
+            FinalTermClick::try_from("v").unwrap(),
+            FinalTermClick::ConservativeVertical
+        );
+        assert_eq!(
+            FinalTermClick::try_from("w").unwrap(),
+            FinalTermClick::SmartVertical
+        );
+        assert!(FinalTermClick::try_from("invalid").is_err());
+    }
+
+    #[test]
+    fn finalterm_click_display() {
+        assert_eq!(format!("{}", FinalTermClick::Line), "line");
+        assert_eq!(format!("{}", FinalTermClick::MultipleLine), "m");
+        assert_eq!(format!("{}", FinalTermClick::ConservativeVertical), "v");
+        assert_eq!(format!("{}", FinalTermClick::SmartVertical), "w");
+    }
+
+    #[test]
+    fn finalterm_click_clone_eq() {
+        let a = FinalTermClick::Line;
+        let b = a.clone();
+        assert_eq!(a, b);
+        assert_ne!(FinalTermClick::Line, FinalTermClick::MultipleLine);
+    }
+
+    // ── FinalTermPromptKind ───────────────────────────────
+
+    #[test]
+    fn finalterm_prompt_kind_default() {
+        assert_eq!(FinalTermPromptKind::default(), FinalTermPromptKind::Initial);
+    }
+
+    #[test]
+    fn finalterm_prompt_kind_try_from() {
+        use core::convert::TryFrom;
+        assert_eq!(
+            FinalTermPromptKind::try_from("i").unwrap(),
+            FinalTermPromptKind::Initial
+        );
+        assert_eq!(
+            FinalTermPromptKind::try_from("r").unwrap(),
+            FinalTermPromptKind::RightSide
+        );
+        assert_eq!(
+            FinalTermPromptKind::try_from("c").unwrap(),
+            FinalTermPromptKind::Continuation
+        );
+        assert_eq!(
+            FinalTermPromptKind::try_from("s").unwrap(),
+            FinalTermPromptKind::Secondary
+        );
+        assert!(FinalTermPromptKind::try_from("x").is_err());
+    }
+
+    #[test]
+    fn finalterm_prompt_kind_display() {
+        assert_eq!(format!("{}", FinalTermPromptKind::Initial), "i");
+        assert_eq!(format!("{}", FinalTermPromptKind::RightSide), "r");
+        assert_eq!(format!("{}", FinalTermPromptKind::Continuation), "c");
+        assert_eq!(format!("{}", FinalTermPromptKind::Secondary), "s");
+    }
+
+    #[test]
+    fn finalterm_prompt_kind_roundtrip() {
+        use core::convert::TryFrom;
+        for kind in [
+            FinalTermPromptKind::Initial,
+            FinalTermPromptKind::RightSide,
+            FinalTermPromptKind::Continuation,
+            FinalTermPromptKind::Secondary,
+        ] {
+            let s = format!("{}", kind);
+            let parsed = FinalTermPromptKind::try_from(s.as_str()).unwrap();
+            assert_eq!(kind, parsed);
+        }
+    }
+
+    // ── Progress ──────────────────────────────────────────
+
+    #[test]
+    fn progress_eq() {
+        assert_eq!(Progress::None, Progress::None);
+        assert_eq!(Progress::SetPercentage(50), Progress::SetPercentage(50));
+        assert_ne!(Progress::SetPercentage(50), Progress::SetPercentage(75));
+        assert_ne!(Progress::SetPercentage(50), Progress::SetError(50));
+    }
+
+    #[test]
+    fn progress_clone() {
+        let a = Progress::SetIndeterminate;
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn progress_debug() {
+        assert!(format!("{:?}", Progress::Paused).contains("Paused"));
+        assert!(format!("{:?}", Progress::SetIndeterminate).contains("SetIndeterminate"));
+    }
+
+    #[test]
+    fn progress_conemu_none() {
+        assert_eq!(
+            parse(&["9", "4", "0"], "\x1b]9;4;0\x1b\\"),
+            OperatingSystemCommand::ConEmuProgress(Progress::None)
+        );
+    }
+
+    // ── ITermDimension ────────────────────────────────────
+
+    #[test]
+    fn iterm_dimension_default() {
+        assert_eq!(ITermDimension::default(), ITermDimension::Automatic);
+    }
+
+    #[test]
+    fn iterm_dimension_display() {
+        assert_eq!(format!("{}", ITermDimension::Automatic), "auto");
+        assert_eq!(format!("{}", ITermDimension::Cells(5)), "5");
+        assert_eq!(format!("{}", ITermDimension::Pixels(100)), "100px");
+        assert_eq!(format!("{}", ITermDimension::Percent(50)), "50%");
+    }
+
+    #[test]
+    fn iterm_dimension_parse_auto() {
+        assert_eq!(
+            "auto".parse::<ITermDimension>().unwrap(),
+            ITermDimension::Automatic
+        );
+    }
+
+    #[test]
+    fn iterm_dimension_parse_cells() {
+        assert_eq!(
+            "5".parse::<ITermDimension>().unwrap(),
+            ITermDimension::Cells(5)
+        );
+    }
+
+    #[test]
+    fn iterm_dimension_parse_pixels() {
+        assert_eq!(
+            "100px".parse::<ITermDimension>().unwrap(),
+            ITermDimension::Pixels(100)
+        );
+    }
+
+    #[test]
+    fn iterm_dimension_parse_percent() {
+        assert_eq!(
+            "50%".parse::<ITermDimension>().unwrap(),
+            ITermDimension::Percent(50)
+        );
+    }
+
+    #[test]
+    fn iterm_dimension_to_pixels_auto() {
+        assert_eq!(ITermDimension::Automatic.to_pixels(10, 80), None);
+    }
+
+    #[test]
+    fn iterm_dimension_to_pixels_cells() {
+        assert_eq!(ITermDimension::Cells(5).to_pixels(10, 80), Some(50));
+    }
+
+    #[test]
+    fn iterm_dimension_to_pixels_pixels() {
+        assert_eq!(ITermDimension::Pixels(200).to_pixels(10, 80), Some(200));
+    }
+
+    #[test]
+    fn iterm_dimension_to_pixels_percent() {
+        // 50% of 80 cells * 10px per cell = 400
+        assert_eq!(ITermDimension::Percent(50).to_pixels(10, 80), Some(400));
+    }
+
+    #[test]
+    fn iterm_dimension_roundtrip() {
+        for dim in [
+            ITermDimension::Automatic,
+            ITermDimension::Cells(42),
+            ITermDimension::Pixels(200),
+            ITermDimension::Percent(75),
+        ] {
+            let s = format!("{}", dim);
+            let parsed: ITermDimension = s.parse().unwrap();
+            assert_eq!(dim, parsed);
+        }
+    }
+
+    // ── ITermUnicodeVersionOp ─────────────────────────────
+
+    #[test]
+    fn iterm_unicode_version_set() {
+        assert_eq!(
+            parse(
+                &["1337", "UnicodeVersion=9"],
+                "\x1b]1337;UnicodeVersion=9\x1b\\"
+            ),
+            OperatingSystemCommand::ITermProprietary(ITermProprietary::UnicodeVersion(
+                ITermUnicodeVersionOp::Set(9)
+            ))
+        );
+    }
+
+    #[test]
+    fn iterm_unicode_version_push() {
+        assert_eq!(
+            parse(
+                &["1337", "UnicodeVersion=push"],
+                "\x1b]1337;UnicodeVersion=push\x1b\\"
+            ),
+            OperatingSystemCommand::ITermProprietary(ITermProprietary::UnicodeVersion(
+                ITermUnicodeVersionOp::Push(None)
+            ))
+        );
+    }
+
+    #[test]
+    fn iterm_unicode_version_push_with_label() {
+        assert_eq!(
+            parse(
+                &["1337", "UnicodeVersion=push mylabel"],
+                "\x1b]1337;UnicodeVersion=push mylabel\x1b\\"
+            ),
+            OperatingSystemCommand::ITermProprietary(ITermProprietary::UnicodeVersion(
+                ITermUnicodeVersionOp::Push(Some("mylabel".into()))
+            ))
+        );
+    }
+
+    #[test]
+    fn iterm_unicode_version_pop() {
+        assert_eq!(
+            parse(
+                &["1337", "UnicodeVersion=pop"],
+                "\x1b]1337;UnicodeVersion=pop\x1b\\"
+            ),
+            OperatingSystemCommand::ITermProprietary(ITermProprietary::UnicodeVersion(
+                ITermUnicodeVersionOp::Pop(None)
+            ))
+        );
+    }
+
+    // ── OSC title variants ────────────────────────────────
+
+    #[test]
+    fn osc_set_window_title() {
+        assert_eq!(
+            parse(&["2", "my title"], "\x1b]2;my title\x1b\\"),
+            OperatingSystemCommand::SetWindowTitle("my title".into())
+        );
+    }
+
+    #[test]
+    fn osc_set_icon_name() {
+        assert_eq!(
+            parse(&["1", "icon"], "\x1b]1;icon\x1b\\"),
+            OperatingSystemCommand::SetIconName("icon".into())
+        );
+    }
+
+    #[test]
+    fn osc_set_icon_name_sun() {
+        assert_eq!(
+            parse(&["Lhello"], "\x1b]Lhello\x1b\\"),
+            OperatingSystemCommand::SetIconNameSun("hello".into())
+        );
+    }
+
+    #[test]
+    fn osc_current_working_directory() {
+        assert_eq!(
+            parse(
+                &["7", "file:///home/user"],
+                "\x1b]7;file:///home/user\x1b\\"
+            ),
+            OperatingSystemCommand::CurrentWorkingDirectory("file:///home/user".into())
+        );
+    }
+
+    // ── OSC selection (52) ────────────────────────────────
+
+    #[test]
+    fn osc_clear_selection() {
+        let result = OperatingSystemCommand::parse(&[b"52", b"c"]);
+        assert_eq!(
+            result,
+            OperatingSystemCommand::ClearSelection(Selection::CLIPBOARD)
+        );
+    }
+
+    #[test]
+    fn osc_query_selection() {
+        let result = OperatingSystemCommand::parse(&[b"52", b"c", b"?"]);
+        assert_eq!(
+            result,
+            OperatingSystemCommand::QuerySelection(Selection::CLIPBOARD)
+        );
+    }
+
+    #[test]
+    fn osc_set_selection() {
+        let result = OperatingSystemCommand::parse(&[b"52", b"c", b"aGVsbG8="]);
+        assert_eq!(
+            result,
+            OperatingSystemCommand::SetSelection(Selection::CLIPBOARD, "hello".into())
+        );
+    }
+
+    // ── OSC system notification ───────────────────────────
+
+    #[test]
+    fn osc_system_notification() {
+        assert_eq!(
+            parse(&["9", "hello world"], "\x1b]9;hello world\x1b\\"),
+            OperatingSystemCommand::SystemNotification("hello world".into())
+        );
+    }
+
+    // ── OSC change color number ───────────────────────────
+
+    #[test]
+    fn osc_change_color_number_query() {
+        assert_eq!(
+            parse(&["4", "1", "?"], "\x1b]4;1;?\x1b\\"),
+            OperatingSystemCommand::ChangeColorNumber(vec![ChangeColorPair {
+                palette_index: 1,
+                color: ColorOrQuery::Query,
+            }])
+        );
+    }
+
+    // ── OSC dynamic colors ────────────────────────────────
+
+    #[test]
+    fn osc_set_text_foreground_query() {
+        let result = OperatingSystemCommand::parse(&[b"10", b"?"]);
+        assert_eq!(
+            result,
+            OperatingSystemCommand::ChangeDynamicColors(
+                DynamicColorNumber::TextForegroundColor,
+                vec![ColorOrQuery::Query]
+            )
+        );
+    }
+
+    #[test]
+    fn osc_set_text_background_query() {
+        let result = OperatingSystemCommand::parse(&[b"11", b"?"]);
+        assert_eq!(
+            result,
+            OperatingSystemCommand::ChangeDynamicColors(
+                DynamicColorNumber::TextBackgroundColor,
+                vec![ColorOrQuery::Query]
+            )
+        );
+    }
+
+    #[test]
+    fn osc_reset_text_foreground() {
+        assert_eq!(
+            parse(&["110"], "\x1b]110\x1b\\"),
+            OperatingSystemCommand::ResetDynamicColor(DynamicColorNumber::TextForegroundColor)
+        );
+    }
+
+    #[test]
+    fn osc_reset_text_background() {
+        assert_eq!(
+            parse(&["111"], "\x1b]111\x1b\\"),
+            OperatingSystemCommand::ResetDynamicColor(DynamicColorNumber::TextBackgroundColor)
+        );
+    }
+
+    // ── OperatingSystemCommand Display ────────────────────
+
+    #[test]
+    fn osc_unspecified_display() {
+        let osc = OperatingSystemCommand::Unspecified(vec![b"999".to_vec(), b"abc".to_vec()]);
+        let display = format!("{}", osc);
+        assert!(display.contains("999"));
+        assert!(display.contains("abc"));
+    }
+
+    #[test]
+    fn osc_clear_selection_display() {
+        let osc = OperatingSystemCommand::ClearSelection(Selection::CLIPBOARD);
+        let display = format!("{}", osc);
+        assert!(display.contains("52"));
+        assert!(display.contains("c"));
+    }
+
+    #[test]
+    fn osc_query_selection_display() {
+        let osc = OperatingSystemCommand::QuerySelection(Selection::PRIMARY);
+        let display = format!("{}", osc);
+        assert!(display.contains("52"));
+        assert!(display.contains("p"));
+        assert!(display.contains("?"));
+    }
+
+    // ── ITermProprietary Display ──────────────────────────
+
+    #[test]
+    fn iterm_set_mark_display() {
+        let osc = OperatingSystemCommand::ITermProprietary(ITermProprietary::SetMark);
+        let display = format!("{}", osc);
+        assert!(display.contains("1337"));
+        assert!(display.contains("SetMark"));
+    }
+
+    #[test]
+    fn iterm_steal_focus_display() {
+        let osc = OperatingSystemCommand::ITermProprietary(ITermProprietary::StealFocus);
+        let display = format!("{}", osc);
+        assert!(display.contains("StealFocus"));
+    }
+
+    #[test]
+    fn iterm_clear_scrollback_display() {
+        let osc = OperatingSystemCommand::ITermProprietary(ITermProprietary::ClearScrollback);
+        let display = format!("{}", osc);
+        assert!(display.contains("ClearScrollback"));
+    }
+
+    #[test]
+    fn iterm_end_copy_display() {
+        let osc = OperatingSystemCommand::ITermProprietary(ITermProprietary::EndCopy);
+        let display = format!("{}", osc);
+        assert!(display.contains("EndCopy"));
+    }
+
+    #[test]
+    fn iterm_request_cell_size_display() {
+        let osc = OperatingSystemCommand::ITermProprietary(ITermProprietary::RequestCellSize);
+        let display = format!("{}", osc);
+        assert!(display.contains("ReportCellSize"));
+    }
+
+    #[test]
+    fn iterm_set_profile_parse() {
+        assert_eq!(
+            parse(
+                &["1337", "SetProfile=myprofile"],
+                "\x1b]1337;SetProfile=myprofile\x1b\\"
+            ),
+            OperatingSystemCommand::ITermProprietary(ITermProprietary::SetProfile(
+                "myprofile".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn iterm_copy_to_clipboard_parse() {
+        assert_eq!(
+            parse(
+                &["1337", "CopyToClipboard=rule"],
+                "\x1b]1337;CopyToClipboard=rule\x1b\\"
+            ),
+            OperatingSystemCommand::ITermProprietary(ITermProprietary::CopyToClipboard(
+                "rule".into()
+            ))
+        );
+    }
+
+    // ── FinalTermSemanticPrompt Display ───────────────────
+
+    #[test]
+    fn finalterm_fresh_line_display() {
+        let ft = FinalTermSemanticPrompt::FreshLine;
+        let display = format!("{}", ft);
+        assert_eq!(display, "133;L");
+    }
+
+    #[test]
+    fn finalterm_start_prompt_display() {
+        let ft = FinalTermSemanticPrompt::StartPrompt(FinalTermPromptKind::RightSide);
+        let display = format!("{}", ft);
+        assert_eq!(display, "133;P;k=r");
+    }
+
+    #[test]
+    fn finalterm_end_prompt_start_input_display() {
+        let ft = FinalTermSemanticPrompt::MarkEndOfPromptAndStartOfInputUntilNextMarker;
+        assert_eq!(format!("{}", ft), "133;B");
+    }
+
+    #[test]
+    fn finalterm_end_prompt_start_input_eol_display() {
+        let ft = FinalTermSemanticPrompt::MarkEndOfPromptAndStartOfInputUntilEndOfLine;
+        assert_eq!(format!("{}", ft), "133;I");
+    }
+
+    #[test]
+    fn finalterm_command_status_display() {
+        let ft = FinalTermSemanticPrompt::CommandStatus {
+            status: 0,
+            aid: None,
+        };
+        assert_eq!(format!("{}", ft), "133;D;0");
+    }
+
+    #[test]
+    fn finalterm_command_status_with_aid_display() {
+        let ft = FinalTermSemanticPrompt::CommandStatus {
+            status: 1,
+            aid: Some("42".into()),
+        };
+        assert_eq!(format!("{}", ft), "133;D;1;err=1;aid=42");
+    }
+
+    #[test]
+    fn finalterm_mark_end_of_input_display() {
+        let ft = FinalTermSemanticPrompt::MarkEndOfInputAndStartOfOutput { aid: None };
+        assert_eq!(format!("{}", ft), "133;C");
+    }
+
+    #[test]
+    fn finalterm_mark_end_of_input_with_aid_display() {
+        let ft = FinalTermSemanticPrompt::MarkEndOfInputAndStartOfOutput {
+            aid: Some("99".into()),
+        };
+        assert_eq!(format!("{}", ft), "133;C;aid=99");
+    }
+
+    // ── OperatingSystemCommandCode ────────────────────────
+
+    #[test]
+    fn osc_code_from_code() {
+        assert_eq!(
+            OperatingSystemCommandCode::from_code("0"),
+            Some(OperatingSystemCommandCode::SetIconNameAndWindowTitle)
+        );
+        assert_eq!(
+            OperatingSystemCommandCode::from_code("2"),
+            Some(OperatingSystemCommandCode::SetWindowTitle)
+        );
+        assert_eq!(
+            OperatingSystemCommandCode::from_code("8"),
+            Some(OperatingSystemCommandCode::SetHyperlink)
+        );
+        assert_eq!(OperatingSystemCommandCode::from_code("999999"), None);
+    }
+
+    #[test]
+    fn osc_code_as_code() {
+        assert_eq!(
+            OperatingSystemCommandCode::SetIconNameAndWindowTitle.as_code(),
+            "0"
+        );
+        assert_eq!(OperatingSystemCommandCode::SetWindowTitle.as_code(), "2");
+        assert_eq!(OperatingSystemCommandCode::ResetColors.as_code(), "104");
+    }
 }

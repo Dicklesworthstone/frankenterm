@@ -1266,4 +1266,540 @@ mod test {
             }
         );
     }
+
+    // ── KittyImageVerbosity ───────────────────────────────
+
+    #[test]
+    fn kitty_verbosity_verbose() {
+        let keys = BTreeMap::new();
+        assert_eq!(
+            KittyImageVerbosity::from_keys(&keys),
+            Some(KittyImageVerbosity::Verbose)
+        );
+    }
+
+    #[test]
+    fn kitty_verbosity_only_errors() {
+        let mut keys = BTreeMap::new();
+        keys.insert("q", "1");
+        assert_eq!(
+            KittyImageVerbosity::from_keys(&keys),
+            Some(KittyImageVerbosity::OnlyErrors)
+        );
+    }
+
+    #[test]
+    fn kitty_verbosity_quiet() {
+        let mut keys = BTreeMap::new();
+        keys.insert("q", "2");
+        assert_eq!(
+            KittyImageVerbosity::from_keys(&keys),
+            Some(KittyImageVerbosity::Quiet)
+        );
+    }
+
+    #[test]
+    fn kitty_verbosity_invalid() {
+        let mut keys = BTreeMap::new();
+        keys.insert("q", "99");
+        assert_eq!(KittyImageVerbosity::from_keys(&keys), None);
+    }
+
+    #[test]
+    fn kitty_verbosity_eq() {
+        assert_eq!(KittyImageVerbosity::Verbose, KittyImageVerbosity::Verbose);
+        assert_ne!(KittyImageVerbosity::Verbose, KittyImageVerbosity::Quiet);
+    }
+
+    #[test]
+    fn kitty_verbosity_clone_copy() {
+        let a = KittyImageVerbosity::Quiet;
+        let b = a;
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn kitty_verbosity_to_keys_verbose() {
+        let mut keys = BTreeMap::new();
+        KittyImageVerbosity::Verbose.to_keys(&mut keys);
+        assert!(!keys.contains_key("q"));
+    }
+
+    #[test]
+    fn kitty_verbosity_to_keys_only_errors() {
+        let mut keys = BTreeMap::new();
+        KittyImageVerbosity::OnlyErrors.to_keys(&mut keys);
+        assert_eq!(keys.get("q"), Some(&"1".to_string()));
+    }
+
+    #[test]
+    fn kitty_verbosity_to_keys_quiet() {
+        let mut keys = BTreeMap::new();
+        KittyImageVerbosity::Quiet.to_keys(&mut keys);
+        assert_eq!(keys.get("q"), Some(&"2".to_string()));
+    }
+
+    // ── KittyImageFormat ──────────────────────────────────
+
+    #[test]
+    fn kitty_format_from_keys_rgb() {
+        let mut keys = BTreeMap::new();
+        keys.insert("f", "24");
+        assert_eq!(
+            KittyImageFormat::from_keys(&keys),
+            Some(Some(KittyImageFormat::Rgb))
+        );
+    }
+
+    #[test]
+    fn kitty_format_from_keys_rgba() {
+        let mut keys = BTreeMap::new();
+        keys.insert("f", "32");
+        assert_eq!(
+            KittyImageFormat::from_keys(&keys),
+            Some(Some(KittyImageFormat::Rgba))
+        );
+    }
+
+    #[test]
+    fn kitty_format_from_keys_png() {
+        let mut keys = BTreeMap::new();
+        keys.insert("f", "100");
+        assert_eq!(
+            KittyImageFormat::from_keys(&keys),
+            Some(Some(KittyImageFormat::Png))
+        );
+    }
+
+    #[test]
+    fn kitty_format_from_keys_none() {
+        let keys = BTreeMap::new();
+        assert_eq!(KittyImageFormat::from_keys(&keys), Some(None));
+    }
+
+    #[test]
+    fn kitty_format_from_keys_invalid() {
+        let mut keys = BTreeMap::new();
+        keys.insert("f", "999");
+        assert_eq!(KittyImageFormat::from_keys(&keys), None);
+    }
+
+    #[test]
+    fn kitty_format_to_keys() {
+        let mut keys = BTreeMap::new();
+        KittyImageFormat::Rgb.to_keys(&mut keys);
+        assert_eq!(keys.get("f"), Some(&"24".to_string()));
+
+        let mut keys = BTreeMap::new();
+        KittyImageFormat::Rgba.to_keys(&mut keys);
+        assert_eq!(keys.get("f"), Some(&"32".to_string()));
+
+        let mut keys = BTreeMap::new();
+        KittyImageFormat::Png.to_keys(&mut keys);
+        assert_eq!(keys.get("f"), Some(&"100".to_string()));
+    }
+
+    #[test]
+    fn kitty_format_eq() {
+        assert_eq!(KittyImageFormat::Rgb, KittyImageFormat::Rgb);
+        assert_ne!(KittyImageFormat::Rgb, KittyImageFormat::Rgba);
+        assert_ne!(KittyImageFormat::Rgba, KittyImageFormat::Png);
+    }
+
+    // ── KittyImageCompression ─────────────────────────────
+
+    #[test]
+    fn kitty_compression_none_from_keys() {
+        let keys = BTreeMap::new();
+        assert_eq!(
+            KittyImageCompression::from_keys(&keys),
+            Some(KittyImageCompression::None)
+        );
+    }
+
+    #[test]
+    fn kitty_compression_deflate_from_keys() {
+        let mut keys = BTreeMap::new();
+        keys.insert("o", "z");
+        assert_eq!(
+            KittyImageCompression::from_keys(&keys),
+            Some(KittyImageCompression::Deflate)
+        );
+    }
+
+    #[test]
+    fn kitty_compression_invalid() {
+        let mut keys = BTreeMap::new();
+        keys.insert("o", "x");
+        assert_eq!(KittyImageCompression::from_keys(&keys), None);
+    }
+
+    #[test]
+    fn kitty_compression_to_keys_none() {
+        let mut keys = BTreeMap::new();
+        KittyImageCompression::None.to_keys(&mut keys);
+        assert!(!keys.contains_key("o"));
+    }
+
+    #[test]
+    fn kitty_compression_to_keys_deflate() {
+        let mut keys = BTreeMap::new();
+        KittyImageCompression::Deflate.to_keys(&mut keys);
+        assert_eq!(keys.get("o"), Some(&"z".to_string()));
+    }
+
+    // ── KittyImageData ────────────────────────────────────
+
+    #[test]
+    fn kitty_data_direct_debug() {
+        let data = KittyImageData::Direct("aGVsbG8=".to_string());
+        let debug = format!("{:?}", data);
+        assert!(debug.contains("Direct"));
+        assert!(debug.contains("8 bytes"));
+    }
+
+    #[test]
+    fn kitty_data_direct_bin_debug() {
+        let data = KittyImageData::DirectBin(vec![1, 2, 3]);
+        let debug = format!("{:?}", data);
+        assert!(debug.contains("DirectBin"));
+        assert!(debug.contains("3 bytes"));
+    }
+
+    #[test]
+    fn kitty_data_file_debug() {
+        let data = KittyImageData::File {
+            path: "/tmp/image.png".into(),
+            data_size: Some(1024),
+            data_offset: None,
+        };
+        let debug = format!("{:?}", data);
+        assert!(debug.contains("File"));
+        assert!(debug.contains("/tmp/image.png"));
+    }
+
+    #[test]
+    fn kitty_data_temp_file_debug() {
+        let data = KittyImageData::TemporaryFile {
+            path: "/tmp/kitty-abc".into(),
+            data_size: None,
+            data_offset: Some(10),
+        };
+        let debug = format!("{:?}", data);
+        assert!(debug.contains("TemporaryFile"));
+    }
+
+    #[test]
+    fn kitty_data_shared_mem_debug() {
+        let data = KittyImageData::SharedMem {
+            name: "my_shm".into(),
+            data_size: None,
+            data_offset: None,
+        };
+        let debug = format!("{:?}", data);
+        assert!(debug.contains("SharedMem"));
+        assert!(debug.contains("my_shm"));
+    }
+
+    #[test]
+    fn kitty_data_eq() {
+        let a = KittyImageData::Direct("abc".into());
+        let b = KittyImageData::Direct("abc".into());
+        assert_eq!(a, b);
+
+        let c = KittyImageData::Direct("def".into());
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn kitty_data_clone() {
+        let a = KittyImageData::DirectBin(vec![1, 2, 3]);
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    // ── KittyImageTransmit ────────────────────────────────
+
+    #[test]
+    fn kitty_transmit_from_keys_basic() {
+        let mut keys = BTreeMap::new();
+        keys.insert("f", "24");
+        keys.insert("s", "10");
+        keys.insert("v", "20");
+        let transmit = KittyImageTransmit::from_keys(&keys, b"aGVsbG8=").unwrap();
+        assert_eq!(transmit.format, Some(KittyImageFormat::Rgb));
+        assert_eq!(transmit.width, Some(10));
+        assert_eq!(transmit.height, Some(20));
+        assert!(!transmit.more_data_follows);
+    }
+
+    #[test]
+    fn kitty_transmit_more_data_follows() {
+        let mut keys = BTreeMap::new();
+        keys.insert("m", "1");
+        let transmit = KittyImageTransmit::from_keys(&keys, b"abc=").unwrap();
+        assert!(transmit.more_data_follows);
+    }
+
+    #[test]
+    fn kitty_transmit_clone_eq() {
+        let t = KittyImageTransmit {
+            format: Some(KittyImageFormat::Png),
+            data: KittyImageData::Direct("data".into()),
+            width: Some(100),
+            height: Some(200),
+            image_id: Some(1),
+            image_number: None,
+            compression: KittyImageCompression::None,
+            more_data_follows: false,
+        };
+        let t2 = t.clone();
+        assert_eq!(t, t2);
+    }
+
+    // ── KittyImagePlacement ───────────────────────────────
+
+    #[test]
+    fn kitty_placement_from_keys() {
+        let mut keys = BTreeMap::new();
+        keys.insert("x", "10");
+        keys.insert("y", "20");
+        keys.insert("c", "5");
+        keys.insert("r", "3");
+        let placement = KittyImagePlacement::from_keys(&keys).unwrap();
+        assert_eq!(placement.x, Some(10));
+        assert_eq!(placement.y, Some(20));
+        assert_eq!(placement.columns, Some(5));
+        assert_eq!(placement.rows, Some(3));
+        assert!(!placement.do_not_move_cursor);
+    }
+
+    #[test]
+    fn kitty_placement_do_not_move_cursor() {
+        let mut keys = BTreeMap::new();
+        keys.insert("C", "1");
+        let placement = KittyImagePlacement::from_keys(&keys).unwrap();
+        assert!(placement.do_not_move_cursor);
+    }
+
+    // ── KittyImageDelete ──────────────────────────────────
+
+    #[test]
+    fn kitty_delete_all_lowercase() {
+        let mut keys = BTreeMap::new();
+        keys.insert("d", "a");
+        let del = KittyImageDelete::from_keys(&keys).unwrap();
+        assert_eq!(del, KittyImageDelete::All { delete: false });
+    }
+
+    #[test]
+    fn kitty_delete_all_uppercase() {
+        let mut keys = BTreeMap::new();
+        keys.insert("d", "A");
+        let del = KittyImageDelete::from_keys(&keys).unwrap();
+        assert_eq!(del, KittyImageDelete::All { delete: true });
+    }
+
+    #[test]
+    fn kitty_delete_by_image_id() {
+        let mut keys = BTreeMap::new();
+        keys.insert("d", "i");
+        keys.insert("i", "42");
+        let del = KittyImageDelete::from_keys(&keys).unwrap();
+        assert_eq!(
+            del,
+            KittyImageDelete::ByImageId {
+                image_id: 42,
+                placement_id: None,
+                delete: false,
+            }
+        );
+    }
+
+    #[test]
+    fn kitty_delete_by_image_number() {
+        let mut keys = BTreeMap::new();
+        keys.insert("d", "N");
+        keys.insert("I", "99");
+        let del = KittyImageDelete::from_keys(&keys).unwrap();
+        assert_eq!(
+            del,
+            KittyImageDelete::ByImageNumber {
+                image_number: 99,
+                placement_id: None,
+                delete: true,
+            }
+        );
+    }
+
+    #[test]
+    fn kitty_delete_at_cursor() {
+        let mut keys = BTreeMap::new();
+        keys.insert("d", "c");
+        let del = KittyImageDelete::from_keys(&keys).unwrap();
+        assert_eq!(del, KittyImageDelete::AtCursorPosition { delete: false });
+    }
+
+    #[test]
+    fn kitty_delete_animation_frames() {
+        let mut keys = BTreeMap::new();
+        keys.insert("d", "F");
+        let del = KittyImageDelete::from_keys(&keys).unwrap();
+        assert_eq!(del, KittyImageDelete::AnimationFrames { delete: true });
+    }
+
+    #[test]
+    fn kitty_delete_at_position() {
+        let mut keys = BTreeMap::new();
+        keys.insert("d", "p");
+        keys.insert("x", "5");
+        keys.insert("y", "10");
+        let del = KittyImageDelete::from_keys(&keys).unwrap();
+        assert_eq!(
+            del,
+            KittyImageDelete::DeleteAt {
+                x: 5,
+                y: 10,
+                delete: false,
+            }
+        );
+    }
+
+    #[test]
+    fn kitty_delete_at_z() {
+        let mut keys = BTreeMap::new();
+        keys.insert("d", "Q");
+        keys.insert("x", "1");
+        keys.insert("y", "2");
+        keys.insert("z", "3");
+        let del = KittyImageDelete::from_keys(&keys).unwrap();
+        assert_eq!(
+            del,
+            KittyImageDelete::DeleteAtZ {
+                x: 1,
+                y: 2,
+                z: 3,
+                delete: true,
+            }
+        );
+    }
+
+    #[test]
+    fn kitty_delete_column() {
+        let mut keys = BTreeMap::new();
+        keys.insert("d", "x");
+        keys.insert("x", "7");
+        let del = KittyImageDelete::from_keys(&keys).unwrap();
+        assert_eq!(
+            del,
+            KittyImageDelete::DeleteColumn {
+                x: 7,
+                delete: false
+            }
+        );
+    }
+
+    #[test]
+    fn kitty_delete_row() {
+        let mut keys = BTreeMap::new();
+        keys.insert("d", "Y");
+        keys.insert("y", "3");
+        let del = KittyImageDelete::from_keys(&keys).unwrap();
+        assert_eq!(del, KittyImageDelete::DeleteRow { y: 3, delete: true });
+    }
+
+    #[test]
+    fn kitty_delete_z_index() {
+        let mut keys = BTreeMap::new();
+        keys.insert("d", "z");
+        keys.insert("z", "-1");
+        let del = KittyImageDelete::from_keys(&keys).unwrap();
+        assert_eq!(
+            del,
+            KittyImageDelete::DeleteZ {
+                z: -1,
+                delete: false,
+            }
+        );
+    }
+
+    #[test]
+    fn kitty_delete_invalid() {
+        let mut keys = BTreeMap::new();
+        keys.insert("d", "!");
+        assert_eq!(KittyImageDelete::from_keys(&keys), None);
+    }
+
+    // ── KittyImage parse roundtrip ────────────────────────
+
+    #[test]
+    fn kitty_parse_query() {
+        let img = KittyImage::parse_apc("Ga=q,f=32,s=10,v=20;AAAA".as_bytes()).unwrap();
+        match img {
+            KittyImage::Query { transmit } => {
+                assert_eq!(transmit.format, Some(KittyImageFormat::Rgba));
+                assert_eq!(transmit.width, Some(10));
+                assert_eq!(transmit.height, Some(20));
+            }
+            other => panic!("expected Query, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn kitty_parse_display() {
+        let img = KittyImage::parse_apc("Ga=p,i=42".as_bytes()).unwrap();
+        match img {
+            KittyImage::Display { image_id, .. } => {
+                assert_eq!(image_id, Some(42));
+            }
+            other => panic!("expected Display, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn kitty_parse_delete_all() {
+        let img = KittyImage::parse_apc("Ga=d,q=2".as_bytes()).unwrap();
+        assert_eq!(
+            img,
+            KittyImage::Delete {
+                what: KittyImageDelete::All { delete: false },
+                verbosity: KittyImageVerbosity::Quiet,
+            }
+        );
+    }
+
+    #[test]
+    fn kitty_image_display_trait() {
+        let img = KittyImage::TransmitData {
+            transmit: KittyImageTransmit {
+                format: Some(KittyImageFormat::Rgb),
+                data: KittyImageData::Direct("aGVsbG8=".to_string()),
+                width: Some(10),
+                height: Some(20),
+                image_id: None,
+                image_number: None,
+                compression: KittyImageCompression::None,
+                more_data_follows: false,
+            },
+            verbosity: KittyImageVerbosity::Verbose,
+        };
+        let display = format!("{}", img);
+        assert!(display.starts_with("\x1b_G"));
+        assert!(display.contains("f=24"));
+        assert!(display.contains("s=10"));
+        assert!(display.contains("v=20"));
+    }
+
+    #[test]
+    fn kitty_image_delete_display() {
+        let img = KittyImage::Delete {
+            what: KittyImageDelete::All { delete: true },
+            verbosity: KittyImageVerbosity::Quiet,
+        };
+        let display = format!("{}", img);
+        assert!(display.starts_with("\x1b_G"));
+        assert!(display.contains("a=d"));
+        assert!(display.contains("d=A"));
+        assert!(display.contains("q=2"));
+    }
 }
