@@ -35,15 +35,6 @@ pub enum SemanticGenerationStatus {
 }
 
 impl SemanticGenerationStatus {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Building => "building",
-            Self::Active => "active",
-            Self::Retired => "retired",
-            Self::Failed => "failed",
-        }
-    }
-
     fn from_str(value: &str) -> Result<Self> {
         match value {
             "building" => Ok(Self::Building),
@@ -438,14 +429,14 @@ impl ChunkVectorStore {
             let chunk_id: String = row.get(0)?;
             let direction_raw: String = row.get(1)?;
             let start_offset = ChunkSourceOffset {
-                segment_id: row.get::<_, i64>(2)? as u64,
-                ordinal: row.get::<_, i64>(3)? as u64,
-                byte_offset: row.get::<_, i64>(4)? as u64,
+                segment_id: row.get(2)?,
+                ordinal: row.get(3)?,
+                byte_offset: row.get(4)?,
             };
             let end_offset = ChunkSourceOffset {
-                segment_id: row.get::<_, i64>(5)? as u64,
-                ordinal: row.get::<_, i64>(6)? as u64,
-                byte_offset: row.get::<_, i64>(7)? as u64,
+                segment_id: row.get(5)?,
+                ordinal: row.get(6)?,
+                byte_offset: row.get(7)?,
             };
             let content_hash: String = row.get(8)?;
             let vector_blob: Vec<u8> = row.get(9)?;
@@ -754,7 +745,7 @@ fn now_epoch_seconds() -> Result<i64> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|err| ChunkVectorStoreError::InvalidDbValue(err.to_string()))?;
-    usize_to_i64(now.as_secs() as usize, "now_epoch_seconds")
+    u64_to_i64(now.as_secs(), "now_epoch_seconds")
 }
 
 fn usize_to_i64(value: usize, field: &'static str) -> Result<i64> {
