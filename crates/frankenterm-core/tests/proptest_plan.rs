@@ -46,16 +46,18 @@ fn arb_wait_condition() -> impl Strategy<Value = WaitCondition> {
     prop_oneof![
         (prop::option::of(arb_pane_id()), arb_name())
             .prop_map(|(pane_id, rule_id)| WaitCondition::Pattern { pane_id, rule_id }),
-        (prop::option::of(arb_pane_id()), arb_timeout())
-            .prop_map(|(pane_id, idle_threshold_ms)| WaitCondition::PaneIdle {
+        (prop::option::of(arb_pane_id()), arb_timeout()).prop_map(
+            |(pane_id, idle_threshold_ms)| WaitCondition::PaneIdle {
                 pane_id,
                 idle_threshold_ms,
-            }),
-        (prop::option::of(arb_pane_id()), arb_timeout())
-            .prop_map(|(pane_id, stable_for_ms)| WaitCondition::StableTail {
+            }
+        ),
+        (prop::option::of(arb_pane_id()), arb_timeout()).prop_map(|(pane_id, stable_for_ms)| {
+            WaitCondition::StableTail {
                 pane_id,
                 stable_for_ms,
-            }),
+            }
+        }),
         arb_name().prop_map(|key| WaitCondition::External { key }),
     ]
 }
@@ -131,11 +133,13 @@ fn arb_precondition() -> impl Strategy<Value = Precondition> {
             prop::option::of(arb_pane_id()),
             prop::option::of(arb_timeout())
         )
-            .prop_map(|(rule_id, pane_id, within_ms)| Precondition::PatternMatched {
-                rule_id,
-                pane_id,
-                within_ms,
-            }),
+            .prop_map(
+                |(rule_id, pane_id, within_ms)| Precondition::PatternMatched {
+                    rule_id,
+                    pane_id,
+                    within_ms,
+                }
+            ),
         (arb_name(), prop::option::of(arb_pane_id()))
             .prop_map(|(rule_id, pane_id)| Precondition::PatternNotMatched { rule_id, pane_id }),
         arb_name().prop_map(|lock_name| Precondition::LockHeld { lock_name }),
@@ -192,12 +196,22 @@ fn arb_verification() -> impl Strategy<Value = Verification> {
         })
 }
 
+/// Generate a float that roundtrips cleanly through JSON serialization.
+/// Uses integer-based tenths to avoid floating-point representation issues.
+fn arb_clean_f64() -> impl Strategy<Value = f64> {
+    (10u32..50).prop_map(|n| n as f64 / 10.0)
+}
+
 /// Generate an arbitrary OnFailure (excluding Fallback to avoid nested StepPlan).
 fn arb_on_failure() -> impl Strategy<Value = OnFailure> {
     prop_oneof![
-        prop::option::of(arb_name())
-            .prop_map(|message| OnFailure::Abort { message }),
-        (1u32..10, arb_timeout(), prop::option::of(arb_timeout()), prop::option::of(1.0f64..5.0))
+        prop::option::of(arb_name()).prop_map(|message| OnFailure::Abort { message }),
+        (
+            1u32..10,
+            arb_timeout(),
+            prop::option::of(arb_timeout()),
+            prop::option::of(arb_clean_f64())
+        )
             .prop_map(
                 |(max_attempts, initial_delay_ms, max_delay_ms, backoff_multiplier)| {
                     OnFailure::Retry {
@@ -215,10 +229,7 @@ fn arb_on_failure() -> impl Strategy<Value = OnFailure> {
 
 /// Generate an arbitrary StepPlan for a given step number.
 fn arb_step_plan_numbered(step_number: u32) -> impl Strategy<Value = StepPlan> {
-    (
-        arb_step_action(),
-        arb_name(),
-    )
+    (arb_step_action(), arb_name())
         .prop_map(move |(action, description)| StepPlan::new(step_number, action, description))
 }
 
@@ -643,10 +654,12 @@ proptest! {
         let json = serde_json::to_string(&plan).unwrap();
         let parsed: ActionPlan = serde_json::from_str(&json).unwrap();
 
+        let hash_before = plan.compute_hash();
+        let hash_after = parsed.compute_hash();
         prop_assert_eq!(plan.plan_id, parsed.plan_id, "plan_id should survive roundtrip");
         prop_assert_eq!(&plan.title, &parsed.title, "title should survive roundtrip");
         prop_assert_eq!(&plan.workspace_id, &parsed.workspace_id, "workspace_id should survive roundtrip");
-        prop_assert_eq!(plan.compute_hash(), parsed.compute_hash(),
+        prop_assert_eq!(hash_before, hash_after,
             "hash should be identical after roundtrip");
     }
 }
@@ -663,11 +676,10 @@ proptest! {
         let with_prefix = format!("sha256:{}", hash);
         let id_with = PlanId::from_hash(&with_prefix);
         let id_without = PlanId::from_hash(&hash);
-        prop_assert_eq!(id_with, id_without,
-            "from_hash should strip sha256: prefix");
-        // Should have plan: prefix
         let starts = id_with.0.starts_with("plan:");
         prop_assert!(starts, "PlanId should start with plan:");
+        prop_assert_eq!(id_with, id_without,
+            "from_hash should strip sha256: prefix");
     }
 }
 

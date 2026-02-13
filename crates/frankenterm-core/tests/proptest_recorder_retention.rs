@@ -32,16 +32,24 @@ const MS_PER_DAY: u64 = 86_400_000;
 /// Generate a valid RetentionConfig (all fields nonzero, t1_extended_days <= 90).
 fn arb_valid_config() -> impl Strategy<Value = RetentionConfig> {
     (
-        1u32..=720,          // hot_hours
-        1u32..=365,          // warm_days
-        1u32..=365,          // cold_days
-        1u32..=720,          // t3_max_hours
-        1u32..=90,           // t1_extended_days
+        1u32..=720,           // hot_hours
+        1u32..=365,           // warm_days
+        1u32..=365,           // cold_days
+        1u32..=720,           // t3_max_hours
+        1u32..=90,            // t1_extended_days
         1u64..=1_073_741_824, // max_segment_bytes (up to 1GB)
-        1u64..=86_400,       // max_segment_duration_secs (up to 1 day)
+        1u64..=86_400,        // max_segment_duration_secs (up to 1 day)
     )
         .prop_map(
-            |(hot_hours, warm_days, cold_days, t3_max_hours, t1_extended_days, max_segment_bytes, max_segment_duration_secs)| {
+            |(
+                hot_hours,
+                warm_days,
+                cold_days,
+                t3_max_hours,
+                t1_extended_days,
+                max_segment_bytes,
+                max_segment_duration_secs,
+            )| {
                 RetentionConfig {
                     hot_hours,
                     warm_days,

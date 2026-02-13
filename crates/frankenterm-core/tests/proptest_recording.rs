@@ -40,8 +40,7 @@ fn arb_delta_encoding() -> impl Strategy<Value = DeltaEncoding> {
 fn arb_diff_op() -> impl Strategy<Value = DiffOp> {
     prop_oneof![
         (0u32..1000, 1u32..500).prop_map(|(offset, len)| DiffOp::Copy { offset, len }),
-        proptest::collection::vec(any::<u8>(), 0..32)
-            .prop_map(|data| DiffOp::Insert { data }),
+        proptest::collection::vec(any::<u8>(), 0..32).prop_map(|data| DiffOp::Insert { data }),
     ]
 }
 
@@ -143,17 +142,15 @@ fn arb_event_payload() -> impl Strategy<Value = RecorderEventPayload> {
             arb_segment_kind(),
             any::<bool>(),
         )
-            .prop_map(
-                |(text, encoding, redaction, segment_kind, is_gap)| {
-                    RecorderEventPayload::EgressOutput {
-                        text,
-                        encoding,
-                        redaction,
-                        segment_kind,
-                        is_gap,
-                    }
+            .prop_map(|(text, encoding, redaction, segment_kind, is_gap)| {
+                RecorderEventPayload::EgressOutput {
+                    text,
+                    encoding,
+                    redaction,
+                    segment_kind,
+                    is_gap,
                 }
-            ),
+            }),
         arb_control_marker_type().prop_map(|cmt| RecorderEventPayload::ControlMarker {
             control_marker_type: cmt,
             details: serde_json::json!({}),
@@ -215,30 +212,31 @@ fn arb_recorder_event() -> impl Strategy<Value = RecorderEvent> {
 }
 
 fn arb_frame_header() -> impl Strategy<Value = FrameHeader> {
-    (any::<u64>(), arb_frame_type(), any::<u8>(), 0u32..10_000).prop_map(
-        |(ts, ft, flags, plen)| FrameHeader {
+    (any::<u64>(), arb_frame_type(), any::<u8>(), 0u32..10_000).prop_map(|(ts, ft, flags, plen)| {
+        FrameHeader {
             timestamp_ms: ts,
             frame_type: ft,
             flags,
             payload_len: plen,
-        },
-    )
+        }
+    })
 }
 
 fn arb_recording_frame() -> impl Strategy<Value = RecordingFrame> {
-    (arb_frame_type(), any::<u8>(), proptest::collection::vec(any::<u8>(), 0..256)).prop_map(
-        |(ft, flags, payload)| {
-            RecordingFrame {
-                header: FrameHeader {
-                    timestamp_ms: 12345,
-                    frame_type: ft,
-                    flags,
-                    payload_len: payload.len() as u32,
-                },
-                payload,
-            }
-        },
+    (
+        arb_frame_type(),
+        any::<u8>(),
+        proptest::collection::vec(any::<u8>(), 0..256),
     )
+        .prop_map(|(ft, flags, payload)| RecordingFrame {
+            header: FrameHeader {
+                timestamp_ms: 12345,
+                frame_type: ft,
+                flags,
+                payload_len: payload.len() as u32,
+            },
+            payload,
+        })
 }
 
 fn arb_actor_kind() -> impl Strategy<Value = ActorKind> {
