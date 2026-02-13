@@ -39,7 +39,7 @@ This document explains how ft captures and restores session state for crash reco
   - Coordinates restoration steps (layout first; optional scrollback/process steps)
 
 - `frankenterm_core::restore_layout::LayoutRestorer`
-  - Recreates windows/tabs/splits via WezTerm CLI operations
+  - Recreates windows/tabs/splits via backend bridge CLI operations (current: WezTerm)
   - Produces an old-pane-id → new-pane-id mapping
 
 - `frankenterm_core::restore_scrollback`
@@ -53,7 +53,7 @@ This document explains how ft captures and restores session state for crash reco
 ### Snapshot capture
 
 ```text
-wezterm cli list → Vec<PaneInfo>
+backend bridge cli list (current: `wezterm cli list`) → Vec<PaneInfo>
   → TopologySnapshot::from_panes()
   → PaneStateSnapshot::from_pane_info() (per pane)
   → compute_state_hash(panes)
@@ -128,4 +128,3 @@ Snapshot performance budgets are encoded as Criterion metadata in:
 - `crates/frankenterm-core/benches/snapshot_engine.rs`
 
 These are used as “operator expectations” and as a regression target during development.
-

@@ -37,7 +37,7 @@ cargo install --git https://github.com/Dicklesworthstone/frankenterm.git ft
 
 - Concepts learned from Ghostty and Zellij (session model, ergonomics, and runtime resilience)
 - Ground-up `ft` subsystems purpose-built for agent swarms
-- Targeted integrations and code adaptation from `/dp/asupersync`, `/dp/frankensqlite`, and `/dp/frankentui`
+- Targeted integrations and code adaptation from `/dp/asupersync`, `/dp/frankensqlite`, and `/frankentui`
 
 ### Why Use ft?
 
@@ -185,7 +185,7 @@ cargo install --git https://github.com/Dicklesworthstone/frankenterm.git ft
 ### Requirements
 
 - **Rust 1.85+** (nightly required for Rust 2024 edition)
-- **Compatibility backend (current):** WezTerm CLI available for existing pane/session interop
+- **Compatibility backend bridge (current):** WezTerm CLI available for existing pane/session interop while native runtime coverage expands
 - **SQLite** (bundled via rusqlite)
 
 ---

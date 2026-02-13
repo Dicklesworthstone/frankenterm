@@ -1,4 +1,4 @@
-# ADR-0009: Upstream Sync and Pinning Policy for /dp/frankentui
+# ADR-0009: Upstream Sync and Pinning Policy for /frankentui
 
 **Status:** Accepted
 **Date:** 2026-02-09
@@ -7,7 +7,7 @@
 
 ## Context
 
-ft consumes `/dp/frankentui` (ftui) as an optional dependency during the TUI
+ft consumes `/frankentui` (ftui) as an optional dependency during the TUI
 migration. The dependency is currently a path dep for fast iteration
 (see ADR-004). Before any release, the dependency must be pinned to a
 specific upstream commit to guarantee reproducible builds.
@@ -38,11 +38,11 @@ and what compatibility risks to watch for.
 
 1. Fetch the latest ftui main:
    ```bash
-   cd /dp/frankentui && git pull origin main
+   cd /frankentui && git pull origin main
    ```
 2. Record the new HEAD:
    ```bash
-   REV=$(cd /dp/frankentui && git rev-parse --short HEAD)
+   REV=$(cd /frankentui && git rev-parse --short HEAD)
    echo "New pin: $REV"
    ```
 3. Update the root `Cargo.toml`:

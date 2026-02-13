@@ -95,7 +95,7 @@ Captured by reading the PTY output buffer and stripping ANSI escape sequences:
 ┌──────────────────────────────────────────────────┐
 │ [Home] Panes  Events  Triage  History  Search    │
 │                                                   │
-│ WezTerm Automata - Home                          │
+│ FrankenTerm - Home                               │
 │ ────────────────────────────────────────────────  │
 │ System: healthy   Panes: 3   Events: 6           │
 │                                                   │

@@ -105,9 +105,9 @@ pub enum QueryError {
 
 3. **`DatabaseNotInitialized`** means no SQLite database is available. Views
    that need storage (Events, Triage, Search, History) should show an empty
-   state with guidance. Panes (from WezTerm IPC) may still work.
+  state with guidance. Panes (from backend bridge IPC, currently WezTerm) may still work.
 
-4. **`WeztermError`** means WezTerm CLI communication failed. Home and Panes
+4. **`WeztermError`** means backend bridge CLI communication failed (current: WezTerm). Home and Panes
    views show degraded state. Other views are unaffected.
 
 5. **`StorageError`** is a catch-all for SQLite failures. Treat as transient;
@@ -122,8 +122,8 @@ pub enum QueryError {
 
 | Field | Type | Source | Notes |
 |-------|------|--------|-------|
-| `pane_id` | `u64` | WezTerm IPC | Stable pane identifier |
-| `title` | `String` | WezTerm IPC | Current pane title (may change) |
+| `pane_id` | `u64` | Backend bridge IPC (current: WezTerm) | Stable pane identifier |
+| `title` | `String` | Backend bridge IPC (current: WezTerm) | Current pane title (may change) |
 | `domain` | `String` | WezTerm IPC | `"local"` or `"ssh:<host>"` |
 | `cwd` | `Option<String>` | WezTerm IPC | Working directory if available |
 | `is_excluded` | `bool` | Computed | Always `false` currently |

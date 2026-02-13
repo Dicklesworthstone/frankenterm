@@ -42,7 +42,7 @@ The current architecture works but has structural limitations:
    Switching between TUI and daemon output requires full alt-screen transitions
    with no intermediate inline option.
 
-FrankenTUI (`/dp/frankentui`) addresses these by design:
+FrankenTUI (`/frankentui`) addresses these by design:
 
 - **One-writer rule:** The UI runtime exclusively owns terminal writes. All other
   output is routed through a controlled sink.

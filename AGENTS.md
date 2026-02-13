@@ -87,7 +87,7 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 - Replacement of legacy terminal workflows for swarm operations
 - Selective design inspiration from Ghostty and Zellij
-- Ground-up ft subsystems plus integration/adaptation from `/dp/asupersync`, `/dp/frankensqlite`, and `/dp/frankentui`
+- Ground-up ft subsystems plus integration/adaptation from `/dp/asupersync`, `/dp/frankensqlite`, and `/frankentui`
 
 ### Core Architecture
 

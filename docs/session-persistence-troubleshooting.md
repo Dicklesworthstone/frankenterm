@@ -11,13 +11,13 @@ This guide covers the most common snapshot/restore failure modes and how to diag
 
 **Likely causes**
 
-- WezTerm isn’t running
+- The active compatibility backend bridge (current: WezTerm) isn’t running
 - `wezterm` CLI is not available in `PATH` or can’t talk to the mux server
 - Pane filters exclude everything
 
 **What to do**
 
-1) Verify WezTerm CLI:
+1) Verify backend bridge CLI (current: WezTerm):
    ```bash
    wezterm cli list
    ```
@@ -120,4 +120,3 @@ ft snapshot list -f json --limit 10
 ft snapshot inspect <id> -f json
 ft session doctor -f json
 ```
-

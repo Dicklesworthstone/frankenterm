@@ -1,6 +1,6 @@
 # Session Persistence (Snapshots)
 
-ft’s session persistence system captures WezTerm mux state into SQLite snapshots so you can:
+ft’s session persistence system captures terminal backend mux state (current bridge: WezTerm) into SQLite snapshots so you can:
 
 - Recover after an unclean shutdown (crash / power loss)
 - Perform safer restarts by snapshotting first
@@ -189,6 +189,5 @@ Criterion budgets for core snapshot components live in `crates/frankenterm-core/
 - SQLite transaction: **p50 < 10ms**
 - SQLite query + deserialize: **p50 < 5ms**
 
-End-to-end `ft snapshot save` time is usually dominated by WezTerm CLI latency and pane count.
+End-to-end `ft snapshot save` time is usually dominated by backend bridge CLI latency (currently WezTerm) and pane count.
 As a rule of thumb, operators should expect a snapshot to complete in **well under a few seconds** for typical local sessions.
-

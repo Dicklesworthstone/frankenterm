@@ -8,7 +8,7 @@
 
 ## 0) What this plan is (and isn’t)
 
-This document is a **single, comprehensive build plan** for `ft`: a Rust-first control plane for **observing and orchestrating WezTerm mux panes** that run AI coding agents (Claude Code, Codex CLI, Gemini CLI, and future agents).
+This document is a **single, comprehensive build plan** for `ft`: a Rust-first swarm-native terminal platform and control plane for AI coding agents (Claude Code, Codex CLI, Gemini CLI, and future agents), with a current compatibility bridge to existing WezTerm mux deployments.
 
 It is deliberately:
 - **Deterministic** (no timing-based “sendkeys” automation).
@@ -19,7 +19,7 @@ It is deliberately:
 Non-goals:
 - Not trying to replace the agents themselves.
 - Not trying to build a general-purpose distributed scheduler on day 1.
-- Not trying to fork/replace WezTerm unless the ROI is overwhelming (see vendoring strategy).
+- Not locking ft to the WezTerm compatibility boundary; the bridge is transitional while native ft runtime capabilities expand.
 
 ---
 
@@ -27,16 +27,16 @@ Non-goals:
 
 ### 1.1 The one-sentence mission
 
-Turn WezTerm’s mux into a **high-reliability “terminal hypervisor”** for agent swarms: *observe everything, understand key events, act safely and reliably, and expose a machine-optimized control surface for agents.*
+Build ft into a **high-reliability swarm-native terminal platform** for agent fleets: *observe everything, understand key events, act safely and reliably, and expose a machine-optimized control surface for agents.*
 
 ### 1.2 The non-negotiables (from JE)
 
-1. **Canonical WezTerm setup** (remote `wezterm-mux-server` per domain via systemd + linger; local reconnects).
+1. **Canonical compatibility-backend setup (current bridge: WezTerm)** (remote `wezterm-mux-server` per domain via systemd + linger; local reconnects).
 2. **Capture ALL output** from ALL panes across ALL domains and persist to **SQLite + FTS5**.
 3. **Detect tell-tale patterns** (compaction, usage limit warnings/reached, session end/resume IDs, auth prompts) and store structured extracts.
-4. **Act via WezTerm APIs**, not brittle sendkeys:
-   - Prefer WezTerm CLI and mux protocol.
-   - Use Lua IPC / OSC user-vars for low-latency signaling when helpful.
+4. **Act via ft adapter interfaces**, not brittle sendkeys:
+   - Prefer backend adapter abstractions (currently WezTerm CLI + mux protocol).
+   - Use Lua IPC / OSC user-vars for low-latency signaling where the compatibility bridge supports it.
 5. **Workflows** are explicit, agent-specific, testable state machines:
    - `handle_usage_limits` (cc/cod/gmi)
    - `handle_compaction` (cc/cod/gmi)
@@ -48,7 +48,7 @@ Turn WezTerm’s mux into a **high-reliability “terminal hypervisor”** for a
    - `fastmcp_rust` for MCP
    - `rich_rust` + `charmed_rust` for ergonomic UX (CLI + optional TUI)
    - `asupersync` + `fastapi_rust` where they add real leverage (sync + HTTP control plane)
-8. Consider **WezTerm vendoring** (selective, transformation-based) and make an explicit recommendation.
+8. Maintain and harden the compatibility bridge (including selective WezTerm vendoring where justified) while prioritizing native ft runtime evolution.
 
 ---
 
@@ -60,7 +60,7 @@ Turn WezTerm’s mux into a **high-reliability “terminal hypervisor”** for a
 2. “Search: where did the agent mention `panic` / `clippy` / `usage limit` last week?”
 3. “This Codex pane hit limit; rotate accounts, re-auth, resume session, send `proceed.`”
 4. “After compaction, automatically re-inject a context refresh prompt.”
-5. “Bring a new remote host online: install matching WezTerm, set up mux server, standardize config.”
+5. “Bring a new remote host online: install the supported backend runtime (currently WezTerm bridge), standardize config, and join swarm operations.”
 6. “I want a clean UI to browse panes and events when I’m debugging at 2am.”
 
 ### 2.2 Agent (robot-mode) stories
@@ -76,7 +76,7 @@ Turn WezTerm’s mux into a **high-reliability “terminal hypervisor”** for a
 
 ### 3.1 High-level architecture
 
-`ft` is a **local control plane** that speaks to WezTerm (local GUI + remote mux servers) and exposes:
+`ft` is a **local control plane** that speaks through backend adapters (currently WezTerm local GUI + remote mux servers) and exposes:
 - **Daemon**: continuous capture + detection + workflow orchestration
 - **SQLite**: durable store + FTS5
 - **CLI**: human + robot modes
@@ -100,7 +100,7 @@ The action loop *never* runs on stale assumptions; it always re-checks current p
 
 ### 4.1 Tiered integration (graceful fallback)
 
-Tier 1 (required): **WezTerm CLI** (`wezterm cli`)
+Tier 1 (required): **Compatibility backend CLI (current bridge: WezTerm)** (`wezterm cli`)
 - `list --format json` as the authoritative “pane inventory”
 - `get-text` to pull content
 - `send-text` to inject input
@@ -115,7 +115,7 @@ Tier 3 (optional, high ROI only): **Selective vendoring of WezTerm crates**
 - Goal: reduce subprocess overhead + enable “subscribe to output” instead of polling.
 - Done as an *optional feature* with hard version checks and clear fallback to Tier 1.
 
-### 4.2 Canonical WezTerm setup (enforced by `ft setup`)
+### 4.2 Canonical compatibility-backend setup (current bridge: WezTerm, enforced by `ft setup`)
 
 We standardize (and optionally auto-install) the remote mux server approach:
 - systemd user unit for `wezterm-mux-server`
@@ -594,7 +594,7 @@ Each time a real-world pattern changes (agent output format drift), add:
 	- `ft robot quick-start`
 
 	### Phase 1: Observation MVP (week 1)
-	- WezTerm CLI adapter: list panes, get text, send text
+	- Compatibility backend CLI adapter (current bridge: WezTerm): list panes, get text, send text
 	- capture loop with adaptive polling + delta extraction
 	- store captures + FTS
 	- `ft robot state/get-text/search`
@@ -666,7 +666,7 @@ Each time a real-world pattern changes (agent output format drift), add:
 	- `ft workflow` — run a workflow manually (guarded)
 	- `ft rules` — list/test rule packs, show matching traces
 	- `ft accounts` — list/refresh accounts, show rotation picks (delegates to `caut`)
-	- `ft setup` — local/remote canonical WezTerm configuration
+	- `ft setup` — local/remote canonical backend-bridge configuration (current: WezTerm)
 	- `ft doctor` — environment checks (wezterm presence, version parity, DB health)
 	- `ft export` — export slices of history (JSONL/NDJSON), DB snapshot, or reports
 	- `ft web` — start HTTP server (`fastapi_rust`) if enabled

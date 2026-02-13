@@ -2,7 +2,7 @@
 
 > **Vision**: Build the central nervous system for AI coding agent fleets—a tool so robust, intelligent, and ergonomic that it enables supersmart swarms of AI agents to coordinate seamlessly and solve humanity's hardest problems.
 
-> **One-sentence mission**: Turn WezTerm's mux into a high-reliability "terminal hypervisor" for agent swarms: *observe everything, understand key events, act safely and reliably, and expose a machine-optimized control surface for agents.*
+> **One-sentence mission**: Build ft into a high-reliability, swarm-native terminal platform for agent fleets: *observe everything, understand key events, act safely and reliably, and expose a machine-optimized control surface for agents.*
 
 ---
 
@@ -49,11 +49,11 @@
 
 `frankenterm` (`ft`) is a high-performance Rust CLI and MCP server that provides:
 
-1. **Perfect Observability**: Real-time capture of ALL terminal output across ALL panes in ALL WezTerm domains
+1. **Perfect Observability**: Real-time capture of ALL terminal output across ALL panes in ALL supported runtime domains (current bridge: WezTerm)
 2. **Intelligent Detection**: SIMD-accelerated pattern matching to identify agent events (compaction, usage limits, errors, session boundaries)
 3. **Automated Response**: Workflow engine that reacts to detected events (quota-aware pause/resume, optional credential failover, context refresh, session resumption)
 4. **Agent-First Control**: Robot mode and MCP interface optimized for AI agents controlling other AI agents
-5. **Deep Integration**: Optional WezTerm vendoring for capabilities beyond public APIs
+5. **Deep Integration**: Compatibility bridge hardening plus native ft runtime expansion for capabilities beyond current public APIs
 
 ### 1.2 Core Principles
 
@@ -64,7 +64,7 @@
 | **Agent-first ergonomics** | Designed for AI agents to use, optimized for token efficiency |
 | **Zero-copy hot paths** | Performance is critical—every Bash command goes through this |
 | **Graceful degradation** | Failures should be handled, not propagated |
-| **Single canonical setup** | One way to configure WezTerm = simpler automation |
+| **Single canonical setup** | One way to configure the active backend/runtime = simpler automation |
 
 ### 1.3 Success Metrics
 
@@ -79,7 +79,7 @@
 
 - **Not replacing agents**: ft orchestrates agents, it doesn't replace Claude Code/Codex/Gemini
 - **Not a general scheduler**: Day 1 is single-machine coordination; distributed scheduling comes later
-- **Not forking WezTerm**: Selective vendoring if ROI is overwhelming, but prefer upstream CLI
+- **Not freezing at compatibility bridge**: Keep bridge reliability high while ft evolves into a full runtime replacement
 
 ---
 
@@ -95,7 +95,7 @@ Grounding the design in concrete use cases ensures we build what matters.
 | H2 | "Search: where did the agent mention `panic` / `clippy` / `usage limit` last week?" | P0 |
 | H3 | "This Codex pane hit limit; rotate accounts, re-auth, resume session, send `proceed.`" | P0 |
 | H4 | "After compaction, automatically re-inject a context refresh prompt." | P0 |
-| H5 | "Bring a new remote host online: install matching WezTerm, set up mux server, standardize config." | P1 |
+| H5 | "Bring a new remote host online: install supported backend runtime (currently WezTerm bridge), standardize config." | P1 |
 | H6 | "I want a clean UI to browse panes and events when debugging at 2am." | P2 |
 | H7 | "Export today's session logs for analysis or archival." | P2 |
 
@@ -1403,7 +1403,7 @@ Patterns are organized into "packs" for scalability and maintainability:
 core.codex         # Codex CLI patterns
 core.claude_code   # Claude Code patterns
 core.gemini        # Gemini CLI patterns
-core.wezterm       # WezTerm mux/server diagnostics
+core.wezterm       # Compatibility backend bridge diagnostics (current: WezTerm mux/server)
 org.local          # User custom rules
 ```
 
@@ -2338,7 +2338,7 @@ Error format:
 ```rust
 #[derive(Parser)]
 #[command(name = "ft")]
-#[command(about = "ft — FrankenTerm — terminal hypervisor for AI agent swarms")]
+#[command(about = "ft — FrankenTerm — swarm-native terminal platform for AI agent fleets")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -2546,7 +2546,7 @@ fn quick_start_help() -> String {
     r#"
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║                         ft — FrankenTerm                                     ║
-║           Terminal hypervisor for AI agent swarms                             ║
+║      Swarm-native terminal platform for AI agent fleets                      ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
 QUICK START
@@ -3305,7 +3305,7 @@ config.ssh_domains = {
 
     // Add wa integration
     lua.push_str(r#"
--- WezTerm Automata (wa) Integration
+-- FrankenTerm (ft) compatibility-bridge integration
 wezterm.on('user-var-changed', function(window, pane, name, value)
   if name:match('^wa%-') then
     wezterm.background_child_process {
@@ -3909,7 +3909,7 @@ pub fn check_version_compatibility() -> Result<VersionStatus> {
 
 ### Phase 1: Foundation (Weeks 1-2)
 - [ ] Project setup with Cargo workspace
-- [ ] Core WezTerm CLI client wrapper
+- [ ] Core compatibility-backend CLI client wrapper (current bridge: WezTerm)
 - [ ] SQLite storage with FTS5
 - [ ] Basic pattern engine (Claude Code, Codex)
 - [ ] Watcher daemon with adaptive polling
@@ -4325,7 +4325,7 @@ Human-oriented (rich output by default via `rich_rust`):
 | `ft workflow` | Run a workflow manually (guarded) |
 | `ft rules` | List/test rule packs, show matching traces |
 | `ft accounts` | List/refresh accounts, show rotation picks |
-| `ft setup` | Local/remote canonical WezTerm configuration |
+| `ft setup` | Local/remote canonical backend-bridge configuration (current: WezTerm) |
 | `ft doctor` | Environment checks (wezterm presence, version parity, DB health) |
 | `ft export` | Export slices of history (JSONL/NDJSON), DB snapshot, or reports |
 | `ft web` | Start HTTP server (`fastapi_rust`) if enabled |
@@ -4410,7 +4410,7 @@ All MCP errors use stable codes prefixed with `WA-MCP-`:
 | `WA-MCP-0001` | Invalid arguments | `robot.invalid_args` |
 | `WA-MCP-0002` | Unknown tool/resource | `robot.unknown_subcommand` |
 | `WA-MCP-0003` | Config error | `robot.config_error` |
-| `WA-MCP-0004` | WezTerm CLI error | `robot.wezterm_error` |
+| `WA-MCP-0004` | Backend bridge CLI error (current: WezTerm) | `robot.wezterm_error` |
 | `WA-MCP-0005` | Storage error | `robot.storage_error` |
 | `WA-MCP-0006` | Policy denied | `robot.policy_denied` |
 | `WA-MCP-0007` | Pane not found | `robot.pane_not_found` |
@@ -4839,7 +4839,7 @@ If we enable vendoring:
 
 ## Summary
 
-This plan outlines a comprehensive system for automating AI coding agent fleets through WezTerm. The key innovations are:
+This plan outlines a comprehensive system for automating AI coding agent fleets through a swarm-native terminal platform with a current WezTerm compatibility bridge. The key innovations are:
 
 1. **Deterministic Automation**: No timing heuristics; actions based on observed state
 2. **Multi-Tier Integration**: CLI → Lua IPC → Vendored, with graceful fallback

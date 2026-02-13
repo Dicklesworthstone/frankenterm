@@ -47,14 +47,14 @@ Foundation types with no dependencies on ft business logic.
 **Dependency rule:** Ring 0 modules depend only on external crates (serde, tokio,
 clap, etc.) and each other. Never on Ring 1+.
 
-## Ring 1: Data (Storage, WezTerm IPC, Ingest)
+## Ring 1: Data (Storage, Backend Bridge IPC, Ingest)
 
-Data access and I/O layer. Reads from/writes to WezTerm and SQLite.
+Data access and I/O layer. Reads from/writes to the active backend bridge (current: WezTerm) and SQLite.
 
 | Module | Responsibility |
 |--------|---------------|
-| `wezterm` | WezTerm CLI client wrapper (`wezterm cli list/get-text`) |
-| `pool` | Connection pooling for WezTerm CLI |
+| `wezterm` | Backend bridge CLI client wrapper (current: `wezterm cli list/get-text`) |
+| `pool` | Connection pooling for backend bridge CLI |
 | `storage` | SQLite storage with FTS5 search |
 | `storage_targets` | Multi-target storage routing |
 | `ingest` | Pane output capture and delta extraction |

@@ -32,6 +32,23 @@ Additional simulation actions used by this suite:
 
 The mock simulation runtime encodes these as append markers/content so expectations and timeline replay remain deterministic.
 
+## Resize Timeline Instrumentation
+
+`Scenario` now exposes stage-level resize timeline probes for baseline attribution:
+
+- `execute_all_with_resize_timeline`
+- `execute_until_with_resize_timeline`
+
+Each resize-class event (`resize`, `set_font_size`, `generate_scrollback`) emits ordered stage samples:
+
+1. `input_intent`
+2. `scheduler_queueing` (includes queue depth before/after)
+3. `logical_reflow`
+4. `render_prep`
+5. `presentation`
+
+The timeline artifact includes nanosecond stage durations, per-event structured records, stage summaries (`p95`, `max`, `avg`), and flamegraph-ready rows via `flame_samples()`.
+
 ## How To Run
 
 ```bash

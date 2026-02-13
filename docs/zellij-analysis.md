@@ -151,8 +151,8 @@ This design supports:
 
 Porting assessment:
 
-- **Strongly recommended** to port this conceptual approach into a FrankenTerm muxer if we ever move beyond “WezTerm mux topology only”.
-- For FrankenTerm’s *current* architecture (hypervisor controlling WezTerm), the immediate value is:
+- **Strongly recommended** to port this conceptual approach into a FrankenTerm muxer as ft expands beyond the current WezTerm compatibility bridge topology.
+- For FrankenTerm’s *current* architecture (swarm platform with a WezTerm compatibility bridge), the immediate value is:
   - a reference design for a future mux server, and
   - a cautionary tale: proportional resizing becomes unmaintainable as soon as floating/stacked panes exist.
 
@@ -193,4 +193,3 @@ If you haven’t read it yet, start with:
 - `evidence/zellij/INVENTORY.md` — crate map + server message bus + orchestration patterns
 
 This doc assumes that context and drills into the muxer/layout surface specifically.
-
