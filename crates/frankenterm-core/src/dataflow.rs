@@ -780,7 +780,7 @@ impl DataflowGraph {
 
         let mut queue: VecDeque<NodeId> = in_degree
             .iter()
-            .filter(|(_, &deg)| deg == 0)
+            .filter(|&(_, &deg)| deg == 0)
             .map(|(&id, _)| id)
             .collect();
 
@@ -936,7 +936,7 @@ impl DataflowGraph {
 
         let mut queue: VecDeque<NodeId> = in_degree
             .iter()
-            .filter(|(_, &deg)| deg == 0)
+            .filter(|&(_, &deg)| deg == 0)
             .map(|(&id, _)| id)
             .collect();
 
@@ -1025,32 +1025,34 @@ mod tests {
         // Diamond: S -> A, S -> B, A+B -> C.
         // When S changes, C should see the new values of both A and B,
         // never a mix of old and new.
-        let mut g = DataflowGraph::new();
-        let s = g.add_source("s", Value::Int(1));
-        let a = g.add_map("a", vec![s], |i| match &i[0] {
+        let mut graph = DataflowGraph::new();
+        let source = graph.add_source("s", Value::Int(1));
+        let add_ten = graph.add_map("a", vec![source], |inputs| match &inputs[0] {
             Value::Int(v) => Value::Int(v + 10),
             _ => Value::None,
         });
-        let b = g.add_map("b", vec![s], |i| match &i[0] {
+        let add_hundred = graph.add_map("b", vec![source], |inputs| match &inputs[0] {
             Value::Int(v) => Value::Int(v + 100),
             _ => Value::None,
         });
-        let c = g.add_combine("c", vec![a, b], |inputs| match (&inputs[0], &inputs[1]) {
-            (Value::Int(x), Value::Int(y)) => Value::Int(x + y),
-            _ => Value::None,
+        let combined = graph.add_combine("c", vec![add_ten, add_hundred], |inputs| {
+            match (&inputs[0], &inputs[1]) {
+                (Value::Int(lhs), Value::Int(rhs)) => Value::Int(lhs + rhs),
+                _ => Value::None,
+            }
         });
 
-        g.propagate();
+        graph.propagate();
         // S=1 → A=11, B=101 → C=112
-        assert_eq!(g.get_value(c), Some(&Value::Int(112)));
+        assert_eq!(graph.get_value(combined), Some(&Value::Int(112)));
 
         // Update S to 2. A should become 12, B should become 102, C should be 114.
         // Glitch would be: C sees A=12 + B=101 = 113 (if B not yet updated).
-        g.update_source(s, Value::Int(2)).unwrap();
-        g.propagate();
-        assert_eq!(g.get_value(a), Some(&Value::Int(12)));
-        assert_eq!(g.get_value(b), Some(&Value::Int(102)));
-        assert_eq!(g.get_value(c), Some(&Value::Int(114)));
+        graph.update_source(source, Value::Int(2)).unwrap();
+        graph.propagate();
+        assert_eq!(graph.get_value(add_ten), Some(&Value::Int(12)));
+        assert_eq!(graph.get_value(add_hundred), Some(&Value::Int(102)));
+        assert_eq!(graph.get_value(combined), Some(&Value::Int(114)));
     }
 
     #[test]
