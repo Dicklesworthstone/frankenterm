@@ -741,3 +741,99 @@ impl Domain for LocalDomain {
         DomainState::Attached
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn domain_state_equality() {
+        assert_eq!(DomainState::Detached, DomainState::Detached);
+        assert_eq!(DomainState::Attached, DomainState::Attached);
+        assert_ne!(DomainState::Detached, DomainState::Attached);
+    }
+
+    #[test]
+    fn domain_state_clone_copy() {
+        let s = DomainState::Attached;
+        let s2 = s; // Copy
+        let s3 = s.clone(); // Clone
+        assert_eq!(s, s2);
+        assert_eq!(s, s3);
+    }
+
+    #[test]
+    fn domain_state_debug() {
+        let dbg = format!("{:?}", DomainState::Detached);
+        assert!(dbg.contains("Detached"));
+        let dbg = format!("{:?}", DomainState::Attached);
+        assert!(dbg.contains("Attached"));
+    }
+
+    #[test]
+    fn split_source_move_pane() {
+        let a = SplitSource::MovePane(42);
+        let b = SplitSource::MovePane(42);
+        assert_eq!(a, b);
+
+        let c = SplitSource::MovePane(99);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn split_source_spawn_no_command() {
+        let a = SplitSource::Spawn {
+            command: None,
+            command_dir: None,
+        };
+        let b = SplitSource::Spawn {
+            command: None,
+            command_dir: None,
+        };
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn split_source_spawn_with_dir() {
+        let a = SplitSource::Spawn {
+            command: None,
+            command_dir: Some("/home/user".to_string()),
+        };
+        let b = SplitSource::Spawn {
+            command: None,
+            command_dir: Some("/home/user".to_string()),
+        };
+        assert_eq!(a, b);
+
+        let c = SplitSource::Spawn {
+            command: None,
+            command_dir: Some("/tmp".to_string()),
+        };
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn split_source_debug() {
+        let s = SplitSource::MovePane(5);
+        let dbg = format!("{:?}", s);
+        assert!(dbg.contains("MovePane"));
+        assert!(dbg.contains("5"));
+    }
+
+    #[test]
+    fn split_source_clone() {
+        let a = SplitSource::MovePane(10);
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn split_source_variants_inequality() {
+        let spawn = SplitSource::Spawn {
+            command: None,
+            command_dir: None,
+        };
+        let mv = SplitSource::MovePane(0);
+        assert_ne!(spawn, mv);
+    }
+}

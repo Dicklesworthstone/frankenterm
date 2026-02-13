@@ -1130,4 +1130,236 @@ mod test {
             _ => unreachable!(),
         }
     }
+
+    // ── PaneConstraints ──────────────────────────────────────
+
+    #[test]
+    fn pane_constraints_default() {
+        let c = PaneConstraints::default();
+        assert_eq!(c.min_width, 5);
+        assert_eq!(c.min_height, 3);
+        assert!(c.max_width.is_none());
+        assert!(c.max_height.is_none());
+        assert!(c.preferred_width.is_none());
+        assert!(c.preferred_height.is_none());
+        assert!(!c.fixed);
+    }
+
+    #[test]
+    fn pane_constraints_equality() {
+        let a = PaneConstraints::default();
+        let b = PaneConstraints::default();
+        assert_eq!(a, b);
+
+        let c = PaneConstraints {
+            min_width: 10,
+            ..Default::default()
+        };
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn pane_constraints_clone_copy() {
+        let a = PaneConstraints {
+            min_width: 20,
+            min_height: 10,
+            max_width: Some(200),
+            max_height: Some(100),
+            preferred_width: Some(80),
+            preferred_height: Some(24),
+            fixed: true,
+        };
+        let b = a; // Copy
+        let c = a.clone(); // Clone
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+    }
+
+    #[test]
+    fn pane_constraints_debug() {
+        let c = PaneConstraints::default();
+        let dbg = format!("{:?}", c);
+        assert!(dbg.contains("PaneConstraints"));
+        assert!(dbg.contains("min_width"));
+    }
+
+    // ── CollapsePriority ─────────────────────────────────────
+
+    #[test]
+    fn collapse_priority_default_is_normal() {
+        assert_eq!(CollapsePriority::default(), CollapsePriority::Normal);
+    }
+
+    #[test]
+    fn collapse_priority_equality() {
+        assert_eq!(CollapsePriority::Never, CollapsePriority::Never);
+        assert_eq!(CollapsePriority::Low, CollapsePriority::Low);
+        assert_eq!(CollapsePriority::Normal, CollapsePriority::Normal);
+        assert_eq!(CollapsePriority::High, CollapsePriority::High);
+        assert_ne!(CollapsePriority::Never, CollapsePriority::High);
+        assert_ne!(CollapsePriority::Low, CollapsePriority::Normal);
+    }
+
+    #[test]
+    fn collapse_priority_clone_copy() {
+        let p = CollapsePriority::High;
+        let p2 = p; // Copy
+        let p3 = p.clone(); // Clone
+        assert_eq!(p, p2);
+        assert_eq!(p, p3);
+    }
+
+    // ── PerformAssignmentResult ──────────────────────────────
+
+    #[test]
+    fn perform_assignment_result_equality() {
+        assert_eq!(
+            PerformAssignmentResult::Unhandled,
+            PerformAssignmentResult::Unhandled
+        );
+        assert_eq!(
+            PerformAssignmentResult::Handled,
+            PerformAssignmentResult::Handled
+        );
+        assert_eq!(
+            PerformAssignmentResult::BlockAssignmentAndRouteToKeyDown,
+            PerformAssignmentResult::BlockAssignmentAndRouteToKeyDown
+        );
+        assert_ne!(
+            PerformAssignmentResult::Unhandled,
+            PerformAssignmentResult::Handled
+        );
+    }
+
+    #[test]
+    fn perform_assignment_result_clone_copy() {
+        let r = PerformAssignmentResult::Handled;
+        let r2 = r; // Copy
+        let r3 = r.clone(); // Clone
+        assert_eq!(r, r2);
+        assert_eq!(r, r3);
+    }
+
+    // ── SearchResult ─────────────────────────────────────────
+
+    #[test]
+    fn search_result_equality() {
+        let a = SearchResult {
+            start_y: 0,
+            start_x: 5,
+            end_y: 0,
+            end_x: 10,
+            match_id: 1,
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn search_result_ordering() {
+        let a = SearchResult {
+            start_y: 0,
+            start_x: 0,
+            end_y: 0,
+            end_x: 5,
+            match_id: 1,
+        };
+        let b = SearchResult {
+            start_y: 1,
+            start_x: 0,
+            end_y: 1,
+            end_x: 5,
+            match_id: 2,
+        };
+        assert!(a < b);
+
+        let c = SearchResult {
+            start_y: 0,
+            start_x: 3,
+            end_y: 0,
+            end_x: 8,
+            match_id: 3,
+        };
+        assert!(a < c);
+    }
+
+    // ── Pattern ──────────────────────────────────────────────
+
+    #[test]
+    fn pattern_default_is_empty_case_sensitive() {
+        let p = Pattern::default();
+        assert_eq!(p, Pattern::CaseSensitiveString("".to_string()));
+    }
+
+    #[test]
+    fn pattern_deref_returns_inner_string() {
+        let p = Pattern::CaseSensitiveString("hello".to_string());
+        assert_eq!(&*p, "hello");
+
+        let p = Pattern::CaseInSensitiveString("world".to_string());
+        assert_eq!(&*p, "world");
+
+        let p = Pattern::Regex("foo.*bar".to_string());
+        assert_eq!(&*p, "foo.*bar");
+    }
+
+    #[test]
+    fn pattern_deref_mut() {
+        let mut p = Pattern::CaseSensitiveString("hello".to_string());
+        p.push_str(" world");
+        assert_eq!(&*p, "hello world");
+    }
+
+    #[test]
+    fn pattern_equality() {
+        let a = Pattern::CaseSensitiveString("test".to_string());
+        let b = Pattern::CaseSensitiveString("test".to_string());
+        assert_eq!(a, b);
+
+        let c = Pattern::CaseInSensitiveString("test".to_string());
+        assert_ne!(a, c);
+    }
+
+    // ── PatternType ──────────────────────────────────────────
+
+    #[test]
+    fn pattern_type_from_pattern() {
+        let p = Pattern::CaseSensitiveString("x".to_string());
+        assert_eq!(PatternType::from(&p), PatternType::CaseSensitiveString);
+
+        let p = Pattern::CaseInSensitiveString("x".to_string());
+        assert_eq!(PatternType::from(&p), PatternType::CaseInSensitiveString);
+
+        let p = Pattern::Regex("x".to_string());
+        assert_eq!(PatternType::from(&p), PatternType::Regex);
+    }
+
+    #[test]
+    fn pattern_type_equality() {
+        assert_eq!(PatternType::Regex, PatternType::Regex);
+        assert_ne!(
+            PatternType::CaseSensitiveString,
+            PatternType::CaseInSensitiveString
+        );
+    }
+
+    // ── CloseReason ──────────────────────────────────────────
+
+    #[test]
+    fn close_reason_equality() {
+        assert_eq!(CloseReason::Window, CloseReason::Window);
+        assert_eq!(CloseReason::Tab, CloseReason::Tab);
+        assert_eq!(CloseReason::Pane, CloseReason::Pane);
+        assert_ne!(CloseReason::Window, CloseReason::Tab);
+        assert_ne!(CloseReason::Tab, CloseReason::Pane);
+    }
+
+    #[test]
+    fn close_reason_clone_copy() {
+        let r = CloseReason::Window;
+        let r2 = r; // Copy
+        let r3 = r.clone(); // Clone
+        assert_eq!(r, r2);
+        assert_eq!(r, r3);
+    }
 }

@@ -361,6 +361,45 @@ fn split_allocation(
     Some((first, second))
 }
 
+fn split_dimension_for_request(
+    dim: usize,
+    request: SplitRequest,
+    min_first: usize,
+    min_second: usize,
+) -> Option<(usize, usize)> {
+    let requested = match request.size {
+        SplitSize::Cells(n) => n,
+        SplitSize::Percent(n) => (dim * (n as usize)) / 100,
+    }
+    .max(1);
+
+    if request.target_is_second {
+        let preferred_first = dim.saturating_sub(1).saturating_sub(requested);
+        split_allocation(dim, min_first, min_second, preferred_first)
+    } else {
+        split_allocation(dim, min_first, min_second, requested)
+    }
+}
+
+fn pane_size_satisfies_constraints(size: &TerminalSize, constraints: PaneConstraints) -> bool {
+    let min_width = constraints.min_width.max(1);
+    let min_height = constraints.min_height.max(1);
+    if size.cols < min_width || size.rows < min_height {
+        return false;
+    }
+    if let Some(max_width) = constraints.max_width {
+        if size.cols > max_width {
+            return false;
+        }
+    }
+    if let Some(max_height) = constraints.max_height {
+        if size.rows > max_height {
+            return false;
+        }
+    }
+    true
+}
+
 fn adjust_x_size(tree: &mut Tree, mut x_adjust: isize, cell_dimensions: &TerminalSize) {
     let (min_x, _) = compute_min_size(tree);
     while x_adjust != 0 {
@@ -1985,35 +2024,52 @@ impl TabInner {
         request: SplitRequest,
     ) -> Option<SplitDirectionAndSize> {
         let cell_dims = self.cell_dimensions();
-
-        fn split_dimension(dim: usize, request: SplitRequest) -> (usize, usize) {
-            let target_size = match request.size {
-                SplitSize::Cells(n) => n,
-                SplitSize::Percent(n) => (dim * (n as usize)) / 100,
-            }
-            .max(1);
-
-            let remain = dim.saturating_sub(target_size + 1);
-
-            if request.target_is_second {
-                (remain, target_size)
-            } else {
-                (target_size, remain)
-            }
-        }
+        let default_new_constraints = PaneConstraints::default();
 
         if request.top_level {
             let size = self.size;
+            let (tree_min_x, tree_min_y) =
+                compute_min_size(self.pane.as_ref().unwrap_or(&Tree::Empty));
 
             let ((width1, width2), (height1, height2)) = match request.direction {
-                SplitDirection::Horizontal => (
-                    split_dimension(size.cols as usize, request),
-                    (size.rows as usize, size.rows as usize),
-                ),
-                SplitDirection::Vertical => (
-                    (size.cols as usize, size.cols as usize),
-                    split_dimension(size.rows as usize, request),
-                ),
+                SplitDirection::Horizontal => {
+                    let min_first = if request.target_is_second {
+                        tree_min_x
+                    } else {
+                        default_new_constraints.min_width
+                    };
+                    let min_second = if request.target_is_second {
+                        default_new_constraints.min_width
+                    } else {
+                        tree_min_x
+                    };
+                    let widths = split_dimension_for_request(
+                        size.cols as usize,
+                        request,
+                        min_first.max(1),
+                        min_second.max(1),
+                    )?;
+                    (widths, (size.rows as usize, size.rows as usize))
+                }
+                SplitDirection::Vertical => {
+                    let min_first = if request.target_is_second {
+                        tree_min_y
+                    } else {
+                        default_new_constraints.min_height
+                    };
+                    let min_second = if request.target_is_second {
+                        default_new_constraints.min_height
+                    } else {
+                        tree_min_y
+                    };
+                    let heights = split_dimension_for_request(
+                        size.rows as usize,
+                        request,
+                        min_first.max(1),
+                        min_second.max(1),
+                    )?;
+                    ((size.cols as usize, size.cols as usize), heights)
+                }
             };
 
             return Some(SplitDirectionAndSize {
@@ -2039,18 +2095,50 @@ impl TabInner {
         // a bogus split state (https://github.com/wezterm/wezterm/issues/723)
         self.set_zoomed(false);
 
-        self.iter_panes().iter().nth(pane_index).map(|pos| {
+        self.iter_panes().iter().nth(pane_index).and_then(|pos| {
+            let existing_constraints = pos.pane.pane_constraints();
             let ((width1, width2), (height1, height2)) = match request.direction {
-                SplitDirection::Horizontal => (
-                    split_dimension(pos.width, request),
-                    (pos.height, pos.height),
-                ),
+                SplitDirection::Horizontal => {
+                    let min_first = if request.target_is_second {
+                        existing_constraints.min_width
+                    } else {
+                        default_new_constraints.min_width
+                    };
+                    let min_second = if request.target_is_second {
+                        default_new_constraints.min_width
+                    } else {
+                        existing_constraints.min_width
+                    };
+                    let widths = split_dimension_for_request(
+                        pos.width,
+                        request,
+                        min_first.max(1),
+                        min_second.max(1),
+                    )?;
+                    (widths, (pos.height, pos.height))
+                }
                 SplitDirection::Vertical => {
-                    ((pos.width, pos.width), split_dimension(pos.height, request))
+                    let min_first = if request.target_is_second {
+                        existing_constraints.min_height
+                    } else {
+                        default_new_constraints.min_height
+                    };
+                    let min_second = if request.target_is_second {
+                        default_new_constraints.min_height
+                    } else {
+                        existing_constraints.min_height
+                    };
+                    let heights = split_dimension_for_request(
+                        pos.height,
+                        request,
+                        min_first.max(1),
+                        min_second.max(1),
+                    )?;
+                    ((pos.width, pos.width), heights)
                 }
             };
 
-            SplitDirectionAndSize {
+            Some(SplitDirectionAndSize {
                 direction: request.direction,
                 first: TerminalSize {
                     rows: height1 as _,
@@ -2066,7 +2154,7 @@ impl TabInner {
                     pixel_width: cell_dims.pixel_width * width2,
                     dpi: cell_dims.dpi,
                 },
-            }
+            })
         })
     }
 
@@ -2169,6 +2257,18 @@ impl TabInner {
             } else {
                 (pane, existing_pane)
             };
+
+            let pane1_constraints = pane1.pane_constraints();
+            let pane2_constraints = pane2.pane_constraints();
+            if !pane_size_satisfies_constraints(&split_info.first, pane1_constraints)
+                || !pane_size_satisfies_constraints(&split_info.second, pane2_constraints)
+            {
+                anyhow::bail!(
+                    "No space for split constraints: first={:?} second={:?}",
+                    split_info.first,
+                    split_info.second
+                );
+            }
 
             pane1.resize(split_info.first)?;
             pane2.resize(split_info.second.clone())?;
@@ -2833,6 +2933,81 @@ mod test {
         assert_eq!(20, panes[1].width);
     }
 
+    #[test]
+    fn compute_split_size_clamps_to_existing_constraints() {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new_with_constraints(
+            1,
+            size,
+            PaneConstraints {
+                min_width: 30,
+                ..PaneConstraints::default()
+            },
+        ));
+
+        let split = tab
+            .compute_split_size(
+                0,
+                SplitRequest {
+                    direction: SplitDirection::Horizontal,
+                    target_is_second: true,
+                    size: SplitSize::Cells(70),
+                    ..Default::default()
+                },
+            )
+            .expect("split to compute");
+
+        assert_eq!(30, split.first.cols);
+        assert_eq!(49, split.second.cols);
+    }
+
+    #[test]
+    fn split_and_insert_rejects_unfittable_constraints() {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new_with_constraints(
+            1,
+            size,
+            PaneConstraints {
+                min_width: 30,
+                ..PaneConstraints::default()
+            },
+        ));
+
+        let result = tab.split_and_insert(
+            0,
+            SplitRequest {
+                direction: SplitDirection::Horizontal,
+                target_is_second: true,
+                size: SplitSize::Cells(5),
+                ..Default::default()
+            },
+            FakePane::new_with_constraints(
+                2,
+                size,
+                PaneConstraints {
+                    min_width: 60,
+                    ..PaneConstraints::default()
+                },
+            ),
+        );
+
+        assert!(result.is_err());
+    }
+
     fn is_send_and_sync<T: Send + Sync>() -> bool {
         true
     }
@@ -2840,5 +3015,356 @@ mod test {
     #[test]
     fn tab_is_send_and_sync() {
         assert!(is_send_and_sync::<Tab>());
+    }
+
+    // ── SplitDirection ───────────────────────────────────────
+
+    #[test]
+    fn split_direction_equality() {
+        assert_eq!(SplitDirection::Horizontal, SplitDirection::Horizontal);
+        assert_eq!(SplitDirection::Vertical, SplitDirection::Vertical);
+        assert_ne!(SplitDirection::Horizontal, SplitDirection::Vertical);
+    }
+
+    #[test]
+    fn split_direction_clone_copy() {
+        let d = SplitDirection::Horizontal;
+        let d2 = d; // Copy
+        let d3 = d.clone(); // Clone
+        assert_eq!(d, d2);
+        assert_eq!(d, d3);
+    }
+
+    #[test]
+    fn split_direction_debug() {
+        assert!(format!("{:?}", SplitDirection::Horizontal).contains("Horizontal"));
+        assert!(format!("{:?}", SplitDirection::Vertical).contains("Vertical"));
+    }
+
+    // ── SplitSize ────────────────────────────────────────────
+
+    #[test]
+    fn split_size_default_is_50_percent() {
+        assert_eq!(SplitSize::default(), SplitSize::Percent(50));
+    }
+
+    #[test]
+    fn split_size_equality() {
+        assert_eq!(SplitSize::Cells(10), SplitSize::Cells(10));
+        assert_eq!(SplitSize::Percent(50), SplitSize::Percent(50));
+        assert_ne!(SplitSize::Cells(10), SplitSize::Cells(20));
+        assert_ne!(SplitSize::Cells(50), SplitSize::Percent(50));
+    }
+
+    #[test]
+    fn split_size_clone_copy() {
+        let s = SplitSize::Cells(42);
+        let s2 = s; // Copy
+        let s3 = s.clone(); // Clone
+        assert_eq!(s, s2);
+        assert_eq!(s, s3);
+    }
+
+    // ── SplitRequest ─────────────────────────────────────────
+
+    #[test]
+    fn split_request_default() {
+        let r = SplitRequest::default();
+        assert_eq!(r.direction, SplitDirection::Horizontal);
+        assert!(r.target_is_second);
+        assert!(!r.top_level);
+        assert_eq!(r.size, SplitSize::Percent(50));
+    }
+
+    #[test]
+    fn split_request_equality() {
+        let a = SplitRequest::default();
+        let b = SplitRequest::default();
+        assert_eq!(a, b);
+        let c = SplitRequest {
+            direction: SplitDirection::Vertical,
+            ..Default::default()
+        };
+        assert_ne!(a, c);
+    }
+
+    // ── PositionedSplit ──────────────────────────────────────
+
+    #[test]
+    fn positioned_split_equality() {
+        let a = PositionedSplit {
+            index: 0,
+            direction: SplitDirection::Horizontal,
+            left: 40,
+            top: 0,
+            size: 24,
+        };
+        let b = PositionedSplit {
+            index: 0,
+            direction: SplitDirection::Horizontal,
+            left: 40,
+            top: 0,
+            size: 24,
+        };
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn positioned_split_inequality() {
+        let a = PositionedSplit {
+            index: 0,
+            direction: SplitDirection::Horizontal,
+            left: 40,
+            top: 0,
+            size: 24,
+        };
+        let b = PositionedSplit {
+            index: 1,
+            direction: SplitDirection::Vertical,
+            left: 0,
+            top: 12,
+            size: 80,
+        };
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn positioned_split_clone_copy() {
+        let a = PositionedSplit {
+            index: 5,
+            direction: SplitDirection::Vertical,
+            left: 10,
+            top: 20,
+            size: 30,
+        };
+        let b = a; // Copy
+        let c = a.clone(); // Clone
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+    }
+
+    #[test]
+    fn positioned_split_debug() {
+        let s = PositionedSplit {
+            index: 0,
+            direction: SplitDirection::Horizontal,
+            left: 40,
+            top: 0,
+            size: 24,
+        };
+        let dbg = format!("{:?}", s);
+        assert!(dbg.contains("PositionedSplit"));
+        assert!(dbg.contains("Horizontal"));
+    }
+
+    // ── SplitDirectionAndSize ────────────────────────────────
+
+    #[test]
+    fn split_direction_and_size_width_horizontal() {
+        let s = SplitDirectionAndSize {
+            direction: SplitDirection::Horizontal,
+            first: TerminalSize {
+                cols: 40,
+                rows: 24,
+                pixel_width: 400,
+                pixel_height: 600,
+                dpi: 96,
+            },
+            second: TerminalSize {
+                cols: 39,
+                rows: 24,
+                pixel_width: 390,
+                pixel_height: 600,
+                dpi: 96,
+            },
+        };
+        // Horizontal: first.cols + second.cols + 1 (for separator)
+        assert_eq!(s.width(), 80);
+        assert_eq!(s.height(), 24);
+    }
+
+    #[test]
+    fn split_direction_and_size_height_vertical() {
+        let s = SplitDirectionAndSize {
+            direction: SplitDirection::Vertical,
+            first: TerminalSize {
+                cols: 80,
+                rows: 12,
+                pixel_width: 800,
+                pixel_height: 300,
+                dpi: 96,
+            },
+            second: TerminalSize {
+                cols: 80,
+                rows: 11,
+                pixel_width: 800,
+                pixel_height: 275,
+                dpi: 96,
+            },
+        };
+        // Vertical: first.rows + second.rows + 1 (for separator)
+        assert_eq!(s.height(), 24);
+        assert_eq!(s.width(), 80);
+    }
+
+    // ── PaneNode ─────────────────────────────────────────────
+
+    #[test]
+    fn pane_node_empty_root_size_is_none() {
+        let node = PaneNode::Empty;
+        assert!(node.root_size().is_none());
+    }
+
+    #[test]
+    fn pane_node_empty_window_and_tab_ids_is_none() {
+        let node = PaneNode::Empty;
+        assert!(node.window_and_tab_ids().is_none());
+    }
+
+    #[test]
+    fn pane_node_leaf_root_size() {
+        let entry = PaneEntry {
+            window_id: 0,
+            tab_id: 0,
+            pane_id: 1,
+            title: "test".to_string(),
+            size: TerminalSize::default(),
+            working_dir: None,
+            is_active_pane: true,
+            is_zoomed_pane: false,
+            workspace: "default".to_string(),
+            cursor_pos: StableCursorPosition::default(),
+            physical_top: 0,
+            top_row: 0,
+            left_col: 0,
+            tty_name: None,
+        };
+        let node = PaneNode::Leaf(entry);
+        let size = node.root_size();
+        assert!(size.is_some());
+        assert_eq!(size.unwrap().rows, 24);
+        assert_eq!(size.unwrap().cols, 80);
+    }
+
+    #[test]
+    fn pane_node_leaf_window_and_tab_ids() {
+        let entry = PaneEntry {
+            window_id: 5,
+            tab_id: 10,
+            pane_id: 1,
+            title: "test".to_string(),
+            size: TerminalSize::default(),
+            working_dir: None,
+            is_active_pane: false,
+            is_zoomed_pane: false,
+            workspace: "ws".to_string(),
+            cursor_pos: StableCursorPosition::default(),
+            physical_top: 0,
+            top_row: 0,
+            left_col: 0,
+            tty_name: Some("/dev/pts/0".to_string()),
+        };
+        let node = PaneNode::Leaf(entry);
+        assert_eq!(node.window_and_tab_ids(), Some((5, 10)));
+    }
+
+    #[test]
+    fn pane_node_debug() {
+        let node = PaneNode::Empty;
+        let dbg = format!("{:?}", node);
+        assert!(dbg.contains("Empty"));
+    }
+
+    // ── SerdeUrl ─────────────────────────────────────────────
+
+    #[test]
+    fn serde_url_from_url() {
+        let url = Url::parse("https://example.com").unwrap();
+        let serde_url = SerdeUrl::from(url.clone());
+        assert_eq!(serde_url.url, url);
+    }
+
+    #[test]
+    fn serde_url_try_from_string() {
+        let serde_url = SerdeUrl::try_from("https://example.com".to_string());
+        assert!(serde_url.is_ok());
+        assert_eq!(serde_url.unwrap().url.as_str(), "https://example.com/");
+    }
+
+    #[test]
+    fn serde_url_try_from_invalid_string() {
+        let result = SerdeUrl::try_from("not a url".to_string());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn serde_url_into_string() {
+        let url = Url::parse("https://example.com/path").unwrap();
+        let serde_url = SerdeUrl::from(url);
+        let s: String = serde_url.into();
+        assert_eq!(s, "https://example.com/path");
+    }
+
+    #[test]
+    fn serde_url_into_url() {
+        let url = Url::parse("file:///home/user").unwrap();
+        let serde_url = SerdeUrl::from(url.clone());
+        let back: Url = serde_url.into();
+        assert_eq!(back, url);
+    }
+
+    #[test]
+    fn serde_url_clone_eq() {
+        let url = Url::parse("https://example.com").unwrap();
+        let a = SerdeUrl::from(url);
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    // ── PaneEntry ────────────────────────────────────────────
+
+    #[test]
+    fn pane_entry_clone_eq() {
+        let entry = PaneEntry {
+            window_id: 0,
+            tab_id: 0,
+            pane_id: 1,
+            title: "shell".to_string(),
+            size: TerminalSize::default(),
+            working_dir: None,
+            is_active_pane: true,
+            is_zoomed_pane: false,
+            workspace: "default".to_string(),
+            cursor_pos: StableCursorPosition::default(),
+            physical_top: 0,
+            top_row: 0,
+            left_col: 0,
+            tty_name: None,
+        };
+        let cloned = entry.clone();
+        assert_eq!(entry, cloned);
+    }
+
+    #[test]
+    fn pane_entry_debug() {
+        let entry = PaneEntry {
+            window_id: 1,
+            tab_id: 2,
+            pane_id: 3,
+            title: "vim".to_string(),
+            size: TerminalSize::default(),
+            working_dir: None,
+            is_active_pane: false,
+            is_zoomed_pane: true,
+            workspace: "coding".to_string(),
+            cursor_pos: StableCursorPosition::default(),
+            physical_top: 100,
+            top_row: 0,
+            left_col: 5,
+            tty_name: Some("/dev/pts/1".to_string()),
+        };
+        let dbg = format!("{:?}", entry);
+        assert!(dbg.contains("PaneEntry"));
+        assert!(dbg.contains("vim"));
     }
 }

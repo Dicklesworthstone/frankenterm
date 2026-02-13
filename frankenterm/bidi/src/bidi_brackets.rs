@@ -135,3 +135,142 @@ pub const BIDI_BRACKETS: &'static [(char, char, BracketType)] = &[
     ('\u{ff62}', '\u{ff63}', BracketType::Open),  // HALFWIDTH LEFT CORNER BRACKET
     ('\u{ff63}', '\u{ff62}', BracketType::Close), // HALFWIDTH RIGHT CORNER BRACKET
 ];
+
+#[cfg(test)]
+mod tests {
+    extern crate alloc;
+    use super::*;
+
+    #[test]
+    fn bracket_type_open_close_equality() {
+        assert_eq!(BracketType::Open, BracketType::Open);
+        assert_eq!(BracketType::Close, BracketType::Close);
+        assert_ne!(BracketType::Open, BracketType::Close);
+    }
+
+    #[test]
+    fn bracket_type_clone_copy() {
+        let b = BracketType::Open;
+        let b2 = b; // Copy
+        let b3 = b.clone(); // Clone
+        assert_eq!(b, b2);
+        assert_eq!(b, b3);
+    }
+
+    #[test]
+    fn bracket_type_debug() {
+        let dbg = alloc::format!("{:?}", BracketType::Open);
+        assert!(dbg.contains("Open"));
+        let dbg = alloc::format!("{:?}", BracketType::Close);
+        assert!(dbg.contains("Close"));
+    }
+
+    #[test]
+    fn bidi_brackets_is_nonempty() {
+        assert!(!BIDI_BRACKETS.is_empty());
+    }
+
+    #[test]
+    fn bidi_brackets_ascii_parentheses() {
+        // '(' should map to ')' as Open
+        let entry = BIDI_BRACKETS.iter().find(|(c, _, _)| *c == '(');
+        assert!(entry.is_some());
+        let (_, pair, btype) = entry.unwrap();
+        assert_eq!(*pair, ')');
+        assert_eq!(*btype, BracketType::Open);
+    }
+
+    #[test]
+    fn bidi_brackets_ascii_parentheses_close() {
+        // ')' should map to '(' as Close
+        let entry = BIDI_BRACKETS.iter().find(|(c, _, _)| *c == ')');
+        assert!(entry.is_some());
+        let (_, pair, btype) = entry.unwrap();
+        assert_eq!(*pair, '(');
+        assert_eq!(*btype, BracketType::Close);
+    }
+
+    #[test]
+    fn bidi_brackets_square_brackets() {
+        let open = BIDI_BRACKETS.iter().find(|(c, _, _)| *c == '[');
+        assert!(open.is_some());
+        let (_, pair, btype) = open.unwrap();
+        assert_eq!(*pair, ']');
+        assert_eq!(*btype, BracketType::Open);
+
+        let close = BIDI_BRACKETS.iter().find(|(c, _, _)| *c == ']');
+        assert!(close.is_some());
+        let (_, pair, btype) = close.unwrap();
+        assert_eq!(*pair, '[');
+        assert_eq!(*btype, BracketType::Close);
+    }
+
+    #[test]
+    fn bidi_brackets_curly_braces() {
+        let open = BIDI_BRACKETS.iter().find(|(c, _, _)| *c == '{');
+        assert!(open.is_some());
+        let (_, pair, btype) = open.unwrap();
+        assert_eq!(*pair, '}');
+        assert_eq!(*btype, BracketType::Open);
+    }
+
+    #[test]
+    fn bidi_brackets_pairs_are_symmetric() {
+        // For every Open bracket, the paired char should be Close
+        for &(open_char, close_char, btype) in BIDI_BRACKETS.iter() {
+            if btype == BracketType::Open {
+                let close_entry = BIDI_BRACKETS.iter().find(|(c, _, _)| *c == close_char);
+                assert!(
+                    close_entry.is_some(),
+                    "close char {:?} for open {:?} not found in table",
+                    close_char,
+                    open_char
+                );
+                let (_, pair_back, close_btype) = close_entry.unwrap();
+                assert_eq!(
+                    *close_btype,
+                    BracketType::Close,
+                    "expected Close for {:?}",
+                    close_char
+                );
+                assert_eq!(
+                    *pair_back, open_char,
+                    "expected {:?} to pair back to {:?}",
+                    close_char, open_char
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bidi_brackets_open_close_count_equal() {
+        let open_count = BIDI_BRACKETS
+            .iter()
+            .filter(|(_, _, b)| *b == BracketType::Open)
+            .count();
+        let close_count = BIDI_BRACKETS
+            .iter()
+            .filter(|(_, _, b)| *b == BracketType::Close)
+            .count();
+        assert_eq!(open_count, close_count);
+    }
+
+    #[test]
+    fn bidi_brackets_all_chars_unique() {
+        // Each bracket character should appear exactly once as the first element
+        let mut seen = alloc::collections::BTreeSet::new();
+        for &(c, _, _) in BIDI_BRACKETS.iter() {
+            assert!(seen.insert(c), "duplicate bracket char: {:?}", c);
+        }
+    }
+
+    #[test]
+    fn bidi_brackets_fullwidth_parentheses() {
+        // U+FF08 FULLWIDTH LEFT PARENTHESIS
+        let entry = BIDI_BRACKETS.iter().find(|(c, _, _)| *c == '\u{FF08}');
+        assert!(entry.is_some());
+        let (_, pair, btype) = entry.unwrap();
+        assert_eq!(*pair, '\u{FF09}');
+        assert_eq!(*btype, BracketType::Open);
+    }
+}
