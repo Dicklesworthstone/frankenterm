@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 58e4b2f977c91c1743b1d5f66ff45db8796c2f9cc91518b91ddddc8233434b41 # shrinks to report = DryRunReport { command: "", target_resolution: None, policy_evaluation: None, expected_actions: [], warnings: [] }
+cc d54d50fc54e70183f5fb3a8100c4da593d0c1ada15702ca8fbe27c4499e67df2 # shrinks to pane_id = 0, domain = "cwd"
