@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 68ceba9b570490debb39d584cf3d3f9fa0313d4fd98ef4ae354798af4472edff # shrinks to init_ms = 813, factor = 2.5418998128760157, attempt = 9
+cc 80ad187e2c03315fbedeb3780815dcc6e247b27aab7fdd1532fa83ffe4af35c3 # shrinks to policy = RetryPolicy { initial_delay: 1ms, max_delay: 1s, backoff_factor: 1.1020177325141753, jitter_percent: 0.0, max_attempts: Some(10) }
