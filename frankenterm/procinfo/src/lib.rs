@@ -926,4 +926,297 @@ mod tests {
             info.status
         );
     }
+
+    // ── Third-pass expansion ────────────────────────────────────
+
+    #[test]
+    fn flatten_parent_no_exe_children_have_exes() {
+        let child = LocalProcessInfo {
+            pid: 2,
+            ppid: 1,
+            name: "worker".to_string(),
+            executable: PathBuf::from("/usr/bin/worker"),
+            argv: vec![],
+            cwd: PathBuf::new(),
+            status: LocalProcessStatus::Run,
+            start_time: 0,
+            children: HashMap::new(),
+        };
+        let mut children = HashMap::new();
+        children.insert(2, child);
+        let proc = LocalProcessInfo {
+            pid: 1,
+            ppid: 0,
+            name: "kthread".to_string(),
+            executable: PathBuf::new(), // no exe
+            argv: vec![],
+            cwd: PathBuf::new(),
+            status: LocalProcessStatus::Run,
+            start_time: 0,
+            children,
+        };
+        let names = proc.flatten_to_exe_names();
+        assert_eq!(names.len(), 1);
+        assert!(names.contains("worker"));
+    }
+
+    #[test]
+    fn flatten_branching_two_subtrees() {
+        let gc1 = LocalProcessInfo {
+            pid: 4,
+            ppid: 2,
+            name: "gc1".to_string(),
+            executable: PathBuf::from("/bin/gc1"),
+            argv: vec![],
+            cwd: PathBuf::new(),
+            status: LocalProcessStatus::Run,
+            start_time: 0,
+            children: HashMap::new(),
+        };
+        let gc2 = LocalProcessInfo {
+            pid: 5,
+            ppid: 3,
+            name: "gc2".to_string(),
+            executable: PathBuf::from("/bin/gc2"),
+            argv: vec![],
+            cwd: PathBuf::new(),
+            status: LocalProcessStatus::Run,
+            start_time: 0,
+            children: HashMap::new(),
+        };
+        let mut c1_kids = HashMap::new();
+        c1_kids.insert(4, gc1);
+        let mut c2_kids = HashMap::new();
+        c2_kids.insert(5, gc2);
+        let child1 = LocalProcessInfo {
+            pid: 2,
+            ppid: 1,
+            name: "c1".to_string(),
+            executable: PathBuf::from("/bin/c1"),
+            argv: vec![],
+            cwd: PathBuf::new(),
+            status: LocalProcessStatus::Run,
+            start_time: 0,
+            children: c1_kids,
+        };
+        let child2 = LocalProcessInfo {
+            pid: 3,
+            ppid: 1,
+            name: "c2".to_string(),
+            executable: PathBuf::from("/bin/c2"),
+            argv: vec![],
+            cwd: PathBuf::new(),
+            status: LocalProcessStatus::Run,
+            start_time: 0,
+            children: c2_kids,
+        };
+        let mut children = HashMap::new();
+        children.insert(2, child1);
+        children.insert(3, child2);
+        let proc = make_proc("root", "/bin/root", children);
+        let names = proc.flatten_to_exe_names();
+        assert_eq!(names.len(), 5);
+        for n in &["root", "c1", "c2", "gc1", "gc2"] {
+            assert!(names.contains(*n), "missing {n}");
+        }
+    }
+
+    #[test]
+    fn process_info_clone_deep_nested() {
+        let grandchild = LocalProcessInfo {
+            pid: 3,
+            ppid: 2,
+            name: "gc".to_string(),
+            executable: PathBuf::from("/bin/gc"),
+            argv: vec!["gc".to_string(), "--deep".to_string()],
+            cwd: PathBuf::from("/deep"),
+            status: LocalProcessStatus::Sleep,
+            start_time: 300,
+            children: HashMap::new(),
+        };
+        let mut gc_map = HashMap::new();
+        gc_map.insert(3, grandchild);
+        let child = LocalProcessInfo {
+            pid: 2,
+            ppid: 1,
+            name: "child".to_string(),
+            executable: PathBuf::from("/bin/child"),
+            argv: vec![],
+            cwd: PathBuf::new(),
+            status: LocalProcessStatus::Run,
+            start_time: 200,
+            children: gc_map,
+        };
+        let mut c_map = HashMap::new();
+        c_map.insert(2, child);
+        let proc = make_proc("top", "/bin/top", c_map);
+        let cloned = proc.clone();
+        assert_eq!(cloned.children.len(), 1);
+        let cloned_child = &cloned.children[&2];
+        assert_eq!(cloned_child.children.len(), 1);
+        let cloned_gc = &cloned_child.children[&3];
+        assert_eq!(cloned_gc.name, "gc");
+        assert_eq!(cloned_gc.argv, vec!["gc", "--deep"]);
+    }
+
+    #[test]
+    fn process_info_large_pid_values() {
+        let proc = LocalProcessInfo {
+            pid: u32::MAX,
+            ppid: u32::MAX - 1,
+            name: "big".to_string(),
+            executable: PathBuf::from("/bin/big"),
+            argv: vec![],
+            cwd: PathBuf::new(),
+            status: LocalProcessStatus::Run,
+            start_time: u64::MAX,
+            children: HashMap::new(),
+        };
+        assert_eq!(proc.pid, u32::MAX);
+        assert_eq!(proc.ppid, u32::MAX - 1);
+        assert_eq!(proc.start_time, u64::MAX);
+    }
+
+    #[test]
+    fn flatten_exe_just_filename_no_directory() {
+        // An executable path with no directory component
+        let proc = LocalProcessInfo {
+            pid: 1,
+            ppid: 0,
+            name: "bare".to_string(),
+            executable: PathBuf::from("myapp"),
+            argv: vec![],
+            cwd: PathBuf::new(),
+            status: LocalProcessStatus::Run,
+            start_time: 0,
+            children: HashMap::new(),
+        };
+        let names = proc.flatten_to_exe_names();
+        assert_eq!(names.len(), 1);
+        assert!(names.contains("myapp"));
+    }
+
+    #[test]
+    fn process_info_debug_contains_executable() {
+        let proc = LocalProcessInfo {
+            pid: 1,
+            ppid: 0,
+            name: "test".to_string(),
+            executable: PathBuf::from("/unique/path/to/binary"),
+            argv: vec![],
+            cwd: PathBuf::new(),
+            status: LocalProcessStatus::Run,
+            start_time: 0,
+            children: HashMap::new(),
+        };
+        let debug = format!("{proc:?}");
+        assert!(debug.contains("/unique/path/to/binary"), "got: {debug}");
+    }
+
+    #[test]
+    fn process_info_debug_shows_children_count() {
+        let mut children = HashMap::new();
+        children.insert(2, make_proc("kid", "/bin/kid", HashMap::new()));
+        let proc = make_proc("parent", "/bin/parent", children);
+        let debug = format!("{proc:?}");
+        // Debug should show the children map which contains an entry
+        assert!(debug.contains("kid"), "got: {debug}");
+    }
+
+    #[test]
+    fn status_clone_preserves_variant() {
+        let variants = [
+            LocalProcessStatus::Idle,
+            LocalProcessStatus::Run,
+            LocalProcessStatus::Sleep,
+            LocalProcessStatus::Stop,
+            LocalProcessStatus::Zombie,
+            LocalProcessStatus::Tracing,
+            LocalProcessStatus::Dead,
+            LocalProcessStatus::Wakekill,
+            LocalProcessStatus::Waking,
+            LocalProcessStatus::Parked,
+            LocalProcessStatus::LockBlocked,
+            LocalProcessStatus::Unknown,
+        ];
+        for v in &variants {
+            let cloned = *v; // Copy
+            assert_eq!(format!("{v:?}"), format!("{cloned:?}"));
+        }
+    }
+
+    #[test]
+    fn flatten_hashset_dedup_behavior() {
+        // Verify flatten returns a HashSet that deduplicates properly
+        let mut children = HashMap::new();
+        for i in 2..12u32 {
+            children.insert(i, LocalProcessInfo {
+                pid: i,
+                ppid: 1,
+                name: format!("worker{i}"),
+                // All have the same exe filename
+                executable: PathBuf::from(format!("/path{i}/same_name")),
+                argv: vec![],
+                cwd: PathBuf::new(),
+                status: LocalProcessStatus::Run,
+                start_time: 0,
+                children: HashMap::new(),
+            });
+        }
+        let proc = make_proc("same_name", "/bin/same_name", children);
+        let names = proc.flatten_to_exe_names();
+        // All 11 processes have exe name "same_name" → deduplicated to 1
+        assert_eq!(names.len(), 1);
+        assert!(names.contains("same_name"));
+    }
+
+    #[test]
+    fn process_info_argv_with_empty_strings() {
+        let proc = LocalProcessInfo {
+            pid: 1,
+            ppid: 0,
+            name: "test".to_string(),
+            executable: PathBuf::from("/bin/test"),
+            argv: vec!["test".to_string(), "".to_string(), "arg".to_string()],
+            cwd: PathBuf::new(),
+            status: LocalProcessStatus::Run,
+            start_time: 0,
+            children: HashMap::new(),
+        };
+        assert_eq!(proc.argv.len(), 3);
+        assert_eq!(proc.argv[1], "");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn with_root_pid_parent_exists() {
+        // Our parent process should be accessible
+        let pid = std::process::id();
+        let info = LocalProcessInfo::with_root_pid(pid).unwrap();
+        let parent = LocalProcessInfo::with_root_pid(info.ppid);
+        assert!(parent.is_some(), "parent process should exist");
+        assert_eq!(parent.unwrap().pid, info.ppid);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn executable_path_matches_with_root_pid() {
+        let pid = std::process::id();
+        let exe_standalone = LocalProcessInfo::executable_path(pid).unwrap();
+        let info = LocalProcessInfo::with_root_pid(pid).unwrap();
+        // Canonicalize to handle macOS /tmp → /private/tmp symlink
+        let a = std::fs::canonicalize(&exe_standalone).unwrap_or(exe_standalone);
+        let b = std::fs::canonicalize(&info.executable).unwrap_or(info.executable);
+        assert_eq!(a, b);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn with_root_pid_current_has_children_map() {
+        let pid = std::process::id();
+        let info = LocalProcessInfo::with_root_pid(pid).unwrap();
+        // children is a HashMap, could be empty for our test process
+        // but the field should be accessible
+        let _ = info.children.len();
+    }
 }

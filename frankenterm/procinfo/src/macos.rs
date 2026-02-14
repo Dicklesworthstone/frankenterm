@@ -539,4 +539,86 @@ mod tests {
         let buf = 1i32.to_ne_bytes().to_vec();
         assert!(parse_exe_and_argv_sysctl(buf).is_none());
     }
+
+    // ── Third-pass expansion ────────────────────────────────────
+
+    #[test]
+    fn status_from_u32_zero_is_unknown() {
+        assert!(matches!(
+            super::LocalProcessStatus::from(0),
+            super::LocalProcessStatus::Unknown
+        ));
+    }
+
+    #[test]
+    fn status_from_u32_six_is_unknown() {
+        assert!(matches!(
+            super::LocalProcessStatus::from(6),
+            super::LocalProcessStatus::Unknown
+        ));
+    }
+
+    #[test]
+    fn status_from_u32_max_is_unknown() {
+        assert!(matches!(
+            super::LocalProcessStatus::from(u32::MAX),
+            super::LocalProcessStatus::Unknown
+        ));
+    }
+
+    #[test]
+    fn test_exe_deeply_nested_path() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1i32.to_ne_bytes());
+        buf.extend_from_slice(b"/a/b/c/d/e/f/g/h/i/j/k/binary\0");
+        buf.extend_from_slice(b"binary\0");
+
+        let (exe_path, argv) = parse_exe_and_argv_sysctl(buf).unwrap();
+        assert_eq!(exe_path, Path::new("/a/b/c/d/e/f/g/h/i/j/k/binary").to_path_buf());
+        assert_eq!(argv, vec!["binary".to_string()]);
+    }
+
+    #[test]
+    fn test_three_args_with_mixed_padding() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&3i32.to_ne_bytes());
+        buf.extend_from_slice(b"/bin/cmd\0");
+        buf.extend_from_slice(&[0; 5]); // padding after exe
+        buf.extend_from_slice(b"cmd\0");
+        buf.extend_from_slice(&[0; 3]); // padding after arg0
+        buf.extend_from_slice(b"--verbose\0");
+        buf.extend_from_slice(&[0; 2]); // padding after arg1
+        buf.extend_from_slice(b"file.txt\0");
+
+        let (exe, argv) = parse_exe_and_argv_sysctl(buf).unwrap();
+        assert_eq!(exe, Path::new("/bin/cmd").to_path_buf());
+        assert_eq!(argv, vec!["cmd".to_string(), "--verbose".to_string(), "file.txt".to_string()]);
+    }
+
+    #[test]
+    fn test_empty_arg_value() {
+        // An argv entry that is an empty string
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&2i32.to_ne_bytes());
+        buf.extend_from_slice(b"/bin/test\0");
+        buf.extend_from_slice(b"test\0");
+        buf.extend_from_slice(b"\0"); // empty arg
+
+        let (_, argv) = parse_exe_and_argv_sysctl(buf).unwrap();
+        assert_eq!(argv, vec!["test".to_string(), "".to_string()]);
+    }
+
+    #[test]
+    fn test_arg_with_dashes_and_slashes() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&3i32.to_ne_bytes());
+        buf.extend_from_slice(b"/usr/bin/rsync\0");
+        buf.extend_from_slice(b"rsync\0");
+        buf.extend_from_slice(b"--archive\0");
+        buf.extend_from_slice(b"/src/dir/\0");
+
+        let (exe, argv) = parse_exe_and_argv_sysctl(buf).unwrap();
+        assert_eq!(exe, Path::new("/usr/bin/rsync").to_path_buf());
+        assert_eq!(argv, vec!["rsync".to_string(), "--archive".to_string(), "/src/dir/".to_string()]);
+    }
 }
