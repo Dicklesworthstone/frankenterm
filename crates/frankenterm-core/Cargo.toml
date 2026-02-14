@@ -245,6 +245,11 @@ harness = false
 name = "irl_bench"
 harness = false
 
+[[bench]]
+name = "native_events_latency"
+harness = false
+required-features = ["native-wezterm"]
+
 [features]
 default = []
 # Public feature flags (stable surface)
