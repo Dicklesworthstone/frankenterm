@@ -18,7 +18,8 @@ use proptest::prelude::*;
 use std::time::Duration;
 
 use frankenterm_core::circuit_breaker::{
-    CircuitBreaker, CircuitBreakerConfig, CircuitBreakerStatus, CircuitStateKind,
+    CircuitBreaker, CircuitBreakerConfig, CircuitBreakerSnapshot, CircuitBreakerStatus,
+    CircuitStateKind,
 };
 
 // ────────────────────────────────────────────────────────────────────
@@ -504,5 +505,314 @@ proptest! {
         }
         prop_assert_eq!(cb.status().state, CircuitStateKind::Closed);
         prop_assert_eq!(cb.status().consecutive_failures, 0);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: CircuitBreakerConfig Default fields
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #[test]
+    fn prop_config_default_valid(_dummy in 0..1u8) {
+        let cfg = CircuitBreakerConfig::default();
+        prop_assert!(cfg.failure_threshold >= 1, "default failure threshold >= 1");
+        prop_assert!(cfg.success_threshold >= 1, "default success threshold >= 1");
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: CircuitBreakerConfig Clone/Debug
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #[test]
+    fn prop_config_clone_preserves(
+        fail_t in 1u32..=10,
+        succ_t in 1u32..=10,
+        cooldown_ms in 1u64..=60_000,
+    ) {
+        let config = CircuitBreakerConfig::new(fail_t, succ_t, Duration::from_millis(cooldown_ms));
+        let cloned = config.clone();
+        prop_assert_eq!(cloned.failure_threshold, config.failure_threshold);
+        prop_assert_eq!(cloned.success_threshold, config.success_threshold);
+    }
+
+    #[test]
+    fn prop_config_debug_nonempty(config in arb_config()) {
+        let dbg = format!("{:?}", config);
+        prop_assert!(!dbg.is_empty(), "Debug output should not be empty");
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: CircuitBreakerStatus Default fields
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #[test]
+    fn prop_status_default_closed(_dummy in 0..1u8) {
+        let status = CircuitBreakerStatus::default();
+        prop_assert_eq!(status.state, CircuitStateKind::Closed);
+        prop_assert_eq!(status.consecutive_failures, 0);
+        prop_assert!(status.open_for_ms.is_none());
+        prop_assert!(status.cooldown_remaining_ms.is_none());
+        prop_assert!(status.half_open_successes.is_none());
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: CircuitStateKind Debug non-empty
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #[test]
+    fn prop_state_kind_debug(
+        kind in prop_oneof![
+            Just(CircuitStateKind::Closed),
+            Just(CircuitStateKind::Open),
+            Just(CircuitStateKind::HalfOpen),
+        ],
+    ) {
+        let dbg = format!("{:?}", kind);
+        prop_assert!(!dbg.is_empty());
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: CircuitStateKind serde snake_case check
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #[test]
+    fn prop_state_kind_serde_snake_case(
+        kind in prop_oneof![
+            Just(CircuitStateKind::Closed),
+            Just(CircuitStateKind::Open),
+            Just(CircuitStateKind::HalfOpen),
+        ],
+    ) {
+        let json = serde_json::to_string(&kind).unwrap();
+        let s = json.trim_matches('"');
+        prop_assert!(s.chars().all(|c| c.is_lowercase() || c == '_'),
+            "serialized form should be snake_case, got {}", s);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: CircuitBreaker with_name preserves config
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #[test]
+    fn prop_with_name_preserves_config(
+        fail_t in 1u32..=10,
+        succ_t in 1u32..=10,
+        cooldown_ms in 1u64..=60_000,
+    ) {
+        let config = CircuitBreakerConfig::new(fail_t, succ_t, Duration::from_millis(cooldown_ms));
+        let cb = CircuitBreaker::with_name("test_circuit", config.clone());
+        let status = cb.status();
+        prop_assert_eq!(status.failure_threshold, config.failure_threshold);
+        prop_assert_eq!(status.success_threshold, config.success_threshold);
+        prop_assert_eq!(status.open_cooldown_ms, cooldown_ms);
+        prop_assert_eq!(status.state, CircuitStateKind::Closed);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: Multiple full cycles work
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn prop_multiple_cycles(
+        fail_t in 1u32..=3,
+        succ_t in 1u32..=3,
+        cycles in 2usize..=5,
+    ) {
+        let config = CircuitBreakerConfig::new(fail_t, succ_t, Duration::ZERO);
+        let mut cb = CircuitBreaker::new(config);
+
+        for _ in 0..cycles {
+            prop_assert_eq!(cb.status().state, CircuitStateKind::Closed);
+
+            for _ in 0..fail_t {
+                cb.record_failure();
+            }
+            prop_assert_eq!(cb.status().state, CircuitStateKind::Open);
+
+            cb.allow();
+            prop_assert_eq!(cb.status().state, CircuitStateKind::HalfOpen);
+
+            for _ in 0..succ_t {
+                cb.record_success();
+            }
+        }
+        prop_assert_eq!(cb.status().state, CircuitStateKind::Closed);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: All successes keeps Closed
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #[test]
+    fn prop_all_successes_stays_closed(
+        config in arb_config(),
+        n in 1usize..=50,
+    ) {
+        let mut cb = CircuitBreaker::new(config);
+        for _ in 0..n {
+            cb.record_success();
+        }
+        prop_assert_eq!(cb.status().state, CircuitStateKind::Closed);
+        prop_assert_eq!(cb.status().consecutive_failures, 0);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: Status serde with Open state fields
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #[test]
+    fn prop_status_serde_open_state(
+        failures in 0u32..=10,
+        fail_t in 1u32..=10,
+        open_for in 0u64..=60_000,
+        cooldown_rem in 0u64..=60_000,
+    ) {
+        let status = CircuitBreakerStatus {
+            state: CircuitStateKind::Open,
+            consecutive_failures: failures,
+            failure_threshold: fail_t,
+            success_threshold: 1,
+            open_cooldown_ms: 30_000,
+            open_for_ms: Some(open_for),
+            cooldown_remaining_ms: Some(cooldown_rem),
+            half_open_successes: None,
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        let back: CircuitBreakerStatus = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.state, CircuitStateKind::Open);
+        prop_assert_eq!(back.open_for_ms, Some(open_for));
+        prop_assert_eq!(back.cooldown_remaining_ms, Some(cooldown_rem));
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: Status serde with HalfOpen state fields
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #[test]
+    fn prop_status_serde_half_open_state(
+        succ_t in 1u32..=10,
+        half_open_succ in 0u32..=9,
+    ) {
+        let status = CircuitBreakerStatus {
+            state: CircuitStateKind::HalfOpen,
+            consecutive_failures: 0,
+            failure_threshold: 3,
+            success_threshold: succ_t,
+            open_cooldown_ms: 10_000,
+            open_for_ms: None,
+            cooldown_remaining_ms: None,
+            half_open_successes: Some(half_open_succ),
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        let back: CircuitBreakerStatus = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.state, CircuitStateKind::HalfOpen);
+        prop_assert_eq!(back.half_open_successes, Some(half_open_succ));
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: CircuitBreakerSnapshot serde roundtrip
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #[test]
+    fn prop_snapshot_serde_roundtrip(
+        fail_t in 1u32..=10,
+        succ_t in 1u32..=10,
+    ) {
+        let snapshot = CircuitBreakerSnapshot {
+            name: "test_breaker".to_string(),
+            status: CircuitBreakerStatus {
+                state: CircuitStateKind::Closed,
+                consecutive_failures: 0,
+                failure_threshold: fail_t,
+                success_threshold: succ_t,
+                open_cooldown_ms: 10_000,
+                open_for_ms: None,
+                cooldown_remaining_ms: None,
+                half_open_successes: None,
+            },
+        };
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let back: CircuitBreakerSnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.name, "test_breaker");
+        prop_assert_eq!(back.status.failure_threshold, fail_t);
+        prop_assert_eq!(back.status.success_threshold, succ_t);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: Config cooldown duration preserved
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #[test]
+    fn prop_config_cooldown_preserved(cooldown_ms in 1u64..=60_000) {
+        let config = CircuitBreakerConfig::new(3, 1, Duration::from_millis(cooldown_ms));
+        let cb = CircuitBreaker::new(config);
+        prop_assert_eq!(cb.status().open_cooldown_ms, cooldown_ms);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: HalfOpen tracks successes incrementally
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #[test]
+    fn prop_half_open_tracks_successes(
+        fail_t in 1u32..=5,
+        succ_t in 2u32..=5,
+    ) {
+        let config = CircuitBreakerConfig::new(fail_t, succ_t, Duration::ZERO);
+        let mut cb = CircuitBreaker::new(config);
+
+        // Open the circuit
+        for _ in 0..fail_t {
+            cb.record_failure();
+        }
+        cb.allow(); // → HalfOpen
+
+        // Each success increments half_open_successes
+        for i in 0..succ_t.saturating_sub(1) {
+            cb.record_success();
+            let status = cb.status();
+            prop_assert_eq!(status.half_open_successes, Some(i + 1),
+                "half_open_successes should be {} after {} successes", i + 1, i + 1);
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: CircuitBreaker Debug non-empty
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #[test]
+    fn prop_circuit_breaker_debug(config in arb_config()) {
+        let cb = CircuitBreaker::new(config);
+        let dbg = format!("{:?}", cb);
+        prop_assert!(!dbg.is_empty());
     }
 }
