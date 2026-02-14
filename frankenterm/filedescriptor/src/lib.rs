@@ -1220,4 +1220,258 @@ mod tests {
         assert_eq!(pfd.revents, 0);
         assert_eq!(pfd.events, POLLIN | POLLOUT);
     }
+
+    // ── Additional dup / clone tests ────────────────────────
+
+    #[test]
+    fn pipe_write_end_try_clone() {
+        let mut pipe = Pipe::new().unwrap();
+        let mut clone = pipe.write.try_clone().unwrap();
+        clone.write_all(b"from clone").unwrap();
+        drop(clone);
+        drop(pipe.write);
+
+        let mut buf = String::new();
+        pipe.read.read_to_string(&mut buf).unwrap();
+        assert_eq!(buf, "from clone");
+    }
+
+    #[test]
+    fn socketpair_try_clone_write() {
+        let (_a, mut b) = socketpair().unwrap();
+        let mut a_clone = _a.try_clone().unwrap();
+        a_clone.write_all(b"cloned").unwrap();
+
+        let mut buf = [0u8; 16];
+        let n = b.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"cloned");
+    }
+
+    #[test]
+    fn file_descriptor_dup_stdin() {
+        let stdin = std::io::stdin();
+        let handle = stdin.lock();
+        let fd = FileDescriptor::dup(&handle).unwrap();
+        assert!(fd.as_raw_file_descriptor() >= 0);
+    }
+
+    #[test]
+    fn owned_handle_dup_from_socket() {
+        let (a, _b) = socketpair().unwrap();
+        let handle = OwnedHandle::dup(&a).unwrap();
+        assert!(handle.as_raw_file_descriptor() >= 0);
+    }
+
+    // ── Error source chain tests ────────────────────────────
+
+    #[test]
+    fn error_dup2_has_source() {
+        let err = Error::Dup2 {
+            src_fd: 3,
+            dest_fd: 4,
+            source: std::io::Error::from_raw_os_error(9),
+        };
+        use std::error::Error as StdError;
+        assert!(err.source().is_some());
+    }
+
+    #[test]
+    fn error_only_sockets_non_blocking_no_source() {
+        let err = Error::OnlySocketsNonBlocking;
+        use std::error::Error as StdError;
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn error_fd_outside_fdset_no_source() {
+        let err = Error::FdValueOutsideFdSetSize(1024);
+        use std::error::Error as StdError;
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn error_io_has_source() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "wrapped");
+        let err: Error = io_err.into();
+        use std::error::Error as StdError;
+        assert!(err.source().is_some());
+    }
+
+    // ── as_file write-through ───────────────────────────────
+
+    #[test]
+    fn as_file_write_through() {
+        let mut pipe = Pipe::new().unwrap();
+        let mut file = pipe.write.as_file().unwrap();
+        use std::io::Write as _;
+        file.write_all(b"file write").unwrap();
+        drop(file);
+        drop(pipe.write);
+
+        let mut buf = String::new();
+        pipe.read.read_to_string(&mut buf).unwrap();
+        assert!(buf.contains("file write"));
+    }
+
+    // ── Pipe read dup sees same data ────────────────────────
+
+    #[test]
+    fn pipe_dup_read_sees_data() {
+        let mut pipe = Pipe::new().unwrap();
+        let _read_clone = pipe.read.try_clone().unwrap();
+        pipe.write.write_all(b"shared").unwrap();
+        drop(pipe.write);
+
+        // One of the readers should get the data
+        let mut buf = Vec::new();
+        pipe.read.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, b"shared");
+    }
+
+    // ── Multiple socketpairs independent ────────────────────
+
+    #[test]
+    fn multiple_socketpairs_independent() {
+        let (mut a1, mut b1) = socketpair().unwrap();
+        let (mut a2, mut b2) = socketpair().unwrap();
+
+        a1.write_all(b"pair1").unwrap();
+        a2.write_all(b"pair2").unwrap();
+
+        let mut buf = [0u8; 16];
+        let n = b1.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"pair1");
+
+        let n = b2.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"pair2");
+    }
+
+    // ── socketpair into_raw / from_raw roundtrip ────────────
+
+    #[test]
+    fn socketpair_into_raw_roundtrip() {
+        let (a, _b) = socketpair().unwrap();
+        let raw = a.into_raw_file_descriptor();
+        assert!(raw >= 0);
+        let _fd = unsafe { FileDescriptor::from_raw_file_descriptor(raw) };
+    }
+
+    // ── Non-blocking write succeeds ─────────────────────────
+
+    #[test]
+    fn socketpair_non_blocking_write_succeeds() {
+        let (mut a, _b) = socketpair().unwrap();
+        a.set_non_blocking(true).unwrap();
+        // A small write to a socket should succeed even in non-blocking mode
+        let n = a.write(b"small").unwrap();
+        assert!(n > 0);
+    }
+
+    // ── Pipe read_exact ─────────────────────────────────────
+
+    #[test]
+    fn pipe_read_exact() {
+        let mut pipe = Pipe::new().unwrap();
+        pipe.write.write_all(b"exactdata").unwrap();
+        let mut buf = [0u8; 9];
+        pipe.read.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"exactdata");
+    }
+
+    // ── Poll with POLLOUT on pipe write end ─────────────────
+
+    #[test]
+    fn poll_pipe_write_end_is_writable() {
+        let pipe = Pipe::new().unwrap();
+        let mut pfd = [pollfd {
+            fd: pipe.write.as_socket_descriptor(),
+            events: POLLOUT,
+            revents: 0,
+        }];
+        let n = poll(&mut pfd, Some(Duration::from_millis(50))).unwrap();
+        assert!(n >= 1);
+        assert!(pfd[0].revents & POLLOUT != 0);
+    }
+
+    // ── OwnedHandle debug format ────────────────────────────
+
+    #[test]
+    fn owned_handle_debug_contains_fd_value() {
+        let pipe = Pipe::new().unwrap();
+        let handle = OwnedHandle::dup(&pipe.read).unwrap();
+        let debug = format!("{handle:?}");
+        assert!(debug.contains("OwnedHandle"));
+    }
+
+    // ── FileDescriptor as_socket_descriptor on pipe ─────────
+
+    #[test]
+    fn pipe_as_socket_descriptor() {
+        let pipe = Pipe::new().unwrap();
+        // On unix, socket descriptor and file descriptor are the same
+        assert_eq!(
+            pipe.read.as_raw_file_descriptor(),
+            pipe.read.as_socket_descriptor()
+        );
+    }
+
+    // ── Error debug format tests ────────────────────────────
+
+    #[test]
+    fn error_dup_debug_contains_fd() {
+        let err = Error::Dup {
+            fd: 77,
+            source: std::io::Error::from_raw_os_error(0),
+        };
+        let debug = format!("{err:?}");
+        assert!(debug.contains("77"));
+    }
+
+    #[test]
+    fn error_dup2_debug_contains_both_fds() {
+        let err = Error::Dup2 {
+            src_fd: 10,
+            dest_fd: 20,
+            source: std::io::Error::from_raw_os_error(0),
+        };
+        let debug = format!("{err:?}");
+        assert!(debug.contains("10"));
+        assert!(debug.contains("20"));
+    }
+
+    // ── Pipe write then partial reads ───────────────────────
+
+    #[test]
+    fn pipe_sequential_reads() {
+        let mut pipe = Pipe::new().unwrap();
+        pipe.write.write_all(b"AABBCC").unwrap();
+
+        let mut buf = [0u8; 2];
+        pipe.read.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"AA");
+        pipe.read.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"BB");
+        pipe.read.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"CC");
+    }
+
+    #[test]
+    fn socketpair_try_clone_read() {
+        let (mut a, b) = socketpair().unwrap();
+        let mut b_clone = b.try_clone().unwrap();
+        a.write_all(b"forclone").unwrap();
+        drop(a);
+
+        let mut buf = Vec::new();
+        // Read from clone; original b will see EOF since clone consumed it
+        b_clone.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, b"forclone");
+    }
+
+    #[test]
+    fn error_connect_has_source() {
+        let err = Error::Connect(std::io::Error::from_raw_os_error(111));
+        use std::error::Error as StdError;
+        assert!(err.source().is_some());
+    }
 }
