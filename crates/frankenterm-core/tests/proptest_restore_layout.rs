@@ -642,6 +642,175 @@ proptest! {
 }
 
 // =========================================================================
+// Property 22a: PaneNode leaf pane_count is always 1
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn prop_leaf_pane_count_is_one(l in arb_leaf()) {
+        prop_assert_eq!(l.pane_count(), 1);
+    }
+}
+
+// =========================================================================
+// Property 22b: PaneNode pane_count equals count_node_leaves
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn prop_pane_count_equals_count_node_leaves(node in arb_pane_node()) {
+        let from_method = node.pane_count();
+        let from_fn = count_node_leaves(&node);
+        prop_assert_eq!(from_method, from_fn);
+    }
+}
+
+// =========================================================================
+// Property 22c: TopologySnapshot pane_ids are non-empty for non-empty topologies
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn prop_nonempty_topology_has_pane_ids(node in arb_pane_node()) {
+        let snapshot = single_tab_snapshot(node);
+        let ids = snapshot.pane_ids();
+        prop_assert!(!ids.is_empty(), "non-empty topology should have at least one pane ID");
+    }
+}
+
+// =========================================================================
+// Property 22d: count_panes with multiple windows is sum of per-window counts
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn prop_count_panes_is_sum_of_windows(
+        windows in proptest::collection::vec(arb_window_snapshot(), 1..=3),
+    ) {
+        let per_window_sum: usize = windows.iter()
+            .flat_map(|w| &w.tabs)
+            .map(|t| count_node_leaves(&t.pane_tree))
+            .sum();
+        let snapshot = TopologySnapshot {
+            schema_version: 1,
+            captured_at: 1000,
+            workspace_id: None,
+            windows: windows.clone(),
+        };
+        prop_assert_eq!(count_panes(&snapshot), per_window_sum);
+    }
+}
+
+// =========================================================================
+// Property 22e: TopologySnapshot with N windows has at least N panes
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn prop_window_count_lower_bound(
+        windows in proptest::collection::vec(arb_window_snapshot(), 1..=4),
+    ) {
+        let n_tabs: usize = windows.iter().map(|w| w.tabs.len()).sum();
+        let snapshot = TopologySnapshot {
+            schema_version: 1,
+            captured_at: 1000,
+            workspace_id: None,
+            windows,
+        };
+        // Each tab has at least 1 pane
+        prop_assert!(count_panes(&snapshot) >= n_tabs,
+            "should have at least as many panes as tabs");
+    }
+}
+
+// =========================================================================
+// Property 22f: RestoreConfig Debug doesn't panic
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn prop_config_debug(config in arb_restore_config()) {
+        let debug = format!("{:?}", config);
+        prop_assert!(!debug.is_empty());
+    }
+}
+
+// =========================================================================
+// Property 22g: RestoreConfig Clone is identical
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn prop_config_clone(config in arb_restore_config()) {
+        let cloned = config.clone();
+        prop_assert_eq!(config.restore_working_dirs, cloned.restore_working_dirs);
+        prop_assert_eq!(config.restore_split_ratios, cloned.restore_split_ratios);
+        prop_assert_eq!(config.continue_on_error, cloned.continue_on_error);
+    }
+}
+
+// =========================================================================
+// Property 22h: TopologySnapshot schema_version is preserved through serde
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(20))]
+
+    #[test]
+    fn prop_topology_schema_version_preserved(snapshot in arb_topology_snapshot()) {
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let back: TopologySnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.schema_version, snapshot.schema_version);
+        prop_assert_eq!(back.captured_at, snapshot.captured_at);
+        prop_assert_eq!(back.workspace_id, snapshot.workspace_id);
+    }
+}
+
+// =========================================================================
+// Property 22i: TopologySnapshot serde preserves window count
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(20))]
+
+    #[test]
+    fn prop_topology_serde_preserves_window_count(snapshot in arb_topology_snapshot()) {
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let back: TopologySnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.windows.len(), snapshot.windows.len());
+    }
+}
+
+// =========================================================================
+// Property 22j: TopologySnapshot serde preserves pane count
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(20))]
+
+    #[test]
+    fn prop_topology_serde_preserves_pane_count(snapshot in arb_topology_snapshot()) {
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let back: TopologySnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(count_panes(&back), count_panes(&snapshot));
+    }
+}
+
+// =========================================================================
 // Unit tests (existing)
 // =========================================================================
 
