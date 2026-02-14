@@ -38,7 +38,6 @@ fn arb_adaptive_config() -> impl Strategy<Value = AdaptiveWatchdogConfig> {
     )
         .prop_map(|(k, pn, mn, mo, dz, cz, hz)| {
             // Ensure degraded_z < critical_z < hung_z
-            let dz = dz;
             let cz = dz + (cz - 1.0).abs() + 0.1;
             let hz = cz + (hz - 2.0).abs() + 0.1;
             AdaptiveWatchdogConfig {

@@ -74,11 +74,11 @@ fn arb_telemetry_snapshot() -> impl Strategy<Value = RuntimeLockMemoryTelemetryS
                 avg_cursor,
             )| {
                 // Sort percentiles to maintain p50 <= p95 <= max ordering
-                let mut wait = [w_p50, w_p95, w_max];
+                let mut wait: [f64; 3] = (w_p50, w_p95, w_max).into();
                 wait.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                let mut hold = [h_p50, h_p95, h_max];
+                let mut hold: [f64; 3] = (h_p50, h_p95, h_max).into();
                 hold.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                let mut cursor = [c_p50, c_p95, c_max];
+                let mut cursor: [u64; 3] = (c_p50, c_p95, c_max).into();
                 cursor.sort();
 
                 RuntimeLockMemoryTelemetrySnapshot {
