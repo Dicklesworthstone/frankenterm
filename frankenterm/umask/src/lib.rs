@@ -540,12 +540,961 @@ mod tests {
         unsafe { umask(original) };
     }
 
+    // ── Individual permission bits (remaining 6) ────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn individual_permission_bits_owner_write() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o200) };
+        {
+            let _saver = UmaskSaver::new();
+            assert_eq!(UmaskSaver::saved_umask(), Some(0o200));
+        }
+        let restored = unsafe { umask(original) };
+        assert_eq!(restored, 0o200);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn individual_permission_bits_owner_execute() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o100) };
+        {
+            let _saver = UmaskSaver::new();
+            assert_eq!(UmaskSaver::saved_umask(), Some(0o100));
+        }
+        let restored = unsafe { umask(original) };
+        assert_eq!(restored, 0o100);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn individual_permission_bits_group_read() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o040) };
+        {
+            let _saver = UmaskSaver::new();
+            assert_eq!(UmaskSaver::saved_umask(), Some(0o040));
+        }
+        let restored = unsafe { umask(original) };
+        assert_eq!(restored, 0o040);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn individual_permission_bits_group_execute() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o010) };
+        {
+            let _saver = UmaskSaver::new();
+            assert_eq!(UmaskSaver::saved_umask(), Some(0o010));
+        }
+        let restored = unsafe { umask(original) };
+        assert_eq!(restored, 0o010);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn individual_permission_bits_other_read() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o004) };
+        {
+            let _saver = UmaskSaver::new();
+            assert_eq!(UmaskSaver::saved_umask(), Some(0o004));
+        }
+        let restored = unsafe { umask(original) };
+        assert_eq!(restored, 0o004);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn individual_permission_bits_other_write() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o002) };
+        {
+            let _saver = UmaskSaver::new();
+            assert_eq!(UmaskSaver::saved_umask(), Some(0o002));
+        }
+        let restored = unsafe { umask(original) };
+        assert_eq!(restored, 0o002);
+        unsafe { umask(original) };
+    }
+
+    // ── Common umask patterns ─────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn common_pattern_022_roundtrips() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o022) };
+        { let _s = UmaskSaver::new(); }
+        let restored = unsafe { umask(original) };
+        assert_eq!(restored, 0o022);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn common_pattern_027_roundtrips() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o027) };
+        { let _s = UmaskSaver::new(); }
+        let restored = unsafe { umask(original) };
+        assert_eq!(restored, 0o027);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn common_pattern_002_roundtrips() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o002) };
+        { let _s = UmaskSaver::new(); }
+        let restored = unsafe { umask(original) };
+        assert_eq!(restored, 0o002);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn common_pattern_077_roundtrips() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o077) };
+        { let _s = UmaskSaver::new(); }
+        let restored = unsafe { umask(original) };
+        assert_eq!(restored, 0o077);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn common_pattern_007_roundtrips() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o007) };
+        { let _s = UmaskSaver::new(); }
+        let restored = unsafe { umask(original) };
+        assert_eq!(restored, 0o007);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn common_pattern_037_roundtrips() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o037) };
+        { let _s = UmaskSaver::new(); }
+        let restored = unsafe { umask(original) };
+        assert_eq!(restored, 0o037);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn common_pattern_066_roundtrips() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o066) };
+        { let _s = UmaskSaver::new(); }
+        let restored = unsafe { umask(original) };
+        assert_eq!(restored, 0o066);
+        unsafe { umask(original) };
+    }
+
+    // ── Saved umask behavioral tests ──────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_umask_reflects_latest_saver() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o033) };
+        let _saver = UmaskSaver::new();
+        assert_eq!(UmaskSaver::saved_umask(), Some(0o033));
+        drop(_saver);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_umask_is_mode_t_value() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o055) };
+        let _saver = UmaskSaver::new();
+        let saved = UmaskSaver::saved_umask().unwrap();
+        assert_eq!(saved as u32, 0o055u32);
+        drop(_saver);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn two_sequential_savers_independent_saved_values() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o011) };
+
+        {
+            let _s1 = UmaskSaver::new();
+            assert_eq!(UmaskSaver::saved_umask(), Some(0o011));
+        }
+        assert!(UmaskSaver::saved_umask().is_none());
+
+        unsafe { umask(0o044) };
+        {
+            let _s2 = UmaskSaver::new();
+            assert_eq!(UmaskSaver::saved_umask(), Some(0o044));
+        }
+        assert!(UmaskSaver::saved_umask().is_none());
+
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_umask_none_cleared_after_nested_drops() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o022) };
+
+        let outer = UmaskSaver::new();
+        let inner = UmaskSaver::new();
+        drop(inner);
+        drop(outer);
+        assert!(UmaskSaver::saved_umask().is_none());
+
+        unsafe { umask(original) };
+    }
+
+    // ── Mask restore correctness with specific values ─────
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_mask_0o111() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o111) };
+        { let _s = UmaskSaver::new(); }
+        let r = unsafe { umask(original) };
+        assert_eq!(r, 0o111);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_mask_0o222() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o222) };
+        { let _s = UmaskSaver::new(); }
+        let r = unsafe { umask(original) };
+        assert_eq!(r, 0o222);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_mask_0o333() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o333) };
+        { let _s = UmaskSaver::new(); }
+        let r = unsafe { umask(original) };
+        assert_eq!(r, 0o333);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_mask_0o444() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o444) };
+        { let _s = UmaskSaver::new(); }
+        let r = unsafe { umask(original) };
+        assert_eq!(r, 0o444);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_mask_0o555() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o555) };
+        { let _s = UmaskSaver::new(); }
+        let r = unsafe { umask(original) };
+        assert_eq!(r, 0o555);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_mask_0o666() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o666) };
+        { let _s = UmaskSaver::new(); }
+        let r = unsafe { umask(original) };
+        assert_eq!(r, 0o666);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_mask_0o234() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o234) };
+        { let _s = UmaskSaver::new(); }
+        let r = unsafe { umask(original) };
+        assert_eq!(r, 0o234);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_mask_0o567() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o567) };
+        { let _s = UmaskSaver::new(); }
+        let r = unsafe { umask(original) };
+        assert_eq!(r, 0o567);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_mask_0o012() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o012) };
+        { let _s = UmaskSaver::new(); }
+        let r = unsafe { umask(original) };
+        assert_eq!(r, 0o012);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_mask_0o345() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o345) };
+        { let _s = UmaskSaver::new(); }
+        let r = unsafe { umask(original) };
+        assert_eq!(r, 0o345);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_mask_0o076() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o076) };
+        { let _s = UmaskSaver::new(); }
+        let r = unsafe { umask(original) };
+        assert_eq!(r, 0o076);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_mask_0o543() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o543) };
+        { let _s = UmaskSaver::new(); }
+        let r = unsafe { umask(original) };
+        assert_eq!(r, 0o543);
+        unsafe { umask(original) };
+    }
+
+    // ── Active mask verification during saver ─────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn active_mask_is_077_from_permissive_start() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o000) };
+        let _saver = UmaskSaver::new();
+        let active = unsafe { umask(0o077) };
+        unsafe { umask(active) };
+        assert_eq!(active, 0o077);
+        drop(_saver);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_mask_is_077_from_restrictive_start() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o777) };
+        let _saver = UmaskSaver::new();
+        let active = unsafe { umask(0o077) };
+        unsafe { umask(active) };
+        assert_eq!(active, 0o077);
+        drop(_saver);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_mask_is_077_from_typical_start() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o022) };
+        let _saver = UmaskSaver::new();
+        let active = unsafe { umask(0o077) };
+        unsafe { umask(active) };
+        assert_eq!(active, 0o077);
+        drop(_saver);
+        unsafe { umask(original) };
+    }
+
+    // ── Multiple cycles with verification ─────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn ten_cycles_all_restore_correctly() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o022) };
+
+        for i in 0..10u32 {
+            let mask = (i * 37) as mode_t & 0o777;
+            unsafe { umask(mask) };
+            { let _s = UmaskSaver::new(); }
+            let restored = unsafe { umask(mask) };
+            assert_eq!(restored, mask, "cycle {i} mask 0o{mask:03o}");
+        }
+
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ten_cycles_saved_umask_transitions() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o022) };
+
+        for i in 0..10u32 {
+            let mask = ((i + 1) * 23) as mode_t & 0o777;
+            unsafe { umask(mask) };
+            assert!(UmaskSaver::saved_umask().is_none());
+            let _s = UmaskSaver::new();
+            assert_eq!(UmaskSaver::saved_umask(), Some(mask));
+            drop(_s);
+            assert!(UmaskSaver::saved_umask().is_none());
+        }
+
+        unsafe { umask(original) };
+    }
+
+    // ── Pair permission patterns ──────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn pair_owner_rw() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o600) };
+        { let _s = UmaskSaver::new(); }
+        let r = unsafe { umask(original) };
+        assert_eq!(r, 0o600);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pair_group_rw() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o060) };
+        { let _s = UmaskSaver::new(); }
+        let r = unsafe { umask(original) };
+        assert_eq!(r, 0o060);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pair_other_rw() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o006) };
+        { let _s = UmaskSaver::new(); }
+        let r = unsafe { umask(original) };
+        assert_eq!(r, 0o006);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pair_owner_rx() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o500) };
+        { let _s = UmaskSaver::new(); }
+        let r = unsafe { umask(original) };
+        assert_eq!(r, 0o500);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pair_group_rx() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o050) };
+        { let _s = UmaskSaver::new(); }
+        let r = unsafe { umask(original) };
+        assert_eq!(r, 0o050);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pair_other_rx() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o005) };
+        { let _s = UmaskSaver::new(); }
+        let r = unsafe { umask(original) };
+        assert_eq!(r, 0o005);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pair_owner_wx() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o300) };
+        { let _s = UmaskSaver::new(); }
+        let r = unsafe { umask(original) };
+        assert_eq!(r, 0o300);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pair_group_wx() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o030) };
+        { let _s = UmaskSaver::new(); }
+        let r = unsafe { umask(original) };
+        assert_eq!(r, 0o030);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pair_other_wx() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o003) };
+        { let _s = UmaskSaver::new(); }
+        let r = unsafe { umask(original) };
+        assert_eq!(r, 0o003);
+        unsafe { umask(original) };
+    }
+
+    // ── Cross-category patterns ───────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn cross_owner_r_group_w_other_x() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o421) };
+        { let _s = UmaskSaver::new(); }
+        let r = unsafe { umask(original) };
+        assert_eq!(r, 0o421);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cross_owner_x_group_r_other_w() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o142) };
+        { let _s = UmaskSaver::new(); }
+        let r = unsafe { umask(original) };
+        assert_eq!(r, 0o142);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cross_owner_w_group_x_other_r() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o214) };
+        { let _s = UmaskSaver::new(); }
+        let r = unsafe { umask(original) };
+        assert_eq!(r, 0o214);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cross_owner_rw_group_rx() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o650) };
+        { let _s = UmaskSaver::new(); }
+        let r = unsafe { umask(original) };
+        assert_eq!(r, 0o650);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cross_group_rw_other_rx() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o065) };
+        { let _s = UmaskSaver::new(); }
+        let r = unsafe { umask(original) };
+        assert_eq!(r, 0o065);
+        unsafe { umask(original) };
+    }
+
+    // ── Nesting depth tests ───────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn four_deep_nested_savers() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o022) };
+
+        let a = UmaskSaver::new();
+        let b = UmaskSaver::new();
+        let c = UmaskSaver::new();
+        let d = UmaskSaver::new();
+        drop(d);
+        drop(c);
+        drop(b);
+        drop(a);
+
+        let r = unsafe { umask(original) };
+        assert_eq!(r, 0o022);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn five_deep_nested_all_saved_umask_077() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o022) };
+
+        let a = UmaskSaver::new();
+        assert_eq!(UmaskSaver::saved_umask(), Some(0o022));
+        let b = UmaskSaver::new();
+        assert_eq!(UmaskSaver::saved_umask(), Some(0o077));
+        let c = UmaskSaver::new();
+        assert_eq!(UmaskSaver::saved_umask(), Some(0o077));
+        let d = UmaskSaver::new();
+        assert_eq!(UmaskSaver::saved_umask(), Some(0o077));
+        let e = UmaskSaver::new();
+        assert_eq!(UmaskSaver::saved_umask(), Some(0o077));
+
+        drop(e);
+        drop(d);
+        drop(c);
+        drop(b);
+        drop(a);
+        unsafe { umask(original) };
+    }
+
+    // ── Default trait equivalence ─────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn default_sets_077_like_new() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o022) };
+        let _saver = UmaskSaver::default();
+        let active = unsafe { umask(0o077) };
+        unsafe { umask(active) };
+        assert_eq!(active, 0o077);
+        drop(_saver);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_captures_saved_umask() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o033) };
+        let _saver = UmaskSaver::default();
+        assert_eq!(UmaskSaver::saved_umask(), Some(0o033));
+        drop(_saver);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_restores_on_drop() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o044) };
+        { let _s = UmaskSaver::default(); }
+        let r = unsafe { umask(original) };
+        assert_eq!(r, 0o044);
+        unsafe { umask(original) };
+    }
+
+    // ── Alternating new/default cycles ────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn alternating_new_default_five_cycles() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o022) };
+
+        for i in 0..5 {
+            unsafe { umask(0o022) };
+            if i % 2 == 0 {
+                let _s = UmaskSaver::new();
+            } else {
+                let _s = UmaskSaver::default();
+            }
+            let r = unsafe { umask(0o022) };
+            assert_eq!(r, 0o022, "cycle {i}");
+        }
+
+        unsafe { umask(original) };
+    }
+
+    // ── Mask stability under repeated queries ─────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_umask_stable_across_repeated_reads() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o055) };
+        let _saver = UmaskSaver::new();
+        for _ in 0..10 {
+            assert_eq!(UmaskSaver::saved_umask(), Some(0o055));
+        }
+        drop(_saver);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_mask_stable_across_repeated_queries() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o022) };
+        let _saver = UmaskSaver::new();
+        for _ in 0..5 {
+            let m = unsafe { umask(0o077) };
+            unsafe { umask(m) };
+            assert_eq!(m, 0o077);
+        }
+        drop(_saver);
+        unsafe { umask(original) };
+    }
+
+    // ── Boundary: single-bit masks ────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn single_bit_001_roundtrips() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o001) };
+        { let _s = UmaskSaver::new(); }
+        let r = unsafe { umask(original) };
+        assert_eq!(r, 0o001);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn single_bit_002_roundtrips() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o002) };
+        { let _s = UmaskSaver::new(); }
+        let r = unsafe { umask(original) };
+        assert_eq!(r, 0o002);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn single_bit_004_roundtrips() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o004) };
+        { let _s = UmaskSaver::new(); }
+        let r = unsafe { umask(original) };
+        assert_eq!(r, 0o004);
+        unsafe { umask(original) };
+    }
+
+    // ── Saved umask transitions in nested create/drops ────
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_saved_umask_after_each_drop() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o022) };
+        SAVED_UMASK.lock().unwrap().take();
+
+        assert!(UmaskSaver::saved_umask().is_none());
+        let a = UmaskSaver::new();
+        assert_eq!(UmaskSaver::saved_umask(), Some(0o022));
+        let b = UmaskSaver::new();
+        assert_eq!(UmaskSaver::saved_umask(), Some(0o077));
+        drop(b);
+        // b's drop calls take(), so saved_umask is None
+        assert!(UmaskSaver::saved_umask().is_none());
+        drop(a);
+        assert!(UmaskSaver::saved_umask().is_none());
+
+        unsafe { umask(original) };
+    }
+
+    // ── Verify the invariant: new() always sets 0o077 ────
+
+    #[cfg(unix)]
+    #[test]
+    fn new_always_sets_077_regardless_of_prior_value() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o022) };
+
+        for &mask in &[0o000, 0o022, 0o077, 0o777, 0o123, 0o456] {
+            unsafe { umask(mask) };
+            let _s = UmaskSaver::new();
+            let active = unsafe { umask(0o077) };
+            unsafe { umask(active) };
+            assert_eq!(active, 0o077, "from mask 0o{mask:03o}");
+            drop(_s);
+        }
+
+        unsafe { umask(original) };
+    }
+
+    // ── Additional restore patterns ───────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_mask_0o015() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o015) };
+        { let _s = UmaskSaver::new(); }
+        let r = unsafe { umask(original) };
+        assert_eq!(r, 0o015);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_mask_0o246() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o246) };
+        { let _s = UmaskSaver::new(); }
+        let r = unsafe { umask(original) };
+        assert_eq!(r, 0o246);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_mask_0o351() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o351) };
+        { let _s = UmaskSaver::new(); }
+        let r = unsafe { umask(original) };
+        assert_eq!(r, 0o351);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_mask_0o472() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o472) };
+        { let _s = UmaskSaver::new(); }
+        let r = unsafe { umask(original) };
+        assert_eq!(r, 0o472);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_mask_0o613() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o613) };
+        { let _s = UmaskSaver::new(); }
+        let r = unsafe { umask(original) };
+        assert_eq!(r, 0o613);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_mask_0o724() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o724) };
+        { let _s = UmaskSaver::new(); }
+        let r = unsafe { umask(original) };
+        assert_eq!(r, 0o724);
+        unsafe { umask(original) };
+    }
+
+    // ── Exhaustive all-9-bits individual tests ────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn single_bit_010_roundtrips() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o010) };
+        { let _s = UmaskSaver::new(); }
+        let r = unsafe { umask(original) };
+        assert_eq!(r, 0o010);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn single_bit_020_roundtrips() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o020) };
+        { let _s = UmaskSaver::new(); }
+        let r = unsafe { umask(original) };
+        assert_eq!(r, 0o020);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn single_bit_040_roundtrips() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o040) };
+        { let _s = UmaskSaver::new(); }
+        let r = unsafe { umask(original) };
+        assert_eq!(r, 0o040);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn single_bit_100_roundtrips() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o100) };
+        { let _s = UmaskSaver::new(); }
+        let r = unsafe { umask(original) };
+        assert_eq!(r, 0o100);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn single_bit_200_roundtrips() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o200) };
+        { let _s = UmaskSaver::new(); }
+        let r = unsafe { umask(original) };
+        assert_eq!(r, 0o200);
+        unsafe { umask(original) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn single_bit_400_roundtrips() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let original = unsafe { umask(0o400) };
+        { let _s = UmaskSaver::new(); }
+        let r = unsafe { umask(original) };
+        assert_eq!(r, 0o400);
+        unsafe { umask(original) };
+    }
+
+    // ── Non-unix platform tests ───────────────────────────
+
     #[cfg(not(unix))]
     #[test]
     fn non_unix_new_does_not_panic() {
         let _g = TEST_LOCK.lock().unwrap();
         let _saver = UmaskSaver::new();
-        // On non-unix, UmaskSaver is essentially a no-op
     }
 
     #[cfg(not(unix))]
