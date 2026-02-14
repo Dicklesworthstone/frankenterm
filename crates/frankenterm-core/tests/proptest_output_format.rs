@@ -36,10 +36,7 @@ fn arb_valid_format_string() -> impl Strategy<Value = String> {
 
 /// Strategy that produces non-auto variants only (Plain, Json).
 fn arb_non_auto_format() -> impl Strategy<Value = OutputFormat> {
-    prop_oneof![
-        Just(OutputFormat::Plain),
-        Just(OutputFormat::Json),
-    ]
+    prop_oneof![Just(OutputFormat::Plain), Just(OutputFormat::Json),]
 }
 
 // ── OutputFormat: Display ↔ FromStr roundtrip ───────────────────────────────
