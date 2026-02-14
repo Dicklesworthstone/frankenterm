@@ -222,6 +222,156 @@ mod tests {
     }
 
     #[test]
+    fn ruleset_profile_state_default_has_default_profile() {
+        let state = RulesetProfileState::default();
+        assert_eq!(state.active_profile, "default");
+        assert!(state.active_last_applied_at.is_none());
+        assert_eq!(state.profiles.len(), 1);
+        assert_eq!(state.profiles[0].name, "default");
+        assert!(state.profiles[0].implicit);
+        assert!(state.profiles[0].path.is_none());
+    }
+
+    #[test]
+    fn pane_bookmark_view_from_record() {
+        let record = PaneBookmarkRecord {
+            id: 1,
+            pane_id: 42,
+            alias: "my-pane".to_string(),
+            tags: Some(vec!["dev".to_string(), "test".to_string()]),
+            description: Some("A test pane".to_string()),
+            created_at: 1000,
+            updated_at: 2000,
+        };
+        let view = PaneBookmarkView::from(record);
+        assert_eq!(view.pane_id, 42);
+        assert_eq!(view.alias, "my-pane");
+        assert_eq!(view.tags, vec!["dev", "test"]);
+        assert_eq!(view.description.as_deref(), Some("A test pane"));
+        assert_eq!(view.created_at, 1000);
+        assert_eq!(view.updated_at, 2000);
+    }
+
+    #[test]
+    fn pane_bookmark_view_from_record_none_tags_defaults_empty() {
+        let record = PaneBookmarkRecord {
+            id: 2,
+            pane_id: 1,
+            alias: "bare".to_string(),
+            tags: None,
+            description: None,
+            created_at: 100,
+            updated_at: 100,
+        };
+        let view = PaneBookmarkView::from(record);
+        assert!(view.tags.is_empty());
+        assert!(view.description.is_none());
+    }
+
+    #[test]
+    fn saved_search_view_from_minimal_record() {
+        let record = SavedSearchRecord::new(
+            "test-search".to_string(),
+            "SELECT 1".to_string(),
+            None,
+            10,
+            crate::storage::SAVED_SEARCH_SINCE_MODE_LAST_RUN.to_string(),
+            None,
+        );
+        let view = SavedSearchView::from(record);
+        assert_eq!(view.name, "test-search");
+        assert_eq!(view.query, "SELECT 1");
+        assert!(view.pane_id.is_none());
+        assert_eq!(view.limit, 10);
+        assert!(!view.enabled);
+        assert!(view.last_run_at.is_none());
+        assert!(view.last_result_count.is_none());
+        assert!(view.last_error.is_none());
+        assert!(view.schedule_interval_ms.is_none());
+    }
+
+    #[test]
+    fn profile_state_tie_breaks_lexicographically() {
+        let root = unique_temp_dir("tie");
+        let rulesets_dir = root.join("rulesets");
+        std::fs::create_dir_all(&rulesets_dir).expect("create rulesets dir");
+        let config_path = root.join("ft.toml");
+        std::fs::write(&config_path, "").expect("write temp config");
+
+        let manifest = crate::rulesets::RulesetManifest {
+            version: 1,
+            rulesets: vec![
+                crate::rulesets::RulesetManifestEntry {
+                    name: "beta".to_string(),
+                    path: "beta.toml".to_string(),
+                    description: None,
+                    created_at: None,
+                    updated_at: None,
+                    last_applied_at: Some(500),
+                },
+                crate::rulesets::RulesetManifestEntry {
+                    name: "alpha".to_string(),
+                    path: "alpha.toml".to_string(),
+                    description: None,
+                    created_at: None,
+                    updated_at: None,
+                    last_applied_at: Some(500),
+                },
+            ],
+        };
+        let manifest_json = serde_json::to_string(&manifest).expect("serialize manifest");
+        std::fs::write(rulesets_dir.join("manifest.json"), manifest_json).expect("write manifest");
+
+        let state = resolve_ruleset_profile_state(Some(&config_path)).expect("resolve state");
+        // Same timestamp => alphabetically first wins
+        assert_eq!(state.active_profile, "alpha");
+        assert_eq!(state.active_last_applied_at, Some(500));
+    }
+
+    #[test]
+    fn profile_state_no_applied_profiles_stays_default() {
+        let root = unique_temp_dir("noapplied");
+        let rulesets_dir = root.join("rulesets");
+        std::fs::create_dir_all(&rulesets_dir).expect("create rulesets dir");
+        let config_path = root.join("ft.toml");
+        std::fs::write(&config_path, "").expect("write temp config");
+
+        let manifest = crate::rulesets::RulesetManifest {
+            version: 1,
+            rulesets: vec![crate::rulesets::RulesetManifestEntry {
+                name: "custom".to_string(),
+                path: "custom.toml".to_string(),
+                description: None,
+                created_at: None,
+                updated_at: None,
+                last_applied_at: None,
+            }],
+        };
+        let manifest_json = serde_json::to_string(&manifest).expect("serialize manifest");
+        std::fs::write(rulesets_dir.join("manifest.json"), manifest_json).expect("write manifest");
+
+        let state = resolve_ruleset_profile_state(Some(&config_path)).expect("resolve state");
+        assert_eq!(state.active_profile, "default");
+        assert!(state.active_last_applied_at.is_none());
+    }
+
+    #[test]
+    fn pane_bookmark_view_serializes_to_json() {
+        let view = PaneBookmarkView {
+            pane_id: 5,
+            alias: "test".to_string(),
+            tags: vec!["a".to_string()],
+            description: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let json = serde_json::to_value(&view).expect("serialize");
+        assert_eq!(json["pane_id"], 5);
+        assert_eq!(json["alias"], "test");
+        assert_eq!(json["tags"][0], "a");
+    }
+
+    #[test]
     fn saved_search_view_preserves_last_run_status() {
         let mut record = SavedSearchRecord::new(
             "errors".to_string(),

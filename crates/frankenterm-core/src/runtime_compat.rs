@@ -584,3 +584,95 @@ where
         .await
         .map_err(|err| err.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_builder_current_thread_builds() {
+        let rt = RuntimeBuilder::current_thread().build();
+        assert!(rt.is_ok());
+    }
+
+    #[test]
+    fn runtime_builder_multi_thread_builds() {
+        let rt = RuntimeBuilder::multi_thread().build();
+        assert!(rt.is_ok());
+    }
+
+    #[test]
+    fn runtime_builder_worker_threads_chainable() {
+        let rt = RuntimeBuilder::multi_thread().worker_threads(2).build();
+        assert!(rt.is_ok());
+    }
+
+    #[test]
+    fn runtime_builder_current_thread_ignores_worker_threads() {
+        // current_thread doesn't support worker_threads; should not panic
+        let rt = RuntimeBuilder::current_thread().worker_threads(4).build();
+        assert!(rt.is_ok());
+    }
+
+    #[test]
+    fn compat_runtime_block_on_runs_future() {
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        let result = rt.block_on(async { 42 });
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn compat_runtime_spawn_detached_does_not_panic() {
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        rt.block_on(async {
+            // Can't directly test the spawned task completes, but ensure no panic
+        });
+        rt.spawn_detached(async {});
+    }
+
+    #[tokio::test]
+    async fn sleep_completes() {
+        let start = std::time::Instant::now();
+        sleep(Duration::from_millis(10)).await;
+        let elapsed = start.elapsed();
+        assert!(elapsed >= Duration::from_millis(5));
+    }
+
+    #[tokio::test]
+    async fn timeout_succeeds_before_deadline() {
+        let result = timeout(Duration::from_secs(1), async { 99 }).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 99);
+    }
+
+    #[tokio::test]
+    async fn timeout_expires_returns_error() {
+        let result = timeout(Duration::from_millis(10), async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            42
+        })
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn block_on_with_async_value() {
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        let value = rt.block_on(async {
+            let a = 10;
+            let b = 20;
+            a + b
+        });
+        assert_eq!(value, 30);
+    }
+
+    #[test]
+    fn multi_thread_runtime_block_on() {
+        let rt = RuntimeBuilder::multi_thread()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        let value = rt.block_on(async { "hello" });
+        assert_eq!(value, "hello");
+    }
+}
