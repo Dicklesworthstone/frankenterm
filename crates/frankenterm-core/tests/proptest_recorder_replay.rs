@@ -11,13 +11,14 @@
 //! 6. Seek correctness: seek(ts) positions cursor at correct event
 //! 7. Reset idempotency: reset then replay yields identical frames
 //! 8. Progress monotonicity: progress never decreases during replay
+//! 9. Serde roundtrips for ReplayConfig, ReplayStats, ReplayState
 
 use proptest::prelude::*;
 
 use frankenterm_core::policy::ActorKind;
 use frankenterm_core::recorder_audit::{AccessTier, ActorIdentity};
 use frankenterm_core::recorder_query::QueryEventKind;
-use frankenterm_core::recorder_replay::{ReplayConfig, ReplaySession, ReplayState};
+use frankenterm_core::recorder_replay::{ReplayConfig, ReplaySession, ReplayState, ReplayStats};
 use frankenterm_core::recorder_retention::SensitivityTier;
 use frankenterm_core::recording::RecorderEventSource;
 
@@ -67,6 +68,32 @@ fn arb_events(
         })
         .collect();
     strategies
+}
+
+fn arb_replay_config() -> impl Strategy<Value = ReplayConfig> {
+    (
+        0.5_f64..4.0,      // speed
+        1000_u64..60_000,   // max_delay_ms
+        any::<bool>(),      // skip_empty
+        any::<bool>(),      // include_markers
+    )
+        .prop_map(|(speed, max_delay_ms, skip_empty, include_markers)| ReplayConfig {
+            speed,
+            max_delay_ms,
+            skip_empty,
+            include_markers,
+            pane_filter: Vec::new(),
+            kind_filter: Vec::new(),
+        })
+}
+
+fn arb_replay_state() -> impl Strategy<Value = ReplayState> {
+    prop_oneof![
+        Just(ReplayState::Ready),
+        Just(ReplayState::Playing),
+        Just(ReplayState::Paused),
+        Just(ReplayState::Completed),
+    ]
 }
 
 fn human() -> ActorIdentity {
@@ -478,5 +505,152 @@ proptest! {
 
         prop_assert_eq!(session.stats().replay_duration_ms, 0,
             "instant replay should have zero total duration");
+    }
+}
+
+// =============================================================================
+// Serde roundtrip: ReplayConfig
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(60))]
+
+    /// ReplayConfig serde roundtrip preserves all fields.
+    #[test]
+    fn prop_replay_config_serde(config in arb_replay_config()) {
+        let json = serde_json::to_string(&config).unwrap();
+        let back: ReplayConfig = serde_json::from_str(&json).unwrap();
+        prop_assert!((back.speed - config.speed).abs() < 1e-10,
+            "speed: {} vs {}", back.speed, config.speed);
+        prop_assert_eq!(back.max_delay_ms, config.max_delay_ms);
+        prop_assert_eq!(back.skip_empty, config.skip_empty);
+        prop_assert_eq!(back.include_markers, config.include_markers);
+        prop_assert_eq!(back.pane_filter.len(), config.pane_filter.len());
+        prop_assert_eq!(back.kind_filter.len(), config.kind_filter.len());
+    }
+
+    /// ReplayConfig default serde roundtrip.
+    #[test]
+    fn prop_replay_config_default_roundtrip(_dummy in 0..1_u8) {
+        let config = ReplayConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        let back: ReplayConfig = serde_json::from_str(&json).unwrap();
+        prop_assert!((back.speed - 1.0).abs() < 1e-15);
+        prop_assert_eq!(back.max_delay_ms, 5000);
+        prop_assert!(!back.skip_empty);
+        prop_assert!(back.include_markers);
+    }
+
+    /// ReplayConfig from empty JSON uses defaults.
+    #[test]
+    fn prop_replay_config_from_empty_json(_dummy in 0..1_u8) {
+        let back: ReplayConfig = serde_json::from_str("{}").unwrap();
+        prop_assert!((back.speed - 1.0).abs() < 1e-15);
+        prop_assert_eq!(back.max_delay_ms, 5000);
+        prop_assert!(back.include_markers);
+    }
+}
+
+// =============================================================================
+// Serde roundtrip: ReplayStats
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(60))]
+
+    /// ReplayStats serde roundtrip preserves all fields.
+    #[test]
+    fn prop_replay_stats_serde(
+        emitted in 0_usize..1000,
+        skipped in 0_usize..1000,
+        original_ms in 0_u64..1_000_000,
+        replay_ms in 0_u64..1_000_000,
+        unique_panes in 0_usize..20,
+        completed in any::<bool>(),
+    ) {
+        let stats = ReplayStats {
+            frames_emitted: emitted,
+            frames_skipped: skipped,
+            original_duration_ms: original_ms,
+            replay_duration_ms: replay_ms,
+            unique_panes,
+            by_kind: std::collections::HashMap::new(),
+            completed,
+        };
+        let json = serde_json::to_string(&stats).unwrap();
+        let back: ReplayStats = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.frames_emitted, emitted);
+        prop_assert_eq!(back.frames_skipped, skipped);
+        prop_assert_eq!(back.original_duration_ms, original_ms);
+        prop_assert_eq!(back.replay_duration_ms, replay_ms);
+        prop_assert_eq!(back.unique_panes, unique_panes);
+        prop_assert_eq!(back.completed, completed);
+    }
+}
+
+// =============================================================================
+// Serde roundtrip: ReplayState
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    /// ReplayState serde roundtrip for all variants.
+    #[test]
+    fn prop_replay_state_serde(state in arb_replay_state()) {
+        let json = serde_json::to_string(&state).unwrap();
+        let back: ReplayState = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, state);
+    }
+
+    /// ReplayState serializes to snake_case strings.
+    #[test]
+    fn prop_replay_state_snake_case(state in arb_replay_state()) {
+        let json = serde_json::to_string(&state).unwrap();
+        let expected = match state {
+            ReplayState::Ready => "\"ready\"",
+            ReplayState::Playing => "\"playing\"",
+            ReplayState::Paused => "\"paused\"",
+            ReplayState::Completed => "\"completed\"",
+        };
+        prop_assert_eq!(&json, expected);
+    }
+}
+
+// =============================================================================
+// Property: Combined pane + kind filter
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn combined_filter_respects_both(
+        events in arb_events(20),
+        filter_pane in 1_u64..5,
+        filter_kind in arb_event_kind(),
+    ) {
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        let config = ReplayConfig::instant()
+            .with_panes(vec![filter_pane])
+            .with_kinds(vec![filter_kind]);
+        let mut session = make_session(events.clone(), config).unwrap();
+        let frames = session.collect_remaining();
+
+        for frame in &frames {
+            prop_assert_eq!(frame.event.pane_id, filter_pane,
+                "frame pane {} should match filter {}", frame.event.pane_id, filter_pane);
+            prop_assert_eq!(frame.event.event_kind, filter_kind,
+                "frame kind {:?} should match filter {:?}", frame.event.event_kind, filter_kind);
+        }
+
+        let expected = events.iter()
+            .filter(|e| e.pane_id == filter_pane && e.event_kind == filter_kind)
+            .count();
+        prop_assert_eq!(frames.len(), expected,
+            "expected {} frames for combined filter, got {}", expected, frames.len());
     }
 }
