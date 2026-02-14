@@ -6873,6 +6873,40 @@ fn now_epoch_ms() -> i64 {
     i64::try_from(now_ms()).unwrap_or(i64::MAX)
 }
 
+fn health_diagnostics_to_json(
+    diagnostics: &[frankenterm_core::output::HealthDiagnostic],
+) -> Vec<serde_json::Value> {
+    diagnostics
+        .iter()
+        .map(|diag| {
+            serde_json::json!({
+                "name": diag.name,
+                "status": diag.status.as_str(),
+                "detail": diag.detail,
+            })
+        })
+        .collect()
+}
+
+fn attach_resize_dashboard_from_status_payload(
+    payload: &mut serde_json::Value,
+    status_payload: &serde_json::Value,
+) {
+    if let Some(dashboard) =
+        frankenterm_core::output::HealthSnapshotRenderer::resize_dashboard_from_status_payload(
+            status_payload,
+        )
+    {
+        payload["resize_dashboard"] =
+            serde_json::to_value(&dashboard).unwrap_or(serde_json::Value::Null);
+        let checks =
+            frankenterm_core::output::HealthSnapshotRenderer::resize_dashboard_diagnostic_checks(
+                &dashboard,
+            );
+        payload["resize_diagnostics"] = serde_json::json!(health_diagnostics_to_json(&checks));
+    }
+}
+
 /// Parse a period string (e.g. "7d", "30d", "90d", "1d") into milliseconds.
 fn parse_period_ms(period: &str) -> i64 {
     let s = period.trim().to_lowercase();
@@ -14368,23 +14402,28 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                     health.clone()
                                                 ) {
                                                     let diags = frankenterm_core::output::HealthSnapshotRenderer::diagnostic_checks(&snapshot);
-                                                    let diag_json: Vec<serde_json::Value> = diags
-                                                        .iter()
-                                                        .map(|d| {
-                                                            serde_json::json!({
-                                                                "name": d.name,
-                                                                "status": format!("{:?}", d.status),
-                                                                "detail": d.detail,
-                                                            })
-                                                        })
-                                                        .collect();
-                                                    payload["diagnostics"] =
-                                                        serde_json::json!(diag_json);
+                                                    payload["diagnostics"] = serde_json::json!(
+                                                        health_diagnostics_to_json(&diags)
+                                                    );
                                                 }
                                             }
                                             if let Some(uptime) = data.get("uptime_ms") {
                                                 payload["uptime_ms"] = uptime.clone();
                                             }
+                                            for key in [
+                                                "resize_control_plane",
+                                                "resize_control_plane_stalled",
+                                                "resize_control_plane_watchdog",
+                                                "resize_degradation_ladder",
+                                            ] {
+                                                if let Some(value) = data.get(key) {
+                                                    payload[key] = value.clone();
+                                                }
+                                            }
+                                            attach_resize_dashboard_from_status_payload(
+                                                &mut payload,
+                                                data,
+                                            );
                                         }
                                     }
                                     Ok(_) => {
@@ -14418,17 +14457,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         frankenterm_core::output::HealthSnapshotRenderer::diagnostic_checks(
                                             &snapshot,
                                         );
-                                    let diag_json: Vec<serde_json::Value> = diags
-                                        .iter()
-                                        .map(|d| {
-                                            serde_json::json!({
-                                                "name": d.name,
-                                                "status": format!("{:?}", d.status),
-                                                "detail": d.detail,
-                                            })
-                                        })
-                                        .collect();
-                                    payload["diagnostics"] = serde_json::json!(diag_json);
+                                    payload["diagnostics"] =
+                                        serde_json::json!(health_diagnostics_to_json(&diags));
                                 }
                             }
 
@@ -14441,6 +14471,28 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     serde_json::to_value(&snapshot).unwrap_or(serde_json::Value::Null);
                                 payload["resize_control_plane_stalled"] =
                                     serde_json::to_value(stalled).unwrap_or(serde_json::Value::Null);
+                            }
+                            if let Some(watchdog) =
+                                frankenterm_core::runtime::evaluate_resize_watchdog(
+                                    u64::try_from(now_epoch_ms()).unwrap_or(0),
+                                )
+                            {
+                                payload["resize_control_plane_watchdog"] =
+                                    serde_json::to_value(&watchdog)
+                                        .unwrap_or(serde_json::Value::Null);
+                                let ladder =
+                                    frankenterm_core::runtime::derive_resize_degradation_ladder(
+                                        &watchdog,
+                                    );
+                                payload["resize_degradation_ladder"] =
+                                    serde_json::to_value(ladder).unwrap_or(serde_json::Value::Null);
+                            }
+                            if payload.get("resize_dashboard").is_none() {
+                                let snapshot = payload.clone();
+                                attach_resize_dashboard_from_status_payload(
+                                    &mut payload,
+                                    &snapshot,
+                                );
                             }
 
                             // Latest crash bundle
@@ -16926,7 +16978,29 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         payload["watcher_running"] = serde_json::Value::Bool(true);
                         if let Some(health_value) = status.get("health") {
                             payload["health"] = health_value.clone();
+                            if let Ok(snapshot) = serde_json::from_value::<
+                                frankenterm_core::crash::HealthSnapshot,
+                            >(health_value.clone())
+                            {
+                                let checks =
+                                    frankenterm_core::output::HealthSnapshotRenderer::diagnostic_checks(
+                                        &snapshot,
+                                    );
+                                payload["diagnostics"] =
+                                    serde_json::json!(health_diagnostics_to_json(&checks));
+                            }
                         }
+                        for key in [
+                            "resize_control_plane",
+                            "resize_control_plane_stalled",
+                            "resize_control_plane_watchdog",
+                            "resize_degradation_ladder",
+                        ] {
+                            if let Some(value) = status.get(key) {
+                                payload[key] = value.clone();
+                            }
+                        }
+                        attach_resize_dashboard_from_status_payload(&mut payload, &status);
                         payload["watcher"] = status;
                     }
                     Ok(None) => {
@@ -16936,6 +17010,47 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         payload["watcher_running"] = serde_json::Value::Bool(false);
                         payload["watcher_error"] = serde_json::Value::String(err);
                     }
+                }
+                if payload.get("health").is_none() {
+                    if let Some(snapshot) = frankenterm_core::crash::HealthSnapshot::get_global() {
+                        payload["health"] =
+                            serde_json::to_value(&snapshot).unwrap_or(serde_json::Value::Null);
+                        let checks =
+                            frankenterm_core::output::HealthSnapshotRenderer::diagnostic_checks(
+                                &snapshot,
+                            );
+                        payload["diagnostics"] =
+                            serde_json::json!(health_diagnostics_to_json(&checks));
+                    }
+                }
+                if payload.get("resize_control_plane").is_none() {
+                    if let Some(snapshot) =
+                        frankenterm_core::resize_scheduler::ResizeSchedulerDebugSnapshot::get_global(
+                        )
+                    {
+                        let now_ms = u64::try_from(now_epoch_ms()).unwrap_or(0);
+                        let stalled = snapshot.stalled_transactions(now_ms, 2_000);
+                        payload["resize_control_plane"] =
+                            serde_json::to_value(&snapshot).unwrap_or(serde_json::Value::Null);
+                        payload["resize_control_plane_stalled"] =
+                            serde_json::to_value(stalled).unwrap_or(serde_json::Value::Null);
+                    }
+                }
+                if payload.get("resize_control_plane_watchdog").is_none() {
+                    if let Some(watchdog) = frankenterm_core::runtime::evaluate_resize_watchdog(
+                        u64::try_from(now_epoch_ms()).unwrap_or(0),
+                    ) {
+                        payload["resize_control_plane_watchdog"] =
+                            serde_json::to_value(&watchdog).unwrap_or(serde_json::Value::Null);
+                        let ladder =
+                            frankenterm_core::runtime::derive_resize_degradation_ladder(&watchdog);
+                        payload["resize_degradation_ladder"] =
+                            serde_json::to_value(ladder).unwrap_or(serde_json::Value::Null);
+                    }
+                }
+                if payload.get("resize_dashboard").is_none() {
+                    let snapshot = payload.clone();
+                    attach_resize_dashboard_from_status_payload(&mut payload, &snapshot);
                 }
                 if let Some(crash) = frankenterm_core::crash::latest_crash_bundle(&layout.crash_dir)
                 {
@@ -16973,15 +17088,18 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     _ => detect_format(),
                 };
 
-                let watcher_health = watcher_status
-                    .ok()
-                    .and_then(|status| status)
+                let watcher_status_payload = watcher_status.ok().and_then(|status| status);
+                let watcher_health = watcher_status_payload
+                    .as_ref()
                     .and_then(|status| status.get("health").cloned())
                     .and_then(|value| {
                         serde_json::from_value::<frankenterm_core::crash::HealthSnapshot>(value)
                             .ok()
                     })
                     .or_else(frankenterm_core::crash::HealthSnapshot::get_global);
+                let watcher_resize_dashboard = watcher_status_payload.as_ref().and_then(
+                    frankenterm_core::output::HealthSnapshotRenderer::resize_dashboard_from_status_payload,
+                );
 
                 let bookmark_pane_ids = if bookmark.is_some() || bookmark_tag.is_some() {
                     let db_path = layout.db_path.to_string_lossy();
@@ -17141,6 +17259,16 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 let health_output =
                                     HealthSnapshotRenderer::render_compact(&snapshot, &ctx);
                                 print!("{health_output}");
+                            }
+                        }
+                        if let Some(dashboard) = watcher_resize_dashboard.as_ref() {
+                            if !output_format.is_json() {
+                                println!();
+                                let resize_output =
+                                    HealthSnapshotRenderer::render_resize_dashboard_compact(
+                                        dashboard, &ctx,
+                                    );
+                                print!("{resize_output}");
                             }
                         }
 
