@@ -1,0 +1,11 @@
+docs/resize-performance-slos.md:4:**Related tasks:** `wa-1u90p.1.2`, `wa-1u90p.1.3`, `wa-1u90p.1.4`, `wa-1u90p.1.5`  
+docs/resize-performance-slos.md:5:**Status:** Draft v0.2 (instrumentation mapped; final calibration pending `wa-1u90p.1.3` + `wa-1u90p.1.5`)
+docs/resize-performance-slos.md:117:- Run runtime warning-threshold tests for lock wait/hold and cursor snapshot memory.
+docs/resize-performance-slos.md:131:- Require lock/memory profile review sign-off (`wa-1u90p.1.3` evidence).
+docs/resize-performance-slos.md:142:- lock/memory telemetry (`max_storage_lock_wait_ms`, `avg_storage_lock_wait_ms`, `storage_lock_contention_events`, `max_storage_lock_hold_ms`, `cursor_snapshot_bytes_last`, `cursor_snapshot_bytes_max`)
+docs/resize-performance-slos.md:177:- `wa-1u90p.1.3`: lock contention + memory attribution under resize storms
+docs/resize-baseline-scenarios.md:115:## Companion Runtime Telemetry (`wa-1u90p.1.3`)
+docs/resize-baseline-scenarios.md:119:- lock contention: `max_storage_lock_wait_ms`, `avg_storage_lock_wait_ms`, `storage_lock_contention_events`
+docs/resize-baseline-scenarios.md:120:- lock hold: `max_storage_lock_hold_ms`, `avg_storage_lock_hold_ms`
+docs/resize-baseline-scenarios.md:121:- cursor snapshot memory: `cursor_snapshot_bytes_last`, `cursor_snapshot_bytes_max`, `avg_cursor_snapshot_bytes`
+docs/resize-baseline-scenarios.md:127:- cursor snapshot memory warning: `64 MiB`

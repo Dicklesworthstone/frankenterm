@@ -2,7 +2,7 @@
 
 **Parent track:** `wa-1u90p.1`  
 **Related tasks:** `wa-1u90p.1.2`, `wa-1u90p.1.3`, `wa-1u90p.1.4`, `wa-1u90p.1.5`  
-**Status:** Draft v0.2 (instrumentation mapped; final calibration pending `wa-1u90p.1.3` + `wa-1u90p.1.5`)
+**Status:** Candidate v1.0 (numeric contract frozen; refresh calibration pending `wa-1u90p.1.3` replay unblock)
 
 This document defines hard SLO targets and release gates for resize/reflow behavior.
 It is the authoritative baseline used by CI, soak, and go/no-go review for the zero-hitch resize program.
@@ -66,6 +66,25 @@ cargo test -p frankenterm-core resize_timeline_summary_and_flame_samples_cover_a
 # Lock/memory warning-threshold coverage
 cargo test -p frankenterm-core warning_threshold_fires -- --nocapture
 ```
+
+## Calibration Intake (2026-02-14)
+
+Latest lock/memory profiling intake from `wa-1u90p.1.3`:
+- `docs/resize-lock-memory-profile-wa-1u90p.1.3.md`
+- `evidence/wa-1u90p.1.3/summaries/simulate_cli_parse.log`
+- `evidence/wa-1u90p.1.3/summaries/simulation_harness_build.log`
+- `evidence/wa-1u90p.1.3/summaries/simulation_harness_build_error_summary.txt`
+- `evidence/wa-1u90p.1.3/summaries/runtime_lock_memory_telemetry_refs.txt`
+- `evidence/wa-1u90p.1.3/summaries/localpane_resize_telemetry_refs.txt`
+
+Current blockers to fresh percentile extraction:
+- `ft simulate run ... --json` path rejects `generate_scrollback` in baseline fixture replay.
+- `workflows.rs` has `std::time::Instant` vs `tokio::time::Instant` mismatches (`E0308`).
+- `search/chunk_vector_store.rs` has `u64: FromSql` type mismatches (`E0277`).
+- `runtime.rs` references missing `RuntimeHandle` field (`E0609`).
+
+Recently cleared blocker:
+- `wa-1u90p.2.3` resolved prior `resize_scheduler` const-trait compile break (`E0658`) by removing const-only path from work-unit normalization.
 
 ## Primary SLO Metrics
 
@@ -144,9 +163,9 @@ Required outputs for each gate:
 
 ## Current Gaps and Near-Term Closure
 
-- Full timeline artifacts are now available via `ft simulate run --json --resize-timeline-json`; plain `--json` mode remains metadata/event playback oriented.
-- Numeric p50/p99 reduction and artifact incidence rollups are expected deliverables of `wa-1u90p.1.5` (see `docs/resize-baseline-bottleneck-dossier.md`).
-- Until `wa-1u90p.1.5` lands, this document remains the normative threshold contract and the artifact schema baseline.
+- Full timeline artifacts are available via `ft simulate run --json --resize-timeline-json`; plain `--json` mode remains metadata/event playback oriented.
+- Numeric p50/p99 refresh and artifact incidence rollups remain blocked on the `wa-1u90p.1.3` replay/build blockers listed above.
+- `wa-1u90p.1.5` consumes this contract as the normative threshold baseline and will tighten ranking confidence after replay unblock.
 
 ## Degradation and Rollback Policy
 
@@ -171,10 +190,10 @@ Rollback/degradation can be lifted only after:
 
 ## Dependency-Bound Sections
 
-These thresholds are explicit and enforceable now, but expected to be tightened
-after remaining baseline tasks land:
-- `wa-1u90p.1.2`: stage-level instrumentation completeness and queue metrics
-- `wa-1u90p.1.3`: lock contention + memory attribution under resize storms
+Thresholds in this document are explicit and enforceable now.
+Refresh-calibration is dependency-bound to:
+- `wa-1u90p.1.3`: unblock replay/build path, then publish fresh `R1..R4` percentile rollups
+- `wa-1u90p.1.5`: incorporate refreshed rollups into final intervention ranking package
 
-When those tasks close, update this document with final calibrated values and
-record the revision in bead notes.
+When replay/build blockers clear, update this document with refreshed percentile
+tables and record the revision in bead notes.
