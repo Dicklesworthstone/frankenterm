@@ -2,13 +2,13 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://wezterm-automata.dev/schemas/wa-robot-search.json",
   "title": "WA Robot Search Response",
-  "description": "Schema for the data field when calling 'wa robot search <query>'. Returns FTS search results.",
+  "description": "Schema for the data field when calling 'wa robot search <query>'. Returns lexical, semantic, or hybrid search results with policy-redacted query/text payloads.",
   "type": "object",
   "required": ["query", "results", "total_hits", "limit"],
   "properties": {
     "query": {
       "type": "string",
-      "description": "The FTS5 query that was executed"
+      "description": "The canonical query string after policy redaction"
     },
     "results": {
       "type": "array",
@@ -44,6 +44,59 @@
       "type": "string",
       "enum": ["lexical", "semantic", "hybrid"],
       "description": "Search mode used for query execution"
+    },
+    "metrics": {
+      "type": "object",
+      "description": "Optional search pipeline metrics (present for semantic/hybrid MCP responses)",
+      "properties": {
+        "requested_mode": {
+          "type": "string",
+          "enum": ["lexical", "semantic", "hybrid"]
+        },
+        "effective_mode": {
+          "type": "string",
+          "enum": ["lexical", "semantic", "hybrid"]
+        },
+        "fallback_reason": {
+          "type": ["string", "null"]
+        },
+        "rrf_k": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "lexical_weight": {
+          "type": "number"
+        },
+        "semantic_weight": {
+          "type": "number"
+        },
+        "lexical_candidates": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "semantic_candidates": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "semantic_cache_hit": {
+          "type": "boolean"
+        },
+        "semantic_latency_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "semantic_rows_scanned": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "semantic_budget_state": {
+          "type": "string"
+        },
+        "semantic_backoff_until_ms": {
+          "type": ["integer", "null"]
+        }
+      },
+      "additionalProperties": false
     }
   },
   "additionalProperties": false,
@@ -73,15 +126,24 @@
         },
         "score": {
           "type": "number",
-          "description": "BM25 relevance score"
+          "description": "Mode-specific ranking score (BM25 for lexical, fused/semantic score for semantic or hybrid)"
         },
         "snippet": {
           "type": "string",
-          "description": "Relevant portion of the segment with match highlights"
+          "description": "Redacted relevant portion of the segment with match highlights"
         },
         "content": {
           "type": "string",
-          "description": "Full segment content (present when snippets are disabled)"
+          "description": "Redacted full segment content (present when snippets are disabled)"
+        },
+        "semantic_score": {
+          "type": "number",
+          "description": "Semantic similarity score (when semantic lane contributes)"
+        },
+        "fusion_rank": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "0-based fused rank position (semantic/hybrid modes)"
         }
       },
       "additionalProperties": false

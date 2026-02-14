@@ -125,7 +125,7 @@ Each robot command has a corresponding typed struct:
 | `robot get-text` | `GetTextData` | Pane text with truncation info |
 | `robot send` | `SendData` | Injection result with policy decision |
 | `robot wait-for` | `WaitForData` | Pattern match polling result |
-| `robot search` | `SearchData` | FTS5 search results with scores |
+| `robot search` | `SearchData` | Lexical/semantic/hybrid search results with mode-aware scores |
 | `robot events` | `EventsData` | Detected events with filters |
 | `robot events annotate/triage/label` | `EventMutationData` | Annotation mutation result |
 | `robot workflow run` | `WorkflowRunData` | Workflow execution start |
@@ -147,6 +147,17 @@ Each robot command has a corresponding typed struct:
 
 All types derive `Serialize` + `Deserialize` and use `#[serde(default)]`
 for optional fields, so they tolerate missing fields from older ft versions.
+
+### Search mode fields
+
+`SearchData`/`SearchHit` include mode-aware optional fields:
+
+- `SearchData.mode`: effective mode label (`lexical`, `semantic`, `hybrid`)
+- `SearchData.metrics`: optional pipeline metrics payload (semantic/hybrid MCP responses)
+- `SearchHit.semantic_score`: optional semantic similarity score
+- `SearchHit.fusion_rank`: optional 0-based rank from fused ordering
+- `SearchData.query`, `SearchHit.snippet`, and `SearchHit.content` are redacted output fields (safe to log by default).
+- Search/read calls can fail with policy decisions (`ErrorCode::ActionDenied`, `ErrorCode::ApprovalRequired`).
 
 ## JSON Schemas
 

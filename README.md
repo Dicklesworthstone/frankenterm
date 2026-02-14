@@ -47,7 +47,7 @@ cargo install --git https://github.com/Dicklesworthstone/frankenterm.git ft
 | **Intelligent Detection** | Multi-agent pattern engine detects rate limits, errors, prompts, completions |
 | **Event-Driven Automation** | Workflows trigger on patterns — no sleep loops or polling heuristics |
 | **Robot Mode API** | JSON interface optimized for AI agents to control other AI agents |
-| **Full-Text Search** | FTS5-powered search across all captured output with BM25 ranking |
+| **Lexical + Hybrid Search** | FTS5 lexical search plus semantic/hybrid retrieval modes across captured output |
 | **Policy Engine** | Capability gates, rate limiting, audit trails for safe multi-agent control |
 
 ---
@@ -82,8 +82,11 @@ $ ft robot get-text 0 --tail 50
 # Wait for a specific pattern (e.g., agent hitting rate limit)
 $ ft robot wait-for 0 "core.codex:usage_reached" --timeout-secs 3600
 
-# Search all captured output
+# Search all captured output (lexical default)
 $ ft robot search "error: compilation failed"
+
+# Semantic/hybrid search mode
+$ ft robot search "error: compilation failed" --mode hybrid
 
 # Send input to a pane (with policy checks)
 $ ft robot send 1 "/compact"
@@ -91,6 +94,8 @@ $ ft robot send 1 "/compact"
 # View recent detection events
 $ ft robot events --limit 10
 ```
+
+Read/query interfaces (`ft get-text`, `ft search`, `ft robot get-text`, `ft robot search`, and MCP `wa.get_text` / `wa.search`) are policy-evaluated and redact secret material in returned text/snippets.
 
 ---
 
@@ -121,6 +126,7 @@ Robot Mode returns structured JSON with consistent schemas. Every response inclu
 - **Observe vs act split**: `ft watch` is read-only; mutating actions must pass the Policy Engine.
 - **No silent gaps**: capture gaps are recorded explicitly and surfaced in events/diagnostics.
 - **Policy-gated sending**: `ft send` and workflows enforce prompt/alt-screen checks, rate limits, and approvals.
+- **Policy-gated reads**: `get-text`/`search` surfaces enforce policy checks and return redacted text payloads.
 
 ## Secure Distributed Mode
 
@@ -343,7 +349,7 @@ ft robot get-text <id> --tail 50      # Pane output as JSON
 ft robot send <id> "<text>" # Send input (with policy)
 ft robot send <id> "<text>" --dry-run  # Preview without executing
 ft robot wait-for <id> <rule_id>       # Wait for pattern
-ft robot search "<query>"   # Search with structured results
+ft robot search "<query>" --mode <lexical|semantic|hybrid>  # Structured search
 ft robot events             # Recent detection events
 ft robot help               # List all robot commands
 ```

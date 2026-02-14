@@ -61,7 +61,7 @@ legacy `wa://...` scheme for backward compatibility.
 | `wa.get_text` | Get text from a pane | `docs/json-schema/wa-robot-get-text.json` |
 | `wa.send` | Send text to a pane | `docs/json-schema/wa-robot-send.json` |
 | `wa.wait_for` | Wait for pattern match | `docs/json-schema/wa-robot-wait-for.json` |
-| `wa.search` | FTS search across captures | `docs/json-schema/wa-robot-search.json` |
+| `wa.search` | Unified lexical/semantic/hybrid search across captures | `docs/json-schema/wa-robot-search.json` |
 | `wa.events` | Query events | `docs/json-schema/wa-robot-events.json` |
 | `wa.events_annotate` | Set/clear an event note | `docs/json-schema/wa-robot-event-mutation.json` |
 | `wa.events_triage` | Set/clear an event triage state | `docs/json-schema/wa-robot-event-mutation.json` |
@@ -92,6 +92,7 @@ All tools accept an optional `format?: "json" | "toon"` parameter (default: `jso
 
 - `wa.get_text`
   - Params: `{ pane_id: u64, tail?: u64=50, escapes?: bool=false }`
+  - Response notes: text payloads are redacted before serialization; policy gates may return `FT-MCP-0006`.
 
 - `wa.send`
   - Params: `{ pane_id: u64, text: string, dry_run?: bool=false, wait_for?: string, timeout_secs?: u64=30, wait_for_regex?: bool=false }`
@@ -101,6 +102,8 @@ All tools accept an optional `format?: "json" | "toon"` parameter (default: `jso
 
 - `wa.search`
   - Params: `{ query: string, limit?: u64=20, pane?: u64, since?: i64, until?: i64, snippets?: bool=true, mode?: "lexical"|"semantic"|"hybrid"="lexical" }`
+  - Response notes: `data.mode` reports effective mode and `data.metrics` may include fusion/cache/budget telemetry for semantic/hybrid runs.
+  - Redaction/policy: response `query`/`snippet`/`content` fields are redacted; denied/approval-required outcomes return `FT-MCP-0006` (approval-required includes a hint command).
 
 - `wa.events`
   - Params: `{ limit?: u64=20, pane?: u64, rule_id?: string, event_type?: string, triage_state?: string, label?: string, unhandled?: bool=false, since?: i64, would_handle?: bool=false, dry_run?: bool=false }`
@@ -173,22 +176,23 @@ Resources are read-only snapshots. Query parameters mirror tool defaults.
 
 ## Error Codes (stable)
 
-All MCP errors use stable codes prefixed with `WA-MCP-`:
+All MCP errors use stable codes prefixed with `FT-MCP-`:
 
 | Error code | Meaning | Robot equivalent |
 |------------|---------|------------------|
-| `WA-MCP-0001` | Invalid arguments | `robot.invalid_args` |
-| `WA-MCP-0002` | Unknown tool/resource | `robot.unknown_subcommand` |
-| `WA-MCP-0003` | Config error | `robot.config_error` |
-| `WA-MCP-0004` | Backend bridge CLI error (current: WezTerm) | `robot.wezterm_error` |
-| `WA-MCP-0005` | Storage error | `robot.storage_error` |
-| `WA-MCP-0006` | Policy denied | `robot.policy_denied` |
-| `WA-MCP-0007` | Pane not found | `robot.pane_not_found` |
-| `WA-MCP-0008` | Workflow error | `robot.workflow_error` |
-| `WA-MCP-0009` | Timeout | `robot.timeout` |
-| `WA-MCP-0010` | Not implemented | `robot.not_implemented` |
-| `WA-MCP-0011` | Approval failed (expired, consumed, mismatch) | `robot.approval_error` |
-| `WA-MCP-0012` | Execution not found | `robot.execution_not_found` |
+| `FT-MCP-0001` | Invalid arguments | `robot.invalid_args` |
+| `FT-MCP-0003` | Config error | `robot.config_error` |
+| `FT-MCP-0004` | Backend bridge CLI error (current: WezTerm) | `robot.wezterm_error` |
+| `FT-MCP-0005` | Storage error | `robot.storage_error` |
+| `FT-MCP-0006` | Policy denied or approval required | `robot.policy_denied`, `robot.require_approval` |
+| `FT-MCP-0007` | Pane not found | `robot.pane_not_found` |
+| `FT-MCP-0008` | Workflow error | `robot.workflow_error` |
+| `FT-MCP-0009` | Timeout | `robot.timeout` |
+| `FT-MCP-0010` | Not implemented | `robot.not_implemented` |
+| `FT-MCP-0011` | Search query lint/FTS syntax error | `robot.fts_query_error` |
+| `FT-MCP-0012` | Reservation conflict | `robot.reservation_conflict` |
+| `FT-MCP-0013` | CAAM/CAUT account backend error | `robot.caut_error` |
+| `FT-MCP-0014` | CASS integration error | `robot.cass_error` |
 
 ## Safety & Policy
 
@@ -200,6 +204,12 @@ Any tool that causes side effects MUST pass the PolicyEngine, including:
 - `wa.accounts_refresh` (if it triggers external calls)
 
 Resources are read-only and MUST not cause side effects.
+
+Policy + redaction also apply to read/query tools:
+- `wa.get_text`
+- `wa.search`
+
+These surfaces may return `FT-MCP-0006` when policy denies access or requires approval, and returned text fields are redacted.
 
 ## Parity & Schema Contract
 

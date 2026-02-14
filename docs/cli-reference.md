@@ -13,7 +13,7 @@ ft stop [--force] [--timeout <secs>]
 ft status
 ft list [--json]
 ft show <pane_id> [--output]        # stub (not yet implemented)
-ft get-text <pane_id> [--escapes]   # stub (not yet implemented)
+ft get-text <pane_id> [--tail <n>] [--escapes]
 ```
 
 ### Search and events
@@ -31,6 +31,11 @@ ft events label <event_id> --remove <label>
 ft events label <event_id> --list
 ft triage [--severity <error|warning|info>] [--only <section>] [--details]
 ```
+
+Mode notes:
+- `lexical` uses FTS5/BM25 ranking.
+- `semantic` uses embedding-backed retrieval with fused ranking score output.
+- `hybrid` fuses lexical + semantic lanes with deterministic rank fusion.
 
 ### Actions, approvals, and audit
 
@@ -122,7 +127,7 @@ ft auth bootstrap <service> [--account <name>]
 
 Notes:
 - `ft auth` requires the `browser` feature to enable Playwright-based flows.
-- `ft show` and `ft get-text` exist but are currently placeholders.
+- `ft show` exists but is still a placeholder.
 
 ## Feature-gated commands
 
@@ -179,6 +184,17 @@ ft robot reservations release <reservation_id>
 ft robot accounts list [--service <openai|anthropic|google>] [--pick]
 ft robot accounts refresh [--service <openai|anthropic|google>]
 ```
+
+Examples:
+- `ft robot search "compilation failed" --mode lexical`
+- `ft robot search "compilation failed" --mode semantic`
+- `ft robot search "compilation failed" --mode hybrid`
+
+Policy/redaction:
+- `ft get-text`, `ft search`, `ft robot get-text`, and `ft robot search` are policy-gated read/query surfaces.
+- Returned text/snippets are passed through the standard secret redactor before output.
+- Redaction applies to echoed query/content fields as well (`query`, `snippet`, `content`) for search responses.
+- Policy denials return `robot.policy_denied`; approval-required paths return `robot.require_approval` with approval guidance.
 
 ## MCP reference
 
