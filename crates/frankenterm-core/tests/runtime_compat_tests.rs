@@ -1,3 +1,5 @@
+#![cfg(not(feature = "asupersync-runtime"))]
+
 //! Tests for runtime_compat module — dual-runtime compatibility layer.
 //!
 //! These tests exercise the tokio path (default, without `asupersync-runtime` feature).

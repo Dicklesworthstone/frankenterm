@@ -1,9 +1,9 @@
 #![cfg(unix)]
 
+use frankenterm_core::runtime_compat::unix::{AsyncReadExt, AsyncWriteExt};
 use frankenterm_core::runtime_compat::{self, unix};
 use std::io;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn socket_path(test_name: &str) -> std::path::PathBuf {
     let ts = std::time::SystemTime::now()
@@ -120,8 +120,10 @@ async fn unix_socket_read_timeout_is_enforced() -> io::Result<()> {
     let client = async move {
         let mut stream = unix::connect(&client_path).await?;
         let mut byte = [0_u8; 1];
-        let timed =
-            runtime_compat::timeout(Duration::from_millis(30), stream.read_exact(&mut byte)).await;
+        let timed = runtime_compat::timeout(Duration::from_millis(30), async {
+            stream.read_exact(&mut byte).await.map(|_| ())
+        })
+        .await;
         assert!(
             timed.is_err(),
             "expected timeout error when peer stays idle, got: {timed:?}"

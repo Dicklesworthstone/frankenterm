@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use frankenterm_core::runtime_compat::unix;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use unix::{AsyncReadExt, AsyncWriteExt};
 
 mod bench_common;
 
@@ -89,7 +89,11 @@ async fn stream_throughput_once(
     frame_count: usize,
     use_framing: bool,
 ) -> io::Result<usize> {
-    let (mut writer, mut reader) = tokio::net::UnixStream::pair()?;
+    let socket_path = socket_path("stream");
+    let listener = unix::bind(&socket_path).await?;
+    let (writer_res, accept_res) = tokio::join!(unix::connect(&socket_path), listener.accept());
+    let mut writer = writer_res?;
+    let (mut reader, _addr) = accept_res?;
     let payload = vec![0xA5u8; payload_size];
 
     let read_task = tokio::spawn(async move {

@@ -97,9 +97,8 @@ fn bench_region_batch(c: &mut Criterion) {
                     let tasks: Vec<_> = (0..n)
                         .map(|_| |_child_cx: Cx| async move { 1_u8 })
                         .collect();
-                    let results = as_runtime
-                        .block_on(spawn_bounded_with_cx(&as_handle, &as_cx, n.max(1), tasks))
-                        .expect("bounded spawn benchmark should succeed");
+                    let results =
+                        as_runtime.block_on(spawn_bounded_with_cx(&as_handle, &as_cx, n.max(1), tasks));
                     black_box(results.len());
                 });
             },
@@ -148,7 +147,6 @@ fn bench_structured_overhead(c: &mut Criterion) {
                         .collect();
                     let completed = runtime
                         .block_on(spawn_bounded_with_cx(&handle, &cx, n.max(1), tasks))
-                        .expect("bounded fanout should succeed")
                         .len();
                     black_box(completed);
                 });

@@ -10,14 +10,12 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::{RwLock, mpsc};
-
 use frankenterm_core::ingest::{CapturedSegmentKind, PaneCursor, PaneRegistry};
 use frankenterm_core::recording::{
     EgressEvent, EgressNoopTap, EgressTap, RecorderSegmentKind, SharedEgressTap,
     captured_kind_to_segment,
 };
-use frankenterm_core::runtime_compat::sleep;
+use frankenterm_core::runtime_compat::{RwLock, mpsc, sleep};
 use frankenterm_core::tailer::{CaptureEvent, TailerConfig, TailerSupervisor};
 use frankenterm_core::wezterm::{PaneInfo, PaneTextSource};
 
@@ -120,7 +118,7 @@ fn pane_map(ids: &[u64]) -> HashMap<u64, PaneInfo> {
 #[tokio::test]
 async fn egress_tap_fires_on_delta_capture() {
     let (tx, mut rx) = mpsc::channel::<CaptureEvent>(16);
-    let cursors = Arc::new(RwLock::new(HashMap::new()));
+    let cursors = Arc::new(RwLock::new(HashMap::<u64, PaneCursor>::new()));
     let registry = Arc::new(RwLock::new(PaneRegistry::new()));
     let shutdown = Arc::new(AtomicBool::new(false));
     let source = Arc::new(FakePaneSource::new());
@@ -184,7 +182,7 @@ async fn egress_tap_fires_on_delta_capture() {
 #[tokio::test]
 async fn egress_tap_captures_gap_segments() {
     let (tx, mut rx) = mpsc::channel::<CaptureEvent>(16);
-    let cursors = Arc::new(RwLock::new(HashMap::new()));
+    let cursors = Arc::new(RwLock::new(HashMap::<u64, PaneCursor>::new()));
     let registry = Arc::new(RwLock::new(PaneRegistry::new()));
     let shutdown = Arc::new(AtomicBool::new(false));
     let source = Arc::new(FakePaneSource::new());
@@ -242,7 +240,7 @@ async fn egress_noop_tap_compiles_as_shared() {
 #[tokio::test]
 async fn egress_tap_multi_pane() {
     let (tx, mut rx) = mpsc::channel::<CaptureEvent>(16);
-    let cursors = Arc::new(RwLock::new(HashMap::new()));
+    let cursors = Arc::new(RwLock::new(HashMap::<u64, PaneCursor>::new()));
     let registry = Arc::new(RwLock::new(PaneRegistry::new()));
     let shutdown = Arc::new(AtomicBool::new(false));
     let source = Arc::new(FakePaneSource::new());
@@ -283,7 +281,7 @@ async fn egress_tap_multi_pane() {
 #[tokio::test]
 async fn egress_tap_not_set_still_works() {
     let (tx, mut rx) = mpsc::channel::<CaptureEvent>(16);
-    let cursors = Arc::new(RwLock::new(HashMap::new()));
+    let cursors = Arc::new(RwLock::new(HashMap::<u64, PaneCursor>::new()));
     let registry = Arc::new(RwLock::new(PaneRegistry::new()));
     let shutdown = Arc::new(AtomicBool::new(false));
     let source = Arc::new(FakePaneSource::new());
@@ -322,7 +320,7 @@ async fn egress_tap_not_set_still_works() {
 #[tokio::test]
 async fn egress_monotonic_sequence() {
     let (tx, mut rx) = mpsc::channel::<CaptureEvent>(16);
-    let cursors = Arc::new(RwLock::new(HashMap::new()));
+    let cursors = Arc::new(RwLock::new(HashMap::<u64, PaneCursor>::new()));
     let registry = Arc::new(RwLock::new(PaneRegistry::new()));
     let shutdown = Arc::new(AtomicBool::new(false));
     let source = Arc::new(FakePaneSource::new());

@@ -111,6 +111,14 @@ async fn ipc_status_includes_resize_watchdog_assessment() {
         ))
     );
 
-    let _ = shutdown_tx.send(()).await;
+    #[cfg(feature = "asupersync-runtime")]
+    {
+        let cx = asupersync::Cx::for_testing();
+        let _ = shutdown_tx.send(&cx, ()).await;
+    }
+    #[cfg(not(feature = "asupersync-runtime"))]
+    {
+        let _ = shutdown_tx.send(()).await;
+    }
     let _ = server_handle.await;
 }
