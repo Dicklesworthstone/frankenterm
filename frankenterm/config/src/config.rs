@@ -21,16 +21,16 @@ use crate::tls::{TlsDomainClient, TlsDomainServer};
 use crate::units::Dimension;
 use crate::unix::UnixDomain;
 use crate::wsl::WslDomain;
+use crate::{
+    CONFIG_DIRS, CellWidth, GpuInfo, IntegratedTitleButtonColor, KeyMapPreference, LoadedConfig,
+    MouseEventTriggerMods, RgbaColor, SerialDomain, SystemBackdrop, WebGpuPowerPreference,
+    default_one_point_oh, default_one_point_oh_f64, default_true,
+    default_win32_acrylic_accent_color,
+};
 #[cfg(feature = "lua")]
 use crate::{
-    default_config_with_overrides_applied, CONFIG_FILE_OVERRIDE, CONFIG_OVERRIDES, CONFIG_SKIP,
-    HOME_DIR,
-};
-use crate::{
-    default_one_point_oh, default_one_point_oh_f64, default_true,
-    default_win32_acrylic_accent_color, CellWidth, GpuInfo, IntegratedTitleButtonColor,
-    KeyMapPreference, LoadedConfig, MouseEventTriggerMods, RgbaColor, SerialDomain, SystemBackdrop,
-    WebGpuPowerPreference, CONFIG_DIRS,
+    CONFIG_FILE_OVERRIDE, CONFIG_OVERRIDES, CONFIG_SKIP, HOME_DIR,
+    default_config_with_overrides_applied,
 };
 use anyhow::Context;
 use frankenterm_bidi::ParagraphDirectionHint;
@@ -211,6 +211,48 @@ pub struct Config {
         validate = "validate_scrollback_lines"
     )]
     pub scrollback_lines: usize,
+
+    /// Cubic slack multiplier used by resize-time bounded KP wrapping.
+    #[dynamic(default = "default_resize_wrap_kp_badness_scale")]
+    pub resize_wrap_kp_badness_scale: u64,
+
+    /// Overflow/force-break penalty used by resize-time bounded KP wrapping.
+    #[dynamic(default = "default_resize_wrap_kp_forced_break_penalty")]
+    pub resize_wrap_kp_forced_break_penalty: u64,
+
+    /// DP lookahead cap used by resize-time bounded KP wrapping.
+    #[dynamic(
+        default = "default_resize_wrap_kp_lookahead_limit",
+        validate = "validate_resize_wrap_kp_lookahead_limit"
+    )]
+    pub resize_wrap_kp_lookahead_limit: usize,
+
+    /// Maximum DP states before deterministic fallback during resize wrapping.
+    #[dynamic(default = "default_resize_wrap_kp_max_dp_states")]
+    pub resize_wrap_kp_max_dp_states: usize,
+
+    /// Enables wrap-quality scorecard telemetry during resize.
+    #[dynamic(default)]
+    pub resize_wrap_scorecard_enabled: bool,
+
+    /// Enables readability gate evaluation over resize wrap scorecards.
+    #[dynamic(default)]
+    pub resize_wrap_readability_gate_enabled: bool,
+
+    /// Max allowed per-line badness delta versus greedy baseline.
+    #[dynamic(default = "default_resize_wrap_readability_max_line_badness_delta")]
+    pub resize_wrap_readability_max_line_badness_delta: i64,
+
+    /// Max allowed aggregate badness delta versus greedy baseline.
+    #[dynamic(default = "default_resize_wrap_readability_max_total_badness_delta")]
+    pub resize_wrap_readability_max_total_badness_delta: i64,
+
+    /// Max allowed percent of fallback-mode lines during resize wrapping.
+    #[dynamic(
+        default = "default_resize_wrap_readability_max_fallback_ratio_percent",
+        validate = "validate_percent_0_100"
+    )]
+    pub resize_wrap_readability_max_fallback_ratio_percent: u8,
 
     /// If no `prog` is specified on the command line, use this
     /// instead of running the user's shell.
@@ -951,7 +993,7 @@ impl Config {
     pub fn update_ulimit(&self) -> anyhow::Result<()> {
         #[cfg(unix)]
         {
-            use nix::sys::resource::{getrlimit, rlim_t, setrlimit, Resource};
+            use nix::sys::resource::{Resource, getrlimit, rlim_t, setrlimit};
             use std::convert::TryInto;
 
             let (no_file_soft, no_file_hard) = getrlimit(Resource::RLIMIT_NOFILE)?;
@@ -980,7 +1022,7 @@ impl Config {
 
         #[cfg(all(unix, not(target_os = "macos")))]
         {
-            use nix::sys::resource::{getrlimit, rlim_t, setrlimit, Resource};
+            use nix::sys::resource::{Resource, getrlimit, rlim_t, setrlimit};
             use std::convert::TryInto;
 
             let (nproc_soft, nproc_hard) = getrlimit(Resource::RLIMIT_NPROC)?;
@@ -1080,7 +1122,7 @@ impl Config {
                         file_name: Some(path_item.path.clone()),
                         lua: None,
                         warnings: vec![],
-                    }
+                    };
                 }
                 Ok(None) => continue,
                 Ok(Some(loaded)) => return loaded,
@@ -1733,6 +1775,34 @@ fn default_scrollback_lines() -> usize {
     3500
 }
 
+fn default_resize_wrap_kp_badness_scale() -> u64 {
+    10_000
+}
+
+fn default_resize_wrap_kp_forced_break_penalty() -> u64 {
+    5_000
+}
+
+fn default_resize_wrap_kp_lookahead_limit() -> usize {
+    64
+}
+
+fn default_resize_wrap_kp_max_dp_states() -> usize {
+    8_192
+}
+
+fn default_resize_wrap_readability_max_line_badness_delta() -> i64 {
+    0
+}
+
+fn default_resize_wrap_readability_max_total_badness_delta() -> i64 {
+    0
+}
+
+fn default_resize_wrap_readability_max_fallback_ratio_percent() -> u8 {
+    100
+}
+
 const MAX_SCROLLBACK_LINES: usize = 999_999_999;
 fn validate_scrollback_lines(value: &usize) -> Result<(), String> {
     if *value > MAX_SCROLLBACK_LINES {
@@ -1741,6 +1811,22 @@ fn validate_scrollback_lines(value: &usize) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn validate_resize_wrap_kp_lookahead_limit(value: &usize) -> Result<(), String> {
+    if *value == 0 {
+        Err("resize_wrap_kp_lookahead_limit must be >= 1".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_percent_0_100(value: &u8) -> Result<(), String> {
+    if *value > 100 {
+        Err(format!("value {value} must be between 0 and 100"))
+    } else {
+        Ok(())
+    }
 }
 
 fn default_initial_rows() -> u16 {

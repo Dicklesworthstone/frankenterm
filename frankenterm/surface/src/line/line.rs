@@ -5,7 +5,7 @@ use crate::line::clusterline::ClusteredLine;
 use crate::line::linebits::LineBits;
 use crate::line::storage::{CellStorage, VisibleCellIter};
 use crate::line::vecstorage::{VecStorage, VecStorageIter};
-use crate::{Change, SequenceNo, SEQ_ZERO};
+use crate::{Change, SEQ_ZERO, SequenceNo};
 use alloc::borrow::Cow;
 #[cfg(feature = "appdata")]
 use alloc::sync::{Arc, Weak};
@@ -217,23 +217,68 @@ impl Line {
             .0
     }
 
-    fn wrap_with_cost_model(
+    /// Wrap the line using an explicit bounded Knuth-Plass cost model.
+    /// Returns wrapped lines and the execution mode (`dp` or `fallback`).
+    pub fn wrap_with_cost_model(
         self,
         width: usize,
         seqno: SequenceNo,
         cost_model: MonospaceKpCostModel,
     ) -> (Vec<Self>, MonospaceWrapMode) {
+        self.wrap_with_report(width, seqno, cost_model).into_parts()
+    }
+
+    /// Wrap the line and return a scorecard that can be used by
+    /// resize-time readability gates.
+    pub fn wrap_with_report(
+        self,
+        width: usize,
+        seqno: SequenceNo,
+        cost_model: MonospaceKpCostModel,
+    ) -> LineWrapReport {
         let mut cells: Vec<CellRef> = self.visible_cells().collect();
         if let Some(end_idx) = cells.iter().rposition(|c| c.str() != " ") {
             cells.truncate(end_idx + 1);
             let tokens: Vec<Cell> = cells.into_iter().map(|cell| cell.as_cell()).collect();
             let plan = bounded_monospace_wrap_plan(&tokens, width, cost_model);
-            (
-                materialize_wrap_lines_from_tokens(&tokens, &plan.break_offsets, seqno),
-                plan.mode,
-            )
+            let selected_candidate =
+                evaluate_break_offsets(&tokens, &plan.break_offsets, width, cost_model);
+            let greedy_offsets = greedy_break_offsets_from_tokens(&tokens, width);
+            let greedy_candidate =
+                evaluate_break_offsets(&tokens, &greedy_offsets, width, cost_model);
+
+            LineWrapReport {
+                lines: materialize_wrap_lines_from_tokens(&tokens, &plan.break_offsets, seqno),
+                scorecard: LineWrapScorecard {
+                    mode: plan.mode,
+                    greedy_total_cost: greedy_candidate.total_cost,
+                    selected_total_cost: selected_candidate.total_cost,
+                    badness_delta: saturating_diff_i64(
+                        selected_candidate.total_cost,
+                        greedy_candidate.total_cost,
+                    ),
+                    greedy_forced_breaks: greedy_candidate.forced_breaks,
+                    selected_forced_breaks: selected_candidate.forced_breaks,
+                    line_count: selected_candidate.line_count,
+                    estimated_states: plan.estimated_states,
+                    evaluated_states: plan.evaluated_states,
+                },
+            }
         } else {
-            (vec![self], MonospaceWrapMode::Fallback)
+            LineWrapReport {
+                lines: vec![self],
+                scorecard: LineWrapScorecard {
+                    mode: MonospaceWrapMode::Fallback,
+                    greedy_total_cost: 0,
+                    selected_total_cost: 0,
+                    badness_delta: 0,
+                    greedy_forced_breaks: 0,
+                    selected_forced_breaks: 0,
+                    line_count: 1,
+                    estimated_states: 0,
+                    evaluated_states: 0,
+                },
+            }
         }
     }
 
@@ -1204,18 +1249,15 @@ impl Line {
 }
 
 /// Sentinel badness for overflow/invalid-width lines.
-#[allow(dead_code)] // Bound to wa-1u90p.3.12 integration follow-up.
-pub(crate) const KP_BADNESS_INF: u64 = u64::MAX / 4;
+pub const KP_BADNESS_INF: u64 = u64::MAX / 4;
 
 /// Terminal defaults for bounded monospace Knuth-Plass scoring.
-#[allow(dead_code)] // Bound to wa-1u90p.3.12 integration follow-up.
-pub(crate) const KP_DEFAULT_LOOKAHEAD_LIMIT: usize = 64;
-#[allow(dead_code)] // Bound to wa-1u90p.3.12 integration follow-up.
-pub(crate) const KP_DEFAULT_MAX_DP_STATES: usize = 8_192;
+pub const KP_DEFAULT_LOOKAHEAD_LIMIT: usize = 64;
+pub const KP_DEFAULT_MAX_DP_STATES: usize = 8_192;
 
 /// Scoring and complexity contract for bounded Knuth-Plass line breaking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct MonospaceKpCostModel {
+pub struct MonospaceKpCostModel {
     /// Cubic slack multiplier.
     pub badness_scale: u64,
     /// Added when the engine must force-break overflow content.
@@ -1226,14 +1268,12 @@ pub(crate) struct MonospaceKpCostModel {
     pub max_dp_states: usize,
 }
 
-#[allow(dead_code)] // Bound to wa-1u90p.3.12 integration follow-up.
 impl Default for MonospaceKpCostModel {
     fn default() -> Self {
         Self::terminal_default()
     }
 }
 
-#[allow(dead_code)] // Bound to wa-1u90p.3.12 integration follow-up.
 impl MonospaceKpCostModel {
     /// Canonical terminal-safe defaults for resize-time wrapping.
     pub const fn terminal_default() -> Self {
@@ -1339,7 +1379,7 @@ pub(crate) fn choose_best_monospace_break_candidate(
 
 /// Execution mode used by the bounded wrap planner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MonospaceWrapMode {
+pub enum MonospaceWrapMode {
     /// DP planner remained within configured state budget.
     Dp,
     /// Planner exceeded budget or had no viable DP plan and used greedy fallback.
@@ -1348,11 +1388,39 @@ pub(crate) enum MonospaceWrapMode {
 
 /// Wrap plan emitted by the bounded planner.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct MonospaceWrapPlan {
+pub struct MonospaceWrapPlan {
     pub mode: MonospaceWrapMode,
     pub break_offsets: Vec<usize>,
     pub estimated_states: usize,
     pub evaluated_states: usize,
+}
+
+/// Per-line wrap quality scorecard suitable for resize regression gates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineWrapScorecard {
+    pub mode: MonospaceWrapMode,
+    pub greedy_total_cost: u64,
+    pub selected_total_cost: u64,
+    pub badness_delta: i64,
+    pub greedy_forced_breaks: usize,
+    pub selected_forced_breaks: usize,
+    pub line_count: usize,
+    pub estimated_states: usize,
+    pub evaluated_states: usize,
+}
+
+/// Full wrap result payload used by integration code in reflow paths.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LineWrapReport {
+    pub lines: Vec<Line>,
+    pub scorecard: LineWrapScorecard,
+}
+
+impl LineWrapReport {
+    fn into_parts(self) -> (Vec<Line>, MonospaceWrapMode) {
+        let mode = self.scorecard.mode;
+        (self.lines, mode)
+    }
 }
 
 #[inline]
@@ -1491,6 +1559,101 @@ pub(crate) fn bounded_monospace_wrap_plan(
 }
 
 #[inline]
+fn evaluate_break_offsets(
+    tokens: &[Cell],
+    break_offsets: &[usize],
+    width: usize,
+    model: MonospaceKpCostModel,
+) -> MonospaceBreakCandidate {
+    let mut total_cost = 0u64;
+    let mut forced_breaks = 0usize;
+    let mut max_line_badness = 0u64;
+    let mut line_count = 0usize;
+    let mut normalized_breaks = Vec::new();
+    let mut start = 0usize;
+
+    for &raw_end in break_offsets {
+        let end = raw_end.min(tokens.len());
+        if end <= start {
+            continue;
+        }
+
+        let line_width = tokens[start..end]
+            .iter()
+            .fold(0usize, |acc, token| acc.saturating_add(token.width()));
+        let is_last_line = end == tokens.len();
+
+        let (line_cost, forced_inc) = if line_width > width {
+            if end == start + 1 {
+                let overflow_cols = line_width.saturating_sub(width) as u64;
+                (
+                    model
+                        .forced_break_penalty
+                        .saturating_mul(overflow_cols.max(1)),
+                    1usize,
+                )
+            } else {
+                (KP_BADNESS_INF, 1usize)
+            }
+        } else {
+            let slack = width.saturating_sub(line_width) as i64;
+            (model.line_badness(slack, width, is_last_line), 0usize)
+        };
+
+        total_cost = total_cost.saturating_add(line_cost);
+        forced_breaks = forced_breaks.saturating_add(forced_inc);
+        max_line_badness = max_line_badness.max(line_cost);
+        line_count = line_count.saturating_add(1);
+        normalized_breaks.push(end);
+        start = end;
+    }
+
+    if start < tokens.len() {
+        let line_width = tokens[start..]
+            .iter()
+            .fold(0usize, |acc, token| acc.saturating_add(token.width()));
+        let (line_cost, forced_inc) = if line_width > width {
+            if tokens.len() == start + 1 {
+                let overflow_cols = line_width.saturating_sub(width) as u64;
+                (
+                    model
+                        .forced_break_penalty
+                        .saturating_mul(overflow_cols.max(1)),
+                    1usize,
+                )
+            } else {
+                (KP_BADNESS_INF, 1usize)
+            }
+        } else {
+            let slack = width.saturating_sub(line_width) as i64;
+            (model.line_badness(slack, width, true), 0usize)
+        };
+
+        total_cost = total_cost.saturating_add(line_cost);
+        forced_breaks = forced_breaks.saturating_add(forced_inc);
+        max_line_badness = max_line_badness.max(line_cost);
+        line_count = line_count.saturating_add(1);
+        normalized_breaks.push(tokens.len());
+    }
+
+    MonospaceBreakCandidate {
+        total_cost,
+        forced_breaks,
+        max_line_badness,
+        line_count,
+        break_offsets: normalized_breaks,
+    }
+}
+
+#[inline]
+fn saturating_diff_i64(lhs: u64, rhs: u64) -> i64 {
+    let lhs = lhs as i128;
+    let rhs = rhs as i128;
+    let diff = lhs - rhs;
+    diff.clamp(i64::MIN as i128, i64::MAX as i128) as i64
+}
+
+#[inline]
 fn materialize_wrap_lines_from_tokens(
     tokens: &[Cell],
     break_offsets: &[usize],
@@ -1542,6 +1705,7 @@ mod tests {
     use super::*;
     use crate::SEQ_ZERO;
     use frankenterm_cell::{Cell, CellAttributes, SemanticType};
+    use std::collections::BTreeSet;
 
     // ── ZoneRange ──────────────────────────────────────────
 
@@ -1921,7 +2085,10 @@ mod tests {
             let badness = model.line_badness(slack as i64, width, false);
             assert!(
                 badness >= prev,
-                "expected non-decreasing badness at slack={slack}: prev={prev} current={badness}"
+                "expected non-decreasing badness at slack={}: prev={} current={}",
+                slack,
+                prev,
+                badness
             );
             prev = badness;
         }
@@ -2113,6 +2280,356 @@ mod tests {
         let a = bounded_monospace_wrap_plan(&tokens, 5, model);
         let b = bounded_monospace_wrap_plan(&tokens, 5, model);
         assert_eq!(a, b);
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct WrapQualityCorpusCase {
+        id: &'static str,
+        category: &'static str,
+        text: &'static str,
+        width: usize,
+        note: &'static str,
+        max_kp_badness_delta: i64,
+        max_fallback_badness_delta: i64,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct WrapQualityModeMetrics {
+        mode: MonospaceWrapMode,
+        selected_total_cost: u64,
+        badness_delta: i64,
+        forced_breaks: usize,
+        line_count: usize,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct WrapQualityCaseMetrics {
+        id: &'static str,
+        category: &'static str,
+        width: usize,
+        note: &'static str,
+        greedy: WrapQualityModeMetrics,
+        kp: WrapQualityModeMetrics,
+        fallback: WrapQualityModeMetrics,
+        max_kp_badness_delta: i64,
+        max_fallback_badness_delta: i64,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct WrapQualityAggregateMetrics {
+        sample_count: usize,
+        kp_fallback_lines: usize,
+        fallback_fallback_lines: usize,
+        kp_fallback_ratio_percent: usize,
+        fallback_fallback_ratio_percent: usize,
+        kp_total_badness_delta: i64,
+        fallback_total_badness_delta: i64,
+        kp_max_badness_delta: i64,
+        fallback_max_badness_delta: i64,
+    }
+
+    const WRAP_QUALITY_CORPUS: &[WrapQualityCorpusCase] = &[
+        WrapQualityCorpusCase {
+            id: "code_render_gate",
+            category: "code",
+            text: "fn render_wrap_scorecard_gate(payload: &str) -> anyhow::Result<()> {",
+            width: 28,
+            note: "Keep function signature chunks readable under narrow widths.",
+            max_kp_badness_delta: 20_000,
+            max_fallback_badness_delta: 120_000,
+        },
+        WrapQualityCorpusCase {
+            id: "log_resize_gate",
+            category: "logs",
+            text: "2026-02-14T02:45:33Z WARN resize_wrap_scorecard_gate fallback_ratio_exceeded pane=17",
+            width: 36,
+            note: "Preserve timestamp + level cohesion while wrapping long diagnostics.",
+            max_kp_badness_delta: 15_000,
+            max_fallback_badness_delta: 80_000,
+        },
+        WrapQualityCorpusCase {
+            id: "prose_operator_guidance",
+            category: "prose",
+            text: "Readable wrapping should keep adjacent clauses together when terminal width fluctuates quickly.",
+            width: 32,
+            note: "Avoid ragged prose with avoidable high-slack lines.",
+            max_kp_badness_delta: 10_000,
+            max_fallback_badness_delta: 70_000,
+        },
+        WrapQualityCorpusCase {
+            id: "long_token_checksum",
+            category: "long_token",
+            text: "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+            width: 24,
+            note: "Long opaque identifiers should not explode badness unexpectedly.",
+            max_kp_badness_delta: 60_000,
+            max_fallback_badness_delta: 150_000,
+        },
+        WrapQualityCorpusCase {
+            id: "unicode_mixed_text",
+            category: "unicode",
+            text: "日本語とemoji🙂を含むログ出力でも改行品質を保つ必要がある",
+            width: 18,
+            note: "Unicode-heavy samples should remain stable with bounded DP.",
+            max_kp_badness_delta: 25_000,
+            max_fallback_badness_delta: 120_000,
+        },
+    ];
+
+    fn greedy_only_model() -> MonospaceKpCostModel {
+        let mut model = MonospaceKpCostModel::terminal_default();
+        model.max_dp_states = 0;
+        model
+    }
+
+    fn constrained_fallback_model() -> MonospaceKpCostModel {
+        let mut model = MonospaceKpCostModel::terminal_default();
+        model.max_dp_states = 8;
+        model.lookahead_limit = 3;
+        model
+    }
+
+    fn measure_wrap_mode(
+        line: &Line,
+        width: usize,
+        model: MonospaceKpCostModel,
+    ) -> WrapQualityModeMetrics {
+        let report = line.clone().wrap_with_report(width, SEQ_ZERO, model);
+        WrapQualityModeMetrics {
+            mode: report.scorecard.mode,
+            selected_total_cost: report.scorecard.selected_total_cost,
+            badness_delta: report.scorecard.badness_delta,
+            forced_breaks: report.scorecard.selected_forced_breaks,
+            line_count: report.scorecard.line_count,
+        }
+    }
+
+    fn evaluate_wrap_quality_corpus() -> (Vec<WrapQualityCaseMetrics>, WrapQualityAggregateMetrics)
+    {
+        let mut metrics = Vec::with_capacity(WRAP_QUALITY_CORPUS.len());
+        let mut kp_fallback_lines = 0usize;
+        let mut fallback_fallback_lines = 0usize;
+        let mut kp_total_badness_delta = 0i64;
+        let mut fallback_total_badness_delta = 0i64;
+        let mut kp_max_badness_delta = i64::MIN;
+        let mut fallback_max_badness_delta = i64::MIN;
+
+        for sample in WRAP_QUALITY_CORPUS {
+            let line: Line = sample.text.into();
+            let greedy = measure_wrap_mode(&line, sample.width, greedy_only_model());
+            let kp = measure_wrap_mode(
+                &line,
+                sample.width,
+                MonospaceKpCostModel::terminal_default(),
+            );
+            let fallback = measure_wrap_mode(&line, sample.width, constrained_fallback_model());
+
+            if matches!(kp.mode, MonospaceWrapMode::Fallback) {
+                kp_fallback_lines = kp_fallback_lines.saturating_add(1);
+            }
+            if matches!(fallback.mode, MonospaceWrapMode::Fallback) {
+                fallback_fallback_lines = fallback_fallback_lines.saturating_add(1);
+            }
+
+            kp_total_badness_delta = kp_total_badness_delta.saturating_add(kp.badness_delta);
+            fallback_total_badness_delta =
+                fallback_total_badness_delta.saturating_add(fallback.badness_delta);
+            kp_max_badness_delta = kp_max_badness_delta.max(kp.badness_delta);
+            fallback_max_badness_delta = fallback_max_badness_delta.max(fallback.badness_delta);
+
+            metrics.push(WrapQualityCaseMetrics {
+                id: sample.id,
+                category: sample.category,
+                width: sample.width,
+                note: sample.note,
+                greedy,
+                kp,
+                fallback,
+                max_kp_badness_delta: sample.max_kp_badness_delta,
+                max_fallback_badness_delta: sample.max_fallback_badness_delta,
+            });
+        }
+
+        let sample_count = metrics.len();
+        let kp_fallback_ratio_percent = if sample_count == 0 {
+            0
+        } else {
+            kp_fallback_lines.saturating_mul(100) / sample_count
+        };
+        let fallback_fallback_ratio_percent = if sample_count == 0 {
+            0
+        } else {
+            fallback_fallback_lines.saturating_mul(100) / sample_count
+        };
+
+        (
+            metrics,
+            WrapQualityAggregateMetrics {
+                sample_count,
+                kp_fallback_lines,
+                fallback_fallback_lines,
+                kp_fallback_ratio_percent,
+                fallback_fallback_ratio_percent,
+                kp_total_badness_delta,
+                fallback_total_badness_delta,
+                kp_max_badness_delta: if kp_max_badness_delta == i64::MIN {
+                    0
+                } else {
+                    kp_max_badness_delta
+                },
+                fallback_max_badness_delta: if fallback_max_badness_delta == i64::MIN {
+                    0
+                } else {
+                    fallback_max_badness_delta
+                },
+            },
+        )
+    }
+
+    fn wrap_mode_str(mode: MonospaceWrapMode) -> &'static str {
+        match mode {
+            MonospaceWrapMode::Dp => "dp",
+            MonospaceWrapMode::Fallback => "fallback",
+        }
+    }
+
+    fn json_escape(raw: &str) -> String {
+        raw.replace('\\', "\\\\")
+            .replace('\"', "\\\"")
+            .replace('\n', "\\n")
+    }
+
+    fn render_wrap_quality_metrics_json(
+        samples: &[WrapQualityCaseMetrics],
+        aggregate: WrapQualityAggregateMetrics,
+    ) -> String {
+        let mut rendered_samples = Vec::with_capacity(samples.len());
+        for sample in samples {
+            rendered_samples.push(format!(
+                "{{\"id\":\"{}\",\"category\":\"{}\",\"width\":{},\"note\":\"{}\",\"greedy\":{{\"mode\":\"{}\",\"selected_total_cost\":{},\"badness_delta\":{},\"forced_breaks\":{},\"line_count\":{}}},\"kp\":{{\"mode\":\"{}\",\"selected_total_cost\":{},\"badness_delta\":{},\"forced_breaks\":{},\"line_count\":{}}},\"fallback\":{{\"mode\":\"{}\",\"selected_total_cost\":{},\"badness_delta\":{},\"forced_breaks\":{},\"line_count\":{}}}}}",
+                json_escape(sample.id),
+                json_escape(sample.category),
+                sample.width,
+                json_escape(sample.note),
+                wrap_mode_str(sample.greedy.mode),
+                sample.greedy.selected_total_cost,
+                sample.greedy.badness_delta,
+                sample.greedy.forced_breaks,
+                sample.greedy.line_count,
+                wrap_mode_str(sample.kp.mode),
+                sample.kp.selected_total_cost,
+                sample.kp.badness_delta,
+                sample.kp.forced_breaks,
+                sample.kp.line_count,
+                wrap_mode_str(sample.fallback.mode),
+                sample.fallback.selected_total_cost,
+                sample.fallback.badness_delta,
+                sample.fallback.forced_breaks,
+                sample.fallback.line_count
+            ));
+        }
+        format!(
+            "{{\"samples\":[{}],\"aggregate\":{{\"sample_count\":{},\"kp_fallback_lines\":{},\"fallback_fallback_lines\":{},\"kp_fallback_ratio_percent\":{},\"fallback_fallback_ratio_percent\":{},\"kp_total_badness_delta\":{},\"fallback_total_badness_delta\":{},\"kp_max_badness_delta\":{},\"fallback_max_badness_delta\":{}}}}}",
+            rendered_samples.join(","),
+            aggregate.sample_count,
+            aggregate.kp_fallback_lines,
+            aggregate.fallback_fallback_lines,
+            aggregate.kp_fallback_ratio_percent,
+            aggregate.fallback_fallback_ratio_percent,
+            aggregate.kp_total_badness_delta,
+            aggregate.fallback_total_badness_delta,
+            aggregate.kp_max_badness_delta,
+            aggregate.fallback_max_badness_delta
+        )
+    }
+
+    #[test]
+    fn wrap_quality_corpus_covers_required_categories() {
+        let categories: BTreeSet<_> = WRAP_QUALITY_CORPUS
+            .iter()
+            .map(|sample| sample.category)
+            .collect();
+        assert!(categories.contains("code"));
+        assert!(categories.contains("logs"));
+        assert!(categories.contains("prose"));
+        assert!(categories.contains("long_token"));
+        assert!(categories.contains("unicode"));
+    }
+
+    #[test]
+    fn wrap_quality_scorecard_outputs_machine_readable_payload() {
+        let (samples, aggregate) = evaluate_wrap_quality_corpus();
+        let payload = render_wrap_quality_metrics_json(&samples, aggregate);
+        assert!(
+            payload.starts_with("{\"samples\":["),
+            "expected machine-readable payload envelope, got: {}",
+            payload
+        );
+        assert!(
+            payload.contains("\"aggregate\":"),
+            "missing aggregate metrics section: {}",
+            payload
+        );
+        for sample in &samples {
+            assert!(
+                payload.contains(&format!("\"id\":\"{}\"", sample.id)),
+                "missing sample id {} in payload: {payload}",
+                sample.id
+            );
+        }
+    }
+
+    #[test]
+    fn wrap_quality_regression_gate_bounds_kp_and_fallback_deltas() {
+        let (samples, aggregate) = evaluate_wrap_quality_corpus();
+        for sample in &samples {
+            assert_eq!(
+                sample.greedy.badness_delta, 0,
+                "greedy baseline should have zero delta for {}",
+                sample.id
+            );
+            assert!(
+                sample.kp.badness_delta <= sample.max_kp_badness_delta,
+                "kp badness delta exceeded gate for {}: {} > {}",
+                sample.id,
+                sample.kp.badness_delta,
+                sample.max_kp_badness_delta
+            );
+            assert!(
+                sample.fallback.badness_delta <= sample.max_fallback_badness_delta,
+                "fallback badness delta exceeded gate for {}: {} > {}",
+                sample.id,
+                sample.fallback.badness_delta,
+                sample.max_fallback_badness_delta
+            );
+            assert!(
+                sample.kp.selected_total_cost
+                    <= sample.fallback.selected_total_cost.saturating_add(120_000),
+                "kp selected cost unexpectedly regressed vs fallback for {}",
+                sample.id
+            );
+        }
+
+        assert!(
+            aggregate.kp_fallback_ratio_percent <= 40,
+            "kp fallback ratio exceeded corpus gate: {}%",
+            aggregate.kp_fallback_ratio_percent
+        );
+        assert!(
+            aggregate.fallback_fallback_ratio_percent >= aggregate.kp_fallback_ratio_percent,
+            "constrained fallback should not fallback less often than kp (fallback={}%, kp={}%)",
+            aggregate.fallback_fallback_ratio_percent,
+            aggregate.kp_fallback_ratio_percent
+        );
+        assert!(
+            aggregate.kp_total_badness_delta
+                <= aggregate
+                    .fallback_total_badness_delta
+                    .saturating_add(50_000),
+            "kp aggregate badness drifted beyond fallback tolerance (kp={}, fallback={})",
+            aggregate.kp_total_badness_delta,
+            aggregate.fallback_total_badness_delta
+        );
     }
 
     #[test]

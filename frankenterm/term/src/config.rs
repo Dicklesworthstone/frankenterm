@@ -1,7 +1,8 @@
 use crate::color::ColorPalette;
-use downcast_rs::{impl_downcast, Downcast};
+use downcast_rs::{Downcast, impl_downcast};
 use frankenterm_bidi::ParagraphDirectionHint;
 use frankenterm_cell::UnicodeVersion;
+use frankenterm_surface::line::MonospaceKpCostModel;
 use frankenterm_surface::{Line, SequenceNo};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -282,6 +283,36 @@ pub trait TerminalConfiguration: Downcast + std::fmt::Debug + Send + Sync {
     /// Returns the size of the scrollback in terms of the number of rows.
     fn scrollback_size(&self) -> usize {
         3500
+    }
+
+    /// Cost model used by resize-time bounded KP wrapping.
+    fn resize_wrap_kp_cost_model(&self) -> MonospaceKpCostModel {
+        MonospaceKpCostModel::terminal_default()
+    }
+
+    /// Enables per-line wrap scorecard emission during resize.
+    fn resize_wrap_scorecard_enabled(&self) -> bool {
+        false
+    }
+
+    /// Enables readability gate evaluation over aggregate resize scorecard metrics.
+    fn resize_wrap_readability_gate_enabled(&self) -> bool {
+        false
+    }
+
+    /// Maximum allowed per-line badness delta versus greedy baseline.
+    fn resize_wrap_readability_max_line_badness_delta(&self) -> i64 {
+        0
+    }
+
+    /// Maximum allowed total badness delta versus greedy baseline.
+    fn resize_wrap_readability_max_total_badness_delta(&self) -> i64 {
+        0
+    }
+
+    /// Maximum allowed fallback ratio (% of wrapped lines using fallback mode).
+    fn resize_wrap_readability_max_fallback_ratio_percent(&self) -> u8 {
+        100
     }
 
     /// Return true if the embedding application wants to use CSI-u encoding

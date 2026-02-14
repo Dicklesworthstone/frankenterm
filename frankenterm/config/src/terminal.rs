@@ -1,6 +1,7 @@
 //! Bridge our gui config into the terminal crate configuration
 
-use crate::{configuration, ConfigHandle, NewlineCanon};
+use crate::{ConfigHandle, NewlineCanon, configuration};
+use frankenterm_term::MonospaceKpCostModel;
 use frankenterm_term::color::ColorPalette;
 use frankenterm_term::config::BidiMode;
 use std::sync::Mutex;
@@ -50,6 +51,39 @@ impl frankenterm_term::TerminalConfiguration for TermConfig {
 
     fn scrollback_size(&self) -> usize {
         self.configuration().scrollback_lines
+    }
+
+    fn resize_wrap_kp_cost_model(&self) -> MonospaceKpCostModel {
+        let config = self.configuration();
+        MonospaceKpCostModel {
+            badness_scale: config.resize_wrap_kp_badness_scale,
+            forced_break_penalty: config.resize_wrap_kp_forced_break_penalty,
+            lookahead_limit: config.resize_wrap_kp_lookahead_limit,
+            max_dp_states: config.resize_wrap_kp_max_dp_states,
+        }
+    }
+
+    fn resize_wrap_scorecard_enabled(&self) -> bool {
+        self.configuration().resize_wrap_scorecard_enabled
+    }
+
+    fn resize_wrap_readability_gate_enabled(&self) -> bool {
+        self.configuration().resize_wrap_readability_gate_enabled
+    }
+
+    fn resize_wrap_readability_max_line_badness_delta(&self) -> i64 {
+        self.configuration()
+            .resize_wrap_readability_max_line_badness_delta
+    }
+
+    fn resize_wrap_readability_max_total_badness_delta(&self) -> i64 {
+        self.configuration()
+            .resize_wrap_readability_max_total_badness_delta
+    }
+
+    fn resize_wrap_readability_max_fallback_ratio_percent(&self) -> u8 {
+        self.configuration()
+            .resize_wrap_readability_max_fallback_ratio_percent
     }
 
     fn enable_csi_u_key_encoding(&self) -> bool {
@@ -123,5 +157,78 @@ impl frankenterm_term::TerminalConfiguration for TermConfig {
             enabled: config.bidi_enabled,
             hint: config.bidi_direction,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use frankenterm_dynamic::Value;
+    use frankenterm_term::TerminalConfiguration;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn term_config_maps_resize_wrap_controls_from_config_handle() {
+        let mut overrides = BTreeMap::new();
+        overrides.insert(
+            Value::String("resize_wrap_kp_badness_scale".into()),
+            Value::U64(42_000),
+        );
+        overrides.insert(
+            Value::String("resize_wrap_kp_forced_break_penalty".into()),
+            Value::U64(7_500),
+        );
+        overrides.insert(
+            Value::String("resize_wrap_kp_lookahead_limit".into()),
+            Value::U64(24),
+        );
+        overrides.insert(
+            Value::String("resize_wrap_kp_max_dp_states".into()),
+            Value::U64(2_048),
+        );
+        overrides.insert(
+            Value::String("resize_wrap_scorecard_enabled".into()),
+            Value::Bool(true),
+        );
+        overrides.insert(
+            Value::String("resize_wrap_readability_gate_enabled".into()),
+            Value::Bool(true),
+        );
+        overrides.insert(
+            Value::String("resize_wrap_readability_max_line_badness_delta".into()),
+            Value::I64(12_345),
+        );
+        overrides.insert(
+            Value::String("resize_wrap_readability_max_total_badness_delta".into()),
+            Value::I64(67_890),
+        );
+        overrides.insert(
+            Value::String("resize_wrap_readability_max_fallback_ratio_percent".into()),
+            Value::U64(37),
+        );
+
+        let handle = crate::overridden_config(&Value::Object(overrides.into()))
+            .expect("override parsing to succeed");
+        let term_config = TermConfig::with_config(handle);
+
+        let model = term_config.resize_wrap_kp_cost_model();
+        assert_eq!(model.badness_scale, 42_000);
+        assert_eq!(model.forced_break_penalty, 7_500);
+        assert_eq!(model.lookahead_limit, 24);
+        assert_eq!(model.max_dp_states, 2_048);
+        assert!(term_config.resize_wrap_scorecard_enabled());
+        assert!(term_config.resize_wrap_readability_gate_enabled());
+        assert_eq!(
+            term_config.resize_wrap_readability_max_line_badness_delta(),
+            12_345
+        );
+        assert_eq!(
+            term_config.resize_wrap_readability_max_total_badness_delta(),
+            67_890
+        );
+        assert_eq!(
+            term_config.resize_wrap_readability_max_fallback_ratio_percent(),
+            37
+        );
     }
 }

@@ -8,8 +8,10 @@ mod c1;
 mod csi;
 // mod selection; FIXME: port to render layer
 use crate::color::ColorPalette;
+use crate::screen::{ResizeReadabilityGatePolicy, ResizeWrapPolicy};
 use frankenterm_escape_parser::csi::{Edit, EraseInDisplay, EraseInLine};
 use frankenterm_escape_parser::{OneBased, OperatingSystemCommand, CSI};
+use frankenterm_surface::line::MonospaceKpCostModel;
 use frankenterm_surface::{CursorShape, CursorVisibility, SequenceNo, SEQ_ZERO};
 use k9::assert_equal as assert_eq;
 use std::sync::{Arc, Mutex};
@@ -308,6 +310,14 @@ fn assert_all_contents(term: &Terminal, file: &str, line: u32, expect_lines: &[&
     let expect: Vec<Line> = expect_lines.iter().map(|s| (*s).into()).collect();
 
     assert_lines_equal(file, line, &screen.all_lines(), &expect, Compare::TEXT);
+}
+
+fn visible_text_snapshot(term: &Terminal) -> Vec<String> {
+    term.screen()
+        .visible_lines()
+        .iter()
+        .map(|line| line.as_str().to_string())
+        .collect()
 }
 
 #[test]
@@ -1101,6 +1111,106 @@ fn test_resize_wrap_roundtrip_with_dpi_and_mutation() {
         file!(),
         line!(),
         &["111", "2222", "aa", "XYZ", "", "", "", ""],
+    );
+}
+
+#[test]
+fn test_resize_wrap_kp_policy_preserves_legacy_visible_semantics() {
+    const LINES: usize = 8;
+    let mut legacy = TestTerm::new(LINES, 10, 32);
+    let mut kp = TestTerm::new(LINES, 10, 32);
+
+    let mut legacy_model = MonospaceKpCostModel::terminal_default();
+    legacy_model.max_dp_states = 0;
+    legacy
+        .screen_mut()
+        .set_resize_wrap_policy(ResizeWrapPolicy {
+            kp_cost_model: legacy_model,
+            scorecard_enabled: false,
+            readability_gate: ResizeReadabilityGatePolicy::default(),
+        });
+    kp.screen_mut()
+        .set_resize_wrap_policy(ResizeWrapPolicy::default());
+
+    let seed = concat!(
+        "alpha beta gamma delta epsilon zeta eta theta\r\n",
+        "A_very_long_token_without_breaks_1234567890\r\n",
+        "rust wrap quality should stay stable under resize churn\r\n",
+    );
+    legacy.print(seed);
+    kp.print(seed);
+
+    let sizes = [
+        (7usize, 96u32),
+        (5usize, 96u32),
+        (12usize, 144u32),
+        (6usize, 144u32),
+        (10usize, 96u32),
+    ];
+
+    for (step, &(cols, dpi)) in sizes.iter().enumerate() {
+        let size = TerminalSize {
+            rows: LINES,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+            dpi,
+        };
+        legacy.resize(size);
+        kp.resize(size);
+        assert_eq!(
+            visible_text_snapshot(&legacy),
+            visible_text_snapshot(&kp),
+            "kp reflow diverged from forced-legacy fallback semantics at step {step} (cols={cols}, dpi={dpi})"
+        );
+    }
+}
+
+#[test]
+fn test_resize_wrap_scorecard_gate_emits_machine_readable_failure() {
+    const LINES: usize = 8;
+    let mut term = TestTerm::new(LINES, 12, 0);
+
+    let mut fallback_model = MonospaceKpCostModel::terminal_default();
+    fallback_model.max_dp_states = 0;
+    term.screen_mut().set_resize_wrap_policy(ResizeWrapPolicy {
+        kp_cost_model: fallback_model,
+        scorecard_enabled: true,
+        readability_gate: ResizeReadabilityGatePolicy {
+            enabled: true,
+            max_line_badness_delta: i64::MAX,
+            max_total_badness_delta: i64::MAX,
+            max_fallback_ratio_percent: 0,
+        },
+    });
+
+    term.print("wrap gate payload should be machine readable under fallback pressure\r\n");
+    term.resize(TerminalSize {
+        rows: LINES,
+        cols: 6,
+        pixel_width: 0,
+        pixel_height: 0,
+        dpi: 96,
+    });
+
+    let payload = term
+        .screen()
+        .last_resize_wrap_gate_payload()
+        .expect("expected machine-readable gate payload");
+    assert!(
+        payload.contains("\"gate\":\"resize_wrap_readability\""),
+        "missing gate identifier in payload: {}",
+        payload
+    );
+    assert!(
+        payload.contains("\"status\":\"fail\""),
+        "expected gate failure status in payload: {}",
+        payload
+    );
+    assert!(
+        payload.contains("\"reason\":\"fallback_ratio_exceeded\""),
+        "expected fallback ratio reason in payload: {}",
+        payload
     );
 }
 

@@ -3,8 +3,11 @@ use super::*;
 use crate::config::BidiMode;
 use crossbeam::thread;
 use frankenterm_surface::SequenceNo;
-use log::debug;
-use std::collections::{hash_map::DefaultHasher, HashMap, VecDeque};
+use frankenterm_surface::line::{
+    LineWrapScorecard as MonospaceLineWrapScorecard, MonospaceKpCostModel, MonospaceWrapMode,
+};
+use log::{debug, warn};
+use std::collections::{HashMap, VecDeque, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Instant;
@@ -48,7 +51,13 @@ pub struct Screen {
 
     pub(crate) saved_cursor: Option<SavedCursor>,
     rewrap_cache: Option<LogicalLineWrapCache>,
+    rewrap_scratch_slots: Vec<Option<Vec<Line>>>,
+    rewrap_row_prefix_scratch: Vec<usize>,
     cold_scrollback_worker: ColdScrollbackReflowWorker,
+    resize_wrap_policy: ResizeWrapPolicy,
+    last_resize_wrap_scorecard: Option<ResizeWrapScorecard>,
+    last_resize_wrap_gate_payload: Option<String>,
+    cursor_consistency_telemetry: CursorConsistencyTelemetry,
 }
 
 const MAX_WRAP_CACHE_ENTRIES: usize = 6;
@@ -56,6 +65,183 @@ const MAX_REFLOW_BATCH_LOGICAL_LINES: usize = 64;
 const REFLOW_OVERSCAN_ROW_MULTIPLIER: usize = 1;
 const REFLOW_OVERSCAN_ROW_CAP: usize = 256;
 const COLD_SCROLLBACK_BACKLOG_DEPTH_CAP: usize = 1_048_576;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResizeReadabilityGatePolicy {
+    pub enabled: bool,
+    pub max_line_badness_delta: i64,
+    pub max_total_badness_delta: i64,
+    pub max_fallback_ratio_percent: u8,
+}
+
+impl Default for ResizeReadabilityGatePolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_line_badness_delta: 0,
+            max_total_badness_delta: 0,
+            max_fallback_ratio_percent: 100,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResizeWrapGateFailureReason {
+    LineBadnessDeltaExceeded,
+    TotalBadnessDeltaExceeded,
+    FallbackRatioExceeded,
+}
+
+impl ResizeWrapGateFailureReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::LineBadnessDeltaExceeded => "line_badness_delta_exceeded",
+            Self::TotalBadnessDeltaExceeded => "total_badness_delta_exceeded",
+            Self::FallbackRatioExceeded => "fallback_ratio_exceeded",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResizeWrapGateStatus {
+    Disabled,
+    Pass,
+    Fail(ResizeWrapGateFailureReason),
+}
+
+impl ResizeWrapGateStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Pass => "pass",
+            Self::Fail(_) => "fail",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResizeWrapPolicy {
+    pub kp_cost_model: MonospaceKpCostModel,
+    pub scorecard_enabled: bool,
+    pub readability_gate: ResizeReadabilityGatePolicy,
+}
+
+impl Default for ResizeWrapPolicy {
+    fn default() -> Self {
+        Self {
+            kp_cost_model: MonospaceKpCostModel::terminal_default(),
+            scorecard_enabled: false,
+            readability_gate: ResizeReadabilityGatePolicy::default(),
+        }
+    }
+}
+
+impl ResizeWrapPolicy {
+    fn from_terminal_configuration(config: &dyn TerminalConfiguration) -> Self {
+        Self {
+            kp_cost_model: config.resize_wrap_kp_cost_model(),
+            scorecard_enabled: config.resize_wrap_scorecard_enabled(),
+            readability_gate: ResizeReadabilityGatePolicy {
+                enabled: config.resize_wrap_readability_gate_enabled(),
+                max_line_badness_delta: config.resize_wrap_readability_max_line_badness_delta(),
+                max_total_badness_delta: config.resize_wrap_readability_max_total_badness_delta(),
+                max_fallback_ratio_percent: config
+                    .resize_wrap_readability_max_fallback_ratio_percent()
+                    .min(100),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct ResizeWrapScorecard {
+    pub scored_lines: usize,
+    pub dp_lines: usize,
+    pub fallback_lines: usize,
+    pub greedy_total_cost: u64,
+    pub selected_total_cost: u64,
+    pub max_badness_delta: i64,
+    pub total_badness_delta: i64,
+}
+
+impl ResizeWrapScorecard {
+    fn record_line(&mut self, scorecard: MonospaceLineWrapScorecard) {
+        self.scored_lines = self.scored_lines.saturating_add(1);
+        match scorecard.mode {
+            MonospaceWrapMode::Dp => {
+                self.dp_lines = self.dp_lines.saturating_add(1);
+            }
+            MonospaceWrapMode::Fallback => {
+                self.fallback_lines = self.fallback_lines.saturating_add(1);
+            }
+        }
+        self.greedy_total_cost = self
+            .greedy_total_cost
+            .saturating_add(scorecard.greedy_total_cost);
+        self.selected_total_cost = self
+            .selected_total_cost
+            .saturating_add(scorecard.selected_total_cost);
+        self.max_badness_delta = self.max_badness_delta.max(scorecard.badness_delta);
+        self.total_badness_delta = self
+            .total_badness_delta
+            .saturating_add(scorecard.badness_delta);
+    }
+
+    fn fallback_ratio_percent(&self) -> usize {
+        if self.scored_lines == 0 {
+            return 0;
+        }
+        self.fallback_lines.saturating_mul(100) / self.scored_lines
+    }
+
+    fn gate_status(&self, policy: ResizeReadabilityGatePolicy) -> ResizeWrapGateStatus {
+        if !policy.enabled {
+            return ResizeWrapGateStatus::Disabled;
+        }
+        if self.max_badness_delta > policy.max_line_badness_delta {
+            return ResizeWrapGateStatus::Fail(
+                ResizeWrapGateFailureReason::LineBadnessDeltaExceeded,
+            );
+        }
+        if self.total_badness_delta > policy.max_total_badness_delta {
+            return ResizeWrapGateStatus::Fail(
+                ResizeWrapGateFailureReason::TotalBadnessDeltaExceeded,
+            );
+        }
+        if self.fallback_ratio_percent() > usize::from(policy.max_fallback_ratio_percent) {
+            return ResizeWrapGateStatus::Fail(ResizeWrapGateFailureReason::FallbackRatioExceeded);
+        }
+        ResizeWrapGateStatus::Pass
+    }
+
+    fn to_machine_payload(&self, policy: ResizeReadabilityGatePolicy) -> String {
+        let status = self.gate_status(policy);
+        let reason = match status {
+            ResizeWrapGateStatus::Fail(reason) => {
+                format!("\"{}\"", reason.as_str())
+            }
+            _ => "null".to_string(),
+        };
+
+        format!(
+            "{{\"gate\":\"resize_wrap_readability\",\"status\":\"{}\",\"reason\":{},\"scored_lines\":{},\"dp_lines\":{},\"fallback_lines\":{},\"fallback_ratio_percent\":{},\"max_badness_delta\":{},\"total_badness_delta\":{},\"greedy_total_cost\":{},\"selected_total_cost\":{},\"policy\":{{\"enabled\":{},\"max_line_badness_delta\":{},\"max_total_badness_delta\":{},\"max_fallback_ratio_percent\":{}}}}}",
+            status.as_str(),
+            reason,
+            self.scored_lines,
+            self.dp_lines,
+            self.fallback_lines,
+            self.fallback_ratio_percent(),
+            self.max_badness_delta,
+            self.total_badness_delta,
+            self.greedy_total_cost,
+            self.selected_total_cost,
+            if policy.enabled { "true" } else { "false" },
+            policy.max_line_badness_delta,
+            policy.max_total_badness_delta,
+            policy.max_fallback_ratio_percent
+        )
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReflowBatchPriority {
@@ -154,6 +340,26 @@ struct ColdScrollbackReflowWorker {
     completed_lines_total: u64,
     completed_batches_total: u64,
     cancellation_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CursorConsistencyTelemetry {
+    checks_passed: u64,
+    checks_failed: u64,
+}
+
+impl CursorConsistencyTelemetry {
+    fn record(&mut self, passed: bool) {
+        if passed {
+            self.checks_passed = self.checks_passed.saturating_add(1);
+        } else {
+            self.checks_failed = self.checks_failed.saturating_add(1);
+        }
+    }
+
+    fn total_checks(&self) -> u64 {
+        self.checks_passed.saturating_add(self.checks_failed)
+    }
 }
 
 impl ColdScrollbackReflowWorker {
@@ -319,12 +525,33 @@ impl Screen {
             keyboard_stack: vec![],
             saved_cursor: None,
             rewrap_cache: None,
+            rewrap_scratch_slots: Vec::new(),
+            rewrap_row_prefix_scratch: Vec::new(),
             cold_scrollback_worker: ColdScrollbackReflowWorker::default(),
+            resize_wrap_policy: ResizeWrapPolicy::from_terminal_configuration(config.as_ref()),
+            last_resize_wrap_scorecard: None,
+            last_resize_wrap_gate_payload: None,
+            cursor_consistency_telemetry: CursorConsistencyTelemetry::default(),
         }
     }
 
     pub fn full_reset(&mut self) {
         self.keyboard_stack.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resize_wrap_policy(&self) -> ResizeWrapPolicy {
+        self.resize_wrap_policy
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_resize_wrap_policy(&mut self, policy: ResizeWrapPolicy) {
+        self.resize_wrap_policy = policy;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_resize_wrap_gate_payload(&self) -> Option<&str> {
+        self.last_resize_wrap_gate_payload.as_deref()
     }
 
     fn scrollback_size(&self) -> usize {
@@ -336,6 +563,30 @@ impl Screen {
         for idx in start..self.lines.len() {
             self.lines[idx].update_last_change_seqno(seqno);
         }
+    }
+
+    fn wrap_single_logical_line_for_resize(
+        line: Line,
+        physical_cols: usize,
+        seqno: SequenceNo,
+        policy: ResizeWrapPolicy,
+    ) -> (Vec<Line>, Option<MonospaceLineWrapScorecard>) {
+        if line.len() <= physical_cols {
+            return (vec![line], None);
+        }
+
+        if policy.scorecard_enabled {
+            let report = line.wrap_with_report(physical_cols, seqno, policy.kp_cost_model);
+            return (report.lines, Some(report.scorecard));
+        }
+
+        if policy.kp_cost_model == MonospaceKpCostModel::terminal_default() {
+            return (line.wrap(physical_cols, seqno), None);
+        }
+
+        let (wrapped, _mode) =
+            line.wrap_with_cost_model(physical_cols, seqno, policy.kp_cost_model);
+        (wrapped, None)
     }
 
     fn compute_layout_signature_for_lines<'a, I>(lines: I) -> u64
@@ -506,6 +757,42 @@ impl Screen {
         None
     }
 
+    fn record_cursor_consistency_telemetry(
+        &mut self,
+        seqno: SequenceNo,
+        cursor_x: usize,
+        cursor_y: PhysRowIndex,
+    ) {
+        let (passed, reason) = if cursor_y >= self.lines.len() {
+            (false, "cursor_phys_out_of_bounds")
+        } else if self
+            .logical_cursor_from_physical(cursor_x, cursor_y)
+            .is_none()
+        {
+            (false, "logical_mapping_missing")
+        } else {
+            let stable_row = self.phys_to_stable_row_index(cursor_y);
+            if self.stable_row_to_phys(stable_row) != Some(cursor_y) {
+                (false, "stable_row_roundtrip_mismatch")
+            } else {
+                (true, "ok")
+            }
+        };
+
+        self.cursor_consistency_telemetry.record(passed);
+        debug!(
+            "cursor_consistency seqno={:?} status={} reason={} cursor_x={} cursor_y={} checks_total={} checks_passed={} checks_failed={}",
+            seqno,
+            if passed { "pass" } else { "fail" },
+            reason,
+            cursor_x,
+            cursor_y,
+            self.cursor_consistency_telemetry.total_checks(),
+            self.cursor_consistency_telemetry.checks_passed,
+            self.cursor_consistency_telemetry.checks_failed
+        );
+    }
+
     fn rebuild_logical_lines_from_physical(&self, seqno: SequenceNo) -> Vec<Line> {
         let mut logical_lines: Vec<Line> = Vec::with_capacity(self.lines.len());
         let mut logical_line: Option<Line> = None;
@@ -541,6 +828,36 @@ impl Screen {
         logical_lines
     }
 
+    fn prepare_rewrap_scratch_slots(&mut self, logical_count: usize) {
+        if self.rewrap_scratch_slots.len() < logical_count {
+            self.rewrap_scratch_slots.resize_with(logical_count, || None);
+        }
+        for slot in self.rewrap_scratch_slots.iter_mut().take(logical_count) {
+            *slot = None;
+        }
+    }
+
+    fn take_wrapped_from_scratch(&mut self, logical_count: usize) -> Vec<Vec<Line>> {
+        let mut wrapped = Vec::with_capacity(logical_count);
+        for slot in self.rewrap_scratch_slots.iter_mut().take(logical_count) {
+            wrapped.push(slot.take().expect("missing wrapped line result after planner"));
+        }
+        wrapped
+    }
+
+    fn rebuild_rewrap_row_prefix_scratch(&mut self, wrapped: &[Vec<Line>]) {
+        self.rewrap_row_prefix_scratch.clear();
+        self.rewrap_row_prefix_scratch
+            .reserve(wrapped.len().saturating_add(1));
+        self.rewrap_row_prefix_scratch.push(0);
+
+        let mut total_rows = 0usize;
+        for lines in wrapped {
+            total_rows = total_rows.saturating_add(lines.len());
+            self.rewrap_row_prefix_scratch.push(total_rows);
+        }
+    }
+
     fn logical_wraps_for_resize(
         &mut self,
         source_signature: u64,
@@ -573,7 +890,7 @@ impl Screen {
                 }
 
                 let wrapped = self.wrap_logical_lines_for_resize(
-                    entry.logical_lines.clone(),
+                    &entry.logical_lines,
                     physical_cols,
                     seqno,
                     Some(&self.build_viewport_reflow_plan_for_current_snapshot(logical_count)),
@@ -594,7 +911,7 @@ impl Screen {
         let logical_lines = self.rebuild_logical_lines_from_physical(seqno);
         let logical_count = logical_lines.len();
         let wrapped = self.wrap_logical_lines_for_resize(
-            logical_lines.clone(),
+            &logical_lines,
             physical_cols,
             seqno,
             Some(&self.build_viewport_reflow_plan_for_current_snapshot(logical_count)),
@@ -632,7 +949,7 @@ impl Screen {
 
     fn wrap_logical_lines_for_resize(
         &mut self,
-        logical_lines: Vec<Line>,
+        logical_lines: &[Line],
         physical_cols: usize,
         seqno: SequenceNo,
         reflow_plan: Option<&ViewportReflowPlan>,
@@ -642,7 +959,11 @@ impl Screen {
             return vec![];
         }
 
-        let mut wrapped_by_index: Vec<Option<Vec<Line>>> = vec![None; logical_count];
+        let wrap_policy = self.resize_wrap_policy;
+        let mut wrap_scorecard = wrap_policy
+            .scorecard_enabled
+            .then(ResizeWrapScorecard::default);
+        self.prepare_rewrap_scratch_slots(logical_count);
         let fallback_plan;
         let plan = match reflow_plan {
             Some(plan) if plan.covers_each_logical_line_once(logical_count) => plan,
@@ -695,12 +1016,18 @@ impl Screen {
             if batch_workers <= 1 || batch_len < batch_workers.saturating_mul(8) {
                 for idx in batch.logical_range.clone() {
                     let line = logical_lines[idx].clone();
-                    let wrapped = if line.len() <= physical_cols {
-                        vec![line]
-                    } else {
-                        line.wrap(physical_cols, seqno)
-                    };
-                    wrapped_by_index[idx] = Some(wrapped);
+                    let (wrapped, line_scorecard) = Self::wrap_single_logical_line_for_resize(
+                        line,
+                        physical_cols,
+                        seqno,
+                        wrap_policy,
+                    );
+                    if let (Some(scorecard), Some(line_scorecard)) =
+                        (wrap_scorecard.as_mut(), line_scorecard)
+                    {
+                        scorecard.record_line(line_scorecard);
+                    }
+                    self.rewrap_scratch_slots[idx] = Some(wrapped);
                 }
                 if batch.priority == ReflowBatchPriority::ColdScrollback {
                     self.cold_scrollback_worker
@@ -725,20 +1052,27 @@ impl Screen {
                         let mut wrapped = Vec::with_capacity(end - start);
                         for (offset, line) in logical_slice.iter().enumerate() {
                             let idx = start + offset;
-                            let wrapped_lines = if line.len() <= physical_cols {
-                                vec![line.clone()]
-                            } else {
-                                line.clone().wrap(physical_cols, seqno)
-                            };
-                            wrapped.push((idx, wrapped_lines));
+                            let (wrapped_lines, line_scorecard) =
+                                Self::wrap_single_logical_line_for_resize(
+                                    line.clone(),
+                                    physical_cols,
+                                    seqno,
+                                    wrap_policy,
+                                );
+                            wrapped.push((idx, wrapped_lines, line_scorecard));
                         }
                         wrapped
                     }));
                 }
 
                 for handle in handles {
-                    for (idx, lines) in handle.join().unwrap() {
-                        wrapped_by_index[idx] = Some(lines);
+                    for (idx, lines, line_scorecard) in handle.join().unwrap() {
+                        if let (Some(scorecard), Some(line_scorecard)) =
+                            (wrap_scorecard.as_mut(), line_scorecard)
+                        {
+                            scorecard.record_line(line_scorecard);
+                        }
+                        self.rewrap_scratch_slots[idx] = Some(lines);
                     }
                 }
             });
@@ -763,27 +1097,45 @@ impl Screen {
             self.cold_scrollback_worker.peak_backlog_depth(),
             cold_batches_completed,
             cold_lines_completed,
-            self.cold_scrollback_worker.completion_throughput_lines_per_sec(),
+            self.cold_scrollback_worker
+                .completion_throughput_lines_per_sec(),
             self.cold_scrollback_worker.cancellation_count()
         );
 
-        for (idx, slot) in wrapped_by_index.iter_mut().enumerate() {
-            if slot.is_some() {
+        for idx in 0..logical_count {
+            if self.rewrap_scratch_slots[idx].is_some() {
                 continue;
             }
             let line = logical_lines[idx].clone();
-            let wrapped = if line.len() <= physical_cols {
-                vec![line]
-            } else {
-                line.wrap(physical_cols, seqno)
-            };
-            *slot = Some(wrapped);
+            let (wrapped, line_scorecard) =
+                Self::wrap_single_logical_line_for_resize(line, physical_cols, seqno, wrap_policy);
+            if let (Some(scorecard), Some(line_scorecard)) =
+                (wrap_scorecard.as_mut(), line_scorecard)
+            {
+                scorecard.record_line(line_scorecard);
+            }
+            self.rewrap_scratch_slots[idx] = Some(wrapped);
         }
 
-        wrapped_by_index
-            .into_iter()
-            .map(|lines| lines.expect("missing wrapped line result after planner"))
-            .collect()
+        if let Some(scorecard) = wrap_scorecard {
+            let gate_status = scorecard.gate_status(wrap_policy.readability_gate);
+            let payload = scorecard.to_machine_payload(wrap_policy.readability_gate);
+            match gate_status {
+                ResizeWrapGateStatus::Fail(_) => {
+                    warn!("resize_wrap_scorecard_gate {}", payload);
+                }
+                _ => {
+                    debug!("resize_wrap_scorecard_gate {}", payload);
+                }
+            }
+            self.last_resize_wrap_scorecard = Some(scorecard);
+            self.last_resize_wrap_gate_payload = Some(payload);
+        } else {
+            self.last_resize_wrap_scorecard = None;
+            self.last_resize_wrap_gate_payload = None;
+        }
+
+        self.take_wrapped_from_scratch(logical_count)
     }
 
     fn rewrap_lines(
@@ -810,16 +1162,17 @@ impl Screen {
         let logical_cursor = self.logical_cursor_from_physical(cursor_x, cursor_y);
         let (wrapped, logical_count, logical_cache_hit, wrap_cache_hit, cache_entries) =
             self.logical_wraps_for_resize(source_signature, physical_cols, seqno);
+        self.rebuild_rewrap_row_prefix_scratch(&wrapped);
         let mut adjusted_cursor = (cursor_x, cursor_y);
-        let wrapped_count: usize = wrapped.iter().map(Vec::len).sum();
+        let wrapped_count = self.rewrap_row_prefix_scratch.last().copied().unwrap_or(0);
         if let Some((logical_idx, logical_x)) = logical_cursor {
             let num_lines = logical_x / physical_cols;
             let last_x = logical_x - (num_lines * physical_cols);
-            let row_base = wrapped
-                .iter()
-                .take(logical_idx)
-                .map(Vec::len)
-                .sum::<usize>();
+            let row_base = self
+                .rewrap_row_prefix_scratch
+                .get(logical_idx)
+                .copied()
+                .unwrap_or(wrapped_count);
             adjusted_cursor = (last_x, row_base + num_lines);
 
             // Special case: if the cursor lands in column zero, we'll
@@ -842,7 +1195,13 @@ impl Screen {
             }
         }
 
-        let mut rewrapped = VecDeque::with_capacity(estimated_capacity.max(physical_rows));
+        let required_capacity = estimated_capacity.max(physical_rows);
+        let mut rewrapped = std::mem::take(&mut self.lines);
+        rewrapped.clear();
+        let additional = required_capacity.saturating_sub(rewrapped.capacity());
+        if additional > 0 {
+            rewrapped.reserve(additional);
+        }
         let mut pruned_rows = 0usize;
         for lines in wrapped {
             for mut line in lines {
@@ -893,6 +1252,7 @@ impl Screen {
             pruned_rows,
             started.elapsed().as_millis()
         );
+        self.record_cursor_consistency_telemetry(seqno, adjusted_cursor.0, adjusted_cursor.1);
 
         adjusted_cursor
     }
@@ -1868,11 +2228,7 @@ impl Screen {
 fn phys_intersection(r1: &Range<PhysRowIndex>, r2: &Range<PhysRowIndex>) -> Range<PhysRowIndex> {
     let start = r1.start.max(r2.start);
     let end = r1.end.min(r2.end);
-    if end > start {
-        start..end
-    } else {
-        0..0
-    }
+    if end > start { start..end } else { 0..0 }
 }
 
 #[cfg(test)]
@@ -1885,9 +2241,23 @@ mod tests {
 
     use std::sync::Arc;
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone, Copy)]
     struct TestTermConfig {
         scrollback: usize,
+        kp_cost_model: MonospaceKpCostModel,
+        scorecard_enabled: bool,
+        readability_gate: ResizeReadabilityGatePolicy,
+    }
+
+    impl Default for TestTermConfig {
+        fn default() -> Self {
+            Self {
+                scrollback: 32,
+                kp_cost_model: MonospaceKpCostModel::terminal_default(),
+                scorecard_enabled: false,
+                readability_gate: ResizeReadabilityGatePolicy::default(),
+            }
+        }
     }
 
     impl TerminalConfiguration for TestTermConfig {
@@ -1897,6 +2267,30 @@ mod tests {
 
         fn color_palette(&self) -> ColorPalette {
             ColorPalette::default()
+        }
+
+        fn resize_wrap_kp_cost_model(&self) -> MonospaceKpCostModel {
+            self.kp_cost_model
+        }
+
+        fn resize_wrap_scorecard_enabled(&self) -> bool {
+            self.scorecard_enabled
+        }
+
+        fn resize_wrap_readability_gate_enabled(&self) -> bool {
+            self.readability_gate.enabled
+        }
+
+        fn resize_wrap_readability_max_line_badness_delta(&self) -> i64 {
+            self.readability_gate.max_line_badness_delta
+        }
+
+        fn resize_wrap_readability_max_total_badness_delta(&self) -> i64 {
+            self.readability_gate.max_total_badness_delta
+        }
+
+        fn resize_wrap_readability_max_fallback_ratio_percent(&self) -> u8 {
+            self.readability_gate.max_fallback_ratio_percent
         }
     }
 
@@ -1927,9 +2321,73 @@ mod tests {
         }
     }
 
-    fn test_screen(rows: usize, cols: usize, dpi: u32) -> Screen {
-        let config: Arc<dyn TerminalConfiguration> = Arc::new(TestTermConfig { scrollback: 32 });
+    fn test_screen_with_config(
+        rows: usize,
+        cols: usize,
+        dpi: u32,
+        config: TestTermConfig,
+    ) -> Screen {
+        let config: Arc<dyn TerminalConfiguration> = Arc::new(config);
         Screen::new(test_size(rows, cols, dpi), &config, true, 0, bidi_mode())
+    }
+
+    fn test_screen(rows: usize, cols: usize, dpi: u32) -> Screen {
+        test_screen_with_config(rows, cols, dpi, TestTermConfig::default())
+    }
+
+    #[test]
+    fn resize_wrap_policy_defaults_preserve_hot_path_budget() {
+        let screen = test_screen(3, 4, 96);
+        let policy = screen.resize_wrap_policy();
+        assert_eq!(
+            policy.kp_cost_model,
+            MonospaceKpCostModel::terminal_default()
+        );
+        assert!(
+            !policy.scorecard_enabled,
+            "scorecard should be off by default to keep resize hot-path overhead low"
+        );
+        assert!(
+            !policy.readability_gate.enabled,
+            "readability gate should be opt-in by default"
+        );
+    }
+
+    #[test]
+    fn resize_wrap_policy_seeds_from_terminal_configuration() {
+        let mut tuned_model = MonospaceKpCostModel::terminal_default();
+        tuned_model.badness_scale = 42_000;
+        tuned_model.forced_break_penalty = 7_500;
+        tuned_model.lookahead_limit = 24;
+        tuned_model.max_dp_states = 2_048;
+
+        let screen = test_screen_with_config(
+            4,
+            6,
+            96,
+            TestTermConfig {
+                scrollback: 64,
+                kp_cost_model: tuned_model,
+                scorecard_enabled: true,
+                readability_gate: ResizeReadabilityGatePolicy {
+                    enabled: true,
+                    max_line_badness_delta: 12_345,
+                    max_total_badness_delta: 67_890,
+                    max_fallback_ratio_percent: 150,
+                },
+            },
+        );
+
+        let policy = screen.resize_wrap_policy();
+        assert_eq!(policy.kp_cost_model, tuned_model);
+        assert!(policy.scorecard_enabled);
+        assert!(policy.readability_gate.enabled);
+        assert_eq!(policy.readability_gate.max_line_badness_delta, 12_345);
+        assert_eq!(policy.readability_gate.max_total_badness_delta, 67_890);
+        assert_eq!(
+            policy.readability_gate.max_fallback_ratio_percent, 100,
+            "screen policy should clamp invalid fallback thresholds"
+        );
     }
 
     #[test]
@@ -2092,10 +2550,11 @@ mod tests {
         );
 
         assert!(plan.covers_each_logical_line_once(logical_count));
-        assert!(plan
-            .batches
-            .iter()
-            .all(|batch| batch.logical_range.len() <= MAX_REFLOW_BATCH_LOGICAL_LINES));
+        assert!(
+            plan.batches
+                .iter()
+                .all(|batch| batch.logical_range.len() <= MAX_REFLOW_BATCH_LOGICAL_LINES)
+        );
         assert_eq!(
             plan.batches
                 .first()
@@ -2147,5 +2606,40 @@ mod tests {
             worker.peak_backlog_depth(),
             COLD_SCROLLBACK_BACKLOG_DEPTH_CAP
         );
+    }
+
+    #[test]
+    fn cursor_consistency_telemetry_records_passes_on_rewrap() {
+        let mut screen = test_screen(4, 6, 96);
+        let attrs = CellAttributes::blank();
+        screen.lines = VecDeque::from(vec![
+            Line::from_text_with_wrapped_last_col("abcdef", &attrs, 0),
+            Line::from_text("ghij", &attrs, 0, None),
+            Line::from_text("klmn", &attrs, 0, None),
+            Line::new(0),
+        ]);
+
+        let cursor = test_cursor(2, 2, 1);
+        let _ = screen.resize(test_size(4, 4, 96), cursor, 1, false);
+
+        assert!(
+            screen.cursor_consistency_telemetry.total_checks() >= 1,
+            "resize rewrap should emit at least one consistency telemetry check"
+        );
+        assert_eq!(
+            screen.cursor_consistency_telemetry.checks_failed, 0,
+            "expected no consistency failures for this deterministic rewrap path"
+        );
+    }
+
+    #[test]
+    fn cursor_consistency_telemetry_records_failures_for_invalid_cursor() {
+        let mut screen = test_screen(2, 2, 96);
+
+        screen.record_cursor_consistency_telemetry(9, 0, 99);
+
+        assert_eq!(screen.cursor_consistency_telemetry.checks_passed, 0);
+        assert_eq!(screen.cursor_consistency_telemetry.checks_failed, 1);
+        assert_eq!(screen.cursor_consistency_telemetry.total_checks(), 1);
     }
 }
