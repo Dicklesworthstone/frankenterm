@@ -419,6 +419,7 @@ impl SnapshotEngine {
                 }
             }
             SnapshotSchedulingMode::Intelligent => {
+                #[cfg_attr(feature = "asupersync-runtime", allow(unused_mut))]
                 let mut trigger_rx = {
                     let mut guard = self.trigger_rx.lock().await;
                     match guard.take() {
@@ -519,21 +520,19 @@ impl SnapshotEngine {
         topology_json: &str,
         now_ms: u64,
     ) -> std::result::Result<String, SnapshotError> {
-        {
-            let guard = self.session_id.read().await;
-            if let Some(ref id) = *guard {
-                // Update last_checkpoint_at and topology
-                let db_path = Arc::clone(&self.db_path);
-                let id = id.clone();
-                let topo = topology_json.to_string();
-                tokio::task::spawn_blocking(move || {
-                    update_session_sync(&db_path, &id, now_ms, &topo)
-                })
-                .await
-                .map_err(|e| SnapshotError::Database(format!("task join: {e}")))?
-                .map_err(|e| SnapshotError::Database(e.to_string()))?;
-                return Ok(guard.clone().unwrap());
-            }
+        let existing_session_id = { self.session_id.read().await.clone() };
+        if let Some(id) = existing_session_id {
+            // Update last_checkpoint_at and topology
+            let db_path = Arc::clone(&self.db_path);
+            let topo = topology_json.to_string();
+            let id_for_closure = id.clone();
+            tokio::task::spawn_blocking(move || {
+                update_session_sync(&db_path, &id_for_closure, now_ms, &topo)
+            })
+            .await
+            .map_err(|e| SnapshotError::Database(format!("task join: {e}")))?
+            .map_err(|e| SnapshotError::Database(e.to_string()))?;
+            return Ok(id);
         }
 
         // Create new session
@@ -592,10 +591,9 @@ impl SnapshotEngine {
 
     /// Mark current session as cleanly shut down.
     pub async fn mark_shutdown(&self) -> std::result::Result<(), SnapshotError> {
-        let guard = self.session_id.read().await;
-        if let Some(ref id) = *guard {
+        let session_id = { self.session_id.read().await.clone() };
+        if let Some(id) = session_id {
             let db_path = Arc::clone(&self.db_path);
-            let id = id.clone();
             tokio::task::spawn_blocking(move || mark_shutdown_sync(&db_path, &id))
                 .await
                 .map_err(|e| SnapshotError::Database(format!("task join: {e}")))?

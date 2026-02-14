@@ -1680,7 +1680,8 @@ impl ObservationRuntime {
                                 // Initialize cursor from storage to resume capture
                                 let (storage_guard, lock_held_since) =
                                     lock_storage_with_profile(&storage, &metrics).await;
-                                let max_seq = storage_guard.get_max_seq(pane_id).await.unwrap_or(None);
+                                let max_seq =
+                                    storage_guard.get_max_seq(pane_id).await.unwrap_or(None);
                                 drop(storage_guard);
                                 metrics.record_storage_lock_hold(lock_held_since.elapsed());
 
@@ -1688,7 +1689,8 @@ impl ObservationRuntime {
 
                                 {
                                     let mut cursors = cursors.write().await;
-                                    cursors.insert(pane_id, PaneCursor::from_seq(pane_id, next_seq));
+                                    cursors
+                                        .insert(pane_id, PaneCursor::from_seq(pane_id, next_seq));
                                 }
 
                                 {
