@@ -8,11 +8,10 @@ use std::path::Path;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::watch;
 
 use crate::Result;
 use crate::recording::{FrameHeader, FrameType, RecordingFrame};
-use crate::runtime_compat::sleep;
+use crate::runtime_compat::{sleep, watch};
 
 // ---------------------------------------------------------------------------
 // Frame parsing

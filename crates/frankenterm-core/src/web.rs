@@ -6,7 +6,7 @@
 
 use crate::events::{Event, EventBus, RecvError};
 use crate::policy::Redactor;
-use crate::runtime_compat::{sleep, timeout};
+use crate::runtime_compat::{mpsc, sleep, timeout};
 use crate::storage::{
     EventQuery, PaneRecord, SearchOptions, SearchResult, SegmentScanQuery, StorageHandle,
 };
@@ -27,7 +27,6 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 const DEFAULT_HOST: &str = "127.0.0.1";
