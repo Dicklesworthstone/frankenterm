@@ -7,8 +7,8 @@ use std::os::unix::fs::symlink as symlink_file;
 #[cfg(windows)]
 use std::os::windows::fs::symlink_file;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
 /// AgentProxy manages an agent.PID symlink in the wezterm runtime
 /// directory.
@@ -86,7 +86,9 @@ impl AgentProxy {
 
         if let Some(inherited) = Self::default_ssh_auth_sock() {
             if let Err(err) = update_symlink(&inherited, &sock_path) {
-                log::error!("failed to set {sock_path:?} to initial inherited SSH_AUTH_SOCK value of {inherited:?}: {err:#}");
+                log::error!(
+                    "failed to set {sock_path:?} to initial inherited SSH_AUTH_SOCK value of {inherited:?}: {err:#}"
+                );
             }
         }
 

@@ -1,11 +1,11 @@
 use crate::domain::{DomainId, WriterWrapper};
 use crate::localpane::LocalPane;
-use crate::pane::{alloc_pane_id, PaneId};
+use crate::pane::{PaneId, alloc_pane_id};
 use crate::tab::{SplitDirection, SplitRequest, SplitSize, Tab, TabId};
 use crate::tmux::{AttachState, TmuxDomain, TmuxDomainState, TmuxRemotePane, TmuxTab};
 use crate::tmux_pty::{TmuxChild, TmuxPty};
 use crate::{Mux, MuxNotification, Pane};
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use frankenterm_term::TerminalSize;
 use parking_lot::{Condvar, Mutex};
 use portable_pty::{MasterPty, PtySize};
@@ -13,7 +13,7 @@ use std::collections::HashSet;
 use std::fmt::{Debug, Write};
 use std::io::Write as _;
 use std::sync::Arc;
-use termwiz::escape::csi::{Cursor, CSI};
+use termwiz::escape::csi::{CSI, Cursor};
 use termwiz::escape::{Action, OneBased};
 use termwiz::tmux_cc::*;
 
@@ -548,9 +548,26 @@ impl TmuxDomainState {
     }
 
     pub fn subscribe_notification(&self) {
+        let mut notification_sub_id = self.notification_sub_id.lock();
+        if notification_sub_id.is_some() {
+            return;
+        }
+
         let mux = Mux::get();
         let domain_id = self.domain_id;
-        mux.subscribe(move |n| {
+        let sub_id = mux.subscribe(move |n| {
+            // Domain lifetimes can outlive tmux sessions and a stale callback
+            // would otherwise accumulate forever in mux subscribers.
+            let Some(mux) = Mux::try_get() else {
+                return false;
+            };
+            let Some(domain) = mux.get_domain(domain_id) else {
+                return false;
+            };
+            if domain.downcast_ref::<TmuxDomain>().is_none() {
+                return false;
+            }
+
             promise::spawn::spawn_into_main_thread(async move {
                 let mux = Mux::get();
                 let domain = match mux.get_domain(domain_id) {
@@ -619,6 +636,15 @@ impl TmuxDomainState {
             .detach();
             true
         });
+        *notification_sub_id = Some(sub_id);
+    }
+
+    pub fn unsubscribe_notification(&self) {
+        let Some(sub_id) = self.notification_sub_id.lock().take() else {
+            return;
+        };
+        let mux = Mux::get();
+        let _ = mux.unsubscribe(sub_id);
     }
 }
 

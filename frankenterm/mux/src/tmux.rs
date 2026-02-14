@@ -1,5 +1,5 @@
 use crate::activity::Activity;
-use crate::domain::{alloc_domain_id, Domain, DomainId, DomainState, SplitSource};
+use crate::domain::{Domain, DomainId, DomainState, SplitSource, alloc_domain_id};
 use crate::pane::{Pane, PaneId};
 use crate::tab::{SplitRequest, Tab, TabId};
 use crate::tmux_commands::{
@@ -74,6 +74,7 @@ pub(crate) struct TmuxDomainState {
     pub tmux_session: Mutex<Option<TmuxSessionId>>,
     pub support_commands: Mutex<HashMap<String, String>>,
     pub attach_state: Mutex<AttachState>,
+    pub notification_sub_id: Mutex<Option<usize>>,
     pending_splits: Mutex<VecDeque<promise::Promise<TmuxPaneId>>>,
     pub backlog: Mutex<HashMap<TmuxPaneId, Vec<u8>>>,
 }
@@ -118,22 +119,39 @@ impl TmuxDomainState {
                 }
                 Event::Exit { reason: _ } => {
                     *self.state.lock() = State::Exit;
-                    let mut pane_map = self.remote_panes.lock();
-                    for (_, v) in pane_map.iter_mut() {
-                        let remote_pane = v.lock();
-                        let (lock, condvar) = &*remote_pane.active_lock;
-                        let mut released = lock.lock();
-                        *released = true;
-                        condvar.notify_all();
+                    self.unsubscribe_notification();
+
+                    {
+                        let mut pane_map = self.remote_panes.lock();
+                        for (_, v) in pane_map.iter_mut() {
+                            let remote_pane = v.lock();
+                            let (lock, condvar) = &*remote_pane.active_lock;
+                            let mut released = lock.lock();
+                            *released = true;
+                            condvar.notify_all();
+                        }
+                        // Drop remote pane state as soon as the tmux session exits.
+                        pane_map.clear();
                     }
+
+                    self.backlog.lock().clear();
+                    self.gui_tabs.lock().clear();
+                    self.pending_splits.lock().clear();
+                    self.tmux_session.lock().take();
+
                     let mut cmd_queue = self.cmd_queue.as_ref().lock();
                     cmd_queue.clear();
 
-                    // Force to quit the tmux mode
+                    // Force-exit tmux mode in the launcher pane and then
+                    // remove all panes in this detached domain from mux state.
+                    let domain_id = self.domain_id;
                     let pane_id = self.pane_id;
                     promise::spawn::spawn_into_main_thread_with_low_priority(async move {
-                        if let Some(x) = Mux::get().get_pane(pane_id) {
-                            let _ = write!(x.writer(), "\n\n");
+                        if let Some(mux) = Mux::try_get() {
+                            if let Some(x) = mux.get_pane(pane_id) {
+                                let _ = write!(x.writer(), "\n\n");
+                            }
+                            mux.domain_was_detached(domain_id);
                         }
                     })
                     .detach();
@@ -348,6 +366,7 @@ impl TmuxDomain {
             tmux_session: Mutex::new(None),
             support_commands: Mutex::new(HashMap::default()),
             attach_state: Mutex::new(AttachState::Init),
+            notification_sub_id: Mutex::new(None),
             pending_splits: Mutex::new(VecDeque::default()),
             backlog: Mutex::new(HashMap::default()),
         });

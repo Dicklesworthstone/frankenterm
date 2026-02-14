@@ -54,14 +54,14 @@ use crate::pane::{CachePolicy, Pane, PaneId};
 use crate::ssh_agent::AgentProxy;
 use crate::tab::{SplitRequest, Tab, TabId};
 use crate::window::{Window, WindowId};
-use anyhow::{anyhow, Context, Error};
+use anyhow::{Context, Error, anyhow};
 use config::keyassignment::SpawnTabDomain;
-use config::{configuration, ExitBehavior, GuiPosition};
+use config::{ExitBehavior, GuiPosition, configuration};
 use domain::{Domain, DomainId, DomainState, SplitSource};
-use filedescriptor::{poll, pollfd, socketpair, AsRawSocketDescriptor, FileDescriptor, POLLIN};
+use filedescriptor::{AsRawSocketDescriptor, FileDescriptor, POLLIN, poll, pollfd, socketpair};
 use frankenterm_term::{Clipboard, ClipboardSelection, DownloadHandler, TerminalSize};
 #[cfg(unix)]
-use libc::{c_int, SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
+use libc::{SO_RCVBUF, SO_SNDBUF, SOL_SOCKET, c_int};
 use log::error;
 use metrics::histogram;
 use parking_lot::{
@@ -82,7 +82,7 @@ use termwiz::escape::csi::{DecPrivateMode, DecPrivateModeCode, Device, Mode};
 use termwiz::escape::{Action, CSI};
 use thiserror::*;
 #[cfg(windows)]
-use winapi::um::winsock2::{SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
+use winapi::um::winsock2::{SO_RCVBUF, SO_SNDBUF, SOL_SOCKET};
 
 pub mod activity;
 pub mod client;
@@ -169,6 +169,7 @@ pub struct Mux {
 }
 
 const BUFSIZE: usize = 1024 * 1024;
+const MAX_HELD_SYNCHRONIZED_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 
 /// This function applies parsed actions to the pane and notifies any
 /// mux subscribers about the output event
@@ -244,6 +245,20 @@ fn parse_buffered_data(pane: Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut rx: Fil
                     }
                 });
                 action_size += size;
+                if hold && action_size >= MAX_HELD_SYNCHRONIZED_OUTPUT_BYTES {
+                    // A buggy app can enter synchronized-output mode and never
+                    // send the reset sequence. Bound buffered memory in that case.
+                    log::warn!(
+                        "forcing synchronized-output flush after {} buffered bytes without reset",
+                        action_size
+                    );
+                    hold = false;
+                    if !actions.is_empty() {
+                        send_actions_to_mux(&pane, &dead, std::mem::take(&mut actions));
+                    }
+                    deadline = None;
+                    action_size = 0;
+                }
                 if !actions.is_empty() && !hold {
                     // If we haven't accumulated too much data,
                     // pause for a short while to increase the chances
@@ -742,7 +757,7 @@ impl Mux {
         self.clients.write().remove(client_id);
     }
 
-    pub fn subscribe<F>(&self, subscriber: F)
+    pub fn subscribe<F>(&self, subscriber: F) -> usize
     where
         F: Fn(MuxNotification) -> bool + 'static + Send + Sync,
     {
@@ -750,6 +765,11 @@ impl Mux {
         self.subscribers
             .write()
             .insert(sub_id, Box::new(subscriber));
+        sub_id
+    }
+
+    pub fn unsubscribe(&self, sub_id: usize) -> bool {
+        self.subscribers.write().remove(&sub_id).is_some()
     }
 
     pub fn notify(&self, notification: MuxNotification) {
@@ -1521,6 +1541,7 @@ impl frankenterm_term::DownloadHandler for MuxDownloader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn default_workspace_value() {
@@ -1569,6 +1590,26 @@ mod tests {
         let n = MuxNotification::Empty;
         let dbg = format!("{:?}", n);
         assert!(dbg.contains("Empty"));
+    }
+
+    #[test]
+    fn subscribe_handle_can_unsubscribe() {
+        let mux = Mux::new(None);
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&notifications);
+
+        let sub_id = mux.subscribe(move |_| {
+            observed.fetch_add(1, Ordering::Relaxed);
+            true
+        });
+
+        mux.notify(MuxNotification::Empty);
+        assert_eq!(notifications.load(Ordering::Relaxed), 1);
+
+        assert!(mux.unsubscribe(sub_id));
+        mux.notify(MuxNotification::Empty);
+        assert_eq!(notifications.load(Ordering::Relaxed), 1);
+        assert!(!mux.unsubscribe(sub_id));
     }
 
     #[test]
