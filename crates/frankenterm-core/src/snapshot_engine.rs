@@ -24,13 +24,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::Mutex;
-use tokio::sync::mpsc;
 
 use crate::agent_correlator::AgentCorrelator;
 use crate::config::{SnapshotConfig, SnapshotSchedulingMode};
 use crate::patterns::{AgentType, Detection, Severity};
-use crate::runtime_compat::sleep;
+use crate::runtime_compat::{Mutex, RwLock, mpsc, sleep, watch};
 use crate::session_pane_state::PaneStateSnapshot;
 use crate::session_topology::TopologySnapshot;
 use crate::wezterm::PaneInfo;
@@ -134,9 +132,9 @@ pub struct SnapshotEngine {
     /// Snapshot configuration.
     config: SnapshotConfig,
     /// Current session ID (set on first capture).
-    session_id: tokio::sync::RwLock<Option<String>>,
+    session_id: RwLock<Option<String>>,
     /// BLAKE3 hash of last captured state (for dedup).
-    last_state_hash: tokio::sync::RwLock<Option<String>>,
+    last_state_hash: RwLock<Option<String>>,
     /// Guard: true while a capture is running.
     in_progress: AtomicBool,
     /// External trigger ingress sender for intelligent scheduling mode.
@@ -152,8 +150,8 @@ impl SnapshotEngine {
         Self {
             db_path,
             config,
-            session_id: tokio::sync::RwLock::new(None),
-            last_state_hash: tokio::sync::RwLock::new(None),
+            session_id: RwLock::new(None),
+            last_state_hash: RwLock::new(None),
             in_progress: AtomicBool::new(false),
             trigger_tx,
             trigger_rx: Mutex::new(Some(trigger_rx)),
@@ -382,11 +380,8 @@ impl SnapshotEngine {
     ///
     /// `pane_provider` is called each time to fetch the current pane list.
     /// This decouples the engine from `WeztermClient` for testability.
-    pub async fn run_periodic<F, Fut>(
-        &self,
-        mut shutdown: tokio::sync::watch::Receiver<bool>,
-        pane_provider: F,
-    ) where
+    pub async fn run_periodic<F, Fut>(&self, mut shutdown: watch::Receiver<bool>, pane_provider: F)
+    where
         F: Fn() -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Option<Vec<PaneInfo>>> + Send,
     {
@@ -1354,7 +1349,7 @@ mod tests {
             db_path.clone(),
             intelligent_config(5.0),
         ));
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let e2 = engine.clone();
         let handle = tokio::spawn(async move {
@@ -1387,7 +1382,7 @@ mod tests {
             db_path.clone(),
             intelligent_config(5.0),
         ));
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let e2 = engine.clone();
         let handle = tokio::spawn(async move {
@@ -1418,7 +1413,7 @@ mod tests {
             db_path.clone(),
             intelligent_config(100.0),
         ));
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let e2 = engine.clone();
         let handle = tokio::spawn(async move {
@@ -1444,7 +1439,7 @@ mod tests {
             db_path.clone(),
             intelligent_config(100.0),
         ));
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let e2 = engine.clone();
         let handle = tokio::spawn(async move {
@@ -1470,7 +1465,7 @@ mod tests {
             db_path.clone(),
             intelligent_config(5.0),
         ));
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let e2 = engine.clone();
         let handle = tokio::spawn(async move {
@@ -1522,7 +1517,7 @@ mod tests {
             db_path.clone(),
             intelligent_config(5.0),
         ));
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let e2 = engine.clone();
         let handle = tokio::spawn(async move {
@@ -1543,7 +1538,7 @@ mod tests {
             db_path.clone(),
             intelligent_config(0.0),
         ));
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let e2 = engine.clone();
         let handle = tokio::spawn(async move {
@@ -1576,7 +1571,7 @@ mod tests {
             ..SnapshotConfig::default()
         };
         let engine = Arc::new(SnapshotEngine::new(db_path.clone(), config));
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let e2 = engine.clone();
         let handle = tokio::spawn(async move {
@@ -1603,8 +1598,8 @@ mod tests {
         let engine = SnapshotEngine {
             db_path,
             config: intelligent_config(5.0),
-            session_id: tokio::sync::RwLock::new(None),
-            last_state_hash: tokio::sync::RwLock::new(None),
+            session_id: RwLock::new(None),
+            last_state_hash: RwLock::new(None),
             in_progress: AtomicBool::new(false),
             trigger_tx,
             trigger_rx: Mutex::new(None),
@@ -1632,7 +1627,7 @@ mod tests {
             db_path.clone(),
             intelligent_config(5.0),
         ));
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let e2 = engine.clone();
         let handle = tokio::spawn(async move {
@@ -1690,7 +1685,7 @@ mod tests {
             db_path.clone(),
             intelligent_config(5.0),
         ));
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let e2 = engine.clone();
         let handle = tokio::spawn(async move {
@@ -1728,7 +1723,7 @@ mod tests {
             db_path.clone(),
             intelligent_config(5.0),
         ));
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let e2 = engine.clone();
         let handle = tokio::spawn(async move {
@@ -1761,7 +1756,7 @@ mod tests {
             db_path.clone(),
             intelligent_config(5.0),
         ));
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let e2 = engine.clone();
         let handle = tokio::spawn(async move {
@@ -1794,7 +1789,7 @@ mod tests {
             db_path.clone(),
             intelligent_config(100.0), // high threshold so only immediates capture
         ));
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let e2 = engine.clone();
         let handle = tokio::spawn(async move {
@@ -1828,7 +1823,7 @@ mod tests {
             db_path.clone(),
             intelligent_config(5.0),
         ));
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         // First call takes the receiver
         let e2 = engine.clone();
@@ -1838,7 +1833,7 @@ mod tests {
         sleep(Duration::from_millis(100)).await;
 
         // Second call should return immediately (receiver already taken)
-        let (_shutdown_tx2, shutdown_rx2) = tokio::sync::watch::channel(false);
+        let (_shutdown_tx2, shutdown_rx2) = watch::channel(false);
         let e3 = engine.clone();
         let result = timeout(Duration::from_secs(2), async move {
             e3.run_periodic(shutdown_rx2, counting_pane_provider())
@@ -1870,7 +1865,7 @@ mod tests {
             ..SnapshotConfig::default()
         };
         let engine = Arc::new(SnapshotEngine::new(db_path.clone(), config));
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let e2 = engine.clone();
         let handle = tokio::spawn(async move {
@@ -1909,7 +1904,7 @@ mod tests {
             db_path.clone(),
             intelligent_config(5.0),
         ));
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let e2 = engine.clone();
         let handle = tokio::spawn(async move {

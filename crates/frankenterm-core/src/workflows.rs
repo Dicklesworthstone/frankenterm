@@ -19,7 +19,7 @@ use crate::policy::{InjectionResult, PaneCapabilities, Redactor};
 use crate::storage::StorageHandle;
 use crate::wezterm::{
     CodexSummaryWaitResult, PaneTextSource, PaneWaiter, WaitMatcher, WaitOptions, WaitResult,
-    WeztermHandleSource, default_wezterm_handle, elapsed_ms, stable_hash, tail_text,
+    WeztermHandleSource, default_wezterm_handle, stable_hash, tail_text,
     wait_for_codex_session_summary,
 };
 use regex::Regex;
@@ -28,12 +28,16 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::LazyLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Type alias for a boxed future used in dyn-compatible traits.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 type PolicyInjector = crate::policy::PolicyGatedInjector<crate::wezterm::WeztermHandle>;
 type PolicyInjectorHandle = Arc<crate::runtime_compat::Mutex<PolicyInjector>>;
+
+fn elapsed_ms(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
 
 // ============================================================================
 // Codex Usage-Limit Helpers (wa-nu4.1.3.2)
@@ -4691,7 +4695,6 @@ pub fn run_unstick_scan_text(config: &UnstickConfig) -> UnstickReport {
 use crate::ingest::Osc133State;
 use crate::patterns::PatternEngine;
 use crate::runtime_compat::sleep;
-use std::time::Instant;
 
 /// Result of waiting for a condition.
 #[derive(Debug, Clone)]

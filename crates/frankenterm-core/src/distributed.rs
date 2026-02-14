@@ -1109,11 +1109,11 @@ mod tests {
     #[cfg(feature = "distributed")]
     use proptest::prelude::*;
     #[cfg(feature = "distributed")]
+    use std::time::Duration;
+    #[cfg(feature = "distributed")]
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     #[cfg(feature = "distributed")]
     use tokio::net::TcpListener;
-    #[cfg(feature = "distributed")]
-    use tokio::time::{Duration, timeout};
     #[cfg(feature = "distributed")]
     use tokio_rustls::{TlsAcceptor, TlsConnector};
 
@@ -1299,7 +1299,7 @@ mod tests {
             )
             .await;
 
-        let server_result = timeout(Duration::from_secs(2), server_task)
+        let server_result = crate::runtime_compat::timeout(Duration::from_secs(2), server_task)
             .await
             .expect("server timeout")
             .expect("join");
@@ -1364,7 +1364,7 @@ mod tests {
             )
             .await;
 
-        let server_result = timeout(Duration::from_secs(2), server_task)
+        let server_result = crate::runtime_compat::timeout(Duration::from_secs(2), server_task)
             .await
             .expect("server timeout")
             .expect("join");
@@ -1434,7 +1434,7 @@ mod tests {
             )
             .await;
 
-        let server_result = timeout(Duration::from_secs(2), server_task)
+        let server_result = crate::runtime_compat::timeout(Duration::from_secs(2), server_task)
             .await
             .expect("server timeout")
             .expect("join");
@@ -1479,7 +1479,7 @@ mod tests {
         client.write_all(b"not tls").await.expect("write");
         let _ = client.shutdown().await;
 
-        let server_result = timeout(Duration::from_secs(2), server_task)
+        let server_result = crate::runtime_compat::timeout(Duration::from_secs(2), server_task)
             .await
             .expect("server timeout")
             .expect("join");
