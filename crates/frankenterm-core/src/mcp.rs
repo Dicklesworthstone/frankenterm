@@ -5623,4 +5623,569 @@ mod tests {
             );
         }
     }
+
+    // ── apply_tail_truncation tests ──────────────────────────────────────
+
+    #[test]
+    fn apply_tail_truncation_no_truncation_when_under_limit() {
+        let text = "line1\nline2\nline3";
+        let (result, truncated, info) = apply_tail_truncation(text, 10);
+        assert_eq!(result, text);
+        assert!(!truncated);
+        assert!(info.is_none());
+    }
+
+    #[test]
+    fn apply_tail_truncation_exact_limit() {
+        let text = "line1\nline2\nline3";
+        let (result, truncated, info) = apply_tail_truncation(text, 3);
+        assert_eq!(result, text);
+        assert!(!truncated);
+        assert!(info.is_none());
+    }
+
+    #[test]
+    fn apply_tail_truncation_truncates_to_tail() {
+        let text = "line1\nline2\nline3\nline4\nline5";
+        let (result, truncated, info) = apply_tail_truncation(text, 2);
+        assert!(truncated);
+        assert_eq!(result, "line4\nline5");
+        let info = info.expect("truncation info present");
+        assert_eq!(info.original_lines, 5);
+        assert_eq!(info.returned_lines, 2);
+        assert!(info.returned_bytes < info.original_bytes);
+    }
+
+    #[test]
+    fn apply_tail_truncation_single_line() {
+        let text = "only one line";
+        let (result, truncated, _) = apply_tail_truncation(text, 1);
+        assert_eq!(result, text);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn apply_tail_truncation_empty_text() {
+        let (result, truncated, _) = apply_tail_truncation("", 5);
+        assert_eq!(result, "");
+        assert!(!truncated);
+    }
+
+    // ── parse_cass_agent tests ───────────────────────────────────────────
+
+    #[test]
+    fn parse_cass_agent_known_agents() {
+        assert!(matches!(parse_cass_agent("codex"), Some(CassAgent::Codex)));
+        assert!(matches!(
+            parse_cass_agent("claude_code"),
+            Some(CassAgent::ClaudeCode)
+        ));
+        assert!(matches!(
+            parse_cass_agent("claude-code"),
+            Some(CassAgent::ClaudeCode)
+        ));
+        assert!(matches!(
+            parse_cass_agent("claude"),
+            Some(CassAgent::ClaudeCode)
+        ));
+        assert!(matches!(
+            parse_cass_agent("gemini"),
+            Some(CassAgent::Gemini)
+        ));
+        assert!(matches!(
+            parse_cass_agent("cursor"),
+            Some(CassAgent::Cursor)
+        ));
+        assert!(matches!(parse_cass_agent("aider"), Some(CassAgent::Aider)));
+        assert!(matches!(
+            parse_cass_agent("chatgpt"),
+            Some(CassAgent::ChatGpt)
+        ));
+        assert!(matches!(
+            parse_cass_agent("chat_gpt"),
+            Some(CassAgent::ChatGpt)
+        ));
+        assert!(matches!(
+            parse_cass_agent("chat-gpt"),
+            Some(CassAgent::ChatGpt)
+        ));
+    }
+
+    #[test]
+    fn parse_cass_agent_case_insensitive() {
+        assert!(matches!(parse_cass_agent("CODEX"), Some(CassAgent::Codex)));
+        assert!(matches!(
+            parse_cass_agent("Claude_Code"),
+            Some(CassAgent::ClaudeCode)
+        ));
+        assert!(matches!(
+            parse_cass_agent("GEMINI"),
+            Some(CassAgent::Gemini)
+        ));
+    }
+
+    #[test]
+    fn parse_cass_agent_trims_whitespace() {
+        assert!(matches!(
+            parse_cass_agent("  codex  "),
+            Some(CassAgent::Codex)
+        ));
+    }
+
+    #[test]
+    fn parse_cass_agent_unknown_returns_none() {
+        assert!(parse_cass_agent("unknown_agent").is_none());
+        assert!(parse_cass_agent("").is_none());
+        assert!(parse_cass_agent("gpt4").is_none());
+    }
+
+    // ── parse_caut_service tests ─────────────────────────────────────────
+
+    #[test]
+    fn parse_caut_service_openai() {
+        assert!(matches!(
+            parse_caut_service("openai"),
+            Some(CautService::OpenAI)
+        ));
+    }
+
+    #[test]
+    fn parse_caut_service_unknown_returns_none() {
+        assert!(parse_caut_service("google").is_none());
+        assert!(parse_caut_service("anthropic").is_none());
+        assert!(parse_caut_service("").is_none());
+    }
+
+    // ── check_refresh_cooldown tests ─────────────────────────────────────
+
+    #[test]
+    fn check_refresh_cooldown_no_previous_refresh() {
+        assert!(check_refresh_cooldown(0, 100_000, 60_000).is_none());
+        assert!(check_refresh_cooldown(-1, 100_000, 60_000).is_none());
+    }
+
+    #[test]
+    fn check_refresh_cooldown_within_cooldown() {
+        // Refreshed 10 seconds ago, cooldown is 60 seconds
+        let result = check_refresh_cooldown(90_000, 100_000, 60_000);
+        assert!(result.is_some());
+        let (elapsed_secs, remaining_secs) = result.unwrap();
+        assert_eq!(elapsed_secs, 10); // 10_000ms / 1000
+        assert_eq!(remaining_secs, 50); // (60_000 - 10_000) / 1000
+    }
+
+    #[test]
+    fn check_refresh_cooldown_past_cooldown() {
+        // Refreshed 120 seconds ago, cooldown is 60 seconds
+        assert!(check_refresh_cooldown(0, 120_000, 60_000).is_none());
+    }
+
+    #[test]
+    fn check_refresh_cooldown_exactly_at_boundary() {
+        // Exactly at cooldown boundary
+        assert!(check_refresh_cooldown(40_000, 100_000, 60_000).is_none());
+    }
+
+    // ── resolve_alt_screen_state tests ───────────────────────────────────
+
+    #[test]
+    fn resolve_alt_screen_unknown_pane_returns_none() {
+        let state = IpcPaneState {
+            pane_id: 1,
+            known: false,
+            observed: None,
+            alt_screen: Some(true),
+            last_status_at: Some(1000),
+            in_gap: None,
+            cursor_alt_screen: Some(true),
+            reason: None,
+        };
+        assert!(resolve_alt_screen_state(&state).is_none());
+    }
+
+    #[test]
+    fn resolve_alt_screen_cursor_takes_priority() {
+        let state = IpcPaneState {
+            pane_id: 1,
+            known: true,
+            observed: None,
+            alt_screen: Some(false),
+            last_status_at: Some(1000),
+            in_gap: None,
+            cursor_alt_screen: Some(true),
+            reason: None,
+        };
+        assert_eq!(resolve_alt_screen_state(&state), Some(true));
+    }
+
+    #[test]
+    fn resolve_alt_screen_falls_back_to_alt_screen_with_status() {
+        let state = IpcPaneState {
+            pane_id: 1,
+            known: true,
+            observed: None,
+            alt_screen: Some(false),
+            last_status_at: Some(1000),
+            in_gap: None,
+            cursor_alt_screen: None,
+            reason: None,
+        };
+        assert_eq!(resolve_alt_screen_state(&state), Some(false));
+    }
+
+    #[test]
+    fn resolve_alt_screen_no_status_no_cursor_returns_none() {
+        let state = IpcPaneState {
+            pane_id: 1,
+            known: true,
+            observed: None,
+            alt_screen: Some(true),
+            last_status_at: None,
+            in_gap: None,
+            cursor_alt_screen: None,
+            reason: None,
+        };
+        assert!(resolve_alt_screen_state(&state).is_none());
+    }
+
+    // ── policy_reason and approval_command tests ─────────────────────────
+
+    #[test]
+    fn policy_reason_allow_returns_none() {
+        let decision = PolicyDecision::Allow {
+            rule_id: None,
+            context: None,
+        };
+        assert!(policy_reason(&decision).is_none());
+    }
+
+    #[test]
+    fn policy_reason_deny_returns_reason() {
+        let decision = PolicyDecision::Deny {
+            reason: "too dangerous".to_string(),
+            rule_id: None,
+            context: None,
+        };
+        assert_eq!(policy_reason(&decision), Some("too dangerous"));
+    }
+
+    #[test]
+    fn policy_reason_require_approval_returns_reason() {
+        let decision = PolicyDecision::RequireApproval {
+            reason: "needs human review".to_string(),
+            approval: None,
+            rule_id: None,
+            context: None,
+        };
+        assert_eq!(policy_reason(&decision), Some("needs human review"));
+    }
+
+    #[test]
+    fn approval_command_allow_returns_none() {
+        let decision = PolicyDecision::Allow {
+            rule_id: None,
+            context: None,
+        };
+        assert!(approval_command(&decision).is_none());
+    }
+
+    #[test]
+    fn approval_command_deny_returns_none() {
+        let decision = PolicyDecision::Deny {
+            reason: "denied".to_string(),
+            rule_id: None,
+            context: None,
+        };
+        assert!(approval_command(&decision).is_none());
+    }
+
+    #[test]
+    fn approval_command_require_approval_no_approval_returns_none() {
+        let decision = PolicyDecision::RequireApproval {
+            reason: "review".to_string(),
+            approval: None,
+            rule_id: None,
+            context: None,
+        };
+        assert!(approval_command(&decision).is_none());
+    }
+
+    // ── injection_from_decision tests ────────────────────────────────────
+
+    #[test]
+    fn injection_from_decision_allow() {
+        let decision = PolicyDecision::Allow {
+            rule_id: None,
+            context: None,
+        };
+        let result = injection_from_decision(decision, "test".to_string(), 1, ActionKind::SendText);
+        assert!(matches!(result, InjectionResult::Allowed { .. }));
+    }
+
+    #[test]
+    fn injection_from_decision_deny() {
+        let decision = PolicyDecision::Deny {
+            reason: "blocked".to_string(),
+            rule_id: None,
+            context: None,
+        };
+        let result = injection_from_decision(decision, "test".to_string(), 1, ActionKind::SendText);
+        assert!(matches!(result, InjectionResult::Denied { .. }));
+    }
+
+    #[test]
+    fn injection_from_decision_require_approval() {
+        let decision = PolicyDecision::RequireApproval {
+            reason: "review".to_string(),
+            approval: None,
+            rule_id: None,
+            context: None,
+        };
+        let result = injection_from_decision(decision, "test".to_string(), 1, ActionKind::SendText);
+        assert!(matches!(result, InjectionResult::RequiresApproval { .. }));
+    }
+
+    // ── default value functions tests ────────────────────────────────────
+
+    #[test]
+    fn default_tail_is_500() {
+        assert_eq!(default_tail(), 500);
+    }
+
+    #[test]
+    fn default_cass_limit_is_10() {
+        assert_eq!(default_cass_limit(), 10);
+    }
+
+    #[test]
+    fn default_cass_offset_is_0() {
+        assert_eq!(default_cass_offset(), 0);
+    }
+
+    #[test]
+    fn default_cass_timeout_secs_is_15() {
+        assert_eq!(default_cass_timeout_secs(), 15);
+    }
+
+    #[test]
+    fn default_cass_context_lines_is_10() {
+        assert_eq!(default_cass_context_lines(), 10);
+    }
+
+    #[test]
+    fn default_events_limit_positive() {
+        assert!(default_events_limit() > 0);
+    }
+
+    #[test]
+    fn default_timeout_secs_positive() {
+        assert!(default_timeout_secs() > 0);
+    }
+
+    #[test]
+    fn default_wait_tail_positive() {
+        assert!(default_wait_tail() > 0);
+    }
+
+    // ── now_ms and elapsed_ms tests ──────────────────────────────────────
+
+    #[test]
+    fn now_ms_returns_reasonable_epoch() {
+        let ts = now_ms();
+        // Should be after 2024-01-01 (1704067200000) and before 2100
+        assert!(ts > 1_704_067_200_000);
+        assert!(ts < 4_102_444_800_000);
+    }
+
+    #[test]
+    fn elapsed_ms_returns_small_value() {
+        let start = Instant::now();
+        let elapsed = elapsed_ms(start);
+        // Should be very small (< 100ms)
+        assert!(elapsed < 100);
+    }
+
+    // ── McpOutputFormat tests ────────────────────────────────────────────
+
+    #[test]
+    fn mcp_output_format_default_is_json() {
+        assert_eq!(McpOutputFormat::default(), McpOutputFormat::Json);
+    }
+
+    #[test]
+    fn mcp_output_format_eq() {
+        assert_eq!(McpOutputFormat::Json, McpOutputFormat::Json);
+        assert_eq!(McpOutputFormat::Toon, McpOutputFormat::Toon);
+        assert_ne!(McpOutputFormat::Json, McpOutputFormat::Toon);
+    }
+
+    // ── extract_mcp_output_format edge cases ─────────────────────────────
+
+    #[test]
+    fn extract_mcp_output_format_invalid_returns_err() {
+        let mut args = serde_json::json!({"format": "yaml"});
+        let result = extract_mcp_output_format(&mut args);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn extract_mcp_output_format_non_string_returns_err() {
+        let mut args = serde_json::json!({"format": 42});
+        let result = extract_mcp_output_format(&mut args);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn extract_mcp_output_format_non_object_returns_json() {
+        let mut args = serde_json::json!("not an object");
+        let result = extract_mcp_output_format(&mut args).expect("should default to json");
+        assert_eq!(result, McpOutputFormat::Json);
+    }
+
+    // ── encode_mcp_contents edge cases ───────────────────────────────────
+
+    #[test]
+    fn encode_mcp_contents_json_passthrough() {
+        let contents = vec![Content::Text {
+            text: r#"{"data": 1}"#.to_string(),
+        }];
+        let result =
+            encode_mcp_contents(contents.clone(), McpOutputFormat::Json).expect("json passthrough");
+        assert_eq!(result.len(), 1);
+        match &result[0] {
+            Content::Text { text } => assert_eq!(text, r#"{"data": 1}"#),
+            _ => panic!("expected text content"),
+        }
+    }
+
+    #[test]
+    fn encode_mcp_contents_toon_invalid_json_returns_err() {
+        let contents = vec![Content::Text {
+            text: "not valid json {[}".to_string(),
+        }];
+        let result = encode_mcp_contents(contents, McpOutputFormat::Toon);
+        assert!(result.is_err());
+    }
+
+    // ── envelope_to_content tests ────────────────────────────────────────
+
+    #[test]
+    fn envelope_to_content_success_serializes() {
+        let envelope = McpEnvelope::success(42, 10);
+        let contents = envelope_to_content(envelope).expect("should serialize");
+        assert_eq!(contents.len(), 1);
+        match &contents[0] {
+            Content::Text { text } => {
+                let v: serde_json::Value = serde_json::from_str(text).expect("valid json");
+                assert_eq!(v["ok"], true);
+                assert_eq!(v["data"], 42);
+            }
+            _ => panic!("expected text content"),
+        }
+    }
+
+    #[test]
+    fn envelope_to_content_error_serializes() {
+        let envelope = McpEnvelope::<()>::error(MCP_ERR_INVALID_ARGS, "bad input", None, 5);
+        let contents = envelope_to_content(envelope).expect("should serialize");
+        assert_eq!(contents.len(), 1);
+        match &contents[0] {
+            Content::Text { text } => {
+                let v: serde_json::Value = serde_json::from_str(text).expect("valid json");
+                assert_eq!(v["ok"], false);
+                assert_eq!(v["error"], "bad input");
+            }
+            _ => panic!("expected text content"),
+        }
+    }
+
+    // ── augment_tool_schema edge cases ───────────────────────────────────
+
+    #[test]
+    fn augment_tool_schema_non_object_schema_is_noop() {
+        let mut schema = serde_json::json!("not an object");
+        augment_tool_schema_with_format(&mut schema);
+        assert_eq!(schema, serde_json::json!("not an object"));
+    }
+
+    #[test]
+    fn augment_tool_schema_non_object_type_is_noop() {
+        let mut schema = serde_json::json!({"type": "array"});
+        augment_tool_schema_with_format(&mut schema);
+        assert!(schema.get("properties").is_none());
+    }
+
+    #[test]
+    fn augment_tool_schema_does_not_overwrite_existing_format() {
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "format": {"type": "number", "description": "custom format"}
+            }
+        });
+        augment_tool_schema_with_format(&mut schema);
+        // Should not overwrite the existing format property
+        assert_eq!(schema["properties"]["format"]["type"], "number");
+    }
+
+    // ── McpEnvelope serde roundtrip ──────────────────────────────────────
+
+    #[test]
+    fn mcp_envelope_success_serde_roundtrip() {
+        let envelope = McpEnvelope::success(vec![1, 2, 3], 42);
+        let json = serde_json::to_string(&envelope).expect("serialize");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["data"], serde_json::json!([1, 2, 3]));
+        assert_eq!(v["elapsed_ms"], 42);
+        assert!(v.get("error").is_none());
+    }
+
+    #[test]
+    fn mcp_envelope_error_serde_roundtrip() {
+        let envelope = McpEnvelope::<String>::error(
+            MCP_ERR_PANE_NOT_FOUND,
+            "pane 99 not found",
+            Some("Check pane_id".to_string()),
+            100,
+        );
+        let json = serde_json::to_string(&envelope).expect("serialize");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["error"], "pane 99 not found");
+        assert_eq!(v["error_code"], MCP_ERR_PANE_NOT_FOUND);
+        assert_eq!(v["hint"], "Check pane_id");
+        assert!(v.get("data").is_none());
+    }
+
+    // ── map_mcp_error additional coverage ────────────────────────────────
+
+    #[test]
+    fn map_mcp_error_wezterm() {
+        let err = crate::Error::Wezterm(WeztermError::CliNotFound);
+        let (code, _hint) = map_mcp_error(&err);
+        assert_eq!(code, MCP_ERR_WEZTERM);
+    }
+
+    // ── MCP_HYBRID_RRF_K constant test ───────────────────────────────────
+
+    #[test]
+    fn mcp_hybrid_rrf_k_is_positive() {
+        assert!(MCP_HYBRID_RRF_K > 0);
+        assert_eq!(MCP_HYBRID_RRF_K, 60);
+    }
+
+    // ── parse_mcp_output_format edge cases ───────────────────────────────
+
+    #[test]
+    fn parse_mcp_output_format_empty_returns_none() {
+        assert!(parse_mcp_output_format("").is_none());
+    }
+
+    #[test]
+    fn parse_mcp_output_format_case_insensitive() {
+        assert_eq!(parse_mcp_output_format("JSON"), Some(McpOutputFormat::Json));
+        assert_eq!(parse_mcp_output_format("Json"), Some(McpOutputFormat::Json));
+        assert_eq!(parse_mcp_output_format("TOON"), Some(McpOutputFormat::Toon));
+    }
 }
