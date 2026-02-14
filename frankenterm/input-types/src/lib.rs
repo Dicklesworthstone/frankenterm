@@ -3560,4 +3560,203 @@ mod test {
         assert!(both.contains(MouseButtons::RIGHT));
         assert!(!both.contains(MouseButtons::MIDDLE));
     }
+
+    // ── Second-pass expansion ────────────────────────────────────
+
+    #[test]
+    fn ctrl_mapping_alpha_lowercase() {
+        assert_eq!(ctrl_mapping('a'), Some('\x01'));
+        assert_eq!(ctrl_mapping('c'), Some('\x03'));
+        assert_eq!(ctrl_mapping('z'), Some('\x1a'));
+    }
+
+    #[test]
+    fn ctrl_mapping_alpha_uppercase() {
+        assert_eq!(ctrl_mapping('A'), Some('\x01'));
+        assert_eq!(ctrl_mapping('C'), Some('\x03'));
+        assert_eq!(ctrl_mapping('Z'), Some('\x1a'));
+    }
+
+    #[test]
+    fn ctrl_mapping_special_chars() {
+        assert_eq!(ctrl_mapping('@'), Some('\x00'));
+        assert_eq!(ctrl_mapping(' '), Some('\x00'));
+        assert_eq!(ctrl_mapping('['), Some('\x1b'));
+        assert_eq!(ctrl_mapping('\\'), Some('\x1c'));
+        assert_eq!(ctrl_mapping(']'), Some('\x1d'));
+        assert_eq!(ctrl_mapping('^'), Some('\x1e'));
+        assert_eq!(ctrl_mapping('_'), Some('\x1f'));
+    }
+
+    #[test]
+    fn ctrl_mapping_returns_none_for_unmapped() {
+        assert_eq!(ctrl_mapping('!'), None);
+        assert_eq!(ctrl_mapping('"'), None);
+        assert_eq!(ctrl_mapping('\u{1F600}'), None);
+    }
+
+    #[test]
+    fn ctrl_mapping_digits_2_through_8() {
+        assert_eq!(ctrl_mapping('2'), Some('\x00'));
+        assert_eq!(ctrl_mapping('3'), Some('\x1b'));
+        assert_eq!(ctrl_mapping('4'), Some('\x1c'));
+        assert_eq!(ctrl_mapping('5'), Some('\x1d'));
+        assert_eq!(ctrl_mapping('6'), Some('\x1e'));
+        assert_eq!(ctrl_mapping('7'), Some('\x1f'));
+        assert_eq!(ctrl_mapping('8'), Some('\x7f'));
+    }
+
+    #[test]
+    fn modifiers_remove_positional_mods() {
+        let mods = Modifiers::CTRL | Modifiers::LEFT_CTRL | Modifiers::SHIFT | Modifiers::LEFT_SHIFT;
+        let cleaned = mods.remove_positional_mods();
+        assert!(cleaned.contains(Modifiers::CTRL));
+        assert!(cleaned.contains(Modifiers::SHIFT));
+        assert!(!cleaned.contains(Modifiers::LEFT_CTRL));
+        assert!(!cleaned.contains(Modifiers::LEFT_SHIFT));
+    }
+
+    #[test]
+    fn modifiers_remove_positional_keeps_logical() {
+        let mods = Modifiers::ALT | Modifiers::RIGHT_ALT | Modifiers::ENHANCED_KEY;
+        let cleaned = mods.remove_positional_mods();
+        assert!(cleaned.contains(Modifiers::ALT));
+        assert!(!cleaned.contains(Modifiers::RIGHT_ALT));
+        assert!(!cleaned.contains(Modifiers::ENHANCED_KEY));
+    }
+
+    #[test]
+    fn modifiers_to_string_with_separator_unix_long() {
+        let mods = Modifiers::CTRL | Modifiers::SHIFT;
+        let s = mods.to_string_with_separator(ModifierToStringArgs {
+            separator: "+",
+            want_none: false,
+            ui_key_cap_rendering: Some(UIKeyCapRendering::UnixLong),
+        });
+        assert!(s.contains("Ctrl"));
+        assert!(s.contains("Shift"));
+        assert!(s.contains('+'));
+    }
+
+    #[test]
+    fn modifiers_to_string_with_separator_emacs() {
+        let mods = Modifiers::CTRL | Modifiers::ALT;
+        let s = mods.to_string_with_separator(ModifierToStringArgs {
+            separator: "-",
+            want_none: false,
+            ui_key_cap_rendering: Some(UIKeyCapRendering::Emacs),
+        });
+        assert!(s.contains('C'));
+        assert!(s.contains('M'));
+    }
+
+    #[test]
+    fn normalize_shift_lowercase_with_shift() {
+        let (key, mods) = KeyCode::Char('a').normalize_shift(Modifiers::SHIFT);
+        assert_eq!(key, KeyCode::Char('A'));
+        assert!(!mods.contains(Modifiers::SHIFT));
+    }
+
+    #[test]
+    fn normalize_shift_uppercase_with_shift() {
+        let (key, mods) = KeyCode::Char('A').normalize_shift(Modifiers::SHIFT);
+        assert_eq!(key, KeyCode::Char('A'));
+        assert!(!mods.contains(Modifiers::SHIFT));
+    }
+
+    #[test]
+    fn normalize_shift_no_shift_is_noop() {
+        let (key, mods) = KeyCode::Char('a').normalize_shift(Modifiers::NONE);
+        assert_eq!(key, KeyCode::Char('a'));
+        assert_eq!(mods, Modifiers::NONE);
+    }
+
+    #[test]
+    fn normalize_shift_nonalpha_with_shift_unchanged() {
+        let (key, mods) = KeyCode::Char('1').normalize_shift(Modifiers::SHIFT);
+        assert_eq!(key, KeyCode::Char('1'));
+        assert!(mods.contains(Modifiers::SHIFT));
+    }
+
+    #[test]
+    fn key_event_normalize_ctrl_control_char() {
+        let event = KeyEvent {
+            key: KeyCode::Char('\x01'),
+            modifiers: Modifiers::CTRL,
+            leds: KeyboardLedStatus::empty(),
+            repeat_count: 1,
+            key_is_down: true,
+            raw: None,
+            #[cfg(windows)]
+            win32_uni_char: None,
+        }
+        .normalize_ctrl();
+        assert_eq!(event.key, KeyCode::Char('a'));
+        assert!(event.modifiers.contains(Modifiers::CTRL));
+    }
+
+    #[test]
+    fn key_event_normalize_ctrl_normal_char_unchanged() {
+        let event = KeyEvent {
+            key: KeyCode::Char('x'),
+            modifiers: Modifiers::CTRL,
+            leds: KeyboardLedStatus::empty(),
+            repeat_count: 1,
+            key_is_down: true,
+            raw: None,
+            #[cfg(windows)]
+            win32_uni_char: None,
+        }
+        .normalize_ctrl();
+        assert_eq!(event.key, KeyCode::Char('x'));
+    }
+
+    #[test]
+    fn mouse_press_variants_are_distinct() {
+        assert_ne!(MousePress::Left, MousePress::Right);
+        assert_ne!(MousePress::Left, MousePress::Middle);
+        assert_ne!(MousePress::Right, MousePress::Middle);
+    }
+
+    #[test]
+    fn mouse_event_kind_vert_wheel() {
+        let up = MouseEventKind::VertWheel(1);
+        let down = MouseEventKind::VertWheel(-1);
+        assert_ne!(up, down);
+        assert_eq!(up, MouseEventKind::VertWheel(1));
+    }
+
+    #[test]
+    fn mouse_event_kind_horz_wheel() {
+        let left = MouseEventKind::HorzWheel(-1);
+        let right = MouseEventKind::HorzWheel(1);
+        assert_ne!(left, right);
+    }
+
+    #[test]
+    fn mouse_buttons_all_variants() {
+        let all = MouseButtons::LEFT
+            | MouseButtons::RIGHT
+            | MouseButtons::MIDDLE
+            | MouseButtons::X1
+            | MouseButtons::X2;
+        assert!(all.contains(MouseButtons::LEFT));
+        assert!(all.contains(MouseButtons::X1));
+        assert!(all.contains(MouseButtons::X2));
+    }
+
+    #[test]
+    fn window_decorations_default_has_title_and_resize() {
+        let wd = WindowDecorations::default();
+        assert!(wd.contains(WindowDecorations::TITLE));
+        assert!(wd.contains(WindowDecorations::RESIZE));
+    }
+
+    #[test]
+    fn window_decorations_try_from_string_roundtrip() {
+        let wd = WindowDecorations::TITLE | WindowDecorations::RESIZE;
+        let s: String = (&wd).into();
+        let parsed = WindowDecorations::try_from(s).unwrap();
+        assert_eq!(parsed, wd);
+    }
 }
