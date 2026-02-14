@@ -21,7 +21,7 @@ use crate::cass::{
 };
 use crate::caut::{CautClient, CautError, CautService};
 use crate::config::{Config, PaneFilterConfig};
-use crate::error::{Error, StorageError, WeztermError};
+use crate::error::{Error, WeztermError};
 use crate::ingest::Osc133State;
 use crate::patterns::{AgentType, PatternEngine};
 use crate::policy::{
@@ -29,8 +29,8 @@ use crate::policy::{
     PolicyGatedInjector, PolicyInput,
 };
 use crate::query_contract::{
-    SearchQueryDefaults, SearchQueryInput, UnifiedSearchMode, ensure_mode_supported,
-    parse_unified_search_query, to_storage_search_options,
+    SearchQueryDefaults, SearchQueryInput, UnifiedSearchMode, parse_unified_search_query,
+    to_storage_search_options,
 };
 use crate::storage::{EventQuery, PaneReservation, StorageHandle};
 use crate::wezterm::{
@@ -58,6 +58,7 @@ const MCP_ERR_FTS_QUERY: &str = "FT-MCP-0011";
 const MCP_ERR_RESERVATION_CONFLICT: &str = "FT-MCP-0012";
 const MCP_ERR_CAUT: &str = "FT-MCP-0013";
 const MCP_ERR_CASS: &str = "FT-MCP-0014";
+const MCP_HYBRID_RRF_K: u32 = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum McpOutputFormat {
@@ -253,6 +254,8 @@ struct McpSearchData {
     #[serde(skip_serializing_if = "Option::is_none")]
     until_filter: Option<i64>,
     mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metrics: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -266,6 +269,10 @@ struct McpSearchHit {
     snippet: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    semantic_score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fusion_rank: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -746,7 +753,6 @@ pub fn build_server_with_db(config: &Config, db_path: Option<PathBuf>) -> Result
             tracing::info!("MCP server shutting down");
         })
         .tool(FormatAwareToolHandler::new(WaStateTool::new(filter)))
-        .tool(FormatAwareToolHandler::new(WaGetTextTool))
         .tool(FormatAwareToolHandler::new(WaWaitForTool))
         .tool(FormatAwareToolHandler::new(WaRulesListTool))
         .tool(FormatAwareToolHandler::new(WaRulesTestTool))
@@ -761,7 +767,12 @@ pub fn build_server_with_db(config: &Config, db_path: Option<PathBuf>) -> Result
     if let Some(ref db_path) = db_path {
         builder = builder
             .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
-                WaSearchTool::new(Arc::clone(db_path)),
+                WaGetTextTool::new(Arc::clone(&config), Some(Arc::clone(db_path))),
+                "wa.get_text",
+                Arc::clone(db_path),
+            )))
+            .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
+                WaSearchTool::new(Arc::clone(&config), Arc::clone(db_path)),
                 "wa.search",
                 Arc::clone(db_path),
             )))
@@ -831,6 +842,11 @@ pub fn build_server_with_db(config: &Config, db_path: Option<PathBuf>) -> Result
             .resource(WaReservationsByPaneTemplateResource::new(Arc::clone(
                 db_path,
             )));
+    } else {
+        builder = builder.tool(FormatAwareToolHandler::new(WaGetTextTool::new(
+            Arc::clone(&config),
+            None,
+        )));
     }
 
     let server = builder.build();
@@ -1491,7 +1507,16 @@ impl ToolHandler for WaStateTool {
 }
 
 // wa.get_text tool
-struct WaGetTextTool;
+struct WaGetTextTool {
+    config: Arc<Config>,
+    db_path: Option<Arc<PathBuf>>,
+}
+
+impl WaGetTextTool {
+    fn new(config: Arc<Config>, db_path: Option<Arc<PathBuf>>) -> Self {
+        Self { config, db_path }
+    }
+}
 
 impl ToolHandler for WaGetTextTool {
     fn definition(&self) -> Tool {
@@ -1532,36 +1557,108 @@ impl ToolHandler for WaGetTextTool {
             }
         };
 
+        let config = Arc::clone(&self.config);
+        let db_path = self.db_path.as_ref().map(Arc::clone);
+
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
 
-        let result = runtime.block_on(async {
-            let wezterm = default_wezterm_handle();
-            wezterm.get_text(params.pane_id, params.escapes).await
-        });
+        let result: std::result::Result<McpGetTextData, McpToolError> =
+            runtime.block_on(async move {
+                let storage = if let Some(path) = db_path.as_ref() {
+                    Some(
+                        StorageHandle::new(&path.to_string_lossy())
+                            .await
+                            .map_err(McpToolError::from_error)?,
+                    )
+                } else {
+                    None
+                };
 
-        match result {
-            Ok(full_text) => {
+                let wezterm = default_wezterm_handle();
+                let pane_info = wezterm
+                    .get_pane(params.pane_id)
+                    .await
+                    .map_err(McpToolError::from_error)?;
+                let domain = pane_info.inferred_domain();
+                let resolution =
+                    resolve_pane_capabilities(&config, storage.as_ref(), params.pane_id).await;
+                let capabilities = resolution.capabilities;
+
+                let mut engine = build_policy_engine(&config, false);
+                let summary = format!("wa.get_text pane_id={}", params.pane_id);
+                let mut input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Mcp)
+                    .with_pane(params.pane_id)
+                    .with_domain(domain)
+                    .with_capabilities(capabilities)
+                    .with_text_summary(summary.clone());
+                if let Some(title) = &pane_info.title {
+                    input = input.with_pane_title(title.clone());
+                }
+                if let Some(cwd) = &pane_info.cwd {
+                    input = input.with_pane_cwd(cwd.clone());
+                }
+
+                let decision = engine.authorize(&input);
+                if decision.is_denied() {
+                    let reason = policy_reason(&decision)
+                        .unwrap_or("Read denied by policy")
+                        .to_string();
+                    return Err(McpToolError::new(MCP_ERR_POLICY, reason, None));
+                }
+                if decision.requires_approval() {
+                    let mut hint = approval_command(&decision);
+                    if let Some(storage) = storage.as_ref() {
+                        let workspace_id =
+                            resolve_workspace_id(&config).map_err(McpToolError::from_error)?;
+                        let store = ApprovalStore::new(
+                            storage,
+                            config.safety.approval.clone(),
+                            workspace_id,
+                        );
+                        let updated = store
+                            .attach_to_decision(decision, &input, Some(summary))
+                            .await
+                            .map_err(McpToolError::from_error)?;
+                        hint = approval_command(&updated);
+                        let reason = policy_reason(&updated)
+                            .unwrap_or("Read requires approval")
+                            .to_string();
+                        return Err(McpToolError::new(MCP_ERR_POLICY, reason, hint));
+                    }
+                    let reason = policy_reason(&decision)
+                        .unwrap_or("Read requires approval")
+                        .to_string();
+                    return Err(McpToolError::new(MCP_ERR_POLICY, reason, hint));
+                }
+
+                let full_text = wezterm
+                    .get_text(params.pane_id, params.escapes)
+                    .await
+                    .map_err(McpToolError::from_error)?;
                 let (text, truncated, truncation_info) =
                     apply_tail_truncation(&full_text, params.tail);
 
-                let data = McpGetTextData {
+                Ok(McpGetTextData {
                     pane_id: params.pane_id,
-                    text,
+                    text: engine.redact_secrets(&text),
                     tail_lines: params.tail,
                     escapes_included: params.escapes,
                     truncated,
                     truncation_info,
-                };
+                })
+            });
+
+        match result {
+            Ok(data) => {
                 let envelope = McpEnvelope::success(data, elapsed_ms(start));
                 envelope_to_content(envelope)
             }
             Err(err) => {
-                let (code, hint) = map_mcp_error(&err);
                 let envelope =
-                    McpEnvelope::<()>::error(code, err.to_string(), hint, elapsed_ms(start));
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
                 envelope_to_content(envelope)
             }
         }
@@ -1956,12 +2053,13 @@ impl ToolHandler for WaSendTool {
 
 // wa.search tool
 struct WaSearchTool {
+    config: Arc<Config>,
     db_path: Arc<PathBuf>,
 }
 
 impl WaSearchTool {
-    fn new(db_path: Arc<PathBuf>) -> Self {
-        Self { db_path }
+    fn new(config: Arc<Config>, db_path: Arc<PathBuf>) -> Self {
+        Self { config, db_path }
     }
 }
 
@@ -1970,7 +2068,7 @@ impl ToolHandler for WaSearchTool {
         Tool {
             name: "wa.search".to_string(),
             description: Some(
-                "Unified lexical search across captured pane output (CLI/robot/MCP contract)"
+                "Unified lexical/semantic/hybrid search across captured pane output (CLI/robot/MCP contract)"
                     .to_string(),
             ),
             input_schema: serde_json::json!({
@@ -1983,7 +2081,7 @@ impl ToolHandler for WaSearchTool {
                     "until": { "type": "integer", "description": "Filter by upper bound time (epoch ms, inclusive)" },
                     "snippets": { "type": "boolean", "default": true, "description": "Include snippets in results" }
                     ,
-                    "mode": { "type": "string", "enum": ["lexical", "semantic", "hybrid"], "default": "lexical", "description": "Search mode (semantic/hybrid reserved for future wa.search support)" }
+                    "mode": { "type": "string", "enum": ["lexical", "semantic", "hybrid"], "default": "lexical", "description": "Search mode (lexical, semantic, or hybrid)" }
                 },
                 "required": ["query"],
                 "additionalProperties": false
@@ -2040,34 +2138,150 @@ impl ToolHandler for WaSearchTool {
         };
         let canonical = parsed.query;
 
-        if let Err(err) = ensure_mode_supported(canonical.mode, &[UnifiedSearchMode::Lexical]) {
-            let envelope = McpEnvelope::<()>::error(
-                MCP_ERR_NOT_IMPLEMENTED,
-                err.message(),
-                err.hint(),
-                elapsed_ms(start),
-            );
-            return envelope_to_content(envelope);
-        }
+        let requested_mode = canonical.mode;
+        let search_mode = match requested_mode {
+            UnifiedSearchMode::Lexical => crate::search::SearchMode::Lexical,
+            UnifiedSearchMode::Semantic => crate::search::SearchMode::Semantic,
+            UnifiedSearchMode::Hybrid => crate::search::SearchMode::Hybrid,
+        };
 
+        let config = Arc::clone(&self.config);
         let db_path = Arc::clone(&self.db_path);
         let query_for_storage = canonical.query.clone();
         let search_options = to_storage_search_options(&canonical);
         let snippets_enabled = canonical.snippets;
+        let semantic_query = if matches!(
+            requested_mode,
+            UnifiedSearchMode::Semantic | UnifiedSearchMode::Hybrid
+        ) {
+            use crate::search::Embedder;
+
+            let embedder = crate::search::HashEmbedder::default();
+            match embedder.embed(&canonical.query) {
+                Ok(vector) => Some((embedder.info().name, vector)),
+                Err(err) => {
+                    let envelope = McpEnvelope::<()>::error(
+                        MCP_ERR_STORAGE,
+                        format!("Failed to embed query for semantic search: {err}"),
+                        Some(
+                            "Try mode=lexical or verify semantic embedding support in this build."
+                                .to_string(),
+                        ),
+                        elapsed_ms(start),
+                    );
+                    return envelope_to_content(envelope);
+                }
+            }
+        } else {
+            None
+        };
+
+        enum SearchExecution {
+            Lexical(Vec<crate::storage::SearchResult>),
+            Hybrid(crate::storage::HybridSearchBundle),
+        }
+
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
 
-        let result = runtime.block_on(async move {
-            let storage = StorageHandle::new(&db_path.to_string_lossy()).await?;
-            storage
-                .search_with_results(&query_for_storage, search_options)
-                .await
-        });
+        let result: std::result::Result<SearchExecution, McpToolError> =
+            runtime.block_on(async move {
+                let storage = StorageHandle::new(&db_path.to_string_lossy())
+                    .await
+                    .map_err(McpToolError::from_error)?;
+
+                let mut engine = build_policy_engine(&config, false);
+                let summary = engine.redact_secrets(&query_for_storage);
+                let mut input = PolicyInput::new(ActionKind::SearchOutput, ActorKind::Mcp)
+                    .with_text_summary(summary.clone());
+
+                if let Some(pane_id) = search_options.pane_id {
+                    let wezterm = default_wezterm_handle();
+                    let pane_info = wezterm
+                        .get_pane(pane_id)
+                        .await
+                        .map_err(McpToolError::from_error)?;
+                    let domain = pane_info.inferred_domain();
+                    let resolution =
+                        resolve_pane_capabilities(&config, Some(&storage), pane_id).await;
+                    input = input
+                        .with_pane(pane_id)
+                        .with_domain(domain)
+                        .with_capabilities(resolution.capabilities);
+                    if let Some(title) = &pane_info.title {
+                        input = input.with_pane_title(title.clone());
+                    }
+                    if let Some(cwd) = &pane_info.cwd {
+                        input = input.with_pane_cwd(cwd.clone());
+                    }
+                } else {
+                    input = input.with_capabilities(PaneCapabilities::unknown());
+                }
+
+                let decision = engine.authorize(&input);
+                if decision.is_denied() {
+                    let reason = policy_reason(&decision)
+                        .unwrap_or("Search denied by policy")
+                        .to_string();
+                    return Err(McpToolError::new(MCP_ERR_POLICY, reason, None));
+                }
+                if decision.requires_approval() {
+                    let workspace_id =
+                        resolve_workspace_id(&config).map_err(McpToolError::from_error)?;
+                    let store =
+                        ApprovalStore::new(&storage, config.safety.approval.clone(), workspace_id);
+                    let updated = store
+                        .attach_to_decision(decision, &input, Some(summary))
+                        .await
+                        .map_err(McpToolError::from_error)?;
+                    let reason = policy_reason(&updated)
+                        .unwrap_or("Search requires approval")
+                        .to_string();
+                    let hint = approval_command(&updated);
+                    return Err(McpToolError::new(MCP_ERR_POLICY, reason, hint));
+                }
+
+                match requested_mode {
+                    UnifiedSearchMode::Lexical => {
+                        let results = storage
+                            .search_with_results(&query_for_storage, search_options)
+                            .await
+                            .map_err(McpToolError::from_error)?;
+                        Ok(SearchExecution::Lexical(results))
+                    }
+                    UnifiedSearchMode::Semantic | UnifiedSearchMode::Hybrid => {
+                        let (embedder_id, query_vector) = semantic_query.ok_or_else(|| {
+                            McpToolError::new(
+                                MCP_ERR_STORAGE,
+                                "semantic query vector missing for non-lexical wa.search mode"
+                                    .to_string(),
+                                None,
+                            )
+                        })?;
+
+                        let bundle = storage
+                            .hybrid_search_with_results(
+                                &query_for_storage,
+                                search_options,
+                                &embedder_id,
+                                &query_vector,
+                                search_mode,
+                                MCP_HYBRID_RRF_K,
+                            )
+                            .await
+                            .map_err(McpToolError::from_error)?;
+                        Ok(SearchExecution::Hybrid(bundle))
+                    }
+                }
+            });
+
+        let redactor = crate::policy::Redactor::new();
+        let redacted_query = redactor.redact(&canonical.query);
 
         match result {
-            Ok(results) => {
+            Ok(SearchExecution::Lexical(results)) => {
                 let total_hits = results.len();
                 let hits: Vec<McpSearchHit> = results
                     .into_iter()
@@ -2077,17 +2291,19 @@ impl ToolHandler for WaSearchTool {
                         seq: r.segment.seq,
                         captured_at: r.segment.captured_at,
                         score: r.score,
-                        snippet: r.snippet,
+                        snippet: r.snippet.map(|snippet| redactor.redact(&snippet)),
                         content: if snippets_enabled {
                             None
                         } else {
-                            Some(r.segment.content)
+                            Some(redactor.redact(&r.segment.content))
                         },
+                        semantic_score: None,
+                        fusion_rank: None,
                     })
                     .collect();
 
                 let data = McpSearchData {
-                    query: canonical.query,
+                    query: redacted_query.clone(),
                     results: hits,
                     total_hits,
                     limit: canonical.limit,
@@ -2095,20 +2311,86 @@ impl ToolHandler for WaSearchTool {
                     since_filter: canonical.since,
                     until_filter: canonical.until,
                     mode: canonical.mode.as_str().to_string(),
+                    metrics: None,
+                };
+                let envelope = McpEnvelope::success(data, elapsed_ms(start));
+                envelope_to_content(envelope)
+            }
+            Ok(SearchExecution::Hybrid(bundle)) => {
+                let crate::storage::HybridSearchBundle {
+                    mode,
+                    requested_mode,
+                    fallback_reason,
+                    rrf_k,
+                    lexical_weight,
+                    semantic_weight,
+                    lexical_candidates,
+                    semantic_candidates,
+                    semantic_cache_hit,
+                    semantic_latency_ms,
+                    semantic_rows_scanned,
+                    semantic_budget_state,
+                    semantic_backoff_until_ms,
+                    results,
+                } = bundle;
+                let effective_mode = mode.clone();
+
+                let total_hits = results.len();
+                let hits: Vec<McpSearchHit> = results
+                    .into_iter()
+                    .map(|hit| {
+                        let result = hit.result;
+                        McpSearchHit {
+                            segment_id: result.segment.id,
+                            pane_id: result.segment.pane_id,
+                            seq: result.segment.seq,
+                            captured_at: result.segment.captured_at,
+                            score: hit.fusion_score,
+                            snippet: result.snippet.map(|snippet| redactor.redact(&snippet)),
+                            content: if snippets_enabled {
+                                None
+                            } else {
+                                Some(redactor.redact(&result.segment.content))
+                            },
+                            semantic_score: hit.semantic_score,
+                            fusion_rank: Some(hit.fusion_rank),
+                        }
+                    })
+                    .collect();
+
+                let metrics = serde_json::json!({
+                    "requested_mode": requested_mode,
+                    "effective_mode": effective_mode,
+                    "fallback_reason": fallback_reason,
+                    "rrf_k": rrf_k,
+                    "lexical_weight": lexical_weight,
+                    "semantic_weight": semantic_weight,
+                    "lexical_candidates": lexical_candidates,
+                    "semantic_candidates": semantic_candidates,
+                    "semantic_cache_hit": semantic_cache_hit,
+                    "semantic_latency_ms": semantic_latency_ms,
+                    "semantic_rows_scanned": semantic_rows_scanned,
+                    "semantic_budget_state": semantic_budget_state,
+                    "semantic_backoff_until_ms": semantic_backoff_until_ms
+                });
+
+                let data = McpSearchData {
+                    query: redacted_query,
+                    results: hits,
+                    total_hits,
+                    limit: canonical.limit,
+                    pane_filter: canonical.pane,
+                    since_filter: canonical.since,
+                    until_filter: canonical.until,
+                    mode: effective_mode,
+                    metrics: Some(metrics),
                 };
                 let envelope = McpEnvelope::success(data, elapsed_ms(start));
                 envelope_to_content(envelope)
             }
             Err(err) => {
-                let (code, hint) = match &err {
-                    Error::Storage(StorageError::FtsQueryError(_)) => (
-                        MCP_ERR_FTS_QUERY,
-                        Some("Check FTS5 query syntax. Supported: words, \"phrases\", prefix*, AND/OR/NOT".to_string()),
-                    ),
-                    _ => map_mcp_error(&err),
-                };
                 let envelope =
-                    McpEnvelope::<()>::error(code, err.to_string(), hint, elapsed_ms(start));
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
                 envelope_to_content(envelope)
             }
         }
@@ -5165,7 +5447,11 @@ mod tests {
 
     #[test]
     fn wa_search_schema_includes_unified_contract_fields() {
-        let tool = WaSearchTool::new(Arc::new(PathBuf::from("wa-test.db"))).definition();
+        let tool = WaSearchTool::new(
+            Arc::new(Config::default()),
+            Arc::new(PathBuf::from("wa-test.db")),
+        )
+        .definition();
         let properties = tool
             .input_schema
             .get("properties")
