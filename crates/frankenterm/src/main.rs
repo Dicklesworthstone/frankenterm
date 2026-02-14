@@ -4,7 +4,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -352,6 +352,7 @@ SEE ALSO:
     /// Get text from a pane
     #[command(after_help = r#"EXAMPLES:
     ft get-text 3                     Get recent text from pane 3
+    ft get-text 3 --tail 120          Return only the last 120 lines
     ft get-text 3 --escapes           Include ANSI escape sequences
 
 SEE ALSO:
@@ -360,6 +361,10 @@ SEE ALSO:
     GetText {
         /// Target pane ID
         pane_id: u64,
+
+        /// Number of lines to return from the end (0 = full buffer)
+        #[arg(long, default_value = "200")]
+        tail: usize,
 
         /// Include escape sequences
         #[arg(long)]
@@ -3561,6 +3566,7 @@ const ROBOT_ERR_CONFIG: &str = "robot.config_error";
 const ROBOT_ERR_FTS_QUERY: &str = "robot.fts_query_error";
 const ROBOT_ERR_STORAGE: &str = "robot.storage_error";
 const ROBOT_BATCH_GET_TEXT_MAX_CONCURRENT: usize = 16;
+const CLI_HYBRID_RRF_K: u32 = 60;
 /// Cooldown period between account refreshes (milliseconds)
 const ROBOT_REFRESH_COOLDOWN_MS: i64 = 30_000;
 
@@ -3583,6 +3589,22 @@ impl From<SearchModeArg> for frankenterm_core::query_contract::UnifiedSearchMode
             SearchModeArg::Lexical => Self::Lexical,
             SearchModeArg::Semantic => Self::Semantic,
             SearchModeArg::Hybrid => Self::Hybrid,
+        }
+    }
+}
+
+fn unified_search_mode_to_core_mode(
+    mode: frankenterm_core::query_contract::UnifiedSearchMode,
+) -> frankenterm_core::search::SearchMode {
+    match mode {
+        frankenterm_core::query_contract::UnifiedSearchMode::Lexical => {
+            frankenterm_core::search::SearchMode::Lexical
+        }
+        frankenterm_core::query_contract::UnifiedSearchMode::Semantic => {
+            frankenterm_core::search::SearchMode::Semantic
+        }
+        frankenterm_core::query_contract::UnifiedSearchMode::Hybrid => {
+            frankenterm_core::search::SearchMode::Hybrid
         }
     }
 }
@@ -4698,6 +4720,130 @@ fn redact_for_output(text: &str) -> String {
     static REDACTOR: LazyLock<frankenterm_core::policy::Redactor> =
         LazyLock::new(frankenterm_core::policy::Redactor::new);
     REDACTOR.redact(text)
+}
+
+fn redact_search_results_for_output(results: &mut [frankenterm_core::storage::SearchResult]) {
+    for result in results {
+        result.segment.content = redact_for_output(&result.segment.content);
+        result.segment.content_len = result.segment.content.len();
+        if let Some(snippet) = result.snippet.as_ref() {
+            result.snippet = Some(redact_for_output(snippet));
+        }
+        if let Some(highlight) = result.highlight.as_ref() {
+            result.highlight = Some(redact_for_output(highlight));
+        }
+    }
+}
+
+fn robot_policy_error_from_decision(
+    decision: &frankenterm_core::policy::PolicyDecision,
+    default_reason: &str,
+) -> (String, String, Option<String>) {
+    match decision {
+        frankenterm_core::policy::PolicyDecision::Deny { .. } => (
+            "robot.policy_denied".to_string(),
+            decision.reason().unwrap_or(default_reason).to_string(),
+            None,
+        ),
+        frankenterm_core::policy::PolicyDecision::RequireApproval { .. } => (
+            "robot.require_approval".to_string(),
+            decision.reason().unwrap_or(default_reason).to_string(),
+            Some("Human approval is required before reading this output.".to_string()),
+        ),
+        frankenterm_core::policy::PolicyDecision::Allow { .. } => (
+            "robot.policy_denied".to_string(),
+            default_reason.to_string(),
+            None,
+        ),
+    }
+}
+
+async fn record_read_search_policy_audit(
+    storage: Option<&frankenterm_core::storage::StorageHandle>,
+    actor: frankenterm_core::policy::ActorKind,
+    action: frankenterm_core::policy::ActionKind,
+    pane_id: Option<u64>,
+    domain: Option<&str>,
+    summary: &str,
+    decision: &frankenterm_core::policy::PolicyDecision,
+    result: &str,
+) {
+    let Some(storage) = storage else {
+        return;
+    };
+
+    let record = frankenterm_core::storage::AuditActionRecord {
+        id: 0,
+        ts: now_epoch_ms(),
+        actor_kind: actor.as_str().to_string(),
+        actor_id: None,
+        correlation_id: None,
+        pane_id,
+        domain: domain.map(str::to_string),
+        action_kind: action.as_str().to_string(),
+        policy_decision: decision.as_str().to_string(),
+        decision_reason: decision.reason().map(str::to_string),
+        rule_id: decision.rule_id().map(str::to_string),
+        input_summary: Some(redact_for_output(summary)),
+        verification_summary: None,
+        decision_context: decision
+            .context()
+            .and_then(|context| serde_json::to_string(context).ok()),
+        result: result.to_string(),
+    };
+
+    if let Err(e) = storage.record_audit_action_redacted(record).await {
+        tracing::warn!(
+            action = action.as_str(),
+            actor = actor.as_str(),
+            "Failed to record read/search policy audit: {e}"
+        );
+    }
+}
+
+async fn authorize_read_or_search_policy(
+    config: &frankenterm_core::config::Config,
+    storage: Option<&frankenterm_core::storage::StorageHandle>,
+    ipc_socket_path: Option<&Path>,
+    action: frankenterm_core::policy::ActionKind,
+    actor: frankenterm_core::policy::ActorKind,
+    pane_id: Option<u64>,
+    summary: &str,
+) -> (frankenterm_core::policy::PolicyDecision, Option<String>) {
+    let mut engine = frankenterm_core::policy::PolicyEngine::new(
+        config.safety.rate_limit_per_pane,
+        config.safety.rate_limit_global,
+        false,
+    )
+    .with_command_gate_config(config.safety.command_gate.clone())
+    .with_policy_rules(config.safety.rules.clone());
+
+    let mut input = frankenterm_core::policy::PolicyInput::new(action, actor)
+        .with_text_summary(redact_for_output(summary));
+    let mut domain = None;
+
+    if let Some(pane_id) = pane_id {
+        input = input.with_pane(pane_id);
+        let resolution = resolve_pane_capabilities(pane_id, storage, ipc_socket_path).await;
+        input = input.with_capabilities(resolution.capabilities);
+
+        let wezterm = frankenterm_core::wezterm::default_wezterm_handle();
+        if let Ok(pane_info) = wezterm.get_pane(pane_id).await {
+            let inferred_domain = pane_info.inferred_domain();
+            domain = Some(inferred_domain.clone());
+            input = input.with_domain(inferred_domain);
+            if let Some(title) = pane_info.title {
+                input = input.with_pane_title(title);
+            }
+            if let Some(cwd) = pane_info.cwd {
+                input = input.with_pane_cwd(cwd);
+            }
+        }
+    } else {
+        input = input.with_capabilities(frankenterm_core::policy::PaneCapabilities::unknown());
+    }
+
+    (engine.authorize(&input), domain)
 }
 
 fn search_lints_have_errors(lints: &[frankenterm_core::storage::SearchLint]) -> bool {
@@ -7313,19 +7459,19 @@ fn build_ipc_rpc_handler(
     })
 }
 
-struct ReqwestWebhookTransport {
-    client: reqwest::Client,
+struct AsupersyncWebhookTransport {
+    client: asupersync::http::h1::HttpClient,
 }
 
-impl ReqwestWebhookTransport {
+impl AsupersyncWebhookTransport {
     fn new() -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: asupersync::http::h1::HttpClient::new(),
         }
     }
 }
 
-impl frankenterm_core::webhook::WebhookTransport for ReqwestWebhookTransport {
+impl frankenterm_core::webhook::WebhookTransport for AsupersyncWebhookTransport {
     fn send<'a>(
         &'a self,
         url: &'a str,
@@ -7337,24 +7483,43 @@ impl frankenterm_core::webhook::WebhookTransport for ReqwestWebhookTransport {
         >,
     > {
         Box::pin(async move {
-            let mut req = self.client.post(url).json(body);
+            let body_bytes = match serde_json::to_vec(body) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    return frankenterm_core::webhook::DeliveryResult::err(
+                        0,
+                        format!("request_failed: serialize_body: {err}"),
+                    );
+                }
+            };
+
+            let mut request_headers = Vec::with_capacity(headers.len() + 1);
+            request_headers.push(("Content-Type".to_string(), "application/json".to_string()));
             for (key, value) in headers {
-                req = req.header(key, value);
+                request_headers.push((key.clone(), value.clone()));
             }
 
-            match req.send().await {
+            match self
+                .client
+                .request(
+                    asupersync::http::h1::Method::Post,
+                    url,
+                    request_headers,
+                    body_bytes,
+                )
+                .await
+            {
                 Ok(resp) => {
-                    let status = resp.status();
-                    if status.is_success() {
-                        frankenterm_core::webhook::DeliveryResult::ok(status.as_u16())
+                    if (200..300).contains(&resp.status) {
+                        frankenterm_core::webhook::DeliveryResult::ok(resp.status)
                     } else {
-                        let body = resp.text().await.unwrap_or_default();
-                        let message = if body.trim().is_empty() {
-                            format!("http {}", status.as_u16())
+                        let body_text = String::from_utf8_lossy(&resp.body);
+                        let message = if body_text.trim().is_empty() {
+                            format!("http {}", resp.status)
                         } else {
-                            format!("http {}: {}", status.as_u16(), body.trim())
+                            format!("http {}: {}", resp.status, body_text.trim())
                         };
-                        frankenterm_core::webhook::DeliveryResult::err(status.as_u16(), message)
+                        frankenterm_core::webhook::DeliveryResult::err(resp.status, message)
                     }
                 }
                 Err(err) => frankenterm_core::webhook::DeliveryResult::err(
@@ -7575,12 +7740,12 @@ async fn distributed_upsert_pane(
 
 #[cfg(feature = "distributed")]
 async fn distributed_publish_security_error<S>(
-    reader: &mut tokio::io::BufReader<S>,
+    reader: &mut asupersync::io::BufReader<S>,
     err: frankenterm_core::distributed::DistributedSecurityError,
 ) where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    S: asupersync::io::AsyncRead + asupersync::io::AsyncWrite + Unpin,
 {
-    use tokio::io::AsyncWriteExt;
+    use asupersync::io::AsyncWriteExt;
 
     let payload = serde_json::json!({
         "ok": false,
@@ -7594,6 +7759,62 @@ async fn distributed_publish_security_error<S>(
         let _ = reader.get_mut().write_all(b"\n").await;
         let _ = reader.get_mut().flush().await;
     }
+}
+
+#[cfg(feature = "distributed")]
+async fn distributed_read_line<S>(
+    reader: &mut asupersync::io::BufReader<S>,
+    line: &mut String,
+) -> std::io::Result<usize>
+where
+    S: asupersync::io::AsyncRead + Unpin,
+{
+    use asupersync::io::AsyncBufRead;
+    use std::future::poll_fn;
+    use std::pin::Pin;
+    use std::task::Poll;
+
+    line.clear();
+    let mut bytes = Vec::new();
+
+    loop {
+        let state = poll_fn(|cx| match Pin::new(&mut *reader).poll_fill_buf(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            Poll::Ready(Ok(available)) => {
+                if available.is_empty() {
+                    return Poll::Ready(Ok(None));
+                }
+
+                let (consumed, found_newline) =
+                    if let Some(pos) = available.iter().position(|&byte| byte == b'\n') {
+                        (pos + 1, true)
+                    } else {
+                        (available.len(), false)
+                    };
+                bytes.extend_from_slice(&available[..consumed]);
+                Pin::new(&mut *reader).consume(consumed);
+                Poll::Ready(Ok(Some(found_newline)))
+            }
+        })
+        .await?;
+
+        match state {
+            None => break,
+            Some(true) => break,
+            Some(false) => {}
+        }
+    }
+
+    if bytes.is_empty() {
+        return Ok(0);
+    }
+
+    let parsed = String::from_utf8(bytes)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+    let len = parsed.len();
+    line.push_str(&parsed);
+    Ok(len)
 }
 
 #[cfg(feature = "distributed")]
@@ -7833,18 +8054,16 @@ async fn distributed_handle_connection<S>(
     event_bus: Arc<frankenterm_core::events::EventBus>,
     shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
 ) where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    S: asupersync::io::AsyncRead + asupersync::io::AsyncWrite + Unpin,
 {
-    use tokio::io::AsyncBufReadExt;
-
     let handshake_timeout = Duration::from_secs(10);
     let message_timeout = Duration::from_secs(30);
-    let mut reader = tokio::io::BufReader::new(stream);
+    let mut reader = asupersync::io::BufReader::new(stream);
     let mut handshake_line = String::new();
 
     let handshake_size = match frankenterm_core::runtime_compat::timeout(
         handshake_timeout,
-        reader.read_line(&mut handshake_line),
+        distributed_read_line(&mut reader, &mut handshake_line),
     )
     .await
     {
@@ -7950,7 +8169,7 @@ async fn distributed_handle_connection<S>(
         let mut line = String::new();
         let read_size = match frankenterm_core::runtime_compat::timeout(
             message_timeout,
-            reader.read_line(&mut line),
+            distributed_read_line(&mut reader, &mut line),
         )
         .await
         {
@@ -8059,8 +8278,8 @@ async fn spawn_distributed_listener(
     event_bus: Arc<frankenterm_core::events::EventBus>,
     shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+    use asupersync::net::TcpListener;
     use std::sync::atomic::Ordering;
-    use tokio::net::TcpListener;
 
     let expected_token =
         match frankenterm_core::distributed::resolve_expected_token(&distributed_config) {
@@ -8075,14 +8294,14 @@ async fn spawn_distributed_listener(
         .collect();
     let allow_agent_ids = Arc::new(allow_agent_ids);
 
-    let listener = TcpListener::bind(&distributed_config.bind_addr).await?;
+    let listener = TcpListener::bind(distributed_config.bind_addr.clone()).await?;
     tracing::info!(bind = %distributed_config.bind_addr, "Distributed listener started");
 
     let ingest_state = Arc::new(DistributedIngestState::new());
     let connection_limiter = frankenterm_core::distributed::ConnectionLimiter::new(256);
-    let tls_acceptor = if distributed_config.tls.enabled {
+    let tls_acceptor: Option<asupersync::tls::TlsAcceptor> = if distributed_config.tls.enabled {
         let bundle = frankenterm_core::distributed::build_tls_bundle(&distributed_config, None)?;
-        Some(tokio_rustls::TlsAcceptor::from(bundle.server))
+        Some(asupersync::tls::TlsAcceptor::new((*bundle.server).clone()))
     } else {
         None
     };
@@ -8173,10 +8392,13 @@ async fn spawn_distributed_listener(
 }
 
 #[cfg(feature = "distributed")]
-trait DistributedIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+trait DistributedIo: asupersync::io::AsyncRead + asupersync::io::AsyncWrite + Unpin + Send {}
 
 #[cfg(feature = "distributed")]
-impl<T> DistributedIo for T where T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T> DistributedIo for T where
+    T: asupersync::io::AsyncRead + asupersync::io::AsyncWrite + Unpin + Send
+{
+}
 
 #[cfg(feature = "distributed")]
 type DistributedIoStream = Box<dyn DistributedIo>;
@@ -8194,22 +8416,45 @@ fn distributed_agent_default_id() -> String {
 }
 
 #[cfg(feature = "distributed")]
+fn distributed_tls_domain(connect_addr: &str) -> String {
+    let trimmed = connect_addr.trim();
+    if let Some(stripped) = trimmed.strip_prefix('[') {
+        if let Some(end) = stripped.find(']') {
+            let host = stripped[..end].trim();
+            if !host.is_empty() {
+                return host.to_string();
+            }
+        }
+    }
+
+    let host = trimmed
+        .rsplit_once(':')
+        .map_or(trimmed, |(host, _)| host)
+        .trim();
+    if host.is_empty() {
+        "localhost".to_string()
+    } else {
+        host.to_string()
+    }
+}
+
+#[cfg(feature = "distributed")]
 async fn distributed_agent_connect(
     connect_addr: &str,
     distributed_config: &frankenterm_core::config::DistributedConfig,
 ) -> anyhow::Result<DistributedIoStream> {
-    use tokio::net::TcpStream;
+    use asupersync::net::TcpStream;
 
-    let tcp = TcpStream::connect(connect_addr).await?;
+    let tcp = TcpStream::connect(connect_addr.to_string()).await?;
     if let Err(err) = tcp.set_nodelay(true) {
         tracing::debug!(error = %err, "Failed to set TCP_NODELAY for distributed agent stream");
     }
 
     if distributed_config.tls.enabled {
         let tls_bundle = frankenterm_core::distributed::build_tls_bundle(distributed_config, None)?;
-        let connector = tokio_rustls::TlsConnector::from(tls_bundle.client);
-        let server_name = frankenterm_core::distributed::build_tls_server_name(connect_addr)?;
-        let tls_stream = connector.connect(server_name, tcp).await?;
+        let connector = asupersync::tls::TlsConnector::new((*tls_bundle.client).clone());
+        let tls_domain = distributed_tls_domain(connect_addr);
+        let tls_stream = connector.connect(&tls_domain, tcp).await?;
         Ok(Box::new(tls_stream))
     } else {
         Ok(Box::new(tcp))
@@ -8240,10 +8485,10 @@ fn distributed_agent_pane_meta(
 
 #[cfg(feature = "distributed")]
 async fn distributed_agent_send_envelope(
-    stream: &mut tokio::io::BufReader<DistributedIoStream>,
+    stream: &mut asupersync::io::BufReader<DistributedIoStream>,
     envelope: &frankenterm_core::wire_protocol::WireEnvelope,
 ) -> anyhow::Result<()> {
-    use tokio::io::AsyncWriteExt;
+    use asupersync::io::AsyncWriteExt;
 
     let bytes = envelope.to_json()?;
     if bytes.len() > frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE {
@@ -8290,7 +8535,7 @@ async fn distributed_agent_seed_segment_cursors(
 async fn distributed_agent_send_pane_snapshot(
     streamer: &mut frankenterm_core::wire_protocol::AgentStreamer,
     storage: &Arc<tokio::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
-    stream: &mut tokio::io::BufReader<DistributedIoStream>,
+    stream: &mut asupersync::io::BufReader<DistributedIoStream>,
 ) -> anyhow::Result<()> {
     use frankenterm_core::events::Event;
     use frankenterm_core::wire_protocol::WirePayload;
@@ -8330,7 +8575,7 @@ async fn distributed_agent_flush_pane_deltas(
     streamer: &mut frankenterm_core::wire_protocol::AgentStreamer,
     storage: &Arc<tokio::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
     segment_cursors: &mut std::collections::HashMap<u64, i64>,
-    stream: &mut tokio::io::BufReader<DistributedIoStream>,
+    stream: &mut asupersync::io::BufReader<DistributedIoStream>,
 ) -> anyhow::Result<usize> {
     use frankenterm_core::events::Event;
     use frankenterm_core::storage::SegmentScanQuery;
@@ -8394,7 +8639,7 @@ async fn distributed_agent_flush_all_panes(
     streamer: &mut frankenterm_core::wire_protocol::AgentStreamer,
     storage: &Arc<tokio::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
     segment_cursors: &mut std::collections::HashMap<u64, i64>,
-    stream: &mut tokio::io::BufReader<DistributedIoStream>,
+    stream: &mut asupersync::io::BufReader<DistributedIoStream>,
 ) -> anyhow::Result<usize> {
     let pane_ids = {
         let storage_guard = storage.lock().await;
@@ -8428,7 +8673,7 @@ async fn distributed_agent_stream_event(
     streamer: &mut frankenterm_core::wire_protocol::AgentStreamer,
     storage: &Arc<tokio::sync::Mutex<frankenterm_core::storage::StorageHandle>>,
     segment_cursors: &mut std::collections::HashMap<u64, i64>,
-    stream: &mut tokio::io::BufReader<DistributedIoStream>,
+    stream: &mut asupersync::io::BufReader<DistributedIoStream>,
 ) -> anyhow::Result<()> {
     use frankenterm_core::events::Event;
     use frankenterm_core::wire_protocol::WirePayload;
@@ -8475,10 +8720,10 @@ async fn distributed_agent_stream_session(
     segment_cursors: &mut std::collections::HashMap<u64, i64>,
     shutdown_flag: &Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<()> {
+    use asupersync::io::AsyncWriteExt;
     use std::sync::atomic::Ordering;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
-    let mut stream = tokio::io::BufReader::new(io);
+    let mut stream = asupersync::io::BufReader::new(io);
     let handshake = DistributedHandshake {
         token: token.map(ToOwned::to_owned),
         agent_id: Some(agent_id.to_string()),
@@ -8495,7 +8740,7 @@ async fn distributed_agent_stream_session(
     let mut handshake_response = String::new();
     match frankenterm_core::runtime_compat::timeout(
         Duration::from_millis(250),
-        stream.read_line(&mut handshake_response),
+        distributed_read_line(&mut stream, &mut handshake_response),
     )
     .await
     {
@@ -8923,6 +9168,7 @@ async fn run_watcher(
     use frankenterm_core::patterns::PatternEngine;
     use frankenterm_core::policy::{PolicyEngine, PolicyGatedInjector};
     use frankenterm_core::runtime::{ObservationRuntime, RuntimeConfig};
+    use frankenterm_core::runtime_compat::{mpsc, watch};
     use frankenterm_core::storage::StorageHandle;
     use frankenterm_core::webhook::WebhookDispatcher;
     use frankenterm_core::workflows::{
@@ -8930,7 +9176,6 @@ async fn run_watcher(
         WorkflowRunnerConfig,
     };
     use std::time::Duration;
-    use tokio::sync::mpsc;
 
     let mut config = config.clone();
     let mut auto_handle = auto_handle;
@@ -9064,7 +9309,7 @@ async fn run_watcher(
         if !config.notifications.webhooks.is_empty() {
             let dispatcher = WebhookDispatcher::new(
                 config.notifications.webhooks.clone(),
-                Box::new(ReqwestWebhookTransport::new()),
+                Box::new(AsupersyncWebhookTransport::new()),
             );
             if dispatcher.active_endpoint_count() > 0 {
                 tracing::info!(
@@ -9505,7 +9750,7 @@ async fn run_watcher(
             let shutdown_flag_for_snap = Arc::clone(&handle.shutdown_flag);
             let loop_timeout = config.cli.timeout_seconds;
             // Bridge AtomicBool shutdown flag into a watch channel for run_periodic
-            let (snap_shutdown_tx, snap_shutdown_rx) = tokio::sync::watch::channel(false);
+            let (snap_shutdown_tx, snap_shutdown_rx) = watch::channel(false);
             tokio::spawn(async move {
                 loop {
                     if shutdown_flag_for_snap.load(std::sync::atomic::Ordering::SeqCst) {
@@ -10664,16 +10909,74 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 return Ok(());
                             }
 
+                            let storage = frankenterm_core::storage::StorageHandle::new(
+                                &ctx.effective.paths.db_path,
+                            )
+                            .await
+                            .ok();
+                            let ipc_socket = Path::new(&ctx.effective.paths.ipc_socket_path);
                             let is_single_pane_mode = pane_id.is_some() && !panes_specified && !all;
                             if is_single_pane_mode {
                                 let pane_id = pane_ids[0];
+                                let summary =
+                                    format!("robot.get_text pane_id={pane_id} tail={tail}");
+                                let (decision, domain) = authorize_read_or_search_policy(
+                                    &config,
+                                    storage.as_ref(),
+                                    Some(ipc_socket),
+                                    frankenterm_core::policy::ActionKind::ReadOutput,
+                                    frankenterm_core::policy::ActorKind::Robot,
+                                    Some(pane_id),
+                                    &summary,
+                                )
+                                .await;
+                                if !decision.is_allowed() {
+                                    let status = if decision.requires_approval() {
+                                        "require_approval"
+                                    } else {
+                                        "denied"
+                                    };
+                                    record_read_search_policy_audit(
+                                        storage.as_ref(),
+                                        frankenterm_core::policy::ActorKind::Robot,
+                                        frankenterm_core::policy::ActionKind::ReadOutput,
+                                        Some(pane_id),
+                                        domain.as_deref(),
+                                        &summary,
+                                        &decision,
+                                        status,
+                                    )
+                                    .await;
+                                    let (code, message, hint) =
+                                        robot_policy_error_from_decision(&decision, "Read denied");
+                                    let response =
+                                        RobotResponse::<RobotGetTextData>::error_with_code(
+                                            &code,
+                                            message,
+                                            hint,
+                                            elapsed_ms(start),
+                                        );
+                                    print_robot_response(&response, format, stats)?;
+                                    return Ok(());
+                                }
                                 match wezterm.get_text(pane_id, escapes).await {
                                     Ok(full_text) => {
                                         let (text, truncated, truncation_info) =
                                             apply_tail_truncation(&full_text, tail);
+                                        record_read_search_policy_audit(
+                                            storage.as_ref(),
+                                            frankenterm_core::policy::ActorKind::Robot,
+                                            frankenterm_core::policy::ActionKind::ReadOutput,
+                                            Some(pane_id),
+                                            domain.as_deref(),
+                                            &summary,
+                                            &decision,
+                                            "success",
+                                        )
+                                        .await;
                                         let data = RobotGetTextData {
                                             pane_id,
-                                            text,
+                                            text: redact_for_output(&text),
                                             tail_lines: tail,
                                             escapes_included: escapes,
                                             truncated,
@@ -10684,6 +10987,17 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         print_robot_response(&response, format, stats)?;
                                     }
                                     Err(e) => {
+                                        record_read_search_policy_audit(
+                                            storage.as_ref(),
+                                            frankenterm_core::policy::ActorKind::Robot,
+                                            frankenterm_core::policy::ActionKind::ReadOutput,
+                                            Some(pane_id),
+                                            domain.as_deref(),
+                                            &summary,
+                                            &decision,
+                                            "error",
+                                        )
+                                        .await;
                                         let (code, hint) = map_wezterm_error_to_robot(&e);
                                         let response =
                                             RobotResponse::<RobotGetTextData>::error_with_code(
@@ -10696,9 +11010,110 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     }
                                 }
                             } else {
-                                let results =
-                                    batch_get_pane_text(wezterm.clone(), &pane_ids, escapes, tail)
+                                let mut decisions: HashMap<
+                                    u64,
+                                    frankenterm_core::policy::PolicyDecision,
+                                > = HashMap::new();
+                                let mut domains: HashMap<u64, Option<String>> = HashMap::new();
+                                let mut results: BTreeMap<u64, RobotPaneTextResult> =
+                                    BTreeMap::new();
+                                let mut authorized_panes = Vec::new();
+
+                                for target_pane_id in &pane_ids {
+                                    let summary = format!(
+                                        "robot.get_text pane_id={target_pane_id} tail={tail}"
+                                    );
+                                    let (decision, domain) = authorize_read_or_search_policy(
+                                        &config,
+                                        storage.as_ref(),
+                                        Some(ipc_socket),
+                                        frankenterm_core::policy::ActionKind::ReadOutput,
+                                        frankenterm_core::policy::ActorKind::Robot,
+                                        Some(*target_pane_id),
+                                        &summary,
+                                    )
+                                    .await;
+                                    decisions.insert(*target_pane_id, decision.clone());
+                                    domains.insert(*target_pane_id, domain.clone());
+
+                                    if decision.is_allowed() {
+                                        authorized_panes.push(*target_pane_id);
+                                    } else {
+                                        let status = if decision.requires_approval() {
+                                            "require_approval"
+                                        } else {
+                                            "denied"
+                                        };
+                                        record_read_search_policy_audit(
+                                            storage.as_ref(),
+                                            frankenterm_core::policy::ActorKind::Robot,
+                                            frankenterm_core::policy::ActionKind::ReadOutput,
+                                            Some(*target_pane_id),
+                                            domain.as_deref(),
+                                            &summary,
+                                            &decision,
+                                            status,
+                                        )
                                         .await;
+                                        let (code, message, hint) =
+                                            robot_policy_error_from_decision(
+                                                &decision,
+                                                "Read denied",
+                                            );
+                                        results.insert(
+                                            *target_pane_id,
+                                            RobotPaneTextResult::Error {
+                                                code,
+                                                message,
+                                                hint,
+                                            },
+                                        );
+                                    }
+                                }
+
+                                if !authorized_panes.is_empty() {
+                                    let mut fetched = batch_get_pane_text(
+                                        wezterm.clone(),
+                                        &authorized_panes,
+                                        escapes,
+                                        tail,
+                                    )
+                                    .await;
+
+                                    for result in fetched.values_mut() {
+                                        if let RobotPaneTextResult::Ok { text, .. } = result {
+                                            *text = redact_for_output(text);
+                                        }
+                                    }
+
+                                    for (pane_id, pane_result) in fetched {
+                                        let status = match &pane_result {
+                                            RobotPaneTextResult::Ok { .. } => "success",
+                                            RobotPaneTextResult::Error { .. } => "error",
+                                        };
+                                        if let Some(decision) = decisions.get(&pane_id) {
+                                            let summary = format!(
+                                                "robot.get_text pane_id={pane_id} tail={tail}"
+                                            );
+                                            let domain = domains.get(&pane_id).and_then(|value| {
+                                                value.as_ref().map(String::as_str)
+                                            });
+                                            record_read_search_policy_audit(
+                                                storage.as_ref(),
+                                                frankenterm_core::policy::ActorKind::Robot,
+                                                frankenterm_core::policy::ActionKind::ReadOutput,
+                                                Some(pane_id),
+                                                domain,
+                                                &summary,
+                                                decision,
+                                                status,
+                                            )
+                                            .await;
+                                        }
+                                        results.insert(pane_id, pane_result);
+                                    }
+                                }
+
                                 let data = RobotBatchGetTextData {
                                     pane_ids,
                                     tail_lines: tail,
@@ -11180,22 +11595,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     }
                                 };
                             let canonical = parsed.query;
-
-                            if let Err(err) =
-                                frankenterm_core::query_contract::ensure_mode_supported(
-                                    canonical.mode,
-                                    &[frankenterm_core::query_contract::UnifiedSearchMode::Lexical],
-                                )
-                            {
-                                let response = RobotResponse::<RobotSearchData>::error_with_code(
-                                    ROBOT_ERR_INVALID_ARGS,
-                                    err.message(),
-                                    err.hint(),
-                                    elapsed_ms(start),
-                                );
-                                print_robot_response(&response, format, stats)?;
-                                return Ok(());
-                            }
+                            let search_mode = unified_search_mode_to_core_mode(canonical.mode);
 
                             // Get workspace layout for db path
                             let layout = match config.workspace_layout(Some(&workspace_root)) {
@@ -11239,13 +11639,114 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     &canonical,
                                 );
                             let query_for_storage = canonical.query.clone();
+                            let policy_summary = format!(
+                                "robot.search query={} mode={} pane={:?}",
+                                redact_for_output(&canonical.query),
+                                canonical.mode.as_str(),
+                                canonical.pane
+                            );
+                            let ipc_socket = Path::new(&ctx.effective.paths.ipc_socket_path);
+                            let (policy_decision, policy_domain) = authorize_read_or_search_policy(
+                                &config,
+                                Some(&storage),
+                                Some(ipc_socket),
+                                frankenterm_core::policy::ActionKind::SearchOutput,
+                                frankenterm_core::policy::ActorKind::Robot,
+                                canonical.pane,
+                                &policy_summary,
+                            )
+                            .await;
+                            if !policy_decision.is_allowed() {
+                                let status = if policy_decision.requires_approval() {
+                                    "require_approval"
+                                } else {
+                                    "denied"
+                                };
+                                record_read_search_policy_audit(
+                                    Some(&storage),
+                                    frankenterm_core::policy::ActorKind::Robot,
+                                    frankenterm_core::policy::ActionKind::SearchOutput,
+                                    canonical.pane,
+                                    policy_domain.as_deref(),
+                                    &policy_summary,
+                                    &policy_decision,
+                                    status,
+                                )
+                                .await;
+                                let (code, message, hint) = robot_policy_error_from_decision(
+                                    &policy_decision,
+                                    "Search denied",
+                                );
+                                let response = RobotResponse::<RobotSearchData>::error_with_code(
+                                    &code,
+                                    message,
+                                    hint,
+                                    elapsed_ms(start),
+                                );
+                                print_robot_response(&response, format, stats)?;
+                                return Ok(());
+                            }
 
                             // Perform search
-                            match storage
-                                .search_with_results(&query_for_storage, options)
-                                .await
-                            {
-                                Ok(results) => {
+                            let search_results: Result<
+                                Vec<frankenterm_core::storage::SearchResult>,
+                                frankenterm_core::Error,
+                            > = match canonical.mode {
+                                frankenterm_core::query_contract::UnifiedSearchMode::Lexical => {
+                                    storage
+                                        .search_with_results(&query_for_storage, options)
+                                        .await
+                                }
+                                frankenterm_core::query_contract::UnifiedSearchMode::Semantic
+                                | frankenterm_core::query_contract::UnifiedSearchMode::Hybrid => {
+                                    use frankenterm_core::search::Embedder;
+                                    let embedder =
+                                        frankenterm_core::search::HashEmbedder::default();
+                                    let query_vector = match embedder.embed(&query_for_storage) {
+                                        Ok(vector) => vector,
+                                        Err(err) => {
+                                            let response =
+                                                RobotResponse::<RobotSearchData>::error_with_code(
+                                                    ROBOT_ERR_STORAGE,
+                                                    format!(
+                                                        "Failed to embed query for semantic search: {err}"
+                                                    ),
+                                                    None,
+                                                    elapsed_ms(start),
+                                                );
+                                            print_robot_response(&response, format, stats)?;
+                                            return Ok(());
+                                        }
+                                    };
+                                    let embedder_id = embedder.info().name;
+                                    match storage
+                                        .hybrid_search_with_results(
+                                            &query_for_storage,
+                                            options,
+                                            &embedder_id,
+                                            &query_vector,
+                                            search_mode,
+                                            CLI_HYBRID_RRF_K,
+                                        )
+                                        .await
+                                    {
+                                        Ok(bundle) => Ok(bundle
+                                            .results
+                                            .into_iter()
+                                            .map(|hit| {
+                                                let mut result = hit.result;
+                                                result.score = hit.fusion_score;
+                                                result
+                                            })
+                                            .collect()),
+                                        Err(err) => Err(err),
+                                    }
+                                }
+                            };
+
+                            match search_results {
+                                Ok(mut results) => {
+                                    redact_search_results_for_output(&mut results);
                                     let total_hits = results.len();
                                     let hits: Vec<RobotSearchHit> = results
                                         .into_iter()
@@ -11264,8 +11765,20 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         })
                                         .collect();
 
+                                    record_read_search_policy_audit(
+                                        Some(&storage),
+                                        frankenterm_core::policy::ActorKind::Robot,
+                                        frankenterm_core::policy::ActionKind::SearchOutput,
+                                        canonical.pane,
+                                        policy_domain.as_deref(),
+                                        &policy_summary,
+                                        &policy_decision,
+                                        "success",
+                                    )
+                                    .await;
+
                                     let data = RobotSearchData {
-                                        query: canonical.query,
+                                        query: redact_for_output(&canonical.query),
                                         results: hits,
                                         total_hits,
                                         limit: canonical.limit,
@@ -11288,6 +11801,17 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         ),
                                         _ => (ROBOT_ERR_STORAGE, None),
                                     };
+                                    record_read_search_policy_audit(
+                                        Some(&storage),
+                                        frankenterm_core::policy::ActorKind::Robot,
+                                        frankenterm_core::policy::ActionKind::SearchOutput,
+                                        canonical.pane,
+                                        policy_domain.as_deref(),
+                                        &policy_summary,
+                                        &policy_decision,
+                                        "error",
+                                    )
+                                    .await;
                                     let response =
                                         RobotResponse::<RobotSearchData>::error_with_code(
                                             code,
@@ -14946,33 +15470,104 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         eprint!("{}", format_search_lints_plain(&parsed.lints));
                     }
                     let canonical = parsed.query;
-
-                    if let Err(err) = frankenterm_core::query_contract::ensure_mode_supported(
-                        canonical.mode,
-                        &[frankenterm_core::query_contract::UnifiedSearchMode::Lexical],
-                    ) {
+                    let policy_summary = format!(
+                        "search query={} mode={} pane={:?}",
+                        redact_for_output(&canonical.query),
+                        canonical.mode.as_str(),
+                        pane
+                    );
+                    let (policy_decision, policy_domain) = authorize_read_or_search_policy(
+                        &config,
+                        Some(&storage),
+                        Some(layout.ipc_socket_path.as_path()),
+                        frankenterm_core::policy::ActionKind::SearchOutput,
+                        frankenterm_core::policy::ActorKind::Human,
+                        pane,
+                        &policy_summary,
+                    )
+                    .await;
+                    if !policy_decision.is_allowed() {
+                        let status = if policy_decision.requires_approval() {
+                            "require_approval"
+                        } else {
+                            "denied"
+                        };
+                        record_read_search_policy_audit(
+                            Some(&storage),
+                            frankenterm_core::policy::ActorKind::Human,
+                            frankenterm_core::policy::ActionKind::SearchOutput,
+                            pane,
+                            policy_domain.as_deref(),
+                            &policy_summary,
+                            &policy_decision,
+                            status,
+                        )
+                        .await;
+                        let reason = policy_decision
+                            .reason()
+                            .unwrap_or("Search denied by policy")
+                            .to_string();
                         if output_format.is_json() {
-                            let mut payload = serde_json::json!({
+                            let payload = serde_json::json!({
                                 "ok": false,
-                                "error": err.message(),
-                                "error_code": err.code(),
+                                "error": reason,
+                                "error_code": if policy_decision.requires_approval() {
+                                    "require_approval"
+                                } else {
+                                    "policy_denied"
+                                },
                                 "version": frankenterm_core::VERSION,
                             });
-                            if let Some(hint) = err.hint() {
-                                payload["hint"] = serde_json::json!(hint);
-                            }
                             println!(
                                 "{}",
                                 serde_json::to_string_pretty(&payload).unwrap_or_default()
                             );
                         } else {
-                            eprintln!("Error: {}", err.message());
-                            if let Some(hint) = err.hint() {
-                                eprintln!("Hint: {hint}");
+                            eprintln!("Error: {reason}");
+                            if policy_decision.requires_approval() {
+                                eprintln!(
+                                    "Hint: Human approval is required before reading this output."
+                                );
                             }
                         }
                         std::process::exit(1);
                     }
+
+                    let requested_mode = canonical.mode;
+                    let search_mode = unified_search_mode_to_core_mode(requested_mode);
+
+                    let semantic_query = if matches!(
+                        requested_mode,
+                        frankenterm_core::query_contract::UnifiedSearchMode::Semantic
+                            | frankenterm_core::query_contract::UnifiedSearchMode::Hybrid
+                    ) {
+                        use frankenterm_core::search::Embedder;
+                        let embedder = frankenterm_core::search::HashEmbedder::default();
+                        let query_vector = match embedder.embed(&canonical.query) {
+                            Ok(vector) => vector,
+                            Err(err) => {
+                                if output_format.is_json() {
+                                    let payload = serde_json::json!({
+                                        "ok": false,
+                                        "error": format!("Failed to embed query for semantic search: {err}"),
+                                        "version": frankenterm_core::VERSION,
+                                    });
+                                    println!(
+                                        "{}",
+                                        serde_json::to_string_pretty(&payload).unwrap_or_default()
+                                    );
+                                } else {
+                                    eprintln!(
+                                        "Error: Failed to embed query for semantic search: {err}"
+                                    );
+                                }
+                                std::process::exit(1);
+                            }
+                        };
+                        Some((embedder.info().name, query_vector))
+                    } else {
+                        None
+                    };
 
                     let mut pane_candidates = bookmark_pane_ids.map(|pane_ids| {
                         let mut ids: Vec<u64> = pane_ids.into_iter().collect();
@@ -14997,61 +15592,207 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         } else if candidate_panes.len() == 1 {
                             let mut options = base_options.clone();
                             options.pane_id = Some(candidate_panes[0]);
-                            storage
-                                .search_with_results(&query_for_storage, options)
-                                .await
+                            match requested_mode {
+                                frankenterm_core::query_contract::UnifiedSearchMode::Lexical => {
+                                    storage
+                                        .search_with_results(&query_for_storage, options)
+                                        .await
+                                }
+                                frankenterm_core::query_contract::UnifiedSearchMode::Semantic
+                                | frankenterm_core::query_contract::UnifiedSearchMode::Hybrid => {
+                                    let (embedder_id, query_vector) = semantic_query
+                                        .as_ref()
+                                        .expect("semantic query should be initialized");
+                                    match storage
+                                        .hybrid_search_with_results(
+                                            &query_for_storage,
+                                            options,
+                                            embedder_id,
+                                            query_vector,
+                                            search_mode,
+                                            CLI_HYBRID_RRF_K,
+                                        )
+                                        .await
+                                    {
+                                        Ok(bundle) => Ok(bundle
+                                            .results
+                                            .into_iter()
+                                            .map(|hit| {
+                                                let mut result = hit.result;
+                                                result.score = hit.fusion_score;
+                                                result
+                                            })
+                                            .collect()),
+                                        Err(e) => Err(e),
+                                    }
+                                }
+                            }
                         } else {
                             let mut combined = Vec::new();
                             for candidate_pane in candidate_panes {
                                 let mut options = base_options.clone();
                                 options.pane_id = Some(candidate_pane);
-                                let mut pane_results = match storage
-                                    .search_with_results(&query_for_storage, options)
-                                    .await
-                                {
-                                    Ok(results) => results,
-                                    Err(e) => {
-                                        if output_format.is_json() {
-                                            println!(
-                                                r#"{{"ok": false, "error": "Search failed: {}", "version": "{}"}}"#,
-                                                e,
-                                                frankenterm_core::VERSION
-                                            );
-                                        } else {
-                                            eprintln!("Error: Search failed: {e}");
+                                let mut pane_results = match requested_mode {
+                                    frankenterm_core::query_contract::UnifiedSearchMode::Lexical => {
+                                        match storage.search_with_results(&query_for_storage, options).await {
+                                            Ok(results) => results,
+                                            Err(e) => {
+                                                if output_format.is_json() {
+                                                    println!(
+                                                        r#"{{"ok": false, "error": "Search failed: {}", "version": "{}"}}"#,
+                                                        e,
+                                                        frankenterm_core::VERSION
+                                                    );
+                                                } else {
+                                                    eprintln!("Error: Search failed: {e}");
+                                                }
+                                                std::process::exit(1);
+                                            }
                                         }
-                                        std::process::exit(1);
+                                    }
+                                    frankenterm_core::query_contract::UnifiedSearchMode::Semantic
+                                    | frankenterm_core::query_contract::UnifiedSearchMode::Hybrid => {
+                                        let (embedder_id, query_vector) = semantic_query
+                                            .as_ref()
+                                            .expect("semantic query should be initialized");
+                                        match storage
+                                            .hybrid_search_with_results(
+                                                &query_for_storage,
+                                                options,
+                                                embedder_id,
+                                                query_vector,
+                                                search_mode,
+                                                CLI_HYBRID_RRF_K,
+                                            )
+                                            .await
+                                        {
+                                            Ok(bundle) => bundle
+                                                .results
+                                                .into_iter()
+                                                .map(|hit| {
+                                                    let mut result = hit.result;
+                                                    result.score = hit.fusion_score;
+                                                    result
+                                                })
+                                                .collect(),
+                                            Err(e) => {
+                                                if output_format.is_json() {
+                                                    println!(
+                                                        r#"{{"ok": false, "error": "Search failed: {}", "version": "{}"}}"#,
+                                                        e,
+                                                        frankenterm_core::VERSION
+                                                    );
+                                                } else {
+                                                    eprintln!("Error: Search failed: {e}");
+                                                }
+                                                std::process::exit(1);
+                                            }
+                                        }
                                     }
                                 };
                                 combined.append(&mut pane_results);
                             }
-                            combined.sort_by(|left, right| {
-                                left.score
-                                    .total_cmp(&right.score)
-                                    .then_with(|| {
-                                        left.segment.captured_at.cmp(&right.segment.captured_at)
-                                    })
-                                    .then_with(|| left.segment.id.cmp(&right.segment.id))
-                            });
+                            if matches!(
+                                requested_mode,
+                                frankenterm_core::query_contract::UnifiedSearchMode::Semantic
+                                    | frankenterm_core::query_contract::UnifiedSearchMode::Hybrid
+                            ) {
+                                combined.sort_by(|left, right| {
+                                    right
+                                        .score
+                                        .total_cmp(&left.score)
+                                        .then_with(|| {
+                                            right.segment.captured_at.cmp(&left.segment.captured_at)
+                                        })
+                                        .then_with(|| right.segment.id.cmp(&left.segment.id))
+                                });
+                            } else {
+                                combined.sort_by(|left, right| {
+                                    left.score
+                                        .total_cmp(&right.score)
+                                        .then_with(|| {
+                                            left.segment.captured_at.cmp(&right.segment.captured_at)
+                                        })
+                                        .then_with(|| left.segment.id.cmp(&right.segment.id))
+                                });
+                            }
                             combined.truncate(canonical.limit);
                             Ok(combined)
                         }
                     } else {
-                        storage
-                            .search_with_results(&query_for_storage, base_options)
-                            .await
+                        match requested_mode {
+                            frankenterm_core::query_contract::UnifiedSearchMode::Lexical => {
+                                storage
+                                    .search_with_results(&query_for_storage, base_options)
+                                    .await
+                            }
+                            frankenterm_core::query_contract::UnifiedSearchMode::Semantic
+                            | frankenterm_core::query_contract::UnifiedSearchMode::Hybrid => {
+                                let (embedder_id, query_vector) = semantic_query
+                                    .as_ref()
+                                    .expect("semantic query should be initialized");
+                                match storage
+                                    .hybrid_search_with_results(
+                                        &query_for_storage,
+                                        base_options,
+                                        embedder_id,
+                                        query_vector,
+                                        search_mode,
+                                        CLI_HYBRID_RRF_K,
+                                    )
+                                    .await
+                                {
+                                    Ok(bundle) => Ok(bundle
+                                        .results
+                                        .into_iter()
+                                        .map(|hit| {
+                                            let mut result = hit.result;
+                                            result.score = hit.fusion_score;
+                                            result
+                                        })
+                                        .collect()),
+                                    Err(e) => Err(e),
+                                }
+                            }
+                        }
                     };
 
                     match search_results {
-                        Ok(results) => {
+                        Ok(mut results) => {
+                            redact_search_results_for_output(&mut results);
+                            record_read_search_policy_audit(
+                                Some(&storage),
+                                frankenterm_core::policy::ActorKind::Human,
+                                frankenterm_core::policy::ActionKind::SearchOutput,
+                                pane,
+                                policy_domain.as_deref(),
+                                &policy_summary,
+                                &policy_decision,
+                                "success",
+                            )
+                            .await;
                             let ctx = RenderContext::new(output_format)
                                 .verbose(cli.verbose)
                                 .limit(canonical.limit);
-                            let output =
-                                SearchResultRenderer::render(&results, &canonical.query, &ctx);
+                            let output = SearchResultRenderer::render(
+                                &results,
+                                &redact_for_output(&canonical.query),
+                                &ctx,
+                            );
                             print!("{output}");
                         }
                         Err(e) => {
+                            record_read_search_policy_audit(
+                                Some(&storage),
+                                frankenterm_core::policy::ActorKind::Human,
+                                frankenterm_core::policy::ActionKind::SearchOutput,
+                                pane,
+                                policy_domain.as_deref(),
+                                &policy_summary,
+                                &policy_decision,
+                                "error",
+                            )
+                            .await;
                             if output_format.is_json() {
                                 println!(
                                     r#"{{"ok": false, "error": "Search failed: {}", "version": "{}"}}"#,
@@ -15695,14 +16436,93 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             }
         }
 
-        Some(Commands::GetText { pane_id, escapes }) => {
-            tracing::info!("Getting text from pane {} (escapes={})", pane_id, escapes);
+        Some(Commands::GetText {
+            pane_id,
+            tail,
+            escapes,
+        }) => {
+            tracing::info!(
+                "Getting text from pane {} (tail={}, escapes={})",
+                pane_id,
+                tail,
+                escapes
+            );
             let wezterm = frankenterm_core::wezterm::default_wezterm_handle();
+            let storage =
+                frankenterm_core::storage::StorageHandle::new(&layout.db_path.to_string_lossy())
+                    .await
+                    .ok();
+            let policy_summary = format!("get-text pane_id={pane_id} tail={tail}");
+            let (policy_decision, policy_domain) = authorize_read_or_search_policy(
+                &config,
+                storage.as_ref(),
+                Some(layout.ipc_socket_path.as_path()),
+                frankenterm_core::policy::ActionKind::ReadOutput,
+                frankenterm_core::policy::ActorKind::Human,
+                Some(pane_id),
+                &policy_summary,
+            )
+            .await;
+            if !policy_decision.is_allowed() {
+                let status = if policy_decision.requires_approval() {
+                    "require_approval"
+                } else {
+                    "denied"
+                };
+                record_read_search_policy_audit(
+                    storage.as_ref(),
+                    frankenterm_core::policy::ActorKind::Human,
+                    frankenterm_core::policy::ActionKind::ReadOutput,
+                    Some(pane_id),
+                    policy_domain.as_deref(),
+                    &policy_summary,
+                    &policy_decision,
+                    status,
+                )
+                .await;
+                let reason = policy_decision
+                    .reason()
+                    .unwrap_or("Read denied by policy")
+                    .to_string();
+                eprintln!("Error: {reason}");
+                if policy_decision.requires_approval() {
+                    eprintln!("Hint: Human approval is required before reading this output.");
+                }
+                std::process::exit(1);
+            }
             match wezterm.get_text(pane_id, escapes).await {
                 Ok(text) => {
-                    print!("{text}");
+                    let output = if tail == 0 {
+                        text
+                    } else {
+                        let (truncated, _, _) = apply_tail_truncation(&text, tail);
+                        truncated
+                    };
+                    record_read_search_policy_audit(
+                        storage.as_ref(),
+                        frankenterm_core::policy::ActorKind::Human,
+                        frankenterm_core::policy::ActionKind::ReadOutput,
+                        Some(pane_id),
+                        policy_domain.as_deref(),
+                        &policy_summary,
+                        &policy_decision,
+                        "success",
+                    )
+                    .await;
+                    print!("{}", redact_for_output(&output));
                 }
                 Err(e) => {
+                    record_read_search_policy_audit(
+                        storage.as_ref(),
+                        frankenterm_core::policy::ActorKind::Human,
+                        frankenterm_core::policy::ActionKind::ReadOutput,
+                        Some(pane_id),
+                        policy_domain.as_deref(),
+                        &policy_summary,
+                        &policy_decision,
+                        "error",
+                    )
+                    .await;
                     eprintln!("Error: {e}");
                     std::process::exit(1);
                 }
@@ -25646,7 +26466,7 @@ async fn handle_notify_command(
                 let endpoint = endpoint.expect("endpoint exists for webhook channel");
                 let dispatcher = frankenterm_core::webhook::WebhookDispatcher::new(
                     vec![endpoint.clone()],
-                    Box::new(ReqwestWebhookTransport::new()),
+                    Box::new(AsupersyncWebhookTransport::new()),
                 );
                 dispatcher.send(&output.payload).await
             };
@@ -33196,6 +34016,110 @@ log_level = "debug"
             },
             _ => panic!("expected Robot command"),
         }
+    }
+
+    #[test]
+    fn cli_get_text_parses_tail() {
+        let cli = Cli::try_parse_from(["ft", "get-text", "7", "--tail", "50", "--escapes"])
+            .expect("get-text tail should parse");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::GetText {
+                pane_id,
+                tail,
+                escapes,
+            }) => {
+                assert_eq!(pane_id, 7);
+                assert_eq!(tail, 50);
+                assert!(escapes);
+            }
+            _ => panic!("expected GetText command"),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_search_policy_default_allows_robot_search() {
+        let config = frankenterm_core::config::Config::default();
+        let (decision, _domain) = authorize_read_or_search_policy(
+            &config,
+            None,
+            None,
+            frankenterm_core::policy::ActionKind::SearchOutput,
+            frankenterm_core::policy::ActorKind::Robot,
+            None,
+            "robot search test",
+        )
+        .await;
+        assert!(
+            decision.is_allowed(),
+            "default robot search should be allowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_search_policy_rule_can_deny_robot_search() {
+        let mut config = frankenterm_core::config::Config::default();
+        config.safety.rules.enabled = true;
+        config
+            .safety
+            .rules
+            .rules
+            .push(frankenterm_core::config::PolicyRule {
+                id: "test.deny.robot.search".to_string(),
+                description: Some("deny robot search output".to_string()),
+                priority: 1,
+                match_on: frankenterm_core::config::PolicyRuleMatch {
+                    actions: vec!["search_output".to_string()],
+                    actors: vec!["robot".to_string()],
+                    ..Default::default()
+                },
+                decision: frankenterm_core::config::PolicyRuleDecision::Deny,
+                message: Some("robot search blocked for test".to_string()),
+            });
+
+        let (decision, _domain) = authorize_read_or_search_policy(
+            &config,
+            None,
+            None,
+            frankenterm_core::policy::ActionKind::SearchOutput,
+            frankenterm_core::policy::ActorKind::Robot,
+            None,
+            "robot search test",
+        )
+        .await;
+        assert!(decision.is_denied(), "rule should deny robot search");
+        assert_eq!(decision.reason(), Some("robot search blocked for test"));
+    }
+
+    #[test]
+    fn redact_search_results_redacts_sensitive_fields() {
+        let mut results = vec![frankenterm_core::storage::SearchResult {
+            segment: frankenterm_core::storage::Segment {
+                id: 1,
+                pane_id: 7,
+                seq: 10,
+                content: "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+                    .to_string(),
+                content_len: 72,
+                content_hash: None,
+                captured_at: 1_700_000_000_000,
+            },
+            snippet: Some("token=sk_test_51N4xAqXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX".to_string()),
+            highlight: Some("password: supersecretpassword123".to_string()),
+            score: 1.0,
+        }];
+
+        redact_search_results_for_output(&mut results);
+        let result = &results[0];
+        assert!(!result.segment.content.contains("EXAMPLEKEY"));
+        assert!(!result.snippet.as_deref().unwrap_or("").contains("sk_test_"));
+        assert!(
+            !result
+                .highlight
+                .as_deref()
+                .unwrap_or("")
+                .contains("supersecretpassword123")
+        );
     }
 
     #[test]
