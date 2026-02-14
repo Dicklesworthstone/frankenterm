@@ -155,7 +155,8 @@ proptest! {
         match v.commit {
             Some(extracted) => {
                 // Extracted commit is lowercase
-                prop_assert_eq!(extracted.as_str(), extracted.to_lowercase().as_str(),
+                let lower = extracted.to_lowercase();
+                prop_assert_eq!(extracted.as_str(), lower.as_str(),
                     "commit should be lowercase");
                 // Extracted commit is all hex
                 prop_assert!(extracted.chars().all(|c: char| c.is_ascii_hexdigit()),
