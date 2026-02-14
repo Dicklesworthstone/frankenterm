@@ -4,10 +4,10 @@
 //! ResizeWatchdogSeverity serde/ordering, ResizeWatchdogAssessment
 //! serde roundtrips, warning_line consistency, and field relationships.
 
+use frankenterm_core::resize_scheduler::{ResizeExecutionPhase, ResizeStalledTransaction};
 use frankenterm_core::runtime::{
     ResizeWatchdogAssessment, ResizeWatchdogSeverity, RuntimeLockMemoryTelemetrySnapshot,
 };
-use frankenterm_core::resize_scheduler::{ResizeExecutionPhase, ResizeStalledTransaction};
 use proptest::prelude::*;
 
 // ── Strategies ──────────────────────────────────────────────────────────────
@@ -51,15 +51,15 @@ fn arb_stalled_transaction() -> impl Strategy<Value = ResizeStalledTransaction> 
 /// Generate a telemetry snapshot with ordered percentile fields.
 fn arb_telemetry_snapshot() -> impl Strategy<Value = RuntimeLockMemoryTelemetrySnapshot> {
     (
-        any::<u64>(),                                  // timestamp_ms
-        (0.0f64..1000.0),                              // avg_storage_lock_wait_ms
-        (0.0f64..1000.0, 0.0f64..1000.0, 0.0f64..1000.0), // p50, p95, max wait
-        any::<u64>(),                                  // storage_lock_contention_events
-        (0.0f64..1000.0),                              // avg_storage_lock_hold_ms
-        (0.0f64..1000.0, 0.0f64..1000.0, 0.0f64..1000.0), // p50, p95, max hold
-        any::<u64>(),                                  // cursor_snapshot_bytes_last
+        any::<u64>(),                                        // timestamp_ms
+        (0.0f64..1000.0),                                    // avg_storage_lock_wait_ms
+        (0.0f64..1000.0, 0.0f64..1000.0, 0.0f64..1000.0),    // p50, p95, max wait
+        any::<u64>(),                                        // storage_lock_contention_events
+        (0.0f64..1000.0),                                    // avg_storage_lock_hold_ms
+        (0.0f64..1000.0, 0.0f64..1000.0, 0.0f64..1000.0),    // p50, p95, max hold
+        any::<u64>(),                                        // cursor_snapshot_bytes_last
         (0u64..1_000_000, 0u64..1_000_000, 0u64..1_000_000), // p50, p95, max bytes
-        (0.0f64..1_000_000.0),                         // avg_cursor_snapshot_bytes
+        (0.0f64..1_000_000.0),                               // avg_cursor_snapshot_bytes
     )
         .prop_map(
             |(
@@ -105,15 +105,15 @@ fn arb_telemetry_snapshot() -> impl Strategy<Value = RuntimeLockMemoryTelemetryS
 fn arb_assessment() -> impl Strategy<Value = ResizeWatchdogAssessment> {
     (
         arb_severity(),
-        0usize..100,                   // stalled_total
-        0usize..100,                   // stalled_critical
-        1u64..10_000,                  // warning_threshold_ms
-        1u64..30_000,                  // critical_threshold_ms
-        1usize..10,                    // critical_stalled_limit
-        any::<bool>(),                 // safe_mode_recommended
-        any::<bool>(),                 // safe_mode_active
-        any::<bool>(),                 // legacy_fallback_enabled
-        "[a-z_]{1,30}",               // recommended_action
+        0usize..100,    // stalled_total
+        0usize..100,    // stalled_critical
+        1u64..10_000,   // warning_threshold_ms
+        1u64..30_000,   // critical_threshold_ms
+        1usize..10,     // critical_stalled_limit
+        any::<bool>(),  // safe_mode_recommended
+        any::<bool>(),  // safe_mode_active
+        any::<bool>(),  // legacy_fallback_enabled
+        "[a-z_]{1,30}", // recommended_action
         proptest::collection::vec(arb_stalled_transaction(), 0..4),
     )
         .prop_map(
@@ -221,29 +221,68 @@ fn assert_snapshot_approx_eq(
     b: &RuntimeLockMemoryTelemetrySnapshot,
 ) -> Result<(), proptest::test_runner::TestCaseError> {
     prop_assert_eq!(a.timestamp_ms, b.timestamp_ms);
-    prop_assert!(f64_approx_eq(a.avg_storage_lock_wait_ms, b.avg_storage_lock_wait_ms),
-        "avg_wait: {} vs {}", a.avg_storage_lock_wait_ms, b.avg_storage_lock_wait_ms);
-    prop_assert!(f64_approx_eq(a.p50_storage_lock_wait_ms, b.p50_storage_lock_wait_ms),
-        "p50_wait: {} vs {}", a.p50_storage_lock_wait_ms, b.p50_storage_lock_wait_ms);
-    prop_assert!(f64_approx_eq(a.p95_storage_lock_wait_ms, b.p95_storage_lock_wait_ms),
-        "p95_wait: {} vs {}", a.p95_storage_lock_wait_ms, b.p95_storage_lock_wait_ms);
-    prop_assert!(f64_approx_eq(a.max_storage_lock_wait_ms, b.max_storage_lock_wait_ms),
-        "max_wait: {} vs {}", a.max_storage_lock_wait_ms, b.max_storage_lock_wait_ms);
-    prop_assert_eq!(a.storage_lock_contention_events, b.storage_lock_contention_events);
-    prop_assert!(f64_approx_eq(a.avg_storage_lock_hold_ms, b.avg_storage_lock_hold_ms),
-        "avg_hold: {} vs {}", a.avg_storage_lock_hold_ms, b.avg_storage_lock_hold_ms);
-    prop_assert!(f64_approx_eq(a.p50_storage_lock_hold_ms, b.p50_storage_lock_hold_ms),
-        "p50_hold: {} vs {}", a.p50_storage_lock_hold_ms, b.p50_storage_lock_hold_ms);
-    prop_assert!(f64_approx_eq(a.p95_storage_lock_hold_ms, b.p95_storage_lock_hold_ms),
-        "p95_hold: {} vs {}", a.p95_storage_lock_hold_ms, b.p95_storage_lock_hold_ms);
-    prop_assert!(f64_approx_eq(a.max_storage_lock_hold_ms, b.max_storage_lock_hold_ms),
-        "max_hold: {} vs {}", a.max_storage_lock_hold_ms, b.max_storage_lock_hold_ms);
+    prop_assert!(
+        f64_approx_eq(a.avg_storage_lock_wait_ms, b.avg_storage_lock_wait_ms),
+        "avg_wait: {} vs {}",
+        a.avg_storage_lock_wait_ms,
+        b.avg_storage_lock_wait_ms
+    );
+    prop_assert!(
+        f64_approx_eq(a.p50_storage_lock_wait_ms, b.p50_storage_lock_wait_ms),
+        "p50_wait: {} vs {}",
+        a.p50_storage_lock_wait_ms,
+        b.p50_storage_lock_wait_ms
+    );
+    prop_assert!(
+        f64_approx_eq(a.p95_storage_lock_wait_ms, b.p95_storage_lock_wait_ms),
+        "p95_wait: {} vs {}",
+        a.p95_storage_lock_wait_ms,
+        b.p95_storage_lock_wait_ms
+    );
+    prop_assert!(
+        f64_approx_eq(a.max_storage_lock_wait_ms, b.max_storage_lock_wait_ms),
+        "max_wait: {} vs {}",
+        a.max_storage_lock_wait_ms,
+        b.max_storage_lock_wait_ms
+    );
+    prop_assert_eq!(
+        a.storage_lock_contention_events,
+        b.storage_lock_contention_events
+    );
+    prop_assert!(
+        f64_approx_eq(a.avg_storage_lock_hold_ms, b.avg_storage_lock_hold_ms),
+        "avg_hold: {} vs {}",
+        a.avg_storage_lock_hold_ms,
+        b.avg_storage_lock_hold_ms
+    );
+    prop_assert!(
+        f64_approx_eq(a.p50_storage_lock_hold_ms, b.p50_storage_lock_hold_ms),
+        "p50_hold: {} vs {}",
+        a.p50_storage_lock_hold_ms,
+        b.p50_storage_lock_hold_ms
+    );
+    prop_assert!(
+        f64_approx_eq(a.p95_storage_lock_hold_ms, b.p95_storage_lock_hold_ms),
+        "p95_hold: {} vs {}",
+        a.p95_storage_lock_hold_ms,
+        b.p95_storage_lock_hold_ms
+    );
+    prop_assert!(
+        f64_approx_eq(a.max_storage_lock_hold_ms, b.max_storage_lock_hold_ms),
+        "max_hold: {} vs {}",
+        a.max_storage_lock_hold_ms,
+        b.max_storage_lock_hold_ms
+    );
     prop_assert_eq!(a.cursor_snapshot_bytes_last, b.cursor_snapshot_bytes_last);
     prop_assert_eq!(a.p50_cursor_snapshot_bytes, b.p50_cursor_snapshot_bytes);
     prop_assert_eq!(a.p95_cursor_snapshot_bytes, b.p95_cursor_snapshot_bytes);
     prop_assert_eq!(a.cursor_snapshot_bytes_max, b.cursor_snapshot_bytes_max);
-    prop_assert!(f64_approx_eq(a.avg_cursor_snapshot_bytes, b.avg_cursor_snapshot_bytes),
-        "avg_cursor: {} vs {}", a.avg_cursor_snapshot_bytes, b.avg_cursor_snapshot_bytes);
+    prop_assert!(
+        f64_approx_eq(a.avg_cursor_snapshot_bytes, b.avg_cursor_snapshot_bytes),
+        "avg_cursor: {} vs {}",
+        a.avg_cursor_snapshot_bytes,
+        b.avg_cursor_snapshot_bytes
+    );
     Ok(())
 }
 

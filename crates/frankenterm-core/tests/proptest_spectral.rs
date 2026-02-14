@@ -20,8 +20,8 @@ use proptest::prelude::*;
 use frankenterm_core::spectral::{
     AgentClass, SampleBuffer, SpectralClassifier, SpectralConfig, SpectralFingerprint,
     SpectralPeak, classify_signal, detect_peaks, generate_impulse_train, generate_sine,
-    generate_white_noise, hann_window, psd_similarity, power_spectral_density,
-    spectral_centroid, spectral_flatness,
+    generate_white_noise, hann_window, power_spectral_density, psd_similarity, spectral_centroid,
+    spectral_flatness,
 };
 
 // =============================================================================
@@ -40,23 +40,21 @@ fn arb_agent_class() -> impl Strategy<Value = AgentClass> {
 fn arb_spectral_config() -> impl Strategy<Value = SpectralConfig> {
     (
         prop_oneof![Just(64usize), Just(128), Just(256), Just(512), Just(1024)],
-        1e-8f64..1e-3,      // idle_power_threshold
-        2.0f64..20.0,        // peak_snr_threshold
-        1usize..10,          // max_polling_peaks
-        1.0f64..20.0,        // min_peak_quality
-        0.1f64..0.9,         // steady_flatness_threshold
-        1.0f64..100.0,       // sample_rate_hz
+        1e-8f64..1e-3, // idle_power_threshold
+        2.0f64..20.0,  // peak_snr_threshold
+        1usize..10,    // max_polling_peaks
+        1.0f64..20.0,  // min_peak_quality
+        0.1f64..0.9,   // steady_flatness_threshold
+        1.0f64..100.0, // sample_rate_hz
     )
-        .prop_map(|(fft_size, ipt, pst, mpp, mpq, sft, srh)| {
-            SpectralConfig {
-                fft_size,
-                idle_power_threshold: ipt,
-                peak_snr_threshold: pst,
-                max_polling_peaks: mpp,
-                min_peak_quality: mpq,
-                steady_flatness_threshold: sft,
-                sample_rate_hz: srh,
-            }
+        .prop_map(|(fft_size, ipt, pst, mpp, mpq, sft, srh)| SpectralConfig {
+            fft_size,
+            idle_power_threshold: ipt,
+            peak_snr_threshold: pst,
+            max_polling_peaks: mpp,
+            min_peak_quality: mpq,
+            steady_flatness_threshold: sft,
+            sample_rate_hz: srh,
         })
 }
 
@@ -68,15 +66,15 @@ fn arb_spectral_peak() -> impl Strategy<Value = SpectralPeak> {
         0.0f64..100.0,
         0.0f64..50.0,
     )
-        .prop_map(|(bin, frequency_hz, power, snr, quality_factor)| {
-            SpectralPeak {
+        .prop_map(
+            |(bin, frequency_hz, power, snr, quality_factor)| SpectralPeak {
                 bin,
                 frequency_hz,
                 power,
                 snr,
                 quality_factor,
-            }
-        })
+            },
+        )
 }
 
 // =============================================================================
