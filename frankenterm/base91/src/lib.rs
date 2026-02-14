@@ -689,4 +689,240 @@ mod test {
         let data: Vec<u8> = (0x20..=0x7E).collect();
         assert_eq!(decode(&encode(&data)), data);
     }
+
+    // ── DECTAB validity ──────────────────────────────────────────
+
+    #[test]
+    fn dectab_has_exactly_91_valid_entries() {
+        let valid_count = DECTAB.iter().filter(|&&v| v != INV).count();
+        assert_eq!(valid_count, 91);
+    }
+
+    #[test]
+    fn dectab_high_bytes_all_invalid() {
+        for i in 128..=255usize {
+            assert_eq!(
+                DECTAB[i], INV,
+                "DECTAB[{i}] should be INV for non-ASCII byte"
+            );
+        }
+    }
+
+    #[test]
+    fn dectab_control_chars_all_invalid() {
+        for i in 0..0x20usize {
+            assert_eq!(
+                DECTAB[i], INV,
+                "DECTAB[{i}] should be INV for control char"
+            );
+        }
+        assert_eq!(DECTAB[0x7F], INV, "DECTAB[DEL] should be INV");
+    }
+
+    // ── Encoded output properties ────────────────────────────────
+
+    #[test]
+    fn non_empty_input_produces_non_empty_output() {
+        for len in 1..=32 {
+            let data = vec![0x42u8; len];
+            let encoded = encode(&data);
+            assert!(
+                !encoded.is_empty(),
+                "encode of {len} bytes should not be empty"
+            );
+        }
+    }
+
+    #[test]
+    fn encode_output_length_monotonic() {
+        let mut prev_len = 0;
+        for size in [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024] {
+            let data: Vec<u8> = (0..size).map(|i| (i % 256) as u8).collect();
+            let enc_len = encode(&data).len();
+            assert!(
+                enc_len >= prev_len,
+                "encoded length should be monotonically non-decreasing: {enc_len} < {prev_len}"
+            );
+            prev_len = enc_len;
+        }
+    }
+
+    #[test]
+    fn encoded_output_uses_only_enctab_chars() {
+        let data: Vec<u8> = (0..1024).map(|i| (i * 41 % 256) as u8).collect();
+        let encoded = encode(&data);
+        let valid: std::collections::HashSet<u8> = ENCTAB.iter().copied().collect();
+        for &b in &encoded {
+            assert!(
+                valid.contains(&b),
+                "encoded byte 0x{b:02x} not in ENCTAB"
+            );
+        }
+    }
+
+    // ── Edge-case roundtrips ─────────────────────────────────────
+
+    #[test]
+    fn roundtrip_single_null_byte() {
+        assert_eq!(decode(&encode(&[0x00])), vec![0x00]);
+    }
+
+    #[test]
+    fn roundtrip_single_0xff() {
+        assert_eq!(decode(&encode(&[0xFF])), vec![0xFF]);
+    }
+
+    #[test]
+    fn roundtrip_repeated_single_byte() {
+        for &b in &[0x00, 0x42, 0x80, 0xFF] {
+            let data = vec![b; 200];
+            assert_eq!(
+                decode(&encode(&data)),
+                data,
+                "roundtrip failed for 200x 0x{b:02x}"
+            );
+        }
+    }
+
+    #[test]
+    fn roundtrip_utf8_text() {
+        let text = "Hello 世界! 🌍 café résumé";
+        let data = text.as_bytes();
+        assert_eq!(decode(&encode(data)), data);
+    }
+
+    // ── Streaming with power-of-2 chunk sizes ────────────────────
+
+    #[test]
+    fn streaming_encode_various_chunk_sizes() {
+        let data: Vec<u8> = (0..500).map(|i| (i * 13 % 256) as u8).collect();
+        let bulk = encode(&data);
+        for chunk_size in [1, 2, 4, 8, 16, 32, 64, 128, 256] {
+            let mut result = Vec::new();
+            {
+                let mut encoder = Base91Encoder::new(&mut result);
+                for chunk in data.chunks(chunk_size) {
+                    encoder.write_all(chunk).unwrap();
+                }
+                encoder.flush().unwrap();
+            }
+            assert_eq!(
+                result, bulk,
+                "streaming encode with chunk_size={chunk_size} differs from bulk"
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_decode_various_chunk_sizes() {
+        let data = b"streaming chunk decode verification";
+        let encoded = encode(data);
+        let bulk = decode(&encoded);
+        for chunk_size in [1, 2, 3, 5, 7, 11] {
+            let mut result = Vec::new();
+            {
+                let mut decoder = Base91Decoder::new(&mut result);
+                for chunk in encoded.chunks(chunk_size) {
+                    decoder.write_all(chunk).unwrap();
+                }
+                decoder.flush().unwrap();
+            }
+            assert_eq!(
+                result, bulk,
+                "streaming decode with chunk_size={chunk_size} differs from bulk"
+            );
+        }
+    }
+
+    // ── Encoder/decoder pipeline ─────────────────────────────────
+
+    #[test]
+    fn pipeline_encode_then_decode() {
+        let original = b"pipeline roundtrip test data 12345";
+        let mut encoded_buf = Vec::new();
+        {
+            let mut encoder = Base91Encoder::new(&mut encoded_buf);
+            encoder.write_all(original).unwrap();
+            encoder.flush().unwrap();
+        }
+        let mut decoded_buf = Vec::new();
+        {
+            let mut decoder = Base91Decoder::new(&mut decoded_buf);
+            decoder.write_all(&encoded_buf).unwrap();
+            decoder.flush().unwrap();
+        }
+        assert_eq!(decoded_buf, original);
+    }
+
+    // ── Empty write preserves state ──────────────────────────────
+
+    #[test]
+    fn empty_write_preserves_encoder_state() {
+        let data = b"preserved";
+        let expected = encode(data);
+        let mut result = Vec::new();
+        {
+            let mut encoder = Base91Encoder::new(&mut result);
+            encoder.write_all(&data[..4]).unwrap();
+            encoder.write_all(b"").unwrap(); // empty write
+            encoder.write_all(&data[4..]).unwrap();
+            encoder.flush().unwrap();
+        }
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn empty_write_preserves_decoder_state() {
+        let encoded = encode(b"preserved decode");
+        let expected = decode(&encoded);
+        let mut result = Vec::new();
+        {
+            let mut decoder = Base91Decoder::new(&mut result);
+            let mid = encoded.len() / 2;
+            decoder.write_all(&encoded[..mid]).unwrap();
+            decoder.write_all(b"").unwrap(); // empty write
+            decoder.write_all(&encoded[mid..]).unwrap();
+            decoder.flush().unwrap();
+        }
+        assert_eq!(result, expected);
+    }
+
+    // ── Capacity estimation ──────────────────────────────────────
+
+    #[test]
+    fn encode_capacity_never_exceeds_124_percent_for_bulk() {
+        // For small inputs, overhead can be higher due to flush padding;
+        // the 23% spec guarantee applies asymptotically
+        for size in [100, 500, 2000, 10000] {
+            let data: Vec<u8> = (0..size).map(|i| (i * 31 % 256) as u8).collect();
+            let encoded = encode(&data);
+            let ratio = encoded.len() as f64 / data.len() as f64;
+            assert!(ratio <= 1.24, "encode ratio exceeds 1.24 for size {}", size);
+        }
+    }
+
+    // ── Large data ───────────────────────────────────────────────
+
+    #[test]
+    fn roundtrip_100kb() {
+        let data: Vec<u8> = (0..102400).map(|i| (i * 59 % 256) as u8).collect();
+        assert_eq!(decode(&encode(&data)), data);
+    }
+
+    // ── Decoder with whitespace-wrapped encoded data ─────────────
+
+    #[test]
+    fn decode_with_crlf_line_wrapping() {
+        let data = b"line-wrapped decode test";
+        let encoded = encode(data);
+        let encoded_str = String::from_utf8(encoded).unwrap();
+        // Wrap every 10 chars with CRLF
+        let wrapped: String = encoded_str
+            .as_bytes()
+            .chunks(10)
+            .map(|chunk| std::str::from_utf8(chunk).unwrap())
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        assert_eq!(decode(wrapped.as_bytes()), data);
+    }
 }
