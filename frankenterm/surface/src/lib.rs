@@ -833,7 +833,7 @@ impl Surface {
         other_x: usize,
         other_y: usize,
     ) -> Vec<DirtyRect> {
-        let mut rects = Vec::new();
+        let mut rects: Vec<DirtyRect> = Vec::new();
 
         for ((row_num, line), other_line) in self
             .lines
@@ -1073,7 +1073,7 @@ fn diff_line_spans(
         .skip_while(|cell| cell.cell_index() < other_x)
         .take_while(|cell| cell.cell_index() < other_x + width);
 
-    let mut spans = Vec::new();
+    let mut spans: Vec<core::ops::Range<usize>> = Vec::new();
 
     for other_cell in other_cells {
         let rel_x = other_cell.cell_index() - other_x;

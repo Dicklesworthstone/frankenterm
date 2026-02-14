@@ -148,6 +148,7 @@ pub mod replay;
 pub mod reports;
 pub mod reservoir_sampler;
 pub mod resize_invariants;
+pub mod resize_memory_controls;
 pub mod resize_scheduler;
 pub mod restore_layout;
 pub mod restore_process;
