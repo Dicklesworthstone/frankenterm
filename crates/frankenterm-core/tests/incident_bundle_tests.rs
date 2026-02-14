@@ -88,7 +88,7 @@ fn crash_bundle_redacts_anthropic_key() {
     ]);
     report.message = format!("Error with key {anthropic_key}");
 
-    let path = write_crash_bundle(tmp.path(), &report, None).unwrap();
+    let path = write_crash_bundle(tmp.path(), &report, None, None).unwrap();
     let content = fs::read_to_string(path.join("crash_report.json")).unwrap();
 
     let prefix = join_parts(&["sk", "-ant-api03"]);
@@ -103,7 +103,7 @@ fn crash_bundle_redacts_openai_key() {
     let openai_key = join_parts(&["sk", "-proj-", "ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"]);
     report.message = format!("Using key {openai_key}");
 
-    let path = write_crash_bundle(tmp.path(), &report, None).unwrap();
+    let path = write_crash_bundle(tmp.path(), &report, None, None).unwrap();
     let content = fs::read_to_string(path.join("crash_report.json")).unwrap();
 
     let prefix = join_parts(&["sk", "-proj-"]);
@@ -118,7 +118,7 @@ fn crash_bundle_redacts_github_token() {
     let github_token = join_parts(&["ghp", "_", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij"]);
     report.message = format!("Auth: {github_token}");
 
-    let path = write_crash_bundle(tmp.path(), &report, None).unwrap();
+    let path = write_crash_bundle(tmp.path(), &report, None, None).unwrap();
     let content = fs::read_to_string(path.join("crash_report.json")).unwrap();
 
     let prefix = join_parts(&["ghp", "_"]);
@@ -135,7 +135,7 @@ fn crash_bundle_redacts_bearer_token() {
             .to_string(),
     );
 
-    let path = write_crash_bundle(tmp.path(), &report, None).unwrap();
+    let path = write_crash_bundle(tmp.path(), &report, None, None).unwrap();
     let content = fs::read_to_string(path.join("crash_report.json")).unwrap();
 
     assert!(
@@ -152,7 +152,7 @@ fn crash_bundle_redacts_database_url() {
         "Connection failed: postgresql://admin:supersecretpass@db.example.com:5432/mydb"
             .to_string();
 
-    let path = write_crash_bundle(tmp.path(), &report, None).unwrap();
+    let path = write_crash_bundle(tmp.path(), &report, None, None).unwrap();
     let content = fs::read_to_string(path.join("crash_report.json")).unwrap();
 
     assert!(
@@ -168,7 +168,7 @@ fn crash_bundle_redacts_stripe_key() {
     let stripe_key = join_parts(&["sk", "_live_", "ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"]);
     report.message = format!("Payment failed with key {stripe_key}");
 
-    let path = write_crash_bundle(tmp.path(), &report, None).unwrap();
+    let path = write_crash_bundle(tmp.path(), &report, None, None).unwrap();
     let content = fs::read_to_string(path.join("crash_report.json")).unwrap();
 
     let prefix = join_parts(&["sk", "_live_"]);
@@ -183,7 +183,7 @@ fn crash_bundle_redacts_aws_access_key() {
     let aws_access_key = join_parts(&["AKI", "A", "IOSFODNN7EXAMPLE"]);
     report.message = format!("AWS error with {aws_access_key}");
 
-    let path = write_crash_bundle(tmp.path(), &report, None).unwrap();
+    let path = write_crash_bundle(tmp.path(), &report, None, None).unwrap();
     let content = fs::read_to_string(path.join("crash_report.json")).unwrap();
 
     // Avoid embedding the full key literal; assert the prefix is gone after redaction.
@@ -205,7 +205,7 @@ fn crash_bundle_redacts_multiple_secrets_in_one_message() {
     report.backtrace =
         Some("Authorization: Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.payload".to_string());
 
-    let path = write_crash_bundle(tmp.path(), &report, None).unwrap();
+    let path = write_crash_bundle(tmp.path(), &report, None, None).unwrap();
     let all_content = read_all_bundle_text(&path);
 
     let anthropic_prefix = join_parts(&["sk", "-ant-api03"]);
@@ -280,7 +280,7 @@ fn incident_bundle_crash_redacts_all_files() {
     let aws_access_key = join_parts(&["AKI", "A", "IOSFODNN7EXAMPLE"]);
     snapshot.warnings = vec![format!("Warning: {aws_access_key} exposed")];
 
-    write_crash_bundle(&crash_dir, &report, Some(&snapshot)).unwrap();
+    write_crash_bundle(&crash_dir, &report, Some(&snapshot), None).unwrap();
 
     let result = export_incident_bundle(&crash_dir, None, &out_dir, IncidentKind::Crash).unwrap();
 
@@ -307,7 +307,7 @@ fn crash_bundle_enforces_size_budget() {
     // Create a very large backtrace to approach the bundle size limit
     report.backtrace = Some("x".repeat(900_000));
 
-    let path = write_crash_bundle(tmp.path(), &report, Some(&basic_snapshot())).unwrap();
+    let path = write_crash_bundle(tmp.path(), &report, Some(&basic_snapshot()), None).unwrap();
 
     // Bundle should still be created
     assert!(path.exists());
@@ -332,7 +332,7 @@ fn crash_bundle_with_huge_health_snapshot_stays_within_budget() {
         .map(|i| format!("Warning #{i}: something happened on pane {i}"))
         .collect();
 
-    let path = write_crash_bundle(tmp.path(), &report, Some(&snapshot)).unwrap();
+    let path = write_crash_bundle(tmp.path(), &report, Some(&snapshot), None).unwrap();
     let manifest_json = fs::read_to_string(path.join("manifest.json")).unwrap();
     let manifest: CrashManifest = serde_json::from_str(&manifest_json).unwrap();
 
@@ -349,7 +349,7 @@ fn crash_bundle_with_unicode_message() {
     let mut report = basic_report();
     report.message = "Crash: 日本語テスト Unicode: 🔥💥 Ñ ü ö ä".to_string();
 
-    let path = write_crash_bundle(tmp.path(), &report, None).unwrap();
+    let path = write_crash_bundle(tmp.path(), &report, None, None).unwrap();
     let content = fs::read_to_string(path.join("crash_report.json")).unwrap();
     let parsed: CrashReport = serde_json::from_str(&content).unwrap();
 
@@ -366,7 +366,7 @@ fn crash_bundle_with_empty_message() {
     report.backtrace = None;
     report.thread_name = None;
 
-    let path = write_crash_bundle(tmp.path(), &report, None).unwrap();
+    let path = write_crash_bundle(tmp.path(), &report, None, None).unwrap();
     let content = fs::read_to_string(path.join("crash_report.json")).unwrap();
     let parsed: CrashReport = serde_json::from_str(&content).unwrap();
 
@@ -393,7 +393,7 @@ fn crash_bundle_with_priority_overrides_in_snapshot() {
         },
     ];
 
-    let path = write_crash_bundle(tmp.path(), &report, Some(&snapshot)).unwrap();
+    let path = write_crash_bundle(tmp.path(), &report, Some(&snapshot), None).unwrap();
     let health_json = fs::read_to_string(path.join("health_snapshot.json")).unwrap();
     let parsed: HealthSnapshot = serde_json::from_str(&health_json).unwrap();
 
@@ -408,7 +408,7 @@ fn incident_bundle_manifest_is_valid_json() {
     let crash_dir = tmp.path().join("crash");
     let out_dir = tmp.path().join("out");
 
-    write_crash_bundle(&crash_dir, &basic_report(), Some(&basic_snapshot())).unwrap();
+    write_crash_bundle(&crash_dir, &basic_report(), Some(&basic_snapshot()), None).unwrap();
 
     let result = export_incident_bundle(&crash_dir, None, &out_dir, IncidentKind::Crash).unwrap();
 
@@ -426,7 +426,7 @@ fn incident_bundle_result_includes_all_files_list() {
     let crash_dir = tmp.path().join("crash");
     let out_dir = tmp.path().join("out");
 
-    write_crash_bundle(&crash_dir, &basic_report(), Some(&basic_snapshot())).unwrap();
+    write_crash_bundle(&crash_dir, &basic_report(), Some(&basic_snapshot()), None).unwrap();
 
     let result = export_incident_bundle(&crash_dir, None, &out_dir, IncidentKind::Crash).unwrap();
 
@@ -456,9 +456,9 @@ fn multiple_crash_bundles_have_unique_names() {
     let mut report = basic_report();
     report.timestamp = 1_700_000_000;
 
-    let path1 = write_crash_bundle(crash_dir, &report, None).unwrap();
-    let path2 = write_crash_bundle(crash_dir, &report, None).unwrap();
-    let path3 = write_crash_bundle(crash_dir, &report, None).unwrap();
+    let path1 = write_crash_bundle(crash_dir, &report, None, None).unwrap();
+    let path2 = write_crash_bundle(crash_dir, &report, None, None).unwrap();
+    let path3 = write_crash_bundle(crash_dir, &report, None, None).unwrap();
 
     // All paths should be unique
     assert_ne!(path1, path2);
@@ -619,7 +619,7 @@ fn list_crash_bundles_ignores_non_bundle_files() {
     let crash_dir = tmp.path();
 
     // Create a real bundle
-    write_crash_bundle(crash_dir, &basic_report(), None).unwrap();
+    write_crash_bundle(crash_dir, &basic_report(), None, None).unwrap();
 
     // Create some non-bundle entries
     fs::create_dir(crash_dir.join("random_directory")).unwrap();
@@ -887,7 +887,7 @@ fn collect_incident_bundle_crash_kind_includes_crash_data() {
     // Write a crash bundle first
     let report = basic_report();
     let snapshot = basic_snapshot();
-    let _ = write_crash_bundle(&crash_dir, &report, Some(&snapshot));
+    let _ = write_crash_bundle(&crash_dir, &report, Some(&snapshot), None);
 
     let opts = IncidentBundleOptions {
         crash_dir: &crash_dir,
@@ -1251,7 +1251,7 @@ fn replay_crash_kind_bundle_validates_crash_report() {
 
     let report = basic_report();
     let snapshot = basic_snapshot();
-    let _ = write_crash_bundle(&crash_dir, &report, Some(&snapshot));
+    let _ = write_crash_bundle(&crash_dir, &report, Some(&snapshot), None);
 
     let opts = IncidentBundleOptions {
         crash_dir: &crash_dir,

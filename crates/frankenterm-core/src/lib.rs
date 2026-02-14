@@ -147,6 +147,7 @@ pub mod recording;
 pub mod replay;
 pub mod reports;
 pub mod reservoir_sampler;
+pub mod resize_crash_forensics;
 pub mod resize_invariants;
 pub mod resize_memory_controls;
 pub mod resize_scheduler;
