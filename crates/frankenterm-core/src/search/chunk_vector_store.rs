@@ -775,3 +775,744 @@ fn i64_to_u64(value: i64, field: &'static str) -> Result<u64> {
 fn i64_to_usize(value: i64, field: &'static str) -> Result<usize> {
     usize::try_from(value).map_err(|_| ChunkVectorStoreError::IntegerOverflow(field))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Helper functions ──────────────────────────────────────────────────
+
+    fn open_in_memory() -> ChunkVectorStore {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", 1).unwrap();
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+        ChunkVectorStore { conn }
+    }
+
+    fn make_normalized_vec(dim: usize) -> Vec<f32> {
+        let val = 1.0 / (dim as f32).sqrt();
+        vec![val; dim]
+    }
+
+    fn make_chunk(
+        chunk_id: &str,
+        pane_id: u64,
+        direction: ChunkDirection,
+        start_ordinal: u64,
+        end_ordinal: u64,
+    ) -> SemanticChunk {
+        SemanticChunk {
+            chunk_id: chunk_id.to_string(),
+            policy_version: "ft.recorder.chunking.v1".to_string(),
+            pane_id,
+            session_id: Some("sess-test".to_string()),
+            direction,
+            start_offset: ChunkSourceOffset {
+                segment_id: 0,
+                ordinal: start_ordinal,
+                byte_offset: start_ordinal * 100,
+            },
+            end_offset: ChunkSourceOffset {
+                segment_id: 0,
+                ordinal: end_ordinal,
+                byte_offset: end_ordinal * 100,
+            },
+            event_ids: vec!["evt-1".to_string()],
+            event_count: 1,
+            occurred_at_start_ms: 1000,
+            occurred_at_end_ms: 1100,
+            text_chars: 50,
+            content_hash: format!("hash-{chunk_id}"),
+            text: format!("content of {chunk_id}"),
+            overlap: None,
+        }
+    }
+
+    fn setup_generation(store: &ChunkVectorStore) {
+        store
+            .register_generation("prof-1", "gen-1", "ft.recorder.chunking.v1", "lex-v1")
+            .unwrap();
+    }
+
+    fn make_upsert(
+        chunk_id: &str,
+        start_ordinal: u64,
+        end_ordinal: u64,
+        dim: usize,
+    ) -> ChunkEmbeddingUpsert {
+        ChunkEmbeddingUpsert {
+            profile_id: "prof-1".to_string(),
+            generation_id: "gen-1".to_string(),
+            chunk: make_chunk(
+                chunk_id,
+                1,
+                ChunkDirection::Egress,
+                start_ordinal,
+                end_ordinal,
+            ),
+            embedding: make_normalized_vec(dim),
+        }
+    }
+
+    // ── SemanticGenerationStatus tests ────────────────────────────────────
+
+    #[test]
+    fn generation_status_from_str_valid() {
+        assert_eq!(
+            SemanticGenerationStatus::from_str("building").unwrap(),
+            SemanticGenerationStatus::Building
+        );
+        assert_eq!(
+            SemanticGenerationStatus::from_str("active").unwrap(),
+            SemanticGenerationStatus::Active
+        );
+        assert_eq!(
+            SemanticGenerationStatus::from_str("retired").unwrap(),
+            SemanticGenerationStatus::Retired
+        );
+        assert_eq!(
+            SemanticGenerationStatus::from_str("failed").unwrap(),
+            SemanticGenerationStatus::Failed
+        );
+    }
+
+    #[test]
+    fn generation_status_from_str_invalid() {
+        assert!(SemanticGenerationStatus::from_str("unknown").is_err());
+        assert!(SemanticGenerationStatus::from_str("").is_err());
+    }
+
+    #[test]
+    fn generation_status_serde_roundtrip() {
+        for status in [
+            SemanticGenerationStatus::Building,
+            SemanticGenerationStatus::Active,
+            SemanticGenerationStatus::Retired,
+            SemanticGenerationStatus::Failed,
+        ] {
+            let json = serde_json::to_string(&status).unwrap();
+            let parsed: SemanticGenerationStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(status, parsed);
+        }
+    }
+
+    // ── direction_to_str / direction_from_str tests ───────────────────────
+
+    #[test]
+    fn direction_str_roundtrip() {
+        for dir in [
+            ChunkDirection::Ingress,
+            ChunkDirection::Egress,
+            ChunkDirection::MixedGlued,
+        ] {
+            let s = direction_to_str(dir);
+            let parsed = direction_from_str(s).unwrap();
+            assert_eq!(dir, parsed);
+        }
+    }
+
+    #[test]
+    fn direction_from_str_invalid() {
+        assert!(direction_from_str("unknown").is_err());
+    }
+
+    // ── encode/decode embedding blob tests ────────────────────────────────
+
+    #[test]
+    fn embedding_blob_roundtrip() {
+        let original = vec![1.0f32, -0.5, 0.25, 3.14];
+        let blob = encode_f32_embedding_blob(&original);
+        let decoded = decode_f32_embedding_blob(&blob, original.len()).unwrap();
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn embedding_blob_empty_roundtrip() {
+        let original: Vec<f32> = vec![];
+        let blob = encode_f32_embedding_blob(&original);
+        let decoded = decode_f32_embedding_blob(&blob, 0).unwrap();
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn decode_blob_wrong_length_fails() {
+        let blob = vec![0u8; 12]; // 3 floats
+        let result = decode_f32_embedding_blob(&blob, 4); // expects 4 floats (16 bytes)
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn decode_blob_rejects_nan() {
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&f32::NAN.to_le_bytes());
+        let result = decode_f32_embedding_blob(&blob, 1);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn decode_blob_rejects_infinity() {
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&f32::INFINITY.to_le_bytes());
+        let result = decode_f32_embedding_blob(&blob, 1);
+        assert!(result.is_err());
+    }
+
+    // ── cosine_similarity tests ───────────────────────────────────────────
+
+    #[test]
+    fn cosine_similarity_identical_vectors() {
+        let v = vec![1.0f32, 0.0, 0.0];
+        let sim = cosine_similarity(&v, &v).unwrap();
+        assert!((sim - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_similarity_orthogonal_vectors() {
+        let a = vec![1.0f32, 0.0];
+        let b = vec![0.0f32, 1.0];
+        let sim = cosine_similarity(&a, &b).unwrap();
+        assert!(sim.abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_similarity_opposite_vectors() {
+        let a = vec![1.0f32, 0.0];
+        let b = vec![-1.0f32, 0.0];
+        let sim = cosine_similarity(&a, &b).unwrap();
+        assert!((sim - (-1.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_similarity_different_lengths_returns_none() {
+        let a = vec![1.0f32, 0.0];
+        let b = vec![1.0f32, 0.0, 0.0];
+        assert!(cosine_similarity(&a, &b).is_none());
+    }
+
+    #[test]
+    fn cosine_similarity_empty_returns_none() {
+        let empty: Vec<f32> = vec![];
+        assert!(cosine_similarity(&empty, &empty).is_none());
+    }
+
+    #[test]
+    fn cosine_similarity_zero_vector_returns_none() {
+        let zero = vec![0.0f32, 0.0, 0.0];
+        let other = vec![1.0f32, 0.0, 0.0];
+        assert!(cosine_similarity(&zero, &other).is_none());
+    }
+
+    // ── is_l2_normalized tests ────────────────────────────────────────────
+
+    #[test]
+    fn is_l2_normalized_unit_vector() {
+        let v = vec![1.0f32, 0.0, 0.0];
+        assert!(is_l2_normalized(&v));
+    }
+
+    #[test]
+    fn is_l2_normalized_uniform() {
+        let dim = 4;
+        let val = 1.0 / (dim as f32).sqrt();
+        let v = vec![val; dim];
+        assert!(is_l2_normalized(&v));
+    }
+
+    #[test]
+    fn is_l2_normalized_unnormalized_fails() {
+        let v = vec![2.0f32, 0.0, 0.0];
+        assert!(!is_l2_normalized(&v));
+    }
+
+    #[test]
+    fn is_l2_normalized_empty_fails() {
+        assert!(!is_l2_normalized(&[]));
+    }
+
+    // ── validate_embedding_vector tests ───────────────────────────────────
+
+    #[test]
+    fn validate_empty_vector_fails() {
+        let result = validate_embedding_vector(&[]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_non_finite_fails() {
+        let result = validate_embedding_vector(&[f32::NAN]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_unnormalized_fails() {
+        let result = validate_embedding_vector(&[2.0, 0.0, 0.0]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_normalized_succeeds() {
+        let v = make_normalized_vec(3);
+        assert!(validate_embedding_vector(&v).is_ok());
+    }
+
+    // ── Integer conversion tests ──────────────────────────────────────────
+
+    #[test]
+    fn u64_to_i64_valid() {
+        assert_eq!(u64_to_i64(42, "test").unwrap(), 42i64);
+    }
+
+    #[test]
+    fn u64_to_i64_overflow() {
+        assert!(u64_to_i64(u64::MAX, "test").is_err());
+    }
+
+    #[test]
+    fn i64_to_u64_valid() {
+        assert_eq!(i64_to_u64(42, "test").unwrap(), 42u64);
+    }
+
+    #[test]
+    fn i64_to_u64_negative_fails() {
+        assert!(i64_to_u64(-1, "test").is_err());
+    }
+
+    #[test]
+    fn usize_to_i64_valid() {
+        assert_eq!(usize_to_i64(100, "test").unwrap(), 100i64);
+    }
+
+    // ── Store: register_generation tests ──────────────────────────────────
+
+    #[test]
+    fn register_generation_creates_building_status() {
+        let store = open_in_memory();
+        store
+            .register_generation("p1", "g1", "chunk-v1", "lex-v1")
+            .unwrap();
+
+        let generation = store.generation("p1", "g1").unwrap().unwrap();
+        assert_eq!(generation.profile_id, "p1");
+        assert_eq!(generation.generation_id, "g1");
+        assert_eq!(generation.status, SemanticGenerationStatus::Building);
+        assert!(generation.activated_at.is_none());
+    }
+
+    #[test]
+    fn register_generation_upsert_updates_versions() {
+        let store = open_in_memory();
+        store
+            .register_generation("p1", "g1", "chunk-v1", "lex-v1")
+            .unwrap();
+        store
+            .register_generation("p1", "g1", "chunk-v2", "lex-v2")
+            .unwrap();
+
+        let generation = store.generation("p1", "g1").unwrap().unwrap();
+        assert_eq!(generation.chunk_policy_version, "chunk-v2");
+        assert_eq!(generation.lexical_schema_version, "lex-v2");
+    }
+
+    // ── Store: activate_generation tests ──────────────────────────────────
+
+    #[test]
+    fn activate_generation_sets_active() {
+        let mut store = open_in_memory();
+        store
+            .register_generation("p1", "g1", "chunk-v1", "lex-v1")
+            .unwrap();
+        store.activate_generation("p1", "g1").unwrap();
+
+        let generation = store.generation("p1", "g1").unwrap().unwrap();
+        assert_eq!(generation.status, SemanticGenerationStatus::Active);
+        assert!(generation.activated_at.is_some());
+    }
+
+    #[test]
+    fn activate_generation_retires_previous() {
+        let mut store = open_in_memory();
+        store
+            .register_generation("p1", "g1", "chunk-v1", "lex-v1")
+            .unwrap();
+        store.activate_generation("p1", "g1").unwrap();
+
+        store
+            .register_generation("p1", "g2", "chunk-v1", "lex-v1")
+            .unwrap();
+        store.activate_generation("p1", "g2").unwrap();
+
+        let g1 = store.generation("p1", "g1").unwrap().unwrap();
+        assert_eq!(g1.status, SemanticGenerationStatus::Retired);
+        assert!(g1.retired_at.is_some());
+
+        let g2 = store.generation("p1", "g2").unwrap().unwrap();
+        assert_eq!(g2.status, SemanticGenerationStatus::Active);
+    }
+
+    #[test]
+    fn activate_nonexistent_generation_fails() {
+        let mut store = open_in_memory();
+        let result = store.activate_generation("p1", "missing");
+        assert!(result.is_err());
+    }
+
+    // ── Store: active_generation tests ────────────────────────────────────
+
+    #[test]
+    fn active_generation_returns_none_when_none_active() {
+        let store = open_in_memory();
+        store
+            .register_generation("p1", "g1", "chunk-v1", "lex-v1")
+            .unwrap();
+        assert!(store.active_generation("p1").unwrap().is_none());
+    }
+
+    #[test]
+    fn active_generation_returns_active() {
+        let mut store = open_in_memory();
+        store
+            .register_generation("p1", "g1", "chunk-v1", "lex-v1")
+            .unwrap();
+        store.activate_generation("p1", "g1").unwrap();
+
+        let generation = store.active_generation("p1").unwrap().unwrap();
+        assert_eq!(generation.generation_id, "g1");
+    }
+
+    // ── Store: upsert_chunk_embedding tests ───────────────────────────────
+
+    #[test]
+    fn upsert_new_embedding_returns_was_update_false() {
+        let mut store = open_in_memory();
+        setup_generation(&store);
+
+        let outcome = store.upsert_chunk_embedding(make_upsert("c1", 0, 5, 4)).unwrap();
+        assert!(!outcome.was_update);
+        assert_eq!(outcome.chunk_id, "c1");
+    }
+
+    #[test]
+    fn upsert_existing_embedding_returns_was_update_true() {
+        let mut store = open_in_memory();
+        setup_generation(&store);
+
+        store.upsert_chunk_embedding(make_upsert("c1", 0, 5, 4)).unwrap();
+        let outcome = store.upsert_chunk_embedding(make_upsert("c1", 0, 5, 4)).unwrap();
+        assert!(outcome.was_update);
+    }
+
+    #[test]
+    fn upsert_without_generation_fails() {
+        let mut store = open_in_memory();
+        let result = store.upsert_chunk_embedding(make_upsert("c1", 0, 5, 4));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn upsert_with_wrong_policy_version_fails() {
+        let mut store = open_in_memory();
+        setup_generation(&store);
+
+        let mut payload = make_upsert("c1", 0, 5, 4);
+        payload.chunk.policy_version = "wrong-version".to_string();
+        let result = store.upsert_chunk_embedding(payload);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn upsert_with_empty_embedding_fails() {
+        let mut store = open_in_memory();
+        setup_generation(&store);
+
+        let mut payload = make_upsert("c1", 0, 5, 4);
+        payload.embedding = vec![];
+        let result = store.upsert_chunk_embedding(payload);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn upsert_with_nan_embedding_fails() {
+        let mut store = open_in_memory();
+        setup_generation(&store);
+
+        let mut payload = make_upsert("c1", 0, 5, 4);
+        payload.embedding = vec![f32::NAN; 4];
+        let result = store.upsert_chunk_embedding(payload);
+        assert!(result.is_err());
+    }
+
+    // ── Store: prune_chunks_through_ordinal tests ─────────────────────────
+
+    #[test]
+    fn prune_deletes_chunks_up_to_cutoff() {
+        let mut store = open_in_memory();
+        setup_generation(&store);
+
+        store.upsert_chunk_embedding(make_upsert("c1", 0, 5, 4)).unwrap();
+        store.upsert_chunk_embedding(make_upsert("c2", 6, 10, 4)).unwrap();
+        store.upsert_chunk_embedding(make_upsert("c3", 11, 15, 4)).unwrap();
+
+        let deleted = store
+            .prune_chunks_through_ordinal("prof-1", "gen-1", 10)
+            .unwrap();
+        assert_eq!(deleted, 2); // c1 (end=5) and c2 (end=10) deleted
+
+        // c3 should remain
+        let hits = store
+            .semantic_search("prof-1", "gen-1", &make_normalized_vec(4), 10)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].chunk_id, "c3");
+    }
+
+    #[test]
+    fn prune_returns_zero_when_nothing_to_delete() {
+        let store = open_in_memory();
+        setup_generation(&store);
+
+        let deleted = store
+            .prune_chunks_through_ordinal("prof-1", "gen-1", 100)
+            .unwrap();
+        assert_eq!(deleted, 0);
+    }
+
+    // ── Store: semantic_search tests ──────────────────────────────────────
+
+    #[test]
+    fn semantic_search_empty_store_returns_empty() {
+        let store = open_in_memory();
+        setup_generation(&store);
+
+        let hits = store
+            .semantic_search("prof-1", "gen-1", &make_normalized_vec(4), 10)
+            .unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn semantic_search_empty_query_returns_empty() {
+        let store = open_in_memory();
+        let hits = store
+            .semantic_search("prof-1", "gen-1", &[], 10)
+            .unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn semantic_search_non_finite_query_fails() {
+        let store = open_in_memory();
+        let result = store.semantic_search("prof-1", "gen-1", &[f32::NAN], 10);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn semantic_search_returns_results_sorted_by_score() {
+        let mut store = open_in_memory();
+        setup_generation(&store);
+
+        // Insert two chunks with different embeddings
+        let mut p1 = make_upsert("c1", 0, 5, 3);
+        p1.embedding = normalize_vec(&[1.0, 0.0, 0.0]);
+        store.upsert_chunk_embedding(p1).unwrap();
+
+        let mut p2 = make_upsert("c2", 6, 10, 3);
+        p2.embedding = normalize_vec(&[0.9, 0.1, 0.0]);
+        store.upsert_chunk_embedding(p2).unwrap();
+
+        // Query with [1, 0, 0] => c1 should be highest score
+        let query = normalize_vec(&[1.0, 0.0, 0.0]);
+        let hits = store
+            .semantic_search("prof-1", "gen-1", &query, 10)
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits[0].score >= hits[1].score);
+        assert_eq!(hits[0].chunk_id, "c1");
+    }
+
+    #[test]
+    fn semantic_search_respects_limit() {
+        let mut store = open_in_memory();
+        setup_generation(&store);
+
+        for i in 0..5 {
+            store
+                .upsert_chunk_embedding(make_upsert(
+                    &format!("c{i}"),
+                    i * 10,
+                    i * 10 + 5,
+                    4,
+                ))
+                .unwrap();
+        }
+
+        let hits = store
+            .semantic_search("prof-1", "gen-1", &make_normalized_vec(4), 2)
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn semantic_search_dimension_mismatch_returns_no_hits() {
+        let mut store = open_in_memory();
+        setup_generation(&store);
+
+        store.upsert_chunk_embedding(make_upsert("c1", 0, 5, 4)).unwrap();
+
+        // Query with different dimension
+        let hits = store
+            .semantic_search("prof-1", "gen-1", &make_normalized_vec(8), 10)
+            .unwrap();
+        assert!(hits.is_empty());
+    }
+
+    // ── Store: drift_report tests ─────────────────────────────────────────
+
+    #[test]
+    fn drift_report_empty_generation() {
+        let store = open_in_memory();
+        setup_generation(&store);
+
+        let report = store
+            .drift_report("prof-1", "gen-1", "lex-v1", None)
+            .unwrap();
+        assert_eq!(report.total_chunks, 0);
+        assert!(!report.lexical_schema_mismatch);
+        assert_eq!(report.chunks_beyond_lexical, 0);
+    }
+
+    #[test]
+    fn drift_report_detects_schema_mismatch() {
+        let store = open_in_memory();
+        setup_generation(&store);
+
+        let report = store
+            .drift_report("prof-1", "gen-1", "lex-v999", None)
+            .unwrap();
+        assert!(report.lexical_schema_mismatch);
+        assert_eq!(report.expected_lexical_schema_version, "lex-v999");
+        assert_eq!(report.generation_lexical_schema_version, "lex-v1");
+    }
+
+    #[test]
+    fn drift_report_counts_chunks_beyond_lexical() {
+        let mut store = open_in_memory();
+        setup_generation(&store);
+
+        store.upsert_chunk_embedding(make_upsert("c1", 0, 5, 4)).unwrap();
+        store.upsert_chunk_embedding(make_upsert("c2", 6, 15, 4)).unwrap();
+
+        let report = store
+            .drift_report("prof-1", "gen-1", "lex-v1", Some(10))
+            .unwrap();
+        assert_eq!(report.total_chunks, 2);
+        assert_eq!(report.chunks_beyond_lexical, 1); // c2 end_ordinal=15 > 10
+    }
+
+    #[test]
+    fn drift_report_nonexistent_generation_fails() {
+        let store = open_in_memory();
+        let result = store.drift_report("missing", "missing", "lex-v1", None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn drift_report_detects_non_normalized_chunks() {
+        let mut store = open_in_memory();
+        setup_generation(&store);
+
+        // Insert a chunk with normalized vector
+        store.upsert_chunk_embedding(make_upsert("c1", 0, 5, 4)).unwrap();
+
+        // Directly insert a non-normalized vector via SQL
+        let blob = encode_f32_embedding_blob(&[2.0, 0.0, 0.0, 0.0]);
+        store
+            .conn
+            .execute(
+                "INSERT INTO semantic_chunk_embeddings (
+                    profile_id, generation_id, chunk_id, chunk_policy_version,
+                    pane_id, session_id, direction,
+                    start_segment_id, start_ordinal, start_byte_offset,
+                    end_segment_id, end_ordinal, end_byte_offset,
+                    event_count, text_chars, content_hash,
+                    embedding_dimension, embedding_vector, inserted_at, updated_at
+                ) VALUES (
+                    'prof-1', 'gen-1', 'c-bad', 'ft.recorder.chunking.v1',
+                    1, NULL, 'egress',
+                    0, 10, 1000,
+                    0, 15, 1500,
+                    1, 50, 'hash-bad',
+                    4, ?1, 1000, 1000
+                )",
+                params![blob],
+            )
+            .unwrap();
+
+        let report = store
+            .drift_report("prof-1", "gen-1", "lex-v1", None)
+            .unwrap();
+        assert_eq!(report.non_normalized_chunks, 1);
+    }
+
+    // ── ChunkVectorHit serde roundtrip ────────────────────────────────────
+
+    #[test]
+    fn chunk_vector_hit_serde_roundtrip() {
+        let hit = ChunkVectorHit {
+            profile_id: "p1".to_string(),
+            generation_id: "g1".to_string(),
+            chunk_id: "c1".to_string(),
+            score: 0.95,
+            direction: ChunkDirection::Egress,
+            start_offset: ChunkSourceOffset {
+                segment_id: 0,
+                ordinal: 0,
+                byte_offset: 0,
+            },
+            end_offset: ChunkSourceOffset {
+                segment_id: 0,
+                ordinal: 5,
+                byte_offset: 500,
+            },
+            content_hash: "hash123".to_string(),
+        };
+
+        let json = serde_json::to_string(&hit).unwrap();
+        let parsed: ChunkVectorHit = serde_json::from_str(&json).unwrap();
+        assert_eq!(hit.chunk_id, parsed.chunk_id);
+        assert_eq!(hit.score, parsed.score);
+    }
+
+    // ── ChunkVectorDriftReport serde roundtrip ────────────────────────────
+
+    #[test]
+    fn drift_report_serde_roundtrip() {
+        let report = ChunkVectorDriftReport {
+            profile_id: "p1".to_string(),
+            generation_id: "g1".to_string(),
+            chunk_policy_version: "chunk-v1".to_string(),
+            generation_status: SemanticGenerationStatus::Active,
+            generation_lexical_schema_version: "lex-v1".to_string(),
+            expected_lexical_schema_version: "lex-v1".to_string(),
+            lexical_schema_mismatch: false,
+            lexical_upto_ordinal: Some(100),
+            total_chunks: 50,
+            max_vector_ordinal: Some(95),
+            chunks_beyond_lexical: 3,
+            non_normalized_chunks: 0,
+        };
+
+        let json = serde_json::to_string(&report).unwrap();
+        let parsed: ChunkVectorDriftReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(report, parsed);
+    }
+
+    // ── Helper for normalizing a vector ───────────────────────────────────
+
+    fn normalize_vec(v: &[f32]) -> Vec<f32> {
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm == 0.0 {
+            return v.to_vec();
+        }
+        v.iter().map(|x| x / norm).collect()
+    }
+}
