@@ -1995,4 +1995,28 @@ mod test {
             );
         }
     }
+
+    #[test]
+    fn emoji_codepoints_via_from_char() {
+        // U+1F600 GRINNING FACE
+        assert_eq!(WcWidth::from_char('\u{1f600}'), WcWidth::WidenedIn9);
+    }
+
+    #[test]
+    fn tab_is_nonprint() {
+        assert_eq!(WcWidth::from_char('\t'), WcWidth::NonPrint);
+    }
+
+    #[test]
+    fn lookup_table_agrees_for_private_use() {
+        let table = WcLookupTable::new();
+        for c in ['\u{e000}', '\u{e100}', '\u{f8ff}'] {
+            assert_eq!(
+                table.classify(c),
+                WcWidth::from_char(c),
+                "mismatch for U+{:04X}",
+                c as u32
+            );
+        }
+    }
 }
