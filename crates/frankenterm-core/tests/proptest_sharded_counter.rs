@@ -311,3 +311,251 @@ proptest! {
         prop_assert_eq!(counter.get(), initial + delta);
     }
 }
+
+// ============================================================================
+// NEW: Counter add is commutative (different shard counts, same total)
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn prop_counter_shard_count_independent(
+        shards_a in 1usize..=16,
+        shards_b in 1usize..=16,
+        values in arb_small_values(),
+    ) {
+        let counter_a = ShardedCounter::with_shards(shards_a);
+        let counter_b = ShardedCounter::with_shards(shards_b);
+        for &v in &values {
+            counter_a.add(v);
+            counter_b.add(v);
+        }
+        prop_assert_eq!(
+            counter_a.get(), counter_b.get(),
+            "counters with different shard counts should give same total"
+        );
+    }
+}
+
+// ============================================================================
+// NEW: Counter reset then add gives just the added amount
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn prop_counter_reset_then_add(
+        shards in arb_shard_count(),
+        before in arb_small_values(),
+        after_val in 0u64..=10_000,
+    ) {
+        let counter = ShardedCounter::with_shards(shards);
+        for &v in &before {
+            counter.add(v);
+        }
+        counter.reset();
+        counter.add(after_val);
+        prop_assert_eq!(
+            counter.get(), after_val,
+            "after reset and add({}), get should be {}", after_val, after_val
+        );
+    }
+}
+
+// ============================================================================
+// NEW: Multiple resets are idempotent
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn prop_counter_double_reset(
+        shards in arb_shard_count(),
+        values in arb_small_values(),
+    ) {
+        let counter = ShardedCounter::with_shards(shards);
+        for &v in &values {
+            counter.add(v);
+        }
+        counter.reset();
+        counter.reset();
+        prop_assert_eq!(counter.get(), 0, "double reset should still be zero");
+    }
+}
+
+// ============================================================================
+// NEW: Max of single value equals that value
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn prop_max_single_value(
+        shards in arb_shard_count(),
+        value in any::<u64>(),
+    ) {
+        let max_tracker = ShardedMax::with_shards(shards);
+        max_tracker.observe(value);
+        prop_assert_eq!(max_tracker.get(), value);
+    }
+}
+
+// ============================================================================
+// NEW: Max is independent of shard count
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn prop_max_shard_count_independent(
+        shards_a in 1usize..=16,
+        shards_b in 1usize..=16,
+        values in arb_values(),
+    ) {
+        let max_a = ShardedMax::with_shards(shards_a);
+        let max_b = ShardedMax::with_shards(shards_b);
+        for &v in &values {
+            max_a.observe(v);
+            max_b.observe(v);
+        }
+        prop_assert_eq!(
+            max_a.get(), max_b.get(),
+            "max trackers with different shard counts should give same result"
+        );
+    }
+}
+
+// ============================================================================
+// NEW: Fresh max tracker returns 0
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn prop_max_fresh_is_zero(shards in arb_shard_count()) {
+        let max_tracker = ShardedMax::with_shards(shards);
+        prop_assert_eq!(max_tracker.get(), 0, "fresh max tracker should return 0");
+    }
+}
+
+// ============================================================================
+// NEW: Max reset then observe gives only the observed value
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn prop_max_reset_then_observe(
+        shards in arb_shard_count(),
+        before in arb_values(),
+        after_val in any::<u64>(),
+    ) {
+        let max_tracker = ShardedMax::with_shards(shards);
+        for &v in &before {
+            max_tracker.observe(v);
+        }
+        max_tracker.reset();
+        max_tracker.observe(after_val);
+        prop_assert_eq!(
+            max_tracker.get(), after_val,
+            "after reset and observe({}), get should be {}", after_val, after_val
+        );
+    }
+}
+
+// ============================================================================
+// NEW: Gauge set then get_max returns the value
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn prop_gauge_set_then_get_max(n in arb_shard_count(), val in 1u64..1_000_000) {
+        let gauge = ShardedGauge::with_shards(n);
+        gauge.set(val);
+        let observed = gauge.get_max();
+        prop_assert!(
+            observed >= val,
+            "gauge get_max should be >= set value: observed={}, val={}", observed, val
+        );
+    }
+}
+
+// ============================================================================
+// NEW: Snapshot serde is deterministic
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn prop_snapshot_serde_deterministic(snap in arb_snapshot()) {
+        let j1 = serde_json::to_string(&snap).unwrap();
+        let j2 = serde_json::to_string(&snap).unwrap();
+        prop_assert_eq!(&j1, &j2);
+    }
+}
+
+// ============================================================================
+// NEW: Snapshot with empty vecs round-trips through serde
+// ============================================================================
+
+#[test]
+fn snapshot_empty_vecs_round_trip() {
+    let snap = ShardedSnapshot {
+        counters: vec![],
+        maxes: vec![],
+        gauges: vec![],
+    };
+    let json = serde_json::to_string(&snap).unwrap();
+    let back: ShardedSnapshot = serde_json::from_str(&json).unwrap();
+    assert!(back.counters.is_empty());
+    assert!(back.maxes.is_empty());
+    assert!(back.gauges.is_empty());
+}
+
+// ============================================================================
+// NEW: Counter Debug formatting
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn prop_counter_debug_nonempty(shards in arb_shard_count()) {
+        let counter = ShardedCounter::with_shards(shards);
+        counter.add(42);
+        let dbg = format!("{:?}", counter);
+        prop_assert!(!dbg.is_empty());
+    }
+
+    #[test]
+    fn prop_max_debug_nonempty(shards in arb_shard_count()) {
+        let max_tracker = ShardedMax::with_shards(shards);
+        max_tracker.observe(42);
+        let dbg = format!("{:?}", max_tracker);
+        prop_assert!(!dbg.is_empty());
+    }
+}
+
+// ============================================================================
+// NEW: Counter fresh state is zero
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn prop_counter_fresh_is_zero(shards in arb_shard_count()) {
+        let counter = ShardedCounter::with_shards(shards);
+        prop_assert_eq!(counter.get(), 0, "fresh counter should return 0");
+    }
+}
