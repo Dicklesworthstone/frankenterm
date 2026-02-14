@@ -720,3 +720,274 @@ proptest! {
         prop_assert_eq!(debug, back);
     }
 }
+
+// ===========================================================================
+// Interactive always scheduled before background (priority ordering)
+// ===========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn prop_interactive_scheduled_before_background(
+        n_bg in 1u64..4,
+        n_int in 1u64..4,
+    ) {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig {
+            frame_budget_units: 1,
+            input_guardrail_enabled: false,
+            ..ResizeSchedulerConfig::default()
+        });
+        // Submit background work first
+        for p in 1..=n_bg {
+            let intent = ResizeIntent {
+                pane_id: p,
+                intent_seq: 1,
+                scheduler_class: ResizeWorkClass::Background,
+                work_units: 1,
+                submitted_at_ms: 1000,
+                domain: ResizeDomain::Local,
+                tab_id: None,
+            };
+            let _ = scheduler.submit_intent(intent);
+        }
+        // Then submit interactive work
+        for p in (n_bg + 1)..=(n_bg + n_int) {
+            let intent = ResizeIntent {
+                pane_id: p,
+                intent_seq: 1,
+                scheduler_class: ResizeWorkClass::Interactive,
+                work_units: 1,
+                submitted_at_ms: 1001,
+                domain: ResizeDomain::Local,
+                tab_id: None,
+            };
+            let _ = scheduler.submit_intent(intent);
+        }
+        // Schedule one frame with budget=1
+        let result = scheduler.schedule_frame_with_budget(1);
+        if !result.scheduled.is_empty() {
+            let snap = scheduler.snapshot();
+            let active_pane = snap.panes.iter().find(|p| p.active_seq.is_some());
+            if let Some(active) = active_pane {
+                prop_assert!(
+                    active.pane_id > n_bg,
+                    "interactive pane should be picked first, but got pane_id={} (bg range 1..={})",
+                    active.pane_id, n_bg
+                );
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// Supersession: newer intent makes active stale
+// ===========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn prop_supersession_detected(
+        pane_id in 1u64..100,
+    ) {
+        let mut scheduler = make_default_scheduler();
+        let intent1 = ResizeIntent {
+            pane_id,
+            intent_seq: 1,
+            scheduler_class: ResizeWorkClass::Interactive,
+            work_units: 1,
+            submitted_at_ms: 1000,
+            domain: ResizeDomain::Local,
+            tab_id: None,
+        };
+        let _ = scheduler.submit_intent(intent1);
+        let _ = scheduler.schedule_frame();
+
+        let intent2 = ResizeIntent {
+            pane_id,
+            intent_seq: 2,
+            scheduler_class: ResizeWorkClass::Interactive,
+            work_units: 1,
+            submitted_at_ms: 1001,
+            domain: ResizeDomain::Local,
+            tab_id: None,
+        };
+        let outcome = scheduler.submit_intent(intent2);
+        prop_assert!(
+            !matches!(outcome, SubmitOutcome::RejectedNonMonotonic { .. }),
+            "seq 2 after seq 1 should not be rejected, got {:?}", outcome
+        );
+        let is_superseded = scheduler.active_is_superseded(pane_id);
+        prop_assert!(is_superseded,
+            "active intent should be superseded after newer submit");
+    }
+}
+
+// ===========================================================================
+// Overload admission: max_pending_panes cap
+// ===========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(80))]
+
+    #[test]
+    fn prop_overload_rejects_beyond_cap(
+        cap in 1usize..5,
+    ) {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig {
+            max_pending_panes: cap,
+            ..ResizeSchedulerConfig::default()
+        });
+        let mut accepted = 0usize;
+        let mut rejected = 0usize;
+        for p in 1..=(cap as u64 + 2) {
+            let intent = ResizeIntent {
+                pane_id: p,
+                intent_seq: 1,
+                scheduler_class: ResizeWorkClass::Background,
+                work_units: 1,
+                submitted_at_ms: 1000,
+                domain: ResizeDomain::Local,
+                tab_id: None,
+            };
+            let outcome = scheduler.submit_intent(intent);
+            match outcome {
+                SubmitOutcome::Accepted { .. } => accepted += 1,
+                SubmitOutcome::DroppedOverload { .. } => rejected += 1,
+                _ => {}
+            }
+        }
+        prop_assert!(
+            scheduler.pending_total() <= cap,
+            "pending {} should not exceed cap {}", scheduler.pending_total(), cap
+        );
+        prop_assert!(
+            rejected > 0,
+            "some submits should be rejected when exceeding cap {}; accepted={}, rejected={}",
+            cap, accepted, rejected
+        );
+    }
+}
+
+// ===========================================================================
+// Lifecycle events: each pane's events start with Queued
+// ===========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(80))]
+
+    #[test]
+    fn prop_lifecycle_stage_ordering(steps in arb_steps(40)) {
+        let debug = execute_trace(&steps);
+        let mut per_intent: HashMap<(u64, u64), Vec<ResizeLifecycleStage>> = HashMap::new();
+        for event in &debug.lifecycle_events {
+            per_intent
+                .entry((event.pane_id, event.intent_seq))
+                .or_default()
+                .push(event.stage);
+        }
+        for ((pane_id, intent_seq), stages) in &per_intent {
+            if let Some(first) = stages.first() {
+                prop_assert_eq!(
+                    *first,
+                    ResizeLifecycleStage::Queued,
+                    "first event for pane {} seq {} should be Queued, got {:?}",
+                    pane_id, intent_seq, first
+                );
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// Phase progression: mark_active_phase advances correctly
+// ===========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn prop_phase_progression(
+        pane_id in 1u64..100,
+    ) {
+        let mut scheduler = make_default_scheduler();
+        let intent = ResizeIntent {
+            pane_id,
+            intent_seq: 1,
+            scheduler_class: ResizeWorkClass::Interactive,
+            work_units: 1,
+            submitted_at_ms: 1000,
+            domain: ResizeDomain::Local,
+            tab_id: None,
+        };
+        let _ = scheduler.submit_intent(intent);
+        let _ = scheduler.schedule_frame();
+
+        let snap = scheduler.snapshot();
+        let pane = snap.panes.iter().find(|p| p.pane_id == pane_id);
+        if let Some(p) = pane {
+            if p.active_seq.is_some() {
+                let ok = scheduler.mark_active_phase(
+                    pane_id, 1, ResizeExecutionPhase::Reflowing, 1001);
+                prop_assert!(ok, "mark Reflowing should succeed");
+
+                let ok = scheduler.mark_active_phase(
+                    pane_id, 1, ResizeExecutionPhase::Presenting, 1002);
+                prop_assert!(ok, "mark Presenting should succeed");
+
+                let ok = scheduler.complete_active(pane_id, 1);
+                prop_assert!(ok, "complete should succeed");
+
+                let snap2 = scheduler.snapshot();
+                let pane2 = snap2.panes.iter().find(|p| p.pane_id == pane_id);
+                if let Some(p2) = pane2 {
+                    prop_assert!(p2.active_seq.is_none(),
+                        "after complete, active_seq should be None");
+                }
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// Deferral aging: background work eventually gets scheduled
+// ===========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(80))]
+
+    #[test]
+    fn prop_background_eventually_scheduled(
+        max_deferrals in 1u32..5,
+    ) {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig {
+            frame_budget_units: 0,
+            max_deferrals_before_force: max_deferrals,
+            input_guardrail_enabled: false,
+            ..ResizeSchedulerConfig::default()
+        });
+        let intent = ResizeIntent {
+            pane_id: 1,
+            intent_seq: 1,
+            scheduler_class: ResizeWorkClass::Background,
+            work_units: 1,
+            submitted_at_ms: 1000,
+            domain: ResizeDomain::Local,
+            tab_id: None,
+        };
+        let _ = scheduler.submit_intent(intent);
+
+        let mut was_scheduled = false;
+        for _ in 0..(max_deferrals as usize + 10) {
+            let _ = scheduler.schedule_frame();
+            if scheduler.active_total() > 0 {
+                was_scheduled = true;
+                break;
+            }
+        }
+        prop_assert!(was_scheduled,
+            "background work should eventually be force-scheduled after {} deferrals",
+            max_deferrals);
+    }
+}
