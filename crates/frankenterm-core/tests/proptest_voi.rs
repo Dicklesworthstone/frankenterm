@@ -16,11 +16,28 @@
 //! 11. Backpressure reduces VOI: Red < Green for same pane
 //! 12. Register/unregister: pane_count tracks correctly
 //! 13. Observations tracked: total_observations increments
+//!
+//! Serde roundtrip coverage:
+//! 14. VoiConfig serde roundtrip: all fields survive JSON encode/decode
+//! 15. VoiConfig default from empty JSON: {} produces Default::default()
+//! 16. VoiConfig deterministic: double-serialize produces identical JSON
+//! 17. BackpressureMultipliers serde roundtrip: green/yellow/red survive JSON
+//! 18. BackpressureMultipliers deterministic: double-serialize identical
+//! 19. SchedulingDecision serde roundtrip: all 7 fields survive JSON
+//! 20. ScheduleResult serde roundtrip: schedule vec + total_entropy + above_threshold
+//! 21. VoiSnapshot serde roundtrip: pane_count + observations + config + entries
+//! 22. PaneSnapshotEntry serde roundtrip: all 6 fields survive JSON
+//! 23. VoiSnapshot from scheduler: snapshot() produces valid serde roundtrip
+//! 24. Schedule completeness: all registered panes appear
+//! 25. Snapshot consistency
 
 use proptest::prelude::*;
 
 use frankenterm_core::bayesian_ledger::PaneState;
-use frankenterm_core::voi::{BackpressureTierInput, VoiConfig, VoiScheduler};
+use frankenterm_core::voi::{
+    BackpressureMultipliers, BackpressureTierInput, PaneSnapshotEntry, ScheduleResult,
+    SchedulingDecision, VoiConfig, VoiScheduler, VoiSnapshot,
+};
 
 // =============================================================================
 // Strategies
@@ -59,6 +76,99 @@ fn arb_config() -> impl Strategy<Value = VoiConfig> {
                 ..VoiConfig::default()
             },
         )
+}
+
+fn arb_pane_state() -> impl Strategy<Value = PaneState> {
+    prop_oneof![
+        Just(PaneState::Active),
+        Just(PaneState::Thinking),
+        Just(PaneState::Idle),
+        Just(PaneState::RateLimited),
+        Just(PaneState::Error),
+        Just(PaneState::Stuck),
+        Just(PaneState::Background),
+    ]
+}
+
+fn arb_backpressure_multipliers() -> impl Strategy<Value = BackpressureMultipliers> {
+    (
+        0.5_f64..5.0, // green
+        1.0_f64..10.0, // yellow
+        2.0_f64..20.0, // red
+    )
+        .prop_map(|(g, y, r)| BackpressureMultipliers {
+            green: g,
+            yellow: y,
+            red: r,
+        })
+}
+
+fn arb_scheduling_decision() -> impl Strategy<Value = SchedulingDecision> {
+    (
+        1_u64..10_000,      // pane_id
+        0.0_f64..100.0,     // voi
+        0.0_f64..10.0,      // entropy
+        0.1_f64..10.0,      // importance
+        0.1_f64..100.0,     // effective_cost
+        arb_pane_state(),    // map_state
+        0_u64..1_000_000,   // staleness_ms
+    )
+        .prop_map(|(pid, voi, entropy, importance, cost, state, stale)| SchedulingDecision {
+            pane_id: pid,
+            voi,
+            entropy,
+            importance,
+            effective_cost: cost,
+            map_state: state,
+            staleness_ms: stale,
+        })
+}
+
+fn arb_pane_snapshot_entry() -> impl Strategy<Value = PaneSnapshotEntry> {
+    (
+        1_u64..10_000,      // pane_id
+        0.0_f64..10.0,      // entropy
+        arb_pane_state(),    // map_state
+        0_u64..1_000_000,   // staleness_ms
+        0_u64..100_000,     // observations
+        0.1_f64..10.0,      // importance
+    )
+        .prop_map(|(pid, entropy, state, stale, obs, imp)| PaneSnapshotEntry {
+            pane_id: pid,
+            entropy,
+            map_state: state,
+            staleness_ms: stale,
+            observations: obs,
+            importance: imp,
+        })
+}
+
+fn arb_schedule_result() -> impl Strategy<Value = ScheduleResult> {
+    (
+        proptest::collection::vec(arb_scheduling_decision(), 0..10),
+        0.0_f64..100.0,
+        0_usize..50,
+    )
+        .prop_map(|(schedule, total_entropy, above_threshold)| ScheduleResult {
+            schedule,
+            total_entropy,
+            above_threshold,
+        })
+}
+
+fn arb_voi_snapshot() -> impl Strategy<Value = VoiSnapshot> {
+    (
+        proptest::collection::vec(arb_pane_snapshot_entry(), 0..10),
+        0_u64..100_000,
+        0.0_f64..100.0,
+    )
+        .prop_map(|(entries, total_obs, total_entropy)| VoiSnapshot {
+            pane_count: entries.len(),
+            total_observations: total_obs,
+            total_entropy,
+            config: VoiConfig::default(),
+            pane_states: entries,
+        })
 }
 
 // =============================================================================
@@ -535,5 +645,197 @@ proptest! {
             prop_assert!(entry.entropy >= 0.0);
             prop_assert!(entry.entropy <= snap.config.max_entropy + 0.01);
         }
+    }
+}
+
+// =============================================================================
+// Serde: VoiConfig roundtrip
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn voi_config_serde_roundtrip(config in arb_config()) {
+        let json = serde_json::to_string(&config).unwrap();
+        let back: VoiConfig = serde_json::from_str(&json).unwrap();
+        prop_assert!((back.min_voi_threshold - config.min_voi_threshold).abs() < 1e-10,
+            "min_voi_threshold: {} vs {}", back.min_voi_threshold, config.min_voi_threshold);
+        prop_assert!((back.entropy_drift_rate - config.entropy_drift_rate).abs() < 1e-10,
+            "entropy_drift_rate: {} vs {}", back.entropy_drift_rate, config.entropy_drift_rate);
+        prop_assert_eq!(back.min_poll_interval_ms, config.min_poll_interval_ms);
+        prop_assert_eq!(back.max_poll_interval_ms, config.max_poll_interval_ms);
+        prop_assert!((back.default_cost_ms - config.default_cost_ms).abs() < 1e-10,
+            "default_cost_ms: {} vs {}", back.default_cost_ms, config.default_cost_ms);
+        prop_assert!((back.default_importance - config.default_importance).abs() < 1e-10,
+            "default_importance: {} vs {}", back.default_importance, config.default_importance);
+        prop_assert!((back.max_entropy - config.max_entropy).abs() < 1e-10,
+            "max_entropy: {} vs {}", back.max_entropy, config.max_entropy);
+    }
+
+    #[test]
+    fn voi_config_default_from_empty_json(_dummy in 0..1_u32) {
+        let back: VoiConfig = serde_json::from_str("{}").unwrap();
+        let def = VoiConfig::default();
+        prop_assert!((back.min_voi_threshold - def.min_voi_threshold).abs() < 1e-10);
+        prop_assert!((back.entropy_drift_rate - def.entropy_drift_rate).abs() < 1e-10);
+        prop_assert_eq!(back.min_poll_interval_ms, def.min_poll_interval_ms);
+        prop_assert_eq!(back.max_poll_interval_ms, def.max_poll_interval_ms);
+        prop_assert!((back.default_cost_ms - def.default_cost_ms).abs() < 1e-10);
+        prop_assert!((back.default_importance - def.default_importance).abs() < 1e-10);
+    }
+
+    #[test]
+    fn voi_config_deterministic(config in arb_config()) {
+        let json1 = serde_json::to_string(&config).unwrap();
+        let json2 = serde_json::to_string(&config).unwrap();
+        prop_assert_eq!(json1, json2);
+    }
+}
+
+// =============================================================================
+// Serde: BackpressureMultipliers roundtrip
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn bp_multipliers_serde_roundtrip(bpm in arb_backpressure_multipliers()) {
+        let json = serde_json::to_string(&bpm).unwrap();
+        let back: BackpressureMultipliers = serde_json::from_str(&json).unwrap();
+        prop_assert!((back.green - bpm.green).abs() < 1e-10,
+            "green: {} vs {}", back.green, bpm.green);
+        prop_assert!((back.yellow - bpm.yellow).abs() < 1e-10,
+            "yellow: {} vs {}", back.yellow, bpm.yellow);
+        prop_assert!((back.red - bpm.red).abs() < 1e-10,
+            "red: {} vs {}", back.red, bpm.red);
+    }
+
+    #[test]
+    fn bp_multipliers_deterministic(bpm in arb_backpressure_multipliers()) {
+        let json1 = serde_json::to_string(&bpm).unwrap();
+        let json2 = serde_json::to_string(&bpm).unwrap();
+        prop_assert_eq!(json1, json2);
+    }
+}
+
+// =============================================================================
+// Serde: SchedulingDecision roundtrip
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn scheduling_decision_serde_roundtrip(dec in arb_scheduling_decision()) {
+        let json = serde_json::to_string(&dec).unwrap();
+        let back: SchedulingDecision = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.pane_id, dec.pane_id);
+        prop_assert!((back.voi - dec.voi).abs() < 1e-10,
+            "voi: {} vs {}", back.voi, dec.voi);
+        prop_assert!((back.entropy - dec.entropy).abs() < 1e-10,
+            "entropy: {} vs {}", back.entropy, dec.entropy);
+        prop_assert!((back.importance - dec.importance).abs() < 1e-10,
+            "importance: {} vs {}", back.importance, dec.importance);
+        prop_assert!((back.effective_cost - dec.effective_cost).abs() < 1e-10,
+            "effective_cost: {} vs {}", back.effective_cost, dec.effective_cost);
+        prop_assert_eq!(back.map_state, dec.map_state);
+        prop_assert_eq!(back.staleness_ms, dec.staleness_ms);
+    }
+}
+
+// =============================================================================
+// Serde: ScheduleResult roundtrip
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn schedule_result_serde_roundtrip(result in arb_schedule_result()) {
+        let json = serde_json::to_string(&result).unwrap();
+        let back: ScheduleResult = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.schedule.len(), result.schedule.len());
+        prop_assert!((back.total_entropy - result.total_entropy).abs() < 1e-10,
+            "total_entropy: {} vs {}", back.total_entropy, result.total_entropy);
+        prop_assert_eq!(back.above_threshold, result.above_threshold);
+        // Spot-check first entry if present
+        if let (Some(orig), Some(rt)) = (result.schedule.first(), back.schedule.first()) {
+            prop_assert_eq!(rt.pane_id, orig.pane_id);
+            prop_assert!((rt.voi - orig.voi).abs() < 1e-10);
+        }
+    }
+}
+
+// =============================================================================
+// Serde: VoiSnapshot roundtrip
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn voi_snapshot_serde_roundtrip(snap in arb_voi_snapshot()) {
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: VoiSnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.pane_count, snap.pane_count);
+        prop_assert_eq!(back.total_observations, snap.total_observations);
+        prop_assert!((back.total_entropy - snap.total_entropy).abs() < 1e-10,
+            "total_entropy: {} vs {}", back.total_entropy, snap.total_entropy);
+        prop_assert_eq!(back.pane_states.len(), snap.pane_states.len());
+        // Spot-check first entry
+        if let (Some(orig), Some(rt)) = (snap.pane_states.first(), back.pane_states.first()) {
+            prop_assert_eq!(rt.pane_id, orig.pane_id);
+            prop_assert!((rt.entropy - orig.entropy).abs() < 1e-10);
+            prop_assert_eq!(rt.map_state, orig.map_state);
+        }
+    }
+}
+
+// =============================================================================
+// Serde: PaneSnapshotEntry roundtrip
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn pane_snapshot_entry_serde_roundtrip(entry in arb_pane_snapshot_entry()) {
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: PaneSnapshotEntry = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.pane_id, entry.pane_id);
+        prop_assert!((back.entropy - entry.entropy).abs() < 1e-10,
+            "entropy: {} vs {}", back.entropy, entry.entropy);
+        prop_assert_eq!(back.map_state, entry.map_state);
+        prop_assert_eq!(back.staleness_ms, entry.staleness_ms);
+        prop_assert_eq!(back.observations, entry.observations);
+        prop_assert!((back.importance - entry.importance).abs() < 1e-10,
+            "importance: {} vs {}", back.importance, entry.importance);
+    }
+}
+
+// =============================================================================
+// Serde: Snapshot from scheduler survives roundtrip
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn snapshot_from_scheduler_serde(
+        pane_ids in arb_pane_ids(5),
+        start_ms in arb_time_ms(),
+    ) {
+        let mut sched = VoiScheduler::new(VoiConfig::default());
+        for &id in &pane_ids {
+            sched.register_pane(id, start_ms);
+        }
+        let snap = sched.snapshot(start_ms + 1000);
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: VoiSnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.pane_count, snap.pane_count);
+        prop_assert_eq!(back.pane_states.len(), snap.pane_states.len());
+        prop_assert_eq!(back.total_observations, snap.total_observations);
     }
 }

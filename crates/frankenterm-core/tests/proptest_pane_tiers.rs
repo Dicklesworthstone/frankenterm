@@ -15,11 +15,26 @@
 //! 10. classify_all covers all panes: result has entry for every registered pane
 //! 11. Config interval_for consistent: custom config intervals applied correctly
 //! 12. Metrics total_panes consistent: metrics.total_panes == pane_count
+//!
+//! Serde roundtrip coverage:
+//! 13. PaneTier serde roundtrip: all variants survive JSON encode/decode
+//! 14. PaneTier serializes to snake_case: "active", "thinking", etc.
+//! 15. PaneTier deterministic: double-serialize produces identical JSON
+//! 16. PaneTier rejects invalid: non-existent variant fails deserialization
+//! 17. TierConfig serde roundtrip: all fields survive JSON encode/decode
+//! 18. TierConfig default from empty JSON: {} produces Default::default()
+//! 19. TierConfig deterministic: double-serialize produces identical JSON
+//! 20. TierMetrics serde roundtrip: all fields survive JSON encode/decode
+//! 21. TierMetrics deterministic: double-serialize produces identical JSON
+//! 22. TierMetrics tier_counts roundtrip: HashMap<String,u64> preserves keys
+//! 23. TierMetrics estimated_rps precision: f64 survives JSON roundtrip within tolerance
+
+use std::collections::HashMap;
 
 use proptest::prelude::*;
 
 use frankenterm_core::backpressure::BackpressureTier;
-use frankenterm_core::pane_tiers::{PaneTier, PaneTierClassifier, TierConfig};
+use frankenterm_core::pane_tiers::{PaneTier, PaneTierClassifier, TierConfig, TierMetrics};
 
 // =============================================================================
 // Strategies
@@ -72,6 +87,33 @@ fn arb_config() -> impl Strategy<Value = TierConfig> {
             dormant_ms: d,
             idle_threshold_secs: it,
             dormant_threshold_secs: dt,
+        })
+}
+
+fn arb_tier_metrics() -> impl Strategy<Value = TierMetrics> {
+    (
+        0_u64..1000,   // active count
+        0_u64..1000,   // thinking count
+        0_u64..1000,   // idle count
+        0_u64..1000,   // background count
+        0_u64..1000,   // dormant count
+        0_u64..100_000, // total_transitions
+        0.001_f64..1000.0, // estimated_rps
+    )
+        .prop_map(|(ac, tc, ic, bc, dc, transitions, rps)| {
+            let mut tier_counts = HashMap::new();
+            tier_counts.insert("active".to_string(), ac);
+            tier_counts.insert("thinking".to_string(), tc);
+            tier_counts.insert("idle".to_string(), ic);
+            tier_counts.insert("background".to_string(), bc);
+            tier_counts.insert("dormant".to_string(), dc);
+            let total = ac + tc + ic + bc + dc;
+            TierMetrics {
+                tier_counts,
+                total_transitions: transitions,
+                total_panes: total,
+                estimated_rps: rps,
+            }
         })
 }
 
@@ -384,5 +426,146 @@ proptest! {
         // Don't register the pane
         prop_assert_eq!(clf.current_tier(pane_id), PaneTier::Active);
         prop_assert_eq!(clf.classify(pane_id), PaneTier::Active);
+    }
+}
+
+// =============================================================================
+// Serde: PaneTier roundtrip
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn pane_tier_serde_roundtrip(tier in arb_tier()) {
+        let json = serde_json::to_string(&tier).unwrap();
+        let back: PaneTier = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(tier, back);
+    }
+
+    #[test]
+    fn pane_tier_snake_case(tier in arb_tier()) {
+        let json = serde_json::to_string(&tier).unwrap();
+        let expected = match tier {
+            PaneTier::Active => "\"active\"",
+            PaneTier::Thinking => "\"thinking\"",
+            PaneTier::Idle => "\"idle\"",
+            PaneTier::Background => "\"background\"",
+            PaneTier::Dormant => "\"dormant\"",
+        };
+        prop_assert_eq!(json.as_str(), expected,
+            "PaneTier::{:?} should serialize to {}", tier, expected);
+    }
+
+    #[test]
+    fn pane_tier_deterministic(tier in arb_tier()) {
+        let json1 = serde_json::to_string(&tier).unwrap();
+        let json2 = serde_json::to_string(&tier).unwrap();
+        prop_assert_eq!(json1, json2);
+    }
+
+    #[test]
+    fn pane_tier_rejects_invalid(_dummy in 0..1_u32) {
+        let result = serde_json::from_str::<PaneTier>("\"nonexistent_tier\"");
+        prop_assert!(result.is_err(), "should reject invalid tier variant");
+    }
+}
+
+// =============================================================================
+// Serde: TierConfig roundtrip
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn tier_config_serde_roundtrip(config in arb_config()) {
+        let json = serde_json::to_string(&config).unwrap();
+        let back: TierConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.active_ms, config.active_ms);
+        prop_assert_eq!(back.thinking_ms, config.thinking_ms);
+        prop_assert_eq!(back.idle_ms, config.idle_ms);
+        prop_assert_eq!(back.background_ms, config.background_ms);
+        prop_assert_eq!(back.dormant_ms, config.dormant_ms);
+        prop_assert_eq!(back.idle_threshold_secs, config.idle_threshold_secs);
+        prop_assert_eq!(back.dormant_threshold_secs, config.dormant_threshold_secs);
+    }
+
+    #[test]
+    fn tier_config_default_from_empty_json(_dummy in 0..1_u32) {
+        let back: TierConfig = serde_json::from_str("{}").unwrap();
+        let def = TierConfig::default();
+        prop_assert_eq!(back.active_ms, def.active_ms);
+        prop_assert_eq!(back.thinking_ms, def.thinking_ms);
+        prop_assert_eq!(back.idle_ms, def.idle_ms);
+        prop_assert_eq!(back.background_ms, def.background_ms);
+        prop_assert_eq!(back.dormant_ms, def.dormant_ms);
+        prop_assert_eq!(back.idle_threshold_secs, def.idle_threshold_secs);
+        prop_assert_eq!(back.dormant_threshold_secs, def.dormant_threshold_secs);
+    }
+
+    #[test]
+    fn tier_config_deterministic(config in arb_config()) {
+        let json1 = serde_json::to_string(&config).unwrap();
+        let json2 = serde_json::to_string(&config).unwrap();
+        prop_assert_eq!(json1, json2);
+    }
+}
+
+// =============================================================================
+// Serde: TierMetrics roundtrip
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn tier_metrics_serde_roundtrip(metrics in arb_tier_metrics()) {
+        let json = serde_json::to_string(&metrics).unwrap();
+        let back: TierMetrics = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.total_transitions, metrics.total_transitions);
+        prop_assert_eq!(back.total_panes, metrics.total_panes);
+        prop_assert_eq!(back.tier_counts.len(), metrics.tier_counts.len());
+        for (k, v) in &metrics.tier_counts {
+            let back_v = back.tier_counts.get(k).copied().unwrap_or(0);
+            prop_assert_eq!(back_v, *v, "tier_counts[{}] mismatch", k);
+        }
+        // f64 comparison with tolerance for JSON roundtrip
+        prop_assert!((back.estimated_rps - metrics.estimated_rps).abs() < 1e-10,
+            "estimated_rps: {} vs {}", back.estimated_rps, metrics.estimated_rps);
+    }
+
+    #[test]
+    fn tier_metrics_deterministic(metrics in arb_tier_metrics()) {
+        let json1 = serde_json::to_string(&metrics).unwrap();
+        let json2 = serde_json::to_string(&metrics).unwrap();
+        prop_assert_eq!(json1, json2);
+    }
+
+    #[test]
+    fn tier_metrics_tier_counts_keys(metrics in arb_tier_metrics()) {
+        let json = serde_json::to_string(&metrics).unwrap();
+        let back: TierMetrics = serde_json::from_str(&json).unwrap();
+        // All original keys should be preserved
+        for key in metrics.tier_counts.keys() {
+            prop_assert!(back.tier_counts.contains_key(key),
+                "tier_counts should preserve key '{}'", key);
+        }
+    }
+
+    #[test]
+    fn tier_metrics_rps_precision(
+        rps in 0.001_f64..100_000.0,
+    ) {
+        let metrics = TierMetrics {
+            tier_counts: HashMap::new(),
+            total_transitions: 0,
+            total_panes: 0,
+            estimated_rps: rps,
+        };
+        let json = serde_json::to_string(&metrics).unwrap();
+        let back: TierMetrics = serde_json::from_str(&json).unwrap();
+        prop_assert!((back.estimated_rps - rps).abs() < 1e-10,
+            "rps should survive roundtrip: {} vs {}", back.estimated_rps, rps);
     }
 }
