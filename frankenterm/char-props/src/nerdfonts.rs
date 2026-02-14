@@ -120,4 +120,54 @@ mod tests {
             }
         }
     }
+
+    // ── Third-pass expansion ────────────────────────────────
+
+    #[test]
+    fn nerd_font_glyph_names_are_unique() {
+        use std::collections::HashSet;
+        let mut seen = HashSet::new();
+        for (name, _) in NERD_FONT_GLYPHS.iter() {
+            assert!(seen.insert(*name), "duplicate glyph name: {name}");
+        }
+    }
+
+    #[test]
+    fn nerd_font_glyph_chars_above_ascii() {
+        // All nerd font glyphs should be outside the basic ASCII range
+        for (name, ch) in NERD_FONT_GLYPHS.iter() {
+            assert!(
+                *ch as u32 > 0x7F,
+                "glyph {name} char U+{:04X} is within ASCII range",
+                *ch as u32
+            );
+        }
+    }
+
+    #[test]
+    fn nerd_font_first_and_last_differ() {
+        let first = NERD_FONT_GLYPHS.first().unwrap();
+        let last = NERD_FONT_GLYPHS.last().unwrap();
+        assert_ne!(first.0, last.0, "first and last glyph names should differ");
+    }
+
+    #[test]
+    fn nerd_fonts_map_len_equals_glyphs_len() {
+        // Confirm HashMap has no collisions (same as array length)
+        assert_eq!(NERD_FONTS.len(), NERD_FONT_GLYPHS.len());
+    }
+
+    #[test]
+    fn nerd_font_quarter_entry_roundtrips() {
+        let q = NERD_FONT_GLYPHS.len() / 4;
+        let (name, expected_char) = NERD_FONT_GLYPHS[q];
+        assert_eq!(NERD_FONTS.get(name), Some(&expected_char));
+    }
+
+    #[test]
+    fn nerd_font_three_quarter_entry_roundtrips() {
+        let q = (NERD_FONT_GLYPHS.len() * 3) / 4;
+        let (name, expected_char) = NERD_FONT_GLYPHS[q];
+        assert_eq!(NERD_FONTS.get(name), Some(&expected_char));
+    }
 }

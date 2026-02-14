@@ -218,4 +218,62 @@ mod tests {
         let c = a; // Still valid - Copy
         assert_eq!(b, c);
     }
+
+    // ── Third-pass expansion ────────────────────────────────
+
+    #[test]
+    fn control_chars_are_text() {
+        assert_eq!(Presentation::for_char('\t'), Presentation::Text);
+        assert_eq!(Presentation::for_char('\n'), Presentation::Text);
+        assert_eq!(Presentation::for_char('\x00'), Presentation::Text);
+    }
+
+    #[test]
+    fn snowman_is_text_presentation() {
+        // U+2603 SNOWMAN has text default presentation
+        assert_eq!(Presentation::for_char('\u{2603}'), Presentation::Text);
+    }
+
+    #[test]
+    fn for_grapheme_flag_sequence_is_emoji() {
+        // Two regional indicator letters form a flag (U+1F1FA U+1F1F8 = US)
+        let (default, _) = Presentation::for_grapheme("\u{1F1FA}\u{1F1F8}");
+        assert_eq!(default, Presentation::Emoji);
+    }
+
+    #[test]
+    fn keycap_base_chars_are_text() {
+        // '#' and '*' are keycap base characters but have text presentation
+        assert_eq!(Presentation::for_char('#'), Presentation::Text);
+        assert_eq!(Presentation::for_char('*'), Presentation::Text);
+    }
+
+    #[test]
+    fn for_grapheme_single_emoji_no_variation() {
+        // Single emoji char without variation selector => no explicit
+        let (default, explicit) = Presentation::for_grapheme("\u{1F4A9}");
+        assert_eq!(default, Presentation::Emoji);
+        assert_eq!(explicit, None);
+    }
+
+    #[test]
+    fn for_char_various_text_scripts() {
+        // Arabic, Hebrew, Cyrillic — all text presentation
+        assert_eq!(Presentation::for_char('\u{0627}'), Presentation::Text); // Arabic Alef
+        assert_eq!(Presentation::for_char('\u{05D0}'), Presentation::Text); // Hebrew Alef
+        assert_eq!(Presentation::for_char('\u{0410}'), Presentation::Text); // Cyrillic A
+    }
+
+    #[test]
+    fn for_char_clock_faces_are_emoji() {
+        // U+1F550 CLOCK FACE ONE OCLOCK has emoji presentation
+        assert_eq!(Presentation::for_char('\u{1F550}'), Presentation::Emoji);
+    }
+
+    #[test]
+    fn for_grapheme_zwj_only_is_text() {
+        // Bare ZWJ with no emoji should be text
+        let (default, _) = Presentation::for_grapheme("\u{200D}");
+        assert_eq!(default, Presentation::Text);
+    }
 }

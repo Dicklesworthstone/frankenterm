@@ -2019,4 +2019,67 @@ mod test {
             );
         }
     }
+
+    // ── Third-pass expansion ────────────────────────────────────
+
+    #[test]
+    fn width_u9_unassigned_is_0() {
+        assert_eq!(WcWidth::Unassigned.width_unicode_9_or_later(), 0);
+    }
+
+    #[test]
+    fn width_u9_noncharacter_is_0() {
+        assert_eq!(WcWidth::NonCharacter.width_unicode_9_or_later(), 0);
+    }
+
+    #[test]
+    fn yi_syllables_are_double_width() {
+        // U+A000 YI SYLLABLE IT
+        assert_eq!(WcWidth::from_char('\u{a000}'), WcWidth::Two);
+    }
+
+    #[test]
+    fn lookup_table_ascii_printable_all_one() {
+        let table = WcLookupTable::new();
+        for c in ' '..='~' {
+            assert_eq!(
+                table.classify(c),
+                WcWidth::One,
+                "ASCII '{}' (U+{:04X}) should be One",
+                c,
+                c as u32
+            );
+        }
+    }
+
+    #[test]
+    fn thai_characters_are_one() {
+        // U+0E01 THAI CHARACTER KO KAI
+        assert_eq!(WcWidth::from_char('\u{0e01}'), WcWidth::One);
+    }
+
+    #[test]
+    fn devanagari_combining_marks() {
+        // U+0900 DEVANAGARI SIGN INVERTED CANDRABINDU (combining)
+        assert_eq!(WcWidth::from_char('\u{0900}'), WcWidth::Combining);
+    }
+
+    #[test]
+    fn wc_width_eq_reflexive() {
+        for w in [
+            WcWidth::One, WcWidth::Two, WcWidth::NonPrint,
+            WcWidth::Combining, WcWidth::Ambiguous, WcWidth::PrivateUse,
+            WcWidth::Unassigned, WcWidth::WidenedIn9, WcWidth::NonCharacter,
+        ] {
+            assert_eq!(w, w, "{:?} should equal itself", w);
+        }
+    }
+
+    #[test]
+    fn variation_selectors_are_combining() {
+        // U+FE0E VARIATION SELECTOR-15
+        assert_eq!(WcWidth::from_char('\u{fe0e}'), WcWidth::Combining);
+        // U+FE0F VARIATION SELECTOR-16
+        assert_eq!(WcWidth::from_char('\u{fe0f}'), WcWidth::Combining);
+    }
 }
