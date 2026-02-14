@@ -259,6 +259,7 @@ mod tests {
         assert_eq!(a, b);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn compute_shape_hash_same_for_equal_links() {
         use std::collections::hash_map::DefaultHasher;
