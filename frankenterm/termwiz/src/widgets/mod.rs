@@ -3,7 +3,9 @@
 #![allow(clippy::new_without_default)]
 use crate::color::ColorAttribute;
 use crate::input::InputEvent;
-use crate::surface::{Change, CursorShape, CursorVisibility, Position, SequenceNo, Surface};
+use crate::surface::{
+    Change, CursorShape, CursorVisibility, DirtyRect, Position, SequenceNo, Surface,
+};
 use crate::Result;
 use fnv::FnvHasher;
 use std::collections::{HashMap, VecDeque};
@@ -41,6 +43,20 @@ pub struct RenderArgs<'a> {
     pub is_focused: bool,
     pub cursor: &'a mut CursorShapeAndPosition,
     pub surface: &'a mut Surface,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RenderTelemetry {
+    /// Number of widgets rendered during the most recent render pass.
+    pub widgets_rendered: usize,
+    /// Number of dirty rectangles emitted while compositing widget surfaces.
+    pub widget_dirty_rects: usize,
+    /// Total dirty cells emitted while compositing widget surfaces.
+    pub widget_dirty_cells: usize,
+    /// Number of dirty rectangles between the previous and current composed frame.
+    pub frame_dirty_rects: usize,
+    /// Total dirty cells between the previous and current composed frame.
+    pub frame_dirty_cells: usize,
 }
 
 /// UpdateArgs provides access to the widget and UI state during
@@ -184,6 +200,7 @@ pub struct Ui<'widget> {
     render: FnvHashMap<WidgetId, RenderData<'widget>>,
     input_queue: VecDeque<WidgetEvent>,
     focused: Option<WidgetId>,
+    last_render_telemetry: RenderTelemetry,
 }
 
 impl<'widget> Ui<'widget> {
@@ -350,6 +367,14 @@ impl<'widget> Ui<'widget> {
         self.focused = Some(id);
     }
 
+    fn accumulate_dirty_rects(rects: &[DirtyRect]) -> (usize, usize) {
+        let count = rects.len();
+        let cells = rects.iter().fold(0usize, |acc, rect| {
+            acc.saturating_add(rect.width.saturating_mul(rect.height))
+        });
+        (count, cells)
+    }
+
     /// Helper for applying the surfaces from the widgets to the target
     /// screen in the correct order (from the root to the leaves)
     fn render_recursive(
@@ -357,6 +382,7 @@ impl<'widget> Ui<'widget> {
         id: WidgetId,
         screen: &mut Surface,
         abs_coords: &ScreenRelativeCoords,
+        telemetry: &mut RenderTelemetry,
     ) -> Result<()> {
         let coords = {
             let render_data = self.render.get_mut(&id).unwrap();
@@ -370,11 +396,15 @@ impl<'widget> Ui<'widget> {
                 };
                 render_data.widget.render(&mut args);
             }
-            screen.draw_from_screen(
+            let (_, dirty_rects) = screen.draw_from_screen_with_dirty_rects(
                 surface,
                 abs_coords.x + render_data.coordinates.x,
                 abs_coords.y + render_data.coordinates.y,
             );
+            let (rect_count, dirty_cells) = Self::accumulate_dirty_rects(&dirty_rects);
+            telemetry.widgets_rendered = telemetry.widgets_rendered.saturating_add(1);
+            telemetry.widget_dirty_rects = telemetry.widget_dirty_rects.saturating_add(rect_count);
+            telemetry.widget_dirty_cells = telemetry.widget_dirty_cells.saturating_add(dirty_cells);
             surface.flush_changes_older_than(SequenceNo::max_value());
             render_data.coordinates
         };
@@ -384,6 +414,7 @@ impl<'widget> Ui<'widget> {
                 child,
                 screen,
                 &ScreenRelativeCoords::new(coords.x + abs_coords.x, coords.y + abs_coords.y),
+                telemetry,
             )?;
         }
 
@@ -438,17 +469,34 @@ impl<'widget> Ui<'widget> {
 
     /// Apply the current state of the widgets to the screen.
     /// This has the side effect of clearing out any unconsumed input queue.
-    /// Returns true if the Ui may need to be updated again; for example,
-    /// if the most recent update operation changed layout.
-    pub fn render_to_screen(&mut self, screen: &mut Surface) -> Result<bool> {
+    /// Returns a tuple of:
+    /// - whether the Ui may need another update pass (e.g. layout changed)
+    /// - dirty rectangles for the composed frame diff, suitable for partial uploads
+    pub fn render_to_screen_with_dirty_rects(
+        &mut self,
+        screen: &mut Surface,
+    ) -> Result<(bool, Vec<DirtyRect>)> {
+        let mut frame_dirty_rects = Vec::new();
         if let Some(root) = self.graph.root {
+            let mut telemetry = RenderTelemetry::default();
             let (width, height) = screen.dimensions();
             // Render from scratch into a fresh screen buffer
             let mut alt_screen = Surface::new(width, height);
-            self.render_recursive(root, &mut alt_screen, &ScreenRelativeCoords::new(0, 0))?;
+            self.render_recursive(
+                root,
+                &mut alt_screen,
+                &ScreenRelativeCoords::new(0, 0),
+                &mut telemetry,
+            )?;
+            frame_dirty_rects = screen.dirty_rects(&alt_screen);
+            let (frame_rect_count, frame_dirty_cells) =
+                Self::accumulate_dirty_rects(&frame_dirty_rects);
+            telemetry.frame_dirty_rects = frame_rect_count;
+            telemetry.frame_dirty_cells = frame_dirty_cells;
             // Now compute a delta and apply it to the actual screen
             let diff = screen.diff_screens(&alt_screen);
             screen.add_changes(diff);
+            self.last_render_telemetry = telemetry;
         }
         // TODO: garbage collect unreachable WidgetId's from self.state
 
@@ -468,7 +516,22 @@ impl<'widget> Ui<'widget> {
         }
 
         let (width, height) = screen.dimensions();
-        self.compute_layout(width, height)
+        let needs_update = self.compute_layout(width, height)?;
+        Ok((needs_update, frame_dirty_rects))
+    }
+
+    /// Apply the current state of the widgets to the screen.
+    /// This has the side effect of clearing out any unconsumed input queue.
+    /// Returns true if the Ui may need to be updated again; for example,
+    /// if the most recent update operation changed layout.
+    pub fn render_to_screen(&mut self, screen: &mut Surface) -> Result<bool> {
+        let (needs_update, _) = self.render_to_screen_with_dirty_rects(screen)?;
+        Ok(needs_update)
+    }
+
+    /// Telemetry from the last render pass.
+    pub fn last_render_telemetry(&self) -> RenderTelemetry {
+        self.last_render_telemetry
     }
 
     fn coord_walk<F: Fn(usize, usize) -> usize>(
@@ -536,5 +599,55 @@ mod test {
         assert_eq!(CursorVisibility::Visible, surface.cursor_visibility());
         ui.render_to_screen(&mut surface).unwrap();
         assert_eq!(CursorVisibility::Hidden, surface.cursor_visibility());
+    }
+
+    struct PaintCell;
+
+    impl Widget for PaintCell {
+        fn render(&mut self, args: &mut RenderArgs) {
+            args.surface.add_changes(vec![
+                Change::CursorPosition {
+                    x: Position::Absolute(0),
+                    y: Position::Absolute(0),
+                },
+                Change::Text("X".to_string()),
+            ]);
+        }
+    }
+
+    #[test]
+    fn render_telemetry_tracks_dirty_rects() {
+        let mut ui = Ui::new();
+        ui.set_root(PaintCell);
+
+        let mut surface = Surface::new(4, 4);
+
+        ui.render_to_screen(&mut surface).unwrap();
+        let first = ui.last_render_telemetry();
+        assert_eq!(first.widgets_rendered, 1);
+        assert!(first.widget_dirty_rects >= 1);
+        assert!(first.widget_dirty_cells >= 1);
+        assert!(first.frame_dirty_rects >= 1);
+        assert!(first.frame_dirty_cells >= 1);
+
+        ui.render_to_screen(&mut surface).unwrap();
+        let second = ui.last_render_telemetry();
+        assert_eq!(second.widgets_rendered, 1);
+        assert_eq!(second.frame_dirty_rects, 0);
+        assert_eq!(second.frame_dirty_cells, 0);
+    }
+
+    #[test]
+    fn render_to_screen_with_dirty_rects_reports_frame_regions() {
+        let mut ui = Ui::new();
+        ui.set_root(PaintCell);
+
+        let mut surface = Surface::new(4, 4);
+
+        let (_, first_rects) = ui.render_to_screen_with_dirty_rects(&mut surface).unwrap();
+        assert!(!first_rects.is_empty());
+
+        let (_, second_rects) = ui.render_to_screen_with_dirty_rects(&mut surface).unwrap();
+        assert!(second_rects.is_empty());
     }
 }
