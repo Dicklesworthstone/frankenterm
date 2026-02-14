@@ -621,4 +621,157 @@ proptest! {
             );
         }
     }
+
+    // ---- NEW: MetricsSnapshot Default has no event_bus ----
+
+    #[test]
+    fn default_snapshot_has_no_event_bus(_dummy in 0..1u8) {
+        let snap = MetricsSnapshot::default();
+        prop_assert!(snap.event_bus.is_none(), "default should have no event_bus");
+    }
+
+    // ---- NEW: MetricsSnapshot Default uptime is zero ----
+
+    #[test]
+    fn default_snapshot_uptime_zero(_dummy in 0..1u8) {
+        let snap = MetricsSnapshot::default();
+        prop_assert!((snap.uptime_seconds - 0.0).abs() < 1e-10);
+        prop_assert_eq!(snap.observed_panes, 0);
+        prop_assert_eq!(snap.events_recorded, 0);
+    }
+
+    // ---- NEW: EventBusSnapshot Default has zero values ----
+
+    #[test]
+    fn event_bus_default_zeroed(_dummy in 0..1u8) {
+        let bus = EventBusSnapshot::default();
+        prop_assert_eq!(bus.events_published, 0);
+        prop_assert_eq!(bus.events_dropped_no_subscribers, 0);
+        prop_assert_eq!(bus.active_subscribers, 0);
+        prop_assert_eq!(bus.capacity, 0);
+    }
+
+    // ---- NEW: EventBusSnapshot Default lag is None ----
+
+    #[test]
+    fn event_bus_default_lag_none(_dummy in 0..1u8) {
+        let bus = EventBusSnapshot::default();
+        prop_assert!(bus.delta_oldest_lag_ms.is_none());
+        prop_assert!(bus.detection_oldest_lag_ms.is_none());
+        prop_assert!(bus.signal_oldest_lag_ms.is_none());
+    }
+
+    // ---- NEW: EventBusSnapshot Clone preserves ----
+
+    #[test]
+    fn event_bus_clone_preserves(bus in arb_event_bus_snapshot()) {
+        let cloned = bus.clone();
+        prop_assert_eq!(cloned.events_published, bus.events_published);
+        prop_assert_eq!(cloned.capacity, bus.capacity);
+        prop_assert_eq!(cloned.delta_queued, bus.delta_queued);
+    }
+
+    // ---- NEW: MetricsSnapshot Clone preserves ----
+
+    #[test]
+    fn metrics_snapshot_clone_preserves(snap in arb_metrics_snapshot()) {
+        let cloned = snap.clone();
+        prop_assert_eq!(cloned.observed_panes, snap.observed_panes);
+        prop_assert_eq!(cloned.events_recorded, snap.events_recorded);
+        prop_assert_eq!(cloned.event_bus.is_some(), snap.event_bus.is_some());
+    }
+
+    // ---- NEW: MetricsSnapshot Debug non-empty ----
+
+    #[test]
+    fn metrics_snapshot_debug_nonempty(snap in arb_metrics_snapshot()) {
+        let dbg = format!("{:?}", snap);
+        prop_assert!(!dbg.is_empty());
+    }
+
+    // ---- NEW: EventBusSnapshot Debug non-empty ----
+
+    #[test]
+    fn event_bus_debug_nonempty(bus in arb_event_bus_snapshot()) {
+        let dbg = format!("{:?}", bus);
+        prop_assert!(!dbg.is_empty());
+    }
+
+    // ---- NEW: Empty prefix renders metrics without leading underscore ----
+
+    #[test]
+    fn empty_prefix_no_leading_underscore(snap in arb_metrics_snapshot()) {
+        let rendered = snap.render_prometheus("");
+        let blocks = parse_metric_blocks(&rendered);
+        for (_, _, value_line) in &blocks {
+            if let Some(name) = metric_name_from_value_line(value_line) {
+                prop_assert!(!name.starts_with('_'),
+                    "empty prefix should not produce leading underscore: {}", name);
+            }
+        }
+    }
+
+    // ---- NEW: Metric names contain no spaces ----
+
+    #[test]
+    fn metric_names_no_spaces(
+        snap in arb_metrics_snapshot(),
+        prefix in arb_prefix(),
+    ) {
+        let rendered = snap.render_prometheus(&prefix);
+        let blocks = parse_metric_blocks(&rendered);
+        for (_, _, value_line) in &blocks {
+            if let Some(name) = metric_name_from_value_line(value_line) {
+                prop_assert!(!name.contains(' '),
+                    "metric name should not contain spaces: '{}'", name);
+            }
+        }
+    }
+
+    // ---- NEW: HELP lines have non-empty descriptions ----
+
+    #[test]
+    fn help_lines_have_descriptions(
+        snap in arb_metrics_snapshot(),
+        prefix in arb_prefix(),
+    ) {
+        let rendered = snap.render_prometheus(&prefix);
+        for line in rendered.lines() {
+            if line.starts_with("# HELP ") {
+                let parts: Vec<&str> = line.splitn(4, ' ').collect();
+                prop_assert!(parts.len() >= 4,
+                    "HELP line should have description: {}", line);
+                prop_assert!(!parts[3].is_empty(),
+                    "HELP description should not be empty: {}", line);
+            }
+        }
+    }
+
+    // ---- NEW: Uptime value matches snapshot ----
+
+    #[test]
+    fn uptime_value_matches_snapshot(prefix in "[a-z]{1,4}") {
+        let snap = MetricsSnapshot {
+            uptime_seconds: 42.5,
+            ..MetricsSnapshot::default()
+        };
+        let rendered = snap.render_prometheus(&prefix);
+        let expected = format!("{}_uptime_seconds 42.5", prefix);
+        prop_assert!(rendered.contains(&expected),
+            "expected '{}' in output", expected);
+    }
+
+    // ---- NEW: Different uptime produces different output ----
+
+    #[test]
+    fn different_uptime_different_output(
+        u1 in 0.0_f64..1_000.0,
+        u2 in 1_001.0_f64..2_000.0,
+    ) {
+        let s1 = MetricsSnapshot { uptime_seconds: u1, ..MetricsSnapshot::default() };
+        let s2 = MetricsSnapshot { uptime_seconds: u2, ..MetricsSnapshot::default() };
+        let r1 = s1.render_prometheus("ft");
+        let r2 = s2.render_prometheus("ft");
+        prop_assert_ne!(r1, r2);
+    }
 }

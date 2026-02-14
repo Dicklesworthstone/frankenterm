@@ -27,7 +27,7 @@ fn arb_timestamp() -> impl Strategy<Value = u64> {
     ]
 }
 
-fn arb_title() -> impl Strategy<Value = String> {
+fn _arb_title() -> impl Strategy<Value = String> {
     prop_oneof![
         Just(String::new()),
         "[a-zA-Z0-9_\\-]{1,50}",
@@ -116,12 +116,12 @@ fn hello_json(proto: u32) -> String {
 // Helper: invoke decode_wire_event via JSON parsing
 // ---------------------------------------------------------------------------
 
-/// We can't call `decode_wire_event` directly from an integration test
-/// because it's not pub. Instead, we test through the JSON→NativeEvent pipeline
-/// by constructing valid JSON and verifying the types parse correctly.
-///
-/// For property testing, we validate JSON construction invariants and
-/// wire format properties.
+// We can't call `decode_wire_event` directly from an integration test
+// because it's not pub. Instead, we test through the JSON→NativeEvent pipeline
+// by constructing valid JSON and verifying the types parse correctly.
+//
+// For property testing, we validate JSON construction invariants and
+// wire format properties.
 
 // ---------------------------------------------------------------------------
 // Property tests: PaneOutput
@@ -165,7 +165,7 @@ proptest! {
     #[test]
     fn base64_output_length(data in arb_binary_data()) {
         let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
-        let expected_len = ((data.len() + 2) / 3) * 4;
+        let expected_len = data.len().div_ceil(3) * 4;
         prop_assert_eq!(encoded.len(), expected_len);
     }
 }
@@ -324,7 +324,7 @@ proptest! {
     fn timestamp_clamp_invariant(ts in any::<u64>()) {
         let clamped = i64::try_from(ts).unwrap_or(i64::MAX);
 
-        if ts <= i64::MAX as u64 {
+        if i64::try_from(ts).is_ok() {
             prop_assert_eq!(clamped, ts as i64);
         } else {
             prop_assert_eq!(clamped, i64::MAX);
@@ -456,5 +456,228 @@ proptest! {
         let json = pane_output_json(pane_id, &data, ts);
         prop_assert!(json.len() < MAX_EVENT_LINE_BYTES,
             "small event line should be under limit: {} >= {}", json.len(), MAX_EVENT_LINE_BYTES);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NEW: Base64 empty data roundtrip
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #[test]
+    fn base64_empty_data_roundtrip(_dummy in 0..1u8) {
+        let data: Vec<u8> = vec![];
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
+        prop_assert!(encoded.is_empty(), "empty data should encode to empty string");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded.as_bytes())
+            .expect("empty decode should succeed");
+        prop_assert!(decoded.is_empty());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NEW: Base64 encoded string contains only valid chars
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #[test]
+    fn base64_chars_valid(data in arb_small_binary_data()) {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
+        for ch in encoded.chars() {
+            prop_assert!(
+                ch.is_ascii_alphanumeric() || ch == '+' || ch == '/' || ch == '=',
+                "base64 char '{}' is invalid", ch
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NEW: PaneOutput JSON has exactly 4 keys
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #[test]
+    fn pane_output_json_key_count(
+        pane_id in arb_pane_id(),
+        data in arb_small_binary_data(),
+        ts in arb_timestamp(),
+    ) {
+        let json = pane_output_json(pane_id, &data, ts);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = parsed.as_object().expect("should be object");
+        prop_assert_eq!(obj.len(), 4, "pane_output should have 4 keys: type, pane_id, data_b64, ts");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NEW: StateChange JSON has nested state object
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #[test]
+    fn state_change_has_nested_state(
+        pane_id in arb_pane_id(),
+        ts in arb_timestamp(),
+    ) {
+        let json = state_change_json(pane_id, "test", 24, 80, false, 0, 0, ts);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        prop_assert!(parsed["state"].is_object(), "state_change should have nested state object");
+        let state = parsed["state"].as_object().unwrap();
+        prop_assert!(state.contains_key("title"));
+        prop_assert!(state.contains_key("rows"));
+        prop_assert!(state.contains_key("cols"));
+        prop_assert!(state.contains_key("is_alt_screen"));
+        prop_assert!(state.contains_key("cursor_row"));
+        prop_assert!(state.contains_key("cursor_col"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NEW: UserVar name and value are distinct keys
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #[test]
+    fn user_var_has_distinct_name_value_keys(
+        pane_id in arb_pane_id(),
+        name in "[A-Z_]{1,10}",
+        value in "[a-z0-9]{1,10}",
+        ts in arb_timestamp(),
+    ) {
+        let json = user_var_json(pane_id, &name, &value, ts);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        prop_assert!(parsed.as_object().unwrap().contains_key("name"));
+        prop_assert!(parsed.as_object().unwrap().contains_key("value"));
+        prop_assert_eq!(parsed["name"].as_str(), Some(name.as_str()));
+        prop_assert_eq!(parsed["value"].as_str(), Some(value.as_str()));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NEW: PaneDestroyed JSON has exactly 3 keys
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #[test]
+    fn pane_destroyed_key_count(
+        pane_id in arb_pane_id(),
+        ts in arb_timestamp(),
+    ) {
+        let json = pane_destroyed_json(pane_id, ts);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = parsed.as_object().expect("should be object");
+        prop_assert_eq!(obj.len(), 3, "pane_destroyed should have 3 keys: type, pane_id, ts");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NEW: Hello JSON has exactly 2 keys
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #[test]
+    fn hello_key_count(proto in any::<u32>()) {
+        let json = hello_json(proto);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = parsed.as_object().expect("should be object");
+        prop_assert_eq!(obj.len(), 2, "hello should have 2 keys: type, proto");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NEW: Timestamp zero maps to zero
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #[test]
+    fn timestamp_zero_is_zero(_dummy in 0..1u8) {
+        let clamped = i64::try_from(0u64).unwrap_or(i64::MAX);
+        prop_assert_eq!(clamped, 0i64);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NEW: All JSON builders produce non-empty strings
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #[test]
+    fn all_builders_nonempty(
+        pane_id in arb_pane_id(),
+        ts in arb_timestamp(),
+    ) {
+        prop_assert!(!pane_output_json(pane_id, &[], ts).is_empty());
+        prop_assert!(!state_change_json(pane_id, "t", 24, 80, false, 0, 0, ts).is_empty());
+        prop_assert!(!user_var_json(pane_id, "N", "v", ts).is_empty());
+        prop_assert!(!pane_created_json(pane_id, "local", None, ts).is_empty());
+        prop_assert!(!pane_destroyed_json(pane_id, ts).is_empty());
+        prop_assert!(!hello_json(1).is_empty());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NEW: Pane output with empty data has empty b64 string
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #[test]
+    fn pane_output_empty_data_b64(
+        pane_id in arb_pane_id(),
+        ts in arb_timestamp(),
+    ) {
+        let json = pane_output_json(pane_id, &[], ts);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(parsed["data_b64"].as_str(), Some(""));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NEW: State change is_alt_screen boolean preserved
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #[test]
+    fn state_change_is_alt_preserved(is_alt in any::<bool>()) {
+        let json = state_change_json(1, "t", 24, 80, is_alt, 0, 0, 100);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(parsed["state"]["is_alt_screen"].as_bool(), Some(is_alt));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NEW: PaneCreated with cwd has 4 keys, without has 3 keys
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #[test]
+    fn pane_created_key_count_with_cwd(
+        pane_id in arb_pane_id(),
+        ts in arb_timestamp(),
+    ) {
+        let with_cwd = pane_created_json(pane_id, "local", Some("/tmp"), ts);
+        let without_cwd = pane_created_json(pane_id, "local", None, ts);
+
+        let p1: serde_json::Value = serde_json::from_str(&with_cwd).unwrap();
+        let p2: serde_json::Value = serde_json::from_str(&without_cwd).unwrap();
+
+        prop_assert_eq!(p1.as_object().unwrap().len(), 5,
+            "pane_created with cwd should have 5 keys: type, pane_id, domain, cwd, ts");
+        prop_assert_eq!(p2.as_object().unwrap().len(), 4,
+            "pane_created without cwd should have 4 keys: type, pane_id, domain, ts");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NEW: Title with simple ASCII preserved in state_change
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #[test]
+    fn state_change_title_preserved(title in "[a-zA-Z0-9_]{1,20}") {
+        let json = state_change_json(1, &title, 24, 80, false, 0, 0, 100);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(parsed["state"]["title"].as_str(), Some(title.as_str()));
     }
 }
