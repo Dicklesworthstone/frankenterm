@@ -498,3 +498,219 @@ proptest! {
         prop_assert!((s.mean.unwrap() - h.mean().unwrap()).abs() < 1e-10);
     }
 }
+
+// =============================================================================
+// NEW: Histogram name preserved
+// =============================================================================
+
+proptest! {
+    #[test]
+    fn histogram_name_preserved(
+        name in "[a-z_]{3,20}",
+    ) {
+        let h = Histogram::new(name.clone(), 100);
+        prop_assert_eq!(h.name(), name.as_str());
+    }
+}
+
+// =============================================================================
+// NEW: Histogram quantile monotonicity (p50 <= p95 <= p99)
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn histogram_quantile_monotonicity(
+        values in proptest::collection::vec(arb_value(), 5..50),
+    ) {
+        let mut h = Histogram::new("test", 1000);
+        for &v in &values {
+            h.record(v);
+        }
+
+        let p50 = h.p50().unwrap();
+        let p95 = h.p95().unwrap();
+        let p99 = h.p99().unwrap();
+
+        prop_assert!(p50 <= p95 + 1e-10,
+            "p50 {} should be <= p95 {}", p50, p95);
+        prop_assert!(p95 <= p99 + 1e-10,
+            "p95 {} should be <= p99 {}", p95, p99);
+    }
+}
+
+// =============================================================================
+// NEW: Histogram single value — all quantiles equal
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn histogram_single_value_all_quantiles_equal(
+        v in arb_value(),
+    ) {
+        let mut h = Histogram::new("test", 100);
+        h.record(v);
+
+        let p50 = h.p50().unwrap();
+        let p95 = h.p95().unwrap();
+        let p99 = h.p99().unwrap();
+
+        prop_assert!((p50 - v).abs() < 1e-10, "p50 {} should equal value {}", p50, v);
+        prop_assert!((p95 - v).abs() < 1e-10, "p95 {} should equal value {}", p95, v);
+        prop_assert!((p99 - v).abs() < 1e-10, "p99 {} should equal value {}", p99, v);
+    }
+}
+
+// =============================================================================
+// NEW: Buffer snapshots().len() == len()
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn buffer_snapshots_len_matches(
+        capacity in 1_usize..50,
+        n_pushes in 0_usize..100,
+    ) {
+        let buf = CircularMetricBuffer::new(capacity);
+        for i in 0..n_pushes {
+            buf.push(arb_snapshot(1, i as u64));
+        }
+        prop_assert_eq!(buf.snapshots().len(), buf.len());
+    }
+}
+
+// =============================================================================
+// NEW: MetricRegistry counter auto-creates on first add
+// =============================================================================
+
+proptest! {
+    #[test]
+    fn registry_counter_auto_creates(
+        name in "[a-z_]{3,20}",
+        value in 1_u64..100,
+    ) {
+        let reg = MetricRegistry::new();
+        prop_assert_eq!(reg.counter_value(&name), 0);
+        reg.add_counter(&name, value);
+        prop_assert_eq!(reg.counter_value(&name), value);
+        prop_assert_eq!(reg.counter_count(), 1);
+    }
+}
+
+// =============================================================================
+// NEW: MetricRegistry counter_count tracks distinct counters
+// =============================================================================
+
+proptest! {
+    #[test]
+    fn registry_counter_count_tracks(
+        n in 1_usize..10,
+    ) {
+        let reg = MetricRegistry::new();
+        for i in 0..n {
+            reg.add_counter(&format!("c_{}", i), 1);
+        }
+        prop_assert_eq!(reg.counter_count(), n);
+    }
+}
+
+// =============================================================================
+// NEW: MetricRegistry histogram_count tracks registrations
+// =============================================================================
+
+proptest! {
+    #[test]
+    fn registry_histogram_count_tracks(
+        n in 1_usize..10,
+    ) {
+        let reg = MetricRegistry::new();
+        for i in 0..n {
+            reg.register_histogram(&format!("h_{}", i), 100);
+        }
+        prop_assert_eq!(reg.histogram_count(), n);
+    }
+}
+
+// =============================================================================
+// NEW: ResourceSnapshot serde roundtrip
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(60))]
+
+    #[test]
+    fn resource_snapshot_serde_roundtrip(
+        pid in 1_u32..10000,
+        rss in 0_u64..1_000_000,
+        fd in 0_u64..10_000,
+        ts in 0_u64..2_000_000_000,
+    ) {
+        let snap = ResourceSnapshot {
+            pid,
+            rss_bytes: rss,
+            virt_bytes: rss * 2,
+            fd_count: fd,
+            io_read_bytes: None,
+            io_write_bytes: None,
+            cpu_percent: None,
+            timestamp_secs: ts,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: ResourceSnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.pid, pid);
+        prop_assert_eq!(back.rss_bytes, rss);
+        prop_assert_eq!(back.fd_count, fd);
+        prop_assert_eq!(back.timestamp_secs, ts);
+    }
+}
+
+// =============================================================================
+// NEW: HistogramSummary serde roundtrip
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(60))]
+
+    #[test]
+    fn histogram_summary_serde_roundtrip(
+        max_samples in 10_usize..100,
+        values in proptest::collection::vec(0.0_f64..1000.0, 1..30),
+    ) {
+        let mut h = Histogram::new("test_summary", max_samples);
+        for &v in &values {
+            h.record(v);
+        }
+        let summary = h.summary();
+        let json = serde_json::to_string(&summary).unwrap();
+        let back: frankenterm_core::telemetry::HistogramSummary = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.name, "test_summary");
+        prop_assert_eq!(back.count, values.len() as u64);
+    }
+}
+
+// =============================================================================
+// NEW: Histogram Clone preserves state
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn histogram_clone_preserves(
+        values in proptest::collection::vec(arb_value(), 1..30),
+    ) {
+        let mut h = Histogram::new("test", 100);
+        for &v in &values {
+            h.record(v);
+        }
+        let cloned = h.clone();
+        prop_assert_eq!(cloned.count(), h.count());
+        prop_assert_eq!(cloned.retained(), h.retained());
+        prop_assert_eq!(cloned.name(), h.name());
+    }
+}

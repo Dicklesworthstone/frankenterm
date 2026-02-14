@@ -375,3 +375,213 @@ fn unlinked_result_has_no_external_id() {
         result.confidence
     );
 }
+
+// =========================================================================
+// NEW: CassCorrelationOptions Clone preserves
+// =========================================================================
+
+proptest! {
+    #[test]
+    fn correlation_options_clone_preserves(opts in arb_correlation_options()) {
+        let cloned = opts.clone();
+        prop_assert_eq!(cloned.window_before_ms, opts.window_before_ms);
+        prop_assert_eq!(cloned.window_after_ms, opts.window_after_ms);
+        prop_assert_eq!(cloned.override_session_id, opts.override_session_id);
+    }
+}
+
+// =========================================================================
+// NEW: CassCorrelationOptions Debug non-empty
+// =========================================================================
+
+proptest! {
+    #[test]
+    fn correlation_options_debug_nonempty(opts in arb_correlation_options()) {
+        let dbg = format!("{:?}", opts);
+        prop_assert!(!dbg.is_empty());
+        prop_assert!(dbg.contains("CassCorrelationOptions"));
+    }
+}
+
+// =========================================================================
+// NEW: CorrelationStatus Copy/PartialEq
+// =========================================================================
+
+proptest! {
+    #[test]
+    fn correlation_status_copy_eq(status in arb_correlation_status()) {
+        let copied = status;
+        prop_assert_eq!(status, copied);
+    }
+}
+
+// =========================================================================
+// NEW: CorrelationStatus Debug non-empty
+// =========================================================================
+
+proptest! {
+    #[test]
+    fn correlation_status_debug_nonempty(status in arb_correlation_status()) {
+        let dbg = format!("{:?}", status);
+        prop_assert!(!dbg.is_empty());
+    }
+}
+
+// =========================================================================
+// NEW: SessionCorrelation Clone preserves key fields
+// =========================================================================
+
+proptest! {
+    #[test]
+    fn session_correlation_clone_preserves(
+        status in arb_correlation_status(),
+        ext_id in proptest::option::of("[a-z0-9-]{5,15}"),
+        confidence in 0.0_f64..1.0,
+        candidates in 0_usize..20,
+    ) {
+        let corr = SessionCorrelation {
+            status,
+            external_id: ext_id.clone(),
+            confidence,
+            reasons: vec!["reason".to_string()],
+            candidates_considered: candidates,
+            window_start_ms: 0,
+            window_end_ms: 100_000,
+            selected_started_at_ms: None,
+            algorithm_version: CASS_CORRELATION_VERSION.to_string(),
+            error: None,
+        };
+        let cloned = corr.clone();
+        prop_assert_eq!(cloned.status, status);
+        prop_assert_eq!(cloned.external_id, ext_id);
+        prop_assert!((cloned.confidence - confidence).abs() < f64::EPSILON);
+        prop_assert_eq!(cloned.candidates_considered, candidates);
+    }
+}
+
+// =========================================================================
+// NEW: SessionCorrelation Debug non-empty
+// =========================================================================
+
+proptest! {
+    #[test]
+    fn session_correlation_debug_nonempty(status in arb_correlation_status()) {
+        let corr = SessionCorrelation {
+            status,
+            external_id: None,
+            confidence: 0.0,
+            reasons: vec![],
+            candidates_considered: 0,
+            window_start_ms: 0,
+            window_end_ms: 0,
+            selected_started_at_ms: None,
+            algorithm_version: CASS_CORRELATION_VERSION.to_string(),
+            error: None,
+        };
+        let dbg = format!("{:?}", corr);
+        prop_assert!(!dbg.is_empty());
+        prop_assert!(dbg.contains("SessionCorrelation"));
+    }
+}
+
+// =========================================================================
+// NEW: CassCorrelationOptions serde deterministic
+// =========================================================================
+
+proptest! {
+    #[test]
+    fn correlation_options_serde_deterministic(opts in arb_correlation_options()) {
+        let j1 = serde_json::to_string(&opts).unwrap();
+        let j2 = serde_json::to_string(&opts).unwrap();
+        prop_assert_eq!(&j1, &j2);
+    }
+}
+
+// =========================================================================
+// NEW: SessionCorrelation serde deterministic
+// =========================================================================
+
+proptest! {
+    #[test]
+    fn session_correlation_serde_deterministic(
+        status in arb_correlation_status(),
+        confidence in 0.0_f64..1.0,
+    ) {
+        let corr = SessionCorrelation {
+            status,
+            external_id: None,
+            confidence,
+            reasons: vec![],
+            candidates_considered: 0,
+            window_start_ms: 0,
+            window_end_ms: 100_000,
+            selected_started_at_ms: None,
+            algorithm_version: CASS_CORRELATION_VERSION.to_string(),
+            error: None,
+        };
+        let j1 = serde_json::to_string(&corr).unwrap();
+        let j2 = serde_json::to_string(&corr).unwrap();
+        prop_assert_eq!(&j1, &j2);
+    }
+}
+
+// =========================================================================
+// NEW: Candidates considered <= session count
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(80))]
+
+    #[test]
+    fn candidates_considered_le_sessions(
+        n_sessions in 0_usize..8,
+        offsets in proptest::collection::vec(-300_000_i64..300_000, 0..8),
+    ) {
+        let base_ms = 1_700_000_000_000_i64;
+        let sessions: Vec<CassSession> = offsets.iter().take(n_sessions).enumerate()
+            .map(|(i, &off)| make_session_at_offset(&format!("s-{i}"), base_ms, off))
+            .collect();
+        let opts = CassCorrelationOptions::default();
+        let result = correlate_from_sessions(&sessions, base_ms, &opts);
+        prop_assert!(result.candidates_considered <= sessions.len(),
+            "candidates {} > sessions {}", result.candidates_considered, sessions.len());
+    }
+}
+
+// =========================================================================
+// NEW: to_external_meta always has confidence field
+// =========================================================================
+
+proptest! {
+    #[test]
+    fn to_external_meta_has_confidence(confidence in 0.0_f64..1.0) {
+        let corr = SessionCorrelation {
+            status: CorrelationStatus::Linked,
+            external_id: Some("test".to_string()),
+            confidence,
+            reasons: vec![],
+            candidates_considered: 1,
+            window_start_ms: 0,
+            window_end_ms: 100_000,
+            selected_started_at_ms: None,
+            algorithm_version: CASS_CORRELATION_VERSION.to_string(),
+            error: None,
+        };
+        let meta = corr.to_external_meta();
+        prop_assert!(meta.get("confidence").is_some());
+    }
+}
+
+// =========================================================================
+// NEW: Default options override_session_id is None
+// =========================================================================
+
+proptest! {
+    #[test]
+    fn default_options_no_override(_dummy in 0..1u8) {
+        let opts = CassCorrelationOptions::default();
+        prop_assert!(opts.override_session_id.is_none());
+        prop_assert!(opts.window_before_ms > 0);
+        prop_assert!(opts.window_after_ms > 0);
+    }
+}
