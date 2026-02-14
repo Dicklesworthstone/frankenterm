@@ -1723,4 +1723,270 @@ mod tests {
         assert!(c.is_leaf());
         assert_eq!(*c.subtree(), Tree::Leaf(42));
     }
+
+    #[test]
+    fn unsplit_left_leaf_then_tree_reconstructs() {
+        let c = Tree::<i32, i32>::new()
+            .cursor()
+            .assign_top(1)
+            .unwrap()
+            .split_leaf_and_insert_right(2)
+            .unwrap()
+            .go_left()
+            .unwrap();
+
+        let (c, _leaf, _data) = c.unsplit_leaf().unwrap();
+        let t = c.tree();
+        assert_eq!(t, Tree::Leaf(2));
+    }
+
+    #[test]
+    fn assign_node_none_clears_data() {
+        let mut c = Tree::<i32, i32>::new()
+            .cursor()
+            .assign_top(1)
+            .unwrap()
+            .split_leaf_and_insert_right(2)
+            .unwrap()
+            .assign_node(Some(42))
+            .unwrap()
+            .assign_node(None)
+            .unwrap();
+        assert_eq!(*c.node_mut().unwrap(), None);
+    }
+
+    #[test]
+    fn split_leaf_insert_right_preserves_original_on_left() {
+        let mut c = Tree::<i32, ()>::Leaf(10)
+            .cursor()
+            .split_leaf_and_insert_right(20)
+            .unwrap()
+            .go_left()
+            .unwrap();
+        assert_eq!(*c.leaf_mut().unwrap(), 10);
+    }
+
+    #[test]
+    fn split_leaf_insert_left_preserves_original_on_right() {
+        let mut c = Tree::<i32, ()>::Leaf(10)
+            .cursor()
+            .split_leaf_and_insert_left(20)
+            .unwrap()
+            .go_right()
+            .unwrap();
+        assert_eq!(*c.leaf_mut().unwrap(), 10);
+    }
+
+    #[test]
+    fn cursor_new_tree_is_empty() {
+        let c: Cursor<i32, ()> = Cursor::new();
+        let t = c.tree();
+        assert!(t.is_empty());
+    }
+
+    #[test]
+    fn go_left_go_up_go_left_returns_to_same() {
+        let t = Tree::<i32, i32>::new()
+            .cursor()
+            .assign_top(1)
+            .unwrap()
+            .split_leaf_and_insert_right(2)
+            .unwrap()
+            .tree();
+
+        let mut c1 = t.cursor().go_left().unwrap();
+        let val1 = *c1.leaf_mut().unwrap();
+        let mut c2 = c1.go_up().unwrap().go_left().unwrap();
+        let val2 = *c2.leaf_mut().unwrap();
+        assert_eq!(val1, val2);
+    }
+
+    #[test]
+    fn split_node_insert_left_increases_leaves_by_one() {
+        let t = Tree::<i32, i32>::new()
+            .cursor()
+            .assign_top(1)
+            .unwrap()
+            .split_leaf_and_insert_right(2)
+            .unwrap()
+            .tree();
+        assert_eq!(t.num_leaves(), 2);
+
+        let t = t
+            .cursor()
+            .split_node_and_insert_left(0)
+            .unwrap()
+            .tree();
+        assert_eq!(t.num_leaves(), 3);
+    }
+
+    #[test]
+    fn split_node_insert_right_increases_leaves_by_one() {
+        let t = Tree::<i32, i32>::new()
+            .cursor()
+            .assign_top(1)
+            .unwrap()
+            .split_leaf_and_insert_right(2)
+            .unwrap()
+            .tree();
+
+        let t = t
+            .cursor()
+            .split_node_and_insert_right(3)
+            .unwrap()
+            .tree();
+        assert_eq!(t.num_leaves(), 3);
+    }
+
+    #[test]
+    fn tree_with_unit_node_data() {
+        let t = Tree::<i32>::new()
+            .cursor()
+            .assign_top(1)
+            .unwrap()
+            .split_leaf_and_insert_right(2)
+            .unwrap()
+            .tree();
+        assert_eq!(t.num_leaves(), 2);
+    }
+
+    #[test]
+    fn subtree_at_node_shows_children() {
+        let c = Tree::<i32, i32>::new()
+            .cursor()
+            .assign_top(1)
+            .unwrap()
+            .split_leaf_and_insert_right(2)
+            .unwrap();
+        match c.subtree() {
+            Tree::Node { left, right, .. } => {
+                assert_eq!(**left, Tree::Leaf(1));
+                assert_eq!(**right, Tree::Leaf(2));
+            }
+            _ => panic!("expected Node"),
+        }
+    }
+
+    #[test]
+    fn path_to_root_from_deeply_nested_right() {
+        let c = Tree::<i32, i32>::new()
+            .cursor()
+            .assign_top(1)
+            .unwrap()
+            .split_leaf_and_insert_right(2)
+            .unwrap()
+            .assign_node(Some(10))
+            .unwrap()
+            .go_right()
+            .unwrap()
+            .split_leaf_and_insert_right(3)
+            .unwrap()
+            .assign_node(Some(20))
+            .unwrap()
+            .go_right()
+            .unwrap();
+
+        let path: Vec<_> = c.path_to_root().collect();
+        assert_eq!(path.len(), 2);
+        assert_eq!(path[0].0, PathBranch::IsRight);
+        assert_eq!(*path[0].1, Some(20));
+        assert_eq!(path[1].0, PathBranch::IsRight);
+        assert_eq!(*path[1].1, Some(10));
+    }
+
+    #[test]
+    fn preorder_visits_all_nodes_and_leaves() {
+        let t = Tree::<i32, i32>::new()
+            .cursor()
+            .assign_top(1)
+            .unwrap()
+            .split_leaf_and_insert_right(2)
+            .unwrap()
+            .assign_node(Some(100))
+            .unwrap()
+            .tree();
+
+        let mut cursor = t.cursor();
+        let mut count = 0;
+        loop {
+            count += 1;
+            match cursor.preorder_next() {
+                Ok(c) => cursor = c,
+                Err(_) => break,
+            }
+        }
+        // Node(100) + Leaf(1) + Leaf(2) = 3 visits
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn leaf_mut_mutate_then_tree_preserves() {
+        let mut c = Tree::<i32>::Leaf(1).cursor();
+        *c.leaf_mut().unwrap() = 100;
+        let t = c.tree();
+        assert_eq!(t, Tree::Leaf(100));
+    }
+
+    #[test]
+    fn go_to_nth_leaf_two_finds_third_leaf() {
+        let t = Tree::<i32, ()>::new()
+            .cursor()
+            .assign_top(1)
+            .unwrap()
+            .split_leaf_and_insert_right(2)
+            .unwrap()
+            .tree();
+
+        let t = t
+            .cursor()
+            .go_to_nth_leaf(1)
+            .unwrap()
+            .split_leaf_and_insert_right(3)
+            .unwrap()
+            .tree();
+
+        let mut c = t.cursor().go_to_nth_leaf(2).unwrap();
+        assert_eq!(*c.leaf_mut().unwrap(), 3);
+    }
+
+    #[test]
+    fn empty_tree_num_leaves_zero() {
+        let t: Tree<String> = Tree::Empty;
+        assert_eq!(t.num_leaves(), 0);
+    }
+
+    #[test]
+    fn cursor_go_left_on_empty_fails() {
+        let c: Cursor<i32, ()> = Cursor::new();
+        assert!(c.go_left().is_err());
+    }
+
+    #[test]
+    fn cursor_go_right_on_empty_fails() {
+        let c: Cursor<i32, ()> = Cursor::new();
+        assert!(c.go_right().is_err());
+    }
+
+    #[test]
+    fn cursor_preorder_next_on_empty_fails() {
+        let c: Cursor<i32, ()> = Cursor::new();
+        assert!(c.preorder_next().is_err());
+    }
+
+    #[test]
+    fn cursor_postorder_next_on_empty_fails() {
+        let c: Cursor<i32, ()> = Cursor::new();
+        assert!(c.postorder_next().is_err());
+    }
+
+    #[test]
+    fn assign_top_on_empty_then_tree() {
+        let t = Tree::<i32>::new()
+            .cursor()
+            .assign_top(77)
+            .unwrap()
+            .tree();
+        assert_eq!(t, Tree::Leaf(77));
+        assert_eq!(t.num_leaves(), 1);
+    }
 }
