@@ -1278,8 +1278,8 @@ impl ObservationRuntime {
                 }
 
                 // Check for config updates
-                if config_rx.has_changed().unwrap_or(false) {
-                    let new_config = config_rx.borrow_and_update().clone();
+                if watch_has_changed(&config_rx) {
+                    let new_config = watch_borrow_and_update_clone(&mut config_rx);
                     if new_config.retention_days != retention_days {
                         info!(
                             old = retention_days,
@@ -1475,7 +1475,7 @@ impl ObservationRuntime {
                     };
                     metrics.record_cursor_snapshot_memory(cursor_snapshot_bytes);
 
-                    let capture_cap = capture_tx.max_capacity();
+                    let capture_cap = mpsc_max_capacity(&capture_tx);
                     let capture_depth = capture_cap.saturating_sub(capture_tx.capacity());
 
                     let (write_depth, write_cap, db_writable) = {
@@ -1632,8 +1632,8 @@ impl ObservationRuntime {
                 }
 
                 // Check for config updates (non-blocking)
-                if config_rx.has_changed().unwrap_or(false) {
-                    let new_config = config_rx.borrow_and_update().clone();
+                if watch_has_changed(&config_rx) {
+                    let new_config = watch_borrow_and_update_clone(&mut config_rx);
                     let new_interval = Duration::from_millis(new_config.poll_interval_ms);
                     if new_interval != current_interval {
                         info!(
@@ -1648,61 +1648,67 @@ impl ObservationRuntime {
                 match wezterm.list_panes().await {
                     Ok(panes) => {
                         heartbeats.record_discovery();
-                        let mut reg = registry.write().await;
-                        let diff = reg.discovery_tick(panes);
+                        let (diff, new_entries) = {
+                            let mut reg = registry.write().await;
+                            let diff = reg.discovery_tick(panes);
+                            let new_entries: Vec<_> = diff
+                                .new_panes
+                                .iter()
+                                .filter_map(|pane_id| {
+                                    reg.get_entry(*pane_id)
+                                        .cloned()
+                                        .map(|entry| (*pane_id, entry))
+                                })
+                                .collect();
+                            (diff, new_entries)
+                        };
 
                         // Handle new panes
-                        for pane_id in &diff.new_panes {
-                            if let Some(entry) = reg.get_entry(*pane_id) {
-                                // Upsert pane in storage
-                                let record = entry.to_pane_record();
+                        for (pane_id, entry) in new_entries {
+                            // Upsert pane in storage
+                            let record = entry.to_pane_record();
+                            let (storage_guard, lock_held_since) =
+                                lock_storage_with_profile(&storage, &metrics).await;
+                            if let Err(e) = storage_guard.upsert_pane(record).await {
+                                error!(pane_id = pane_id, error = %e, "Failed to upsert pane");
+                            }
+                            drop(storage_guard);
+                            metrics.record_storage_lock_hold(lock_held_since.elapsed());
+
+                            // Create cursor if observed
+                            if entry.should_observe() {
+                                // Initialize cursor from storage to resume capture
                                 let (storage_guard, lock_held_since) =
                                     lock_storage_with_profile(&storage, &metrics).await;
-                                if let Err(e) = storage_guard.upsert_pane(record).await {
-                                    error!(pane_id = pane_id, error = %e, "Failed to upsert pane");
-                                }
+                                let max_seq = storage_guard.get_max_seq(pane_id).await.unwrap_or(None);
                                 drop(storage_guard);
                                 metrics.record_storage_lock_hold(lock_held_since.elapsed());
 
-                                // Create cursor if observed
-                                if entry.should_observe() {
-                                    // Initialize cursor from storage to resume capture
-                                    let (storage_guard, lock_held_since) =
-                                        lock_storage_with_profile(&storage, &metrics).await;
-                                    let max_seq =
-                                        storage_guard.get_max_seq(*pane_id).await.unwrap_or(None);
-                                    drop(storage_guard);
-                                    metrics.record_storage_lock_hold(lock_held_since.elapsed());
+                                let next_seq = max_seq.map_or(0, |s| s + 1);
 
-                                    let next_seq = max_seq.map_or(0, |s| s + 1);
-
-                                    {
-                                        let mut cursors = cursors.write().await;
-                                        cursors.insert(
-                                            *pane_id,
-                                            PaneCursor::from_seq(*pane_id, next_seq),
-                                        );
-                                    }
-
-                                    {
-                                        let mut contexts = detection_contexts.write().await;
-                                        let mut ctx = DetectionContext::new();
-                                        ctx.pane_id = Some(*pane_id);
-                                        contexts.insert(*pane_id, ctx);
-                                    }
-
-                                    debug!(
-                                        pane_id = pane_id,
-                                        next_seq = next_seq,
-                                        "Started observing pane"
-                                    );
-                                } else if let Some(reason) = entry.observation.ignore_reason() {
-                                    info!(
-                                        pane_id = pane_id,
-                                        reason = reason,
-                                        "Pane ignored by observation filter"
-                                    );
+                                {
+                                    let mut cursors = cursors.write().await;
+                                    cursors.insert(pane_id, PaneCursor::from_seq(pane_id, next_seq));
                                 }
+
+                                {
+                                    let mut contexts = detection_contexts.write().await;
+                                    let mut ctx = DetectionContext::new();
+                                    ctx.pane_id = Some(pane_id);
+                                    contexts.insert(pane_id, ctx);
+                                }
+
+                                debug!(
+                                    pane_id = pane_id,
+                                    next_seq = next_seq,
+                                    "Started observing pane"
+                                );
+                            } else if let Some(reason) = entry.observation.ignore_reason() {
+                                info!(
+                                    pane_id = pane_id,
+                                    reason = reason,
+                                    "Pane ignored by observation filter"
+                                );
                             }
                         }
 
@@ -1823,8 +1829,8 @@ impl ObservationRuntime {
                         }
 
                         // Check for config updates
-                        if config_rx.has_changed().unwrap_or(false) {
-                            let new_config = config_rx.borrow_and_update().clone();
+                        if watch_has_changed(&config_rx) {
+                            let new_config = watch_borrow_and_update_clone(&mut config_rx);
                             let new_tailer_config = TailerConfig {
                                 min_interval: Duration::from_millis(new_config.min_poll_interval_ms),
                                 max_interval: Duration::from_millis(new_config.poll_interval_ms),
@@ -2107,7 +2113,12 @@ impl ObservationRuntime {
 
         tokio::spawn(async move {
             loop {
-                match timeout(Duration::from_millis(25), capture_ingress_rx.recv()).await {
+                match timeout(
+                    Duration::from_millis(25),
+                    mpsc_recv_option(&mut capture_ingress_rx),
+                )
+                .await
+                {
                     Ok(maybe_event) => match maybe_event {
                         Some(event) => {
                             if shutdown_flag.load(Ordering::SeqCst) {
@@ -2166,8 +2177,8 @@ impl ObservationRuntime {
                     // Continue to drain but don't block forever
                 }
 
-                if config_rx.has_changed().unwrap_or(false) {
-                    let new_config = config_rx.borrow_and_update().clone();
+                if watch_has_changed(&config_rx) {
+                    let new_config = watch_borrow_and_update_clone(&mut config_rx);
                     if new_config.patterns != current_patterns {
                         match PatternEngine::from_config_with_root(
                             &new_config.patterns,
@@ -2263,12 +2274,14 @@ impl ObservationRuntime {
 
                         // Run pattern detection on the content
                         let detections = {
-                            let mut contexts = detection_contexts.write().await;
-                            let ctx = contexts.entry(pane_id).or_insert_with(|| {
-                                let mut c = DetectionContext::new();
-                                c.pane_id = Some(pane_id);
-                                c
-                            });
+                            let mut ctx = {
+                                let mut contexts = detection_contexts.write().await;
+                                contexts.remove(&pane_id).unwrap_or_else(|| {
+                                    let mut c = DetectionContext::new();
+                                    c.pane_id = Some(pane_id);
+                                    c
+                                })
+                            };
 
                             // If this was a gap/discontinuity, clear the tail buffer because
                             // previous context is no longer valid or contiguous.
@@ -2278,9 +2291,13 @@ impl ObservationRuntime {
 
                             let detections = {
                                 let engine = pattern_engine.read().await;
-                                engine.detect_with_context(&content, ctx)
+                                engine.detect_with_context(&content, &mut ctx)
                             };
-                            drop(contexts);
+
+                            {
+                                let mut contexts = detection_contexts.write().await;
+                                contexts.insert(pane_id, ctx);
+                            }
                             detections
                         };
 
@@ -2604,17 +2621,66 @@ const SNAPSHOT_IDLE_WINDOW_SECS: u64 = 5 * 60;
 /// Minimum interval between `MemoryPressure` trigger emissions.
 const SNAPSHOT_MEMORY_TRIGGER_COOLDOWN_SECS: u64 = 2 * 60;
 
+fn watch_has_changed<T>(rx: &watch::Receiver<T>) -> bool {
+    #[cfg(feature = "asupersync-runtime")]
+    {
+        rx.has_changed()
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
+    {
+        rx.has_changed().unwrap_or(false)
+    }
+}
+
+fn watch_borrow_and_update_clone<T: Clone>(rx: &mut watch::Receiver<T>) -> T {
+    #[cfg(feature = "asupersync-runtime")]
+    {
+        rx.borrow_and_clone()
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
+    {
+        rx.borrow_and_update().clone()
+    }
+}
+
+fn mpsc_max_capacity<T>(tx: &mpsc::Sender<T>) -> usize {
+    #[cfg(feature = "asupersync-runtime")]
+    {
+        tx.capacity()
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
+    {
+        tx.max_capacity()
+    }
+}
+
+async fn mpsc_recv_option<T>(rx: &mut mpsc::Receiver<T>) -> Option<T> {
+    #[cfg(feature = "asupersync-runtime")]
+    {
+        let cx = crate::cx::for_testing();
+        rx.recv(&cx).await.ok()
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
+    {
+        rx.recv().await
+    }
+}
+
 impl RuntimeHandle {
     /// Current capture channel queue depth (pending items waiting for persistence).
     #[must_use]
     pub fn capture_queue_depth(&self) -> usize {
-        self.capture_tx.max_capacity() - self.capture_tx.capacity()
+        mpsc_max_capacity(&self.capture_tx).saturating_sub(self.capture_tx.capacity())
     }
 
     /// Maximum capture channel capacity.
     #[must_use]
     pub fn capture_queue_capacity(&self) -> usize {
-        self.capture_tx.max_capacity()
+        mpsc_max_capacity(&self.capture_tx)
     }
 
     /// Current write queue depth (pending commands for the storage writer thread).

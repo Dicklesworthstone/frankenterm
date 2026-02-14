@@ -4910,7 +4910,15 @@ impl WriteCommandSender {
     }
 
     fn max_capacity(&self) -> usize {
-        self.inner.max_capacity()
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            self.inner.capacity()
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            self.inner.max_capacity()
+        }
     }
 
     fn capacity(&self) -> usize {

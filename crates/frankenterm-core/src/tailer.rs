@@ -684,6 +684,16 @@ where
                 // of doing a normal capture.  The gap signals to downstream consumers
                 // that data was lost during sustained backpressure.
                 if overflow_gap_pending {
+                    #[cfg(feature = "asupersync-runtime")]
+                    let permit = {
+                        let reserve_cx = crate::cx::for_testing();
+                        match timeout(send_timeout, tx.reserve(&reserve_cx)).await {
+                            Ok(Ok(permit)) => permit,
+                            Ok(Err(_)) => return (pane_id, PollOutcome::ChannelClosed),
+                            Err(_) => return (pane_id, PollOutcome::Backpressure),
+                        }
+                    };
+                    #[cfg(not(feature = "asupersync-runtime"))]
                     let permit = match timeout(send_timeout, tx.reserve()).await {
                         Ok(Ok(permit)) => permit,
                         Ok(Err(_)) => return (pane_id, PollOutcome::ChannelClosed),
@@ -743,6 +753,16 @@ where
                     return (pane_id, PollOutcome::CircuitOpen { retry_after_ms });
                 }
 
+                #[cfg(feature = "asupersync-runtime")]
+                let permit = {
+                    let reserve_cx = crate::cx::for_testing();
+                    match timeout(send_timeout, tx.reserve(&reserve_cx)).await {
+                        Ok(Ok(permit)) => permit,
+                        Ok(Err(_)) => return (pane_id, PollOutcome::ChannelClosed),
+                        Err(_) => return (pane_id, PollOutcome::Backpressure),
+                    }
+                };
+                #[cfg(not(feature = "asupersync-runtime"))]
                 let permit = match timeout(send_timeout, tx.reserve()).await {
                     Ok(Ok(permit)) => permit,
                     Ok(Err(_)) => return (pane_id, PollOutcome::ChannelClosed),
