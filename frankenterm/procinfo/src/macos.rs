@@ -446,4 +446,97 @@ mod tests {
         let (_, argv) = result.unwrap();
         assert_eq!(argv.len(), 1);
     }
+
+    // ── Second-pass expansion ────────────────────────────────────
+
+    #[test]
+    fn status_from_u32_idle() {
+        assert!(matches!(
+            super::LocalProcessStatus::from(1),
+            super::LocalProcessStatus::Idle
+        ));
+    }
+
+    #[test]
+    fn status_from_u32_run() {
+        assert!(matches!(
+            super::LocalProcessStatus::from(2),
+            super::LocalProcessStatus::Run
+        ));
+    }
+
+    #[test]
+    fn status_from_u32_sleep() {
+        assert!(matches!(
+            super::LocalProcessStatus::from(3),
+            super::LocalProcessStatus::Sleep
+        ));
+    }
+
+    #[test]
+    fn status_from_u32_stop() {
+        assert!(matches!(
+            super::LocalProcessStatus::from(4),
+            super::LocalProcessStatus::Stop
+        ));
+    }
+
+    #[test]
+    fn status_from_u32_zombie() {
+        assert!(matches!(
+            super::LocalProcessStatus::from(5),
+            super::LocalProcessStatus::Zombie
+        ));
+    }
+
+    #[test]
+    fn status_from_u32_unknown_for_unrecognized() {
+        assert!(matches!(
+            super::LocalProcessStatus::from(99),
+            super::LocalProcessStatus::Unknown
+        ));
+    }
+
+    #[test]
+    fn test_empty_exe_path() {
+        // argc=0 with empty exe path string
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0i32.to_ne_bytes());
+        buf.extend_from_slice(b"\0"); // empty exe path
+
+        let (exe_path, argv) = parse_exe_and_argv_sysctl(buf).unwrap();
+        assert_eq!(exe_path, Path::new("").to_path_buf());
+        assert!(argv.is_empty());
+    }
+
+    #[test]
+    fn test_long_exe_path() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0i32.to_ne_bytes());
+        let long_path = format!("/{}", "a".repeat(200));
+        buf.extend_from_slice(long_path.as_bytes());
+        buf.push(0); // NUL terminator
+
+        let (exe_path, _) = parse_exe_and_argv_sysctl(buf).unwrap();
+        assert_eq!(exe_path.to_string_lossy().len(), 201);
+    }
+
+    #[test]
+    fn test_arg_with_unicode() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1i32.to_ne_bytes());
+        buf.extend_from_slice(b"/usr/bin/echo\0");
+        buf.extend_from_slice("héllo wörld".as_bytes());
+        buf.push(0);
+
+        let (_, argv) = parse_exe_and_argv_sysctl(buf).unwrap();
+        assert_eq!(argv, vec!["héllo wörld".to_string()]);
+    }
+
+    #[test]
+    fn test_buffer_just_argc() {
+        // Buffer with only argc, nothing else
+        let buf = 1i32.to_ne_bytes().to_vec();
+        assert!(parse_exe_and_argv_sysctl(buf).is_none());
+    }
 }

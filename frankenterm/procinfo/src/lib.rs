@@ -794,4 +794,136 @@ mod tests {
         let exe = LocalProcessInfo::executable_path(pid).unwrap();
         assert!(exe.exists(), "executable should exist on disk");
     }
+
+    // ── Second-pass expansion ────────────────────────────────────
+
+    #[test]
+    fn flatten_single_child_no_grandchildren() {
+        let child = LocalProcessInfo {
+            pid: 2,
+            ppid: 1,
+            name: "ls".to_string(),
+            executable: PathBuf::from("/bin/ls"),
+            argv: vec!["ls".to_string(), "-la".to_string()],
+            cwd: PathBuf::from("/tmp"),
+            status: LocalProcessStatus::Run,
+            start_time: 100,
+            children: HashMap::new(),
+        };
+        let mut children = HashMap::new();
+        children.insert(2, child);
+        let proc = make_proc("sh", "/bin/sh", children);
+        let names = proc.flatten_to_exe_names();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains("sh"));
+        assert!(names.contains("ls"));
+    }
+
+    #[test]
+    fn flatten_three_distinct_children() {
+        let mut children = HashMap::new();
+        for (id, name) in [(2u32, "cat"), (3, "grep"), (4, "sed")] {
+            children.insert(id, LocalProcessInfo {
+                pid: id,
+                ppid: 1,
+                name: name.to_string(),
+                executable: PathBuf::from(format!("/usr/bin/{}", name)),
+                argv: vec![],
+                cwd: PathBuf::new(),
+                status: LocalProcessStatus::Run,
+                start_time: 0,
+                children: HashMap::new(),
+            });
+        }
+        let proc = make_proc("pipe", "/usr/bin/pipe", children);
+        let names = proc.flatten_to_exe_names();
+        assert_eq!(names.len(), 4);
+    }
+
+    #[test]
+    fn status_copy_semantics() {
+        let a = LocalProcessStatus::Run;
+        let b = a;
+        // Both should work since Copy
+        let _da = format!("{:?}", a);
+        let _db = format!("{:?}", b);
+    }
+
+    #[test]
+    fn status_dead_debug() {
+        assert_eq!(format!("{:?}", LocalProcessStatus::Dead), "Dead");
+    }
+
+    #[test]
+    fn status_tracing_debug() {
+        assert_eq!(format!("{:?}", LocalProcessStatus::Tracing), "Tracing");
+    }
+
+    #[test]
+    fn status_wakekill_debug() {
+        assert_eq!(format!("{:?}", LocalProcessStatus::Wakekill), "Wakekill");
+    }
+
+    #[test]
+    fn status_waking_debug() {
+        assert_eq!(format!("{:?}", LocalProcessStatus::Waking), "Waking");
+    }
+
+    #[test]
+    fn status_parked_debug() {
+        assert_eq!(format!("{:?}", LocalProcessStatus::Parked), "Parked");
+    }
+
+    #[test]
+    fn status_unknown_debug() {
+        assert_eq!(format!("{:?}", LocalProcessStatus::Unknown), "Unknown");
+    }
+
+    #[test]
+    fn status_stop_debug() {
+        assert_eq!(format!("{:?}", LocalProcessStatus::Stop), "Stop");
+    }
+
+    #[test]
+    fn status_sleep_debug() {
+        assert_eq!(format!("{:?}", LocalProcessStatus::Sleep), "Sleep");
+    }
+
+    #[test]
+    fn status_run_debug() {
+        assert_eq!(format!("{:?}", LocalProcessStatus::Run), "Run");
+    }
+
+    #[test]
+    fn process_info_empty_argv() {
+        let proc = make_proc("daemon", "/usr/sbin/daemon", HashMap::new());
+        assert!(proc.argv.is_empty());
+    }
+
+    #[test]
+    fn process_info_children_empty_by_default() {
+        let proc = make_proc("leaf", "/bin/leaf", HashMap::new());
+        assert!(proc.children.is_empty());
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn with_root_pid_argv_is_nonempty() {
+        let pid = std::process::id();
+        let info = LocalProcessInfo::with_root_pid(pid).unwrap();
+        // Test runner should have at least one argument
+        assert!(!info.argv.is_empty(), "test process should have argv");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn with_root_pid_status_is_run() {
+        let pid = std::process::id();
+        let info = LocalProcessInfo::with_root_pid(pid).unwrap();
+        assert!(
+            matches!(info.status, LocalProcessStatus::Run),
+            "current process should be running, got {:?}",
+            info.status
+        );
+    }
 }
