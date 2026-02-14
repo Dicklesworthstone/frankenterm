@@ -816,6 +816,31 @@ fn collect_pane_resize_work(
     }
 }
 
+const RESIZE_FANOUT_PARALLEL_THRESHOLD: usize = 8;
+const RESIZE_FANOUT_MIN_BATCH_SIZE: usize = 4;
+const RESIZE_FANOUT_MAX_WORKERS: usize = 8;
+
+fn compute_resize_fanout_workers(work_len: usize, available_parallelism: usize) -> usize {
+    if work_len < RESIZE_FANOUT_PARALLEL_THRESHOLD {
+        return 1;
+    }
+
+    let mut workers = work_len
+        .min(available_parallelism.max(1))
+        .min(RESIZE_FANOUT_MAX_WORKERS);
+    while workers > 1 && work_len.div_ceil(workers) < RESIZE_FANOUT_MIN_BATCH_SIZE {
+        workers -= 1;
+    }
+    workers.max(1)
+}
+
+fn resize_fanout_workers_for_host(work_len: usize) -> usize {
+    let available = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    compute_resize_fanout_workers(work_len, available)
+}
+
 fn apply_sizes_from_splits(tree: &Tree, size: &TerminalSize) {
     let mut work = Vec::new();
     collect_pane_resize_work(tree, size, &mut work);
@@ -827,10 +852,8 @@ fn apply_sizes_from_splits(tree: &Tree, size: &TerminalSize) {
         return;
     }
 
-    let worker_count = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .min(work.len());
+    let work_len = work.len();
+    let worker_count = resize_fanout_workers_for_host(work_len);
 
     if worker_count <= 1 {
         for (pane, pane_size) in work {
@@ -839,11 +862,30 @@ fn apply_sizes_from_splits(tree: &Tree, size: &TerminalSize) {
         return;
     }
 
-    let mut buckets: Vec<Vec<(Arc<dyn Pane>, TerminalSize)>> =
-        (0..worker_count).map(|_| Vec::new()).collect();
-    for (idx, item) in work.into_iter().enumerate() {
-        buckets[idx % worker_count].push(item);
+    let bucket_len = work_len.div_ceil(worker_count);
+    let mut buckets = Vec::with_capacity(worker_count);
+    let mut iter = work.into_iter();
+    while buckets.len() < worker_count {
+        let mut bucket = Vec::with_capacity(bucket_len);
+        for _ in 0..bucket_len {
+            if let Some(item) = iter.next() {
+                bucket.push(item);
+            } else {
+                break;
+            }
+        }
+        if bucket.is_empty() {
+            break;
+        }
+        buckets.push(bucket);
     }
+
+    log::trace!(
+        "apply_sizes_from_splits fanout panes={} workers={} bucket_len={}",
+        work_len,
+        buckets.len(),
+        bucket_len
+    );
 
     let _ = crossbeam::thread::scope(|scope| {
         for bucket in buckets {
@@ -3101,6 +3143,7 @@ mod test {
     use parking_lot::{MappedMutexGuard, Mutex};
     use proptest::prelude::*;
     use rangeset::RangeSet;
+    use std::convert::TryFrom;
     use std::ops::Range;
     use termwiz::surface::SequenceNo;
     use url::Url;
@@ -3265,15 +3308,16 @@ mod test {
         assert_eq!(80, panes[0].width);
         assert_eq!(24, panes[0].height);
 
-        assert!(tab
-            .compute_split_size(
+        assert!(
+            tab.compute_split_size(
                 1,
                 SplitRequest {
                     direction: SplitDirection::Horizontal,
                     ..Default::default()
                 }
             )
-            .is_none());
+            .is_none()
+        );
 
         let horz_size = tab
             .compute_split_size(
@@ -4045,6 +4089,27 @@ mod test {
         );
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn resize_fanout_worker_plan_stays_sequential_for_small_work() {
+        assert_eq!(1, compute_resize_fanout_workers(1, 16));
+        assert_eq!(1, compute_resize_fanout_workers(7, 16));
+    }
+
+    #[test]
+    fn resize_fanout_worker_plan_caps_worker_count() {
+        assert_eq!(
+            RESIZE_FANOUT_MAX_WORKERS,
+            compute_resize_fanout_workers(256, 64)
+        );
+    }
+
+    #[test]
+    fn resize_fanout_worker_plan_enforces_min_batch_size() {
+        assert_eq!(2, compute_resize_fanout_workers(9, 16));
+        assert_eq!(3, compute_resize_fanout_workers(12, 16));
+        assert_eq!(2, compute_resize_fanout_workers(8, 16));
     }
 
     proptest! {
