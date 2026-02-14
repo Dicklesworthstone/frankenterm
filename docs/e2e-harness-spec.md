@@ -29,6 +29,8 @@ This document specifies the end-to-end test harness for `ft`. The harness valida
 | `--keep-artifacts` | Always keep artifacts (even on success) | delete on success |
 | `--artifacts-dir DIR` | Override artifacts directory | `./e2e-artifacts/<timestamp>` |
 | `--timeout SECS` | Global timeout per scenario | 120 |
+| `--retries N` | Retry each scenario up to `N` times on failure | 0 |
+| `--seed VALUE` | Deterministic run seed used for per-scenario seeds | auto (current UTC seconds) |
 | `--list` | List available scenarios and exit | - |
 | `--self-check` | Run harness self-check only | - |
 | `--parallel N` | Run N scenarios in parallel | 1 (sequential) |
@@ -65,6 +67,9 @@ e2e-artifacts/
     ├── summary.txt                  # Human-readable summary
     ├── ft_config_effective.toml     # Resolved configuration
     ├── scenario_01_capture_search/
+    │   ├── orchestration_manifest.json # Scenario metadata + attempt history + seed
+    │   ├── attempt_01/                 # First attempt artifacts (full scenario output)
+    │   ├── attempt_02/                 # Retry artifacts (if retries > 0 and needed)
     │   ├── test_artifacts_manifest.json # Canonical artifact schema (wa.test_artifacts.v1)
     │   ├── correlation.jsonl        # Correlation + timing row for this scenario
     │   ├── ft_watch.log             # Watcher stdout/stderr
@@ -92,6 +97,9 @@ rust_version: 1.85.0-nightly
 os: Linux 6.x x86_64
 shell: /bin/bash
 temp_workspace: /tmp/ft-e2e-abc123
+run_seed: 1739523600
+run_seed_source: auto
+scenario_retries: 1
 ```
 
 ### `summary.json` Schema
@@ -102,6 +110,9 @@ temp_workspace: /tmp/ft-e2e-abc123
   "schema_version": "wa.e2e.summary.v2",
   "test_artifact_schema_version": "wa.test_artifacts.v1",
   "timestamp": "2026-01-19T09:00:00Z",
+  "run_seed": "1739523600",
+  "run_seed_source": "auto",
+  "scenario_retries": 1,
   "duration_secs": 45.2,
   "total": 3,
   "passed": 2,
@@ -111,6 +122,13 @@ temp_workspace: /tmp/ft-e2e-abc123
     {
       "name": "capture_search",
       "status": "passed",
+      "scenario_seed": "f1d2d2f924e986ac",
+      "max_attempts": 2,
+      "attempts": [
+        { "attempt": 1, "status": "failed", "exit_code": 1, "duration_secs": 5.0 },
+        { "attempt": 2, "status": "passed", "exit_code": 0, "duration_secs": 4.2 }
+      ],
+      "orchestration_manifest": "scenario_01_capture_search/orchestration_manifest.json",
       "duration_secs": 12.3,
       "artifacts_dir": "scenario_01_capture_search",
       "test_artifacts_manifest": "scenario_01_capture_search/test_artifacts_manifest.json"
@@ -400,10 +418,31 @@ Hint: Check if watcher started successfully and pane was observed.
 |----------|-------------|---------|
 | `FT_E2E_KEEP_ARTIFACTS` | Always keep artifacts | `1` |
 | `FT_E2E_TIMEOUT` | Override timeout (seconds) | `300` |
+| `FT_E2E_RETRIES` | Retry each scenario up to N times | `2` |
+| `FT_E2E_SEED` | Deterministic run seed override | `release-2026-02-14` |
 | `FT_E2E_VERBOSE` | Enable verbose output | `1` |
 | `FT_E2E_WORKSPACE` | Override workspace path | `/tmp/ft-e2e` |
 | `FT_LOG_LEVEL` | Log level for ft processes | `debug` |
 | `FT_LOG_FORMAT` | Log format (`pretty`/`json`) | `json` |
+
+---
+
+## Reproducible Invocation
+
+Use explicit seed and retry policy in CI/nightly so failures are replayable:
+
+```bash
+# Nightly baseline (single retry for transient backend startup races)
+./scripts/e2e_test.sh --default-only --seed nightly-$(date -u +%F) --retries 1 --keep-artifacts
+
+# Exact replay of a failed run
+./scripts/e2e_test.sh capture_search --seed 1739523600 --retries 1 --keep-artifacts --verbose
+```
+
+Each scenario writes `orchestration_manifest.json` with:
+- scenario metadata from the registry (description/default/prereqs/why)
+- derived deterministic `scenario_seed`
+- per-attempt status, duration, and exit code
 
 ---
 

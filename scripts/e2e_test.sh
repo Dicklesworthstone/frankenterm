@@ -47,6 +47,9 @@ VERBOSE=false
 KEEP_ARTIFACTS=false
 ARTIFACTS_DIR=""
 TIMEOUT="$DEFAULT_TIMEOUT"
+SCENARIO_RETRIES=0
+RUN_SEED=""
+RUN_SEED_SOURCE="auto"
 SELF_CHECK_ONLY=false
 SKIP_SELF_CHECK=false
 LIST_ONLY=false
@@ -112,6 +115,8 @@ Options:
     --keep-artifacts      Always keep artifacts (even on success)
     --artifacts-dir DIR   Override artifacts directory
     --timeout SECS        Global timeout per scenario (default: $DEFAULT_TIMEOUT)
+    --retries N           Retry each scenario up to N times on failure (default: 0)
+    --seed VALUE          Deterministic run seed used for per-scenario seeds
     --list                List available scenarios and exit
     --self-check          Run harness self-check only
     --skip-self-check     Skip prerequisites check (for CI setup-only scenarios)
@@ -137,6 +142,8 @@ Exit Codes:
 Environment Variables:
     FT_E2E_KEEP_ARTIFACTS  Always keep artifacts (1)
     FT_E2E_TIMEOUT         Override timeout (seconds)
+    FT_E2E_RETRIES         Retry count override (integer)
+    FT_E2E_SEED            Deterministic run seed override
     FT_E2E_VERBOSE         Enable verbose output (1)
     FT_E2E_WORKSPACE       Override workspace path
     FT_LOG_LEVEL           Log level for wa processes
@@ -171,6 +178,15 @@ parse_args() {
                 ;;
             --timeout)
                 TIMEOUT="$2"
+                shift 2
+                ;;
+            --retries)
+                SCENARIO_RETRIES="$2"
+                shift 2
+                ;;
+            --seed)
+                RUN_SEED="$2"
+                RUN_SEED_SOURCE="explicit"
                 shift 2
                 ;;
             --list)
@@ -229,6 +245,11 @@ parse_args() {
     # Apply environment variable overrides
     if [[ -n "${FT_E2E_KEEP_ARTIFACTS:-}" ]]; then KEEP_ARTIFACTS=true; fi
     if [[ -n "${FT_E2E_TIMEOUT:-}" ]]; then TIMEOUT="$FT_E2E_TIMEOUT"; fi
+    if [[ -n "${FT_E2E_RETRIES:-}" ]]; then SCENARIO_RETRIES="$FT_E2E_RETRIES"; fi
+    if [[ -n "${FT_E2E_SEED:-}" ]]; then
+        RUN_SEED="$FT_E2E_SEED"
+        RUN_SEED_SOURCE="env"
+    fi
     if [[ -n "${FT_E2E_VERBOSE:-}" ]]; then VERBOSE=true; fi
     if [[ -n "${FT_E2E_WORKSPACE:-}" ]]; then WORKSPACE="$FT_E2E_WORKSPACE"; fi
 }
@@ -459,6 +480,93 @@ is_valid_scenario() {
     return 1
 }
 
+find_scenario_registry_entry() {
+    local name="$1"
+    for entry in "${SCENARIO_REGISTRY[@]}"; do
+        local entry_name=""
+        IFS='|' read -r entry_name _ <<< "$entry"
+        if [[ "$entry_name" == "$name" ]]; then
+            echo "$entry"
+            return 0
+        fi
+    done
+    return 1
+}
+
+scenario_metadata_json() {
+    local name="$1"
+    local entry=""
+    local desc=""
+    local default_flag="false"
+    local prereqs=""
+    local why=""
+
+    entry=$(find_scenario_registry_entry "$name" || true)
+    if [[ -n "$entry" ]]; then
+        IFS='|' read -r _ desc default_flag prereqs why <<< "$entry"
+    fi
+
+    jq -cn \
+        --arg name "$name" \
+        --arg description "$desc" \
+        --argjson default "$([[ "$default_flag" == "true" ]] && echo true || echo false)" \
+        --arg prereqs "$prereqs" \
+        --arg why "$why" \
+        '{
+            name: $name,
+            description: $description,
+            default: $default,
+            prerequisites: (if $prereqs == "" then [] else ($prereqs | split(",")) end),
+            why: $why
+        }'
+}
+
+compute_scenario_seed_hex() {
+    local name="$1"
+    local scenario_num="$2"
+    local payload="${RUN_SEED}|${scenario_num}|${name}"
+
+    if command -v shasum >/dev/null 2>&1; then
+        printf '%s' "$payload" | shasum -a 256 | awk '{print substr($1,1,16)}'
+    elif command -v sha256sum >/dev/null 2>&1; then
+        printf '%s' "$payload" | sha256sum | awk '{print substr($1,1,16)}'
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 - "$payload" <<'PY'
+import hashlib
+import sys
+print(hashlib.sha256(sys.argv[1].encode("utf-8")).hexdigest()[:16])
+PY
+    else
+        # Last-resort fallback if hash utilities are unavailable.
+        printf '%016x\n' "$scenario_num"
+    fi
+}
+
+scenario_retry_backoff_secs() {
+    local attempt_num="$1"
+    local backoff=$((1 << (attempt_num - 1)))
+    if [[ "$backoff" -gt 8 ]]; then
+        backoff=8
+    fi
+    echo "$backoff"
+}
+
+validate_orchestration_config() {
+    if ! [[ "$SCENARIO_RETRIES" =~ ^[0-9]+$ ]]; then
+        echo "Invalid --retries value: $SCENARIO_RETRIES (expected integer >= 0)" >&2
+        exit 3
+    fi
+    if ! [[ "$PARALLEL" =~ ^[0-9]+$ ]] || [[ "$PARALLEL" -lt 1 ]]; then
+        echo "Invalid --parallel value: $PARALLEL (expected integer >= 1)" >&2
+        exit 3
+    fi
+
+    if [[ -z "$RUN_SEED" ]]; then
+        RUN_SEED="$(date -u +%s)"
+        RUN_SEED_SOURCE="auto"
+    fi
+}
+
 # ==============================================================================
 # Artifacts Management
 # ==============================================================================
@@ -486,6 +594,9 @@ rust_version: $(rustc --version 2>/dev/null || echo "N/A")
 os: $(uname -a)
 shell: $SHELL
 temp_workspace: ${WORKSPACE:-auto}
+run_seed: $RUN_SEED
+run_seed_source: $RUN_SEED_SOURCE
+scenario_retries: $SCENARIO_RETRIES
 EOF
 
     log_verbose "Artifacts directory: $RUN_ARTIFACTS_DIR"
@@ -515,6 +626,9 @@ write_summary() {
   "schema_version": "wa.e2e.summary.v2",
   "test_artifact_schema_version": "wa.test_artifacts.v1",
   "timestamp": "$TIMESTAMP",
+  "run_seed": "$RUN_SEED",
+  "run_seed_source": "$RUN_SEED_SOURCE",
+  "scenario_retries": $SCENARIO_RETRIES,
   "duration_secs": $duration,
   "total": $TOTAL,
   "passed": $PASSED,
@@ -529,6 +643,8 @@ EOF
 E2E Test Summary
 ================
 Timestamp: $TIMESTAMP
+Run Seed:  $RUN_SEED ($RUN_SEED_SOURCE)
+Retries:   $SCENARIO_RETRIES
 Duration:  ${duration}s
 
 Results:
@@ -8262,49 +8378,42 @@ EOF
     return $result
 }
 
-run_scenario() {
+dispatch_scenario() {
     local name="$1"
-    local scenario_num="$2"
-    local scenario_dir="$RUN_ARTIFACTS_DIR/scenario_$(printf '%02d' "$scenario_num")_$name"
-
-    mkdir -p "$scenario_dir"
-
-    log_info "Starting scenario: $name"
-    local start_time=$(date +%s)
-
+    local scenario_dir="$2"
     local result=0
 
-        case "$name" in
-            capture_search)
-                run_scenario_capture_search "$scenario_dir" || result=$?
-                ;;
-            search_linting_rebuild)
-                run_scenario_search_linting_rebuild "$scenario_dir" || result=$?
-                ;;
-            natural_language)
-                run_scenario_natural_language "$scenario_dir" || result=$?
-                ;;
-            compaction_workflow)
-                run_scenario_compaction_workflow "$scenario_dir" || result=$?
-                ;;
-            unhandled_event_lifecycle)
-                run_scenario_unhandled_event_lifecycle "$scenario_dir" || result=$?
-                ;;
-            workflow_lifecycle)
-                run_scenario_workflow_lifecycle "$scenario_dir" || result=$?
-                ;;
-            dry_run_mode)
-                run_scenario_dry_run_mode "$scenario_dir" || result=$?
-                ;;
-            events_unhandled_alias)
-                run_scenario_events_unhandled_alias "$scenario_dir" || result=$?
-                ;;
-            events_annotations_triage)
-                run_scenario_events_annotations_triage "$scenario_dir" || result=$?
-                ;;
-            history_undo_workflow)
-                run_scenario_history_undo_workflow "$scenario_dir" || result=$?
-                ;;
+    case "$name" in
+        capture_search)
+            run_scenario_capture_search "$scenario_dir" || result=$?
+            ;;
+        search_linting_rebuild)
+            run_scenario_search_linting_rebuild "$scenario_dir" || result=$?
+            ;;
+        natural_language)
+            run_scenario_natural_language "$scenario_dir" || result=$?
+            ;;
+        compaction_workflow)
+            run_scenario_compaction_workflow "$scenario_dir" || result=$?
+            ;;
+        unhandled_event_lifecycle)
+            run_scenario_unhandled_event_lifecycle "$scenario_dir" || result=$?
+            ;;
+        workflow_lifecycle)
+            run_scenario_workflow_lifecycle "$scenario_dir" || result=$?
+            ;;
+        dry_run_mode)
+            run_scenario_dry_run_mode "$scenario_dir" || result=$?
+            ;;
+        events_unhandled_alias)
+            run_scenario_events_unhandled_alias "$scenario_dir" || result=$?
+            ;;
+        events_annotations_triage)
+            run_scenario_events_annotations_triage "$scenario_dir" || result=$?
+            ;;
+        history_undo_workflow)
+            run_scenario_history_undo_workflow "$scenario_dir" || result=$?
+            ;;
         policy_denial)
             run_scenario_policy_denial "$scenario_dir" || result=$?
             ;;
@@ -8329,15 +8438,15 @@ run_scenario() {
         stress_scale)
             run_scenario_stress_scale "$scenario_dir" || result=$?
             ;;
-	        graceful_shutdown)
-	            run_scenario_graceful_shutdown "$scenario_dir" || result=$?
-	            ;;
-	        watcher_crash_bundle)
-	            run_scenario_watcher_crash_bundle "$scenario_dir" || result=$?
-	            ;;
-	        pane_exclude_filter)
-	            run_scenario_pane_exclude_filter "$scenario_dir" || result=$?
-	            ;;
+        graceful_shutdown)
+            run_scenario_graceful_shutdown "$scenario_dir" || result=$?
+            ;;
+        watcher_crash_bundle)
+            run_scenario_watcher_crash_bundle "$scenario_dir" || result=$?
+            ;;
+        pane_exclude_filter)
+            run_scenario_pane_exclude_filter "$scenario_dir" || result=$?
+            ;;
         workspace_isolation)
             run_scenario_workspace_isolation "$scenario_dir" || result=$?
             ;;
@@ -8387,11 +8496,117 @@ run_scenario() {
             ;;
     esac
 
+    return "$result"
+}
+
+promote_attempt_artifacts() {
+    local scenario_dir="$1"
+    local attempt_dir="$2"
+    if [[ ! -d "$attempt_dir" ]]; then
+        return 0
+    fi
+    while IFS= read -r file_path; do
+        cp -f "$file_path" "$scenario_dir/"
+    done < <(find "$attempt_dir" -maxdepth 1 -type f | LC_ALL=C sort)
+}
+
+run_scenario() {
+    local name="$1"
+    local scenario_num="$2"
+    local scenario_dir="$RUN_ARTIFACTS_DIR/scenario_$(printf '%02d' "$scenario_num")_$name"
+    local scenario_seed_hex=""
+    local scenario_metadata=""
+    local max_attempts=$((SCENARIO_RETRIES + 1))
+    local attempts_json="[]"
+    local selected_attempt_dir=""
+    local start_time=$(date +%s)
+    local result=1
+    local attempt=1
+
+    mkdir -p "$scenario_dir"
+
+    scenario_seed_hex=$(compute_scenario_seed_hex "$name" "$scenario_num")
+    scenario_metadata=$(scenario_metadata_json "$name")
+
+    export FT_E2E_RUN_SEED="$RUN_SEED"
+    export FT_E2E_SCENARIO_SEED="$scenario_seed_hex"
+    export FT_E2E_SCENARIO_NAME="$name"
+    export FT_E2E_SCENARIO_INDEX="$scenario_num"
+
+    log_info "Starting scenario: $name (seed=$scenario_seed_hex attempts=$max_attempts)"
+
+    for ((attempt=1; attempt<=max_attempts; attempt++)); do
+        local attempt_dir="$scenario_dir/attempt_$(printf '%02d' "$attempt")"
+        local attempt_result=0
+        local attempt_start=$(date +%s)
+        local attempt_duration=0
+        local attempt_started_at=""
+        local backoff_secs=0
+
+        mkdir -p "$attempt_dir"
+        attempt_started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+        if [[ "$attempt" -gt 1 ]]; then
+            log_warn "Retrying scenario $name (attempt $attempt/$max_attempts)"
+        fi
+
+        dispatch_scenario "$name" "$attempt_dir" || attempt_result=$?
+        attempt_duration=$(( $(date +%s) - attempt_start ))
+        selected_attempt_dir="$attempt_dir"
+
+        attempts_json=$(jq -c \
+            --argjson attempt "$attempt" \
+            --arg started_at "$attempt_started_at" \
+            --argjson duration_secs "$attempt_duration" \
+            --argjson exit_code "$attempt_result" \
+            --arg status "$([[ "$attempt_result" -eq 0 ]] && echo passed || echo failed)" \
+            '. + [{
+                attempt: $attempt,
+                started_at: $started_at,
+                duration_secs: $duration_secs,
+                exit_code: $exit_code,
+                status: $status
+            }]' <<< "$attempts_json")
+
+        if [[ "$attempt_result" -eq 0 ]]; then
+            result=0
+            break
+        fi
+
+        result="$attempt_result"
+        if [[ "$attempt" -lt "$max_attempts" ]]; then
+            backoff_secs=$(scenario_retry_backoff_secs "$attempt")
+            log_warn "Scenario $name failed attempt $attempt/$max_attempts (exit=$attempt_result); backing off ${backoff_secs}s"
+            sleep "$backoff_secs"
+        fi
+    done
+
+    promote_attempt_artifacts "$scenario_dir" "$selected_attempt_dir"
+
     local duration=$(( $(date +%s) - start_time ))
+
+    local orchestration_manifest="$scenario_dir/orchestration_manifest.json"
+    jq -n \
+        --arg scenario "$name" \
+        --argjson scenario_index "$scenario_num" \
+        --arg run_seed "$RUN_SEED" \
+        --arg scenario_seed "$scenario_seed_hex" \
+        --argjson max_attempts "$max_attempts" \
+        --argjson attempts "$attempts_json" \
+        --argjson metadata "$scenario_metadata" \
+        '{
+            scenario: $scenario,
+            scenario_index: $scenario_index,
+            run_seed: $run_seed,
+            scenario_seed: $scenario_seed,
+            max_attempts: $max_attempts,
+            metadata: $metadata,
+            attempts: $attempts
+        }' > "$orchestration_manifest"
 
     local status="passed"
     local failure_signature=""
-    if [[ $result -eq 0 ]]; then
+    if [[ "$result" -eq 0 ]]; then
         touch "$scenario_dir/PASS"
         log_pass "Scenario $name: PASSED (${duration}s)"
         ((PASSED++))
@@ -8407,6 +8622,7 @@ run_scenario() {
         echo "FAILURE DETAILS"
         echo "==============="
         echo "Scenario: $name"
+        echo "Seed: $scenario_seed_hex"
         echo "Duration: ${duration}s"
         echo ""
         echo "Artifacts saved to: $scenario_dir/"
@@ -8420,6 +8636,10 @@ run_scenario() {
         --arg name "$name" \
         --arg status "$status" \
         --argjson duration_secs "$duration" \
+        --arg scenario_seed "$scenario_seed_hex" \
+        --argjson max_attempts "$max_attempts" \
+        --argjson attempts "$attempts_json" \
+        --arg orchestration_manifest "$(basename "$scenario_dir")/orchestration_manifest.json" \
         --arg artifacts_dir "$(basename "$scenario_dir")" \
         --arg test_artifacts_manifest "$(basename "$scenario_dir")/test_artifacts_manifest.json" \
         --arg failure_signature "$failure_signature" \
@@ -8427,12 +8647,16 @@ run_scenario() {
             name: $name,
             status: $status,
             duration_secs: $duration_secs,
+            scenario_seed: $scenario_seed,
+            max_attempts: $max_attempts,
+            attempts: $attempts,
+            orchestration_manifest: $orchestration_manifest,
             artifacts_dir: $artifacts_dir,
             test_artifacts_manifest: $test_artifacts_manifest
         } + (if $status == "failed" and $failure_signature != "" then {error: $failure_signature} else {} end)')
     SCENARIO_SUMMARIES+=("$summary_entry")
 
-    return $result
+    return "$result"
 }
 
 # ==============================================================================
@@ -8441,6 +8665,7 @@ run_scenario() {
 
 main() {
     parse_args "$@"
+    validate_orchestration_config
 
     # Handle --list
     if [[ "$LIST_ONLY" == "true" ]]; then
@@ -8503,6 +8728,7 @@ main() {
     fi
 
     TOTAL=${#scenarios_to_run[@]}
+    log_info "Orchestration: run_seed=$RUN_SEED retries=$SCENARIO_RETRIES parallel=$PARALLEL"
     log_info "Running $TOTAL scenario(s): ${scenarios_to_run[*]}"
     echo ""
 
