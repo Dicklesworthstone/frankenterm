@@ -255,3 +255,208 @@ proptest! {
         prop_assert!(debug.contains("killed"), "Debug should mention 'killed'");
     }
 }
+
+// ── ReapReport: JSON schema exactness ───────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// Serialized JSON object has exactly 4 keys (scanned, killed, killed_pids, errors).
+    #[test]
+    fn report_json_has_exactly_four_keys(r in arb_consistent_report()) {
+        let json = serde_json::to_string(&r).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = value.as_object().unwrap();
+        prop_assert_eq!(obj.len(), 4,
+            "expected exactly 4 JSON keys, got {}: {:?}",
+            obj.len(), obj.keys().collect::<Vec<_>>());
+    }
+
+    /// The "scanned" field is always a JSON number.
+    #[test]
+    fn report_json_scanned_is_number(r in arb_consistent_report()) {
+        let json = serde_json::to_string(&r).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let scanned = value.get("scanned").unwrap();
+        prop_assert!(scanned.is_number(),
+            "'scanned' should be a JSON number, got: {}", scanned);
+    }
+
+    /// The "killed" field is always a JSON number.
+    #[test]
+    fn report_json_killed_is_number(r in arb_consistent_report()) {
+        let json = serde_json::to_string(&r).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let killed = value.get("killed").unwrap();
+        prop_assert!(killed.is_number(),
+            "'killed' should be a JSON number, got: {}", killed);
+    }
+
+    /// Each error string is preserved exactly in serialized JSON.
+    #[test]
+    fn report_errors_preserved_through_json(r in arb_consistent_report()) {
+        let json = serde_json::to_string(&r).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let errors = value.get("errors").unwrap().as_array().unwrap();
+        prop_assert_eq!(errors.len(), r.errors.len(),
+            "errors array length mismatch");
+        for (i, val) in errors.iter().enumerate() {
+            let s = val.as_str().unwrap();
+            prop_assert_eq!(s, r.errors[i].as_str(),
+                "error mismatch at index {}: expected {:?}, got {:?}",
+                i, r.errors[i], s);
+        }
+    }
+
+    /// Report with no errors serializes errors as an empty JSON array.
+    #[test]
+    fn report_empty_errors_serializes_empty_array(
+        scanned_extra in 0usize..100,
+        killed_pids in proptest::collection::vec(1u32..65535, 0..20),
+    ) {
+        let killed = killed_pids.len();
+        let scanned = killed + scanned_extra;
+        let r = ReapReport {
+            scanned,
+            killed,
+            killed_pids,
+            errors: vec![],
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let errors = value.get("errors").unwrap().as_array().unwrap();
+        prop_assert!(errors.is_empty(),
+            "errors should serialize as empty array, got {} elements", errors.len());
+    }
+}
+
+// ── ReapReport: Clone ordering and identity ─────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// Cloned report preserves killed_pids ordering exactly.
+    #[test]
+    fn report_clone_preserves_killed_pids_order(r in arb_consistent_report()) {
+        let cloned = r.clone();
+        for (i, pid) in cloned.killed_pids.iter().enumerate() {
+            prop_assert_eq!(*pid, r.killed_pids[i],
+                "killed_pids order mismatch at index {}: clone has {}, original has {}",
+                i, pid, r.killed_pids[i]);
+        }
+    }
+
+    /// Default().clone() produces same field values as a fresh Default().
+    #[test]
+    fn report_default_clone_is_default(_i in 0..1u8) {
+        let original = ReapReport::default();
+        let cloned = original.clone();
+        let fresh = ReapReport::default();
+        prop_assert_eq!(cloned.scanned, fresh.scanned);
+        prop_assert_eq!(cloned.killed, fresh.killed);
+        prop_assert_eq!(cloned.killed_pids, fresh.killed_pids);
+        prop_assert_eq!(cloned.errors, fresh.errors);
+    }
+
+    /// Full deep equality check on arbitrary (possibly inconsistent) report clone,
+    /// including killed_pids and errors vectors.
+    #[test]
+    fn arbitrary_report_clone_preserves_all_fields(r in arb_arbitrary_report()) {
+        let cloned = r.clone();
+        prop_assert_eq!(cloned.scanned, r.scanned);
+        prop_assert_eq!(cloned.killed, r.killed);
+        prop_assert_eq!(cloned.killed_pids.len(), r.killed_pids.len(),
+            "killed_pids length mismatch after clone");
+        for (i, pid) in cloned.killed_pids.iter().enumerate() {
+            prop_assert_eq!(*pid, r.killed_pids[i],
+                "killed_pids mismatch at index {} after clone", i);
+        }
+        prop_assert_eq!(cloned.errors.len(), r.errors.len(),
+            "errors length mismatch after clone");
+        for (i, err) in cloned.errors.iter().enumerate() {
+            prop_assert_eq!(err.as_str(), r.errors[i].as_str(),
+                "errors mismatch at index {} after clone", i);
+        }
+    }
+}
+
+// ── ReapReport: JSON size and formatting properties ─────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// More killed_pids produce a longer (or equal) JSON string than a baseline
+    /// report with the same scanned/killed but no pids.
+    #[test]
+    fn report_json_size_nonnegative_correlation_with_pids(r in arb_consistent_report()) {
+        let baseline = ReapReport {
+            scanned: r.scanned,
+            killed: r.killed,
+            killed_pids: vec![],
+            errors: r.errors.clone(),
+        };
+        let json_with_pids = serde_json::to_string(&r).unwrap();
+        let json_baseline = serde_json::to_string(&baseline).unwrap();
+        prop_assert!(json_with_pids.len() >= json_baseline.len(),
+            "JSON with {} pids (len={}) should be >= baseline (len={})",
+            r.killed_pids.len(), json_with_pids.len(), json_baseline.len());
+    }
+
+    /// Pretty-printed JSON always contains newlines.
+    #[test]
+    fn report_json_pretty_has_newlines(r in arb_consistent_report()) {
+        let json = serde_json::to_string_pretty(&r).unwrap();
+        prop_assert!(json.contains('\n'),
+            "pretty-printed JSON should contain newlines");
+    }
+
+    /// Compact JSON does not contain newlines.
+    #[test]
+    fn report_json_compact_no_unnecessary_whitespace(r in arb_consistent_report()) {
+        let json = serde_json::to_string(&r).unwrap();
+        prop_assert!(!json.contains('\n'),
+            "compact JSON should not contain newlines, got: {:?}", json);
+    }
+}
+
+// ── ReapReport: Debug output properties ─────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+
+    /// Debug format for a report with errors is longer than for an empty default report.
+    #[test]
+    fn report_debug_length_grows_with_content(r in arb_consistent_report()) {
+        let empty_debug = format!("{:?}", ReapReport::default());
+        let this_debug = format!("{:?}", r);
+        // A report with any non-zero content should have a longer Debug repr than
+        // or equal to an empty report (pids, errors, and counts all add characters).
+        prop_assert!(this_debug.len() >= empty_debug.len(),
+            "Debug of populated report (len={}) should be >= empty report (len={})",
+            this_debug.len(), empty_debug.len());
+    }
+}
+
+// ── ReapReport: strategy-level invariants ───────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// All PIDs produced by arb_consistent_report are strictly positive (> 0).
+    #[test]
+    fn report_killed_pids_all_positive_in_strategy(r in arb_consistent_report()) {
+        for (i, pid) in r.killed_pids.iter().enumerate() {
+            prop_assert!(*pid > 0,
+                "killed_pids[{}] should be > 0, got {}", i, pid);
+        }
+    }
+
+    /// For consistent reports, scanned >= killed_pids.len()
+    /// (since killed == killed_pids.len() and killed <= scanned).
+    #[test]
+    fn report_scanned_ge_killed_pids_len(r in arb_consistent_report()) {
+        prop_assert!(r.scanned >= r.killed_pids.len(),
+            "scanned ({}) should be >= killed_pids.len() ({})",
+            r.scanned, r.killed_pids.len());
+    }
+}

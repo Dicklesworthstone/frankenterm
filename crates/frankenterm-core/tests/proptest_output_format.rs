@@ -5,6 +5,7 @@
 
 use frankenterm_core::output::OutputFormat;
 use proptest::prelude::*;
+use std::str::FromStr;
 
 // ── Strategies ──────────────────────────────────────────────────────────────
 
@@ -30,6 +31,14 @@ fn arb_valid_format_string() -> impl Strategy<Value = String> {
         Just("Auto".to_string()),
         Just("Plain".to_string()),
         Just("Json".to_string()),
+    ]
+}
+
+/// Strategy that produces non-auto variants only (Plain, Json).
+fn arb_non_auto_format() -> impl Strategy<Value = OutputFormat> {
+    prop_oneof![
+        Just(OutputFormat::Plain),
+        Just(OutputFormat::Json),
     ]
 }
 
@@ -245,5 +254,186 @@ proptest! {
     #[test]
     fn format_reflexive(fmt in arb_output_format()) {
         prop_assert_eq!(fmt, fmt);
+    }
+}
+
+// ── OutputFormat: FromStr roundtrip (new) ───────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+
+    /// FromStr then Display roundtrip: parse a valid string, Display the result,
+    /// verify it parses back to the same variant.
+    #[test]
+    fn format_fromstr_roundtrip(s in arb_valid_format_string()) {
+        let parsed = OutputFormat::from_str(&s);
+        prop_assert!(parsed.is_ok(), "valid string '{}' should parse via FromStr", s);
+        let fmt = parsed.unwrap();
+        let displayed = fmt.to_string();
+        let reparsed = OutputFormat::from_str(&displayed);
+        prop_assert!(reparsed.is_ok(), "Display output '{}' should reparse via FromStr", displayed);
+        prop_assert_eq!(fmt, reparsed.unwrap(),
+            "FromStr roundtrip failed for '{}': displayed='{}', reparsed={:?}",
+            s, displayed, reparsed);
+    }
+}
+
+// ── OutputFormat: Display properties (new) ──────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// Display output contains only ASCII characters.
+    #[test]
+    fn format_display_is_ascii(fmt in arb_output_format()) {
+        let s = fmt.to_string();
+        prop_assert!(s.is_ascii(),
+            "Display output '{}' contains non-ASCII characters", s);
+    }
+
+    /// Display output contains no whitespace.
+    #[test]
+    fn format_display_no_whitespace(fmt in arb_output_format()) {
+        let s = fmt.to_string();
+        prop_assert!(!s.contains(char::is_whitespace),
+            "Display output '{}' contains whitespace", s);
+    }
+}
+
+// ── OutputFormat: parse edge cases (new) ────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// Empty string returns None from parse.
+    #[test]
+    fn format_parse_none_for_empty(_i in 0..1u8) {
+        prop_assert_eq!(OutputFormat::parse(""), None,
+            "empty string should not parse to any format");
+    }
+
+    /// Numeric strings return None from parse.
+    #[test]
+    fn format_parse_none_for_numeric(s in "[0-9]{1,8}") {
+        prop_assert_eq!(OutputFormat::parse(&s), None,
+            "numeric string '{}' should not parse to any format", s);
+    }
+}
+
+// ── OutputFormat: Clone equality (new) ──────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// Clone produces an equal value.
+    #[test]
+    fn format_clone_eq(fmt in arb_output_format()) {
+        #[allow(clippy::clone_on_copy)]
+        let cloned = fmt.clone();
+        prop_assert_eq!(fmt, cloned,
+            "Clone of {:?} should equal original", fmt);
+    }
+}
+
+// ── OutputFormat: double parse idempotency (new) ────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+
+    /// parse(display(parse(s))) == parse(s) for valid strings.
+    #[test]
+    fn format_double_parse_idempotent(s in arb_valid_format_string()) {
+        let first = OutputFormat::parse(&s);
+        prop_assert!(first.is_some(), "valid string '{}' should parse", s);
+        let displayed = first.unwrap().to_string();
+        let second = OutputFormat::parse(&displayed);
+        prop_assert_eq!(first, second,
+            "double parse not idempotent: parse('{}')={:?}, parse(display(parse('{}')))={:?}",
+            s, first, s, second);
+    }
+}
+
+// ── OutputFormat: effective() determinism and distinctness (new) ─────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// Plain.effective() always returns the same value across repeated calls.
+    #[test]
+    fn format_effective_plain_deterministic(_i in 0..1u8) {
+        let eff1 = OutputFormat::Plain.effective();
+        let eff2 = OutputFormat::Plain.effective();
+        prop_assert_eq!(eff1, eff2,
+            "Plain.effective() is non-deterministic");
+    }
+
+    /// Json.effective() always returns the same value across repeated calls.
+    #[test]
+    fn format_effective_json_deterministic(_i in 0..1u8) {
+        let eff1 = OutputFormat::Json.effective();
+        let eff2 = OutputFormat::Json.effective();
+        prop_assert_eq!(eff1, eff2,
+            "Json.effective() is non-deterministic");
+    }
+
+    /// Plain.effective() and Json.effective() are distinct.
+    #[test]
+    fn format_effective_plain_json_distinct(_i in 0..1u8) {
+        let eff_plain = OutputFormat::Plain.effective();
+        let eff_json = OutputFormat::Json.effective();
+        prop_assert_ne!(eff_plain, eff_json,
+            "Plain.effective() and Json.effective() should be different");
+    }
+}
+
+// ── OutputFormat: boolean exclusivity for non-Auto (new) ────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// For Plain and Json, exactly one of is_json()/is_plain() is true.
+    #[test]
+    fn format_is_json_xor_is_plain_for_non_auto(fmt in arb_non_auto_format()) {
+        let j = fmt.is_json();
+        let p = fmt.is_plain();
+        prop_assert!(j ^ p,
+            "{:?}: is_json()={}, is_plain()={} — expected exactly one true",
+            fmt, j, p);
+    }
+}
+
+// ── OutputFormat: comprehensive variant coverage (new) ──────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// For every variant, parse(display(v)) == Some(v).
+    #[test]
+    fn format_all_variants_parse_from_display(fmt in arb_output_format()) {
+        let displayed = fmt.to_string();
+        let parsed = OutputFormat::parse(&displayed);
+        prop_assert_eq!(parsed, Some(fmt),
+            "parse(display({:?})) = {:?}, expected Some({:?})", fmt, parsed, fmt);
+    }
+
+    /// "text" and "plain" both parse to Plain, confirming alias consistency.
+    #[test]
+    fn format_text_and_plain_parse_to_same(_i in 0..1u8) {
+        let from_text = OutputFormat::parse("text");
+        let from_plain = OutputFormat::parse("plain");
+        prop_assert_eq!(from_text, from_plain,
+            "\"text\" and \"plain\" should parse to the same variant");
+        prop_assert_eq!(from_text, Some(OutputFormat::Plain));
+    }
+
+    /// Debug output contains the variant name ("Auto", "Plain", or "Json").
+    #[test]
+    fn format_debug_contains_variant_name(fmt in arb_output_format()) {
+        let debug = format!("{:?}", fmt);
+        let contains_name = debug.contains("Auto")
+            || debug.contains("Plain")
+            || debug.contains("Json");
+        prop_assert!(contains_name,
+            "Debug output '{}' does not contain any variant name", debug);
     }
 }

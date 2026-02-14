@@ -282,3 +282,208 @@ fn default_required_tier() {
     // Default: include_text=true, no max_sensitivity, empty pane_ids
     assert_eq!(req.required_tier(), AccessTier::A1RedactedQuery);
 }
+
+// =========================================================================
+// NEW: ExportFormat — Clone/Copy/Debug
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    /// ExportFormat Copy semantics preserve equality.
+    #[test]
+    fn prop_format_copy(fmt in arb_export_format()) {
+        let copied = fmt;
+        prop_assert_eq!(fmt, copied);
+    }
+
+    /// ExportFormat Debug is non-empty.
+    #[test]
+    fn prop_format_debug_nonempty(fmt in arb_export_format()) {
+        let dbg = format!("{:?}", fmt);
+        prop_assert!(!dbg.is_empty());
+    }
+
+    /// ExportFormat Debug contains variant name.
+    #[test]
+    fn prop_format_debug_contains_variant(fmt in arb_export_format()) {
+        let dbg = format!("{:?}", fmt);
+        let has_name = dbg.contains("JsonLines")
+            || dbg.contains("Csv")
+            || dbg.contains("Transcript");
+        prop_assert!(has_name, "Debug '{}' should contain variant name", dbg);
+    }
+
+    /// ExportFormat Display is ASCII.
+    #[test]
+    fn prop_format_display_ascii(fmt in arb_export_format()) {
+        let s = fmt.to_string();
+        prop_assert!(s.is_ascii(), "Display '{}' should be ASCII", s);
+    }
+}
+
+// =========================================================================
+// NEW: ExportFormat — pretty JSON roundtrip
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    /// Pretty JSON roundtrip.
+    #[test]
+    fn prop_format_pretty_serde(fmt in arb_export_format()) {
+        let json = serde_json::to_string_pretty(&fmt).unwrap();
+        let back: ExportFormat = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(fmt, back);
+    }
+}
+
+// =========================================================================
+// NEW: ExportRequest — serde with sensitivity tiers
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    /// ExportRequest with T1Standard sensitivity roundtrips.
+    #[test]
+    fn prop_request_serde_with_t1_sensitivity(fmt in arb_export_format()) {
+        let req = ExportRequest {
+            format: fmt,
+            max_sensitivity: Some(SensitivityTier::T1Standard),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: ExportRequest = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.max_sensitivity, Some(SensitivityTier::T1Standard));
+        prop_assert_eq!(back.format, fmt);
+    }
+
+    /// ExportRequest with T3Restricted sensitivity roundtrips.
+    #[test]
+    fn prop_request_serde_with_t3_sensitivity(fmt in arb_export_format()) {
+        let req = ExportRequest {
+            format: fmt,
+            max_sensitivity: Some(SensitivityTier::T3Restricted),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: ExportRequest = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.max_sensitivity, Some(SensitivityTier::T3Restricted));
+    }
+
+    /// ExportRequest serde is deterministic.
+    #[test]
+    fn prop_request_serde_deterministic(req in arb_export_request()) {
+        let j1 = serde_json::to_string(&req).unwrap();
+        let j2 = serde_json::to_string(&req).unwrap();
+        prop_assert_eq!(&j1, &j2);
+    }
+}
+
+// =========================================================================
+// NEW: ExportRequest — Clone / Debug
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    /// ExportRequest Clone preserves all fields.
+    #[test]
+    fn prop_request_clone(req in arb_export_request()) {
+        let cloned = req.clone();
+        prop_assert_eq!(cloned.format, req.format);
+        prop_assert_eq!(&cloned.pane_ids, &req.pane_ids);
+        prop_assert_eq!(cloned.max_events, req.max_events);
+        prop_assert_eq!(cloned.include_text, req.include_text);
+        prop_assert_eq!(&cloned.label, &req.label);
+    }
+
+    /// ExportRequest Debug is non-empty.
+    #[test]
+    fn prop_request_debug_nonempty(req in arb_export_request()) {
+        let dbg = format!("{:?}", req);
+        prop_assert!(!dbg.is_empty());
+    }
+}
+
+// =========================================================================
+// NEW: required_tier — T1/T2 sensitivity boundaries
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    /// T1Standard sensitivity with text gives at least A1.
+    #[test]
+    fn prop_required_tier_t1_standard(pane_ids in proptest::collection::vec(0_u64..100, 0..5)) {
+        let req = ExportRequest {
+            include_text: true,
+            max_sensitivity: Some(SensitivityTier::T1Standard),
+            pane_ids,
+            ..Default::default()
+        };
+        let tier = req.required_tier();
+        prop_assert!(
+            tier == AccessTier::A1RedactedQuery
+                || tier == AccessTier::A2FullQuery
+                || tier == AccessTier::A3PrivilegedRaw,
+            "T1Standard tier should be >= A1, got {:?}", tier
+        );
+    }
+
+    /// required_tier with no text is always A0 regardless of sensitivity.
+    #[test]
+    fn prop_required_tier_no_text_any_sensitivity(
+        pane_ids in proptest::collection::vec(0_u64..100, 0..5),
+    ) {
+        for sensitivity in [
+            Some(SensitivityTier::T1Standard),
+            Some(SensitivityTier::T2Sensitive),
+            Some(SensitivityTier::T3Restricted),
+            None,
+        ] {
+            let req = ExportRequest {
+                include_text: false,
+                max_sensitivity: sensitivity,
+                pane_ids: pane_ids.clone(),
+                ..Default::default()
+            };
+            prop_assert_eq!(req.required_tier(), AccessTier::A0PublicMetadata,
+                "no text should always be A0, got {:?} for sensitivity {:?}",
+                req.required_tier(), sensitivity);
+        }
+    }
+}
+
+// =========================================================================
+// NEW: Builder method isolation
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    /// with_max_events doesn't change format or pane_ids.
+    #[test]
+    fn prop_with_max_events_isolation(
+        start in 0_u64..1_000_000,
+        end in 0_u64..1_000_000,
+        max in 0_usize..10_000,
+    ) {
+        let base = ExportRequest::jsonl(start, end);
+        let modified = base.clone().with_max_events(max);
+        prop_assert_eq!(modified.format, ExportFormat::JsonLines);
+        prop_assert_eq!(modified.time_range.unwrap().start_ms, start);
+        prop_assert_eq!(modified.max_events, max);
+    }
+
+    /// with_label doesn't change format or include_text.
+    #[test]
+    fn prop_with_label_isolation(label in "[a-z ]{3,20}") {
+        let base = ExportRequest::default();
+        let modified = base.clone().with_label(label.clone());
+        prop_assert_eq!(modified.format, base.format);
+        prop_assert_eq!(modified.include_text, base.include_text);
+        prop_assert_eq!(modified.label.as_deref(), Some(label.as_str()));
+    }
+}
