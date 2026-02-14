@@ -96,4 +96,33 @@ mod tests {
         assert!(debug.contains("ContentNotFound"));
         assert!(debug.contains("sha256-"));
     }
+
+    #[test]
+    fn storage_dir_io_error_debug_output() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "gone");
+        let err = Error::StorageDirIoError(PathBuf::from("/data"), io_err);
+        let debug = format!("{err:?}");
+        assert!(debug.contains("StorageDirIoError"));
+    }
+
+    #[test]
+    fn storage_not_init_source_is_none() {
+        use std::error::Error as StdError;
+        let err = Error::StorageNotInit;
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn lease_expired_source_is_none() {
+        use std::error::Error as StdError;
+        let err = Error::LeaseExpired;
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn already_initialized_source_is_none() {
+        use std::error::Error as StdError;
+        let err = Error::AlreadyInitializedStorage;
+        assert!(err.source().is_none());
+    }
 }

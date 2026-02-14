@@ -30,11 +30,9 @@ impl BlobManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{clear_storage, register_storage, BlobStorage, BoxedReader, BufSeekRead};
+    use crate::storage::{clear_storage, register_storage, BlobStorage, BoxedReader, BufSeekRead, TEST_LOCK};
     use std::io::Cursor;
     use std::sync::{Arc, Mutex};
-
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     struct InMemoryStorage {
         data: Mutex<std::collections::HashMap<ContentId, Vec<u8>>>,

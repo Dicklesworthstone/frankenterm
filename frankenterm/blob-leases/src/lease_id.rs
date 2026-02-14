@@ -94,4 +94,36 @@ mod tests {
         let id = LeaseId::new();
         assert!(id.pid() > 0);
     }
+
+    #[test]
+    fn display_format_starts_with_lease_pid() {
+        let id = LeaseId::new();
+        let display = format!("{id}");
+        assert!(display.starts_with("lease:pid="));
+    }
+
+    #[test]
+    fn display_uuid_portion_is_36_chars() {
+        let id = LeaseId::new();
+        let display = format!("{id}");
+        let uuid_part = display.split(',').nth(1).unwrap();
+        // Hyphenated UUID v4 is always 36 chars (8-4-4-4-12)
+        assert_eq!(uuid_part.len(), 36);
+    }
+
+    #[test]
+    fn three_ids_all_unique() {
+        let a = LeaseId::new();
+        let b = LeaseId::new();
+        let c = LeaseId::new();
+        assert_ne!(a, b);
+        assert_ne!(b, c);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn equality_is_reflexive() {
+        let id = LeaseId::new();
+        assert_eq!(id, id);
+    }
 }

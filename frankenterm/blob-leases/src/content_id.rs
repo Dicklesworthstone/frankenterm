@@ -127,4 +127,36 @@ mod tests {
         let id = ContentId::for_bytes(b"stable");
         assert_eq!(format!("{id}"), format!("{id}"));
     }
+
+    #[test]
+    fn single_byte_inputs_produce_distinct_ids() {
+        let ids: Vec<_> = (0u8..=255).map(|b| ContentId::for_bytes(&[b])).collect();
+        let set: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(set.len(), 256);
+    }
+
+    #[test]
+    fn copy_semantics_preserve_value() {
+        let a = ContentId::for_bytes(b"copy");
+        let b = a; // Copy
+        let c = a; // still valid
+        assert_eq!(b, c);
+    }
+
+    #[test]
+    fn display_hex_length_is_consistent() {
+        // SHA-256 produces 32 bytes = 64 hex chars (with possible zero-stripped per-byte)
+        let id = ContentId::for_bytes(b"length check");
+        let display = format!("{id}");
+        let hex_part = display.strip_prefix("sha256-").unwrap();
+        // Each byte is 1-2 hex chars, so between 32 and 64 chars
+        assert!(hex_part.len() >= 32 && hex_part.len() <= 64);
+    }
+
+    #[test]
+    fn hash_bytes_differ_for_different_inputs() {
+        let a = ContentId::for_bytes(b"x").as_hash_bytes();
+        let b = ContentId::for_bytes(b"y").as_hash_bytes();
+        assert_ne!(a, b);
+    }
 }

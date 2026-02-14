@@ -70,14 +70,17 @@ pub fn clear_storage() {
     STORAGE.lock().unwrap().take();
 }
 
+/// Serialize all tests across modules that touch the global STORAGE.
+/// Both storage::tests and manager::tests must use this same lock.
+#[cfg(test)]
+pub(crate) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::TEST_LOCK;
     use std::io::Cursor;
     use std::sync::Mutex as StdMutex;
-
-    // Serialize tests that touch the global STORAGE to avoid interference
-    static TEST_LOCK: StdMutex<()> = StdMutex::new(());
 
     /// Minimal in-memory storage for testing the register/get/clear cycle
     struct InMemoryStorage {
@@ -304,6 +307,48 @@ mod tests {
         register_storage(storage).unwrap();
         let s = get_storage().unwrap();
         assert!(s.advise_pid_terminated(12345).is_ok());
+        clear_storage();
+    }
+
+    #[test]
+    fn register_clear_register_cycle() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        clear_storage();
+        let s1 = Arc::new(InMemoryStorage::new());
+        register_storage(s1).unwrap();
+        assert!(get_storage().is_ok());
+        clear_storage();
+        assert!(get_storage().is_err());
+        let s2 = Arc::new(InMemoryStorage::new());
+        register_storage(s2).unwrap();
+        assert!(get_storage().is_ok());
+        clear_storage();
+    }
+
+    #[test]
+    fn multiple_get_storage_returns_same_arc() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        clear_storage();
+        let storage = Arc::new(InMemoryStorage::new());
+        register_storage(storage).unwrap();
+        let a = get_storage().unwrap();
+        let b = get_storage().unwrap();
+        // Both should point to the same allocation
+        assert!(Arc::ptr_eq(&a, &b));
+        clear_storage();
+    }
+
+    #[test]
+    fn store_then_advise_lease_dropped_succeeds() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        clear_storage();
+        let storage = Arc::new(InMemoryStorage::new());
+        register_storage(storage).unwrap();
+        let s = get_storage().unwrap();
+        let cid = ContentId::for_bytes(b"drop test");
+        let lid = LeaseId::new();
+        s.store(cid, b"drop test", lid).unwrap();
+        assert!(s.advise_lease_dropped(lid, cid).is_ok());
         clear_storage();
     }
 }
