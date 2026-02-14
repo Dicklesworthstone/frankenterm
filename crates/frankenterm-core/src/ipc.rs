@@ -747,6 +747,18 @@ async fn handle_request_with_context(
                 .and_then(|snapshot| serde_json::to_value(snapshot).ok())
                 .unwrap_or(serde_json::Value::Null);
             payload["health"] = health;
+            if let Some(snapshot) =
+                crate::resize_scheduler::ResizeSchedulerDebugSnapshot::get_global()
+            {
+                let stalled = snapshot.stalled_transactions(now_ms(), 2_000);
+                payload["resize_control_plane"] =
+                    serde_json::to_value(&snapshot).unwrap_or(serde_json::Value::Null);
+                payload["resize_control_plane_stalled"] =
+                    serde_json::to_value(stalled).unwrap_or(serde_json::Value::Null);
+            } else {
+                payload["resize_control_plane"] = serde_json::Value::Null;
+                payload["resize_control_plane_stalled"] = serde_json::Value::Null;
+            }
             IpcResponse::ok_with_data(payload)
         }
         IpcRequest::PaneState { pane_id } => handle_pane_state(pane_id, ctx).await,

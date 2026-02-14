@@ -2272,7 +2272,7 @@ enum RobotCommands {
         command: RobotReservationCommands,
     },
 
-    /// Get watcher health snapshot (queue depths, ingest lag, stuck panes, scheduler state)
+    /// Get watcher health snapshot and resize control-plane lifecycle/stall introspection
     Health,
 
     /// Submit an approval code for a pending action
@@ -6432,7 +6432,7 @@ fn build_robot_help() -> RobotHelp {
             },
             RobotCommandInfo {
                 name: "health",
-                description: "Get watcher health snapshot (queue depths, ingest lag, stuck panes)",
+                description: "Get watcher health + resize lifecycle snapshots/stall heuristics",
             },
             RobotCommandInfo {
                 name: "approve",
@@ -13846,6 +13846,17 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         .collect();
                                     payload["diagnostics"] = serde_json::json!(diag_json);
                                 }
+                            }
+
+                            if let Some(snapshot) =
+                                frankenterm_core::resize_scheduler::ResizeSchedulerDebugSnapshot::get_global()
+                            {
+                                let now_ms = u64::try_from(now_epoch_ms()).unwrap_or(0);
+                                let stalled = snapshot.stalled_transactions(now_ms, 2_000);
+                                payload["resize_control_plane"] =
+                                    serde_json::to_value(&snapshot).unwrap_or(serde_json::Value::Null);
+                                payload["resize_control_plane_stalled"] =
+                                    serde_json::to_value(stalled).unwrap_or(serde_json::Value::Null);
                             }
 
                             // Latest crash bundle
