@@ -41,13 +41,15 @@ proptest! {
         prop_assert!(next <= backoff.max, "next {:?} > max {:?}", next, backoff.max);
     }
 
-    /// next_delay is always >= current (monotonic growth) when factor >= 1.
+    /// next_delay is always >= current (monotonic growth) when factor >= 1
+    /// and current hasn't already exceeded max (capping reduces to max).
     #[test]
     fn prop_next_delay_monotonic(
         max_ms in 100_u64..100_000,
         factor in 1_u32..10,
         current_ms in 1_u64..1000,
     ) {
+        prop_assume!(current_ms <= max_ms);
         let backoff = Backoff {
             initial: Duration::from_millis(1),
             max: Duration::from_millis(max_ms),

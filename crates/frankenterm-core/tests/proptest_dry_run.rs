@@ -438,10 +438,12 @@ proptest! {
     ) {
         let t = TargetResolution::new(pane_id, &domain);
         let json = serde_json::to_string(&t).unwrap();
-        prop_assert!(!json.contains("title"));
-        prop_assert!(!json.contains("cwd"));
-        prop_assert!(!json.contains("is_active"));
-        prop_assert!(!json.contains("agent_type"));
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = parsed.as_object().unwrap();
+        prop_assert!(!obj.contains_key("title"), "title should be absent");
+        prop_assert!(!obj.contains_key("cwd"), "cwd should be absent");
+        prop_assert!(!obj.contains_key("is_active"), "is_active should be absent");
+        prop_assert!(!obj.contains_key("agent_type"), "agent_type should be absent");
     }
 }
 
