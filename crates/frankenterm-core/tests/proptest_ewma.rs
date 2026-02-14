@@ -414,3 +414,230 @@ proptest! {
             constant, constant, ewma.value());
     }
 }
+
+// =============================================================================
+// Property: New EWMA is not initialized
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn new_ewma_not_initialized(hl in arb_half_life_ms()) {
+        let ewma = Ewma::with_half_life_ms(hl);
+        prop_assert!(!ewma.is_initialized());
+        prop_assert_eq!(ewma.count(), 0);
+        prop_assert!((ewma.value() - 0.0).abs() < 1e-10,
+            "uninit EWMA should have value 0");
+    }
+}
+
+// =============================================================================
+// Property: Double reset is idempotent
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn double_reset_idempotent(
+        values in proptest::collection::vec(arb_value(), 1..10),
+    ) {
+        let mut ewma = Ewma::with_half_life_ms(1000.0);
+        for (i, &v) in values.iter().enumerate() {
+            ewma.observe(v, i as u64 * 100);
+        }
+
+        ewma.reset();
+        ewma.reset();
+        prop_assert!(!ewma.is_initialized());
+        prop_assert_eq!(ewma.count(), 0);
+    }
+}
+
+// =============================================================================
+// Property: Stats serde roundtrip
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn stats_serde_roundtrip(
+        hl in arb_half_life_ms(),
+        values in proptest::collection::vec(arb_value(), 1..10),
+    ) {
+        let mut ewma = Ewma::with_half_life_ms(hl);
+        for (i, &v) in values.iter().enumerate() {
+            ewma.observe(v, i as u64 * 100);
+        }
+
+        let stats = ewma.stats();
+        let json = serde_json::to_string(&stats).unwrap();
+        let back: serde_json::Value = serde_json::from_str(&json).unwrap();
+        prop_assert!(back.is_object());
+        prop_assert!(back.get("value").is_some());
+        prop_assert!(back.get("count").is_some());
+        prop_assert!(back.get("half_life_ms").is_some());
+    }
+}
+
+// =============================================================================
+// Property: Constant input → zero variance
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn constant_input_zero_variance(
+        hl in arb_half_life_ms(),
+        constant in arb_value(),
+    ) {
+        let mut tracker = EwmaWithVariance::with_half_life_ms(hl);
+        for i in 0..20_u64 {
+            tracker.observe(constant, i * 100);
+        }
+
+        prop_assert!(tracker.variance() < 1e-6,
+            "constant input should have near-zero variance, got {}", tracker.variance());
+    }
+}
+
+// =============================================================================
+// Property: EwmaWithVariance mean tracks EWMA value
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn variance_mean_tracks_ewma(
+        hl in arb_half_life_ms(),
+        values in proptest::collection::vec(arb_value(), 2..20),
+    ) {
+        let mut ewma = Ewma::with_half_life_ms(hl);
+        let mut tracker = EwmaWithVariance::with_half_life_ms(hl);
+        for (i, &v) in values.iter().enumerate() {
+            ewma.observe(v, i as u64 * 100);
+            tracker.observe(v, i as u64 * 100);
+        }
+
+        prop_assert!((tracker.mean() - ewma.value()).abs() < 1e-6,
+            "EwmaWithVariance mean {} should track Ewma value {}",
+            tracker.mean(), ewma.value());
+    }
+}
+
+// =============================================================================
+// Property: EwmaWithVariance count tracks observations
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn variance_count_tracks(n in 1_usize..50) {
+        let mut tracker = EwmaWithVariance::with_half_life_ms(1000.0);
+        for i in 0..n {
+            tracker.observe(i as f64, i as u64 * 100);
+        }
+        prop_assert_eq!(tracker.count(), n as u64);
+    }
+}
+
+// =============================================================================
+// Property: RateEstimator single tick
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn rate_single_tick(hl in 100.0_f64..50_000.0) {
+        let mut rate = RateEstimator::with_half_life_ms(hl);
+        rate.tick(1000); // 1 second
+        prop_assert_eq!(rate.total_events(), 1);
+    }
+}
+
+// =============================================================================
+// Property: EWMA monotone toward new value
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// When all observations are the same new value, EWMA moves monotonically
+    /// toward that value from the initial observation.
+    #[test]
+    fn ewma_monotone_toward_target(
+        hl in 10.0_f64..5000.0,
+        initial in -500.0_f64..500.0,
+        target in -500.0_f64..500.0,
+    ) {
+        let mut ewma = Ewma::with_half_life_ms(hl);
+        ewma.observe(initial, 0);
+
+        let mut prev = initial;
+        for i in 1..=20_u64 {
+            ewma.observe(target, i * (hl.round() as u64 / 10).max(1));
+            let current = ewma.value();
+            // EWMA should move toward target (or stay same if already there)
+            if (target - initial).abs() > 1e-10 {
+                let prev_dist = (target - prev).abs();
+                let curr_dist = (target - current).abs();
+                prop_assert!(curr_dist <= prev_dist + 1e-6,
+                    "EWMA should move toward target: prev_dist={}, curr_dist={}", prev_dist, curr_dist);
+            }
+            prev = current;
+        }
+    }
+}
+
+// =============================================================================
+// Property: RateEstimator double reset idempotent
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn rate_double_reset(n in 2_usize..20) {
+        let mut rate = RateEstimator::with_half_life_ms(5000.0);
+        for i in 0..n {
+            rate.tick(i as u64 * 100);
+        }
+        rate.reset();
+        rate.reset();
+        prop_assert_eq!(rate.total_events(), 0);
+        prop_assert!((rate.rate_per_sec() - 0.0).abs() < 1e-10);
+    }
+}
+
+// =============================================================================
+// Property: EwmaWithVariance stddev is sqrt of variance
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn stddev_is_sqrt_variance(
+        values in proptest::collection::vec(arb_value(), 2..20),
+    ) {
+        let mut tracker = EwmaWithVariance::with_half_life_ms(1000.0);
+        for (i, &v) in values.iter().enumerate() {
+            tracker.observe(v, i as u64 * 100);
+        }
+
+        let variance = tracker.variance();
+        let stddev = tracker.stddev();
+        if variance > 0.0 {
+            prop_assert!((stddev - variance.sqrt()).abs() < 1e-10,
+                "stddev {} should be sqrt of variance {}", stddev, variance);
+        } else {
+            prop_assert!(stddev < 1e-10, "stddev should be ~0 when variance is ~0");
+        }
+    }
+}
