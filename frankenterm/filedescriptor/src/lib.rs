@@ -1043,4 +1043,181 @@ mod tests {
         // flush is a no-op on unix but should succeed
         pipe.write.flush().unwrap();
     }
+
+    // ── Error source chains ──────────────────────────────────
+
+    #[test]
+    fn error_pipe_has_source() {
+        let io_err = std::io::Error::from_raw_os_error(2);
+        let err = Error::Pipe(io_err);
+        use std::error::Error as StdError;
+        assert!(err.source().is_some());
+    }
+
+    #[test]
+    fn error_dup_has_source() {
+        let err = Error::Dup {
+            fd: 5,
+            source: std::io::Error::from_raw_os_error(9),
+        };
+        use std::error::Error as StdError;
+        assert!(err.source().is_some());
+    }
+
+    #[test]
+    fn error_illegal_fd_no_source() {
+        let err = Error::IllegalFdValue(-999);
+        use std::error::Error as StdError;
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn error_only_sockets_non_blocking_display() {
+        let err = Error::OnlySocketsNonBlocking;
+        assert!(err.to_string().contains("socket"));
+    }
+
+    // ── Multiple pipes simultaneously ────────────────────────
+
+    #[test]
+    fn multiple_pipes_independent() {
+        let mut p1 = Pipe::new().unwrap();
+        let mut p2 = Pipe::new().unwrap();
+
+        p1.write.write_all(b"pipe1").unwrap();
+        p2.write.write_all(b"pipe2").unwrap();
+        drop(p1.write);
+        drop(p2.write);
+
+        let mut buf1 = String::new();
+        let mut buf2 = String::new();
+        p1.read.read_to_string(&mut buf1).unwrap();
+        p2.read.read_to_string(&mut buf2).unwrap();
+        assert_eq!(buf1, "pipe1");
+        assert_eq!(buf2, "pipe2");
+    }
+
+    // ── Partial reads from pipe ──────────────────────────────
+
+    #[test]
+    fn pipe_partial_read() {
+        let mut pipe = Pipe::new().unwrap();
+        pipe.write.write_all(b"abcdef").unwrap();
+
+        let mut buf = [0u8; 3];
+        let n = pipe.read.read(&mut buf).unwrap();
+        assert!(n > 0 && n <= 3);
+    }
+
+    // ── FileDescriptor new from pipe ─────────────────────────
+
+    #[test]
+    fn file_descriptor_new_from_raw() {
+        let pipe = Pipe::new().unwrap();
+        let raw = pipe.write.into_raw_file_descriptor();
+        let fd = FileDescriptor::new(unsafe {
+            FileDescriptor::from_raw_file_descriptor(raw)
+        });
+        assert!(fd.as_raw_file_descriptor() >= 0);
+    }
+
+    // ── as_stdio and as_file for write end ───────────────────
+
+    #[test]
+    fn as_stdio_from_write_end() {
+        let pipe = Pipe::new().unwrap();
+        let _stdio = pipe.write.as_stdio().unwrap();
+    }
+
+    #[test]
+    fn as_file_from_write_end() {
+        let pipe = Pipe::new().unwrap();
+        let _file = pipe.write.as_file().unwrap();
+    }
+
+    // ── Dup of write end, write through dup ──────────────────
+
+    #[test]
+    fn dup_write_end_and_write_through_both() {
+        let mut pipe = Pipe::new().unwrap();
+        let mut dup_write = pipe.write.try_clone().unwrap();
+
+        pipe.write.write_all(b"original").unwrap();
+        dup_write.write_all(b"+dup").unwrap();
+        drop(pipe.write);
+        drop(dup_write);
+
+        let mut buf = String::new();
+        pipe.read.read_to_string(&mut buf).unwrap();
+        assert_eq!(buf, "original+dup");
+    }
+
+    // ── Socketpair non-blocking on both ends ─────────────────
+
+    #[test]
+    fn socketpair_both_non_blocking() {
+        let (mut a, mut b) = socketpair().unwrap();
+        a.set_non_blocking(true).unwrap();
+        b.set_non_blocking(true).unwrap();
+
+        // Both should return WouldBlock when no data
+        let mut buf = [0u8; 16];
+        assert_eq!(a.read(&mut buf).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(b.read(&mut buf).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    // ── Poll with multiple ready fds ─────────────────────────
+
+    #[test]
+    fn poll_two_ready_fds() {
+        let (a1, mut b1) = socketpair().unwrap();
+        let (a2, mut b2) = socketpair().unwrap();
+
+        b1.write_all(b"d1").unwrap();
+        b2.write_all(b"d2").unwrap();
+
+        let mut pfd = [
+            pollfd {
+                fd: a1.as_socket_descriptor(),
+                events: POLLIN,
+                revents: 0,
+            },
+            pollfd {
+                fd: a2.as_socket_descriptor(),
+                events: POLLIN,
+                revents: 0,
+            },
+        ];
+        let n = poll(&mut pfd, Some(Duration::from_millis(100))).unwrap();
+        assert_eq!(n, 2);
+        assert!(pfd[0].revents & POLLIN != 0);
+        assert!(pfd[1].revents & POLLIN != 0);
+    }
+
+    // ── Result type alias ────────────────────────────────────
+
+    #[test]
+    fn result_type_alias_ok() {
+        let r: super::Result<i32> = Ok(42);
+        assert_eq!(r.unwrap(), 42);
+    }
+
+    #[test]
+    fn result_type_alias_err() {
+        let r: super::Result<i32> = Err(Error::IllegalFdValue(-1));
+        assert!(r.is_err());
+    }
+
+    // ── pollfd struct ────────────────────────────────────────
+
+    #[test]
+    fn pollfd_default_revents_zero() {
+        let pfd = pollfd {
+            fd: 0,
+            events: POLLIN | POLLOUT,
+            revents: 0,
+        };
+        assert_eq!(pfd.revents, 0);
+        assert_eq!(pfd.events, POLLIN | POLLOUT);
+    }
 }
