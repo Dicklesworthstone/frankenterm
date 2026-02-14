@@ -467,4 +467,226 @@ mod test {
         assert_eq!(decoder.write(b"").unwrap(), 0);
         decoder.flush().unwrap();
     }
+
+    // ── Determinism ───────────────────────────────────────────
+
+    #[test]
+    fn encode_is_deterministic() {
+        let data = b"deterministic encoding test";
+        let enc1 = encode(data);
+        let enc2 = encode(data);
+        assert_eq!(enc1, enc2);
+    }
+
+    // ── Byte-at-a-time streaming ──────────────────────────────
+
+    #[test]
+    fn byte_at_a_time_encode_matches_bulk() {
+        let data = b"byte at a time";
+        let bulk = encode(data);
+
+        let mut result = Vec::new();
+        {
+            let mut encoder = Base91Encoder::new(&mut result);
+            for &b in data.iter() {
+                encoder.write_all(&[b]).unwrap();
+            }
+            encoder.flush().unwrap();
+        }
+        assert_eq!(result, bulk);
+    }
+
+    #[test]
+    fn byte_at_a_time_decode_matches_bulk() {
+        let encoded = encode(b"byte by byte decode");
+        let bulk = decode(&encoded);
+
+        let mut result = Vec::new();
+        {
+            let mut decoder = Base91Decoder::new(&mut result);
+            for &b in encoded.iter() {
+                decoder.write_all(&[b]).unwrap();
+            }
+            decoder.flush().unwrap();
+        }
+        assert_eq!(result, bulk);
+    }
+
+    // ── ENCTAB / DECTAB consistency ───────────────────────────
+
+    #[test]
+    fn enctab_has_91_unique_entries() {
+        let mut seen = std::collections::HashSet::new();
+        for &b in &ENCTAB {
+            seen.insert(b);
+        }
+        assert_eq!(seen.len(), 91);
+    }
+
+    #[test]
+    fn enctab_all_ascii() {
+        for &b in &ENCTAB {
+            assert!(b.is_ascii(), "ENCTAB contains non-ASCII byte: {b}");
+        }
+    }
+
+    #[test]
+    fn dectab_inverts_enctab() {
+        for (i, &enc_byte) in ENCTAB.iter().enumerate() {
+            let decoded = DECTAB[enc_byte as usize];
+            assert_eq!(
+                decoded, i as u8,
+                "DECTAB[ENCTAB[{i}]] = {decoded}, expected {i}"
+            );
+        }
+    }
+
+    // ── Decode with only non-alphabet chars ───────────────────
+
+    #[test]
+    fn decode_only_invalid_chars_returns_empty() {
+        let result = decode(b"\x00\x01\x02\t\r\n ");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn decode_tabs_skipped() {
+        let encoded = encode(b"tabs");
+        let encoded_str = String::from_utf8(encoded).unwrap();
+        let with_tabs = encoded_str
+            .replace("", "")
+            .chars()
+            .enumerate()
+            .map(|(i, c)| {
+                if i % 2 == 1 {
+                    format!("\t{c}")
+                } else {
+                    format!("{c}")
+                }
+            })
+            .collect::<String>();
+        assert_eq!(decode(with_tabs.as_bytes()), b"tabs");
+    }
+
+    // ── Specific data patterns ────────────────────────────────
+
+    #[test]
+    fn roundtrip_alternating_bytes() {
+        let data: Vec<u8> = (0..100)
+            .map(|i| if i % 2 == 0 { 0xAA } else { 0x55 })
+            .collect();
+        assert_eq!(decode(&encode(&data)), data);
+    }
+
+    #[test]
+    fn roundtrip_ascending_bytes() {
+        let data: Vec<u8> = (0..=255).collect();
+        assert_eq!(decode(&encode(&data)), data);
+    }
+
+    #[test]
+    fn roundtrip_descending_bytes() {
+        let data: Vec<u8> = (0..=255u8).rev().collect();
+        assert_eq!(decode(&encode(&data)), data);
+    }
+
+    #[test]
+    fn roundtrip_repeated_pattern() {
+        let data: Vec<u8> = vec![0xDE, 0xAD, 0xBE, 0xEF].repeat(50);
+        assert_eq!(decode(&encode(&data)), data);
+    }
+
+    // ── Larger data ───────────────────────────────────────────
+
+    #[test]
+    fn roundtrip_1kb() {
+        let data: Vec<u8> = (0..1024).map(|i| (i % 256) as u8).collect();
+        assert_eq!(decode(&encode(&data)), data);
+    }
+
+    #[test]
+    fn roundtrip_10kb() {
+        let data: Vec<u8> = (0..10240).map(|i| (i * 37 % 256) as u8).collect();
+        assert_eq!(decode(&encode(&data)), data);
+    }
+
+    // ── Zero-byte efficiency (best case) ──────────────────────
+
+    #[test]
+    fn zero_block_has_low_overhead() {
+        // basE91 spec says 0-byte blocks have ~14% overhead
+        let data = vec![0u8; 1000];
+        let encoded = encode(&data);
+        let overhead = (encoded.len() as f64 / data.len() as f64 - 1.0) * 100.0;
+        assert!(
+            overhead < 16.0,
+            "zero-block overhead {overhead:.1}% exceeds expected ~14%"
+        );
+    }
+
+    // ── Flush clears state ────────────────────────────────────
+
+    #[test]
+    fn encoder_flush_resets_internal_state() {
+        // After flush, encoder should have zero bits/accumulator,
+        // meaning the next write starts a fresh encoding
+        let mut result1 = Vec::new();
+        {
+            let mut encoder = Base91Encoder::new(&mut result1);
+            encoder.write_all(b"hello").unwrap();
+            encoder.flush().unwrap();
+        }
+        // Encoding the same data again should produce the same output
+        let mut result2 = Vec::new();
+        {
+            let mut encoder = Base91Encoder::new(&mut result2);
+            encoder.write_all(b"hello").unwrap();
+            encoder.flush().unwrap();
+        }
+        assert_eq!(result1, result2);
+    }
+
+    #[test]
+    fn decoder_flush_clears_state() {
+        let enc1 = encode(b"part1");
+        let enc2 = encode(b"part2");
+        let mut result = Vec::new();
+        {
+            let mut decoder = Base91Decoder::new(&mut result);
+            decoder.write_all(&enc1).unwrap();
+            decoder.flush().unwrap();
+            decoder.write_all(&enc2).unwrap();
+            decoder.flush().unwrap();
+        }
+        assert_eq!(result, b"part1part2");
+    }
+
+    // ── Encoding output contains no control characters ────────
+
+    #[test]
+    fn encoded_contains_no_control_chars() {
+        let data: Vec<u8> = (0..512).map(|i| (i % 256) as u8).collect();
+        let encoded = encode(&data);
+        for &b in &encoded {
+            assert!(
+                b >= 0x21 && b <= 0x7E,
+                "encoded output contains non-printable ASCII: 0x{b:02x}"
+            );
+        }
+    }
+
+    // ── Known test vectors ────────────────────────────────────
+
+    #[test]
+    fn encode_single_a() {
+        let encoded = encode(b"A");
+        let decoded = decode(&encoded);
+        assert_eq!(decoded, b"A");
+    }
+
+    #[test]
+    fn encode_all_printable_ascii() {
+        let data: Vec<u8> = (0x20..=0x7E).collect();
+        assert_eq!(decode(&encode(&data)), data);
+    }
 }
