@@ -2271,4 +2271,117 @@ mod tests {
         assert!(v > 0.0);
         assert!(v < 0.04045);
     }
+
+    // ── Third-pass expansion ────────────────────────────────────
+
+    #[test]
+    fn srgba_tuple_premultiply_demultiply_roundtrip() {
+        let orig = SrgbaTuple(0.8, 0.4, 0.2, 0.6);
+        let roundtripped = orig.premultiply().demultiply();
+        assert!((roundtripped.0 - orig.0).abs() < 0.001);
+        assert!((roundtripped.1 - orig.1).abs() < 0.001);
+        assert!((roundtripped.2 - orig.2).abs() < 0.001);
+        assert!((roundtripped.3 - orig.3).abs() < 0.001);
+    }
+
+    #[test]
+    fn srgba_tuple_premultiply_full_alpha_unchanged() {
+        let t = SrgbaTuple(0.5, 0.3, 0.7, 1.0);
+        let pm = t.premultiply();
+        assert!((pm.0 - t.0).abs() < 0.001);
+        assert!((pm.1 - t.1).abs() < 0.001);
+        assert!((pm.2 - t.2).abs() < 0.001);
+    }
+
+    #[test]
+    fn srgba_tuple_copy_clone() {
+        let a = SrgbaTuple(0.1, 0.2, 0.3, 0.4);
+        let b = a; // Copy
+        let c = a.clone();
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+    }
+
+    #[test]
+    fn srgba_tuple_interpolate_quarter() {
+        let a = SrgbaTuple(0.0, 0.0, 0.0, 1.0);
+        let b = SrgbaTuple(1.0, 1.0, 1.0, 1.0);
+        let q = a.interpolate(b, 0.25);
+        assert!((q.0 - 0.25).abs() < 0.02);
+    }
+
+    #[test]
+    fn srgba_pixel_all_channels_max() {
+        let p = SrgbaPixel::rgba(255, 255, 255, 255);
+        assert_eq!(p.as_rgba(), (255, 255, 255, 255));
+    }
+
+    #[test]
+    fn srgba_pixel_all_channels_zero() {
+        let p = SrgbaPixel::rgba(0, 0, 0, 0);
+        assert_eq!(p.as_rgba(), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn srgba_tuple_to_linear_preserves_alpha() {
+        let t = SrgbaTuple(0.5, 0.5, 0.5, 0.75);
+        let lin = t.to_linear();
+        assert!((lin.3 - 0.75).abs() < 0.001);
+    }
+
+    #[test]
+    fn linear_rgba_to_srgb_preserves_alpha() {
+        let lin = LinearRgba(0.5, 0.5, 0.5, 0.3);
+        let srgb = lin.to_srgb();
+        assert!((srgb.3 - 0.3).abs() < 0.001);
+    }
+
+    #[test]
+    fn srgba_tuple_mul_alpha_zero_makes_transparent() {
+        let t = SrgbaTuple(1.0, 0.5, 0.25, 1.0);
+        let t2 = t.mul_alpha(0.0);
+        assert_eq!(t2.3, 0.0);
+        assert_eq!(t2.0, 1.0); // RGB unchanged
+    }
+
+    #[test]
+    fn linear_rgba_with_components_debug() {
+        let c = LinearRgba::with_components(0.1, 0.2, 0.3, 0.4);
+        let debug = format!("{c:?}");
+        assert!(debug.contains("LinearRgba"));
+    }
+
+    #[test]
+    fn srgba_pixel_to_linear_black() {
+        let p = SrgbaPixel::rgba(0, 0, 0, 255);
+        let lin = p.to_linear();
+        assert_eq!(lin.0, 0.0);
+        assert_eq!(lin.1, 0.0);
+        assert_eq!(lin.2, 0.0);
+    }
+
+    #[test]
+    fn srgba_tuple_from_u8_triple_alpha_is_one() {
+        let t: SrgbaTuple = (100u8, 100u8, 100u8).into();
+        assert!((t.3 - 1.0).abs() < 0.001);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn srgba_tuple_hashset_dedup() {
+        use std::collections::HashSet;
+        let a = SrgbaTuple(0.5, 0.5, 0.5, 1.0);
+        let b = SrgbaTuple(0.5, 0.5, 0.5, 1.0);
+        let mut set = HashSet::new();
+        set.insert(a);
+        set.insert(b);
+        assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn linear_rgba_clone_eq() {
+        let a = LinearRgba(0.1, 0.2, 0.3, 0.4);
+        let b = a;
+        assert_eq!(a, b);
+    }
 }
