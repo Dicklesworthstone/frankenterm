@@ -12,40 +12,51 @@ use proptest::prelude::*;
 
 fn arb_analytics_summary() -> impl Strategy<Value = AnalyticsSummaryData> {
     (
-        "[a-zA-Z 0-9]{1,30}",   // period_label
-        any::<i64>(),            // total_tokens
-        (0.0f64..100_000.0),     // total_cost
-        any::<i64>(),            // rate_limit_hits
-        any::<i64>(),            // workflow_runs
+        "[a-zA-Z 0-9]{1,30}", // period_label
+        any::<i64>(),         // total_tokens
+        (0.0f64..100_000.0),  // total_cost
+        any::<i64>(),         // rate_limit_hits
+        any::<i64>(),         // workflow_runs
     )
-        .prop_map(|(period_label, total_tokens, total_cost, rate_limit_hits, workflow_runs)| {
-            AnalyticsSummaryData {
-                period_label,
-                total_tokens,
-                total_cost,
-                rate_limit_hits,
-                workflow_runs,
-            }
-        })
+        .prop_map(
+            |(period_label, total_tokens, total_cost, rate_limit_hits, workflow_runs)| {
+                AnalyticsSummaryData {
+                    period_label,
+                    total_tokens,
+                    total_cost,
+                    rate_limit_hits,
+                    workflow_runs,
+                }
+            },
+        )
 }
 
 fn arb_rule_list_item() -> impl Strategy<Value = RuleListItem> {
     (
-        "[a-z._]{1,30}",           // id
-        "[a-z_]{1,15}",            // agent_type
-        "[a-z._]{1,20}",          // event_type
+        "[a-z._]{1,30}", // id
+        "[a-z_]{1,15}",  // agent_type
+        "[a-z._]{1,20}", // event_type
         prop_oneof![
             Just("info".to_string()),
             Just("warning".to_string()),
             Just("critical".to_string()),
         ],
-        "[a-zA-Z ]{1,50}",         // description
+        "[a-zA-Z ]{1,50}",                // description
         prop::option::of("[a-z_]{1,20}"), // workflow
-        0usize..10,                // anchor_count
-        any::<bool>(),             // has_regex
+        0usize..10,                       // anchor_count
+        any::<bool>(),                    // has_regex
     )
         .prop_map(
-            |(id, agent_type, event_type, severity, description, workflow, anchor_count, has_regex)| {
+            |(
+                id,
+                agent_type,
+                event_type,
+                severity,
+                description,
+                workflow,
+                anchor_count,
+                has_regex,
+            )| {
                 RuleListItem {
                     id,
                     agent_type,
@@ -62,43 +73,41 @@ fn arb_rule_list_item() -> impl Strategy<Value = RuleListItem> {
 
 fn arb_rule_test_match() -> impl Strategy<Value = RuleTestMatch> {
     (
-        "[a-z._]{1,30}",           // rule_id
-        "[a-z_]{1,15}",            // agent_type
-        "[a-z._]{1,20}",          // event_type
+        "[a-z._]{1,30}", // rule_id
+        "[a-z_]{1,15}",  // agent_type
+        "[a-z._]{1,20}", // event_type
         prop_oneof![
             Just("info".to_string()),
             Just("warning".to_string()),
             Just("critical".to_string()),
         ],
-        (0.0f64..1.0),             // confidence
-        "[a-zA-Z0-9 ]{1,50}",     // matched_text
+        (0.0f64..1.0),        // confidence
+        "[a-zA-Z0-9 ]{1,50}", // matched_text
     )
         .prop_map(
-            |(rule_id, agent_type, event_type, severity, confidence, matched_text)| {
-                RuleTestMatch {
-                    rule_id,
-                    agent_type,
-                    event_type,
-                    severity,
-                    confidence,
-                    matched_text,
-                    extracted: None,
-                }
+            |(rule_id, agent_type, event_type, severity, confidence, matched_text)| RuleTestMatch {
+                rule_id,
+                agent_type,
+                event_type,
+                severity,
+                confidence,
+                matched_text,
+                extracted: None,
             },
         )
 }
 
 fn arb_rule_detail() -> impl Strategy<Value = RuleDetail> {
     (
-        "[a-z._]{1,30}",           // id
-        "[a-z_]{1,15}",            // agent_type
-        "[a-z._]{1,20}",          // event_type
+        "[a-z._]{1,30}", // id
+        "[a-z_]{1,15}",  // agent_type
+        "[a-z._]{1,20}", // event_type
         prop_oneof![
             Just("info".to_string()),
             Just("warning".to_string()),
             Just("critical".to_string()),
         ],
-        "[a-zA-Z ]{1,50}",         // description
+        "[a-zA-Z ]{1,50}",                               // description
         proptest::collection::vec("[a-z ]{1,20}", 0..5), // anchors
         prop::option::of("[a-z.*]+"),                    // regex
         prop::option::of("[a-z_]{1,20}"),                // workflow

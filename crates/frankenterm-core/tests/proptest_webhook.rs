@@ -51,24 +51,19 @@ fn arb_endpoint_config_with_headers() -> impl Strategy<Value = WebhookEndpointCo
         arb_webhook_template(),
         proptest::collection::vec("[a-z.*:]{3,20}", 0..3),
         any::<bool>(),
-        proptest::collection::vec(
-            ("[A-Z][a-z-]{3,15}", "[a-zA-Z0-9 ]{3,20}"),
-            0..4,
-        ),
+        proptest::collection::vec(("[A-Z][a-z-]{3,15}", "[a-zA-Z0-9 ]{3,20}"), 0..4),
     )
-        .prop_map(
-            |(name, url, template, events, enabled, header_pairs)| {
-                let headers = header_pairs.into_iter().collect::<HashMap<_, _>>();
-                WebhookEndpointConfig {
-                    name,
-                    url,
-                    template,
-                    events,
-                    headers,
-                    enabled,
-                }
-            },
-        )
+        .prop_map(|(name, url, template, events, enabled, header_pairs)| {
+            let headers = header_pairs.into_iter().collect::<HashMap<_, _>>();
+            WebhookEndpointConfig {
+                name,
+                url,
+                template,
+                events,
+                headers,
+                enabled,
+            }
+        })
 }
 
 fn arb_payload() -> impl Strategy<Value = NotificationPayload> {

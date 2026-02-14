@@ -28,13 +28,13 @@ use frankenterm_core::watchdog::{Component, HealthStatus};
 
 fn arb_adaptive_config() -> impl Strategy<Value = AdaptiveWatchdogConfig> {
     (
-        0.5f64..10.0,    // sensitivity_k
-        0.01f64..1000.0, // process_noise
+        0.5f64..10.0,     // sensitivity_k
+        0.01f64..1000.0,  // process_noise
         0.01f64..10000.0, // measurement_noise
-        1usize..20,      // min_observations
-        0.5f64..5.0,     // degraded_z
-        1.0f64..8.0,     // critical_z
-        2.0f64..15.0,    // hung_z
+        1usize..20,       // min_observations
+        0.5f64..5.0,      // degraded_z
+        1.0f64..8.0,      // critical_z
+        2.0f64..15.0,     // hung_z
     )
         .prop_map(|(k, pn, mn, mo, dz, cz, hz)| {
             // Ensure degraded_z < critical_z < hung_z
@@ -64,12 +64,12 @@ fn arb_health_status() -> impl Strategy<Value = HealthStatus> {
 fn arb_health_classification() -> impl Strategy<Value = HealthClassification> {
     (
         arb_health_status(),
-        proptest::option::of(-10.0f64..20.0),  // z_score
+        proptest::option::of(-10.0f64..20.0),    // z_score
         proptest::option::of(100.0f64..60000.0), // adaptive_threshold_ms
         proptest::option::of(100.0f64..60000.0), // estimated_interval_ms
         proptest::option::of(1.0f64..500.0),     // estimated_std_dev_ms
-        0usize..200,                              // observations
-        any::<bool>(),                            // adaptive_mode
+        0usize..200,                             // observations
+        any::<bool>(),                           // adaptive_mode
     )
         .prop_map(|(status, z, threshold, interval, std_dev, obs, adaptive)| {
             HealthClassification {

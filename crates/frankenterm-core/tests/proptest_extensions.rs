@@ -123,23 +123,21 @@ fn arb_capability_level() -> impl Strategy<Value = CapabilityLevel> {
 
 fn arb_sandbox_capabilities() -> impl Strategy<Value = SandboxCapabilities> {
     (
-        any::<bool>(),           // read_pane_output
-        any::<bool>(),           // send_notifications
-        any::<bool>(),           // http_requests
+        any::<bool>(), // read_pane_output
+        any::<bool>(), // send_notifications
+        any::<bool>(), // http_requests
         arb_file_access_scope(),
-        any::<bool>(),           // invoke_workflows
-        any::<bool>(),           // send_text
+        any::<bool>(), // invoke_workflows
+        any::<bool>(), // send_text
     )
-        .prop_map(
-            |(rpo, sn, hr, fa, iw, st)| SandboxCapabilities {
-                read_pane_output: rpo,
-                send_notifications: sn,
-                http_requests: hr,
-                file_access: fa,
-                invoke_workflows: iw,
-                send_text: st,
-            },
-        )
+        .prop_map(|(rpo, sn, hr, fa, iw, st)| SandboxCapabilities {
+            read_pane_output: rpo,
+            send_notifications: sn,
+            http_requests: hr,
+            file_access: fa,
+            invoke_workflows: iw,
+            send_text: st,
+        })
 }
 
 fn arb_extension_manifest() -> impl Strategy<Value = ExtensionManifest> {
@@ -168,16 +166,13 @@ fn arb_extension_manifest() -> impl Strategy<Value = ExtensionManifest> {
 }
 
 fn arb_sandbox_violation() -> impl Strategy<Value = SandboxViolation> {
-    (
-        "[a-z_]{3,15}",
-        "[a-z_]{5,20}",
-        "[A-Za-z ]{10,40}",
-    )
-        .prop_map(|(extension_name, capability, message)| SandboxViolation {
+    ("[a-z_]{3,15}", "[a-z_]{5,20}", "[A-Za-z ]{10,40}").prop_map(
+        |(extension_name, capability, message)| SandboxViolation {
             extension_name,
             capability,
             message,
-        })
+        },
+    )
 }
 
 // =========================================================================

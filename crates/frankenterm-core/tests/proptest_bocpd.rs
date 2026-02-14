@@ -26,72 +26,80 @@ use frankenterm_core::bocpd::{
 
 fn arb_bocpd_config() -> impl Strategy<Value = BocpdConfig> {
     (
-        0.001f64..0.1,    // hazard_rate
-        0.1f64..0.99,     // detection_threshold
-        5usize..50,       // min_observations
-        50usize..500,     // max_run_length
+        0.001f64..0.1, // hazard_rate
+        0.1f64..0.99,  // detection_threshold
+        5usize..50,    // min_observations
+        50usize..500,  // max_run_length
     )
-        .prop_map(|(hazard_rate, detection_threshold, min_observations, max_run_length)| {
-            BocpdConfig {
+        .prop_map(
+            |(hazard_rate, detection_threshold, min_observations, max_run_length)| BocpdConfig {
                 hazard_rate,
                 detection_threshold,
                 min_observations,
                 max_run_length,
-            }
-        })
+            },
+        )
 }
 
 fn arb_change_point() -> impl Strategy<Value = ChangePoint> {
     (
-        0u64..10_000,     // observation_index
-        0.0f64..1.0,      // posterior_probability
-        0usize..500,       // map_run_length
+        0u64..10_000, // observation_index
+        0.0f64..1.0,  // posterior_probability
+        0usize..500,  // map_run_length
     )
-        .prop_map(|(observation_index, posterior_probability, map_run_length)| {
-            ChangePoint {
+        .prop_map(
+            |(observation_index, posterior_probability, map_run_length)| ChangePoint {
                 observation_index,
                 posterior_probability,
                 map_run_length,
-            }
-        })
+            },
+        )
 }
 
 fn arb_output_features() -> impl Strategy<Value = OutputFeatures> {
     (
-        0.0f64..1000.0,   // output_rate
+        0.0f64..1000.0,    // output_rate
         0.0f64..100_000.0, // byte_rate
         0.0f64..8.0,       // entropy
         0.0f64..1.0,       // unique_line_ratio
         0.0f64..1.0,       // ansi_density
     )
-        .prop_map(|(output_rate, byte_rate, entropy, unique_line_ratio, ansi_density)| {
-            OutputFeatures {
+        .prop_map(
+            |(output_rate, byte_rate, entropy, unique_line_ratio, ansi_density)| OutputFeatures {
                 output_rate,
                 byte_rate,
                 entropy,
                 unique_line_ratio,
                 ansi_density,
-            }
-        })
+            },
+        )
 }
 
 fn arb_pane_change_point() -> impl Strategy<Value = PaneChangePoint> {
     (
-        0u64..1000,         // pane_id
-        0u64..10_000,       // observation_index
-        0.0f64..1.0,        // posterior_probability
+        0u64..1000,                                  // pane_id
+        0u64..10_000,                                // observation_index
+        0.0f64..1.0,                                 // posterior_probability
         proptest::option::of(arb_output_features()), // features_at_change
-        0u64..2_000_000_000, // timestamp_secs
+        0u64..2_000_000_000,                         // timestamp_secs
     )
-        .prop_map(|(pane_id, observation_index, posterior_probability, features_at_change, timestamp_secs)| {
-            PaneChangePoint {
+        .prop_map(
+            |(
                 pane_id,
                 observation_index,
                 posterior_probability,
                 features_at_change,
                 timestamp_secs,
-            }
-        })
+            )| {
+                PaneChangePoint {
+                    pane_id,
+                    observation_index,
+                    posterior_probability,
+                    features_at_change,
+                    timestamp_secs,
+                }
+            },
+        )
 }
 
 fn arb_pane_summary() -> impl Strategy<Value = PaneBocpdSummary> {
@@ -103,16 +111,25 @@ fn arb_pane_summary() -> impl Strategy<Value = PaneBocpdSummary> {
         0u64..500,
         proptest::bool::ANY,
     )
-        .prop_map(|(pane_id, observation_count, change_point_count, current_change_prob, map_run_length, in_warmup)| {
-            PaneBocpdSummary {
+        .prop_map(
+            |(
                 pane_id,
                 observation_count,
                 change_point_count,
                 current_change_prob,
                 map_run_length,
                 in_warmup,
-            }
-        })
+            )| {
+                PaneBocpdSummary {
+                    pane_id,
+                    observation_count,
+                    change_point_count,
+                    current_change_prob,
+                    map_run_length,
+                    in_warmup,
+                }
+            },
+        )
 }
 
 fn arb_bocpd_snapshot() -> impl Strategy<Value = BocpdSnapshot> {
@@ -121,12 +138,10 @@ fn arb_bocpd_snapshot() -> impl Strategy<Value = BocpdSnapshot> {
         0u64..500,
         prop::collection::vec(arb_pane_summary(), 0..10),
     )
-        .prop_map(|(pane_count, total_change_points, panes)| {
-            BocpdSnapshot {
-                pane_count,
-                total_change_points,
-                panes,
-            }
+        .prop_map(|(pane_count, total_change_points, panes)| BocpdSnapshot {
+            pane_count,
+            total_change_points,
+            panes,
         })
 }
 

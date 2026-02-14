@@ -7,9 +7,8 @@ use proptest::prelude::*;
 use frankenterm_core::circuit_breaker::CircuitBreakerStatus;
 use frankenterm_core::patterns::AgentType;
 use frankenterm_core::sharding::{
-    AssignmentStrategy, ShardHealthEntry, ShardHealthReport, ShardId,
-    assign_pane_with_strategy, decode_sharded_pane_id, encode_sharded_pane_id,
-    is_sharded_pane_id,
+    AssignmentStrategy, ShardHealthEntry, ShardHealthReport, ShardId, assign_pane_with_strategy,
+    decode_sharded_pane_id, encode_sharded_pane_id, is_sharded_pane_id,
 };
 use frankenterm_core::watchdog::HealthStatus;
 
@@ -44,7 +43,8 @@ fn arb_health_status() -> impl Strategy<Value = HealthStatus> {
     ]
 }
 
-fn arb_circuit_state_kind() -> impl Strategy<Value = frankenterm_core::circuit_breaker::CircuitStateKind> {
+fn arb_circuit_state_kind()
+-> impl Strategy<Value = frankenterm_core::circuit_breaker::CircuitStateKind> {
     prop_oneof![
         Just(frankenterm_core::circuit_breaker::CircuitStateKind::Closed),
         Just(frankenterm_core::circuit_breaker::CircuitStateKind::Open),
@@ -55,16 +55,16 @@ fn arb_circuit_state_kind() -> impl Strategy<Value = frankenterm_core::circuit_b
 fn arb_circuit_breaker_status() -> impl Strategy<Value = CircuitBreakerStatus> {
     (
         arb_circuit_state_kind(),
-        0u32..100,           // consecutive_failures
-        1u32..20,            // failure_threshold
-        1u32..10,            // success_threshold
-        1000u64..60_000,     // open_cooldown_ms
-        proptest::option::of(0u64..60_000),  // open_for_ms
-        proptest::option::of(0u64..60_000),  // cooldown_remaining_ms
-        proptest::option::of(0u32..10),      // half_open_successes
+        0u32..100,                          // consecutive_failures
+        1u32..20,                           // failure_threshold
+        1u32..10,                           // success_threshold
+        1000u64..60_000,                    // open_cooldown_ms
+        proptest::option::of(0u64..60_000), // open_for_ms
+        proptest::option::of(0u64..60_000), // cooldown_remaining_ms
+        proptest::option::of(0u32..10),     // half_open_successes
     )
-        .prop_map(|(state, cf, ft, st, ocms, ofms, crms, hos)| {
-            CircuitBreakerStatus {
+        .prop_map(
+            |(state, cf, ft, st, ocms, ofms, crms, hos)| CircuitBreakerStatus {
                 state,
                 consecutive_failures: cf,
                 failure_threshold: ft,
@@ -73,29 +73,29 @@ fn arb_circuit_breaker_status() -> impl Strategy<Value = CircuitBreakerStatus> {
                 open_for_ms: ofms,
                 cooldown_remaining_ms: crms,
                 half_open_successes: hos,
-            }
-        })
+            },
+        )
 }
 
 fn arb_shard_health_entry() -> impl Strategy<Value = ShardHealthEntry> {
     (
-        0usize..100,             // shard_id
-        "[a-z]{3,12}",           // label
+        0usize..100,   // shard_id
+        "[a-z]{3,12}", // label
         arb_health_status(),
-        proptest::option::of(0usize..1000),  // pane_count
+        proptest::option::of(0usize..1000), // pane_count
         arb_circuit_breaker_status(),
         proptest::option::of("[a-z ]{3,30}"), // error
     )
-        .prop_map(|(shard_id, label, status, pane_count, circuit, error)| {
-            ShardHealthEntry {
+        .prop_map(
+            |(shard_id, label, status, pane_count, circuit, error)| ShardHealthEntry {
                 shard_id: ShardId(shard_id),
                 label,
                 status,
                 pane_count,
                 circuit,
                 error,
-            }
-        })
+            },
+        )
 }
 
 fn arb_shard_health_report() -> impl Strategy<Value = ShardHealthReport> {
@@ -104,12 +104,10 @@ fn arb_shard_health_report() -> impl Strategy<Value = ShardHealthReport> {
         arb_health_status(),
         prop::collection::vec(arb_shard_health_entry(), 0..8),
     )
-        .prop_map(|(timestamp_ms, overall, shards)| {
-            ShardHealthReport {
-                timestamp_ms,
-                overall,
-                shards,
-            }
+        .prop_map(|(timestamp_ms, overall, shards)| ShardHealthReport {
+            timestamp_ms,
+            overall,
+            shards,
         })
 }
 

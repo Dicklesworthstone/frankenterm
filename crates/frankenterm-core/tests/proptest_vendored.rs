@@ -45,17 +45,15 @@ fn arb_commit_hash() -> impl Strategy<Value = String> {
 
 /// Generate a pure-numeric string (will NOT be treated as a commit hash).
 fn arb_numeric_date() -> impl Strategy<Value = String> {
-    (2020u32..2030, 1u32..13, 1u32..29)
-        .prop_map(|(y, m, d)| format!("{y}{m:02}{d:02}"))
+    (2020u32..2030, 1u32..13, 1u32..29).prop_map(|(y, m, d)| format!("{y}{m:02}{d:02}"))
 }
 
 /// Generate WezTerm-style version strings.
 fn arb_wezterm_version() -> impl Strategy<Value = String> {
     prop_oneof![
         // "wezterm <date>-<time>-<commit>"
-        (arb_numeric_date(), arb_commit_hash()).prop_map(|(date, commit)| {
-            format!("wezterm {date}-110809-{commit}")
-        }),
+        (arb_numeric_date(), arb_commit_hash())
+            .prop_map(|(date, commit)| { format!("wezterm {date}-110809-{commit}") }),
         // "wezterm <date>" (no commit)
         arb_numeric_date().prop_map(|date| format!("wezterm {date}")),
         // "wezterm-gui 0.0.0+<commit>"
