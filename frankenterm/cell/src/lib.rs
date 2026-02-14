@@ -1000,6 +1000,7 @@ pub enum AttributeChange {
 #[cfg(test)]
 mod test {
     use super::*;
+    use alloc::{format, vec};
     use crate::color::SrgbaTuple;
 
     #[test]
@@ -1046,6 +1047,7 @@ mod test {
         }
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn test_width() {
         let foot = "\u{1f9b6}";
@@ -1246,6 +1248,7 @@ mod test {
         assert_eq!(attr, ColorAttribute::PaletteIndex(42));
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn small_color_clone_eq_hash() {
         let a = SmallColor::PaletteIndex(7);
@@ -1711,6 +1714,7 @@ mod test {
 
     // ── CellAttributes: compute_shape_hash ──────────────────
 
+    #[cfg(feature = "std")]
     #[test]
     fn compute_shape_hash_differs_for_different_attrs() {
         use std::collections::hash_map::DefaultHasher;

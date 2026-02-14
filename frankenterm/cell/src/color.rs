@@ -161,7 +161,6 @@ mod tests {
 
     #[test]
     fn color_attribute_hash_consistency() {
-        use core::hash::Hash;
         // Just verify it doesn't panic
         let mut set = alloc::collections::BTreeSet::new();
         set.insert(format!("{:?}", ColorAttribute::Default));
