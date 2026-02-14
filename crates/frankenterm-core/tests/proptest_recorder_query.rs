@@ -9,6 +9,11 @@
 //! 4. Audit completeness: every execute() call generates exactly one audit entry
 //! 5. Sensitivity filtering: min/max tier filters are respected
 //! 6. Elevation: grants raise effective tier; expiry restores base tier
+//! 7. RecorderQueryRequest serde roundtrip
+//! 8. TimeRange serde roundtrip + contains invariant
+//! 9. QueryEventKind serde roundtrip + snake_case
+//! 10. QueryStats serde roundtrip + default
+//! 11. RecorderQueryRequest required_tier logic
 
 use proptest::prelude::*;
 
@@ -17,12 +22,14 @@ use frankenterm_core::recorder_audit::{
     AccessTier, ActorIdentity, AuditLog, AuditLogConfig, AuthzDecision,
 };
 use frankenterm_core::recorder_query::{
-    InMemoryEventStore, QueryError, RecorderQueryExecutor, RecorderQueryRequest,
+    InMemoryEventStore, QueryError, QueryEventKind, QueryStats, RecorderQueryExecutor,
+    RecorderQueryRequest, TimeRange,
 };
 use frankenterm_core::recorder_retention::SensitivityTier;
 use frankenterm_core::recording::{
-    RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderEvent, RecorderEventCausality, RecorderEventPayload,
-    RecorderEventSource, RecorderIngressKind, RecorderRedactionLevel, RecorderTextEncoding,
+    RecorderEvent, RecorderEventCausality, RecorderEventPayload, RecorderEventSource,
+    RecorderIngressKind, RecorderRedactionLevel, RecorderTextEncoding,
+    RECORDER_EVENT_SCHEMA_VERSION_V1,
 };
 
 // =============================================================================
@@ -63,6 +70,15 @@ fn arb_access_tier() -> impl Strategy<Value = AccessTier> {
         Just(AccessTier::A2FullQuery),
         Just(AccessTier::A3PrivilegedRaw),
         Just(AccessTier::A4Admin),
+    ]
+}
+
+fn arb_query_event_kind() -> impl Strategy<Value = QueryEventKind> {
+    prop_oneof![
+        Just(QueryEventKind::IngressText),
+        Just(QueryEventKind::EgressOutput),
+        Just(QueryEventKind::ControlMarker),
+        Just(QueryEventKind::LifecycleMarker),
     ]
 }
 
@@ -108,6 +124,29 @@ fn arb_event_set(count: usize) -> impl Strategy<Value = Vec<RecorderEvent>> {
         })
         .collect();
     strategies
+}
+
+fn arb_time_range() -> impl Strategy<Value = TimeRange> {
+    (0_u64..1_000_000, 1_u64..1_000_000).prop_map(|(start, delta)| TimeRange {
+        start_ms: start,
+        end_ms: start + delta,
+    })
+}
+
+fn arb_query_stats() -> impl Strategy<Value = QueryStats> {
+    (
+        0_usize..10_000,
+        0_usize..10_000,
+        0_usize..10_000,
+        0_usize..10_000,
+    )
+        .prop_map(|(scanned, matched, redacted, excluded)| QueryStats {
+            events_scanned: scanned,
+            events_matched: matched,
+            events_redacted: redacted,
+            events_excluded: excluded,
+            ..Default::default()
+        })
 }
 
 fn make_executor(events: Vec<RecorderEvent>) -> RecorderQueryExecutor<InMemoryEventStore> {
@@ -611,5 +650,177 @@ proptest! {
             prop_assert_eq!(masked.len(), text.len(),
                 "masked text length ({}) should equal original ({})", masked.len(), text.len());
         }
+    }
+}
+
+// =============================================================================
+// Serde: RecorderQueryRequest roundtrip
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(60))]
+
+    #[test]
+    fn prop_query_request_serde_roundtrip(
+        limit in 1_usize..1000,
+        offset in 0_usize..500,
+        include_text in any::<bool>(),
+        pane_ids in prop::collection::vec(0_u64..1000, 0..5),
+    ) {
+        let req = RecorderQueryRequest {
+            time_range: None,
+            pane_ids,
+            sources: vec![],
+            text_pattern: None,
+            limit,
+            offset,
+            include_text,
+            min_sensitivity: None,
+            max_sensitivity: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: RecorderQueryRequest = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.limit, req.limit);
+        prop_assert_eq!(back.offset, req.offset);
+        prop_assert_eq!(back.include_text, req.include_text);
+        prop_assert_eq!(back.pane_ids.len(), req.pane_ids.len());
+    }
+
+    #[test]
+    fn prop_query_request_default_from_empty_json(_dummy in 0..1_u8) {
+        let req: RecorderQueryRequest = serde_json::from_str("{}").unwrap();
+        prop_assert_eq!(req.limit, 100, "default limit should be 100");
+        prop_assert!(req.include_text, "default include_text should be true");
+        prop_assert!(req.pane_ids.is_empty());
+        prop_assert!(req.time_range.is_none());
+        prop_assert!(req.text_pattern.is_none());
+    }
+}
+
+// =============================================================================
+// Serde: TimeRange roundtrip + contains invariant
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(60))]
+
+    #[test]
+    fn prop_time_range_serde_roundtrip(range in arb_time_range()) {
+        let json = serde_json::to_string(&range).unwrap();
+        let back: TimeRange = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.start_ms, range.start_ms);
+        prop_assert_eq!(back.end_ms, range.end_ms);
+    }
+
+    #[test]
+    fn prop_time_range_contains_endpoints(range in arb_time_range()) {
+        // Start and end are both inclusive.
+        prop_assert!(range.contains(range.start_ms), "range should contain start");
+        prop_assert!(range.contains(range.end_ms), "range should contain end");
+        // One before start should be excluded.
+        if range.start_ms > 0 {
+            prop_assert!(!range.contains(range.start_ms - 1), "range should exclude start-1");
+        }
+        // One after end should be excluded.
+        if range.end_ms < u64::MAX {
+            prop_assert!(!range.contains(range.end_ms + 1), "range should exclude end+1");
+        }
+    }
+}
+
+// =============================================================================
+// Serde: QueryEventKind roundtrip + snake_case
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn prop_query_event_kind_serde(kind in arb_query_event_kind()) {
+        let json = serde_json::to_string(&kind).unwrap();
+        let back: QueryEventKind = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, kind);
+    }
+
+    #[test]
+    fn prop_query_event_kind_snake_case(kind in arb_query_event_kind()) {
+        let json = serde_json::to_string(&kind).unwrap();
+        let expected = match kind {
+            QueryEventKind::IngressText => "\"ingress_text\"",
+            QueryEventKind::EgressOutput => "\"egress_output\"",
+            QueryEventKind::ControlMarker => "\"control_marker\"",
+            QueryEventKind::LifecycleMarker => "\"lifecycle_marker\"",
+        };
+        prop_assert_eq!(json.as_str(), expected);
+    }
+}
+
+// =============================================================================
+// Serde: QueryStats roundtrip + default
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(60))]
+
+    #[test]
+    fn prop_query_stats_serde_roundtrip(stats in arb_query_stats()) {
+        let json = serde_json::to_string(&stats).unwrap();
+        let back: QueryStats = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.events_scanned, stats.events_scanned);
+        prop_assert_eq!(back.events_matched, stats.events_matched);
+        prop_assert_eq!(back.events_redacted, stats.events_redacted);
+        prop_assert_eq!(back.events_excluded, stats.events_excluded);
+    }
+
+    #[test]
+    fn prop_query_stats_default(_dummy in 0..1_u8) {
+        let stats = QueryStats::default();
+        prop_assert_eq!(stats.events_scanned, 0);
+        prop_assert_eq!(stats.events_matched, 0);
+        prop_assert_eq!(stats.events_redacted, 0);
+        prop_assert_eq!(stats.events_excluded, 0);
+        // Duration has #[serde(skip)], so shouldn't appear in JSON.
+        let json = serde_json::to_string(&stats).unwrap();
+        prop_assert!(!json.contains("duration"), "duration should be skipped in serde");
+    }
+}
+
+// =============================================================================
+// Serde: RecorderQueryRequest required_tier logic
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(60))]
+
+    /// Metadata-only queries (include_text=false) always require A0.
+    #[test]
+    fn prop_metadata_only_requires_a0(
+        pane_ids in prop::collection::vec(0_u64..100, 0..5),
+    ) {
+        let req = RecorderQueryRequest {
+            include_text: false,
+            pane_ids,
+            ..Default::default()
+        };
+        prop_assert_eq!(req.required_tier(), AccessTier::A0PublicMetadata);
+    }
+
+    /// Cross-pane text queries require A2.
+    #[test]
+    fn prop_cross_pane_requires_a2(
+        pane_count in 2_usize..10,
+    ) {
+        let pane_ids: Vec<u64> = (0..pane_count as u64).collect();
+        let req = RecorderQueryRequest::for_panes(pane_ids);
+        prop_assert_eq!(req.required_tier(), AccessTier::A2FullQuery);
+    }
+
+    /// Text search queries require A2.
+    #[test]
+    fn prop_text_search_requires_a2(
+        pattern in "[a-z]{3,20}",
+    ) {
+        let req = RecorderQueryRequest::text_search(pattern);
+        prop_assert_eq!(req.required_tier(), AccessTier::A2FullQuery);
     }
 }
