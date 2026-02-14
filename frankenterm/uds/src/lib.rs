@@ -442,4 +442,288 @@ mod tests {
         s2.write_all(b"two").unwrap();
         cleanup(&path);
     }
+
+    // ── Large data transfer ───────────────────────────────────
+
+    #[test]
+    fn large_data_roundtrip() {
+        let path = temp_socket_path("large");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let data: Vec<u8> = (0..8192).map(|i| (i % 256) as u8).collect();
+
+        let client = std::thread::spawn({
+            let path = path.clone();
+            let data = data.clone();
+            move || {
+                let mut stream = UnixStream::connect(&path).unwrap();
+                stream.write_all(&data).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        let (mut server_stream, _) = listener.accept().unwrap();
+        client.join().unwrap();
+        drop(listener);
+
+        let mut buf = Vec::new();
+        server_stream.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, data);
+        cleanup(&path);
+    }
+
+    // ── Binary data ──────────────────────────────────────────
+
+    #[test]
+    fn binary_data_all_byte_values() {
+        let path = temp_socket_path("binary");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let data: Vec<u8> = (0..=255).collect();
+
+        let client = std::thread::spawn({
+            let path = path.clone();
+            let data = data.clone();
+            move || {
+                let mut stream = UnixStream::connect(&path).unwrap();
+                stream.write_all(&data).unwrap();
+            }
+        });
+
+        let (mut server_stream, _) = listener.accept().unwrap();
+        client.join().unwrap();
+        drop(listener);
+
+        let mut buf = Vec::new();
+        server_stream.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, data);
+        cleanup(&path);
+    }
+
+    // ── EOF behavior ─────────────────────────────────────────
+
+    #[test]
+    fn read_returns_eof_after_writer_drops() {
+        let path = temp_socket_path("eof");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+
+        let client = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let mut stream = UnixStream::connect(&path).unwrap();
+                stream.write_all(b"fin").unwrap();
+                // stream drops here, closing the connection
+            }
+        });
+
+        let (mut server_stream, _) = listener.accept().unwrap();
+        client.join().unwrap();
+
+        let mut buf = Vec::new();
+        server_stream.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, b"fin");
+
+        // Further reads should return 0 (EOF)
+        let mut extra = [0u8; 16];
+        let n = server_stream.read(&mut extra).unwrap();
+        assert_eq!(n, 0);
+        cleanup(&path);
+    }
+
+    // ── Non-blocking read ────────────────────────────────────
+
+    #[test]
+    fn nonblocking_read_returns_would_block() {
+        let path = temp_socket_path("nonblock");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+
+        let client = std::thread::spawn({
+            let path = path.clone();
+            move || UnixStream::connect(&path).unwrap()
+        });
+
+        let (mut server_stream, _) = listener.accept().unwrap();
+        let _client_stream = client.join().unwrap();
+
+        server_stream.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 16];
+        let result = server_stream.read(&mut buf);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        cleanup(&path);
+    }
+
+    // ── Listener re-bind after cleanup ───────────────────────
+
+    #[test]
+    fn rebind_after_cleanup() {
+        let path = temp_socket_path("rebind");
+        cleanup(&path);
+
+        {
+            let _listener = UnixListener::bind(&path).unwrap();
+        }
+        // After dropping listener, clean up socket file and re-bind
+        cleanup(&path);
+        let _listener2 = UnixListener::bind(&path).unwrap();
+        cleanup(&path);
+    }
+
+    // ── DerefMut ─────────────────────────────────────────────
+
+    #[test]
+    fn unix_stream_deref_mut_exposes_inner() {
+        let path = temp_socket_path("deref_mut_s");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+
+        let client = std::thread::spawn({
+            let path = path.clone();
+            move || UnixStream::connect(&path).unwrap()
+        });
+
+        let (mut server_stream, _) = listener.accept().unwrap();
+        let _client_stream = client.join().unwrap();
+        // DerefMut gives mutable access to inner StreamImpl
+        let inner: &mut StreamImpl = &mut *server_stream;
+        let _ = inner.set_nonblocking(true);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn unix_listener_deref_mut_exposes_inner() {
+        let path = temp_socket_path("deref_mut_l");
+        cleanup(&path);
+        let mut listener = UnixListener::bind(&path).unwrap();
+        // DerefMut gives mutable access to inner ListenerImpl
+        let inner: &mut ListenerImpl = &mut *listener;
+        inner.set_nonblocking(true).unwrap();
+        cleanup(&path);
+    }
+
+    // ── Sequential connections ────────────────────────────────
+
+    #[test]
+    fn sequential_connections_work() {
+        let path = temp_socket_path("seq");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+
+        for i in 0..3u8 {
+            let client = std::thread::spawn({
+                let path = path.clone();
+                move || {
+                    let mut stream = UnixStream::connect(&path).unwrap();
+                    stream.write_all(&[i]).unwrap();
+                }
+            });
+
+            let (mut server_stream, _) = listener.accept().unwrap();
+            client.join().unwrap();
+
+            let mut buf = [0u8; 1];
+            server_stream.read_exact(&mut buf).unwrap();
+            assert_eq!(buf[0], i);
+        }
+        cleanup(&path);
+    }
+
+    // ── into_raw_fd / from_raw_fd ────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn into_raw_fd_and_from_raw_fd_roundtrip() {
+        let path = temp_socket_path("rawfd_rt");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+
+        let client = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let mut stream = UnixStream::connect(&path).unwrap();
+                stream.write_all(b"rawfd test").unwrap();
+            }
+        });
+
+        let (server_stream, _) = listener.accept().unwrap();
+        client.join().unwrap();
+
+        // Convert to raw fd and back
+        let raw = server_stream.into_raw_fd();
+        assert!(raw >= 0);
+        let mut restored = unsafe { UnixStream::from_raw_fd(raw) };
+
+        let mut buf = Vec::new();
+        restored.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, b"rawfd test");
+        cleanup(&path);
+    }
+
+    // ── Multiple messages over same connection ────────────────
+
+    #[test]
+    fn multiple_messages_same_connection() {
+        let path = temp_socket_path("multi_msg");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+
+        let client = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let mut stream = UnixStream::connect(&path).unwrap();
+                for i in 0..5u8 {
+                    stream.write_all(&[i; 10]).unwrap();
+                    stream.flush().unwrap();
+                }
+            }
+        });
+
+        let (mut server_stream, _) = listener.accept().unwrap();
+        client.join().unwrap();
+        drop(listener);
+
+        let mut buf = Vec::new();
+        server_stream.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf.len(), 50);
+        cleanup(&path);
+    }
+
+    // ── Simultaneous bidirectional ───────────────────────────
+
+    #[test]
+    fn simultaneous_bidirectional_exchange() {
+        let path = temp_socket_path("simul_bidir");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+
+        let client_handle = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let mut stream = UnixStream::connect(&path).unwrap();
+                // Send, then receive
+                stream.write_all(b"client-data").unwrap();
+                stream.flush().unwrap();
+                let mut buf = [0u8; 64];
+                let n = stream.read(&mut buf).unwrap();
+                String::from_utf8(buf[..n].to_vec()).unwrap()
+            }
+        });
+
+        let (mut server_stream, _) = listener.accept().unwrap();
+        // Read from client, then send response
+        let mut buf = [0u8; 64];
+        let n = server_stream.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"client-data");
+        server_stream.write_all(b"server-data").unwrap();
+        server_stream.flush().unwrap();
+
+        let client_received = client_handle.join().unwrap();
+        assert_eq!(client_received, "server-data");
+        cleanup(&path);
+    }
 }
