@@ -5,6 +5,7 @@
 //! enforcement.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
@@ -429,6 +430,25 @@ where
     global_sequence: Arc<crate::recording::GlobalSequence>,
 }
 
+/// Minimal task-set abstraction for polling tasks.
+///
+/// This keeps tailer scheduling logic decoupled from a concrete task set
+/// implementation while the runtime migration is in progress.
+pub trait PollTaskSet {
+    fn spawn_poll_task<F>(&mut self, future: F)
+    where
+        F: Future<Output = (u64, PollOutcome)> + Send + 'static;
+}
+
+impl PollTaskSet for JoinSet<(u64, PollOutcome)> {
+    fn spawn_poll_task<F>(&mut self, future: F)
+    where
+        F: Future<Output = (u64, PollOutcome)> + Send + 'static,
+    {
+        self.spawn(future);
+    }
+}
+
 impl<S> TailerSupervisor<S>
 where
     S: PaneTextSource + Send + Sync + 'static,
@@ -617,7 +637,10 @@ where
     /// Uses weighted scheduling: panes are sorted by priority (lower = higher),
     /// then filtered through the capture budget. Under contention, higher-priority
     /// panes get a larger share of the capture budget.
-    pub fn spawn_ready(&mut self, join_set: &mut JoinSet<(u64, PollOutcome)>) {
+    pub fn spawn_ready<T>(&mut self, task_set: &mut T)
+    where
+        T: PollTaskSet,
+    {
         if self.shutdown_flag.load(Ordering::SeqCst) {
             return;
         }
@@ -645,6 +668,25 @@ where
         let available = self.semaphore.available_permits();
         let selected = self.scheduler.select_panes(&ready_panes, available);
 
+        macro_rules! reserve_capture_event_permit {
+            ($pane_id:expr, $tx:expr, $send_timeout:expr, $reserve_cx:ident, $permit:ident) => {
+                #[cfg(feature = "asupersync-runtime")]
+                let $reserve_cx = crate::cx::for_testing();
+                #[cfg(feature = "asupersync-runtime")]
+                let $permit = match timeout($send_timeout, $tx.reserve(&$reserve_cx)).await {
+                    Ok(Ok(permit)) => permit,
+                    Ok(Err(_)) => return ($pane_id, PollOutcome::ChannelClosed),
+                    Err(_) => return ($pane_id, PollOutcome::Backpressure),
+                };
+                #[cfg(not(feature = "asupersync-runtime"))]
+                let $permit = match timeout($send_timeout, $tx.reserve()).await {
+                    Ok(Ok(permit)) => permit,
+                    Ok(Err(_)) => return ($pane_id, PollOutcome::ChannelClosed),
+                    Err(_) => return ($pane_id, PollOutcome::Backpressure),
+                };
+            };
+        }
+
         for pane_id in selected {
             // Check if this pane needs an overflow gap emitted before normal capture
             let overflow_gap_pending = self
@@ -666,7 +708,7 @@ where
             let overlap_size = self.config.overlap_size;
             let send_timeout = self.config.send_timeout;
 
-            join_set.spawn(async move {
+            task_set.spawn_poll_task(async move {
                 let Ok(_permit) = semaphore.acquire_owned().await else {
                     return (pane_id, PollOutcome::Backpressure);
                 };
@@ -684,20 +726,13 @@ where
                 // of doing a normal capture.  The gap signals to downstream consumers
                 // that data was lost during sustained backpressure.
                 if overflow_gap_pending {
-                    #[cfg(feature = "asupersync-runtime")]
-                    let reserve_cx = crate::cx::for_testing();
-                    #[cfg(feature = "asupersync-runtime")]
-                    let permit = match timeout(send_timeout, tx.reserve(&reserve_cx)).await {
-                        Ok(Ok(permit)) => permit,
-                        Ok(Err(_)) => return (pane_id, PollOutcome::ChannelClosed),
-                        Err(_) => return (pane_id, PollOutcome::Backpressure),
-                    };
-                    #[cfg(not(feature = "asupersync-runtime"))]
-                    let permit = match timeout(send_timeout, tx.reserve()).await {
-                        Ok(Ok(permit)) => permit,
-                        Ok(Err(_)) => return (pane_id, PollOutcome::ChannelClosed),
-                        Err(_) => return (pane_id, PollOutcome::Backpressure),
-                    };
+                    reserve_capture_event_permit!(
+                        pane_id,
+                        tx,
+                        send_timeout,
+                        overflow_reserve_cx,
+                        permit
+                    );
 
                     let gap_segment = {
                         let mut cursors = cursors.write().await;
@@ -752,20 +787,13 @@ where
                     return (pane_id, PollOutcome::CircuitOpen { retry_after_ms });
                 }
 
-                #[cfg(feature = "asupersync-runtime")]
-                let reserve_cx = crate::cx::for_testing();
-                #[cfg(feature = "asupersync-runtime")]
-                let permit = match timeout(send_timeout, tx.reserve(&reserve_cx)).await {
-                    Ok(Ok(permit)) => permit,
-                    Ok(Err(_)) => return (pane_id, PollOutcome::ChannelClosed),
-                    Err(_) => return (pane_id, PollOutcome::Backpressure),
-                };
-                #[cfg(not(feature = "asupersync-runtime"))]
-                let permit = match timeout(send_timeout, tx.reserve()).await {
-                    Ok(Ok(permit)) => permit,
-                    Ok(Err(_)) => return (pane_id, PollOutcome::ChannelClosed),
-                    Err(_) => return (pane_id, PollOutcome::Backpressure),
-                };
+                reserve_capture_event_permit!(
+                    pane_id,
+                    tx,
+                    send_timeout,
+                    capture_reserve_cx,
+                    permit
+                );
 
                 let text = match source.get_text(pane_id, false).await {
                     Ok(text) => {
@@ -1729,7 +1757,7 @@ mod tests {
             ..Default::default()
         };
 
-        let (tx, mut rx) = mpsc::channel(10);
+        let (tx, rx) = mpsc::channel(10);
         let cursors = Arc::new(RwLock::new(HashMap::new()));
         let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -1793,7 +1821,7 @@ mod tests {
             ..Default::default()
         };
 
-        let (tx, mut rx) = mpsc::channel(10);
+        let (tx, rx) = mpsc::channel(10);
         let cursors = Arc::new(RwLock::new(HashMap::new()));
         let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
         let shutdown = Arc::new(AtomicBool::new(false));

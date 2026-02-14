@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::config as wa_config;
-use crate::runtime_compat::unix::{self as compat_unix, AsyncReadExt, AsyncWriteExt, UnixStream};
-use crate::runtime_compat::{mpsc, sleep, timeout, watch};
+use crate::runtime_compat::unix::{self as compat_unix, AsyncWriteExt, UnixStream};
+use crate::runtime_compat::{mpsc, timeout, watch};
 use codec::{
     CODEC_VERSION, CompressionMode, DecodedPdu, GetCodecVersion, GetCodecVersionResponse, GetLines,
     GetLinesResponse, GetPaneRenderChanges, GetPaneRenderChangesResponse, ListPanes,
@@ -490,9 +490,12 @@ impl DirectMuxClient {
             }
 
             let mut temp = vec![0u8; 4096];
-            let read = timeout(self.config.read_timeout, self.stream.read(&mut temp))
-                .await
-                .map_err(|_| DirectMuxError::ReadTimeout)??;
+            let read = timeout(
+                self.config.read_timeout,
+                unix_stream_read(&mut self.stream, &mut temp),
+            )
+            .await
+            .map_err(|_| DirectMuxError::ReadTimeout)??;
             if read == 0 {
                 return Err(DirectMuxError::Disconnected);
             }
@@ -597,6 +600,22 @@ fn is_local_unix_socket(path: &Path) -> bool {
         .unwrap_or(true)
 }
 
+#[cfg(feature = "asupersync-runtime")]
+async fn unix_stream_read(stream: &mut UnixStream, buf: &mut [u8]) -> std::io::Result<usize> {
+    use crate::runtime_compat::unix::AsyncRead;
+    use asupersync::io::ReadBuf;
+    use std::pin::Pin;
+
+    let mut read_buf = ReadBuf::new(buf);
+    std::future::poll_fn(|cx| Pin::new(&mut *stream).poll_read(cx, &mut read_buf)).await?;
+    Ok(read_buf.filled().len())
+}
+
+#[cfg(not(feature = "asupersync-runtime"))]
+async fn unix_stream_read(stream: &mut UnixStream, buf: &mut [u8]) -> std::io::Result<usize> {
+    stream.read(buf).await
+}
+
 // ---------------------------------------------------------------------------
 // PaneOutputSubscription: stream pane output as deltas (wa-nu4.4.2.2)
 // ---------------------------------------------------------------------------
@@ -651,10 +670,61 @@ pub struct PaneOutputSubscription {
     cancel: watch::Sender<bool>,
 }
 
+async fn pane_delta_recv(rx: &mut mpsc::Receiver<PaneDelta>) -> Option<PaneDelta> {
+    #[cfg(feature = "asupersync-runtime")]
+    {
+        let cx = crate::cx::for_testing();
+        rx.recv(&cx).await.ok()
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
+    {
+        rx.recv().await
+    }
+}
+
+async fn pane_delta_send(tx: &mpsc::Sender<PaneDelta>, delta: PaneDelta) {
+    #[cfg(feature = "asupersync-runtime")]
+    {
+        let cx = crate::cx::for_testing();
+        let _ = tx.send(&cx, delta).await;
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
+    {
+        let _ = tx.send(delta).await;
+    }
+}
+
+fn cancel_requested(cancel_rx: &mut watch::Receiver<bool>) -> bool {
+    #[cfg(feature = "asupersync-runtime")]
+    {
+        cancel_rx.borrow_and_clone()
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
+    {
+        *cancel_rx.borrow_and_update()
+    }
+}
+
+async fn wait_for_cancel_change(cancel_rx: &mut watch::Receiver<bool>) -> bool {
+    #[cfg(feature = "asupersync-runtime")]
+    {
+        let cx = crate::cx::for_testing();
+        cancel_rx.changed(&cx).await.is_ok()
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
+    {
+        cancel_rx.changed().await.is_ok()
+    }
+}
+
 impl PaneOutputSubscription {
     /// Receive the next delta. Returns `None` when the subscription ends.
     pub async fn next(&mut self) -> Option<PaneDelta> {
-        self.receiver.recv().await
+        pane_delta_recv(&mut self.receiver).await
     }
 
     /// Cancel the subscription.
@@ -690,13 +760,15 @@ pub fn subscribe_pane_output(
 
         loop {
             // Check cancellation
-            if *cancel_rx.borrow() {
-                let _ = tx
-                    .send(PaneDelta::Ended {
+            if cancel_requested(&mut cancel_rx) {
+                pane_delta_send(
+                    &tx,
+                    PaneDelta::Ended {
                         pane_id,
                         reason: "cancelled".to_string(),
-                    })
-                    .await;
+                    },
+                )
+                .await;
                 break;
             }
 
@@ -711,8 +783,9 @@ pub fn subscribe_pane_output(
                     // Detect gaps in seqno
                     if let Some(prev) = last_seqno {
                         if seqno > prev + 1 {
-                            let _ = tx
-                                .send(PaneDelta::Gap {
+                            pane_delta_send(
+                                &tx,
+                                PaneDelta::Gap {
                                     pane_id,
                                     reason: format!(
                                         "seqno jump: {} -> {} (missed {})",
@@ -720,8 +793,9 @@ pub fn subscribe_pane_output(
                                         seqno,
                                         seqno - prev - 1
                                     ),
-                                })
-                                .await;
+                                },
+                            )
+                            .await;
                         }
                     }
                     last_seqno = Some(seqno);
@@ -739,22 +813,26 @@ pub fn subscribe_pane_output(
 
                         // Bounded send — if the channel is full, emit a gap
                         if tx.try_send(delta).is_err() {
-                            let _ = tx
-                                .send(PaneDelta::Gap {
+                            pane_delta_send(
+                                &tx,
+                                PaneDelta::Gap {
                                     pane_id,
                                     reason: "slow consumer: channel full".to_string(),
-                                })
-                                .await;
+                                },
+                            )
+                            .await;
                         }
                     }
                 }
                 Err(DirectMuxError::Disconnected) => {
-                    let _ = tx
-                        .send(PaneDelta::Ended {
+                    pane_delta_send(
+                        &tx,
+                        PaneDelta::Ended {
                             pane_id,
                             reason: "mux socket disconnected".to_string(),
-                        })
-                        .await;
+                        },
+                    )
+                    .await;
                     break;
                 }
                 Err(DirectMuxError::ReadTimeout) => {
@@ -762,27 +840,32 @@ pub fn subscribe_pane_output(
                     tracing::debug!(pane_id, "subscription poll timeout, retrying");
                 }
                 Err(err) => {
-                    let _ = tx
-                        .send(PaneDelta::Ended {
+                    pane_delta_send(
+                        &tx,
+                        PaneDelta::Ended {
                             pane_id,
                             reason: format!("subscription error: {err}"),
-                        })
-                        .await;
+                        },
+                    )
+                    .await;
                     break;
                 }
             }
 
-            // Wait for the next poll interval or cancellation
-            tokio::select! {
-                () = sleep(config.poll_interval) => {}
-                _ = cancel_rx.changed() => {
-                    if *cancel_rx.borrow() {
-                        let _ = tx.send(PaneDelta::Ended {
+            // Wait for either poll interval elapse or cancellation signal.
+            if let Ok(changed_ok) =
+                timeout(config.poll_interval, wait_for_cancel_change(&mut cancel_rx)).await
+            {
+                if !changed_ok || cancel_requested(&mut cancel_rx) {
+                    pane_delta_send(
+                        &tx,
+                        PaneDelta::Ended {
                             pane_id,
                             reason: "cancelled".to_string(),
-                        }).await;
-                        break;
-                    }
+                        },
+                    )
+                    .await;
+                    break;
                 }
             }
         }
@@ -809,6 +892,7 @@ fn total_dirty_rows(ranges: &[std::ops::Range<isize>]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_compat::sleep;
     use crate::runtime_compat::unix as compat_unix;
     use proptest::prelude::*;
     use std::collections::{HashMap, HashSet};
@@ -878,7 +962,9 @@ mod tests {
             let mut responses: HashMap<u64, Pdu> = HashMap::new();
             loop {
                 let mut temp = vec![0u8; 4096];
-                let read = stream.read(&mut temp).await.expect("read");
+                let read = unix_stream_read(&mut stream, &mut temp)
+                    .await
+                    .expect("read");
                 if read == 0 {
                     break;
                 }
@@ -1267,7 +1353,9 @@ mod tests {
 
                 loop {
                     let mut temp = vec![0u8; 4096];
-                    let read = stream.read(&mut temp).await.expect("read");
+                    let read = unix_stream_read(&mut stream, &mut temp)
+                        .await
+                        .expect("read");
                     if read == 0 {
                         break;
                     }
@@ -1470,7 +1558,9 @@ mod tests {
             let (mut stream, _) = listener.accept().await.expect("accept");
             let mut read_buf = Vec::new();
             let mut temp = vec![0u8; 4096];
-            let read = stream.read(&mut temp).await.expect("read");
+            let read = unix_stream_read(&mut stream, &mut temp)
+                .await
+                .expect("read");
             read_buf.extend_from_slice(&temp[..read]);
             if let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
                 // Respond with wrong codec version
@@ -1584,7 +1674,7 @@ mod tests {
 
             loop {
                 let mut temp = vec![0u8; 4096];
-                let read = match stream.read(&mut temp).await {
+                let read = match unix_stream_read(&mut stream, &mut temp).await {
                     Ok(0) => break,
                     Ok(n) => n,
                     Err(_) => break,
@@ -1694,7 +1784,7 @@ mod tests {
             let mut read_buf = Vec::new();
             loop {
                 let mut temp = vec![0u8; 4096];
-                let read = match stream.read(&mut temp).await {
+                let read = match unix_stream_read(&mut stream, &mut temp).await {
                     Ok(0) => break,
                     Ok(n) => n,
                     Err(_) => break,

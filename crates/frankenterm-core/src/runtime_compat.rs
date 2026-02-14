@@ -257,6 +257,15 @@ impl SemaphorePermit<'_> {
 }
 
 #[cfg(feature = "asupersync-runtime")]
+impl std::fmt::Debug for SemaphorePermit<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SemaphorePermit")
+            .field("count", &self.count())
+            .finish()
+    }
+}
+
+#[cfg(feature = "asupersync-runtime")]
 #[derive(Debug)]
 pub struct OwnedSemaphorePermit {
     inner: asupersync::sync::OwnedSemaphorePermit,

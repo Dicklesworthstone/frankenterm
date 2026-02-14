@@ -962,6 +962,22 @@ mod tests {
     use crate::runtime_compat::{sleep, timeout};
     use crate::wezterm::PaneSize;
 
+    async fn recv_trigger(rx: &mut mpsc::Receiver<SnapshotTrigger>) -> SnapshotTrigger {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::for_testing();
+            rx.recv(&cx)
+                .await
+                .expect("snapshot trigger recv should succeed")
+        }
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            rx.recv()
+                .await
+                .expect("snapshot trigger recv should succeed")
+        }
+    }
+
     fn make_test_pane(id: u64, rows: u32, cols: u32) -> PaneInfo {
         PaneInfo {
             pane_id: id,
@@ -1335,8 +1351,14 @@ mod tests {
         assert!(engine.emit_trigger(SnapshotTrigger::StateTransition));
 
         let mut rx = engine.trigger_rx.lock().await.take().unwrap();
-        assert_eq!(rx.recv().await.unwrap(), SnapshotTrigger::WorkCompleted);
-        assert_eq!(rx.recv().await.unwrap(), SnapshotTrigger::StateTransition);
+        assert_eq!(
+            recv_trigger(&mut rx).await,
+            SnapshotTrigger::WorkCompleted
+        );
+        assert_eq!(
+            recv_trigger(&mut rx).await,
+            SnapshotTrigger::StateTransition
+        );
     }
 
     fn checkpoint_count(db_path: &str) -> i64 {

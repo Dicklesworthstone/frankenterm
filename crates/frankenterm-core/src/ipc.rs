@@ -1262,6 +1262,18 @@ mod tests {
         (shutdown_tx, handle)
     }
 
+    async fn send_shutdown(shutdown_tx: &mpsc::Sender<()>) {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::for_testing();
+            let _ = shutdown_tx.send(&cx, ()).await;
+        }
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let _ = shutdown_tx.send(()).await;
+        }
+    }
+
     #[tokio::test]
     async fn ipc_auth_rejects_missing_token() {
         let temp_dir = TempDir::new().unwrap();
@@ -1281,7 +1293,7 @@ mod tests {
                 .contains("missing auth token")
         );
 
-        let _ = shutdown_tx.send(()).await;
+        send_shutdown(&shutdown_tx).await;
         let _ = server_handle.await;
     }
 
@@ -1303,7 +1315,7 @@ mod tests {
                 .contains("invalid auth token")
         );
 
-        let _ = shutdown_tx.send(()).await;
+        send_shutdown(&shutdown_tx).await;
         let _ = server_handle.await;
     }
 
@@ -1326,7 +1338,7 @@ mod tests {
                 .contains("auth token expired")
         );
 
-        let _ = shutdown_tx.send(()).await;
+        send_shutdown(&shutdown_tx).await;
         let _ = server_handle.await;
     }
 
@@ -1355,7 +1367,7 @@ mod tests {
                 .contains("insufficient scope")
         );
 
-        let _ = shutdown_tx.send(()).await;
+        send_shutdown(&shutdown_tx).await;
         let _ = server_handle.await;
     }
 
@@ -1395,7 +1407,7 @@ mod tests {
         assert!(response.ok);
 
         // Shutdown
-        let _ = shutdown_tx.send(()).await;
+        send_shutdown(&shutdown_tx).await;
         let _ = server_handle.await;
     }
 
@@ -1415,7 +1427,7 @@ mod tests {
         crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
         assert!(socket_path.exists());
 
-        let _ = shutdown_tx.send(()).await;
+        send_shutdown(&shutdown_tx).await;
         let _ = server_handle.await;
         assert!(!socket_path.exists());
     }
@@ -1522,7 +1534,7 @@ mod tests {
             Some("unknown_pane")
         );
 
-        let _ = shutdown_tx.send(()).await;
+        send_shutdown(&shutdown_tx).await;
         let _ = server_handle.await;
     }
 
@@ -1581,7 +1593,7 @@ mod tests {
             panic!("Expected UserVarReceived event, got {:?}", event);
         }
 
-        let _ = shutdown_tx.send(()).await;
+        send_shutdown(&shutdown_tx).await;
         let _ = server_handle.await;
     }
 
@@ -1645,7 +1657,7 @@ mod tests {
             Some(&serde_json::json!(3900))
         );
 
-        let _ = shutdown_tx.send(()).await;
+        send_shutdown(&shutdown_tx).await;
         let _ = server_handle.await;
     }
 
@@ -1695,7 +1707,7 @@ mod tests {
         assert!(response.error.is_some());
         assert!(response.error.unwrap().contains("invalid request"));
 
-        let _ = shutdown_tx.send(()).await;
+        send_shutdown(&shutdown_tx).await;
         let _ = server_handle.await;
     }
 
@@ -1744,7 +1756,7 @@ mod tests {
         assert!(response.error.is_some());
         assert!(response.error.unwrap().contains("too large"));
 
-        let _ = shutdown_tx.send(()).await;
+        send_shutdown(&shutdown_tx).await;
         let _ = server_handle.await;
     }
 
@@ -1781,7 +1793,7 @@ mod tests {
             handle.await.unwrap();
         }
 
-        let _ = shutdown_tx.send(()).await;
+        send_shutdown(&shutdown_tx).await;
         let _ = server_handle.await;
     }
 }

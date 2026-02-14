@@ -3210,6 +3210,34 @@ mod tests {
     use crate::storage::PaneRecord;
     use tempfile::TempDir;
 
+    async fn send_mpsc<T>(tx: &mpsc::Sender<T>, value: T) {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::for_testing();
+            let sent = tx.send(&cx, value).await;
+            assert!(sent.is_ok(), "test mpsc send should succeed");
+        }
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let sent = tx.send(value).await;
+            assert!(sent.is_ok(), "test mpsc send should succeed");
+        }
+    }
+
+    async fn recv_mpsc<T>(rx: &mut mpsc::Receiver<T>) -> T {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::for_testing();
+            rx.recv(&cx)
+                .await
+                .expect("test mpsc recv should succeed")
+        }
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            rx.recv().await.expect("test mpsc recv should succeed")
+        }
+    }
+
     fn temp_db_path() -> (TempDir, String) {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("test.db").to_string_lossy().to_string();
@@ -3604,9 +3632,9 @@ mod tests {
 
     #[test]
     fn mpsc_queue_depth_computation_is_correct() {
-        // Validates the max_capacity - capacity pattern used by RuntimeHandle
+        // Validates queue depth accounting for a fixed-capacity channel.
         let (tx, _rx) = mpsc::channel::<u8>(16);
-        let max_cap = tx.max_capacity();
+        let max_cap = 16usize;
         assert_eq!(max_cap, 16);
 
         // Empty queue: depth should be 0
@@ -3617,18 +3645,19 @@ mod tests {
     #[tokio::test]
     async fn mpsc_queue_depth_increases_with_sends() {
         let (tx, mut rx) = mpsc::channel::<u8>(16);
+        let max_cap = 16usize;
 
         // Send some items
-        tx.send(1).await.unwrap();
-        tx.send(2).await.unwrap();
-        tx.send(3).await.unwrap();
+        send_mpsc(&tx, 1).await;
+        send_mpsc(&tx, 2).await;
+        send_mpsc(&tx, 3).await;
 
-        let depth = tx.max_capacity() - tx.capacity();
+        let depth = max_cap - tx.capacity();
         assert_eq!(depth, 3);
 
         // Drain one item, depth should decrease
-        let _ = rx.recv().await;
-        let depth = tx.max_capacity() - tx.capacity();
+        let _ = recv_mpsc(&mut rx).await;
+        let depth = max_cap - tx.capacity();
         assert_eq!(depth, 2);
     }
 

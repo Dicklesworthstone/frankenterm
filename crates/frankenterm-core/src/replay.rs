@@ -1308,19 +1308,16 @@ mod tests {
         let (tx, rx) = watch::channel(PlayerControl::Play);
         let mut sink = CollectorSink::new();
 
-        // Keep tx alive in main task; clone for spawned task.
-        let tx2 = tx.clone();
         tokio::spawn(async move {
             // Stop fires at t=1s, before frame B at t=5s.
             sleep(Duration::from_secs(1)).await;
-            let _ = tx2.send(PlayerControl::Stop);
+            let _ = tx.send(PlayerControl::Stop);
         });
 
         player.play(&mut sink, rx).await.unwrap();
         assert_eq!(player.state(), PlayerState::Stopped);
         // Only frame A (at t=0) should have been output.
         assert_eq!(sink.output, b"A");
-        drop(tx); // explicit drop after assertions
     }
 
     #[tokio::test]
@@ -1973,19 +1970,17 @@ mod tests {
         let (tx, rx) = watch::channel(PlayerControl::Play);
         let mut sink = CollectorSink::new();
 
-        let tx2 = tx.clone();
         tokio::spawn(async move {
             // Pause at 1s, resume at 2s
             sleep(Duration::from_secs(1)).await;
-            let _ = tx2.send(PlayerControl::Pause);
+            let _ = tx.send(PlayerControl::Pause);
             sleep(Duration::from_secs(1)).await;
-            let _ = tx2.send(PlayerControl::Play);
+            let _ = tx.send(PlayerControl::Play);
         });
 
         player.play(&mut sink, rx).await.unwrap();
         assert_eq!(player.state(), PlayerState::Finished);
         assert_eq!(sink.output, b"ABC");
-        drop(tx);
     }
 
     #[test]

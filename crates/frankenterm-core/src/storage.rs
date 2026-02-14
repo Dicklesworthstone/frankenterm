@@ -20850,6 +20850,34 @@ mod backpressure_integration_tests {
             .to_string()
     }
 
+    async fn send_mpsc<T>(tx: &mpsc::Sender<T>, value: T) {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::for_testing();
+            let sent = tx.send(&cx, value).await;
+            assert!(sent.is_ok(), "test mpsc send should succeed");
+        }
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let sent = tx.send(value).await;
+            assert!(sent.is_ok(), "test mpsc send should succeed");
+        }
+    }
+
+    async fn recv_mpsc<T>(rx: &mut mpsc::Receiver<T>) -> T {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::for_testing();
+            rx.recv(&cx)
+                .await
+                .expect("test mpsc recv should succeed")
+        }
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            rx.recv().await.expect("test mpsc recv should succeed")
+        }
+    }
+
     #[tokio::test]
     async fn capture_channel_backpressure_detected() {
         // Simulate backpressure on the capture channel:
@@ -20859,17 +20887,19 @@ mod backpressure_integration_tests {
         use std::time::Duration;
 
         let (tx, _rx) = mpsc::channel::<u8>(2);
+        let max_cap = 2usize;
 
         // Fill the channel
-        tx.send(1).await.unwrap();
-        tx.send(2).await.unwrap();
+        send_mpsc(&tx, 1).await;
+        send_mpsc(&tx, 2).await;
 
-        // Channel is full — reserve should time out
-        let result = crate::runtime_compat::timeout(Duration::from_millis(50), tx.reserve()).await;
+        // Channel is full — next send should block and timeout.
+        let result = crate::runtime_compat::timeout(Duration::from_millis(50), send_mpsc(&tx, 3))
+            .await;
         assert!(result.is_err(), "Should timeout when channel is full");
 
         // Verify depth
-        let depth = tx.max_capacity() - tx.capacity();
+        let depth = max_cap - tx.capacity();
         assert_eq!(depth, 2, "Queue should be at capacity");
     }
 
@@ -20878,24 +20908,25 @@ mod backpressure_integration_tests {
         use std::time::Duration;
 
         let (tx, mut rx) = mpsc::channel::<u8>(4);
+        let max_cap = 4usize;
 
         // Fill partially
-        tx.send(1).await.unwrap();
-        tx.send(2).await.unwrap();
-        tx.send(3).await.unwrap();
+        send_mpsc(&tx, 1).await;
+        send_mpsc(&tx, 2).await;
+        send_mpsc(&tx, 3).await;
 
-        let depth_before = tx.max_capacity() - tx.capacity();
+        let depth_before = max_cap - tx.capacity();
         assert_eq!(depth_before, 3);
 
         // Consume all items
-        rx.recv().await.unwrap();
-        rx.recv().await.unwrap();
-        rx.recv().await.unwrap();
+        let _ = recv_mpsc(&mut rx).await;
+        let _ = recv_mpsc(&mut rx).await;
+        let _ = recv_mpsc(&mut rx).await;
 
         // Small yield for channel state to update
         crate::runtime_compat::sleep(Duration::from_millis(1)).await;
 
-        let depth_after = tx.max_capacity() - tx.capacity();
+        let depth_after = max_cap - tx.capacity();
         assert_eq!(depth_after, 0, "Queue should drain when consumer resumes");
     }
 
