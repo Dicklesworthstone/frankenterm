@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::memory_pressure::MemoryPressureTier;
 
 /// Configuration for memory-pressure-aware resize controls.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ResizeMemoryConfig {
     /// Enable memory-pressure-aware resize throttling.
@@ -159,8 +159,7 @@ impl ResizeMemoryPolicy {
 
         match tier {
             MemoryPressureTier::Green => {
-                self.metrics.green_computations =
-                    self.metrics.green_computations.saturating_add(1);
+                self.metrics.green_computations = self.metrics.green_computations.saturating_add(1);
                 self.green_budget(tier)
             }
             MemoryPressureTier::Yellow => {
@@ -541,5 +540,367 @@ mod tests {
         assert!(green.max_scratch_bytes > yellow.max_scratch_bytes);
         assert!(yellow.max_scratch_bytes > orange.max_scratch_bytes);
         assert!(orange.max_scratch_bytes > red.max_scratch_bytes);
+    }
+
+    // -- Custom config override tests --
+
+    #[test]
+    fn custom_batch_sizes_propagate_to_budgets() {
+        let config = ResizeMemoryConfig {
+            normal_batch_size: 128,
+            yellow_batch_size: 64,
+            orange_batch_size: 16,
+            ..ResizeMemoryConfig::default()
+        };
+        let mut policy = ResizeMemoryPolicy::new(config);
+
+        assert_eq!(
+            policy
+                .compute_budget(MemoryPressureTier::Green)
+                .cold_batch_size,
+            128
+        );
+        assert_eq!(
+            policy
+                .compute_budget(MemoryPressureTier::Yellow)
+                .cold_batch_size,
+            64
+        );
+        assert_eq!(
+            policy
+                .compute_budget(MemoryPressureTier::Orange)
+                .cold_batch_size,
+            16
+        );
+        // Red always uses batch_size=1 regardless of config.
+        assert_eq!(
+            policy
+                .compute_budget(MemoryPressureTier::Red)
+                .cold_batch_size,
+            1
+        );
+    }
+
+    #[test]
+    fn custom_overscan_caps_propagate() {
+        let config = ResizeMemoryConfig {
+            normal_overscan_cap: 512,
+            yellow_overscan_cap: 256,
+            pressure_overscan_cap: 64,
+            ..ResizeMemoryConfig::default()
+        };
+        let mut policy = ResizeMemoryPolicy::new(config);
+
+        assert_eq!(
+            policy
+                .compute_budget(MemoryPressureTier::Green)
+                .overscan_cap,
+            512
+        );
+        assert_eq!(
+            policy
+                .compute_budget(MemoryPressureTier::Yellow)
+                .overscan_cap,
+            256
+        );
+        assert_eq!(
+            policy
+                .compute_budget(MemoryPressureTier::Orange)
+                .overscan_cap,
+            64
+        );
+        assert_eq!(
+            policy.compute_budget(MemoryPressureTier::Red).overscan_cap,
+            64
+        );
+    }
+
+    #[test]
+    fn custom_scratch_buffer_scales_per_tier() {
+        let config = ResizeMemoryConfig {
+            max_scratch_buffer_bytes: 1024,
+            ..ResizeMemoryConfig::default()
+        };
+        let mut policy = ResizeMemoryPolicy::new(config);
+
+        assert_eq!(
+            policy
+                .compute_budget(MemoryPressureTier::Green)
+                .max_scratch_bytes,
+            1024
+        );
+        assert_eq!(
+            policy
+                .compute_budget(MemoryPressureTier::Yellow)
+                .max_scratch_bytes,
+            512
+        );
+        assert_eq!(
+            policy
+                .compute_budget(MemoryPressureTier::Orange)
+                .max_scratch_bytes,
+            256
+        );
+        assert_eq!(
+            policy
+                .compute_budget(MemoryPressureTier::Red)
+                .max_scratch_bytes,
+            128
+        );
+    }
+
+    #[test]
+    fn custom_compaction_batch_scales_per_tier() {
+        let config = ResizeMemoryConfig {
+            compaction_batch_size: 1000,
+            ..ResizeMemoryConfig::default()
+        };
+        let mut policy = ResizeMemoryPolicy::new(config);
+
+        // Green: no compaction, but batch_size stored as-is.
+        let green = policy.compute_budget(MemoryPressureTier::Green);
+        assert_eq!(green.compaction_batch_size, 1000);
+        assert!(!green.compact_before_resize);
+
+        // Yellow: full compaction batch size.
+        assert_eq!(
+            policy
+                .compute_budget(MemoryPressureTier::Yellow)
+                .compaction_batch_size,
+            1000
+        );
+        // Orange: halved.
+        assert_eq!(
+            policy
+                .compute_budget(MemoryPressureTier::Orange)
+                .compaction_batch_size,
+            500
+        );
+        // Red: quartered.
+        assert_eq!(
+            policy
+                .compute_budget(MemoryPressureTier::Red)
+                .compaction_batch_size,
+            250
+        );
+    }
+
+    #[test]
+    fn red_compaction_batch_clamps_to_one_for_tiny_config() {
+        let config = ResizeMemoryConfig {
+            compaction_batch_size: 3,
+            ..ResizeMemoryConfig::default()
+        };
+        let mut policy = ResizeMemoryPolicy::new(config);
+
+        // 3 / 4 = 0, but max(0, 1) = 1.
+        let red = policy.compute_budget(MemoryPressureTier::Red);
+        assert_eq!(red.compaction_batch_size, 1);
+    }
+
+    // -- Boundary condition tests --
+
+    #[test]
+    fn effective_cold_batch_size_zero_remaining() {
+        let budget = ResizeMemoryBudget {
+            tier: MemoryPressureTier::Green,
+            cold_batch_size: 64,
+            cold_reflow_paused: false,
+            overscan_cap: 256,
+            backlog_cap: 1_048_576,
+            compact_before_resize: false,
+            compaction_batch_size: 256,
+            max_scratch_bytes: 64 * 1024 * 1024,
+        };
+        assert_eq!(effective_cold_batch_size(&budget, 0), 0);
+    }
+
+    #[test]
+    fn effective_cold_batch_size_exactly_at_batch() {
+        let budget = ResizeMemoryBudget {
+            tier: MemoryPressureTier::Green,
+            cold_batch_size: 64,
+            cold_reflow_paused: false,
+            overscan_cap: 256,
+            backlog_cap: 1_048_576,
+            compact_before_resize: false,
+            compaction_batch_size: 256,
+            max_scratch_bytes: 64 * 1024 * 1024,
+        };
+        assert_eq!(effective_cold_batch_size(&budget, 64), 64);
+    }
+
+    #[test]
+    fn effective_overscan_rows_zero_scrollback() {
+        let budget = ResizeMemoryBudget {
+            tier: MemoryPressureTier::Green,
+            cold_batch_size: 64,
+            cold_reflow_paused: false,
+            overscan_cap: 256,
+            backlog_cap: 1_048_576,
+            compact_before_resize: false,
+            compaction_batch_size: 256,
+            max_scratch_bytes: 64 * 1024 * 1024,
+        };
+        // scrollback_lines == physical_rows => no overscan available.
+        assert_eq!(effective_overscan_rows(&budget, 24, 24), 0);
+        // scrollback_lines < physical_rows => saturating sub yields 0.
+        assert_eq!(effective_overscan_rows(&budget, 24, 10), 0);
+    }
+
+    #[test]
+    fn effective_overscan_rows_zero_physical() {
+        let budget = ResizeMemoryBudget {
+            tier: MemoryPressureTier::Green,
+            cold_batch_size: 64,
+            cold_reflow_paused: false,
+            overscan_cap: 256,
+            backlog_cap: 1_048_576,
+            compact_before_resize: false,
+            compaction_batch_size: 256,
+            max_scratch_bytes: 64 * 1024 * 1024,
+        };
+        // Zero physical rows with scrollback => all scrollback is overscan.
+        assert_eq!(effective_overscan_rows(&budget, 0, 100), 100);
+    }
+
+    #[test]
+    fn scratch_allocation_exact_limit() {
+        let budget = ResizeMemoryBudget {
+            tier: MemoryPressureTier::Green,
+            cold_batch_size: 64,
+            cold_reflow_paused: false,
+            overscan_cap: 256,
+            backlog_cap: 1_048_576,
+            compact_before_resize: false,
+            compaction_batch_size: 256,
+            max_scratch_bytes: 1000,
+        };
+        assert!(scratch_allocation_allowed(&budget, 1000));
+        assert!(!scratch_allocation_allowed(&budget, 1001));
+    }
+
+    #[test]
+    fn scratch_allocation_zero_bytes() {
+        let budget = ResizeMemoryBudget {
+            tier: MemoryPressureTier::Red,
+            cold_batch_size: 1,
+            cold_reflow_paused: true,
+            overscan_cap: 32,
+            backlog_cap: 1000,
+            compact_before_resize: true,
+            compaction_batch_size: 64,
+            max_scratch_bytes: 0,
+        };
+        assert!(scratch_allocation_allowed(&budget, 0));
+        assert!(!scratch_allocation_allowed(&budget, 1));
+    }
+
+    // -- Config accessor test --
+
+    #[test]
+    fn config_accessor_returns_construction_config() {
+        let config = ResizeMemoryConfig {
+            normal_batch_size: 999,
+            yellow_batch_size: 500,
+            ..ResizeMemoryConfig::default()
+        };
+        let policy = ResizeMemoryPolicy::new(config.clone());
+        assert_eq!(policy.config(), &config);
+    }
+
+    // -- Metrics saturation tests --
+
+    #[test]
+    fn metrics_saturate_at_u64_max() {
+        let mut policy = ResizeMemoryPolicy::new(ResizeMemoryConfig::default());
+
+        // Manually max out a counter, then compute_budget should saturate.
+        policy.metrics = ResizeMemoryMetrics {
+            budget_computations: u64::MAX,
+            green_computations: u64::MAX,
+            ..ResizeMemoryMetrics::default()
+        };
+        let _ = policy.compute_budget(MemoryPressureTier::Green);
+        assert_eq!(policy.metrics().budget_computations, u64::MAX);
+        assert_eq!(policy.metrics().green_computations, u64::MAX);
+    }
+
+    // -- Serde roundtrip tests --
+
+    #[test]
+    fn config_serde_roundtrip() {
+        let config = ResizeMemoryConfig::default();
+        let json = serde_json::to_string(&config).expect("serialize config");
+        let restored: ResizeMemoryConfig = serde_json::from_str(&json).expect("deserialize config");
+        assert_eq!(config, restored);
+    }
+
+    #[test]
+    fn budget_serde_roundtrip() {
+        let mut policy = ResizeMemoryPolicy::new(ResizeMemoryConfig::default());
+        let budget = policy.compute_budget(MemoryPressureTier::Orange);
+        let json = serde_json::to_string(&budget).expect("serialize budget");
+        let restored: ResizeMemoryBudget = serde_json::from_str(&json).expect("deserialize budget");
+        assert_eq!(budget, restored);
+    }
+
+    #[test]
+    fn metrics_serde_roundtrip() {
+        let mut policy = ResizeMemoryPolicy::new(ResizeMemoryConfig::default());
+        let _ = policy.compute_budget(MemoryPressureTier::Yellow);
+        let _ = policy.compute_budget(MemoryPressureTier::Red);
+        let metrics = policy.metrics().clone();
+        let json = serde_json::to_string(&metrics).expect("serialize metrics");
+        let restored: ResizeMemoryMetrics =
+            serde_json::from_str(&json).expect("deserialize metrics");
+        assert_eq!(metrics, restored);
+    }
+
+    // -- Multi-tier transition sequence test --
+
+    #[test]
+    fn repeated_tier_escalation_tracks_metrics_correctly() {
+        let mut policy = ResizeMemoryPolicy::new(ResizeMemoryConfig::default());
+
+        // Simulate escalating pressure: Green → Yellow → Orange → Red → Green.
+        let _ = policy.compute_budget(MemoryPressureTier::Green);
+        let _ = policy.compute_budget(MemoryPressureTier::Yellow);
+        let _ = policy.compute_budget(MemoryPressureTier::Orange);
+        let _ = policy.compute_budget(MemoryPressureTier::Red);
+        let _ = policy.compute_budget(MemoryPressureTier::Green);
+
+        let m = policy.metrics();
+        assert_eq!(m.budget_computations, 5);
+        assert_eq!(m.green_computations, 2);
+        assert_eq!(m.yellow_computations, 1);
+        assert_eq!(m.orange_computations, 1);
+        assert_eq!(m.red_computations, 1);
+    }
+
+    #[test]
+    fn disabled_policy_tier_stored_in_budget() {
+        let config = ResizeMemoryConfig {
+            enabled: false,
+            ..ResizeMemoryConfig::default()
+        };
+        let mut policy = ResizeMemoryPolicy::new(config);
+
+        // When disabled, budget uses green params but stores the actual tier.
+        let budget = policy.compute_budget(MemoryPressureTier::Red);
+        assert_eq!(budget.tier, MemoryPressureTier::Red);
+        assert_eq!(budget.cold_batch_size, 64); // Green params despite Red tier.
+    }
+
+    #[test]
+    fn red_backlog_cap_is_quarter_of_orange() {
+        let config = ResizeMemoryConfig {
+            orange_backlog_cap: 200_000,
+            ..ResizeMemoryConfig::default()
+        };
+        let mut policy = ResizeMemoryPolicy::new(config);
+
+        let red = policy.compute_budget(MemoryPressureTier::Red);
+        assert_eq!(red.backlog_cap, 50_000); // 200_000 / 4
     }
 }

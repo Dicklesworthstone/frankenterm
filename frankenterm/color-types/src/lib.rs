@@ -500,7 +500,6 @@ impl SrgbaTuple {
             self.to_rgba_string()
         }
     }
-
 }
 
 impl core::fmt::Display for SrgbaTuple {

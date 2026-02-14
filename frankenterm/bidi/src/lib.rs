@@ -33,8 +33,7 @@ pub use level::Level;
 /// Placeholder codepoint index that corresponds to NO_LEVEL
 const DELETED: usize = usize::max_value();
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic, Default)]
 pub enum ParagraphDirectionHint {
     #[default]
     LeftToRight,
@@ -44,7 +43,6 @@ pub enum ParagraphDirectionHint {
     /// Attempt to auto-detect but fall back to RTL
     AutoRightToLeft,
 }
-
 
 impl ParagraphDirectionHint {
     /// Returns just the direction portion of the hint, independent
@@ -1467,8 +1465,7 @@ impl BidiContext {
                         // Do nothing
                     } else if overflow_embedding > 0 {
                         overflow_embedding -= 1;
-                    } else if !stack.isolate_status()
-                    && stack.depth() >= 2 {
+                    } else if !stack.isolate_status() && stack.depth() >= 2 {
                         stack.pop();
                     }
                 }

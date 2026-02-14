@@ -516,7 +516,8 @@ impl CommandBuilder {
 
         let home = self.get_home_dir()?;
         let dir: &OsStr = self
-            .cwd.as_deref()
+            .cwd
+            .as_deref()
             .filter(|dir| std::path::Path::new(dir).is_dir())
             .unwrap_or(home.as_ref());
         let shell = self.get_shell();
