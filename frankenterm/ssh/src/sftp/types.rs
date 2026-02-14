@@ -52,10 +52,12 @@ impl FileType {
         let flags = FileTypeFlags::from_bits_truncate(mode);
         if flags.contains(FileTypeFlags::DIR) {
             Self::Dir
+        } else if flags.contains(FileTypeFlags::SYMLINK) {
+            // Check SYMLINK before FILE because SYMLINK (0o120000) contains
+            // the FILE bit (0o100000), so `contains(FILE)` would match symlinks.
+            Self::Symlink
         } else if flags.contains(FileTypeFlags::FILE) {
             Self::File
-        } else if flags.contains(FileTypeFlags::SYMLINK) {
-            Self::Symlink
         } else {
             Self::Other
         }
