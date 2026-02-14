@@ -1023,6 +1023,88 @@ fn test_resize_wrap() {
 }
 
 #[test]
+fn test_resize_wrap_roundtrip_with_dpi_and_mutation() {
+    const LINES: usize = 8;
+    let mut term = TestTerm::new(LINES, 4, 0);
+    term.print("111\r\n2222aa\r\n333\r\n");
+    assert_visible_contents(
+        &term,
+        file!(),
+        line!(),
+        &["111", "2222", "aa", "333", "", "", "", ""],
+    );
+
+    term.resize(TerminalSize {
+        rows: LINES,
+        cols: 6,
+        pixel_width: 0,
+        pixel_height: 0,
+        dpi: 96,
+    });
+    assert_visible_contents(
+        &term,
+        file!(),
+        line!(),
+        &["111", "2222aa", "333", "", "", "", "", ""],
+    );
+
+    // Change DPI and return to the narrow width to exercise
+    // wrap-cache invalidation on metrics changes.
+    term.resize(TerminalSize {
+        rows: LINES,
+        cols: 4,
+        pixel_width: 0,
+        pixel_height: 0,
+        dpi: 144,
+    });
+    assert_visible_contents(
+        &term,
+        file!(),
+        line!(),
+        &["111", "2222", "aa", "333", "", "", "", ""],
+    );
+
+    // Mutate content after rewrap cycles to ensure subsequent resizes
+    // rebuild from current logical content rather than stale wraps.
+    term.cup(0, 3);
+    term.print("XYZ");
+    assert_visible_contents(
+        &term,
+        file!(),
+        line!(),
+        &["111", "2222", "aa", "XYZ", "", "", "", ""],
+    );
+
+    term.resize(TerminalSize {
+        rows: LINES,
+        cols: 6,
+        pixel_width: 0,
+        pixel_height: 0,
+        dpi: 144,
+    });
+    assert_visible_contents(
+        &term,
+        file!(),
+        line!(),
+        &["111", "2222aa", "XYZ", "", "", "", "", ""],
+    );
+
+    term.resize(TerminalSize {
+        rows: LINES,
+        cols: 4,
+        pixel_width: 0,
+        pixel_height: 0,
+        dpi: 144,
+    });
+    assert_visible_contents(
+        &term,
+        file!(),
+        line!(),
+        &["111", "2222", "aa", "XYZ", "", "", "", ""],
+    );
+}
+
+#[test]
 fn test_resize_wrap_issue_971() {
     const LINES: usize = 4;
     let mut term = TestTerm::new(LINES, 4, 0);

@@ -100,11 +100,12 @@ mod tests {
 
     #[test]
     fn action_clone_copy() {
+        fn assert_clone<T: Clone>(_: &T) {}
+
         let a = Action::Print;
+        assert_clone(&a);
         let b = a;
-        let c = a.clone();
         assert_eq!(a, b);
-        assert_eq!(a, c);
     }
 
     #[test]
@@ -153,11 +154,12 @@ mod tests {
 
     #[test]
     fn state_clone_copy() {
+        fn assert_clone<T: Clone>(_: &T) {}
+
         let a = State::CsiEntry;
+        assert_clone(&a);
         let b = a;
-        let c = a.clone();
         assert_eq!(a, b);
-        assert_eq!(a, c);
     }
 
     #[test]
@@ -175,7 +177,6 @@ mod tests {
 
     #[test]
     fn state_hash() {
-        use core::hash::{Hash, Hasher};
         use std::collections::HashSet;
         let mut set = HashSet::new();
         set.insert(State::Ground);

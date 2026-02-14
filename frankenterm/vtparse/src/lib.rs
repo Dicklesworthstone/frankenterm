@@ -840,10 +840,7 @@ mod test {
 
     #[test]
     fn test_osc_too_many_params() {
-        let fields = (0..MAX_OSC + 2)
-            .into_iter()
-            .map(|i| i.to_string())
-            .collect::<Vec<_>>();
+        let fields = (0..MAX_OSC + 2).map(|i| i.to_string()).collect::<Vec<_>>();
         let input = format!("\x1b]{}\x07", fields.join(";"));
         let actions = parse_as_vec(input.as_bytes());
         assert_eq!(actions.len(), 1);
@@ -966,7 +963,7 @@ mod test {
         assert_eq!(
             parse_as_vec(input.as_bytes()),
             vec![VTAction::CsiDispatch {
-                params: params,
+                params,
                 parameters_truncated: false,
                 byte: b'p'
             }]
@@ -1208,11 +1205,15 @@ mod test {
 
     #[test]
     fn csi_param_clone_eq() {
+        fn assert_clone<T: Clone>(_: &T) {}
+
         let a = CsiParam::Integer(7);
+        assert_clone(&a);
         let b = a;
         assert_eq!(a, b);
 
         let c = CsiParam::P(b'?');
+        assert_clone(&c);
         let d = c;
         assert_eq!(c, d);
         assert!(a != c);
@@ -1233,6 +1234,23 @@ mod test {
             hash_of(&CsiParam::Integer(42)),
             hash_of(&CsiParam::Integer(42))
         );
+    }
+
+    #[test]
+    fn csi_param_hash_set_dedupes_equal_values() {
+        use std::collections::HashSet;
+
+        let mut set = HashSet::new();
+        set.insert(CsiParam::Integer(5));
+        set.insert(CsiParam::Integer(5)); // duplicate
+        set.insert(CsiParam::P(b';'));
+        set.insert(CsiParam::P(b';')); // duplicate
+        set.insert(CsiParam::P(b':'));
+
+        assert_eq!(set.len(), 3);
+        assert!(set.contains(&CsiParam::Integer(5)));
+        assert!(set.contains(&CsiParam::P(b';')));
+        assert!(set.contains(&CsiParam::P(b':')));
     }
 
     // --- VTParser state tests ---
@@ -1266,6 +1284,21 @@ mod test {
     #[test]
     fn parse_byte_by_byte_matches_parse_all() {
         let input = b"\x1b[32mhello\x1b[0m";
+        let all_at_once = parse_as_vec(input);
+
+        let mut parser = VTParser::new();
+        let mut actor = CollectingVTActor::default();
+        for &b in input {
+            parser.parse_byte(b, &mut actor);
+        }
+        let byte_by_byte = actor.into_vec();
+
+        assert_eq!(all_at_once, byte_by_byte);
+    }
+
+    #[test]
+    fn parse_byte_by_byte_matches_parse_all_mixed_controls() {
+        let input = b"A\r\n\x1b[2J\x1b[1;31mZ\x07";
         let all_at_once = parse_as_vec(input);
 
         let mut parser = VTParser::new();
@@ -1542,6 +1575,21 @@ mod test {
     }
 
     #[test]
+    fn vt_action_clone_complex_variant() {
+        let a = VTAction::CsiDispatch {
+            params: vec![
+                CsiParam::Integer(1),
+                CsiParam::P(b';'),
+                CsiParam::Integer(31),
+            ],
+            parameters_truncated: false,
+            byte: b'm',
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    #[test]
     fn vt_action_debug() {
         let a = VTAction::Print('a');
         let dbg = format!("{:?}", a);
@@ -1552,6 +1600,23 @@ mod test {
     fn vt_action_eq_different_variants() {
         assert!(VTAction::Print('a') != VTAction::ExecuteC0orC1(b'a'));
         assert!(VTAction::DcsUnhook != VTAction::Print('x'));
+    }
+
+    #[test]
+    fn vt_action_eq_same_variant_payload() {
+        let a = VTAction::EscDispatch {
+            params: vec![],
+            intermediates: vec![b'('],
+            ignored_excess_intermediates: false,
+            byte: b'B',
+        };
+        let b = VTAction::EscDispatch {
+            params: vec![],
+            intermediates: vec![b'('],
+            ignored_excess_intermediates: false,
+            byte: b'B',
+        };
+        assert_eq!(a, b);
     }
 
     // --- Mixed content ---

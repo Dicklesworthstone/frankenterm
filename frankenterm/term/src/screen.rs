@@ -4,7 +4,8 @@ use crate::config::BidiMode;
 use crossbeam::thread;
 use frankenterm_surface::SequenceNo;
 use log::debug;
-use std::collections::VecDeque;
+use std::collections::{hash_map::DefaultHasher, HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Instant;
 use termwiz::input::KeyboardEncoding;
@@ -46,6 +47,66 @@ pub struct Screen {
     pub dpi: u32,
 
     pub(crate) saved_cursor: Option<SavedCursor>,
+    rewrap_cache: Option<LogicalLineWrapCache>,
+}
+
+const MAX_WRAP_CACHE_ENTRIES: usize = 6;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct WrapCacheKey {
+    physical_cols: usize,
+    dpi: u32,
+}
+
+#[derive(Debug, Clone)]
+struct LogicalLineWrapCache {
+    source_signature: u64,
+    logical_lines: Vec<Line>,
+    wrapped_by_key: HashMap<WrapCacheKey, Vec<Vec<Line>>>,
+    wrap_key_order: VecDeque<WrapCacheKey>,
+}
+
+impl LogicalLineWrapCache {
+    fn new(source_signature: u64, logical_lines: Vec<Line>) -> Self {
+        Self {
+            source_signature,
+            logical_lines,
+            wrapped_by_key: HashMap::new(),
+            wrap_key_order: VecDeque::new(),
+        }
+    }
+
+    fn touch_key(&mut self, key: WrapCacheKey) {
+        if let Some(idx) = self.wrap_key_order.iter().position(|k| *k == key) {
+            self.wrap_key_order.remove(idx);
+        }
+        self.wrap_key_order.push_back(key);
+    }
+
+    fn get_wrapped(&mut self, key: WrapCacheKey) -> Option<Vec<Vec<Line>>> {
+        let wrapped = self.wrapped_by_key.get(&key).cloned();
+        if wrapped.is_some() {
+            self.touch_key(key);
+        }
+        wrapped
+    }
+
+    fn insert_wrapped(&mut self, key: WrapCacheKey, wrapped: Vec<Vec<Line>>) {
+        if !self.wrapped_by_key.contains_key(&key)
+            && self.wrapped_by_key.len() >= MAX_WRAP_CACHE_ENTRIES
+        {
+            if let Some(evicted) = self.wrap_key_order.pop_front() {
+                self.wrapped_by_key.remove(&evicted);
+            }
+        }
+        self.wrapped_by_key.insert(key, wrapped);
+        self.touch_key(key);
+    }
+
+    fn clear_wraps(&mut self) {
+        self.wrapped_by_key.clear();
+        self.wrap_key_order.clear();
+    }
 }
 
 fn scrollback_size(config: &Arc<dyn TerminalConfiguration>, allow_scrollback: bool) -> usize {
@@ -88,6 +149,7 @@ impl Screen {
             dpi: size.dpi,
             keyboard_stack: vec![],
             saved_cursor: None,
+            rewrap_cache: None,
         }
     }
 
@@ -104,6 +166,151 @@ impl Screen {
         for idx in start..self.lines.len() {
             self.lines[idx].update_last_change_seqno(seqno);
         }
+    }
+
+    fn compute_layout_signature_for_lines<'a, I>(lines: I) -> u64
+    where
+        I: IntoIterator<Item = &'a Line>,
+    {
+        let mut hasher = DefaultHasher::new();
+        let mut line_count = 0usize;
+        for line in lines {
+            line_count += 1;
+            line.len().hash(&mut hasher);
+            line.last_cell_was_wrapped().hash(&mut hasher);
+            line.compute_shape_hash().hash(&mut hasher);
+        }
+        line_count.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn compute_layout_signature(&self) -> u64 {
+        Self::compute_layout_signature_for_lines(self.lines.iter())
+    }
+
+    fn logical_cursor_from_physical(
+        &self,
+        cursor_x: usize,
+        cursor_y: PhysRowIndex,
+    ) -> Option<(usize, usize)> {
+        let mut logical_idx = 0usize;
+        let mut prefix_len = 0usize;
+
+        for (phys_idx, line) in self.lines.iter().enumerate() {
+            if phys_idx == cursor_y {
+                return Some((logical_idx, cursor_x + prefix_len));
+            }
+
+            if line.last_cell_was_wrapped() {
+                prefix_len += line.len();
+            } else {
+                logical_idx += 1;
+                prefix_len = 0;
+            }
+        }
+
+        None
+    }
+
+    fn rebuild_logical_lines_from_physical(&self, seqno: SequenceNo) -> Vec<Line> {
+        let mut logical_lines: Vec<Line> = Vec::with_capacity(self.lines.len());
+        let mut logical_line: Option<Line> = None;
+
+        for mut line in self.lines.iter().cloned() {
+            line.update_last_change_seqno(seqno);
+            let was_wrapped = line.last_cell_was_wrapped();
+
+            if was_wrapped {
+                line.set_last_cell_was_wrapped(false, seqno);
+            }
+
+            let line = match logical_line.take() {
+                None => line,
+                Some(mut prior) => {
+                    prior.append_line(line, seqno);
+                    prior
+                }
+            };
+
+            if was_wrapped {
+                logical_line.replace(line);
+                continue;
+            }
+
+            logical_lines.push(line);
+        }
+
+        if let Some(line) = logical_line.take() {
+            logical_lines.push(line);
+        }
+
+        logical_lines
+    }
+
+    fn logical_wraps_for_resize(
+        &mut self,
+        source_signature: u64,
+        physical_cols: usize,
+        seqno: SequenceNo,
+    ) -> (Vec<Vec<Line>>, usize, bool, bool, usize) {
+        let wrap_key = WrapCacheKey {
+            physical_cols,
+            dpi: self.dpi,
+        };
+        let mut logical_cache_hit = false;
+        let mut wrap_cache_hit = false;
+        let mut cache = self.rewrap_cache.take();
+
+        if let Some(entry) = cache.as_mut() {
+            if entry.source_signature == source_signature {
+                logical_cache_hit = true;
+                let logical_count = entry.logical_lines.len();
+                if let Some(wrapped) = entry.get_wrapped(wrap_key) {
+                    wrap_cache_hit = true;
+                    let cache_entries = entry.wrapped_by_key.len();
+                    self.rewrap_cache = cache;
+                    return (
+                        wrapped,
+                        logical_count,
+                        logical_cache_hit,
+                        wrap_cache_hit,
+                        cache_entries,
+                    );
+                }
+
+                let wrapped = Self::wrap_logical_lines_for_resize(
+                    entry.logical_lines.clone(),
+                    physical_cols,
+                    seqno,
+                );
+                entry.insert_wrapped(wrap_key, wrapped.clone());
+                let cache_entries = entry.wrapped_by_key.len();
+                self.rewrap_cache = cache;
+                return (
+                    wrapped,
+                    logical_count,
+                    logical_cache_hit,
+                    wrap_cache_hit,
+                    cache_entries,
+                );
+            }
+        }
+
+        let logical_lines = self.rebuild_logical_lines_from_physical(seqno);
+        let logical_count = logical_lines.len();
+        let wrapped =
+            Self::wrap_logical_lines_for_resize(logical_lines.clone(), physical_cols, seqno);
+        let mut new_cache = LogicalLineWrapCache::new(source_signature, logical_lines);
+        new_cache.insert_wrapped(wrap_key, wrapped.clone());
+        let cache_entries = new_cache.wrapped_by_key.len();
+        self.rewrap_cache = Some(new_cache);
+        (
+            wrapped,
+            logical_count,
+            logical_cache_hit,
+            wrap_cache_hit,
+            cache_entries,
+        )
     }
 
     fn needs_rewrap_for_width_change(&self, physical_cols: usize) -> bool {
@@ -209,51 +416,13 @@ impl Screen {
                 .unwrap_or(original_len)
                 .max(original_len)
         };
-        let mut logical_lines: Vec<Line> = Vec::with_capacity(original_len);
-        let mut logical_line: Option<Line> = None;
-        let mut logical_cursor: Option<(usize, usize)> = None;
+        let source_signature = self.compute_layout_signature();
+        let logical_cursor = self.logical_cursor_from_physical(cursor_x, cursor_y);
+        let (wrapped, logical_count, logical_cache_hit, wrap_cache_hit, cache_entries) =
+            self.logical_wraps_for_resize(source_signature, physical_cols, seqno);
         let mut adjusted_cursor = (cursor_x, cursor_y);
-
-        for (phys_idx, mut line) in self.lines.drain(..).enumerate() {
-            line.update_last_change_seqno(seqno);
-            let was_wrapped = line.last_cell_was_wrapped();
-
-            if was_wrapped {
-                line.set_last_cell_was_wrapped(false, seqno);
-            }
-
-            let line = match logical_line.take() {
-                None => {
-                    if phys_idx == cursor_y {
-                        logical_cursor = Some((logical_lines.len(), cursor_x));
-                    }
-                    line
-                }
-                Some(mut prior) => {
-                    if phys_idx == cursor_y {
-                        logical_cursor = Some((logical_lines.len(), cursor_x + prior.len()));
-                    }
-                    prior.append_line(line, seqno);
-                    prior
-                }
-            };
-
-            if was_wrapped {
-                logical_line.replace(line);
-                continue;
-            }
-
-            logical_lines.push(line);
-        }
-
-        if let Some(line) = logical_line.take() {
-            logical_lines.push(line);
-        }
-
-        let logical_count = logical_lines.len();
-        let wrapped = Self::wrap_logical_lines_for_resize(logical_lines, physical_cols, seqno);
         let wrapped_count: usize = wrapped.iter().map(Vec::len).sum();
-        if let Some((logical_idx, logical_x)) = logical_cursor.take() {
+        if let Some((logical_idx, logical_x)) = logical_cursor {
             let num_lines = logical_x / physical_cols;
             let last_x = logical_x - (num_lines * physical_cols);
             let row_base = wrapped
@@ -284,22 +453,14 @@ impl Screen {
         }
 
         let mut rewrapped = VecDeque::with_capacity(estimated_capacity.max(physical_rows));
+        let mut pruned_rows = 0usize;
         for lines in wrapped {
-            for line in lines {
+            for mut line in lines {
+                line.update_last_change_seqno(seqno);
                 rewrapped.push_back(line);
             }
         }
         self.lines = rewrapped;
-
-        debug!(
-            "rewrap_lines cols={}→{} physical_lines={} logical_lines={} rewrapped_lines={} elapsed_ms={}",
-            old_cols,
-            physical_cols,
-            original_len,
-            logical_count,
-            wrapped_count,
-            started.elapsed().as_millis()
-        );
 
         // If we resized narrower and generated additional lines,
         // we may need to scroll the lines to make room.  However,
@@ -311,7 +472,37 @@ impl Screen {
             && self.lines.back().map(Line::is_whitespace).unwrap_or(false)
         {
             self.lines.pop_back();
+            pruned_rows += 1;
         }
+
+        if pruned_rows > 0 {
+            self.rewrap_cache = None;
+        } else {
+            let layout_signature = self.compute_layout_signature();
+            if let Some(cache) = self.rewrap_cache.as_mut() {
+                cache.source_signature = layout_signature;
+            }
+        }
+
+        let final_cache_entries = self
+            .rewrap_cache
+            .as_ref()
+            .map(|cache| cache.wrapped_by_key.len())
+            .unwrap_or(0);
+
+        debug!(
+            "rewrap_lines cols={}→{} physical_lines={} logical_lines={} rewrapped_lines={} cache.logical={} cache.wrap={} cache.entries={} pruned_rows={} elapsed_ms={}",
+            old_cols,
+            physical_cols,
+            original_len,
+            logical_count,
+            wrapped_count,
+            logical_cache_hit,
+            wrap_cache_hit,
+            final_cache_entries.max(cache_entries),
+            pruned_rows,
+            started.elapsed().as_millis()
+        );
 
         adjusted_cursor
     }
@@ -337,7 +528,13 @@ impl Screen {
             "resize screen to {physical_cols}x{physical_rows} dpi={}",
             size.dpi
         );
+        let dpi_changed = self.dpi != size.dpi;
         self.dpi = size.dpi;
+        if dpi_changed {
+            if let Some(cache) = self.rewrap_cache.as_mut() {
+                cache.clear_wraps();
+            }
+        }
 
         // pre-prune blank lines that range from the cursor position to the end of the display;
         // this avoids growing the scrollback size when rapidly switching between normal and
@@ -496,7 +693,7 @@ impl Screen {
     /// Returns a copy of the lines in the screen (including scrollback)
     #[cfg(test)]
     pub fn all_lines(&self) -> Vec<Line> {
-        self.lines.iter().map(|l| l.clone()).collect()
+        self.lines.iter().cloned().collect()
     }
 
     pub fn insert_cell(
@@ -1285,5 +1482,144 @@ fn phys_intersection(r1: &Range<PhysRowIndex>, r2: &Range<PhysRowIndex>) -> Rang
         start..end
     } else {
         0..0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::color::ColorPalette;
+    use frankenterm_bidi::ParagraphDirectionHint;
+    use frankenterm_cell::{Cell, CellAttributes};
+    use frankenterm_surface::{CursorShape, CursorVisibility};
+
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct TestTermConfig {
+        scrollback: usize,
+    }
+
+    impl TerminalConfiguration for TestTermConfig {
+        fn scrollback_size(&self) -> usize {
+            self.scrollback
+        }
+
+        fn color_palette(&self) -> ColorPalette {
+            ColorPalette::default()
+        }
+    }
+
+    fn test_size(rows: usize, cols: usize, dpi: u32) -> TerminalSize {
+        TerminalSize {
+            rows,
+            cols,
+            pixel_width: cols * 8,
+            pixel_height: rows * 16,
+            dpi,
+        }
+    }
+
+    fn test_cursor(x: usize, y: VisibleRowIndex, seqno: SequenceNo) -> CursorPosition {
+        CursorPosition {
+            x,
+            y,
+            shape: CursorShape::Default,
+            visibility: CursorVisibility::Visible,
+            seqno,
+        }
+    }
+
+    fn bidi_mode() -> BidiMode {
+        BidiMode {
+            enabled: false,
+            hint: ParagraphDirectionHint::LeftToRight,
+        }
+    }
+
+    fn test_screen(rows: usize, cols: usize, dpi: u32) -> Screen {
+        let config: Arc<dyn TerminalConfiguration> = Arc::new(TestTermConfig { scrollback: 32 });
+        Screen::new(test_size(rows, cols, dpi), &config, true, 0, bidi_mode())
+    }
+
+    #[test]
+    fn rewrap_cache_tracks_width_and_dpi_keys() {
+        let mut screen = test_screen(3, 4, 96);
+        let attrs = CellAttributes::blank();
+
+        screen.lines = VecDeque::from(vec![
+            Line::from_text_with_wrapped_last_col("abcd", &attrs, 0),
+            Line::from_text("ef", &attrs, 0, None),
+            Line::new(0),
+        ]);
+
+        let cursor = test_cursor(1, 1, 1);
+        let cursor = screen.resize(test_size(3, 3, 96), cursor, 1, false);
+
+        let cache = screen.rewrap_cache.as_ref().expect("rewrap cache to exist");
+        assert_eq!(cache.wrapped_by_key.len(), 1);
+        assert!(
+            cache.wrapped_by_key.contains_key(&WrapCacheKey {
+                physical_cols: 3,
+                dpi: 96
+            }),
+            "expected resize key 3x96 in wrap cache"
+        );
+
+        let cursor = screen.resize(test_size(3, 4, 96), cursor, 2, false);
+        let cache = screen.rewrap_cache.as_ref().expect("rewrap cache to exist");
+        assert_eq!(cache.wrapped_by_key.len(), 2);
+        assert!(
+            cache.wrapped_by_key.contains_key(&WrapCacheKey {
+                physical_cols: 4,
+                dpi: 96
+            }),
+            "expected resize key 4x96 in wrap cache"
+        );
+
+        let _cursor = screen.resize(test_size(3, 4, 144), cursor, 3, false);
+        let cache = screen.rewrap_cache.as_ref().expect("rewrap cache to exist");
+        assert_eq!(
+            cache.wrapped_by_key.len(),
+            0,
+            "dpi change should clear wrap cache keys"
+        );
+    }
+
+    #[test]
+    fn rewrap_cache_rebuilds_after_content_mutation() {
+        let mut screen = test_screen(3, 4, 96);
+        let attrs = CellAttributes::blank();
+
+        screen.lines = VecDeque::from(vec![
+            Line::from_text_with_wrapped_last_col("abcd", &attrs, 0),
+            Line::from_text("ef", &attrs, 0, None),
+            Line::new(0),
+        ]);
+
+        let cursor = test_cursor(1, 1, 1);
+        let cursor = screen.resize(test_size(3, 3, 96), cursor, 1, false);
+        let cursor = screen.resize(test_size(3, 4, 96), cursor, 2, false);
+        let cache = screen.rewrap_cache.as_ref().expect("rewrap cache to exist");
+        assert_eq!(cache.wrapped_by_key.len(), 2);
+
+        // Use a seqno that is already in play to verify that
+        // content-shape based invalidation catches this mutation.
+        screen.set_cell(0, 0, &Cell::new('Z', attrs.clone()), 2);
+
+        let _cursor = screen.resize(test_size(3, 3, 96), cursor, 3, false);
+        let cache = screen.rewrap_cache.as_ref().expect("rewrap cache to exist");
+        assert_eq!(
+            cache.wrapped_by_key.len(),
+            1,
+            "content mutation should rebuild wraps from canonical lines"
+        );
+        assert!(
+            cache.wrapped_by_key.contains_key(&WrapCacheKey {
+                physical_cols: 3,
+                dpi: 96
+            }),
+            "rebuilt cache should contain only active resize key"
+        );
     }
 }

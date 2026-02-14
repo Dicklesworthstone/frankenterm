@@ -106,3 +106,130 @@ impl<'a> Iterator for VecStorageIter<'a> {
         Some(CellRef::CellRef { cell_index, cell })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use frankenterm_cell::{Cell, CellAttributes};
+
+    fn make_cells(s: &str) -> Vec<Cell> {
+        s.chars()
+            .map(|c| Cell::new(c, CellAttributes::default()))
+            .collect()
+    }
+
+    // ── VecStorage ─────────────────────────────────────────
+
+    #[test]
+    fn vec_storage_new() {
+        let vs = VecStorage::new(make_cells("abc"));
+        assert_eq!(vs.len(), 3);
+    }
+
+    #[test]
+    fn vec_storage_empty() {
+        let vs = VecStorage::new(vec![]);
+        assert_eq!(vs.len(), 0);
+        assert!(vs.is_empty());
+    }
+
+    #[test]
+    fn vec_storage_deref_access() {
+        let vs = VecStorage::new(make_cells("hi"));
+        // Deref to Vec<Cell>
+        assert_eq!(vs[0].str(), "h");
+        assert_eq!(vs[1].str(), "i");
+    }
+
+    #[test]
+    fn vec_storage_deref_mut_push() {
+        let mut vs = VecStorage::new(make_cells("ab"));
+        vs.push(Cell::new('c', CellAttributes::default()));
+        assert_eq!(vs.len(), 3);
+    }
+
+    #[test]
+    fn vec_storage_set_cell() {
+        let mut vs = VecStorage::new(make_cells("ab"));
+        vs.set_cell(0, Cell::new('X', CellAttributes::default()), false);
+        assert_eq!(vs[0].str(), "X");
+        assert_eq!(vs[1].str(), "b");
+    }
+
+    #[test]
+    fn vec_storage_clone_eq() {
+        let vs = VecStorage::new(make_cells("test"));
+        let vs2 = vs.clone();
+        assert_eq!(vs, vs2);
+    }
+
+    #[test]
+    fn vec_storage_ne() {
+        let vs1 = VecStorage::new(make_cells("ab"));
+        let vs2 = VecStorage::new(make_cells("cd"));
+        assert_ne!(vs1, vs2);
+    }
+
+    #[test]
+    fn vec_storage_debug() {
+        let vs = VecStorage::new(make_cells("x"));
+        let dbg = format!("{:?}", vs);
+        assert!(dbg.contains("VecStorage"));
+    }
+
+    // ── VecStorageIter ─────────────────────────────────────
+
+    #[test]
+    fn vec_storage_iter_single_width() {
+        let vs = VecStorage::new(make_cells("abc"));
+        let iter = VecStorageIter {
+            cells: vs.iter(),
+            idx: 0,
+            skip_width: 0,
+        };
+        let refs: Vec<_> = iter.collect();
+        assert_eq!(refs.len(), 3);
+        assert_eq!(refs[0].str(), "a");
+        assert_eq!(refs[1].str(), "b");
+        assert_eq!(refs[2].str(), "c");
+    }
+
+    #[test]
+    fn vec_storage_iter_cell_indices() {
+        let vs = VecStorage::new(make_cells("xy"));
+        let iter = VecStorageIter {
+            cells: vs.iter(),
+            idx: 0,
+            skip_width: 0,
+        };
+        let refs: Vec<_> = iter.collect();
+        assert_eq!(refs[0].cell_index(), 0);
+        assert_eq!(refs[1].cell_index(), 1);
+    }
+
+    #[test]
+    fn vec_storage_iter_empty() {
+        let vs = VecStorage::new(vec![]);
+        let iter = VecStorageIter {
+            cells: vs.iter(),
+            idx: 0,
+            skip_width: 0,
+        };
+        assert_eq!(iter.count(), 0);
+    }
+
+    #[test]
+    fn vec_storage_iter_with_initial_skip() {
+        let vs = VecStorage::new(make_cells("abc"));
+        let iter = VecStorageIter {
+            cells: vs.iter(),
+            idx: 0,
+            skip_width: 1, // skip first cell as if preceded by double-wide
+        };
+        let refs: Vec<_> = iter.collect();
+        // Should skip 'a', then yield 'b' and 'c'
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].str(), "b");
+        assert_eq!(refs[1].str(), "c");
+    }
+}

@@ -1220,3 +1220,547 @@ impl<'a> From<&'a str> for Line {
         Line::from_text(s, &CellAttributes::default(), SEQ_ZERO, None)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::SEQ_ZERO;
+    use frankenterm_cell::{Cell, CellAttributes, SemanticType};
+
+    // ── ZoneRange ──────────────────────────────────────────
+
+    #[test]
+    fn zone_range_construction() {
+        let zr = ZoneRange {
+            semantic_type: SemanticType::Output,
+            range: 0..10,
+        };
+        assert_eq!(zr.range, 0..10);
+        assert_eq!(zr.semantic_type, SemanticType::Output);
+    }
+
+    #[test]
+    fn zone_range_clone_eq() {
+        let zr = ZoneRange {
+            semantic_type: SemanticType::Input,
+            range: 3..7,
+        };
+        let zr2 = zr.clone();
+        assert_eq!(zr, zr2);
+    }
+
+    #[test]
+    fn zone_range_debug() {
+        let zr = ZoneRange {
+            semantic_type: SemanticType::Output,
+            range: 0..5,
+        };
+        let dbg = format!("{:?}", zr);
+        assert!(dbg.contains("ZoneRange"));
+    }
+
+    // ── DoubleClickRange ───────────────────────────────────
+
+    #[test]
+    fn double_click_range_variants() {
+        let r = DoubleClickRange::Range(0..5);
+        let w = DoubleClickRange::RangeWithWrap(0..5);
+        assert_ne!(r, w);
+    }
+
+    #[test]
+    fn double_click_range_clone_eq() {
+        let r = DoubleClickRange::Range(2..8);
+        let r2 = r.clone();
+        assert_eq!(r, r2);
+    }
+
+    // ── Line construction ──────────────────────────────────
+
+    #[test]
+    fn line_from_str() {
+        let line: Line = "hello".into();
+        assert_eq!(line.len(), 5);
+        assert_eq!(line.as_str().as_ref(), "hello");
+    }
+
+    #[test]
+    fn line_from_empty_str() {
+        let line: Line = "".into();
+        assert_eq!(line.len(), 0);
+        assert_eq!(line.as_str().as_ref(), "");
+    }
+
+    #[test]
+    fn line_with_width() {
+        let line = Line::with_width(10, SEQ_ZERO);
+        assert_eq!(line.len(), 10);
+    }
+
+    #[test]
+    fn line_with_width_zero() {
+        let line = Line::with_width(0, SEQ_ZERO);
+        assert_eq!(line.len(), 0);
+    }
+
+    #[test]
+    fn line_with_width_and_cell() {
+        let cell = Cell::new('x', CellAttributes::default());
+        let line = Line::with_width_and_cell(5, cell, SEQ_ZERO);
+        assert_eq!(line.len(), 5);
+        assert_eq!(line.as_str().as_ref(), "xxxxx");
+    }
+
+    #[test]
+    fn line_from_cells() {
+        let cells = vec![
+            Cell::new('a', CellAttributes::default()),
+            Cell::new('b', CellAttributes::default()),
+        ];
+        let line = Line::from_cells(cells, SEQ_ZERO);
+        assert_eq!(line.len(), 2);
+        assert_eq!(line.as_str().as_ref(), "ab");
+    }
+
+    #[test]
+    fn line_new_starts_empty() {
+        let line = Line::new(SEQ_ZERO);
+        assert_eq!(line.len(), 0);
+    }
+
+    #[test]
+    fn line_from_text() {
+        let attrs = CellAttributes::default();
+        let line = Line::from_text("abc", &attrs, 1, None);
+        assert_eq!(line.len(), 3);
+        assert_eq!(line.as_str().as_ref(), "abc");
+        assert_eq!(line.current_seqno(), 0);
+    }
+
+    // ── Line seqno ─────────────────────────────────────────
+
+    #[test]
+    fn line_current_seqno() {
+        let line = Line::with_width(5, 42);
+        assert_eq!(line.current_seqno(), 42);
+    }
+
+    #[test]
+    fn line_update_last_change_seqno_takes_max() {
+        let mut line = Line::with_width(5, 10);
+        line.update_last_change_seqno(5);
+        // Should keep the higher seqno
+        assert_eq!(line.current_seqno(), 10);
+        line.update_last_change_seqno(20);
+        assert_eq!(line.current_seqno(), 20);
+    }
+
+    #[test]
+    fn line_changed_since() {
+        let line = Line::with_width(5, 10);
+        assert!(line.changed_since(5));
+        assert!(!line.changed_since(10));
+        assert!(!line.changed_since(15));
+    }
+
+    #[test]
+    fn line_changed_since_seq_zero_always_true() {
+        let line = Line::with_width(5, SEQ_ZERO);
+        assert!(line.changed_since(0));
+        assert!(line.changed_since(100));
+    }
+
+    // ── Line width/height flags ────────────────────────────
+
+    #[test]
+    fn line_default_is_single_width() {
+        let line = Line::with_width(10, SEQ_ZERO);
+        assert!(line.is_single_width());
+        assert!(!line.is_double_width());
+        assert!(!line.is_double_height_top());
+        assert!(!line.is_double_height_bottom());
+    }
+
+    #[test]
+    fn line_set_double_width() {
+        let mut line = Line::with_width(10, SEQ_ZERO);
+        line.set_double_width(1);
+        assert!(line.is_double_width());
+        assert!(!line.is_single_width());
+    }
+
+    #[test]
+    fn line_set_double_height_top() {
+        let mut line = Line::with_width(10, SEQ_ZERO);
+        line.set_double_height_top(1);
+        assert!(line.is_double_height_top());
+        assert!(!line.is_single_width());
+        assert!(!line.is_double_width());
+    }
+
+    #[test]
+    fn line_set_double_height_bottom() {
+        let mut line = Line::with_width(10, SEQ_ZERO);
+        line.set_double_height_bottom(1);
+        assert!(line.is_double_height_bottom());
+        assert!(!line.is_single_width());
+    }
+
+    #[test]
+    fn line_set_single_width_clears_double() {
+        let mut line = Line::with_width(10, SEQ_ZERO);
+        line.set_double_width(1);
+        assert!(!line.is_single_width());
+        line.set_single_width(2);
+        assert!(line.is_single_width());
+    }
+
+    // ── Line bidi ──────────────────────────────────────────
+
+    #[test]
+    fn line_bidi_default() {
+        let line = Line::with_width(5, SEQ_ZERO);
+        let (enabled, hint) = line.bidi_info();
+        assert!(!enabled);
+        assert_eq!(hint, ParagraphDirectionHint::LeftToRight);
+    }
+
+    #[test]
+    fn line_set_bidi_enabled() {
+        let mut line = Line::with_width(5, SEQ_ZERO);
+        line.set_bidi_enabled(true, 1);
+        let (enabled, _) = line.bidi_info();
+        assert!(enabled);
+    }
+
+    #[test]
+    fn line_set_bidi_info_roundtrip() {
+        let mut line = Line::with_width(5, SEQ_ZERO);
+        for hint in [
+            ParagraphDirectionHint::LeftToRight,
+            ParagraphDirectionHint::RightToLeft,
+            ParagraphDirectionHint::AutoLeftToRight,
+            ParagraphDirectionHint::AutoRightToLeft,
+        ] {
+            line.set_bidi_info(true, hint, 1);
+            let (enabled, got) = line.bidi_info();
+            assert!(enabled);
+            assert_eq!(got, hint, "roundtrip failed for {:?}", hint);
+        }
+    }
+
+    // ── Line text operations ───────────────────────────────
+
+    #[test]
+    fn line_as_str() {
+        let line: Line = "hello world".into();
+        assert_eq!(line.as_str().as_ref(), "hello world");
+    }
+
+    #[test]
+    fn line_columns_as_str() {
+        let line: Line = "hello world".into();
+        assert_eq!(line.columns_as_str(0..5), "hello");
+        assert_eq!(line.columns_as_str(6..11), "world");
+    }
+
+    #[test]
+    fn line_columns_as_str_empty_range() {
+        let line: Line = "hello".into();
+        assert_eq!(line.columns_as_str(2..2), "");
+    }
+
+    #[test]
+    fn line_columns_as_line() {
+        let line: Line = "abcdef".into();
+        let sub = line.columns_as_line(1..4);
+        assert_eq!(sub.as_str().as_ref(), "bcd");
+    }
+
+    #[test]
+    fn line_is_whitespace_true() {
+        let line: Line = "     ".into();
+        assert!(line.is_whitespace());
+    }
+
+    #[test]
+    fn line_is_whitespace_false() {
+        let line: Line = "  x  ".into();
+        assert!(!line.is_whitespace());
+    }
+
+    #[test]
+    fn line_is_whitespace_empty() {
+        let line = Line::from_cells(vec![], SEQ_ZERO);
+        assert!(line.is_whitespace());
+    }
+
+    // ── Line resize / mutate ───────────────────────────────
+
+    #[test]
+    fn line_resize_grow() {
+        let mut line: Line = "hi".into();
+        assert_eq!(line.len(), 2);
+        line.resize(5, 1);
+        assert_eq!(line.len(), 5);
+    }
+
+    #[test]
+    fn line_resize_shrink() {
+        let mut line: Line = "hello".into();
+        line.resize(3, 1);
+        assert_eq!(line.len(), 3);
+        assert_eq!(line.as_str().as_ref(), "hel");
+    }
+
+    #[test]
+    fn line_resize_and_clear() {
+        let mut line: Line = "hello".into();
+        line.resize_and_clear(3, 1, CellAttributes::default());
+        assert_eq!(line.len(), 3);
+        assert!(line.is_whitespace());
+    }
+
+    #[test]
+    fn line_split_off() {
+        let mut line: Line = "hello world".into();
+        let remainder = line.split_off(5, 1);
+        assert_eq!(line.as_str().as_ref(), "hello");
+        assert_eq!(remainder.as_str().as_ref(), " world");
+    }
+
+    #[test]
+    fn line_split_off_beyond_len() {
+        let mut line: Line = "hi".into();
+        let remainder = line.split_off(100, 1);
+        assert_eq!(line.as_str().as_ref(), "hi");
+        assert_eq!(remainder.len(), 0);
+    }
+
+    #[test]
+    fn line_set_cell() {
+        let mut line = Line::with_width(5, SEQ_ZERO);
+        line.set_cell(0, Cell::new('A', CellAttributes::default()), 1);
+        line.set_cell(1, Cell::new('B', CellAttributes::default()), 1);
+        assert_eq!(line.columns_as_str(0..2), "AB");
+    }
+
+    #[test]
+    fn line_erase_cell() {
+        let mut line: Line = "abcde".into();
+        line.erase_cell(2, 1);
+        // After erasing index 2, cells shift left and a blank is appended
+        assert_eq!(line.len(), 5);
+        assert_eq!(line.columns_as_str(0..2), "ab");
+        assert_eq!(line.columns_as_str(2..4), "de");
+    }
+
+    #[test]
+    fn line_erase_cell_beyond_len() {
+        let mut line: Line = "abc".into();
+        // Should be a no-op
+        line.erase_cell(10, 1);
+        assert_eq!(line.as_str().as_ref(), "abc");
+    }
+
+    // ── Line wrap ──────────────────────────────────────────
+
+    #[test]
+    fn line_last_cell_was_wrapped_default_false() {
+        let line: Line = "hello".into();
+        assert!(!line.last_cell_was_wrapped());
+    }
+
+    #[test]
+    fn line_set_last_cell_was_wrapped() {
+        let mut line: Line = "hello".into();
+        line.set_last_cell_was_wrapped(true, 1);
+        assert!(line.last_cell_was_wrapped());
+    }
+
+    #[test]
+    fn line_wrap_single_line_fits() {
+        let line: Line = "hi".into();
+        let wrapped = line.wrap(10, 1);
+        assert_eq!(wrapped.len(), 1);
+        assert_eq!(wrapped[0].as_str().as_ref(), "hi");
+    }
+
+    #[test]
+    fn line_wrap_splits_long_line() {
+        let line: Line = "abcdef".into();
+        let wrapped = line.wrap(3, 1);
+        assert_eq!(wrapped.len(), 2);
+        assert_eq!(wrapped[0].as_str().as_ref(), "abc");
+        assert!(wrapped[0].last_cell_was_wrapped());
+        assert_eq!(wrapped[1].as_str().as_ref(), "def");
+    }
+
+    // ── Line clone / eq ────────────────────────────────────
+
+    #[test]
+    fn line_clone_equals_original() {
+        let line: Line = "hello".into();
+        let cloned = line.clone();
+        assert_eq!(line, cloned);
+    }
+
+    #[test]
+    fn line_ne_different_content() {
+        let a: Line = "hello".into();
+        let b: Line = "world".into();
+        assert_ne!(a, b);
+    }
+
+    // ── Line compress / changes ────────────────────────────
+
+    #[test]
+    fn line_compress_for_scrollback_roundtrip() {
+        let line: Line = "test data".into();
+        let mut compressed = line.clone();
+        compressed.compress_for_scrollback();
+        compressed.coerce_vec_storage();
+        assert_eq!(line, compressed);
+    }
+
+    #[test]
+    fn line_has_hyperlink_default_false() {
+        let line: Line = "hello".into();
+        assert!(!line.has_hyperlink());
+    }
+
+    #[test]
+    fn line_changes_simple() {
+        let line: Line = "abc".into();
+        let changes = line.changes(&CellAttributes::default());
+        // Should produce at least a Text change
+        assert!(!changes.is_empty());
+        match &changes[0] {
+            Change::Text(t) => assert_eq!(t, "abc"),
+            _ => panic!("expected Text change"),
+        }
+    }
+
+    #[test]
+    fn line_get_cell() {
+        let line: Line = "hello".into();
+        let cell = line.get_cell(0).unwrap();
+        assert_eq!(cell.str(), "h");
+        let cell = line.get_cell(4).unwrap();
+        assert_eq!(cell.str(), "o");
+    }
+
+    #[test]
+    fn line_get_cell_out_of_bounds() {
+        let line: Line = "hi".into();
+        assert!(line.get_cell(10).is_none());
+    }
+
+    #[test]
+    fn line_visible_cells_count() {
+        let line: Line = "test".into();
+        assert_eq!(line.visible_cells().count(), 4);
+    }
+
+    #[test]
+    fn line_prune_trailing_blanks() {
+        let mut line = Line::with_width(10, SEQ_ZERO);
+        line.set_cell(0, Cell::new('a', CellAttributes::default()), 1);
+        line.set_cell(1, Cell::new('b', CellAttributes::default()), 1);
+        // Cells 2..9 are blanks
+        line.prune_trailing_blanks(2);
+        assert_eq!(line.len(), 2);
+        assert_eq!(line.as_str().as_ref(), "ab");
+    }
+
+    #[test]
+    fn line_fill_range() {
+        let mut line = Line::with_width(5, SEQ_ZERO);
+        let cell = Cell::new('X', CellAttributes::default());
+        line.fill_range(1..4, &cell, 1);
+        assert_eq!(line.columns_as_str(1..4), "XXX");
+    }
+
+    #[test]
+    fn line_overlay_text() {
+        let mut line = Line::with_width(10, SEQ_ZERO);
+        line.overlay_text_with_attribute(2, "hi", CellAttributes::default(), 1);
+        assert_eq!(line.columns_as_str(2..4), "hi");
+    }
+
+    // ── Line double-click ──────────────────────────────────
+
+    #[test]
+    fn line_double_click_range_word() {
+        let line: Line = "hello world".into();
+        let r = line.compute_double_click_range(2, |s| s.chars().all(|c| c.is_alphanumeric()));
+        assert_eq!(r, DoubleClickRange::Range(0..5));
+    }
+
+    #[test]
+    fn line_double_click_range_at_space() {
+        let line: Line = "hello world".into();
+        let r = line.compute_double_click_range(5, |s| s.chars().all(|c| c.is_alphanumeric()));
+        assert_eq!(r, DoubleClickRange::Range(5..5));
+    }
+
+    #[test]
+    fn line_insert_cell() {
+        let mut line: Line = "abde".into();
+        line.insert_cell(2, Cell::new('c', CellAttributes::default()), 5, 1);
+        assert_eq!(line.columns_as_str(0..5), "abcde");
+    }
+
+    #[test]
+    fn line_remove_cell() {
+        let mut line: Line = "abcde".into();
+        line.remove_cell(2, 1);
+        assert_eq!(line.len(), 4);
+        assert_eq!(line.as_str().as_ref(), "abde");
+    }
+
+    #[test]
+    fn line_remove_cell_beyond_len() {
+        let mut line: Line = "ab".into();
+        line.remove_cell(10, 1);
+        assert_eq!(line.as_str().as_ref(), "ab");
+    }
+
+    #[test]
+    fn line_semantic_zone_ranges() {
+        let mut line: Line = "hello".into();
+        let zones = line.semantic_zone_ranges();
+        // Default text should produce at least one zone
+        assert!(!zones.is_empty());
+    }
+
+    #[test]
+    fn line_compute_shape_hash_differs() {
+        let a: Line = "hello".into();
+        let b: Line = "world".into();
+        assert_ne!(a.compute_shape_hash(), b.compute_shape_hash());
+    }
+
+    #[test]
+    fn line_compute_shape_hash_same() {
+        let a: Line = "hello".into();
+        let b: Line = "hello".into();
+        assert_eq!(a.compute_shape_hash(), b.compute_shape_hash());
+    }
+
+    #[test]
+    fn line_from_text_with_wrapped_last_col() {
+        let line =
+            Line::from_text_with_wrapped_last_col("abc", &CellAttributes::default(), SEQ_ZERO);
+        assert!(line.last_cell_was_wrapped());
+        assert_eq!(line.as_str().as_ref(), "abc");
+    }
+
+    #[test]
+    fn line_append_line() {
+        let mut line1: Line = "hello".into();
+        let line2: Line = " world".into();
+        line1.append_line(line2, 1);
+        assert_eq!(line1.as_str().as_ref(), "hello world");
+    }
+}
