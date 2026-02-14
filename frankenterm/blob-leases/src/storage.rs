@@ -258,4 +258,52 @@ mod tests {
         assert_eq!(buf, b"reader test");
         clear_storage();
     }
+
+    #[test]
+    fn lease_by_content_succeeds_for_stored() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        clear_storage();
+        let storage = Arc::new(InMemoryStorage::new());
+        register_storage(storage).unwrap();
+        let s = get_storage().unwrap();
+        let cid = ContentId::for_bytes(b"leaseable");
+        let lid = LeaseId::new();
+        s.store(cid, b"leaseable", lid).unwrap();
+        assert!(s.lease_by_content(cid, LeaseId::new()).is_ok());
+        clear_storage();
+    }
+
+    #[test]
+    fn lease_by_content_fails_for_missing() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        clear_storage();
+        let storage = Arc::new(InMemoryStorage::new());
+        register_storage(storage).unwrap();
+        let s = get_storage().unwrap();
+        let cid = ContentId::for_bytes(b"ghost");
+        assert!(s.lease_by_content(cid, LeaseId::new()).is_err());
+        clear_storage();
+    }
+
+    #[test]
+    fn advise_of_pid_succeeds() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        clear_storage();
+        let storage = Arc::new(InMemoryStorage::new());
+        register_storage(storage).unwrap();
+        let s = get_storage().unwrap();
+        assert!(s.advise_of_pid(std::process::id()).is_ok());
+        clear_storage();
+    }
+
+    #[test]
+    fn advise_pid_terminated_succeeds() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        clear_storage();
+        let storage = Arc::new(InMemoryStorage::new());
+        register_storage(storage).unwrap();
+        let s = get_storage().unwrap();
+        assert!(s.advise_pid_terminated(12345).is_ok());
+        clear_storage();
+    }
 }

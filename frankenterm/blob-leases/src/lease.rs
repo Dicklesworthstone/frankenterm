@@ -235,6 +235,38 @@ mod tests {
         clear_storage();
         drop(lease); // Should not panic even though storage is gone
     }
+
+    #[test]
+    fn blob_lease_reader_seek_works() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let _s = setup_storage();
+        let lease = BlobManager::store(b"seekable content").unwrap();
+        let mut reader = lease.get_reader().unwrap();
+        std::io::Seek::seek(&mut reader, std::io::SeekFrom::Start(9)).unwrap();
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut buf).unwrap();
+        assert_eq!(buf, b"content");
+        clear_storage();
+    }
+
+    #[test]
+    fn two_leases_same_data_have_same_content_id() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let _s = setup_storage();
+        let l1 = BlobManager::store(b"shared").unwrap();
+        let l2 = BlobManager::store(b"shared").unwrap();
+        assert_eq!(l1.content_id(), l2.content_id());
+        clear_storage();
+    }
+
+    #[test]
+    fn blob_lease_get_reader_without_storage_fails() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let _s = setup_storage();
+        let lease = BlobManager::store(b"temp reader").unwrap();
+        clear_storage();
+        assert!(lease.get_reader().is_err());
+    }
 }
 
 impl Drop for LeaseInner {

@@ -107,4 +107,24 @@ mod tests {
         set.insert(ContentId::for_bytes(b"key"));
         assert_eq!(set.len(), 1);
     }
+
+    #[test]
+    fn large_data_produces_valid_id() {
+        let data = vec![0xFFu8; 100_000];
+        let id = ContentId::for_bytes(&data);
+        assert_ne!(id.as_hash_bytes(), [0u8; 32]);
+    }
+
+    #[test]
+    fn nearly_identical_content_produces_different_ids() {
+        let a = ContentId::for_bytes(b"data0");
+        let b = ContentId::for_bytes(b"data1");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn display_is_consistent_across_calls() {
+        let id = ContentId::for_bytes(b"stable");
+        assert_eq!(format!("{id}"), format!("{id}"));
+    }
 }

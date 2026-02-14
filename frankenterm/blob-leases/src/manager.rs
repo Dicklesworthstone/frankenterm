@@ -226,4 +226,38 @@ mod tests {
         assert_ne!(lease1.content_id(), lease2.content_id());
         clear_storage();
     }
+
+    #[test]
+    fn get_by_content_id_data_matches_original() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let _s = setup_storage();
+        BlobManager::store(b"verify data").unwrap();
+        let cid = ContentId::for_bytes(b"verify data");
+        let lease = BlobManager::get_by_content_id(cid).unwrap();
+        assert_eq!(lease.get_data().unwrap(), b"verify data");
+        clear_storage();
+    }
+
+    #[test]
+    fn store_binary_data() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let _s = setup_storage();
+        let data: Vec<u8> = (0..=255).collect();
+        let lease = BlobManager::store(&data).unwrap();
+        assert_eq!(lease.get_data().unwrap(), data);
+        clear_storage();
+    }
+
+    #[test]
+    fn store_multiple_items_independently() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let _s = setup_storage();
+        let l1 = BlobManager::store(b"first").unwrap();
+        let l2 = BlobManager::store(b"second").unwrap();
+        let l3 = BlobManager::store(b"third").unwrap();
+        assert_eq!(l1.get_data().unwrap(), b"first");
+        assert_eq!(l2.get_data().unwrap(), b"second");
+        assert_eq!(l3.get_data().unwrap(), b"third");
+        clear_storage();
+    }
 }

@@ -74,4 +74,24 @@ mod tests {
         assert!(debug.contains("uuid"));
         assert!(debug.contains("pid"));
     }
+
+    #[test]
+    fn display_is_non_empty() {
+        let id = LeaseId::new();
+        assert!(!format!("{id}").is_empty());
+    }
+
+    #[test]
+    fn clone_and_copy_are_equal() {
+        let id = LeaseId::new();
+        let copied = id;
+        let cloned = id.clone();
+        assert_eq!(copied, cloned);
+    }
+
+    #[test]
+    fn pid_is_nonzero() {
+        let id = LeaseId::new();
+        assert!(id.pid() > 0);
+    }
 }

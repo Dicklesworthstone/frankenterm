@@ -72,4 +72,28 @@ mod tests {
         assert!(msg.contains("/tmp/blobs"), "got: {msg}");
         assert!(msg.contains("denied"), "got: {msg}");
     }
+
+    #[test]
+    fn lease_expired_debug_output() {
+        let err = Error::LeaseExpired;
+        let debug = format!("{err:?}");
+        assert!(debug.contains("LeaseExpired"));
+    }
+
+    #[test]
+    fn io_error_source_is_some() {
+        use std::error::Error as StdError;
+        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "oops");
+        let err: Error = io_err.into();
+        assert!(err.source().is_some());
+    }
+
+    #[test]
+    fn content_not_found_debug_includes_hash() {
+        let id = ContentId::for_bytes(b"gone");
+        let err = Error::ContentNotFound(id);
+        let debug = format!("{err:?}");
+        assert!(debug.contains("ContentNotFound"));
+        assert!(debug.contains("sha256-"));
+    }
 }
