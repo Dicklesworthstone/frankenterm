@@ -633,4 +633,203 @@ mod tests {
         assert_eq!(result, "main thread");
         drop(exec);
     }
+
+    // ── SimpleExecutor construction tests ─────────────────────
+
+    #[test]
+    fn simple_executor_new_configures_scheduler() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let _exec = SimpleExecutor::new();
+        // The constructor should mark scheduler as configured
+        assert!(is_scheduler_configured());
+    }
+
+    // ── spawn_into_new_thread captured variables ────────────
+
+    #[test]
+    fn spawn_into_new_thread_captures_variable() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let exec = ScopedExecutor::new();
+        let captured = String::from("captured value");
+        let task = spawn_into_new_thread(move || Ok(captured));
+        let result = block_on(exec.run(task));
+        assert_eq!(result.unwrap(), "captured value");
+        drop(exec);
+    }
+
+    #[test]
+    fn spawn_into_new_thread_captures_arc() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let exec = ScopedExecutor::new();
+        let shared = Arc::new(StdMutex::new(vec![1, 2, 3]));
+        let shared_clone = Arc::clone(&shared);
+        let task = spawn_into_new_thread(move || {
+            let data = shared_clone.lock().unwrap().clone();
+            Ok(data)
+        });
+        let result = block_on(exec.run(task));
+        assert_eq!(result.unwrap(), vec![1, 2, 3]);
+        drop(exec);
+    }
+
+    // ── block_on deeper nesting ─────────────────────────────
+
+    #[test]
+    fn block_on_deeply_nested_async() {
+        let result = block_on(async {
+            let a = async {
+                let b = async {
+                    let c = async { 10 };
+                    c.await + 5
+                };
+                b.await * 2
+            };
+            a.await + 1
+        });
+        assert_eq!(result, 31); // ((10 + 5) * 2) + 1
+    }
+
+    #[test]
+    fn block_on_with_tuple() {
+        let result = block_on(async { (1, "two", 3.0f64) });
+        assert_eq!(result.0, 1);
+        assert_eq!(result.1, "two");
+        assert!((result.2 - 3.0).abs() < f64::EPSILON);
+    }
+
+    // ── Scoped executor with result type ────────────────────
+
+    #[test]
+    fn scoped_executor_spawn_returns_result_ok() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let exec = ScopedExecutor::new();
+        let task = spawn_into_main_thread(async { Ok::<i32, anyhow::Error>(42) });
+        let result = block_on(exec.run(task));
+        assert_eq!(result.unwrap(), 42);
+        drop(exec);
+    }
+
+    #[test]
+    fn scoped_executor_spawn_returns_result_err() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let exec = ScopedExecutor::new();
+        let task =
+            spawn_into_main_thread(async { Err::<i32, anyhow::Error>(anyhow!("spawned err")) });
+        let result = block_on(exec.run(task));
+        assert_eq!(result.unwrap_err().to_string(), "spawned err");
+        drop(exec);
+    }
+
+    // ── spawn_into_main_thread_with_low_priority additional ──
+
+    #[test]
+    fn spawn_low_priority_returns_vec() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let exec = ScopedExecutor::new();
+        let task = spawn_into_main_thread_with_low_priority(async { vec![10, 20, 30] });
+        let result = block_on(exec.run(task));
+        assert_eq!(result, vec![10, 20, 30]);
+        drop(exec);
+    }
+
+    #[test]
+    fn spawn_low_priority_multiple_tasks() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let exec = ScopedExecutor::new();
+        let t1 = spawn_into_main_thread_with_low_priority(async { 10 });
+        let t2 = spawn_into_main_thread_with_low_priority(async { 20 });
+        let result = block_on(exec.run(async { t1.await + t2.await }));
+        assert_eq!(result, 30);
+        drop(exec);
+    }
+
+    // ── Mixed priority tasks ────────────────────────────────
+
+    #[test]
+    fn mixed_priority_tasks_all_complete() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let exec = ScopedExecutor::new();
+        let high = spawn_into_main_thread(async { 100 });
+        let low = spawn_into_main_thread_with_low_priority(async { 200 });
+        let result = block_on(exec.run(async { high.await + low.await }));
+        assert_eq!(result, 300);
+        drop(exec);
+    }
+
+    // ── spawn_into_new_thread with tuple result ─────────────
+
+    #[test]
+    fn spawn_into_new_thread_with_tuple() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let exec = ScopedExecutor::new();
+        let task = spawn_into_new_thread(|| Ok((42, "hello".to_string())));
+        let result = block_on(exec.run(task));
+        let (num, s) = result.unwrap();
+        assert_eq!(num, 42);
+        assert_eq!(s, "hello");
+        drop(exec);
+    }
+
+    // ── block_on with closures producing futures ────────────
+
+    #[test]
+    fn block_on_with_async_move() {
+        let value = String::from("moved");
+        let result = block_on(async move { value.len() });
+        assert_eq!(result, 5);
+    }
+
+    // ── Sequential scoped executor reuse ────────────────────
+
+    #[test]
+    fn scoped_executor_reuse_across_iterations() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        for i in 0..5 {
+            let exec = ScopedExecutor::new();
+            let task = spawn_into_main_thread(async move { i * 10 });
+            let result = block_on(exec.run(task));
+            assert_eq!(result, i * 10);
+            drop(exec);
+        }
+    }
+
+    // ── spawn_into_new_thread heavy computation ─────────────
+
+    #[test]
+    fn spawn_into_new_thread_fibonacci() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let exec = ScopedExecutor::new();
+        let task = spawn_into_new_thread(|| {
+            fn fib(n: u64) -> u64 {
+                if n <= 1 {
+                    return n;
+                }
+                let mut a = 0u64;
+                let mut b = 1u64;
+                for _ in 2..=n {
+                    let c = a + b;
+                    a = b;
+                    b = c;
+                }
+                b
+            }
+            Ok(fib(20))
+        });
+        let result = block_on(exec.run(task));
+        assert_eq!(result.unwrap(), 6765);
+        drop(exec);
+    }
+
+    // ── block_on with async chain ───────────────────────────
+
+    #[test]
+    fn block_on_async_chain() {
+        let result = block_on(async {
+            let step1 = async { 1 }.await;
+            let step2 = async move { step1 + 2 }.await;
+            let step3 = async move { step2 * 3 }.await;
+            step3
+        });
+        assert_eq!(result, 9); // (1 + 2) * 3
+    }
 }
