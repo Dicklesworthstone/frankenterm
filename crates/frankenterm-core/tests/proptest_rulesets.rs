@@ -422,3 +422,333 @@ fn patterns_config_patch_default_is_all_none() {
     assert!(p.pack_overrides.is_none());
     assert!(p.quick_reject_enabled.is_none());
 }
+
+// =========================================================================
+// PatternsConfigPatch: Clone and Debug
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Clone preserves all fields.
+    #[test]
+    fn prop_patch_clone_preserves(patch in arb_patterns_config_patch()) {
+        let cloned = patch.clone();
+        prop_assert_eq!(&cloned.packs, &patch.packs);
+        prop_assert_eq!(cloned.quick_reject_enabled, patch.quick_reject_enabled);
+        match (&cloned.pack_overrides, &patch.pack_overrides) {
+            (Some(a), Some(b)) => prop_assert_eq!(a.len(), b.len()),
+            (None, None) => {}
+            _ => prop_assert!(false, "pack_overrides mismatch after clone"),
+        }
+    }
+
+    /// Debug is non-empty and contains type name.
+    #[test]
+    fn prop_patch_debug_non_empty(patch in arb_patterns_config_patch()) {
+        let debug = format!("{:?}", patch);
+        prop_assert!(!debug.is_empty());
+        prop_assert!(debug.contains("PatternsConfigPatch"));
+    }
+
+    /// PatternsConfig Clone preserves all fields.
+    #[test]
+    fn prop_patterns_config_clone(base in arb_patterns_config()) {
+        let cloned = base.clone();
+        prop_assert_eq!(&cloned.packs, &base.packs);
+        prop_assert_eq!(cloned.quick_reject_enabled, base.quick_reject_enabled);
+        prop_assert_eq!(cloned.user_packs_enabled, base.user_packs_enabled);
+        prop_assert_eq!(&cloned.user_packs_dir, &base.user_packs_dir);
+        prop_assert_eq!(cloned.pack_overrides.len(), base.pack_overrides.len());
+    }
+}
+
+// =========================================================================
+// PatternsConfigPatch::apply_to — preserves unrelated fields
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// apply_to always preserves user_packs_enabled and user_packs_dir.
+    #[test]
+    fn prop_apply_preserves_user_packs(
+        base in arb_patterns_config(),
+        patch in arb_patterns_config_patch(),
+    ) {
+        let result = patch.apply_to(&base);
+        prop_assert_eq!(result.user_packs_enabled, base.user_packs_enabled);
+        prop_assert_eq!(&result.user_packs_dir, &base.user_packs_dir);
+    }
+
+    /// apply_to with only packs set doesn't change quick_reject_enabled.
+    #[test]
+    fn prop_apply_packs_only_preserves_quick_reject(
+        base in arb_patterns_config(),
+        new_packs in proptest::collection::vec(arb_pack_name(), 0..5),
+    ) {
+        let patch = PatternsConfigPatch {
+            packs: Some(new_packs),
+            pack_overrides: None,
+            quick_reject_enabled: None,
+        };
+        let result = patch.apply_to(&base);
+        prop_assert_eq!(result.quick_reject_enabled, base.quick_reject_enabled);
+    }
+
+    /// apply_to with only quick_reject set doesn't change packs.
+    #[test]
+    fn prop_apply_qr_only_preserves_packs(
+        base in arb_patterns_config(),
+        qr in any::<bool>(),
+    ) {
+        let patch = PatternsConfigPatch {
+            packs: None,
+            pack_overrides: None,
+            quick_reject_enabled: Some(qr),
+        };
+        let result = patch.apply_to(&base);
+        prop_assert_eq!(&result.packs, &base.packs);
+    }
+
+    /// Applying a full patch (all Some) replaces packs, quick_reject, and merges overrides.
+    #[test]
+    fn prop_apply_full_patch(
+        base in arb_patterns_config(),
+        new_packs in proptest::collection::vec(arb_pack_name(), 0..5),
+        new_overrides in proptest::collection::hash_map(arb_pack_name(), arb_pack_override(), 0..3),
+        new_qr in any::<bool>(),
+    ) {
+        let patch = PatternsConfigPatch {
+            packs: Some(new_packs.clone()),
+            pack_overrides: Some(new_overrides.clone()),
+            quick_reject_enabled: Some(new_qr),
+        };
+        let result = patch.apply_to(&base);
+        prop_assert_eq!(&result.packs, &new_packs);
+        prop_assert_eq!(result.quick_reject_enabled, new_qr);
+        // All overlay keys should be present
+        for key in new_overrides.keys() {
+            prop_assert!(result.pack_overrides.contains_key(key),
+                "overlay key '{}' missing", key);
+        }
+    }
+}
+
+// =========================================================================
+// RulesetManifest: Clone and Debug
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// RulesetManifest Clone preserves version and entry count.
+    #[test]
+    fn prop_manifest_clone_preserves(
+        entries in proptest::collection::vec(arb_ruleset_manifest_entry(), 0..5),
+    ) {
+        let manifest = RulesetManifest { version: 1, rulesets: entries };
+        let cloned = manifest.clone();
+        prop_assert_eq!(cloned.version, manifest.version);
+        prop_assert_eq!(cloned.rulesets.len(), manifest.rulesets.len());
+        for (a, b) in cloned.rulesets.iter().zip(manifest.rulesets.iter()) {
+            prop_assert_eq!(&a.name, &b.name);
+            prop_assert_eq!(&a.path, &b.path);
+        }
+    }
+
+    /// RulesetManifest Debug is non-empty.
+    #[test]
+    fn prop_manifest_debug_non_empty(
+        entries in proptest::collection::vec(arb_ruleset_manifest_entry(), 0..3),
+    ) {
+        let manifest = RulesetManifest { version: 1, rulesets: entries };
+        let debug = format!("{:?}", manifest);
+        prop_assert!(!debug.is_empty());
+        prop_assert!(debug.contains("RulesetManifest"));
+    }
+
+    /// RulesetManifest JSON has expected top-level keys.
+    #[test]
+    fn prop_manifest_json_structure(
+        entries in proptest::collection::vec(arb_ruleset_manifest_entry(), 0..5),
+    ) {
+        let manifest = RulesetManifest { version: 1, rulesets: entries };
+        let json = serde_json::to_string(&manifest).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = value.as_object().unwrap();
+        prop_assert!(obj.contains_key("version"));
+        prop_assert!(obj.contains_key("rulesets"));
+        prop_assert_eq!(obj["version"].as_u64(), Some(1));
+    }
+}
+
+// =========================================================================
+// RulesetManifestEntry: Clone and Debug
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Entry Clone preserves all fields.
+    #[test]
+    fn prop_entry_clone_preserves(entry in arb_ruleset_manifest_entry()) {
+        let cloned = entry.clone();
+        prop_assert_eq!(&cloned.name, &entry.name);
+        prop_assert_eq!(&cloned.path, &entry.path);
+        prop_assert_eq!(cloned.description, entry.description);
+        prop_assert_eq!(cloned.created_at, entry.created_at);
+        prop_assert_eq!(cloned.updated_at, entry.updated_at);
+        prop_assert_eq!(cloned.last_applied_at, entry.last_applied_at);
+    }
+
+    /// Entry Debug is non-empty and contains entry name.
+    #[test]
+    fn prop_entry_debug_contains_name(entry in arb_ruleset_manifest_entry()) {
+        let debug = format!("{:?}", entry);
+        prop_assert!(!debug.is_empty());
+        prop_assert!(debug.contains(&entry.name),
+            "debug '{}' should contain name '{}'", debug, entry.name);
+    }
+
+    /// Entry JSON has expected field names.
+    #[test]
+    fn prop_entry_json_fields(entry in arb_ruleset_manifest_entry()) {
+        let json = serde_json::to_string(&entry).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = value.as_object().unwrap();
+        prop_assert!(obj.contains_key("name"));
+        prop_assert!(obj.contains_key("path"));
+    }
+}
+
+// =========================================================================
+// RulesetProfileFile: Clone, Debug, defaults
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// RulesetProfileFile Clone preserves all fields.
+    #[test]
+    fn prop_profile_file_clone_preserves(
+        name in "[a-z]{3,10}",
+        desc in proptest::option::of("[A-Za-z ]{5,30}"),
+        inherits in proptest::option::of("[a-z]{3,10}"),
+    ) {
+        let profile = RulesetProfileFile {
+            name: name.clone(),
+            description: desc.clone(),
+            inherits: inherits.clone(),
+            patterns: PatternsConfigPatch::default(),
+        };
+        let cloned = profile.clone();
+        prop_assert_eq!(&cloned.name, &profile.name);
+        prop_assert_eq!(&cloned.description, &profile.description);
+        prop_assert_eq!(&cloned.inherits, &profile.inherits);
+    }
+
+    /// RulesetProfileFile Debug is non-empty.
+    #[test]
+    fn prop_profile_file_debug_non_empty(
+        name in "[a-z]{3,10}",
+    ) {
+        let profile = RulesetProfileFile {
+            name,
+            ..Default::default()
+        };
+        let debug = format!("{:?}", profile);
+        prop_assert!(!debug.is_empty());
+        prop_assert!(debug.contains("RulesetProfileFile"));
+    }
+
+    /// Default RulesetProfileFile has empty name and no inherits.
+    #[test]
+    fn prop_profile_file_default_empty(_dummy in 0..1u8) {
+        let profile = RulesetProfileFile::default();
+        prop_assert!(profile.name.is_empty());
+        prop_assert!(profile.description.is_none());
+        prop_assert!(profile.inherits.is_none());
+        prop_assert!(profile.patterns.packs.is_none());
+    }
+}
+
+// =========================================================================
+// PackOverride: Clone, Debug, serde
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// PackOverride Clone preserves fields.
+    #[test]
+    fn prop_pack_override_clone(po in arb_pack_override()) {
+        let cloned = po.clone();
+        prop_assert_eq!(&cloned.disabled_rules, &po.disabled_rules);
+        prop_assert_eq!(&cloned.severity_overrides, &po.severity_overrides);
+    }
+
+    /// PackOverride Debug is non-empty.
+    #[test]
+    fn prop_pack_override_debug(po in arb_pack_override()) {
+        let debug = format!("{:?}", po);
+        prop_assert!(!debug.is_empty());
+        prop_assert!(debug.contains("PackOverride"));
+    }
+
+    /// PackOverride serde roundtrip preserves disabled_rules.
+    #[test]
+    fn prop_pack_override_serde_roundtrip(po in arb_pack_override()) {
+        let json = serde_json::to_string(&po).unwrap();
+        let back: PackOverride = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.disabled_rules, &po.disabled_rules);
+        prop_assert_eq!(&back.severity_overrides, &po.severity_overrides);
+    }
+
+    /// Default PackOverride has empty fields.
+    #[test]
+    fn prop_pack_override_default_empty(_dummy in 0..1u8) {
+        let po = PackOverride::default();
+        prop_assert!(po.disabled_rules.is_empty());
+        prop_assert!(po.severity_overrides.is_empty());
+        prop_assert!(po.extra.is_empty());
+    }
+}
+
+// =========================================================================
+// touch_last_applied: additional edge cases
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// Touching with same timestamp twice doesn't create duplicates.
+    #[test]
+    fn prop_touch_same_ts_no_dup(
+        name in "[a-z]{3,10}",
+        path in "[a-z]{3,10}\\.toml",
+        ts in 1u64..2_000_000,
+    ) {
+        let mut manifest = RulesetManifest::default();
+        frankenterm_core::rulesets::touch_last_applied(&mut manifest, &name, &path, ts);
+        frankenterm_core::rulesets::touch_last_applied(&mut manifest, &name, &path, ts);
+        prop_assert_eq!(manifest.rulesets.len(), 1);
+        prop_assert_eq!(manifest.rulesets[0].last_applied_at, Some(ts));
+    }
+
+    /// Touching multiple distinct entries preserves all.
+    #[test]
+    fn prop_touch_multiple_entries(
+        n1 in "[a-z]{3,5}",
+        n2 in "[f-z]{3,5}",
+        n3 in "[a-e]{3,5}",
+    ) {
+        // Ensure distinct names
+        prop_assume!(n1 != n2 && n2 != n3 && n1 != n3);
+        let mut manifest = RulesetManifest::default();
+        frankenterm_core::rulesets::touch_last_applied(&mut manifest, &n1, &format!("{}.toml", n1), 100);
+        frankenterm_core::rulesets::touch_last_applied(&mut manifest, &n2, &format!("{}.toml", n2), 200);
+        frankenterm_core::rulesets::touch_last_applied(&mut manifest, &n3, &format!("{}.toml", n3), 300);
+        prop_assert_eq!(manifest.rulesets.len(), 3);
+    }
+}
