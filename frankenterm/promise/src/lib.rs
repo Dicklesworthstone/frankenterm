@@ -538,4 +538,122 @@ mod tests {
         let anyhow_err: anyhow::Error = err.into();
         assert!(anyhow_err.to_string().contains("Promise was dropped"));
     }
+
+    #[test]
+    fn broken_promise_source_is_none() {
+        let err = BrokenPromise {};
+        let error: &dyn std::error::Error = &err;
+        assert!(error.source().is_none());
+    }
+
+    #[test]
+    fn promise_ok_then_err_overwrites_to_err() {
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut p: Promise<i32> = Promise::new();
+        let mut fut = p.get_future().unwrap();
+        p.ok(42);
+        p.err(anyhow::anyhow!("overwritten")); // overwrites the Ok
+        match StdFuture::poll(Pin::new(&mut fut), &mut cx) {
+            Poll::Ready(Err(e)) => assert_eq!(e.to_string(), "overwritten"),
+            other => panic!("{}", format!("expected Ready(Err), got {other:?}")),
+        }
+    }
+
+    #[test]
+    fn promise_with_tuple_type() {
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut p: Promise<(i32, String)> = Promise::new();
+        let mut fut = p.get_future().unwrap();
+        p.ok((42, "answer".to_string()));
+        match StdFuture::poll(Pin::new(&mut fut), &mut cx) {
+            Poll::Ready(Ok((num, s))) => {
+                assert_eq!(num, 42);
+                assert_eq!(s, "answer");
+            }
+            other => panic!("{}", format!("expected Ready(Ok), got {other:?}")),
+        }
+    }
+
+    #[test]
+    fn future_ok_with_zero_value() {
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = Future::ok(0i32);
+        match StdFuture::poll(Pin::new(&mut fut), &mut cx) {
+            Poll::Ready(Ok(val)) => assert_eq!(val, 0),
+            other => panic!("{}", format!("expected Ready(Ok(0)), got {other:?}")),
+        }
+    }
+
+    #[test]
+    fn future_err_empty_message() {
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = Future::<i32>::err(anyhow::anyhow!(""));
+        match StdFuture::poll(Pin::new(&mut fut), &mut cx) {
+            Poll::Ready(Err(e)) => assert_eq!(e.to_string(), ""),
+            other => panic!("{}", format!("expected Ready(Err), got {other:?}")),
+        }
+    }
+
+    #[test]
+    fn promise_drop_future_first() {
+        let mut p: Promise<i32> = Promise::new();
+        let fut = p.get_future().unwrap();
+        drop(fut); // drop future before resolving
+        // Promise can still be resolved without panic
+        assert!(p.ok(42));
+    }
+
+    #[test]
+    fn promise_with_nested_result_type() {
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut p: Promise<Result<i32, String>> = Promise::new();
+        let mut fut = p.get_future().unwrap();
+        p.ok(Ok(42));
+        match StdFuture::poll(Pin::new(&mut fut), &mut cx) {
+            Poll::Ready(Ok(inner)) => assert_eq!(inner, Ok(42)),
+            other => panic!("{}", format!("expected Ready(Ok(Ok(42))), got {other:?}")),
+        }
+    }
+
+    #[test]
+    fn future_ok_consumed_then_pending() {
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = Future::ok(42i32);
+        // First poll consumes the value
+        assert!(matches!(
+            StdFuture::poll(Pin::new(&mut fut), &mut cx),
+            Poll::Ready(Ok(42))
+        ));
+        // Second poll is pending because the value was consumed
+        assert!(matches!(
+            StdFuture::poll(Pin::new(&mut fut), &mut cx),
+            Poll::Pending
+        ));
+    }
+
+    #[test]
+    fn broken_promise_downcast_from_anyhow() {
+        let err = BrokenPromise {};
+        let anyhow_err: anyhow::Error = err.into();
+        assert!(anyhow_err.downcast_ref::<BrokenPromise>().is_some());
+    }
+
+    #[test]
+    fn promise_with_empty_string() {
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut p: Promise<String> = Promise::new();
+        let mut fut = p.get_future().unwrap();
+        p.ok(String::new());
+        match StdFuture::poll(Pin::new(&mut fut), &mut cx) {
+            Poll::Ready(Ok(val)) => assert!(val.is_empty()),
+            other => panic!("{}", format!("expected Ready(Ok(\"\")), got {other:?}")),
+        }
+    }
 }

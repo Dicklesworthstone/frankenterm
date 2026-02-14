@@ -540,4 +540,97 @@ mod tests {
         let _exec = ScopedExecutor::new();
         assert!(get_scoped().is_some());
     }
+
+    #[test]
+    fn block_on_with_bool() {
+        let result = block_on(async { true });
+        assert!(result);
+    }
+
+    #[test]
+    fn block_on_with_option_some() {
+        let result = block_on(async { Some(42) });
+        assert_eq!(result, Some(42));
+    }
+
+    #[test]
+    fn block_on_with_option_none() {
+        let result: Option<i32> = block_on(async { None });
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn block_on_with_result_err() {
+        let result: anyhow::Result<i32> = block_on(async { Err(anyhow!("async err")) });
+        assert_eq!(result.unwrap_err().to_string(), "async err");
+    }
+
+    #[test]
+    fn scoped_executor_runs_string_future() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let exec = ScopedExecutor::new();
+        let result = block_on(exec.run(async { String::from("scoped") }));
+        assert_eq!(result, "scoped");
+        drop(exec);
+    }
+
+    #[test]
+    fn spawn_into_new_thread_with_bool_result() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let exec = ScopedExecutor::new();
+        let task = spawn_into_new_thread(|| Ok(true));
+        let result = block_on(exec.run(task));
+        assert!(result.unwrap());
+        drop(exec);
+    }
+
+    #[test]
+    fn scoped_executor_run_with_result_err() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let exec = ScopedExecutor::new();
+        let result: anyhow::Result<i32> = block_on(exec.run(async { Err(anyhow!("scoped err")) }));
+        assert_eq!(result.unwrap_err().to_string(), "scoped err");
+        drop(exec);
+    }
+
+    #[test]
+    fn block_on_with_large_computation() {
+        let result = block_on(async {
+            let sum: u64 = (1..=1000).sum();
+            sum
+        });
+        assert_eq!(result, 500500);
+    }
+
+    #[test]
+    fn spawn_into_new_thread_with_unit_result() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let exec = ScopedExecutor::new();
+        let task = spawn_into_new_thread(|| Ok(()));
+        let result = block_on(exec.run(task));
+        assert!(result.is_ok());
+        drop(exec);
+    }
+
+    #[test]
+    fn scoped_executor_sequential_create_drop() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        for i in 0..3 {
+            let exec = ScopedExecutor::new();
+            let result = block_on(exec.run(async move { i }));
+            assert_eq!(result, i);
+            drop(exec);
+            assert!(get_scoped().is_none());
+        }
+    }
+
+    #[test]
+    fn spawn_into_main_thread_with_string() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let exec = ScopedExecutor::new();
+        let task = spawn_into_main_thread(async { String::from("main thread") });
+        let result = block_on(exec.run(task));
+        assert_eq!(result, "main thread");
+        drop(exec);
+    }
 }
