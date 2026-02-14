@@ -1807,4 +1807,84 @@ Config {
         config.add_config_string("Host foo\n    Port 22\n");
         assert!(config.loaded_config_files().is_empty());
     }
+
+    #[test]
+    fn config_set_option_overrides_config_file() {
+        let mut config = Config::new();
+        let mut fake_env = ConfigMap::new();
+        fake_env.insert("HOME".to_string(), "/home/me".to_string());
+        fake_env.insert("USER".to_string(), "me".to_string());
+        config.assign_environment(fake_env);
+
+        config.add_config_string("Host myhost\n    Port 2222\n");
+        config.set_option("port", "9999");
+
+        let opts = config.for_host("myhost");
+        assert_eq!(opts.get("port").unwrap(), "9999");
+    }
+
+    #[test]
+    fn config_empty_string() {
+        let mut config = Config::new();
+        config.add_config_string("");
+        assert!(config.enumerate_hosts().is_empty());
+    }
+
+    #[test]
+    fn config_comment_only() {
+        let mut config = Config::new();
+        config.add_config_string("# This is a comment\n# Another comment\n");
+        assert!(config.enumerate_hosts().is_empty());
+    }
+
+    #[test]
+    fn config_should_expand_environment_known_keys() {
+        let config = Config::new();
+        assert!(config.should_expand_environment("certificatefile"));
+        assert!(config.should_expand_environment("controlpath"));
+        assert!(config.should_expand_environment("identityagent"));
+        assert!(config.should_expand_environment("identityfile"));
+        assert!(config.should_expand_environment("userknownhostsfile"));
+        assert!(config.should_expand_environment("localforward"));
+        assert!(config.should_expand_environment("remoteforward"));
+    }
+
+    #[test]
+    fn config_should_not_expand_environment_unknown_keys() {
+        let config = Config::new();
+        assert!(!config.should_expand_environment("hostname"));
+        assert!(!config.should_expand_environment("port"));
+        assert!(!config.should_expand_environment("user"));
+    }
+
+    #[test]
+    fn config_match_all_stanza() {
+        let mut config = Config::new();
+        let mut fake_env = ConfigMap::new();
+        fake_env.insert("HOME".to_string(), "/home/me".to_string());
+        fake_env.insert("USER".to_string(), "me".to_string());
+        config.assign_environment(fake_env);
+
+        config.add_config_string("Match all\n    SendEnv LANG\n");
+
+        let opts = config.for_host("anyhost");
+        assert_eq!(opts.get("sendenv").unwrap(), "LANG");
+    }
+
+    #[test]
+    fn pattern_star_matches_everything() {
+        let pat = Pattern::new("*", false);
+        assert!(pat.match_text("anything"));
+        assert!(pat.match_text(""));
+        assert!(pat.match_text("foo.bar.baz"));
+    }
+
+    #[test]
+    fn config_percent_escape() {
+        let config = Config::new();
+        let mut value = "literal%%percent".to_string();
+        let token_map = ConfigMap::new();
+        config.expand_tokens(&mut value, &[], &token_map);
+        assert_eq!(value, "literal%percent");
+    }
 }
