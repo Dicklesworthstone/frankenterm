@@ -412,6 +412,143 @@ mod tests {
             .with_capabilities(PaneCapabilities::prompt())
     }
 
+    // -----------------------------------------------------------------------
+    // Pure helper function tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn hash_allow_once_code_is_deterministic() {
+        let hash1 = hash_allow_once_code("ABC123");
+        let hash2 = hash_allow_once_code("ABC123");
+        assert_eq!(hash1, hash2);
+        assert!(hash1.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn hash_allow_once_code_different_inputs_differ() {
+        let hash1 = hash_allow_once_code("ABC123");
+        let hash2 = hash_allow_once_code("XYZ789");
+        assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn sha256_hex_known_value() {
+        // SHA256 of empty string is well-known.
+        let hash = sha256_hex("");
+        assert_eq!(
+            hash,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn sha256_hex_is_64_hex_chars() {
+        let hash = sha256_hex("hello");
+        assert_eq!(hash.len(), 64);
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn generate_allow_once_code_correct_length() {
+        let code = generate_allow_once_code(8);
+        assert_eq!(code.len(), 8);
+        let code16 = generate_allow_once_code(16);
+        assert_eq!(code16.len(), 16);
+    }
+
+    #[test]
+    fn generate_allow_once_code_all_uppercase_alphanumeric() {
+        let code = generate_allow_once_code(100);
+        assert!(
+            code.chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+        );
+    }
+
+    #[test]
+    fn generate_allow_once_code_different_each_time() {
+        let a = generate_allow_once_code(16);
+        let b = generate_allow_once_code(16);
+        // Extremely unlikely to be equal.
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn summary_for_input_basic() {
+        let input = base_input();
+        let s = summary_for_input(&input);
+        assert!(s.contains("send_text"));
+        assert!(s.contains("pane 1"));
+        assert!(s.contains("(local)"));
+        assert!(s.contains("echo hi"));
+    }
+
+    #[test]
+    fn summary_for_input_minimal() {
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+        let s = summary_for_input(&input);
+        assert!(s.contains("send_text"));
+        // No pane, no domain, no summary.
+        assert!(!s.contains("pane"));
+        assert!(!s.contains('('));
+    }
+
+    #[test]
+    fn expiry_ms_normal_value() {
+        assert_eq!(expiry_ms(300), 300_000);
+    }
+
+    #[test]
+    fn expiry_ms_zero() {
+        assert_eq!(expiry_ms(0), 0);
+    }
+
+    #[test]
+    fn expiry_ms_large_value_saturates() {
+        // u64::MAX seconds → should saturate to i64::MAX.
+        let result = expiry_ms(u64::MAX);
+        assert_eq!(result, i64::MAX);
+    }
+
+    #[test]
+    fn now_ms_returns_positive() {
+        let ms = now_ms();
+        assert!(ms > 0);
+    }
+
+    #[test]
+    fn approval_scope_from_input_sets_fields() {
+        let input = base_input();
+        let scope = ApprovalScope::from_input("my-ws", &input);
+        assert_eq!(scope.workspace_id, "my-ws");
+        assert_eq!(scope.action_kind, "send_text");
+        assert_eq!(scope.pane_id, Some(1));
+        assert!(scope.action_fingerprint.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn approval_audit_context_default_is_none() {
+        let ctx = ApprovalAuditContext::default();
+        assert!(ctx.correlation_id.is_none());
+        assert!(ctx.decision_context.is_none());
+    }
+
+    #[test]
+    fn fingerprint_for_input_includes_all_fields() {
+        let input = base_input()
+            .with_command_text("rm -rf /")
+            .with_workflow("wf-123");
+        let fp = fingerprint_for_input(&input);
+        assert!(fp.starts_with("sha256:"));
+
+        // Changing any field should change fingerprint.
+        let input2 = base_input()
+            .with_command_text("rm -rf /")
+            .with_workflow("wf-456");
+        let fp2 = fingerprint_for_input(&input2);
+        assert_ne!(fp, fp2);
+    }
+
     #[test]
     fn fingerprint_is_deterministic() {
         let input = base_input();

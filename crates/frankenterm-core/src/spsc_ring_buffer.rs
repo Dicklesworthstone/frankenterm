@@ -215,6 +215,96 @@ mod tests {
         assert_eq!(rx.recv().await, None);
     }
 
+    #[test]
+    #[should_panic(expected = "SPSC capacity must be > 0")]
+    fn zero_capacity_panics() {
+        let (_, _) = channel::<u8>(0);
+    }
+
+    #[test]
+    fn try_recv_on_empty_returns_none() {
+        let (_tx, rx) = channel::<u32>(4);
+        assert_eq!(rx.try_recv(), None);
+    }
+
+    #[test]
+    fn depth_and_capacity_methods() {
+        let (tx, rx) = channel::<u32>(4);
+        assert_eq!(tx.capacity(), 4);
+        assert_eq!(rx.capacity(), 4);
+        assert_eq!(tx.depth(), 0);
+        assert_eq!(rx.depth(), 0);
+
+        tx.try_send(1).unwrap();
+        tx.try_send(2).unwrap();
+        assert_eq!(tx.depth(), 2);
+        assert_eq!(rx.depth(), 2);
+
+        rx.try_recv();
+        assert_eq!(tx.depth(), 1);
+        assert_eq!(rx.depth(), 1);
+    }
+
+    #[test]
+    fn close_from_producer_side() {
+        let (tx, rx) = channel::<u32>(4);
+        tx.try_send(1).unwrap();
+        tx.close();
+
+        assert!(tx.is_closed());
+        assert!(rx.is_closed());
+
+        // Items already in buffer can still be received.
+        assert_eq!(rx.try_recv(), Some(1));
+        assert_eq!(rx.try_recv(), None);
+    }
+
+    #[test]
+    fn try_send_on_closed_returns_err() {
+        let (tx, _rx) = channel::<u32>(4);
+        tx.close();
+        assert!(tx.try_send(42).is_err());
+    }
+
+    #[test]
+    fn drop_producer_closes_channel() {
+        let (tx, rx) = channel::<u32>(4);
+        tx.try_send(99).unwrap();
+        drop(tx);
+        assert!(rx.is_closed());
+        // Drain remaining.
+        assert_eq!(rx.try_recv(), Some(99));
+        assert_eq!(rx.try_recv(), None);
+    }
+
+    #[tokio::test]
+    async fn recv_on_closed_empty_returns_none() {
+        let (tx, rx) = channel::<u32>(4);
+        drop(tx);
+        assert_eq!(rx.recv().await, None);
+    }
+
+    #[tokio::test]
+    async fn send_on_closed_returns_err() {
+        let (tx, rx) = channel::<u32>(4);
+        drop(rx);
+        tx.close(); // Consumer drop doesn't auto-close.
+        let result = tx.send(1).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn fill_and_drain_multiple_cycles() {
+        let (tx, rx) = channel::<u32>(2);
+        for cycle in 0..5u32 {
+            let base = cycle * 2;
+            tx.send(base).await.unwrap();
+            tx.send(base + 1).await.unwrap();
+            assert_eq!(rx.recv().await, Some(base));
+            assert_eq!(rx.recv().await, Some(base + 1));
+        }
+    }
+
     #[tokio::test]
     async fn send_waits_until_consumer_frees_capacity() {
         let (tx, rx) = channel(1);
