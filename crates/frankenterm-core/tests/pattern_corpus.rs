@@ -1,9 +1,11 @@
 //! Golden corpus tests for pattern detection.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use frankenterm_core::patterns::PatternEngine;
+use serde::Deserialize;
 use serde_json::Value;
 
 fn corpus_dir() -> PathBuf {
@@ -25,6 +27,75 @@ fn collect_txt_files(dir: &Path, out: &mut Vec<PathBuf>) {
             out.push(path);
         }
     }
+}
+
+const DOGFOOD_MARKER: &str = "_dogfood_";
+
+#[derive(Debug, Deserialize)]
+struct DogfoodMeta {
+    scenario: String,
+    source: String,
+    captured_at: String,
+    platform: String,
+    cross_platform: String,
+    sanitized: bool,
+}
+
+fn is_dogfood_fixture(path: &Path) -> bool {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem.contains(DOGFOOD_MARKER))
+}
+
+fn read_dogfood_meta(fixture: &Path) -> DogfoodMeta {
+    let meta_path = fixture.with_extension("meta.json");
+    let meta_str = fs::read_to_string(&meta_path)
+        .unwrap_or_else(|e| panic!("Missing metadata file {}: {e}", meta_path.display()));
+
+    serde_json::from_str(&meta_str)
+        .unwrap_or_else(|e| panic!("Failed to parse {}: {e}", meta_path.display()))
+}
+
+fn validate_dogfood_meta(meta: &DogfoodMeta, fixture: &Path) {
+    assert!(
+        !meta.scenario.trim().is_empty(),
+        "Missing scenario in metadata for {}",
+        fixture.display()
+    );
+    assert!(
+        !meta.source.trim().is_empty(),
+        "Missing source in metadata for {}",
+        fixture.display()
+    );
+    assert!(
+        meta.sanitized,
+        "Dogfood fixture must be sanitized: {}",
+        fixture.display()
+    );
+    assert!(
+        matches!(meta.platform.as_str(), "macos" | "linux"),
+        "Invalid platform '{}' in {} (expected 'macos' or 'linux')",
+        meta.platform,
+        fixture.display()
+    );
+    assert!(
+        matches!(meta.cross_platform.as_str(), "pending" | "complete"),
+        "Invalid cross_platform '{}' in {} (expected 'pending' or 'complete')",
+        meta.cross_platform,
+        fixture.display()
+    );
+
+    let captured_at = meta.captured_at.trim();
+    let looks_like_iso8601 = captured_at.contains('T')
+        && (captured_at.ends_with('Z')
+            || captured_at.contains('+')
+            || captured_at.rsplit_once('-').is_some());
+    assert!(
+        looks_like_iso8601,
+        "captured_at must look like ISO-8601 in {} (got '{}')",
+        fixture.display(),
+        meta.captured_at
+    );
 }
 
 fn canonicalize(value: &Value) -> Value {
@@ -65,6 +136,78 @@ fn extract_rule_ids(value: &Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+#[test]
+fn dogfood_metadata_is_well_formed_and_cross_platform_consistent() {
+    let base_dir = corpus_dir();
+    let mut fixtures = Vec::new();
+    collect_txt_files(&base_dir, &mut fixtures);
+    fixtures.sort();
+
+    let mut scenario_platforms: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut scenario_status: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+
+    for fixture in fixtures {
+        if !is_dogfood_fixture(&fixture) {
+            continue;
+        }
+
+        let meta = read_dogfood_meta(&fixture);
+        validate_dogfood_meta(&meta, &fixture);
+
+        scenario_platforms
+            .entry(meta.scenario.clone())
+            .or_default()
+            .insert(meta.platform.clone());
+        scenario_status
+            .entry(meta.scenario)
+            .or_default()
+            .insert(meta.cross_platform);
+    }
+
+    assert!(
+        !scenario_platforms.is_empty(),
+        "Expected at least one dogfood fixture with metadata"
+    );
+
+    for (scenario, statuses) in &scenario_status {
+        assert_eq!(
+            statuses.len(),
+            1,
+            "Scenario '{}' has conflicting cross_platform states: {:?}",
+            scenario,
+            statuses
+        );
+    }
+
+    for (scenario, platforms) in scenario_platforms {
+        let status = scenario_status
+            .get(&scenario)
+            .and_then(|statuses| statuses.iter().next())
+            .unwrap_or_else(|| panic!("Missing cross_platform status for scenario '{scenario}'"));
+
+        match status.as_str() {
+            "complete" => {
+                let expected = BTreeSet::from([String::from("linux"), String::from("macos")]);
+                assert_eq!(
+                    platforms, expected,
+                    "Scenario '{}' is complete but platforms are {:?}",
+                    scenario, platforms
+                );
+            }
+            "pending" => {
+                assert_eq!(
+                    platforms.len(),
+                    1,
+                    "Scenario '{}' is pending and must only have one captured platform, got {:?}",
+                    scenario,
+                    platforms
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
 }
 
 #[test]
