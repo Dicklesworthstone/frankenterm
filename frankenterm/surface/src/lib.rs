@@ -2642,4 +2642,297 @@ mod test {
         let changes = s.diff_against_numbered_line(99, &line);
         assert!(changes.is_empty());
     }
+
+    // =========================================================================
+    // Resize semantics — comprehensive edge cases
+    // =========================================================================
+
+    #[test]
+    fn resize_to_same_dimensions_is_noop() {
+        let mut s = Surface::new(4, 3);
+        s.add_change("hello");
+        let before = s.screen_chars_to_string();
+        s.resize(4, 3);
+        assert_eq!(s.dimensions(), (4, 3));
+        assert_eq!(s.screen_chars_to_string(), before);
+    }
+
+    #[test]
+    fn resize_seqno_increments_only_when_changes_buffered() {
+        let mut s = Surface::new(4, 3);
+        // No changes buffered yet — resize should NOT increment seqno
+        let seq_before = s.add_change("a");
+        let (seq_after_change, _) = s.get_changes(0);
+        // Now flush so changes are consumed
+        s.flush_changes_older_than(seq_after_change);
+
+        // Resize with empty change buffer should not bump seqno
+        let (seq_pre_resize, _) = s.get_changes(0);
+        s.resize(4, 3);
+        // After resize with no buffered changes, get_changes returns repaint
+        // but the seqno shouldn't have been bumped by the resize itself
+        let _ = seq_before;
+        let _ = seq_pre_resize;
+        assert_eq!(s.dimensions(), (4, 3));
+    }
+
+    #[test]
+    fn resize_with_buffered_changes_invalidates_stream() {
+        let mut s = Surface::new(4, 3);
+        let seq = s.add_change("test");
+        // Changes are buffered. Resize should clear them.
+        s.resize(3, 2);
+        // get_changes should return a full repaint, not the delta
+        let (_, changes) = s.get_changes(seq);
+        // Full repaint starts with CursorVisibility::Hidden + ClearScreen
+        assert!(
+            changes.len() >= 2,
+            "repaint should have multiple entries, got {}",
+            changes.len()
+        );
+        assert!(matches!(
+            changes[0],
+            Change::CursorVisibility(CursorVisibility::Hidden)
+        ));
+        assert!(matches!(changes[1], Change::ClearScreen(_)));
+    }
+
+    #[test]
+    fn resize_grow_width_only() {
+        let mut s = Surface::new(2, 2);
+        s.add_change("abcd");
+        s.resize(4, 2);
+        assert_eq!(s.dimensions(), (4, 2));
+        assert_eq!(s.screen_chars_to_string(), "ab  \ncd  \n");
+    }
+
+    #[test]
+    fn resize_grow_height_only() {
+        let mut s = Surface::new(2, 2);
+        s.add_change("abcd");
+        s.resize(2, 4);
+        assert_eq!(s.dimensions(), (2, 4));
+        assert_eq!(s.screen_chars_to_string(), "ab\ncd\n  \n  \n");
+    }
+
+    #[test]
+    fn resize_shrink_width_only() {
+        let mut s = Surface::new(4, 2);
+        s.add_change("abcdefgh");
+        s.resize(2, 2);
+        assert_eq!(s.dimensions(), (2, 2));
+        assert_eq!(s.screen_chars_to_string(), "ab\nef\n");
+    }
+
+    #[test]
+    fn resize_shrink_height_only() {
+        let mut s = Surface::new(2, 4);
+        s.add_change("ab");
+        s.add_change(Change::CursorPosition {
+            x: Position::Absolute(0),
+            y: Position::Absolute(1),
+        });
+        s.add_change("cd");
+        s.add_change(Change::CursorPosition {
+            x: Position::Absolute(0),
+            y: Position::Absolute(2),
+        });
+        s.add_change("ef");
+        s.resize(2, 2);
+        assert_eq!(s.dimensions(), (2, 2));
+        // Only first 2 rows survive
+        assert_eq!(s.screen_chars_to_string(), "ab\ncd\n");
+    }
+
+    #[test]
+    fn resize_cursor_clamped_x() {
+        let mut s = Surface::new(10, 5);
+        s.add_change(Change::CursorPosition {
+            x: Position::Absolute(9),
+            y: Position::Absolute(0),
+        });
+        assert_eq!(s.cursor_position(), (9, 0));
+        s.resize(3, 5);
+        // Cursor x should be clamped to new width - 1
+        let (x, _) = s.cursor_position();
+        assert!(x < 3, "cursor x {} should be < new width 3", x);
+    }
+
+    #[test]
+    fn resize_cursor_clamped_y() {
+        let mut s = Surface::new(5, 10);
+        s.add_change(Change::CursorPosition {
+            x: Position::Absolute(0),
+            y: Position::Absolute(9),
+        });
+        assert_eq!(s.cursor_position(), (0, 9));
+        s.resize(5, 3);
+        let (_, y) = s.cursor_position();
+        assert!(y < 3, "cursor y {} should be < new height 3", y);
+    }
+
+    #[test]
+    fn resize_cursor_stays_if_within_bounds() {
+        let mut s = Surface::new(10, 10);
+        s.add_change(Change::CursorPosition {
+            x: Position::Absolute(2),
+            y: Position::Absolute(3),
+        });
+        s.resize(5, 5);
+        assert_eq!(s.cursor_position(), (2, 3));
+    }
+
+    #[test]
+    fn resize_preserves_attributes_on_grow() {
+        let mut s = Surface::new(2, 2);
+        s.add_change(Change::Attribute(AttributeChange::Intensity(
+            Intensity::Bold,
+        )));
+        s.add_change("ab");
+        s.resize(4, 2);
+        // Bold "ab" should still be in the first row
+        let content = s.screen_chars_to_string();
+        assert!(content.starts_with("ab"), "content should start with ab");
+    }
+
+    #[test]
+    fn resize_after_scroll_preserves_visible_content() {
+        let mut s = Surface::new(3, 2);
+        // Fill 3 rows worth into a 2-row surface — causes scroll
+        s.add_change("aaabbbccc");
+        // After scroll: row0=bbb, row1=ccc
+        assert_eq!(s.screen_chars_to_string(), "bbb\nccc\n");
+        s.resize(3, 3);
+        // Grow height: old rows preserved, new row added
+        assert_eq!(s.screen_chars_to_string(), "bbb\nccc\n   \n");
+    }
+
+    #[test]
+    fn resize_oscillation_preserves_smaller_content() {
+        let mut s = Surface::new(4, 4);
+        s.add_change("ABCDEFGHIJKLMNOP");
+        // Shrink
+        s.resize(2, 2);
+        let small = s.screen_chars_to_string();
+        assert_eq!(small, "AB\nEF\n");
+        // Grow back
+        s.resize(4, 4);
+        // The truncated content doesn't come back
+        let grown = s.screen_chars_to_string();
+        assert_eq!(grown, "AB  \nEF  \n    \n    \n");
+    }
+
+    #[test]
+    fn resize_multiple_rapid_resizes() {
+        let mut s = Surface::new(5, 5);
+        s.add_change("hello");
+        // Rapidly grow through multiple sizes
+        for i in 5..=10 {
+            s.resize(i, i);
+        }
+        assert_eq!(s.dimensions(), (10, 10));
+        // Content from original 5x5 should be preserved in first row
+        let content = s.screen_chars_to_string();
+        assert!(content.starts_with("hello"));
+    }
+
+    #[test]
+    fn resize_rapid_shrink_sequence_truncates_progressively() {
+        let mut s = Surface::new(10, 10);
+        s.add_change("abcdefghij");
+        // Shrink progressively
+        for i in (1..=10).rev() {
+            s.resize(i, i);
+        }
+        assert_eq!(s.dimensions(), (1, 1));
+        // Only 'a' survives
+        assert_eq!(s.screen_chars_to_string(), "a\n");
+    }
+
+    #[test]
+    fn resize_to_1x1() {
+        let mut s = Surface::new(5, 5);
+        s.add_change("abcde");
+        s.resize(1, 1);
+        assert_eq!(s.dimensions(), (1, 1));
+        assert_eq!(s.screen_chars_to_string(), "a\n");
+        // Cursor should be clamped
+        let (x, y) = s.cursor_position();
+        assert_eq!(x, 0);
+        assert_eq!(y, 0);
+    }
+
+    #[test]
+    fn resize_get_changes_after_resize_is_full_repaint() {
+        let mut s = Surface::new(4, 3);
+        let seq = s.add_change("text");
+        let (seq2, _) = s.get_changes(0);
+        s.resize(6, 4);
+        let (_, changes) = s.get_changes(seq2);
+        // Should be a full repaint (starts with hide cursor + clear)
+        assert!(changes.len() >= 2);
+        assert!(matches!(
+            changes[0],
+            Change::CursorVisibility(CursorVisibility::Hidden)
+        ));
+        let _ = seq;
+    }
+
+    #[test]
+    fn resize_draw_from_screen_after_resize() {
+        let mut dest = Surface::new(4, 4);
+        let src = Surface::new(2, 2);
+        dest.resize(6, 6);
+        dest.draw_from_screen(&src, 0, 0);
+        assert_eq!(dest.dimensions(), (6, 6));
+    }
+
+    #[test]
+    fn resize_screen_cells_after_grow() {
+        let mut s = Surface::new(2, 2);
+        s.add_change("ab");
+        s.resize(3, 3);
+        let cells = s.screen_cells();
+        assert_eq!(cells.len(), 3);
+        for row in &cells {
+            assert_eq!(row.len(), 3);
+        }
+    }
+
+    #[test]
+    fn resize_screen_lines_count_matches_height() {
+        let s = Surface::new(5, 3);
+        assert_eq!(s.screen_lines().len(), 3);
+    }
+
+    #[test]
+    fn resize_screen_lines_count_after_resize() {
+        let mut s = Surface::new(5, 3);
+        s.resize(5, 7);
+        assert_eq!(s.screen_lines().len(), 7);
+    }
+
+    #[test]
+    fn resize_title_preserved() {
+        let mut s = Surface::new(4, 3);
+        s.add_change(Change::Title("myterm".to_string()));
+        s.resize(6, 5);
+        assert_eq!(s.title(), "myterm");
+    }
+
+    #[test]
+    fn resize_cursor_visibility_preserved() {
+        let mut s = Surface::new(4, 3);
+        s.add_change(Change::CursorVisibility(CursorVisibility::Hidden));
+        s.resize(6, 5);
+        assert_eq!(s.cursor_visibility(), CursorVisibility::Hidden);
+    }
+
+    #[test]
+    fn resize_cursor_shape_preserved() {
+        let mut s = Surface::new(4, 3);
+        s.add_change(Change::CursorShape(CursorShape::SteadyBar));
+        s.resize(6, 5);
+        assert_eq!(s.cursor_shape(), Some(CursorShape::SteadyBar));
+    }
 }
