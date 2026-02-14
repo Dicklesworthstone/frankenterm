@@ -251,4 +251,70 @@ mod tests {
         let dbg = format!("{:?}", event);
         assert!(dbg.contains("Authenticated"));
     }
+
+    #[test]
+    fn dead_session_source_is_none() {
+        let err = DeadSession;
+        let error: &dyn std::error::Error = &err;
+        assert!(error.source().is_none());
+    }
+
+    #[test]
+    fn session_event_host_verify_debug() {
+        let (tx, _rx) = smol::channel::bounded(1);
+        let event = SessionEvent::HostVerify(HostVerificationEvent {
+            message: "Trust this host?".to_string(),
+            reply: tx,
+        });
+        let dbg = format!("{:?}", event);
+        assert!(dbg.contains("HostVerify"));
+    }
+
+    #[test]
+    fn session_event_authenticate_debug() {
+        let (tx, _rx) = smol::channel::bounded(1);
+        let event = SessionEvent::Authenticate(AuthenticationEvent {
+            username: "testuser".to_string(),
+            instructions: "".to_string(),
+            prompts: vec![],
+            reply: tx,
+        });
+        let dbg = format!("{:?}", event);
+        assert!(dbg.contains("Authenticate"));
+        assert!(dbg.contains("testuser"));
+    }
+
+    #[test]
+    fn session_event_host_verification_failed_debug() {
+        let event = SessionEvent::HostVerificationFailed(HostVerificationFailed {
+            remote_address: "10.0.0.1:22".to_string(),
+            key: "SHA256:test".to_string(),
+            file: None,
+        });
+        let dbg = format!("{:?}", event);
+        assert!(dbg.contains("HostVerificationFailed"));
+        assert!(dbg.contains("10.0.0.1:22"));
+    }
+
+    #[test]
+    fn exec_debug() {
+        let exec = Exec {
+            command_line: "ls -la".to_string(),
+            env: None,
+        };
+        let dbg = format!("{:?}", exec);
+        assert!(dbg.contains("Exec"));
+        assert!(dbg.contains("ls -la"));
+    }
+
+    #[test]
+    fn signal_channel_debug() {
+        let sig = SignalChannel {
+            channel: 1,
+            signame: "TERM",
+        };
+        let dbg = format!("{:?}", sig);
+        assert!(dbg.contains("SignalChannel"));
+        assert!(dbg.contains("TERM"));
+    }
 }

@@ -599,9 +599,10 @@ impl Screen {
                         break;
                     }
                     let end = (start + chunk_size).min(batch.logical_range.end);
+                    let logical_slice = &logical_lines[start..end];
                     handles.push(scope.spawn(move |_| {
                         let mut wrapped = Vec::with_capacity(end - start);
-                        for (offset, line) in logical_lines[start..end].iter().enumerate() {
+                        for (offset, line) in logical_slice.iter().enumerate() {
                             let idx = start + offset;
                             let wrapped_lines = if line.len() <= physical_cols {
                                 vec![line.clone()]
@@ -1865,6 +1866,92 @@ mod tests {
                 dpi: 96
             }),
             "rebuilt cache should contain only active resize key"
+        );
+    }
+
+    #[test]
+    fn viewport_reflow_plan_prioritizes_viewport_then_near_then_cold() {
+        let mut screen = test_screen(4, 4, 96);
+        let attrs = CellAttributes::blank();
+
+        screen.lines = VecDeque::from(vec![
+            Line::from_text("l0", &attrs, 0, None),
+            Line::from_text("l1", &attrs, 0, None),
+            Line::from_text_with_wrapped_last_col("l2a", &attrs, 0),
+            Line::from_text("l2b", &attrs, 0, None),
+            Line::from_text("l3", &attrs, 0, None),
+            Line::from_text("l4", &attrs, 0, None),
+            Line::from_text_with_wrapped_last_col("l5a", &attrs, 0),
+            Line::from_text("l5b", &attrs, 0, None),
+            Line::from_text("l6", &attrs, 0, None),
+            Line::from_text("l7", &attrs, 0, None),
+            Line::from_text("l8", &attrs, 0, None),
+            Line::from_text("l9", &attrs, 0, None),
+        ]);
+
+        let logical_count = Screen::logical_line_physical_ranges(&screen.lines).len();
+        assert_eq!(logical_count, 10);
+
+        let plan = screen.build_viewport_reflow_plan_for_current_snapshot(logical_count);
+        assert!(plan.covers_each_logical_line_once(logical_count));
+        assert_eq!(plan.batches.len(), 3);
+        assert_eq!(plan.batches[0].priority, ReflowBatchPriority::Viewport);
+        assert_eq!(plan.batches[0].logical_range, 6..10);
+        assert_eq!(plan.batches[1].priority, ReflowBatchPriority::NearViewport);
+        assert_eq!(plan.batches[1].logical_range, 3..6);
+        assert_eq!(plan.batches[2].priority, ReflowBatchPriority::ColdScrollback);
+        assert_eq!(plan.batches[2].logical_range, 0..3);
+    }
+
+    #[test]
+    fn viewport_reflow_plan_is_deterministic_for_identical_snapshot() {
+        let mut screen = test_screen(3, 5, 96);
+        let attrs = CellAttributes::blank();
+
+        screen.lines = VecDeque::from(vec![
+            Line::from_text("aa", &attrs, 0, None),
+            Line::from_text_with_wrapped_last_col("bbbb", &attrs, 0),
+            Line::from_text("cccc", &attrs, 0, None),
+            Line::from_text("dd", &attrs, 0, None),
+            Line::from_text("ee", &attrs, 0, None),
+            Line::from_text("ff", &attrs, 0, None),
+        ]);
+
+        let logical_count = Screen::logical_line_physical_ranges(&screen.lines).len();
+        let first = screen.build_viewport_reflow_plan_for_current_snapshot(logical_count);
+        let second = screen.build_viewport_reflow_plan_for_current_snapshot(logical_count);
+
+        assert_eq!(first, second);
+        assert!(first.covers_each_logical_line_once(logical_count));
+    }
+
+    #[test]
+    fn viewport_reflow_plan_handles_empty_buffer() {
+        let plan = Screen::build_viewport_reflow_plan_from_ranges(&[], 0..0, 0);
+        assert!(plan.batches.is_empty());
+        assert!(plan.covers_each_logical_line_once(0));
+    }
+
+    #[test]
+    fn viewport_reflow_plan_handles_huge_buffer_with_bounded_batches() {
+        let logical_count = 4096usize;
+        let logical_ranges: Vec<Range<usize>> = (0..logical_count).map(|idx| idx..idx + 1).collect();
+        let visible_range = (logical_count - 32)..logical_count;
+        let plan =
+            Screen::build_viewport_reflow_plan_from_ranges(&logical_ranges, visible_range, logical_count);
+
+        assert!(plan.covers_each_logical_line_once(logical_count));
+        assert!(
+            plan.batches
+                .iter()
+                .all(|batch| batch.logical_range.len() <= MAX_REFLOW_BATCH_LOGICAL_LINES)
+        );
+        assert_eq!(
+            plan.batches
+                .first()
+                .expect("non-empty plan for non-empty logical ranges")
+                .priority,
+            ReflowBatchPriority::Viewport
         );
     }
 }
