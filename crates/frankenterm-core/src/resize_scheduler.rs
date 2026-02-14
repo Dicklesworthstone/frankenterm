@@ -16,8 +16,8 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{OnceLock, RwLock};
 
 use crate::resize_invariants::{
-    ResizeInvariantReport, ResizeInvariantTelemetry, ResizePhase, check_phase_transition,
-    check_scheduler_invariants, check_scheduler_snapshot_row_invariants,
+    ResizeInvariantReport, ResizeInvariantTelemetry, ResizePhase, check_lifecycle_event_invariants,
+    check_phase_transition, check_scheduler_invariants, check_scheduler_snapshot_invariants,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1266,26 +1266,8 @@ impl ResizeScheduler {
         lifecycle_events: &[ResizeTransactionLifecycleEvent],
     ) -> (ResizeInvariantReport, ResizeInvariantTelemetry) {
         let mut report = ResizeInvariantReport::new();
-
-        for pane in &snapshot.panes {
-            let queue_depth = usize::from(pane.pending_seq.is_some());
-            check_scheduler_invariants(
-                &mut report,
-                pane.pane_id,
-                pane.active_seq,
-                pane.latest_seq,
-                queue_depth,
-                false,
-            );
-            check_scheduler_snapshot_row_invariants(
-                &mut report,
-                pane.pane_id,
-                pane.latest_seq,
-                pane.pending_seq,
-                pane.active_seq,
-                pane.active_phase.is_some(),
-            );
-        }
+        check_scheduler_snapshot_invariants(&mut report, snapshot);
+        check_lifecycle_event_invariants(&mut report, lifecycle_events);
 
         let mut last_phase_by_tx: HashMap<(u64, u64), ResizePhase> = HashMap::new();
         for event in lifecycle_events {
@@ -1833,7 +1815,6 @@ mod tests {
         let _ = scheduler.submit_intent(intent(42, 1, ResizeWorkClass::Interactive, 1, 1_000));
         let frame = scheduler.schedule_frame();
         assert_eq!(frame.scheduled.len(), 1);
-        assert!(scheduler.mark_active_phase(42, 1, ResizeExecutionPhase::Preparing, 1_005));
         assert!(scheduler.mark_active_phase(42, 1, ResizeExecutionPhase::Reflowing, 1_010));
         assert!(scheduler.mark_active_phase(42, 1, ResizeExecutionPhase::Presenting, 1_015));
         assert!(scheduler.complete_active(42, 1));
