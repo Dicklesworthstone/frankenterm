@@ -4,7 +4,7 @@
 //!
 //! # Architecture
 //!
-//! The event bus uses tokio's broadcast channels for multi-consumer fanout:
+//! The event bus uses runtime-compat broadcast channels for multi-consumer fanout:
 //! - Single producer publishes events via `EventBus::publish()`
 //! - Subscribers can listen to all events or specific channels (delta/detection/signal)
 //! - Bounded capacity provides backpressure (slow consumers get lagged)
@@ -40,10 +40,10 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::broadcast;
 
 use crate::patterns::Detection;
 use crate::policy::Redactor;
+use crate::runtime_compat::broadcast;
 
 /// Payload for user-var events received via IPC from shell hooks.
 ///
@@ -669,8 +669,8 @@ impl EventSubscriber {
     pub async fn recv(&mut self) -> Result<Event, RecvError> {
         match self.receiver.recv().await {
             Ok(event) => Ok(event),
-            Err(broadcast::error::RecvError::Closed) => Err(RecvError::Closed),
-            Err(broadcast::error::RecvError::Lagged(n)) => {
+            Err(broadcast::RecvError::Closed) => Err(RecvError::Closed),
+            Err(broadcast::RecvError::Lagged(n)) => {
                 // Track lag and return an error so caller knows they missed events
                 self.lagged_count += n;
                 self.metrics
@@ -687,9 +687,9 @@ impl EventSubscriber {
     pub fn try_recv(&mut self) -> Option<Result<Event, RecvError>> {
         match self.receiver.try_recv() {
             Ok(event) => Some(Ok(event)),
-            Err(broadcast::error::TryRecvError::Empty) => None,
-            Err(broadcast::error::TryRecvError::Closed) => Some(Err(RecvError::Closed)),
-            Err(broadcast::error::TryRecvError::Lagged(n)) => {
+            Err(broadcast::TryRecvError::Empty) => None,
+            Err(broadcast::TryRecvError::Closed) => Some(Err(RecvError::Closed)),
+            Err(broadcast::TryRecvError::Lagged(n)) => {
                 self.lagged_count += n;
                 self.metrics
                     .subscriber_lag_events

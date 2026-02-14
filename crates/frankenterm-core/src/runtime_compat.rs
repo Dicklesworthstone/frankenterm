@@ -2,7 +2,7 @@
 //!
 //! This module intentionally keeps the API small and explicit:
 //! - sync primitive type aliases (`Mutex`, `RwLock`, `Semaphore`, ...)
-//! - channel module aliases (`mpsc`, `watch`)
+//! - channel module aliases (`mpsc`, `watch`, `broadcast`)
 //! - runtime lifecycle wrappers (`RuntimeBuilder`, `Runtime`, `CompatRuntime`)
 //! - time helpers (`sleep`, `timeout`)
 //!
@@ -305,6 +305,17 @@ pub mod watch {
     pub use tokio::sync::watch::{
         Receiver, Sender, channel,
         error::{RecvError, SendError},
+    };
+}
+
+/// Broadcast channel aliases for the active runtime.
+///
+/// Note: this remains tokio-backed while the broader broadcast migration is
+/// completed; exposing it via runtime_compat centralizes call sites.
+pub mod broadcast {
+    pub use tokio::sync::broadcast::{
+        Receiver, Sender, channel,
+        error::{RecvError, SendError, TryRecvError},
     };
 }
 
