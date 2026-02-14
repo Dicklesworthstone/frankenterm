@@ -2472,6 +2472,42 @@ mod tests {
     }
 
     #[test]
+    fn resize_reflow_reuses_scratch_buffers() {
+        let mut screen = test_screen(4, 6, 96);
+        let attrs = CellAttributes::blank();
+
+        screen.lines = VecDeque::from(vec![
+            Line::from_text_with_wrapped_last_col("abcdefghijkl", &attrs, 0),
+            Line::from_text("mnop", &attrs, 0, None),
+            Line::from_text_with_wrapped_last_col("qrstuv", &attrs, 0),
+            Line::from_text("wxyz", &attrs, 0, None),
+            Line::new(0),
+        ]);
+
+        let cursor = test_cursor(2, 3, 1);
+        let cursor = screen.resize(test_size(4, 4, 96), cursor, 1, false);
+        let first_slots_capacity = screen.rewrap_scratch_slots.capacity();
+        let first_prefix_capacity = screen.rewrap_row_prefix_scratch.capacity();
+        let used_slots = screen.rewrap_row_prefix_scratch.len().saturating_sub(1);
+        assert!(
+            screen.rewrap_scratch_slots[..used_slots]
+                .iter()
+                .all(Option::is_none),
+            "scratch slots should be emptied after materializing wrapped lines"
+        );
+
+        let _ = screen.resize(test_size(4, 5, 96), cursor, 2, false);
+        assert!(
+            screen.rewrap_scratch_slots.capacity() >= first_slots_capacity,
+            "rewrap slot buffer should be reused across resize cycles"
+        );
+        assert!(
+            screen.rewrap_row_prefix_scratch.capacity() >= first_prefix_capacity,
+            "row-prefix scratch buffer should be reused across resize cycles"
+        );
+    }
+
+    #[test]
     fn viewport_reflow_plan_prioritizes_viewport_then_near_then_cold() {
         let mut screen = test_screen(4, 4, 96);
         let attrs = CellAttributes::blank();

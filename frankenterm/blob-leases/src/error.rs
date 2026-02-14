@@ -142,4 +142,18 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("no access"), "got: {msg}");
     }
+
+    #[test]
+    fn already_initialized_debug_output() {
+        let err = Error::AlreadyInitializedStorage;
+        let debug = format!("{err:?}");
+        assert!(debug.contains("AlreadyInitializedStorage"));
+    }
+
+    #[test]
+    fn content_not_found_display_starts_with_content() {
+        let id = ContentId::for_bytes(b"test");
+        let err = Error::ContentNotFound(id);
+        assert!(err.to_string().starts_with("Content with id"));
+    }
 }
