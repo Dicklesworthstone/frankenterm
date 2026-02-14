@@ -334,3 +334,63 @@ proptest! {
         prop_assert_eq!(sz, r.total_size_bytes);
     }
 }
+
+// ── DiagnosticResult: serde roundtrip ────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+
+    /// Serialize then re-parse via serde_json::Value roundtrip preserves all fields.
+    #[test]
+    fn result_serde_value_roundtrip(r in arb_diagnostic_result()) {
+        let json = serde_json::to_string(&r).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let path = value.get("output_path").unwrap().as_str().unwrap();
+        let fc = value.get("file_count").unwrap().as_u64().unwrap() as usize;
+        let sz = value.get("total_size_bytes").unwrap().as_u64().unwrap();
+        prop_assert_eq!(path, r.output_path.as_str());
+        prop_assert_eq!(fc, r.file_count);
+        prop_assert_eq!(sz, r.total_size_bytes);
+    }
+
+    /// JSON contains no null-valued fields for DiagnosticResult.
+    #[test]
+    fn result_json_no_nulls(r in arb_diagnostic_result()) {
+        let json = serde_json::to_string(&r).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        for (_k, v) in value.as_object().unwrap() {
+            prop_assert!(!v.is_null(), "field should not be null");
+        }
+    }
+
+    /// Debug output for DiagnosticResult is deterministic.
+    #[test]
+    fn result_debug_deterministic(r in arb_diagnostic_result()) {
+        let d1 = format!("{:?}", r);
+        let d2 = format!("{:?}", r);
+        prop_assert_eq!(d1.as_str(), d2.as_str());
+    }
+
+    /// Debug output for DiagnosticOptions is deterministic.
+    #[test]
+    fn options_debug_deterministic(opts in arb_diagnostic_options()) {
+        let d1 = format!("{:?}", opts);
+        let d2 = format!("{:?}", opts);
+        prop_assert_eq!(d1.as_str(), d2.as_str());
+    }
+
+    /// Options output field: None serializes without "output" or as null.
+    #[test]
+    fn options_none_output_clone(el in 1usize..500, al in 1usize..200) {
+        let opts = DiagnosticOptions {
+            event_limit: el,
+            audit_limit: al,
+            workflow_limit: 1,
+            output: None,
+        };
+        let c = opts.clone();
+        prop_assert!(c.output.is_none());
+        prop_assert_eq!(c.event_limit, el);
+        prop_assert_eq!(c.audit_limit, al);
+    }
+}

@@ -346,3 +346,116 @@ fn render_with_empty_context_unchanged() {
     let rendered = render_explanation(tmpl, &ctx);
     assert_eq!(rendered, tmpl.detailed);
 }
+
+// =========================================================================
+// Additional property tests for coverage
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(20))]
+
+    /// format_explanation is deterministic.
+    #[test]
+    fn prop_format_deterministic(_dummy in 0..1_u8) {
+        let ids = list_template_ids();
+        for id in &ids {
+            let tmpl = get_explanation(id).unwrap();
+            let f1 = format_explanation(tmpl, None);
+            let f2 = format_explanation(tmpl, None);
+            prop_assert_eq!(&f1, &f2,
+                "format_explanation should be deterministic for '{}'", id);
+        }
+    }
+
+    /// format_explanation output is non-empty for every template.
+    #[test]
+    fn prop_format_nonempty(_dummy in 0..1_u8) {
+        let ids = list_template_ids();
+        for id in &ids {
+            let tmpl = get_explanation(id).unwrap();
+            let formatted = format_explanation(tmpl, None);
+            prop_assert!(!formatted.is_empty(),
+                "format_explanation should be non-empty for '{}'", id);
+        }
+    }
+
+    /// render_explanation output is non-empty for every template.
+    #[test]
+    fn prop_render_nonempty(_dummy in 0..1_u8) {
+        let ids = list_template_ids();
+        let ctx = HashMap::new();
+        for id in &ids {
+            let tmpl = get_explanation(id).unwrap();
+            let rendered = render_explanation(tmpl, &ctx);
+            prop_assert!(!rendered.is_empty(),
+                "render_explanation should be non-empty for '{}'", id);
+        }
+    }
+
+    /// list_template_ids is deterministic across calls.
+    #[test]
+    fn prop_list_ids_deterministic(_dummy in 0..1_u8) {
+        let ids1 = list_template_ids();
+        let ids2 = list_template_ids();
+        prop_assert_eq!(ids1.len(), ids2.len());
+        for (a, b) in ids1.iter().zip(ids2.iter()) {
+            prop_assert_eq!(a, b);
+        }
+    }
+
+    /// All template IDs are non-empty strings.
+    #[test]
+    fn prop_all_ids_nonempty(_dummy in 0..1_u8) {
+        let ids = list_template_ids();
+        for id in &ids {
+            prop_assert!(!id.is_empty(), "template ID should be non-empty");
+        }
+    }
+
+    /// list_templates_by_category is deterministic.
+    #[test]
+    fn prop_category_list_deterministic(cat in "deny|workflow|event|risk") {
+        let t1 = list_templates_by_category(&cat);
+        let t2 = list_templates_by_category(&cat);
+        prop_assert_eq!(t1.len(), t2.len(),
+            "category '{}' template count should be deterministic", cat);
+        for (a, b) in t1.iter().zip(t2.iter()) {
+            prop_assert_eq!(a.id, b.id);
+        }
+    }
+
+    /// All template scenarios are non-empty.
+    #[test]
+    fn prop_all_scenarios_nonempty(_dummy in 0..1_u8) {
+        let ids = list_template_ids();
+        for id in &ids {
+            let tmpl = get_explanation(id).unwrap();
+            prop_assert!(!tmpl.scenario.is_empty(),
+                "scenario for '{}' should be non-empty", id);
+        }
+    }
+
+    /// All template briefs are non-empty.
+    #[test]
+    fn prop_all_briefs_nonempty(_dummy in 0..1_u8) {
+        let ids = list_template_ids();
+        for id in &ids {
+            let tmpl = get_explanation(id).unwrap();
+            prop_assert!(!tmpl.brief.is_empty(),
+                "brief for '{}' should be non-empty", id);
+        }
+    }
+
+    /// format_explanation contains the detailed text (or a rendered version of it).
+    #[test]
+    fn prop_format_contains_detailed(_dummy in 0..1_u8) {
+        let ids = list_template_ids();
+        for id in &ids {
+            let tmpl = get_explanation(id).unwrap();
+            let formatted = format_explanation(tmpl, None);
+            // The detailed text should appear in the formatted output
+            prop_assert!(formatted.contains(tmpl.detailed),
+                "formatted '{}' should contain detailed text", id);
+        }
+    }
+}
