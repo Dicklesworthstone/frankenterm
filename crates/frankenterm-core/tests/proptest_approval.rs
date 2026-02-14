@@ -551,3 +551,150 @@ proptest! {
             "max_active_tokens should be > 0, got {}", config.max_active_tokens);
     }
 }
+
+// =============================================================================
+// ApprovalScope: clone and debug
+// =============================================================================
+
+#[test]
+fn approval_scope_clone_preserves() {
+    let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot).with_pane(42);
+    let scope = ApprovalScope::from_input("ws1", &input);
+    let c = scope.clone();
+    assert_eq!(scope.workspace_id, c.workspace_id);
+    assert_eq!(scope.action_kind, c.action_kind);
+    assert_eq!(scope.pane_id, c.pane_id);
+    assert_eq!(scope.action_fingerprint, c.action_fingerprint);
+}
+
+#[test]
+fn approval_scope_debug_nonempty() {
+    let input = PolicyInput::new(ActionKind::Spawn, ActorKind::Human);
+    let scope = ApprovalScope::from_input("ws", &input);
+    let d = format!("{:?}", scope);
+    assert!(!d.is_empty());
+    assert!(d.contains("ApprovalScope"));
+}
+
+// =============================================================================
+// ApprovalAuditContext: clone, debug, default
+// =============================================================================
+
+#[test]
+fn audit_context_clone_preserves() {
+    let mut ctx = ApprovalAuditContext::default();
+    ctx.correlation_id = Some("corr-123".into());
+    ctx.decision_context = Some("test context".into());
+    let c = ctx.clone();
+    assert_eq!(ctx.correlation_id, c.correlation_id);
+    assert_eq!(ctx.decision_context, c.decision_context);
+}
+
+#[test]
+fn audit_context_debug_nonempty() {
+    let ctx = ApprovalAuditContext::default();
+    let d = format!("{:?}", ctx);
+    assert!(!d.is_empty());
+}
+
+// =============================================================================
+// ApprovalConfig: clone and debug
+// =============================================================================
+
+#[test]
+fn approval_config_clone_preserves() {
+    let cfg = ApprovalConfig {
+        token_expiry_secs: 999,
+        max_active_tokens: 42,
+        require_reapproval_on_failure: true,
+    };
+    let c = cfg.clone();
+    assert_eq!(cfg.token_expiry_secs, c.token_expiry_secs);
+    assert_eq!(cfg.max_active_tokens, c.max_active_tokens);
+    assert_eq!(
+        cfg.require_reapproval_on_failure,
+        c.require_reapproval_on_failure
+    );
+}
+
+#[test]
+fn approval_config_debug_nonempty() {
+    let cfg = ApprovalConfig::default();
+    let d = format!("{:?}", cfg);
+    assert!(!d.is_empty());
+}
+
+// =============================================================================
+// ActionKind: as_str is always non-empty
+// =============================================================================
+
+#[test]
+fn action_kind_as_str_nonempty() {
+    let kinds = [
+        ActionKind::SendText,
+        ActionKind::SendCtrlC,
+        ActionKind::SendCtrlD,
+        ActionKind::SendCtrlZ,
+        ActionKind::SendControl,
+        ActionKind::Spawn,
+        ActionKind::Split,
+        ActionKind::Activate,
+        ActionKind::Close,
+        ActionKind::BrowserAuth,
+        ActionKind::WorkflowRun,
+        ActionKind::ReservePane,
+        ActionKind::ReleasePane,
+        ActionKind::ReadOutput,
+        ActionKind::SearchOutput,
+        ActionKind::WriteFile,
+        ActionKind::DeleteFile,
+        ActionKind::ExecCommand,
+    ];
+    for kind in &kinds {
+        let s = kind.as_str();
+        assert!(!s.is_empty(), "{:?} has empty as_str()", kind);
+    }
+}
+
+// =============================================================================
+// ActionKind: serde roundtrip
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn action_kind_serde_roundtrip(kind in arb_action_kind()) {
+        let json = serde_json::to_string(&kind).unwrap();
+        let back: ActionKind = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(kind.as_str(), back.as_str());
+    }
+
+    #[test]
+    fn actor_kind_serde_roundtrip(actor in arb_actor_kind()) {
+        let json = serde_json::to_string(&actor).unwrap();
+        let back: ActorKind = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(actor, back);
+    }
+}
+
+// =============================================================================
+// PolicyInput: debug and clone
+// =============================================================================
+
+#[test]
+fn policy_input_debug_nonempty() {
+    let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+    let d = format!("{:?}", input);
+    assert!(!d.is_empty());
+}
+
+#[test]
+fn policy_input_clone_preserves_action() {
+    let input = PolicyInput::new(ActionKind::Spawn, ActorKind::Human)
+        .with_pane(99)
+        .with_domain("test");
+    let c = input.clone();
+    assert_eq!(input.action.as_str(), c.action.as_str());
+    assert_eq!(input.pane_id, c.pane_id);
+}

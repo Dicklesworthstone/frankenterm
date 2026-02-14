@@ -459,3 +459,141 @@ proptest! {
         }
     }
 }
+
+// =========================================================================
+// ExplanationTemplate: Clone, Debug, Serialize
+// =========================================================================
+
+#[test]
+fn template_clone_preserves_id() {
+    let tmpl = get_explanation("deny.alt_screen").unwrap();
+    let c = tmpl.clone();
+    assert_eq!(tmpl.id, c.id);
+    assert_eq!(tmpl.scenario, c.scenario);
+    assert_eq!(tmpl.brief, c.brief);
+    assert_eq!(tmpl.detailed, c.detailed);
+}
+
+#[test]
+fn template_debug_nonempty() {
+    let tmpl = get_explanation("deny.alt_screen").unwrap();
+    let d = format!("{:?}", tmpl);
+    assert!(!d.is_empty());
+    assert!(d.contains("deny.alt_screen"));
+}
+
+#[test]
+fn template_serialize_to_json() {
+    let tmpl = get_explanation("deny.alt_screen").unwrap();
+    let json = serde_json::to_string(tmpl).unwrap();
+    assert!(!json.is_empty());
+    // Verify JSON contains the template id
+    assert!(json.contains("deny.alt_screen"));
+}
+
+#[test]
+fn template_serialize_all_templates() {
+    let ids = list_template_ids();
+    for id in &ids {
+        let tmpl = get_explanation(id).unwrap();
+        let json = serde_json::to_string(tmpl).unwrap();
+        assert!(
+            !json.is_empty(),
+            "serialization of '{}' should be non-empty",
+            id
+        );
+    }
+}
+
+// =========================================================================
+// Static template constants are registered
+// =========================================================================
+
+#[test]
+fn all_static_constants_registered() {
+    // Verify each known static constant is accessible via get_explanation
+    let expected_ids = [
+        "deny.alt_screen",
+        "deny.command_running",
+        "deny.recent_gap",
+        "deny.rate_limited",
+        "deny.unknown_pane",
+        "deny.permission",
+        "workflow.usage_limit",
+        "workflow.compaction",
+        "workflow.error_detected",
+        "workflow.approval_needed",
+        "event.pattern_detected",
+        "event.gap_detected",
+        "risk.elevated",
+        "risk.high",
+        "risk.factor.alt_screen",
+        "risk.factor.destructive_tokens",
+        "risk.factor.sudo_elevation",
+    ];
+    for id in &expected_ids {
+        assert!(
+            get_explanation(id).is_some(),
+            "static constant '{}' should be registered",
+            id
+        );
+    }
+}
+
+#[test]
+fn registered_count_matches_static_constants() {
+    let ids = list_template_ids();
+    // At minimum, the 17 known statics should be registered
+    assert!(
+        ids.len() >= 17,
+        "expected >= 17 templates, got {}",
+        ids.len()
+    );
+}
+
+// =========================================================================
+// Edge case: malformed placeholders
+// =========================================================================
+
+#[test]
+fn render_with_unmatched_braces_unchanged() {
+    let tmpl = get_explanation("deny.alt_screen").unwrap();
+    let mut ctx = HashMap::new();
+    ctx.insert("nonexistent_key".to_string(), "value".to_string());
+    let rendered = render_explanation(tmpl, &ctx);
+    // Since the key doesn't appear in the template, output should match the detailed text
+    assert_eq!(rendered, tmpl.detailed);
+}
+
+// =========================================================================
+// Category completeness
+// =========================================================================
+
+#[test]
+fn all_categories_have_templates() {
+    for cat in &["deny", "workflow", "event", "risk"] {
+        let templates = list_templates_by_category(cat);
+        assert!(
+            !templates.is_empty(),
+            "category '{}' should have at least one template",
+            cat
+        );
+    }
+}
+
+#[test]
+fn category_templates_all_match_prefix() {
+    for cat in &["deny", "workflow", "event", "risk"] {
+        let templates = list_templates_by_category(cat);
+        for tmpl in &templates {
+            assert!(
+                tmpl.id.starts_with(&format!("{}.", cat)),
+                "template '{}' in category '{}' should start with '{}.', got '{}'",
+                tmpl.id,
+                cat,
+                cat,
+                tmpl.id
+            );
+        }
+    }
+}
