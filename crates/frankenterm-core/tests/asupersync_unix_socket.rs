@@ -10,7 +10,11 @@ fn socket_path(test_name: &str) -> std::path::PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    std::env::temp_dir().join(format!("frankenterm-{test_name}-{ts}.sock"))
+    let name_hash = test_name.bytes().fold(0u32, |acc, byte| {
+        acc.wrapping_mul(16777619) ^ u32::from(byte)
+    });
+    let suffix = ts & 0xffff_ffff;
+    std::path::PathBuf::from(format!("/tmp/ft-{name_hash:08x}-{suffix:x}.sock"))
 }
 
 #[tokio::test]
@@ -128,5 +132,66 @@ async fn unix_socket_read_timeout_is_enforced() -> io::Result<()> {
     let (server_res, client_res) = tokio::join!(server, client);
     server_res?;
     client_res?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn unix_socket_binary_pdu_frame_round_trip() -> io::Result<()> {
+    let socket_path = socket_path("runtime-compat-pdu-frame");
+    let listener = unix::bind(&socket_path).await?;
+
+    let payload: Vec<u8> = (0..128u16).map(|v| (v % 251) as u8).collect();
+    let frame_len = u32::try_from(payload.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "payload too large"))?;
+    let server_payload = payload.clone();
+    let client_payload = payload.clone();
+
+    let server = async move {
+        let (mut stream, _addr) = listener.accept().await?;
+        let mut len_buf = [0_u8; 4];
+        stream.read_exact(&mut len_buf).await?;
+        let received_len = u32::from_be_bytes(len_buf);
+        assert_eq!(received_len, frame_len);
+
+        let mut received_payload = vec![0_u8; usize::try_from(received_len).unwrap_or(0)];
+        stream.read_exact(&mut received_payload).await?;
+        assert_eq!(received_payload, server_payload);
+        Ok::<(), io::Error>(())
+    };
+
+    let client_path = socket_path.clone();
+    let client = async move {
+        let mut stream = unix::connect(&client_path).await?;
+        stream.write_all(&frame_len.to_be_bytes()).await?;
+        stream.write_all(&client_payload).await?;
+        Ok::<(), io::Error>(())
+    };
+
+    let (server_res, client_res) = tokio::join!(server, client);
+    server_res?;
+    client_res?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn unix_socket_connect_unreachable_fails_within_timeout() -> io::Result<()> {
+    let socket_path = socket_path("runtime-compat-connect-unreachable");
+
+    let timed = runtime_compat::timeout(Duration::from_millis(50), unix::connect(&socket_path))
+        .await
+        .map_err(|err| io::Error::new(io::ErrorKind::TimedOut, err))?;
+
+    let err = timed.expect_err("expected connect to fail for missing socket path");
+    assert!(
+        matches!(
+            err.kind(),
+            io::ErrorKind::NotFound
+                | io::ErrorKind::ConnectionRefused
+                | io::ErrorKind::AddrNotAvailable
+        ),
+        "unexpected connect error kind: {:?}",
+        err.kind()
+    );
+
     Ok(())
 }

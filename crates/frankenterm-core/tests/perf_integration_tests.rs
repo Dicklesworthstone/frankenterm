@@ -19,6 +19,7 @@ use frankenterm_core::pool::{Pool, PoolConfig, PoolError};
 use frankenterm_core::retry::{
     RetryPolicy, with_retry, with_retry_and_circuit, with_retry_outcome,
 };
+use frankenterm_core::runtime_compat::sleep;
 use frankenterm_core::watchdog::{Component, HealthStatus, HeartbeatRegistry, WatchdogConfig};
 
 // =============================================================================
@@ -77,7 +78,7 @@ async fn pool_under_load() {
         handles.push(tokio::spawn(async move {
             let guard = pool.acquire().await.unwrap();
             // Simulate work
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            sleep(Duration::from_millis(5)).await;
             drop(guard);
             completed.fetch_add(1, Ordering::SeqCst);
         }));
@@ -118,7 +119,7 @@ async fn pool_exhaustion_waits() {
     });
 
     // Release after 200ms
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    sleep(Duration::from_millis(200)).await;
     drop(guard);
 
     let wait_time = waiter.await.unwrap();
@@ -162,7 +163,7 @@ async fn pool_evict_idle() {
     }
 
     // Wait for connections to become stale
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    sleep(Duration::from_millis(100)).await;
 
     let evicted = pool.evict_idle().await;
     assert_eq!(evicted, 4);
@@ -877,7 +878,7 @@ async fn concurrent_pool_acquire_and_evict() {
     let acquire_task = tokio::spawn(async move {
         for _ in 0..20 {
             if let Ok(guard) = pool1.acquire().await {
-                tokio::time::sleep(Duration::from_millis(5)).await;
+                sleep(Duration::from_millis(5)).await;
                 drop(guard);
             }
         }
@@ -886,7 +887,7 @@ async fn concurrent_pool_acquire_and_evict() {
     let evict_task = tokio::spawn(async move {
         for _ in 0..10 {
             pool2.evict_idle().await;
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            sleep(Duration::from_millis(10)).await;
         }
     });
 
@@ -920,7 +921,7 @@ async fn pool_stress_100_concurrent() {
         let completed = completed.clone();
         handles.push(tokio::spawn(async move {
             let guard = pool.acquire().await.unwrap();
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            sleep(Duration::from_millis(1)).await;
             drop(guard);
             completed.fetch_add(1, Ordering::SeqCst);
         }));

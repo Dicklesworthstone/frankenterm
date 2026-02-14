@@ -15,6 +15,7 @@ use codec::{
     CODEC_VERSION, GetCodecVersionResponse, GetPaneRenderChangesResponse, Pdu, UnitResponse,
 };
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use frankenterm_core::runtime_compat::sleep;
 use frankenterm_core::vendored::{DirectMuxClient, DirectMuxClientConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -131,7 +132,7 @@ async fn setup_client(
             }
 
             if !render_responses.is_empty() {
-                tokio::time::sleep(response_batch_delay).await;
+                sleep(response_batch_delay).await;
                 if reverse_batch_responses {
                     render_responses.reverse();
                 }

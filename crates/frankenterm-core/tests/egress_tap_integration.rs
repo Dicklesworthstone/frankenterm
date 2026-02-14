@@ -17,6 +17,7 @@ use frankenterm_core::recording::{
     EgressEvent, EgressNoopTap, EgressTap, RecorderSegmentKind, SharedEgressTap,
     captured_kind_to_segment,
 };
+use frankenterm_core::runtime_compat::sleep;
 use frankenterm_core::tailer::{CaptureEvent, TailerConfig, TailerSupervisor};
 use frankenterm_core::wezterm::{PaneInfo, PaneTextSource};
 
@@ -159,7 +160,7 @@ async fn egress_tap_fires_on_delta_capture() {
     source
         .set_text(1, "$ prompt\nline1\nline2\nnew output\n")
         .await;
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    sleep(Duration::from_millis(20)).await;
 
     let mut js = tokio::task::JoinSet::new();
     tailer.spawn_ready(&mut js);
@@ -216,7 +217,7 @@ async fn egress_tap_captures_gap_segments() {
     source
         .set_text(1, "completely different text that shares no overlap")
         .await;
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    sleep(Duration::from_millis(20)).await;
 
     let mut js = tokio::task::JoinSet::new();
     tailer.spawn_ready(&mut js);
@@ -347,7 +348,7 @@ async fn egress_monotonic_sequence() {
         source
             .set_text(1, &format!("aaaa\nbbbb\ncccc\ndddd\neeee\nout-{i}\n"))
             .await;
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        sleep(Duration::from_millis(20)).await;
         let mut js = tokio::task::JoinSet::new();
         tailer.spawn_ready(&mut js);
         while let Some(r) = js.join_next().await {

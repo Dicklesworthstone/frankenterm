@@ -341,7 +341,7 @@ fn compat_runtime_spawn_detached_runs() {
     rt.block_on(async move {
         rt2_spawn_helper(&flag2);
         // Give the detached task time to run
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        runtime_compat::sleep(Duration::from_millis(50)).await;
     });
 
     assert_eq!(flag.load(Ordering::SeqCst), 1);

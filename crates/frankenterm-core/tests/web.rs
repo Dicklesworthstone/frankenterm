@@ -2,14 +2,14 @@
 mod web_tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use frankenterm_core::events::{Event, EventBus};
     use frankenterm_core::patterns::{AgentType, Detection, Severity};
+    use frankenterm_core::runtime_compat::{sleep, timeout};
     use frankenterm_core::storage::{PaneRecord, StorageHandle};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
-    use tokio::time::Instant;
 
     use frankenterm_core::web::{WebServerConfig, start_web_server};
 
@@ -40,7 +40,7 @@ mod web_tests {
                 }
                 Err(err) => {
                     last_err = Some(err);
-                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    sleep(Duration::from_millis(20)).await;
                 }
             }
         }
@@ -62,7 +62,7 @@ mod web_tests {
                 }
                 Err(err) => {
                     last_err = Some(err);
-                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    sleep(Duration::from_millis(20)).await;
                 }
             }
         }
@@ -90,7 +90,7 @@ mod web_tests {
                             break;
                         }
                         let mut chunk = [0_u8; 2048];
-                        match tokio::time::timeout(deadline - now, stream.read(&mut chunk)).await {
+                        match timeout(deadline - now, stream.read(&mut chunk)).await {
                             Ok(Ok(0)) => break,
                             Ok(Ok(n)) => {
                                 buf.extend_from_slice(&chunk[..n]);
@@ -103,7 +103,7 @@ mod web_tests {
                 }
                 Err(err) => {
                     last_err = Some(err);
-                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    sleep(Duration::from_millis(20)).await;
                 }
             }
         }
@@ -377,7 +377,7 @@ mod web_tests {
             fetch_stream_prefix(addr, req, Duration::from_secs(3), 512).await
         });
 
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        sleep(Duration::from_millis(80)).await;
         let secret = "auth token sk-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let seg = storage.append_segment(7, secret, None).await?;
         let _ = event_bus.publish(Event::SegmentCaptured {
@@ -434,7 +434,7 @@ mod web_tests {
             fetch_stream_prefix(addr, req, Duration::from_secs(4), 640).await
         });
 
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        sleep(Duration::from_millis(80)).await;
         for i in 0..64_u64 {
             let detection = Detection {
                 rule_id: format!("core.test:{i}"),
@@ -471,7 +471,7 @@ mod web_tests {
             if event_bus.subscriber_count() == 0 {
                 return Ok(());
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            sleep(Duration::from_millis(25)).await;
         }
 
         assert_eq!(

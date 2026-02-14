@@ -14,6 +14,7 @@ use codec::{
 };
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use frankenterm_core::config::VendoredCompressionMode;
+use frankenterm_core::runtime_compat::timeout;
 use frankenterm_core::vendored::{DirectMuxClient, DirectMuxClientConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -164,7 +165,7 @@ async fn connect_once(mode: VendoredCompressionMode) -> Result<(), String> {
         .map_err(|err| err.to_string())?;
     drop(client);
 
-    let _ = tokio::time::timeout(Duration::from_secs(1), server).await;
+    let _ = timeout(Duration::from_secs(1), server).await;
     Ok(())
 }
 
@@ -194,7 +195,7 @@ async fn connect_with_manual_fallback() -> Result<(), String> {
         .map_err(|err| err.to_string())?;
     drop(client);
 
-    let _ = tokio::time::timeout(Duration::from_secs(1), server).await;
+    let _ = timeout(Duration::from_secs(1), server).await;
     Ok(())
 }
 

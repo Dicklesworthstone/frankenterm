@@ -903,7 +903,7 @@ fn triage_timestamp_updates_on_mutation() {
         let ts1 = ann1.triage_updated_at.unwrap();
 
         // Small delay then update
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        frankenterm_core::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
 
         storage
             .set_event_triage_state(
@@ -1025,7 +1025,7 @@ fn note_timestamp_updates_on_mutation() {
             .unwrap();
         let ts1 = ann1.note_updated_at.unwrap();
 
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        frankenterm_core::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
 
         storage
             .set_event_note(

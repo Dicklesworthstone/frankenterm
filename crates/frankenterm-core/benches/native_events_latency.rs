@@ -14,6 +14,7 @@ use std::time::Duration;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use frankenterm_core::native_events::{NativeEvent, NativeEventListener};
 use frankenterm_core::runtime_compat::mpsc;
+use frankenterm_core::runtime_compat::timeout;
 use frankenterm_core::runtime_compat::unix::{self as compat_unix, AsyncWriteExt};
 
 mod bench_common;
@@ -68,14 +69,14 @@ fn bench_native_first_message_latency(c: &mut Criterion) {
                 .await
                 .expect("write pane output event");
 
-            let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+            let event = timeout(Duration::from_secs(2), event_rx.recv())
                 .await
                 .expect("timeout waiting for native event")
                 .expect("event channel closed unexpectedly");
             black_box(event);
 
             shutdown.store(true, Ordering::SeqCst);
-            let _ = tokio::time::timeout(Duration::from_secs(2), listener_task).await;
+            let _ = timeout(Duration::from_secs(2), listener_task).await;
         });
     });
 
@@ -120,7 +121,7 @@ fn bench_native_batch_throughput(c: &mut Criterion) {
                     }
 
                     for _ in 0..*events_per_batch {
-                        let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+                        let event = timeout(Duration::from_secs(2), event_rx.recv())
                             .await
                             .expect("timeout waiting for native event")
                             .expect("event channel closed unexpectedly");
@@ -133,7 +134,7 @@ fn bench_native_batch_throughput(c: &mut Criterion) {
                     }
 
                     shutdown.store(true, Ordering::SeqCst);
-                    let _ = tokio::time::timeout(Duration::from_secs(2), listener_task).await;
+                    let _ = timeout(Duration::from_secs(2), listener_task).await;
                 });
             },
         );
