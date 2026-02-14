@@ -612,6 +612,277 @@ fn push_metric(output: &mut String, name: String, help: &str, metric_type: &str,
     let _ = writeln!(output, "{name} {value}");
 }
 
+#[cfg(test)]
+mod pure_tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // MetricsSnapshot defaults
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn metrics_snapshot_default_is_zeroed() {
+        let snap = MetricsSnapshot::default();
+        assert!(snap.uptime_seconds.abs() < f64::EPSILON);
+        assert_eq!(snap.observed_panes, 0);
+        assert_eq!(snap.capture_queue_depth, 0);
+        assert_eq!(snap.capture_queue_capacity, 0);
+        assert_eq!(snap.write_queue_depth, 0);
+        assert_eq!(snap.segments_persisted, 0);
+        assert_eq!(snap.events_recorded, 0);
+        assert!(snap.ingest_lag_avg_ms.abs() < f64::EPSILON);
+        assert_eq!(snap.ingest_lag_max_ms, 0);
+        assert_eq!(snap.ingest_lag_sum_ms, 0);
+        assert_eq!(snap.ingest_lag_count, 0);
+        assert!(snap.db_last_write_age_ms.is_none());
+        assert_eq!(snap.native_output_input_events, 0);
+        assert_eq!(snap.native_output_batches_emitted, 0);
+        assert!(snap.event_bus.is_none());
+    }
+
+    #[test]
+    fn event_bus_snapshot_default_is_zeroed() {
+        let snap = EventBusSnapshot::default();
+        assert_eq!(snap.events_published, 0);
+        assert_eq!(snap.events_dropped_no_subscribers, 0);
+        assert_eq!(snap.active_subscribers, 0);
+        assert_eq!(snap.capacity, 0);
+        assert!(snap.delta_oldest_lag_ms.is_none());
+        assert!(snap.detection_oldest_lag_ms.is_none());
+        assert!(snap.signal_oldest_lag_ms.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Prometheus rendering
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn render_prometheus_empty_prefix() {
+        let snap = MetricsSnapshot::default();
+        let rendered = snap.render_prometheus("");
+        // Without prefix, metric names should not start with _.
+        assert!(rendered.contains("uptime_seconds"));
+        assert!(rendered.contains("observed_panes"));
+        assert!(!rendered.contains("__uptime_seconds"));
+    }
+
+    #[test]
+    fn render_prometheus_with_prefix() {
+        let snap = MetricsSnapshot::default();
+        let rendered = snap.render_prometheus("ft");
+        assert!(rendered.contains("ft_uptime_seconds"));
+        assert!(rendered.contains("ft_segments_persisted_total"));
+        assert!(rendered.contains("ft_ingest_lag_avg_ms"));
+    }
+
+    #[test]
+    fn render_prometheus_sanitizes_prefix() {
+        let snap = MetricsSnapshot::default();
+        // Special chars in prefix should be replaced with _.
+        let rendered = snap.render_prometheus("my-app.v2");
+        assert!(rendered.contains("my_app_v2_uptime_seconds"));
+    }
+
+    #[test]
+    fn render_prometheus_db_write_age_none_renders_minus_one() {
+        let snap = MetricsSnapshot {
+            db_last_write_age_ms: None,
+            ..MetricsSnapshot::default()
+        };
+        let rendered = snap.render_prometheus("t");
+        assert!(rendered.contains("t_db_last_write_age_ms -1"));
+    }
+
+    #[test]
+    fn render_prometheus_db_write_age_some_renders_value() {
+        let snap = MetricsSnapshot {
+            db_last_write_age_ms: Some(42),
+            ..MetricsSnapshot::default()
+        };
+        let rendered = snap.render_prometheus("t");
+        assert!(rendered.contains("t_db_last_write_age_ms 42"));
+    }
+
+    #[test]
+    fn render_prometheus_with_nonzero_values() {
+        let snap = MetricsSnapshot {
+            uptime_seconds: 123.456,
+            observed_panes: 5,
+            capture_queue_depth: 10,
+            capture_queue_capacity: 100,
+            segments_persisted: 999,
+            events_recorded: 1234,
+            ingest_lag_avg_ms: 2.5,
+            ingest_lag_max_ms: 8,
+            ..MetricsSnapshot::default()
+        };
+        let rendered = snap.render_prometheus("ft");
+        assert!(rendered.contains("ft_uptime_seconds 123.456"));
+        assert!(rendered.contains("ft_observed_panes 5"));
+        assert!(rendered.contains("ft_capture_queue_depth 10"));
+        assert!(rendered.contains("ft_segments_persisted_total 999"));
+        assert!(rendered.contains("ft_events_recorded_total 1234"));
+    }
+
+    #[test]
+    fn render_prometheus_includes_help_and_type_lines() {
+        let snap = MetricsSnapshot::default();
+        let rendered = snap.render_prometheus("x");
+        // Each metric should have HELP and TYPE lines.
+        assert!(rendered.contains("# HELP x_uptime_seconds"));
+        assert!(rendered.contains("# TYPE x_uptime_seconds gauge"));
+        assert!(rendered.contains("# HELP x_segments_persisted_total"));
+        assert!(rendered.contains("# TYPE x_segments_persisted_total counter"));
+    }
+
+    #[test]
+    fn render_prometheus_includes_event_bus_when_present() {
+        let snap = MetricsSnapshot {
+            event_bus: Some(EventBusSnapshot {
+                events_published: 100,
+                events_dropped_no_subscribers: 5,
+                active_subscribers: 3,
+                subscriber_lag_events: 2,
+                capacity: 1024,
+                delta_queued: 10,
+                detection_queued: 20,
+                signal_queued: 30,
+                delta_subscribers: 1,
+                detection_subscribers: 1,
+                signal_subscribers: 1,
+                delta_oldest_lag_ms: Some(50),
+                detection_oldest_lag_ms: None,
+                signal_oldest_lag_ms: Some(75),
+            }),
+            ..MetricsSnapshot::default()
+        };
+        let rendered = snap.render_prometheus("ft");
+        assert!(rendered.contains("ft_event_bus_events_published_total 100"));
+        assert!(rendered.contains("ft_event_bus_events_dropped_total 5"));
+        assert!(rendered.contains("ft_event_bus_active_subscribers 3"));
+        assert!(rendered.contains("ft_event_bus_capacity 1024"));
+        assert!(rendered.contains("ft_event_bus_delta_queued 10"));
+        assert!(rendered.contains("ft_event_bus_delta_oldest_lag_ms 50"));
+        // None → -1
+        assert!(rendered.contains("ft_event_bus_detection_oldest_lag_ms -1"));
+        assert!(rendered.contains("ft_event_bus_signal_oldest_lag_ms 75"));
+    }
+
+    #[test]
+    fn render_prometheus_excludes_event_bus_when_absent() {
+        let snap = MetricsSnapshot {
+            event_bus: None,
+            ..MetricsSnapshot::default()
+        };
+        let rendered = snap.render_prometheus("ft");
+        assert!(!rendered.contains("event_bus_events_published"));
+        assert!(!rendered.contains("event_bus_capacity"));
+    }
+
+    #[test]
+    fn render_prometheus_native_output_metrics() {
+        let snap = MetricsSnapshot {
+            native_output_input_events: 500,
+            native_output_batches_emitted: 100,
+            native_output_input_bytes: 50_000,
+            native_output_emitted_bytes: 48_000,
+            native_output_max_batch_events: 10,
+            native_output_max_batch_bytes: 8192,
+            native_output_coalesce_ratio: 5.0,
+            ..MetricsSnapshot::default()
+        };
+        let rendered = snap.render_prometheus("ft");
+        assert!(rendered.contains("ft_native_output_input_events_total 500"));
+        assert!(rendered.contains("ft_native_output_batches_emitted_total 100"));
+        assert!(rendered.contains("ft_native_output_coalesce_ratio 5"));
+    }
+
+    // -----------------------------------------------------------------------
+    // format_float edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn format_float_nan_renders_zero() {
+        assert_eq!(format_float(f64::NAN), "0");
+    }
+
+    #[test]
+    fn format_float_infinity_renders_zero() {
+        assert_eq!(format_float(f64::INFINITY), "0");
+        assert_eq!(format_float(f64::NEG_INFINITY), "0");
+    }
+
+    #[test]
+    fn format_float_normal_renders_value() {
+        assert_eq!(format_float(3.14), "3.14");
+        assert_eq!(format_float(0.0), "0");
+    }
+
+    // -----------------------------------------------------------------------
+    // sanitize_prefix
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sanitize_prefix_alphanumeric_passes_through() {
+        assert_eq!(sanitize_prefix("abc_123"), "abc_123");
+    }
+
+    #[test]
+    fn sanitize_prefix_special_chars_replaced() {
+        assert_eq!(sanitize_prefix("my-app.v2"), "my_app_v2");
+        assert_eq!(sanitize_prefix("a/b\\c"), "a_b_c");
+    }
+
+    #[test]
+    fn sanitize_prefix_empty_stays_empty() {
+        assert_eq!(sanitize_prefix(""), "");
+    }
+
+    // -----------------------------------------------------------------------
+    // is_localhost_bind
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn localhost_detection_comprehensive() {
+        // Should be localhost.
+        assert!(is_localhost_bind("127.0.0.1:9090"));
+        assert!(is_localhost_bind("localhost:9090"));
+        assert!(is_localhost_bind("[::1]:9090"));
+        // When parsed as SocketAddr, ::1 is loopback.
+        assert!(is_localhost_bind("[::1]:8080"));
+
+        // Should NOT be localhost.
+        assert!(!is_localhost_bind("0.0.0.0:9090"));
+        assert!(!is_localhost_bind("192.168.1.1:9090"));
+        assert!(!is_localhost_bind("example.com:9090"));
+    }
+
+    // -----------------------------------------------------------------------
+    // metric_name
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn metric_name_with_prefix() {
+        assert_eq!(metric_name("ft", "uptime"), "ft_uptime");
+    }
+
+    #[test]
+    fn metric_name_without_prefix() {
+        assert_eq!(metric_name("", "uptime"), "uptime");
+    }
+
+    // -----------------------------------------------------------------------
+    // FixedMetricsCollector
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn fixed_metrics_collector_is_clone() {
+        let snap = MetricsSnapshot::default();
+        let collector = FixedMetricsCollector::new(snap);
+        let _cloned = collector.clone();
+    }
+}
+
 #[cfg(all(test, feature = "metrics"))]
 mod tests {
     use super::*;

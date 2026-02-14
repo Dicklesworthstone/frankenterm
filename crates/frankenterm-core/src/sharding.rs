@@ -1053,6 +1053,299 @@ mod tests {
         assert_eq!(shard1.pane_count().await, 1);
     }
 
+    // -----------------------------------------------------------------------
+    // Encode / decode edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn encode_decode_shard_zero_local_zero() {
+        let encoded = encode_sharded_pane_id(ShardId(0), 0);
+        assert_eq!(encoded, 0);
+        let (s, l) = decode_sharded_pane_id(encoded);
+        assert_eq!(s, ShardId(0));
+        assert_eq!(l, 0);
+    }
+
+    #[test]
+    fn encode_decode_max_shard() {
+        let max_shard = (1usize << SHARD_ID_BITS) - 1;
+        let shard = ShardId(max_shard);
+        let local = 42_u64;
+        let encoded = encode_sharded_pane_id(shard, local);
+        let (s, l) = decode_sharded_pane_id(encoded);
+        assert_eq!(s, shard);
+        assert_eq!(l, local);
+    }
+
+    #[test]
+    fn encode_decode_max_local() {
+        let shard = ShardId(1);
+        let encoded = encode_sharded_pane_id(shard, LOCAL_PANE_ID_MASK);
+        let (s, l) = decode_sharded_pane_id(encoded);
+        assert_eq!(s, shard);
+        assert_eq!(l, LOCAL_PANE_ID_MASK);
+    }
+
+    #[test]
+    fn encode_local_overflow_masked() {
+        let shard = ShardId(1);
+        // Pass a value larger than LOCAL_PANE_ID_MASK; high bits should be masked.
+        let big_local = LOCAL_PANE_ID_MASK + 1;
+        let encoded = encode_sharded_pane_id(shard, big_local);
+        let (s, l) = decode_sharded_pane_id(encoded);
+        assert_eq!(s, shard);
+        assert_eq!(l, 0); // Overflow wraps to 0 after mask.
+    }
+
+    // -----------------------------------------------------------------------
+    // is_sharded_pane_id
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn shard_zero_pane_is_not_sharded() {
+        let encoded = encode_sharded_pane_id(ShardId(0), 123);
+        assert!(!is_sharded_pane_id(encoded));
+    }
+
+    #[test]
+    fn nonzero_shard_pane_is_sharded() {
+        let encoded = encode_sharded_pane_id(ShardId(1), 123);
+        assert!(is_sharded_pane_id(encoded));
+    }
+
+    // -----------------------------------------------------------------------
+    // ShardId Display / serde
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn shard_id_display() {
+        assert_eq!(ShardId(0).to_string(), "0");
+        assert_eq!(ShardId(42).to_string(), "42");
+    }
+
+    #[test]
+    fn shard_id_serde_roundtrip() {
+        let id = ShardId(7);
+        let json = serde_json::to_string(&id).unwrap();
+        let back: ShardId = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, id);
+    }
+
+    #[test]
+    fn shard_id_ordering() {
+        assert!(ShardId(0) < ShardId(1));
+        assert!(ShardId(1) < ShardId(100));
+    }
+
+    // -----------------------------------------------------------------------
+    // AssignmentStrategy
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn assignment_strategy_default_is_round_robin() {
+        assert_eq!(
+            AssignmentStrategy::default(),
+            AssignmentStrategy::RoundRobin
+        );
+    }
+
+    #[test]
+    fn assignment_strategy_round_robin_serde() {
+        let s = AssignmentStrategy::RoundRobin;
+        let json = serde_json::to_string(&s).unwrap();
+        let back: AssignmentStrategy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s);
+    }
+
+    #[test]
+    fn assignment_strategy_consistent_hash_serde() {
+        let s = AssignmentStrategy::ConsistentHash { virtual_nodes: 64 };
+        let json = serde_json::to_string(&s).unwrap();
+        let back: AssignmentStrategy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s);
+    }
+
+    #[test]
+    fn assign_empty_shards_returns_shard_zero() {
+        let s = AssignmentStrategy::RoundRobin;
+        let result = assign_pane_with_strategy(&s, &[], 42, None, None);
+        assert_eq!(result, ShardId(0));
+    }
+
+    #[test]
+    fn assign_by_domain_resolves_known_domain() {
+        let shards = vec![ShardId(0), ShardId(1)];
+        let strategy = AssignmentStrategy::ByDomain {
+            domain_to_shard: HashMap::from([("local".to_string(), ShardId(1))]),
+            default_shard: Some(ShardId(0)),
+        };
+        let result = assign_pane_with_strategy(&strategy, &shards, 1, Some("local"), None);
+        assert_eq!(result, ShardId(1));
+    }
+
+    #[test]
+    fn assign_by_domain_unknown_uses_default() {
+        let shards = vec![ShardId(0), ShardId(1)];
+        let strategy = AssignmentStrategy::ByDomain {
+            domain_to_shard: HashMap::new(),
+            default_shard: Some(ShardId(0)),
+        };
+        let result = assign_pane_with_strategy(&strategy, &shards, 1, Some("unknown"), None);
+        assert_eq!(result, ShardId(0));
+    }
+
+    #[test]
+    fn assign_round_robin_deterministic_for_same_pane() {
+        let shards = vec![ShardId(0), ShardId(1), ShardId(2)];
+        let strategy = AssignmentStrategy::RoundRobin;
+        // RoundRobin doesn't use pane_id, so it falls through to deterministic_fallback_shard.
+        let a = assign_pane_with_strategy(&strategy, &shards, 42, None, None);
+        let b = assign_pane_with_strategy(&strategy, &shards, 42, None, None);
+        // Both should be deterministic for same seed.
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn assign_consistent_hash_deterministic() {
+        let shards = vec![ShardId(0), ShardId(1), ShardId(2)];
+        let strategy = AssignmentStrategy::ConsistentHash { virtual_nodes: 128 };
+        let a = assign_pane_with_strategy(&strategy, &shards, 99, None, None);
+        let b = assign_pane_with_strategy(&strategy, &shards, 99, None, None);
+        assert_eq!(a, b);
+        assert!(shards.contains(&a));
+    }
+
+    // -----------------------------------------------------------------------
+    // ShardHealthReport
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn health_report_all_healthy_no_unhealthy() {
+        let report = ShardHealthReport {
+            timestamp_ms: 1000,
+            overall: HealthStatus::Healthy,
+            shards: vec![ShardHealthEntry {
+                shard_id: ShardId(0),
+                label: "s0".to_string(),
+                status: HealthStatus::Healthy,
+                pane_count: Some(3),
+                circuit: CircuitBreakerStatus::default(),
+                error: None,
+            }],
+        };
+        assert!(report.unhealthy_shards().is_empty());
+        assert!(report.watchdog_warnings().is_empty());
+    }
+
+    #[test]
+    fn health_report_mixed_healthy_and_degraded() {
+        let report = ShardHealthReport {
+            timestamp_ms: 1000,
+            overall: HealthStatus::Degraded,
+            shards: vec![
+                ShardHealthEntry {
+                    shard_id: ShardId(0),
+                    label: "s0".to_string(),
+                    status: HealthStatus::Healthy,
+                    pane_count: Some(3),
+                    circuit: CircuitBreakerStatus::default(),
+                    error: None,
+                },
+                ShardHealthEntry {
+                    shard_id: ShardId(1),
+                    label: "s1".to_string(),
+                    status: HealthStatus::Degraded,
+                    pane_count: None,
+                    circuit: CircuitBreakerStatus::default(),
+                    error: Some("timeout".to_string()),
+                },
+            ],
+        };
+        let unhealthy = report.unhealthy_shards();
+        assert_eq!(unhealthy.len(), 1);
+        assert_eq!(unhealthy[0].shard_id, ShardId(1));
+
+        let warnings = report.watchdog_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("Shard 1 (s1)"));
+        assert!(warnings[0].contains("timeout"));
+    }
+
+    #[test]
+    fn health_report_serde_roundtrip() {
+        let report = ShardHealthReport {
+            timestamp_ms: 1234,
+            overall: HealthStatus::Healthy,
+            shards: vec![],
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        let back: ShardHealthReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.timestamp_ms, 1234);
+        assert_eq!(back.overall, HealthStatus::Healthy);
+    }
+
+    // -----------------------------------------------------------------------
+    // infer_agent_type
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn infer_agent_type_from_pane_title() {
+        use crate::wezterm::PaneInfo;
+
+        fn pane_with_title(title: &str) -> PaneInfo {
+            serde_json::from_value(serde_json::json!({
+                "pane_id": 0,
+                "tab_id": 0,
+                "window_id": 0,
+                "title": title,
+            }))
+            .unwrap()
+        }
+
+        assert_eq!(
+            infer_agent_type(&pane_with_title("codex-session-1")),
+            AgentType::Codex
+        );
+        assert_eq!(
+            infer_agent_type(&pane_with_title("claude-code-dev")),
+            AgentType::ClaudeCode
+        );
+        assert_eq!(
+            infer_agent_type(&pane_with_title("gemini-worker")),
+            AgentType::Gemini
+        );
+        assert_eq!(
+            infer_agent_type(&pane_with_title("bash shell")),
+            AgentType::Unknown
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // circuit_state_rank
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn circuit_state_rank_ordering() {
+        assert!(
+            circuit_state_rank(CircuitStateKind::Closed)
+                < circuit_state_rank(CircuitStateKind::HalfOpen)
+        );
+        assert!(
+            circuit_state_rank(CircuitStateKind::HalfOpen)
+                < circuit_state_rank(CircuitStateKind::Open)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // normalize_domain
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn normalize_domain_lowercases_and_trims() {
+        assert_eq!(normalize_domain("  LOCAL  "), "local");
+        assert_eq!(normalize_domain("SSH:Prod"), "ssh:prod");
+    }
+
     #[tokio::test]
     async fn shard_health_report_marks_failed_shard_hung() {
         let healthy = Arc::new(MockWezterm::new());
