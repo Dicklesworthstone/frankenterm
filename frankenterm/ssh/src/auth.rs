@@ -158,6 +158,30 @@ mod tests {
         assert!(event.username.is_empty());
         assert!(event.instructions.is_empty());
     }
+
+    #[test]
+    fn authentication_event_try_answer_empty_vec() {
+        let (tx, rx) = bounded(1);
+        let event = AuthenticationEvent {
+            username: "user".to_string(),
+            instructions: "".to_string(),
+            prompts: vec![],
+            reply: tx,
+        };
+        event.try_answer(vec![]).unwrap();
+        let result = smol::block_on(rx.recv()).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn authentication_prompt_empty_string() {
+        let prompt = AuthenticationPrompt {
+            prompt: "".to_string(),
+            echo: false,
+        };
+        assert!(prompt.prompt.is_empty());
+        assert!(!prompt.echo);
+    }
 }
 
 impl crate::sessioninner::SessionInner {

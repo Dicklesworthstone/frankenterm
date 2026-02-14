@@ -130,6 +130,54 @@ mod tests {
             assert!(result);
         });
     }
+
+    #[test]
+    fn host_verification_failed_source_is_none() {
+        let err = HostVerificationFailed {
+            remote_address: "host:22".to_string(),
+            key: "fp".to_string(),
+            file: None,
+        };
+        let error: &dyn std::error::Error = &err;
+        assert!(error.source().is_none());
+    }
+
+    #[test]
+    fn host_verification_failed_with_path() {
+        let err = HostVerificationFailed {
+            remote_address: "server.example.com:22".to_string(),
+            key: "SHA256:abcdef1234567890".to_string(),
+            file: Some(std::path::PathBuf::from("/very/long/path/to/.ssh/known_hosts")),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("server.example.com:22"));
+        assert!(msg.contains("SHA256:abcdef1234567890"));
+        assert!(msg.contains("/very/long/path/to/.ssh/known_hosts"));
+    }
+
+    #[test]
+    fn host_verification_event_message_accessible() {
+        let (tx, _rx) = smol::channel::bounded(1);
+        let event = HostVerificationEvent {
+            message: "Do you trust this host?".to_string(),
+            reply: tx,
+        };
+        assert_eq!(event.message, "Do you trust this host?");
+    }
+
+    #[test]
+    fn host_verification_event_async_reject() {
+        let (tx, rx) = smol::channel::bounded(1);
+        let event = HostVerificationEvent {
+            message: "Trust?".to_string(),
+            reply: tx,
+        };
+        smol::block_on(async {
+            event.answer(false).await.unwrap();
+            let result = rx.recv().await.unwrap();
+            assert!(!result);
+        });
+    }
 }
 
 impl crate::sessioninner::SessionInner {
