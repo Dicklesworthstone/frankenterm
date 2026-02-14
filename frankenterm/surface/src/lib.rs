@@ -17,6 +17,7 @@
 )]
 use crate::line::CellRef;
 use alloc::borrow::Cow;
+use alloc::collections::BTreeSet;
 use core::cmp::min;
 use finl_unicode::grapheme_clusters::Graphemes;
 use frankenterm_cell::color::ColorAttribute;
@@ -104,6 +105,25 @@ impl CursorShape {
 /// The sequence is only meaningful within a given `Surface` instance.
 pub type SequenceNo = usize;
 pub const SEQ_ZERO: SequenceNo = 0;
+
+/// A rectangular dirty region in surface cell coordinates.
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub struct DirtyRect {
+    pub x: usize,
+    pub y: usize,
+    pub width: usize,
+    pub height: usize,
+}
+
+impl DirtyRect {
+    #[inline]
+    fn can_vertical_merge(&self, row: usize, span: &core::ops::Range<usize>) -> bool {
+        self.x == span.start
+            && self.width == span.end.saturating_sub(span.start)
+            && self.y.saturating_add(self.height) == row
+    }
+}
 
 /// The `Surface` type represents the contents of a terminal screen.
 /// It is not directly connected to a terminal device.
@@ -797,6 +817,131 @@ impl Surface {
         diff_state.changes
     }
 
+    /// Compute dirty rectangles for the specified region, comparing `self`
+    /// against `other` without materializing a textual change stream.
+    ///
+    /// Rectangles are coalesced vertically when adjacent rows dirty the same
+    /// horizontal span, producing larger upload-friendly regions.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dirty_rects_region(
+        &self,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+        other: &Surface,
+        other_x: usize,
+        other_y: usize,
+    ) -> Vec<DirtyRect> {
+        let mut rects = Vec::new();
+
+        for ((row_num, line), other_line) in self
+            .lines
+            .iter()
+            .enumerate()
+            .skip(y)
+            .take_while(|(row_num, _)| *row_num < y + height)
+            .zip(other.lines.iter().skip(other_y))
+        {
+            let spans = diff_line_spans(line, other_line, x, width, other_x);
+            for span in spans {
+                if let Some(last) = rects.last_mut() {
+                    if last.can_vertical_merge(row_num, &span) {
+                        last.height = last.height.saturating_add(1);
+                        continue;
+                    }
+                }
+                rects.push(DirtyRect {
+                    x: span.start,
+                    y: row_num,
+                    width: span.end.saturating_sub(span.start),
+                    height: 1,
+                });
+            }
+        }
+
+        rects
+    }
+
+    /// Compute full-surface dirty rectangles between `self` and `other`.
+    pub fn dirty_rects(&self, other: &Surface) -> Vec<DirtyRect> {
+        self.dirty_rects_region(0, 0, self.width, self.height, other, 0, 0)
+    }
+
+    /// Compute tile-aligned dirty regions for a target tile grid.
+    ///
+    /// This is intended as a staging primitive for partial GPU uploads.
+    /// A zero `tile_width` or `tile_height` returns an empty result.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dirty_tiles_region(
+        &self,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+        other: &Surface,
+        other_x: usize,
+        other_y: usize,
+        tile_width: usize,
+        tile_height: usize,
+    ) -> Vec<DirtyRect> {
+        if tile_width == 0 || tile_height == 0 {
+            return Vec::new();
+        }
+
+        let mut touched_tiles = BTreeSet::new();
+        for rect in self.dirty_rects_region(x, y, width, height, other, other_x, other_y) {
+            if rect.width == 0 || rect.height == 0 {
+                continue;
+            }
+            let start_tx = rect.x / tile_width;
+            let end_tx = (rect.x + rect.width - 1) / tile_width;
+            let start_ty = rect.y / tile_height;
+            let end_ty = (rect.y + rect.height - 1) / tile_height;
+            for ty in start_ty..=end_ty {
+                for tx in start_tx..=end_tx {
+                    touched_tiles.insert((tx, ty));
+                }
+            }
+        }
+
+        let mut tiles = Vec::with_capacity(touched_tiles.len());
+        for (tx, ty) in touched_tiles {
+            let tile_x = tx * tile_width;
+            let tile_y = ty * tile_height;
+            if tile_x >= self.width || tile_y >= self.height {
+                continue;
+            }
+            tiles.push(DirtyRect {
+                x: tile_x,
+                y: tile_y,
+                width: min(tile_width, self.width - tile_x),
+                height: min(tile_height, self.height - tile_y),
+            });
+        }
+        tiles
+    }
+
+    /// Compute full-surface tile-aligned dirty regions between `self` and `other`.
+    pub fn dirty_tiles(
+        &self,
+        other: &Surface,
+        tile_width: usize,
+        tile_height: usize,
+    ) -> Vec<DirtyRect> {
+        self.dirty_tiles_region(
+            0,
+            0,
+            self.width,
+            self.height,
+            other,
+            0,
+            0,
+            tile_width,
+            tile_height,
+        )
+    }
+
     pub fn diff_lines(&self, other_lines: Vec<&Line>) -> Vec<Change> {
         let mut diff_state = DiffState::default();
         for ((row_num, line), other_line) in self.lines.iter().enumerate().zip(other_lines.iter()) {
@@ -908,6 +1053,64 @@ fn diff_line(
             diff_state.set_cell(x + rel_x, row_num, other_cell);
         }
     }
+}
+
+/// Compute horizontal dirty spans for one line diff.
+fn diff_line_spans(
+    line: &Line,
+    other_line: &Line,
+    x: usize,
+    width: usize,
+    other_x: usize,
+) -> Vec<core::ops::Range<usize>> {
+    let mut cells = line
+        .visible_cells()
+        .skip_while(|cell| cell.cell_index() < x)
+        .take_while(|cell| cell.cell_index() < x + width)
+        .peekable();
+    let other_cells = other_line
+        .visible_cells()
+        .skip_while(|cell| cell.cell_index() < other_x)
+        .take_while(|cell| cell.cell_index() < other_x + width);
+
+    let mut spans = Vec::new();
+
+    for other_cell in other_cells {
+        let rel_x = other_cell.cell_index() - other_x;
+        let mut comparison_cell = None;
+
+        while let Some(cell) = cells.peek() {
+            let cell_rel_x = cell.cell_index() - x;
+            if cell_rel_x == rel_x {
+                comparison_cell = Some(*cell);
+                break;
+            } else if cell_rel_x > rel_x {
+                break;
+            }
+            cells.next();
+        }
+
+        let changed = match comparison_cell {
+            Some(comparison_cell) => !comparison_cell.same_contents(&other_cell),
+            None => true,
+        };
+
+        if changed {
+            let start = x + rel_x;
+            let end = min(start + other_cell.width().max(1), x + width);
+            if end > start {
+                if let Some(last) = spans.last_mut() {
+                    if start <= last.end {
+                        last.end = last.end.max(end);
+                        continue;
+                    }
+                }
+                spans.push(start..end);
+            }
+        }
+    }
+
+    spans
 }
 
 /// Applies a Position update to either the x or y position.
@@ -1486,6 +1689,100 @@ mod test {
                 changes
             );
         }
+    }
+
+    #[test]
+    fn dirty_rects_identical_surfaces_empty() {
+        let left = Surface::new(6, 4);
+        let right = Surface::new(6, 4);
+        assert!(left.dirty_rects(&right).is_empty());
+    }
+
+    #[test]
+    fn dirty_rects_merge_adjacent_cells_same_row() {
+        let left = Surface::new(8, 4);
+        let mut right = Surface::new(8, 4);
+        right.add_change(Change::CursorPosition {
+            x: Position::Absolute(2),
+            y: Position::Absolute(1),
+        });
+        right.add_change("abc");
+
+        assert_eq!(
+            left.dirty_rects(&right),
+            vec![DirtyRect {
+                x: 2,
+                y: 1,
+                width: 3,
+                height: 1
+            }]
+        );
+    }
+
+    #[test]
+    fn dirty_rects_merge_vertical_when_span_matches() {
+        let left = Surface::new(8, 5);
+        let mut right = Surface::new(8, 5);
+        for y in 1..=2 {
+            right.add_change(Change::CursorPosition {
+                x: Position::Absolute(3),
+                y: Position::Absolute(y),
+            });
+            right.add_change("ab");
+        }
+
+        assert_eq!(
+            left.dirty_rects(&right),
+            vec![DirtyRect {
+                x: 3,
+                y: 1,
+                width: 2,
+                height: 2
+            }]
+        );
+    }
+
+    #[test]
+    fn dirty_tiles_dedup_and_clip_edges() {
+        let left = Surface::new(10, 6);
+        let mut right = Surface::new(10, 6);
+
+        right.add_change(Change::CursorPosition {
+            x: Position::Absolute(1),
+            y: Position::Absolute(1),
+        });
+        right.add_change("ab");
+        right.add_change(Change::CursorPosition {
+            x: Position::Absolute(8),
+            y: Position::Absolute(4),
+        });
+        right.add_change("z");
+
+        assert_eq!(
+            left.dirty_tiles(&right, 4, 3),
+            vec![
+                DirtyRect {
+                    x: 0,
+                    y: 0,
+                    width: 4,
+                    height: 3,
+                },
+                DirtyRect {
+                    x: 8,
+                    y: 3,
+                    width: 2,
+                    height: 3,
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn dirty_tiles_zero_sized_tile_returns_empty() {
+        let left = Surface::new(4, 4);
+        let right = Surface::new(4, 4);
+        assert!(left.dirty_tiles(&right, 0, 4).is_empty());
+        assert!(left.dirty_tiles(&right, 4, 0).is_empty());
     }
 
     #[test]

@@ -58,6 +58,8 @@ pub struct Screen {
     last_resize_wrap_scorecard: Option<ResizeWrapScorecard>,
     last_resize_wrap_gate_payload: Option<String>,
     cursor_consistency_telemetry: CursorConsistencyTelemetry,
+    last_good_frame: Option<LastGoodFrame>,
+    last_good_frame_lifecycle: LastGoodFrameLifecycle,
 }
 
 const MAX_WRAP_CACHE_ENTRIES: usize = 6;
@@ -65,6 +67,48 @@ const MAX_REFLOW_BATCH_LOGICAL_LINES: usize = 64;
 const REFLOW_OVERSCAN_ROW_MULTIPLIER: usize = 1;
 const REFLOW_OVERSCAN_ROW_CAP: usize = 256;
 const COLD_SCROLLBACK_BACKLOG_DEPTH_CAP: usize = 1_048_576;
+const LAST_GOOD_FRAME_MAX_BYTES_MULTIPLIER: usize = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LastGoodFrameTransition {
+    ResizeBegin,
+    ResizeCommit,
+    ContentMutation,
+    ScrollbackErase,
+}
+
+impl LastGoodFrameTransition {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ResizeBegin => "resize_begin",
+            Self::ResizeCommit => "resize_commit",
+            Self::ContentMutation => "content_mutation",
+            Self::ScrollbackErase => "scrollback_erase",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LastGoodFrame {
+    visible_lines: Vec<Line>,
+    cols: usize,
+    rows: usize,
+    layout_signature: u64,
+    captured_seqno: SequenceNo,
+    estimated_bytes: usize,
+    lineage_id: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct LastGoodFrameLifecycle {
+    capture_count: u64,
+    invalidation_count: u64,
+    drop_over_budget_count: u64,
+    current_retained_bytes: usize,
+    peak_retained_bytes: usize,
+    last_budget_bytes: usize,
+    last_lineage_id: u64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ResizeReadabilityGatePolicy {
@@ -532,6 +576,8 @@ impl Screen {
             last_resize_wrap_scorecard: None,
             last_resize_wrap_gate_payload: None,
             cursor_consistency_telemetry: CursorConsistencyTelemetry::default(),
+            last_good_frame: None,
+            last_good_frame_lifecycle: LastGoodFrameLifecycle::default(),
         }
     }
 
@@ -556,6 +602,141 @@ impl Screen {
 
     fn scrollback_size(&self) -> usize {
         scrollback_size(&self.config, self.allow_scrollback)
+    }
+
+    fn visible_frame_snapshot(&self) -> Vec<Line> {
+        let start = self.lines.len().saturating_sub(self.physical_rows);
+        self.lines.iter().skip(start).take(self.physical_rows).cloned().collect()
+    }
+
+    fn estimate_frame_bytes(lines: &[Line]) -> usize {
+        lines
+            .iter()
+            .map(|line| {
+                line.len()
+                    .saturating_mul(std::mem::size_of::<Cell>())
+                    .max(std::mem::size_of::<Line>())
+            })
+            .sum()
+    }
+
+    fn retained_frame_byte_budget(&self) -> usize {
+        self.physical_rows
+            .saturating_mul(self.physical_cols.max(1))
+            .saturating_mul(std::mem::size_of::<Cell>())
+            .saturating_mul(LAST_GOOD_FRAME_MAX_BYTES_MULTIPLIER.max(1))
+    }
+
+    fn invalidate_last_good_frame(
+        &mut self,
+        transition: LastGoodFrameTransition,
+        seqno: Option<SequenceNo>,
+    ) {
+        if let Some(prior) = self.last_good_frame.take() {
+            self.last_good_frame_lifecycle.invalidation_count = self
+                .last_good_frame_lifecycle
+                .invalidation_count
+                .saturating_add(1);
+            self.last_good_frame_lifecycle.current_retained_bytes = 0;
+            let lineage_id = self
+                .last_good_frame_lifecycle
+                .last_lineage_id
+                .saturating_add(1);
+            self.last_good_frame_lifecycle.last_lineage_id = lineage_id;
+            debug!(
+                "last_good_frame_lineage id={} transition={} action=invalidate seqno={:?} prior_lineage_id={} prior_seqno={} prior_dims={}x{} prior_signature={} prior_bytes={} prior_lines={}",
+                lineage_id,
+                transition.as_str(),
+                seqno,
+                prior.lineage_id,
+                prior.captured_seqno,
+                prior.cols,
+                prior.rows,
+                prior.layout_signature,
+                prior.estimated_bytes,
+                prior.visible_lines.len()
+            );
+        }
+    }
+
+    fn retain_last_good_frame(&mut self, seqno: SequenceNo, transition: LastGoodFrameTransition) {
+        let visible_lines = self.visible_frame_snapshot();
+        let estimated_bytes = Self::estimate_frame_bytes(&visible_lines);
+        let budget_bytes = self.retained_frame_byte_budget();
+        self.last_good_frame_lifecycle.last_budget_bytes = budget_bytes;
+
+        if estimated_bytes > budget_bytes {
+            self.last_good_frame_lifecycle.drop_over_budget_count = self
+                .last_good_frame_lifecycle
+                .drop_over_budget_count
+                .saturating_add(1);
+            self.invalidate_last_good_frame(transition, Some(seqno));
+            debug!(
+                "last_good_frame_lineage id={} transition={} action=drop_over_budget seqno={} estimated_bytes={} budget_bytes={}",
+                self.last_good_frame_lifecycle.last_lineage_id,
+                transition.as_str(),
+                seqno,
+                estimated_bytes,
+                budget_bytes
+            );
+            return;
+        }
+
+        let layout_signature = Self::compute_layout_signature_for_lines(visible_lines.iter());
+        let prior_dims = self
+            .last_good_frame
+            .as_ref()
+            .map(|frame| format!("{}x{}", frame.cols, frame.rows))
+            .unwrap_or_else(|| "none".to_string());
+        let prior_signature = self
+            .last_good_frame
+            .as_ref()
+            .map(|frame| frame.layout_signature.to_string())
+            .unwrap_or_else(|| "none".to_string());
+        let action = if self.last_good_frame.is_some() {
+            "replace"
+        } else {
+            "retain"
+        };
+
+        self.last_good_frame_lifecycle.capture_count = self
+            .last_good_frame_lifecycle
+            .capture_count
+            .saturating_add(1);
+        self.last_good_frame_lifecycle.current_retained_bytes = estimated_bytes;
+        self.last_good_frame_lifecycle.peak_retained_bytes = self
+            .last_good_frame_lifecycle
+            .peak_retained_bytes
+            .max(estimated_bytes);
+        let lineage_id = self
+            .last_good_frame_lifecycle
+            .last_lineage_id
+            .saturating_add(1);
+        self.last_good_frame_lifecycle.last_lineage_id = lineage_id;
+        self.last_good_frame = Some(LastGoodFrame {
+            visible_lines,
+            cols: self.physical_cols,
+            rows: self.physical_rows,
+            layout_signature,
+            captured_seqno: seqno,
+            estimated_bytes,
+            lineage_id,
+        });
+
+        debug!(
+            "last_good_frame_lineage id={} transition={} action={} seqno={} dims={}x{} signature={} bytes={} budget_bytes={} prior_dims={} prior_signature={}",
+            lineage_id,
+            transition.as_str(),
+            action,
+            seqno,
+            self.physical_cols,
+            self.physical_rows,
+            layout_signature,
+            estimated_bytes,
+            budget_bytes,
+            prior_dims,
+            prior_signature
+        );
     }
 
     fn mark_visible_lines_dirty(&mut self, seqno: SequenceNo) {
@@ -1284,6 +1465,7 @@ impl Screen {
             "resize screen to {physical_cols}x{physical_rows} dpi={}",
             size.dpi
         );
+        self.retain_last_good_frame(seqno, LastGoodFrameTransition::ResizeBegin);
         let dpi_changed = self.dpi != size.dpi;
         self.dpi = size.dpi;
         if dpi_changed {
@@ -1403,6 +1585,7 @@ impl Screen {
 
         self.physical_rows = physical_rows;
         self.physical_cols = physical_cols;
+        self.retain_last_good_frame(seqno, LastGoodFrameTransition::ResizeCommit);
         CursorPosition {
             x: cursor_x,
             y: new_cursor_y,
@@ -1459,6 +1642,7 @@ impl Screen {
         right_margin: usize,
         seqno: SequenceNo,
     ) {
+        self.invalidate_last_good_frame(LastGoodFrameTransition::ContentMutation, Some(seqno));
         let phys_cols = self.physical_cols;
 
         let line_idx = self.phys_row(y);
@@ -1480,6 +1664,7 @@ impl Screen {
         seqno: SequenceNo,
         blank_attr: CellAttributes,
     ) {
+        self.invalidate_last_good_frame(LastGoodFrameTransition::ContentMutation, Some(seqno));
         let line_idx = self.phys_row(y);
         let line = self.line_mut(line_idx);
         line.erase_cell_with_margin(x, right_margin, seqno, blank_attr);
@@ -1488,6 +1673,7 @@ impl Screen {
     /// Set a cell.  the x and y coordinates are relative to the visible screeen
     /// origin.  0,0 is the top left.
     pub fn set_cell(&mut self, x: usize, y: VisibleRowIndex, cell: &Cell, seqno: SequenceNo) {
+        self.invalidate_last_good_frame(LastGoodFrameTransition::ContentMutation, Some(seqno));
         let line_idx = self.phys_row(y);
         //debug!("set_cell x={} y={} phys={} {:?}", x, y, line_idx, cell);
 
@@ -1504,6 +1690,7 @@ impl Screen {
         attr: CellAttributes,
         seqno: SequenceNo,
     ) {
+        self.invalidate_last_good_frame(LastGoodFrameTransition::ContentMutation, Some(seqno));
         let line_idx = self.phys_row(y);
         let line = self.line_mut(line_idx);
         line.set_cell_grapheme(x, text, width, attr, seqno);
@@ -1529,6 +1716,7 @@ impl Screen {
         seqno: SequenceNo,
         bidi_mode: BidiMode,
     ) {
+        self.invalidate_last_good_frame(LastGoodFrameTransition::ContentMutation, Some(seqno));
         let line_idx = self.phys_row(y);
         let line = self.line_mut(line_idx);
         if cols.start == 0 {
@@ -1641,6 +1829,7 @@ impl Screen {
         blank_attr: CellAttributes,
         bidi_mode: BidiMode,
     ) {
+        self.invalidate_last_good_frame(LastGoodFrameTransition::ContentMutation, Some(seqno));
         log::debug!(
             "scroll_up_within_margins region:{:?} margins:{:?} rows={}",
             scroll_region,
@@ -1737,6 +1926,7 @@ impl Screen {
         blank_attr: CellAttributes,
         bidi_mode: BidiMode,
     ) {
+        self.invalidate_last_good_frame(LastGoodFrameTransition::ContentMutation, Some(seqno));
         let phys_scroll = self.phys_range(scroll_region);
         let num_rows = num_rows.min(phys_scroll.end - phys_scroll.start);
         let scrollback_ok = scroll_region.start == 0 && self.allow_scrollback;
@@ -1847,6 +2037,7 @@ impl Screen {
     }
 
     pub fn erase_scrollback(&mut self) {
+        self.invalidate_last_good_frame(LastGoodFrameTransition::ScrollbackErase, None);
         let len = self.lines.len();
         let to_clear = len - self.physical_rows;
         for _ in 0..to_clear {
@@ -1877,6 +2068,7 @@ impl Screen {
         blank_attr: CellAttributes,
         bidi_mode: BidiMode,
     ) {
+        self.invalidate_last_good_frame(LastGoodFrameTransition::ContentMutation, Some(seqno));
         debug!("scroll_down {:?} {}", scroll_region, num_rows);
         let phys_scroll = self.phys_range(scroll_region);
         let num_rows = num_rows.min(phys_scroll.end - phys_scroll.start);
@@ -1918,6 +2110,7 @@ impl Screen {
         blank_attr: CellAttributes,
         bidi_mode: BidiMode,
     ) {
+        self.invalidate_last_good_frame(LastGoodFrameTransition::ContentMutation, Some(seqno));
         if left_and_right_margins.start == 0 && left_and_right_margins.end == self.physical_cols {
             return self.scroll_down(scroll_region, num_rows, seqno, blank_attr, bidi_mode);
         }
@@ -2651,6 +2844,87 @@ mod tests {
             worker.peak_backlog_depth(),
             COLD_SCROLLBACK_BACKLOG_DEPTH_CAP
         );
+    }
+
+    #[test]
+    fn last_good_frame_tracks_resize_begin_and_commit_lineage() {
+        let mut screen = test_screen(3, 4, 96);
+        let attrs = CellAttributes::blank();
+        screen.lines = VecDeque::from(vec![
+            Line::from_text("abcd", &attrs, 0, None),
+            Line::from_text("efgh", &attrs, 0, None),
+            Line::from_text("ijkl", &attrs, 0, None),
+        ]);
+
+        let cursor = test_cursor(1, 2, 7);
+        let _ = screen.resize(test_size(3, 3, 96), cursor, 8, false);
+
+        assert_eq!(screen.last_good_frame_lifecycle.capture_count, 2);
+        assert!(
+            screen.last_good_frame_lifecycle.current_retained_bytes > 0,
+            "resize commit should retain a non-empty frame snapshot"
+        );
+        let frame = screen
+            .last_good_frame
+            .as_ref()
+            .expect("resize commit should preserve last-good-frame");
+        assert_eq!(frame.cols, 3);
+        assert_eq!(frame.rows, 3);
+        assert_eq!(frame.captured_seqno, 8);
+        assert_eq!(frame.lineage_id, screen.last_good_frame_lifecycle.last_lineage_id);
+        assert!(
+            frame.estimated_bytes <= screen.last_good_frame_lifecycle.last_budget_bytes,
+            "retained frame must fit within configured byte budget"
+        );
+    }
+
+    #[test]
+    fn last_good_frame_invalidates_on_content_mutation() {
+        let mut screen = test_screen(2, 4, 96);
+        let attrs = CellAttributes::blank();
+        screen.lines = VecDeque::from(vec![
+            Line::from_text("abcd", &attrs, 0, None),
+            Line::from_text("wxyz", &attrs, 0, None),
+        ]);
+
+        let cursor = test_cursor(0, 1, 1);
+        let _ = screen.resize(test_size(2, 3, 96), cursor, 2, false);
+        assert!(
+            screen.last_good_frame.is_some(),
+            "resize should capture a retained frame before mutation"
+        );
+        let prior_invalidations = screen.last_good_frame_lifecycle.invalidation_count;
+
+        screen.set_cell(0, 0, &Cell::new('Z', attrs.clone()), 3);
+
+        assert!(screen.last_good_frame.is_none());
+        assert_eq!(
+            screen.last_good_frame_lifecycle.invalidation_count,
+            prior_invalidations + 1
+        );
+        assert_eq!(screen.last_good_frame_lifecycle.current_retained_bytes, 0);
+    }
+
+    #[test]
+    fn last_good_frame_drops_snapshot_when_budget_exceeded() {
+        let mut screen = test_screen(1, 2, 96);
+        let attrs = CellAttributes::blank();
+        screen.lines = VecDeque::from(vec![Line::from_text(
+            "this line is intentionally oversized relative to viewport budget",
+            &attrs,
+            0,
+            None,
+        )]);
+
+        let estimated = Screen::estimate_frame_bytes(&screen.visible_frame_snapshot());
+        let budget = screen.retained_frame_byte_budget();
+        assert!(estimated > budget);
+
+        screen.retain_last_good_frame(4, LastGoodFrameTransition::ResizeBegin);
+
+        assert!(screen.last_good_frame.is_none());
+        assert_eq!(screen.last_good_frame_lifecycle.drop_over_budget_count, 1);
+        assert_eq!(screen.last_good_frame_lifecycle.current_retained_bytes, 0);
     }
 
     #[test]
