@@ -1142,7 +1142,7 @@ mod tests {
 
     #[test]
     fn command_builder_ne_different_args() {
-        let mut a = CommandBuilder::new("foo");
+        let a = CommandBuilder::new("foo");
         let mut b = CommandBuilder::new("foo");
         b.arg("extra");
         assert_ne!(a, b);
@@ -1206,5 +1206,75 @@ mod tests {
             cmd.get_env("SPECIAL"),
             Some(OsStr::new("foo=bar;baz&qux"))
         );
+    }
+
+    // ── Third-pass expansion ────────────────────────────────────
+
+    #[test]
+    fn from_argv_preserves_order() {
+        let args = vec![
+            OsString::from("prog"),
+            OsString::from("arg1"),
+            OsString::from("arg2"),
+        ];
+        let cmd = CommandBuilder::from_argv(args.clone());
+        assert_eq!(*cmd.get_argv(), args);
+    }
+
+    #[test]
+    fn from_argv_empty_vec_is_default() {
+        let cmd = CommandBuilder::from_argv(vec![]);
+        assert!(cmd.is_default_prog());
+    }
+
+    #[test]
+    fn env_remove_missing_key_is_noop() {
+        let mut cmd = CommandBuilder::new("test");
+        // Should not panic
+        cmd.env_remove("NONEXISTENT_VAR_12345");
+    }
+
+    #[test]
+    fn env_clear_drops_all_vars() {
+        let mut cmd = CommandBuilder::new("test");
+        cmd.env("A", "1");
+        cmd.env("B", "2");
+        cmd.env_clear();
+        assert_eq!(cmd.get_env("A"), None);
+        assert_eq!(cmd.get_env("B"), None);
+    }
+
+    #[test]
+    fn clear_cwd_after_set() {
+        let mut cmd = CommandBuilder::new("test");
+        cmd.cwd("/some/path");
+        assert!(cmd.get_cwd().is_some());
+        cmd.clear_cwd();
+        assert!(cmd.get_cwd().is_none());
+    }
+
+    #[test]
+    fn new_default_prog_flag() {
+        let cmd = CommandBuilder::new_default_prog();
+        assert!(cmd.is_default_prog());
+    }
+
+    #[test]
+    fn new_with_prog_not_default() {
+        let cmd = CommandBuilder::new("test");
+        assert!(!cmd.is_default_prog());
+    }
+
+    #[test]
+    fn args_adds_multiple() {
+        let mut cmd = CommandBuilder::new("prog");
+        cmd.args(["a", "b", "c"]);
+        assert_eq!(cmd.get_argv().len(), 4); // prog + a + b + c
+    }
+
+    #[test]
+    fn controlling_tty_is_true_by_default() {
+        let cmd = CommandBuilder::new("test");
+        assert!(cmd.get_controlling_tty());
     }
 }

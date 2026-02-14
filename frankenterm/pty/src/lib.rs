@@ -734,4 +734,104 @@ mod tests {
         };
         assert_eq!(s, s);
     }
+
+    // ── Third-pass expansion ────────────────────────────────────
+
+    #[test]
+    fn exit_status_with_signal_code_is_1() {
+        let s = ExitStatus::with_signal("SIGKILL");
+        assert_eq!(s.exit_code(), 1);
+    }
+
+    #[test]
+    fn exit_status_with_signal_is_not_success() {
+        let s = ExitStatus::with_signal("SIGTERM");
+        assert!(!s.success());
+    }
+
+    #[test]
+    fn exit_status_signal_name_matches() {
+        let s = ExitStatus::with_signal("SIGUSR1");
+        assert_eq!(s.signal(), Some("SIGUSR1"));
+    }
+
+    #[test]
+    fn exit_status_exit_code_no_signal() {
+        let s = ExitStatus::with_exit_code(42);
+        assert!(s.signal().is_none());
+    }
+
+    #[test]
+    fn exit_status_display_zero_is_success_text() {
+        assert_eq!(format!("{}", ExitStatus::with_exit_code(0)), "Success");
+    }
+
+    #[test]
+    fn exit_status_display_sigint_terminated() {
+        assert_eq!(
+            format!("{}", ExitStatus::with_signal("SIGINT")),
+            "Terminated by SIGINT"
+        );
+    }
+
+    #[test]
+    fn exit_status_clone_preserves_signal_some() {
+        let a = ExitStatus::with_signal("SIGHUP");
+        let b = a.clone();
+        assert_eq!(b.signal(), Some("SIGHUP"));
+        assert!(!b.success());
+    }
+
+    #[test]
+    fn pty_size_default_rows_cols_pixels() {
+        let s = PtySize::default();
+        assert_eq!(s.rows, 24);
+        assert_eq!(s.cols, 80);
+        assert_eq!(s.pixel_width, 0);
+        assert_eq!(s.pixel_height, 0);
+    }
+
+    #[test]
+    fn pty_size_rows_differ_ne() {
+        let a = PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
+        let b = PtySize { rows: 25, cols: 80, pixel_width: 0, pixel_height: 0 };
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn pty_size_cols_differ_ne() {
+        let a = PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
+        let b = PtySize { rows: 24, cols: 120, pixel_width: 0, pixel_height: 0 };
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn pty_size_copy_both_survive() {
+        let a = PtySize { rows: 10, cols: 20, pixel_width: 5, pixel_height: 5 };
+        let b = a; // Copy
+        let c = a; // Still valid
+        assert_eq!(b, c);
+    }
+
+    #[test]
+    fn pty_size_debug_shows_row_col_fields() {
+        let s = PtySize { rows: 1, cols: 2, pixel_width: 3, pixel_height: 4 };
+        let dbg = format!("{s:?}");
+        assert!(dbg.contains("rows: 1"));
+        assert!(dbg.contains("cols: 2"));
+    }
+
+    #[test]
+    fn exit_status_debug_contains_struct_name() {
+        let s = ExitStatus::with_exit_code(0);
+        let dbg = format!("{s:?}");
+        assert!(dbg.contains("ExitStatus"));
+    }
+
+    #[test]
+    fn exit_status_u32_max_code() {
+        let s = ExitStatus::with_exit_code(u32::MAX);
+        assert_eq!(s.exit_code(), u32::MAX);
+        assert!(!s.success());
+    }
 }
