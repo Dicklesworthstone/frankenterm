@@ -20,8 +20,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock, RwLock as StdRwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::sharded_counter::{ShardedCounter, ShardedGauge, ShardedMax};
@@ -276,6 +276,50 @@ impl Default for RuntimeConfig {
 /// Uses sharded atomics (cache-line-padded per-core counters) to eliminate
 /// false sharing and SeqCst contention. Writes distribute across shards;
 /// reads aggregate infrequently.
+static GLOBAL_RUNTIME_LOCK_MEMORY_TELEMETRY: OnceLock<
+    StdRwLock<Option<RuntimeLockMemoryTelemetrySnapshot>>,
+> = OnceLock::new();
+
+/// Machine-readable lock contention and cursor-memory telemetry snapshot.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct RuntimeLockMemoryTelemetrySnapshot {
+    /// Snapshot timestamp in epoch milliseconds.
+    pub timestamp_ms: u64,
+    /// Average storage lock wait in milliseconds.
+    pub avg_storage_lock_wait_ms: f64,
+    /// Maximum storage lock wait in milliseconds.
+    pub max_storage_lock_wait_ms: f64,
+    /// Count of lock acquisitions that crossed contention threshold.
+    pub storage_lock_contention_events: u64,
+    /// Average storage lock hold time in milliseconds.
+    pub avg_storage_lock_hold_ms: f64,
+    /// Maximum storage lock hold time in milliseconds.
+    pub max_storage_lock_hold_ms: f64,
+    /// Last cursor snapshot memory sample in bytes.
+    pub cursor_snapshot_bytes_last: u64,
+    /// Peak cursor snapshot memory sample in bytes.
+    pub cursor_snapshot_bytes_max: u64,
+    /// Average cursor snapshot memory in bytes.
+    pub avg_cursor_snapshot_bytes: f64,
+}
+
+impl RuntimeLockMemoryTelemetrySnapshot {
+    /// Update the latest global lock/memory telemetry snapshot.
+    pub fn update_global(snapshot: Self) {
+        let lock = GLOBAL_RUNTIME_LOCK_MEMORY_TELEMETRY.get_or_init(|| StdRwLock::new(None));
+        if let Ok(mut guard) = lock.write() {
+            *guard = Some(snapshot);
+        }
+    }
+
+    /// Get the latest lock/memory telemetry snapshot.
+    #[must_use]
+    pub fn get_global() -> Option<Self> {
+        let lock = GLOBAL_RUNTIME_LOCK_MEMORY_TELEMETRY.get_or_init(|| StdRwLock::new(None));
+        lock.read().ok().and_then(|guard| guard.clone())
+    }
+}
+
 #[derive(Debug)]
 pub struct RuntimeMetrics {
     /// Count of segments persisted
@@ -499,6 +543,22 @@ impl RuntimeMetrics {
             0.0
         } else {
             sum as f64 / count as f64
+        }
+    }
+
+    /// Build a machine-readable lock/memory telemetry snapshot.
+    #[must_use]
+    pub fn lock_memory_snapshot(&self) -> RuntimeLockMemoryTelemetrySnapshot {
+        RuntimeLockMemoryTelemetrySnapshot {
+            timestamp_ms: epoch_ms_u64(),
+            avg_storage_lock_wait_ms: self.avg_storage_lock_wait_ms(),
+            max_storage_lock_wait_ms: self.max_storage_lock_wait_ms(),
+            storage_lock_contention_events: self.storage_lock_contention_events(),
+            avg_storage_lock_hold_ms: self.avg_storage_lock_hold_ms(),
+            max_storage_lock_hold_ms: self.max_storage_lock_hold_ms(),
+            cursor_snapshot_bytes_last: self.cursor_snapshot_bytes_last(),
+            cursor_snapshot_bytes_max: self.cursor_snapshot_bytes_max(),
+            avg_cursor_snapshot_bytes: self.avg_cursor_snapshot_bytes(),
         }
     }
 
@@ -1285,6 +1345,9 @@ impl ObservationRuntime {
                     };
 
                     HealthSnapshot::update_global(snapshot);
+                    RuntimeLockMemoryTelemetrySnapshot::update_global(
+                        metrics.lock_memory_snapshot(),
+                    );
                     last_health_snapshot = now;
                 }
             }
@@ -2569,6 +2632,7 @@ impl RuntimeHandle {
         };
 
         HealthSnapshot::update_global(snapshot);
+        RuntimeLockMemoryTelemetrySnapshot::update_global(self.metrics.lock_memory_snapshot());
     }
 
     /// Take ownership of the storage handle for external shutdown.
@@ -3026,6 +3090,48 @@ mod tests {
         assert_eq!(metrics.cursor_snapshot_bytes_last(), 4096);
         assert_eq!(metrics.cursor_snapshot_bytes_max(), 4096);
         assert!((metrics.avg_cursor_snapshot_bytes() - 2560.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn runtime_metrics_lock_memory_snapshot_reflects_metrics() {
+        let metrics = RuntimeMetrics::default();
+        metrics.record_storage_lock_wait(Duration::from_micros(750));
+        metrics.record_storage_lock_wait(Duration::from_millis(2));
+        metrics.record_storage_lock_hold(Duration::from_millis(4));
+        metrics.record_storage_lock_hold(Duration::from_millis(12));
+        metrics.record_cursor_snapshot_memory(1024);
+        metrics.record_cursor_snapshot_memory(8192);
+
+        let snapshot = metrics.lock_memory_snapshot();
+        assert!(snapshot.timestamp_ms > 0);
+        assert!(snapshot.avg_storage_lock_wait_ms > 0.0);
+        assert!(snapshot.max_storage_lock_wait_ms >= 2.0);
+        assert_eq!(snapshot.storage_lock_contention_events, 1);
+        assert!(snapshot.avg_storage_lock_hold_ms >= 4.0);
+        assert!(snapshot.max_storage_lock_hold_ms >= 12.0);
+        assert_eq!(snapshot.cursor_snapshot_bytes_last, 8192);
+        assert_eq!(snapshot.cursor_snapshot_bytes_max, 8192);
+        assert!((snapshot.avg_cursor_snapshot_bytes - 4608.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn runtime_lock_memory_snapshot_global_roundtrip() {
+        let snapshot = RuntimeLockMemoryTelemetrySnapshot {
+            timestamp_ms: 42,
+            avg_storage_lock_wait_ms: 1.25,
+            max_storage_lock_wait_ms: 5.0,
+            storage_lock_contention_events: 7,
+            avg_storage_lock_hold_ms: 2.5,
+            max_storage_lock_hold_ms: 8.0,
+            cursor_snapshot_bytes_last: 128,
+            cursor_snapshot_bytes_max: 512,
+            avg_cursor_snapshot_bytes: 320.0,
+        };
+        RuntimeLockMemoryTelemetrySnapshot::update_global(snapshot.clone());
+        assert_eq!(
+            RuntimeLockMemoryTelemetrySnapshot::get_global(),
+            Some(snapshot)
+        );
     }
 
     #[test]

@@ -743,9 +743,19 @@ async fn handle_request_with_context(
                 "events_queued": total_queued,
                 "subscriber_count": total_subscribers,
             });
-            let health = HealthSnapshot::get_global()
+            let mut health = HealthSnapshot::get_global()
                 .and_then(|snapshot| serde_json::to_value(snapshot).ok())
                 .unwrap_or(serde_json::Value::Null);
+            if let Some(runtime_lock_memory) =
+                crate::runtime::RuntimeLockMemoryTelemetrySnapshot::get_global()
+                    .and_then(|snapshot| serde_json::to_value(snapshot).ok())
+            {
+                if let Some(health_obj) = health.as_object_mut() {
+                    health_obj.insert("runtime_lock_memory".to_string(), runtime_lock_memory);
+                } else {
+                    payload["runtime_lock_memory"] = runtime_lock_memory;
+                }
+            }
             payload["health"] = health;
             if let Some(snapshot) =
                 crate::resize_scheduler::ResizeSchedulerDebugSnapshot::get_global()
@@ -1561,6 +1571,19 @@ mod tests {
     async fn ipc_status_returns_event_bus_stats() {
         let temp_dir = TempDir::new().unwrap();
         let socket_path = temp_dir.path().join("test.sock");
+        crate::runtime::RuntimeLockMemoryTelemetrySnapshot::update_global(
+            crate::runtime::RuntimeLockMemoryTelemetrySnapshot {
+                timestamp_ms: 123,
+                avg_storage_lock_wait_ms: 1.5,
+                max_storage_lock_wait_ms: 3.0,
+                storage_lock_contention_events: 2,
+                avg_storage_lock_hold_ms: 2.5,
+                max_storage_lock_hold_ms: 4.0,
+                cursor_snapshot_bytes_last: 2048,
+                cursor_snapshot_bytes_max: 4096,
+                avg_cursor_snapshot_bytes: 3072.0,
+            },
+        );
 
         let server = IpcServer::bind(&socket_path).await.unwrap();
         let event_bus = Arc::new(EventBus::new(100));
@@ -1582,6 +1605,18 @@ mod tests {
         assert!(data.get("uptime_ms").is_some());
         assert!(data.get("events_queued").is_some());
         assert!(data.get("subscriber_count").is_some());
+        let health = data
+            .get("health")
+            .and_then(serde_json::Value::as_object)
+            .expect("health object should be present");
+        let runtime_lock_memory = health
+            .get("runtime_lock_memory")
+            .and_then(serde_json::Value::as_object)
+            .expect("runtime_lock_memory should be embedded in health");
+        assert_eq!(
+            runtime_lock_memory.get("max_storage_lock_wait_ms"),
+            Some(&serde_json::json!(3.0))
+        );
 
         let _ = shutdown_tx.send(()).await;
         let _ = server_handle.await;
