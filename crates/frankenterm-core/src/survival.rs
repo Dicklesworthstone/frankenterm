@@ -329,6 +329,392 @@ pub struct HazardReport {
 }
 
 // =============================================================================
+// Restart scheduling
+// =============================================================================
+
+/// Scheduling mode for automatic mux restart planning.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum RestartMode {
+    /// Fully automatic scheduling; execute when score exceeds `min_score`.
+    Automatic { min_score: f64 },
+    /// Compute recommendations but do not execute.
+    Advisory,
+    /// Disable scheduler decisions (manual restart only).
+    Manual,
+}
+
+impl Default for RestartMode {
+    fn default() -> Self {
+        Self::Advisory
+    }
+}
+
+/// Configuration for restart window selection.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RestartSchedulerConfig {
+    /// Scheduler mode (automatic/advisory/manual).
+    pub mode: RestartMode,
+    /// Hazard threshold used by urgency sigmoid.
+    pub hazard_threshold: f64,
+    /// Sigmoid steepness for hazard urgency.
+    pub urgency_steepness: f64,
+    /// Hard minimum time between restarts.
+    pub cooldown_hours: f64,
+    /// Planning horizon in minutes.
+    pub schedule_horizon_minutes: u32,
+    /// EWMA alpha for hourly activity profile learning.
+    pub activity_ewma_alpha: f64,
+    /// Initial activity level (0.0-1.0) for all hours before learning.
+    pub default_activity: f64,
+    /// Whether a pre-restart snapshot should be required.
+    pub pre_restart_snapshot: bool,
+    /// Advance warning lead time.
+    pub advance_warning_minutes: u32,
+}
+
+impl Default for RestartSchedulerConfig {
+    fn default() -> Self {
+        Self {
+            mode: RestartMode::Advisory,
+            hazard_threshold: 0.8,
+            urgency_steepness: 8.0,
+            cooldown_hours: 12.0,
+            schedule_horizon_minutes: 24 * 60,
+            activity_ewma_alpha: 0.2,
+            default_activity: 0.5,
+            pre_restart_snapshot: true,
+            advance_warning_minutes: 30,
+        }
+    }
+}
+
+/// 24-hour activity profile with per-hour EWMA buckets (UTC).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ActivityProfile {
+    alpha: f64,
+    hourly_ewma: [f64; 24],
+    sample_count: [u64; 24],
+}
+
+impl ActivityProfile {
+    /// Create a new profile.
+    #[must_use]
+    pub fn new(alpha: f64, default_activity: f64) -> Self {
+        let alpha = alpha.clamp(0.0, 1.0);
+        let default_activity = default_activity.clamp(0.0, 1.0);
+        Self {
+            alpha,
+            hourly_ewma: [default_activity; 24],
+            sample_count: [0; 24],
+        }
+    }
+
+    /// Update using a UTC timestamped activity sample.
+    pub fn update(&mut self, observed_at: SystemTime, normalized_activity: f64) {
+        let hour = hour_of_day_utc(observed_at);
+        self.update_hour(hour, normalized_activity);
+    }
+
+    /// Update a specific hour bucket directly.
+    pub fn update_hour(&mut self, hour: u8, normalized_activity: f64) {
+        let index = usize::from(hour % 24);
+        let sample = normalized_activity.clamp(0.0, 1.0);
+        let prev = self.hourly_ewma[index];
+        let next = if self.sample_count[index] == 0 {
+            sample
+        } else {
+            self.alpha.mul_add(sample, (1.0 - self.alpha) * prev)
+        };
+        self.hourly_ewma[index] = next.clamp(0.0, 1.0);
+        self.sample_count[index] = self.sample_count[index].saturating_add(1);
+    }
+
+    /// Predict activity level for a timestamp.
+    #[must_use]
+    pub fn predict(&self, at: SystemTime) -> f64 {
+        self.predict_hour(hour_of_day_utc(at))
+    }
+
+    /// Predict activity for a UTC hour bucket.
+    #[must_use]
+    pub fn predict_hour(&self, hour: u8) -> f64 {
+        self.hourly_ewma[usize::from(hour % 24)]
+    }
+
+    /// Number of samples ingested for a UTC hour bucket.
+    #[must_use]
+    pub fn sample_count(&self, hour: u8) -> u64 {
+        self.sample_count[usize::from(hour % 24)]
+    }
+
+    /// Snapshot of hourly EWMA values.
+    #[must_use]
+    pub fn hourly_snapshot(&self) -> [f64; 24] {
+        self.hourly_ewma
+    }
+}
+
+/// Hazard forecast point for a candidate restart window.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct HazardForecastPoint {
+    /// Minutes from `now` to this candidate.
+    pub offset_minutes: u32,
+    /// Predicted hazard rate at candidate time.
+    pub hazard_rate: f64,
+    /// Optional precomputed activity estimate (0.0-1.0); if absent, use profile.
+    pub predicted_activity: Option<f64>,
+}
+
+/// Detailed score components for restart candidate evaluation.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RestartScoreBreakdown {
+    /// Sigmoid urgency from hazard rate.
+    pub hazard_urgency: f64,
+    /// Inverse normalized activity (prefer low activity windows).
+    pub activity_minimum: f64,
+    /// Cooldown-sensitive recency factor.
+    pub recency_penalty: f64,
+    /// Final composite score.
+    pub score: f64,
+}
+
+/// Scheduler recommendation for a restart window.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RestartRecommendation {
+    /// Recommended execution timestamp.
+    pub scheduled_for_epoch_secs: u64,
+    /// Candidate offset from evaluation time.
+    pub offset_minutes: u32,
+    /// Predicted hazard at selected time.
+    pub hazard_rate: f64,
+    /// Predicted activity at selected time.
+    pub predicted_activity: f64,
+    /// Scoring breakdown.
+    pub breakdown: RestartScoreBreakdown,
+    /// Whether this recommendation should execute automatically.
+    pub should_execute_automatically: bool,
+    /// Optional warning timestamp.
+    pub warning_epoch_secs: Option<u64>,
+    /// Optional pre-restart snapshot timestamp.
+    pub snapshot_epoch_secs: Option<u64>,
+}
+
+/// Restart scheduler combining hazard urgency and activity minima.
+#[derive(Debug, Clone)]
+pub struct RestartScheduler {
+    config: RestartSchedulerConfig,
+    activity_profile: ActivityProfile,
+    last_restart_at: Option<SystemTime>,
+}
+
+impl RestartScheduler {
+    /// Create a new scheduler with learned activity profile support.
+    #[must_use]
+    pub fn new(config: RestartSchedulerConfig) -> Self {
+        let activity_profile =
+            ActivityProfile::new(config.activity_ewma_alpha, config.default_activity);
+        Self {
+            config,
+            activity_profile,
+            last_restart_at: None,
+        }
+    }
+
+    /// Immutable scheduler configuration.
+    #[must_use]
+    pub fn config(&self) -> &RestartSchedulerConfig {
+        &self.config
+    }
+
+    /// Immutable access to the activity profile.
+    #[must_use]
+    pub fn activity_profile(&self) -> &ActivityProfile {
+        &self.activity_profile
+    }
+
+    /// Mutable access to the activity profile.
+    pub fn activity_profile_mut(&mut self) -> &mut ActivityProfile {
+        &mut self.activity_profile
+    }
+
+    /// Update activity profile from observed load.
+    pub fn record_activity(&mut self, observed_at: SystemTime, normalized_activity: f64) {
+        self.activity_profile
+            .update(observed_at, normalized_activity);
+    }
+
+    /// Set the last known restart timestamp.
+    pub fn set_last_restart_at(&mut self, at: Option<SystemTime>) {
+        self.last_restart_at = at;
+    }
+
+    /// Return the last known restart timestamp.
+    #[must_use]
+    pub fn last_restart_at(&self) -> Option<SystemTime> {
+        self.last_restart_at
+    }
+
+    /// Record that a restart just happened at `at`.
+    pub fn record_restart(&mut self, at: SystemTime) {
+        self.last_restart_at = Some(at);
+    }
+
+    /// Compute score components for a candidate restart window.
+    #[must_use]
+    pub fn score_components(
+        &self,
+        hazard_rate: f64,
+        predicted_activity: f64,
+        elapsed_since_last_restart: Option<Duration>,
+    ) -> RestartScoreBreakdown {
+        let steepness = self.config.urgency_steepness.max(1e-6);
+        let hazard_urgency = sigmoid((hazard_rate - self.config.hazard_threshold) * steepness);
+        let activity_minimum = (1.0 - predicted_activity.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+
+        let recency_penalty = if let Some(elapsed) = elapsed_since_last_restart {
+            let cooldown_hours = self.config.cooldown_hours.max(1e-6);
+            let elapsed_hours = elapsed.as_secs_f64() / 3600.0;
+            (1.0 - (-(elapsed_hours / cooldown_hours)).exp()).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+
+        let score = (hazard_urgency * activity_minimum * recency_penalty).clamp(0.0, 1.0);
+        RestartScoreBreakdown {
+            hazard_urgency,
+            activity_minimum,
+            recency_penalty,
+            score,
+        }
+    }
+
+    /// Recommend the best restart window from forecast points.
+    #[must_use]
+    pub fn recommend(
+        &self,
+        now: SystemTime,
+        forecast: &[HazardForecastPoint],
+    ) -> Option<RestartRecommendation> {
+        if forecast.is_empty() || matches!(self.config.mode, RestartMode::Manual) {
+            return None;
+        }
+
+        let mut best: Option<(HazardForecastPoint, SystemTime, RestartScoreBreakdown, f64)> = None;
+
+        for point in forecast {
+            if point.offset_minutes > self.config.schedule_horizon_minutes {
+                continue;
+            }
+
+            let candidate_at =
+                now.checked_add(Duration::from_secs(u64::from(point.offset_minutes) * 60))?;
+            if !self.is_candidate_eligible(candidate_at) {
+                continue;
+            }
+
+            let activity = point
+                .predicted_activity
+                .unwrap_or_else(|| self.activity_profile.predict(candidate_at))
+                .clamp(0.0, 1.0);
+            let elapsed = self
+                .last_restart_at
+                .and_then(|last| candidate_at.duration_since(last).ok());
+            let breakdown = self.score_components(point.hazard_rate, activity, elapsed);
+
+            match best {
+                None => {
+                    best = Some((*point, candidate_at, breakdown, activity));
+                }
+                Some((best_point, _, best_breakdown, _)) => {
+                    let better_score = breakdown.score > best_breakdown.score + f64::EPSILON;
+                    let tie_break_earlier = (breakdown.score - best_breakdown.score).abs()
+                        <= f64::EPSILON
+                        && point.offset_minutes < best_point.offset_minutes;
+                    if better_score || tie_break_earlier {
+                        best = Some((*point, candidate_at, breakdown, activity));
+                    }
+                }
+            }
+        }
+
+        let (point, candidate_at, breakdown, activity) = best?;
+        let scheduled_for_epoch_secs = epoch_secs(candidate_at)?;
+        let should_execute_automatically = match self.config.mode {
+            RestartMode::Automatic { min_score } => breakdown.score >= min_score,
+            RestartMode::Advisory | RestartMode::Manual => false,
+        };
+
+        let warning_epoch_secs = if self.config.advance_warning_minutes == 0 {
+            None
+        } else {
+            candidate_at
+                .checked_sub(Duration::from_secs(
+                    u64::from(self.config.advance_warning_minutes) * 60,
+                ))
+                .and_then(epoch_secs)
+        };
+
+        let snapshot_epoch_secs = self
+            .config
+            .pre_restart_snapshot
+            .then_some(scheduled_for_epoch_secs);
+
+        Some(RestartRecommendation {
+            scheduled_for_epoch_secs,
+            offset_minutes: point.offset_minutes,
+            hazard_rate: point.hazard_rate,
+            predicted_activity: activity,
+            breakdown,
+            should_execute_automatically,
+            warning_epoch_secs,
+            snapshot_epoch_secs,
+        })
+    }
+
+    fn cooldown_duration(&self) -> Duration {
+        Duration::from_secs_f64(self.config.cooldown_hours.max(0.0) * 3600.0)
+    }
+
+    fn is_candidate_eligible(&self, candidate_at: SystemTime) -> bool {
+        let Some(last_restart) = self.last_restart_at else {
+            return true;
+        };
+
+        let cooldown = self.cooldown_duration();
+        if cooldown.is_zero() {
+            return true;
+        }
+
+        match last_restart.checked_add(cooldown) {
+            Some(next_allowed) => candidate_at >= next_allowed,
+            None => false,
+        }
+    }
+}
+
+#[must_use]
+fn sigmoid(x: f64) -> f64 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+#[must_use]
+fn hour_of_day_utc(at: SystemTime) -> u8 {
+    let secs = at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    ((secs / 3600) % 24) as u8
+}
+
+#[must_use]
+fn epoch_secs(at: SystemTime) -> Option<u64> {
+    at.duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+// =============================================================================
 // Survival model
 // =============================================================================
 
@@ -641,6 +1027,7 @@ mod tests {
     #![allow(clippy::float_cmp)]
 
     use super::*;
+    use proptest::prelude::*;
 
     // -- Weibull parameters ---------------------------------------------------
 
@@ -861,6 +1248,224 @@ mod tests {
             HazardAction::AlertAndPrepareRestart.to_string(),
             "alert_and_prepare_restart"
         );
+    }
+
+    // -- Restart scheduler ----------------------------------------------------
+
+    fn scheduler_config(mode: RestartMode) -> RestartSchedulerConfig {
+        RestartSchedulerConfig {
+            mode,
+            ..RestartSchedulerConfig::default()
+        }
+    }
+
+    #[test]
+    fn restart_scheduler_prefers_high_hazard_low_activity() {
+        let scheduler = RestartScheduler::new(scheduler_config(RestartMode::Advisory));
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(2 * 3600);
+        let forecast = vec![
+            HazardForecastPoint {
+                offset_minutes: 60,
+                hazard_rate: 0.9,
+                predicted_activity: Some(0.8),
+            },
+            HazardForecastPoint {
+                offset_minutes: 120,
+                hazard_rate: 1.2,
+                predicted_activity: Some(0.1),
+            },
+        ];
+
+        let recommendation = scheduler.recommend(now, &forecast).expect("recommendation");
+        assert_eq!(recommendation.offset_minutes, 120);
+        assert!(recommendation.breakdown.score > 0.0);
+        assert!(!recommendation.should_execute_automatically);
+    }
+
+    #[test]
+    fn restart_scheduler_enforces_cooldown() {
+        let mut scheduler =
+            RestartScheduler::new(scheduler_config(RestartMode::Automatic { min_score: 0.0 }));
+        scheduler.set_last_restart_at(Some(SystemTime::UNIX_EPOCH + Duration::from_secs(3600)));
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(2 * 3600);
+        let forecast = vec![
+            HazardForecastPoint {
+                offset_minutes: 30,
+                hazard_rate: 1.3,
+                predicted_activity: Some(0.0),
+            },
+            HazardForecastPoint {
+                offset_minutes: 11 * 60,
+                hazard_rate: 1.3,
+                predicted_activity: Some(0.0),
+            },
+            HazardForecastPoint {
+                offset_minutes: 12 * 60,
+                hazard_rate: 1.3,
+                predicted_activity: Some(0.0),
+            },
+        ];
+
+        let recommendation = scheduler.recommend(now, &forecast).expect("recommendation");
+        assert_eq!(recommendation.offset_minutes, 12 * 60);
+    }
+
+    #[test]
+    fn restart_scheduler_manual_mode_returns_none() {
+        let scheduler = RestartScheduler::new(scheduler_config(RestartMode::Manual));
+        let now = SystemTime::UNIX_EPOCH;
+        let forecast = vec![HazardForecastPoint {
+            offset_minutes: 10,
+            hazard_rate: 2.0,
+            predicted_activity: Some(0.0),
+        }];
+        assert!(scheduler.recommend(now, &forecast).is_none());
+    }
+
+    #[test]
+    fn restart_scheduler_advisory_and_automatic_choose_same_window() {
+        let forecast = vec![
+            HazardForecastPoint {
+                offset_minutes: 15,
+                hazard_rate: 0.9,
+                predicted_activity: Some(0.4),
+            },
+            HazardForecastPoint {
+                offset_minutes: 45,
+                hazard_rate: 1.1,
+                predicted_activity: Some(0.2),
+            },
+        ];
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(9 * 3600);
+
+        let advisory = RestartScheduler::new(scheduler_config(RestartMode::Advisory))
+            .recommend(now, &forecast)
+            .expect("advisory recommendation");
+        let automatic =
+            RestartScheduler::new(scheduler_config(RestartMode::Automatic { min_score: 0.0 }))
+                .recommend(now, &forecast)
+                .expect("automatic recommendation");
+
+        assert_eq!(advisory.offset_minutes, automatic.offset_minutes);
+    }
+
+    #[test]
+    fn activity_profile_updates_hourly_ewma() {
+        let mut profile = ActivityProfile::new(0.5, 0.2);
+        profile.update_hour(3, 0.8);
+        profile.update_hour(3, 0.6);
+        // first sample seeds 0.8, second sample EWMA(0.5)=0.7
+        assert!((profile.predict_hour(3) - 0.7).abs() < 1e-10);
+        assert_eq!(profile.sample_count(3), 2);
+    }
+
+    proptest! {
+        #[test]
+        fn restart_score_monotonic_in_hazard_for_equal_activity(
+            hazard_a in 0.0f64..2.0,
+            hazard_b in 0.0f64..2.0,
+            activity in 0.0f64..1.0
+        ) {
+            let scheduler = RestartScheduler::new(scheduler_config(RestartMode::Advisory));
+            let (low, high) = if hazard_a <= hazard_b {
+                (hazard_a, hazard_b)
+            } else {
+                (hazard_b, hazard_a)
+            };
+            let elapsed = Some(Duration::from_secs((24.0 * 3600.0) as u64));
+            let low_score = scheduler
+                .score_components(low, activity, elapsed)
+                .score;
+            let high_score = scheduler
+                .score_components(high, activity, elapsed)
+                .score;
+            prop_assert!(high_score + 1e-12 >= low_score);
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn restart_recommendation_matches_bruteforce_argmax(
+            points in prop::collection::vec((0.0f64..2.0, 0.0f64..1.0), 1..24)
+        ) {
+            let scheduler = RestartScheduler::new(scheduler_config(RestartMode::Automatic { min_score: 0.0 }));
+            let now = SystemTime::UNIX_EPOCH + Duration::from_secs(12 * 3600);
+            let forecast: Vec<HazardForecastPoint> = points
+                .iter()
+                .enumerate()
+                .map(|(idx, (hazard, activity))| HazardForecastPoint {
+                    offset_minutes: (idx as u32) * 30,
+                    hazard_rate: *hazard,
+                    predicted_activity: Some(*activity),
+                })
+                .collect();
+
+            let recommendation = scheduler.recommend(now, &forecast).expect("recommendation");
+
+            let mut best_offset = 0u32;
+            let mut best_score = f64::NEG_INFINITY;
+            for point in &forecast {
+                let score = scheduler
+                    .score_components(
+                        point.hazard_rate,
+                        point.predicted_activity.unwrap_or(0.5),
+                        None
+                    )
+                    .score;
+                let better = score > best_score + f64::EPSILON;
+                let tie_break = (score - best_score).abs() <= f64::EPSILON
+                    && point.offset_minutes < best_offset;
+                if better || tie_break {
+                    best_offset = point.offset_minutes;
+                    best_score = score;
+                }
+            }
+
+            prop_assert_eq!(recommendation.offset_minutes, best_offset);
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn restart_scheduler_cooldown_never_violated(
+            deltas in prop::collection::vec(1u32..180u32, 1..40)
+        ) {
+            let mut scheduler = RestartScheduler::new(RestartSchedulerConfig {
+                mode: RestartMode::Automatic { min_score: 0.0 },
+                cooldown_hours: 6.0,
+                ..RestartSchedulerConfig::default()
+            });
+
+            let forecast = vec![HazardForecastPoint {
+                offset_minutes: 0,
+                hazard_rate: 2.0,
+                predicted_activity: Some(0.0),
+            }];
+
+            let mut now = SystemTime::UNIX_EPOCH + Duration::from_secs(3600);
+            let mut restart_times = Vec::new();
+
+            for delta_minutes in deltas {
+                now = now
+                    .checked_add(Duration::from_secs(u64::from(delta_minutes) * 60))
+                    .expect("time overflow");
+
+                if let Some(rec) = scheduler.recommend(now, &forecast)
+                    && rec.should_execute_automatically
+                {
+                    let scheduled_at = SystemTime::UNIX_EPOCH
+                        .checked_add(Duration::from_secs(rec.scheduled_for_epoch_secs))
+                        .expect("time overflow");
+                    scheduler.record_restart(scheduled_at);
+                    restart_times.push(rec.scheduled_for_epoch_secs);
+                }
+            }
+
+            let cooldown_secs = (6.0 * 3600.0) as u64;
+            for pair in restart_times.windows(2) {
+                prop_assert!(pair[1] >= pair[0] + cooldown_secs);
+            }
+        }
     }
 
     // -- SurvivalModel --------------------------------------------------------
