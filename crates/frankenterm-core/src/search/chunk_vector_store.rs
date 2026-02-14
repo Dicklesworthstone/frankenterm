@@ -428,15 +428,27 @@ impl ChunkVectorStore {
         let rows = stmt.query_map(params![profile_id, generation_id, dimension], |row| {
             let chunk_id: String = row.get(0)?;
             let direction_raw: String = row.get(1)?;
+            let start_segment_id: i64 = row.get(2)?;
+            let start_ordinal: i64 = row.get(3)?;
+            let start_byte_offset: i64 = row.get(4)?;
+            let end_segment_id: i64 = row.get(5)?;
+            let end_ordinal: i64 = row.get(6)?;
+            let end_byte_offset: i64 = row.get(7)?;
             let start_offset = ChunkSourceOffset {
-                segment_id: row.get(2)?,
-                ordinal: row.get(3)?,
-                byte_offset: row.get(4)?,
+                segment_id: u64::try_from(start_segment_id)
+                    .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(2, start_segment_id))?,
+                ordinal: u64::try_from(start_ordinal)
+                    .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(3, start_ordinal))?,
+                byte_offset: u64::try_from(start_byte_offset)
+                    .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(4, start_byte_offset))?,
             };
             let end_offset = ChunkSourceOffset {
-                segment_id: row.get(5)?,
-                ordinal: row.get(6)?,
-                byte_offset: row.get(7)?,
+                segment_id: u64::try_from(end_segment_id)
+                    .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(5, end_segment_id))?,
+                ordinal: u64::try_from(end_ordinal)
+                    .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(6, end_ordinal))?,
+                byte_offset: u64::try_from(end_byte_offset)
+                    .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(7, end_byte_offset))?,
             };
             let content_hash: String = row.get(8)?;
             let vector_blob: Vec<u8> = row.get(9)?;

@@ -816,6 +816,7 @@ impl ObservationRuntime {
             event_bus: self.event_bus.clone(),
             heartbeats: Arc::clone(&self.heartbeats),
             capture_tx: capture_tx_probe,
+            wezterm_handle: Arc::clone(&self.wezterm_handle),
             native_events: native_handle,
             scheduler_snapshot: Arc::clone(&self.scheduler_snapshot),
         })
@@ -2251,6 +2252,8 @@ pub struct RuntimeHandle {
     pub heartbeats: Arc<HeartbeatRegistry>,
     /// Capture channel sender (cloned for queue depth instrumentation)
     capture_tx: mpsc::Sender<CaptureEvent>,
+    /// WezTerm interface handle for health/warning probes.
+    wezterm_handle: WeztermHandle,
     /// Shared scheduler snapshot for health reporting (written by capture task).
     scheduler_snapshot: Arc<RwLock<crate::tailer::SchedulerSnapshot>>,
 }
