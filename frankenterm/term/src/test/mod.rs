@@ -1105,6 +1105,92 @@ fn test_resize_wrap_roundtrip_with_dpi_and_mutation() {
 }
 
 #[test]
+fn test_resize_cold_scrollback_converges_and_bounds_line_growth() {
+    const ROWS: usize = 8;
+    const SCROLLBACK: usize = 32;
+    let mut term = TestTerm::new(ROWS, 8, SCROLLBACK);
+
+    for idx in 0..160 {
+        term.print(format!("line{idx:03}-abcdefghijklmnop\r\n"));
+    }
+
+    let resize_steps = [4usize, 11, 5, 10, 6, 9, 7, 8];
+    let soft_growth_bound = (ROWS + SCROLLBACK) * 4;
+    for (step, &cols) in resize_steps.iter().enumerate() {
+        term.resize(TerminalSize {
+            rows: ROWS,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+            dpi: if step % 2 == 0 { 96 } else { 144 },
+        });
+
+        let line_count = term.screen().all_lines().len();
+        assert!(
+            line_count <= soft_growth_bound,
+            "line growth exceeded soft bound after step {} (cols={}): {} > {}",
+            step,
+            cols,
+            line_count,
+            soft_growth_bound
+        );
+    }
+
+    let mut steady_line_counts = Vec::new();
+    for _ in 0..4 {
+        term.resize(TerminalSize {
+            rows: ROWS,
+            cols: 8,
+            pixel_width: 0,
+            pixel_height: 0,
+            dpi: 96,
+        });
+        steady_line_counts.push(term.screen().all_lines().len());
+    }
+    let baseline_steady_count = steady_line_counts[0];
+    assert!(
+        steady_line_counts
+            .iter()
+            .all(|&count| count <= baseline_steady_count.saturating_add(1)),
+        "steady-state resize should not keep growing line count: {:?}",
+        steady_line_counts
+    );
+
+    term.resize(TerminalSize {
+        rows: ROWS,
+        cols: 8,
+        pixel_width: 0,
+        pixel_height: 0,
+        dpi: 96,
+    });
+    let first_converged_snapshot: Vec<String> = term
+        .screen()
+        .visible_lines()
+        .iter()
+        .map(|line| line.as_str().to_string())
+        .collect();
+
+    term.resize(TerminalSize {
+        rows: ROWS,
+        cols: 8,
+        pixel_width: 0,
+        pixel_height: 0,
+        dpi: 96,
+    });
+    let second_converged_snapshot: Vec<String> = term
+        .screen()
+        .visible_lines()
+        .iter()
+        .map(|line| line.as_str().to_string())
+        .collect();
+
+    assert_eq!(
+        first_converged_snapshot, second_converged_snapshot,
+        "steady-state resize should converge without visible drift"
+    );
+}
+
+#[test]
 fn test_resize_wrap_issue_971() {
     const LINES: usize = 4;
     let mut term = TestTerm::new(LINES, 4, 0);

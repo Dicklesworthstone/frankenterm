@@ -202,6 +202,7 @@ impl ColdScrollbackReflowWorker {
         self.backlog_depth = 0;
     }
 
+    #[cfg(test)]
     fn backlog_depth(&self) -> usize {
         self.backlog_depth
     }
@@ -214,10 +215,12 @@ impl ColdScrollbackReflowWorker {
         self.completion_throughput_lines_per_sec
     }
 
+    #[cfg(test)]
     fn completed_lines_total(&self) -> u64 {
         self.completed_lines_total
     }
 
+    #[cfg(test)]
     fn completed_batches_total(&self) -> u64 {
         self.completed_batches_total
     }
@@ -226,6 +229,7 @@ impl ColdScrollbackReflowWorker {
         self.cancellation_count
     }
 
+    #[cfg(test)]
     fn active_intent(&self) -> Option<SequenceNo> {
         self.active_intent
     }
