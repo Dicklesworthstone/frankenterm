@@ -4,7 +4,7 @@
 mod mmap_store;
 
 use mmap_store::{
-    build_offsets_from_lengths, page_align_down, LineOffset, MmapScrollbackStore, MmapStoreConfig,
+    LineOffset, MmapScrollbackStore, MmapStoreConfig, build_offsets_from_lengths, page_align_down,
 };
 use proptest::prelude::*;
 

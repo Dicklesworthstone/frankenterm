@@ -31,7 +31,7 @@
 //! 24. LayoutRestorer restore preserves pane_id_map size matching count_panes (async unit)
 //! 25. LayoutRestorer restore with splits creates correct pane count (async unit)
 
-use frankenterm_core::restore_layout::{count_panes, RestoreConfig};
+use frankenterm_core::restore_layout::{RestoreConfig, count_panes};
 use frankenterm_core::session_topology::{PaneNode, TabSnapshot, TopologySnapshot, WindowSnapshot};
 use proptest::prelude::*;
 
@@ -423,7 +423,7 @@ proptest! {
     fn prop_count_panes_hsplit_sum(
         children in proptest::collection::vec(arb_pane_node(), 2..=4),
     ) {
-        let expected: usize = children.iter().map(|c| count_node_leaves(c)).sum();
+        let expected: usize = children.iter().map(count_node_leaves).sum();
         let node = PaneNode::HSplit {
             children: children.into_iter().map(|c| (0.5, c)).collect(),
         };
@@ -445,7 +445,7 @@ proptest! {
     fn prop_count_panes_vsplit_sum(
         children in proptest::collection::vec(arb_pane_node(), 2..=4),
     ) {
-        let expected: usize = children.iter().map(|c| count_node_leaves(c)).sum();
+        let expected: usize = children.iter().map(count_node_leaves).sum();
         let node = PaneNode::VSplit {
             children: children.into_iter().map(|c| (0.5, c)).collect(),
         };
@@ -809,11 +809,7 @@ async fn restore_with_splits_creates_correct_pane_count() {
     }
     // All new pane IDs should be distinct
     let new_ids: std::collections::HashSet<u64> = result.pane_id_map.values().copied().collect();
-    assert_eq!(
-        new_ids.len(),
-        4,
-        "all 4 new pane IDs should be distinct"
-    );
+    assert_eq!(new_ids.len(), 4, "all 4 new pane IDs should be distinct");
     // MockWezterm should have exactly 4 panes
     let mock_count = mock.pane_count().await;
     assert_eq!(
