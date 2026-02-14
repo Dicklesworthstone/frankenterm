@@ -16,7 +16,8 @@ use proptest::prelude::*;
 use std::collections::HashSet;
 
 use frankenterm_core::entropy_scheduler::{
-    EntropyScheduler, EntropySchedulerConfig, EntropySchedulerSnapshot,
+    EntropyScheduler, EntropySchedulerConfig, EntropySchedulerSnapshot, schedule_interval,
+    schedule_interval_default,
 };
 
 // ────────────────────────────────────────────────────────────────────
@@ -564,5 +565,192 @@ proptest! {
         let expected_panes: HashSet<u64> = pane_ids.iter().copied().collect();
 
         prop_assert_eq!(decision_panes, expected_panes);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// EntropySchedulerConfig: derives and default
+// ────────────────────────────────────────────────────────────────────
+
+#[test]
+fn config_default_has_sane_values() {
+    let cfg = EntropySchedulerConfig::default();
+    assert!(cfg.min_interval_ms < cfg.max_interval_ms);
+    assert!(cfg.base_interval_ms > 0);
+    assert!(cfg.window_size > 0);
+    assert!(cfg.min_samples > 0);
+    assert!(cfg.warmup_interval_ms > 0);
+    assert!(cfg.density_floor >= 0.0);
+    assert!(cfg.density_floor <= 1.0);
+}
+
+#[test]
+fn config_clone_preserves() {
+    let cfg = EntropySchedulerConfig {
+        base_interval_ms: 999,
+        min_interval_ms: 5,
+        max_interval_ms: 30000,
+        density_floor: 0.1,
+        window_size: 2048,
+        min_samples: 50,
+        warmup_interval_ms: 250,
+    };
+    let c = cfg.clone();
+    assert_eq!(cfg.base_interval_ms, c.base_interval_ms);
+    assert_eq!(cfg.min_interval_ms, c.min_interval_ms);
+    assert_eq!(cfg.max_interval_ms, c.max_interval_ms);
+    assert_eq!(cfg.window_size, c.window_size);
+    assert_eq!(cfg.min_samples, c.min_samples);
+}
+
+#[test]
+fn config_debug_nonempty() {
+    let cfg = EntropySchedulerConfig::default();
+    let d = format!("{:?}", cfg);
+    assert!(!d.is_empty());
+}
+
+#[test]
+fn config_serde_roundtrip() {
+    let cfg = EntropySchedulerConfig {
+        base_interval_ms: 500,
+        min_interval_ms: 10,
+        max_interval_ms: 10000,
+        density_floor: 0.08,
+        window_size: 8192,
+        min_samples: 100,
+        warmup_interval_ms: 300,
+    };
+    let json = serde_json::to_string(&cfg).unwrap();
+    let back: EntropySchedulerConfig = serde_json::from_str(&json).unwrap();
+    assert_eq!(cfg.base_interval_ms, back.base_interval_ms);
+    assert_eq!(cfg.min_interval_ms, back.min_interval_ms);
+    assert_eq!(cfg.max_interval_ms, back.max_interval_ms);
+    assert_eq!(cfg.window_size, back.window_size);
+    assert_eq!(cfg.min_samples, back.min_samples);
+}
+
+// ────────────────────────────────────────────────────────────────────
+// EntropySchedulerSnapshot: derives
+// ────────────────────────────────────────────────────────────────────
+
+#[test]
+fn snapshot_debug_nonempty() {
+    let mut sched = EntropyScheduler::new(EntropySchedulerConfig::default());
+    sched.register_pane(1);
+    let snap = sched.snapshot();
+    let d = format!("{:?}", snap);
+    assert!(!d.is_empty());
+}
+
+#[test]
+fn snapshot_clone_preserves() {
+    let mut sched = EntropyScheduler::new(EntropySchedulerConfig::default());
+    sched.register_pane(1);
+    sched.feed_bytes(1, &[0u8; 500]);
+    let snap = sched.snapshot();
+    let c = snap.clone();
+    assert_eq!(snap.pane_count, c.pane_count);
+    assert_eq!(snap.pane_states.len(), c.pane_states.len());
+}
+
+// ────────────────────────────────────────────────────────────────────
+// schedule_interval free function
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// schedule_interval returns a value within [min, max].
+    #[test]
+    fn prop_schedule_interval_clamped(
+        config in arb_config(),
+        data in arb_data(3000),
+    ) {
+        let interval = schedule_interval(&data, &config);
+        prop_assert!(
+            interval >= config.min_interval_ms,
+            "interval {} < min {}", interval, config.min_interval_ms
+        );
+        prop_assert!(
+            interval <= config.max_interval_ms,
+            "interval {} > max {}", interval, config.max_interval_ms
+        );
+    }
+
+    /// schedule_interval on empty data returns max_interval_ms.
+    #[test]
+    fn prop_schedule_interval_empty_returns_max(
+        config in arb_config(),
+    ) {
+        let interval = schedule_interval(&[], &config);
+        prop_assert_eq!(interval, config.max_interval_ms);
+    }
+
+    /// schedule_interval_default returns same as schedule_interval with default config.
+    #[test]
+    fn prop_schedule_interval_default_matches(
+        data in arb_data(2000),
+    ) {
+        let a = schedule_interval_default(&data);
+        let b = schedule_interval(&data, &EntropySchedulerConfig::default());
+        prop_assert_eq!(a, b);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// EntropyScheduleResult: decision field invariants
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// Each decision's density is in [0.0, 1.0].
+    #[test]
+    fn prop_decision_density_bounded(
+        n_panes in 1usize..=5,
+        data in arb_data(2000),
+    ) {
+        let cfg = EntropySchedulerConfig {
+            min_samples: 10,
+            ..Default::default()
+        };
+        let mut sched = EntropyScheduler::new(cfg);
+        for i in 0..n_panes {
+            let pid = (i + 1) as u64;
+            sched.register_pane(pid);
+            sched.feed_bytes(pid, &data);
+        }
+        let result = sched.schedule();
+        for d in &result.decisions {
+            prop_assert!(d.density >= 0.0 && d.density <= 1.0,
+                "decision density {} out of [0,1]", d.density);
+            prop_assert!(d.entropy >= 0.0 && d.entropy <= 8.001,
+                "decision entropy {} out of [0,8]", d.entropy);
+        }
+    }
+
+    /// Schedule result serde roundtrip preserves structure.
+    #[test]
+    fn prop_schedule_result_serde_roundtrip(
+        n_panes in 1usize..=4,
+        data in arb_data(1000),
+    ) {
+        let cfg = EntropySchedulerConfig {
+            min_samples: 10,
+            ..Default::default()
+        };
+        let mut sched = EntropyScheduler::new(cfg);
+        for i in 0..n_panes {
+            let pid = (i + 1) as u64;
+            sched.register_pane(pid);
+            sched.feed_bytes(pid, &data);
+        }
+        let result = sched.schedule();
+        let json = serde_json::to_string(&result).unwrap();
+        let back: frankenterm_core::entropy_scheduler::EntropyScheduleResult =
+            serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(result.decisions.len(), back.decisions.len());
+        prop_assert_eq!(result.warmup_count, back.warmup_count);
     }
 }

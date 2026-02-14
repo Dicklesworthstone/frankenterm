@@ -17,8 +17,9 @@ use proptest::prelude::*;
 use std::collections::HashSet;
 
 use frankenterm_core::sequence_model::{
-    ClockSkewDetector, CorrelationContext, CorrelationTracker, ReplayOrder, SequenceAssigner,
-    merge_replay_streams, validate_replay_order,
+    ClockSkewAnomaly, ClockSkewDetector, ClockSkewPolicy, CorrelationContext, CorrelationTracker,
+    ReplayOrder, ReplayOrderViolation, SequenceAssigner, merge_replay_streams,
+    validate_replay_order,
 };
 
 // ────────────────────────────────────────────────────────────────────
@@ -525,6 +526,19 @@ proptest! {
         }
     }
 
+    /// Forward jump > 60s is also flagged.
+    #[test]
+    fn prop_forward_jump_detected(
+        threshold in 10u64..=100,
+    ) {
+        let detector = ClockSkewDetector::new(threshold);
+        detector.observe(0, 1000, 0);
+        let anomaly = detector.observe(0, 1000 + 61_000, 1);
+        prop_assert!(anomaly.is_some(), "forward jump > 60s should be flagged");
+        let a = anomaly.unwrap();
+        prop_assert!(a.delta_ms > 60_000, "forward jump delta should be > 60s");
+    }
+
     /// clear() resets all state — subsequent observations start fresh.
     #[test]
     fn prop_clear_resets_detector(
@@ -545,4 +559,212 @@ proptest! {
         let a = detector.observe(0, 1, 0);
         prop_assert!(a.is_none(), "first observe after clear should not be anomaly");
     }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// ClockSkewPolicy: derives and default
+// ────────────────────────────────────────────────────────────────────
+
+#[test]
+fn clock_skew_policy_default_is_ignore() {
+    let policy = ClockSkewPolicy::default();
+    assert_eq!(policy, ClockSkewPolicy::IgnoreUseSequence);
+}
+
+#[test]
+fn clock_skew_policy_clone_copy_eq() {
+    let a = ClockSkewPolicy::FlagOnly;
+    let b = a; // Copy
+    let c = a.clone();
+    assert_eq!(a, b);
+    assert_eq!(a, c);
+    assert_ne!(a, ClockSkewPolicy::IgnoreUseSequence);
+}
+
+#[test]
+fn clock_skew_policy_serde_roundtrip() {
+    for variant in [
+        ClockSkewPolicy::IgnoreUseSequence,
+        ClockSkewPolicy::FlagOnly,
+    ] {
+        let json = serde_json::to_string(&variant).unwrap();
+        let back: ClockSkewPolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(variant, back);
+    }
+}
+
+#[test]
+fn clock_skew_policy_debug_nonempty() {
+    let d = format!("{:?}", ClockSkewPolicy::FlagOnly);
+    assert!(!d.is_empty());
+    assert!(d.contains("FlagOnly"));
+}
+
+// ────────────────────────────────────────────────────────────────────
+// ClockSkewAnomaly: serde and derives
+// ────────────────────────────────────────────────────────────────────
+
+#[test]
+fn clock_skew_anomaly_serde_roundtrip() {
+    let anomaly = ClockSkewAnomaly {
+        pane_id: 42,
+        event_ts_ms: 5000,
+        prev_ts_ms: 10000,
+        delta_ms: -5000,
+        global_sequence: 99,
+    };
+    let json = serde_json::to_string(&anomaly).unwrap();
+    let back: ClockSkewAnomaly = serde_json::from_str(&json).unwrap();
+    assert_eq!(anomaly, back);
+}
+
+#[test]
+fn clock_skew_anomaly_clone_eq() {
+    let a = ClockSkewAnomaly {
+        pane_id: 1,
+        event_ts_ms: 100,
+        prev_ts_ms: 200,
+        delta_ms: -100,
+        global_sequence: 5,
+    };
+    let b = a.clone();
+    assert_eq!(a, b);
+}
+
+#[test]
+fn clock_skew_anomaly_debug_nonempty() {
+    let a = ClockSkewAnomaly {
+        pane_id: 1,
+        event_ts_ms: 100,
+        prev_ts_ms: 200,
+        delta_ms: -100,
+        global_sequence: 5,
+    };
+    let d = format!("{:?}", a);
+    assert!(!d.is_empty());
+}
+
+// ────────────────────────────────────────────────────────────────────
+// ReplayOrder: Hash consistency with Eq
+// ────────────────────────────────────────────────────────────────────
+
+#[test]
+fn replay_order_hash_consistent_with_eq() {
+    use std::hash::{Hash, Hasher};
+    let a = ReplayOrder::new(10, 20, 30);
+    let b = ReplayOrder::new(10, 20, 30);
+    assert_eq!(a, b);
+
+    let mut hasher_a = std::collections::hash_map::DefaultHasher::new();
+    a.hash(&mut hasher_a);
+    let mut hasher_b = std::collections::hash_map::DefaultHasher::new();
+    b.hash(&mut hasher_b);
+    assert_eq!(hasher_a.finish(), hasher_b.finish());
+}
+
+#[test]
+fn replay_order_copy_semantics() {
+    let a = ReplayOrder::new(1, 2, 3);
+    let b = a; // Copy
+    assert_eq!(a, b);
+}
+
+// ────────────────────────────────────────────────────────────────────
+// ReplayOrderViolation: validation detects specific variants
+// ────────────────────────────────────────────────────────────────────
+
+#[test]
+fn validate_detects_global_regression() {
+    let orders = vec![ReplayOrder::new(10, 0, 0), ReplayOrder::new(5, 1, 0)];
+    let violations = validate_replay_order(&orders);
+    assert!(!violations.is_empty());
+    assert!(matches!(
+        &violations[0],
+        ReplayOrderViolation::GlobalSequenceRegression { .. }
+    ));
+}
+
+#[test]
+fn validate_detects_pane_regression() {
+    // Same pane, global goes up but pane seq goes backward
+    let orders = vec![ReplayOrder::new(1, 0, 5), ReplayOrder::new(2, 0, 3)];
+    let violations = validate_replay_order(&orders);
+    assert!(!violations.is_empty());
+    assert!(matches!(
+        &violations[0],
+        ReplayOrderViolation::PaneSequenceRegression { .. }
+    ));
+}
+
+#[test]
+fn validate_detects_duplicate_order() {
+    let orders = vec![ReplayOrder::new(1, 0, 0), ReplayOrder::new(1, 0, 0)];
+    let violations = validate_replay_order(&orders);
+    assert!(!violations.is_empty());
+    assert!(
+        violations
+            .iter()
+            .any(|v| matches!(v, ReplayOrderViolation::DuplicateOrder { .. }))
+    );
+}
+
+#[test]
+fn replay_order_violation_clone_debug() {
+    let v = ReplayOrderViolation::DuplicateOrder {
+        order: ReplayOrder::new(1, 2, 3),
+    };
+    let c = v.clone();
+    assert_eq!(v, c);
+    let d = format!("{:?}", v);
+    assert!(!d.is_empty());
+}
+
+// ────────────────────────────────────────────────────────────────────
+// SequenceAssigner: Default
+// ────────────────────────────────────────────────────────────────────
+
+#[test]
+fn sequence_assigner_debug_nonempty() {
+    let a = SequenceAssigner::new();
+    let d = format!("{:?}", a);
+    assert!(!d.is_empty());
+}
+
+// ────────────────────────────────────────────────────────────────────
+// CorrelationContext: Default is empty
+// ────────────────────────────────────────────────────────────────────
+
+#[test]
+fn correlation_context_default_is_empty() {
+    let ctx = CorrelationContext::empty();
+    assert!(!ctx.has_links());
+    assert_eq!(ctx.parent_event_id, None);
+    assert_eq!(ctx.trigger_event_id, None);
+    assert_eq!(ctx.root_event_id, None);
+    assert_eq!(ctx.batch_id, None);
+}
+
+#[test]
+fn correlation_context_clone_debug() {
+    let ctx = CorrelationContext {
+        parent_event_id: Some("p1".into()),
+        trigger_event_id: None,
+        root_event_id: Some("r1".into()),
+        batch_id: None,
+    };
+    let c = ctx.clone();
+    assert_eq!(ctx, c);
+    let d = format!("{:?}", ctx);
+    assert!(!d.is_empty());
+}
+
+// ────────────────────────────────────────────────────────────────────
+// CorrelationTracker: Default
+// ────────────────────────────────────────────────────────────────────
+
+#[test]
+fn correlation_tracker_debug_nonempty() {
+    let t = CorrelationTracker::new();
+    let d = format!("{:?}", t);
+    assert!(!d.is_empty());
 }
